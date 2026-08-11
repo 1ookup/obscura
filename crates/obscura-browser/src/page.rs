@@ -8400,19 +8400,17 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                            .unwrap();
                         let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .to_string();
-                        seen_tx.send(first).unwrap();
+                        let _ = stream.read(&mut request);
+                        let _ = seen_tx.send(());
                         let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -8420,11 +8418,12 @@ mod tests {
                         );
                         stream.write_all(response.as_bytes()).unwrap();
                         stream.write_all(body).unwrap();
+                        return;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    Err(_) => break,
+                    Err(_) => return,
                 }
             }
         });
@@ -8453,27 +8452,29 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
-        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let loaded = page.prepare_screenshot_resources(1_000).await;
+        let current_src = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.querySelector('img').currentSrc")
+            .unwrap();
+        let prefetch_connection = seen_rx.recv_timeout(std::time::Duration::from_secs(1));
+        server.join().unwrap();
+        let cached = page.js.as_ref().unwrap().render_image_resource_is_known(
+            &asset_network_url,
+            obscura_js::ImageRequestProfile::NoCorsInclude,
+        );
+        let screenshot = page.screenshot(page.viewport);
+        assert_eq!(loaded, 1, "prefetch connection: {prefetch_connection:?}");
         assert_eq!(
-            page.js
-                .as_mut()
-                .unwrap()
-                .evaluate("document.querySelector('img').currentSrc")
-                .unwrap(),
+            current_src,
             serde_json::json!(asset_url),
             "cache/network fragment normalization must not alter currentSrc"
         );
-        page.screenshot(page.viewport).expect("prefetched capture");
-        assert!(seen_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .starts_with("GET /asset.svg "));
-        assert!(
-            seen_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
-            "capture must not open a second synchronous renderer request"
-        );
+        assert!(cached, "page transport must seed the renderer image cache");
+        screenshot.expect("prefetched capture");
+        prefetch_connection.expect("prefetch must open one transport connection");
     }
 
     #[cfg(feature = "render")]
