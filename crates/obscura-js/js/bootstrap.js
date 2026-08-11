@@ -1823,6 +1823,16 @@ function _seedInsertedTreeState(node, parent, connected) {
   node._treeParentEpoch = _treeMutationEpoch;
   node._treeConnected = !!connected;
   node._treeConnectedEpoch = _treeMutationEpoch;
+  // Insertion adopts the node into the parent's document. Restamp only the
+  // moved root; descendants re-resolve lazily (weak consistency, see
+  // Node#ownerDocument). Free while no iframe content document exists.
+  if (_iframeContentDocsSeen) {
+    node._ownerDocRoot = parent
+      ? (parent._scopeRoot !== undefined
+          ? parent._scopeRoot
+          : (parent instanceof Document ? parent._nid : parent._ownerDocRoot))
+      : undefined;
+  }
 }
 
 function _seedUnchangedConnection(node, connected) {
@@ -1853,11 +1863,40 @@ class Node {
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
-  get ownerDocument() { return globalThis.document; }
+  get ownerDocument() {
+    // Owner-document scope cache (design 2.3). The stamp is the owning
+    // document root nid; creation and insertion paths stamp it when they know
+    // the scope, cross-document moves restamp only the moved root (a
+    // descendant may keep a stale owner until re-resolved -- accepted weak
+    // consistency for Phase 2b; adoptNode and insertion restamp the root).
+    // Pages that never create an iframe content document take the constant
+    // no-op path below.
+    const main = globalThis.document;
+    const cached = this._ownerDocRoot;
+    if (cached !== undefined) {
+      return (main === null || cached === main._nid) ? main : _scopedDocumentFor(cached);
+    }
+    if (!_iframeContentDocsSeen) return main;
+    const mainNid = main ? main._nid : 0;
+    const root = +_dom("document_root", this._nid);
+    // A detached subtree's scope root is its own top ancestor, not a document
+    // node; ownership stays with the main document unless the root is an
+    // iframe content-document root (the only non-main document nodes in the
+    // arena).
+    const owner = (root > 0 && root !== mainNid
+        && (_scopedDocs.has(root) || +_dom("node_type", root) === 9))
+      ? root
+      : mainNid;
+    this._ownerDocRoot = owner;
+    return owner === mainNid ? main : _scopedDocumentFor(owner);
+  }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
     try {
-      const doc = globalThis.document;
+      // Frame content nodes resolve against their own document's base; the
+      // ownerDocument lookup is cached and skipped entirely on pages without
+      // iframe content documents.
+      const doc = (_iframeContentDocsSeen && this.ownerDocument) || globalThis.document;
       const docUrl = (doc && doc.URL) || "";
       const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
       if (baseEl) {
@@ -3818,6 +3857,18 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    const nativeRoot = +_dom("iframe_content_document_root", this._nid);
+    if (nativeRoot >= 0) {
+      // Native content document committed by the Rust frame loader. The
+      // same-origin gate compares typed DocumentScope origins in Rust, never
+      // serialized origin strings; cross-origin content reads as null.
+      if (!_frameSameOrigin(nativeRoot)) return null;
+      const doc = _scopedDocumentFor(nativeRoot);
+      doc._defaultViewProxy = _frameWindowProxyFor(this);
+      return doc;
+    }
+    // Legacy shim below: dynamically created iframes the Rust loader has not
+    // handled. Its string-origin compare retires with Phase 3.5 unification.
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -3834,6 +3885,11 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    // A native content document gets the stable WindowProxy regardless of
+    // origin; per-property access checks live on the proxy itself.
+    if (+_dom("iframe_content_document_root", this._nid) >= 0) {
+      return _frameWindowProxyFor(this);
+    }
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -4795,6 +4851,9 @@ class Document extends Node {
     el._ns = "http://www.w3.org/1999/xhtml";
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
+    // Creation knows its scope: stamp the owner-document root (scoped
+    // documents carry _scopeRoot, the main document its own nid).
+    el._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
     _cache.set(nid, el);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
@@ -4828,6 +4887,7 @@ class Document extends Node {
     el._ns = effectiveNamespace;
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
+    el._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
     _cache.set(nid, el);
     return el;
   }
@@ -4835,6 +4895,7 @@ class Document extends Node {
     const nid = +_dom("create_text_node", String(t));
     const n = new Text(nid);
     _seedDetachedTreeState(n);
+    n._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
     _cache.set(nid, n);
     return n;
   }
@@ -4842,6 +4903,7 @@ class Document extends Node {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
     _seedDetachedTreeState(n);
+    n._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
     _cache.set(nid, n);
     return n;
   }
@@ -4882,6 +4944,7 @@ class Document extends Node {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
     _seedDetachedTreeState(frag);
+    frag._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
     _cache.set(nid, frag);
     return frag;
   }
@@ -5885,7 +5948,12 @@ function _wrap(nid) {
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
-  else if (t === 9) n = new Document(nid);
+  else if (t === 9) {
+    // The only non-main document nodes in the arena are iframe content-
+    // document roots; hand back the scoped wrapper so queries stay in-frame.
+    const main = globalThis.document;
+    n = (main && nid !== main._nid) ? _scopedDocumentFor(nid) : new Document(nid);
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -5900,6 +5968,222 @@ function _wrapEl(nid) {
 }
 
 globalThis._wrap = _wrap;
+
+// ---------------------------------------------------------------------------
+// Iframe content documents (Phase 2b). The Rust frame loader commits real
+// content documents into the shared DomTree; these wrappers bind Document
+// methods to a content root and gate cross-frame access on the typed
+// DocumentScope origin. Same NodeId space as the main document, so node
+// wrapping reuses _wrap/_cache unchanged. Per-frame realms are Phase 3.7.
+// ---------------------------------------------------------------------------
+
+// rootNid -> _ScopedDocument. Flags that at least one content document was
+// wrapped this page, which turns on the (otherwise free) ownerDocument logic.
+const _scopedDocs = new Map();
+let _iframeContentDocsSeen = false;
+
+// Same-origin test between a frame content document and the calling realm.
+// The comparison runs in Rust on the typed Origin enum; JS never compares
+// serialized origins (two "null" strings are not same-origin). The calling
+// realm is the single main world until Phase 3.7.
+function _frameSameOrigin(rootNid) {
+  return _dom("iframe_scope_same_origin", rootNid) === "true";
+}
+
+function _scopedDocumentFor(rootNid) {
+  let doc = _scopedDocs.get(rootNid);
+  if (!doc) {
+    doc = new _ScopedDocument(rootNid);
+    _scopedDocs.set(rootNid, doc);
+    _cache.set(rootNid, doc);
+    _iframeContentDocsSeen = true;
+  }
+  return doc;
+}
+
+// Document bound to an iframe content root. Inherited Document methods that
+// route through this.querySelector/this.documentElement/this.createElement
+// (head, body, title setter, getElementsBy*, children, ...) become scoped for
+// free; only the root-0 primitives are overridden.
+class _ScopedDocument extends Document {
+  constructor(rootNid) {
+    super(rootNid);
+    this._scopeRoot = rootNid;
+  }
+  _scopeInfo() { return _domParse("document_scope_info", this._scopeRoot); }
+  get documentElement() {
+    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, "html"));
+  }
+  querySelector(s) {
+    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, s));
+  }
+  querySelectorAll(s) {
+    const ids = _domParse("query_selector_all_scoped", this._scopeRoot, s) || [];
+    return _nodeList(ids.map(_wrapEl).filter(Boolean));
+  }
+  getElementById(id) {
+    // CSS.escape is an identity stub in this runtime; use the same
+    // attribute-selector escape as the native get_element_by_id fallback.
+    const sel = '[id="' + String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, sel));
+  }
+  get title() {
+    const t = this.querySelector("title");
+    if (!t) return "";
+    return (t.textContent || "").split(/[\t\n\f\r ]+/).filter(Boolean).join(" ");
+  }
+  set title(v) {
+    // The inherited setter builds head/title through this.* methods, which
+    // are scoped here.
+    Object.getOwnPropertyDescriptor(Document.prototype, "title").set.call(this, v);
+  }
+  get URL() { const info = this._scopeInfo(); return (info && info.url) || "about:blank"; }
+  get baseURI() {
+    const info = this._scopeInfo();
+    const docUrl = (info && (info.baseUrl || info.url)) || "about:blank";
+    const base = this.querySelector("base[href]");
+    if (base) {
+      const href = base.getAttribute("href");
+      if (href) { try { return new URL(href, docUrl).href; } catch (e) {} }
+    }
+    return docUrl;
+  }
+  get compatMode() {
+    const info = this._scopeInfo();
+    return info && info.quirks ? "BackCompat" : "CSS1Compat";
+  }
+  get referrer() { return ""; }
+  // Wired by the contentDocument/contentWindow getters; null for a document
+  // no longer presented in a frame.
+  get defaultView() { return this._defaultViewProxy || null; }
+  get location() { return this._defaultViewProxy ? this._defaultViewProxy.location : null; }
+  set location(url) { /* frame navigation routes through Rust in Phase 3.5 */ }
+  get doctype() {
+    const ids = _domParse("child_nodes", this._scopeRoot) || [];
+    for (const cid of ids) {
+      if (+_dom("node_type", cid) === 10) return _wrap(+cid);
+    }
+    return null;
+  }
+}
+
+// HTML cross-origin Window property allowlist. Everything else on a
+// cross-origin WindowProxy throws SecurityError.
+const _crossOriginWindowProps = new Set([
+  "window", "self", "frames", "length", "top", "parent", "opener", "closed",
+  "location", "postMessage", "blur", "focus", "close",
+]);
+
+// host nid -> WindowProxy facade. The proxy identity is stable across the
+// frame's navigations; every access re-reads the active content root.
+const _frameWindowProxies = new Map();
+
+function _frameWindowProxyFor(hostEl) {
+  const hostNid = hostEl._nid;
+  const existing = _frameWindowProxies.get(hostNid);
+  if (existing) return existing;
+
+  const contentRoot = () => +_dom("iframe_content_document_root", hostNid);
+  const sameOrigin = () => {
+    const root = contentRoot();
+    return root >= 0 && _frameSameOrigin(root);
+  };
+  const securityError = () => new DOMException(
+    'Blocked a frame with origin "'
+      + (globalThis.location ? globalThis.location.origin : "null")
+      + '" from accessing a cross-origin frame.',
+    "SecurityError");
+
+  // Stable per-proxy location. Reads re-check the frame origin on every
+  // access; writes/assign/replace are permitted cross-origin per HTML but
+  // stay stubs until frame navigation routes through Rust (Phase 3.5).
+  const frameLocation = {
+    get href() {
+      const root = contentRoot();
+      if (root < 0 || !_frameSameOrigin(root)) throw securityError();
+      const info = _domParse("document_scope_info", root);
+      return (info && info.url) || "about:blank";
+    },
+    set href(v) {},
+    assign() {},
+    replace() {},
+    reload() {},
+    toString() { return this.href; },
+  };
+  for (const part of ["origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash"]) {
+    Object.defineProperty(frameLocation, part, {
+      get() {
+        // this.href throws SecurityError cross-origin; let it propagate.
+        const href = this.href;
+        try { const u = new URL(href); return u[part]; }
+        catch (e) { return part === "pathname" ? "/" : ""; }
+      },
+      configurable: true,
+      enumerable: true,
+    });
+  }
+
+  const target = {
+    get document() {
+      const root = contentRoot();
+      if (root < 0) return null;
+      if (!_frameSameOrigin(root)) throw securityError();
+      const doc = _scopedDocumentFor(root);
+      doc._defaultViewProxy = proxy;
+      return doc;
+    },
+    get location() { return frameLocation; },
+    set location(v) { /* cross-origin navigation write; wiring is Phase 3.5 */ },
+    get frameElement() {
+      if (!sameOrigin()) throw securityError();
+      return hostEl;
+    },
+    get name() {
+      if (!sameOrigin()) throw securityError();
+      return hostEl.getAttribute("name") || "";
+    },
+    // Single-realm: the top and (for frames embedded by the top document)
+    // parent window are the main global. The full ancestor WindowProxy chain
+    // for nested frames arrives with per-frame realms (Phase 3.7).
+    get top() { return globalThis; },
+    get parent() { return globalThis; },
+    get length() {
+      const root = contentRoot();
+      if (root < 0) return 0;
+      return (_domParse("query_selector_all_scoped", root, "iframe") || []).length;
+    },
+    get closed() { return false; },
+    get opener() { return null; },
+    // Cross-document messaging is Phase 4; the function must exist so
+    // feature detection and fire-and-forget senders do not throw.
+    postMessage() {},
+    blur() {},
+    focus() {},
+    close() {},
+  };
+  Object.defineProperty(target, "self", { get: () => proxy, configurable: true });
+  Object.defineProperty(target, "window", { get: () => proxy, configurable: true });
+  Object.defineProperty(target, "frames", { get: () => proxy, configurable: true });
+
+  const proxy = new Proxy(target, {
+    // Access checks run per property operation, not only on contentDocument:
+    // cross-origin callers get the HTML allowlist; anything else throws.
+    get(t, key) {
+      if (Reflect.has(t, key)) return Reflect.get(t, key);
+      if (typeof key === "string" && !sameOrigin()) throw securityError();
+      return undefined;
+    },
+    set(t, key, value) {
+      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
+        throw securityError();
+      }
+      return Reflect.set(t, key, value);
+    },
+  });
+  _frameWindowProxies.set(hostNid, proxy);
+  return proxy;
+}
+
 globalThis.self = globalThis;
 
 globalThis.document = null;
@@ -13884,11 +14168,17 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 
 // Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
 // nodes between documents (portals, iframe hand-off) call it; the missing
-// method throws "adoptNode is not a function". With no second document to
-// transfer ownership from, the node is already ours, so return it as-is,
-// matching the observable effect of adoption into this document.
+// method throws "adoptNode is not a function". Adoption transfers ownership
+// without cloning: restamp the adopted root's owner-document cache; its
+// descendants re-resolve lazily (same weak-consistency strategy as
+// insertion, see Node#ownerDocument).
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
-  Document.prototype.adoptNode = function(node) { return node || null; };
+  Document.prototype.adoptNode = function(node) {
+    if (node && node._nid !== undefined) {
+      node._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    }
+    return node || null;
+  };
 }
 
 // Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
@@ -13997,6 +14287,12 @@ globalThis.__obscura_init = function() {
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
+
+  // Frame wrappers belong to the replaced document; the Rust loader creates
+  // fresh content roots for the new page.
+  _scopedDocs.clear();
+  _frameWindowProxies.clear();
+  _iframeContentDocsSeen = false;
 
   const documentNid = +_dom("document_node_id");
   globalThis.document = new Document(documentNid);

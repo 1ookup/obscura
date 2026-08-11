@@ -1253,6 +1253,192 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .unwrap_or(false)
                 .to_string()
         }
+        // Create a fresh content-document root for an <iframe> host, replacing
+        // (and reporting) any previously active root so navigation can retire
+        // the old document's wrappers.
+        "create_iframe_content_document" => {
+            let host = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                // nid 0 is the document; parse failure ("undefined") also lands
+                // here. Neither is ever an iframe host.
+                _ => return "null".into(),
+            };
+            match dom.create_iframe_content_document(NodeId::new(host)) {
+                Ok((root, previous)) => serde_json::json!({
+                    "root": root.index(),
+                    "previous": previous.map(|id| id.index()),
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+            }
+        }
+        "iframe_content_document_root" => {
+            let host = arg1.parse::<u32>().unwrap_or(0);
+            dom.iframe_content_document(NodeId::new(host))
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
+        // Parse a complete HTML document and graft it under a content root.
+        // Returns the parsed document's quirks bool, which is also recorded on
+        // the root's DocumentScope when one exists.
+        "parse_into_subtree" => {
+            let root = match arg1.parse::<u32>() {
+                // Root 0 is the top document; grafting a second full document
+                // into it would corrupt the tree.
+                Ok(n) if n > 0 => NodeId::new(n),
+                _ => return "null".into(),
+            };
+            if dom.get_node(root).is_none() {
+                return "null".into();
+            }
+            let quirks = obscura_dom::parse_into_subtree(dom, root, &arg2);
+            if let Some(mut scope) = dom.document_scope(root) {
+                scope.quirks = quirks;
+                dom.set_document_scope(root, scope);
+            }
+            quirks.to_string()
+        }
+        // Root of the node's owning document: 0 for the main document, the
+        // content root for iframe content nodes. Shadow boundaries are crossed
+        // host-ward; tree_scope_root already stops at parentless roots, so a
+        // document or iframe content root ends the climb.
+        "document_root" => {
+            let mut current = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            // Each iteration crosses one shadow boundary; nesting depth is
+            // bounded by the arena size, so a corrupt host chain cannot spin.
+            for _ in 0..=dom.len() {
+                let Some(root) = dom.tree_scope_root(current) else {
+                    return "-1".into();
+                };
+                if dom.is_shadow_root(root) {
+                    if let Some(shadow) = dom.shadow_root_info(root) {
+                        current = shadow.host;
+                        continue;
+                    }
+                }
+                return root.index().to_string();
+            }
+            "-1".into()
+        }
+        // Same-origin test between a content root's DocumentScope and the
+        // top-level document (Origin::from_url of the page URL). The calling
+        // realm is always the main world until per-frame realms land (Phase
+        // 3.7), so the incumbent origin is the page origin. Compares the typed
+        // Origin enum; serialized "null" origins are never compared equal.
+        "iframe_scope_same_origin" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            match dom.document_scope(root) {
+                Some(scope) => {
+                    let top = obscura_dom::Origin::from_url(&gs.url);
+                    scope.origin.same_origin(&top).to_string()
+                }
+                // No registered scope: fail closed.
+                None => "false".into(),
+            }
+        }
+        "document_scope_info" => {
+            let root = arg1.parse::<u32>().unwrap_or(0);
+            match dom.document_scope(NodeId::new(root)) {
+                Some(scope) => serde_json::json!({
+                    "url": scope.url,
+                    "origin": scope.origin.serialize(),
+                    "baseUrl": scope.base_url,
+                    "sandboxActive": scope.sandbox.active,
+                    "allowScripts": scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS),
+                    "allowSameOrigin": scope
+                        .sandbox
+                        .allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN),
+                    "frameId": scope.frame_id,
+                    "documentGeneration": scope.document_generation,
+                    "quirks": scope.quirks,
+                })
+                .to_string(),
+                None => "null".into(),
+            }
+        }
+        // Record scope state for a content root. arg2 is JSON: url, baseUrl,
+        // sandbox (attribute value or null), frameId, documentGeneration, and
+        // either originUrl (origin computed from the URL) or origin
+        // ({"type":"tuple",scheme,host,port} or {"type":"opaque"} for an
+        // inherited/serialized origin; opaque allocates a fresh id). quirks and
+        // csp are owned by other paths and survive a scope rewrite.
+        "set_document_scope" => {
+            let root = match arg1.parse::<u32>() {
+                // The top-level document's scope is owned by page state, not
+                // the per-root registry; never register root 0 here.
+                Ok(n) if n > 0 => NodeId::new(n),
+                _ => return "false".into(),
+            };
+            if dom.get_node(root).is_none() {
+                return "false".into();
+            }
+            let Ok(spec) = serde_json::from_str::<serde_json::Value>(&arg2) else {
+                return "false".into();
+            };
+            let origin = match spec.get("originUrl").and_then(|v| v.as_str()) {
+                Some(url) => obscura_dom::Origin::from_url(url),
+                None => {
+                    let origin = spec.get("origin");
+                    match origin.and_then(|o| o.get("type")).and_then(|t| t.as_str()) {
+                        Some("tuple") => obscura_dom::Origin::Tuple {
+                            scheme: origin
+                                .and_then(|o| o.get("scheme"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            host: origin
+                                .and_then(|o| o.get("host"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            port: origin
+                                .and_then(|o| o.get("port"))
+                                .and_then(|v| v.as_u64())
+                                .and_then(|port| u16::try_from(port).ok()),
+                        },
+                        _ => obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new()),
+                    }
+                }
+            };
+            let sandbox =
+                obscura_dom::SandboxFlags::parse(spec.get("sandbox").and_then(|v| v.as_str()));
+            let url = spec
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let base_url = spec
+                .get("baseUrl")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&url)
+                .to_string();
+            let frame_id = spec
+                .get("frameId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let document_generation = spec
+                .get("documentGeneration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let existing = dom.document_scope(root);
+            let quirks = existing.as_ref().map(|scope| scope.quirks).unwrap_or(false);
+            let csp = existing.and_then(|scope| scope.csp);
+            dom.set_document_scope(
+                root,
+                obscura_dom::DocumentScope {
+                    url,
+                    origin,
+                    base_url,
+                    sandbox,
+                    csp,
+                    frame_id,
+                    document_generation,
+                    quirks,
+                },
+            );
+            "true".into()
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match &n.data {
@@ -2841,6 +3027,140 @@ mod tests {
     fn fetch_url_validation_honors_per_context_private_network_opt_in() {
         let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
         assert!(validate_fetch_url(&loopback, true).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_content_document_ops_scope_queries_to_the_frame_document() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            r#"<html><body><iframe id="frame"></iframe><div id="main-div"></div></body></html>"#,
+        ));
+        runtime.set_url("http://example.com/iframe-content-ops");
+        runtime.run_page_init();
+        let result = runtime
+            .evaluate(
+                r##"(function() {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    const mainDiv = Number(op("query_selector", "#main-div"));
+                    const notAnIframe = JSON.parse(
+                        op("create_iframe_content_document", mainDiv));
+                    const created = JSON.parse(
+                        op("create_iframe_content_document", host));
+                    const quirks = op(
+                        "parse_into_subtree",
+                        created.root,
+                        '<!doctype html><html><body><p id="inner">in frame</p></body></html>');
+                    const inner = Number(
+                        op("query_selector_scoped", created.root, "#inner"));
+                    return {
+                        hostError: notAnIframe.error ?? null,
+                        previous: created.previous,
+                        root: created.root,
+                        activeRoot: Number(op("iframe_content_document_root", host)),
+                        quirks,
+                        innerFound: inner > 0,
+                        innerDocRoot: Number(op("document_root", inner)),
+                        mainDocRoot: Number(op("document_root", mainDiv)),
+                        mainSeesInner: Number(op("query_selector", "#inner")),
+                        mainScopedSeesInner:
+                            JSON.parse(op("query_selector_all_scoped", 0, "#inner")).length,
+                    };
+                })()"##,
+            )
+            .unwrap();
+        assert_eq!(
+            result["hostError"],
+            serde_json::json!("iframe content host is not an iframe element"),
+        );
+        assert_eq!(result["previous"], serde_json::Value::Null);
+        assert!(result["root"].as_u64().is_some_and(|root| root > 0));
+        assert_eq!(result["activeRoot"], result["root"]);
+        assert_eq!(result["quirks"], serde_json::json!("false"));
+        assert_eq!(result["innerFound"], serde_json::json!(true));
+        assert_eq!(result["innerDocRoot"], result["root"]);
+        assert_eq!(result["mainDocRoot"], serde_json::json!(0));
+        assert_eq!(result["mainSeesInner"], serde_json::json!(-1));
+        assert_eq!(result["mainScopedSeesInner"], serde_json::json!(0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_scope_info_round_trips_and_records_parse_quirks() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            r#"<html><body><iframe id="frame"></iframe></body></html>"#,
+        ));
+        runtime.set_url("http://example.com/iframe-scope-ops");
+        runtime.run_page_init();
+        let result = runtime
+            .evaluate(
+                r##"(function() {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    const created = JSON.parse(
+                        op("create_iframe_content_document", host));
+                    const missing = op("document_scope_info", created.root);
+                    const set = op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://frame.example/page",
+                        baseUrl: "https://frame.example/",
+                        sandbox: "allow-scripts",
+                        frameId: "frame-1",
+                        documentGeneration: 3,
+                        originUrl: "https://frame.example/page",
+                    }));
+                    const info = JSON.parse(op("document_scope_info", created.root));
+                    const quirksParse = op(
+                        "parse_into_subtree",
+                        created.root,
+                        '<html><body><p>quirky</p></body></html>');
+                    const afterParse = JSON.parse(
+                        op("document_scope_info", created.root));
+                    const opaqueSet = op("set_document_scope", created.root, JSON.stringify({
+                        url: "about:blank",
+                        baseUrl: "https://frame.example/",
+                        sandbox: null,
+                        frameId: "frame-1",
+                        documentGeneration: 4,
+                        originUrl: null,
+                        origin: { type: "opaque" },
+                    }));
+                    const opaqueInfo = JSON.parse(op("document_scope_info", created.root));
+                    return {
+                        missing, set, info, quirksParse,
+                        afterParseQuirks: afterParse.quirks,
+                        opaqueSet, opaqueInfo,
+                    };
+                })()"##,
+            )
+            .unwrap();
+        assert_eq!(result["missing"], serde_json::json!("null"));
+        assert_eq!(result["set"], serde_json::json!("true"));
+        assert_eq!(
+            result["info"],
+            serde_json::json!({
+                "url": "https://frame.example/page",
+                "origin": "https://frame.example",
+                "baseUrl": "https://frame.example/",
+                "sandboxActive": true,
+                "allowScripts": true,
+                "allowSameOrigin": false,
+                "frameId": "frame-1",
+                "documentGeneration": 3,
+                "quirks": false,
+            }),
+        );
+        // A doctype-less document parses in quirks mode; the parse writes the
+        // bit back onto the scope, and a later scope rewrite preserves it.
+        assert_eq!(result["quirksParse"], serde_json::json!("true"));
+        assert_eq!(result["afterParseQuirks"], serde_json::json!(true));
+        assert_eq!(result["opaqueSet"], serde_json::json!("true"));
+        assert_eq!(result["opaqueInfo"]["origin"], serde_json::json!("null"));
+        assert_eq!(result["opaqueInfo"]["sandboxActive"], serde_json::json!(false));
+        assert_eq!(result["opaqueInfo"]["allowSameOrigin"], serde_json::json!(true));
+        assert_eq!(result["opaqueInfo"]["documentGeneration"], serde_json::json!(4));
+        assert_eq!(result["opaqueInfo"]["quirks"], serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

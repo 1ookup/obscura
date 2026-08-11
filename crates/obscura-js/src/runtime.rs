@@ -2601,6 +2601,260 @@ mod tests {
         );
     }
 
+    // Phase 2b: native iframe content documents. The Rust loader normally
+    // creates these; tests drive the same ops directly.
+    const FRAME_OPS_PRELUDE: &str = r#"
+        const op = (cmd, a1, a2) =>
+            Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+        const setupFrame = (hostId, html, originUrl) => {
+            const host = document.getElementById(hostId)._nid;
+            const created = JSON.parse(op("create_iframe_content_document", host));
+            if (html) op("parse_into_subtree", created.root, html);
+            op("set_document_scope", created.root, JSON.stringify({
+                url: originUrl,
+                originUrl,
+                frameId: "test-frame",
+                documentGeneration: 1,
+            }));
+            return created.root;
+        };
+    "#;
+
+    #[test]
+    fn native_iframe_same_origin_content_document_is_scoped() {
+        let mut rt = setup_runtime(
+            "<html><body><iframe id=f></iframe><div id=outer></div></body></html>",
+        );
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                setupFrame("f",
+                    '<!DOCTYPE html><html><head><title>  Frame\t Title </title></head>' +
+                    '<body><div id="inner">frame text</div></body></html>',
+                    "http://example.com/frame");
+                const iframe = document.getElementById("f");
+                const cd = iframe.contentDocument;
+                const inner = cd.getElementById("inner");
+                return {{
+                    isDocument: cd instanceof Document,
+                    identity: cd === iframe.contentDocument,
+                    title: cd.title,
+                    innerText: inner ? inner.textContent : null,
+                    docElTag: cd.documentElement.tagName,
+                    bodyTag: cd.body.tagName,
+                    headTag: cd.head.tagName,
+                    url: cd.URL,
+                    baseURI: cd.baseURI,
+                    mainCannotSeeFrameId: document.getElementById("inner") === null,
+                    frameCannotSeeMainId: cd.getElementById("outer") === null,
+                    windowDocument: iframe.contentWindow.document === cd,
+                    windowIdentity: iframe.contentWindow === iframe.contentWindow,
+                    locationHref: iframe.contentWindow.location.href,
+                    createdTag: cd.createElement("span").tagName,
+                }};
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!({
+                "isDocument": true,
+                "identity": true,
+                "title": "Frame Title",
+                "innerText": "frame text",
+                "docElTag": "HTML",
+                "bodyTag": "BODY",
+                "headTag": "HEAD",
+                "url": "http://example.com/frame",
+                "baseURI": "http://example.com/frame",
+                "mainCannotSeeFrameId": true,
+                "frameCannotSeeMainId": true,
+                "windowDocument": true,
+                "windowIdentity": true,
+                "locationHref": "http://example.com/frame",
+                "createdTag": "SPAN",
+            })
+        );
+    }
+
+    #[test]
+    fn native_iframe_cross_origin_access_is_blocked() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                setupFrame("f",
+                    '<html><body><div id="secret"></div></body></html>',
+                    "http://evil.example.net/frame");
+                const iframe = document.getElementById("f");
+                const win = iframe.contentWindow;
+                const thrown = (fn) => {{
+                    try {{ fn(); return null; }} catch (e) {{ return e.name; }}
+                }};
+                return {{
+                    contentDocumentNull: iframe.contentDocument === null,
+                    windowNotNull: win !== null && win !== undefined,
+                    documentThrows: thrown(() => win.document),
+                    locationHrefThrows: thrown(() => win.location.href),
+                    locationOriginThrows: thrown(() => win.location.origin),
+                    frameElementThrows: thrown(() => win.frameElement),
+                    expandoThrows: thrown(() => win.someExpando),
+                    replaceIsFunction: typeof win.location.replace === "function",
+                    topIsMain: win.top === globalThis,
+                    parentIsMain: win.parent === globalThis,
+                    selfIsWindow: win.self === win && win.window === win && win.frames === win,
+                    postMessageType: typeof win.postMessage,
+                    closed: win.closed,
+                    length: win.length,
+                }};
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!({
+                "contentDocumentNull": true,
+                "windowNotNull": true,
+                "documentThrows": "SecurityError",
+                "locationHrefThrows": "SecurityError",
+                "locationOriginThrows": "SecurityError",
+                "frameElementThrows": "SecurityError",
+                "expandoThrows": "SecurityError",
+                "replaceIsFunction": true,
+                "topIsMain": true,
+                "parentIsMain": true,
+                "selfIsWindow": true,
+                "postMessageType": "function",
+                "closed": false,
+                "length": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn native_iframe_opaque_origins_are_never_same_origin() {
+        // Two opaque origins both serialize as "null" but must not compare
+        // equal; contentDocument stays null even though the page origin would
+        // also serialize as "null" for a data: top-level URL.
+        let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("data:text/html,top");
+        rt.run_page_init();
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                const host = document.getElementById("f")._nid;
+                const created = JSON.parse(op("create_iframe_content_document", host));
+                op("parse_into_subtree", created.root, "<html><body></body></html>");
+                op("set_document_scope", created.root, JSON.stringify({{
+                    url: "data:text/html,frame",
+                    origin: {{ type: "opaque" }},
+                    frameId: "test-frame",
+                    documentGeneration: 1,
+                }}));
+                const iframe = document.getElementById("f");
+                return {{
+                    contentDocumentNull: iframe.contentDocument === null,
+                    windowNotNull: iframe.contentWindow !== null,
+                }};
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!({
+                "contentDocumentNull": true,
+                "windowNotNull": true,
+            })
+        );
+    }
+
+    #[test]
+    fn native_iframe_window_proxy_is_stable_across_navigation() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                setupFrame("f", '<html><body><p id=one></p></body></html>',
+                    "http://example.com/first");
+                const iframe = document.getElementById("f");
+                const win = iframe.contentWindow;
+                const firstDoc = iframe.contentDocument;
+                const firstUrl = win.location.href;
+                // Navigate: a fresh content root replaces the old document.
+                setupFrame("f", '<html><body><p id=two></p></body></html>',
+                    "http://example.com/second");
+                return {{
+                    proxyStable: iframe.contentWindow === win,
+                    newDoc: iframe.contentDocument !== firstDoc,
+                    docFollows: win.document === iframe.contentDocument,
+                    firstUrl,
+                    secondUrl: win.location.href,
+                }};
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!({
+                "proxyStable": true,
+                "newDoc": true,
+                "docFollows": true,
+                "firstUrl": "http://example.com/first",
+                "secondUrl": "http://example.com/second",
+            })
+        );
+    }
+
+    #[test]
+    fn native_iframe_owner_document_semantics() {
+        let mut rt = setup_runtime(
+            "<html><body><iframe id=f></iframe><div id=outer></div></body></html>",
+        );
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                // Before any content document exists, main-document nodes hit
+                // the constant no-op path.
+                const beforeMain = document.body.ownerDocument === document
+                    && document.createElement("div").ownerDocument === document;
+                setupFrame("f", '<html><body><div id="inner"></div></body></html>',
+                    "http://example.com/frame");
+                const iframe = document.getElementById("f");
+                const cd = iframe.contentDocument;
+                const inner = cd.getElementById("inner");
+                const scopedCreated = cd.createElement("em");
+                const results = {{
+                    beforeMain,
+                    mainStillMain: document.getElementById("outer").ownerDocument === document,
+                    frameNodeOwner: inner.ownerDocument === cd,
+                    scopedCreatedOwner: scopedCreated.ownerDocument === cd,
+                    docOwnerNull: cd.ownerDocument === null,
+                }};
+                // Cross-document moves restamp the moved root.
+                const fromMain = document.createElement("span");
+                cd.body.appendChild(fromMain);
+                results.movedIntoFrame = fromMain.ownerDocument === cd;
+                document.body.appendChild(inner);
+                results.movedOutOfFrame = inner.ownerDocument === document;
+                const adopted = document.createElement("b");
+                cd.adoptNode(adopted);
+                results.adopted = adopted.ownerDocument === cd;
+                return results;
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!({
+                "beforeMain": true,
+                "mainStillMain": true,
+                "frameNodeOwner": true,
+                "scopedCreatedOwner": true,
+                "docOwnerNull": true,
+                "movedIntoFrame": true,
+                "movedOutOfFrame": true,
+                "adopted": true,
+            })
+        );
+    }
+
     #[test]
     fn document_domain_getter_and_valid_relaxation_match_effective_host() {
         let dom = parse_html("<html><body></body></html>");
