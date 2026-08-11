@@ -11568,6 +11568,66 @@ mod tests {
     }
 
     #[test]
+    fn closed_shadow_iframe_content_composites_into_parent() {
+        let tree = parse_html(
+            "<!DOCTYPE html><html><body style=\"margin:0\"><div id=host></div></body></html>",
+        );
+        let shadow_host = tree.query_selector("#host").unwrap().unwrap();
+        let shadow_root = tree
+            .attach_shadow_root(shadow_host, ShadowRootMode::Closed)
+            .unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            shadow_root,
+            "<iframe style=\"display:block;border:0;width:100px;height:50px\"></iframe>",
+        );
+        let frame_host = tree
+            .query_selector_from(shadow_root, "iframe")
+            .unwrap()
+            .unwrap();
+        let (content_root, _) = tree.create_iframe_content_document(frame_host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            content_root,
+            "<!DOCTYPE html><html><body style=\"margin:0;background:rgb(255,0,0)\"></body></html>",
+        );
+
+        let mut resources = RenderResourceCache::default();
+        let mut sheet_cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let child = render_frame_document(
+            &tree,
+            content_root,
+            (100.0, 50.0),
+            None,
+            &mut resources,
+            &mut sheet_cache,
+            &mut timeline,
+            &EMPTY_CANVAS_SURFACES,
+        )
+        .expect("child paint");
+        let stub = StubFrameSurfaces {
+            host: frame_host,
+            pixmap: child,
+        };
+        let mut parent_resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (300.0, 200.0), None, &mut parent_resources).expect("prepare");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let output = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree,
+            &mut prepared,
+            &mut parent_resources,
+            &scroll,
+            [255, 255, 255, 255],
+            &stub,
+        )
+        .expect("parent paint");
+        let inside = output.pixel(10, 10).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+    }
+
+    #[test]
     fn frame_surface_blit_does_not_double_multiply_alpha() {
         let tree = parse_html(
             "<!DOCTYPE html><html><body style=\"margin:0\">\

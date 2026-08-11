@@ -769,6 +769,26 @@ impl DomTree {
         self.is_iframe_content_document(root).then_some(root)
     }
 
+    /// Return the document root containing `node`, crossing native
+    /// ShadowRoot-to-host edges but not crossing an iframe content-document
+    /// root back to its host. This is the document ownership walk browser
+    /// subsystems need for nodes in open or closed shadow trees.
+    pub fn containing_document_root_shadow_including(&self, node: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            inner.nodes.get(current.index())?.as_ref()?;
+            if current == inner.document
+                || inner.iframe_content_documents_by_root.contains_key(&current)
+                || inner.document_scopes.contains_key(&current)
+            {
+                return Some(current);
+            }
+            current = Self::host_including_parent_without_iframe(&inner, current)?;
+        }
+        None
+    }
+
     pub fn document_scope(&self, root: NodeId) -> Option<DocumentScope> {
         self.inner.borrow().document_scopes.get(&root).cloned()
     }
@@ -893,6 +913,18 @@ impl DomTree {
             .and_then(|entry| entry.parent)
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
             .or_else(|| inner.iframe_content_documents_by_root.get(&node).copied())
+    }
+
+    fn host_including_parent_without_iframe(
+        inner: &DomTreeInner,
+        node: NodeId,
+    ) -> Option<NodeId> {
+        inner
+            .nodes
+            .get(node.index())
+            .and_then(|entry| entry.as_ref())
+            .and_then(|entry| entry.parent)
+            .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
     }
 
     /// DOM insertion rejects a node when it is a host-including inclusive
@@ -1445,6 +1477,81 @@ impl DomTree {
     pub fn shadow_descendants(&self, host: NodeId) -> Option<Vec<NodeId>> {
         let root = self.shadow_root(host)?;
         Some(self.descendants(root))
+    }
+
+    /// Find iframe hosts below one document root, entering every native open
+    /// or closed shadow tree while deliberately not entering iframe content
+    /// documents. Document selectors remain tree-scoped; this traversal is
+    /// for browser internals that create browsing contexts.
+    pub fn iframe_hosts_in_shadow_including_subtree(&self, root: NodeId) -> Vec<NodeId> {
+        let inner = self.inner.borrow();
+        if inner
+            .nodes
+            .get(root.index())
+            .and_then(|entry| entry.as_ref())
+            .is_none()
+        {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut stack = Vec::new();
+        Self::push_children_reversed(&inner, root, &mut stack);
+
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = inner
+                .nodes
+                .get(current.index())
+                .and_then(|entry| entry.as_ref())
+            else {
+                continue;
+            };
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "iframe")
+            {
+                result.push(current);
+            }
+
+            // Push light children first so the hosted shadow tree is visited
+            // first after the LIFO reversal. Both trees remain connected DOM
+            // subtrees and can independently contain browsing contexts.
+            Self::push_children_reversed(&inner, current, &mut stack);
+            if let Some(shadow_root) = inner.shadow_roots_by_host.get(&current) {
+                Self::push_children_reversed(&inner, *shadow_root, &mut stack);
+            }
+            if visited.len() >= inner.nodes.len() {
+                break;
+            }
+        }
+        result
+    }
+
+    fn push_children_reversed(
+        inner: &DomTreeInner,
+        parent: NodeId,
+        stack: &mut Vec<NodeId>,
+    ) {
+        let mut child = inner
+            .nodes
+            .get(parent.index())
+            .and_then(|entry| entry.as_ref())
+            .and_then(|node| node.first_child);
+        let mut children = Vec::new();
+        for _ in 0..=inner.nodes.len() {
+            let Some(child_id) = child else { break };
+            children.push(child_id);
+            child = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|node| node.next_sibling);
+        }
+        stack.extend(children.into_iter().rev());
     }
 
     /// Whether `node` is an HTML `<slot>` element. Slot assignment is defined
@@ -2353,6 +2460,59 @@ mod tests {
         assert_eq!(
             tree.attach_shadow_root(host, ShadowRootMode::Open),
             Err(AttachShadowError::HostAlreadyHasShadowRoot)
+        );
+    }
+
+    #[test]
+    fn browser_iframe_discovery_crosses_open_and_closed_shadow_roots_only() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let light_frame = element(&tree, "iframe");
+        tree.append_child(document, light_frame);
+
+        let open_host = element(&tree, "open-host");
+        tree.append_child(document, open_host);
+        let open_root = tree
+            .attach_shadow_root(open_host, ShadowRootMode::Open)
+            .unwrap();
+        let open_frame = element(&tree, "iframe");
+        tree.append_child(open_root, open_frame);
+
+        let nested_host = element(&tree, "nested-host");
+        tree.append_child(open_root, nested_host);
+        let closed_root = tree
+            .attach_shadow_root(nested_host, ShadowRootMode::Closed)
+            .unwrap();
+        let closed_frame = element(&tree, "iframe");
+        tree.append_child(closed_root, closed_frame);
+
+        let (content_root, _) = tree
+            .create_iframe_content_document(light_frame)
+            .unwrap();
+        let content_frame = element(&tree, "iframe");
+        tree.append_child(content_root, content_frame);
+
+        assert_eq!(
+            tree.iframe_hosts_in_shadow_including_subtree(document),
+            vec![light_frame, open_frame, closed_frame]
+        );
+        assert_eq!(
+            tree.iframe_hosts_in_shadow_including_subtree(content_root),
+            vec![content_frame]
+        );
+        assert_eq!(
+            tree.containing_document_root_shadow_including(closed_frame),
+            Some(document)
+        );
+        assert_eq!(
+            tree.containing_document_root_shadow_including(content_frame),
+            Some(content_root)
+        );
+
+        // Browser-internal discovery must not change author selector scopes.
+        assert_eq!(
+            tree.query_selector_all("iframe").unwrap(),
+            vec![light_frame]
         );
     }
 

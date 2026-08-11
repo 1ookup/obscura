@@ -2909,17 +2909,39 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
-        if let Some(js) = &mut self.js {
-            if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                Self::settle_runtime_for_duration(js, max_ms).await;
-            } else {
+        if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
+            self.settle_for_duration(max_ms).await;
+        } else {
+            let deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(max_ms);
+            loop {
+                let now = tokio::time::Instant::now();
+                let Some(remaining) = deadline.checked_duration_since(now) else {
+                    break;
+                };
+                let Some(js) = self.js.as_mut() else {
+                    break;
+                };
                 // A deno_core event loop remains "busy" for any future timer,
                 // including analytics intervals and animation loops which do
                 // not make the page more ready. Require a short window without
                 // observable document/network/script activity instead. The
                 // absolute caller budget and V8 watchdog still bound both
                 // asynchronous work and synchronous microtask storms.
-                let _ = js.run_event_loop_until_quiescent(max_ms, 150).await;
+                let _ = js
+                    .run_event_loop_until_quiescent(
+                        duration_millis_u64(remaining),
+                        150,
+                    )
+                    .await;
+                // Timers and fetch completions can insert iframes after the
+                // navigation-time fixed-point drain. Hand those requests to
+                // the Rust frame controller, then give successfully committed
+                // child scripts another event-loop pass within the same
+                // caller deadline.
+                if self.process_pending_frame_navigations().await == 0 {
+                    break;
+                }
             }
         }
         #[cfg(feature = "render")]
@@ -2951,8 +2973,23 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
-            Self::settle_runtime_for_duration(js, duration_ms).await;
+        const FRAME_TASK_SLICE_MS: u64 = 100;
+        let started = tokio::time::Instant::now();
+        let requested = tokio::time::Duration::from_millis(duration_ms);
+        loop {
+            let elapsed = started.elapsed();
+            let Some(remaining) = requested.checked_sub(elapsed) else {
+                break;
+            };
+            let Some(js) = self.js.as_mut() else {
+                break;
+            };
+            let slice_ms = duration_millis_u64(remaining).min(FRAME_TASK_SLICE_MS);
+            if slice_ms == 0 {
+                break;
+            }
+            Self::settle_runtime_for_duration(js, slice_ms).await;
+            self.process_pending_frame_navigations().await;
         }
     }
 
@@ -2962,10 +2999,12 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        match self.js.as_mut() {
+        let idle = match self.js.as_mut() {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
-        }
+        }?;
+        let navigated = self.process_pending_frame_navigations().await;
+        Ok(idle && navigated == 0)
     }
 
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
@@ -3278,8 +3317,24 @@ impl Page {
             // Rust loader committed above (real frame lifecycle lands with
             // Phase 3.5). Deferred one macrotask so handlers attached by page
             // scripts, which run below, still observe them.
-            let _ = js.execute_script("<iframe-load>",
-                "setTimeout(function() { var iframes = document.querySelectorAll('iframe'); for (var i = 0; i < iframes.length; i++) { var f = iframes[i]; try { if (+Deno.core.ops.op_dom('iframe_content_document_root', String(f._nid), '') >= 0) f.dispatchEvent(new Event('load')); } catch (e) {} } }, 0);");
+            let hosts = self
+                .frames
+                .get(self.frames.main_frame_id())
+                .map(|main| {
+                    main.children
+                        .iter()
+                        .filter_map(|frame_id| self.frames.get(frame_id))
+                        .filter_map(|frame| frame.host_nid)
+                        .map(|host| host.raw().to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let script = format!(
+                "setTimeout(function() {{ for (const nid of [{}]) {{ try {{ const f = globalThis._wrapEl(nid); if (f && +Deno.core.ops.op_dom('iframe_content_document_root', String(nid), '') >= 0) f.dispatchEvent(new Event('load')); }} catch (e) {{}} }} }}, 0);",
+                hosts,
+            );
+            let _ = js.execute_script("<iframe-load>", &script);
         }
 
         // Scripts can synchronously flush style/layout through
@@ -3492,9 +3547,7 @@ impl Page {
                     let mut index = 0;
                     while index < roots.len() {
                         let root = roots[index].0;
-                        for host in
-                            dom.query_selector_all_from(root, "iframe").unwrap_or_default()
-                        {
+                        for host in dom.iframe_hosts_in_shadow_including_subtree(root) {
                             if let Some(content_root) = dom.iframe_content_document(host) {
                                 let frame_base = dom
                                     .document_scope(content_root)
@@ -4400,7 +4453,7 @@ impl Page {
         let mut discovered = Vec::new();
         if let Some(dom) = self.dom.as_ref() {
             let main_id = self.frames.main_frame_id().to_string();
-            for host in dom.query_selector_all("iframe").unwrap_or_default() {
+            for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
                 if dom.is_connected(host) && self.frames.by_host(host).is_none() {
                     discovered.push((main_id.clone(), host));
                 }
@@ -4416,10 +4469,7 @@ impl Page {
                 })
                 .collect();
             for (parent_id, root) in frame_scopes {
-                for host in dom
-                    .query_selector_all_from(root, "iframe")
-                    .unwrap_or_default()
-                {
+                for host in dom.iframe_hosts_in_shadow_including_subtree(root) {
                     if dom.is_connected(host) && self.frames.by_host(host).is_none() {
                         discovered.push((parent_id.clone(), host));
                     }
@@ -5286,8 +5336,7 @@ impl Page {
         // Each child gets its own browsing context; sandbox flags propagate.
         let nested: Vec<(obscura_dom::NodeId, FrameNavigationRequest)> = {
             let dom = self.dom.as_ref().expect("checked above");
-            dom.query_selector_all_from(content_root, "iframe")
-                .unwrap_or_default()
+            dom.iframe_hosts_in_shadow_including_subtree(content_root)
                 .into_iter()
                 .map(|nested_host| {
                     let node = dom.get_node(nested_host);
@@ -5335,9 +5384,9 @@ impl Page {
             return 0;
         };
         let hosts: Vec<(obscura_dom::NodeId, FrameNavigationRequest)> = dom
-            .query_selector_all("iframe")
-            .unwrap_or_default()
+            .iframe_hosts_in_shadow_including_subtree(dom.document())
             .into_iter()
+            .filter(|host| dom.is_connected(*host))
             .filter(|host| self.frames.by_host(*host).is_none())
             .map(|host| {
                 let node = dom.get_node(host);
@@ -5769,6 +5818,276 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn closed_shadow_iframe_gets_a_browsing_context_and_navigates() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const host = document.createElement('div');
+                    document.body.appendChild(host);
+                    const root = host.attachShadow({mode: 'closed'});
+                    const frame = document.createElement('iframe');
+                    globalThis.closedShadowHost = host;
+                    globalThis.closedShadowFrame = frame;
+                    globalThis.closedShadowLoads = 0;
+                    frame.addEventListener('load', () => closedShadowLoads++);
+                    frame.srcdoc = '<script>globalThis.shadowMarker = 1;</script>';
+                    root.appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        let (host, frame_id, content_root) = {
+            let js = page.js.as_ref().unwrap();
+            let host = js
+                .with_dom(|dom| {
+                    dom.iframe_hosts_in_shadow_including_subtree(dom.document())
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                })
+                .unwrap();
+            let frame = page.frames.by_host(host).expect("shadow browsing context");
+            (host, frame.frame_id.clone(), frame.active_document_root.unwrap())
+        };
+        assert_eq!(
+            page.frames.get(&frame_id).unwrap().parent_frame_id.as_deref(),
+            Some(page.frames.main_frame_id())
+        );
+        assert_eq!(
+            page.js
+                .as_ref()
+                .unwrap()
+                .with_dom(|dom| {
+                    (
+                        dom.containing_document_root_shadow_including(host),
+                        dom.iframe_content_document(host),
+                    )
+                })
+                .unwrap(),
+            (Some(obscura_dom::NodeId::new(0)), Some(content_root))
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[closedShadowHost.shadowRoot, document.querySelectorAll('iframe').length, closedShadowFrame.contentWindow.shadowMarker, closedShadowLoads]",
+                )
+                .unwrap(),
+            serde_json::json!([null, 0, 1, 1]),
+        );
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "closedShadowFrame.srcdoc = '<script>globalThis.shadowMarker = 2;</' + 'script>'",
+            )
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[closedShadowFrame.contentWindow.shadowMarker, closedShadowLoads]")
+                .unwrap(),
+            serde_json::json!([2, 2]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shadow_iframe_in_child_document_uses_child_as_parent_frame() {
+        let mut page = frame_test_page(
+            "<!doctype html><iframe id=outer srcdoc='<p>outer</p>'></iframe>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+        let outer_host = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| dom.query_selector("#outer").unwrap().unwrap())
+            .unwrap();
+        let outer_id = page.frames.by_host(outer_host).unwrap().frame_id.clone();
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"document.getElementById('outer').contentWindow.eval(`(() => {
+                    const host = document.createElement('div');
+                    document.body.appendChild(host);
+                    const root = host.attachShadow({mode: 'open'});
+                    const frame = document.createElement('iframe');
+                    globalThis.nestedShadowFrame = frame;
+                    frame.srcdoc = '<script>globalThis.nestedMarker = 7;</script>';
+                    root.appendChild(frame);
+                })()`)"#,
+            )
+            .unwrap();
+
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        let nested = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| {
+                let outer_root = dom.iframe_content_document(outer_host).unwrap();
+                let nested = dom
+                    .iframe_hosts_in_shadow_including_subtree(outer_root)
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    dom.containing_document_root_shadow_including(nested),
+                    Some(outer_root)
+                );
+                nested
+            })
+            .unwrap();
+        let nested_frame = page.frames.by_host(nested).expect("nested shadow frame");
+        assert_eq!(nested_frame.parent_frame_id.as_deref(), Some(outer_id.as_str()));
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "document.getElementById('outer').contentWindow.nestedShadowFrame.contentWindow.nestedMarker",
+                )
+                .unwrap(),
+            serde_json::json!(7.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_settle_drains_iframe_navigation_created_by_a_timer() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"setTimeout(() => {
+                    const host = document.createElement('div');
+                    document.body.appendChild(host);
+                    const root = host.attachShadow({mode: 'closed'});
+                    const frame = document.createElement('iframe');
+                    globalThis.timerShadowFrame = frame;
+                    frame.srcdoc = '<script>globalThis.timerFrameMarker = 9;</script>';
+                    root.appendChild(frame);
+                }, 20)"#,
+            )
+            .unwrap();
+
+        page.settle_for_duration(300).await;
+
+        let host = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| {
+                dom.iframe_hosts_in_shadow_including_subtree(dom.document())
+                    .into_iter()
+                    .next()
+            })
+            .flatten()
+            .expect("timer-created shadow iframe");
+        let frame = page
+            .frames
+            .by_host(host)
+            .expect("timer-created shadow frame has a browsing context");
+        assert_eq!(
+            frame.parent_frame_id.as_deref(),
+            Some(page.frames.main_frame_id())
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("timerShadowFrame.contentWindow.timerFrameMarker")
+                .unwrap(),
+            serde_json::json!(9.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adaptive_settle_drains_delayed_shadow_iframe_navigation() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"setTimeout(() => {
+                    const host = document.body.appendChild(document.createElement('div'));
+                    const frame = document.createElement('iframe');
+                    globalThis.adaptiveShadowFrame = frame;
+                    frame.srcdoc = '<script>globalThis.adaptiveMarker = 4;</script>';
+                    host.attachShadow({mode: 'open'}).appendChild(frame);
+                }, 20)"#,
+            )
+            .unwrap();
+
+        page.settle(500).await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("adaptiveShadowFrame.contentWindow.adaptiveMarker")
+                .unwrap(),
+            serde_json::json!(4.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_event_loop_turn_commits_pending_shadow_iframe() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const host = document.body.appendChild(document.createElement('div'));
+                    const frame = document.createElement('iframe');
+                    globalThis.autonomousShadowFrame = frame;
+                    frame.srcdoc = '<script>globalThis.autonomousMarker = 6;</script>';
+                    host.attachShadow({mode: 'closed'}).appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+
+        assert!(!page.run_autonomous_event_loop_turn().await.unwrap());
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("autonomousShadowFrame.contentWindow.autonomousMarker")
+                .unwrap(),
+            serde_json::json!(6.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_iframe_navigation_still_dispatches_load() {
         let mut page = frame_test_page("<html><body></body></html>");
         page.document_origin = Some(obscura_dom::Origin::from_url(
@@ -5889,6 +6208,34 @@ mod tests {
         let frame = page.frames.by_host(host).expect("browsing context");
         assert_eq!(frame.active_document_root, Some(root));
         assert_eq!(frame.document_generation, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declarative_closed_shadow_iframe_loads_before_runtime_init() {
+        let mut page = frame_test_page(
+            "<!doctype html><div><template shadowrootmode=closed>\
+             <iframe srcdoc='<p id=shadow-content>loaded</p>'></iframe>\
+             </template></div>",
+        );
+
+        assert_eq!(page.load_child_frames().await, 1);
+        let dom = page.dom.as_ref().unwrap();
+        assert!(dom.query_selector("iframe").unwrap().is_none());
+        let host = dom
+            .iframe_hosts_in_shadow_including_subtree(dom.document())
+            .into_iter()
+            .next()
+            .expect("closed-shadow iframe host");
+        let root = dom.iframe_content_document(host).expect("content document");
+        let marker = dom
+            .query_selector_from(root, "#shadow-content")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dom.text_content(marker), "loaded");
+        assert_eq!(
+            page.frames.by_host(host).unwrap().parent_frame_id.as_deref(),
+            Some(page.frames.main_frame_id())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
