@@ -1070,6 +1070,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_window_proxy_compares_child_origin_with_calling_frame() {
+        let mut rt = setup_runtime(
+            "<html><body><iframe id=outer></iframe></body></html>",
+        );
+        let outer_root = setup_frame(
+            &mut rt,
+            "outer",
+            "<html><body><iframe id=child-a></iframe><iframe id=child-b></iframe></body></html>",
+            "http://b.example/frame",
+            1,
+        );
+
+        let roots = rt
+            .evaluate(&format!(
+                r##"(() => {{
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const make = (selector, url, frameId) => {{
+                        const host = +op("query_selector_scoped", {outer_root}, selector);
+                        const created = JSON.parse(op("create_iframe_content_document", host));
+                        op("parse_into_subtree", created.root, "<html><body>child</body></html>");
+                        op("set_document_scope", created.root, JSON.stringify({{
+                            url,
+                            originUrl: url,
+                            frameId,
+                            documentGeneration: 1,
+                        }}));
+                        return created.root;
+                    }};
+                    return [
+                        make("#child-a", "http://example.com/child", "child-a"),
+                        make("#child-b", "http://b.example/child", "child-b"),
+                    ];
+                }})()"##
+            ))
+            .unwrap();
+        assert!(roots.is_array());
+
+        rt.ensure_frame_realm(
+            "outer-frame",
+            1,
+            outer_root,
+            "http://b.example/frame",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "outer-frame",
+                1,
+                "<t>",
+                r#"[
+                    document.getElementById("child-a").contentDocument === null,
+                    document.getElementById("child-b").contentDocument.body.textContent,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([true, "child"]),
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn postmessage_target_origin_filtering() {
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");

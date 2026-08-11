@@ -5984,10 +5984,12 @@ let _iframeContentDocsSeen = false;
 
 // Same-origin test between a frame content document and the calling realm.
 // The comparison runs in Rust on the typed Origin enum; JS never compares
-// serialized origins (two "null" strings are not same-origin). The calling
-// realm is the single main world until Phase 3.7.
+// serialized origins (two "null" strings are not same-origin). A nested
+// frame must compare its child against itself, not against the top document:
+// top=A -> frame=B -> child=A is cross-origin to its caller even though the
+// child matches top, while a B child remains same-origin with the B caller.
 function _frameSameOrigin(rootNid) {
-  return _dom("iframe_scope_same_origin", rootNid) === "true";
+  return _dom("iframe_scopes_same_origin", _callingFrameRoot(), rootNid) === "true";
 }
 
 // Cross-document postMessage (Phase 4). Structured cloning reuses the Worker
