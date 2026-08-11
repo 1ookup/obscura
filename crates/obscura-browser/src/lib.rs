@@ -1,4 +1,5 @@
 pub mod context;
+pub mod frame_policy;
 pub mod frames;
 pub mod lifecycle;
 pub mod page;
@@ -7,6 +8,7 @@ pub mod pdf;
 pub mod profiles;
 
 pub use context::BrowserContext;
+pub use frame_policy::{frame_embedding_allowed, ContentSecurityPolicy, FrameBlockedReason};
 pub use frames::{BrowsingContext, CommitError, CommittedDocument, FrameRegistry};
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;

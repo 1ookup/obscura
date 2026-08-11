@@ -12,6 +12,7 @@ render = ["obscura-js/render", "dep:image"]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 obscura-js = { workspace = true }
+html5ever = { workspace = true }
 tokio = { workspace = true }
 futures = "0.3"
 url = { workspace = true }

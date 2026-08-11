@@ -4,8 +4,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
-    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    CallbackRegistry, Method, ObscuraHttpClient, ObscuraNetError, RequestCallback,
+    ResourceRequest, ResourceType, Response, ResponseCallback,
 };
 use url::Url;
 
@@ -216,6 +216,11 @@ struct DeviceMetricsBaseline {
 pub struct Page {
     pub id: String,
     pub frame_id: String,
+    /// Browser-core frame tree (docs/Iframe-support-design.md Phase 1.7).
+    /// The main frame is registered on construction; child entries appear
+    /// when iframe browsing contexts are created. CDP projects this
+    /// registry rather than keeping its own frame model.
+    pub frames: crate::frames::FrameRegistry,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
     pub js: Option<ObscuraJsRuntime>,
@@ -285,6 +290,10 @@ pub struct Page {
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
     callbacks: Arc<CallbackRegistry>,
+    /// Materialized frame stylesheet graphs keyed by canonical root URL
+    /// (Phase 3.6). The same sheet referenced from several frames is fetched
+    /// once per top-level navigation; None caches a failed fetch.
+    frame_stylesheet_cache: std::collections::HashMap<String, Option<String>>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -885,6 +894,7 @@ impl Page {
 
         Page {
             id,
+            frames: crate::frames::FrameRegistry::new(frame_id.clone()),
             frame_id,
             url: None,
             dom: None,
@@ -916,6 +926,7 @@ impl Page {
             preload_scripts: Vec::new(),
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
+            frame_stylesheet_cache: std::collections::HashMap::new(),
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -2571,6 +2582,24 @@ impl Page {
             .unwrap_or_default();
 
         self.dom = Some(dom);
+        // Phase 2b: the Rust frame loader replaces the JS iframe pre-scan; it
+        // covers src, srcdoc, data:, nesting, sandbox propagation and the
+        // XFO/frame-ancestors/frame-src gates. It must run before init_js
+        // moves the DomTree into the JS runtime (self.dom.take() below), and
+        // after detaching the previous document's child frames: their host
+        // nids belong to the replaced tree, and a stale by_host entry would
+        // mask a host in the new document (nids restart per document).
+        let main_frame_id = self.frames.main_frame_id().to_string();
+        let stale_children = self
+            .frames
+            .get(&main_frame_id)
+            .map(|main| main.children.clone())
+            .unwrap_or_default();
+        for child in stale_children {
+            self.frames.detach(&child);
+        }
+        self.frame_stylesheet_cache.clear();
+        self.load_child_frames().await;
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
 
@@ -2612,8 +2641,12 @@ impl Page {
             js.reset_animation_timeline();
         }
         if let Some(js) = &mut self.js {
+            // Fire the load events of iframe hosts whose content document the
+            // Rust loader committed above (real frame lifecycle lands with
+            // Phase 3.5). Deferred one macrotask so handlers attached by page
+            // scripts, which run below, still observe them.
             let _ = js.execute_script("<iframe-load>",
-                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
+                "setTimeout(function() { var iframes = document.querySelectorAll('iframe'); for (var i = 0; i < iframes.length; i++) { var f = iframes[i]; try { if (+Deno.core.ops.op_dom('iframe_content_document_root', String(f._nid), '') >= 0) f.dispatchEvent(new Event('load')); } catch (e) {} } }, 0);");
         }
 
         // Scripts can synchronously flush style/layout through
@@ -2789,39 +2822,65 @@ impl Page {
                     candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
                 }
             }
+            // CSS sources per document root: the main document plus every
+            // active iframe content document (Phase 3.6), whose relative
+            // url() assets resolve against the frame's own base URL.
             let css_sources = js
                 .with_dom(|dom| {
+                    let mut roots: Vec<(obscura_dom::NodeId, Option<String>)> =
+                        vec![(dom.document(), None)];
+                    let mut index = 0;
+                    while index < roots.len() {
+                        let root = roots[index].0;
+                        for host in
+                            dom.query_selector_all_from(root, "iframe").unwrap_or_default()
+                        {
+                            if let Some(content_root) = dom.iframe_content_document(host) {
+                                let frame_base = dom
+                                    .document_scope(content_root)
+                                    .map(|scope| scope.base_url);
+                                roots.push((content_root, frame_base));
+                            }
+                        }
+                        index += 1;
+                    }
                     let mut sources = Vec::new();
-                    for id in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(id) else {
-                            continue;
-                        };
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "style")
-                        {
-                            sources.push(dom.text_content(id));
-                        }
-                        if let Some(style) = node.get_attribute("style") {
-                            sources.push(style.to_string());
-                        }
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "use")
-                        {
-                            if let Some(href) = node
-                                .get_attribute("href")
-                                .or_else(|| node.get_attribute("xlink:href"))
+                    for (root, root_base) in roots {
+                        for id in dom.descendants(root) {
+                            let Some(node) = dom.get_node(id) else {
+                                continue;
+                            };
+                            if node
+                                .as_element()
+                                .is_some_and(|element| element.local.as_ref() == "style")
                             {
-                                sources.push(format!("url({href})"));
+                                sources.push((dom.text_content(id), root_base.clone()));
+                            }
+                            if let Some(style) = node.get_attribute("style") {
+                                sources.push((style.to_string(), root_base.clone()));
+                            }
+                            if node
+                                .as_element()
+                                .is_some_and(|element| element.local.as_ref() == "use")
+                            {
+                                if let Some(href) = node
+                                    .get_attribute("href")
+                                    .or_else(|| node.get_attribute("xlink:href"))
+                                {
+                                    sources.push((format!("url({href})"), root_base.clone()));
+                                }
                             }
                         }
                     }
                     sources
                 })
                 .unwrap_or_default();
-            for css in css_sources {
-                for raw in css_resource_urls(&css, &base_url) {
+            for (css, root_base) in css_sources {
+                let scan_base = root_base
+                    .as_deref()
+                    .and_then(|raw| url::Url::parse(raw).ok())
+                    .unwrap_or_else(|| base_url.clone());
+                for raw in css_resource_urls(&css, &scan_base) {
                     if let Ok(mut url) = url::Url::parse(&raw) {
                         let kind = render_resource_type(&url);
                         url.set_fragment(None);
@@ -3735,6 +3794,669 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
     pattern.ends_with('*') || remainder.is_empty()
 }
 
+// ---------------------------------------------------------------------------
+// Frame navigation controller (docs/Iframe-support-design.md Phase 3.1/3.5).
+//
+// Every iframe load is a navigation request driven from Rust: no CORS
+// filtering applies, and the gates are the embedder's `frame-src` plus the
+// response's `X-Frame-Options` / `frame-ancestors` (frame_policy.rs). All
+// entry points (parser insertion, src/srcdoc mutation, location, CDP
+// Page.navigate(frameId)) are expected to funnel through `navigate_frame`.
+// Script execution and sub-resource loading for frame documents integrate in
+// Phase 3.6-3.8.
+// ---------------------------------------------------------------------------
+
+/// Depth cap for nested frames, enforced at the loader so a self-embedding
+/// page fetch-loops before paint ever runs. Blink's kMaxFrameDepth is on the
+/// order of 100; this is deliberately lower but far above real embed stacks.
+pub const MAX_FRAME_DEPTH: usize = 32;
+
+/// A navigation request for one frame. `srcdoc` takes precedence over `url`,
+/// per the HTML processing model.
+#[derive(Clone, Debug, Default)]
+pub struct FrameNavigationRequest {
+    /// Absolute or parent-base-relative URL; `None` (with no srcdoc) is the
+    /// initial about:blank document.
+    pub url: Option<String>,
+    pub srcdoc: Option<String>,
+    pub method: Option<String>,
+    pub body: Option<Vec<u8>>,
+    pub referrer: Option<String>,
+    /// Parsed `sandbox` attribute of the host element. Propagation from the
+    /// parent scope happens inside the controller.
+    pub sandbox: obscura_dom::SandboxFlags,
+    pub user_activated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameNavigateError {
+    UnknownFrame,
+    /// A newer navigation started; this one is abandoned.
+    Superseded,
+    DepthExceeded,
+    /// URL equals an ancestor document's URL in this frame chain.
+    SelfEmbedding,
+    Blocked(crate::frame_policy::FrameBlockedReason),
+    Fetch(String),
+    Dom(String),
+}
+
+impl std::fmt::Display for FrameNavigateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownFrame => f.write_str("unknown frame id"),
+            Self::Superseded => f.write_str("superseded by a newer navigation"),
+            Self::DepthExceeded => f.write_str("frame nesting depth exceeded"),
+            Self::SelfEmbedding => f.write_str("frame URL matches an ancestor document"),
+            Self::Blocked(reason) => write!(f, "{reason}"),
+            Self::Fetch(message) => write!(f, "frame fetch failed: {message}"),
+            Self::Dom(message) => write!(f, "frame dom commit failed: {message}"),
+        }
+    }
+}
+
+impl Page {
+    /// The document URL and origin of each ancestor of `frame_id`, nearest
+    /// first, ending with the top-level document.
+    fn frame_ancestor_chain(&self, frame_id: &str) -> Vec<(String, obscura_dom::Origin)> {
+        let mut chain = Vec::new();
+        let mut current = self
+            .frames
+            .get(frame_id)
+            .and_then(|frame| frame.parent_frame_id.clone());
+        while let Some(ancestor_id) = current {
+            let Some(frame) = self.frames.get(&ancestor_id) else {
+                break;
+            };
+            if frame.parent_frame_id.is_none() {
+                // Main frame: URL and origin come from the page itself.
+                let url = self
+                    .url
+                    .as_ref()
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|| "about:blank".to_string());
+                let origin = obscura_dom::Origin::from_url(&url);
+                chain.push((url, origin));
+            } else if let Some(scope) = frame
+                .active_document_root
+                .and_then(|root| self.dom.as_ref()?.document_scope(root))
+            {
+                chain.push((scope.url.clone(), scope.origin.clone()));
+            }
+            current = frame.parent_frame_id.clone();
+        }
+        chain
+    }
+
+    /// The parent document's scope pieces needed for inheritance: (base URL,
+    /// origin, sandbox, csp). For the main frame the CSP hook is not yet
+    /// wired (main-document CSP tracking lands with Phase 3.6).
+    fn frame_parent_inheritance(
+        &self,
+        frame_id: &str,
+    ) -> (String, obscura_dom::Origin, obscura_dom::SandboxFlags, Option<String>) {
+        let parent = self
+            .frames
+            .get(frame_id)
+            .and_then(|frame| frame.parent_frame_id.as_deref())
+            .and_then(|parent_id| self.frames.get(parent_id));
+        if let Some(parent) = parent {
+            if parent.parent_frame_id.is_some() {
+                if let Some(scope) = parent
+                    .active_document_root
+                    .and_then(|root| self.dom.as_ref().and_then(|dom| dom.document_scope(root)))
+                {
+                    return (
+                        scope.base_url.clone(),
+                        scope.origin.clone(),
+                        scope.sandbox,
+                        scope.csp.clone(),
+                    );
+                }
+            }
+        }
+        let url = self
+            .url
+            .as_ref()
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| "about:blank".to_string());
+        let origin = obscura_dom::Origin::from_url(&url);
+        (url, origin, obscura_dom::SandboxFlags::default(), None)
+    }
+
+    /// Navigate one child frame. Commits a new content document into the
+    /// shared DomTree, updates the frame registry, and recursively starts
+    /// navigations for iframes found in the committed content.
+    pub fn navigate_frame<'a>(
+        &'a mut self,
+        frame_id: &'a str,
+        request: FrameNavigationRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), FrameNavigateError>> + 'a>,
+    > {
+        Box::pin(self.navigate_frame_inner(frame_id, request))
+    }
+
+    async fn navigate_frame_inner(
+        &mut self,
+        frame_id: &str,
+        request: FrameNavigationRequest,
+    ) -> Result<(), FrameNavigateError> {
+        let host_nid = self
+            .frames
+            .get(frame_id)
+            .ok_or(FrameNavigateError::UnknownFrame)?
+            .host_nid
+            .ok_or(FrameNavigateError::UnknownFrame)?;
+        let navigation_generation = self
+            .frames
+            .begin_navigation(frame_id)
+            .ok_or(FrameNavigateError::UnknownFrame)?;
+        if self.frames.depth(frame_id) > MAX_FRAME_DEPTH {
+            return Err(FrameNavigateError::DepthExceeded);
+        }
+
+        let (parent_base, parent_origin, parent_sandbox, parent_csp) =
+            self.frame_parent_inheritance(frame_id);
+        let sandbox = request.sandbox.merged_with_parent(parent_sandbox);
+        let sandbox_forces_opaque =
+            sandbox.active && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN);
+        let ancestors = self.frame_ancestor_chain(frame_id);
+
+        // Resolve the document: URL, origin, and HTML body.
+        let (document_url, base_url, origin, html) = if let Some(srcdoc) = request.srcdoc {
+            // srcdoc inherits the creator origin unless sandbox forces opaque;
+            // its base URL is the creator's.
+            let origin = if sandbox_forces_opaque {
+                obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
+            } else {
+                parent_origin.clone()
+            };
+            (
+                "about:srcdoc".to_string(),
+                parent_base.clone(),
+                origin,
+                srcdoc,
+            )
+        } else {
+            let raw_url = request.url.as_deref().unwrap_or("about:blank");
+            if raw_url == "about:blank" || raw_url.is_empty() {
+                let origin = if sandbox_forces_opaque {
+                    obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
+                } else {
+                    parent_origin.clone()
+                };
+                (
+                    "about:blank".to_string(),
+                    parent_base.clone(),
+                    origin,
+                    String::new(),
+                )
+            } else {
+                // A relative URL resolves against the parent document's base.
+                // `Url::join` handles absolute URLs, `data:` and `blob:`
+                // correctly, unlike a substring test on "://".
+                let base = Url::parse(&parent_base)
+                    .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                let resolved = base
+                    .join(raw_url)
+                    .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
+                let resolved_str = resolved.to_string();
+
+                // Loader-level recursion guard: refuse a frame whose URL
+                // equals an ancestor document's URL in its own frame chain.
+                if ancestors.iter().any(|(url, _)| *url == resolved_str) {
+                    return Err(FrameNavigateError::SelfEmbedding);
+                }
+                // The embedding document's CSP gates the request.
+                if let Some(csp) = &parent_csp {
+                    let policy = crate::frame_policy::ContentSecurityPolicy::parse(csp);
+                    if !policy.frame_src_allows(&resolved_str, &parent_origin) {
+                        return Err(FrameNavigateError::Blocked(
+                            crate::frame_policy::FrameBlockedReason::CspFrameSrc,
+                        ));
+                    }
+                }
+
+                if resolved.scheme() == "data" {
+                    let body = decode_data_uri(&resolved_str).unwrap_or_default();
+                    // data: documents always get a fresh opaque origin.
+                    (
+                        resolved_str.clone(),
+                        resolved_str,
+                        obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new()),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    )
+                } else {
+                    let method = match request.method.as_deref() {
+                        Some("POST") | Some("post") => Method::POST,
+                        _ => Method::GET,
+                    };
+                    let response = self
+                        .http_client
+                        .fetch_with_method(
+                            method,
+                            &resolved,
+                            request.body.clone(),
+                            Some(&self.callbacks),
+                        )
+                        .await
+                        .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
+                    // A stale navigation must not commit, parse or execute.
+                    if !self
+                        .frames
+                        .navigation_is_current(frame_id, navigation_generation)
+                    {
+                        return Err(FrameNavigateError::Superseded);
+                    }
+
+                    // Response gates: X-Frame-Options / frame-ancestors,
+                    // evaluated against the complete ancestor origin chain.
+                    // A blocked navigation must not expose its body.
+                    let response_origin = obscura_dom::Origin::from_url(response.url.as_str());
+                    let xfo: Vec<String> = response
+                        .header("x-frame-options")
+                        .map(|value| vec![value.to_string()])
+                        .unwrap_or_default();
+                    let policies: Vec<crate::frame_policy::ContentSecurityPolicy> = response
+                        .header("content-security-policy")
+                        .map(|value| vec![crate::frame_policy::ContentSecurityPolicy::parse(value)])
+                        .unwrap_or_default();
+                    let ancestor_origins: Vec<obscura_dom::Origin> =
+                        ancestors.iter().map(|(_, origin)| origin.clone()).collect();
+                    crate::frame_policy::frame_embedding_allowed(
+                        &xfo,
+                        &policies,
+                        &response_origin,
+                        &ancestor_origins,
+                    )
+                    .map_err(FrameNavigateError::Blocked)?;
+
+                    let final_url = response.url.to_string();
+                    let origin = if sandbox_forces_opaque {
+                        obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
+                    } else {
+                        response_origin
+                    };
+                    let html = response.text();
+                    (final_url.clone(), final_url, origin, html)
+                }
+            }
+        };
+
+        if !self
+            .frames
+            .navigation_is_current(frame_id, navigation_generation)
+        {
+            return Err(FrameNavigateError::Superseded);
+        }
+
+        // Commit: fresh content root, scope, parsed content, registry update.
+        let dom = self
+            .dom
+            .as_ref()
+            .ok_or_else(|| FrameNavigateError::Dom("page has no document".to_string()))?;
+        let (content_root, _replaced) = dom
+            .create_iframe_content_document(host_nid)
+            .map_err(|error| FrameNavigateError::Dom(error.to_string()))?;
+        let quirks = if html.is_empty() {
+            false
+        } else {
+            obscura_dom::parse_into_subtree(dom, content_root, &html)
+        };
+        let committed = self
+            .frames
+            .commit_document(frame_id, navigation_generation, Some(content_root))
+            .map_err(|error| match error {
+                crate::frames::CommitError::UnknownFrame => FrameNavigateError::UnknownFrame,
+                crate::frames::CommitError::Superseded => FrameNavigateError::Superseded,
+            })?;
+        let dom = self.dom.as_ref().expect("checked above");
+        dom.set_document_scope(
+            content_root,
+            obscura_dom::DocumentScope {
+                url: document_url,
+                origin,
+                base_url: base_url.clone(),
+                sandbox,
+                csp: None,
+                frame_id: frame_id.to_string(),
+                document_generation: committed.document_generation,
+                quirks,
+            },
+        );
+        // The superseded document is detached by the registry swap inside
+        // attach_iframe_content_document. Until Phase 2's wrapper-lifetime
+        // work lands, no JS wrapper can retain it, so free it eagerly.
+        if let Some(previous) = committed.previous_root {
+            dom.remove(previous);
+        }
+
+        // External stylesheets of the committed content (Phase 3.6). A failed
+        // or blocked sheet never fails the navigation.
+        self.load_frame_stylesheets(frame_id, navigation_generation, content_root)
+            .await;
+
+        // Discover nested frames in the committed content and navigate them.
+        // Each child gets its own browsing context; sandbox flags propagate.
+        let nested: Vec<(obscura_dom::NodeId, FrameNavigationRequest)> = {
+            let dom = self.dom.as_ref().expect("checked above");
+            dom.query_selector_all_from(content_root, "iframe")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|nested_host| {
+                    let node = dom.get_node(nested_host);
+                    let attr = |name: &str| {
+                        node.as_ref()
+                            .and_then(|node| node.get_attribute(name))
+                            .map(str::to_string)
+                    };
+                    (
+                        nested_host,
+                        FrameNavigationRequest {
+                            url: attr("src"),
+                            srcdoc: attr("srcdoc"),
+                            sandbox: obscura_dom::SandboxFlags::parse(
+                                attr("sandbox").as_deref(),
+                            ),
+                            ..FrameNavigationRequest::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        for (nested_host, nested_request) in nested {
+            if !self
+                .frames
+                .navigation_is_current(frame_id, navigation_generation)
+            {
+                return Err(FrameNavigateError::Superseded);
+            }
+            let Some(child_id) = self.frames.attach_child(frame_id, nested_host) else {
+                continue;
+            };
+            // A nested frame failing to load must not fail this navigation;
+            // browsers paint the parent regardless.
+            let _ = self.navigate_frame(&child_id, nested_request).await;
+        }
+        Ok(())
+    }
+
+    /// Create browsing contexts for the top-level document's iframes and
+    /// drive their navigations through the Rust controller. Returns the
+    /// number of frames started.
+    pub async fn load_child_frames(&mut self) -> usize {
+        let Some(dom) = self.dom.as_ref() else {
+            return 0;
+        };
+        let hosts: Vec<(obscura_dom::NodeId, FrameNavigationRequest)> = dom
+            .query_selector_all("iframe")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|host| self.frames.by_host(*host).is_none())
+            .map(|host| {
+                let node = dom.get_node(host);
+                let attr = |name: &str| {
+                    node.as_ref()
+                        .and_then(|node| node.get_attribute(name))
+                        .map(str::to_string)
+                };
+                (
+                    host,
+                    FrameNavigationRequest {
+                        url: attr("src"),
+                        srcdoc: attr("srcdoc"),
+                        sandbox: obscura_dom::SandboxFlags::parse(attr("sandbox").as_deref()),
+                        ..FrameNavigationRequest::default()
+                    },
+                )
+            })
+            .collect();
+        let main_frame_id = self.frames.main_frame_id().to_string();
+        let mut started = 0;
+        for (host, request) in hosts {
+            let Some(frame_id) = self.frames.attach_child(&main_frame_id, host) else {
+                continue;
+            };
+            started += 1;
+            let _ = self.navigate_frame(&frame_id, request).await;
+        }
+        started
+    }
+
+    /// Fetch and install external stylesheets for one committed frame content
+    /// document (Phase 3.6). Each fetched graph is inserted as a `<style>`
+    /// node right after its source `<link>`, tagged
+    /// `data-obscura-materialized`, which the per-root render pipeline's
+    /// `<style>` scan picks up. Discovery mirrors the main document's
+    /// `linked_stylesheet_requests`: disabled alternates stay dormant and
+    /// media-gated sheets still fetch, carrying the media condition onto the
+    /// installed `<style>`. Blocked or failed links are skipped silently.
+    async fn load_frame_stylesheets(
+        &mut self,
+        frame_id: &str,
+        navigation_generation: u64,
+        content_root: obscura_dom::NodeId,
+    ) {
+        let Some(scope) = self
+            .dom
+            .as_ref()
+            .and_then(|dom| dom.document_scope(content_root))
+        else {
+            return;
+        };
+        // Frame link hrefs resolve against the frame document's base URL
+        // (the creator's base for srcdoc), never the top document's.
+        let Ok(base) = Url::parse(&scope.base_url) else {
+            return;
+        };
+        let links: Vec<(obscura_dom::NodeId, String, Option<String>)> = {
+            let Some(dom) = self.dom.as_ref() else {
+                return;
+            };
+            dom.query_selector_all_from(content_root, "link[rel~=\"stylesheet\"]")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|link_id| {
+                    let node = dom.get_node(link_id)?;
+                    if node.get_attribute("disabled").is_some() {
+                        return None;
+                    }
+                    let href = node.get_attribute("href")?.to_string();
+                    let media = node.get_attribute("media").map(str::to_string);
+                    Some((link_id, href, media))
+                })
+                .collect()
+        };
+        for (link_id, href, media) in links {
+            let Ok(resolved) = base.join(&href) else {
+                continue;
+            };
+            let (key, resolved) = canonical_stylesheet_url(resolved);
+            if !subresource_allowed(Some(&base), resolved.as_str())
+                || self.should_block_url(resolved.as_str())
+            {
+                tracing::info!("Blocked frame stylesheet: {}", resolved);
+                continue;
+            }
+            let Some(css) = self.materialize_frame_stylesheet(key, resolved, &base).await
+            else {
+                continue;
+            };
+            // A stale navigation must not mutate the committed document.
+            if !self
+                .frames
+                .navigation_is_current(frame_id, navigation_generation)
+            {
+                return;
+            }
+            let Some(dom) = self.dom.as_ref() else {
+                return;
+            };
+            // The link may have been detached while the sheet was in flight,
+            // or a sheet already installed for it.
+            let Some(link) = dom.get_node(link_id) else {
+                continue;
+            };
+            let Some(parent) = link.parent else {
+                continue;
+            };
+            let already = link.next_sibling.and_then(|sibling| {
+                dom.with_node(sibling, |node| {
+                    node.get_attribute("data-obscura-materialized").is_some()
+                })
+            });
+            if already == Some(true) {
+                continue;
+            }
+            let style = dom.new_node(obscura_dom::NodeData::Element {
+                name: html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from("style"),
+                ),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            });
+            dom.with_node_mut(style, |node| {
+                node.set_attribute("data-obscura-materialized", "1".to_string());
+                if let Some(media) = &media {
+                    if !media.trim().is_empty() {
+                        node.set_attribute("media", media.clone());
+                    }
+                }
+            });
+            let text = dom.new_node(obscura_dom::NodeData::Text { contents: css });
+            dom.append_child(style, text);
+            match link.next_sibling {
+                Some(next) => dom.insert_before(next, style),
+                None => dom.append_child(parent, style),
+            }
+        }
+    }
+
+    /// Fetch one external stylesheet graph (`@import`s included, bounded by
+    /// the shared depth and resource caps) and return the materialized CSS
+    /// with relative `url()` values rebased onto each sheet's response URL.
+    /// Results are cached per canonical root URL for the page's lifetime of
+    /// the current top-level document, so the same sheet referenced from
+    /// several frames is fetched once. Frame subresources use the plain page
+    /// transport, like frame navigation itself.
+    async fn materialize_frame_stylesheet(
+        &mut self,
+        root_key: String,
+        root_url: Url,
+        base: &Url,
+    ) -> Option<String> {
+        if let Some(cached) = self.frame_stylesheet_cache.get(&root_key) {
+            return cached.clone();
+        }
+        let callbacks = self.callbacks.clone();
+        let mut sheets = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
+        let mut scheduled = std::collections::HashSet::new();
+        scheduled.insert(root_key.clone());
+        let mut pending = vec![(root_key.clone(), root_url, 0u8)];
+        while let Some((key, requested_url, depth)) = pending.pop() {
+            let (css, response_url) = if requested_url.scheme() == "data" {
+                let Some(body) = decode_data_uri(requested_url.as_str()) else {
+                    continue;
+                };
+                (
+                    String::from_utf8_lossy(&body).into_owned(),
+                    requested_url.clone(),
+                )
+            } else {
+                let request = ResourceRequest::subresource(ResourceType::Stylesheet, base);
+                let response = match self
+                    .http_client
+                    .fetch_resource_with_callbacks(&requested_url, request, Some(&callbacks))
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Failed to fetch frame stylesheet {}: {}",
+                            requested_url,
+                            error
+                        );
+                        continue;
+                    }
+                };
+                let response_url = response.url.clone();
+                self.record_network_event_with_body(
+                    response_url.as_str(),
+                    "GET",
+                    "Stylesheet",
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    false,
+                );
+                (
+                    obscura_net::decode_non_html(&response.body, response.content_type()),
+                    response_url,
+                )
+            };
+
+            let (response_key, response_url) = canonical_stylesheet_url(response_url);
+            if let Some(existing) = aliases.get(&response_key).cloned() {
+                aliases.insert(key, existing);
+                continue;
+            }
+            let (imports, rules) = split_css_imports(&css);
+            let imports = if depth < MAX_STYLESHEET_IMPORT_DEPTH {
+                imports
+            } else {
+                Vec::new()
+            };
+            aliases.insert(key.clone(), key.clone());
+            aliases.insert(response_key, key.clone());
+            sheets.insert(
+                key,
+                LoadedStylesheet {
+                    response_url: response_url.clone(),
+                    imports: imports.clone(),
+                    rules,
+                },
+            );
+            for import in imports {
+                let Ok(import_url) = response_url.join(&import.url) else {
+                    continue;
+                };
+                let (import_key, import_url) = canonical_stylesheet_url(import_url);
+                if aliases.contains_key(&import_key) || scheduled.contains(&import_key) {
+                    continue;
+                }
+                if scheduled.len() >= MAX_STYLESHEET_RESOURCES {
+                    tracing::warn!(
+                        "frame stylesheet resource cap reached at {} resources",
+                        MAX_STYLESHEET_RESOURCES
+                    );
+                    continue;
+                }
+                if !subresource_allowed(Some(base), import_url.as_str())
+                    || self.should_block_url(import_url.as_str())
+                {
+                    tracing::info!("Blocked frame stylesheet import: {}", import_url);
+                    continue;
+                }
+                scheduled.insert(import_key.clone());
+                pending.push((import_key, import_url, depth + 1));
+            }
+        }
+        let css = materialize_stylesheet_graph(
+            &root_key,
+            &sheets,
+            &aliases,
+            &mut std::collections::HashSet::new(),
+        );
+        self.frame_stylesheet_cache.insert(root_key, css.clone());
+        css
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3747,6 +4469,309 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    fn frame_test_page(html: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-test".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-test".to_string(), context);
+        page.url = Some(url::Url::parse("https://top.example/app/").unwrap());
+        page.dom = Some(parse_html(html));
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn srcdoc_frame_commits_content_document_with_inherited_origin() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe srcdoc=\"<p id=hi>hello</p>\"></iframe></body></html>",
+        );
+        let started = page.load_child_frames().await;
+        assert_eq!(started, 1);
+
+        let dom = page.dom.as_ref().unwrap();
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let root = dom.iframe_content_document(host).expect("content document");
+        let scope = dom.document_scope(root).expect("scope recorded");
+        assert_eq!(scope.url, "about:srcdoc");
+        // srcdoc inherits the creator origin.
+        assert_eq!(
+            scope.origin,
+            obscura_dom::Origin::from_url("https://top.example/app/")
+        );
+        let p = dom.query_selector_from(root, "#hi").unwrap().unwrap();
+        assert_eq!(dom.text_content(p), "hello");
+        // Frame content stays out of the top document's scope.
+        assert!(dom.query_selector("#hi").unwrap().is_none());
+        // The registry tracks the committed document.
+        let frame = page.frames.by_host(host).expect("browsing context");
+        assert_eq!(frame.active_document_root, Some(root));
+        assert_eq!(frame.document_generation, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_srcdoc_gets_opaque_origin_and_nested_frames_recurse() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body>\
+             <iframe sandbox=\"\" srcdoc=\"<iframe srcdoc='<b id=deep>x</b>'></iframe>\"></iframe>\
+             </body></html>",
+        );
+        page.load_child_frames().await;
+
+        let dom = page.dom.as_ref().unwrap();
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let root = dom.iframe_content_document(host).unwrap();
+        let scope = dom.document_scope(root).unwrap();
+        // sandbox without allow-same-origin forces a fresh opaque origin.
+        assert!(scope.origin.is_opaque());
+        assert!(scope.sandbox.active);
+
+        // The nested iframe got its own browsing context and document, and
+        // sandbox flags propagated to it.
+        let nested_host = dom.query_selector_from(root, "iframe").unwrap().unwrap();
+        let nested_root = dom.iframe_content_document(nested_host).expect("nested doc");
+        let nested_scope = dom.document_scope(nested_root).unwrap();
+        assert!(nested_scope.origin.is_opaque());
+        assert!(nested_scope.sandbox.active);
+        let deep = dom.query_selector_from(nested_root, "#deep").unwrap().unwrap();
+        assert_eq!(dom.text_content(deep), "x");
+        let nested_frame = page.frames.by_host(nested_host).expect("nested context");
+        assert_eq!(
+            nested_frame.parent_frame_id.as_deref(),
+            Some(page.frames.by_host(host).unwrap().frame_id.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_navigation_blocks_self_embedding_and_frame_src() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe></iframe></body></html>",
+        );
+        let dom = page.dom.as_ref().unwrap();
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let main_id = page.frames.main_frame_id().to_string();
+        let frame_id = page.frames.attach_child(&main_id, host).unwrap();
+
+        // A frame whose URL equals an ancestor document URL is refused at
+        // the loader, before any fetch.
+        let result = page
+            .navigate_frame(
+                &frame_id,
+                super::FrameNavigationRequest {
+                    url: Some("https://top.example/app/".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(result, Err(super::FrameNavigateError::SelfEmbedding));
+
+        // about:blank commits synchronously with the creator origin.
+        let result = page
+            .navigate_frame(&frame_id, super::FrameNavigationRequest::default())
+            .await;
+        assert_eq!(result, Ok(()));
+        let dom = page.dom.as_ref().unwrap();
+        let root = dom.iframe_content_document(host).unwrap();
+        let scope = dom.document_scope(root).unwrap();
+        assert_eq!(scope.url, "about:blank");
+        assert!(!scope.origin.is_opaque());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_url_frame_gets_opaque_origin_not_relative_join() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body>\
+             <iframe src=\"data:text/html,<i id=d>data</i>\"></iframe>\
+             </body></html>",
+        );
+        page.load_child_frames().await;
+        let dom = page.dom.as_ref().unwrap();
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let root = dom.iframe_content_document(host).expect("data: doc");
+        let scope = dom.document_scope(root).unwrap();
+        // data: is not treated as a relative URL and gets an opaque origin.
+        assert!(scope.url.starts_with("data:"));
+        assert!(scope.origin.is_opaque());
+        let node = dom.query_selector_from(root, "#d").unwrap().unwrap();
+        assert_eq!(dom.text_content(node), "data");
+    }
+
+    /// 1x1 PNG, color #e02020. Valid bytes so the render image cache accepts
+    /// the seed (image_intrinsic_dimensions must parse it).
+    const TEST_PIXEL_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
+        2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 120, 160, 160,
+        0, 0, 3, 4, 1, 33, 103, 116, 190, 231, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    fn spawn_frame_stylesheet_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..32 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let _ = request_tx.send(path.clone());
+                let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        b"<!doctype html><html><body>\
+                          <iframe src=\"/sub/frame.html\"></iframe>\
+                          </body></html>"
+                            .to_vec(),
+                    ),
+                    "/sub/frame.html" => (
+                        "text/html",
+                        b"<!doctype html><html><head>\
+                          <link rel=\"stylesheet\" href=\"css/frame.css\">\
+                          <link rel=\"stylesheet\" href=\"css/frame.css\">\
+                          <link rel=\"stylesheet\" href=\"css/print.css\" media=\"print\">\
+                          <link rel=\"stylesheet\" href=\"css/frame.css\" disabled>\
+                          </head><body>\
+                          <img src=\"img/pixel.png\">\
+                          <iframe src=\"/inner.html\"></iframe>\
+                          </body></html>"
+                            .to_vec(),
+                    ),
+                    "/sub/css/frame.css" => (
+                        "text/css",
+                        b"@import 'imported.css';body{background:url('img/bg.png')}".to_vec(),
+                    ),
+                    "/sub/css/imported.css" => ("text/css", b".imp{color:red}".to_vec()),
+                    "/sub/css/print.css" => ("text/css", b".print-only{display:none}".to_vec()),
+                    "/inner.html" => (
+                        "text/html",
+                        b"<!doctype html><html><head>\
+                          <link rel=\"stylesheet\" href=\"/css/inner.css\">\
+                          </head><body></body></html>"
+                            .to_vec(),
+                    ),
+                    "/css/inner.css" => ("text/css", b".inner{color:blue}".to_vec()),
+                    "/sub/img/pixel.png" | "/sub/css/img/bg.png" => {
+                        ("image/png", TEST_PIXEL_PNG.to_vec())
+                    }
+                    _ => ("text/plain", b"missing".to_vec()),
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (origin, request_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_external_stylesheets_materialize_with_imports_and_rebased_urls() {
+        let (origin, requests) = spawn_frame_stylesheet_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-css".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-css".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        let (frame_styles, inner_css, print_media) = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().expect("frame host");
+                let root = dom.iframe_content_document(host).expect("content doc");
+                let styles: Vec<(String, Option<String>)> = dom
+                    .query_selector_all_from(root, "style")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|sid| {
+                        dom.get_node(*sid)
+                            .and_then(|node| {
+                                node.get_attribute("data-obscura-materialized")
+                                    .map(|_| ())
+                            })
+                            .is_some()
+                    })
+                    .map(|sid| {
+                        let media = dom
+                            .get_node(sid)
+                            .and_then(|node| node.get_attribute("media").map(str::to_string));
+                        (dom.text_content(sid), media)
+                    })
+                    .collect();
+                let inner_host = dom
+                    .query_selector_from(root, "iframe")
+                    .unwrap()
+                    .expect("inner host");
+                let inner_root = dom
+                    .iframe_content_document(inner_host)
+                    .expect("inner content doc");
+                let inner_css: Vec<String> = dom
+                    .query_selector_all_from(inner_root, "style")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|sid| dom.text_content(sid))
+                    .collect();
+                let print_media = styles
+                    .iter()
+                    .find(|(css, _)| css.contains(".print-only"))
+                    .and_then(|(_, media)| media.clone());
+                (styles, inner_css, print_media)
+            })
+            .expect("dom available");
+
+        // Two enabled frame.css links plus the media-gated print.css load;
+        // the disabled link stays dormant.
+        assert_eq!(frame_styles.len(), 3);
+        let frame_css = &frame_styles[0].0;
+        // Imported rules precede the importing sheet and relative url()
+        // values are rebased onto the sheet's response URL.
+        let imp = frame_css.find(".imp{color:red}").expect("imported rule");
+        let body_rule = frame_css.find("body{background:").expect("own rule");
+        assert!(imp < body_rule);
+        assert!(frame_css.contains(&format!("url(\"{origin}/sub/css/img/bg.png\")")));
+        assert_eq!(print_media.as_deref(), Some("print"));
+
+        // Nested frame documents get their stylesheets too.
+        assert!(inner_css.iter().any(|css| css.contains(".inner{color:blue}")));
+
+        // The same sheet referenced from two links is fetched once.
+        let paths: Vec<String> = requests.try_iter().collect();
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.as_str() == "/sub/css/frame.css")
+                .count(),
+            1
+        );
+
+        // Frame <img> resources are discovered and warmed through the page
+        // transport into the shared render cache.
+        #[cfg(feature = "render")]
+        assert!(page.js.as_ref().unwrap().render_image_resource_is_known(
+            &format!("{origin}/sub/img/pixel.png"),
+            obscura_js::ImageRequestProfile::NoCorsInclude,
+        ));
+    }
 
     #[test]
     fn navigation_timeout_environment_default_remains_thirty_seconds() {

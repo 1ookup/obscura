@@ -1870,6 +1870,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures",
+ "html5ever",
  "image",
  "obscura-dom",
  "obscura-js",

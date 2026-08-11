@@ -12,6 +12,9 @@ pub use client::{
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
     ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
 };
+// The HTTP method type accepted by `ObscuraHttpClient::fetch_with_method`,
+// re-exported so navigation callers do not need a direct reqwest dependency.
+pub use reqwest::Method;
 pub use cookies::{default_cookie_path, CookieInfo, CookieJar};
 pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,

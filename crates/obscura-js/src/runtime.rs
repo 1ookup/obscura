@@ -809,43 +809,67 @@ impl ObscuraJsRuntime {
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
+        // The main document plus every active iframe content document
+        // (Phase 3.6). Frame candidates resolve against the frame's own base
+        // URL. The page viewport stands in for the frame content box during
+        // srcset selection; plain src candidates are unaffected.
+        let mut roots: Vec<(obscura_dom::NodeId, Option<String>)> =
+            vec![(dom.document(), base_url)];
+        let mut index = 0;
+        while index < roots.len() {
+            let root = roots[index].0;
+            for host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+                if let Some(content_root) = dom.iframe_content_document(host) {
+                    let frame_base = dom.document_scope(content_root).map(|scope| scope.base_url);
+                    roots.push((content_root, frame_base));
+                }
+            }
+            index += 1;
+        }
         let mut urls = Vec::new();
-        for id in dom.descendants(dom.document()) {
-            let Some(node) = dom.get_node(id) else {
-                continue;
-            };
-            let Some(element) = node.as_element() else {
-                continue;
-            };
-            let candidate = match element.local.as_ref() {
-                "img" => state
-                    .render_resources
-                    .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
-                    .map(|(url, _, known, _)| {
-                        let profile = match node
-                            .get_attribute("crossorigin")
-                            .map(|value| value.trim().to_ascii_lowercase())
-                            .as_deref()
-                        {
-                            Some("use-credentials") => {
-                                crate::ops::ImageRequestProfile::CorsInclude
-                            }
-                            Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
-                            None => crate::ops::ImageRequestProfile::NoCorsInclude,
-                        };
-                        (url, profile, known)
-                    }),
-                "video" => state
-                    .render_resources
-                    .cached_video_poster_metadata(dom, id, base_url.as_deref())
-                    .map(|(url, profile, known, _)| (url, profile, known)),
-                _ => None,
-            };
-            let Some((url, profile, known)) = candidate else {
-                continue;
-            };
-            if !known && !url.starts_with("data:") {
-                urls.push((url, profile));
+        for (root, root_base) in roots {
+            for id in dom.descendants(root) {
+                let Some(node) = dom.get_node(id) else {
+                    continue;
+                };
+                let Some(element) = node.as_element() else {
+                    continue;
+                };
+                let candidate = match element.local.as_ref() {
+                    "img" => state
+                        .render_resources
+                        .cached_image_element_metadata(
+                            dom,
+                            id,
+                            state.viewport,
+                            root_base.as_deref(),
+                        )
+                        .map(|(url, _, known, _)| {
+                            let profile = match node
+                                .get_attribute("crossorigin")
+                                .map(|value| value.trim().to_ascii_lowercase())
+                                .as_deref()
+                            {
+                                Some("use-credentials") => {
+                                    crate::ops::ImageRequestProfile::CorsInclude
+                                }
+                                Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
+                                None => crate::ops::ImageRequestProfile::NoCorsInclude,
+                            };
+                            (url, profile, known)
+                        }),
+                    "video" => state
+                        .render_resources
+                        .cached_video_poster_metadata(dom, id, root_base.as_deref())
+                        .map(|(url, profile, known, _)| (url, profile, known)),
+                    _ => None,
+                };
+                let Some((url, profile, known)) = candidate else {
+                    continue;
+                };
+                if !known && !url.starts_with("data:") {
+                    urls.push((url, profile));
+                }
             }
         }
         urls.sort();
