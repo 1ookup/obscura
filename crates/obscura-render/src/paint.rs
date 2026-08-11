@@ -2272,6 +2272,7 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animat
 ) -> Option<PreparedRender> {
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
+        tree.document(),
         viewport,
         base_url,
         resources,
@@ -2436,6 +2437,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
     drop(previous);
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
+        tree.document(),
         viewport,
         base_url,
         resources,
@@ -2481,6 +2483,7 @@ fn retained_animation_restyle_mutations(
 
 fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     tree: &DomTree,
+    layout_root: obscura_dom::tree::NodeId,
     viewport: (f32, f32),
     base_url: Option<&str>,
     resources: &mut RenderResourceCache,
@@ -2500,7 +2503,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
     let (mut intrinsic, mut selected_images) =
-        collect_image_intrinsics(tree, viewport, base_url, resources);
+        collect_image_intrinsics(tree, layout_root, viewport, base_url, resources);
     // Preserve the HTML source fallback separately: a remembered CSS content
     // image temporarily overrides it, but a changed/removed/failed content
     // selection must restore the source before the correction layout.
@@ -2533,6 +2536,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     let mut laid = match retained {
         Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
             tree,
+            layout_root,
             viewport,
             &intrinsic,
             &fonts,
@@ -2544,6 +2548,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         ),
         None => layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
+            layout_root,
             viewport,
             &intrinsic,
             &fonts,
@@ -2574,6 +2579,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         }
         laid = layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
+            layout_root,
             viewport,
             &intrinsic,
             &fonts,
@@ -2585,7 +2591,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     }
     let derived = laid.derived_layout_state(tree, viewport);
     let root_font_size = tree
-        .query_selector("html")
+        .query_selector_from(layout_root, "html")
         .ok()
         .flatten()
         .and_then(|root| laid.styles.get(&root))
@@ -3187,13 +3193,13 @@ fn style_has_canvas_background(style: &crate::LayoutStyle) -> bool {
 }
 
 fn canvas_background_source(tree: &DomTree, laid: &crate::DomLayout) -> Option<CanvasBackground> {
-    let root = tree.query_selector("html").ok().flatten()?;
+    let root = tree.query_selector_from(laid.root, "html").ok().flatten()?;
     let root_style = laid.styles.get(&root)?;
     let root_is_contained = root_style.containing_block_triggers & crate::CB_TRIGGER_CONTAIN != 0;
     if root_is_contained || style_has_canvas_background(root_style) {
         return Some(CanvasBackground { root, source: root });
     }
-    let body = tree.query_selector("body").ok().flatten();
+    let body = tree.query_selector_from(laid.root, "body").ok().flatten();
     let source = body
         .filter(|body| {
             laid.styles.get(body).is_some_and(|style| {
@@ -3383,7 +3389,7 @@ fn paint_laid_dom_scrolled(
         ),
     };
     let root_font_size = tree
-        .query_selector("html")
+        .query_selector_from(laid.root, "html")
         .ok()
         .flatten()
         .and_then(|root| laid.styles.get(&root))
@@ -3472,7 +3478,7 @@ fn paint_laid_dom_scrolled(
     let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
     paint_nodes.extend(crate::dom::rendered_descendants(
         tree,
-        paint_root.unwrap_or_else(|| tree.document()),
+        paint_root.unwrap_or(laid.root),
     ));
     for nid in paint_nodes.iter().copied() {
         if consumed.contains(&nid) {
@@ -8879,6 +8885,7 @@ fn paint_positioned_pseudo(
 /// NodeId.
 fn collect_image_intrinsics(
     tree: &DomTree,
+    layout_root: obscura_dom::tree::NodeId,
     viewport: (f32, f32),
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
@@ -8888,7 +8895,7 @@ fn collect_image_intrinsics(
 ) {
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, layout_root) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };

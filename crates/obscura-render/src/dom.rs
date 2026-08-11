@@ -296,6 +296,11 @@ impl OverflowClip {
 
 /// Per-element border boxes after layout, in viewport coordinates.
 pub struct DomLayout {
+    /// The render root this layout was computed from: the document node for
+    /// the top-level document, or an iframe content-document root. Whole-tree
+    /// walks scope to this root rather than `tree.document()` so that
+    /// per-document render roots can coexist on one arena.
+    pub root: NodeId,
     pub rects: HashMap<NodeId, Rect>,
     /// Per-line border-box fragments for ordinary non-replaced inline
     /// elements. `rects` retains their union for `getBoundingClientRect()`;
@@ -1036,7 +1041,7 @@ impl DomLayout {
     /// incorrectly disappear.
     pub(crate) fn refresh_effective_visibility(&mut self, tree: &DomTree) {
         let mut inherited: HashMap<NodeId, (bool, bool)> = HashMap::new();
-        for id in rendered_descendants(tree, tree.document()) {
+        for id in rendered_descendants(tree, self.root) {
             let parent_state = rendered_parent(tree, id)
                 .and_then(|parent| inherited.get(&parent).copied())
                 .unwrap_or((false, false));
@@ -1066,7 +1071,7 @@ impl DomLayout {
         self.translates.clear();
         self.transforms.clear();
 
-        let root = rendered_descendants(tree, tree.document())
+        let root = rendered_descendants(tree, self.root)
             .into_iter()
             .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()));
         if let Some(root_id) = root {
@@ -1145,7 +1150,7 @@ impl DomLayout {
         let mut fixed = HashSet::new();
         let mut has_fixed_cb: HashMap<NodeId, bool> = HashMap::new();
 
-        for id in rendered_descendants(tree, tree.document()) {
+        for id in rendered_descendants(tree, self.root) {
             let parent = rendered_parent(tree, id);
             let parent_is_fixed = parent.is_some_and(|parent| fixed.contains(&parent));
             let ancestor_has_fixed_cb = parent
@@ -1181,7 +1186,7 @@ impl DomLayout {
         root_content_size: (f32, f32),
         viewport_fixed: &HashSet<NodeId>,
     ) -> ScrollTree {
-        let nodes = rendered_descendants(tree, tree.document());
+        let nodes = rendered_descendants(tree, self.root);
         let node_capacity = nodes
             .iter()
             .map(|id| id.index())
@@ -1460,7 +1465,7 @@ impl DomLayout {
         let mut bottom = viewport.1.max(0.0);
 
         if let Some(root) = tree
-            .descendants(tree.document())
+            .descendants(self.root)
             .into_iter()
             .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
         {
@@ -1521,7 +1526,7 @@ impl DomLayout {
             .and_then(|root| self.styles.get(&root).and_then(|style| style.font_size))
             .unwrap_or(16.0);
 
-        for id in rendered_descendants(tree, tree.document()) {
+        for id in rendered_descendants(tree, self.root) {
             let parent = rendered_parent(tree, id);
             let inherited_scrollport = parent
                 .and_then(|parent| nearest_scrollport.get(parent.index()).copied())
@@ -3024,7 +3029,11 @@ impl CssCounterState {
 /// its descendants and following siblings, and expire with their shared
 /// parent. That is the scope shape used by browser counter managers and covers
 /// nested chapter numbering as well as line counters reset on a `<code>`.
-fn resolve_css_counters(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+fn resolve_css_counters(
+    tree: &DomTree,
+    layout_root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
     fn walk(
         tree: &DomTree,
         id: NodeId,
@@ -3088,7 +3097,7 @@ fn resolve_css_counters(tree: &DomTree, styles: &mut HashMap<NodeId, crate::Layo
     }
 
     let mut counters = CssCounterState::default();
-    let root_scopes = walk(tree, tree.document(), styles, &mut counters);
+    let root_scopes = walk(tree, layout_root, styles, &mut counters);
     counters.pop_created(&root_scopes);
 }
 
@@ -4026,6 +4035,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
 ) -> DomLayout {
     layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
         tree,
+        tree.document(),
         viewport,
         intrinsic,
         fonts,
@@ -4038,6 +4048,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
 
 pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
     tree: &DomTree,
+    layout_root: NodeId,
     viewport: (f32, f32),
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
@@ -4048,6 +4059,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_anim
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
+        layout_root,
         viewport,
         intrinsic,
         fonts,
@@ -4097,6 +4109,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
     let mut animation_timeline = crate::AnimationTimelineState::default();
     layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
         tree,
+        tree.document(),
         viewport,
         intrinsic,
         fonts,
@@ -4113,6 +4126,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
 
 pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
     tree: &DomTree,
+    layout_root: NodeId,
     viewport: (f32, f32),
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
@@ -4124,6 +4138,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
+        layout_root,
         viewport,
         intrinsic,
         fonts,
@@ -4160,6 +4175,7 @@ fn layout_dom_with_web_fonts_pass_limit(
     let mut animation_timeline = crate::AnimationTimelineState::default();
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
+        tree.document(),
         viewport,
         intrinsic,
         fonts,
@@ -4181,11 +4197,12 @@ fn layout_dom_with_web_fonts_pass_limit(
 /// edges explicitly here also discovers roots nested inside other roots.
 fn collect_shadow_stylesheets(
     tree: &DomTree,
+    layout_root: NodeId,
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
 ) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
     let mut roots = Vec::new();
-    let mut stack = vec![tree.document()];
+    let mut stack = vec![layout_root];
     let mut visited = HashSet::new();
     while let Some(node) = stack.pop() {
         if !visited.insert(node) {
@@ -4232,6 +4249,7 @@ fn collect_shadow_stylesheets(
 
 fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     tree: &DomTree,
+    layout_root: NodeId,
     viewport: (f32, f32),
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
@@ -4247,7 +4265,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 
     // Collect the text of every <style> block in document order.
     let mut css_sources = Vec::new();
-    for nid in tree.descendants(tree.document()) {
+    for nid in tree.descendants(layout_root) {
         if let Some(node) = tree.get_node(nid) {
             if let Some(elem) = node.as_element() {
                 if elem.local.as_ref() == "style"
@@ -4279,7 +4297,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             false,
         ),
     };
-    let shadow_sheets = collect_shadow_stylesheets(tree, viewport, media_type);
+    let shadow_sheets = collect_shadow_stylesheets(tree, layout_root, viewport, media_type);
     let t_parse = t0.elapsed();
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
@@ -4307,8 +4325,8 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 (style.container_type != crate::ContainerType::Normal).then_some(*node)
             })
             .collect::<HashSet<_>>();
-        let connected = std::iter::once(tree.document())
-            .chain(rendered_descendants(tree, tree.document()))
+        let connected = std::iter::once(layout_root)
+            .chain(rendered_descendants(tree, layout_root))
             .collect::<HashSet<_>>();
         retained.styles.retain(|node, _| connected.contains(node));
         retained
@@ -4323,7 +4341,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                     let mut matcher = tree.matcher();
                     add_container_query_reset_scopes(
                         tree,
-                        tree.document(),
+                        layout_root,
                         &sheet,
                         &mut matcher,
                         &active_containers,
@@ -4367,6 +4385,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     let (mut laid, _, mut query, mut cascade_time) =
         layout_dom_once(
             tree,
+            layout_root,
             viewport,
             intrinsic,
             fonts,
@@ -4434,9 +4453,9 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     // its children. Keep this O(nodes): walking every ancestor separately
     // makes a deeply nested document quadratic before layout even starts.
     let mut element_depths = HashMap::new();
-    element_depths.insert(tree.document(), 0usize);
+    element_depths.insert(layout_root, 0usize);
     let mut max_dom_depth = 1usize;
-    for id in rendered_descendants(tree, tree.document()) {
+    for id in rendered_descendants(tree, layout_root) {
         let Some(node) = tree.get_node(id) else {
             continue;
         };
@@ -4456,6 +4475,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
         let (next, signature, pass_query, pass_cascade) =
             layout_dom_once(
                 tree,
+                layout_root,
                 viewport,
                 intrinsic,
                 fonts,
@@ -4514,6 +4534,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
         let (fallback, _, fallback_query, fallback_cascade) =
             layout_dom_once(
                 tree,
+                layout_root,
                 viewport,
                 intrinsic,
                 fonts,
@@ -4551,6 +4572,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 
 fn layout_dom_once(
     tree: &DomTree,
+    layout_root: NodeId,
     viewport: (f32, f32),
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
@@ -4581,14 +4603,14 @@ fn layout_dom_once(
     // into children, pop on the way back out. This is what lets descendant
     // combinators (".mw-body .firstHeading") fast-reject via the filter
     // instead of falling back to the always-true "can't reject" case.
-    let quirks_mode = !tree.descendants(tree.document()).into_iter().any(|id| {
+    let quirks_mode = !tree.descendants(layout_root).into_iter().any(|id| {
         tree.get_node(id).map_or(false, |node| {
             matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
         })
     });
     cascade_walk(
         tree,
-        tree.document(),
+        layout_root,
         &sheet,
         &sheet,
         shadow_sheets,
@@ -4605,7 +4627,7 @@ fn layout_dom_once(
         false,
         fresh_styles.as_ref(),
     );
-    resolve_css_counters(tree, &mut styles);
+    resolve_css_counters(tree, layout_root, &mut styles);
     let cascade_time = t1.elapsed();
     let (signature, query_stats) = evaluator.map_or_else(
         || (None, crate::css::ContainerQueryStats::default()),
@@ -4614,7 +4636,7 @@ fn layout_dom_once(
             (Some(signature), stats)
         },
     );
-    grow_trailing_auto_cells(tree, &mut styles);
+    grow_trailing_auto_cells(tree, layout_root, &mut styles);
 
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
@@ -4627,7 +4649,7 @@ fn layout_dom_once(
     // The document node itself is not an element; lay out from the first
     // element descendant (the <html> root).
     let root = tree
-        .descendants(tree.document())
+        .descendants(layout_root)
         .into_iter()
         .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
 
@@ -5730,7 +5752,7 @@ fn layout_dom_once(
         // Border-collapse is inherited, so only distribute a table's
         // effective spacing to the legacy flex fallback after the computed
         // top-down values are known.
-        propagate_border_spacing(tree, &mut styles);
+        propagate_border_spacing(tree, layout_root, &mut styles);
 
         // Resolve native form-control intrinsic border-box geometry after
         // inheritance and author cascading. Text-like inputs use the HTML
@@ -6165,6 +6187,7 @@ fn layout_dom_once(
             }
             let static_position_candidates = reparent_inset_positioned_nodes(
                 tree,
+                layout_root,
                 &mut taffy_tree,
                 taffy_root,
                 &id_map,
@@ -6874,7 +6897,7 @@ fn layout_dom_once(
                 &mut generated_rects,
             );
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
-            synthesize_row_rects(tree, &mut rects);
+            synthesize_row_rects(tree, layout_root, &mut rects);
         }
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
@@ -7068,6 +7091,7 @@ fn layout_dom_once(
 
     (
         DomLayout {
+            root: layout_root,
             rects,
             inline_fragments,
             styles,
@@ -7316,7 +7340,7 @@ fn folded_inline_relative_offset(
 
 fn container_snapshot(tree: &DomTree, layout: &DomLayout) -> crate::css::ContainerSnapshot {
     let root_font_size = tree
-        .descendants(tree.document())
+        .descendants(layout.root)
         .into_iter()
         .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
         .and_then(|id| layout.styles.get(&id))
@@ -7385,7 +7409,11 @@ fn container_snapshot(tree: &DomTree, layout: &DomLayout) -> crate::css::Contain
 /// layout intent (fixed-size leading cells, one expanding trailing cell) and
 /// leaves the others shrink-to-fit, matching a shrink-to-fit table exactly
 /// when there is no surplus width to distribute in the first place.
-fn grow_trailing_auto_cells(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+fn grow_trailing_auto_cells(
+    tree: &DomTree,
+    layout_root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
     let is_tag = |id: NodeId, tags: &[&str]| -> bool {
         match tree
             .get_node(id)
@@ -7395,7 +7423,7 @@ fn grow_trailing_auto_cells(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
             None => false,
         }
     };
-    for tr in rendered_descendants(tree, tree.document()) {
+    for tr in rendered_descendants(tree, layout_root) {
         if !is_tag(tr, &["tr"]) {
             continue;
         }
@@ -7421,7 +7449,11 @@ fn grow_trailing_auto_cells(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
 /// down as the table's own row gap (space between stacked `<tr>`s) and every
 /// descendant `<tr>`'s column gap (space between cells within a row), without
 /// crossing into a nested `<table>`'s own scope.
-fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+fn propagate_border_spacing(
+    tree: &DomTree,
+    layout_root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
     fn local_name(tree: &DomTree, id: NodeId) -> Option<String> {
         tree.get_node(id)
             .and_then(|n| n.as_element().map(|e| e.local.to_string()))
@@ -7450,7 +7482,7 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
         }
     }
 
-    for id in rendered_descendants(tree, tree.document()) {
+    for id in rendered_descendants(tree, layout_root) {
         if local_name(tree, id).as_deref() != Some("table") {
             continue;
         }
@@ -8170,6 +8202,7 @@ struct StaticPositionCandidate {
 /// caller harvests that coordinate and reparents it in a bounded second pass.
 fn reparent_inset_positioned_nodes(
     tree: &DomTree,
+    layout_root: NodeId,
     taffy_tree: &mut TaffyTree<usize>,
     taffy_root: taffy::NodeId,
     id_map: &HashMap<taffy::NodeId, NodeId>,
@@ -8183,7 +8216,7 @@ fn reparent_inset_positioned_nodes(
     let mut nearest_fixed_cb_for_children: HashMap<NodeId, taffy::NodeId> = HashMap::new();
     let mut static_candidates = Vec::new();
 
-    for dom_id in rendered_descendants(tree, tree.document()) {
+    for dom_id in rendered_descendants(tree, layout_root) {
         let Some(style) = styles.get(&dom_id) else {
             continue;
         };
@@ -9904,11 +9937,11 @@ fn tokenize_with_spaces(text: &str) -> Vec<String> {
 /// extent must ignore the portion of a `rowspan` that continues through later
 /// rows. Nested-table cells must not participate at all. Sections are then the
 /// union of their already-synthesized direct rows.
-fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
+fn synthesize_row_rects(tree: &DomTree, layout_root: NodeId, rects: &mut HashMap<NodeId, Rect>) {
     let mut rows = Vec::new();
     let mut sections = Vec::new();
     let mut table_inline: HashMap<NodeId, Rect> = HashMap::new();
-    for id in rendered_descendants(tree, tree.document()) {
+    for id in rendered_descendants(tree, layout_root) {
         let local = match tree
             .get_node(id)
             .and_then(|n| n.as_element().map(|e| e.local.to_string()))
@@ -16357,6 +16390,7 @@ mod tests {
         let mut timeline = crate::AnimationTimelineState::default();
         let (mut initial, _) = layout_dom_with_web_fonts_pass_limit_at_animation_time(
             &tree,
+            tree.document(),
             (800.0, 600.0),
             &HashMap::new(),
             &[],
@@ -16375,6 +16409,7 @@ mod tests {
         let (incremental, telemetry) =
             layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 &tree,
+                tree.document(),
                 (800.0, 600.0),
                 &HashMap::new(),
                 &[],
@@ -16389,6 +16424,7 @@ mod tests {
         let mut full_timeline = crate::AnimationTimelineState::default();
         let (full, _) = layout_dom_with_web_fonts_pass_limit_at_animation_time(
             &tree,
+            tree.document(),
             (800.0, 600.0),
             &HashMap::new(),
             &[],
