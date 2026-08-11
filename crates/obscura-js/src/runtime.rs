@@ -119,7 +119,7 @@ fn render_frame_tree_into(
     ) else {
         return;
     };
-    for nested_host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+    for nested_host in dom.iframe_hosts_in_shadow_including_subtree(root) {
         if let Some(nested_root) = dom.iframe_content_document(nested_host) {
             if let Some(nested_viewport) = frame_content_box(prepared.layout(), nested_host) {
                 render_frame_tree_into(
@@ -160,7 +160,7 @@ fn build_frame_surfaces(
     let (Some(dom), Some(prepared)) = (dom, prepared) else {
         return out;
     };
-    for host in dom.query_selector_all("iframe").unwrap_or_default() {
+    for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
         if let Some(root) = dom.iframe_content_document(host) {
             if let Some(viewport) = frame_content_box(prepared.layout(), host) {
                 render_frame_tree_into(dom, host, root, viewport, resources, canvas, &mut out, 1);
@@ -183,7 +183,7 @@ fn input_hit_in_document(
 ) -> Option<(NodeId, NodeId, (f32, f32))> {
     if depth <= 32 {
         let mut frame_hit = None;
-        for host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+        for host in dom.iframe_hosts_in_shadow_including_subtree(root) {
             if !prepared.point_hits_box_with_scroll(host, point, scroll) {
                 continue;
             }
@@ -1172,7 +1172,7 @@ impl ObscuraJsRuntime {
         let mut index = 0;
         while index < roots.len() {
             let root = roots[index].0;
-            for host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+            for host in dom.iframe_hosts_in_shadow_including_subtree(root) {
                 if let Some(content_root) = dom.iframe_content_document(host) {
                     let frame_base = dom.document_scope(content_root).map(|scope| scope.base_url);
                     roots.push((content_root, frame_base));
@@ -2681,6 +2681,11 @@ impl ObscuraJsRuntime {
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
         self.begin_javascript_task();
+        // A frame-targeted postMessage queued by the previous browser task is
+        // itself a task. Deliver it before polling later timers/network work;
+        // waiting until poll_event_loop returns can reverse task order or
+        // starve the message on a continuously busy page.
+        self.drain_frame_messages();
         self.ensure_frame_message_pump();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
@@ -2811,7 +2816,10 @@ impl ObscuraJsRuntime {
                     "(function() {{\n\
                        var data;\n\
                        try {{ data = JSON.parse({payload}).v; }} catch (e) {{ return; }}\n\
-                       var evt = new MessageEvent('message', {{ data: data, origin: {origin}, source: {source_expr} }});\n\
+                       // This task is the user agent's postMessage delivery,\n\
+                       // so the MessageEvent is trusted. Direct constructor\n\
+                       // calls by author script remain untrusted.\n\
+                       var evt = globalThis.__obscura_markTrusted(new MessageEvent('message', {{ data: data, origin: {origin}, source: {source_expr} }}));\n\
                        try {{ globalThis.dispatchEvent(evt); }} catch (e) {{}}\n\
                        if (typeof globalThis.onmessage === 'function') {{\n\
                          try {{ globalThis.onmessage.call(globalThis, evt); }} catch (e) {{}}\n\
@@ -3063,6 +3071,10 @@ impl ObscuraJsRuntime {
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
+        // Messages queued by the previous turn precede work polled in this
+        // one. This also guarantees progress when recurring page work keeps
+        // deno_core's poll from reaching its return-side drain.
+        let delivered_before_poll = self.drain_frame_messages();
         // Queued main-realm frame messages (Phase 4) need their recv pump
         // running before this poll so they resolve during it.
         self.ensure_frame_message_pump();
@@ -3092,7 +3104,10 @@ impl ObscuraJsRuntime {
             // (Phase 4). A non-empty drain means the tick was not idle: the
             // deliveries may have enqueued main-realm messages whose recv op
             // resolves on the next tick, so callers must keep pumping.
-            Ok(idle) => Ok(idle && self.drain_frame_messages() == 0),
+            Ok(idle) => {
+                let delivered_after_poll = self.drain_frame_messages();
+                Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
+            }
             Err(error) => Err(error),
         }
     }
@@ -3114,6 +3129,9 @@ impl ObscuraJsRuntime {
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
         self.begin_javascript_task();
+        // Preserve postMessage task ordering and make already-queued frame
+        // traffic progress before a long-lived runtime poll can park.
+        let delivered_before_poll = self.drain_frame_messages();
         self.ensure_frame_message_pump();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
@@ -3161,7 +3179,10 @@ impl ObscuraJsRuntime {
         match result {
             // Same task-boundary message drain as the cooperative tick
             // (Phase 4): a delivery means this turn was not idle.
-            Ok(idle) => Ok(idle && self.drain_frame_messages() == 0),
+            Ok(idle) => {
+                let delivered_after_poll = self.drain_frame_messages();
+                Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
+            }
             Err(error) => Err(error),
         }
     }
@@ -3743,6 +3764,61 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_surfaces_include_iframes_in_closed_shadow_trees() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0"><div id="widget"></div></body></html>"#,
+        );
+        let widget = dom.query_selector("#widget").unwrap().unwrap();
+        let widget_root = dom
+            .attach_shadow_root(widget, obscura_dom::ShadowRootMode::Closed)
+            .unwrap();
+        obscura_dom::parse_into_subtree(
+            &dom,
+            widget_root,
+            r#"<iframe style="display:block;border:0;width:100px;height:50px"></iframe>"#,
+        );
+        let frame_host = dom
+            .query_selector_from(widget_root, "iframe")
+            .unwrap()
+            .unwrap();
+        let (content_root, _) = dom.create_iframe_content_document(frame_host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &dom,
+            content_root,
+            r#"<html><body id="frame-body" style="margin:0"></body></html>"#,
+        );
+        let frame_body = dom
+            .query_selector_from(content_root, "#frame-body")
+            .unwrap()
+            .unwrap();
+        let frame_shadow = dom
+            .attach_shadow_root(frame_body, obscura_dom::ShadowRootMode::Closed)
+            .unwrap();
+        obscura_dom::parse_into_subtree(
+            &dom,
+            frame_shadow,
+            r#"<div style="width:100px;height:50px;background:rgb(255,0,0)"></div>"#,
+        );
+
+        // Author selectors remain tree-scoped, but the browser's rendering
+        // pipeline must still discover and composite this browsing context.
+        assert!(dom.query_selector_all("iframe").unwrap().is_empty());
+        let mut resources = obscura_render::RenderResourceCache::default();
+        let prepared = obscura_render::prepare_dom(&dom, (200.0, 100.0), None, &mut resources)
+            .expect("parent layout");
+        let surfaces = build_frame_surfaces(
+            Some(&dom),
+            Some(&prepared),
+            &mut resources,
+            &HashMap::new(),
+        );
+        let frame = surfaces.get(&frame_host).expect("closed-shadow frame surface");
+        let pixel = frame.pixel(50, 25).expect("frame center");
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
     }
 
     #[test]

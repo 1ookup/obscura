@@ -6088,6 +6088,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_event_loop_delivers_shadow_frame_message_before_next_task() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const host = document.body.appendChild(document.createElement('div'));
+                    const frame = document.createElement('iframe');
+                    globalThis.autonomousMessageFrame = frame;
+                    frame.srcdoc = `<script>
+                        window.addEventListener('message', event => {
+                            globalThis.autonomousReply = event.data.reply;
+                        });
+                    <\/script>`;
+                    host.attachShadow({mode: 'closed'}).appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+
+        // First turn commits the dynamic browsing context and creates its
+        // realm. A queued frame message is already a browser task and must be
+        // delivered before a timer scheduled after postMessage. Waiting until
+        // deno's poll returns reverses that ordering and can starve delivery
+        // entirely when the page keeps the poll continuously busy.
+        assert!(!page.run_autonomous_event_loop_turn().await.unwrap());
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(() => { autonomousMessageFrame.contentWindow.postMessage({ reply: 17 }, '*'); setTimeout(() => { globalThis.replySeenByNextTask = autonomousMessageFrame.contentWindow.autonomousReply; }, 0); })()",
+            )
+            .unwrap();
+        let _ = page.run_autonomous_event_loop_turn().await.unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("autonomousMessageFrame.contentWindow.autonomousReply")
+                .unwrap(),
+            serde_json::json!(17.0),
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.replySeenByNextTask")
+                .unwrap(),
+            serde_json::json!(17.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_iframe_navigation_still_dispatches_load() {
         let mut page = frame_test_page("<html><body></body></html>");
         page.document_origin = Some(obscura_dom::Origin::from_url(
@@ -6690,6 +6747,48 @@ mod tests {
                 .evaluate("document.getElementById('pout').textContent")
                 .unwrap(),
             serde_json::json!("echo:2:https://top.example:true")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_document_postmessage_events_are_trusted() {
+        // UA-delivered message events are trusted in browsers. Constructing a
+        // MessageEvent in author script remains untrusted; only delivery via
+        // postMessage receives the browser-owned trust marker.
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body>\
+             <iframe srcdoc=\"\
+               <script>\
+                 window.addEventListener('message', function(e) {\
+                   parent.postMessage({ childTrusted: e.isTrusted }, '*');\
+                 });\
+               </script>\"></iframe>\
+             <script>\
+               globalThis.trustResult = null;\
+               window.addEventListener('message', function(e) {\
+                 globalThis.trustResult = {\
+                   childTrusted: e.data.childTrusted,\
+                   parentTrusted: e.isTrusted,\
+                   constructedTrusted: (new MessageEvent('message')).isTrusted\
+                 };\
+               });\
+               document.querySelector('iframe').contentWindow.postMessage('start', '*');\
+             </script>\
+             </body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+        page.execute_scripts().await;
+        page.js.as_mut().unwrap().deliver_pending_frame_messages().await;
+
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.trustResult").unwrap(),
+            serde_json::json!({
+                "childTrusted": true,
+                "parentTrusted": true,
+                "constructedTrusted": false,
+            })
         );
     }
 

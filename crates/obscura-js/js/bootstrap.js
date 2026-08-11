@@ -6370,7 +6370,12 @@ async function _frameMessageRecvLoop() {
           if (hostEl) source = _frameWindowProxyFor(hostEl);
         } catch (e) {}
       }
-      const evt = new MessageEvent("message", { data, origin: entry.origin || "", source });
+      // postMessage delivery is performed by the user agent, so its event is
+      // trusted. Author-created `new MessageEvent(...)` instances remain
+      // untrusted; only this browser-owned delivery path marks the event.
+      const evt = __obscura_markTrusted(new MessageEvent("message", {
+        data, origin: entry.origin || "", source
+      }));
       try { globalThis.dispatchEvent(evt); } catch (e) {}
       if (typeof globalThis.onmessage === "function") {
         try { globalThis.onmessage.call(globalThis, evt); } catch (e) {}
