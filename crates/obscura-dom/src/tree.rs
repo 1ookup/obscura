@@ -65,6 +65,231 @@ impl fmt::Display for AttachShadowError {
 
 impl std::error::Error for AttachShadowError {}
 
+/// A unique id for an opaque origin. Two opaque origins are same-origin only
+/// when their ids are equal; the `"null"` serialization is never compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OpaqueOriginId(u64);
+
+impl OpaqueOriginId {
+    /// Allocate a fresh opaque origin, unique for the process lifetime.
+    pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        OpaqueOriginId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for OpaqueOriginId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The origin of a document scope, per HTML's origin concept. Same-origin
+/// tests compare this enum, never serialized strings: two opaque origins both
+/// serialize as `"null"` without being same-origin.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// A tuple origin. `port` is `None` for the scheme's default port, per the
+    /// URL origin serialization.
+    Tuple {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+    Opaque(OpaqueOriginId),
+}
+
+impl Origin {
+    /// Derive a tuple origin from an absolute URL, or a fresh opaque origin
+    /// for schemes without an authority-based origin (`data:`, `about:`,
+    /// `javascript:`, malformed input). Origin *inheritance* (about:blank,
+    /// srcdoc, sandbox) is the caller's decision; this only computes the URL's
+    /// own origin.
+    pub fn from_url(url: &str) -> Origin {
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return Origin::Opaque(OpaqueOriginId::new());
+        };
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss" | "ftp" | "file") {
+            return Origin::Opaque(OpaqueOriginId::new());
+        }
+        let authority = rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("");
+        // `file:` URLs get an opaque origin, matching browser defaults.
+        if scheme == "file" {
+            return Origin::Opaque(OpaqueOriginId::new());
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            // An IPv6 literal's colon is inside brackets, not a port separator.
+            Some((host, port)) if !port.contains(']') => {
+                match port.parse::<u16>() {
+                    Ok(port) => (host, Some(port)),
+                    Err(_) => (authority, None),
+                }
+            }
+            _ => (authority, None),
+        };
+        if host.is_empty() {
+            return Origin::Opaque(OpaqueOriginId::new());
+        }
+        let default_port = match scheme.as_str() {
+            "http" | "ws" => Some(80),
+            "https" | "wss" => Some(443),
+            "ftp" => Some(21),
+            _ => None,
+        };
+        Origin::Tuple {
+            scheme,
+            host: host.to_ascii_lowercase(),
+            port: if port == default_port { None } else { port },
+        }
+    }
+
+    /// The HTML origin serialization: `scheme://host[:port]`, or `"null"` for
+    /// opaque origins. For display and `MessageEvent.origin` only; never use
+    /// the serialization for a same-origin decision.
+    pub fn serialize(&self) -> String {
+        match self {
+            Origin::Tuple { scheme, host, port } => match port {
+                Some(port) => format!("{scheme}://{host}:{port}"),
+                None => format!("{scheme}://{host}"),
+            },
+            Origin::Opaque(_) => "null".to_string(),
+        }
+    }
+
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Origin::Opaque(_))
+    }
+
+    /// The authoritative same-origin test.
+    pub fn same_origin(&self, other: &Origin) -> bool {
+        self == other
+    }
+}
+
+/// Parsed `sandbox` attribute state captured for a navigation. `active` is
+/// true whenever the attribute is present (even empty, which is the most
+/// restrictive form); `allow` holds the granted `allow-*` tokens. Unknown
+/// tokens are ignored, so missing permissions fail closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SandboxFlags {
+    pub active: bool,
+    allow: u32,
+}
+
+impl SandboxFlags {
+    pub const ALLOW_SCRIPTS: u32 = 1 << 0;
+    pub const ALLOW_SAME_ORIGIN: u32 = 1 << 1;
+    pub const ALLOW_FORMS: u32 = 1 << 2;
+    pub const ALLOW_POPUPS: u32 = 1 << 3;
+    pub const ALLOW_TOP_NAVIGATION: u32 = 1 << 4;
+    pub const ALLOW_TOP_NAVIGATION_BY_USER_ACTIVATION: u32 = 1 << 5;
+    pub const ALLOW_POPUPS_TO_ESCAPE_SANDBOX: u32 = 1 << 6;
+    pub const ALLOW_MODALS: u32 = 1 << 7;
+    pub const ALLOW_DOWNLOADS: u32 = 1 << 8;
+    pub const ALLOW_POINTER_LOCK: u32 = 1 << 9;
+    pub const ALLOW_PRESENTATION: u32 = 1 << 10;
+    pub const ALLOW_ORIENTATION_LOCK: u32 = 1 << 11;
+
+    /// Parse a `sandbox` attribute value. `None` means the attribute is
+    /// absent (no sandboxing).
+    pub fn parse(attr: Option<&str>) -> SandboxFlags {
+        let Some(attr) = attr else {
+            return SandboxFlags::default();
+        };
+        let mut allow = 0u32;
+        for token in attr.split_ascii_whitespace() {
+            allow |= match token.to_ascii_lowercase().as_str() {
+                "allow-scripts" => Self::ALLOW_SCRIPTS,
+                "allow-same-origin" => Self::ALLOW_SAME_ORIGIN,
+                "allow-forms" => Self::ALLOW_FORMS,
+                "allow-popups" => Self::ALLOW_POPUPS,
+                "allow-top-navigation" => Self::ALLOW_TOP_NAVIGATION,
+                "allow-top-navigation-by-user-activation" => {
+                    Self::ALLOW_TOP_NAVIGATION_BY_USER_ACTIVATION
+                }
+                "allow-popups-to-escape-sandbox" => Self::ALLOW_POPUPS_TO_ESCAPE_SANDBOX,
+                "allow-modals" => Self::ALLOW_MODALS,
+                "allow-downloads" => Self::ALLOW_DOWNLOADS,
+                "allow-pointer-lock" => Self::ALLOW_POINTER_LOCK,
+                "allow-presentation" => Self::ALLOW_PRESENTATION,
+                "allow-orientation-lock" => Self::ALLOW_ORIENTATION_LOCK,
+                // Unknown flags never grant a capability.
+                _ => 0,
+            };
+        }
+        SandboxFlags {
+            active: true,
+            allow,
+        }
+    }
+
+    pub fn allows(&self, flag: u32) -> bool {
+        !self.active || self.allow & flag != 0
+    }
+
+    /// Sandbox flags propagate to nested browsing contexts: the child is
+    /// restricted by every restriction of the parent.
+    pub fn merged_with_parent(&self, parent: SandboxFlags) -> SandboxFlags {
+        if !parent.active {
+            return *self;
+        }
+        if !self.active {
+            return parent;
+        }
+        SandboxFlags {
+            active: true,
+            allow: self.allow & parent.allow,
+        }
+    }
+}
+
+/// Per-document-scope state, keyed by the content-document root node. The
+/// top-level document's scope is owned by the embedding page state, not by
+/// this registry.
+#[derive(Clone, Debug)]
+pub struct DocumentScope {
+    pub url: String,
+    pub origin: Origin,
+    pub base_url: String,
+    pub sandbox: SandboxFlags,
+    pub csp: Option<String>,
+    /// Browsing-context id, stable across navigations of the same frame.
+    pub frame_id: String,
+    /// Increments for every committed cross-document navigation of the frame.
+    pub document_generation: u64,
+    /// Whether this content document was parsed in (full) quirks mode.
+    pub quirks: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachIframeError {
+    HostIsNotIframe,
+    /// The content root must be a detached, unregistered Document node.
+    InvalidContentRoot,
+    WouldCreateCycle,
+}
+
+impl fmt::Display for AttachIframeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HostIsNotIframe => "iframe content host is not an iframe element",
+            Self::InvalidContentRoot => "iframe content root is not a detached document node",
+            Self::WouldCreateCycle => "attaching this content document would create a cycle",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for AttachIframeError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
     pub name: QualName,
@@ -258,6 +483,18 @@ pub(crate) struct DomTreeInner {
     /// into a shadow tree by accident.
     shadow_roots: HashMap<NodeId, ShadowRoot>,
     shadow_roots_by_host: HashMap<NodeId, NodeId>,
+    /// Iframe content documents mirror the shadow-root pattern: the content
+    /// root is a `NodeData::Document` node with `parent = None`, owned by its
+    /// host `<iframe>` element and invisible to light-tree traversal. Unlike
+    /// shadow roots, re-attachment is legal because frames navigate: these
+    /// maps hold only the *active* content document per host.
+    iframe_content_documents: HashMap<NodeId, NodeId>,
+    iframe_content_documents_by_root: HashMap<NodeId, NodeId>,
+    /// Scope state for every live content root, active or superseded by a
+    /// later navigation. An entry lives until its root is removed from the
+    /// arena, so retained wrappers of a detached document keep their URL,
+    /// origin and sandbox until collected.
+    document_scopes: HashMap<NodeId, DocumentScope>,
     /// Full-document HTML parsing enables declarative shadow roots. Fragment
     /// parsing (including innerHTML) deliberately leaves this false.
     pub(crate) allow_declarative_shadow_roots: bool,
@@ -286,6 +523,9 @@ impl DomTree {
                 id_index: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
+                iframe_content_documents: HashMap::new(),
+                iframe_content_documents_by_root: HashMap::new(),
+                document_scopes: HashMap::new(),
                 allow_declarative_shadow_roots: false,
                 quirks: false,
             }),
@@ -420,6 +660,125 @@ impl DomTree {
         self.inner.borrow().shadow_roots.contains_key(&node)
     }
 
+    /// Create a fresh content-document root and attach it to `host`,
+    /// replacing (and returning) the previously active root, if any.
+    pub fn create_iframe_content_document(
+        &self,
+        host: NodeId,
+    ) -> Result<(NodeId, Option<NodeId>), AttachIframeError> {
+        let root = self.new_node(NodeData::Document);
+        match self.attach_iframe_content_document(host, root) {
+            Ok(previous) => Ok((root, previous)),
+            Err(error) => {
+                self.remove(root);
+                Err(error)
+            }
+        }
+    }
+
+    /// Attach `root` as `host`'s active content document. Unlike shadow roots,
+    /// re-attachment is legal because frames navigate: when the host already
+    /// has a content root, the new root atomically becomes active and the old
+    /// root id is returned. The old root stays in the arena (retained JS
+    /// wrappers keep a usable detached document) until the embedder removes
+    /// it via the ordinary removal path, which also drops its scope entry.
+    pub fn attach_iframe_content_document(
+        &self,
+        host: NodeId,
+        root: NodeId,
+    ) -> Result<Option<NodeId>, AttachIframeError> {
+        let mut inner = self.inner.borrow_mut();
+        let host_is_iframe = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .and_then(|node| node.as_element())
+            .is_some_and(|element| element.local.as_ref() == "iframe");
+        if !host_is_iframe {
+            return Err(AttachIframeError::HostIsNotIframe);
+        }
+
+        let valid_root = root != inner.document
+            && !inner.shadow_roots.contains_key(&root)
+            && !inner.iframe_content_documents_by_root.contains_key(&root)
+            && !inner.document_scopes.contains_key(&root)
+            && inner
+                .nodes
+                .get(root.index())
+                .and_then(|node| node.as_ref())
+                .is_some_and(|node| {
+                    matches!(node.data, NodeData::Document)
+                        && node.parent.is_none()
+                        && node.prev_sibling.is_none()
+                        && node.next_sibling.is_none()
+                });
+        if !valid_root {
+            return Err(AttachIframeError::InvalidContentRoot);
+        }
+        // The host must not live inside the content document it would own.
+        if Self::would_create_host_including_cycle(&inner, host, root) {
+            return Err(AttachIframeError::WouldCreateCycle);
+        }
+
+        let previous = inner.iframe_content_documents.insert(host, root);
+        if let Some(previous) = previous {
+            inner.iframe_content_documents_by_root.remove(&previous);
+            // The superseded document is no longer connected to the page.
+            Self::set_subtree_connected(&mut inner, previous, false);
+        }
+        inner.iframe_content_documents_by_root.insert(root, host);
+        let connected = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .is_some_and(|node| node.connected);
+        Self::set_subtree_connected(&mut inner, root, connected);
+        Ok(previous)
+    }
+
+    /// The active content-document root hosted by `host`.
+    pub fn iframe_content_document(&self, host: NodeId) -> Option<NodeId> {
+        self.inner
+            .borrow()
+            .iframe_content_documents
+            .get(&host)
+            .copied()
+    }
+
+    /// The host `<iframe>` of an *active* content root.
+    pub fn iframe_host(&self, root: NodeId) -> Option<NodeId> {
+        self.inner
+            .borrow()
+            .iframe_content_documents_by_root
+            .get(&root)
+            .copied()
+    }
+
+    /// True for any live content-document root, active or superseded. Scope
+    /// entries outlive replacement, so nodes of a detached document still
+    /// resolve as iframe content rather than as top-document members.
+    pub fn is_iframe_content_document(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        inner.iframe_content_documents_by_root.contains_key(&node)
+            || inner.document_scopes.contains_key(&node)
+    }
+
+    /// The content-document root whose tree scope contains `node`, if any.
+    pub fn containing_iframe_content_document(&self, node: NodeId) -> Option<NodeId> {
+        let root = self.tree_scope_root(node)?;
+        self.is_iframe_content_document(root).then_some(root)
+    }
+
+    pub fn document_scope(&self, root: NodeId) -> Option<DocumentScope> {
+        self.inner.borrow().document_scopes.get(&root).cloned()
+    }
+
+    /// Record scope state for a content root. The entry lives until the root
+    /// is removed from the arena.
+    pub fn set_document_scope(&self, root: NodeId, scope: DocumentScope) {
+        self.inner.borrow_mut().document_scopes.insert(root, scope);
+    }
+
     /// Return the root of `node`'s local tree scope. This follows ordinary
     /// parent links only, so a shadow descendant resolves to its ShadowRoot and
     /// a light descendant resolves to its document or detached subtree root.
@@ -452,6 +811,8 @@ impl DomTree {
                 current = parent;
             } else if let Some(root) = inner.shadow_roots.get(&current) {
                 current = root.host;
+            } else if let Some(host) = inner.iframe_content_documents_by_root.get(&current) {
+                current = *host;
             } else {
                 return Some(current);
             }
@@ -478,7 +839,8 @@ impl DomTree {
             .get(root.index())
             .and_then(|entry| entry.as_ref())
             .is_some_and(|node| node.first_child.is_none())
-            && !inner.shadow_roots_by_host.contains_key(&root);
+            && !inner.shadow_roots_by_host.contains_key(&root)
+            && !inner.iframe_content_documents.contains_key(&root);
         if is_leaf {
             if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
                 node.connected = connected;
@@ -506,6 +868,9 @@ impl DomTree {
             if let Some(root) = shadow_root {
                 stack.push(root);
             }
+            if let Some(content_root) = inner.iframe_content_documents.get(&node_id) {
+                stack.push(*content_root);
+            }
             // Valid trees terminate naturally. The bound is defense in depth
             // against a corrupt sibling cycle, which must not spin here.
             for _ in 0..=inner.nodes.len() {
@@ -527,6 +892,7 @@ impl DomTree {
             .and_then(|entry| entry.as_ref())
             .and_then(|entry| entry.parent)
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
+            .or_else(|| inner.iframe_content_documents_by_root.get(&node).copied())
     }
 
     /// DOM insertion rejects a node when it is a host-including inclusive
@@ -542,7 +908,8 @@ impl DomTree {
             .get(child.index())
             .and_then(|entry| entry.as_ref())
             .is_some_and(|entry| entry.first_child.is_some())
-            || inner.shadow_roots_by_host.contains_key(&child);
+            || inner.shadow_roots_by_host.contains_key(&child)
+            || inner.iframe_content_documents.contains_key(&child);
         if !child_can_be_ancestor {
             return false;
         }
@@ -791,9 +1158,14 @@ impl DomTree {
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
 
-        // The document and registered ShadowRoots have no ordinary parent and
-        // cannot be detached through light-tree mutation APIs.
-        if node_id == inner.document || inner.shadow_roots.contains_key(&node_id) {
+        // The document, registered ShadowRoots and iframe content documents
+        // have no ordinary parent and cannot be detached through light-tree
+        // mutation APIs.
+        if node_id == inner.document
+            || inner.shadow_roots.contains_key(&node_id)
+            || inner.iframe_content_documents_by_root.contains_key(&node_id)
+            || inner.document_scopes.contains_key(&node_id)
+        {
             return;
         }
 
@@ -907,6 +1279,15 @@ impl DomTree {
             if let Some(root_id) = inner.shadow_roots_by_host.remove(&id) {
                 inner.shadow_roots.remove(&root_id);
             }
+            if let Some(host) = inner.iframe_content_documents_by_root.remove(&id) {
+                if inner.iframe_content_documents.get(&host) == Some(&id) {
+                    inner.iframe_content_documents.remove(&host);
+                }
+            }
+            if let Some(root_id) = inner.iframe_content_documents.remove(&id) {
+                inner.iframe_content_documents_by_root.remove(&root_id);
+            }
+            inner.document_scopes.remove(&id);
         }
 
         // Only free slots that are currently live. Freeing an out-of-range id
@@ -952,6 +1333,10 @@ impl DomTree {
 
             if let Some(root) = inner.shadow_roots_by_host.get(&current) {
                 stack.push(*root);
+            }
+
+            if let Some(content_root) = inner.iframe_content_documents.get(&current) {
+                stack.push(*content_root);
             }
 
             let mut children = Vec::new();
@@ -1300,7 +1685,14 @@ impl DomTree {
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
         let indexed = self.inner.borrow().id_index.get(id).copied();
-        if indexed.is_some_and(|node| self.containing_shadow_root(node).is_none()) {
+        // The index answers only when the node's tree scope is the document's:
+        // shadow descendants and iframe content documents keep their ids to
+        // themselves. Detached and template-content nodes retain the legacy
+        // best-effort lookup behavior used internally.
+        if indexed.is_some_and(|node| {
+            self.containing_shadow_root(node).is_none()
+                && self.containing_iframe_content_document(node).is_none()
+        }) {
             return indexed;
         }
 
@@ -1523,6 +1915,20 @@ impl DomTree {
                 }
             }
 
+            // Declarative shadow roots live outside the child lists, so the
+            // ordinary walk never reaches them. Recreate the root on the
+            // imported element and queue its children, or an imported
+            // document fragment silently drops its components' shadow DOM.
+            if let Some(src_root) = source.shadow_root(src_id) {
+                if let Some(info) = source.shadow_root_info(src_root) {
+                    if let Ok(dest_root) = self.attach_shadow_root(new_id, info.mode) {
+                        for child_id in source.children(src_root).into_iter().rev() {
+                            stack.push((dest_root, child_id));
+                        }
+                    }
+                }
+            }
+
             for child_id in source.children(src_id).into_iter().rev() {
                 stack.push((new_id, child_id));
             }
@@ -1669,6 +2075,204 @@ mod tests {
         let x = tree.new_node(NodeData::Text { contents: "x".into() });
         let y = tree.new_node(NodeData::Text { contents: "y".into() });
         assert_ne!(x, y, "double-free aliased two live nodes onto the same slot");
+    }
+
+    #[test]
+    fn origin_tuple_parsing_normalizes_scheme_host_and_default_port() {
+        assert_eq!(
+            Origin::from_url("HTTPS://Example.COM:443/a/b?q#f"),
+            Origin::Tuple {
+                scheme: "https".into(),
+                host: "example.com".into(),
+                port: None,
+            }
+        );
+        assert_eq!(
+            Origin::from_url("http://user:pass@example.com:8080/x"),
+            Origin::Tuple {
+                scheme: "http".into(),
+                host: "example.com".into(),
+                port: Some(8080),
+            }
+        );
+        assert!(Origin::from_url("data:text/html,hi").is_opaque());
+        assert!(Origin::from_url("about:blank").is_opaque());
+        assert!(Origin::from_url("not a url").is_opaque());
+        // Opaque origins are never same-origin, even though both serialize
+        // as "null".
+        let a = Origin::from_url("data:text/html,a");
+        let b = Origin::from_url("data:text/html,a");
+        assert_eq!(a.serialize(), "null");
+        assert!(!a.same_origin(&b));
+        assert!(a.same_origin(&a));
+    }
+
+    #[test]
+    fn sandbox_flags_fail_closed_and_merge_with_parent() {
+        let absent = SandboxFlags::parse(None);
+        assert!(!absent.active);
+        assert!(absent.allows(SandboxFlags::ALLOW_SCRIPTS));
+
+        let empty = SandboxFlags::parse(Some(""));
+        assert!(empty.active);
+        assert!(!empty.allows(SandboxFlags::ALLOW_SCRIPTS));
+        assert!(!empty.allows(SandboxFlags::ALLOW_SAME_ORIGIN));
+
+        let scripts = SandboxFlags::parse(Some("allow-scripts allow-unknown-token"));
+        assert!(scripts.allows(SandboxFlags::ALLOW_SCRIPTS));
+        assert!(!scripts.allows(SandboxFlags::ALLOW_SAME_ORIGIN));
+
+        let parent = SandboxFlags::parse(Some("allow-scripts allow-forms"));
+        let child = SandboxFlags::parse(Some("allow-scripts allow-popups"));
+        let merged = child.merged_with_parent(parent);
+        assert!(merged.allows(SandboxFlags::ALLOW_SCRIPTS));
+        assert!(!merged.allows(SandboxFlags::ALLOW_FORMS));
+        assert!(!merged.allows(SandboxFlags::ALLOW_POPUPS));
+    }
+
+    fn iframe_with_host(tree: &DomTree) -> NodeId {
+        let host = element(tree, "iframe");
+        tree.append_child(tree.document(), host);
+        host
+    }
+
+    #[test]
+    fn iframe_content_document_attaches_scopes_and_replaces_on_navigation() {
+        let tree = DomTree::new();
+        let host = iframe_with_host(&tree);
+        let (root, previous) = tree.create_iframe_content_document(host).unwrap();
+        assert_eq!(previous, None);
+        assert_eq!(tree.iframe_content_document(host), Some(root));
+        assert_eq!(tree.iframe_host(root), Some(host));
+        assert!(tree.is_iframe_content_document(root));
+        assert!(tree.is_connected(root));
+
+        let inner_div = element_with_id(&tree, "div", "frame-id");
+        tree.append_child(root, inner_div);
+        // Content-document ids never answer the top document's lookup.
+        assert_eq!(tree.get_element_by_id("frame-id"), None);
+        assert_eq!(tree.tree_scope_root(inner_div), Some(root));
+        assert_eq!(tree.containing_iframe_content_document(inner_div), Some(root));
+        // The composed-root walk hops content root -> host -> document.
+        assert_eq!(tree.shadow_including_root(inner_div), Some(tree.document()));
+        // Content is invisible to light traversal from the document.
+        assert!(!tree.descendants(tree.document()).contains(&inner_div));
+
+        tree.set_document_scope(
+            root,
+            DocumentScope {
+                url: "https://frame.example/".into(),
+                origin: Origin::from_url("https://frame.example/"),
+                base_url: "https://frame.example/".into(),
+                sandbox: SandboxFlags::default(),
+                csp: None,
+                frame_id: "frame-1".into(),
+                document_generation: 1,
+                quirks: false,
+            },
+        );
+
+        // Navigation: a second attach replaces the active document and
+        // returns the superseded root, which stays live but detached.
+        let (next, previous) = tree.create_iframe_content_document(host).unwrap();
+        assert_eq!(previous, Some(root));
+        assert_eq!(tree.iframe_content_document(host), Some(next));
+        assert_eq!(tree.iframe_host(root), None);
+        assert!(!tree.is_connected(root));
+        assert!(tree.is_connected(next));
+        // The old document keeps its scope until collected, so its nodes
+        // still resolve as iframe content, not top-document members.
+        assert!(tree.is_iframe_content_document(root));
+        assert_eq!(tree.text_content(inner_div), "");
+        assert_eq!(tree.get_element_by_id("frame-id"), None);
+
+        // Collecting the old root drops registries and scope.
+        tree.remove(root);
+        assert!(!tree.is_iframe_content_document(root));
+        assert!(tree.document_scope(root).is_none());
+        assert_eq!(tree.iframe_content_document(host), Some(next));
+    }
+
+    #[test]
+    fn iframe_content_attach_rejects_structural_misuse() {
+        let tree = DomTree::new();
+        let not_iframe = element(&tree, "div");
+        tree.append_child(tree.document(), not_iframe);
+        assert_eq!(
+            tree.create_iframe_content_document(not_iframe).unwrap_err(),
+            AttachIframeError::HostIsNotIframe
+        );
+
+        let host = iframe_with_host(&tree);
+        // The tree's own document is not a valid content root.
+        assert_eq!(
+            tree.attach_iframe_content_document(host, tree.document())
+                .unwrap_err(),
+            AttachIframeError::InvalidContentRoot
+        );
+        // An attached element is not a valid content root.
+        assert_eq!(
+            tree.attach_iframe_content_document(host, not_iframe)
+                .unwrap_err(),
+            AttachIframeError::InvalidContentRoot
+        );
+        // A nested iframe cannot adopt an ancestor content document.
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        let nested_host = element(&tree, "iframe");
+        tree.append_child(root, nested_host);
+        assert_eq!(
+            tree.attach_iframe_content_document(nested_host, root)
+                .unwrap_err(),
+            AttachIframeError::InvalidContentRoot
+        );
+        let fresh = tree.new_node(NodeData::Document);
+        tree.attach_iframe_content_document(nested_host, fresh)
+            .expect("nested iframe hosts its own document");
+        assert_eq!(tree.shadow_including_root(fresh), Some(tree.document()));
+    }
+
+    #[test]
+    fn removing_iframe_host_subtree_frees_owned_content_document() {
+        let tree = DomTree::new();
+        let wrapper = element(&tree, "div");
+        tree.append_child(tree.document(), wrapper);
+        let host = element(&tree, "iframe");
+        tree.append_child(wrapper, host);
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        let inner_div = element_with_id(&tree, "div", "inner");
+        tree.append_child(root, inner_div);
+        tree.set_document_scope(
+            root,
+            DocumentScope {
+                url: "about:blank".into(),
+                origin: Origin::Opaque(OpaqueOriginId::new()),
+                base_url: "about:blank".into(),
+                sandbox: SandboxFlags::default(),
+                csp: None,
+                frame_id: "frame-1".into(),
+                document_generation: 1,
+                quirks: false,
+            },
+        );
+
+        tree.remove(wrapper);
+        assert!(tree.get_node(root).is_none());
+        assert!(tree.get_node(inner_div).is_none());
+        assert!(!tree.is_iframe_content_document(root));
+        assert!(tree.document_scope(root).is_none());
+        assert_eq!(tree.iframe_content_document(host), None);
+        // remove_child (wrapper-preserving) also purges owned ids: rebuild
+        // and verify the id index does not leak content-document ids.
+        let host2 = iframe_with_host(&tree);
+        let (root2, _) = tree.create_iframe_content_document(host2).unwrap();
+        let inner2 = element_with_id(&tree, "div", "inner2");
+        tree.append_child(root2, inner2);
+        tree.remove_child(host2);
+        assert!(!tree.inner.borrow().id_index.contains_key("inner2"));
+        // Detached host keeps its content document, like a detached shadow
+        // host keeps its shadow tree, until actually freed.
+        assert_eq!(tree.iframe_content_document(host2), Some(root2));
+        assert!(!tree.is_connected(root2));
     }
 
     #[test]

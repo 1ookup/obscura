@@ -361,6 +361,18 @@ pub fn parse_html(html: &str) -> DomTree {
         .one(html.as_bytes())
 }
 
+/// Parse a complete HTML document and graft its children under
+/// `content_root`, an out-of-band Document node such as an iframe content
+/// document. Declarative shadow roots are enabled, as for any full-document
+/// parse. Returns whether the parsed document was in (full) quirks mode so
+/// the caller can record it on the content root's `DocumentScope`; the
+/// embedding tree's own quirks flag is left untouched.
+pub fn parse_into_subtree(tree: &DomTree, content_root: NodeId, html: &str) -> bool {
+    let tmp = parse_html(html);
+    tree.import_children_from(content_root, &tmp, tmp.document());
+    tmp.is_quirks()
+}
+
 pub fn parse_fragment(html: &str) -> DomTree {
     let context_name = QualName::new(None, ns!(html), local_name!("body"));
     parse_fragment_with_context(html, context_name)
@@ -569,6 +581,45 @@ mod tests {
         assert!(tree.query_selector_from(root, "#first").unwrap().is_some());
         assert_eq!(element_children(&tree, host), vec![duplicate, light]);
         assert_eq!(element_children(&tree, duplicate_contents), vec![second]);
+    }
+
+    #[test]
+    fn parse_into_subtree_grafts_full_document_including_head_and_shadow_roots() {
+        let tree = parse_html("<!DOCTYPE html><html><body><iframe></iframe></body></html>");
+        let host = tree.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        let quirks = parse_into_subtree(
+            &tree,
+            root,
+            "<!DOCTYPE html><html><head><title>Frame</title></head><body>\
+             <div id=in-frame>hi</div>\
+             <x-card><template shadowrootmode=\"open\"><b>shadow</b></template></x-card>\
+             </body></html>",
+        );
+        assert!(!quirks);
+
+        // The full document structure survives: head, title, body content.
+        let title = tree.query_selector_from(root, "title").unwrap().unwrap();
+        assert_eq!(tree.text_content(title), "Frame");
+        let in_frame = tree.query_selector_from(root, "#in-frame").unwrap().unwrap();
+        assert_eq!(tree.text_content(in_frame), "hi");
+        // The embedding document's scope stays isolated.
+        assert_eq!(tree.get_element_by_id("in-frame"), None);
+        assert!(tree.query_selector("#in-frame").unwrap().is_none());
+        // Declarative shadow roots inside the frame content import as real
+        // shadow roots, not as leftover template elements.
+        let card = tree.query_selector_from(root, "x-card").unwrap().unwrap();
+        let shadow = tree.shadow_root(card).expect("imported declarative root");
+        assert!(tree
+            .shadow_descendants(card)
+            .unwrap()
+            .iter()
+            .any(|id| tree.text_content(*id) == "shadow"));
+        assert_eq!(tree.tree_scope_root(shadow), Some(shadow));
+        // Quirks mode of the frame document does not leak to the outer tree.
+        let quirky = parse_into_subtree(&tree, root, "<html><body></body></html>");
+        assert!(quirky);
+        assert!(!tree.is_quirks());
     }
 
     #[test]

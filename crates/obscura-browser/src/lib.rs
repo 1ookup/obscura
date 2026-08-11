@@ -1,4 +1,5 @@
 pub mod context;
+pub mod frames;
 pub mod lifecycle;
 pub mod page;
 #[cfg(feature = "render")]
@@ -6,6 +7,7 @@ pub mod pdf;
 pub mod profiles;
 
 pub use context::BrowserContext;
+pub use frames::{BrowsingContext, CommitError, CommittedDocument, FrameRegistry};
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]
