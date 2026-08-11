@@ -1481,6 +1481,69 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_worker_uses_creator_url_and_frame_global_callbacks() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "http://example.com/frame/path/page.html";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"globalThis.frameWorkerResult = null;
+               globalThis.frameWorkerFetchUrl = null;
+               globalThis.fetch = async function (url) {
+                   frameWorkerFetchUrl = String(url);
+                   return {
+                       ok: true,
+                       url: String(url),
+                       text: async function () { return "postMessage(location.href)"; },
+                   };
+               };
+               const worker = new Worker('worker.js');
+               worker.onmessage = function (event) {
+                   frameWorkerResult = event.data;
+               };"#,
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            let done = rt
+                .execute_script_in_frame_realm(
+                    "frame-test",
+                    1,
+                    "<probe>",
+                    "frameWorkerResult !== null",
+                )
+                .unwrap();
+            if done == serde_json::json!(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[frameWorkerFetchUrl, frameWorkerResult]",
+            )
+            .unwrap(),
+            serde_json::json!([
+                "http://example.com/frame/path/worker.js",
+                "http://example.com/frame/path/worker.js",
+            ]),
+        );
+        assert_eq!(
+            rt.evaluate("[typeof frameWorkerResult, typeof frameWorkerFetchUrl]")
+                .unwrap(),
+            serde_json::json!(["undefined", "undefined"]),
+        );
+    }
+
     // ---- Cross-document postMessage (Phase 4) ----
 
     #[tokio::test(flavor = "current_thread")]

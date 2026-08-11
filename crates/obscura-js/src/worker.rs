@@ -14,13 +14,26 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::mpsc as std_mpsc;
+use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use deno_core::v8::IsolateHandle;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::runtime::ObscuraJsRuntime;
+
+/// Page-owned network state inherited by a dedicated worker. Dedicated
+/// workers have a separate global and isolate, but they fetch through their
+/// creator's browser context, cookie jar, callbacks and request policy.
+pub(crate) struct WorkerEnvironment {
+    pub cookie_jar: Option<Arc<obscura_net::CookieJar>>,
+    pub http_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
+    pub callbacks: Option<Arc<obscura_net::CallbackRegistry>>,
+    pub blocked_urls: Vec<String>,
+    pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(feature = "stealth")]
+    pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
+}
 
 /// Upper bound on live workers per page. Chromium has no fixed cap, but each
 /// Obscura worker costs an OS thread plus a V8 isolate; a page asking for more
@@ -87,11 +100,12 @@ impl WorkerHost {
     /// only until the worker runtime exists (bounded), not until the source
     /// finishes: a source that loops forever still returns a usable id whose
     /// isolate handle `terminate` can kill.
-    pub fn spawn(
+    pub(crate) fn spawn(
         &mut self,
         source: String,
         script_url: String,
         kind: String,
+        environment: WorkerEnvironment,
     ) -> Result<u32, String> {
         if self.workers.len() >= MAX_WORKERS {
             return Err(format!(
@@ -105,7 +119,15 @@ impl WorkerHost {
         let thread = std::thread::Builder::new()
             .name(format!("obscura-worker-{id}"))
             .spawn(move || {
-                worker_thread_main(source, script_url, kind, msg_rx, out_tx, ready_tx)
+                worker_thread_main(
+                    source,
+                    script_url,
+                    kind,
+                    environment,
+                    msg_rx,
+                    out_tx,
+                    ready_tx,
+                )
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?;
         let isolate_handle = match ready_rx.recv_timeout(SPAWN_READY_TIMEOUT) {
@@ -195,7 +217,8 @@ fn is_termination(error: &str) -> bool {
 fn worker_thread_main(
     source: String,
     script_url: String,
-    _kind: String,
+    kind: String,
+    environment: WorkerEnvironment,
     mut inbox: UnboundedReceiver<String>,
     out_tx: UnboundedSender<String>,
     ready_tx: std_mpsc::Sender<Result<IsolateHandle, String>>,
@@ -217,12 +240,40 @@ fn worker_thread_main(
             // A separate isolate from the page's, seeded from the same startup
             // snapshot; ObscuraJsRuntime construction already serializes
             // isolate creation through ISOLATE_CREATE_LOCK (#430).
-            let mut rt = ObscuraJsRuntime::with_base_url(&script_url);
+            let proxy_url = environment
+                .http_client
+                .as_ref()
+                .and_then(|client| client.proxy_url().map(str::to_string));
+            let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
+            // reqwest's pooled client is created inside the creator's Tokio
+            // runtime. Build the worker's pool on this thread while retaining
+            // the browser-context cookie jar, proxy and private-network
+            // policy; moving the initialized pool across runtimes produces a
+            // reqwest builder error on the first worker fetch.
+            let worker_http_client = environment.http_client.as_ref().map(|creator| {
+                Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+                    environment
+                        .cookie_jar
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(obscura_net::CookieJar::new())),
+                    creator.proxy_url(),
+                    creator.allow_private_network,
+                ))
+            });
             {
                 let state = rt.state_handle().clone();
                 let mut gs = state.borrow_mut();
                 gs.worker_outbox = Some(out_tx.clone());
                 gs.url = script_url.clone();
+                gs.cookie_jar = environment.cookie_jar;
+                gs.http_client = worker_http_client;
+                gs.callbacks = environment.callbacks;
+                gs.blocked_urls = environment.blocked_urls;
+                gs.page_in_flight = environment.page_in_flight;
+                #[cfg(feature = "stealth")]
+                {
+                    gs.stealth_client = environment.stealth_client;
+                }
             }
             // Hand the isolate handle back before running author code so
             // spawn returns quickly even when the source never yields.
@@ -237,7 +288,12 @@ fn worker_thread_main(
             }
             // HTML "run a worker": the worker source executes exactly once.
             // Later messages only dispatch events (worker_event_loop below).
-            if let Err(e) = rt.execute_script("<obscura:worker-script>", &source) {
+            let source_result = if kind == "module" {
+                rt.load_inline_module(&source, &script_url, 30_000).await
+            } else {
+                rt.execute_script("<obscura:worker-script>", &source)
+            };
+            if let Err(e) = source_result {
                 let _ = out_tx.send(error_entry(&e));
                 if is_termination(&e) {
                     return;
@@ -449,6 +505,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
 mod tests {
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+    use std::sync::Arc;
 
     fn page_runtime() -> ObscuraJsRuntime {
         let mut rt = ObscuraJsRuntime::new();
@@ -634,6 +691,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_worker_executes_with_module_semantics() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const source = "postMessage({ url: import.meta.url, topThis: this === undefined });";
+            const url = 'data:text/javascript,' + encodeURIComponent(source);
+            globalThis.__expectedUrl = url;
+            globalThis.__got = [];
+            const worker = new Worker(url, { type: 'module' });
+            worker.onmessage = (event) => { globalThis.__got.push(event.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate(
+                "JSON.stringify([__got[0].url === __expectedUrl, __got[0].topThis])",
+            )
+            .unwrap(),
+            serde_json::json!("[true,true]"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_cross_origin_classic_throws_security_error() {
         let mut rt = page_runtime();
         assert_eq!(
@@ -766,5 +848,77 @@ mod tests {
             rt.evaluate("globalThis.__got[0].loc").unwrap(),
             serde_json::json!(format!("{origin}/worker.js")),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_fetch_inherits_creator_cookie_and_http_client() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or_default();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (content_type, body) = if request.starts_with("GET /worker.js ") {
+                    (
+                        "text/javascript",
+                        "fetch('/api', { credentials: 'include' })\
+                         .then(function (response) { return response.text(); })\
+                         .then(function (text) { postMessage(text); })\
+                         .catch(function (error) { postMessage('error:' + error); });",
+                    )
+                } else {
+                    (
+                        "text/plain",
+                        if request.contains("Cookie: creator=frame")
+                            || request.contains("cookie: creator=frame")
+                        {
+                            "cookie-ok"
+                        } else {
+                            "cookie-missing"
+                        },
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let page_url = url::Url::parse(&format!("{origin}/frame/page.html")).unwrap();
+        let jar = Arc::new(obscura_net::CookieJar::new());
+        jar.set_cookie("creator=frame; Path=/", &page_url);
+        let client = Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar.clone(),
+            None,
+            true,
+        ));
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(page_url.as_str());
+        rt.set_cookie_jar(jar);
+        rt.set_http_client(client);
+        rt.run_page_init();
+
+        rt.execute_script(
+            "<test>",
+            r#"
+            const w = new Worker('/worker.js');
+            globalThis.__got = [];
+            w.onmessage = (event) => { globalThis.__got.push(event.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "JSON.stringify(globalThis.__got)",
+            &serde_json::json!(r#"["cookie-ok"]"#),
+        )
+        .await;
     }
 }

@@ -6527,7 +6527,12 @@ function _environmentSettings() {
     const cookieUrl = /^(?:https?|wss?):/i.test(url) ? url : baseUrl;
     return { root, url, baseUrl, cookieUrl, origin: info.origin || "null" };
   }
-  const url = _domParse("document_url") || "about:blank";
+  // Dedicated workers deliberately have no Document. Their environment URL
+  // is the final worker script URL installed by worker_prep_script, not the
+  // empty DOM state of the fresh isolate.
+  const workerUrl = typeof globalThis.document === "undefined"
+    ? globalThis.__virtualUrl : null;
+  const url = workerUrl || _domParse("document_url") || "about:blank";
   let origin = "null";
   try { origin = new URL(url).origin; } catch (e) {}
   const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
@@ -13080,9 +13085,8 @@ globalThis.opener = null;
 // global scope, and terminate() kills only the worker isolate. Messaging uses
 // the JSON-clonable subset of structured clone (a {"v": data} envelope, so an
 // undefined payload round-trips as an absent property).
-// TODO(phase 3.11 follow-up): full structured clone, transfer lists, module
-// workers (options.type === 'module' currently runs as a classic script),
-// worker-src CSP, options.name/credentials, http(s) importScripts.
+// TODO(phase 3.11 follow-up): full structured clone, transfer lists,
+// worker-src CSP, options.name, and http(s) importScripts.
 function _workerScriptFromDataUrl(url) {
   const comma = url.indexOf(',');
   if (comma < 0) throw new DOMException("Failed to construct 'Worker': invalid data: URL", 'SyntaxError');
@@ -13112,6 +13116,16 @@ globalThis.Worker = class Worker {
     this._pending = [];
     const worker = this;
     const href = String(url);
+    const workerType = options && options.type !== undefined
+      ? String(options.type) : 'classic';
+    if (workerType !== 'classic' && workerType !== 'module') {
+      throw new TypeError("Failed to construct 'Worker': '" + workerType + "' is not a valid WorkerType.");
+    }
+    const credentials = options && options.credentials !== undefined
+      ? String(options.credentials) : 'same-origin';
+    if (credentials !== 'omit' && credentials !== 'same-origin' && credentials !== 'include') {
+      throw new TypeError("Failed to construct 'Worker': '" + credentials + "' is not a valid RequestCredentials value.");
+    }
     // Resolve against the creator document's base. Frame realms re-run
     // bootstrap, so `location` here is the creator frame's own.
     let resolved = href;
@@ -13120,8 +13134,8 @@ globalThis.Worker = class Worker {
       throw new DOMException("Failed to construct 'Worker': '" + href + "' is not a valid URL.", 'SyntaxError');
     }
     const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
-    if (typeof blobSource === 'string') { this._spawn(blobSource, resolved); return; }
-    if (resolved.startsWith('data:')) { this._spawn(_workerScriptFromDataUrl(resolved), resolved); return; }
+    if (typeof blobSource === 'string') { this._spawn(blobSource, resolved, workerType); return; }
+    if (resolved.startsWith('data:')) { this._spawn(_workerScriptFromDataUrl(resolved), resolved, workerType); return; }
     if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
       // HTML "fetch a classic worker script" uses request mode "same-origin":
       // a cross-origin classic worker constructor throws SecurityError.
@@ -13130,7 +13144,7 @@ globalThis.Worker = class Worker {
         sameOrigin = new URL(resolved).origin
           === new URL(globalThis.location?.href || 'about:blank').origin;
       } catch (e) {}
-      if (!sameOrigin) {
+      if (workerType === 'classic' && !sameOrigin) {
         throw new DOMException(
           "Failed to construct 'Worker': script at '" + resolved + "' cannot be accessed from origin '"
             + (globalThis.location?.origin ?? 'null') + "'.",
@@ -13141,20 +13155,23 @@ globalThis.Worker = class Worker {
       // while the fetch is in flight queue in _pending and flush after spawn.
       (async () => {
         try {
-          const resp = await fetch(resolved);
+          const resp = await fetch(resolved, {
+            mode: workerType === 'module' ? 'cors' : 'same-origin',
+            credentials,
+          });
           if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 0));
           const source = await resp.text();
-          if (!worker._terminated) worker._spawn(source, resp.url || resolved);
+          if (!worker._terminated) worker._spawn(source, resp.url || resolved, workerType);
         } catch (e) { worker._dispatchError(e && e.message ? e.message : String(e)); }
       })();
       return;
     }
     throw new DOMException("Failed to construct 'Worker': unsupported script URL scheme.", 'SecurityError');
   }
-  _spawn(source, finalUrl) {
+  _spawn(source, finalUrl, workerType = 'classic') {
     if (this._terminated) return;
     let id;
-    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), 'classic'); }
+    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType)); }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
     this._id = id;
     const queued = this._pending;

@@ -4650,6 +4650,18 @@ fn op_worker_spawn(
     #[string] kind: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
+    let environment = {
+        let gs = shared.borrow();
+        crate::worker::WorkerEnvironment {
+            cookie_jar: gs.cookie_jar.clone(),
+            http_client: gs.http_client.clone(),
+            callbacks: gs.callbacks.clone(),
+            blocked_urls: gs.blocked_urls.clone(),
+            page_in_flight: Arc::clone(&gs.page_in_flight),
+            #[cfg(feature = "stealth")]
+            stealth_client: gs.stealth_client.clone(),
+        }
+    };
     let mut gs = shared.borrow_mut();
     let host = gs
         .worker_host
@@ -4657,7 +4669,7 @@ fn op_worker_spawn(
     // Panic-safe: a failed spawn must not unwind into V8 (AGENTS.md); the
     // page sees a catchable constructor error instead.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        host.spawn(source, url, kind)
+        host.spawn(source, url, kind, environment)
     })) {
         Ok(Ok(id)) => Ok(id),
         Ok(Err(message)) => Err(deno_error::JsErrorBox::generic(message)),
