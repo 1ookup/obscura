@@ -120,9 +120,13 @@ async fn setup() -> (CdpContext, String, String, String) {
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    // Chromium only reports executionContextCreated after Runtime.enable.
+    // Most tests below inspect or route through those advertised contexts;
+    // the explicit navigate-only test exercises the disabled-domain path.
+    cdp_ok(&mut ctx, 1, "Runtime.enable", json!({}), session_id).await;
     cdp_ok(
         &mut ctx,
-        1,
+        2,
         "Page.navigate",
         json!({"url": url, "waitUntil": "load"}),
         session_id,
