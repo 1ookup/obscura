@@ -733,7 +733,7 @@ async fn runtime_enable_backfills_contexts_for_already_committed_frames() {
 // bootstrap per frame. The scriptless page creates no realm on its own, so
 // the realm list staying empty is the whole assertion.
 #[tokio::test(flavor = "current_thread")]
-async fn no_frame_realm_is_created_without_runtime_enable() {
+async fn navigate_only_creates_the_frame_window_realm_without_advertising_it() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
     let mut ctx = CdpContext::new();
@@ -752,19 +752,23 @@ async fn no_frame_realm_is_created_without_runtime_enable() {
     // The frame is projected...
     let tree = cdp_ok(&mut ctx, 35, "Page.getFrameTree", json!({}), sid).await;
     assert!(tree["frameTree"]["childFrames"][0]["frame"]["id"].is_string());
-    // ...but nothing built a V8 context for it.
+    // The browsing context owns its Window realm even before Runtime.enable,
+    // so contentWindow and author scripts have browser-like identity. CDP
+    // still does not advertise an execution context until the client enables
+    // Runtime, and no isolated utility realm is allocated speculatively.
     let realms = ctx
         .get_page(&page_id)
         .and_then(|page| page.js.as_ref())
         .map(|js| js.list_frame_realms())
         .expect("page runtime");
+    assert_eq!(realms.len(), 1, "unexpected speculative realms: {realms:?}");
+    assert_eq!(realms[0].2, obscura_js::realm::MAIN_WORLD);
+    assert!(realms[0].3);
     assert!(
-        realms.is_empty(),
-        "navigate-only client must not pay for frame realms: {realms:?}"
-    );
-    assert!(
-        ctx.execution_contexts.is_empty(),
-        "no frame context is advertised without Runtime.enable"
+        ctx.execution_contexts
+            .values()
+            .all(|entry| entry.frame_id == page_id),
+        "no child-frame context is advertised without Runtime.enable"
     );
 }
 
