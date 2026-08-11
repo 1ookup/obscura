@@ -1,0 +1,832 @@
+//! Frame Window realms (docs/Iframe-support-design.md, Phase 3.7): additional
+//! `v8::Context`s inside the existing `ObscuraJsRuntime` isolate, one per
+//! iframe content document generation.
+//!
+//! deno_core 0.350 has no public realm API, so contexts are built directly on
+//! the isolate. The `Deno.core` JS binding object is per-context; it is
+//! bridged by injecting the main context's `Deno` global into the new context
+//! (objects may cross contexts within one isolate), then re-executing the
+//! bootstrap source, which the snapshot bakes into the default context only.
+//! Inside a frame realm, `document` binds to the frame's content root: the
+//! realm host defines `__obscura_frame_document_nid` before bootstrap and
+//! `__obscura_init` builds the realm's `document` as that bootstrap
+//! instance's `_ScopedDocument(content_root)` (scoped op_dom queries).
+//!
+//! [`FrameRealmHost`] is the managed registry, keyed by
+//! `(frame_id, document_generation)`, created lazily and destroyed by
+//! generation. [`SecondaryRealm`] is the retained feasibility spike
+//! (implementation order item 1); nothing on the main path constructs either.
+
+use std::collections::HashMap;
+
+use deno_core::v8;
+
+use crate::runtime::ObscuraJsRuntime;
+
+/// bootstrap.js source. The snapshot (build.rs) contains its executed result
+/// in the default context only; a secondary context runs the source again.
+const BOOTSTRAP_SRC: &str = include_str!("../js/bootstrap.js");
+
+/// Mirror of the `<obscura:init>` script the runtime constructor executes in
+/// the default context (runtime.rs).
+const REALM_INIT_SRC: &str =
+    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;";
+
+/// A secondary context in the runtime's isolate. Dropping the handle releases
+/// the context to GC; the main context is unaffected.
+pub struct SecondaryRealm {
+    context: v8::Global<v8::Context>,
+}
+
+/// A managed frame Window realm: the context handle plus the metadata that
+/// identifies which document it serves.
+pub struct FrameRealm {
+    context: v8::Global<v8::Context>,
+    /// Arena index of the frame's content-document root node.
+    pub content_root: u32,
+    /// Base URL handed to the realm at creation (`__obscura_frame_base_url`).
+    pub base_url: String,
+    /// DocumentScope url/origin serialized at creation time; `None` when the
+    /// content root had no registered scope yet.
+    pub scope_url: Option<String>,
+    pub scope_origin: Option<String>,
+}
+
+/// Registry of frame Window realms keyed by `(frame_id, document_generation)`.
+/// Owned by `ObscuraJsRuntime`; empty on pages without iframes, so the main
+/// path never pays for it.
+#[derive(Default)]
+pub struct FrameRealmHost {
+    realms: HashMap<(String, u64), FrameRealm>,
+}
+
+impl FrameRealmHost {
+    pub fn get(&self, frame_id: &str, generation: u64) -> Option<&FrameRealm> {
+        self.realms.get(&(frame_id.to_string(), generation))
+    }
+
+    pub fn contains(&self, frame_id: &str, generation: u64) -> bool {
+        self.realms.contains_key(&(frame_id.to_string(), generation))
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.realms.len()
+    }
+}
+
+fn alloc_err(what: &str) -> String {
+    format!("realm: {what} allocation failed")
+}
+
+impl ObscuraJsRuntime {
+    /// Create a fresh context in this runtime's isolate and inject the main
+    /// context's `Deno` binding object so ops are callable from realm script.
+    fn create_realm_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let main_context = scope.get_current_context();
+        let main_global = main_context.global(scope);
+        let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
+        let deno_val = main_global
+            .get(scope, deno_key.into())
+            .filter(|v| v.is_object())
+            .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+
+        let context = v8::Context::new(scope, v8::ContextOptions::default());
+        // Same security token as the main context. Plain contexts install no
+        // access-check callbacks, but equal tokens keep V8's same-origin
+        // checks permissive while objects (Deno.core) are shared across
+        // realms. Author-visible cross-frame access checks live in the
+        // WindowProxy layer (bootstrap.js), not in V8 tokens.
+        let token = main_context.get_security_token(scope);
+        context.set_security_token(token);
+        {
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            global.set(scope, deno_key.into(), deno_val);
+        }
+        Ok(v8::Global::new(scope, context))
+    }
+
+    /// Spike entry point (implementation order item 1); the managed layer is
+    /// [`ObscuraJsRuntime::ensure_frame_realm`].
+    pub fn create_secondary_realm(&mut self) -> Result<SecondaryRealm, String> {
+        Ok(SecondaryRealm {
+            context: self.create_realm_context()?,
+        })
+    }
+
+    /// Lazily create the Window realm for `(frame_id, generation)`. Returns
+    /// `true` when a realm was created, `false` when one already existed (a
+    /// generation identifies one committed document, so an existing entry is
+    /// reused as-is). Creation follows the spike flow (fresh context, `Deno`
+    /// binding, init globals, bootstrap re-execution, `__obscura_init`), with
+    /// one addition: `__obscura_frame_document_nid` / `__obscura_frame_base_url`
+    /// are defined on the realm global before bootstrap runs, which makes
+    /// `__obscura_init` bind the realm's `document` to `content_root` as a
+    /// `_ScopedDocument` (scoped op_dom queries) instead of the top document.
+    pub fn ensure_frame_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        content_root: u32,
+        base_url: &str,
+    ) -> Result<bool, String> {
+        if self.frame_realms.contains(frame_id, generation) {
+            return Ok(false);
+        }
+
+        let context = self.create_realm_context()?;
+        {
+            // The frame flags must exist before any realm script runs:
+            // bootstrap and __obscura_init both execute below and the
+            // document-binding hook reads the nid inside __obscura_init.
+            let scope = &mut self.deno_runtime_mut().handle_scope();
+            let context = v8::Local::new(scope, &context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            let nid_key = v8::String::new(scope, "__obscura_frame_document_nid")
+                .ok_or_else(|| alloc_err("key"))?;
+            let nid_val = v8::Number::new(scope, f64::from(content_root));
+            global.set(scope, nid_key.into(), nid_val.into());
+            let url_key = v8::String::new(scope, "__obscura_frame_base_url")
+                .ok_or_else(|| alloc_err("key"))?;
+            let url_val =
+                v8::String::new(scope, base_url).ok_or_else(|| alloc_err("value"))?;
+            global.set(scope, url_key.into(), url_val.into());
+        }
+        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        self.execute_in_context(
+            &context,
+            "<obscura:frame-realm-page-init>",
+            "globalThis.__obscura_init();",
+        )?;
+
+        // Snapshot the content root's scope for later diagnostics/routing;
+        // the scope may legitimately not exist yet (about:blank pre-commit).
+        let (scope_url, scope_origin) = {
+            let state = self.state_handle().borrow();
+            match state.dom.as_ref().and_then(|dom| {
+                dom.document_scope(obscura_dom::NodeId::new(content_root))
+            }) {
+                Some(scope) => (Some(scope.url.clone()), Some(scope.origin.serialize())),
+                None => (None, None),
+            }
+        };
+        self.frame_realms.realms.insert(
+            (frame_id.to_string(), generation),
+            FrameRealm {
+                context,
+                content_root,
+                base_url: base_url.to_string(),
+                scope_url,
+                scope_origin,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Run `source` with Script semantics in the realm registered for
+    /// `(frame_id, generation)`; the JSON-ified completion value follows
+    /// [`ObscuraJsRuntime::realm_execute_script`].
+    pub fn execute_script_in_frame_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        // Clone the handle (a second Global to the same context) so the
+        // registry borrow ends before V8 re-borrows the runtime.
+        let context = self
+            .frame_realms
+            .get(frame_id, generation)
+            .ok_or_else(|| {
+                format!("realm: no frame realm for ({frame_id}, generation {generation})")
+            })?
+            .context
+            .clone();
+        self.execute_in_context(&context, name, source)
+    }
+
+    /// Destroy one document generation's realm. Returns whether it existed.
+    pub fn destroy_frame_realm_generation(&mut self, frame_id: &str, generation: u64) -> bool {
+        let removed = self
+            .frame_realms
+            .realms
+            .remove(&(frame_id.to_string(), generation))
+            .is_some();
+        if removed {
+            self.deno_runtime_mut().v8_isolate().low_memory_notification();
+        }
+        removed
+    }
+
+    /// Destroy every realm registered for `frame_id` (all generations), e.g.
+    /// on frame detach. Returns how many were dropped.
+    pub fn destroy_frame_realm(&mut self, frame_id: &str) -> usize {
+        let before = self.frame_realms.realms.len();
+        self.frame_realms.realms.retain(|(id, _), _| id != frame_id);
+        let removed = before - self.frame_realms.realms.len();
+        if removed > 0 {
+            self.deno_runtime_mut().v8_isolate().low_memory_notification();
+        }
+        removed
+    }
+
+    /// Registry view, for callers that only need metadata.
+    pub fn frame_realm(&self, frame_id: &str, generation: u64) -> Option<&FrameRealm> {
+        self.frame_realms.get(frame_id, generation)
+    }
+
+    /// Install the runtime-init globals and re-execute bootstrap.js in the
+    /// realm. Order matters: the Deno binding was injected at creation, the
+    /// init globals come next, then the bootstrap source (it calls ops).
+    pub fn bootstrap_secondary_realm(&mut self, realm: &SecondaryRealm) -> Result<(), String> {
+        self.realm_execute_script(realm, "<obscura:realm-init>", REALM_INIT_SRC)?;
+        self.realm_execute_script(realm, "<obscura:realm-bootstrap>", BOOTSTRAP_SRC)?;
+        Ok(())
+    }
+
+    /// Run `__obscura_init()` in the realm, the per-page half of bootstrap.
+    /// Requires an installed DOM (`set_dom`): it resolves the document node
+    /// over `op_dom`.
+    pub fn init_secondary_realm_page(&mut self, realm: &SecondaryRealm) -> Result<(), String> {
+        self.realm_execute_script(
+            realm,
+            "<obscura:realm-page-init>",
+            "globalThis.__obscura_init();",
+        )?;
+        Ok(())
+    }
+
+    /// Test helper: expose the main context's global proxy in the realm under
+    /// `name` so realm scripts can compare identities across realms.
+    pub fn realm_expose_main_global(
+        &mut self,
+        realm: &SecondaryRealm,
+        name: &str,
+    ) -> Result<(), String> {
+        let context = realm.context.clone();
+        self.expose_main_global_in_context(&context, name)
+    }
+
+    /// Test helper: same as [`ObscuraJsRuntime::realm_expose_main_global`],
+    /// for a managed frame realm.
+    pub fn frame_realm_expose_main_global(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        name: &str,
+    ) -> Result<(), String> {
+        let context = self
+            .frame_realms
+            .get(frame_id, generation)
+            .ok_or_else(|| {
+                format!("realm: no frame realm for ({frame_id}, generation {generation})")
+            })?
+            .context
+            .clone();
+        self.expose_main_global_in_context(&context, name)
+    }
+
+    fn expose_main_global_in_context(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        name: &str,
+    ) -> Result<(), String> {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let main_global = scope.get_current_context().global(scope);
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let key = v8::String::new(scope, name).ok_or_else(|| alloc_err("key"))?;
+        let global = context.global(scope);
+        global.set(scope, key.into(), main_global.into());
+        Ok(())
+    }
+
+    /// Compile and run `source` with Script semantics in the realm's context.
+    /// Top-level `var`/`function`, directive prologues and the completion
+    /// value all follow the Script goal, mirroring `execute_classic_script`.
+    /// The completion value is returned JSON-ified (objects via
+    /// JSON.stringify) for test assertions.
+    pub fn realm_execute_script(
+        &mut self,
+        realm: &SecondaryRealm,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        let context = realm.context.clone();
+        self.execute_in_context(&context, name, source)
+    }
+
+    fn execute_in_context(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let source =
+            v8::String::new(scope, source).ok_or_else(|| alloc_err("source"))?;
+        let name = v8::String::new(scope, name).ok_or_else(|| alloc_err("script URL"))?;
+        let origin = v8::ScriptOrigin::new(
+            scope,
+            name.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        let scope = &mut v8::TryCatch::new(scope);
+        let Some(script) = v8::Script::compile(scope, source, Some(&origin)) else {
+            return Err(realm_error(scope, "compilation"));
+        };
+        let Some(value) = script.run(scope) else {
+            return Err(realm_error(scope, "execution"));
+        };
+
+        if value.is_undefined() || value.is_null() {
+            return Ok(serde_json::Value::Null);
+        }
+        if value.is_boolean() {
+            return Ok(serde_json::Value::Bool(value.boolean_value(scope)));
+        }
+        if value.is_number() {
+            let n = value.number_value(scope).unwrap_or(0.0);
+            return Ok(serde_json::json!(n));
+        }
+        if value.is_string() {
+            return Ok(serde_json::Value::String(value.to_rust_string_lossy(scope)));
+        }
+        if let Some(json) = v8::json::stringify(scope, value) {
+            let text = json.to_rust_string_lossy(scope);
+            if let Ok(parsed) = serde_json::from_str(&text) {
+                return Ok(parsed);
+            }
+        }
+        Ok(serde_json::Value::String(value.to_rust_string_lossy(scope)))
+    }
+
+    /// Drop the realm's context and ask V8 for a full GC so context teardown
+    /// happens now rather than at isolate drop.
+    pub fn destroy_secondary_realm(&mut self, realm: SecondaryRealm) {
+        drop(realm);
+        self.deno_runtime_mut().v8_isolate().low_memory_notification();
+    }
+}
+
+fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String {
+    if scope.is_execution_terminating() {
+        scope.cancel_terminate_execution();
+        return "JS error: Uncaught Error: execution terminated".to_string();
+    }
+    match scope.exception() {
+        Some(exception) => {
+            let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+            format!("JS error: {error}")
+        }
+        None => format!("JS error: script {phase} failed without an exception"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::ObscuraJsRuntime;
+    use obscura_dom::parse_html;
+
+    fn setup_runtime(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/test");
+        rt.set_title("Test Page");
+        rt.run_page_init();
+        rt
+    }
+
+    #[test]
+    fn secondary_realm_top_level_bindings_stay_out_of_main_context() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let realm = rt.create_secondary_realm().unwrap();
+        rt.bootstrap_secondary_realm(&realm).unwrap();
+
+        rt.realm_execute_script(
+            &realm,
+            "<t>",
+            "var __realm_spike_x = 41; function __realm_spike_f() { return __realm_spike_x + 1; }",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                "[typeof __realm_spike_x, typeof __realm_spike_f, __realm_spike_f(), globalThis.__realm_spike_x]",
+            )
+            .unwrap(),
+            serde_json::json!(["number", "function", 42, 41])
+        );
+        // The main context must not see the realm's top-level bindings.
+        assert_eq!(
+            rt.evaluate("[typeof __realm_spike_x, typeof __realm_spike_f]")
+                .unwrap(),
+            serde_json::json!(["undefined", "undefined"])
+        );
+    }
+
+    #[test]
+    fn secondary_realm_has_own_global_and_intrinsics() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let realm = rt.create_secondary_realm().unwrap();
+        rt.bootstrap_secondary_realm(&realm).unwrap();
+        rt.realm_expose_main_global(&realm, "__main").unwrap();
+
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                r#"[
+                    globalThis !== __main,
+                    Object !== __main.Object,
+                    Array !== __main.Array,
+                    ({}) instanceof Object,
+                    (new __main.Object()) instanceof __main.Object,
+                    !(({}) instanceof __main.Object),
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([true, true, true, true, true, true])
+        );
+
+        // A Script-goal directive prologue applies to the whole script.
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                r#""use strict";
+                var __strict_probe;
+                try { __realm_spike_undeclared = 1; __strict_probe = "assigned"; }
+                catch (e) { __strict_probe = e.constructor.name; }
+                __strict_probe"#,
+            )
+            .unwrap(),
+            serde_json::json!("ReferenceError")
+        );
+        // Without the directive the same assignment succeeds (sloppy Script).
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                "__realm_spike_sloppy = 7; typeof __realm_spike_sloppy",
+            )
+            .unwrap(),
+            serde_json::json!("number")
+        );
+    }
+
+    #[test]
+    fn secondary_realm_ops_reach_shared_dom() {
+        let mut rt = setup_runtime(
+            "<html><head><title>Test Page</title></head><body><div id=\"probe\">hello</div></body></html>",
+        );
+        let realm = rt.create_secondary_realm().unwrap();
+        rt.bootstrap_secondary_realm(&realm).unwrap();
+        rt.init_secondary_realm_page(&realm).unwrap();
+
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                "[document.title, document.getElementById('probe').textContent]",
+            )
+            .unwrap(),
+            serde_json::json!(["Test Page", "hello"])
+        );
+
+        // A mutation performed in the realm is visible from the main context:
+        // both realms drive the same native DomTree through op_dom.
+        rt.realm_execute_script(
+            &realm,
+            "<t>",
+            "document.getElementById('probe').setAttribute('data-realm', 'second')",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("document.getElementById('probe').getAttribute('data-realm')")
+                .unwrap(),
+            serde_json::json!("second")
+        );
+
+        // Wrapper identity stays per-realm even though the node is shared.
+        rt.realm_expose_main_global(&realm, "__main").unwrap();
+        assert_eq!(
+            rt.realm_execute_script(
+                &realm,
+                "<t>",
+                "[document !== __main.document, document instanceof Document, !(document instanceof __main.Document)]",
+            )
+            .unwrap(),
+            serde_json::json!([true, true, true])
+        );
+    }
+
+    #[test]
+    fn destroying_secondary_realm_keeps_main_context_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let realm = rt.create_secondary_realm().unwrap();
+        rt.bootstrap_secondary_realm(&realm).unwrap();
+        rt.realm_execute_script(&realm, "<t>", "var __realm_spike_x = 1;")
+            .unwrap();
+        rt.destroy_secondary_realm(realm);
+
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+        assert_eq!(
+            rt.evaluate("document.body.tagName").unwrap(),
+            serde_json::json!("BODY")
+        );
+
+        // A fresh realm starts from a clean global again.
+        let second = rt.create_secondary_realm().unwrap();
+        assert_eq!(
+            rt.realm_execute_script(&second, "<t>", "typeof __realm_spike_x")
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
+    }
+
+    // ---- Managed frame realms (Phase 3.7 host layer) ----
+
+    /// Create + parse + scope an iframe content document through the same
+    /// op_dom commands the Rust frame loader uses, from the main context.
+    /// Returns the content root nid.
+    fn setup_frame(
+        rt: &mut ObscuraJsRuntime,
+        host_id: &str,
+        html: &str,
+        origin_url: &str,
+        generation: u64,
+    ) -> u32 {
+        let script = format!(
+            r#"(() => {{
+                const op = (cmd, a1, a2) =>
+                    Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                const host = document.getElementById({host_id:?})._nid;
+                const created = JSON.parse(op("create_iframe_content_document", host));
+                op("parse_into_subtree", created.root, {html:?});
+                op("set_document_scope", created.root, JSON.stringify({{
+                    url: {origin_url:?},
+                    originUrl: {origin_url:?},
+                    frameId: "frame-test",
+                    documentGeneration: {generation},
+                }}));
+                return created.root;
+            }})()"#
+        );
+        rt.evaluate(&script).unwrap().as_f64().unwrap() as u32
+    }
+
+    const FRAME_HTML: &str = "<html><head><title>Frame Title</title></head>\
+        <body><div id=\"inner\">frame text</div></body></html>";
+
+    #[test]
+    fn frame_realm_document_binds_frame_content_root() {
+        let mut rt = setup_runtime(
+            "<html><head><title>Test Page</title></head>\
+             <body><iframe id=f></iframe><div id=mainonly>main</div></body></html>",
+        );
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        assert!(rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame").unwrap());
+        rt.frame_realm_expose_main_global("frame-test", 1, "__main").unwrap();
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"[
+                    document.getElementById('inner').textContent,
+                    document.getElementById('mainonly') === null,
+                    document.title,
+                    document.URL,
+                    document.documentElement.tagName,
+                    document.body.tagName,
+                    document instanceof Document,
+                    globalThis.document !== __main.document,
+                    globalThis !== __main,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                "frame text", true, "Frame Title", "http://example.com/frame",
+                "HTML", "BODY", true, true, true,
+            ])
+        );
+        // The main context still sees its own document, not the frame's.
+        assert_eq!(
+            rt.evaluate("[document.getElementById('inner') === null, document.title]")
+                .unwrap(),
+            serde_json::json!([true, "Test Page"])
+        );
+
+        // Registry metadata snapshots the content root's DocumentScope.
+        let realm = rt.frame_realm("frame-test", 1).unwrap();
+        assert_eq!(realm.content_root, root);
+        assert_eq!(realm.base_url, "http://example.com/frame");
+        assert_eq!(realm.scope_url.as_deref(), Some("http://example.com/frame"));
+        assert_eq!(realm.scope_origin.as_deref(), Some("http://example.com"));
+    }
+
+    #[test]
+    fn frame_realm_scripts_share_top_level_bindings() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        assert!(rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame").unwrap());
+
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "var frx = 1; function frf() { return frx + 41; } let frl = 5;",
+        )
+        .unwrap();
+        // ensure is idempotent: the same generation keeps its realm, so the
+        // top-level bindings from the first script survive.
+        assert!(!rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame").unwrap());
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"[
+                    frx, frf(), frl,
+                    this === globalThis,
+                    globalThis === window,
+                    globalThis.frx,
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([1, 42, 5, true, true, 1])
+        );
+        // Nothing leaked into the main context.
+        assert_eq!(
+            rt.evaluate("[typeof frx, typeof frf, typeof frl]").unwrap(),
+            serde_json::json!(["undefined", "undefined", "undefined"])
+        );
+    }
+
+    #[test]
+    fn frame_realm_dynamic_code_binds_realm_global() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        rt.frame_realm_expose_main_global("frame-test", 1, "__main").unwrap();
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"var frg = 10;
+                (0, eval)("var frEvalVar = 7;");
+                [
+                    (0, eval)("frg + 1"),
+                    Function("return frg + 2")(),
+                    (function() { var loc = 30; return eval("loc + frg"); })(),
+                    Function("return globalThis")() === globalThis,
+                    (0, eval)("globalThis") === globalThis,
+                    Function("return globalThis")() !== __main,
+                    typeof frEvalVar,
+                    Function("return typeof document")(),
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([11, 12, 40, true, true, true, "number", "object"])
+        );
+        // Indirect eval declared its var on the frame realm global only.
+        assert_eq!(
+            rt.evaluate("[typeof frg, typeof frEvalVar]").unwrap(),
+            serde_json::json!(["undefined", "undefined"])
+        );
+    }
+
+    #[test]
+    fn frame_realm_generations_destroy_independently() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root1 = setup_frame(
+            &mut rt,
+            "f",
+            "<html><body><p id=one></p></body></html>",
+            "http://example.com/first",
+            1,
+        );
+        rt.ensure_frame_realm("frame-test", 1, root1, "http://example.com/first")
+            .unwrap();
+        rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "var marker = 123;")
+            .unwrap();
+
+        // A navigation commits a new content root under a new generation.
+        let root2 = setup_frame(
+            &mut rt,
+            "f",
+            "<html><body><p id=two></p></body></html>",
+            "http://example.com/second",
+            2,
+        );
+        rt.ensure_frame_realm("frame-test", 2, root2, "http://example.com/second")
+            .unwrap();
+        assert_eq!(rt.frame_realms.active_count(), 2);
+        // The new generation is a fresh realm bound to the new document.
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                2,
+                "<t>",
+                "[typeof marker, document.getElementById('two') !== null, document.URL]",
+            )
+            .unwrap(),
+            serde_json::json!(["undefined", true, "http://example.com/second"])
+        );
+
+        // Destroying the old generation leaves main and the new realm intact.
+        assert!(rt.destroy_frame_realm_generation("frame-test", 1));
+        assert!(!rt.destroy_frame_realm_generation("frame-test", 1));
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+        assert_eq!(
+            rt.evaluate("document.body.tagName").unwrap(),
+            serde_json::json!("BODY")
+        );
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 2, "<t>", "document.title")
+                .unwrap(),
+            serde_json::json!("")
+        );
+
+        // Destroying the whole frame drops every generation; execution then
+        // fails until a realm is recreated, and recreation starts clean.
+        assert_eq!(rt.destroy_frame_realm("frame-test"), 1);
+        assert_eq!(rt.frame_realms.active_count(), 0);
+        assert!(rt
+            .execute_script_in_frame_realm("frame-test", 2, "<t>", "1")
+            .unwrap_err()
+            .contains("no frame realm"));
+        assert!(rt.ensure_frame_realm("frame-test", 2, root2, "http://example.com/second").unwrap());
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                2,
+                "<t>",
+                "[typeof marker, document.getElementById('two') !== null]",
+            )
+            .unwrap(),
+            serde_json::json!(["undefined", true])
+        );
+        assert_eq!(rt.evaluate("document.body.tagName").unwrap(), serde_json::json!("BODY"));
+    }
+
+    #[test]
+    fn frame_realm_dom_writes_are_visible_to_main_context() {
+        // Same-origin frame so the main context may read contentDocument.
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"document.getElementById('inner').setAttribute('data-realm', 'yes');
+               const added = document.createElement('span');
+               added.id = 'added';
+               added.textContent = 'from realm';
+               document.body.appendChild(added);"#,
+        )
+        .unwrap();
+
+        // The shared DomTree carries the mutation to the main context, which
+        // observes it through the frame's scoped content document.
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const cd = document.getElementById('f').contentDocument;
+                    return [
+                        cd.getElementById('inner').getAttribute('data-realm'),
+                        cd.getElementById('added').textContent,
+                        document.getElementById('added') === null,
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!(["yes", "from realm", true])
+        );
+    }
+}

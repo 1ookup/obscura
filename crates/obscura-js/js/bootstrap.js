@@ -14295,11 +14295,22 @@ globalThis.__obscura_init = function() {
   _iframeContentDocsSeen = false;
 
   const documentNid = +_dom("document_node_id");
-  globalThis.document = new Document(documentNid);
-  // parentNode on <html> reaches the backing document node. Keep that wrapper
-  // canonical so getRootNode(), isConnected, and identity comparisons return
-  // the same Document object exposed as globalThis.document.
-  _cache.set(documentNid, globalThis.document);
+  // Frame realm hook (Phase 3.7): the Rust realm host defines this nid on a
+  // fresh frame context before bootstrap runs, so this realm's `document`
+  // binds to its iframe content root through _ScopedDocument (scoped op_dom
+  // queries). The main context never defines the flag and is unaffected.
+  const frameRootNid = globalThis.__obscura_frame_document_nid;
+  if (typeof frameRootNid === "number" && frameRootNid > 0) {
+    // _scopedDocumentFor caches the wrapper in _cache as the canonical
+    // Document object for the content root.
+    globalThis.document = _scopedDocumentFor(frameRootNid);
+  } else {
+    globalThis.document = new Document(documentNid);
+    // parentNode on <html> reaches the backing document node. Keep that wrapper
+    // canonical so getRootNode(), isConnected, and identity comparisons return
+    // the same Document object exposed as globalThis.document.
+    _cache.set(documentNid, globalThis.document);
+  }
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(globalThis.document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);

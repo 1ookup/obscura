@@ -94,6 +94,9 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
+    /// pages without iframes; the main-context path never touches it.
+    pub(crate) frame_realms: crate::realm::FrameRealmHost,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -260,6 +263,7 @@ impl ObscuraJsRuntime {
             import_map,
             module_load_activity,
             isolate_handle,
+            frame_realms: crate::realm::FrameRealmHost::default(),
         }
     }
 
@@ -944,6 +948,18 @@ impl ObscuraJsRuntime {
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+    }
+
+    /// Direct access to the deno_core runtime for the realm host
+    /// (src/realm.rs). No main-path caller.
+    pub(crate) fn deno_runtime_mut(&mut self) -> &mut JsRuntime {
+        &mut self.runtime
+    }
+
+    /// Shared page-state handle for the realm host (src/realm.rs): frame
+    /// realm creation records the content root's DocumentScope metadata.
+    pub(crate) fn state_handle(&self) -> &Rc<RefCell<ObscuraState>> {
+        &self.state
     }
 
     /// Override the coordinates the navigator.geolocation shim reports. The

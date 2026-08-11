@@ -3,6 +3,7 @@ mod import_map;
 pub mod markdown;
 pub mod module_loader;
 pub mod ops;
+pub mod realm;
 pub mod runtime;
 pub mod v8_flags;
 
