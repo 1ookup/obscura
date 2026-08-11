@@ -67,3 +67,79 @@ fn navigation_prunes_stale_execution_context_ids() {
         ctx.valid_context_ids.len()
     );
 }
+
+// Phase 6.2: the execution-context table must shrink in lockstep with
+// `valid_context_ids`, and every pruned child-frame context must surface a
+// Runtime.executionContextDestroyed (with its uniqueId) plus a
+// Page.frameDetached for its advertised frame, before the new document's
+// events.
+#[test]
+fn navigation_prunes_execution_context_table_and_emits_teardown() {
+    let mut ctx = CdpContext::new();
+    ctx.valid_context_ids.insert(555);
+    ctx.execution_contexts.insert(
+        555,
+        obscura_cdp::dispatch::ExecutionContextEntry {
+            frame_id: "frame-page-1-1".to_string(),
+            generation: 1,
+            world_id: 0,
+            is_default: true,
+            world_name: String::new(),
+            unique_id: "ctx-frame-page-1-555".to_string(),
+        },
+    );
+    ctx.advertised_frames
+        .push(("frame-page-1-1".to_string(), "2".to_string()));
+
+    navigate(&mut ctx, "page-1");
+
+    assert!(
+        ctx.execution_contexts.is_empty(),
+        "execution-context table must shrink with valid_context_ids: {:?}",
+        ctx.execution_contexts.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !ctx.valid_context_ids.contains(&555),
+        "stale frame context id must be pruned"
+    );
+    assert!(
+        ctx.advertised_frames.is_empty(),
+        "detached frames must leave the advertised list"
+    );
+
+    let destroyed_idx = ctx
+        .pending_events
+        .iter()
+        .position(|e| {
+            e.method == "Runtime.executionContextDestroyed"
+                && e.params["executionContextId"] == 555
+                && e.params["executionContextUniqueId"] == "ctx-frame-page-1-555"
+        })
+        .expect("executionContextDestroyed must be emitted for the pruned frame context");
+    let detached_idx = ctx
+        .pending_events
+        .iter()
+        .position(|e| {
+            e.method == "Page.frameDetached"
+                && e.params["frameId"] == "frame-page-1-1"
+                && e.params["reason"] == "remove"
+        })
+        .expect("frameDetached must be emitted for the pruned frame");
+    let new_doc_idx = ctx
+        .pending_events
+        .iter()
+        .position(|e| e.method == "Page.frameNavigated")
+        .expect("main frameNavigated present");
+    assert!(
+        destroyed_idx < new_doc_idx && detached_idx < new_doc_idx,
+        "teardown events must precede the new document's events \
+         (destroyed {destroyed_idx}, detached {detached_idx}, nav {new_doc_idx})"
+    );
+
+    // Every table key must remain registered in valid_context_ids after any
+    // later navigation (lockstep invariant, empty-set case).
+    navigate(&mut ctx, "page-1");
+    for context_id in ctx.execution_contexts.keys() {
+        assert!(ctx.valid_context_ids.contains(context_id));
+    }
+}

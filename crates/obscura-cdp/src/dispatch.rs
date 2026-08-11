@@ -37,6 +37,25 @@ pub(crate) struct ScreencastState {
     pub autonomous_frame_pending: bool,
 }
 
+/// One advertised execution context backed by a real world realm in the
+/// page's JS runtime (Phase 6.2): every child-frame world, plus the main
+/// frame's isolated worlds (Phase 6.3). Context ids absent from
+/// `execution_contexts` keep the historical main-context semantics (ids 1/2
+/// and the main frame's default world), so a page whose client never asks for
+/// a frame or an isolated world is untouched.
+#[derive(Clone, Debug)]
+pub struct ExecutionContextEntry {
+    pub frame_id: String,
+    pub generation: u64,
+    pub world_id: u64,
+    pub is_default: bool,
+    /// `Page.createIsolatedWorld` worldName; empty for a default world.
+    pub world_name: String,
+    /// `uniqueId` reported in executionContextCreated; echoed back in
+    /// executionContextDestroyed like Chrome does.
+    pub unique_id: String,
+}
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
@@ -82,6 +101,27 @@ pub struct CdpContext {
     // claims and increments from this counter so the ids real Chrome would
     // emit (incrementing, never reused) are mirrored.
     pub next_isolated_context_id: i64,
+    // Execution-context table for child-frame contexts (Phase 6.2): contextId
+    // -> the frame world realm it addresses. Kept in lockstep with
+    // `valid_context_ids`: every key here is also in the set; ids in the set
+    // but not here are main-context ids (1/2 plus the main frame's isolated
+    // worlds), which keep the pre-iframe single-isolate routing.
+    pub execution_contexts: HashMap<i64, ExecutionContextEntry>,
+    // Whether the client enabled the Runtime domain, i.e. whether it cares
+    // about execution contexts at all. Frame world realms cost a bootstrap
+    // re-execution each, so they stay lazy (created by frame script
+    // execution) unless this is set; with it, every committed child document
+    // gets its default context eagerly, which is what Chrome does and what
+    // Playwright's frame.evaluate needs on a frame that has no <script>.
+    // A plain Page.navigate + captureScreenshot client never sets it and
+    // therefore never pays for a realm.
+    pub runtime_enabled: bool,
+    // Child frames already surfaced to the client via Page.frameAttached, in
+    // emission order (parents before children), with the loaderId they were
+    // last advertised with. A loaderId change on a live frame re-emits the
+    // frame lifecycle without a second frameAttached; a frame missing from
+    // the registry gets Page.frameDetached. Empty on pages without iframes.
+    pub advertised_frames: Vec<(String, String)>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
@@ -172,6 +212,9 @@ impl CdpContext {
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
+            execution_contexts: HashMap::new(),
+            runtime_enabled: false,
+            advertised_frames: Vec::new(),
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -286,6 +329,21 @@ impl CdpContext {
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        // Child frame ids are page-scoped ("frame-<page>-<n>"); drop their
+        // advertised entries and execution contexts with the page.
+        let child_prefix = format!("frame-{id}-");
+        self.advertised_frames
+            .retain(|(frame_id, _)| !frame_id.starts_with(&child_prefix));
+        let stale: Vec<i64> = self
+            .execution_contexts
+            .iter()
+            .filter(|(_, entry)| entry.frame_id.starts_with(&child_prefix))
+            .map(|(context_id, _)| *context_id)
+            .collect();
+        for context_id in stale {
+            self.execution_contexts.remove(&context_id);
+            self.valid_context_ids.remove(&context_id);
+        }
         #[cfg(feature = "render")]
         {
             let removed: Vec<String> = self
@@ -377,8 +435,10 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.captureSnapshot"
             | "Page.stopScreencast"
             | "Page.screencastFrameAck"
-            | "Page.createIsolatedWorld"
-            | "Runtime.enable"
+            // Page.createIsolatedWorld and Runtime.enable left this list in
+            // Phase 6.3: both can create a real V8 context (a child frame
+            // world, or the eager default world of a scriptless frame), so
+            // their handlers must hold the per-connection V8 lock.
             | "Runtime.disable"
             | "Runtime.runIfWaitingForDebugger"
             | "Runtime.getExceptionDetails"

@@ -705,6 +705,698 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     )
 }
 
+/// Recursive `Page.getFrameTree` child nodes for the children of
+/// `parent_frame_id` (Phase 6.1). Frame identity and loader come from the
+/// registry, url/origin from the committed DocumentScope; a frame whose
+/// document has not committed reports about:blank with a null origin.
+fn frame_tree_children(page: &obscura_browser::Page, parent_frame_id: &str) -> Vec<Value> {
+    let child_ids: Vec<String> = page
+        .frames
+        .get(parent_frame_id)
+        .map(|frame| frame.children.clone())
+        .unwrap_or_default();
+    child_ids
+        .iter()
+        .filter_map(|child_id| {
+            let frame = page.frames.get(child_id)?;
+            let scope = frame.active_document_root.and_then(|root| {
+                page.with_dom(|dom| dom.document_scope(root)).flatten()
+            });
+            let (url, security_origin) = scope
+                .map(|scope| (scope.url.clone(), scope.origin.serialize()))
+                .unwrap_or_else(|| ("about:blank".to_string(), "null".to_string()));
+            Some(json!({
+                "frame": {
+                    "id": frame.frame_id,
+                    "parentId": parent_frame_id,
+                    "loaderId": frame.loader_id,
+                    "url": url,
+                    "domainAndRegistry": "",
+                    "securityOrigin": security_origin,
+                    "mimeType": "text/html",
+                    "adFrameStatus": { "adFrameType": "none" },
+                },
+                "childFrames": frame_tree_children(page, child_id),
+            }))
+        })
+        .collect()
+}
+
+/// Snapshot of one live child frame for the CDP projection (Phase 6): frame
+/// identity from the browser-core registry, document url/origin from its
+/// committed DocumentScope.
+struct ChildFrameSnapshot {
+    frame_id: String,
+    parent_frame_id: String,
+    loader_id: String,
+    generation: u64,
+    url: String,
+    security_origin: String,
+    /// Content-document root of the committed document, `None` before the
+    /// frame commits one. Realm creation needs it together with `base_url`.
+    content_root: Option<u32>,
+    base_url: String,
+    /// False for a sandboxed frame without `allow-scripts`: it gets no realm
+    /// and therefore no execution context, matching the fail-closed policy of
+    /// the frame script runner.
+    scripts_allowed: bool,
+}
+
+/// Live child frames of the page, parents before children (registry BFS from
+/// the main frame). Empty (and cheap) on pages without iframes.
+fn collect_child_frames(page: &obscura_browser::Page) -> Vec<ChildFrameSnapshot> {
+    let mut meta: Vec<(String, String, String, u64, Option<obscura_dom::NodeId>)> = Vec::new();
+    let mut queue: std::collections::VecDeque<String> = page
+        .frames
+        .get(page.frames.main_frame_id())
+        .map(|main| main.children.iter().cloned().collect())
+        .unwrap_or_default();
+    while let Some(frame_id) = queue.pop_front() {
+        let Some(frame) = page.frames.get(&frame_id) else {
+            continue;
+        };
+        queue.extend(frame.children.iter().cloned());
+        meta.push((
+            frame.frame_id.clone(),
+            frame.parent_frame_id.clone().unwrap_or_default(),
+            frame.loader_id.clone(),
+            frame.document_generation,
+            frame.active_document_root,
+        ));
+    }
+    if meta.is_empty() {
+        return Vec::new();
+    }
+    // (url, origin, base_url, scripts_allowed)
+    let scopes: Vec<Option<(String, String, String, bool)>> = page
+        .with_dom(|dom| {
+            meta.iter()
+                .map(|(_, _, _, _, root)| {
+                    root.and_then(|root| dom.document_scope(root)).map(|scope| {
+                        let scripts_allowed =
+                            scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS);
+                        (
+                            scope.url.clone(),
+                            scope.origin.serialize(),
+                            scope.base_url.clone(),
+                            scripts_allowed,
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![None; meta.len()]);
+    meta.into_iter()
+        .zip(scopes)
+        .map(|((frame_id, parent_frame_id, loader_id, generation, root), scope)| {
+            let (url, security_origin, base_url, scripts_allowed) =
+                scope.unwrap_or_else(|| {
+                    (
+                        "about:blank".to_string(),
+                        "null".to_string(),
+                        "about:blank".to_string(),
+                        false,
+                    )
+                });
+            ChildFrameSnapshot {
+                frame_id,
+                parent_frame_id,
+                loader_id,
+                generation,
+                url,
+                security_origin,
+                content_root: root.map(|root| root.raw()),
+                base_url,
+                scripts_allowed,
+            }
+        })
+        .collect()
+}
+
+/// Emit `Runtime.executionContextDestroyed` / `Page.frameDetached` for every
+/// execution-context entry or advertised child frame of `page_id` the live
+/// registry no longer backs (frame detached, or document generation
+/// superseded), pruning `execution_contexts`, `valid_context_ids` and
+/// `advertised_frames` in step. Chrome emits this teardown before any
+/// new-document event, so callers invoke it first. No-op on pages that never
+/// advertised a child frame.
+pub(crate) fn emit_frame_teardown_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    page_id: &str,
+) {
+    let child_prefix = format!("frame-{page_id}-");
+    if !ctx
+        .execution_contexts
+        .values()
+        .any(|entry| entry.frame_id.starts_with(&child_prefix))
+        && !ctx
+            .advertised_frames
+            .iter()
+            .any(|(frame_id, _)| frame_id.starts_with(&child_prefix))
+    {
+        return;
+    }
+    // frame_id -> current document generation. A page that is gone tears
+    // everything of its frames down.
+    let live: std::collections::HashMap<String, u64> = ctx
+        .get_page(page_id)
+        .map(|page| {
+            collect_child_frames(page)
+                .into_iter()
+                .map(|frame| (frame.frame_id, frame.generation))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut stale_contexts: Vec<(i64, String)> = ctx
+        .execution_contexts
+        .iter()
+        .filter(|(_, entry)| {
+            entry.frame_id.starts_with(&child_prefix)
+                && live
+                    .get(&entry.frame_id)
+                    .map_or(true, |generation| *generation != entry.generation)
+        })
+        .map(|(context_id, entry)| (*context_id, entry.unique_id.clone()))
+        .collect();
+    stale_contexts.sort_by_key(|(context_id, _)| *context_id);
+    for (context_id, unique_id) in &stale_contexts {
+        ctx.pending_events.push(CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            params: json!({
+                "executionContextId": context_id,
+                "executionContextUniqueId": unique_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.execution_contexts.remove(context_id);
+        ctx.valid_context_ids.remove(context_id);
+    }
+
+    // Children before parents: advertisement order is parents-first, so the
+    // reverse walk detaches leaves first, like the registry's own teardown.
+    let removed: Vec<String> = ctx
+        .advertised_frames
+        .iter()
+        .rev()
+        .filter(|(frame_id, _)| {
+            frame_id.starts_with(&child_prefix) && !live.contains_key(frame_id)
+        })
+        .map(|(frame_id, _)| frame_id.clone())
+        .collect();
+    for frame_id in &removed {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameDetached".into(),
+            params: json!({"frameId": frame_id, "reason": "remove"}),
+            session_id: session_id.clone(),
+        });
+    }
+    ctx.advertised_frames
+        .retain(|(frame_id, _)| !removed.contains(frame_id));
+}
+
+/// Advertise the live child frames of `page_id` and their execution contexts:
+/// `Page.frameAttached` for frames the client has not seen, then the
+/// `frameStartedLoading` / `frameNavigated` / `frameStoppedLoading` lifecycle
+/// for every frame whose loader changed since the last advertisement, then
+/// `Runtime.executionContextCreated` for every live frame world realm not yet
+/// in the execution-context table (see `emit_frame_execution_contexts`).
+/// No-op on pages without iframes.
+pub(crate) fn emit_frame_rollout_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    page_id: &str,
+) {
+    let snapshots = {
+        let Some(page) = ctx.get_page(page_id) else {
+            return;
+        };
+        let snapshots = collect_child_frames(page);
+        if snapshots.is_empty() {
+            return;
+        }
+        snapshots
+    };
+
+    for frame in &snapshots {
+        let advertised = ctx
+            .advertised_frames
+            .iter_mut()
+            .find(|(frame_id, _)| frame_id == &frame.frame_id);
+        match advertised {
+            Some((_, loader_id)) if *loader_id == frame.loader_id => continue,
+            Some((_, loader_id)) => *loader_id = frame.loader_id.clone(),
+            None => {
+                ctx.advertised_frames
+                    .push((frame.frame_id.clone(), frame.loader_id.clone()));
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.frameAttached".into(),
+                    params: json!({
+                        "frameId": frame.frame_id,
+                        "parentFrameId": frame.parent_frame_id,
+                    }),
+                    session_id: session_id.clone(),
+                });
+            }
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameStartedLoading".into(),
+            params: json!({"frameId": frame.frame_id}),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({
+                "frame": {
+                    "id": frame.frame_id,
+                    "parentId": frame.parent_frame_id,
+                    "loaderId": frame.loader_id,
+                    "url": frame.url,
+                    "domainAndRegistry": "",
+                    "securityOrigin": frame.security_origin,
+                    "mimeType": "text/html",
+                    "adFrameStatus": {"adFrameType": "none"},
+                },
+                "type": "Navigation",
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame.frame_id}),
+            session_id: session_id.clone(),
+        });
+    }
+
+    emit_frame_execution_contexts(ctx, session_id, page_id, &snapshots);
+}
+
+/// Emit `Runtime.executionContextCreated` for every live child-frame world
+/// realm of `page_id` not yet in the execution-context table, and enroll it.
+///
+/// When the client enabled the Runtime domain, each committed child document
+/// first gets its default world realm created eagerly, so a frame with no
+/// `<script>` still has an execution context a client can evaluate in (real
+/// Chrome creates one for every active document). Without `Runtime.enable`
+/// nothing is created: realms stay lazy behind frame script execution and a
+/// navigate-and-screenshot client pays nothing for them.
+fn emit_frame_execution_contexts(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    page_id: &str,
+    snapshots: &[ChildFrameSnapshot],
+) {
+    if ctx.runtime_enabled {
+        for frame in snapshots {
+            let Some(content_root) = frame.content_root else {
+                continue;
+            };
+            if !frame.scripts_allowed {
+                continue;
+            }
+            let Some(page) = ctx.get_page_mut(page_id) else {
+                return;
+            };
+            let Some(js) = page.js.as_mut() else {
+                continue;
+            };
+            // A failed realm never blocks the event stream: the frame keeps
+            // its tree and lifecycle projection and simply advertises no
+            // context, which is the pre-6b behavior.
+            if let Err(error) = js.ensure_frame_realm(
+                &frame.frame_id,
+                frame.generation,
+                content_root,
+                &frame.base_url,
+            ) {
+                tracing::trace!("cdp: eager frame realm failed ({}): {error}", frame.frame_id);
+            }
+        }
+    }
+
+    // (frame_id, generation, world_id, is_default, world_name)
+    let realms: Vec<(String, u64, u64, bool, String)> = ctx
+        .get_page(page_id)
+        .and_then(|page| page.js.as_ref())
+        .map(|js| {
+            js.list_frame_realms()
+                .into_iter()
+                .map(|(frame_id, generation, world_id, is_default)| {
+                    let name = js
+                        .frame_realm_world(&frame_id, generation, world_id)
+                        .and_then(|realm| realm.world_name.clone())
+                        .unwrap_or_default();
+                    (frame_id, generation, world_id, is_default, name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let enrolled: std::collections::HashSet<(String, u64, u64)> = ctx
+        .execution_contexts
+        .values()
+        .map(|entry| (entry.frame_id.clone(), entry.generation, entry.world_id))
+        .collect();
+    for frame in snapshots {
+        let mut frame_realms: Vec<&(String, u64, u64, bool, String)> = realms
+            .iter()
+            .filter(|(frame_id, generation, _, _, _)| {
+                frame_id == &frame.frame_id && *generation == frame.generation
+            })
+            .collect();
+        frame_realms.sort_by_key(|(_, _, world_id, _, _)| *world_id);
+        for (frame_id, generation, world_id, is_default, world_name) in frame_realms {
+            if enrolled.contains(&(frame_id.clone(), *generation, *world_id)) {
+                continue;
+            }
+            let context_id = ctx.next_isolated_context();
+            let unique_id = format!("ctx-frame-{page_id}-{context_id}");
+            ctx.pending_events.push(CdpEvent {
+                method: "Runtime.executionContextCreated".into(),
+                params: json!({
+                    "context": {
+                        "id": context_id,
+                        "origin": frame.security_origin,
+                        "name": world_name,
+                        "uniqueId": unique_id,
+                        "auxData": {
+                            "isDefault": is_default,
+                            "type": if *is_default { "default" } else { "isolated" },
+                            "frameId": frame_id,
+                        }
+                    }
+                }),
+                session_id: session_id.clone(),
+            });
+            ctx.execution_contexts.insert(
+                context_id,
+                crate::dispatch::ExecutionContextEntry {
+                    frame_id: frame_id.clone(),
+                    generation: *generation,
+                    world_id: *world_id,
+                    is_default: *is_default,
+                    world_name: world_name.clone(),
+                    unique_id,
+                },
+            );
+        }
+    }
+}
+
+/// `Runtime.enable` backfill: advertise an execution context for every child
+/// frame already committed when the client enables the Runtime domain, like
+/// Chrome, which replays the contexts that exist at enable time. Nothing is
+/// emitted for a page without iframes.
+pub(crate) fn emit_existing_frame_contexts(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    page_id: &str,
+) {
+    let snapshots = match ctx.get_page(page_id) {
+        Some(page) => collect_child_frames(page),
+        None => return,
+    };
+    if snapshots.is_empty() {
+        return;
+    }
+    emit_frame_execution_contexts(ctx, session_id, page_id, &snapshots);
+}
+
+/// `Page.createIsolatedWorld` against a child frame (Phase 6.3): build a real
+/// isolated world realm for the frame's committed document and advertise its
+/// execution context only after the realm exists. Creating the same-named
+/// world twice for one document returns the existing context, like Chrome.
+fn create_child_frame_isolated_world(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    world_name: &str,
+    page_id: &str,
+) -> Result<Value, String> {
+    let (generation, content_root, base_url, security_origin, existing_world, next_world) = {
+        let page = ctx
+            .get_session_page(session_id)
+            .ok_or("No page for session")?;
+        let frame = page
+            .frames
+            .get(frame_id)
+            .ok_or("No frame for given id found")?;
+        let root = frame
+            .active_document_root
+            .ok_or("No frame for given id found")?;
+        let scope = page.with_dom(|dom| dom.document_scope(root)).flatten();
+        let base_url = scope
+            .as_ref()
+            .map(|scope| scope.base_url.clone())
+            .unwrap_or_else(|| "about:blank".to_string());
+        let security_origin = scope
+            .as_ref()
+            .map(|scope| scope.origin.serialize())
+            .unwrap_or_else(|| "null".to_string());
+        let generation = frame.document_generation;
+        // World ids are per (frame, generation): reuse a live same-named
+        // world, otherwise claim the next id above every live world.
+        let mut existing_world = None;
+        let mut max_world = obscura_js::realm::MAIN_WORLD;
+        if let Some(js) = page.js.as_ref() {
+            for (realm_frame, realm_generation, world_id, _) in js.list_frame_realms() {
+                if realm_frame != frame_id || realm_generation != generation {
+                    continue;
+                }
+                max_world = max_world.max(world_id);
+                if world_id > obscura_js::realm::MAIN_WORLD
+                    && !world_name.is_empty()
+                    && js
+                        .frame_realm_world(&realm_frame, realm_generation, world_id)
+                        .and_then(|realm| realm.world_name.as_deref())
+                        == Some(world_name)
+                {
+                    existing_world = Some(world_id);
+                }
+            }
+        }
+        (
+            generation,
+            root.raw(),
+            base_url,
+            security_origin,
+            existing_world,
+            max_world + 1,
+        )
+    };
+
+    if let Some(world_id) = existing_world {
+        if let Some((context_id, _)) = ctx.execution_contexts.iter().find(|(_, entry)| {
+            entry.frame_id == frame_id
+                && entry.generation == generation
+                && entry.world_id == world_id
+        }) {
+            return Ok(json!({ "executionContextId": context_id }));
+        }
+    }
+
+    {
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or("No page for session")?;
+        let js = page.js.as_mut().ok_or("No JS runtime for page")?;
+        js.ensure_isolated_world_realm(
+            frame_id,
+            generation,
+            next_world,
+            world_name,
+            content_root,
+            &base_url,
+        )?;
+    }
+
+    let context_id = ctx.next_isolated_context();
+    let unique_id = format!("ctx-frame-{page_id}-{context_id}");
+    ctx.pending_events.push(CdpEvent {
+        method: "Runtime.executionContextCreated".to_string(),
+        params: json!({
+            "context": {
+                "id": context_id,
+                "origin": security_origin,
+                "name": world_name,
+                "uniqueId": unique_id,
+                "auxData": {
+                    "isDefault": false,
+                    "type": "isolated",
+                    "frameId": frame_id,
+                }
+            }
+        }),
+        session_id: session_id.clone(),
+    });
+    ctx.execution_contexts.insert(
+        context_id,
+        crate::dispatch::ExecutionContextEntry {
+            frame_id: frame_id.to_string(),
+            generation,
+            world_id: next_world,
+            is_default: false,
+            world_name: world_name.to_string(),
+            unique_id,
+        },
+    );
+    Ok(json!({ "executionContextId": context_id }))
+}
+
+/// World id of a main-frame isolated world: its 1-based position in the
+/// registered world list. World id 0 stays the page's own context, which is
+/// not a realm. Registers the name on first sight; position-derived ids mean
+/// the world re-emitted after a navigation addresses the same realm key as
+/// the one `Page.createIsolatedWorld` returned.
+fn main_frame_world_id(ctx: &mut CdpContext, world_name: &str) -> u64 {
+    match ctx.isolated_worlds.iter().position(|name| name == world_name) {
+        Some(index) => index as u64 + 1,
+        None => {
+            ctx.isolated_worlds.push(world_name.to_string());
+            ctx.isolated_worlds.len() as u64
+        }
+    }
+}
+
+/// `Page.createIsolatedWorld` against the main frame (Phase 6.3, risk row
+/// "Isolated worlds silently target the main frame"): register a real world
+/// context whose evaluations run in their own `v8::Context` over the main
+/// document, instead of echoing the frame id back while evaluation reaches
+/// the page's own global.
+///
+/// The realm itself is built on first use (`ensure_context_realm`). Creating
+/// it here would cost a bootstrap re-execution on every page for clients that
+/// register a utility world and never evaluate in it, and would bind it to
+/// the about:blank document when the world is created before the first
+/// navigation, as Playwright does.
+fn create_main_frame_isolated_world(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    world_name: &str,
+    page_url: &str,
+    page_id: &str,
+) -> Result<Value, String> {
+    let world_id = main_frame_world_id(ctx, world_name);
+    let generation = ctx
+        .get_session_page(session_id)
+        .and_then(|page| page.frames.get(frame_id))
+        .map(|frame| frame.document_generation)
+        .unwrap_or_default();
+    // Same-named world of the live document returns its context, like Chrome.
+    if let Some((context_id, _)) = ctx.execution_contexts.iter().find(|(_, entry)| {
+        entry.frame_id == frame_id
+            && entry.generation == generation
+            && entry.world_id == world_id
+    }) {
+        return Ok(json!({ "executionContextId": context_id }));
+    }
+
+    let context_id = ctx.next_isolated_context();
+    let unique_id = format!("ctx-isolated-{page_id}-{context_id}");
+    ctx.pending_events.push(CdpEvent {
+        method: "Runtime.executionContextCreated".to_string(),
+        params: json!({
+            "context": {
+                "id": context_id,
+                "origin": page_url,
+                "name": world_name,
+                "uniqueId": unique_id,
+                "auxData": {
+                    "isDefault": false,
+                    "type": "isolated",
+                    "frameId": frame_id,
+                }
+            }
+        }),
+        session_id: session_id.clone(),
+    });
+    ctx.execution_contexts.insert(
+        context_id,
+        crate::dispatch::ExecutionContextEntry {
+            frame_id: frame_id.to_string(),
+            generation,
+            world_id,
+            is_default: false,
+            world_name: world_name.to_string(),
+            unique_id,
+        },
+    );
+    Ok(json!({ "executionContextId": context_id }))
+}
+
+/// Make sure the world realm an execution-context entry addresses exists
+/// before an evaluation is routed into it.
+///
+/// Child-frame worlds are created by the rollout and `createIsolatedWorld`
+/// paths, so this is a lookup for them; a main-frame isolated world is built
+/// here, on first use. The live registry must still back the entry's document
+/// generation, so a handle to a superseded document is rejected with Chrome's
+/// wording rather than resurrecting a realm over the new document.
+pub(crate) fn ensure_context_realm(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    context_id: i64,
+) -> Result<(), String> {
+    let Some(entry) = ctx.execution_contexts.get(&context_id).cloned() else {
+        return Ok(());
+    };
+    let stale = || format!("Cannot find context with specified id: {context_id}");
+    let (content_root, base_url) = {
+        let page = ctx
+            .get_session_page(session_id)
+            .ok_or("No page for session")?;
+        let exists = page.js.as_ref().is_some_and(|js| {
+            js.frame_realm_world(&entry.frame_id, entry.generation, entry.world_id)
+                .is_some()
+        });
+        if exists {
+            return Ok(());
+        }
+        let frame = page.frames.get(&entry.frame_id).ok_or_else(stale)?;
+        if frame.document_generation != entry.generation {
+            return Err(stale());
+        }
+        if entry.frame_id == page.frames.main_frame_id() {
+            // The main frame's document root is the DomTree's own document
+            // node, so the realm's `document` is the page document (bootstrap
+            // treats a zero frame root as "not a frame realm" and builds a
+            // plain Document over it).
+            let root = page
+                .with_dom(|dom| dom.document().raw())
+                .ok_or_else(stale)?;
+            (root, page.url_string())
+        } else {
+            // Child frame: the committed content root and its document base.
+            let root = frame.active_document_root.ok_or_else(stale)?;
+            let base_url = page
+                .with_dom(|dom| dom.document_scope(root))
+                .flatten()
+                .map(|scope| scope.base_url)
+                .unwrap_or_else(|| "about:blank".to_string());
+            (root.raw(), base_url)
+        }
+    };
+    let page = ctx
+        .get_session_page_mut(session_id)
+        .ok_or("No page for session")?;
+    let js = page.js.as_mut().ok_or_else(stale)?;
+    if entry.world_id == obscura_js::realm::MAIN_WORLD {
+        js.ensure_frame_realm(&entry.frame_id, entry.generation, content_root, &base_url)?;
+    } else {
+        js.ensure_isolated_world_realm(
+            &entry.frame_id,
+            entry.generation,
+            entry.world_id,
+            &entry.world_name,
+            content_root,
+            &base_url,
+        )?;
+    }
+    Ok(())
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -724,6 +1416,12 @@ pub fn emit_navigation_events(
         .insert(page_id.to_string(), loader_id.to_string());
     let es = session_id.clone();
     let ts = timestamp();
+
+    // Phase 6.4: the previous document's child frames and their execution
+    // contexts are gone; Chrome emits their frameDetached /
+    // executionContextDestroyed before any event of the new document. No-op
+    // unless a child frame was advertised earlier.
+    emit_frame_teardown_events(ctx, session_id, page_id);
 
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
@@ -785,6 +1483,11 @@ pub fn emit_navigation_events(
     // executionContextCreated events are emitted. Issue #407: previously this
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
+    // Keep the execution-context table in lockstep with the id set. The
+    // teardown above already emitted Destroyed for (and removed) every entry
+    // of this page's frames; this clears any cross-page leftovers so no table
+    // entry can outlive its id.
+    ctx.execution_contexts.clear();
     // securityOrigin is an origin serialization ("scheme://host[:port]" or
     // "null" for opaque origins), not the full document URL.
     let security_origin = obscura_dom::Origin::from_url(&page_url).serialize();
@@ -813,22 +1516,57 @@ pub fn emit_navigation_events(
     // The default world is re-created as context id 2; re-register it. Isolated
     // worlds register themselves via next_isolated_context in the loop below.
     ctx.valid_context_ids.insert(2);
-    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
-        vec!["__puppeteer_utility_world__24.40.0".to_string()]
-    } else {
+    // A client that never asked for a world still gets puppeteer's utility
+    // world advertised, but only as a name: it stays outside the
+    // execution-context table, so it keeps the historical main-context
+    // routing and costs no realm on a page nobody evaluates a world in.
+    let registered_worlds = !ctx.isolated_worlds.is_empty();
+    let world_names: Vec<String> = if registered_worlds {
         ctx.isolated_worlds.clone()
+    } else {
+        vec!["__puppeteer_utility_world__24.40.0".to_string()]
     };
+    let main_generation = ctx
+        .get_page(page_id)
+        .and_then(|page| page.frames.get(frame_id))
+        .map(|frame| frame.document_generation)
+        .unwrap_or_default();
     // Issue #192: fresh, monotonically increasing executionContextId per re-create.
-    for world_name in &world_names {
+    for (index, world_name) in world_names.iter().enumerate() {
         let world_ctx_id = ctx.next_isolated_context();
+        let unique_id = format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id);
         phase1.push(CdpEvent {
             method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
+            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": unique_id, "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
             session_id: es.clone(),
         });
+        if registered_worlds {
+            // Phase 6.3: the world the client created keeps addressing its own
+            // realm across navigations, instead of quietly falling back to the
+            // page's main global once the context was re-created. World ids
+            // follow the registration order (main_frame_world_id).
+            ctx.execution_contexts.insert(
+                world_ctx_id,
+                crate::dispatch::ExecutionContextEntry {
+                    frame_id: frame_id.to_string(),
+                    generation: main_generation,
+                    world_id: index as u64 + 1,
+                    is_default: false,
+                    world_name: world_name.clone(),
+                    unique_id,
+                },
+            );
+        }
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
+
+    // Phase 6.4: child frames committed during this navigation surface after
+    // the main frame's commit and before its DOMContentLoaded/load, the
+    // window in which Chrome streams subframe lifecycle. Emits
+    // frameAttached/started/navigated/stopped plus executionContextCreated
+    // for each live frame world realm. No-op on pages without iframes.
+    emit_frame_rollout_events(ctx, session_id, page_id);
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
@@ -1039,12 +1777,101 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
         .unwrap_or(WaitUntil::DomContentLoaded)
 }
 
+/// `Page.navigate` carrying a child frame's `frameId` (Phase 6.5): reuse the
+/// browser-core `navigate_frame` controller, then surface the frame's
+/// lifecycle and fresh execution contexts. The main frame's URL is untouched.
+async fn navigate_child_frame(
+    url: &str,
+    frame_id: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<Value, String> {
+    // Same file:// gate as the main-frame path.
+    let allow_file_access = ctx
+        .get_session_page(session_id)
+        .map(|page| page.context.allow_file_access)
+        .unwrap_or(ctx.default_context.allow_file_access);
+    if url_is_file_scheme(url) && !allow_file_access {
+        return Err(
+            "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+        );
+    }
+    let referrer = params
+        .get("referrer")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let (page_id, sandbox) = {
+        let page = ctx
+            .get_session_page(session_id)
+            .ok_or("No page for session")?;
+        let frame = page
+            .frames
+            .get(frame_id)
+            .ok_or("No frame with given id found")?;
+        // The host element's sandbox attribute still applies to a
+        // CDP-initiated navigation; parent flags merge inside the controller.
+        let sandbox_attr = frame.host_nid.and_then(|host| {
+            page.with_dom(|dom| {
+                dom.get_node(host)
+                    .and_then(|node| node.get_attribute("sandbox").map(str::to_string))
+            })
+            .flatten()
+        });
+        (
+            page.id.clone(),
+            obscura_dom::SandboxFlags::parse(sandbox_attr.as_deref()),
+        )
+    };
+    let request = obscura_browser::page::FrameNavigationRequest {
+        url: Some(url.to_string()),
+        referrer,
+        sandbox,
+        ..Default::default()
+    };
+    let loader_id = {
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or("No page for session")?;
+        page.navigate_frame_for_cdp(frame_id, request)
+            .await
+            .map_err(|error| error.to_string())?;
+        page.frames
+            .get(frame_id)
+            .map(|frame| frame.loader_id.clone())
+            .unwrap_or_default()
+    };
+    // Old-document contexts (and any removed descendant frames) go first,
+    // then the navigated subtree's lifecycle and fresh realm contexts.
+    emit_frame_teardown_events(ctx, session_id, &page_id);
+    emit_frame_rollout_events(ctx, session_id, &page_id);
+    Ok(json!({
+        "frameId": frame_id,
+        "loaderId": loader_id,
+    }))
+}
+
 async fn do_navigate(
     url: &str,
     params: &Value,
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
+    // Phase 6.5: a frameId addressing a child frame routes through the Rust
+    // frame navigation controller; absent or main-frame ids keep the
+    // whole-page path (frameId was previously ignored entirely).
+    let child_frame: Option<String> = params
+        .get("frameId")
+        .and_then(|v| v.as_str())
+        .filter(|fid| {
+            ctx.get_session_page(session_id)
+                .is_some_and(|page| *fid != page.frame_id)
+        })
+        .map(str::to_string);
+    if let Some(frame_id) = child_frame {
+        return navigate_child_frame(url, &frame_id, params, ctx, session_id).await;
+    }
+
     let wait_until = parse_wait_until(params);
 
     // Block CDP-initiated file:// navigation by default.
@@ -1177,12 +2004,15 @@ pub async fn handle(
                         "mimeType": "text/html",
                         "adFrameStatus": { "adFrameType": "none" },
                     },
-                    "childFrames": [],
+                    // Phase 6.1: recursive projection of the browser-core
+                    // frame registry. The main frame's id stays equal to the
+                    // targetId (Chromium convention Playwright depends on).
+                    "childFrames": frame_tree_children(page, page.frames.main_frame_id()),
                 }
             }))
         }
         "createIsolatedWorld" => {
-            let (frame_id_param, world_name, page_url, page_id) = {
+            let (frame_id_param, world_name, page_url, page_id, main_frame_id) = {
                 let page = ctx
                     .get_session_page(session_id)
                     .ok_or("No page for session")?;
@@ -1199,42 +2029,40 @@ pub async fn handle(
                         .to_string(),
                     page.url_string(),
                     page.id.clone(),
+                    page.frame_id.clone(),
                 )
             };
-            // Track this world so Page.navigate can re-emit a context for it
-            // post-navigation. Without this, Playwright (and Puppeteer)
-            // hang in any operation that uses the utility world — including
-            // page.title() — because their utility world is gone after
+            // Phase 6.3: every world is a real realm now (own global and
+            // wrapper cache, same native DOM). A child frame builds it
+            // eagerly against its committed content root; the main frame
+            // registers the world and builds it on first use. Registering
+            // the world name is also what makes Page.navigate re-emit a
+            // context for it post-navigation: without that, Playwright (and
+            // Puppeteer) hang in any operation that uses the utility world,
+            // including page.title(), because it is gone after
             // Runtime.executionContextsCleared and never re-created.
-            if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
-                ctx.isolated_worlds.push(world_name.clone());
+            if frame_id_param != main_frame_id {
+                return create_child_frame_isolated_world(
+                    ctx,
+                    session_id,
+                    &frame_id_param,
+                    &world_name,
+                    &page_id,
+                );
             }
             // Issue #192: every isolated world emission gets a fresh id from
             // the monotonic counter and is registered as a valid contextId.
             // Reusing id 100 across navigations made Playwright's bookkeeping
             // diverge (it expected 101 on the second nav) and Runtime.evaluate
             // failed with "Cannot find context with specified id: 101".
-            let context_id = ctx.next_isolated_context();
-
-            ctx.pending_events.push(CdpEvent {
-                method: "Runtime.executionContextCreated".to_string(),
-                params: json!({
-                    "context": {
-                        "id": context_id,
-                        "origin": page_url,
-                        "name": world_name,
-                        "uniqueId": format!("ctx-isolated-{}-{}", page_id, context_id),
-                        "auxData": {
-                            "isDefault": false,
-                            "type": "isolated",
-                            "frameId": frame_id_param,
-                        }
-                    }
-                }),
-                session_id: session_id.clone(),
-            });
-
-            Ok(json!({ "executionContextId": context_id }))
+            create_main_frame_isolated_world(
+                ctx,
+                session_id,
+                &frame_id_param,
+                &world_name,
+                &page_url,
+                &page_id,
+            )
         }
         "setLifecycleEventsEnabled" => Ok(json!({})),
         "addScriptToEvaluateOnNewDocument" => {

@@ -4368,6 +4368,42 @@ impl Page {
         Box::pin(self.navigate_frame_inner(frame_id, request))
     }
 
+    /// CDP `Page.navigate(frameId)` entry point (Phase 6.5). After a full page
+    /// load the DomTree lives inside the JS runtime, while the frame
+    /// navigation controller works on `self.dom`; borrow the tree back for
+    /// the Rust-side commit, return it, then run the committed subtree's
+    /// classic scripts (the full-page flow does that in
+    /// `execute_frame_scripts`, which a single-frame navigation bypasses).
+    pub async fn navigate_frame_for_cdp(
+        &mut self,
+        frame_id: &str,
+        request: FrameNavigationRequest,
+    ) -> Result<(), FrameNavigateError> {
+        let borrowed_from_js = if self.dom.is_none() {
+            match self.js.as_ref().and_then(|js| js.take_dom()) {
+                Some(dom) => {
+                    self.dom = Some(dom);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        let result = self.navigate_frame(frame_id, request).await;
+        if borrowed_from_js {
+            if let Some(dom) = self.dom.take() {
+                if let Some(js) = self.js.as_ref() {
+                    js.set_dom(dom);
+                }
+            }
+        }
+        if result.is_ok() {
+            self.execute_frame_subtree_scripts(frame_id).await;
+        }
+        result
+    }
+
     async fn navigate_frame_inner(
         &mut self,
         frame_id: &str,

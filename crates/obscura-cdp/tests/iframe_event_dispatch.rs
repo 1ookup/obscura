@@ -131,6 +131,57 @@ async fn iframe_document_dispatches_registered_listeners() {
     assert_eq!(val["plainReturn"], true, "no cancellation -> dispatchEvent returns true");
 }
 
+// Phase 6 guard: a page whose markup has no iframes must see zero new frame
+// events (frameAttached/Detached, executionContextDestroyed), and a
+// script-created iframe (which has no browsing-context registry entry) must
+// not start emitting them either. The pre-iframe event stream is the oracle.
+#[tokio::test(flavor = "current_thread")]
+async fn pages_without_registry_iframes_emit_no_frame_events() {
+    let (mut ctx, sid) = setup().await;
+    let frame_event_count = |ctx: &CdpContext| {
+        ctx.pending_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.method.as_str(),
+                    "Page.frameAttached"
+                        | "Page.frameDetached"
+                        | "Runtime.executionContextDestroyed"
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        frame_event_count(&ctx),
+        0,
+        "navigating an iframe-less page must not synthesize frame events"
+    );
+    assert!(
+        ctx.execution_contexts.is_empty() && ctx.advertised_frames.is_empty(),
+        "no child-frame bookkeeping may appear for an iframe-less page"
+    );
+
+    // A dynamically created iframe lives only in the JS shim (no registry
+    // browsing context), so no CDP frame lifecycle may be invented for it.
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            return iframe.contentDocument ? 'has-doc' : 'no-doc';
+        })()"#,
+        &sid,
+    )
+    .await;
+    assert_eq!(v["result"]["value"], "has-doc");
+    assert_eq!(
+        frame_event_count(&ctx),
+        0,
+        "script-created iframes must not emit CDP frame events"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn iframe_load_reaches_onload_and_addeventlistener() {
     let (mut ctx, sid) = setup().await;
