@@ -23,8 +23,10 @@
 
 use std::collections::HashMap;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::v8;
 
+use crate::import_map::ImportMap;
 use crate::runtime::ObscuraJsRuntime;
 
 /// The frame's own Window realm: the default execution context CDP reports
@@ -81,6 +83,16 @@ pub struct FrameRealmHost {
     realms: HashMap<(String, u64, u64), FrameRealm>,
 }
 
+/// One frame Document's V8 module registry. V8 modules are context-bound, so
+/// they cannot use deno_core's main-realm module map without evaluating
+/// `globalThis`, DOM APIs and lexical bindings in the top Window.
+#[derive(Default)]
+pub(crate) struct FrameModuleMap {
+    import_map: ImportMap,
+    modules: HashMap<String, v8::Global<v8::Module>>,
+    resolutions: HashMap<(i32, String), String>,
+}
+
 impl FrameRealmHost {
     /// The frame's main-world realm.
     pub fn get(&self, frame_id: &str, generation: u64) -> Option<&FrameRealm> {
@@ -109,6 +121,63 @@ impl FrameRealmHost {
 
 fn alloc_err(what: &str) -> String {
     format!("realm: {what} allocation failed")
+}
+
+fn decode_frame_module_data_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("data:")?;
+    let (metadata, payload) = rest.split_once(',')?;
+    let bytes = if metadata
+        .split(';')
+        .any(|token| token.eq_ignore_ascii_case("base64"))
+    {
+        let payload: String = payload.chars().filter(|ch| !ch.is_whitespace()).collect();
+        BASE64.decode(payload).ok()?
+    } else {
+        let bytes = payload.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                let value = u8::from_str_radix(
+                    std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?,
+                    16,
+                );
+                if let Ok(value) = value {
+                    decoded.push(value);
+                    index += 3;
+                    continue;
+                }
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        decoded
+    };
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn frame_module_resolve_callback<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    // SAFETY: V8 invokes this synchronously inside instantiate_module below.
+    // That call installs a pointer to the live FrameModuleMap in the isolate
+    // slot and removes it before returning.
+    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    let map = unsafe {
+        scope
+            .get_slot::<*const FrameModuleMap>()?
+            .as_ref()?
+    };
+    let raw = specifier.to_rust_string_lossy(scope);
+    let module_key = map
+        .resolutions
+        .get(&(referrer.get_identity_hash().get(), raw))?;
+    map.modules
+        .get(module_key)
+        .map(|module| v8::Local::new(scope, module))
 }
 
 impl ObscuraJsRuntime {
@@ -371,6 +440,334 @@ impl ObscuraJsRuntime {
         self.execute_script_in_frame_world_realm(frame_id, generation, MAIN_WORLD, name, source)
     }
 
+    /// Merge a parser-discovered import map into one frame Document's module
+    /// map. Resolution history is document-local, matching the browser model.
+    pub fn add_frame_import_map(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        source: &str,
+        base_url: &str,
+    ) -> Result<(), String> {
+        let parsed = ImportMap::parse(source, base_url)?;
+        self.frame_module_maps
+            .entry((frame_id.to_string(), generation))
+            .or_default()
+            .import_map
+            .merge(parsed);
+        Ok(())
+    }
+
+    /// Fetch and compile an ES module graph in a frame's own V8
+    /// context. deno_core's public module APIs always target its main realm,
+    /// so using them here would point global and DOM access at the top Window.
+    pub async fn prepare_module_in_frame_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        root_key: &str,
+        module_url: &str,
+        inline_source: Option<&str>,
+        document_url: &str,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        let context = self.frame_world_context(frame_id, generation, MAIN_WORLD)?;
+        let map_key = (frame_id.to_string(), generation);
+        let mut module_map = self.frame_module_maps.remove(&map_key).unwrap_or_default();
+        let result = self
+            .prepare_frame_module_graph(
+                &context,
+                &mut module_map,
+                root_key,
+                module_url,
+                inline_source,
+                document_url,
+                budget_ms,
+            )
+            .await;
+        self.frame_module_maps.insert(map_key, module_map);
+        result
+    }
+
+    async fn prepare_frame_module_graph(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        module_map: &mut FrameModuleMap,
+        root_key: &str,
+        module_url: &str,
+        inline_source: Option<&str>,
+        document_url: &str,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
+        let mut pending = std::collections::VecDeque::from([(
+            root_key.to_string(),
+            module_url.to_string(),
+            inline_source.map(str::to_string),
+            document_url.to_string(),
+        )]);
+
+        while let Some((module_key, requested_url, inline, referrer_url)) = pending.pop_front() {
+            if module_map.modules.contains_key(&module_key) {
+                continue;
+            }
+            let (final_url, source) = match inline {
+                Some(source) => (requested_url, source),
+                None => {
+                    let remaining = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .ok_or_else(|| "Frame module graph load timed out".to_string())?;
+                    tokio::time::timeout(
+                        remaining,
+                        self.fetch_frame_module_source(
+                            &requested_url,
+                            document_url,
+                            &referrer_url,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "Frame module graph load timed out".to_string())??
+                }
+            };
+
+            let (identity, requests) = self.compile_frame_module_source(
+                context,
+                module_map,
+                &module_key,
+                &final_url,
+                &source,
+            )?;
+            let referrer = deno_core::ModuleSpecifier::parse(&final_url)
+                .map_err(|error| format!("Invalid frame module URL {final_url}: {error}"))?;
+            for raw in requests {
+                let resolved = module_map.import_map.resolve(&raw, &referrer)?;
+                let resolved_key = resolved.to_string();
+                module_map
+                    .resolutions
+                    .insert((identity, raw), resolved_key.clone());
+                if !module_map.modules.contains_key(&resolved_key) {
+                    pending.push_back((
+                        resolved_key.clone(),
+                        resolved_key,
+                        None,
+                        final_url.clone(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Instantiate and evaluate a graph prepared by
+    /// [`Self::prepare_module_in_frame_realm`]. Keeping this separate lets the
+    /// HTML scheduler fetch modules at their parser encounter point while
+    /// deferring non-async evaluation until parsing is complete.
+    pub async fn evaluate_module_in_frame_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        root_key: &str,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        let context = self.frame_world_context(frame_id, generation, MAIN_WORLD)?;
+        let map_key = (frame_id.to_string(), generation);
+        let mut module_map = self.frame_module_maps.remove(&map_key).unwrap_or_default();
+        let result = self
+            .evaluate_frame_module(&context, &mut module_map, root_key, budget_ms)
+            .await;
+        self.frame_module_maps.insert(map_key, module_map);
+        result
+    }
+
+    async fn evaluate_frame_module(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        module_map: &mut FrameModuleMap,
+        root_key: &str,
+        budget_ms: u64,
+    ) -> Result<(), String> {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
+        let root = module_map
+            .modules
+            .get(root_key)
+            .ok_or_else(|| "Frame root module was not compiled".to_string())?
+            .clone();
+        let promise = {
+            let scope = &mut self.deno_runtime_mut().handle_scope();
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let module = v8::Local::new(scope, &root);
+            if module.get_status() == v8::ModuleStatus::Evaluated {
+                return Ok(());
+            }
+            if module.get_status() == v8::ModuleStatus::Uninstantiated {
+                scope.set_slot(module_map as *const FrameModuleMap);
+                let instantiated =
+                    module.instantiate_module(scope, frame_module_resolve_callback);
+                scope.remove_slot::<*const FrameModuleMap>();
+                if instantiated.is_none() {
+                    return Err("Frame module instantiation error".to_string());
+                }
+            }
+            let value = module.evaluate(scope).ok_or_else(|| {
+                let message = module.get_exception().to_rust_string_lossy(scope);
+                format!("Frame module evaluation error: {message}")
+            })?;
+            let promise = v8::Local::<v8::Promise>::try_from(value)
+                .map_err(|_| "Frame module evaluation did not return a Promise".to_string())?;
+            v8::Global::new(scope, promise)
+        };
+
+        let completed = self
+            .resolve_promises_until(
+                |runtime| {
+                    runtime.frame_module_promise_state(context, &promise)
+                        != v8::PromiseState::Pending
+                },
+                deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0),
+            )
+            .await;
+        if !completed {
+            return Err("Frame module evaluation timed out".to_string());
+        }
+        let (state, result) = self.frame_module_promise_result(context, &promise);
+        match state {
+            v8::PromiseState::Fulfilled => Ok(()),
+            v8::PromiseState::Rejected => Err(format!("Frame module evaluation error: {result}")),
+            v8::PromiseState::Pending => Err("Frame module evaluation timed out".to_string()),
+        }
+    }
+
+    async fn fetch_frame_module_source(
+        &self,
+        url: &str,
+        document_url: &str,
+        referrer_url: &str,
+    ) -> Result<(String, String), String> {
+        let requested = deno_core::ModuleSpecifier::parse(url)
+            .map_err(|error| format!("Invalid frame module URL {url}: {error}"))?;
+        if requested.scheme() == "data" {
+            let source = decode_frame_module_data_url(url)
+                .ok_or_else(|| "Invalid data: frame module URL".to_string())?;
+            return Ok((url.to_string(), source));
+        }
+        let document = deno_core::ModuleSpecifier::parse(document_url)
+            .unwrap_or_else(|_| requested.clone());
+        let referrer = deno_core::ModuleSpecifier::parse(referrer_url)
+            .unwrap_or_else(|_| document.clone());
+        let (client, callbacks) = {
+            let state = self.state_handle().borrow();
+            (
+                state
+                    .http_client
+                    .clone()
+                    .ok_or_else(|| "No HTTP client wired for frame modules".to_string())?,
+                state.callbacks.clone(),
+            )
+        };
+        let response = client
+            .fetch_resource_with_callbacks(
+                &requested,
+                obscura_net::ResourceRequest::module_script(&document, &referrer),
+                callbacks.as_deref(),
+            )
+            .await
+            .map_err(|error| format!("Failed to fetch frame module {url}: {error}"))?;
+        if !(200..=299).contains(&response.status) {
+            return Err(format!(
+                "Frame module {url} returned HTTP {}",
+                response.status
+            ));
+        }
+        let source = obscura_net::decode_non_html(&response.body, response.content_type());
+        Ok((response.url.to_string(), source))
+    }
+
+    fn compile_frame_module_source(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        module_map: &mut FrameModuleMap,
+        module_key: &str,
+        module_url: &str,
+        source: &str,
+    ) -> Result<(i32, Vec<String>), String> {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(scope, source)
+            .ok_or_else(|| alloc_err("module source"))?;
+        let name = v8::String::new(scope, module_url)
+            .ok_or_else(|| alloc_err("module URL"))?;
+        let origin = v8::ScriptOrigin::new(
+            scope,
+            name.into(),
+            0,
+            0,
+            false,
+            -1,
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        let mut source = v8::script_compiler::Source::new(source, Some(&origin));
+        let scope = &mut v8::TryCatch::new(scope);
+        let module = v8::script_compiler::compile_module(scope, &mut source).ok_or_else(|| {
+            let message = scope
+                .exception()
+                .map(|value| value.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "unknown compile error".to_string());
+            format!("Frame module compile error ({module_url}): {message}")
+        })?;
+        let identity = module.get_identity_hash().get();
+        let requests = module.get_module_requests();
+        let mut imports = Vec::with_capacity(requests.length());
+        for index in 0..requests.length() {
+            let request = requests
+                .get(scope, index)
+                .and_then(|value| v8::Local::<v8::ModuleRequest>::try_from(value).ok())
+                .ok_or_else(|| "Frame module request metadata was invalid".to_string())?;
+            imports.push(request.get_specifier().to_rust_string_lossy(scope));
+        }
+        module_map
+            .modules
+            .insert(module_key.to_string(), v8::Global::new(scope, module));
+        Ok((identity, imports))
+    }
+
+    fn frame_module_promise_state(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        promise: &v8::Global<v8::Promise>,
+    ) -> v8::PromiseState {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::Local::new(scope, promise).state()
+    }
+
+    fn frame_module_promise_result(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        promise: &v8::Global<v8::Promise>,
+    ) -> (v8::PromiseState, String) {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let promise = v8::Local::new(scope, promise);
+        (
+            promise.state(),
+            promise.result(scope).to_rust_string_lossy(scope),
+        )
+    }
+
     /// Run `source` with Script semantics in a specific frame world realm.
     pub fn execute_script_in_frame_world_realm(
         &mut self,
@@ -406,6 +803,8 @@ impl ObscuraJsRuntime {
     /// Destroy one document generation's realms (every world). Returns whether
     /// any existed. Object handles bound to those worlds are invalidated.
     pub fn destroy_frame_realm_generation(&mut self, frame_id: &str, generation: u64) -> bool {
+        self.frame_module_maps
+            .remove(&(frame_id.to_string(), generation));
         let before = self.frame_realms.realms.len();
         self.frame_realms
             .realms
@@ -422,6 +821,8 @@ impl ObscuraJsRuntime {
     /// Destroy every realm registered for `frame_id` (all generations and
     /// worlds), e.g. on frame detach. Returns how many were dropped.
     pub fn destroy_frame_realm(&mut self, frame_id: &str) -> usize {
+        self.frame_module_maps
+            .retain(|(id, _), _| id != frame_id);
         let before = self.frame_realms.realms.len();
         self.frame_realms.realms.retain(|(id, _, _), _| id != frame_id);
         let removed = before - self.frame_realms.realms.len();

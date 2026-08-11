@@ -2245,7 +2245,7 @@ impl Page {
         );
     }
 
-    /// Run the classic `<script>` elements of every committed child frame in
+    /// Run the `<script>` elements of every committed child frame in
     /// that frame's own Window realm (Phase 3.8). Runs after `init_js` (the
     /// realm host and the DomTree live in the runtime by then) and before the
     /// main document's `execute_scripts`: frame documents commit while the
@@ -2273,7 +2273,7 @@ impl Page {
         self.execute_frame_scripts_in_order(order).await;
     }
 
-    /// Run the classic scripts of the frames in `order` under the shared phase
+    /// Run the scripts of the frames in `order` under the shared phase
     /// budget: a soft deadline observed between scripts plus a watchdog for a
     /// synchronous overrun inside one frame script. Same budget shape as the
     /// main document's script phase.
@@ -2305,7 +2305,7 @@ impl Page {
         }
     }
 
-    /// Run the classic scripts of `root_frame_id` and its nested frames
+    /// Run the scripts of `root_frame_id` and its nested frames
     /// (outermost first). Used by the CDP single-frame navigation path, where
     /// only the navigated subtree has a fresh document; the full-page flow
     /// walks the whole tree via [`Self::execute_frame_scripts`].
@@ -2375,19 +2375,25 @@ impl Page {
             .or_else(|| Url::parse(&frame_base).ok())
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
 
+        #[derive(Clone, Copy)]
+        enum FrameScriptKind {
+            Classic,
+            Module,
+            ImportMap,
+        }
         struct FrameScript {
             src: Option<String>,
             inline: String,
             nid: u32,
             base_url: String,
+            kind: FrameScriptKind,
+            is_defer: bool,
+            is_async: bool,
         }
         // Discovery mirrors the main document's scan, scoped to the content
         // root. Content documents are parentless subtrees, so descendants()
         // never crosses into a nested frame's document. The <base> pre-scan is
-        // document-local, seeded from the frame scope's base URL. defer and
-        // async scripts run in document order with the others: frame parsing
-        // has already completed here, which is the defer semantics and a
-        // deliberate in-order approximation for async.
+        // document-local, seeded from the frame scope's base URL.
         let scripts: Vec<FrameScript> = self
             .js
             .as_ref()
@@ -2435,15 +2441,14 @@ impl Page {
                             .unwrap_or("")
                             .trim()
                             .to_ascii_lowercase();
-                        match script_type.as_str() {
-                            "" | "text/javascript" | "application/javascript" => {}
-                            // TODO(Phase 3.10): per-realm module maps. The
-                            // module loader is a per-runtime singleton bound
-                            // to the top document today, so frame modules and
-                            // import maps stay off until then.
-                            "module" | "importmap" => continue,
+                        let kind = match script_type.as_str() {
+                            "" | "text/javascript" | "application/javascript" => {
+                                FrameScriptKind::Classic
+                            }
+                            "module" => FrameScriptKind::Module,
+                            "importmap" => FrameScriptKind::ImportMap,
                             _ => continue,
-                        }
+                        };
                         let src = node.get_attribute("src").map(str::to_string);
                         let inline = if src.is_none() {
                             dom.text_content(sid)
@@ -2455,6 +2460,9 @@ impl Page {
                                 src,
                                 inline,
                                 nid: sid.raw(),
+                                kind,
+                                is_defer: node.get_attribute("defer").is_some(),
+                                is_async: node.get_attribute("async").is_some(),
                                 base_url: bases_at_script
                                     .get(&sid.raw())
                                     .cloned()
@@ -2493,6 +2501,9 @@ impl Page {
         // checks inside fetch_resource_with_callbacks.
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
+            if !matches!(script.kind, FrameScriptKind::Classic) {
+                continue;
+            }
             let Some(src) = &script.src else {
                 continue;
             };
@@ -2593,45 +2604,190 @@ impl Page {
             fetched.insert(index, (url, code, resp));
         }
 
+        macro_rules! execute_classic {
+            ($index:expr) => {{
+                let script = &scripts[$index];
+                let executable = if script.src.is_some() {
+                    fetched.remove(&$index).map(|(url, code, resp)| {
+                        self.record_network_event_with_body(
+                            &url,
+                            "GET",
+                            "Script",
+                            resp.status,
+                            &resp.headers,
+                            &resp.body,
+                            false,
+                        );
+                        (resp.url.to_string(), code)
+                    })
+                } else {
+                    Some((script.base_url.clone(), script.inline.clone()))
+                };
+                if let Some((execution_url, code)) = executable {
+                    if let Some(js) = self.js.as_mut() {
+                        // currentScript is non-null only for classic script
+                        // evaluation, never for ES modules.
+                        let _ = js.execute_script_in_frame_realm(
+                            frame_id,
+                            generation,
+                            "<current-script>",
+                            &format!("globalThis.__currentScriptNid={};", script.nid),
+                        );
+                        if let Err(error) = js.execute_script_in_frame_realm(
+                            frame_id,
+                            generation,
+                            &execution_url,
+                            &code,
+                        ) {
+                            tracing::warn!(
+                                "Frame script error ({}): {}",
+                                execution_url,
+                                error
+                            );
+                        }
+                        let _ = js.execute_script_in_frame_realm(
+                            frame_id,
+                            generation,
+                            "<current-script>",
+                            "globalThis.__currentScriptNid=0;",
+                        );
+                    }
+                }
+            }};
+        }
+
+        enum PostParseScript {
+            Classic(usize),
+            Module(String),
+        }
+        let mut post_parse = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!("execute_frame_scripts: deadline reached mid-frame");
                 break;
             }
-            let (execution_url, code) = if script.src.is_some() {
-                let Some((url, code, resp)) = fetched.remove(&index) else {
-                    continue;
-                };
-                self.record_network_event_with_body(
-                    &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
-                );
-                (resp.url.to_string(), code)
-            } else {
-                (script.base_url.clone(), script.inline.clone())
-            };
-            let Some(js) = self.js.as_mut() else {
-                return;
-            };
-            // currentScript points at this script element for the duration of
-            // its execution; the realm's Document getter reads the realm-local
-            // __currentScriptNid, same contract as the main document's.
-            let _ = js.execute_script_in_frame_realm(
-                frame_id,
-                generation,
-                "<current-script>",
-                &format!("globalThis.__currentScriptNid={};", script.nid),
-            );
-            if let Err(error) =
-                js.execute_script_in_frame_realm(frame_id, generation, &execution_url, &code)
-            {
-                tracing::warn!("Frame script error ({}): {}", execution_url, error);
+            match script.kind {
+                FrameScriptKind::ImportMap => {
+                    if script.src.is_none() {
+                        if let Some(js) = self.js.as_mut() {
+                            if let Err(error) = js.add_frame_import_map(
+                                frame_id,
+                                generation,
+                                &script.inline,
+                                &script.base_url,
+                            ) {
+                                tracing::warn!("Frame import map error: {}", error);
+                            }
+                        }
+                    }
+                }
+                FrameScriptKind::Classic => {
+                    if script.is_defer && !script.is_async && script.src.is_some() {
+                        post_parse.push(PostParseScript::Classic(index));
+                    } else {
+                        execute_classic!(index);
+                    }
+                }
+                FrameScriptKind::Module => {
+                    let module_url = match &script.src {
+                        Some(src) => Url::parse(&script.base_url)
+                            .ok()
+                            .and_then(|base| base.join(src).ok())
+                            .map(|url| url.to_string()),
+                        None => Some(script.base_url.clone()),
+                    };
+                    let Some(module_url) = module_url else {
+                        continue;
+                    };
+                    if script.src.is_some()
+                        && !subresource_allowed(
+                            Url::parse(&script.base_url).ok().as_ref(),
+                            &module_url,
+                        )
+                    {
+                        continue;
+                    }
+                    let root_key = if script.src.is_some() {
+                        module_url.clone()
+                    } else {
+                        format!("frame-inline:{frame_id}:{generation}:{}", script.nid)
+                    };
+                    let remaining_ms = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or(0);
+                    let inline = script.src.is_none().then_some(script.inline.as_str());
+                    let prepared = match self.js.as_mut() {
+                        Some(js) => {
+                            js.prepare_module_in_frame_realm(
+                                frame_id,
+                                generation,
+                                &root_key,
+                                &module_url,
+                                inline,
+                                initiator.as_str(),
+                                remaining_ms,
+                            )
+                            .await
+                        }
+                        None => return,
+                    };
+                    if let Err(error) = prepared {
+                        tracing::warn!("Frame module graph error ({}): {}", module_url, error);
+                        continue;
+                    }
+                    if script.is_async {
+                        let result = match self.js.as_mut() {
+                            Some(js) => {
+                                js.evaluate_module_in_frame_realm(
+                                    frame_id,
+                                    generation,
+                                    &root_key,
+                                    remaining_ms,
+                                )
+                                .await
+                            }
+                            None => return,
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!("Frame module error ({}): {}", module_url, error);
+                        }
+                    } else {
+                        post_parse.push(PostParseScript::Module(root_key));
+                    }
+                }
             }
-            let _ = js.execute_script_in_frame_realm(
-                frame_id,
-                generation,
-                "<current-script>",
-                "globalThis.__currentScriptNid=0;",
-            );
+        }
+
+        for scheduled in post_parse {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("execute_frame_scripts: deadline reached during post-parse work");
+                break;
+            }
+            match scheduled {
+                PostParseScript::Classic(index) => execute_classic!(index),
+                PostParseScript::Module(root_key) => {
+                    let remaining_ms = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or(0);
+                    let result = match self.js.as_mut() {
+                        Some(js) => {
+                            js.evaluate_module_in_frame_realm(
+                                frame_id,
+                                generation,
+                                &root_key,
+                                remaining_ms,
+                            )
+                            .await
+                        }
+                        None => return,
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!("Frame module evaluation error: {}", error);
+                    }
+                }
+            }
         }
     }
 
@@ -6077,6 +6233,89 @@ mod tests {
                 .evaluate("typeof extVar")
                 .unwrap(),
             serde_json::json!("undefined")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_modules_use_frame_import_map_realm_and_post_parse_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (content_type, body) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        "<!doctype html><iframe id=f src='/frame.html'></iframe>",
+                    ),
+                    "/frame.html" => (
+                        "text/html",
+                        "<!doctype html><div id=out></div>\
+                         <script>globalThis.order=['classic']</script>\
+                         <script defer src='/defer.js'></script>\
+                         <script type=importmap>{\"imports\":{\"dep\":\"/dep.js\"}}</script>\
+                         <script type=module>\
+                           import { value } from 'dep';\
+                           order.push(value);\
+                           globalThis.moduleGlobalIsFrame = globalThis === window;\
+                           globalThis.moduleCurrentScript = document.currentScript;\
+                           document.getElementById('out').textContent = order.join(',');\
+                         </script>\
+                         <script>order.push('parser-tail')</script>",
+                    ),
+                    "/defer.js" => (
+                        "application/javascript",
+                        "order.push('defer')",
+                    ),
+                    "/dep.js" => (
+                        "application/javascript",
+                        "export const value = 'module';",
+                    ),
+                    _ => ("text/plain", "unexpected"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-module".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-module".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => { const w = document.getElementById('f').contentWindow; return [w.document.getElementById('out').textContent, w.moduleGlobalIsFrame, w.moduleCurrentScript]; })()",
+                )
+                .unwrap(),
+            serde_json::json!(["classic,parser-tail,defer,module", true, null]),
+        );
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("typeof order").unwrap(),
+            serde_json::json!("undefined"),
         );
     }
 

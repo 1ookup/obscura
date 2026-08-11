@@ -237,6 +237,10 @@ pub struct ObscuraJsRuntime {
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
     /// pages without iframes; the main-context path never touches it.
     pub(crate) frame_realms: crate::realm::FrameRealmHost,
+    /// Per-document ES module maps for frame realms. These are separate from
+    /// deno_core's top-level module map because each Window realm has its own
+    /// module identities and import-map resolution state.
+    pub(crate) frame_module_maps: HashMap<(String, u64), crate::realm::FrameModuleMap>,
     /// Whether the main realm's cross-document message recv loop (bootstrap
     /// `_frameMessageRecvLoop`, Phase 4) has been started. It spawns an async
     /// op, which requires a live tokio context, so the pump paths start it
@@ -431,6 +435,7 @@ impl ObscuraJsRuntime {
             module_load_activity,
             isolate_handle,
             frame_realms: crate::realm::FrameRealmHost::default(),
+            frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
         }
     }
