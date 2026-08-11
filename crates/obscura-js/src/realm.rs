@@ -13,15 +13,23 @@
 //! instance's `_ScopedDocument(content_root)` (scoped op_dom queries).
 //!
 //! [`FrameRealmHost`] is the managed registry, keyed by
-//! `(frame_id, document_generation)`, created lazily and destroyed by
-//! generation. [`SecondaryRealm`] is the retained feasibility spike
-//! (implementation order item 1); nothing on the main path constructs either.
+//! `(frame_id, document_generation, world_id)`, created lazily and destroyed
+//! by generation. `world_id` [`MAIN_WORLD`] is the frame's own Window realm
+//! (the default execution context); ids above it are CDP isolated worlds
+//! (Phase 6.3): a separate `v8::Context` with its own global and DOM wrapper
+//! cache, but the same native DOM (both reach `content_root` through op_dom).
+//! [`SecondaryRealm`] is the retained feasibility spike (implementation order
+//! item 1); nothing on the main path constructs either.
 
 use std::collections::HashMap;
 
 use deno_core::v8;
 
 use crate::runtime::ObscuraJsRuntime;
+
+/// The frame's own Window realm: the default execution context CDP reports
+/// with `auxData.isDefault = true`. Isolated worlds use ids above this.
+pub const MAIN_WORLD: u64 = 0;
 
 /// bootstrap.js source. The snapshot (build.rs) contains its executed result
 /// in the default context only; a secondary context runs the source again.
@@ -39,9 +47,15 @@ pub struct SecondaryRealm {
 }
 
 /// A managed frame Window realm: the context handle plus the metadata that
-/// identifies which document it serves.
+/// identifies which document and world it serves.
 pub struct FrameRealm {
     context: v8::Global<v8::Context>,
+    /// Which world this realm is: [`MAIN_WORLD`] for the frame's own Window,
+    /// higher ids for CDP isolated worlds.
+    pub world_id: u64,
+    /// Isolated-world name (`Page.createIsolatedWorld` worldName); `None` for
+    /// the main world.
+    pub world_name: Option<String>,
     /// Arena index of the frame's content-document root node.
     pub content_root: u32,
     /// Base URL handed to the realm at creation (`__obscura_frame_base_url`).
@@ -52,21 +66,40 @@ pub struct FrameRealm {
     pub scope_origin: Option<String>,
 }
 
-/// Registry of frame Window realms keyed by `(frame_id, document_generation)`.
-/// Owned by `ObscuraJsRuntime`; empty on pages without iframes, so the main
-/// path never pays for it.
+impl FrameRealm {
+    /// Whether this is the frame's default (main) world.
+    pub fn is_default(&self) -> bool {
+        self.world_id == MAIN_WORLD
+    }
+}
+
+/// Registry of frame Window realms keyed by
+/// `(frame_id, document_generation, world_id)`. Owned by `ObscuraJsRuntime`;
+/// empty on pages without iframes, so the main path never pays for it.
 #[derive(Default)]
 pub struct FrameRealmHost {
-    realms: HashMap<(String, u64), FrameRealm>,
+    realms: HashMap<(String, u64, u64), FrameRealm>,
 }
 
 impl FrameRealmHost {
+    /// The frame's main-world realm.
     pub fn get(&self, frame_id: &str, generation: u64) -> Option<&FrameRealm> {
-        self.realms.get(&(frame_id.to_string(), generation))
+        self.get_world(frame_id, generation, MAIN_WORLD)
     }
 
+    pub fn get_world(&self, frame_id: &str, generation: u64, world_id: u64) -> Option<&FrameRealm> {
+        self.realms
+            .get(&(frame_id.to_string(), generation, world_id))
+    }
+
+    /// Whether the frame's main-world realm exists.
     pub fn contains(&self, frame_id: &str, generation: u64) -> bool {
-        self.realms.contains_key(&(frame_id.to_string(), generation))
+        self.contains_world(frame_id, generation, MAIN_WORLD)
+    }
+
+    pub fn contains_world(&self, frame_id: &str, generation: u64, world_id: u64) -> bool {
+        self.realms
+            .contains_key(&(frame_id.to_string(), generation, world_id))
     }
 
     pub fn active_count(&self) -> usize {
@@ -131,7 +164,48 @@ impl ObscuraJsRuntime {
         content_root: u32,
         base_url: &str,
     ) -> Result<bool, String> {
-        if self.frame_realms.contains(frame_id, generation) {
+        self.ensure_frame_world_realm(frame_id, generation, MAIN_WORLD, None, content_root, base_url)
+    }
+
+    /// Lazily create a CDP isolated world realm (Phase 6.3) for
+    /// `(frame_id, generation, world_id)`. `world_id` must be above
+    /// [`MAIN_WORLD`]. The world gets its own `v8::Context` (own global, own
+    /// DOM wrapper cache) but binds `document` to the same `content_root`, so
+    /// its ops reach the same native DOM as the frame main world without
+    /// leaking utility globals into it. Returns `true` on creation, `false`
+    /// when the world already existed.
+    pub fn ensure_isolated_world_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        world_name: &str,
+        content_root: u32,
+        base_url: &str,
+    ) -> Result<bool, String> {
+        if world_id == MAIN_WORLD {
+            return Err("realm: isolated world id must be above MAIN_WORLD".to_string());
+        }
+        self.ensure_frame_world_realm(
+            frame_id,
+            generation,
+            world_id,
+            Some(world_name),
+            content_root,
+            base_url,
+        )
+    }
+
+    fn ensure_frame_world_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        world_name: Option<&str>,
+        content_root: u32,
+        base_url: &str,
+    ) -> Result<bool, String> {
+        if self.frame_realms.contains_world(frame_id, generation, world_id) {
             return Ok(false);
         }
 
@@ -194,9 +268,11 @@ impl ObscuraJsRuntime {
             }
         };
         self.frame_realms.realms.insert(
-            (frame_id.to_string(), generation),
+            (frame_id.to_string(), generation, world_id),
             FrameRealm {
                 context,
+                world_id,
+                world_name: world_name.map(|s| s.to_string()),
                 content_root,
                 base_url: base_url.to_string(),
                 scope_url,
@@ -216,47 +292,101 @@ impl ObscuraJsRuntime {
         name: &str,
         source: &str,
     ) -> Result<serde_json::Value, String> {
+        self.execute_script_in_frame_world_realm(frame_id, generation, MAIN_WORLD, name, source)
+    }
+
+    /// Run `source` with Script semantics in a specific frame world realm.
+    pub fn execute_script_in_frame_world_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
         // Clone the handle (a second Global to the same context) so the
         // registry borrow ends before V8 re-borrows the runtime.
-        let context = self
-            .frame_realms
-            .get(frame_id, generation)
-            .ok_or_else(|| {
-                format!("realm: no frame realm for ({frame_id}, generation {generation})")
-            })?
-            .context
-            .clone();
+        let context = self.frame_world_context(frame_id, generation, world_id)?;
         self.execute_in_context(&context, name, source)
     }
 
-    /// Destroy one document generation's realm. Returns whether it existed.
-    pub fn destroy_frame_realm_generation(&mut self, frame_id: &str, generation: u64) -> bool {
-        let removed = self
-            .frame_realms
-            .realms
-            .remove(&(frame_id.to_string(), generation))
-            .is_some();
-        if removed {
-            self.deno_runtime_mut().v8_isolate().low_memory_notification();
-        }
-        removed
+    /// Clone the context handle for a frame world realm, or a no-realm error.
+    pub(crate) fn frame_world_context(
+        &self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+    ) -> Result<v8::Global<v8::Context>, String> {
+        self.frame_realms
+            .get_world(frame_id, generation, world_id)
+            .map(|realm| realm.context.clone())
+            .ok_or_else(|| {
+                format!(
+                    "realm: no frame realm for ({frame_id}, generation {generation}, world {world_id})"
+                )
+            })
     }
 
-    /// Destroy every realm registered for `frame_id` (all generations), e.g.
-    /// on frame detach. Returns how many were dropped.
-    pub fn destroy_frame_realm(&mut self, frame_id: &str) -> usize {
+    /// Destroy one document generation's realms (every world). Returns whether
+    /// any existed. Object handles bound to those worlds are invalidated.
+    pub fn destroy_frame_realm_generation(&mut self, frame_id: &str, generation: u64) -> bool {
         let before = self.frame_realms.realms.len();
-        self.frame_realms.realms.retain(|(id, _), _| id != frame_id);
+        self.frame_realms
+            .realms
+            .retain(|(id, gen, _), _| !(id == frame_id && *gen == generation));
         let removed = before - self.frame_realms.realms.len();
         if removed > 0 {
+            self.invalidate_object_handles(frame_id, Some(generation));
+            self.deno_runtime_mut().v8_isolate().low_memory_notification();
+        }
+        removed > 0
+    }
+
+    /// Destroy every realm registered for `frame_id` (all generations and
+    /// worlds), e.g. on frame detach. Returns how many were dropped.
+    pub fn destroy_frame_realm(&mut self, frame_id: &str) -> usize {
+        let before = self.frame_realms.realms.len();
+        self.frame_realms.realms.retain(|(id, _, _), _| id != frame_id);
+        let removed = before - self.frame_realms.realms.len();
+        if removed > 0 {
+            self.invalidate_object_handles(frame_id, None);
             self.deno_runtime_mut().v8_isolate().low_memory_notification();
         }
         removed
     }
 
-    /// Registry view, for callers that only need metadata.
+    /// Registry view of the frame main world, for callers that only need
+    /// metadata.
     pub fn frame_realm(&self, frame_id: &str, generation: u64) -> Option<&FrameRealm> {
         self.frame_realms.get(frame_id, generation)
+    }
+
+    /// Registry view of a specific world.
+    pub fn frame_realm_world(
+        &self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+    ) -> Option<&FrameRealm> {
+        self.frame_realms.get_world(frame_id, generation, world_id)
+    }
+
+    /// Keys of every live frame realm world. Empty (and allocation-free apart
+    /// from the Vec) on pages without iframes.
+    pub fn frame_realm_keys(&self) -> Vec<(String, u64, u64)> {
+        self.frame_realms.realms.keys().cloned().collect()
+    }
+
+    /// Read-only projection for CDP execution-context events (Phase 6.2):
+    /// `(frame_id, generation, world_id, is_default)` for every live realm.
+    pub fn list_frame_realms(&self) -> Vec<(String, u64, u64, bool)> {
+        self.frame_realms
+            .realms
+            .iter()
+            .map(|((id, gen, world), realm)| {
+                (id.clone(), *gen, *world, realm.is_default())
+            })
+            .collect()
     }
 
     /// Install the runtime-init globals and re-execute bootstrap.js in the
@@ -411,8 +541,14 @@ fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String
     }
     match scope.exception() {
         Some(exception) => {
-            let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-            format!("JS error: {error}")
+            // Stringify the exception directly instead of
+            // JsError::from_v8_exception: the latter walks the V8 stack trace
+            // assuming the isolate's default context is current, and crashes
+            // (EXC_BAD_ACCESS) when called inside a secondary realm's
+            // ContextScope. A plain coercion is context-safe and enough for a
+            // frame realm error message.
+            let msg = exception.to_rust_string_lossy(scope);
+            format!("JS error: {msg}")
         }
         None => format!("JS error: script {phase} failed without an exception"),
     }
@@ -1169,5 +1305,317 @@ mod tests {
             .unwrap(),
             serde_json::json!(["yes", "from realm", true])
         );
+    }
+
+    // ---- Isolated worlds (Phase 6.3) ----
+
+    #[test]
+    fn isolated_world_has_own_global_but_shares_frame_dom() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        // world 7 is a CDP isolated world over the same content root.
+        assert!(rt
+            .ensure_isolated_world_realm(
+                "frame-test",
+                1,
+                7,
+                "utility",
+                root,
+                "http://example.com/frame",
+            )
+            .unwrap());
+        // Idempotent per world.
+        assert!(!rt
+            .ensure_isolated_world_realm(
+                "frame-test",
+                1,
+                7,
+                "utility",
+                root,
+                "http://example.com/frame",
+            )
+            .unwrap());
+
+        // A utility global set in the isolated world does not leak into the
+        // frame main world, yet both worlds resolve the same DOM node.
+        rt.execute_script_in_frame_world_realm(
+            "frame-test",
+            1,
+            7,
+            "<t>",
+            "window.__utility = 'x'; document.getElementById('inner').setAttribute('data-w', 'iso');",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-test",
+                1,
+                7,
+                "<t>",
+                "[typeof window.__utility, document.getElementById('inner').getAttribute('data-w')]",
+            )
+            .unwrap(),
+            serde_json::json!(["string", "iso"])
+        );
+        // Frame main world: no __utility, but sees the shared mutation.
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[typeof window.__utility, document.getElementById('inner').getAttribute('data-w'), document.getElementById('inner') !== null]",
+            )
+            .unwrap(),
+            serde_json::json!(["undefined", "iso", true])
+        );
+        // Main context is untouched.
+        assert_eq!(
+            rt.evaluate("typeof window.__utility").unwrap(),
+            serde_json::json!("undefined")
+        );
+
+        // Registry reflects both worlds; only the main world is default.
+        let mut worlds: Vec<(u64, bool)> = rt
+            .list_frame_realms()
+            .into_iter()
+            .filter(|(id, gen, _, _)| id == "frame-test" && *gen == 1)
+            .map(|(_, _, world, is_default)| (world, is_default))
+            .collect();
+        worlds.sort();
+        assert_eq!(worlds, vec![(super::MAIN_WORLD, true), (7, false)]);
+    }
+
+    // ---- Frame RemoteObject evaluation (Phase 6.2) ----
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_cdp_evaluate_returns_remote_objects() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        // number by value
+        let n = rt
+            .evaluate_in_frame_realm_for_cdp("frame-test", 1, super::MAIN_WORLD, "40 + 2", true, false, 1000)
+            .await
+            .unwrap();
+        assert_eq!(n.js_type, "number");
+        assert_eq!(n.value, Some(serde_json::json!(42.0)));
+        assert!(n.object_id.is_none());
+
+        // string, evaluated against the frame document
+        let s = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "document.getElementById('inner').textContent",
+                true,
+                false,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.js_type, "string");
+        assert_eq!(s.value, Some(serde_json::json!("frame text")));
+
+        // object gets an objectId bound to the realm
+        let obj = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "({ a: 1, b: 'x' })",
+                false,
+                false,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obj.js_type, "object");
+        assert!(obj.object_id.is_some());
+
+        // awaitPromise on a resolved promise returns the value
+        let p = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "Promise.resolve(7)",
+                true,
+                true,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.js_type, "number");
+        assert_eq!(p.value, Some(serde_json::json!(7.0)));
+
+        // a throw under awaitPromise surfaces as an error (CDP exceptionDetails)
+        let err = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "(() => { throw new Error('boom'); })()",
+                false,
+                true,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("boom"), "unexpected error: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_call_function_on_and_get_properties() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        let obj = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "({ a: 1, b: 'x', c: { nested: true } })",
+                false,
+                false,
+                1000,
+            )
+            .await
+            .unwrap();
+        let oid = obj.object_id.clone().unwrap();
+
+        // callFunctionOn with the handle as `this`
+        let called = rt
+            .call_function_on_in_frame_realm(
+                "frame-test",
+                1,
+                super::MAIN_WORLD,
+                "function() { return this.a + 10; }",
+                Some(&oid),
+                &[],
+                true,
+                false,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(called.value, Some(serde_json::json!(11.0)));
+
+        // getProperties on the same handle: primitives inline, objects get a
+        // child objectId bound to the same world.
+        let props = rt.get_properties_in_frame_realm(&oid).unwrap();
+        let arr = props.as_array().unwrap();
+        let by_name = |name: &str| arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name)).cloned().unwrap();
+        assert_eq!(by_name("a").get("value"), Some(&serde_json::json!(1)));
+        assert_eq!(by_name("b").get("value"), Some(&serde_json::json!("x")));
+        let child = by_name("c");
+        let child_oid = child.get("childOid").and_then(|v| v.as_str()).unwrap().to_string();
+        // The child handle drills in through the same routing.
+        let child_props = rt.get_properties_in_frame_realm(&child_oid).unwrap();
+        assert_eq!(
+            child_props.as_array().unwrap().iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some("nested")).and_then(|p| p.get("value")),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_object_handles_do_not_cross_worlds_or_frames() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe><iframe id=g></iframe></body></html>");
+        let root_a = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/a", 1);
+        rt.ensure_frame_realm("frame-a", 1, root_a, "http://example.com/a")
+            .unwrap();
+        rt.ensure_isolated_world_realm("frame-a", 1, 7, "utility", root_a, "http://example.com/a")
+            .unwrap();
+        let root_b = setup_frame(&mut rt, "g", FRAME_HTML, "http://example.com/b", 1);
+        rt.ensure_frame_realm("frame-b", 1, root_b, "http://example.com/b")
+            .unwrap();
+
+        // A handle allocated in frame-a's isolated world 7.
+        let iso = rt
+            .evaluate_in_frame_realm_for_cdp("frame-a", 1, 7, "({ v: 1 })", false, false, 1000)
+            .await
+            .unwrap();
+        let iso_oid = iso.object_id.clone().unwrap();
+
+        // Using it in the main world of frame-a is rejected (different world).
+        let cross_world = rt
+            .call_function_on_in_frame_realm(
+                "frame-a",
+                1,
+                super::MAIN_WORLD,
+                "function() { return 1; }",
+                Some(&iso_oid),
+                &[],
+                true,
+                false,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(cross_world.contains("different execution context"), "{cross_world}");
+
+        // Using it as an argument in another frame is rejected too.
+        let cross_frame = rt
+            .call_function_on_in_frame_realm(
+                "frame-b",
+                1,
+                super::MAIN_WORLD,
+                "function(x) { return x; }",
+                None,
+                &[serde_json::json!({ "objectId": iso_oid })],
+                true,
+                false,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(cross_frame.contains("execution context"), "{cross_frame}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroying_generation_invalidates_its_handles_and_worlds() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        rt.ensure_isolated_world_realm("frame-test", 1, 7, "utility", root, "http://example.com/frame")
+            .unwrap();
+
+        let obj = rt
+            .evaluate_in_frame_realm_for_cdp("frame-test", 1, super::MAIN_WORLD, "({ a: 1 })", false, false, 1000)
+            .await
+            .unwrap();
+        let oid = obj.object_id.clone().unwrap();
+        assert!(rt.get_properties_in_frame_realm(&oid).is_ok());
+
+        // Destroying the generation drops every world and every handle.
+        assert!(rt.destroy_frame_realm_generation("frame-test", 1));
+        assert!(rt.frame_realm_world("frame-test", 1, 7).is_none());
+        assert!(rt.frame_realm("frame-test", 1).is_none());
+        let stale = rt.get_properties_in_frame_realm(&oid).unwrap_err();
+        assert!(stale.contains("not a live frame realm handle"), "{stale}");
+
+        // The main context is unaffected.
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+        assert_eq!(
+            rt.evaluate("document.body.tagName").unwrap(),
+            serde_json::json!("BODY")
+        );
+    }
+
+    #[test]
+    fn pages_without_iframes_allocate_no_realms() {
+        let mut rt = setup_runtime("<html><body><p>plain</p></body></html>");
+        assert_eq!(rt.frame_realms.active_count(), 0);
+        assert!(rt.frame_realm_keys().is_empty());
+        assert!(rt.list_frame_realms().is_empty());
+        // Main-context CDP evaluation is unaffected.
+        assert_eq!(rt.evaluate("2 + 3").unwrap(), serde_json::json!(5.0));
     }
 }

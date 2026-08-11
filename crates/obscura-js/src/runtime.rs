@@ -215,6 +215,12 @@ pub struct ObscuraJsRuntime {
     runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
+    /// Routing for RemoteObject handles that live in a frame world realm
+    /// rather than the main context (Phase 6.2): objectId ->
+    /// `(frame_id, generation, world_id)`. Main-context handles are absent
+    /// here (their stash lives on the main global's `__obscura_objects`).
+    /// Empty on pages without iframes.
+    object_realm: HashMap<String, (String, u64, u64)>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
@@ -253,6 +259,23 @@ fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
         .as_millis()
         .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
     Some(millis.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Escape an objectId for embedding inside a single-quoted JS string literal.
+/// Main-context oids are plain JSON with no single quotes, but frame realm
+/// child oids append arbitrary property-key text, so guard the delimiters.
+fn escape_oid(oid: &str) -> String {
+    oid.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// A frame-realm meta read returns the `meta_extract_js` JSON as a string;
+/// parse it back to an object (mirrors the main-context meta handling).
+fn normalize_meta_value(meta: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &meta {
+        serde_json::from_str(s).unwrap_or_else(|_| meta.clone())
+    } else {
+        meta
+    }
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
@@ -399,6 +422,7 @@ impl ObscuraJsRuntime {
             runtime,
             state,
             object_store: HashMap::new(),
+            object_realm: HashMap::new(),
             object_counter: 0,
             import_map,
             module_load_activity,
@@ -1579,6 +1603,19 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
+        // Frame world handle: delete from that realm's stash and drop routing.
+        if let Some(key) = self.object_realm.remove(object_id) {
+            let escaped = escape_oid(object_id);
+            let code = format!("delete globalThis.__obscura_objects['{}'];", escaped);
+            let _ = self.execute_script_in_frame_world_realm(
+                &key.0,
+                key.1,
+                key.2,
+                "<release-realm>",
+                &code,
+            );
+            return;
+        }
         if self.object_store.remove(object_id).is_some() {
             let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
             let _ = self.runtime.execute_script("<release>", code);
@@ -1591,7 +1628,526 @@ impl ObscuraJsRuntime {
             "globalThis.__obscura_objects = {};".to_string(),
         );
         self.object_store.clear();
+        // Reset each frame world's own stash and drop its routing. No-op on
+        // pages without iframes (both maps empty).
+        for (frame_id, generation, world_id) in self.frame_realm_keys() {
+            let _ = self.execute_script_in_frame_world_realm(
+                &frame_id,
+                generation,
+                world_id,
+                "<releaseGroup-realm>",
+                "globalThis.__obscura_objects = {};",
+            );
+        }
+        self.object_realm.clear();
     }
+
+    // ---- Frame world RemoteObject evaluation (Phase 6.2) ----
+    //
+    // These mirror the main-context `*_for_cdp` methods but run in a specific
+    // frame world's `v8::Context`. Each frame realm has its own
+    // `__obscura_objects` stash (installed by the realm init), so the same
+    // handle mechanism works per world. `object_realm` records which world a
+    // returned `objectId` lives in, so later getProperties / callFunctionOn /
+    // releaseObject route to the right context and cross-world handles are
+    // rejected. On pages without iframes nothing here is ever reached.
+
+    /// CDP routing probe (Phase 6.2): which frame world owns `object_id`, if
+    /// any. `None` means the handle is a main-context handle (or unknown), so
+    /// the caller keeps the historical main-context path. Handles carry no
+    /// distinguishing prefix, so this lookup is the discriminator.
+    pub fn object_realm_key(&self, object_id: &str) -> Option<(String, u64, u64)> {
+        self.object_realm.get(object_id).cloned()
+    }
+
+    /// Drop routing for handles owned by a frame's worlds when their realm is
+    /// destroyed (navigation/detach). `generation = None` clears every
+    /// generation of the frame.
+    pub(crate) fn invalidate_object_handles(&mut self, frame_id: &str, generation: Option<u64>) {
+        self.object_realm.retain(|_, (fid, gen, _)| {
+            !(fid == frame_id && generation.map_or(true, |g| *gen == g))
+        });
+    }
+
+    /// `Runtime.evaluate` routed into a frame world realm. Returns the same
+    /// `RemoteObjectInfo` shape as `evaluate_for_cdp_with_timeout`; a returned
+    /// non-primitive carries an `objectId` bound to `(frame_id, generation,
+    /// world_id)`.
+    pub async fn evaluate_in_frame_realm_for_cdp(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
+        // Fail fast (and identically to other realm ops) if the world is gone.
+        let _ = self.frame_world_context(frame_id, generation, world_id)?;
+        self.begin_javascript_task();
+
+        self.object_counter += 1;
+        let oid = self.make_oid(self.object_counter);
+        let escaped_oid = escape_oid(&oid);
+        let done_counter = self.object_counter;
+        let cleaned_expr = expression
+            .trim()
+            .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+
+        if await_promise {
+            let code = format!(
+                "(async function() {{\n\
+                    try {{\n\
+                        var __result = await (\n{expr}\n);\n\
+                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                    }}\n\
+                    globalThis.__obscura_done_{done_counter} = true;\n\
+                }})()",
+                expr = cleaned_expr,
+                oid = escaped_oid,
+                meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
+                done_counter = done_counter,
+            );
+            self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<eval-remote-frame>",
+                &code,
+            )?;
+
+            let fid = frame_id.to_string();
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let settled = self
+                .resolve_promises_until(
+                    |rt| {
+                        rt.execute_script_in_frame_world_realm(
+                            &fid, generation, world_id, "<done?>", &sentinel,
+                        )
+                        .ok()
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
+                    },
+                    await_timeout_ms,
+                )
+                .await;
+            if !settled {
+                return Err(format!(
+                    "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+                ));
+            }
+
+            let rejected = self
+                .execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readRejected>",
+                    "globalThis.__obscura_await_rejected",
+                )?
+                .as_bool()
+                .unwrap_or(false);
+            if rejected {
+                let err = self.execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readError>",
+                    &format!(
+                        "String(globalThis.__obscura_objects['{oid}'] && \
+                         (globalThis.__obscura_objects['{oid}'].message || \
+                          globalThis.__obscura_objects['{oid}']))",
+                        oid = escaped_oid,
+                    ),
+                )?;
+                return Err(format!("Promise rejected: {}", err.as_str().unwrap_or("")));
+            }
+
+            if return_by_value {
+                let read = self.execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readResult>",
+                    &format!("globalThis.__obscura_objects['{}']", escaped_oid),
+                )?;
+                return Ok(Self::info_from_json(&read));
+            }
+            let meta = self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<readMeta>",
+                "globalThis.__obscura_await_meta",
+            )?;
+            let meta_json = normalize_meta_value(meta);
+            self.object_realm
+                .insert(oid.clone(), (frame_id.to_string(), generation, world_id));
+            return Ok(Self::info_from_meta(&meta_json, Some(oid)));
+        }
+
+        if return_by_value {
+            let code = format!(
+                "(function() {{\n\
+                    var __result;\n\
+                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                    return __result;\n\
+                }})()",
+                expr = cleaned_expr,
+            );
+            let val = self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<eval-frame-value>",
+                &code,
+            )?;
+            return Ok(Self::info_from_json(&val));
+        }
+
+        let code = format!(
+            "(function() {{\n\
+                var __result;\n\
+                try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                return {meta_fn};\n\
+            }})()",
+            expr = cleaned_expr,
+            oid = escaped_oid,
+            meta_fn = Self::meta_extract_js("__result"),
+        );
+        let meta = self.execute_script_in_frame_world_realm(
+            frame_id,
+            generation,
+            world_id,
+            "<eval-remote-frame>",
+            &code,
+        )?;
+        let meta_json = normalize_meta_value(meta);
+        self.object_realm
+            .insert(oid.clone(), (frame_id.to_string(), generation, world_id));
+        Ok(Self::info_from_meta(&meta_json, Some(oid)))
+    }
+
+    /// `Runtime.callFunctionOn` routed into a frame world realm. `object_id`
+    /// (the `this` handle) and any `objectId` argument must belong to the same
+    /// world; a handle from another world or the main context is rejected.
+    pub async fn call_function_on_in_frame_realm(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
+        let _ = self.frame_world_context(frame_id, generation, world_id)?;
+        self.begin_javascript_task();
+
+        let key = (frame_id.to_string(), generation, world_id);
+        let this_expr = self.realm_this_expr(object_id, &key)?;
+        let (setup, args_list) = self.realm_build_args(arguments, &key)?;
+
+        self.object_counter += 1;
+        let oid = self.make_oid(self.object_counter);
+        let escaped_oid = escape_oid(&oid);
+        let done_counter = self.object_counter;
+
+        if await_promise {
+            let code = format!(
+                "(async function() {{\n\
+                    {setup}\n\
+                    var __fn = ({fn_decl});\n\
+                    var __this = ({this_expr});\n\
+                    try {{\n\
+                        var __result = await __fn.call(__this, {args});\n\
+                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                    }}\n\
+                    globalThis.__obscura_done_{done_counter} = true;\n\
+                }})()",
+                setup = setup,
+                fn_decl = function_declaration,
+                this_expr = this_expr,
+                args = args_list,
+                oid = escaped_oid,
+                meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
+                done_counter = done_counter,
+            );
+            self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<callFnAsync-frame>",
+                &code,
+            )?;
+
+            let fid = frame_id.to_string();
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let settled = self
+                .resolve_promises_until(
+                    |rt| {
+                        rt.execute_script_in_frame_world_realm(
+                            &fid, generation, world_id, "<done?>", &sentinel,
+                        )
+                        .ok()
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
+                    },
+                    await_timeout_ms,
+                )
+                .await;
+            if !settled {
+                return Err(format!(
+                    "Runtime.callFunctionOn promise did not settle within {await_timeout_ms}ms"
+                ));
+            }
+            let rejected = self
+                .execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readRejected>",
+                    "globalThis.__obscura_await_rejected",
+                )?
+                .as_bool()
+                .unwrap_or(false);
+            if rejected {
+                let err = self.execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readError>",
+                    &format!(
+                        "String(globalThis.__obscura_objects['{oid}'] && \
+                         (globalThis.__obscura_objects['{oid}'].message || \
+                          globalThis.__obscura_objects['{oid}']))",
+                        oid = escaped_oid,
+                    ),
+                )?;
+                return Err(format!("Promise rejected: {}", err.as_str().unwrap_or("")));
+            }
+            if return_by_value {
+                let read = self.execute_script_in_frame_world_realm(
+                    frame_id,
+                    generation,
+                    world_id,
+                    "<readResult>",
+                    &format!("globalThis.__obscura_objects['{}']", escaped_oid),
+                )?;
+                return Ok(Self::info_from_json(&read));
+            }
+            let meta = self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<readMeta>",
+                "globalThis.__obscura_await_meta",
+            )?;
+            let meta_json = normalize_meta_value(meta);
+            self.object_realm.insert(oid.clone(), key);
+            return Ok(Self::info_from_meta(&meta_json, Some(oid)));
+        }
+
+        if return_by_value {
+            let code = format!(
+                "(function() {{\n\
+                    {setup}\n\
+                    var __fn = ({fn_decl});\n\
+                    var __this = ({this_expr});\n\
+                    return __fn.call(__this, {args});\n\
+                }})()",
+                setup = setup,
+                fn_decl = function_declaration,
+                this_expr = this_expr,
+                args = args_list,
+            );
+            let val = self.execute_script_in_frame_world_realm(
+                frame_id,
+                generation,
+                world_id,
+                "<callFnByValue-frame>",
+                &code,
+            )?;
+            return Ok(Self::info_from_json(&val));
+        }
+
+        let code = format!(
+            "(function() {{\n\
+                {setup}\n\
+                var __fn = ({fn_decl});\n\
+                var __this = ({this_expr});\n\
+                var __result = __fn.call(__this, {args});\n\
+                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                return {meta_fn};\n\
+            }})()",
+            setup = setup,
+            fn_decl = function_declaration,
+            this_expr = this_expr,
+            args = args_list,
+            oid = escaped_oid,
+            meta_fn = Self::meta_extract_js("__result"),
+        );
+        let meta = self.execute_script_in_frame_world_realm(
+            frame_id,
+            generation,
+            world_id,
+            "<callFnRemote-frame>",
+            &code,
+        )?;
+        let meta_json = normalize_meta_value(meta);
+        self.object_realm.insert(oid.clone(), key);
+        Ok(Self::info_from_meta(&meta_json, Some(oid)))
+    }
+
+    /// `Runtime.getProperties` routed into a frame world realm. Returns the
+    /// own-enumerable properties of the handle as a JSON array of
+    /// `{ name, type, value | childOid, subtype?, className?, description? }`;
+    /// object-typed children get a fresh `objectId` bound to the same world so
+    /// the caller can drill in. Rejects a handle from another world.
+    pub fn get_properties_in_frame_realm(
+        &mut self,
+        object_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let key = self.object_realm.get(object_id).cloned().ok_or_else(|| {
+            "Runtime.getProperties: objectId is not a live frame realm handle".to_string()
+        })?;
+        let escaped = escape_oid(object_id);
+        let code = format!(
+            "(function() {{\
+                var obj = globalThis.__obscura_objects['{oid}'];\
+                if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return [];\
+                var keys = Object.keys(obj);\
+                return keys.map(function(k) {{\
+                    var v = obj[k];\
+                    var t = typeof v;\
+                    var item = {{ name: k, type: t }};\
+                    if (v === null) {{ item.value = null; return item; }}\
+                    if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
+                    var childOid = '{oid}::' + k;\
+                    globalThis.__obscura_objects[childOid] = v;\
+                    item.childOid = childOid;\
+                    if (typeof v.nodeType === 'number') {{\
+                        item.subtype = 'node';\
+                        item.className = v.constructor && v.constructor.name ? v.constructor.name : (v.tagName ? 'HTML' + v.tagName.charAt(0) + v.tagName.slice(1).toLowerCase() + 'Element' : 'Node');\
+                        item.description = v.tagName ? v.tagName.toLowerCase() : (v.nodeName || 'node');\
+                    }} else if (Array.isArray(v)) {{\
+                        item.subtype = 'array';\
+                        item.className = 'Array';\
+                        item.description = 'Array(' + v.length + ')';\
+                    }} else {{\
+                        item.className = (v.constructor && v.constructor.name) || 'Object';\
+                        item.description = item.className;\
+                    }}\
+                    return item;\
+                }});\
+            }})()",
+            oid = escaped,
+        );
+        let result = self.execute_script_in_frame_world_realm(
+            &key.0,
+            key.1,
+            key.2,
+            "<getProps-frame>",
+            &code,
+        )?;
+        if let serde_json::Value::Array(items) = &result {
+            for item in items {
+                if let Some(child) = item.get("childOid").and_then(|v| v.as_str()) {
+                    self.object_realm.insert(child.to_string(), key.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Resolve the `this` receiver for a frame-realm callFunctionOn: the world
+    /// global, or a same-world handle expression. Cross-world/unknown rejects.
+    fn realm_this_expr(
+        &self,
+        object_id: Option<&str>,
+        key: &(String, u64, u64),
+    ) -> Result<String, String> {
+        match object_id {
+            None => Ok("globalThis".to_string()),
+            Some(oid) => match self.object_realm.get(oid) {
+                Some(owner) if owner == key => {
+                    Ok(format!("globalThis.__obscura_objects['{}']", escape_oid(oid)))
+                }
+                Some(_) => Err(
+                    "Runtime.callFunctionOn: objectId belongs to a different execution context"
+                        .to_string(),
+                ),
+                None => Err(
+                    "Runtime.callFunctionOn: objectId is not a live frame realm handle".to_string(),
+                ),
+            },
+        }
+    }
+
+    /// Build the argument setup/list for a frame-realm callFunctionOn. Mirrors
+    /// [`Self::build_args`] but resolves `objectId` args against the same world
+    /// and rejects cross-world handles.
+    fn realm_build_args(
+        &self,
+        arguments: &[serde_json::Value],
+        key: &(String, u64, u64),
+    ) -> Result<(String, String), String> {
+        let mut setup_lines = Vec::new();
+        let mut arg_names = Vec::new();
+        for (i, arg) in arguments.iter().enumerate() {
+            let arg_name = format!("__arg{}", i);
+            if let Some(value) = arg.get("value") {
+                let json_str =
+                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
+                setup_lines.push(format!("var {} = {};", arg_name, json_str));
+            } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
+                match self.object_realm.get(oid) {
+                    Some(owner) if owner == key => setup_lines.push(format!(
+                        "var {} = globalThis.__obscura_objects['{}'];",
+                        arg_name,
+                        escape_oid(oid),
+                    )),
+                    Some(_) => {
+                        return Err(
+                            "Runtime.callFunctionOn: argument objectId belongs to a different execution context"
+                                .to_string(),
+                        )
+                    }
+                    None => {
+                        return Err(
+                            "Runtime.callFunctionOn: argument objectId is not a live frame realm handle"
+                                .to_string(),
+                        )
+                    }
+                }
+            } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
+                setup_lines.push(format!("var {} = {};", arg_name, unser));
+            } else {
+                setup_lines.push(format!("var {} = undefined;", arg_name));
+            }
+            arg_names.push(arg_name);
+        }
+        Ok((setup_lines.join("\n"), arg_names.join(", ")))
+    }
+
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
         let prepared = self.prepare_module(url, budget_ms).await?;
