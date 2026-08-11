@@ -6538,7 +6538,7 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
 
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let length = stream.read(&mut request).unwrap();
@@ -6561,7 +6561,15 @@ mod tests {
                          <script type=importmap>{\"imports\":{\"dep\":\"/dep.js\"}}</script>\
                          <script type=module>\
                            import { value } from 'dep';\
+                           const lazyName = './lazy.js';\
+                           const lazy = await import('./lazy.js');\
+                           const repeated = await import(lazyName);\
+                           const templated = `${(await import(`./lazy.js`)).value}`;\
                            order.push(value);\
+                           order.push(lazy.value);\
+                           order.push(templated);\
+                           globalThis.dynamicNamespaceReused = lazy === repeated;\
+                           globalThis.dynamicHelperEnumerable = Object.keys(globalThis).some(key => key.startsWith('__obscura_frame_dynamic_import_'));\
                            globalThis.moduleGlobalIsFrame = globalThis === window;\
                            globalThis.moduleCurrentScript = document.currentScript;\
                            document.getElementById('out').textContent = order.join(',');\
@@ -6575,6 +6583,10 @@ mod tests {
                     "/dep.js" => (
                         "application/javascript",
                         "export const value = 'module';",
+                    ),
+                    "/lazy.js" => (
+                        "application/javascript",
+                        "globalThis.lazyRealmIsFrame = globalThis === window; export const value = 'dynamic';",
                     ),
                     _ => ("text/plain", "unexpected"),
                 };
@@ -6605,7 +6617,15 @@ mod tests {
                     "(() => { const w = document.getElementById('f').contentWindow; return [w.document.getElementById('out').textContent, w.moduleGlobalIsFrame, w.moduleCurrentScript]; })()",
                 )
                 .unwrap(),
-            serde_json::json!(["classic,parser-tail,defer,module", true, null]),
+            serde_json::json!(["classic,parser-tail,defer,module,dynamic,dynamic", true, null]),
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("(() => { const w = document.getElementById('f').contentWindow; return [w.lazyRealmIsFrame, w.dynamicNamespaceReused, w.dynamicHelperEnumerable]; })()")
+                .unwrap(),
+            serde_json::json!([true, true, false]),
         );
         assert_eq!(
             page.js.as_mut().unwrap().evaluate("typeof order").unwrap(),

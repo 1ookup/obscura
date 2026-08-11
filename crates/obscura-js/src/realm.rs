@@ -91,6 +91,14 @@ pub(crate) struct FrameModuleMap {
     import_map: ImportMap,
     modules: HashMap<String, v8::Global<v8::Module>>,
     resolutions: HashMap<(i32, String), String>,
+    evaluations: HashMap<String, v8::Global<v8::Promise>>,
+    dynamic_helpers: Vec<Box<FrameDynamicImportHelper>>,
+    next_dynamic_helper: u64,
+}
+
+struct FrameDynamicImportHelper {
+    module_map: *mut FrameModuleMap,
+    referrer_url: String,
 }
 
 impl FrameRealmHost {
@@ -156,6 +164,295 @@ fn decode_frame_module_data_url(url: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn skip_frame_module_trivia(source: &str, mut index: usize) -> usize {
+    let bytes = source.as_bytes();
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len()
+                && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+            {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+        } else {
+            return index;
+        }
+    }
+}
+
+fn frame_hex_escape(bytes: &[u8], index: usize, length: usize) -> Option<u32> {
+    let digits = std::str::from_utf8(bytes.get(index..index + length)?).ok()?;
+    u32::from_str_radix(digits, 16).ok()
+}
+
+fn frame_dynamic_import_literal(source: &str, index: usize) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut index = skip_frame_module_trivia(source, index);
+    let quote = *bytes.get(index)?;
+    if quote != b'\'' && quote != b'"' && quote != b'`' {
+        return None;
+    }
+    index += 1;
+    let mut value = String::new();
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == quote {
+            let tail = skip_frame_module_trivia(source, index + 1);
+            return matches!(bytes.get(tail), Some(b')' | b','))
+                .then_some(value);
+        }
+        if quote == b'`' && byte == b'$' && bytes.get(index + 1) == Some(&b'{') {
+            return None;
+        }
+        if byte == b'\\' {
+            index += 1;
+            let escaped = *bytes.get(index)?;
+            match escaped {
+                b'n' => value.push('\n'),
+                b'r' => value.push('\r'),
+                b't' => value.push('\t'),
+                b'b' => value.push('\u{0008}'),
+                b'f' => value.push('\u{000c}'),
+                b'v' => value.push('\u{000b}'),
+                b'0' if !bytes.get(index + 1).is_some_and(u8::is_ascii_digit) => {
+                    value.push('\0')
+                }
+                b'\n' => {}
+                b'\r' => {
+                    if bytes.get(index + 1) == Some(&b'\n') {
+                        index += 1;
+                    }
+                }
+                b'x' => {
+                    let code = frame_hex_escape(bytes, index + 1, 2)?;
+                    value.push(char::from_u32(code)?);
+                    index += 2;
+                }
+                b'u' if bytes.get(index + 1) == Some(&b'{') => {
+                    let start = index + 2;
+                    let end = bytes.get(start..)?.iter().position(|byte| *byte == b'}')? + start;
+                    if end == start || end - start > 6 {
+                        return None;
+                    }
+                    let code = frame_hex_escape(bytes, start, end - start)?;
+                    value.push(char::from_u32(code)?);
+                    index = end;
+                }
+                b'u' => {
+                    let mut code = frame_hex_escape(bytes, index + 1, 4)?;
+                    index += 4;
+                    if (0xd800..=0xdbff).contains(&code)
+                        && bytes.get(index + 1) == Some(&b'\\')
+                        && bytes.get(index + 2) == Some(&b'u')
+                    {
+                        if let Some(low) = frame_hex_escape(bytes, index + 3, 4)
+                            .filter(|low| (0xdc00..=0xdfff).contains(low))
+                        {
+                            code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                            index += 6;
+                        }
+                    }
+                    value.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+                other => value.push(other as char),
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\n' || byte == b'\r' {
+            return None;
+        }
+        let character = source[index..].chars().next()?;
+        value.push(character);
+        index += character.len_utf8();
+    }
+    None
+}
+
+fn scan_frame_template(
+    source: &str,
+    index: &mut usize,
+    imports: &mut Vec<usize>,
+    literals: &mut Vec<String>,
+) {
+    let bytes = source.as_bytes();
+    *index += 1;
+    while *index < bytes.len() {
+        if bytes[*index] == b'\\' {
+            *index = (*index + 2).min(bytes.len());
+        } else if bytes[*index] == b'`' {
+            *index += 1;
+            return;
+        } else if bytes[*index] == b'$' && bytes.get(*index + 1) == Some(&b'{') {
+            *index += 2;
+            scan_frame_code(source, index, true, imports, literals);
+        } else {
+            *index += source[*index..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+        }
+    }
+}
+
+fn scan_frame_code(
+    source: &str,
+    index: &mut usize,
+    stop_on_closing_brace: bool,
+    imports: &mut Vec<usize>,
+    literals: &mut Vec<String>,
+) {
+    let bytes = source.as_bytes();
+    let mut brace_depth = 0usize;
+    while *index < bytes.len() {
+        match bytes[*index] {
+            b'\'' | b'"' => {
+                let quote = bytes[*index];
+                *index += 1;
+                while *index < bytes.len() {
+                    if bytes[*index] == b'\\' {
+                        *index = (*index + 2).min(bytes.len());
+                    } else if bytes[*index] == quote {
+                        *index += 1;
+                        break;
+                    } else {
+                        *index += source[*index..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(1);
+                    }
+                }
+            }
+            b'`' => scan_frame_template(source, index, imports, literals),
+            b'{' => {
+                brace_depth += 1;
+                *index += 1;
+            }
+            b'}' if stop_on_closing_brace && brace_depth == 0 => {
+                *index += 1;
+                return;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                *index += 1;
+            }
+            b'/' if bytes.get(*index + 1) == Some(&b'/') => {
+                *index += 2;
+                while *index < bytes.len() && bytes[*index] != b'\n' {
+                    *index += 1;
+                }
+            }
+            b'/' if bytes.get(*index + 1) == Some(&b'*') => {
+                *index += 2;
+                while *index + 1 < bytes.len()
+                    && !(bytes[*index] == b'*' && bytes[*index + 1] == b'/')
+                {
+                    *index += 1;
+                }
+                *index = (*index + 2).min(bytes.len());
+            }
+            b'/' if frame_slash_starts_regex(source, *index) => {
+                *index += 1;
+                let mut in_class = false;
+                while *index < bytes.len() {
+                    match bytes[*index] {
+                        b'\\' => *index = (*index + 2).min(bytes.len()),
+                        b'[' => {
+                            in_class = true;
+                            *index += 1;
+                        }
+                        b']' => {
+                            in_class = false;
+                            *index += 1;
+                        }
+                        b'/' if !in_class => {
+                            *index += 1;
+                            while *index < bytes.len() && bytes[*index].is_ascii_alphabetic() {
+                                *index += 1;
+                            }
+                            break;
+                        }
+                        _ => *index += 1,
+                    }
+                }
+            }
+            b'i'
+                if source[*index..].starts_with("import")
+                    && (*index == 0
+                        || !bytes[*index - 1].is_ascii_alphanumeric()
+                            && bytes[*index - 1] != b'_'
+                            && bytes[*index - 1] != b'$') =>
+            {
+                let after = *index + "import".len();
+                let open = skip_frame_module_trivia(source, after);
+                if bytes.get(open) == Some(&b'(') {
+                    imports.push(*index);
+                    if let Some(raw) = frame_dynamic_import_literal(source, open + 1) {
+                        literals.push(raw);
+                    }
+                }
+                *index = after;
+            }
+            _ => {
+                *index += source[*index..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+            }
+        }
+    }
+}
+
+/// Route `import()` calls away from deno_core's main-realm module map. The
+/// lexer visits template substitutions but leaves template text, strings,
+/// comments and regular expressions untouched. Literal requests are prepared
+/// with the surrounding frame graph; computed requests can reuse any module
+/// already present in that graph and otherwise reject without crossing realms.
+fn rewrite_frame_dynamic_imports(
+    source: &str,
+    helper_name: &str,
+) -> (String, Vec<String>) {
+    let mut imports = Vec::new();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    scan_frame_code(source, &mut index, false, &mut imports, &mut literals);
+    let mut rewritten = String::with_capacity(source.len() + imports.len() * helper_name.len());
+    let mut copy_from = 0;
+    for index in imports {
+        rewritten.push_str(&source[copy_from..index]);
+        rewritten.push_str(helper_name);
+        copy_from = index + "import".len();
+    }
+    rewritten.push_str(&source[copy_from..]);
+    (rewritten, literals)
+}
+
+fn frame_slash_starts_regex(source: &str, slash: usize) -> bool {
+    let before = source[..slash].trim_end();
+    let Some(last) = before.as_bytes().last().copied() else {
+        return true;
+    };
+    if b"([{=:;,!?&|+-*%^~<>".contains(&last) {
+        return true;
+    }
+    before
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .next_back()
+        .is_some_and(|word| matches!(word, "return" | "throw" | "case" | "delete" | "void" | "typeof" | "yield" | "await"))
+}
+
 fn frame_module_resolve_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -180,6 +477,147 @@ fn frame_module_resolve_callback<'s>(
         .map(|module| v8::Local::new(scope, module))
 }
 
+fn reject_frame_dynamic_import<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    message: &str,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let message = v8::String::new(scope, message)?;
+    let error = v8::Exception::type_error(scope, message);
+    resolver.reject(scope, error);
+    Some(resolver.get_promise(scope))
+}
+
+fn frame_dynamic_import_namespace(
+    _scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(args.data());
+}
+
+fn frame_dynamic_import_rethrow(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    scope.throw_exception(args.get(0));
+}
+
+fn frame_dynamic_import_evaluation<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    evaluation: v8::Local<'s, v8::Promise>,
+    namespace: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let on_fulfilled = v8::Function::builder(frame_dynamic_import_namespace)
+        .data(namespace)
+        .build(scope)?;
+    let on_rejected = v8::Function::new(scope, frame_dynamic_import_rethrow)?;
+    evaluation.then2(scope, on_fulfilled, on_rejected)
+}
+
+fn frame_dynamic_import_helper(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(external) = v8::Local::<v8::External>::try_from(args.data()).ok() else {
+        return;
+    };
+    let helper = unsafe { &*(external.value() as *const FrameDynamicImportHelper) };
+    let raw = args.get(0).to_rust_string_lossy(scope);
+    let Ok(referrer) = deno_core::ModuleSpecifier::parse(&helper.referrer_url) else {
+        if let Some(promise) = reject_frame_dynamic_import(scope, "Invalid frame module referrer") {
+            rv.set(promise.into());
+        }
+        return;
+    };
+    let map = unsafe { &mut *helper.module_map };
+    let Ok(resolved) = map.import_map.resolve(&raw, &referrer) else {
+        if let Some(promise) = reject_frame_dynamic_import(
+            scope,
+            &format!("Failed to resolve frame dynamic import {raw}"),
+        ) {
+            rv.set(promise.into());
+        }
+        return;
+    };
+    let module_key = resolved.to_string();
+    let Some(module) = map.modules.get(&module_key).cloned() else {
+        if let Some(promise) = reject_frame_dynamic_import(
+            scope,
+            &format!("Frame dynamic module was not prepared: {module_key}"),
+        ) {
+            rv.set(promise.into());
+        }
+        return;
+    };
+    let module = v8::Local::new(scope, &module);
+    if module.get_status() == v8::ModuleStatus::Uninstantiated {
+        scope.set_slot(map as *const FrameModuleMap);
+        let instantiated = module.instantiate_module(scope, frame_module_resolve_callback);
+        scope.remove_slot::<*const FrameModuleMap>();
+        if instantiated != Some(true) {
+            if let Some(promise) = reject_frame_dynamic_import(
+                scope,
+                &format!("Failed to instantiate frame dynamic module {module_key}"),
+            ) {
+                rv.set(promise.into());
+            }
+            return;
+        }
+    }
+    if module.get_status() == v8::ModuleStatus::Errored {
+        if let Some(resolver) = v8::PromiseResolver::new(scope) {
+            resolver.reject(scope, module.get_exception());
+            rv.set(resolver.get_promise(scope).into());
+        }
+        return;
+    }
+    let namespace = v8::Global::new(scope, module.get_module_namespace());
+    let namespace = v8::Local::new(scope, &namespace);
+    if let Some(evaluation) = map.evaluations.get(&module_key) {
+        let evaluation = v8::Local::new(scope, evaluation);
+        if let Some(promise) = frame_dynamic_import_evaluation(scope, evaluation, namespace) {
+            rv.set(promise.into());
+        }
+        return;
+    }
+    if module.get_status() == v8::ModuleStatus::Evaluated {
+        if let Some(resolver) = v8::PromiseResolver::new(scope) {
+            resolver.resolve(scope, namespace);
+            rv.set(resolver.get_promise(scope).into());
+        }
+        return;
+    }
+    if module.get_status() != v8::ModuleStatus::Instantiated {
+        if let Some(promise) = reject_frame_dynamic_import(
+            scope,
+            &format!("Frame dynamic module is already evaluating: {module_key}"),
+        ) {
+            rv.set(promise.into());
+        }
+        return;
+    }
+    let Some(value) = module.evaluate(scope) else {
+        if let Some(promise) = reject_frame_dynamic_import(
+            scope,
+            &format!("Failed to evaluate frame dynamic module {module_key}"),
+        ) {
+            rv.set(promise.into());
+        }
+        return;
+    };
+    let Ok(evaluation) = v8::Local::<v8::Promise>::try_from(value) else {
+        return;
+    };
+    map.evaluations
+        .insert(module_key, v8::Global::new(scope, evaluation));
+    if let Some(promise) = frame_dynamic_import_evaluation(scope, evaluation, namespace) {
+        rv.set(promise.into());
+    }
+}
+
 impl ObscuraJsRuntime {
     /// Create a fresh context in this runtime's isolate and inject the main
     /// context's `Deno` binding object so ops are callable from realm script.
@@ -187,7 +625,7 @@ impl ObscuraJsRuntime {
         let main_context = self.deno_runtime_mut().main_context();
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let main_context = v8::Local::new(scope, &main_context);
-        let (deno_key, deno_val, token) = {
+        let (deno_key, deno_val, token, context_state, module_map) = {
             let scope = &mut v8::ContextScope::new(scope, main_context);
             let main_global = main_context.global(scope);
             let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
@@ -196,10 +634,18 @@ impl ObscuraJsRuntime {
                 .filter(|v| v.is_object())
                 .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
             let token = main_context.get_security_token(scope);
+            let context_state = main_context.get_aligned_pointer_from_embedder_data(
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+            );
+            let module_map = main_context.get_aligned_pointer_from_embedder_data(
+                deno_core::MODULE_MAP_SLOT_INDEX,
+            );
             (
                 v8::Global::new(scope, deno_key),
                 v8::Global::new(scope, deno_val),
                 v8::Global::new(scope, token),
+                context_state,
+                module_map,
             )
         };
 
@@ -211,6 +657,21 @@ impl ObscuraJsRuntime {
         // WindowProxy layer (bootstrap.js), not in V8 tokens.
         let token = v8::Local::new(scope, &token);
         context.set_security_token(token);
+        // deno_core's isolate-wide dynamic-import hook unconditionally reads
+        // these slots. Frame modules normally route import() through their own
+        // helper below, but sharing the live main pointers makes an unhandled
+        // syntax edge reject or fall back safely instead of dereferencing null
+        // and crashing the worker process.
+        unsafe {
+            context.set_aligned_pointer_in_embedder_data(
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+                context_state,
+            );
+            context.set_aligned_pointer_in_embedder_data(
+                deno_core::MODULE_MAP_SLOT_INDEX,
+                module_map,
+            );
+        }
         {
             let scope = &mut v8::ContextScope::new(scope, context);
             let global = context.global(scope);
@@ -476,11 +937,14 @@ impl ObscuraJsRuntime {
     ) -> Result<(), String> {
         let context = self.frame_world_context(frame_id, generation, MAIN_WORLD)?;
         let map_key = (frame_id.to_string(), generation);
-        let mut module_map = self.frame_module_maps.remove(&map_key).unwrap_or_default();
+        let mut module_map = self
+            .frame_module_maps
+            .remove(&map_key)
+            .unwrap_or_else(|| Box::new(FrameModuleMap::default()));
         let result = self
             .prepare_frame_module_graph(
                 &context,
-                &mut module_map,
+                module_map.as_mut(),
                 root_key,
                 module_url,
                 inline_source,
@@ -534,7 +998,7 @@ impl ObscuraJsRuntime {
                 }
             };
 
-            let (identity, requests) = self.compile_frame_module_source(
+            let (identity, requests, dynamic_requests) = self.compile_frame_module_source(
                 context,
                 module_map,
                 &module_key,
@@ -549,6 +1013,18 @@ impl ObscuraJsRuntime {
                 module_map
                     .resolutions
                     .insert((identity, raw), resolved_key.clone());
+                if !module_map.modules.contains_key(&resolved_key) {
+                    pending.push_back((
+                        resolved_key.clone(),
+                        resolved_key,
+                        None,
+                        final_url.clone(),
+                    ));
+                }
+            }
+            for raw in dynamic_requests {
+                let resolved = module_map.import_map.resolve(&raw, &referrer)?;
+                let resolved_key = resolved.to_string();
                 if !module_map.modules.contains_key(&resolved_key) {
                     pending.push_back((
                         resolved_key.clone(),
@@ -576,9 +1052,12 @@ impl ObscuraJsRuntime {
     ) -> Result<(), String> {
         let context = self.frame_world_context(frame_id, generation, MAIN_WORLD)?;
         let map_key = (frame_id.to_string(), generation);
-        let mut module_map = self.frame_module_maps.remove(&map_key).unwrap_or_default();
+        let mut module_map = self
+            .frame_module_maps
+            .remove(&map_key)
+            .unwrap_or_else(|| Box::new(FrameModuleMap::default()));
         let result = self
-            .evaluate_frame_module(&context, &mut module_map, root_key, budget_ms)
+            .evaluate_frame_module(&context, module_map.as_mut(), root_key, budget_ms)
             .await;
         self.frame_module_maps.insert(map_key, module_map);
         result
@@ -598,7 +1077,9 @@ impl ObscuraJsRuntime {
             .get(root_key)
             .ok_or_else(|| "Frame root module was not compiled".to_string())?
             .clone();
-        let promise = {
+        let promise = if let Some(promise) = module_map.evaluations.get(root_key) {
+            promise.clone()
+        } else {
             let scope = &mut self.deno_runtime_mut().handle_scope();
             let context = v8::Local::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -621,7 +1102,11 @@ impl ObscuraJsRuntime {
             })?;
             let promise = v8::Local::<v8::Promise>::try_from(value)
                 .map_err(|_| "Frame module evaluation did not return a Promise".to_string())?;
-            v8::Global::new(scope, promise)
+            let promise = v8::Global::new(scope, promise);
+            module_map
+                .evaluations
+                .insert(root_key.to_string(), promise.clone());
+            promise
         };
 
         let completed = self
@@ -699,11 +1184,18 @@ impl ObscuraJsRuntime {
         module_key: &str,
         module_url: &str,
         source: &str,
-    ) -> Result<(i32, Vec<String>), String> {
+    ) -> Result<(i32, Vec<String>, Vec<String>), String> {
+        let helper_name = format!(
+            "__obscura_frame_dynamic_import_{}",
+            module_map.next_dynamic_helper,
+        );
+        module_map.next_dynamic_helper = module_map.next_dynamic_helper.wrapping_add(1);
+        let (source, dynamic_requests) =
+            rewrite_frame_dynamic_imports(source, &helper_name);
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let context = v8::Local::new(scope, context);
         let scope = &mut v8::ContextScope::new(scope, context);
-        let source = v8::String::new(scope, source)
+        let source = v8::String::new(scope, &source)
             .ok_or_else(|| alloc_err("module source"))?;
         let name = v8::String::new(scope, module_url)
             .ok_or_else(|| alloc_err("module URL"))?;
@@ -742,7 +1234,27 @@ impl ObscuraJsRuntime {
         module_map
             .modules
             .insert(module_key.to_string(), v8::Global::new(scope, module));
-        Ok((identity, imports))
+        let helper = Box::new(FrameDynamicImportHelper {
+            module_map: module_map as *mut FrameModuleMap,
+            referrer_url: module_url.to_string(),
+        });
+        let helper_ptr = (&*helper) as *const FrameDynamicImportHelper as *mut std::ffi::c_void;
+        let data = v8::External::new(scope, helper_ptr);
+        let function = v8::Function::builder(frame_dynamic_import_helper)
+            .data(data.into())
+            .build(scope)
+            .ok_or_else(|| alloc_err("frame dynamic import helper"))?;
+        let global = scope.get_current_context().global(scope);
+        let name = v8::String::new(scope, &helper_name)
+            .ok_or_else(|| alloc_err("frame dynamic import helper name"))?;
+        let attributes = v8::PropertyAttribute::READ_ONLY
+            | v8::PropertyAttribute::DONT_ENUM
+            | v8::PropertyAttribute::DONT_DELETE;
+        if global.define_own_property(scope, name.into(), function.into(), attributes) != Some(true) {
+            return Err("Failed to install frame dynamic import helper".to_string());
+        }
+        module_map.dynamic_helpers.push(helper);
+        Ok((identity, imports, dynamic_requests))
     }
 
     fn frame_module_promise_state(
@@ -1045,6 +1557,7 @@ fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String
 
 #[cfg(test)]
 mod tests {
+    use super::rewrite_frame_dynamic_imports;
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -1056,6 +1569,34 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn frame_dynamic_import_rewrite_ignores_text_comments_and_regexes() {
+        let source = r#"
+            const literal = import('./literal.js');
+            const escaped = import /* gap */ ('./\u0065scaped.js');
+            const noSubstitution = import(`./template.js`);
+            const computed = import(name);
+            const text = "import('./text.js')";
+            // import('./comment.js')
+            const pattern = /import\(['"]ignored/;
+            const template = `text ${import('./nested.js').then(use)}`;
+        "#;
+        let (rewritten, literals) =
+            rewrite_frame_dynamic_imports(source, "__frame_import");
+        assert_eq!(
+            literals,
+            vec!["./literal.js", "./escaped.js", "./template.js", "./nested.js"]
+        );
+        assert!(rewritten.contains("__frame_import('./literal.js')"));
+        assert!(rewritten.contains("__frame_import /* gap */ ('./\\u0065scaped.js')"));
+        assert!(rewritten.contains("__frame_import(`./template.js`)"));
+        assert!(rewritten.contains("__frame_import(name)"));
+        assert!(rewritten.contains("\"import('./text.js')\""));
+        assert!(rewritten.contains("// import('./comment.js')"));
+        assert!(rewritten.contains("/import\\(['\"]ignored/"));
+        assert!(rewritten.contains("`text ${__frame_import('./nested.js').then(use)}`"));
     }
 
     #[test]
