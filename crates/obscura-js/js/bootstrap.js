@@ -5990,6 +5990,40 @@ function _frameSameOrigin(rootNid) {
   return _dom("iframe_scope_same_origin", rootNid) === "true";
 }
 
+// Cross-document postMessage (Phase 4). Structured cloning reuses the Worker
+// JSON envelope (_workerSerializeMessage, a hoisted top-level declaration);
+// transfer lists are not supported yet (TODO). The typed-origin targetOrigin
+// comparison runs in Rust (op_post_to_frame / op_post_to_parent) and a
+// mismatch drops silently per spec; this helper only normalizes the author
+// value: WindowPostMessageOptions default "/", and a SyntaxError for a string
+// that is neither "*" nor "/" nor a parseable absolute URL.
+function _normalizeTargetOrigin(targetOrigin) {
+  if (targetOrigin === undefined || targetOrigin === null) return "/";
+  if (typeof targetOrigin === "object") return _normalizeTargetOrigin(targetOrigin.targetOrigin);
+  const t = String(targetOrigin);
+  if (t === "*" || t === "/") return t;
+  // Spec: parse as a URL with no base; failure throws SyntaxError. The
+  // bootstrap URL shim resolves relative inputs against the document, so an
+  // explicit absolute-scheme test replaces the constructor probe here.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(t)) {
+    throw new DOMException(
+      "Failed to execute 'postMessage' on 'Window': Invalid target origin '"
+        + t + "' in a call to 'postMessage'.",
+      "SyntaxError");
+  }
+  return t;
+}
+
+// The calling realm's own content root, 0 in the main Window realm. Frame
+// realms get the flag injected by the Rust realm host before bootstrap runs.
+// In this shared-isolate model the flag is the realm's identity claim toward
+// the postMessage ops (design doc, Constraints) — an honesty boundary, not a
+// security proof.
+function _callingFrameRoot() {
+  const nid = globalThis.__obscura_frame_document_nid;
+  return (typeof nid === "number" && nid > 0) ? nid : 0;
+}
+
 function _scopedDocumentFor(rootNid) {
   let doc = _scopedDocs.get(rootNid);
   if (!doc) {
@@ -6154,9 +6188,14 @@ function _frameWindowProxyFor(hostEl) {
     },
     get closed() { return false; },
     get opener() { return null; },
-    // Cross-document messaging is Phase 4; the function must exist so
-    // feature detection and fire-and-forget senders do not throw.
-    postMessage() {},
+    // Cross-document messaging (Phase 4): enqueue through the realm-aware
+    // Rust queue. Works from the main realm and from a frame realm holding a
+    // nested frame's proxy; the sender identifies its own realm.
+    postMessage(message, targetOrigin) {
+      const to = _normalizeTargetOrigin(targetOrigin);
+      const payload = _workerSerializeMessage(message);
+      try { Deno.core.ops.op_post_to_frame(hostNid, payload, to, _callingFrameRoot()); } catch (e) {}
+    },
     blur() {},
     focus() {},
     close() {},
@@ -6182,6 +6221,143 @@ function _frameWindowProxyFor(hostEl) {
   });
   _frameWindowProxies.set(hostNid, proxy);
   return proxy;
+}
+// The Rust-built frame-message delivery script and the main realm's recv
+// loop resolve these by name from separate scripts; export them explicitly
+// (snapshot-context scripts do not expose top-level declarations by name).
+globalThis._wrapEl = _wrapEl;
+globalThis._frameWindowProxyFor = _frameWindowProxyFor;
+
+// Main-realm delivery pump for cross-document messages (Phase 4). Mirrors
+// Worker._recvLoop: an unref'd async op parks until a frame posts toward the
+// main Window, so an idle page still settles while delivery happens whenever
+// the embedder pumps the event loop. Started lazily by the Rust pump paths
+// (ObscuraJsRuntime::ensure_frame_message_pump) the first time a main-realm
+// message is queued — an async op can only be spawned inside a live tokio
+// context, and messages queue in Rust until the loop's first scan, so the
+// late start loses nothing. Frame realms receive through the Rust-side drain
+// (ObscuraJsRuntime::drain_frame_messages) instead.
+let _frameMessageLoopStarted = false;
+async function _frameMessageRecvLoop() {
+  if (_frameMessageLoopStarted) return;
+  _frameMessageLoopStarted = true;
+  while (true) {
+    let batchJson;
+    try {
+      const pending = Deno.core.ops.op_frame_message_recv();
+      // The op completes eagerly when messages are already queued; unref of
+      // an already-settled op promise must not tear the loop down.
+      try { Deno.core.unrefOpPromise(pending); } catch (e) {}
+      batchJson = await pending;
+    } catch (e) { break; }
+    if (!batchJson) break;
+    let entries = [];
+    try { entries = JSON.parse(batchJson); } catch (e) { continue; }
+    for (const entry of entries) {
+      if (!entry) continue;
+      let data;
+      try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
+      // The sender is a frame document; its WindowProxy in this realm comes
+      // from the host element, so e.source === host.contentWindow holds.
+      let source = null;
+      if (typeof entry.sourceHost === "number" && entry.sourceHost > 0) {
+        try {
+          const hostEl = _wrapEl(entry.sourceHost);
+          if (hostEl) source = _frameWindowProxyFor(hostEl);
+        } catch (e) {}
+      }
+      const evt = new MessageEvent("message", { data, origin: entry.origin || "", source });
+      try { globalThis.dispatchEvent(evt); } catch (e) {}
+      if (typeof globalThis.onmessage === "function") {
+        try { globalThis.onmessage.call(globalThis, evt); } catch (e) {}
+      }
+    }
+  }
+}
+// Rust starts the pump by name (ensure_frame_message_pump). Top-level
+// declarations in the snapshot-built main context are not reachable from
+// later scripts, so export explicitly — same reason as `globalThis._wrap`.
+globalThis._frameMessageRecvLoop = _frameMessageRecvLoop;
+
+// Frame-realm `parent` / `top` references (Phase 4; the frame side of Phase
+// 2.5). Each is a window reference backed by ops: postMessage routes through
+// op_post_to_parent, a same-origin ancestor exposes its document, and
+// cross-origin access is limited to the HTML cross-origin Window allowlist —
+// the same policy _frameWindowProxyFor enforces in the other direction. A
+// nested frame's `parent` addresses its direct parent document's realm and
+// `top` always addresses the main Window; an ancestor ref's own `parent`
+// collapses to `top` until full multi-level chains land (TODO).
+function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) {
+  const sameOrigin = () =>
+    _dom("iframe_scopes_same_origin", selfRoot, targetRoot) === "true";
+  const securityError = () => new DOMException(
+    'Blocked a frame with origin "'
+      + (globalThis.location ? globalThis.location.origin : "null")
+      + '" from accessing a cross-origin frame.',
+    "SecurityError");
+  // Reads require same-origin; writes/assign/replace stay stubs until parent
+  // navigation from a child routes through Rust (Phase 3.5 follow-on).
+  const ancestorLocation = {
+    get href() {
+      if (!sameOrigin()) throw securityError();
+      if (targetRoot > 0) {
+        const info = _domParse("document_scope_info", targetRoot);
+        return (info && info.url) || "about:blank";
+      }
+      return _domParse("document_url") || "about:blank";
+    },
+    set href(v) {},
+    assign() {},
+    replace() {},
+    reload() {},
+    toString() { return this.href; },
+  };
+  const target = {
+    postMessage(message, targetOrigin) {
+      const to = _normalizeTargetOrigin(targetOrigin);
+      const payload = _workerSerializeMessage(message);
+      try { Deno.core.ops.op_post_to_parent(_callingFrameRoot() || selfRoot, payload, to, !!toTop); } catch (e) {}
+    },
+    get document() {
+      if (!sameOrigin()) throw securityError();
+      if (targetRoot > 0) return _scopedDocumentFor(targetRoot);
+      // Realm-local wrapper for the main document.
+      const nid = +_dom("document_node_id");
+      let doc = _cache.get(nid);
+      if (!doc) { doc = new Document(nid); _cache.set(nid, doc); }
+      return doc;
+    },
+    get location() { return ancestorLocation; },
+    set location(v) { /* cross-origin navigation write; wiring is Phase 3.5 */ },
+    get top() { return globalThis.top; },
+    get parent() { return globalThis.top; },
+    get length() {
+      const root = targetRoot > 0 ? targetRoot : +_dom("document_node_id");
+      return (_domParse("query_selector_all_scoped", root, "iframe") || []).length;
+    },
+    get closed() { return false; },
+    get opener() { return null; },
+    blur() {},
+    focus() {},
+    close() {},
+  };
+  Object.defineProperty(target, "self", { get: () => ref, configurable: true });
+  Object.defineProperty(target, "window", { get: () => ref, configurable: true });
+  Object.defineProperty(target, "frames", { get: () => ref, configurable: true });
+  const ref = new Proxy(target, {
+    get(t, key) {
+      if (Reflect.has(t, key)) return Reflect.get(t, key);
+      if (typeof key === "string" && !sameOrigin()) throw securityError();
+      return undefined;
+    },
+    set(t, key, value) {
+      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
+        throw securityError();
+      }
+      return Reflect.set(t, key, value);
+    },
+  });
+  return ref;
 }
 
 globalThis.self = globalThis;
@@ -12691,112 +12867,170 @@ navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not a
 
 globalThis.opener = null;
 
+// Dedicated Worker (design doc Phase 3.11): each worker owns a persistent,
+// separate JsRuntime/isolate hosted by src/worker.rs. The worker source runs
+// exactly once in that runtime; messages dispatch events into its retained
+// global scope, and terminate() kills only the worker isolate. Messaging uses
+// the JSON-clonable subset of structured clone (a {"v": data} envelope, so an
+// undefined payload round-trips as an absent property).
+// TODO(phase 3.11 follow-up): full structured clone, transfer lists, module
+// workers (options.type === 'module' currently runs as a classic script),
+// worker-src CSP, options.name/credentials, http(s) importScripts.
+function _workerScriptFromDataUrl(url) {
+  const comma = url.indexOf(',');
+  if (comma < 0) throw new DOMException("Failed to construct 'Worker': invalid data: URL", 'SyntaxError');
+  const meta = url.slice(5, comma);
+  const payload = url.slice(comma + 1);
+  if (/;base64$/i.test(meta)) return atob(payload);
+  try { return decodeURIComponent(payload); } catch (e) { return payload; }
+}
+
+function _workerSerializeMessage(data) {
+  if (typeof data === 'function' || typeof data === 'symbol') {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  let payload;
+  try { payload = JSON.stringify({ v: data }); }
+  catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+  return payload === undefined ? '{}' : payload;
+}
+
 globalThis.Worker = class Worker {
-  constructor(url) {
+  constructor(url, options) {
     this.onmessage = null;
     this.onerror = null;
-    this._terminated = false;
     this._listeners = {};
+    this._terminated = false;
+    this._id = null;
+    this._pending = [];
     const worker = this;
-
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
-      if (blob) {
-        worker._code = blob;
-        // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
-        return;
+    const href = String(url);
+    // Resolve against the creator document's base. Frame realms re-run
+    // bootstrap, so `location` here is the creator frame's own.
+    let resolved = href;
+    try { resolved = new URL(href, globalThis.location?.href || 'about:blank').href; }
+    catch (e) {
+      throw new DOMException("Failed to construct 'Worker': '" + href + "' is not a valid URL.", 'SyntaxError');
+    }
+    const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
+    if (typeof blobSource === 'string') { this._spawn(blobSource, resolved); return; }
+    if (resolved.startsWith('data:')) { this._spawn(_workerScriptFromDataUrl(resolved), resolved); return; }
+    if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
+      // HTML "fetch a classic worker script" uses request mode "same-origin":
+      // a cross-origin classic worker constructor throws SecurityError.
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(resolved).origin
+          === new URL(globalThis.location?.href || 'about:blank').origin;
+      } catch (e) {}
+      if (!sameOrigin) {
+        throw new DOMException(
+          "Failed to construct 'Worker': script at '" + resolved + "' cannot be accessed from origin '"
+            + (globalThis.location?.origin ?? 'null') + "'.",
+          'SecurityError');
       }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
+      // Fetch the source through the page's fetch (interception and SSRF
+      // gates included) without blocking the main thread. Messages posted
+      // while the fetch is in flight queue in _pending and flush after spawn.
       (async () => {
         try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
+          const resp = await fetch(resolved);
+          if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 0));
+          const source = await resp.text();
+          if (!worker._terminated) worker._spawn(source, resp.url || resolved);
+        } catch (e) { worker._dispatchError(e && e.message ? e.message : String(e)); }
       })();
+      return;
     }
+    throw new DOMException("Failed to construct 'Worker': unsupported script URL scheme.", 'SecurityError');
   }
-  _makeScope() {
-    const worker = this;
-    // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
-    const scope = {
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
-      postMessage: (msg) => {
-        if (worker._terminated) return;
-        const evt = { data: msg };
-        if (worker.onmessage) worker.onmessage(evt);
-        const ls = worker._listeners['message'] || [];
-        for (const h of ls) h(evt);
-      },
-      addEventListener: (type, fn) => {
-        if (!scope._ev) scope._ev = {};
-        if (!scope._ev[type]) scope._ev[type] = [];
-        scope._ev[type].push(fn);
-      },
-      close: () => { worker._terminated = true; },
-      crypto: globalThis.crypto,
-      Crypto: globalThis.Crypto,
-      TextEncoder: globalThis.TextEncoder,
-      TextDecoder: globalThis.TextDecoder,
-      atob: globalThis.atob,
-      btoa: globalThis.btoa,
-      setTimeout: globalThis.setTimeout,
-      setInterval: globalThis.setInterval,
-      clearTimeout: globalThis.clearTimeout,
-      clearInterval: globalThis.clearInterval,
-      scheduler: globalThis.scheduler,
-      Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
-      console: globalThis.console,
-      performance: globalThis.performance,
-      location: globalThis.location,
-    };
-    scope.self = scope;
-    return scope;
-  }
-  _autoRun() {
-    if (this._terminated || !this._code) return;
-    const worker = this;
-    const scope = worker._makeScope();
-    try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
-    } catch(e) {
-      console.error('Worker error:', e.message);
-      if (worker.onerror) worker.onerror(e);
-    }
-  }
-  postMessage(data) {
+  _spawn(source, finalUrl) {
     if (this._terminated) return;
+    let id;
+    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), 'classic'); }
+    catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
+    this._id = id;
+    const queued = this._pending;
+    this._pending = [];
+    for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
+    this._recvLoop();
+  }
+  async _recvLoop() {
     const worker = this;
-    setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
+    while (!worker._terminated && worker._id !== null) {
+      let batchJson;
       try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
-        const evs = (scope._ev && scope._ev['message']) || [];
-        if (evs.length) { for (const h of evs) h({ data }); }
-        else if (scope.onmessage) scope.onmessage({ data });
-      } catch(e) {
-        console.error('Worker error:', e.message);
-        if (worker.onerror) worker.onerror(e);
+        const pending = Deno.core.ops.op_worker_recv(worker._id);
+        // Unref: an idle page with live workers must still settle. Delivery
+        // happens whenever the embedder pumps the event loop.
+        Deno.core.unrefOpPromise(pending);
+        batchJson = await pending;
+      } catch (e) { break; }
+      if (!batchJson) break; // worker terminated or its thread exited
+      let entries = [];
+      try { entries = JSON.parse(batchJson); } catch (e) { continue; }
+      for (const entry of entries) {
+        if (worker._terminated) return;
+        if (!entry) continue;
+        if (entry.kind === 'error') { worker._dispatchError(entry.message || 'Worker error'); continue; }
+        let data;
+        try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
+        const evt = new MessageEvent('message', { data });
+        if (typeof worker.onmessage === 'function') {
+          try { worker.onmessage(evt); } catch (e) { console.error('Worker onmessage error:', e); }
+        }
+        for (const handler of (worker._listeners['message'] || []).slice()) {
+          try { handler.call(worker, evt); } catch (e) { console.error('Worker message listener error:', e); }
+        }
+      }
+    }
+  }
+  _dispatchError(message) {
+    const worker = this;
+    // Deliver asynchronously so `new Worker(...)` callers can attach onerror.
+    setTimeout(() => {
+      if (worker._terminated) return;
+      const evt = { type: 'error', message: String(message), target: worker };
+      const handlers = (worker._listeners['error'] || []).slice();
+      if (typeof worker.onerror === 'function') {
+        try { worker.onerror(evt); } catch (e) {}
+      } else if (!handlers.length) {
+        console.error('Worker error:', String(message));
+      }
+      for (const handler of handlers) {
+        try { handler.call(worker, evt); } catch (e) {}
       }
     }, 0);
   }
-  terminate() { this._terminated = true; }
+  postMessage(data) {
+    if (this._terminated) return;
+    const payload = _workerSerializeMessage(data);
+    if (this._id === null) { this._pending.push(payload); return; }
+    Deno.core.ops.op_worker_post_message(this._id, payload);
+  }
+  terminate() {
+    if (this._terminated) return;
+    this._terminated = true;
+    this._pending.length = 0;
+    if (this._id !== null) {
+      try { Deno.core.ops.op_worker_terminate(this._id); } catch (e) {}
+    }
+  }
   addEventListener(type, fn) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(fn);
+    if (typeof fn !== 'function') return;
+    const ls = this._listeners[type] || (this._listeners[type] = []);
+    if (ls.indexOf(fn) < 0) ls.push(fn);
   }
   removeEventListener(type, fn) {
-    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+    const ls = this._listeners[type];
+    if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); }
+  }
+  dispatchEvent(evt) {
+    const handlers = (this._listeners[(evt && evt.type) || ''] || []).slice();
+    for (const handler of handlers) {
+      try { handler.call(this, evt); } catch (e) {}
+    }
+    return true;
   }
 };
 
@@ -14304,6 +14538,24 @@ globalThis.__obscura_init = function() {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root.
     globalThis.document = _scopedDocumentFor(frameRootNid);
+    // Ancestor window wiring (Phase 4): `parent` addresses the direct parent
+    // document's realm, `top` the main Window; frameElement follows the
+    // same-origin-with-parent rule (a cross-origin container reads null).
+    const container = _domParse("frame_container_info", frameRootNid) || {};
+    const parentRoot =
+      typeof container.parentRoot === "number" && container.parentRoot > 0
+        ? container.parentRoot : 0;
+    const topRef = _ancestorWindowRef(frameRootNid, 0, true);
+    globalThis.top = topRef;
+    globalThis.parent =
+      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef;
+    globalThis.frameElement = null;
+    try {
+      if (typeof container.host === "number" && container.host > 0
+          && _dom("iframe_scopes_same_origin", frameRootNid, parentRoot) === "true") {
+        globalThis.frameElement = _wrapEl(container.host);
+      }
+    } catch (e) {}
   } else {
     globalThis.document = new Document(documentNid);
     // parentNode on <html> reaches the backing document node. Keep that wrapper

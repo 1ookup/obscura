@@ -96,9 +96,54 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+/// Delivery target of a queued cross-document message (design doc Phase 4).
+pub(crate) enum FrameMessageTarget {
+    /// The top-level document's Window; dispatched by the bootstrap recv loop
+    /// awaiting `op_frame_message_recv`.
+    Main,
+    /// One frame document generation's Window realm (src/realm.rs). Entries
+    /// whose generation no longer has a live realm are dropped at drain time.
+    Frame { frame_id: String, generation: u64 },
+}
+
+/// How the receiving realm reconstructs `MessageEvent.source`. Single-isolate
+/// approximation: the source WindowProxy is re-derived inside the target
+/// realm rather than carried as a live cross-realm reference.
+pub(crate) enum FrameMessageSource {
+    /// Sender not representable in the target realm yet (e.g. a sibling
+    /// frame); `source` delivers as null. TODO(Phase 4 follow-on).
+    None,
+    /// The receiving frame realm's own `parent` reference (the sender is the
+    /// direct parent document).
+    Parent,
+    /// The receiving frame realm's `top` reference (the sender is the top
+    /// document but not the direct parent).
+    Top,
+    /// The WindowProxy for this `<iframe>` host element in the receiving
+    /// realm (the sender is that host's content document).
+    ChildHost(u32),
+}
+
+/// A cross-document message queued by op_post_to_frame / op_post_to_parent.
+pub(crate) struct PendingFrameMessage {
+    pub(crate) target: FrameMessageTarget,
+    /// Serialized sender origin (`Origin::serialize`) for MessageEvent.origin.
+    pub(crate) origin: String,
+    /// Structured-clone JSON envelope `{"v": ...}`, the same format Worker
+    /// messaging uses (bootstrap `_workerSerializeMessage`).
+    pub(crate) payload: String,
+    pub(crate) source: FrameMessageSource,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    /// Typed origin of the top-level document, derived exactly once per
+    /// committed document. Same-origin checks against frame scopes must use
+    /// this instance: re-deriving from `url` would mint a fresh opaque id on
+    /// every call, so a data:/sandboxed top document would never be
+    /// same-origin with the srcdoc frames that inherited its origin.
+    pub top_origin: Option<obscura_dom::Origin>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -226,6 +271,24 @@ pub struct ObscuraState {
     /// rather than wrapper state, because it must survive moves and clones and
     /// because fragment parsing can create nodes before a JS wrapper exists.
     pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
+    /// Dedicated Worker registry (src/worker.rs, Phase 3.11). Lazily created
+    /// on the first `new Worker(...)`, so pages without workers pay nothing.
+    pub(crate) worker_host: Option<crate::worker::WorkerHost>,
+    /// Set only inside a worker's own runtime: channel back to the page,
+    /// drained by the page-side Worker recv loop (op_worker_recv).
+    pub(crate) worker_outbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Set by the worker-global `close()`; the worker thread's event loop
+    /// exits at the next task boundary.
+    pub(crate) worker_close_requested: bool,
+    /// Cross-document postMessage queue (design doc Phase 4). Senders enqueue
+    /// through op_post_to_frame / op_post_to_parent after the typed-origin
+    /// targetOrigin check; MainRealm-targeted entries resolve the async
+    /// op_frame_message_recv pump and Frame-targeted entries are executed
+    /// into their realm by `ObscuraJsRuntime::drain_frame_messages`.
+    pub(crate) frame_messages: Vec<PendingFrameMessage>,
+    /// Wakes a parked op_frame_message_recv when a MainRealm-targeted entry
+    /// lands.
+    pub(crate) frame_message_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ObscuraState {
@@ -233,6 +296,7 @@ impl ObscuraState {
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            top_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
@@ -293,6 +357,11 @@ impl ObscuraState {
             resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
+            worker_host: None,
+            worker_outbox: None,
+            worker_close_requested: false,
+            frame_messages: Vec::new(),
+            frame_message_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -1329,11 +1398,58 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
             match dom.document_scope(root) {
                 Some(scope) => {
-                    let top = obscura_dom::Origin::from_url(&gs.url);
+                    // The stored top origin keeps opaque identity stable; the
+                    // from_url fallback only serves embedders that never set
+                    // it (correct for tuple origins, fresh-opaque otherwise).
+                    let top = gs
+                        .top_origin
+                        .clone()
+                        .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url));
                     scope.origin.same_origin(&top).to_string()
                 }
                 // No registered scope: fail closed.
                 None => "false".into(),
+            }
+        }
+        // Same-origin test between two document scopes; root 0 means the
+        // top-level document. Backs the frame realm's parent/top access
+        // checks (Phase 4). Fails closed on a missing scope.
+        "iframe_scopes_same_origin" => {
+            let origin_of = |raw: u32| -> Option<obscura_dom::Origin> {
+                if raw == 0 {
+                    Some(
+                        gs.top_origin
+                            .clone()
+                            .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url)),
+                    )
+                } else {
+                    dom.document_scope(NodeId::new(raw)).map(|scope| scope.origin)
+                }
+            };
+            match (
+                origin_of(arg1.parse().unwrap_or(0)),
+                origin_of(arg2.parse().unwrap_or(0)),
+            ) {
+                (Some(a), Some(b)) => a.same_origin(&b).to_string(),
+                _ => "false".into(),
+            }
+        }
+        // Container placement of an active frame content root: its host
+        // <iframe> nid and the content root of the document containing that
+        // host (0 = the top document). Used by the frame realm's parent/top
+        // wiring; -1/-1 for a detached (superseded) root.
+        "frame_container_info" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            match dom.iframe_host(root) {
+                Some(host) => {
+                    let parent_root = dom
+                        .containing_iframe_content_document(host)
+                        .map(|id| id.index() as i64)
+                        .unwrap_or(0);
+                    serde_json::json!({ "host": host.index(), "parentRoot": parent_root })
+                        .to_string()
+                }
+                None => serde_json::json!({ "host": -1, "parentRoot": -1 }).to_string(),
             }
         }
         "document_scope_info" => {
@@ -4329,6 +4445,330 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+// --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
+//
+// Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
+// op_worker_terminate, called by the bootstrap `Worker` class.
+// Worker-side: op_worker_post_to_page / op_worker_close, called by the worker
+// global scope installed by worker.rs (the worker runtime registers the same
+// extension, so both sets exist in both runtimes; the state fields they read
+// keep them inert on the wrong side).
+
+#[op2(fast)]
+fn op_worker_spawn(
+    state: &OpState,
+    #[string] source: String,
+    #[string] url: String,
+    #[string] kind: String,
+) -> Result<u32, deno_error::JsErrorBox> {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let host = gs
+        .worker_host
+        .get_or_insert_with(crate::worker::WorkerHost::new);
+    // Panic-safe: a failed spawn must not unwind into V8 (AGENTS.md); the
+    // page sees a catchable constructor error instead.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        host.spawn(source, url, kind)
+    })) {
+        Ok(Ok(id)) => Ok(id),
+        Ok(Err(message)) => Err(deno_error::JsErrorBox::generic(message)),
+        Err(_) => Err(deno_error::JsErrorBox::generic("worker spawn panicked")),
+    }
+}
+
+#[op2(fast)]
+fn op_worker_post_message(state: &OpState, id: u32, #[string] payload: &str) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let gs = shared.borrow();
+    gs.worker_host
+        .as_ref()
+        .is_some_and(|host| host.post_message(id, payload))
+}
+
+/// Await the worker's next outbox batch. Returns a JSON array of entries, or
+/// an empty string once the worker is terminated/gone. The bootstrap recv
+/// loop unrefs the promise so an idle page with live workers still settles.
+#[op2(async)]
+#[string]
+async fn op_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    let outbox = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let gs = shared.borrow();
+        gs.worker_host.as_ref().and_then(|host| host.outbox(id))
+    };
+    let Some(outbox) = outbox else {
+        return String::new();
+    };
+    let mut rx = outbox.lock().await;
+    let Some(first) = rx.recv().await else {
+        return String::new();
+    };
+    let mut entries = vec![first];
+    while let Ok(next) = rx.try_recv() {
+        entries.push(next);
+    }
+    // Entries are already JSON objects; frame the batch as a JSON array.
+    format!("[{}]", entries.join(","))
+}
+
+#[op2(fast)]
+fn op_worker_terminate(state: &OpState, id: u32) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    match gs.worker_host.as_mut() {
+        Some(host) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host.terminate(id)))
+                .unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
+#[op2(fast)]
+fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let gs = shared.borrow();
+    match gs.worker_outbox.as_ref() {
+        Some(tx) => tx.send(crate::worker::message_entry(payload)).is_ok(),
+        None => false,
+    }
+}
+
+#[op2(fast)]
+fn op_worker_close(state: &OpState) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().worker_close_requested = true;
+}
+
+// --- Cross-document postMessage ops (design doc Phase 4) ---
+//
+// One queue in ObscuraState carries messages between the main Window and the
+// per-frame Window realms (src/realm.rs). The targetOrigin decision compares
+// typed DocumentScope origins here in Rust; delivery is realm-aware:
+// MainRealm-targeted entries resolve the async op_frame_message_recv pump the
+// bootstrap starts in the main realm, Frame-targeted entries are dispatched
+// into their realm by `ObscuraJsRuntime::drain_frame_messages`, which drops
+// entries whose document generation has been destroyed.
+//
+// The sender's identity (`sender_root`) is read from the calling realm's own
+// globals by bootstrap. In this single-isolate model author script could
+// forge another frame's root nid; that is the documented honesty boundary of
+// sharing one process (design doc, Constraints), not a supported capability.
+
+/// Match a normalized `targetOrigin` against the target document's typed
+/// origin: `'*'` always passes, `'/'` means "the sender's own origin", and
+/// anything else is an absolute URL whose origin must match. An opaque target
+/// origin can only be reached through `'*'` (a fresh opaque parse result is
+/// never same-origin), and `'/'` from an opaque sender only matches the
+/// target that inherited the very same opaque origin instance.
+fn post_message_target_allows(
+    target_origin: &str,
+    sender: &obscura_dom::Origin,
+    target: &obscura_dom::Origin,
+) -> bool {
+    match target_origin {
+        "*" => true,
+        "/" => sender.same_origin(target),
+        explicit => obscura_dom::Origin::from_url(explicit).same_origin(target),
+    }
+}
+
+/// Window.postMessage toward a frame: the caller holds the host `<iframe>`'s
+/// WindowProxy (contentWindow / frames[i] / window[i]). `sender_root` is 0
+/// when the calling realm is the main Window, else the caller's own content
+/// root nid. A targetOrigin mismatch discards silently, per spec.
+#[op2]
+#[string]
+fn op_post_to_frame(
+    state: &OpState,
+    host_nid: u32,
+    #[string] payload: &str,
+    #[string] target_origin: &str,
+    sender_root: u32,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let message = {
+        let Some(dom) = gs.dom.as_ref() else {
+            return "no-frame".into();
+        };
+        let host = NodeId::new(host_nid);
+        let Some(target_root) = dom.iframe_content_document(host) else {
+            return "no-frame".into();
+        };
+        let Some(target_scope) = dom.document_scope(target_root) else {
+            return "no-frame".into();
+        };
+        let sender_origin = if sender_root > 0 {
+            match dom.document_scope(NodeId::new(sender_root)) {
+                Some(scope) => scope.origin,
+                // A realm whose document scope was collected is stale.
+                None => return "dropped".into(),
+            }
+        } else {
+            gs.top_origin
+                .clone()
+                .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url))
+        };
+        if !post_message_target_allows(target_origin, &sender_origin, &target_scope.origin) {
+            return "dropped".into();
+        }
+        // MessageEvent.source, reconstructed in the target realm: `parent`
+        // when the sender document directly contains the host, `top` when the
+        // sender is the top document further up the chain, else null for now.
+        let host_container = dom.containing_iframe_content_document(host);
+        let source = if sender_root == 0 {
+            match host_container {
+                None => FrameMessageSource::Parent,
+                Some(_) => FrameMessageSource::Top,
+            }
+        } else if host_container == Some(NodeId::new(sender_root)) {
+            FrameMessageSource::Parent
+        } else {
+            FrameMessageSource::None
+        };
+        PendingFrameMessage {
+            target: FrameMessageTarget::Frame {
+                frame_id: target_scope.frame_id.clone(),
+                generation: target_scope.document_generation,
+            },
+            origin: sender_origin.serialize(),
+            payload: payload.to_string(),
+            source,
+        }
+    };
+    gs.frame_messages.push(message);
+    "ok".into()
+}
+
+/// postMessage from a frame realm toward its direct parent (`to_top` false)
+/// or the top-level Window (`to_top` true). `sender_root` is the calling
+/// realm's own content root nid. When the direct parent is itself a frame,
+/// the message targets that parent frame's realm; otherwise it targets the
+/// main Window's recv pump.
+#[op2]
+#[string]
+fn op_post_to_parent(
+    state: &OpState,
+    sender_root: u32,
+    #[string] payload: &str,
+    #[string] target_origin: &str,
+    to_top: bool,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let message = {
+        let Some(dom) = gs.dom.as_ref() else {
+            return "dropped".into();
+        };
+        let sender_node = NodeId::new(sender_root);
+        let Some(sender_scope) = dom.document_scope(sender_node) else {
+            // Stale realm: its document has been collected.
+            return "dropped".into();
+        };
+        // A superseded root is no longer an active content document, so it
+        // has no host and no browsing context to speak from.
+        let Some(host) = dom.iframe_host(sender_node) else {
+            return "dropped".into();
+        };
+        let parent_root = if to_top {
+            None
+        } else {
+            dom.containing_iframe_content_document(host)
+        };
+        let (target, target_doc_origin) = match parent_root {
+            None => (
+                FrameMessageTarget::Main,
+                gs.top_origin
+                    .clone()
+                    .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url)),
+            ),
+            Some(proot) => {
+                let Some(parent_scope) = dom.document_scope(proot) else {
+                    return "dropped".into();
+                };
+                (
+                    FrameMessageTarget::Frame {
+                        frame_id: parent_scope.frame_id.clone(),
+                        generation: parent_scope.document_generation,
+                    },
+                    parent_scope.origin,
+                )
+            }
+        };
+        if !post_message_target_allows(target_origin, &sender_scope.origin, &target_doc_origin) {
+            return "dropped".into();
+        }
+        PendingFrameMessage {
+            target,
+            origin: sender_scope.origin.serialize(),
+            payload: payload.to_string(),
+            // In the receiving realm the sender is a child frame document:
+            // its WindowProxy is derived from the host element.
+            source: FrameMessageSource::ChildHost(host.index() as u32),
+        }
+    };
+    let to_main = matches!(message.target, FrameMessageTarget::Main);
+    gs.frame_messages.push(message);
+    if to_main {
+        gs.frame_message_notify.notify_one();
+    }
+    "ok".into()
+}
+
+/// Await the next batch of MainRealm-targeted cross-document messages as a
+/// JSON array of `{data, origin, sourceHost}` entries. The bootstrap recv
+/// loop unrefs the returned promise so an idle page with frames still
+/// settles; delivery happens whenever the embedder pumps the event loop.
+#[op2(async)]
+#[string]
+async fn op_frame_message_recv(state: Rc<RefCell<OpState>>) -> String {
+    let (shared, notify) = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let notify = shared.borrow().frame_message_notify.clone();
+        (shared, notify)
+    };
+    loop {
+        // Create the wake future before scanning the queue so an enqueue
+        // between the scan and the await cannot be lost.
+        let notified = notify.notified();
+        let batch: Vec<String> = {
+            let mut gs = shared.borrow_mut();
+            let mut kept = Vec::new();
+            let mut taken = Vec::new();
+            for msg in gs.frame_messages.drain(..) {
+                match msg.target {
+                    FrameMessageTarget::Main => taken.push(msg),
+                    FrameMessageTarget::Frame { .. } => kept.push(msg),
+                }
+            }
+            gs.frame_messages = kept;
+            taken
+                .into_iter()
+                .map(|msg| {
+                    let source_host = match msg.source {
+                        FrameMessageSource::ChildHost(nid) => serde_json::json!(nid),
+                        _ => serde_json::Value::Null,
+                    };
+                    serde_json::json!({
+                        "data": msg.payload,
+                        "origin": msg.origin,
+                        "sourceHost": source_host,
+                    })
+                    .to_string()
+                })
+                .collect()
+        };
+        if !batch.is_empty() {
+            return format!("[{}]", batch.join(","));
+        }
+        notified.await;
+    }
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -4360,6 +4800,15 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_worker_spawn(),
+        op_worker_post_message(),
+        op_worker_recv(),
+        op_worker_terminate(),
+        op_worker_post_to_page(),
+        op_worker_close(),
+        op_post_to_frame(),
+        op_post_to_parent(),
+        op_frame_message_recv(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.

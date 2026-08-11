@@ -153,9 +153,29 @@ impl ObscuraJsRuntime {
             let url_val =
                 v8::String::new(scope, base_url).ok_or_else(|| alloc_err("value"))?;
             global.set(scope, url_key.into(), url_val.into());
+            // Realm identity for cross-document messaging (Phase 4): the
+            // bootstrap reads these to identify the calling realm to the
+            // postMessage ops. Author script in this realm could rewrite
+            // them; that is the shared-isolate honesty boundary documented
+            // in the design's Constraints, not a security mechanism.
+            let fid_key = v8::String::new(scope, "__obscura_frame_id")
+                .ok_or_else(|| alloc_err("key"))?;
+            let fid_val =
+                v8::String::new(scope, frame_id).ok_or_else(|| alloc_err("value"))?;
+            global.set(scope, fid_key.into(), fid_val.into());
+            let gen_key = v8::String::new(scope, "__obscura_frame_generation")
+                .ok_or_else(|| alloc_err("key"))?;
+            let gen_val = v8::Number::new(scope, generation as f64);
+            global.set(scope, gen_key.into(), gen_val.into());
         }
-        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        // Bootstrap runs first, matching the main context (its bootstrap is
+        // baked into the snapshot, then `<obscura:init>` runs). REALM_INIT must
+        // come after: bootstrap's `_preHideInternals` re-declares
+        // `__obscura_objects` as undefined, so seeding it before bootstrap
+        // would be wiped and the RemoteObject stash (Phase 6.2) would be
+        // missing in the realm.
         self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
         self.execute_in_context(
             &context,
             "<obscura:frame-realm-page-init>",
@@ -790,6 +810,327 @@ mod tests {
             serde_json::json!(["undefined", true])
         );
         assert_eq!(rt.evaluate("document.body.tagName").unwrap(), serde_json::json!("BODY"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_timer_callback_fires_in_its_realm() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"var __realmTimerRan = false;
+               setTimeout(() => {
+                   __realmTimerRan = [
+                       document.getElementById('inner').textContent,
+                       globalThis === window,
+                   ];
+               }, 0);
+               // A string handler compiles in the scheduling realm: the realm
+               // bootstrap's own indirect eval runs it against this global.
+               setTimeout("var __realmStringTimer = document.title;", 0);"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+
+        // The callbacks ran in the frame realm: their document is the frame
+        // document and the flags landed on the realm global, not main's.
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[__realmTimerRan, __realmStringTimer]",
+            )
+            .unwrap(),
+            serde_json::json!([["frame text", true], "Frame Title"])
+        );
+        assert_eq!(
+            rt.evaluate("[typeof globalThis.__realmTimerRan, typeof globalThis.__realmStringTimer]")
+                .unwrap(),
+            serde_json::json!(["undefined", "undefined"])
+        );
+    }
+
+    // ---- Cross-document postMessage (Phase 4) ----
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parent_and_frame_exchange_messages_with_origin_and_source() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        // Frame side: record the delivery and echo back through e.source.
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"var __got = null;
+               window.addEventListener('message', (e) => {
+                   __got = {
+                       data: e.data,
+                       origin: e.origin,
+                       sourceIsParent: e.source === window.parent,
+                   };
+                   e.source.postMessage({ echo: e.data.a + 1 }, '*');
+               });"#,
+        )
+        .unwrap();
+        // Same-origin frame: frameElement resolves to the host element.
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "globalThis.frameElement ? globalThis.frameElement.getAttribute('id') : null",
+            )
+            .unwrap(),
+            serde_json::json!("f")
+        );
+
+        // Main side: capture origin and assert source identity against the
+        // stable contentWindow proxy, then post into the frame.
+        rt.evaluate(
+            r#"(() => {
+                globalThis.__gotMain = null;
+                window.addEventListener('message', (e) => {
+                    globalThis.__gotMain = {
+                        data: e.data,
+                        origin: e.origin,
+                        sourceIsProxy: e.source === document.getElementById('f').contentWindow,
+                    };
+                });
+                document.getElementById('f').contentWindow.postMessage({ a: 1 }, '*');
+                return true;
+            })()"#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(500).await.unwrap();
+
+        // One ping-pong round: the parent's message reached the frame realm
+        // (drain), and the frame's reply reached the main realm (recv pump).
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "__got")
+                .unwrap(),
+            serde_json::json!({
+                "data": { "a": 1 },
+                "origin": "http://example.com",
+                "sourceIsParent": true,
+            })
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__gotMain").unwrap(),
+            serde_json::json!({
+                "data": { "echo": 2 },
+                "origin": "http://example.com",
+                "sourceIsProxy": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn postmessage_target_origin_filtering() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "var __count = 0; window.addEventListener('message', () => { __count++; });",
+        )
+        .unwrap();
+
+        // Mismatched explicit origin: silently dropped.
+        rt.evaluate(
+            "document.getElementById('f').contentWindow.postMessage({x:1}, 'http://other.example')",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "__count")
+                .unwrap(),
+            serde_json::json!(0.0)
+        );
+
+        // '/' resolves to the sender's origin; sender and frame share
+        // http://example.com, so it delivers.
+        rt.evaluate("document.getElementById('f').contentWindow.postMessage({x:2}, '/')")
+            .unwrap();
+        // Matching explicit origin delivers too.
+        rt.evaluate(
+            "document.getElementById('f').contentWindow.postMessage({x:3}, 'http://example.com')",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "__count")
+                .unwrap(),
+            serde_json::json!(2.0)
+        );
+
+        // A targetOrigin that is neither '*', '/', nor a URL throws
+        // SyntaxError synchronously (evaluate() maps caught throws to null,
+        // so capture the exception in JS).
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    try {
+                        document.getElementById('f').contentWindow.postMessage({x:4}, 'not a url');
+                        return "no-throw";
+                    } catch (e) {
+                        return e.name + ":"
+                            + (String(e.message).includes("Invalid target origin") ? "msg-ok" : e.message);
+                    }
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!("SyntaxError:msg-ok")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_opaque_frame_matches_star_only_and_reports_null_origin() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        // Opaque origin (sandbox without allow-same-origin, scripts allowed).
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = document.getElementById("f")._nid;
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("parse_into_subtree", created.root, "<html><body><p>s</p></body></html>");
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "about:srcdoc",
+                        origin: { type: "opaque" },
+                        sandbox: "allow-scripts",
+                        frameId: "frame-test",
+                        documentGeneration: 1,
+                    }));
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/test")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"var __msgs = [];
+               window.addEventListener('message', (e) => { __msgs.push(e.data); });
+               // Opaque frame reporting toward the parent: origin is "null".
+               parent.postMessage({ hello: true }, '*');"#,
+        )
+        .unwrap();
+
+        rt.evaluate(
+            r#"(() => {
+                globalThis.__mainOrigin = null;
+                window.addEventListener('message', (e) => { globalThis.__mainOrigin = e.origin; });
+                const w = document.getElementById('f').contentWindow;
+                w.postMessage({ n: 1 }, '*');                  // delivered
+                w.postMessage({ n: 2 }, 'http://example.com'); // opaque only matches '*'
+                w.postMessage({ n: 3 }, '/');                  // tuple sender vs opaque target
+                return true;
+            })()"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(300).await.unwrap();
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "__msgs")
+                .unwrap(),
+            serde_json::json!([{ "n": 1 }])
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__mainOrigin").unwrap(),
+            serde_json::json!("null")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn messages_for_destroyed_generation_are_dropped() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root1 = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root1, "http://example.com/frame")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "var __g1 = 0; window.addEventListener('message', () => { __g1++; });",
+        )
+        .unwrap();
+
+        // Enqueue toward generation 1, then re-navigate before any pump: the
+        // commit path replaces the content root and destroys the old realm
+        // (mirroring Page::navigate_frame).
+        rt.evaluate("document.getElementById('f').contentWindow.postMessage({stale:1}, '*')")
+            .unwrap();
+        let root2 = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 2);
+        rt.destroy_frame_realm("frame-test");
+        rt.ensure_frame_realm("frame-test", 2, root2, "http://example.com/frame")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            2,
+            "<t>",
+            "var __g2 = 0; window.addEventListener('message', () => { __g2++; });",
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(200).await.unwrap();
+
+        // The stale message reached neither the new document generation nor
+        // anything else; a fresh message to generation 2 still delivers.
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 2, "<t>", "__g2")
+                .unwrap(),
+            serde_json::json!(0.0)
+        );
+        rt.evaluate("document.getElementById('f').contentWindow.postMessage({fresh:1}, '*')")
+            .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 2, "<t>", "__g2")
+                .unwrap(),
+            serde_json::json!(1.0)
+        );
+        // Main realm unaffected throughout.
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
+
+    #[test]
+    fn window_indexed_access_returns_the_frame_window_proxy() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let _root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const w = document.getElementById('f').contentWindow;
+                    return [
+                        window.length,
+                        window[0] === w,
+                        window.frames[0] === w,
+                        window.frames === window,
+                        typeof w.postMessage === 'function',
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([1, true, true, true, true])
+        );
     }
 
     #[test]

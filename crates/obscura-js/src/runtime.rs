@@ -228,6 +228,11 @@ pub struct ObscuraJsRuntime {
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
     /// pages without iframes; the main-context path never touches it.
     pub(crate) frame_realms: crate::realm::FrameRealmHost,
+    /// Whether the main realm's cross-document message recv loop (bootstrap
+    /// `_frameMessageRecvLoop`, Phase 4) has been started. It spawns an async
+    /// op, which requires a live tokio context, so the pump paths start it
+    /// lazily once a MainRealm-targeted message exists.
+    frame_message_pump_started: bool,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -324,6 +329,10 @@ impl WatchdogToken {
 // fixed-wait path while retaining an absolute backstop for infinite script.
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
+/// Upper bound on chained cross-document message rounds inside one drain
+/// (Phase 4): delivering a message can enqueue further messages, so the drain
+/// loops, and a mutually recursive postMessage pair must not spin forever.
+const FRAME_MESSAGE_DRAIN_ROUNDS: usize = 64;
 
 impl ObscuraJsRuntime {
     /// Freeze the document timeline for one JavaScript task. Browser timelines
@@ -395,6 +404,7 @@ impl ObscuraJsRuntime {
             module_load_activity,
             isolate_handle,
             frame_realms: crate::realm::FrameRealmHost::default(),
+            frame_message_pump_started: false,
         }
     }
 
@@ -458,6 +468,12 @@ impl ObscuraJsRuntime {
             gs.scroll_generation = 0;
             gs.resolved_scroll = None;
         }
+    }
+
+    /// Record the top document's typed origin (one instance per committed
+    /// document, so opaque identity stays stable across same-origin checks).
+    pub fn set_top_origin(&self, origin: obscura_dom::Origin) {
+        self.state.borrow_mut().top_origin = Some(origin);
     }
 
     pub fn set_url(&self, url: &str) {
@@ -1892,6 +1908,7 @@ impl ObscuraJsRuntime {
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
         self.begin_javascript_task();
+        self.ensure_frame_message_pump();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
@@ -1904,7 +1921,173 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Event loop error: {}", e));
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        // Cross-document messages queued by the tasks above (Phase 4). Each
+        // frame-realm delivery may resolve the main realm's recv op or queue
+        // further tasks, so pump again after every non-empty drain, bounded
+        // because messages can produce messages. Free for pages without
+        // pending messages (one empty-queue check).
+        for _ in 0..FRAME_MESSAGE_DRAIN_ROUNDS {
+            if self.drain_frame_messages() == 0 {
+                break;
+            }
+            self.ensure_frame_message_pump();
+            let follow_up = self
+                .runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            if follow_up.is_err() {
+                break;
+            }
+        }
         result
+    }
+
+    /// Start the main realm's cross-document message recv loop the first
+    /// time a MainRealm-targeted entry is queued (Phase 4). Must only be
+    /// called from an async pump path: the loop's `op_frame_message_recv`
+    /// can only be spawned inside a live tokio context. Messages queue in
+    /// Rust until the loop's first scan, so nothing is lost by the lazy
+    /// start; pages that never receive frame messages pay one bool check.
+    fn ensure_frame_message_pump(&mut self) {
+        if self.frame_message_pump_started {
+            return;
+        }
+        let has_main_entry = self
+            .state
+            .borrow()
+            .frame_messages
+            .iter()
+            .any(|msg| matches!(msg.target, crate::ops::FrameMessageTarget::Main));
+        if !has_main_entry {
+            return;
+        }
+        self.frame_message_pump_started = true;
+        if let Err(error) = self.runtime.execute_script(
+            "<obscura:frame-message-pump>",
+            "if (typeof globalThis._frameMessageRecvLoop === 'function') globalThis._frameMessageRecvLoop();",
+        ) {
+            tracing::warn!("frame message pump start failed: {error}");
+        }
+    }
+
+    /// Deliver queued cross-document messages addressed to frame Window
+    /// realms (design doc Phase 4). MainRealm-targeted entries stay queued
+    /// for the bootstrap's async recv pump (`op_frame_message_recv`). A
+    /// message whose target document generation no longer has a live realm is
+    /// dropped, which is the "target generation destroyed before delivery"
+    /// semantics the design requires. Delivery can enqueue further messages
+    /// (ping-pong), so the drain loops with a bound. Returns how many
+    /// messages were dispatched into frame realms. Pages without pending
+    /// messages pay one empty-Vec check.
+    pub fn drain_frame_messages(&mut self) -> usize {
+        use crate::ops::{FrameMessageSource, FrameMessageTarget, PendingFrameMessage};
+        let mut delivered = 0;
+        for _ in 0..FRAME_MESSAGE_DRAIN_ROUNDS {
+            let batch: Vec<PendingFrameMessage> = {
+                let mut state = self.state.borrow_mut();
+                if state.frame_messages.is_empty() {
+                    return delivered;
+                }
+                let mut kept = Vec::new();
+                let mut taken = Vec::new();
+                for msg in state.frame_messages.drain(..) {
+                    match msg.target {
+                        FrameMessageTarget::Frame { .. } => taken.push(msg),
+                        FrameMessageTarget::Main => kept.push(msg),
+                    }
+                }
+                state.frame_messages = kept;
+                taken
+            };
+            if batch.is_empty() {
+                return delivered;
+            }
+            for msg in batch {
+                let FrameMessageTarget::Frame {
+                    frame_id,
+                    generation,
+                } = msg.target
+                else {
+                    continue;
+                };
+                // Target generation destroyed (navigation/detach): drop.
+                if !self.frame_realms.contains(&frame_id, generation) {
+                    continue;
+                }
+                let source_expr = match msg.source {
+                    FrameMessageSource::Parent => "globalThis.parent".to_string(),
+                    FrameMessageSource::Top => "globalThis.top".to_string(),
+                    // The sender is a child frame: derive its WindowProxy in
+                    // the receiving realm from the host element.
+                    FrameMessageSource::ChildHost(nid) => format!(
+                        "(function() {{ try {{ var h = _wrapEl({nid}); \
+                         return h ? _frameWindowProxyFor(h) : null; }} \
+                         catch (e) {{ return null; }} }})()"
+                    ),
+                    FrameMessageSource::None => "null".to_string(),
+                };
+                // The payload is already a JSON envelope. Embed it (and the
+                // origin) as JS string literals and JSON.parse in the realm;
+                // never interpolate raw message text into script source.
+                let payload = serde_json::to_string(&msg.payload)
+                    .unwrap_or_else(|_| "\"{}\"".to_string());
+                let origin =
+                    serde_json::to_string(&msg.origin).unwrap_or_else(|_| "\"\"".to_string());
+                let script = format!(
+                    "(function() {{\n\
+                       var data;\n\
+                       try {{ data = JSON.parse({payload}).v; }} catch (e) {{ return; }}\n\
+                       var evt = new MessageEvent('message', {{ data: data, origin: {origin}, source: {source_expr} }});\n\
+                       try {{ globalThis.dispatchEvent(evt); }} catch (e) {{}}\n\
+                       if (typeof globalThis.onmessage === 'function') {{\n\
+                         try {{ globalThis.onmessage.call(globalThis, evt); }} catch (e) {{}}\n\
+                       }}\n\
+                     }})();"
+                );
+                if let Err(error) = self.execute_script_in_frame_realm(
+                    &frame_id,
+                    generation,
+                    "<obscura:frame-message>",
+                    &script,
+                ) {
+                    tracing::warn!("frame message delivery failed ({frame_id}): {error}");
+                }
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+
+    /// Ensure queued cross-document messages get at least one delivery pass
+    /// outside a full settle: frame-targeted entries drain directly, and
+    /// MainRealm-targeted entries need event-loop ticks so the bootstrap recv
+    /// op can resolve and dispatch. Cheap no-op when nothing is queued.
+    pub async fn deliver_pending_frame_messages(&mut self) {
+        for _ in 0..FRAME_MESSAGE_DRAIN_ROUNDS {
+            self.drain_frame_messages();
+            let pending = self.state.borrow().frame_messages.len();
+            if pending == 0 {
+                return;
+            }
+            // Only MainRealm-targeted entries remain; one cooperative tick
+            // lets op_frame_message_recv resolve and dispatch them (the tick
+            // drains any frame-targeted responses itself).
+            let idle = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    self.run_cooperative_event_loop_tick(),
+                )
+                .await,
+                Ok(Ok(true))
+            );
+            let after = self.state.borrow().frame_messages.len();
+            if idle && after >= pending {
+                // The pump made no progress (e.g. no recv loop is running);
+                // leave the entries for the next settle instead of spinning.
+                return;
+            }
+        }
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
@@ -1958,10 +2141,34 @@ impl ObscuraJsRuntime {
     }
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
-        self.evaluate("globalThis.__obscura_nextPendingTimeoutDelay?.() ?? -1")
-        .ok()
-        .and_then(|value| value.as_f64())
-        .filter(|delay| *delay >= 0.0)
+        const NEXT_DELAY_SRC: &str =
+            "globalThis.__obscura_nextPendingTimeoutDelay?.() ?? -1";
+        let mut nearest = self
+            .evaluate(NEXT_DELAY_SRC)
+            .ok()
+            .and_then(|value| value.as_f64())
+            .filter(|delay| *delay >= 0.0);
+        // Each frame realm re-runs bootstrap, so it keeps its own pending
+        // deadline map. Fold those in so a near frame timer holds the settle
+        // window open too. Pages without iframes have no realms and skip this.
+        for (frame_id, generation, world_id) in self.frame_realm_keys() {
+            let frame_delay = self
+                .execute_script_in_frame_world_realm(
+                    &frame_id,
+                    generation,
+                    world_id,
+                    "<obscura:frame-timer-poll>",
+                    NEXT_DELAY_SRC,
+                )
+                .ok()
+                .and_then(|value| value.as_f64())
+                .filter(|delay| *delay >= 0.0);
+            nearest = match (nearest, frame_delay) {
+                (Some(main), Some(frame)) => Some(main.min(frame)),
+                (main, frame) => main.or(frame),
+            };
+        }
+        nearest
     }
 
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
@@ -2083,9 +2290,12 @@ impl ObscuraJsRuntime {
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
+        // Queued main-realm frame messages (Phase 4) need their recv pump
+        // running before this poll so they resolve during it.
+        self.ensure_frame_message_pump();
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let tick = self
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
@@ -2103,7 +2313,15 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        match result {
+            // Deliver queued cross-document messages at the task boundary
+            // (Phase 4). A non-empty drain means the tick was not idle: the
+            // deliveries may have enqueued main-realm messages whose recv op
+            // resolves on the next tick, so callers must keep pumping.
+            Ok(idle) => Ok(idle && self.drain_frame_messages() == 0),
+            Err(error) => Err(error),
+        }
     }
 
     /// Drive one browser task while allowing the future to remain parked on
@@ -2123,6 +2341,7 @@ impl ObscuraJsRuntime {
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
         self.begin_javascript_task();
+        self.ensure_frame_message_pump();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
@@ -2136,7 +2355,7 @@ impl ObscuraJsRuntime {
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -2165,7 +2384,13 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        match result {
+            // Same task-boundary message drain as the cooperative tick
+            // (Phase 4): a delivery means this turn was not idle.
+            Ok(idle) => Ok(idle && self.drain_frame_messages() == 0),
+            Err(error) => Err(error),
+        }
     }
 
     /// Drive one cooperative event-loop turn for browser lifecycle code that
