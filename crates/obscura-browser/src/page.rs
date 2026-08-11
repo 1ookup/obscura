@@ -4849,6 +4849,23 @@ impl Page {
         if let Some(previous) = committed.previous_root {
             dom.remove(previous);
         }
+        // A browsing context survives its own navigation, but every child
+        // browsing context belongs to the superseded Document and must be
+        // detached with its complete subtree before discovering children in
+        // the replacement document.
+        let stale_children = self
+            .frames
+            .get(frame_id)
+            .map(|frame| frame.children.clone())
+            .unwrap_or_default();
+        for child in stale_children {
+            let removed = self.frames.detach(&child);
+            if let Some(js) = self.js.as_mut() {
+                for context in removed {
+                    js.destroy_frame_realm(&context.frame_id);
+                }
+            }
+        }
         // Every realm registered for this frame belongs to a superseded
         // generation (the freshly committed one has no realm yet; it is
         // created lazily at script execution), so drop them all.
@@ -5344,6 +5361,69 @@ mod tests {
         assert_eq!(
             page.js.as_mut().unwrap().evaluate("dynamicLoads").unwrap(),
             serde_json::json!(3.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_navigation_detaches_superseded_descendants_and_realms() {
+        let mut page = frame_test_page(
+            "<!doctype html><iframe id=outer srcdoc=\"\
+             <script>globalThis.outerOld=1</script>\
+             <iframe srcdoc='<script>globalThis.innerOld=1</script>'></iframe>\
+             \"></iframe>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        let (outer_id, outer_generation, inner_id) = {
+            let js = page.js.as_ref().unwrap();
+            let outer_host = js
+                .with_dom(|dom| dom.query_selector("#outer").unwrap().unwrap())
+                .unwrap();
+            let outer = page.frames.by_host(outer_host).unwrap();
+            let inner_id = outer.children.first().unwrap().clone();
+            (
+                outer.frame_id.clone(),
+                outer.document_generation,
+                inner_id,
+            )
+        };
+        assert!(page
+            .js
+            .as_ref()
+            .unwrap()
+            .frame_realm_keys()
+            .iter()
+            .any(|(frame_id, _, _)| frame_id == &inner_id));
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "document.getElementById('outer').srcdoc = '<script>globalThis.outerNew=2</' + 'script>'",
+            )
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+
+        let outer = page.frames.get(&outer_id).unwrap();
+        assert_eq!(outer.document_generation, outer_generation + 1);
+        assert!(outer.children.is_empty());
+        assert!(page.frames.get(&inner_id).is_none());
+        assert!(!page
+            .js
+            .as_ref()
+            .unwrap()
+            .frame_realm_keys()
+            .iter()
+            .any(|(frame_id, _, _)| frame_id == &inner_id));
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('outer').contentWindow.outerNew")
+                .unwrap(),
+            serde_json::json!(2.0),
         );
     }
 
