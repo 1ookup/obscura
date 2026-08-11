@@ -1890,7 +1890,15 @@ async fn do_navigate(
         );
     }
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_scripts: Vec<obscura_browser::PreloadScript> = ctx
+        .preload_scripts
+        .iter()
+        .map(|(_, source, world_name, world_id)| obscura_browser::PreloadScript {
+            source: source.clone(),
+            world_name: world_name.clone(),
+            world_id: *world_id,
+        })
+        .collect();
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
@@ -2067,11 +2075,38 @@ pub async fn handle(
         "setLifecycleEventsEnabled" => Ok(json!({})),
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let world_name = params
+                .get("worldName")
+                .and_then(|value| value.as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            let world_id = world_name
+                .as_deref()
+                .map(|name| main_frame_world_id(ctx, name))
+                .unwrap_or(obscura_js::realm::MAIN_WORLD);
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
-                ctx.preload_scripts
-                    .push((identifier.clone(), source.to_string()));
+                let preload = obscura_browser::PreloadScript {
+                    source: source.to_string(),
+                    world_name: world_name.clone(),
+                    world_id,
+                };
+                ctx.preload_scripts.push((
+                    identifier.clone(),
+                    source.to_string(),
+                    world_name,
+                    world_id,
+                ));
+                if params
+                    .get("runImmediately")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Some(page) = ctx.get_session_page_mut(session_id) {
+                        page.run_preload_script_immediately(&preload);
+                    }
+                }
             }
             Ok(json!({ "identifier": identifier }))
         }
@@ -2080,7 +2115,8 @@ pub async fn handle(
                 .get("identifier")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            ctx.preload_scripts.retain(|(id, _)| id != identifier);
+            ctx.preload_scripts
+                .retain(|(id, _, _, _)| id != identifier);
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),

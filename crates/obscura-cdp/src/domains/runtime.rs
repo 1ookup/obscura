@@ -464,12 +464,15 @@ pub async fn handle(
                 // each new document, and puppeteer registers bindings
                 // once-per-page rather than once-per-document.
                 let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
-                ctx.preload_scripts.push((key, shim.clone()));
+                ctx.preload_scripts.retain(|(k, _, _, _)| k != &key);
+                ctx.preload_scripts
+                    .push((key, shim.clone(), None, obscura_js::realm::MAIN_WORLD));
                 // Install on the current page so the binding is usable
                 // immediately, without waiting for the next navigation.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    page.evaluate(&shim);
+                    page.run_preload_script_immediately(
+                        &obscura_browser::PreloadScript::main_world(shim),
+                    );
                 }
             }
             Ok(json!({}))
@@ -478,9 +481,14 @@ pub async fn handle(
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if !name.is_empty() {
                 let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
+                ctx.preload_scripts.retain(|(k, _, _, _)| k != &key);
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    page.evaluate(&format!("delete globalThis['{}'];", name));
+                    page.run_preload_script_immediately(
+                        &obscura_browser::PreloadScript::main_world(format!(
+                            "delete globalThis['{}'];",
+                            name
+                        )),
+                    );
                 }
             }
             Ok(json!({}))

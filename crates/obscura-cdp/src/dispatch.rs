@@ -73,7 +73,8 @@ pub struct CdpContext {
     page_counter: u32,
     browser_context_counter: u32,
     target_session_counter: u64,
-    pub preload_scripts: Vec<(String, String)>, // (identifier, source)
+    /// (identifier, source, optional isolated-world name, world id)
+    pub preload_scripts: Vec<(String, String, Option<String>, u64)>,
     pub preload_counter: u32,
     // World names registered via Page.createIsolatedWorld. After every
     // navigation Obscura clears execution contexts (via

@@ -214,6 +214,26 @@ struct DeviceMetricsBaseline {
     device_scale_factor: f32,
 }
 
+/// Source registered through `Page.addScriptToEvaluateOnNewDocument`.
+/// `world_name == None` targets each document's main world; a named entry
+/// targets the matching isolated world id assigned by CDP.
+#[derive(Clone, Debug)]
+pub struct PreloadScript {
+    pub source: String,
+    pub world_name: Option<String>,
+    pub world_id: u64,
+}
+
+impl PreloadScript {
+    pub fn main_world(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            world_name: None,
+            world_id: obscura_js::realm::MAIN_WORLD,
+        }
+    }
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -294,7 +314,7 @@ pub struct Page {
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
-    preload_scripts: Vec<String>,
+    preload_scripts: Vec<PreloadScript>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -1804,15 +1824,6 @@ impl Page {
         // also where puppeteer's `exposeFunction` wrapper installs itself —
         // if preload runs after page scripts, every early binding call
         // hits an undefined function and silently no-ops.
-        let preload_sources = self.preload_scripts.clone();
-        if let Some(js) = &mut self.js {
-            for source in &preload_sources {
-                if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
-                    tracing::debug!("Preload script error: {}", e);
-                }
-            }
-        }
-
         // Per-module budget. Modules on an already-rendered page are
         // enhancement, not the app: give them a short budget so one slow
         // non-essential module (e.g. YC's bookface, whose top-level eval
@@ -2351,6 +2362,7 @@ impl Page {
         // empty about:blank document and a sandboxed document whose author
         // scripts are disabled. contentWindow/eval/CDP must not depend on the
         // presence of a <script> element.
+        let frame_preloads = self.preload_scripts.clone();
         let Some(js) = self.js.as_mut() else {
             return;
         };
@@ -2359,6 +2371,43 @@ impl Page {
         {
             tracing::warn!("frame realm creation failed ({frame_id}): {error}");
             return;
+        }
+        // New-document scripts run in every matching frame world after the
+        // browser bootstrap and before any author script, including when the
+        // sandbox suppresses author execution.
+        for preload in frame_preloads {
+            let result = match preload.world_name.as_deref() {
+                None => js
+                    .execute_script_in_frame_realm(
+                        frame_id,
+                        generation,
+                        "<preload>",
+                        &preload.source,
+                    )
+                    .map(|_| ()),
+                Some(world_name) => js
+                    .ensure_isolated_world_realm(
+                        frame_id,
+                        generation,
+                        preload.world_id,
+                        world_name,
+                        content_root.raw(),
+                        &frame_base,
+                    )
+                    .and_then(|_| {
+                        js.execute_script_in_frame_world_realm(
+                            frame_id,
+                            generation,
+                            preload.world_id,
+                            "<preload>",
+                            &preload.source,
+                        )
+                        .map(|_| ())
+                    }),
+            };
+            if let Err(error) = result {
+                tracing::debug!("Frame preload script error: {}", error);
+            }
         }
         // A sandbox without allow-scripts suppresses author scripts after the
         // realm exists. Nested frames carry their parent's merged flags.
@@ -3076,14 +3125,7 @@ impl Page {
             // Runtime.addBinding shim) must run on about:blank too —
             // puppeteer's `browser.newPage()` lands on about:blank and
             // a follow-up `exposeFunction` is unusable otherwise.
-            let preload_sources = self.preload_scripts.clone();
-            if let Some(js) = &mut self.js {
-                for source in &preload_sources {
-                    if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
-                        tracing::debug!("Preload script error on about:blank: {}", e);
-                    }
-                }
-            }
+            self.inject_main_document_preloads();
             return Ok(());
         }
 
@@ -3184,6 +3226,10 @@ impl Page {
         self.frame_stylesheet_cache.clear();
         self.load_child_frames().await;
         self.init_js();
+        // The top Window's new-document scripts precede every child-frame and
+        // top-document author script, just as they precede HTML parsing in a
+        // browser. Child worlds receive their own injection below.
+        self.inject_main_document_preloads();
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
@@ -4431,15 +4477,147 @@ impl Page {
         }
     }
 
-    pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
+    pub fn set_preload_scripts(&mut self, scripts: Vec<PreloadScript>) {
         self.preload_scripts = scripts;
+    }
+
+    fn inject_main_document_preloads(&mut self) {
+        let scripts = self.preload_scripts.clone();
+        if scripts.is_empty() {
+            return;
+        }
+        let frame_id = self.frames.main_frame_id().to_string();
+        let generation = self
+            .frames
+            .get(&frame_id)
+            .map(|frame| frame.document_generation)
+            .unwrap_or_default();
+        let content_root = self
+            .js
+            .as_ref()
+            .and_then(|js| js.with_dom(|dom| dom.document().raw()))
+            .unwrap_or_default();
+        let base_url = self.url_string();
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        for script in scripts {
+            let result = match script.world_name.as_deref() {
+                None => js.execute_script_guarded("<preload>", &script.source),
+                Some(world_name) => js
+                    .ensure_isolated_world_realm(
+                        &frame_id,
+                        generation,
+                        script.world_id,
+                        world_name,
+                        content_root,
+                        &base_url,
+                    )
+                    .and_then(|_| {
+                        js.execute_script_in_frame_world_realm(
+                            &frame_id,
+                            generation,
+                            script.world_id,
+                            "<preload>",
+                            &script.source,
+                        )
+                        .map(|_| ())
+                    }),
+            };
+            if let Err(error) = result {
+                tracing::debug!("Preload script error: {}", error);
+            }
+        }
+    }
+
+    /// Apply a newly registered source to every already-existing matching
+    /// world, implementing CDP runImmediately.
+    pub fn run_preload_script_immediately(&mut self, script: &PreloadScript) {
+        let main_id = self.frames.main_frame_id().to_string();
+        let main_generation = self
+            .frames
+            .get(&main_id)
+            .map(|frame| frame.document_generation)
+            .unwrap_or_default();
+        let main_root = self
+            .with_dom(|dom| dom.document().raw())
+            .unwrap_or_default();
+        let main_base = self.url_string();
+        let child_targets: Vec<(String, u64, u32, String)> = self
+            .frames
+            .frame_ids()
+            .filter(|frame_id| *frame_id != main_id)
+            .filter_map(|frame_id| {
+                let frame = self.frames.get(frame_id)?;
+                let root = frame.active_document_root?;
+                let base = self
+                    .with_dom(|dom| dom.document_scope(root))
+                    .flatten()
+                    .map(|scope| scope.base_url)
+                    .unwrap_or_else(|| "about:blank".to_string());
+                Some((
+                    frame_id.to_string(),
+                    frame.document_generation,
+                    root.raw(),
+                    base,
+                ))
+            })
+            .collect();
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        match script.world_name.as_deref() {
+            None => {
+                let _ = js.execute_script_guarded("<preload>", &script.source);
+                for (frame_id, generation, root, base) in child_targets {
+                    if js
+                        .ensure_frame_realm(&frame_id, generation, root, &base)
+                        .is_ok()
+                    {
+                        let _ = js.execute_script_in_frame_realm(
+                            &frame_id,
+                            generation,
+                            "<preload>",
+                            &script.source,
+                        );
+                    }
+                }
+            }
+            Some(world_name) => {
+                let mut targets =
+                    vec![(main_id, main_generation, main_root, main_base)];
+                targets.extend(child_targets);
+                for (frame_id, generation, root, base) in targets {
+                    if js
+                        .ensure_isolated_world_realm(
+                            &frame_id,
+                            generation,
+                            script.world_id,
+                            world_name,
+                            root,
+                            &base,
+                        )
+                        .is_ok()
+                    {
+                        let _ = js.execute_script_in_frame_world_realm(
+                            &frame_id,
+                            generation,
+                            script.world_id,
+                            "<preload>",
+                            &script.source,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Append a script that runs in the page before any of the page's own
     /// `<script>` tags, matching CDP `Page.addScriptToEvaluateOnNewDocument`.
     /// Takes effect on the next navigation (`goto` / `navigate*`).
     pub fn add_preload_script(&mut self, script: &str) {
-        self.preload_scripts.push(script.to_string());
+        self.preload_scripts
+            .push(PreloadScript::main_world(script));
     }
 
     /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
@@ -5848,6 +6026,62 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_preloads_run_before_author_scripts_in_matching_worlds() {
+        let mut page = frame_test_page(
+            "<!doctype html><iframe id=f srcdoc=\"\
+             <script>\
+               globalThis.authorSawPreload=globalThis.preloadValue;\
+               globalThis.authorSawUtility=typeof globalThis.utilityValue;\
+             </script>\
+             \"></iframe>",
+        );
+        page.set_preload_scripts(vec![
+            super::PreloadScript::main_world("globalThis.preloadValue='ready'"),
+            super::PreloadScript {
+                source: "globalThis.utilityValue='isolated'".to_string(),
+                world_name: Some("utility".to_string()),
+                world_id: 7,
+            },
+        ]);
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[document.getElementById('f').contentWindow.authorSawPreload, document.getElementById('f').contentWindow.authorSawUtility]",
+                )
+                .unwrap(),
+            serde_json::json!(["ready", "undefined"]),
+        );
+        let (frame_id, generation) = {
+            let js = page.js.as_ref().unwrap();
+            let host = js
+                .with_dom(|dom| dom.query_selector("#f").unwrap().unwrap())
+                .unwrap();
+            let frame = page.frames.by_host(host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_world_realm(
+                    &frame_id,
+                    generation,
+                    7,
+                    "<test>",
+                    "[utilityValue, typeof preloadValue, typeof authorSawPreload]",
+                )
+                .unwrap(),
+            serde_json::json!(["isolated", "undefined", "undefined"]),
         );
     }
 

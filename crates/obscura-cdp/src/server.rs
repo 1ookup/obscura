@@ -1191,7 +1191,15 @@ async fn process_with_interception(
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_scripts: Vec<obscura_browser::PreloadScript> = ctx
+        .preload_scripts
+        .iter()
+        .map(|(_, source, world_name, world_id)| obscura_browser::PreloadScript {
+            source: source.clone(),
+            world_name: world_name.clone(),
+            world_id: *world_id,
+        })
+        .collect();
 
     if let Some(tx) = &ctx.intercept_tx {
         page.set_intercept_tx(tx.clone());
