@@ -14,6 +14,7 @@
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_frame_realm_globals', '__obscura_realm_bridge',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
     '__obscura_registerLinkedStylesheet',
@@ -88,6 +89,28 @@ globalThis.dispatchEvent = function(event) {
   for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
   return !event.defaultPrevented;
 };
+
+// A cross-context V8 GlobalProxy exposes built-in bindings but can miss
+// properties created later on the owning global object. Keep one realm-owned
+// bridge whose traps execute in that realm and forward every live operation
+// to its actual global. Rust shares this bridge between contexts; author-facing
+// WindowProxy facades still enforce origin checks and stable navigation identity.
+globalThis.__obscura_realm_bridge = new Proxy({}, {
+  get(_target, key) { return Reflect.get(globalThis, key, globalThis); },
+  set(_target, key, value) { return Reflect.set(globalThis, key, value, globalThis); },
+  has(_target, key) { return Reflect.has(globalThis, key); },
+  ownKeys() { return Reflect.ownKeys(globalThis); },
+  getOwnPropertyDescriptor(_target, key) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(globalThis, key);
+    if (descriptor) descriptor.configurable = true;
+    return descriptor;
+  },
+  defineProperty(_target, key, descriptor) {
+    return Reflect.defineProperty(globalThis, key, descriptor);
+  },
+  deleteProperty(_target, key) { return Reflect.deleteProperty(globalThis, key); },
+  getPrototypeOf() { return Reflect.getPrototypeOf(globalThis); },
+});
 
 let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
@@ -3863,6 +3886,8 @@ class Element extends Node {
       // same-origin gate compares typed DocumentScope origins in Rust, never
       // serialized origin strings; cross-origin content reads as null.
       if (!_frameSameOrigin(nativeRoot)) return null;
+      const realmGlobal = _frameRealmGlobalFor(nativeRoot);
+      if (realmGlobal && realmGlobal.document) return realmGlobal.document;
       const doc = _scopedDocumentFor(nativeRoot);
       doc._defaultViewProxy = _frameWindowProxyFor(this);
       return doc;
@@ -6122,6 +6147,23 @@ const _crossOriginWindowProps = new Set([
 // frame's navigations; every access re-reads the active content root.
 const _frameWindowProxies = new Map();
 
+// Rust rebuilds this context-local registry whenever a managed frame realm is
+// created or destroyed. Values are live, realm-owned bridges to the frame main
+// worlds, so same-origin WindowProxy access reaches the realm that executes the
+// frame's scripts instead of a detached JS facade with copied constructors.
+function _frameRealmGlobalFor(rootNid) {
+  const globals = globalThis.__obscura_frame_realm_globals;
+  return globals ? (globals[String(rootNid)] || null) : null;
+}
+function _frameRealmOwnKeys(realmGlobal) {
+  try { return realmGlobal.Reflect.ownKeys(realmGlobal); }
+  catch (e) { return Reflect.ownKeys(realmGlobal); }
+}
+function _frameRealmOwnDescriptor(realmGlobal, key) {
+  try { return realmGlobal.Object.getOwnPropertyDescriptor(realmGlobal, key); }
+  catch (e) { return Reflect.getOwnPropertyDescriptor(realmGlobal, key); }
+}
+
 function _frameWindowProxyFor(hostEl) {
   const hostNid = hostEl._nid;
   const existing = _frameWindowProxies.get(hostNid);
@@ -6172,11 +6214,20 @@ function _frameWindowProxyFor(hostEl) {
       const root = contentRoot();
       if (root < 0) return null;
       if (!_frameSameOrigin(root)) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(root);
+      if (realmGlobal && realmGlobal.document) return realmGlobal.document;
       const doc = _scopedDocumentFor(root);
       doc._defaultViewProxy = proxy;
       return doc;
     },
-    get location() { return frameLocation; },
+    get location() {
+      const root = contentRoot();
+      if (root >= 0 && _frameSameOrigin(root)) {
+        const realmGlobal = _frameRealmGlobalFor(root);
+        if (realmGlobal && realmGlobal.location) return realmGlobal.location;
+      }
+      return frameLocation;
+    },
     set location(v) { /* cross-origin navigation write; wiring is Phase 3.5 */ },
     get frameElement() {
       if (!sameOrigin()) throw securityError();
@@ -6220,13 +6271,65 @@ function _frameWindowProxyFor(hostEl) {
     get(t, key) {
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
-      return undefined;
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      return realmGlobal ? Reflect.get(realmGlobal, key, realmGlobal) : undefined;
     },
     set(t, key, value) {
       if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
         throw securityError();
       }
-      return Reflect.set(t, key, value);
+      if (Reflect.has(t, key)) return Reflect.set(t, key, value);
+      const realmGlobal = sameOrigin() ? _frameRealmGlobalFor(contentRoot()) : null;
+      return realmGlobal
+        ? Reflect.set(realmGlobal, key, value, realmGlobal)
+        : Reflect.set(t, key, value);
+    },
+    has(t, key) {
+      if (Reflect.has(t, key)) return true;
+      if (typeof key === "string" && !sameOrigin()) return false;
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      return !!realmGlobal && Reflect.has(realmGlobal, key);
+    },
+    ownKeys(t) {
+      const keys = Reflect.ownKeys(t);
+      if (!sameOrigin()) return keys;
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (!realmGlobal) return keys;
+      const seen = new Set(keys);
+      for (const key of _frameRealmOwnKeys(realmGlobal)) {
+        if (!seen.has(key)) keys.push(key);
+      }
+      return keys;
+    },
+    getOwnPropertyDescriptor(t, key) {
+      const own = Reflect.getOwnPropertyDescriptor(t, key);
+      if (own) return own;
+      if (typeof key === "string" && !sameOrigin()) return undefined;
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const descriptor = realmGlobal
+        ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
+      if (!descriptor) return undefined;
+      descriptor.configurable = true;
+      return descriptor;
+    },
+    defineProperty(t, key, descriptor) {
+      if (!sameOrigin()) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      return realmGlobal
+        ? Reflect.defineProperty(realmGlobal, key, descriptor)
+        : Reflect.defineProperty(t, key, descriptor);
+    },
+    deleteProperty(t, key) {
+      if (!sameOrigin()) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      return realmGlobal
+        ? Reflect.deleteProperty(realmGlobal, key)
+        : Reflect.deleteProperty(t, key);
+    },
+    getPrototypeOf(t) {
+      if (!sameOrigin()) return Reflect.getPrototypeOf(t);
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      return realmGlobal ? Reflect.getPrototypeOf(realmGlobal) : Reflect.getPrototypeOf(t);
     },
   });
   _frameWindowProxies.set(hostNid, proxy);
@@ -14601,6 +14704,7 @@ globalThis.__obscura_init = function() {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root.
     globalThis.document = _scopedDocumentFor(frameRootNid);
+    globalThis.document._defaultViewProxy = globalThis;
     // Ancestor window wiring (Phase 4): `parent` addresses the direct parent
     // document's realm, `top` the main Window; frameElement follows the
     // same-origin-with-parent rule (a cross-origin container reads null).

@@ -115,14 +115,24 @@ impl ObscuraJsRuntime {
     /// Create a fresh context in this runtime's isolate and inject the main
     /// context's `Deno` binding object so ops are callable from realm script.
     fn create_realm_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
+        let main_context = self.deno_runtime_mut().main_context();
         let scope = &mut self.deno_runtime_mut().handle_scope();
-        let main_context = scope.get_current_context();
-        let main_global = main_context.global(scope);
-        let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
-        let deno_val = main_global
-            .get(scope, deno_key.into())
-            .filter(|v| v.is_object())
-            .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+        let main_context = v8::Local::new(scope, &main_context);
+        let (deno_key, deno_val, token) = {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let main_global = main_context.global(scope);
+            let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
+            let deno_val = main_global
+                .get(scope, deno_key.into())
+                .filter(|v| v.is_object())
+                .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+            let token = main_context.get_security_token(scope);
+            (
+                v8::Global::new(scope, deno_key),
+                v8::Global::new(scope, deno_val),
+                v8::Global::new(scope, token),
+            )
+        };
 
         let context = v8::Context::new(scope, v8::ContextOptions::default());
         // Same security token as the main context. Plain contexts install no
@@ -130,11 +140,13 @@ impl ObscuraJsRuntime {
         // checks permissive while objects (Deno.core) are shared across
         // realms. Author-visible cross-frame access checks live in the
         // WindowProxy layer (bootstrap.js), not in V8 tokens.
-        let token = main_context.get_security_token(scope);
+        let token = v8::Local::new(scope, &token);
         context.set_security_token(token);
         {
             let scope = &mut v8::ContextScope::new(scope, context);
             let global = context.global(scope);
+            let deno_key = v8::Local::new(scope, &deno_key);
+            let deno_val = v8::Local::new(scope, &deno_val);
             global.set(scope, deno_key.into(), deno_val);
         }
         Ok(v8::Global::new(scope, context))
@@ -279,7 +291,71 @@ impl ObscuraJsRuntime {
                 scope_origin,
             },
         );
+        self.rebuild_frame_realm_global_registries()?;
         Ok(true)
+    }
+
+    /// Rebuild the context-local lookup used by JavaScript WindowProxy
+    /// facades. Each receiver gets a live realm-owned bridge for every frame
+    /// main world. Rebuilding, rather than mutating, also releases contexts
+    /// belonging to destroyed generations.
+    fn rebuild_frame_realm_global_registries(&mut self) -> Result<(), String> {
+        let frame_targets: Vec<(u32, v8::Global<v8::Context>)> = self
+            .frame_realms
+            .realms
+            .values()
+            .filter(|realm| realm.world_id == MAIN_WORLD)
+            .map(|realm| (realm.content_root, realm.context.clone()))
+            .collect();
+        let receiver_contexts: Vec<v8::Global<v8::Context>> = self
+            .frame_realms
+            .realms
+            .values()
+            .map(|realm| realm.context.clone())
+            .collect();
+
+        let main_context_global = self.deno_runtime_mut().main_context();
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let mut targets = Vec::with_capacity(frame_targets.len());
+        for (content_root, context) in frame_targets {
+            let context = v8::Local::new(scope, &context);
+            let global = {
+                let scope = &mut v8::ContextScope::new(scope, context);
+                let global = context.global(scope);
+                let key = v8::String::new(scope, "__obscura_realm_bridge")
+                    .ok_or_else(|| alloc_err("realm bridge key"))?;
+                let bridge = global
+                    .get(scope, key.into())
+                    .and_then(|value| value.to_object(scope))
+                    .ok_or_else(|| "realm: frame context has no realm bridge".to_string())?;
+                v8::Global::new(scope, bridge)
+            };
+            targets.push((content_root, global));
+        }
+
+        let mut receivers = Vec::with_capacity(receiver_contexts.len() + 1);
+        receivers.push(main_context_global);
+        receivers.extend(receiver_contexts);
+        for receiver in receivers {
+            let receiver = v8::Local::new(scope, &receiver);
+            let scope = &mut v8::ContextScope::new(scope, receiver);
+            let registry = v8::Object::new(scope);
+            for (content_root, target) in &targets {
+                let key = v8::String::new(scope, &content_root.to_string())
+                    .ok_or_else(|| alloc_err("frame realm registry key"))?;
+                let target = v8::Local::new(scope, target);
+                if registry.set(scope, key.into(), target.into()) != Some(true) {
+                    return Err("realm: failed to populate frame global registry".to_string());
+                }
+            }
+            let key = v8::String::new(scope, "__obscura_frame_realm_globals")
+                .ok_or_else(|| alloc_err("frame realm registry property"))?;
+            let global = receiver.global(scope);
+            if global.set(scope, key.into(), registry.into()) != Some(true) {
+                return Err("realm: failed to install frame global registry".to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Run `source` with Script semantics in the realm registered for
@@ -337,6 +413,7 @@ impl ObscuraJsRuntime {
         let removed = before - self.frame_realms.realms.len();
         if removed > 0 {
             self.invalidate_object_handles(frame_id, Some(generation));
+            let _ = self.rebuild_frame_realm_global_registries();
             self.deno_runtime_mut().v8_isolate().low_memory_notification();
         }
         removed > 0
@@ -350,6 +427,7 @@ impl ObscuraJsRuntime {
         let removed = before - self.frame_realms.realms.len();
         if removed > 0 {
             self.invalidate_object_handles(frame_id, None);
+            let _ = self.rebuild_frame_realm_global_registries();
             self.deno_runtime_mut().v8_isolate().low_memory_notification();
         }
         removed
@@ -445,12 +523,19 @@ impl ObscuraJsRuntime {
         context: &v8::Global<v8::Context>,
         name: &str,
     ) -> Result<(), String> {
+        let main_context = self.deno_runtime_mut().main_context();
         let scope = &mut self.deno_runtime_mut().handle_scope();
-        let main_global = scope.get_current_context().global(scope);
+        let main_context = v8::Local::new(scope, &main_context);
+        let main_global = {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let main_global = main_context.global(scope);
+            v8::Global::new(scope, main_global)
+        };
         let context = v8::Local::new(scope, context);
         let scope = &mut v8::ContextScope::new(scope, context);
         let key = v8::String::new(scope, name).ok_or_else(|| alloc_err("key"))?;
         let global = context.global(scope);
+        let main_global = v8::Local::new(scope, &main_global);
         global.set(scope, key.into(), main_global.into());
         Ok(())
     }
@@ -1476,6 +1561,54 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!(["yes", "from realm", true])
+        );
+    }
+
+    #[test]
+    fn same_origin_window_proxy_targets_the_live_frame_global() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "var frameMarker = 7; globalThis.frameObject = { realm: 'child' };",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const iframe = document.getElementById('f');
+                    const child = iframe.contentWindow;
+                    child.parentAssigned = 11;
+                    child.eval('globalThis.evalAssigned = 13');
+                    return [
+                        child.frameMarker,
+                        child.frameObject.realm,
+                        child.parentAssigned,
+                        child.evalAssigned,
+                        child.Array !== Array,
+                        child.document === iframe.contentDocument,
+                        Object.getOwnPropertyNames(child).includes('frameMarker'),
+                        !Object.getOwnPropertyNames(child).some(name => name.includes('obscura')),
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([7, "child", 11, 13, true, true, true, true]),
+        );
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[parentAssigned, evalAssigned]",
+            )
+            .unwrap(),
+            serde_json::json!([11, 13]),
         );
     }
 
