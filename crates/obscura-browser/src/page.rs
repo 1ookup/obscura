@@ -4942,6 +4942,12 @@ impl Page {
         }
         if result.is_ok() {
             self.execute_frame_subtree_scripts(frame_id).await;
+        }
+        // HTML deliberately fires iframe load even when fetching or embedding
+        // fails, so callers cannot use the event to probe network resources.
+        // A superseded navigation is the exception: its replacement owns the
+        // eventual load event.
+        if !matches!(&result, Err(FrameNavigateError::Superseded)) {
             self.dispatch_frame_load_event(frame_id);
         }
         result
@@ -5695,6 +5701,38 @@ mod tests {
         assert_eq!(
             page.js.as_mut().unwrap().evaluate("dynamicLoads").unwrap(),
             serde_json::json!(3.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_iframe_navigation_still_dispatches_load() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    globalThis.failedFrameLoads = 0;
+                    frame.addEventListener('load', () => failedFrameLoads++);
+                    frame.src = location.href;
+                    document.body.appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(page.process_pending_frame_navigations().await, 0);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("failedFrameLoads")
+                .unwrap(),
+            serde_json::json!(1.0),
         );
     }
 
