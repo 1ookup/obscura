@@ -384,9 +384,12 @@ impl ObscuraJsRuntime {
             .collect();
 
         let main_context_global = self.deno_runtime_mut().main_context();
+        let mut target_contexts = Vec::with_capacity(frame_targets.len() + 1);
+        target_contexts.push((0, main_context_global.clone()));
+        target_contexts.extend(frame_targets);
         let scope = &mut self.deno_runtime_mut().handle_scope();
-        let mut targets = Vec::with_capacity(frame_targets.len());
-        for (content_root, context) in frame_targets {
+        let mut targets = Vec::with_capacity(target_contexts.len());
+        for (content_root, context) in target_contexts {
             let context = v8::Local::new(scope, &context);
             let global = {
                 let scope = &mut v8::ContextScope::new(scope, context);
@@ -2010,6 +2013,58 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!([11, 13]),
+        );
+    }
+
+    #[test]
+    fn same_origin_parent_and_top_forward_live_author_globals() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.evaluate("globalThis.parentMarker = { value: 7 }")
+            .unwrap();
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"(() => {
+                    parent.childWrite = 11;
+                    top.topWrite = 13;
+                    return [
+                        parent.parentMarker.value,
+                        top.parentMarker.value,
+                        'parentMarker' in parent,
+                        Object.getOwnPropertyNames(parent).includes('parentMarker'),
+                        parent === top,
+                        parent.window === parent,
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([7, 7, true, true, true, true]),
+        );
+        assert_eq!(
+            rt.evaluate("[childWrite, topWrite]").unwrap(),
+            serde_json::json!([11, 13]),
+        );
+
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "parent.location.href = '/from-frame'",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/from-frame".to_string(),
+                "GET".to_string(),
+                String::new(),
+            )),
         );
     }
 

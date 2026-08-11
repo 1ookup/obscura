@@ -6389,9 +6389,12 @@ globalThis._frameMessageRecvLoop = _frameMessageRecvLoop;
 // cross-origin access is limited to the HTML cross-origin Window allowlist —
 // the same policy _frameWindowProxyFor enforces in the other direction. A
 // nested frame's `parent` addresses its direct parent document's realm and
-// `top` always addresses the main Window; an ancestor ref's own `parent`
-// collapses to `top` until full multi-level chains land (TODO).
+// `top` always addresses the main Window.
+const _ancestorWindowRefs = new Map();
 function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) {
+  const cacheKey = selfRoot + ":" + targetRoot;
+  const cached = _ancestorWindowRefs.get(cacheKey);
+  if (cached) return cached;
   const sameOrigin = () =>
     _dom("iframe_scopes_same_origin", selfRoot, targetRoot) === "true";
   const securityError = () => new DOMException(
@@ -6399,8 +6402,11 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       + (globalThis.location ? globalThis.location.origin : "null")
       + '" from accessing a cross-origin frame.',
     "SecurityError");
-  // Reads require same-origin; writes/assign/replace stay stubs until parent
-  // navigation from a child routes through Rust (Phase 3.5 follow-on).
+  const targetGlobal = () => _frameRealmGlobalFor(targetRoot);
+  const navigate = (value) => {
+    const url = _resolveUrl(String(value));
+    Deno.core.ops.op_navigate_frame(targetRoot, url, "GET", "");
+  };
   const ancestorLocation = {
     get href() {
       if (!sameOrigin()) throw securityError();
@@ -6410,10 +6416,10 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       }
       return _domParse("document_url") || "about:blank";
     },
-    set href(v) {},
-    assign() {},
-    replace() {},
-    reload() {},
+    set href(v) { navigate(v); },
+    assign(v) { navigate(v); },
+    replace(v) { navigate(v); },
+    reload() { navigate(this.href); },
     toString() { return this.href; },
   };
   const target = {
@@ -6424,17 +6430,27 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     },
     get document() {
       if (!sameOrigin()) throw securityError();
-      if (targetRoot > 0) return _scopedDocumentFor(targetRoot);
-      // Realm-local wrapper for the main document.
-      const nid = +_dom("document_node_id");
-      let doc = _cache.get(nid);
-      if (!doc) { doc = new Document(nid); _cache.set(nid, doc); }
-      return doc;
+      const realmGlobal = targetGlobal();
+      if (realmGlobal && realmGlobal.document) return realmGlobal.document;
+      return targetRoot > 0 ? _scopedDocumentFor(targetRoot) : null;
     },
-    get location() { return ancestorLocation; },
-    set location(v) { /* cross-origin navigation write; wiring is Phase 3.5 */ },
-    get top() { return globalThis.top; },
-    get parent() { return globalThis.top; },
+    get location() {
+      if (sameOrigin()) {
+        const realmGlobal = targetGlobal();
+        if (realmGlobal && realmGlobal.location) return realmGlobal.location;
+      }
+      return ancestorLocation;
+    },
+    set location(v) { navigate(v); },
+    get top() { return toTop ? ref : globalThis.top; },
+    get parent() {
+      if (targetRoot === 0) return ref;
+      const container = _domParse("frame_container_info", targetRoot) || {};
+      const parentRoot =
+        typeof container.parentRoot === "number" && container.parentRoot > 0
+          ? container.parentRoot : 0;
+      return _ancestorWindowRef(selfRoot, parentRoot, parentRoot === 0);
+    },
     get length() {
       const root = targetRoot > 0 ? targetRoot : +_dom("document_node_id");
       return (_domParse("query_selector_all_scoped", root, "iframe") || []).length;
@@ -6452,15 +6468,49 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     get(t, key) {
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
-      return undefined;
+      const realmGlobal = targetGlobal();
+      return realmGlobal ? Reflect.get(realmGlobal, key, realmGlobal) : undefined;
     },
     set(t, key, value) {
       if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
         throw securityError();
       }
-      return Reflect.set(t, key, value);
+      if (Reflect.has(t, key)) return Reflect.set(t, key, value);
+      const realmGlobal = sameOrigin() ? targetGlobal() : null;
+      return realmGlobal
+        ? Reflect.set(realmGlobal, key, value, realmGlobal)
+        : Reflect.set(t, key, value);
+    },
+    has(t, key) {
+      if (Reflect.has(t, key)) return true;
+      if (typeof key === "string" && !sameOrigin()) return false;
+      const realmGlobal = targetGlobal();
+      return !!realmGlobal && Reflect.has(realmGlobal, key);
+    },
+    ownKeys(t) {
+      const keys = Reflect.ownKeys(t);
+      if (!sameOrigin()) return keys;
+      const realmGlobal = targetGlobal();
+      if (!realmGlobal) return keys;
+      const seen = new Set(keys);
+      for (const key of _frameRealmOwnKeys(realmGlobal)) {
+        if (!seen.has(key)) keys.push(key);
+      }
+      return keys;
+    },
+    getOwnPropertyDescriptor(t, key) {
+      const own = Reflect.getOwnPropertyDescriptor(t, key);
+      if (own) return own;
+      if (typeof key === "string" && !sameOrigin()) return undefined;
+      const realmGlobal = targetGlobal();
+      const descriptor = realmGlobal
+        ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
+      if (!descriptor) return undefined;
+      descriptor.configurable = true;
+      return descriptor;
     },
   });
+  _ancestorWindowRefs.set(cacheKey, ref);
   return ref;
 }
 
