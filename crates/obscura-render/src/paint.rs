@@ -896,9 +896,10 @@ impl PreparedRender {
         if self.has_active_declarative_css_animations() {
             return false;
         }
+        let root = self.layout.root;
         let connected = |node: obscura_dom::tree::NodeId| {
             tree.get_node(node).is_some()
-                && (node == tree.document() || tree.ancestors(node).contains(&tree.document()))
+                && (node == root || tree.ancestors(node).contains(&root))
         };
         let mut updates = Vec::new();
         let mut has_transform_effect = false;
@@ -1213,7 +1214,7 @@ impl PreparedRender {
             }
         }
         if let Some(root_node) = tree
-            .descendants(tree.document())
+            .descendants(self.layout.root)
             .into_iter()
             .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
         {
@@ -2424,6 +2425,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         .then(|| {
             retained_animation_restyle_mutations(
                 tree,
+                previous.layout.root,
                 &previous.layout.styles,
                 animation_timeline,
             )
@@ -2462,12 +2464,13 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
 
 fn retained_animation_restyle_mutations(
     tree: &DomTree,
+    layout_root: obscura_dom::tree::NodeId,
     styles: &HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
     animation_timeline: &crate::AnimationTimelineState,
 ) -> Vec<crate::dom::RetainedStyleMutation> {
     let connected = |node: obscura_dom::tree::NodeId| {
         tree.get_node(node).is_some()
-            && (node == tree.document() || tree.ancestors(node).contains(&tree.document()))
+            && (node == layout_root || tree.ancestors(node).contains(&layout_root))
     };
     let mut css_nodes = styles
         .iter()
@@ -2534,11 +2537,11 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .collect::<HashMap<_, _>>();
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
+    let fonts = collect_web_fonts(tree, layout_root, base_url, resources, dynamic_fonts);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
-    let svg_fonts = if has_inline_svg_text(tree) {
+    let svg_fonts = if has_inline_svg_text(tree, layout_root) {
         svg_font_database_with_web_fonts(&fonts)
     } else {
         svg_font_database()
@@ -3151,7 +3154,7 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
     {
         return false;
     }
-    !tree.descendants(tree.document()).into_iter().any(|id| {
+    !tree.descendants(laid.root).into_iter().any(|id| {
         tree.get_node(id).is_some_and(|node| {
             node.as_element().is_some_and(|name| {
                 matches!(
@@ -7006,6 +7009,7 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
 /// the subset containing ASCII.
 fn collect_web_fonts(
     tree: &DomTree,
+    layout_root: obscura_dom::tree::NodeId,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
@@ -7014,7 +7018,7 @@ fn collect_web_fonts(
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
 
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, layout_root) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -7066,7 +7070,7 @@ fn collect_web_fonts(
     // already resolved relative to the HTML. Fetch those first, while retaining
     // the matching @font-face descriptors needed for CSS family/weight lookup.
     let mut preloads = Vec::new();
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+    for nid in crate::dom::rendered_descendants(tree, layout_root) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -10288,8 +10292,8 @@ fn svg_font_database_with_web_fonts(
     std::sync::Arc::new(database)
 }
 
-fn has_inline_svg_text(tree: &DomTree) -> bool {
-    crate::dom::rendered_descendants(tree, tree.document())
+fn has_inline_svg_text(tree: &DomTree, layout_root: obscura_dom::tree::NodeId) -> bool {
+    crate::dom::rendered_descendants(tree, layout_root)
         .into_iter()
         .any(|nid| {
         tree.get_node(nid).is_some_and(|node| {
@@ -10908,7 +10912,13 @@ fn inject_external_sprites(
         local_fragments.iter().map(String::as_str).collect();
     let mut local_nodes = std::collections::HashMap::new();
     if !wanted_local.is_empty() {
-        for nid in tree.descendants(tree.document()) {
+        // Resolve local fragment references inside the svg's own tree scope:
+        // a frame document's sprite symbols live under its content root, and
+        // a parent document's ids must not answer a frame's `<use>`.
+        let scope_root = tree
+            .tree_scope_root(root)
+            .unwrap_or_else(|| tree.document());
+        for nid in tree.descendants(scope_root) {
             let Some(node) = tree.get_node(nid) else {
                 continue;
             };
@@ -15225,6 +15235,52 @@ mod tests {
     }
 
     #[test]
+    fn frame_svg_use_resolves_symbols_in_its_own_tree_scope() {
+        // The parent and the frame document both define `#dup`. A `<use>`
+        // inside the frame must copy the frame's symbol, never the parent's:
+        // fragment references resolve within the referencing element's tree
+        // scope.
+        let tree = parse_html(
+            r##"<html><body>
+                <svg style="display:none"><symbol id="dup" viewBox="0 0 10 10"><rect data-owner="parent"/></symbol></svg>
+                <iframe></iframe>
+            </body></html>"##,
+        );
+        let host = tree.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            root,
+            r##"<html><body>
+                <svg style="display:none"><symbol id="dup" viewBox="0 0 10 10"><rect data-owner="frame"/></symbol></svg>
+                <svg id="icon" viewBox="0 0 10 10"><use href="#dup"/></svg>
+            </body></html>"##,
+        );
+        let svg = tree.query_selector_from(root, "#icon").unwrap().unwrap();
+        let mut markup = serialize_svg(&tree, svg);
+        let mut cache = RenderResourceCache::default();
+        let mut sprite_cache = std::collections::HashMap::new();
+        inject_external_sprites(
+            &tree,
+            svg,
+            None,
+            None,
+            None,
+            &mut markup,
+            &mut cache,
+            &mut sprite_cache,
+        );
+        assert!(
+            markup.contains(r#"data-owner="frame""#),
+            "frame symbol must win inside the frame scope: {markup}"
+        );
+        assert!(
+            !markup.contains(r#"data-owner="parent""#),
+            "parent symbol must not leak into the frame: {markup}"
+        );
+    }
+
+    #[test]
     fn injects_document_level_symbol_into_target_svg() {
         // Frameworks commonly keep one hidden sprite beside the application
         // root and reference it from otherwise independent inline SVGs.
@@ -16718,7 +16774,12 @@ mod tests {
             "the timeline accessor must return the exact deduplicated target set"
         );
 
-        let mutations = retained_animation_restyle_mutations(&tree, &HashMap::new(), &timeline);
+        let mutations = retained_animation_restyle_mutations(
+            &tree,
+            tree.document(),
+            &HashMap::new(),
+            &timeline,
+        );
         assert_eq!(
             mutations,
             vec![crate::dom::RetainedStyleMutation::WaapiAnimation {

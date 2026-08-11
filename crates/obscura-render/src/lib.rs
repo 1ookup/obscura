@@ -27,7 +27,8 @@ pub use border::{
 
 pub mod dom;
 pub use dom::{
-    layout_dom, layout_dom_with_images, layout_dom_with_resources, AttributeStyleMutation,
+    layout_dom, layout_dom_from_root, layout_dom_with_images, layout_dom_with_resources,
+    AttributeStyleMutation,
     DomLayout, RetainedStyleMutation, StickyLayout, TreeStyleMutation,
 };
 

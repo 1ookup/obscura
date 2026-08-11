@@ -1003,6 +1003,61 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    /// Hit-test descent into iframe content for one document level (Phase
+    /// 5.8). `point` is in this layout's viewport coordinates, already
+    /// adjusted for this document's root scroll by the caller. Returns the
+    /// host, its active content-document root and the point translated into
+    /// the child's viewport coordinates; the caller recurses with the
+    /// child's own layout (and applies the child's scroll) to descend
+    /// further.
+    ///
+    /// Among overlapping hosts the last one in tree order wins, which is the
+    /// paint order for equal stacking; z-index between sibling iframes is
+    /// not consulted (documented approximation until full paint-order hit
+    /// testing lands).
+    pub fn frame_content_at_point(
+        &self,
+        tree: &DomTree,
+        point: (f32, f32),
+    ) -> Option<(NodeId, NodeId, (f32, f32))> {
+        let mut hit = None;
+        for host in rendered_descendants(tree, self.root) {
+            let is_iframe = tree
+                .get_node(host)
+                .and_then(|node| node.as_element().map(|e| e.local.as_ref() == "iframe"))
+                .unwrap_or(false);
+            if !is_iframe {
+                continue;
+            }
+            let Some(root) = tree.iframe_content_document(host) else {
+                continue;
+            };
+            let (Some(rect), Some(style)) = (self.rects.get(&host), self.styles.get(&host))
+            else {
+                continue;
+            };
+            let translate = self.translates.get(&host).copied().unwrap_or((0.0, 0.0));
+            let content_x = rect.x + translate.0 + style.border.left + style.padding.left;
+            let content_y = rect.y + translate.1 + style.border.top + style.padding.top;
+            let content_w =
+                (rect.width - style.border.left - style.border.right - style.padding.left
+                    - style.padding.right)
+                    .max(0.0);
+            let content_h =
+                (rect.height - style.border.top - style.border.bottom - style.padding.top
+                    - style.padding.bottom)
+                    .max(0.0);
+            if point.0 >= content_x
+                && point.0 < content_x + content_w
+                && point.1 >= content_y
+                && point.1 < content_y + content_h
+            {
+                hit = Some((host, root, (point.0 - content_x, point.1 - content_y)));
+            }
+        }
+        hit
+    }
+
     pub(crate) fn derived_layout_state(
         &self,
         tree: &DomTree,
@@ -3104,6 +3159,28 @@ fn resolve_css_counters(
 /// Lay out a DOM tree within `viewport` (width, height) in CSS pixels.
 pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
     layout_dom_with_images(tree, viewport, &HashMap::new())
+}
+
+/// Lay out one document scope, main document or an iframe content root, at
+/// `viewport`. Hit testing and geometry against a child frame document use
+/// this with the frame's content-box size as the viewport.
+pub fn layout_dom_from_root(tree: &DomTree, root: NodeId, viewport: (f32, f32)) -> DomLayout {
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    layout_dom_with_web_fonts_pass_limit_at_animation_time(
+        tree,
+        root,
+        viewport,
+        &HashMap::new(),
+        &[],
+        None,
+        None,
+        None,
+        &[],
+        crate::CssMediaType::Screen,
+        crate::AnimationSample::default(),
+        &mut animation_timeline,
+    )
+    .0
 }
 
 /// Like [`layout_dom`], but `intrinsic` supplies fetched intrinsic pixel sizes
@@ -15580,6 +15657,48 @@ mod tests {
                 "{item_id} incorrectly used the in-flow auto-margin fallback: grid={grid:?} item={item:?}"
             );
         }
+    }
+
+    #[test]
+    fn frame_content_at_point_translates_into_child_viewport_recursively() {
+        let tree = parse_html(
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <iframe style=\"display:block;border:4px solid #000;width:200px;height:100px\"></iframe>\
+             </body></html>",
+        );
+        let host = tree.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            root,
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <iframe id=\"inner\" style=\"display:block;border:0;width:50px;height:40px\"></iframe>\
+             </body></html>",
+        );
+        let inner_host = tree.query_selector_from(root, "#inner").unwrap().unwrap();
+        let (inner_root, _) = tree.create_iframe_content_document(inner_host).unwrap();
+
+        let parent = layout_dom(&tree, (400.0, 300.0));
+        // Outside the content box (inside the 4px border): no hit.
+        assert!(parent.frame_content_at_point(&tree, (2.0, 2.0)).is_none());
+        // Inside: translated past the border into child viewport coords.
+        let (hit_host, hit_root, local) = parent
+            .frame_content_at_point(&tree, (14.0, 24.0))
+            .expect("point inside the frame content box");
+        assert_eq!(hit_host, host);
+        assert_eq!(hit_root, root);
+        assert!((local.0 - 10.0).abs() < 0.01 && (local.1 - 20.0).abs() < 0.01);
+
+        // Recurse with the child's own layout to reach the nested document.
+        let child = crate::dom::layout_dom_from_root(&tree, hit_root, (200.0, 100.0));
+        let (nested_host, nested_root, nested_local) = child
+            .frame_content_at_point(&tree, local)
+            .expect("nested frame under the translated point");
+        assert_eq!(nested_host, inner_host);
+        assert_eq!(nested_root, inner_root);
+        assert!((nested_local.0 - 10.0).abs() < 0.01 && (nested_local.1 - 20.0).abs() < 0.01);
+        // Past the nested frame's box: the child level reports no hit.
+        assert!(child.frame_content_at_point(&tree, (150.0, 90.0)).is_none());
     }
 
     #[test]
