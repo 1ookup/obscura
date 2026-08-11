@@ -634,6 +634,16 @@ impl<'a> CanvasSurface<'a> {
 /// VM backing store, but the returned slice cannot escape the capture call.
 pub trait CanvasSurfaceSource {
     fn surface(&self, node: obscura_dom::tree::NodeId) -> Option<CanvasSurface<'_>>;
+
+    /// Paint-time lookup for a rendered iframe content document, keyed by the
+    /// host `<iframe>` element. The returned pixmap is already premultiplied
+    /// (unlike `surface`, whose canvas bytes are straight alpha) and is
+    /// normally exactly the content-box size so the blit is 1:1. Rendering
+    /// the child surface happens before parent paint (see
+    /// `render_frame_document`); this hook only composites it.
+    fn frame_surface(&self, _host: obscura_dom::tree::NodeId) -> Option<&Pixmap> {
+        None
+    }
 }
 
 struct EmptyCanvasSurfaceSource;
@@ -2792,6 +2802,115 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
     )
 }
 
+/// Prepare one iframe content document for painting. `root` is the frame's
+/// content-document root in the shared arena and `viewport` the host's
+/// content-box size in CSS pixels. The per-root pipeline (Phase 5.1) keeps
+/// the child cascade, viewport units, scroll tree and stacking contexts
+/// fully isolated from the parent document.
+///
+/// The caller supplies per-root `StylesheetCache` and
+/// `AnimationTimelineState` (Phase 5.2): sharing the parent's single-slot
+/// stylesheet cache would make parent and child evict each other on every
+/// alternation, and the timeline is NodeId-keyed per document.
+/// `RenderResourceCache` MAY be shared with the parent for URL-keyed
+/// resources.
+pub fn prepare_frame_document(
+    tree: &DomTree,
+    root: obscura_dom::tree::NodeId,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> Option<PreparedRender> {
+    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
+        tree,
+        root,
+        viewport,
+        base_url,
+        resources,
+        &[],
+        stylesheet_cache,
+        None,
+        crate::CssMediaType::Screen,
+        crate::AnimationSample::default(),
+        animation_timeline,
+    )
+}
+
+/// Render one iframe content document into its own premultiplied surface,
+/// ready for `CanvasSurfaceSource::frame_surface` compositing. The surface is
+/// exactly `viewport` in size so the parent blit is 1:1. Nested frames
+/// composite through `canvas_surfaces` recursively.
+pub fn render_frame_document(
+    tree: &DomTree,
+    root: obscura_dom::tree::NodeId,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_timeline: &mut crate::AnimationTimelineState,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Pixmap> {
+    let mut prepared = prepare_frame_document(
+        tree,
+        root,
+        viewport,
+        base_url,
+        resources,
+        stylesheet_cache,
+        animation_timeline,
+    )?;
+    paint_prepared_frame_document(tree, &mut prepared, resources, canvas_surfaces)
+}
+
+/// Paint an already-prepared frame document into its surface. Split from
+/// `render_frame_document` so an embedder can prepare first (to learn nested
+/// iframe content-box geometry from the layout), render the nested surfaces
+/// bottom-up, and then paint this document with those surfaces reachable
+/// through `canvas_surfaces`.
+pub fn paint_prepared_frame_document(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Pixmap> {
+    let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
+    let mut pixmap = Pixmap::new(w, h)?;
+    // An unstyled frame document paints on a white canvas, like a top-level
+    // document; the child's own root/body background overrides it below.
+    pixmap.fill(Color::from_rgba8(255, 255, 255, 255));
+    let canvas_background = canvas_background_source(tree, &prepared.layout);
+    paint_laid_dom_scrolled(
+        tree,
+        prepared.viewport,
+        prepared.base_url.as_deref(),
+        (0.0, 0.0),
+        None,
+        None,
+        pixmap,
+        resources,
+        &prepared.selected_images,
+        canvas_surfaces,
+        &prepared.svg_fonts,
+        prepared.content_size,
+        &prepared.viewport_fixed,
+        &prepared.sticky,
+        &prepared.scroll_tree,
+        &mut prepared.layout,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (0.0, 0.0),
+        1.0,
+        false,
+        canvas_background,
+    )
+}
+
 /// Paint an arbitrary document-space rectangle from one retained layout and
 /// resolved scroll snapshot. The live root viewport remains the containing
 /// block for fixed and sticky descendants, while ordinary document content is
@@ -4337,6 +4456,37 @@ fn paint_laid_dom_scrolled(
                     &content_visible,
                     style.object_fit,
                     style.object_position,
+                    &mut pixmap,
+                    radius.inset(content_insets),
+                    element_clip_mask,
+                );
+            }
+        }
+
+        if box_on_surface && name.local.as_ref() == "iframe" {
+            if let Some(child) = canvas_surfaces.frame_surface(nid) {
+                // Iframe content is replaced content with the same content-box
+                // geometry as canvas. The child pixmap is already
+                // premultiplied, so it must NOT go through the canvas path,
+                // whose straight-to-premultiplied conversion would multiply
+                // alpha twice.
+                let content_insets = crate::Sides {
+                    top: style.border.top + style.padding.top,
+                    right: style.border.right + style.padding.right,
+                    bottom: style.border.bottom + style.padding.bottom,
+                    left: style.border.left + style.padding.left,
+                };
+                let content_rect = crate::Rect {
+                    x: rect.x + content_insets.left,
+                    y: rect.y + content_insets.top,
+                    width: (rect.width - content_insets.left - content_insets.right).max(0.0),
+                    height: (rect.height - content_insets.top - content_insets.bottom).max(0.0),
+                };
+                let content_visible = content_rect.intersect(&visible_rect).unwrap_or_default();
+                paint_frame_surface(
+                    child,
+                    &content_rect,
+                    &content_visible,
                     &mut pixmap,
                     radius.inset(content_insets),
                     element_clip_mask,
@@ -9289,6 +9439,96 @@ fn length_to_px(len: &str, viewport_width: f32) -> Option<f32> {
     num(&t)
 }
 
+/// Composite a rendered iframe content surface into the parent pixmap. The
+/// child pixmap is premultiplied (it came out of tiny-skia), so unlike
+/// `paint_canvas_surface` there is no alpha conversion here: converting again
+/// would double-multiply. The blit is `ObjectFit::Fill`; the child surface is
+/// rendered at the content-box size, so the common case is 1:1 with no scale
+/// factor entering the coordinate math.
+fn paint_frame_surface(
+    child: &Pixmap,
+    rect: &crate::Rect,
+    visible_rect: &crate::Rect,
+    pixmap: &mut Pixmap,
+    clip_radius: crate::ResolvedBorderRadii,
+    extra_clip: Option<&tiny_skia::Mask>,
+) -> bool {
+    if child.width() == 0
+        || child.height() == 0
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+        || !rect_intersects_paint_surface(visible_rect, pixmap, 1.0)
+    {
+        return false;
+    }
+
+    let has_radius = !clip_radius.is_zero();
+    let needs_box_clip = has_radius
+        || rect.width > visible_rect.width + 0.5
+        || rect.height > visible_rect.height + 0.5
+        || rect.x < visible_rect.x - 0.5
+        || rect.y < visible_rect.y - 0.5;
+    let mut clip = extra_clip.cloned();
+    if needs_box_clip {
+        let path = if has_radius {
+            rounded_rect_path_radii(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+                clip_radius,
+            )
+        } else {
+            Rect::from_xywh(
+                visible_rect.x,
+                visible_rect.y,
+                visible_rect.width,
+                visible_rect.height,
+            )
+            .and_then(|rect| {
+                let mut builder = PathBuilder::new();
+                builder.push_rect(rect);
+                builder.finish()
+            })
+        };
+        match (clip.as_mut(), path) {
+            (Some(mask), Some(path)) => {
+                mask.intersect_path(&path, FillRule::Winding, true, Transform::identity())
+            }
+            (None, _) => {
+                clip = rounded_box_clip_mask_radii(
+                    pixmap.width(),
+                    pixmap.height(),
+                    visible_rect,
+                    clip_radius,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let transform = Transform::from_row(
+        rect.width / child.width() as f32,
+        0.0,
+        0.0,
+        rect.height / child.height() as f32,
+        rect.x,
+        rect.y,
+    );
+    pixmap.draw_pixmap(
+        0,
+        0,
+        child.as_ref(),
+        &tiny_skia::PixmapPaint {
+            quality: FilterQuality::Bilinear,
+            ..tiny_skia::PixmapPaint::default()
+        },
+        transform,
+        clip.as_ref(),
+    );
+    true
+}
+
 fn paint_canvas_surface(
     surface: CanvasSurface<'_>,
     rect: &crate::Rect,
@@ -11180,6 +11420,121 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    struct StubFrameSurfaces {
+        host: obscura_dom::tree::NodeId,
+        pixmap: Pixmap,
+    }
+
+    impl CanvasSurfaceSource for StubFrameSurfaces {
+        fn surface(&self, _node: obscura_dom::tree::NodeId) -> Option<CanvasSurface<'_>> {
+            None
+        }
+        fn frame_surface(&self, host: obscura_dom::tree::NodeId) -> Option<&Pixmap> {
+            (host == self.host).then_some(&self.pixmap)
+        }
+    }
+
+    #[test]
+    fn iframe_content_renders_isolated_and_composites_into_parent() {
+        let tree = parse_html(
+            "<!DOCTYPE html><html><head><style>p { color: rgb(0,0,255); }</style></head>\
+             <body style=\"margin:0\">\
+             <iframe id=\"f\" style=\"display:block;border:0;width:100px;height:50px\"></iframe>\
+             </body></html>",
+        );
+        let host = tree.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            root,
+            "<!DOCTYPE html><html><body style=\"margin:0;background:rgb(255,0,0)\">\
+             </body></html>",
+        );
+
+        // Child renders at the content-box size with its own cascade: fully
+        // red, unaffected by the parent's stylesheet.
+        let mut resources = RenderResourceCache::default();
+        let mut sheet_cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let child = render_frame_document(
+            &tree,
+            root,
+            (100.0, 50.0),
+            None,
+            &mut resources,
+            &mut sheet_cache,
+            &mut timeline,
+            &EMPTY_CANVAS_SURFACES,
+        )
+        .expect("child paint");
+        assert_eq!(child.width(), 100);
+        assert_eq!(child.height(), 50);
+        let px = child.pixel(10, 10).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue()), (255, 0, 0));
+
+        // Parent composites the child surface into the iframe content box.
+        let stub = StubFrameSurfaces {
+            host,
+            pixmap: child,
+        };
+        let mut parent_resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (300.0, 200.0), None, &mut parent_resources).expect("prepare");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let out = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree,
+            &mut prepared,
+            &mut parent_resources,
+            &scroll,
+            [255, 255, 255, 255],
+            &stub,
+        )
+        .expect("parent paint");
+        let inside = out.pixel(10, 10).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+        let outside = out.pixel(200, 100).unwrap();
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn frame_surface_blit_does_not_double_multiply_alpha() {
+        let tree = parse_html(
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <iframe style=\"display:block;border:0;width:10px;height:10px\"></iframe>\
+             </body></html>",
+        );
+        let host = tree.query_selector("iframe").unwrap().unwrap();
+        // A half-transparent green surface, premultiplied exactly once.
+        let mut half_green = Pixmap::new(10, 10).unwrap();
+        half_green.fill(tiny_skia::Color::from_rgba(0.0, 1.0, 0.0, 0.5).unwrap());
+        let stub = StubFrameSurfaces {
+            host,
+            pixmap: half_green,
+        };
+        let mut resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (20.0, 20.0), None, &mut resources).expect("prepare");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let out = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            [255, 255, 255, 255],
+            &stub,
+        )
+        .expect("paint");
+        // 50% green over white must be (128, 255, 128)-ish. A double
+        // premultiply would darken green toward (128, 191, 128) or lower.
+        let px = out.pixel(5, 5).unwrap();
+        assert!(px.red() >= 124 && px.red() <= 132, "red {}", px.red());
+        assert!(px.green() >= 250, "green {}", px.green());
+        assert!(px.blue() >= 124 && px.blue() <= 132, "blue {}", px.blue());
+    }
 
     #[test]
     fn native_shadow_flat_tree_paints_shadow_and_slotted_content_only() {

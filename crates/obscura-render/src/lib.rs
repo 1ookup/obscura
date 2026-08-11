@@ -95,6 +95,11 @@ mod image_capability_tests {
 
 #[cfg(feature = "paint")]
 mod paint;
+/// The premultiplied raster surface type used for frame compositing, re-
+/// exported so embedders can hold rendered iframe surfaces without a direct
+/// tiny-skia dependency.
+#[cfg(feature = "paint")]
+pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
@@ -103,8 +108,9 @@ pub use paint::{
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
     paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,
     paint_prepared_with_scroll, paint_prepared_with_scroll_and_surface_color,
+    paint_prepared_frame_document,
     paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces, prepare_dom,
-    prepare_dom_at_animation_time,
+    prepare_dom_at_animation_time, prepare_frame_document, render_frame_document,
     prepare_dom_with_dynamic_fonts, prepare_dom_with_dynamic_fonts_at_animation_time,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time,

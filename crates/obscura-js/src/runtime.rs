@@ -36,6 +36,137 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     }
 }
 
+/// Canvas surfaces plus rendered iframe content surfaces, for captures of
+/// pages that host child frame documents.
+#[cfg(feature = "render")]
+struct RuntimeSurfaceSource<'a> {
+    canvas: &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+    frames: &'a HashMap<NodeId, obscura_render::Pixmap>,
+}
+
+#[cfg(feature = "render")]
+impl obscura_render::CanvasSurfaceSource for RuntimeSurfaceSource<'_> {
+    fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
+        let surface = self.canvas.get(&node)?;
+        obscura_render::CanvasSurface::from_rgba8(
+            surface.width,
+            surface.height,
+            surface.pixels.as_ref(),
+        )
+    }
+    fn frame_surface(&self, host: NodeId) -> Option<&obscura_render::Pixmap> {
+        self.frames.get(&host)
+    }
+}
+
+/// The content-box size of an iframe host in its owning document's layout:
+/// the viewport of the child document (Phase 5.3, sizing is strictly one-way).
+#[cfg(feature = "render")]
+fn frame_content_box(
+    layout: &obscura_render::DomLayout,
+    host: NodeId,
+) -> Option<(f32, f32)> {
+    let rect = layout.rects.get(&host)?;
+    let style = layout.styles.get(&host)?;
+    let width = rect.width
+        - style.border.left
+        - style.border.right
+        - style.padding.left
+        - style.padding.right;
+    let height = rect.height
+        - style.border.top
+        - style.border.bottom
+        - style.padding.top
+        - style.padding.bottom;
+    (width >= 1.0 && height >= 1.0).then_some((width.floor(), height.floor()))
+}
+
+/// Render one frame document and, bottom-up, every frame nested inside it,
+/// inserting each host's surface into `out`. Depth is bounded as a backstop;
+/// the loader already caps nesting (Phase 3.5).
+#[cfg(feature = "render")]
+fn render_frame_tree_into(
+    dom: &obscura_dom::DomTree,
+    host: NodeId,
+    root: NodeId,
+    viewport: (f32, f32),
+    resources: &mut obscura_render::RenderResourceCache,
+    canvas: &HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+    out: &mut HashMap<NodeId, obscura_render::Pixmap>,
+    depth: usize,
+) {
+    if depth > 32 {
+        return;
+    }
+    let base_url = dom.document_scope(root).map(|scope| scope.base_url);
+    // Per-root stylesheet cache and animation timeline (Phase 5.2): the
+    // parent's single-slot cache must not alternate with the child's.
+    // Surfaces are currently rebuilt per capture; retained per-frame caches
+    // are the Phase 5.5 follow-on.
+    let mut stylesheet_cache = obscura_render::StylesheetCache::default();
+    let mut timeline = obscura_render::AnimationTimelineState::default();
+    let Some(mut prepared) = obscura_render::prepare_frame_document(
+        dom,
+        root,
+        viewport,
+        base_url.as_deref(),
+        resources,
+        &mut stylesheet_cache,
+        &mut timeline,
+    ) else {
+        return;
+    };
+    for nested_host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+        if let Some(nested_root) = dom.iframe_content_document(nested_host) {
+            if let Some(nested_viewport) = frame_content_box(prepared.layout(), nested_host) {
+                render_frame_tree_into(
+                    dom,
+                    nested_host,
+                    nested_root,
+                    nested_viewport,
+                    resources,
+                    canvas,
+                    out,
+                    depth + 1,
+                );
+            }
+        }
+    }
+    let source = RuntimeSurfaceSource {
+        canvas,
+        frames: out,
+    };
+    if let Some(pixmap) =
+        obscura_render::paint_prepared_frame_document(dom, &mut prepared, resources, &source)
+    {
+        out.insert(host, pixmap);
+    }
+}
+
+/// Render every active iframe content document of the page, deepest first,
+/// keyed by host NodeId. Requires the parent document's prepared layout for
+/// top-level frame geometry.
+#[cfg(feature = "render")]
+fn build_frame_surfaces(
+    dom: Option<&obscura_dom::DomTree>,
+    prepared: Option<&obscura_render::PreparedRender>,
+    resources: &mut obscura_render::RenderResourceCache,
+    canvas: &HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+) -> HashMap<NodeId, obscura_render::Pixmap> {
+    let mut out = HashMap::new();
+    let (Some(dom), Some(prepared)) = (dom, prepared) else {
+        return out;
+    };
+    for host in dom.query_selector_all("iframe").unwrap_or_default() {
+        if let Some(root) = dom.iframe_content_document(host) {
+            if let Some(viewport) = frame_content_box(prepared.layout(), host) {
+                render_frame_tree_into(dom, host, root, viewport, resources, canvas, &mut out, 1);
+            }
+        }
+    }
+    out
+}
+
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
@@ -641,14 +772,23 @@ impl ObscuraJsRuntime {
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let frame_surfaces = build_frame_surfaces(
+                dom.as_ref(),
+                prepared_render.as_ref(),
+                render_resources,
+                canvas_surfaces,
+            );
+            let source = RuntimeSurfaceSource {
+                canvas: canvas_surfaces,
+                frames: &frame_surfaces,
+            };
             obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
                 scroll,
                 surface_color,
-                &canvas_surfaces,
+                &source,
             )
         })
     }
@@ -684,7 +824,16 @@ impl ObscuraJsRuntime {
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let frame_surfaces = build_frame_surfaces(
+                dom.as_ref(),
+                prepared_render.as_ref(),
+                render_resources,
+                canvas_surfaces,
+            );
+            let source = RuntimeSurfaceSource {
+                canvas: canvas_surfaces,
+                frames: &frame_surfaces,
+            };
             obscura_render::screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
@@ -695,7 +844,7 @@ impl ObscuraJsRuntime {
                 scroll,
                 region,
                 surface_color,
-                &canvas_surfaces,
+                &source,
             )
         })
     }
@@ -722,7 +871,16 @@ impl ObscuraJsRuntime {
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let frame_surfaces = build_frame_surfaces(
+                dom.as_ref(),
+                prepared_render.as_ref(),
+                render_resources,
+                canvas_surfaces,
+            );
+            let source = RuntimeSurfaceSource {
+                canvas: canvas_surfaces,
+                frames: &frame_surfaces,
+            };
             obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
@@ -733,7 +891,7 @@ impl ObscuraJsRuntime {
                 scroll,
                 region,
                 paint_backgrounds,
-                &canvas_surfaces,
+                &source,
             )
         })
     }
