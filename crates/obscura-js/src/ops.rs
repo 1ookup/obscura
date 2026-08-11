@@ -31,6 +31,16 @@ pub type InterceptCallback = Arc<
     >,
 >;
 
+/// Origin-keyed backing areas for one Web Storage namespace. The outer owner
+/// determines browser lifetime: BrowserContext for localStorage and Page for
+/// sessionStorage. Individual V8 realms only hold shared handles.
+pub type SharedStorageAreas =
+    Arc<std::sync::Mutex<HashMap<String, Vec<(String, String)>>>>;
+
+pub fn new_storage_areas() -> SharedStorageAreas {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
 #[derive(Debug)]
 pub enum InterceptResolution {
     Continue {
@@ -166,6 +176,15 @@ pub struct ObscuraState {
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
+    /// Navigation requests made by a child Window realm. The u32 is the
+    /// calling document root, which the browser layer resolves back to its
+    /// stable browsing context before starting the navigation.
+    pub pending_frame_navigations: Vec<(u32, String, String, String)>,
+    /// Origin-keyed Web Storage backing shared by every Window realm attached
+    /// to the configured browser-owned namespaces. Areas retain insertion
+    /// order for Storage.key().
+    pub local_storage: SharedStorageAreas,
+    pub session_storage: SharedStorageAreas,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -307,6 +326,9 @@ impl ObscuraState {
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
+            pending_frame_navigations: Vec::new(),
+            local_storage: new_storage_areas(),
+            session_storage: new_storage_areas(),
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -3711,6 +3733,20 @@ fn op_get_cookies(state: &OpState) -> String {
     jar.get_js_visible_cookies(&url)
 }
 
+#[op2]
+#[string]
+fn op_get_cookies_for_url(state: &OpState, #[string] document_url: &str) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    let Some(jar) = &gs.cookie_jar else {
+        return String::new();
+    };
+    let Ok(url) = url::Url::parse(document_url) else {
+        return String::new();
+    };
+    jar.get_js_visible_cookies(&url)
+}
+
 #[op2(fast)]
 fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     let gs = state.borrow::<SharedState>().clone();
@@ -3727,11 +3763,114 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
 }
 
 #[op2(fast)]
+fn op_set_cookie_for_url(
+    state: &OpState,
+    #[string] document_url: &str,
+    #[string] cookie_str: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    let Some(jar) = &gs.cookie_jar else {
+        return;
+    };
+    let Ok(url) = url::Url::parse(document_url) else {
+        return;
+    };
+    jar.set_cookie_from_js(cookie_str, &url);
+}
+
+#[op2]
+#[string]
+fn op_origin_storage(
+    state: &OpState,
+    #[string] action: &str,
+    #[string] kind: &str,
+    #[string] origin: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    if origin.is_empty() || origin == "null" {
+        return "null".to_string();
+    }
+    let gs = state.borrow::<SharedState>().clone();
+    let areas = if kind == "session" {
+        gs.borrow().session_storage.clone()
+    } else {
+        gs.borrow().local_storage.clone()
+    };
+    let Ok(mut areas) = areas.lock() else {
+        return "null".to_string();
+    };
+    let area = areas.entry(origin.to_string()).or_default();
+    match action {
+        "get" => area
+            .iter()
+            .find(|(stored_key, _)| stored_key == key)
+            .map(|(_, stored_value)| serde_json::Value::String(stored_value.clone()).to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        "set" => {
+            if let Some((_, stored_value)) =
+                area.iter_mut().find(|(stored_key, _)| stored_key == key)
+            {
+                *stored_value = value.to_string();
+            } else {
+                area.push((key.to_string(), value.to_string()));
+            }
+            "true".to_string()
+        }
+        "remove" => {
+            area.retain(|(stored_key, _)| stored_key != key);
+            "true".to_string()
+        }
+        "clear" => {
+            area.clear();
+            "true".to_string()
+        }
+        "key" => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| area.get(index))
+            .map(|(stored_key, _)| serde_json::Value::String(stored_key.clone()).to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        "keys" => serde_json::to_string(
+            &area.iter().map(|(stored_key, _)| stored_key).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string()),
+        "length" => area.len().to_string(),
+        _ => "null".to_string(),
+    }
+}
+
+#[op2(fast)]
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+#[op2(fast)]
+fn op_navigate_frame(
+    state: &OpState,
+    document_root: u32,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    if document_root == 0 {
+        let gs = state.borrow::<SharedState>().clone();
+        let mut gs = gs.borrow_mut();
+        gs.url = url.to_string();
+        gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+        return;
+    }
+    let gs = state.borrow::<SharedState>().clone();
+    gs.borrow_mut().pending_frame_navigations.push((
+        document_root,
+        url.to_string(),
+        method.to_string(),
+        body.to_string(),
+    ));
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -4779,8 +4918,12 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
+        op_get_cookies_for_url(),
         op_set_cookie(),
+        op_set_cookie_for_url(),
+        op_origin_storage(),
         op_navigate(),
+        op_navigate_frame(),
         op_async_runtime_available(),
         op_posted_task(),
         op_binding_called(),

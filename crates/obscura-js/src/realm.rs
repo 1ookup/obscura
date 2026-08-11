@@ -1132,6 +1132,117 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn frame_environment_uses_its_url_origin_cookies_and_storage_area() {
+        let mut rt = setup_runtime(
+            "<html><body><iframe id=f></iframe><iframe id=g></iframe></body></html>",
+        );
+        let frame_url = "http://frame.example/dir/page.html";
+        let f_root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        let g_root = setup_frame(&mut rt, "g", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-f", 1, f_root, frame_url)
+            .unwrap();
+        rt.ensure_frame_realm("frame-g", 1, g_root, frame_url)
+            .unwrap();
+
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        jar.set_cookie(
+            "frame_cookie=inside; Path=/",
+            &url::Url::parse(frame_url).unwrap(),
+        );
+        jar.set_cookie(
+            "top_cookie=outside; Path=/",
+            &url::Url::parse("http://example.com/test").unwrap(),
+        );
+        rt.set_cookie_jar(jar);
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-f",
+                1,
+                "<t>",
+                r#"(() => {
+                    localStorage.setItem("shared", "frame-value");
+                    sessionStorage.setItem("session-shared", "frame-session");
+                    location.href = "next.html";
+                    return [
+                        location.href,
+                        location.origin,
+                        document.cookie,
+                    ];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                "http://frame.example/dir/next.html",
+                "http://frame.example",
+                "frame_cookie=inside",
+            ]),
+        );
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-g",
+                1,
+                "<t>",
+                "[localStorage.getItem('shared'), sessionStorage.getItem('session-shared')]",
+            )
+            .unwrap(),
+            serde_json::json!(["frame-value", "frame-session"]),
+        );
+        assert_eq!(
+            rt.evaluate(
+                "[localStorage.getItem('shared'), sessionStorage.getItem('session-shared'), document.cookie]"
+            )
+            .unwrap(),
+            serde_json::json!([null, null, "top_cookie=outside"]),
+        );
+
+        assert!(rt.take_pending_navigation().is_none());
+        assert_eq!(
+            rt.take_pending_frame_navigations(),
+            vec![(
+                f_root,
+                "http://frame.example/dir/next.html".to_string(),
+                "GET".to_string(),
+                String::new(),
+            )],
+        );
+
+        let (intercept_tx, mut intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(intercept_tx);
+        rt.set_intercept_enabled(true);
+        let intercepted = tokio::spawn(async move {
+            let request = intercept_rx.recv().await.expect("frame fetch intercepted");
+            let url = request.url.clone();
+            request
+                .resolver
+                .send(crate::ops::InterceptResolution::Fulfill {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: "frame-response".to_string(),
+                })
+                .unwrap();
+            url
+        });
+        rt.execute_script_in_frame_realm(
+            "frame-g",
+            1,
+            "<t>",
+            "globalThis.__frameFetch = null; fetch('asset.json').then(r => r.text()).then(v => { __frameFetch = v; });",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(
+            intercepted.await.unwrap(),
+            "http://frame.example/dir/asset.json"
+        );
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-g", 1, "<t>", "__frameFetch")
+                .unwrap(),
+            serde_json::json!("frame-response"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn postmessage_target_origin_filtering() {
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
         let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);

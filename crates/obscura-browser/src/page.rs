@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
+use obscura_js::ops::{new_storage_areas, SharedStorageAreas};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, Method, ObscuraHttpClient, ObscuraNetError, RequestCallback,
@@ -233,6 +234,9 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// sessionStorage namespace for this top-level browsing context. It
+    /// survives document navigations but is not shared with another Page.
+    session_storage: SharedStorageAreas,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
     /// separate from `url`: direct automation navigations have no referrer,
@@ -909,6 +913,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            session_storage: new_storage_areas(),
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
@@ -1154,6 +1159,10 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_storage_areas(
+            self.context.local_storage.clone(),
+            self.session_storage.clone(),
+        );
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -4956,6 +4965,63 @@ mod tests {
         page.url = Some(url::Url::parse("https://top.example/app/").unwrap());
         page.dom = Some(parse_html(html));
         page
+    }
+
+    #[test]
+    fn web_storage_lifetimes_match_context_and_page() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new(
+            "storage-test".to_string(),
+        ));
+        let mut page = super::Page::new("storage-page".to_string(), context.clone());
+        page.url = Some(url::Url::parse("https://storage.example/first").unwrap());
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://storage.example/first",
+        ));
+        page.dom = Some(parse_html("<html></html>"));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(() => { localStorage.setItem('local', 'kept'); sessionStorage.setItem('session', 'kept'); })()",
+            )
+            .unwrap();
+
+        // Replacing the document replaces every realm but preserves both
+        // storage namespaces for this top-level browsing context.
+        page.url = Some(url::Url::parse("https://storage.example/second").unwrap());
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://storage.example/second",
+        ));
+        page.dom = Some(parse_html("<html></html>"));
+        page.init_js();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[localStorage.local, sessionStorage.session]")
+                .unwrap(),
+            serde_json::json!(["kept", "kept"]),
+        );
+
+        // A second top-level browsing context shares localStorage through the
+        // BrowserContext and receives a fresh sessionStorage namespace.
+        let mut other = super::Page::new("storage-other".to_string(), context);
+        other.url = Some(url::Url::parse("https://storage.example/other").unwrap());
+        other.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://storage.example/other",
+        ));
+        other.dom = Some(parse_html("<html></html>"));
+        other.init_js();
+        assert_eq!(
+            other
+                .js
+                .as_mut()
+                .unwrap()
+                .evaluate("[localStorage.local, sessionStorage.session]")
+                .unwrap(),
+            serde_json::json!(["kept", null]),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -4011,10 +4011,10 @@ class Element extends Node {
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
-      Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
+      _navigateCurrentContext(targetUrl, 'POST', encoded);
     } else {
       const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      _navigateCurrentContext(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
     }
   }
   reset() {
@@ -4780,7 +4780,7 @@ class Document extends Node {
   }
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
@@ -5267,11 +5267,19 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
-    return Deno.core.ops.op_get_cookies();
+    const settings = _environmentSettings();
+    if (settings.origin === "null") {
+      throw new DOMException("The document is sandboxed and lacks an origin.", "SecurityError");
+    }
+    return Deno.core.ops.op_get_cookies_for_url(settings.cookieUrl);
   }
   set cookie(v) {
     if (!v) return;
-    Deno.core.ops.op_set_cookie(v);
+    const settings = _environmentSettings();
+    if (settings.origin === "null") {
+      throw new DOMException("The document is sandboxed and lacks an origin.", "SecurityError");
+    }
+    Deno.core.ops.op_set_cookie_for_url(settings.cookieUrl, String(v));
   }
   write(...args) {
     var html = args.join('');
@@ -6365,10 +6373,34 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
 globalThis.self = globalThis;
 
 globalThis.document = null;
+function _environmentSettings() {
+  const root = _callingFrameRoot();
+  if (root > 0) {
+    const info = _domParse("document_scope_info", root) || {};
+    const url = info.url || globalThis.__obscura_frame_base_url || "about:blank";
+    const baseUrl = (globalThis.document && globalThis.document.baseURI)
+      || info.baseUrl || globalThis.__obscura_frame_base_url || url;
+    const cookieUrl = /^(?:https?|wss?):/i.test(url) ? url : baseUrl;
+    return { root, url, baseUrl, cookieUrl, origin: info.origin || "null" };
+  }
+  const url = _domParse("document_url") || "about:blank";
+  let origin = "null";
+  try { origin = new URL(url).origin; } catch (e) {}
+  const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
+  return { root: 0, url, baseUrl, cookieUrl: url, origin };
+}
 function _resolveUrl(url) {
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _environmentSettings().baseUrl).href; } catch(e) { return url; }
+}
+function _navigateCurrentContext(url, method, body) {
+  const settings = _environmentSettings();
+  if (settings.root > 0) {
+    Deno.core.ops.op_navigate_frame(settings.root, url, method, body);
+  } else {
+    Deno.core.ops.op_navigate(url, method, body);
+  }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -6378,11 +6410,11 @@ function _resolveUrl(url) {
 // freezes on the original route.
 globalThis.__virtualUrl = null;
 function __currentUrl() {
-  return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
+  return globalThis.__virtualUrl || _environmentSettings().url;
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -6392,14 +6424,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -7003,7 +7035,7 @@ globalThis.fetch = async (input, init = {}) => {
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
-      const base = _domParse("document_url") || "about:blank";
+      const base = _environmentSettings().baseUrl;
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
@@ -7018,7 +7050,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
-  const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
+  const pageOrigin = _environmentSettings().origin;
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
@@ -10381,32 +10413,61 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // backing map. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+// Every Window realm receives its own Storage wrapper, while the backing area
+// lives in the page's native state and is keyed by typed serialized origin.
+// This makes same-origin frames share entries without sharing wrappers or
+// constructors. Opaque origins have no storage key and fail closed.
+function _storageOrigin() {
+  const origin = _environmentSettings().origin;
+  if (!origin || origin === 'null') {
+    throw new DOMException('Access to storage is not allowed from an opaque origin.', 'SecurityError');
+  }
+  return origin;
+}
+function _storageCall(action, kind, key, value) {
+  return Deno.core.ops.op_origin_storage(
+    action, kind, _storageOrigin(), String(key ?? ''), String(value ?? ''));
+}
+Storage.prototype.getItem = function(k) {
+  return JSON.parse(_storageCall('get', this._kind, String(k), ''));
+};
+Storage.prototype.setItem = function(k, v) {
+  _storageCall('set', this._kind, String(k), String(v));
+};
+Storage.prototype.removeItem = function(k) {
+  _storageCall('remove', this._kind, String(k), '');
+};
+Storage.prototype.clear = function() {
+  _storageCall('clear', this._kind, '', '');
+};
+Storage.prototype.key = function(i) {
+  return JSON.parse(_storageCall('key', this._kind, i >>> 0, ''));
+};
+Object.defineProperty(Storage.prototype, 'length', {
+  get: function() { return +_storageCall('length', this._kind, '', ''); }, configurable: true,
+});
 
-const _mkStore = () => {
+const _mkStore = (kind) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  Object.defineProperty(target, '_kind', { value: kind, writable: false, enumerable: false, configurable: true });
+  const isReal = (p) => p === '_kind' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return t.getItem(p) !== null; },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys(t) { return JSON.parse(_storageCall('keys', t._kind, '', '')); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      if (typeof p !== 'symbol') {
+        const value = t.getItem(p);
+        if (value !== null) return { value, writable: true, enumerable: true, configurable: true };
+      }
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore('local');
+globalThis.sessionStorage = _mkStore('session');
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {

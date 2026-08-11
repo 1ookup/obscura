@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use obscura_js::ops::{new_storage_areas, SharedStorageAreas};
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
+    /// localStorage namespace shared by every page in this browser context.
+    pub local_storage: SharedStorageAreas,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -121,6 +124,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage: new_storage_areas(),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -178,6 +182,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage: new_storage_areas(),
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),

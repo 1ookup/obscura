@@ -13,7 +13,10 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, SharedStorageAreas,
+    StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -448,6 +451,16 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    pub fn set_storage_areas(
+        &self,
+        local_storage: SharedStorageAreas,
+        session_storage: SharedStorageAreas,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.local_storage = local_storage;
+        state.session_storage = session_storage;
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
     }
@@ -541,6 +554,10 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
+    }
+
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
+        std::mem::take(&mut self.state.borrow_mut().pending_frame_navigations)
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
