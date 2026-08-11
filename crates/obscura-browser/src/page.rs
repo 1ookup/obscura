@@ -308,6 +308,9 @@ pub struct Page {
     network_event_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
+    /// Child browsing context most recently focused by native input. CDP key
+    /// events continue in that realm until a main-document press replaces it.
+    input_frame_target: Option<(String, u64)>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
@@ -957,6 +960,7 @@ impl Page {
             network_event_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
+            input_frame_target: None,
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
@@ -3933,6 +3937,44 @@ impl Page {
                 _ => serde_json::Value::Null,
             }
         }
+    }
+
+    /// Resolve top-level viewport coordinates into the deepest rendered frame
+    /// document. The frame id/generation is absent for the main document.
+    #[cfg(feature = "render")]
+    pub fn input_target_at_point(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<(Option<(String, u64)>, u32, f32, f32)> {
+        let (root, node, point) = self.js.as_ref()?.input_target_at_point(x, y)?;
+        let main_root = self.js.as_ref()?.with_dom(|dom| dom.document())?;
+        if root == main_root {
+            return Some((None, node.raw(), point.0, point.1));
+        }
+        let frame = self
+            .frames
+            .frame_ids()
+            .filter_map(|id| self.frames.get(id))
+            .find(|frame| frame.active_document_root == Some(root))?;
+        Some((
+            Some((frame.frame_id.clone(), frame.document_generation)),
+            node.raw(),
+            point.0,
+            point.1,
+        ))
+    }
+
+    pub fn set_input_frame_target(&mut self, target: Option<(String, u64)>) {
+        self.input_frame_target = target;
+    }
+
+    pub fn input_frame_target(&self) -> Option<(String, u64)> {
+        let (frame_id, generation) = self.input_frame_target.as_ref()?;
+        self.frames
+            .get(frame_id)
+            .filter(|frame| frame.document_generation == *generation)
+            .map(|_| (frame_id.clone(), *generation))
     }
 
     pub async fn evaluate_for_cdp(

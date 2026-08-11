@@ -1784,6 +1784,63 @@ impl PreparedRender {
         Some(rect)
     }
 
+    /// Whether a viewport point lies inside this node's border box and every
+    /// inherited overflow clip in the resolved scroll snapshot. Input hit
+    /// testing shares this geometry with CSSOM and paint instead of trying to
+    /// reconstruct scrolling and clipping from immutable layout rectangles.
+    pub fn point_hits_box_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        point: (f32, f32),
+        scroll: &ResolvedScrollState,
+    ) -> bool {
+        let Some(rect) = self.viewport_rect_with_scroll(id, scroll) else {
+            return false;
+        };
+        if point.0 < rect.x
+            || point.0 >= rect.x + rect.width
+            || point.1 < rect.y
+            || point.1 >= rect.y + rect.height
+        {
+            return false;
+        }
+        if let Some(clip) = scroll.inherited_clip_for(id) {
+            if !clip.contains_point(point) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Viewport-relative content box used as the child browsing context's
+    /// coordinate origin and viewport size.
+    pub fn viewport_content_box_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<crate::Rect> {
+        let rect = self.viewport_rect_with_scroll(id, scroll)?;
+        let style = self.layout.styles.get(&id)?;
+        let x = rect.x + style.border.left + style.padding.left;
+        let y = rect.y + style.border.top + style.padding.top;
+        Some(crate::Rect {
+            x,
+            y,
+            width: (rect.width
+                - style.border.left
+                - style.border.right
+                - style.padding.left
+                - style.padding.right)
+                .max(0.0),
+            height: (rect.height
+                - style.border.top
+                - style.border.bottom
+                - style.padding.top
+                - style.padding.bottom)
+                .max(0.0),
+        })
+    }
+
     /// Every CSS border-box fragment in the current root viewport. Ordinary
     /// inlines can have one fragment per line; all other boxes expose their
     /// single border box. Keeping this separate from the bounding union is

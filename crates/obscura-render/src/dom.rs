@@ -168,6 +168,11 @@ pub struct OverflowClip {
 }
 
 impl OverflowClip {
+    pub(crate) fn contains_point(&self, point: (f32, f32)) -> bool {
+        !self.x.is_some_and(|(start, end)| point.0 < start || point.0 >= end)
+            && !self.y.is_some_and(|(start, end)| point.1 < start || point.1 >= end)
+    }
+
     pub(crate) fn for_box(rect: &Rect, style: &crate::LayoutStyle, tx: f32, ty: f32) -> Self {
         let left = rect.x + tx + style.border.left;
         let top = rect.y + ty + style.border.top;

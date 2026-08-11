@@ -37,6 +37,41 @@ async fn serve_fixture() -> String {
     format!("http://{addr}/")
 }
 
+async fn serve_iframe_fixture() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let length = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..length]);
+            let path = request.split_whitespace().nth(1).unwrap_or("/");
+            let body = match path {
+                "/child" => r#"<!doctype html><style>
+                    html,body { margin:0; width:100%; height:100%; }
+                    #child { position:absolute; left:20px; top:30px; width:100px; height:50px; }
+                    #nested { position:absolute; left:150px; top:20px; width:100px; height:80px; border:5px solid black; }
+                </style><button id=child>child</button><input id=field><iframe id=nested src=/grand></iframe>
+                <script>globalThis.childLog=[];globalThis.childWheel=[]; child.addEventListener('click',e=>{childLog.push([e.clientX,e.clientY,globalThis===window]);field.focus()});child.addEventListener('wheel',e=>{childWheel.push([e.clientX,e.clientY,e.deltaY,globalThis===window]);e.preventDefault()});</script>"#,
+                "/grand" => r#"<!doctype html><style>html,body{margin:0}#grand{position:absolute;left:10px;top:10px;width:60px;height:30px}</style>
+                    <button id=grand>grand</button><script>globalThis.grandLog=[];grand.addEventListener('click',e=>grandLog.push([e.clientX,e.clientY,globalThis===window]));</script>"#,
+                _ => r#"<!doctype html><style>
+                    html,body { margin:0; }
+                    #clip { position:absolute; left:100px; top:80px; width:300px; height:120px; overflow:hidden; }
+                    #frame { display:block; width:300px; height:200px; border:10px solid black; }
+                </style><div id=clip><iframe id=frame src=/child></iframe></div>"#,
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    format!("http://{addr}/")
+}
+
 async fn cdp(
     ctx: &mut CdpContext,
     id: u64,
@@ -85,6 +120,43 @@ async fn setup() -> (CdpContext, String) {
     )
     .await;
     (ctx, session_id.to_string())
+}
+
+async fn setup_iframe() -> (CdpContext, String) {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_iframe_fixture().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "input-iframe-session";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+    (ctx, session_id.to_string())
+}
+
+async fn click(ctx: &mut CdpContext, sid: &str, x: f64, y: f64) {
+    cdp(
+        ctx,
+        80,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":x,"y":y,"button":"left"}),
+        sid,
+    )
+    .await;
+    cdp(
+        ctx,
+        81,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":x,"y":y,"button":"left"}),
+        sid,
+    )
+    .await;
 }
 
 async fn wheel(ctx: &mut CdpContext, id: u64, sid: &str, x: f64, y: f64, dx: f64, dy: f64) {
@@ -374,4 +446,84 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         json!(["radio-b:mousedown", "radio-b:mouseup", "radio-b:click", "radio-b:input", "radio-b:change"]),
         "the newly selected radio alone receives activation events"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_events_enter_iframe_realm_with_local_client_coordinates() {
+    let (mut ctx, sid) = setup_iframe().await;
+    // Parent content origin (110,90), child button point (30,40).
+    click(&mut ctx, &sid, 140.0, 130.0).await;
+    let result = evaluate(
+        &mut ctx,
+        82,
+        "JSON.stringify(document.getElementById('frame').contentWindow.childLog)",
+        &sid,
+    )
+    .await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([[30, 40, true]]));
+
+    cdp(
+        &mut ctx,
+        83,
+        "Input.dispatchKeyEvent",
+        json!({"type":"char","text":"x"}),
+        &sid,
+    )
+    .await;
+    let typed = evaluate(
+        &mut ctx,
+        84,
+        "document.getElementById('frame').contentWindow.document.getElementById('field').value",
+        &sid,
+    )
+    .await;
+    assert_eq!(typed["result"]["value"], "x");
+
+    wheel(&mut ctx, 85, &sid, 140.0, 130.0, 0.0, 25.0).await;
+    let wheel_result = evaluate(
+        &mut ctx,
+        86,
+        "JSON.stringify(document.getElementById('frame').contentWindow.childWheel)",
+        &sid,
+    )
+    .await;
+    let wheel_log: Value = serde_json::from_str(
+        wheel_result["result"]["value"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wheel_log, json!([[30, 40, 25, true]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_events_descend_through_nested_iframes() {
+    let (mut ctx, sid) = setup_iframe().await;
+    // Parent content origin (110,90), nested content origin in child
+    // (155,25), grandchild button point (15,15).
+    click(&mut ctx, &sid, 280.0, 130.0).await;
+    let result = evaluate(
+        &mut ctx,
+        82,
+        "JSON.stringify(document.getElementById('frame').contentWindow.document.getElementById('nested').contentWindow.grandLog)",
+        &sid,
+    )
+    .await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([[15, 15, true]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clipped_iframe_content_does_not_receive_mouse_events() {
+    let (mut ctx, sid) = setup_iframe().await;
+    // This lies in the iframe's own content box but beyond #clip's right edge.
+    click(&mut ctx, &sid, 415.0, 160.0).await;
+    let result = evaluate(
+        &mut ctx,
+        82,
+        "JSON.stringify(document.getElementById('frame').contentWindow.childLog)",
+        &sid,
+    )
+    .await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([]));
 }

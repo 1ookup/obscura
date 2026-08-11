@@ -1,6 +1,72 @@
+use obscura_browser::Page;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
+
+struct InputDispatchTarget {
+    frame: Option<(String, u64)>,
+    node: Option<u32>,
+    x: f64,
+    y: f64,
+}
+
+fn input_dispatch_target(page: &mut Page, x: f64, y: f64) -> InputDispatchTarget {
+    #[cfg(feature = "render")]
+    if let Some((Some(frame), node, local_x, local_y)) =
+        page.input_target_at_point(x as f32, y as f32)
+    {
+        return InputDispatchTarget {
+            frame: Some(frame),
+            node: Some(node),
+            x: f64::from(local_x),
+            y: f64::from(local_y),
+        };
+    }
+    InputDispatchTarget { frame: None, node: None, x, y }
+}
+
+fn evaluate_input_script(page: &mut Page, target: &InputDispatchTarget, source: &str) {
+    if let Some((frame_id, generation)) = target.frame.as_ref() {
+        let content_root = page
+            .frames
+            .get(frame_id)
+            .and_then(|frame| frame.active_document_root)
+            .map(|root| root.raw());
+        let base_url = content_root
+            .and_then(|root| {
+                page.js.as_ref()?.with_dom(|dom| {
+                    dom.document_scope(obscura_dom::NodeId::new(root))
+                        .map(|scope| scope.base_url)
+                })?
+            })
+            .unwrap_or_else(|| page.url_string());
+        if let Some(js) = page.js.as_mut() {
+            if let Some(content_root) = content_root {
+                let _ = js.ensure_frame_realm(
+                    frame_id,
+                    *generation,
+                    content_root,
+                    &base_url,
+                );
+            }
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                *generation,
+                "<cdp-input>",
+                source,
+            );
+        }
+    } else {
+        page.evaluate(source);
+    }
+}
+
+fn input_target_js(target: &InputDispatchTarget, fallback: &str) -> String {
+    target
+        .node
+        .map(|node| format!("_wrap({node})"))
+        .unwrap_or_else(|| fallback.to_string())
+}
 
 // Insert `escaped_text` at the caret, replacing any non-collapsed selection
 // the way a real browser does when you type over selected text (for example
@@ -109,17 +175,24 @@ pub async fn handle(
 
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let target = input_dispatch_target(page, x, y);
+                    page.set_input_frame_target(target.frame.clone());
+                    let target_js = input_target_js(
+                        &target,
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body"),
+                    );
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = {target_js};\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = target.x,
+                        y = target.y,
+                        target_js = target_js,
                         button_code = button_code,
                         buttons = buttons,
                         click_count = click_count,
@@ -128,13 +201,18 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    evaluate_input_script(page, &target, &code);
                 }
             } else if event_type == "mouseReleased" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let target = input_dispatch_target(page, x, y);
+                    let target_js = input_target_js(
+                        &target,
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body"),
+                    );
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = {target_js};\
                             if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
@@ -197,8 +275,9 @@ pub async fn handle(
                                 else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
                             }}\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = target.x,
+                        y = target.y,
+                        target_js = target_js,
                         button_code = button_code,
                         click_count = click_count,
                         alt_key = alt_key,
@@ -206,16 +285,21 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    evaluate_input_script(page, &target, &code);
                     page.process_pending_navigation().await.map_err(|e| e.to_string())?;
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let target = input_dispatch_target(page, x, y);
+                    let target_js = input_target_js(
+                        &target,
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement"),
+                    );
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement;\
+                            var target = {target_js};\
                             if (!target) return;\
                             var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             if (!target.dispatchEvent(wheel)) return;\
@@ -247,8 +331,9 @@ pub async fn handle(
                                 }}, 0);\
                             }} else if (scrollTarget && typeof scrollTarget.scrollBy === 'function') scrollTarget.scrollBy(dx, dy);\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = target.x,
+                        y = target.y,
+                        target_js = target_js,
                         delta_x = delta_x,
                         delta_y = delta_y,
                         alt_key = alt_key,
@@ -256,7 +341,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    evaluate_input_script(page, &target, &code);
                 }
             }
 
@@ -269,6 +354,12 @@ pub async fn handle(
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let target = InputDispatchTarget {
+                    frame: page.input_frame_target(),
+                    node: None,
+                    x: 0.0,
+                    y: 0.0,
+                };
                 match event_type {
                     "keyDown" | "rawKeyDown" => {
                         let js = format!(
@@ -284,13 +375,13 @@ pub async fn handle(
                             key = key.replace('\\', "\\\\").replace('\'', "\\'"),
                             code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
-                        page.evaluate(&js);
+                        evaluate_input_script(page, &target, &js);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             // Need to escape backslash BEFORE single-quote so the new
                             // backslashes from quote escaping don't get double-escaped.
                             let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            evaluate_input_script(page, &target, &insert_text_js(&escaped_text));
                         }
 
                         if key == "Enter" {
@@ -310,11 +401,11 @@ pub async fn handle(
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
                                 }\
                             })()";
-                            page.evaluate(js);
+                            evaluate_input_script(page, &target, js);
                         }
 
                         if key == "Backspace" {
-                            page.evaluate(BACKSPACE_JS);
+                            evaluate_input_script(page, &target, BACKSPACE_JS);
                         }
                     }
                     "keyUp" => {
@@ -327,12 +418,12 @@ pub async fn handle(
                             key = key.replace('\\', "\\\\").replace('\'', "\\'"),
                             code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
-                        page.evaluate(&js);
+                        evaluate_input_script(page, &target, &js);
                     }
                     "char" => {
                         if !text.is_empty() {
                             let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            evaluate_input_script(page, &target, &insert_text_js(&escaped_text));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }

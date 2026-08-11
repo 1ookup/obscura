@@ -170,6 +170,91 @@ fn build_frame_surfaces(
     out
 }
 
+#[cfg(feature = "render")]
+fn input_hit_in_document(
+    dom: &obscura_dom::DomTree,
+    root: NodeId,
+    prepared: &obscura_render::PreparedRender,
+    scroll: &obscura_render::ResolvedScrollState,
+    point: (f32, f32),
+    resources: &mut obscura_render::RenderResourceCache,
+    element_scroll_offsets: &HashMap<NodeId, (f32, f32)>,
+    depth: usize,
+) -> Option<(NodeId, NodeId, (f32, f32))> {
+    if depth <= 32 {
+        let mut frame_hit = None;
+        for host in dom.query_selector_all_from(root, "iframe").unwrap_or_default() {
+            if !prepared.point_hits_box_with_scroll(host, point, scroll) {
+                continue;
+            }
+            let Some(content) = prepared.viewport_content_box_with_scroll(host, scroll) else {
+                continue;
+            };
+            if point.0 >= content.x
+                && point.0 < content.x + content.width
+                && point.1 >= content.y
+                && point.1 < content.y + content.height
+            {
+                if let Some(child_root) = dom.iframe_content_document(host) {
+                    frame_hit = Some((child_root, content));
+                }
+            }
+        }
+        if let Some((child_root, content)) = frame_hit {
+            let viewport = (content.width.floor(), content.height.floor());
+            let base_url = dom.document_scope(child_root).map(|scope| scope.base_url);
+            let mut stylesheet_cache = obscura_render::StylesheetCache::default();
+            let mut timeline = obscura_render::AnimationTimelineState::default();
+            if let Some(child) = obscura_render::prepare_frame_document(
+                dom,
+                child_root,
+                viewport,
+                base_url.as_deref(),
+                resources,
+                &mut stylesheet_cache,
+                &mut timeline,
+            ) {
+                let child_scroll = child.resolve_scroll_state(
+                    dom,
+                    (0.0, 0.0),
+                    element_scroll_offsets,
+                );
+                let local = (point.0 - content.x, point.1 - content.y);
+                return input_hit_in_document(
+                    dom,
+                    child_root,
+                    &child,
+                    &child_scroll,
+                    local,
+                    resources,
+                    element_scroll_offsets,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    let mut fallback = None;
+    let mut hit = None;
+    for node in dom.descendants(root) {
+        let Some(is_root_element) = dom.get_node(node).and_then(|node| {
+            node.as_element()
+                .map(|element| matches!(element.local.as_ref(), "html" | "body"))
+        }) else {
+            continue;
+        };
+        if !prepared.point_hits_box_with_scroll(node, point, scroll) {
+            continue;
+        }
+        if is_root_element {
+            fallback = Some(node);
+        } else {
+            hit = Some(node);
+        }
+    }
+    hit.or(fallback).map(|node| (root, node, point))
+}
+
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
@@ -711,6 +796,36 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         let requested = state.scroll_offset;
         clamp_scroll_offset(&mut state, requested)
+    }
+
+    /// Renderer-backed input hit test across nested iframe document roots.
+    /// The returned point is relative to the deepest browsing context's
+    /// viewport, matching MouseEvent.clientX/clientY in Chromium.
+    #[cfg(feature = "render")]
+    pub fn input_target_at_point(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(NodeId, NodeId, (f32, f32))> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let mut state = self.state.borrow_mut();
+        ensure_resolved_scroll(&mut state)?;
+        let state = &mut *state;
+        let dom = state.dom.as_ref()?;
+        let prepared = state.prepared_render.as_ref()?;
+        let scroll = &state.resolved_scroll.as_ref()?.1;
+        input_hit_in_document(
+            dom,
+            dom.document(),
+            prepared,
+            scroll,
+            (x, y),
+            &mut state.render_resources,
+            &state.element_scroll_offsets,
+            0,
+        )
     }
 
     /// Select the document-timeline instant used by the next render flush.
