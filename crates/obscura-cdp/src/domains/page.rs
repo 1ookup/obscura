@@ -996,42 +996,41 @@ pub(crate) fn emit_frame_rollout_events(
 /// realm of `page_id` not yet in the execution-context table, and enroll it.
 ///
 /// When the client enabled the Runtime domain, each committed child document
-/// first gets its default world realm created eagerly, so a frame with no
-/// `<script>` still has an execution context a client can evaluate in (real
-/// Chrome creates one for every active document). Without `Runtime.enable`
-/// nothing is created: realms stay lazy behind frame script execution and a
-/// navigate-and-screenshot client pays nothing for them.
+/// first gets its default world realm created eagerly if the browser layer has
+/// not already created it. Without `Runtime.enable`, realms remain internal
+/// browsing-context state and are not enrolled or advertised through CDP.
 fn emit_frame_execution_contexts(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
     page_id: &str,
     snapshots: &[ChildFrameSnapshot],
 ) {
-    if ctx.runtime_enabled {
-        for frame in snapshots {
-            let Some(content_root) = frame.content_root else {
-                continue;
-            };
-            if !frame.scripts_allowed {
-                continue;
-            }
-            let Some(page) = ctx.get_page_mut(page_id) else {
-                return;
-            };
-            let Some(js) = page.js.as_mut() else {
-                continue;
-            };
-            // A failed realm never blocks the event stream: the frame keeps
-            // its tree and lifecycle projection and simply advertises no
-            // context, which is the pre-6b behavior.
-            if let Err(error) = js.ensure_frame_realm(
-                &frame.frame_id,
-                frame.generation,
-                content_root,
-                &frame.base_url,
-            ) {
-                tracing::trace!("cdp: eager frame realm failed ({}): {error}", frame.frame_id);
-            }
+    if !ctx.runtime_enabled {
+        return;
+    }
+    for frame in snapshots {
+        let Some(content_root) = frame.content_root else {
+            continue;
+        };
+        if !frame.scripts_allowed {
+            continue;
+        }
+        let Some(page) = ctx.get_page_mut(page_id) else {
+            return;
+        };
+        let Some(js) = page.js.as_mut() else {
+            continue;
+        };
+        // A failed realm never blocks the event stream: the frame keeps
+        // its tree and lifecycle projection and simply advertises no
+        // context, which is the pre-6b behavior.
+        if let Err(error) = js.ensure_frame_realm(
+            &frame.frame_id,
+            frame.generation,
+            content_root,
+            &frame.base_url,
+        ) {
+            tracing::trace!("cdp: eager frame realm failed ({}): {error}", frame.frame_id);
         }
     }
 
