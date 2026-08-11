@@ -616,6 +616,24 @@ impl SsrfGuardResolver {
     }
 }
 
+fn validate_resolved_addresses(
+    host: &str,
+    addrs: &[SocketAddr],
+    allow_private: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !allow_private {
+        if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
+            return Err(format!(
+                "SSRF blocked: '{}' resolves to forbidden address {}",
+                host,
+                bad.ip()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let allow = self.allow_private || env_allows_private_network();
@@ -625,16 +643,7 @@ impl Resolve for SsrfGuardResolver {
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
                 .collect();
-            if !allow {
-                if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
-                        "SSRF blocked: '{}' resolves to forbidden address {}",
-                        host,
-                        bad.ip()
-                    )
-                    .into());
-                }
-            }
+            validate_resolved_addresses(&host, &addrs, allow)?;
             let iter: Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })
@@ -1668,13 +1677,12 @@ pub enum ObscuraNetError {
 mod ssrf_tests {
     use super::{
         is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
-        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        validate_resolved_addresses, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
+        RequestCredentials, RequestMode, ResourceRequest, ResourceType,
     };
     use crate::cookies::CookieJar;
-    use reqwest::dns::{Name, Resolve};
     use std::collections::HashMap;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2413,29 +2421,20 @@ mod ssrf_tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolver_blocks_hostname_that_resolves_to_loopback() {
-        // localtest.me is a public DNS name that resolves to 127.0.0.1 — the
-        // canonical DNS-rebinding test. The guard must reject it. If DNS is
-        // unavailable the lookup itself errors (also Err), so the assertion
-        // holds either way.
-        let r = SsrfGuardResolver::new(false);
-        let res = r.resolve(Name::from_str("localtest.me").unwrap()).await;
-        assert!(res.is_err(), "localtest.me -> 127.0.0.1 must be blocked");
+    fn socket(s: &str) -> SocketAddr {
+        SocketAddr::new(ip(s), 0)
     }
 
-    #[tokio::test]
-    async fn resolver_does_not_ssrf_block_public_host() {
-        // A public host must not be SSRF-blocked. Tolerate a no-network sandbox
-        // by only failing on an actual SSRF rejection, not a lookup failure.
-        let r = SsrfGuardResolver::new(false);
-        match r.resolve(Name::from_str("example.com").unwrap()).await {
-            Ok(_) => {}
-            Err(e) => assert!(
-                !e.to_string().contains("SSRF blocked"),
-                "example.com wrongly SSRF-blocked: {e}"
-            ),
-        }
+    #[test]
+    fn resolver_rejects_any_forbidden_address_deterministically() {
+        let loopback = [socket("127.0.0.1")];
+        let mixed = [socket("93.184.216.34"), socket("169.254.169.254")];
+        let public = [socket("93.184.216.34"), socket("2606:4700:4700::1111")];
+
+        assert!(validate_resolved_addresses("rebind.test", &loopback, false).is_err());
+        assert!(validate_resolved_addresses("mixed.test", &mixed, false).is_err());
+        assert!(validate_resolved_addresses("public.test", &public, false).is_ok());
+        assert!(validate_resolved_addresses("allowed.test", &loopback, true).is_ok());
     }
 
     /// Mint a throwaway CA plus a 127.0.0.1 leaf it signed, and serve one
