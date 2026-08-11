@@ -785,6 +785,9 @@ pub fn emit_navigation_events(
     // executionContextCreated events are emitted. Issue #407: previously this
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
+    // securityOrigin is an origin serialization ("scheme://host[:port]" or
+    // "null" for opaque origins), not the full document URL.
+    let security_origin = obscura_dom::Origin::from_url(&page_url).serialize();
     let mut phase1 = vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),
@@ -798,7 +801,7 @@ pub fn emit_navigation_events(
         },
         CdpEvent {
             method: "Page.frameNavigated".into(),
-            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
+            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": security_origin, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
             session_id: es.clone(),
         },
         CdpEvent {
@@ -1153,6 +1156,16 @@ pub async fn handle(
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
+            // Origin serialization, not the full URL. The page's stored
+            // per-document origin keeps opaque identity; fall back to
+            // deriving from the URL when unset (fresh page).
+            let security_origin = page
+                .document_origin
+                .as_ref()
+                .map(obscura_dom::Origin::serialize)
+                .unwrap_or_else(|| {
+                    obscura_dom::Origin::from_url(&page.url_string()).serialize()
+                });
             Ok(json!({
                 "frameTree": {
                     "frame": {
@@ -1160,7 +1173,7 @@ pub async fn handle(
                         "loaderId": "initial-loader",
                         "url": page.url_string(),
                         "domainAndRegistry": "",
-                        "securityOrigin": page.url_string(),
+                        "securityOrigin": security_origin,
                         "mimeType": "text/html",
                         "adFrameStatus": { "adFrameType": "none" },
                     },
