@@ -228,6 +228,9 @@ pub struct Page {
     /// keeps one identity; re-deriving from the URL would mint a fresh
     /// opaque id per call and break srcdoc same-origin access.
     pub document_origin: Option<obscura_dom::Origin>,
+    /// Content-Security-Policy of the committed top-level response. Child
+    /// frame requests consult its frame-src/child-src/default-src chain.
+    document_csp: Option<String>,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
     pub js: Option<ObscuraJsRuntime>,
@@ -907,6 +910,7 @@ impl Page {
             frames: crate::frames::FrameRegistry::new(frame_id.clone()),
             frame_id,
             document_origin: None,
+            document_csp: None,
             url: None,
             dom: None,
             js: None,
@@ -2873,6 +2877,7 @@ impl Page {
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.document_origin = Some(obscura_dom::Origin::from_url(url.as_str()));
+        self.document_csp = None;
         self.url = Some(url.clone());
         self.network_events.clear();
 
@@ -2956,6 +2961,9 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        self.document_csp = response
+            .header("content-security-policy")
+            .map(str::to_string);
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
@@ -4510,8 +4518,7 @@ impl Page {
     }
 
     /// The parent document's scope pieces needed for inheritance: (base URL,
-    /// origin, sandbox, csp). For the main frame the CSP hook is not yet
-    /// wired (main-document CSP tracking lands with Phase 3.6).
+    /// origin, sandbox, csp).
     fn frame_parent_inheritance(
         &self,
         frame_id: &str,
@@ -4548,7 +4555,12 @@ impl Page {
             .document_origin
             .clone()
             .unwrap_or_else(|| obscura_dom::Origin::from_url(&url));
-        (url, origin, obscura_dom::SandboxFlags::default(), None)
+        (
+            url,
+            origin,
+            obscura_dom::SandboxFlags::default(),
+            self.document_csp.clone(),
+        )
     }
 
     /// Navigate one child frame. Commits a new content document into the
@@ -4663,7 +4675,7 @@ impl Page {
         let ancestors = self.frame_ancestor_chain(frame_id);
 
         // Resolve the document: URL, origin, and HTML body.
-        let (document_url, base_url, origin, html) = if let Some(srcdoc) = request.srcdoc {
+        let resolved_document = if let Some(srcdoc) = request.srcdoc {
             // srcdoc inherits the creator origin unless sandbox forces opaque;
             // its base URL is the creator's.
             let origin = if sandbox_forces_opaque {
@@ -4676,6 +4688,7 @@ impl Page {
                 parent_base.clone(),
                 origin,
                 srcdoc,
+                None,
             )
         } else {
             let raw_url = request.url.as_deref().unwrap_or("about:blank");
@@ -4690,6 +4703,7 @@ impl Page {
                     parent_base.clone(),
                     origin,
                     String::new(),
+                    None,
                 )
             } else {
                 // A relative URL resolves against the parent document's base.
@@ -4725,6 +4739,7 @@ impl Page {
                         resolved_str,
                         obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new()),
                         String::from_utf8_lossy(&body).into_owned(),
+                        None,
                     )
                 } else {
                     let method = match request.method.as_deref() {
@@ -4772,16 +4787,20 @@ impl Page {
                     .map_err(FrameNavigateError::Blocked)?;
 
                     let final_url = response.url.to_string();
+                    let document_csp = response
+                        .header("content-security-policy")
+                        .map(str::to_string);
                     let origin = if sandbox_forces_opaque {
                         obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
                     } else {
                         response_origin
                     };
                     let html = response.text();
-                    (final_url.clone(), final_url, origin, html)
+                    (final_url.clone(), final_url, origin, html, document_csp)
                 }
             }
         };
+        let (document_url, base_url, origin, html, document_csp) = resolved_document;
 
         if !self
             .frames
@@ -4818,7 +4837,7 @@ impl Page {
                 origin,
                 base_url: base_url.clone(),
                 sandbox,
-                csp: None,
+                csp: document_csp,
                 frame_id: frame_id.to_string(),
                 document_generation: committed.document_generation,
                 quirks,
@@ -5422,6 +5441,96 @@ mod tests {
         let scope = dom.document_scope(root).unwrap();
         assert_eq!(scope.url, "about:blank");
         assert!(!scope.origin.is_opaque());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_frame_src_blocks_child_and_nested_frame_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                request_tx.send(path.clone()).unwrap();
+                let (csp, body) = match path.as_str() {
+                    "/main-blocked" => (
+                        Some("frame-src 'none'"),
+                        "<!doctype html><iframe src='/blocked.html'></iframe>",
+                    ),
+                    "/main-nested" => (
+                        None,
+                        "<!doctype html><iframe src='/child.html'></iframe>",
+                    ),
+                    "/child.html" => (
+                        Some("frame-src 'none'"),
+                        "<!doctype html><p id=child>child</p><iframe src='/grandchild.html'></iframe>",
+                    ),
+                    _ => (None, "unexpected request"),
+                };
+                let csp_header = csp
+                    .map(|value| format!("Content-Security-Policy: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{csp_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-csp".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-csp".to_string(), context);
+
+        page.navigate(&format!("{origin}/main-blocked")).await.unwrap();
+        let blocked_has_document = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                dom.iframe_content_document(host).is_some()
+            })
+            .unwrap();
+        assert!(!blocked_has_document);
+
+        page.navigate(&format!("{origin}/main-nested")).await.unwrap();
+        let (child_text, nested_has_document, child_csp) = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                let child = dom.query_selector_from(root, "#child").unwrap().unwrap();
+                let nested = dom.query_selector_from(root, "iframe").unwrap().unwrap();
+                (
+                    dom.text_content(child),
+                    dom.iframe_content_document(nested).is_some(),
+                    dom.document_scope(root).unwrap().csp,
+                )
+            })
+            .unwrap();
+        assert_eq!(child_text, "child");
+        assert!(!nested_has_document);
+        assert_eq!(child_csp.as_deref(), Some("frame-src 'none'"));
+
+        let requested: Vec<String> = request_rx.try_iter().collect();
+        assert_eq!(
+            requested,
+            vec!["/main-blocked", "/main-nested", "/child.html"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
