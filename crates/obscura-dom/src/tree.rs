@@ -842,18 +842,22 @@ impl DomTree {
     /// Unlike `remove()`, this does NOT free the nodes — the JS side may
     /// still hold references to the wrappers.
     pub fn remove_child(&self, node_id: NodeId) {
-        // Collect all id attribute values in the subtree. We snapshot them
-        // before detaching so `get_attribute` can still see the tree.
+        // Collect all id attribute values in the subtree, including every
+        // owned (shadow) subtree hosted below it. A light-only walk would
+        // leave shadow-descendant ids registered in `id_index`, where the
+        // first-wins entry then permanently shadows later same-id elements.
+        // We snapshot the ids before detaching so `get_attribute` can still
+        // see the tree. Unlike `remove()`, the `shadow_roots` /
+        // `shadow_roots_by_host` registrations stay: no arena slot is freed
+        // here (JS wrappers may still reference these nodes), so the entries
+        // cannot dangle, and a detached host keeps its shadow tree exactly
+        // like a browser (`host.shadowRoot` stays usable, re-insertion
+        // restores rendering).
         let ids_to_remove: Vec<String> = {
-            let descendants = self.descendants(node_id);
+            let subtree = self.inclusive_owned_subtrees(node_id);
             let inner = self.inner.borrow();
             let mut ids: Vec<String> = Vec::new();
-            if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-                if let Some(id_val) = node.get_attribute("id") {
-                    ids.push(id_val.to_string());
-                }
-            }
-            for desc_id in &descendants {
+            for desc_id in &subtree {
                 if let Some(Some(node)) = inner.nodes.get(desc_id.index()) {
                     if let Some(id_val) = node.get_attribute("id") {
                         ids.push(id_val.to_string());
@@ -1665,6 +1669,42 @@ mod tests {
         let x = tree.new_node(NodeData::Text { contents: "x".into() });
         let y = tree.new_node(NodeData::Text { contents: "y".into() });
         assert_ne!(x, y, "double-free aliased two live nodes onto the same slot");
+    }
+
+    #[test]
+    fn remove_child_purges_owned_subtree_ids_and_keeps_shadow_registration() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let wrapper = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        let light = element_with_id(&tree, "span", "light-id");
+        tree.append_child(document, wrapper);
+        tree.append_child(wrapper, host);
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .expect("element can host one shadow root");
+        let shadow = element_with_id(&tree, "button", "shadow-id");
+        tree.append_child(root, shadow);
+
+        tree.remove_child(wrapper);
+
+        // Light AND shadow ids leave the index. A light-only walk left the
+        // shadow descendant registered, where the first-wins entry then
+        // permanently shadowed later same-id elements.
+        {
+            let inner = tree.inner.borrow();
+            assert!(!inner.id_index.contains_key("light-id"));
+            assert!(!inner.id_index.contains_key("shadow-id"));
+        }
+        let replacement = element_with_id(&tree, "p", "shadow-id");
+        tree.append_child(document, replacement);
+        assert_eq!(tree.get_element_by_id("shadow-id"), Some(replacement));
+
+        // remove_child does not free nodes: the detached host keeps its
+        // shadow tree, like a browser, so re-insertion restores it.
+        assert_eq!(tree.shadow_root(host), Some(root));
+        assert_eq!(tree.shadow_children(host), Some(vec![shadow]));
     }
 
     #[test]
