@@ -255,6 +255,17 @@ pub struct PreparedModule {
     description: String,
 }
 
+/// An awaitPromise Runtime.evaluate whose expression has started but whose
+/// completion has not yet been pumped. The browser layer uses this boundary
+/// to service synchronous iframe navigation intents before waiting for a
+/// Promise that may depend on the frame's load event.
+pub struct PendingCdpEvaluation {
+    oid: String,
+    done_counter: u64,
+    started_at: std::time::Instant,
+    expression_preview: String,
+}
+
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
     if remaining.is_zero() {
@@ -1224,6 +1235,156 @@ impl ObscuraJsRuntime {
         .await
     }
 
+    pub fn start_await_evaluate_for_cdp(
+        &mut self,
+        expression: &str,
+    ) -> Result<PendingCdpEvaluation, String> {
+        let started_at = std::time::Instant::now();
+        let expression_preview = expression
+            .chars()
+            .take(200)
+            .map(|character| {
+                if character == '\n' || character == '\t' {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        self.begin_javascript_task();
+        self.object_counter += 1;
+        let oid = self.make_oid(self.object_counter);
+        let done_counter = self.object_counter;
+        let cleaned_expr = expression
+            .trim()
+            .trim_end_matches(|character: char| character == ';' || character.is_whitespace());
+        let code = format!(
+            "(async function() {{\n\
+                try {{\n\
+                    var __result = await (\n{expr}\n);\n\
+                    globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    globalThis.__obscura_await_meta = {meta_fn};\n\
+                    globalThis.__obscura_await_rejected = false;\n\
+                }} catch(e) {{\n\
+                    globalThis.__obscura_objects['{oid}'] = e;\n\
+                    globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                    globalThis.__obscura_await_rejected = true;\n\
+                }}\n\
+                globalThis.__obscura_done_{done_counter} = true;\n\
+            }})()",
+            expr = cleaned_expr,
+            oid = oid,
+            meta_fn = Self::meta_extract_js("__result"),
+            err_meta_fn = Self::meta_extract_js("e"),
+            done_counter = done_counter,
+        );
+        self.runtime
+            .execute_script("<eval-remote>", code)
+            .map_err(|error| format!("JS error: {error}"))?;
+        Ok(PendingCdpEvaluation {
+            oid,
+            done_counter,
+            started_at,
+            expression_preview,
+        })
+    }
+
+    pub async fn finish_await_evaluate_for_cdp(
+        &mut self,
+        pending: PendingCdpEvaluation,
+        return_by_value: bool,
+        await_timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
+        let PendingCdpEvaluation {
+            oid,
+            done_counter,
+            started_at,
+            expression_preview,
+        } = pending;
+        let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+        let settled = self
+            .resolve_promises_until(
+                |runtime| {
+                    runtime
+                        .runtime
+                        .execute_script("<done?>", sentinel.clone())
+                        .ok()
+                        .and_then(|value| runtime.v8_to_json(value).ok())
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                },
+                await_timeout_ms,
+            )
+            .await;
+        if !settled {
+            return Err(format!(
+                "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
+            ));
+        }
+        let elapsed = started_at.elapsed();
+        if elapsed > std::time::Duration::from_secs(1) {
+            tracing::debug!(
+                "Runtime.evaluate awaitPromise took {}ms; expr={}",
+                elapsed.as_millis(),
+                expression_preview,
+            );
+        }
+        let rejected = self
+            .runtime
+            .execute_script(
+                "<readRejected>",
+                "globalThis.__obscura_await_rejected".to_string(),
+            )
+            .map_err(|error| format!("JS error: {error}"))?;
+        if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+            let error = self
+                .runtime
+                .execute_script(
+                    "<readError>",
+                    format!(
+                        "String(globalThis.__obscura_objects['{0}'] && \
+                         (globalThis.__obscura_objects['{0}'].message || \
+                          globalThis.__obscura_objects['{0}']))",
+                        oid
+                    ),
+                )
+                .map_err(|error| format!("JS error: {error}"))?;
+            return Err(format!(
+                "Promise rejected: {}",
+                self.v8_to_json(error)?.as_str().unwrap_or("")
+            ));
+        }
+        let meta = self
+            .runtime
+            .execute_script(
+                "<readMeta>",
+                "globalThis.__obscura_await_meta".to_string(),
+            )
+            .map_err(|error| format!("JS error: {error}"))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta = match meta {
+            serde_json::Value::String(serialized) => {
+                serde_json::from_str(&serialized).unwrap_or(serde_json::Value::String(serialized))
+            }
+            value => value,
+        };
+        self.object_store.insert(
+            oid.clone(),
+            format!("globalThis.__obscura_objects['{}']", oid),
+        );
+        if return_by_value {
+            let value = self
+                .runtime
+                .execute_script(
+                    "<readResult>",
+                    format!("globalThis.__obscura_objects['{}']", oid),
+                )
+                .map_err(|error| format!("JS error: {error}"))?;
+            return Ok(Self::info_from_json(&self.v8_to_json(value)?));
+        }
+        Ok(Self::info_from_meta(&meta, Some(oid)))
+    }
+
     pub async fn evaluate_for_cdp_with_timeout(
         &mut self,
         expression: &str,
@@ -1231,7 +1392,13 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        if !await_promise && return_by_value {
+        if await_promise {
+            let pending = self.start_await_evaluate_for_cdp(expression)?;
+            return self
+                .finish_await_evaluate_for_cdp(pending, return_by_value, await_timeout_ms)
+                .await;
+        }
+        if return_by_value {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
         }
@@ -1252,103 +1419,24 @@ impl ObscuraJsRuntime {
         // swallows the closing paren and our wrapper breaks. A newline
         // before the `)` terminates any trailing line comment so the
         // parens close on their own line.
-        let done_counter = self.object_counter;
-        let meta_code = if await_promise {
-            format!(
-                "(async function() {{\n\
-                    try {{\n\
-                        var __result = await (\n{expr}\n);\n\
-                        globalThis.__obscura_objects['{oid}'] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                    }}\n\
-                    globalThis.__obscura_done_{done_counter} = true;\n\
-                }})()",
-                expr = cleaned_expr,
-                oid = oid,
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-                done_counter = done_counter,
-            )
-        } else {
-            format!(
-                "(function() {{\n\
-                    var __result;\n\
-                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
-                    return {meta_fn};\n\
-                }})()",
-                expr = cleaned_expr,
-                oid = oid,
-                meta_fn = Self::meta_extract_js("__result"),
-            )
-        };
+        let meta_code = format!(
+            "(function() {{\n\
+                var __result;\n\
+                try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                return {meta_fn};\n\
+            }})()",
+            expr = cleaned_expr,
+            oid = oid,
+            meta_fn = Self::meta_extract_js("__result"),
+        );
 
         let result = self
             .runtime
             .execute_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
-        let meta_str = if await_promise {
-            let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
-            let settled = self
-                .resolve_promises_until(
-                    |rt| {
-                        rt.runtime
-                            .execute_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
-                    },
-                    await_timeout_ms,
-                )
-                .await;
-            if !settled {
-                return Err(format!(
-                    "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
-                ));
-            }
-            let __dt = __t0.elapsed();
-            if __dt > std::time::Duration::from_secs(1) {
-                let preview: String = expression
-                    .chars()
-                    .take(200)
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .collect();
-                tracing::debug!(
-                    "Runtime.evaluate awaitPromise took {}ms; expr={}",
-                    __dt.as_millis(),
-                    preview,
-                );
-            }
-            let rejected = self
-                .runtime
-                .execute_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
-                    .map_err(|e| format!("JS error: {}", e))?;
-                return Err(format!(
-                    "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
-                ));
-            }
-            self.runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?
-        } else {
-            result
-        };
-        let meta_str = self.v8_to_json(meta_str)?;
+        let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
         } else {
@@ -1358,18 +1446,6 @@ impl ObscuraJsRuntime {
             oid.clone(),
             format!("globalThis.__obscura_objects['{}']", oid),
         );
-
-        if await_promise && return_by_value {
-            let read = self
-                .runtime
-                .execute_script(
-                    "<readResult>",
-                    format!("globalThis.__obscura_objects['{}']", oid),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(read)?;
-            return Ok(Self::info_from_json(&json_val));
-        }
 
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }

@@ -3984,11 +3984,33 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if await_promise {
+            let pending = self
+                .js
+                .as_mut()
+                .ok_or("JavaScript runtime unavailable")?
+                .start_await_evaluate_for_cdp(expression)?;
+            // The expression above may synchronously set iframe.src or append
+            // a connected iframe and then await its load event. Commit those
+            // browser tasks before pumping the Promise, otherwise each side
+            // waits for the other until the CDP timeout.
+            self.process_pending_frame_navigations().await;
+            return self
+                .js
+                .as_mut()
+                .ok_or("JavaScript runtime unavailable")?
+                .finish_await_evaluate_for_cdp(
+                    pending,
+                    return_by_value,
+                    await_timeout_ms,
+                )
+                .await;
+        }
         if let Some(js) = &mut self.js {
             js.evaluate_for_cdp_with_timeout(
                 expression,
                 return_by_value,
-                await_promise,
+                false,
                 await_timeout_ms,
             )
             .await

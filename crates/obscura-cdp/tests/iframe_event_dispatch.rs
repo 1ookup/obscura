@@ -206,7 +206,7 @@ async fn iframe_load_reaches_onload_and_addeventlistener() {
                 };
                 iframe.addEventListener('load', () => events.push('listener'));
                 document.body.appendChild(iframe);
-                iframe.src = location.href;
+                iframe.src = new URL('/child', location.href).href;
             });
         })()"#,
         &sid,
