@@ -2342,14 +2342,27 @@ impl Page {
         else {
             return;
         };
-        // A sandbox without allow-scripts fails closed: no realm, no scripts.
-        // Nested frames carry their parent's flags merged in at navigation.
+        let frame_base = scope.base_url.clone();
+        // Every committed browsing context owns a Window realm, including an
+        // empty about:blank document and a sandboxed document whose author
+        // scripts are disabled. contentWindow/eval/CDP must not depend on the
+        // presence of a <script> element.
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            js.ensure_frame_realm(frame_id, generation, content_root.raw(), &frame_base)
+        {
+            tracing::warn!("frame realm creation failed ({frame_id}): {error}");
+            return;
+        }
+        // A sandbox without allow-scripts suppresses author scripts after the
+        // realm exists. Nested frames carry their parent's merged flags.
         if scope.sandbox.active
             && !scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS)
         {
             return;
         }
-        let frame_base = scope.base_url.clone();
         // Subresource initiator/referrer: the frame document's URL when it is
         // a network document, else the inherited base (srcdoc, about:blank).
         let initiator = Url::parse(&scope.url)
@@ -2456,12 +2469,6 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return;
         };
-        if let Err(error) =
-            js.ensure_frame_realm(frame_id, generation, content_root.raw(), &frame_base)
-        {
-            tracing::warn!("frame realm creation failed ({frame_id}): {error}");
-            return;
-        }
         // Already-started marks are frame-document-local: set them in the
         // frame's realm so frame code moving these nodes cannot re-run them.
         let ids = scripts
@@ -3091,6 +3098,16 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+
+        // Script insertion/src/location changes enqueue real frame
+        // navigations. Drain to a bounded fixed point so a newly loaded frame
+        // may create its own child without letting hostile content grow an
+        // unbounded synchronous navigation chain.
+        for _ in 0..8 {
+            if self.process_pending_frame_navigations().await == 0 {
+                break;
+            }
+        }
 
         // Cross-document postMessage traffic produced by frame and page
         // scripts gets one delivery pass before readiness (Phase 4). It runs
@@ -4073,6 +4090,175 @@ impl Page {
         }
     }
 
+    /// Commit iframe navigations requested by script through the Rust frame
+    /// controller. This also discovers newly-connected iframe elements, whose
+    /// initial about:blank/src/srcdoc browsing context cannot be created while
+    /// synchronous JavaScript still owns the V8 isolate.
+    pub async fn process_pending_frame_navigations(&mut self) -> usize {
+        let (root_requests, iframe_requests) = match self.js.as_ref() {
+            Some(js) => (
+                js.take_pending_frame_navigations(),
+                js.take_pending_iframe_navigations(),
+            ),
+            None => return 0,
+        };
+        if root_requests.is_empty() && iframe_requests.is_empty() {
+            return 0;
+        }
+
+        let borrowed_from_js = if self.dom.is_none() {
+            match self.js.as_ref().and_then(|js| js.take_dom()) {
+                Some(dom) => {
+                    self.dom = Some(dom);
+                    true
+                }
+                None => return 0,
+            }
+        } else {
+            false
+        };
+
+        let mut explicit_by_host = std::collections::HashMap::new();
+        for request in iframe_requests {
+            explicit_by_host.insert(request.host_nid, request);
+        }
+
+        let mut discovered = Vec::new();
+        if let Some(dom) = self.dom.as_ref() {
+            let main_id = self.frames.main_frame_id().to_string();
+            for host in dom.query_selector_all("iframe").unwrap_or_default() {
+                if dom.is_connected(host) && self.frames.by_host(host).is_none() {
+                    discovered.push((main_id.clone(), host));
+                }
+            }
+            let frame_scopes: Vec<(String, obscura_dom::NodeId)> = self
+                .frames
+                .frame_ids()
+                .filter_map(|frame_id| {
+                    let frame = self.frames.get(frame_id)?;
+                    frame
+                        .active_document_root
+                        .map(|root| (frame_id.to_string(), root))
+                })
+                .collect();
+            for (parent_id, root) in frame_scopes {
+                for host in dom
+                    .query_selector_all_from(root, "iframe")
+                    .unwrap_or_default()
+                {
+                    if dom.is_connected(host) && self.frames.by_host(host).is_none() {
+                        discovered.push((parent_id.clone(), host));
+                    }
+                }
+            }
+        }
+
+        let mut jobs: Vec<(String, FrameNavigationRequest)> = Vec::new();
+        let mut latest_by_root = std::collections::HashMap::new();
+        for (document_root, url, method, body) in root_requests {
+            latest_by_root.insert(document_root, (url, method, body));
+        }
+        for (document_root, (url, method, body)) in latest_by_root {
+            let frame_id = self.frames.frame_ids().find_map(|frame_id| {
+                self.frames.get(frame_id).and_then(|frame| {
+                    (frame.active_document_root == Some(obscura_dom::NodeId::new(document_root)))
+                        .then(|| frame_id.to_string())
+                })
+            });
+            if let Some(frame_id) = frame_id {
+                jobs.push((
+                    frame_id,
+                    FrameNavigationRequest {
+                        url: Some(url),
+                        method: Some(method),
+                        body: (!body.is_empty()).then_some(body.into_bytes()),
+                        ..FrameNavigationRequest::default()
+                    },
+                ));
+            }
+        }
+
+        for (parent_id, host) in discovered {
+            if let Some(frame_id) = self.frames.attach_child(&parent_id, host) {
+                let request = self
+                    .dom
+                    .as_ref()
+                    .and_then(|dom| dom.get_node(host))
+                    .map(|node| FrameNavigationRequest {
+                        url: node.get_attribute("src").map(str::to_string),
+                        srcdoc: node.get_attribute("srcdoc").map(str::to_string),
+                        sandbox: obscura_dom::SandboxFlags::parse(
+                            node.get_attribute("sandbox"),
+                        ),
+                        ..FrameNavigationRequest::default()
+                    })
+                    .unwrap_or_default();
+                jobs.push((frame_id, request));
+            }
+        }
+
+        for (host_nid, pending) in explicit_by_host {
+            let host = obscura_dom::NodeId::new(host_nid);
+            let Some(frame_id) = self.frames.by_host(host).map(|frame| frame.frame_id.clone()) else {
+                continue;
+            };
+            let Some(dom) = self.dom.as_ref() else {
+                continue;
+            };
+            if !dom.is_connected(host) {
+                continue;
+            }
+            let sandbox = dom
+                .get_node(host)
+                .map(|node| obscura_dom::SandboxFlags::parse(node.get_attribute("sandbox")))
+                .unwrap_or_default();
+            let request = if let Some(url) = pending.url {
+                FrameNavigationRequest {
+                    url: Some(url),
+                    method: Some(pending.method),
+                    body: (!pending.body.is_empty()).then_some(pending.body.into_bytes()),
+                    sandbox,
+                    ..FrameNavigationRequest::default()
+                }
+            } else {
+                dom.get_node(host)
+                    .map(|node| FrameNavigationRequest {
+                        url: node.get_attribute("src").map(str::to_string),
+                        srcdoc: node.get_attribute("srcdoc").map(str::to_string),
+                        sandbox,
+                        ..FrameNavigationRequest::default()
+                    })
+                    .unwrap_or_default()
+            };
+            if let Some(existing) = jobs.iter_mut().find(|(id, _)| *id == frame_id) {
+                existing.1 = request;
+            } else {
+                jobs.push((frame_id, request));
+            }
+        }
+
+        if borrowed_from_js {
+            if let Some(dom) = self.dom.take() {
+                if let Some(js) = self.js.as_ref() {
+                    js.set_dom(dom);
+                }
+            }
+        }
+
+        let mut committed = 0;
+        for (frame_id, request) in jobs {
+            match self.navigate_frame_for_cdp(&frame_id, request).await {
+                Ok(()) => committed += 1,
+                Err(error) => tracing::debug!(
+                    "script-requested iframe navigation for {} failed: {}",
+                    frame_id,
+                    error
+                ),
+            }
+        }
+        committed
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         if let Some(js) = &self.js {
             js.take_pending_binding_calls()
@@ -4170,6 +4356,7 @@ impl Page {
             self.push_history(self.url_string());
             Ok(true)
         } else {
+            self.process_pending_frame_navigations().await;
             Ok(false)
         }
     }
@@ -4409,8 +4596,44 @@ impl Page {
         }
         if result.is_ok() {
             self.execute_frame_subtree_scripts(frame_id).await;
+            self.dispatch_frame_load_event(frame_id);
         }
         result
+    }
+
+    fn dispatch_frame_load_event(&mut self, frame_id: &str) {
+        let Some(frame) = self.frames.get(frame_id) else {
+            return;
+        };
+        let Some(host) = frame.host_nid else {
+            return;
+        };
+        let parent = frame.parent_frame_id.clone();
+        let script = format!(
+            "(() => {{ const host = globalThis._wrapEl({}); if (host) host.dispatchEvent(new Event('load')); }})()",
+            host.raw(),
+        );
+        let Some(parent_id) = parent else {
+            return;
+        };
+        if parent_id == self.frames.main_frame_id() {
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.execute_script("<iframe-load>", &script);
+            }
+            return;
+        }
+        let Some(parent) = self.frames.get(&parent_id) else {
+            return;
+        };
+        let generation = parent.document_generation;
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script_in_frame_realm(
+                &parent_id,
+                generation,
+                "<iframe-load>",
+                &script,
+            );
+        }
     }
 
     async fn navigate_frame_inner(
@@ -5025,6 +5248,87 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_iframe_navigation_uses_the_frame_controller() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    frame.id = 'dynamic';
+                    globalThis.dynamicLoads = 0;
+                    frame.addEventListener('load', () => dynamicLoads++);
+                    frame.srcdoc = '<script>globalThis.frameMarker = 1;</script>';
+                    document.body.appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        let (frame_id, first_generation) = {
+            let js = page.js.as_ref().unwrap();
+            let host = js
+                .with_dom(|dom| dom.query_selector("#dynamic").unwrap().unwrap())
+                .unwrap();
+            let frame = page.frames.by_host(host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[document.getElementById('dynamic').contentWindow.frameMarker, dynamicLoads]")
+                .unwrap(),
+            serde_json::json!([1, 1]),
+        );
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "document.getElementById('dynamic').setAttribute('srcdoc', '<script>globalThis.frameMarker = 2;</script>')",
+            )
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        let frame = page.frames.get(&frame_id).unwrap();
+        assert_eq!(frame.document_generation, first_generation + 1);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[document.getElementById('dynamic').contentWindow.frameMarker, dynamicLoads]")
+                .unwrap(),
+            serde_json::json!([2, 2]),
+        );
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('dynamic').contentWindow.eval(\"location.href = 'about:blank'\")")
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        let frame = page.frames.get(&frame_id).unwrap();
+        assert_eq!(frame.document_generation, first_generation + 2);
+        let scope = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| dom.document_scope(frame.active_document_root.unwrap()))
+            .flatten()
+            .unwrap();
+        assert_eq!(scope.url, "about:blank");
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("dynamicLoads").unwrap(),
+            serde_json::json!(3.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn srcdoc_frame_commits_content_document_with_inherited_origin() {
         let mut page = frame_test_page(
             "<!DOCTYPE html><html><body><iframe srcdoc=\"<p id=hi>hello</p>\"></iframe></body></html>",
@@ -5224,7 +5528,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(text, "x");
-        // Fail closed means no realm was even created for the frame.
+        // The browsing context still owns a Window realm; only author script
+        // execution is suppressed by the sandbox flag.
         let host = page
             .with_dom(|dom| dom.query_selector("iframe").unwrap().unwrap())
             .unwrap();
@@ -5237,7 +5542,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .frame_realm(&frame_id, generation)
-            .is_none());
+            .is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

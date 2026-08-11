@@ -1815,6 +1815,11 @@ function __prepareInsertedSubtree(root) {
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
+  if (root.nodeType === 1 && root.localName === 'iframe') {
+    Deno.core.ops.op_queue_iframe_navigation(root._nid);
+  }
+  const iframeIds = _domParse("query_selector_all_scoped", root._nid, "iframe") || [];
+  for (const nid of iframeIds) Deno.core.ops.op_queue_iframe_navigation(+nid);
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
@@ -3178,6 +3183,9 @@ class Element extends Node {
     }
     if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
+    if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
+      Deno.core.ops.op_queue_iframe_navigation(this._nid);
+    }
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -3218,6 +3226,9 @@ class Element extends Node {
     }
     if (n === "style") this._style._replaceFromAttribute("");
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
+    if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
+      Deno.core.ops.op_queue_iframe_navigation(this._nid);
+    }
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3847,37 +3858,9 @@ class Element extends Node {
   }
   set src(v) {
     this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
-    }
   }
-  _loadIframeSrc(url) {
-    let fullUrl = url;
-    if (!url.includes('://')) {
-      try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
-    }
-    const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
-      if (resp.ok || resp.type === 'opaque') {
-        const html = await resp.text();
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      } else {
-        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      }
-
-      // Dispatch through the element so the onload property/attribute and any
-      // addEventListener('load', ...) listeners all run. Calling el.onload()
-      // directly bypasses listeners registered via addEventListener.
-      el.dispatchEvent(new Event('load'));
-    }).catch(() => {
-      el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-
-      el.dispatchEvent(new Event('load'));
-    });
-  }
+  get srcdoc() { return this.localName === 'iframe' ? (this.getAttribute('srcdoc') || '') : undefined; }
+  set srcdoc(v) { if (this.localName === 'iframe') this.setAttribute('srcdoc', v); }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     const nativeRoot = +_dom("iframe_content_document_root", this._nid);
@@ -6126,7 +6109,7 @@ class _ScopedDocument extends Document {
   // no longer presented in a frame.
   get defaultView() { return this._defaultViewProxy || null; }
   get location() { return this._defaultViewProxy ? this._defaultViewProxy.location : null; }
-  set location(url) { /* frame navigation routes through Rust in Phase 3.5 */ }
+  set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get doctype() {
     const ids = _domParse("child_nodes", this._scopeRoot) || [];
     for (const cid of ids) {
@@ -6179,10 +6162,14 @@ function _frameWindowProxyFor(hostEl) {
       + (globalThis.location ? globalThis.location.origin : "null")
       + '" from accessing a cross-origin frame.',
     "SecurityError");
+  const navigate = (value) => {
+    const url = _resolveUrl(String(value));
+    Deno.core.ops.op_navigate_iframe(hostNid, url, "GET", "");
+  };
 
   // Stable per-proxy location. Reads re-check the frame origin on every
-  // access; writes/assign/replace are permitted cross-origin per HTML but
-  // stay stubs until frame navigation routes through Rust (Phase 3.5).
+  // access; writes/assign/replace are permitted cross-origin per HTML and
+  // enqueue a navigation through the Rust frame controller.
   const frameLocation = {
     get href() {
       const root = contentRoot();
@@ -6190,10 +6177,14 @@ function _frameWindowProxyFor(hostEl) {
       const info = _domParse("document_scope_info", root);
       return (info && info.url) || "about:blank";
     },
-    set href(v) {},
-    assign() {},
-    replace() {},
-    reload() {},
+    set href(v) { navigate(v); },
+    assign(v) { navigate(v); },
+    replace(v) { navigate(v); },
+    reload() {
+      const root = contentRoot();
+      const info = root >= 0 ? _domParse("document_scope_info", root) : null;
+      navigate((info && info.url) || "about:blank");
+    },
     toString() { return this.href; },
   };
   for (const part of ["origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash"]) {
@@ -6228,7 +6219,7 @@ function _frameWindowProxyFor(hostEl) {
       }
       return frameLocation;
     },
-    set location(v) { /* cross-origin navigation write; wiring is Phase 3.5 */ },
+    set location(v) { navigate(v); },
     get frameElement() {
       if (!sameOrigin()) throw securityError();
       return hostEl;

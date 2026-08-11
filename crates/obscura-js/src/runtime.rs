@@ -14,8 +14,8 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    build_extension, node_is_script, ObscuraState, SharedStorageAreas,
-    StoredNetworkResponseBody,
+    build_extension, node_is_script, ObscuraState, PendingIframeNavigation,
+    SharedStorageAreas, StoredNetworkResponseBody,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
@@ -558,6 +558,10 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_frame_navigations)
+    }
+
+    pub fn take_pending_iframe_navigations(&self) -> Vec<PendingIframeNavigation> {
+        std::mem::take(&mut self.state.borrow_mut().pending_iframe_navigations)
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {

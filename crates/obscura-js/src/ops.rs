@@ -68,6 +68,16 @@ pub struct InterceptedRequest {
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingIframeNavigation {
+    pub host_nid: u32,
+    /// Explicit URL for WindowProxy.location navigation. `None` means an
+    /// iframe attribute changed and the browser must snapshot src/srcdoc.
+    pub url: Option<String>,
+    pub method: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredNetworkResponseBody {
     pub body: String,
@@ -180,6 +190,7 @@ pub struct ObscuraState {
     /// calling document root, which the browser layer resolves back to its
     /// stable browsing context before starting the navigation.
     pub pending_frame_navigations: Vec<(u32, String, String, String)>,
+    pub pending_iframe_navigations: Vec<PendingIframeNavigation>,
     /// Origin-keyed Web Storage backing shared by every Window realm attached
     /// to the configured browser-owned namespaces. Areas retain insertion
     /// order for Storage.key().
@@ -327,6 +338,7 @@ impl ObscuraState {
             stealth_client: None,
             pending_navigation: None,
             pending_frame_navigations: Vec::new(),
+            pending_iframe_navigations: Vec::new(),
             local_storage: new_storage_areas(),
             session_storage: new_storage_areas(),
             intercept_tx: None,
@@ -3873,6 +3885,43 @@ fn op_navigate_frame(
     ));
 }
 
+#[op2(fast)]
+fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    if !gs
+        .pending_iframe_navigations
+        .iter()
+        .any(|request| request.host_nid == host_nid && request.url.is_none())
+    {
+        gs.pending_iframe_navigations.push(PendingIframeNavigation {
+            host_nid,
+            url: None,
+            method: "GET".to_string(),
+            body: String::new(),
+        });
+    }
+}
+
+#[op2(fast)]
+fn op_navigate_iframe(
+    state: &OpState,
+    host_nid: u32,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    gs.borrow_mut()
+        .pending_iframe_navigations
+        .push(PendingIframeNavigation {
+            host_nid,
+            url: Some(url.to_string()),
+            method: method.to_string(),
+            body: body.to_string(),
+        });
+}
+
 /// Whether async host work can be scheduled without aborting the isolate.
 ///
 /// Some low-level embedders intentionally execute a synchronous expression
@@ -4924,6 +4973,8 @@ pub fn build_extension() -> Extension {
         op_origin_storage(),
         op_navigate(),
         op_navigate_frame(),
+        op_queue_iframe_navigation(),
+        op_navigate_iframe(),
         op_async_runtime_available(),
         op_posted_task(),
         op_binding_called(),
