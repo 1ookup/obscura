@@ -221,6 +221,12 @@ pub struct Page {
     /// when iframe browsing contexts are created. CDP projects this
     /// registry rather than keeping its own frame model.
     pub frames: crate::frames::FrameRegistry,
+    /// Typed origin of the current top-level document, derived exactly once
+    /// per committed document. Frame origin inheritance and same-origin
+    /// checks share this instance so an opaque top origin (data:, sandboxed)
+    /// keeps one identity; re-deriving from the URL would mint a fresh
+    /// opaque id per call and break srcdoc same-origin access.
+    pub document_origin: Option<obscura_dom::Origin>,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
     pub js: Option<ObscuraJsRuntime>,
@@ -896,6 +902,7 @@ impl Page {
             id,
             frames: crate::frames::FrameRegistry::new(frame_id.clone()),
             frame_id,
+            document_origin: None,
             url: None,
             dom: None,
             js: None,
@@ -1099,6 +1106,9 @@ impl Page {
             self.context.proxy_url.clone(),
         );
         rt.set_url(&self.url_string());
+        if let Some(origin) = &self.document_origin {
+            rt.set_top_origin(origin.clone());
+        }
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
@@ -2222,6 +2232,389 @@ impl Page {
         );
     }
 
+    /// Run the classic `<script>` elements of every committed child frame in
+    /// that frame's own Window realm (Phase 3.8). Runs after `init_js` (the
+    /// realm host and the DomTree live in the runtime by then) and before the
+    /// main document's `execute_scripts`: frame documents commit while the
+    /// parent parses, so their parser scripts run before the parent document
+    /// signals readiness. Pages without iframes return without touching the
+    /// runtime.
+    async fn execute_frame_scripts(&mut self) {
+        if self.js.is_none() {
+            return;
+        }
+        // Outermost first: walk the registry tree from the main frame so a
+        // parent frame's scripts run before its nested frames' scripts.
+        let mut order: Vec<String> = Vec::new();
+        let mut queue: std::collections::VecDeque<String> = self
+            .frames
+            .get(self.frames.main_frame_id())
+            .map(|main| main.children.iter().cloned().collect())
+            .unwrap_or_default();
+        while let Some(frame_id) = queue.pop_front() {
+            if let Some(frame) = self.frames.get(&frame_id) {
+                queue.extend(frame.children.iter().cloned());
+                order.push(frame_id);
+            }
+        }
+        self.execute_frame_scripts_in_order(order).await;
+    }
+
+    /// Run the classic scripts of the frames in `order` under the shared phase
+    /// budget: a soft deadline observed between scripts plus a watchdog for a
+    /// synchronous overrun inside one frame script. Same budget shape as the
+    /// main document's script phase.
+    async fn execute_frame_scripts_in_order(&mut self, order: Vec<String>) {
+        if order.is_empty() {
+            return;
+        }
+        let deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000);
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(deadline_ms);
+        let watchdog = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(deadline_ms + 1000)));
+        for frame_id in order {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("execute_frame_scripts: deadline reached, skipping remaining frames");
+                break;
+            }
+            self.execute_frame_scripts_for(&frame_id, deadline).await;
+        }
+        if let Some(token) = watchdog {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
+            }
+        }
+    }
+
+    /// Run the classic scripts of `root_frame_id` and its nested frames
+    /// (outermost first). Used by the CDP single-frame navigation path, where
+    /// only the navigated subtree has a fresh document; the full-page flow
+    /// walks the whole tree via [`Self::execute_frame_scripts`].
+    async fn execute_frame_subtree_scripts(&mut self, root_frame_id: &str) {
+        if self.js.is_none() || self.frames.get(root_frame_id).is_none() {
+            return;
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([root_frame_id.to_string()]);
+        while let Some(frame_id) = queue.pop_front() {
+            if let Some(frame) = self.frames.get(&frame_id) {
+                queue.extend(frame.children.iter().cloned());
+                order.push(frame_id);
+            }
+        }
+        self.execute_frame_scripts_in_order(order).await;
+    }
+
+    async fn execute_frame_scripts_for(
+        &mut self,
+        frame_id: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let Some(frame) = self.frames.get(frame_id) else {
+            return;
+        };
+        let Some(content_root) = frame.active_document_root else {
+            return;
+        };
+        let generation = frame.document_generation;
+
+        let Some(scope) = self
+            .js
+            .as_ref()
+            .and_then(|js| js.with_dom(|dom| dom.document_scope(content_root)))
+            .flatten()
+        else {
+            return;
+        };
+        // A sandbox without allow-scripts fails closed: no realm, no scripts.
+        // Nested frames carry their parent's flags merged in at navigation.
+        if scope.sandbox.active
+            && !scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS)
+        {
+            return;
+        }
+        let frame_base = scope.base_url.clone();
+        // Subresource initiator/referrer: the frame document's URL when it is
+        // a network document, else the inherited base (srcdoc, about:blank).
+        let initiator = Url::parse(&scope.url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .or_else(|| Url::parse(&frame_base).ok())
+            .unwrap_or_else(|| Url::parse("about:blank").unwrap());
+
+        struct FrameScript {
+            src: Option<String>,
+            inline: String,
+            nid: u32,
+            base_url: String,
+        }
+        // Discovery mirrors the main document's scan, scoped to the content
+        // root. Content documents are parentless subtrees, so descendants()
+        // never crosses into a nested frame's document. The <base> pre-scan is
+        // document-local, seeded from the frame scope's base URL. defer and
+        // async scripts run in document order with the others: frame parsing
+        // has already completed here, which is the defer semantics and a
+        // deliberate in-order approximation for async.
+        let scripts: Vec<FrameScript> = self
+            .js
+            .as_ref()
+            .and_then(|js| {
+                js.with_dom(|dom| {
+                    let script_ids = dom
+                        .query_selector_all_from(content_root, "script")
+                        .unwrap_or_default();
+                    let mut bases_at_script = std::collections::HashMap::new();
+                    let mut active_base = Url::parse(&frame_base).ok();
+                    let mut found_base = false;
+                    for nid in dom.descendants(content_root) {
+                        let Some(node) = dom.get_node(nid) else {
+                            continue;
+                        };
+                        let Some(name) = node.as_element() else {
+                            continue;
+                        };
+                        if name.local.as_ref() == "base" && !found_base {
+                            if let Some(href) = node.get_attribute("href") {
+                                found_base = true;
+                                if let Some(resolved) =
+                                    active_base.as_ref().and_then(|base| base.join(href).ok())
+                                {
+                                    active_base = Some(resolved);
+                                }
+                            }
+                        } else if name.local.as_ref() == "script" {
+                            bases_at_script.insert(
+                                nid.raw(),
+                                active_base
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| frame_base.clone()),
+                            );
+                        }
+                    }
+                    let mut scripts = Vec::new();
+                    for sid in script_ids {
+                        let Some(node) = dom.get_node(sid) else {
+                            continue;
+                        };
+                        let script_type = node
+                            .get_attribute("type")
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase();
+                        match script_type.as_str() {
+                            "" | "text/javascript" | "application/javascript" => {}
+                            // TODO(Phase 3.10): per-realm module maps. The
+                            // module loader is a per-runtime singleton bound
+                            // to the top document today, so frame modules and
+                            // import maps stay off until then.
+                            "module" | "importmap" => continue,
+                            _ => continue,
+                        }
+                        let src = node.get_attribute("src").map(str::to_string);
+                        let inline = if src.is_none() {
+                            dom.text_content(sid)
+                        } else {
+                            String::new()
+                        };
+                        if src.is_some() || !inline.trim().is_empty() {
+                            scripts.push(FrameScript {
+                                src,
+                                inline,
+                                nid: sid.raw(),
+                                base_url: bases_at_script
+                                    .get(&sid.raw())
+                                    .cloned()
+                                    .unwrap_or_else(|| frame_base.clone()),
+                            });
+                        }
+                    }
+                    scripts
+                })
+            })
+            .unwrap_or_default();
+        if scripts.is_empty() {
+            return;
+        }
+
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            js.ensure_frame_realm(frame_id, generation, content_root.raw(), &frame_base)
+        {
+            tracing::warn!("frame realm creation failed ({frame_id}): {error}");
+            return;
+        }
+        // Already-started marks are frame-document-local: set them in the
+        // frame's realm so frame code moving these nodes cannot re-run them.
+        let ids = scripts
+            .iter()
+            .map(|script| script.nid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = js.execute_script_in_frame_realm(
+            frame_id,
+            generation,
+            "<parser-scripts>",
+            &format!("globalThis.__markParserScripts([{ids}]);"),
+        );
+
+        // Prefetch external classics concurrently, then execute in document
+        // order. Gates mirror the main document's: scheme allowlist against
+        // the frame base, interception blocklist, and the transport's SSRF
+        // checks inside fetch_resource_with_callbacks.
+        let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
+        for (index, script) in scripts.iter().enumerate() {
+            let Some(src) = &script.src else {
+                continue;
+            };
+            let full_url = if src.starts_with("http://") || src.starts_with("https://") {
+                src.clone()
+            } else {
+                Url::parse(&script.base_url)
+                    .ok()
+                    .and_then(|base| base.join(src).ok())
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|| src.clone())
+            };
+            if !subresource_allowed(Url::parse(&frame_base).ok().as_ref(), &full_url) {
+                tracing::warn!(
+                    "blocking cross-scheme frame <script src>: frame={} src={}",
+                    scope.url,
+                    full_url,
+                );
+                continue;
+            }
+            if self.should_block_url(&full_url) {
+                tracing::info!("Blocked frame script by interception: {}", full_url);
+                continue;
+            }
+            fetch_tasks.push((index, full_url));
+        }
+        let client = self.http_client.clone();
+        let callbacks = self.callbacks.clone();
+        let fetch_futures: Vec<_> = fetch_tasks
+            .into_iter()
+            .map(|(index, url)| {
+                let client = client.clone();
+                let callbacks = callbacks.clone();
+                let initiator = initiator.clone();
+                async move {
+                    let parsed =
+                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    if parsed.scheme() == "data" {
+                        let body = decode_data_uri(&url).unwrap_or_default();
+                        let content_type = url
+                            .strip_prefix("data:")
+                            .and_then(|s| s.split(',').next())
+                            .unwrap_or("application/javascript")
+                            .split(';')
+                            .next()
+                            .unwrap_or("application/javascript")
+                            .to_string();
+                        let mut headers = std::collections::HashMap::new();
+                        headers.insert("content-type".to_string(), content_type);
+                        let resp = obscura_net::Response {
+                            url: parsed,
+                            status: 200,
+                            headers,
+                            body,
+                            redirected_from: Vec::new(),
+                        };
+                        return Some((index, url, resp));
+                    }
+                    let request =
+                        ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    match client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                        .await
+                    {
+                        Ok(resp) => Some((index, url, resp)),
+                        Err(error) => {
+                            tracing::warn!("Failed to fetch frame script {}: {}", url, error);
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+        use futures::StreamExt as _;
+        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(8);
+        let fetch_results =
+            match tokio::time::timeout_at(deadline, fetch_stream.collect::<Vec<_>>()).await {
+                Ok(results) => results,
+                Err(_) => {
+                    tracing::warn!("execute_frame_scripts: fetch deadline reached");
+                    Vec::new()
+                }
+            };
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+            std::collections::HashMap::new();
+        for result in fetch_results {
+            let Some((index, url, resp)) = result else {
+                continue;
+            };
+            if !script_response_is_executable(resp.status) {
+                self.record_network_event_with_body(
+                    &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
+                );
+                tracing::warn!("Refusing to execute frame script {} after HTTP {}", url, resp.status);
+                continue;
+            }
+            let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+            fetched.insert(index, (url, code, resp));
+        }
+
+        for (index, script) in scripts.iter().enumerate() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("execute_frame_scripts: deadline reached mid-frame");
+                break;
+            }
+            let (execution_url, code) = if script.src.is_some() {
+                let Some((url, code, resp)) = fetched.remove(&index) else {
+                    continue;
+                };
+                self.record_network_event_with_body(
+                    &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
+                );
+                (resp.url.to_string(), code)
+            } else {
+                (script.base_url.clone(), script.inline.clone())
+            };
+            let Some(js) = self.js.as_mut() else {
+                return;
+            };
+            // currentScript points at this script element for the duration of
+            // its execution; the realm's Document getter reads the realm-local
+            // __currentScriptNid, same contract as the main document's.
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<current-script>",
+                &format!("globalThis.__currentScriptNid={};", script.nid),
+            );
+            if let Err(error) =
+                js.execute_script_in_frame_realm(frame_id, generation, &execution_url, &code)
+            {
+                tracing::warn!("Frame script error ({}): {}", execution_url, error);
+            }
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<current-script>",
+                "globalThis.__currentScriptNid=0;",
+            );
+        }
+    }
+
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
         self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
             .await
@@ -2463,6 +2856,7 @@ impl Page {
 
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
+        self.document_origin = Some(obscura_dom::Origin::from_url(url.as_str()));
         self.url = Some(url.clone());
         self.network_events.clear();
 
@@ -2562,6 +2956,7 @@ impl Page {
         );
 
         if !response.redirected_from.is_empty() {
+            self.document_origin = Some(obscura_dom::Origin::from_url(response.url.as_str()));
             self.url = Some(response.url.clone());
         }
 
@@ -2596,7 +2991,15 @@ impl Page {
             .map(|main| main.children.clone())
             .unwrap_or_default();
         for child in stale_children {
-            self.frames.detach(&child);
+            let removed = self.frames.detach(&child);
+            // The old document's frame realms die with the old runtime when
+            // init_js below replaces it; destroy them eagerly anyway so a
+            // future runtime-reuse change cannot leak them.
+            if let Some(js) = self.js.as_mut() {
+                for context in &removed {
+                    js.destroy_frame_realm(&context.frame_id);
+                }
+            }
         }
         self.frame_stylesheet_cache.clear();
         self.load_child_frames().await;
@@ -2666,6 +3069,12 @@ impl Page {
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
+        // Frame classic scripts run in their own Window realms before the
+        // main document's scripts (Phase 3.8): frame documents committed
+        // during the parse above, so their parser scripts precede the parent
+        // document's readiness signals.
+        self.execute_frame_scripts().await;
+
         // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
         // not before. Skipping execute_scripts() on the DCL path meant
         // every inline <script> in the page was silently dropped: form
@@ -2673,6 +3082,16 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+
+        // Cross-document postMessage traffic produced by frame and page
+        // scripts gets one delivery pass before readiness (Phase 4). It runs
+        // after the main scripts so parent-side listeners registered there
+        // observe frame messages, matching the task-queue timing; later
+        // pumps (settle, event-loop ticks) keep draining as messages appear.
+        // Pages without pending messages return immediately.
+        if let Some(js) = &mut self.js {
+            js.deliver_pending_frame_messages().await;
+        }
 
         #[cfg(feature = "render")]
         {
@@ -2774,6 +3193,7 @@ impl Page {
 
     pub fn navigate_blank(&mut self) {
         self.js = None;
+        self.document_origin = Some(obscura_dom::Origin::from_url("about:blank"));
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
             "<!DOCTYPE html><html><head></head><body></body></html>",
@@ -3869,13 +4289,18 @@ impl Page {
                 break;
             };
             if frame.parent_frame_id.is_none() {
-                // Main frame: URL and origin come from the page itself.
+                // Main frame: URL and origin come from the page itself. Use
+                // the stored document origin so an opaque top keeps one
+                // identity across every check.
                 let url = self
                     .url
                     .as_ref()
                     .map(|url| url.to_string())
                     .unwrap_or_else(|| "about:blank".to_string());
-                let origin = obscura_dom::Origin::from_url(&url);
+                let origin = self
+                    .document_origin
+                    .clone()
+                    .unwrap_or_else(|| obscura_dom::Origin::from_url(&url));
                 chain.push((url, origin));
             } else if let Some(scope) = frame
                 .active_document_root
@@ -3920,7 +4345,13 @@ impl Page {
             .as_ref()
             .map(|url| url.to_string())
             .unwrap_or_else(|| "about:blank".to_string());
-        let origin = obscura_dom::Origin::from_url(&url);
+        // Shared per-document origin instance: srcdoc/about:blank frames
+        // inherit it, and the same-origin op compares against it, so an
+        // opaque top origin stays equal to itself.
+        let origin = self
+            .document_origin
+            .clone()
+            .unwrap_or_else(|| obscura_dom::Origin::from_url(&url));
         (url, origin, obscura_dom::SandboxFlags::default(), None)
     }
 
@@ -4130,6 +4561,12 @@ impl Page {
         // work lands, no JS wrapper can retain it, so free it eagerly.
         if let Some(previous) = committed.previous_root {
             dom.remove(previous);
+        }
+        // Every realm registered for this frame belongs to a superseded
+        // generation (the freshly committed one has no realm yet; it is
+        // created lazily at script execution), so drop them all.
+        if let Some(js) = self.js.as_mut() {
+            js.destroy_frame_realm(frame_id);
         }
 
         // External stylesheets of the committed content (Phase 3.6). A failed
@@ -4600,6 +5037,273 @@ mod tests {
         assert_eq!(dom.text_content(node), "data");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_inline_scripts_execute_in_their_frame_realm() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe srcdoc=\"\
+             <div id=out>before</div>\
+             <script>var frameVar='ran';document.getElementById('out').textContent=frameVar;</script>\
+             <script>document.getElementById('out').setAttribute('data-second', frameVar + (document.currentScript ? '/cs' : '/nocs'));</script>\
+             \"></iframe></body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        // Both scripts ran against the frame document; the second saw the
+        // first's top-level var (shared frame global) and its own
+        // document.currentScript.
+        let (text, second) = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                let out = dom.query_selector_from(root, "#out").unwrap().unwrap();
+                (
+                    dom.text_content(out),
+                    dom.get_node(out)
+                        .and_then(|node| node.get_attribute("data-second").map(str::to_string)),
+                )
+            })
+            .unwrap();
+        assert_eq!(text, "ran");
+        assert_eq!(second.as_deref(), Some("ran/cs"));
+
+        // The frame's top-level binding stayed out of the main realm, and the
+        // frame realm still holds it.
+        let host = page
+            .with_dom(|dom| dom.query_selector("iframe").unwrap().unwrap())
+            .unwrap();
+        let (frame_id, generation) = {
+            let frame = page.frames.by_host(host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(
+            js.evaluate("typeof frameVar").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            js.execute_script_in_frame_realm(&frame_id, generation, "<t>", "frameVar")
+                .unwrap(),
+            serde_json::json!("ran")
+        );
+        // currentScript was restored after the last script finished.
+        assert_eq!(
+            js.execute_script_in_frame_realm(
+                &frame_id,
+                generation,
+                "<t>",
+                "document.currentScript === null",
+            )
+            .unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_frame_scripts_do_not_execute() {
+        // sandbox="" withholds allow-scripts, so the frame must stay inert.
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe sandbox=\"\" srcdoc=\"\
+             <div id=s>x</div>\
+             <script>document.getElementById('s').textContent='hacked';</script>\
+             \"></iframe></body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        let text = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                let s = dom.query_selector_from(root, "#s").unwrap().unwrap();
+                dom.text_content(s)
+            })
+            .unwrap();
+        assert_eq!(text, "x");
+        // Fail closed means no realm was even created for the frame.
+        let host = page
+            .with_dom(|dom| dom.query_selector("iframe").unwrap().unwrap())
+            .unwrap();
+        let (frame_id, generation) = {
+            let frame = page.frames.by_host(host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        assert!(page
+            .js
+            .as_ref()
+            .unwrap()
+            .frame_realm(&frame_id, generation)
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_frame_scripts_execute_in_their_own_realms() {
+        // The nested markup avoids quotes so it survives the srcdoc-in-srcdoc
+        // attribute nesting; each script publishes through document.title.
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe srcdoc=\"\
+             <script>var outerV=1;document.title=100+outerV;</script>\
+             <iframe srcdoc='<script>var innerV=41;document.title=innerV+1;</script>'></iframe>\
+             \"></iframe></body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        let (outer_host, inner_host) = page
+            .with_dom(|dom| {
+                let outer = dom.query_selector("iframe").unwrap().unwrap();
+                let outer_root = dom.iframe_content_document(outer).unwrap();
+                let inner = dom
+                    .query_selector_from(outer_root, "iframe")
+                    .unwrap()
+                    .unwrap();
+                (outer, inner)
+            })
+            .unwrap();
+        let (outer_id, outer_generation) = {
+            let frame = page.frames.by_host(outer_host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        let (inner_id, inner_generation) = {
+            let frame = page.frames.by_host(inner_host).unwrap();
+            (frame.frame_id.clone(), frame.document_generation)
+        };
+        let js = page.js.as_mut().unwrap();
+        // Each document got its own realm with its own top-level bindings and
+        // its own scoped document.
+        assert_eq!(
+            js.execute_script_in_frame_realm(
+                &outer_id,
+                outer_generation,
+                "<t>",
+                "[document.title, outerV, typeof innerV]",
+            )
+            .unwrap(),
+            serde_json::json!(["101", 1, "undefined"])
+        );
+        assert_eq!(
+            js.execute_script_in_frame_realm(
+                &inner_id,
+                inner_generation,
+                "<t>",
+                "[document.title, innerV, typeof outerV]",
+            )
+            .unwrap(),
+            serde_json::json!(["42", 41, "undefined"])
+        );
+        assert_eq!(
+            js.evaluate("[typeof outerV, typeof innerV]").unwrap(),
+            serde_json::json!(["undefined", "undefined"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_and_parent_exchange_postmessage_round_trip() {
+        // Phase 4: parent -> child via contentWindow.postMessage('/', same
+        // origin), child handler writes the delivery into its own DOM and
+        // echoes through e.source; the parent's listener asserts payload,
+        // sender origin and source identity against the contentWindow proxy.
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body>\
+             <iframe srcdoc=\"\
+               <div id=out>none</div>\
+               <script>\
+                 window.addEventListener('message', function(e) {\
+                   document.getElementById('out').textContent = 'got:' + e.data.n + ':' + e.origin;\
+                   e.source.postMessage({ n: e.data.n + 1 }, '*');\
+                 });\
+               </script>\"></iframe>\
+             <div id=pout>none</div>\
+             <script>\
+               window.addEventListener('message', function(e) {\
+                 document.getElementById('pout').textContent =\
+                   'echo:' + e.data.n + ':' + e.origin + ':' + (e.source === document.querySelector('iframe').contentWindow);\
+               });\
+               document.querySelector('iframe').contentWindow.postMessage({ n: 1 }, '/');\
+             </script>\
+             </body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+        page.execute_scripts().await;
+        // The navigation flow runs this delivery pass after the scripts; the
+        // direct-call harness invokes it the same way.
+        page.js.as_mut().unwrap().deliver_pending_frame_messages().await;
+
+        // Child side observed the parent's message (data + serialized parent
+        // origin), written into the frame document.
+        let child_text = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                let out = dom.query_selector_from(root, "#out").unwrap().unwrap();
+                dom.text_content(out)
+            })
+            .unwrap();
+        assert_eq!(child_text, "got:1:https://top.example");
+
+        // Parent side observed the echo: payload, the frame's origin (srcdoc
+        // inherits the parent origin) and source === contentWindow proxy.
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('pout').textContent")
+                .unwrap(),
+            serde_json::json!("echo:2:https://top.example:true")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_frame_parent_postmessage_targets_intermediate_frame_realm() {
+        // Phase 4 nesting: the innermost frame's `parent` addresses the
+        // intermediate frame's realm, not the main Window. The inner srcdoc
+        // is single-quote delimited, so its script avoids quotes entirely
+        // (String.fromCharCode(42) === '*').
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe srcdoc=\"\
+             <div id=oout>none</div>\
+             <script>\
+               window.addEventListener('message', function(e) {\
+                 document.getElementById('oout').textContent = 'inner:' + e.data.n + ':' + e.origin\
+                   + ':' + (e.source === document.querySelector('iframe').contentWindow);\
+               });\
+             </script>\
+             <iframe srcdoc='<script>parent.postMessage({n:5}, String.fromCharCode(42));</script>'></iframe>\
+             \"></iframe></body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+        page.js.as_mut().unwrap().deliver_pending_frame_messages().await;
+
+        // The intermediate frame realm received the message with the inner
+        // frame's origin (inherited srcdoc chain) and its source resolved to
+        // that realm's contentWindow proxy for the inner host.
+        let outer_text = page
+            .with_dom(|dom| {
+                let outer = dom.query_selector("iframe").unwrap().unwrap();
+                let outer_root = dom.iframe_content_document(outer).unwrap();
+                let out = dom.query_selector_from(outer_root, "#oout").unwrap().unwrap();
+                dom.text_content(out)
+            })
+            .unwrap();
+        assert_eq!(outer_text, "inner:5:https://top.example:true");
+        // Nothing leaked to the main Window's queue or listeners.
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("typeof globalThis.__gotMain")
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
+    }
+
     /// 1x1 PNG, color #e02020. Valid bytes so the render image cache accepts
     /// the seed (image_intrinsic_dimensions must parse it).
     const TEST_PIXEL_PNG: &[u8] = &[
@@ -4679,6 +5383,105 @@ mod tests {
             }
         });
         (origin, request_rx)
+    }
+
+    fn spawn_frame_script_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let _ = request_tx.send(path.clone());
+                let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        b"<!doctype html><html><body>\
+                          <iframe src=\"/sub/frame.html\"></iframe>\
+                          </body></html>"
+                            .to_vec(),
+                    ),
+                    "/sub/frame.html" => (
+                        "text/html",
+                        b"<!doctype html><html><body>\
+                          <div id=\"t\">before</div>\
+                          <script src=\"js/app.js\"></script>\
+                          </body></html>"
+                            .to_vec(),
+                    ),
+                    // The relative src resolved against the frame document's
+                    // URL, not the top document's.
+                    "/sub/js/app.js" => (
+                        "application/javascript",
+                        b"var extVar=7;document.getElementById('t').textContent='external';"
+                            .to_vec(),
+                    ),
+                    _ => ("text/plain", b"missing".to_vec()),
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (origin, request_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_external_scripts_execute_and_resolve_against_frame_base() {
+        let (origin, requests) = spawn_frame_script_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-script".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-script".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        let text = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                let t = dom.query_selector_from(root, "#t").unwrap().unwrap();
+                dom.text_content(t)
+            })
+            .unwrap();
+        assert_eq!(text, "external");
+
+        let requested: Vec<String> = requests.try_iter().collect();
+        assert!(
+            requested.iter().any(|path| path == "/sub/js/app.js"),
+            "expected the frame-relative script fetch, saw {requested:?}",
+        );
+
+        // The external frame script's top-level var stayed in its realm.
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("typeof extVar")
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
