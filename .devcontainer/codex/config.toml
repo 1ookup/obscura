@@ -1,0 +1,17 @@
+# Mounted at ~/.codex/config.toml inside the container.
+#
+# This has to be the *user-level* file: a project-level .codex/config.toml
+# silently ignores `model_provider` and `model_providers`, so a custom endpoint
+# declared there would never take effect.
+
+model = "gpt-5.5"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom endpoint"
+base_url = "https://REPLACE-ME.example.com/v1"
+# Names the environment variable holding the key — the key itself is never
+# written here. devcontainer.json forwards it from the host.
+env_key = "CUSTOM_API_KEY"
+# `responses` is the only supported value and the default when omitted.
+wire_api = "responses"

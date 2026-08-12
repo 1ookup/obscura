@@ -1,0 +1,7 @@
+{
+  "model": "claude-opus-4-8",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://REPLACE-ME.example.com"
+  },
+  "includeCoAuthoredBy": false
+}

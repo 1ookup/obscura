@@ -1,0 +1,86 @@
+{
+  "name": "obscura",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // V8 is compiled from source on the first build. Under-provisioning the
+  // Docker VM is the usual cause of a mid-build OOM kill.
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+
+  // Both are named volumes: the V8 compile is the expensive part of this repo,
+  // and losing target/ to a container rebuild means paying for it again.
+  "mounts": [
+    "source=obscura-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=obscura-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=obscura-cargo-git,target=/usr/local/cargo/git,type=volume",
+
+    // Only the two model-config files are bind-mounted, so editing them in the
+    // container edits the repo copy. Everything else the CLIs write — sessions,
+    // history, login state, caches — lands on the volumes below instead of in
+    // the working tree.
+    "source=${localWorkspaceFolder}/.devcontainer/claude/settings.json,target=/home/vscode/.claude/settings.json,type=bind",
+    "source=${localWorkspaceFolder}/.devcontainer/codex/config.toml,target=/home/vscode/.codex/config.toml,type=bind",
+    "source=obscura-claude-home,target=/home/vscode/.claude,type=volume",
+    "source=obscura-codex-home,target=/home/vscode/.codex,type=volume"
+  ],
+
+  "containerEnv": {
+    // Both match the build commands in AGENTS.md. Capping jobs at 2 keeps the
+    // V8 compile inside a modest memory budget; raise it inline
+    // (`CARGO_BUILD_JOBS=8 cargo build ...`) if the host has room.
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+
+    // Credentials are forwarded from the host environment and never written to
+    // the repo. Deliberately ANTHROPIC_AUTH_TOKEN (Bearer) rather than
+    // ANTHROPIC_API_KEY (x-api-key): a custom base URL almost always expects
+    // Bearer, and setting both makes the SDK send both headers, which the API
+    // rejects. CUSTOM_API_KEY is the `env_key` named in codex/config.toml.
+    "ANTHROPIC_AUTH_TOKEN": "${localEnv:ANTHROPIC_AUTH_TOKEN}",
+    "CUSTOM_API_KEY": "${localEnv:CUSTOM_API_KEY}"
+  },
+
+  "forwardPorts": [9222],
+  "portsAttributes": {
+    "9222": {
+      "label": "Obscura CDP (obscura serve)",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        // Analyze the render build — without this the whole obscura-render
+        // surface and every `#[cfg(feature = "render")]` block reads as dead.
+        "rust-analyzer.cargo.features": ["render"],
+        // Give rust-analyzer its own target dir so background checks don't sit
+        // on the cargo lock while a release build is running.
+        "rust-analyzer.cargo.targetDir": true,
+        "rust-analyzer.check.command": "check",
+        "[rust]": {
+          // AGENTS.md: the tree is not rustfmt-clean, and a blanket format
+          // buries the real change in noise.
+          "editor.formatOnSave": false
+        },
+        "files.watcherExclude": {
+          "**/target/**": true
+        }
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}
