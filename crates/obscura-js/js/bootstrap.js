@@ -13918,10 +13918,18 @@ if (!globalThis.crypto.subtle) {
   globalThis.crypto.subtle = subtle;
 }
 
-if (typeof DOMRect === 'undefined') {
-  globalThis.DOMRect = class DOMRect {
+// DOMRect extends DOMRectReadOnly in every browser, so `rect instanceof
+// DOMRectReadOnly` holds and the base interface is reachable on its own.
+// Both are [Exposed=(Window,Worker)].
+if (typeof DOMRectReadOnly === 'undefined') {
+  globalThis.DOMRectReadOnly = class DOMRectReadOnly {
     constructor(x=0,y=0,w=0,h=0) { this.x=x;this.y=y;this.width=w;this.height=h;this.top=y;this.right=x+w;this.bottom=y+h;this.left=x; }
     toJSON() { return {x:this.x,y:this.y,width:this.width,height:this.height,top:this.top,right:this.right,bottom:this.bottom,left:this.left}; }
+    static fromRect(r={}) { return new DOMRectReadOnly(r.x,r.y,r.width,r.height); }
+  };
+}
+if (typeof DOMRect === 'undefined') {
+  globalThis.DOMRect = class DOMRect extends DOMRectReadOnly {
     static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
   };
 }

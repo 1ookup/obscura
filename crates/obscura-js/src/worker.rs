@@ -478,7 +478,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'NamedNodeMap', 'ShadowRoot', 'Range', 'StaticRange', 'AbstractRange',
     'Selection', 'DOMParser', 'XMLSerializer', 'XSLTProcessor',
     'XPathEvaluator', 'XPathResult', 'XPathExpression', 'DOMTokenList',
-    'DOMStringMap', 'DOMRect', 'DOMRectReadOnly', 'DOMRectList',
+    // DOMRect and DOMRectReadOnly are [Exposed=(Window,Worker)] and stay --
+    // only the live-list form, which exists to back getClientRects(), is
+    // Window-only.
+    'DOMStringMap', 'DOMRectList',
     // Observers scoped to layout/DOM
     'MutationObserver', 'MutationRecord', 'IntersectionObserver',
     'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry',
@@ -1056,8 +1059,22 @@ mod tests {
               'chrome','alert','matchMedia','getComputedStyle',
               'requestAnimationFrame','innerWidth','devicePixelRatio',
               'Window','Navigator','SharedWorker'];
+            // The other direction: stripping the Window surface must not take
+            // anything [Exposed=(Window,Worker)] with it. DOMRect and
+            // DOMRectReadOnly were removed by an over-broad DOM* sweep and are
+            // the reason this half of the assertion exists.
+            const kept = ['DOMRect','DOMRectReadOnly','MessageChannel','MessagePort',
+              'MessageEvent','BroadcastChannel','Event','EventTarget','ErrorEvent',
+              'Blob','File','FileReader','URL','URLSearchParams','TextEncoder',
+              'TextDecoder','ReadableStream','AbortController','Headers','Request',
+              'Response','fetch','WebSocket','XMLHttpRequest','FormData','crypto',
+              'performance','PerformanceObserver','ImageData','OffscreenCanvas',
+              'createImageBitmap','Worker','indexedDB','caches','structuredClone',
+              'queueMicrotask','reportError','atob','btoa','setTimeout','setInterval'];
             const src = "const names = " + JSON.stringify(names) + ";" +
+              "const kept = " + JSON.stringify(kept) + ";" +
               "postMessage({ leaked: names.filter((n) => typeof self[n] !== 'undefined')," +
+              " dropped: kept.filter((n) => typeof self[n] === 'undefined')," +
               " indexed: Object.getOwnPropertyNames(self).filter((k) => /^[0-9]+$/.test(k)).length });";
             const url = 'data:text/javascript,' + encodeURIComponent(src);
             globalThis.__got = [];
@@ -1068,7 +1085,7 @@ mod tests {
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         assert_eq!(
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
-            serde_json::json!(r#"{"leaked":[],"indexed":0}"#),
+            serde_json::json!(r#"{"leaked":[],"dropped":[],"indexed":0}"#),
         );
     }
 
