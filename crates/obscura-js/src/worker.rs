@@ -281,6 +281,11 @@ fn worker_thread_main(
                 let mut gs = state.borrow_mut();
                 gs.worker_outbox = Some(out_tx.clone());
                 gs.url = script_url.clone();
+                // Carried so a nested `new Worker(...)` can inherit it: this
+                // runtime's `url` is the worker's own `blob:`/`data:` script
+                // URL, which describes no origin to inherit from.
+                gs.inherited_origin = Some(worker_origin.clone());
+                gs.inherited_secure_context = worker_secure;
                 gs.cookie_jar = environment.cookie_jar;
                 gs.http_client = worker_http_client;
                 gs.callbacks = environment.callbacks;
@@ -1015,6 +1020,93 @@ mod tests {
             serde_json::json!(
                 r#"{"tag":"[object DedicatedWorkerGlobalScope]","ctor":"DedicatedWorkerGlobalScope","protoCtor":"DedicatedWorkerGlobalScope","isDedicated":true,"isWorkerScope":true,"isEventTarget":true,"name":"","ownName":true,"origin":"string","secure":"boolean","isolated":"boolean"}"#
             ),
+        );
+    }
+
+    /// A worker created inside a worker inherits the same origin. The nested
+    /// worker's creator URL is its parent's `data:`/`blob:` script URL, which
+    /// carries no origin, and the parent runtime's `url` is that same script
+    /// URL -- so without the inherited value being carried forward the chain
+    /// collapses to "null" one level down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_worker_inherits_the_document_origin() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            // The inner worker reports its scope; the outer one relays it
+            // alongside its own so both levels are visible at once. The inner
+            // URL is embedded with JSON.stringify: encodeURIComponent leaves
+            // quotes alone, so concatenating it into a quoted literal would
+            // let a quote in the source terminate that literal early.
+            const innerUrl = 'data:text/javascript,'
+              + encodeURIComponent("postMessage({origin: origin, secure: isSecureContext})");
+            const outer = [
+              "var scope = {origin: origin, secure: isSecureContext};",
+              "postMessage({hello: scope});",
+              "try {",
+              "  var child = new Worker(" + JSON.stringify(innerUrl) + ");",
+              "  child.onmessage = function (e) { postMessage({outer: scope, inner: e.data}); };",
+              "  child.onerror = function (e) { postMessage({outer: scope, childError: String(e.message || e)}); };",
+              "} catch (err) { postMessage({outer: scope, threw: String(err && err.message || err)}); }",
+            ].join("");
+            globalThis.__got = [];
+            const w = new Worker('data:text/javascript,' + encodeURIComponent(outer));
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.onerror = (e) => { globalThis.__got.push({error: String(e.message || e)}); };
+            "#,
+        )
+        .unwrap();
+        // Two worker threads, each building its own isolate behind the shared
+        // creation lock, so this chain needs a longer budget than a
+        // single-level round trip.
+        for _ in 0..1200 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            if rt.evaluate("globalThis.__got.length").unwrap() == serde_json::json!(2.0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // page_runtime() serves http://example.com/app/index.html. The relay
+        // carries both levels: [0] is the outer worker announcing itself, [1]
+        // is the outer worker forwarding what the nested one reported.
+        assert_eq!(
+            rt.evaluate(
+                "JSON.stringify([__got[1].outer.origin, __got[1].inner.origin, \
+                 __got[1].outer.secure, __got[1].inner.secure])"
+            )
+            .unwrap(),
+            serde_json::json!(r#"["http://example.com","http://example.com",false,false]"#),
+        );
+    }
+
+    /// A `blob:` URL carries its creator's origin in its path, so a worker
+    /// built from one reports that origin rather than an opaque "null" -- and
+    /// an https creator makes it a secure context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_worker_reports_the_creating_origin() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://secure.example/app/index.html");
+        rt.run_page_init();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const source = "postMessage({origin: origin, secure: isSecureContext, href: location.href})";
+            const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+            globalThis.__blobUrl = url;
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate(
+                "JSON.stringify([__got[0].origin, __got[0].secure, __got[0].href === __blobUrl])"
+            )
+            .unwrap(),
+            serde_json::json!(r#"["https://secure.example",true,true]"#),
         );
     }
 

@@ -13198,9 +13198,17 @@ globalThis.Worker = class Worker {
       let batchJson;
       try {
         const pending = Deno.core.ops.op_worker_recv(worker._id);
-        // Unref: an idle page with live workers must still settle. Delivery
-        // happens whenever the embedder pumps the event loop.
-        Deno.core.unrefOpPromise(pending);
+        // Unref on a page: an idle page with live workers must still settle,
+        // and the embedder pumps the loop often enough to deliver.
+        //
+        // Not inside a worker. A worker's loop has no embedder pumping it --
+        // it parks once nothing is ref'd, so an unref'd receive is never
+        // polled again and a nested worker's messages arrive only when some
+        // unrelated ref'd op (a pending timer) happens to keep the parent
+        // awake. A worker holding a live child worker is not idle.
+        if (typeof WorkerGlobalScope === 'undefined') {
+          Deno.core.unrefOpPromise(pending);
+        }
         batchJson = await pending;
       } catch (e) { break; }
       if (!batchJson) break; // worker terminated or its thread exited

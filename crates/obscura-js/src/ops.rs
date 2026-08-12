@@ -307,6 +307,12 @@ pub struct ObscuraState {
     /// Set only inside a worker's own runtime: channel back to the page,
     /// drained by the page-side Worker recv loop (op_worker_recv).
     pub(crate) worker_outbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Set only inside a worker's own runtime: the origin and secure-context
+    /// flag this worker inherited from its creator. A worker's own `url` is
+    /// its script URL, which for the usual `blob:`/`data:` worker describes no
+    /// origin, so a nested `new Worker(...)` has nothing else to inherit from.
+    pub(crate) inherited_origin: Option<String>,
+    pub(crate) inherited_secure_context: bool,
     /// Set by the worker-global `close()`; the worker thread's event loop
     /// exits at the next task boundary.
     pub(crate) worker_close_requested: bool,
@@ -393,6 +399,8 @@ impl ObscuraState {
             already_started_scripts: RefCell::new(HashSet::new()),
             worker_host: None,
             worker_outbox: None,
+            inherited_origin: None,
+            inherited_secure_context: false,
             worker_close_requested: false,
             frame_messages: Vec::new(),
             frame_message_notify: Arc::new(tokio::sync::Notify::new()),
@@ -4642,6 +4650,16 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 // extension, so both sets exist in both runtimes; the state fields they read
 // keep them inert on the wrong side).
 
+/// Whether a serialized origin is a "potentially trustworthy origin" in the
+/// sense the secure-context definition uses: TLS-backed, or loopback.
+fn is_potentially_trustworthy(origin: &str) -> bool {
+    origin.starts_with("https://")
+        || origin.starts_with("wss://")
+        || origin.starts_with("http://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("http://[::1]")
+}
+
 #[op2(fast)]
 fn op_worker_spawn(
     state: &OpState,
@@ -4654,29 +4672,49 @@ fn op_worker_spawn(
     let shared = state.borrow::<SharedState>().clone();
     let environment = {
         let gs = shared.borrow();
-        // The worker's origin is the creator's, not its script's: a `blob:` or
-        // `data:` worker script has no origin of its own, and deriving one
-        // from the URL reports "null" for the page it was spawned by.
+        // A worker's origin is its creator's. `creator_url` is the
+        // constructing realm's own `location.href`: frame realms each have
+        // their own, and `SharedState.url` is the top-level document's, so
+        // reading the state would give a cross-origin frame's worker the
+        // page's origin and call an https frame under an http page insecure.
         //
-        // `creator_url` is the constructing realm's own `location.href`.
-        // `SharedState` is per-page and its `url` is the top-level document's,
-        // so a worker built inside a cross-origin frame would otherwise
-        // inherit the page's origin -- and, for an https frame under an http
-        // page, be told it is not a secure context.
-        let creator = url::Url::parse(&creator_url)
+        // `Url::origin` already unwraps `blob:https://host/uuid` to the inner
+        // tuple origin, which is what a blob worker should report.
+        let tuple_origin = url::Url::parse(&creator_url)
             .ok()
-            .or_else(|| url::Url::parse(&gs.url).ok());
-        let origin = creator
-            .as_ref()
-            .filter(|parsed| parsed.scheme() != "data" && parsed.scheme() != "blob")
-            .map(|parsed| parsed.origin().ascii_serialization())
-            .unwrap_or_else(|| "null".to_string());
-        // "Potentially trustworthy origin": https/wss/file plus the loopback
-        // hosts. file:// qualifies despite its origin serializing to "null".
-        let secure_context = creator.as_ref().is_some_and(|parsed| {
-            matches!(parsed.scheme(), "https" | "wss" | "file")
-                || matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
-        });
+            .map(|parsed| parsed.origin())
+            .filter(url::Origin::is_tuple);
+
+        let (origin, secure_context) = match tuple_origin {
+            Some(parsed) => {
+                let serialized = parsed.ascii_serialization();
+                let secure = is_potentially_trustworthy(&serialized);
+                (serialized, secure)
+            }
+            // `data:` and `about:blank` have opaque origins and inherit from
+            // whoever created them. Inside a worker that is the origin this
+            // worker itself inherited -- a nested worker cannot recover it
+            // from `url`, which is its parent's `blob:`/`data:` script URL.
+            None => match gs.inherited_origin.clone() {
+                Some(inherited) => (inherited, gs.inherited_secure_context),
+                None => {
+                    let page = url::Url::parse(&gs.url).ok();
+                    let origin = page
+                        .as_ref()
+                        .map(|parsed| parsed.origin())
+                        .filter(url::Origin::is_tuple)
+                        .map(|parsed| parsed.ascii_serialization())
+                        // file: serializes to an opaque origin, as in a browser.
+                        .unwrap_or_else(|| "null".to_string());
+                    // Checked on the scheme as well as the origin: a file:
+                    // document is a secure context even though its origin is
+                    // opaque, so the serialization alone cannot answer this.
+                    let secure = is_potentially_trustworthy(&origin)
+                        || page.as_ref().is_some_and(|parsed| parsed.scheme() == "file");
+                    (origin, secure)
+                }
+            },
+        };
         crate::worker::WorkerEnvironment {
             cookie_jar: gs.cookie_jar.clone(),
             http_client: gs.http_client.clone(),
