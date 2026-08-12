@@ -179,6 +179,38 @@ window.addEventListener('message', function (e) {
 这能拿到完整内容，例如
 `{"source":"cloudflare-challenge","widgetId":"...","event":"overrunBegin"}`。
 
+### Step 6 — CDP 预注入：完整消息内容，与父→子通道的验证
+
+step 5 之后重跑，用预注入拿到完整负载：
+
+```
+  617 ms  {"source":"cloudflare-challenge","widgetId":"ievvq","event":"init",
+           "mode":"managed","nextRcV":"..."}
+  619 ms  {"source":"cloudflare-challenge","widgetId":"ievvq","event":"requestExtraParams"}
+ 2786 ms  {"source":"cloudflare-challenge","widgetId":"ievvq","event":"translationInit",
+           "displayLanguage":"en-us",...}
+13008 ms  {"source":"cloudflare-challenge","widgetId":"ievvq","event":"overrunBegin"}
+ food x42 ；无 complete；页面无任何错误事件
+```
+
+`requestExtraParams` 是**子窗口向父窗口要参数**，其后的 2.2 s 空档正卡在这里。
+
+想抓父→子方向时包装了 `HTMLIFrameElement.prototype.contentWindow` 的 getter，
+结果 `translationInit` 与 food 心跳一并消失——**钩子本身扰动了流程，该次测量作废**。
+在真实页面上包装 DOM 访问器要先确认它不改变被测行为。
+
+改用可控用例验证父→子通道，三项均正常：
+
+```
+IN   child→parent   {"source":"child","event":"requestExtraParams"}
+OUT  parent→iframe  未抛异常
+IN   child→parent   {"reply":"via-e.source"}      ← 子窗口收到并经 e.source 回复
+     子窗口 got[0].from = <父窗口 origin>          ← origin 归属正确
+```
+
+投递、`e.source`、origin 三者都对。所以真实场景中父窗口若未回应
+`requestExtraParams`，原因在 api.js 自身的逻辑路径，而非通道不通——**这一点尚未证实**。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -191,6 +223,7 @@ window.addEventListener('message', function (e) {
 | trace 的脚本名列对动态脚本一律记为 `<page-eval>` | 无法区分主页面代码与 iframe 内挑战代码；`challenges.cloudflare.com` 名下 0 条不代表没执行 | 该列不可用于分辨 realm；需要 realm 内注入 |
 | Cloudflare 在**失败路径上也会下发** `cf_clearance` | 误判「过盾成功」 | 判据是 `cf_chl_rc_ni`（Not Interested）等结果码，以及复用该 cookie 能否拿到真实内容 |
 | 页面脚本会在加载时缓存原生方法引用 | `--eval` 阶段（页面脚本之后）挂的钩子无效 | 用 CDP 预注入，在页面脚本之前挂 |
+| 包装 DOM 访问器（如 `contentWindow` getter）会改变被测行为 | step 6 中 `translationInit` 与心跳一并消失，整次测量作废 | 先用可控用例验证同一机制，再决定是否需要在真实页面上挂钩 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
@@ -202,5 +235,7 @@ window.addEventListener('message', function (e) {
   `/ci/` 图片请求走这条路径。修它需要让 `document_base_url()` 能按节点定位所属
   frame realm。
 - `/pat/` 请求仍未出现。
+- 父窗口是否回应了子窗口的 `requestExtraParams` 未证实。父→子通道本身已验证可用
+  （step 6），需要一种不扰动流程的观测方式。
 - 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
   可被检测的差异，未修。
