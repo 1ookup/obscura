@@ -267,3 +267,176 @@ CALL/RET 记录。
 | HIT/MISS 全都没有 | 加了 `--no-use-ic` | 去掉该 flag |
 | 所有记录 line:col 都是 1:1 | 漏了 `EnsureSourcePositionsAvailable` 或用了 code offset 而非 `frame->position()` | 检查补丁是否正确应用 |
 | 页面行为与无 trace 时不同 | `--trace` 开销改变了页面时序 | 使用 `OBSCURA_TRACE_MODE=lookups` |
+
+## 调试工作流：Stealth + Trace + Proxy + 截图
+
+完整的反检测页面诊断管线，组合 TLS 指纹伪装、V8 层调用追踪、代理出口、定时截图。
+
+### 前置条件
+
+```bash
+# 1. 构建带 stealth feature 的二进制
+V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  --features render,stealth \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+
+# 2. 代理证书。Reqable 等 MITM 代理用自签证书，需传入根证书路径。
+#    证书路径取决于代理工具：
+#      Reqable: ~/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt
+#      其他代理: 导出 CA 证书后指定路径
+REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
+```
+
+### 单次抓取 + 截图 + 全量 trace
+
+```bash
+SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+  obscura \
+  --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation \
+    --trace-property-lookup-file=/tmp/trace.tsv" \
+  fetch https://example.com \
+  --dump text \
+  --proxy http://127.0.0.1:9000 \
+  --stealth \
+  --timeout 60 \
+  --wait 30 \
+  --screenshot /tmp/screenshot.png
+```
+
+关键参数：
+- `--v8-flags` 必须在 `fetch` 子命令**之前**（全局选项）
+- `SSL_CERT_FILE` 指向代理的 CA 证书，解决 TLS 验证
+- `OBSCURA_ALLOW_PRIVATE_NETWORK=1` 允许连接 `127.0.0.1` 代理
+- `--stealth` 启用浏览器指纹伪装和 TLS 指纹匹配
+- `--timeout 60` 加大超时：反检测页面持续有脚本活动，需更长时间
+- `--wait 30` 停留 30 秒观察页面状态变化
+
+### CDP 定时截图（每秒一张 × 30 秒）
+
+单张 `--screenshot` 只在等待终点截图。需要时序截图时，通过 CDP 协议控制：
+
+```bash
+# 1. 启动 CDP server
+SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+  obscura serve --port 9223 --proxy http://127.0.0.1:9000 --stealth &
+
+# 2. 通过 CDP WebSocket 控制页面
+#    连接浏览器级 WebSocket，用 Target.createTarget 创建页面，
+#    再用 Target.attachToTarget 获取 sessionId，
+#    然后循环 Page.captureScreenshot（每秒 1 次，共 30 次）
+```
+
+Python 示例：
+
+```python
+import asyncio, json, base64, websockets
+
+BROWSER_WS = "ws://127.0.0.1:9223/devtools/browser"
+
+async def capture_timeline(url, out_dir, count=30, interval=1.0):
+    async with websockets.connect(BROWSER_WS, max_size=10*1024*1024) as ws:
+        resp = await cmd(ws, "Target.createTarget",
+                         {"url": "about:blank"}, msg_id=1)
+        tid = resp["result"]["targetId"]
+        resp = await cmd(ws, "Target.attachToTarget",
+                         {"targetId": tid, "flatten": True}, msg_id=2)
+        sid = resp["result"]["sessionId"]
+
+        await cmd(ws, "Page.enable", session_id=sid, msg_id=3)
+        await cmd(ws, "Page.navigate", {"url": url}, session_id=sid, msg_id=4)
+
+        import time
+        for i in range(count):
+            resp = await cmd(ws, "Page.captureScreenshot",
+                           {"format": "png"}, session_id=sid, msg_id=100 + i)
+            data = resp["result"]["data"]
+            with open(f"{out_dir}/shot-{i+1:02d}.png", "wb") as f:
+                f.write(base64.b64decode(data))
+            if i < count - 1:
+                await asyncio.sleep(interval)
+```
+
+注：`serve` 命令不支持 `--v8-flags`。如需同时 trace 和 CDP 截图，用 `fetch --screenshot`+ `--v8-flags`（单张），或用定时截图后分析单次 trace。
+
+### Trace 错误分析
+
+从 trace 中提取反检测页面的错误信号：
+
+```bash
+T=/tmp/trace.tsv
+
+# 1. 错误关键字
+grep "RET" "$T" | awk -F'\t' '$4=="<page-eval>"' \
+  | grep -iE "error|turnstile|fail|unsupported" \
+  | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn
+
+# 2. 不存在属性（环境探测）
+awk -F'\t' '$1=="MISS" && $4=="<page-eval>"' "$T" \
+  | while IFS=$'\t' read type rcv prop script ln col val stack; do
+      echo "recv=$rcv  prop=$prop  line=$ln:$col  stack=$stack"
+    done
+
+# 3. 资源加载记录
+grep "set src" "$T" | awk -F'\t' '$1=="CALL"' \
+  | awk -F'\t' '$4 !~ /obscura|^ext:/' | awk -F'\t' '{print $7}'
+
+# 4. 网络请求（XHR/fetch）
+grep -E "XMLHttpRequest|open.*POST|send" "$T" \
+  | awk -F'\t' '$4=="<page-eval>" && $1=="CALL"'
+
+# 5. Turnstile/Cloudflare 挑战状态码
+grep "cf_chl" "$T" | awk -F'\t' '$1=="RET"' \
+  | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn
+
+# 6. 统计脚本来源
+cut -f4 "$T" | sort | uniq -c | sort -rn | head -15
+```
+
+### 诊断信号对照表
+
+| Trace 信号 | 含义 | 排查方向 |
+|-----------|------|---------|
+| `script error` | 跨域脚本异常，通常由 TLS 指纹不匹配导致资源加载失败 | 确认 `--stealth` 已启用 |
+| `[Turnstile] Unhandled error:` | Turnstile widget 未初始化 | TLS 层已过，检查 JS 环境 |
+| `Window.turnstile` MISS | Turnstile API 未挂载到全局 | `api.js` 加载后环境检测拒绝初始化 |
+| `orc-onerror` | Turnstile Orchestrator 错误回调 | 挑战流程在某阶段失败 |
+| `cf_chl_rc_ni` | Cloudflare 判定 "Not Interested" | 挑战彻底未通过 |
+| `unsupportedbrowser` | Cloudflare 标记浏览器不支持 | 检查 User-Agent 和 feature detection |
+| `challenge.supported_browsers` 高频出现 | 挑战在反复验证浏览器兼容性 | 页面持续轮询等待通过 |
+| `<page-eval>` 占主导 (>99%) | 几乎所有代码通过 eval 注入 | 反检测 payload 的正确形态 |
+| 截图持续不变 | 页面卡在某一状态 | 挑战未通过，脚本阻塞或死循环 |
+
+### 实战：zencare.co Cloudflare 5 秒盾
+
+```bash
+# 全量诊断命令
+REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
+SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+  obscura \
+  --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation \
+    --trace-property-lookup-file=/tmp/zencare-trace.tsv" \
+  fetch https://zencare.co/1.txt \
+  --dump text \
+  --proxy http://127.0.0.1:9000 \
+  --stealth \
+  --timeout 60 \
+  --wait 30 \
+  --screenshot /tmp/zencare.png
+```
+
+非 Stealth vs Stealth 对比：
+
+| 维度 | 无 Stealth | 带 Stealth |
+|------|-----------|-----------|
+| TLS 指纹 | 不匹配 | 匹配 |
+| 关键错误 | `script error`, `Turnstile Unhandled error` | `Window.turnstile` MISS, `cf_chl_rc_ni` |
+| 挑战资源加载 | 未加载 | 已加载（`api.js` 等全部 fetch 成功） |
+| iframe | 创建但未 append 到 DOM | 创建但 Turnstile 初始化失败 |
+| 截图 | 32KB，转圈动画 | 56KB，widget 部分渲染 |
+| 失败层 | TLS | Javascript 环境检测 |
+| XHR 验证请求 | 未发送 | 已发送 POST `/cdn-cgi/.../fo/...` |
+| 结论 | TLS 指纹被拦截 | Stealth 过了 TLS，但 JS 环境仍被拒绝 |
+
+这表明 Cloudflare 的检测分**两层**：
+1. **TLS 层** — `--stealth` 可以解决
+2. **JS 环境层** — 即使 TLS 和 API 调用都正确，Turnstile 内部的环境检测仍可能拒绝非标准浏览器
