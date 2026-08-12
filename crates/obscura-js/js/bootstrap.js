@@ -6636,6 +6636,17 @@ Object.defineProperty(globalThis, 'location', {
   configurable: false,
   enumerable: true,
 });
+// The object literal above inherits straight from Object.prototype, so
+// `location instanceof Location` threw (no such global) and
+// Object.prototype.toString.call(location) read "[object Object]". Give it the
+// real interface. Location's members stay own properties of the instance, which
+// matches Chrome: every one of them is [LegacyUnforgeable] in the HTML spec.
+function Location() { throw new TypeError("Illegal constructor"); }
+Object.defineProperty(globalThis, 'Location', {
+  value: Location, writable: true, enumerable: false, configurable: true,
+});
+_markNative(Location);
+Object.setPrototypeOf(_locationObj, Location.prototype);
 
 globalThis.window = globalThis;
 globalThis.self = globalThis;
@@ -6720,8 +6731,15 @@ for (let i = 0; i < 50; i++) {
 }
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
-// navigatorPrototype checks don't throw a ReferenceError.
-function Navigator() {}
+// navigatorPrototype checks don't throw a ReferenceError. The whole bootstrap
+// runs inside an IIFE, so the declaration alone stays function-scoped and
+// `window.Navigator` was undefined -- a one-line tell, since every browser
+// exposes the interface object. Chrome publishes interface globals as
+// enumerable:false, hence defineProperty rather than a plain assignment.
+function Navigator() { throw new TypeError("Illegal constructor"); }
+Object.defineProperty(globalThis, 'Navigator', {
+  value: Navigator, writable: true, enumerable: false, configurable: true,
+});
 _markNative(Navigator);
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
@@ -9703,7 +9721,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+globalThis.PerformanceObserver = class PerformanceObserver { constructor(){} observe(){} disconnect(){} };
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -9805,6 +9823,12 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
+// Every interface below is a *named* class expression on purpose. An anonymous
+// one leaves `.name` as "" and `Ctor.toString()` as "function () { [native
+// code] }" where a real engine prints the name; worse, V8 derives a receiver's
+// constructor name from it, so every instance introspects as a plain "Object"
+// -- the property-lookup trace of a Cloudflare challenge labelled all of its
+// MessageEvent reads "Object.*" for exactly this reason.
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return _trustedEvents.has(this); }
@@ -9820,7 +9844,7 @@ globalThis.Event = class Event {
   }
 };
 _markNative(Event);
-globalThis.CustomEvent = class extends Event {
+globalThis.CustomEvent = class CustomEvent extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
@@ -9832,7 +9856,7 @@ globalThis.CustomEvent = class extends Event {
     this.detail = detail;
   }
 };
-globalThis.MouseEvent = class extends Event {
+globalThis.MouseEvent = class MouseEvent extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
@@ -9852,7 +9876,7 @@ globalThis.MouseEvent = class extends Event {
     this.relatedTarget=relatedTarget===undefined?null:relatedTarget;
   }
 };
-globalThis.KeyboardEvent = class extends Event {
+globalThis.KeyboardEvent = class KeyboardEvent extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
   // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
   initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
@@ -9867,13 +9891,13 @@ globalThis.KeyboardEvent = class extends Event {
     this.metaKey=!!metaKey;
   }
 };
-globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
-globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
-globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
-globalThis.AnimationEvent = class extends Event {};
-globalThis.TransitionEvent = class extends Event {};
-globalThis.UIEvent = class extends Event {
+globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
+globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
+globalThis.ErrorEvent = class ErrorEvent extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
+globalThis.PointerEvent = class PointerEvent extends Event { constructor(t,o={}) { super(t,o); } };
+globalThis.AnimationEvent = class AnimationEvent extends Event {};
+globalThis.TransitionEvent = class TransitionEvent extends Event {};
+globalThis.UIEvent = class UIEvent extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initUIEvent(type,canBubble,cancelable,view,detail) {
@@ -9886,11 +9910,11 @@ globalThis.UIEvent = class extends Event {
 // WheelEvent inherits all MouseEvent coordinates and modifier state. CDP
 // Input.dispatchMouseEvent supplies those fields and automation libraries use
 // them to distinguish wheel gestures over nested panes.
-globalThis.WheelEvent = class extends MouseEvent {
+globalThis.WheelEvent = class WheelEvent extends MouseEvent {
   constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; }
 };
 
-globalThis.CompositionEvent = class extends Event {
+globalThis.CompositionEvent = class CompositionEvent extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.data=o.data||""; }
   // Legacy DOM Level 3 initializer. Positional signature per UI Events spec.
   initCompositionEvent(type,canBubble,cancelable,view,data) {
@@ -9900,7 +9924,7 @@ globalThis.CompositionEvent = class extends Event {
     this.data=data===undefined?"":String(data);
   }
 };
-globalThis.PopStateEvent = class extends Event {
+globalThis.PopStateEvent = class PopStateEvent extends Event {
   constructor(type, init) {
     super(type, init || {});
     // Real PopStateEvent exposes `state` from the entry being navigated to.
@@ -9910,13 +9934,7 @@ globalThis.PopStateEvent = class extends Event {
     this.state = init && 'state' in init ? init.state : null;
   }
 };
-globalThis.HashChangeEvent = class extends Event {};
-// Named class expression on purpose. An anonymous one leaves `.name` as ""
-// and `MessageEvent.toString()` as "function () { [native code] }" where a
-// real engine prints the name; worse, V8 derives a receiver's constructor
-// name from it, so every instance introspects as a plain "Object" -- the
-// property-lookup trace of a Cloudflare challenge labelled all of its
-// MessageEvent reads "Object.*" for exactly this reason.
+globalThis.HashChangeEvent = class HashChangeEvent extends Event {};
 globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(t,o={}) {
     super(t,o);
@@ -9939,8 +9957,8 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
     this.total = i.total != null ? Number(i.total) : 0;
   }
 };
-globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+globalThis.ClipboardEvent = class ClipboardEvent extends Event {};
+globalThis.SubmitEvent = class SubmitEvent extends Event {};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
 // newState are "open"/"closed". These events do not bubble; beforetoggle is
@@ -10793,7 +10811,9 @@ globalThis.atob = globalThis.atob || ((s) => {
     back() { this.go(-1); }
     forward() { this.go(1); }
   }
-  Object.defineProperty(History.prototype, Symbol.toStringTag, {value: "History"});
+  // configurable:true is what WebIDL specifies for @@toStringTag; the default
+  // (false) is observable through getOwnPropertyDescriptor.
+  Object.defineProperty(History.prototype, Symbol.toStringTag, {value: "History", configurable: true});
   Object.defineProperty(globalThis, "History", {
     value: History, writable: true, configurable: true,
   });
@@ -15521,6 +15541,124 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _iframeRealmGlobalNames = Array.from(new Set(constructors.concat(standardGlobals)))
     .filter(name => name in globalThis);
   _iframeRealmGlobalNameSet = new Set(_iframeRealmGlobalNames);
+})();
+
+// WebIDL requires every interface prototype object to carry @@toStringTag with
+// the interface identifier, as {writable:false, enumerable:false,
+// configurable:true}, and the interface object's `.name` to be that same
+// identifier. Obscura satisfied neither on ~35 interfaces, so
+// `Object.prototype.toString.call(new MessageEvent('m'))` answered
+// "[object Object]" where a browser answers "[object MessageEvent]" -- a check
+// jQuery, lodash and every fingerprinting bundle makes, and one that no real
+// engine can fail.
+//
+// The list is enumerated by hand rather than derived from "every capitalised
+// global" on purpose: ECMAScript builtins must NOT carry a tag (Chrome's
+// Date.prototype and RegExp.prototype have no own @@toStringTag), so a
+// blanket sweep would trade one discrepancy for a fresh one. Legacy factory
+// functions -- Image, Audio -- are omitted for the same reason: they are not
+// interfaces, and in a browser they share HTMLImageElement's / HTMLAudio-
+// Element's prototype rather than owning one to brand.
+//
+// Runs last so it sees every interface, including the ones the WPT conformance
+// shims install above.
+(function _brandWebIDLInterfaces() {
+  var names = [
+    // Events
+    'Event', 'CustomEvent', 'UIEvent', 'MouseEvent', 'KeyboardEvent',
+    'FocusEvent', 'InputEvent', 'ErrorEvent', 'PointerEvent', 'WheelEvent',
+    'CompositionEvent', 'AnimationEvent', 'TransitionEvent', 'PopStateEvent',
+    'HashChangeEvent', 'MessageEvent', 'ProgressEvent', 'ClipboardEvent',
+    'SubmitEvent', 'ToggleEvent', 'PromiseRejectionEvent', 'StorageEvent',
+    'EventSource',
+    // Core DOM. `Node` must precede `EventTarget`: the two are the same
+    // function here (`globalThis.EventTarget = Node`), and whichever name is
+    // seen first wins the brand. Real nodes vastly outnumber bare
+    // `new EventTarget()` instances, so Node is the better answer for the
+    // prototype they share.
+    'Node', 'EventTarget', 'Element', 'Document', 'XMLDocument', 'DocumentFragment',
+    'DocumentType', 'CharacterData', 'Text', 'Comment', 'CDATASection',
+    'ProcessingInstruction', 'Attr', 'NamedNodeMap', 'NodeList',
+    'HTMLCollection', 'DOMTokenList', 'ShadowRoot', 'Range', 'StaticRange',
+    'TreeWalker', 'Selection', 'DOMParser', 'XMLSerializer', 'XPathResult',
+    'CustomElementRegistry', 'ElementInternals', 'DOMException',
+    // HTML element interfaces that own their prototype. The rest are aliases
+    // of Element and are filtered out by the constructor check below.
+    'HTMLFormElement', 'HTMLImageElement', 'HTMLMediaElement',
+    'HTMLVideoElement', 'HTMLAudioElement', 'HTMLTrackElement',
+    'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
+    'SVGSVGElement', 'SVGAnimatedString',
+    // Text tracks
+    'TextTrack', 'TextTrackList', 'TextTrackCue', 'TextTrackCueList', 'VTTCue',
+    // CSSOM
+    'CSSStyleDeclaration', 'CSSRule', 'CSSStyleRule', 'CSSRuleList',
+    'CSSStyleSheet', 'StyleSheetList', 'MediaQueryList',
+    'FontFace', 'FontFaceSet',
+    // Window plumbing
+    'Window', 'Navigator', 'Location', 'History', 'Screen', 'Storage',
+    'NetworkInformation', 'ValidityState',
+    // Observers and animation
+    'MutationObserver', 'PerformanceObserver', 'IntersectionObserver',
+    'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry',
+    'ResizeObserverSize', 'Animation', 'KeyframeEffect', 'DocumentTimeline',
+    // Fetch, XHR and streams
+    'Headers', 'Request', 'Response', 'FormData', 'AbortController',
+    'AbortSignal', 'XMLHttpRequest', 'XMLHttpRequestEventTarget',
+    'ReadableStream', 'WritableStream', 'TransformStream',
+    'TextEncoder', 'TextDecoder', 'TextEncoderStream', 'TextDecoderStream',
+    'URL', 'URLSearchParams', 'URLPattern', 'WebSocket',
+    // Files and crypto
+    'Blob', 'File', 'FileReader', 'Crypto', 'SubtleCrypto', 'CryptoKey',
+    // Workers and messaging
+    'Worker', 'SharedWorker', 'MessageChannel', 'MessagePort',
+    'BroadcastChannel', 'Scheduler', 'ServiceWorkerContainer',
+    // Graphics and geometry
+    'CanvasRenderingContext2D', 'WebGLRenderingContext',
+    'WebGL2RenderingContext', 'OffscreenCanvas', 'Path2D', 'ImageData',
+    'ImageBitmap', 'DOMMatrix', 'DOMPoint', 'DOMRect', 'DOMRectReadOnly',
+    'DOMRectList',
+    // Media, storage and the long tail of stubs
+    'MediaStream', 'MediaStreamTrack', 'AudioBuffer', 'AudioContext',
+    'OfflineAudioContext', 'SpeechSynthesisUtterance', 'Notification',
+    'ContentIndex', 'IDBKeyRange', 'RTCPeerConnection', 'RTCIceCandidate',
+    'RTCSessionDescription',
+  ];
+  // Two aliasing shapes have to be filtered, and they need different tests.
+  var branded = new Set();
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var ctor;
+    try { ctor = globalThis[name]; } catch (e) { continue; }
+    if (typeof ctor !== 'function' || !ctor.prototype) { continue; }
+    // Shape 1: distinct constructors sharing one prototype object, as in
+    // `globalThis.HTMLDivElement = Element`. Branding through the alias would
+    // stamp the wrong identifier on Element.prototype, so only the
+    // constructor that owns the prototype may name it. Order-independent.
+    if (ctor.prototype.constructor !== ctor) { continue; }
+    // Shape 2: one constructor published under two names, as in
+    // `globalThis.EventTarget = Node`. Here the ownership test passes for both
+    // names, so the first name in the list wins and the second is dropped --
+    // otherwise the later name would also rewrite `.name` on the shared
+    // constructor and undo the earlier brand.
+    if (branded.has(ctor.prototype)) { continue; }
+    branded.add(ctor.prototype);
+    if (ctor.name !== name) {
+      try {
+        Object.defineProperty(ctor, 'name', {
+          value: name, writable: false, enumerable: false, configurable: true,
+        });
+      } catch (e) {}
+    }
+    // Interfaces that already declare their own tag (several do it with a
+    // getter in the class body) keep it; re-defining would only churn the
+    // descriptor shape.
+    if (Object.prototype.hasOwnProperty.call(ctor.prototype, Symbol.toStringTag)) { continue; }
+    try {
+      Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+        value: name, writable: false, enumerable: false, configurable: true,
+      });
+    } catch (e) {}
+  }
 })();
 
 (function _markBuiltinsNative() {

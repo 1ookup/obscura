@@ -16778,4 +16778,103 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
     }
+
+    /// WebIDL brands every interface: the constructor's `.name` is the
+    /// interface identifier and the prototype carries @@toStringTag with the
+    /// same string. Obscura shipped neither on most interfaces, so
+    /// `Object.prototype.toString.call(new MessageEvent('m'))` read
+    /// "[object Object]" and V8 rendered every instance of the 17 anonymous
+    /// classes as a bare "Object" in property-lookup traces.
+    #[test]
+    fn webidl_interfaces_expose_name_and_to_string_tag() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const names = [
+                    'Event', 'CustomEvent', 'MessageEvent', 'MouseEvent', 'KeyboardEvent',
+                    'FocusEvent', 'InputEvent', 'ErrorEvent', 'PointerEvent', 'UIEvent',
+                    'WheelEvent', 'ProgressEvent', 'PopStateEvent', 'HashChangeEvent',
+                    'ClipboardEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent',
+                    'CompositionEvent', 'PerformanceObserver', 'MutationObserver',
+                    'Node', 'Element', 'Document', 'Headers', 'Request', 'Response',
+                    'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
+                    'Navigator', 'Location',
+                ];
+                const bad = [];
+                for (const n of names) {
+                    const C = globalThis[n];
+                    if (typeof C !== 'function') { bad.push(n + ': missing'); continue; }
+                    if (C.name !== n) { bad.push(n + ': name=' + JSON.stringify(C.name)); }
+                    const d = Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag);
+                    if (!d) { bad.push(n + ': no toStringTag'); continue; }
+                    // Accessor-defined tags predate this pass and are left alone;
+                    // only the value has to agree.
+                    const tag = 'get' in d && d.get ? d.get.call(C.prototype) : d.value;
+                    if (tag !== n) { bad.push(n + ': tag=' + JSON.stringify(tag)); }
+                    if (d.enumerable) { bad.push(n + ': tag enumerable'); }
+                    if (!d.configurable) { bad.push(n + ': tag not configurable'); }
+                    if ('value' in d && d.writable) { bad.push(n + ': tag writable'); }
+                }
+                return bad;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
+    /// The brand has to survive the things that made it worth adding: the
+    /// tag must reach instances, constructors must still print as native code
+    /// (naming the anonymous classes could have regressed `toString` to
+    /// source), and the prototype chains must be untouched.
+    #[test]
+    fn webidl_branding_keeps_native_to_string_and_prototype_chains() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const e = new MessageEvent('m');
+                return {
+                    instanceTag: Object.prototype.toString.call(e),
+                    customEventTag: Object.prototype.toString.call(new CustomEvent('c')),
+                    ctorToString: MessageEvent.toString(),
+                    keyboardToString: KeyboardEvent.toString(),
+                    inheritance: (e instanceof MessageEvent) && (e instanceof Event)
+                        && (new WheelEvent('w') instanceof MouseEvent),
+                    // The tag lives on the prototype only; a browser reports no
+                    // own @@toStringTag on the instance.
+                    ownTagOnInstance: Object.prototype.hasOwnProperty.call(e, Symbol.toStringTag),
+                    locationIsLocation: location instanceof Location,
+                    navigatorIsNavigator: navigator instanceof Navigator,
+                    locationTag: Object.prototype.toString.call(location),
+                    navigatorTag: Object.prototype.toString.call(navigator),
+                    // Aliased element interfaces share one prototype, so the
+                    // brand must stay on the owner rather than the last alias.
+                    elementTag: Object.prototype.toString.call(document.createElement('div')),
+                    // ECMAScript builtins must not have been swept up.
+                    dateUntouched:
+                        Object.getOwnPropertyDescriptor(Date.prototype, Symbol.toStringTag) === undefined
+                        && Object.getOwnPropertyDescriptor(RegExp.prototype, Symbol.toStringTag) === undefined,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instanceTag": "[object MessageEvent]",
+                "customEventTag": "[object CustomEvent]",
+                "ctorToString": "function MessageEvent() { [native code] }",
+                "keyboardToString": "function KeyboardEvent() { [native code] }",
+                "inheritance": true,
+                "ownTagOnInstance": false,
+                "locationIsLocation": true,
+                "navigatorIsNavigator": true,
+                "locationTag": "[object Location]",
+                "navigatorTag": "[object Navigator]",
+                "elementTag": "[object Element]",
+                "dateUntouched": true,
+            })
+        );
+    }
 }
