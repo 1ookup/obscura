@@ -2479,7 +2479,11 @@ function _applyDocQueryEncoding(u) {
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
-function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+// This realm's document, not the top-level one: `document_url` is the Rust
+// side's page URL, so links inside a frame resolved against the embedder.
+function _anchorBase() {
+  return globalThis.location?.href || _domParse("document_url") || "about:blank";
+}
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
@@ -3910,8 +3914,9 @@ class Element extends Node {
     return this._iframeWin;
   }
   get action() {
-    const action = this.getAttribute("action") || _domParse("document_url") || "";
-    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+    const base = _anchorBase();
+    const action = this.getAttribute("action") || base || "";
+    try { return new URL(action, base).href; } catch(e) { return action; }
   }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
@@ -7369,7 +7374,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     let url = this._url;
     if (url && !url.includes('://')) {
       try {
-        const base = _domParse("document_url") || "about:blank";
+        // This realm's own document, not the top-level one. `document_url` is
+        // the Rust side's page URL, so a request made from inside a frame
+        // resolved against the embedder: a challenge widget POSTing to
+        // `/cdn-cgi/...` from an iframe reached the embedding site instead of
+        // its own origin, which answered 400. `fetch` was already correct
+        // because it bases on `location`, and every frame realm has its own.
+        const base = globalThis.location?.href
+          || _domParse("document_url")
+          || "about:blank";
         url = new URL(url, base).href;
       } catch(e) {}
     }
