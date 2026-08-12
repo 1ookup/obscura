@@ -5656,13 +5656,30 @@ fn image_request_profile(dom: &DomTree, node_id: NodeId) -> ImageRequestProfile 
     }
 }
 
+/// The base a node's URLs resolve against. `document_base_url` reads the
+/// top-level page URL, which is wrong for a node in a frame document: an
+/// `<img>` created inside a widget's iframe would be fetched from the
+/// embedder's origin. The caller passes its node's `baseURI`, already derived
+/// from that node's own document; an empty string means "use the page".
+#[cfg(feature = "render")]
+fn node_base_url(gs: &ObscuraState, node_base: &str) -> Option<String> {
+    if node_base.is_empty() {
+        return document_base_url(gs);
+    }
+    match url::Url::parse(node_base) {
+        Ok(url) => Some(url.to_string()),
+        Err(_) => document_base_url(gs),
+    }
+}
+
 #[cfg(feature = "render")]
 fn profiled_cached_image_metadata(
     gs: &ObscuraState,
     node_id: NodeId,
+    node_base: &str,
 ) -> Option<(String, f32, bool, Option<(f32, f32)>)> {
     let dom = gs.dom.as_ref()?;
-    let base_url = document_base_url(gs);
+    let base_url = node_base_url(gs, node_base);
     gs.render_resources.cached_image_element_metadata(
         dom,
         node_id,
@@ -5672,8 +5689,8 @@ fn profiled_cached_image_metadata(
 }
 
 #[cfg(feature = "render")]
-fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String {
-    match profiled_cached_image_metadata(gs, node_id) {
+fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId, node_base: &str) -> String {
+    match profiled_cached_image_metadata(gs, node_id, node_base) {
         Some((current_src, density, known, dimensions)) => {
             image_metadata_json(current_src, density, known, dimensions)
         }
@@ -5687,7 +5704,12 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
+fn op_image_metadata(
+    state: &OpState,
+    nid: u32,
+    _cached_only: bool,
+    #[string] node_base: &str,
+) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
@@ -5700,7 +5722,7 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
     if !is_image {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
     }
-    cached_image_metadata_for_node(&gs, node_id)
+    cached_image_metadata_for_node(&gs, node_id, node_base)
 }
 
 /// Compatibility path for standalone render runtimes which deliberately
@@ -5708,8 +5730,12 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
 /// transport. Browser pages always install `ObscuraHttpClient` before page
 /// script runs and never enter this synchronous loader.
 #[cfg(feature = "render")]
-fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {
-    let base_url = document_base_url(&gs);
+fn load_image_metadata_without_page_transport(
+    gs: &mut ObscuraState,
+    node_id: NodeId,
+    node_base: &str,
+) -> String {
+    let base_url = node_base_url(gs, node_base);
     let viewport = gs.viewport;
     let previous_dimensions = gs.dom.as_ref().and_then(|dom| {
         gs.render_resources
@@ -5745,6 +5771,7 @@ fn finish_async_image_metadata(
     document_generation: u64,
     expected_url: &str,
     request_profile: ImageRequestProfile,
+    node_base: &str,
 ) -> String {
     let gs = shared.borrow();
     if gs.document_generation != document_generation {
@@ -5760,7 +5787,7 @@ fn finish_async_image_metadata(
             .to_string();
     }
     let Some((current_src, density, known, dimensions)) =
-        profiled_cached_image_metadata(&gs, node_id)
+        profiled_cached_image_metadata(&gs, node_id, node_base)
     else {
         return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
             .to_string();
@@ -5778,7 +5805,11 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2(async)]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(
+    state: Rc<RefCell<OpState>>,
+    nid: u32,
+    #[string] node_base: String,
+) -> String {
     let shared = {
         let state = state.borrow();
         state.borrow::<SharedState>().clone()
@@ -5807,15 +5838,18 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         }
         let profile = image_request_profile(dom, node_id);
         let Some((selected_url, _, known, _)) =
-            profiled_cached_image_metadata(&gs, node_id)
+            profiled_cached_image_metadata(&gs, node_id, &node_base)
         else {
             return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" })
                 .to_string();
         };
         if known {
-            return cached_image_metadata_for_node(&gs, node_id);
+            return cached_image_metadata_for_node(&gs, node_id, &node_base);
         }
-        let initiator = url::Url::parse(&gs.url)
+        // The referrer and origin of a frame's image request are the frame's,
+        // not the embedder's -- Chrome sends the widget document as Referer.
+        let initiator = url::Url::parse(node_base_url(&gs, &node_base).as_deref().unwrap_or(&gs.url))
+            .or_else(|_| url::Url::parse(&gs.url))
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
@@ -5852,7 +5886,11 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     #[cfg(not(feature = "stealth"))]
     let has_page_transport = http_client.is_some();
     if !has_page_transport {
-        return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
+        return load_image_metadata_without_page_transport(
+            &mut shared.borrow_mut(),
+            node_id,
+            &node_base,
+        );
     }
 
     // Different CORS/credential profiles do not share an in-flight response.
@@ -5876,6 +5914,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             document_generation,
             &selected_url,
             request_profile,
+            &node_base,
         );
     }
 
@@ -5975,6 +6014,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         document_generation,
         &selected_url,
         request_profile,
+        &node_base,
     )
 }
 

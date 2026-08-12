@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。已修掉三处真实缺陷（step 4、step 5、step 8），流程推进到
+当前状态：**未通过**。已修掉四处真实缺陷（step 4、5、8、11），流程推进到
 「iframe 内取回 822 KB JSVMP 载荷」后停住——浏览器在此之后还有 6 个请求，obscura
 一个都没发。当前最可疑的未修项是 **timer 早期迟发**（step 9）。
 
@@ -144,15 +144,14 @@ POST 到 `challenges.cloudflare.com` 并得到 200。
 | `XMLHttpRequest.open(m, '/x')` | **页面源** | iframe 源 |
 | `<a href>` | **页面源** | iframe 源 |
 | `<form action>` | **页面源** | iframe 源 |
-| `new Image().src` | **页面源** | **仍是页面源** |
+| `new Image().src` | **页面源** | 仍是页面源，见 step 11 |
 
 成因：这几处都以 Rust 侧的 `document_url`（顶层页面 URL）为基准，而 `fetch`
 用的是 `location`，每个 frame realm 各有其一。挑战用 XHR 发 `/fo/` POST，于是
 打到了 embedder。提交 `d0043eb`。
 
-Image 仍未修：它走 `op_load_image_metadata`，在 Rust 侧由
-`document_base_url()` 按页面 URL 解析，那里拿不到 frame realm。浏览器流程中
-widget 会从 iframe 内取一张 `/ci/` 图，所以这条仍有影响。
+Image 当时未修：它走 `op_load_image_metadata`，在 Rust 侧由 `document_base_url()`
+按页面 URL 解析。已在 step 11 修掉。
 
 ### v8 trace 取不到 postMessage 内容
 
@@ -337,6 +336,39 @@ JS**，其中 `op_layout_geometry → ensure_prepared_geometry` 占 11%。所以
 其中 `/ci/` 的请求头是 `sec-fetch-dest: image` + `no-cors`——即 `new Image().src`，
 正好撞上 step 5 未修的那条。
 
+### Step 11 — 修复：iframe 内的 `<img>` 按页面源解析（step 5 遗留项）
+
+浏览器流程里 `/ci/` 那张图（`sec-fetch-dest: image` + `no-cors`，即 `new Image().src`）
+发自 widget iframe 内部。obscura 把它解析到了**顶层页面**的源上。
+
+成因与 step 5 同源但另一条路径：`img.src` 的 **getter** 早就用 `this.baseURI`
+（按节点的 ownerDocument 算）返回了正确的绝对 URL，但真正发请求的
+`op_load_image_metadata` / `op_image_metadata` 在 Rust 侧**重新解析一遍**，用的是
+`document_base_url()` —— 它读 `state.url`，也就是页面 URL。
+
+修法：两个 op 各加一个 `node_base` 参数，JS 侧传 `this.baseURI`；Rust 侧新增
+`node_base_url()`，非空时用它，为空退回原行为。请求的 initiator（决定 Referer /
+Origin）同样改用它——Chrome 发的 `/ci/` 请求 Referer 是 widget 文档，不是嵌入页。
+
+效果（`scripts/realm_probe.sh`，与当初发现问题的是同一个探针）：
+
+| | 修复前 | 修复后 |
+|---|--------|--------|
+| `new Image().src` | **页面源** :8901 | frame 源 :8902 |
+| 落在页面源的探针 | `probe-img` | **none** |
+
+回归测试：`crates/obscura-js/src/realm.rs`
+（`a_frames_image_resolves_against_the_frame_not_the_page`），同时断言
+`getAttribute('src')` 仍是作者写的字面值。
+
+**流程仍未推进**——请求序列还是同样 4 条。`/ci/` 在浏览器流程里排在 `/pat/` 之后，
+而 obscura 连 `/pat/` 都没走到，所以这条路径目前还没有机会被执行。修的是真缺陷，
+但它排在阻塞点的下游。
+
+顺带查到的构建陷阱：`node_base_url` 忘了加 `#[cfg(feature = "render")]`，
+默认 feature 下编译不过。`cargo build --features render,stealth` 是绿的，
+**必须另跑一次 `cargo check` 的默认 feature 组合**才会暴露。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -369,9 +401,6 @@ JS**，其中 `op_layout_geometry → ensure_prepared_geometry` 占 11%。所以
 - 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:894:9)`（step 8）。浏览器里
   setTimeout 回调的栈到回调那一帧就结束，下面没有引擎帧。
 - `overrunBegin` 仍出现，挑战不完成。
-- `new Image().src` 在 frame realm 内仍解析到页面源（step 5），浏览器流程里的
-  `/ci/` 图片请求走这条路径。修它需要让 `document_base_url()` 能按节点定位所属
-  frame realm。
 - `/pat/` 请求仍未出现。
 - 父窗口是否回应了子窗口的 `requestExtraParams` 未证实。父→子通道本身已验证可用
   （step 6），需要一种不扰动流程的观测方式。

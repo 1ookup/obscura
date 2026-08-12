@@ -5753,7 +5753,9 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        // The node's own base, not the page's: an image created inside a
+        // frame must be fetched from that frame's origin.
+        Promise.resolve(op(this._nid >>> 0, String(this.baseURI || ""))).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -5777,7 +5779,7 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, String(this.baseURI || "")));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {

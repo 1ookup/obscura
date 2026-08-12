@@ -2085,6 +2085,43 @@ mod tests {
         );
     }
 
+    /// An `<img>` created inside a frame resolves its relative `src` against
+    /// the frame's document, not the embedder's. Chrome's Turnstile flow
+    /// fetches a `/ci/` image from inside the widget iframe; resolving that
+    /// against the page sent it to the embedding site instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frames_image_resolves_against_the_frame_not_the_page() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://frame.example/widget/inner.html";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+
+        let resolved = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"(() => {
+                     const img = document.createElement('img');
+                     img.setAttribute('src', '/ci/token');
+                     document.body.appendChild(img);
+                     return [img.src, img.baseURI, img.getAttribute('src')];
+                   })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolved,
+            serde_json::json!([
+                "https://frame.example/ci/token",
+                "https://frame.example/widget/inner.html",
+                // The attribute keeps the author's literal value.
+                "/ci/token",
+            ])
+        );
+    }
+
     /// A worker's origin comes from the document that constructed it. When
     /// that document is a cross-origin frame, reading the origin off the
     /// top-level page hands the worker the wrong one -- and `self.origin` is
