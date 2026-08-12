@@ -31,6 +31,18 @@ pub(crate) struct WorkerEnvironment {
     pub callbacks: Option<Arc<obscura_net::CallbackRegistry>>,
     pub blocked_urls: Vec<String>,
     pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// `new Worker(url, {name})`. Surfaces as `self.name`, which is `""` for a
+    /// worker constructed without one -- not `undefined`, which is what an
+    /// absent binding would report and what marks a scope as not-a-worker.
+    pub name: String,
+    /// The creator's origin. A worker's origin is inherited from the document
+    /// that created it, so a `blob:`/`data:` worker still reports the page's
+    /// origin rather than deriving one from its own script URL.
+    pub origin: String,
+    /// Whether the creator was a secure context. Carried separately because an
+    /// opaque origin serializes to "null" and cannot be re-inspected for its
+    /// scheme.
+    pub secure_context: bool,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
@@ -218,7 +230,7 @@ fn worker_thread_main(
     source: String,
     script_url: String,
     kind: String,
-    environment: WorkerEnvironment,
+    mut environment: WorkerEnvironment,
     mut inbox: UnboundedReceiver<String>,
     out_tx: UnboundedSender<String>,
     ready_tx: std_mpsc::Sender<Result<IsolateHandle, String>>,
@@ -244,6 +256,10 @@ fn worker_thread_main(
                 .http_client
                 .as_ref()
                 .and_then(|client| client.proxy_url().map(str::to_string));
+            // Read before the field-by-field move into the runtime state below.
+            let worker_name = std::mem::take(&mut environment.name);
+            let worker_origin = std::mem::take(&mut environment.origin);
+            let worker_secure = environment.secure_context;
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
             // reqwest's pooled client is created inside the creator's Tokio
             // runtime. Build the worker's pool on this thread while retaining
@@ -280,9 +296,10 @@ fn worker_thread_main(
             if ready_tx.send(Ok(rt.isolate_handle())).is_err() {
                 return;
             }
-            if let Err(e) =
-                rt.execute_script("<obscura:worker-prep>", &worker_prep_script(&script_url))
-            {
+            if let Err(e) = rt.execute_script(
+                "<obscura:worker-prep>",
+                &worker_prep_script(&script_url, &worker_name, &worker_origin, worker_secure),
+            ) {
                 let _ = out_tx.send(error_entry(&format!("worker global setup failed: {e}")));
                 return;
             }
@@ -390,52 +407,355 @@ fn dispatch_message(
     }
 }
 
-fn worker_prep_script(script_url: &str) -> String {
-    let literal = serde_json::Value::String(script_url.to_string()).to_string();
-    WORKER_PREP_TEMPLATE.replace("__OBSCURA_WORKER_URL__", &literal)
+fn worker_prep_script(script_url: &str, name: &str, origin: &str, secure: bool) -> String {
+    let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+    WORKER_PREP_TEMPLATE
+        .replace("__OBSCURA_WORKER_URL__", &json(script_url))
+        .replace("__OBSCURA_WORKER_NAME__", &json(name))
+        .replace("__OBSCURA_WORKER_ORIGIN__", &json(origin))
+        .replace("__OBSCURA_WORKER_SECURE__", if secure { "true" } else { "false" })
 }
 
 /// Executed in the fresh worker runtime before the worker source. The
 /// snapshot global is the page bootstrap's Window; this strips the
 /// Window-only surface and installs the DedicatedWorkerGlobalScope API.
+///
+/// Parity matters here beyond correctness. A dedicated worker is the one
+/// scope an anti-bot payload can inspect without the page ever seeing the
+/// probe, and the cheapest tells are structural: `Object.prototype.toString`
+/// on the global, `self.constructor.name`, whether `HTMLElement` resolves,
+/// whether `navigator` carries `plugins`. A scope that answers "Window",
+/// "[object Object]" and "yes" to those is not a worker in any browser.
 const WORKER_PREP_TEMPLATE: &str = r#"(function () {
-  // Author checks like `typeof document` / `'document' in self` must match a
-  // worker scope. These globals were created by plain assignment in the page
-  // bootstrap, so they are configurable and deletable.
-  delete globalThis.window;
-  delete globalThis.document;
-  delete globalThis.top;
-  delete globalThis.parent;
-  delete globalThis.frames;
-  delete globalThis.frameElement;
-  globalThis.self = globalThis;
-  globalThis.WorkerGlobalScope = function WorkerGlobalScope() {};
-  globalThis.DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {};
-  globalThis.WorkerLocation = function WorkerLocation() {};
-  // The page bootstrap pins `location` non-configurable, but all its getters
-  // derive from `__virtualUrl` when set. Pointing it at the final worker
-  // script URL gives location.href/origin/protocol/... WorkerLocation reads.
-  // TODO(phase 3.11 follow-up): a real WorkerLocation instance (readonly, no
-  // assign()/reload()/replace()).
-  globalThis.__virtualUrl = __OBSCURA_WORKER_URL__;
+  var G = globalThis;
+  var defineProperty = Object.defineProperty;
+  var getOwnPropertyNames = Object.getOwnPropertyNames;
 
-  var listeners = { message: [], error: [] };
-  globalThis.addEventListener = function (type, fn) {
-    if (typeof fn !== 'function') return;
-    var ls = listeners[type] || (listeners[type] = []);
-    if (ls.indexOf(fn) < 0) ls.push(fn);
+  function def(target, name, value, enumerable) {
+    defineProperty(target, name, {
+      value: value, writable: true, enumerable: !!enumerable, configurable: true,
+    });
+  }
+  function defGet(target, name, getter, enumerable) {
+    defineProperty(target, name, {
+      get: getter, enumerable: !!enumerable, configurable: true,
+    });
+  }
+  // Accessor pair backing an `on*` IDL attribute: assignment sticks, reads
+  // return the last assignment, and the initial value is null rather than
+  // undefined (absent handlers are a tell -- browsers pre-declare them).
+  function defEventHandler(target, name) {
+    var current = null;
+    defineProperty(target, name, {
+      get: function () { return current; },
+      set: function (v) { current = (typeof v === 'function' || (v && typeof v === 'object')) ? v : null; },
+      enumerable: true, configurable: true,
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // 1. Strip the Window/DOM surface.
+  //
+  // The worker runtime boots from the page's snapshot, so every global the
+  // page bootstrap installs is present here too -- `document`, `Element`,
+  // `localStorage`, all 49 `HTML*Element` constructors. None of them exist
+  // in a real DedicatedWorkerGlobalScope, and a single `typeof HTMLElement`
+  // is enough to classify the scope. Deleted before anything below runs so
+  // the worker API installs onto a clean global.
+  // ---------------------------------------------------------------------
+  var WINDOW_ONLY = [
+    // Browsing-context self-references and the document tree
+    'window', 'document', 'top', 'parent', 'frames', 'frameElement', 'length',
+    'opener', 'name',
+    // Window-only constructors
+    'Window', 'Navigator', 'Location', 'History', 'Screen', 'Storage',
+    'BarProp', 'VisualViewport', 'CustomElementRegistry', 'SharedWorker',
+    // Core DOM (Exposed=Window)
+    'Document', 'HTMLDocument', 'XMLDocument', 'DocumentFragment',
+    'DocumentType', 'DOMImplementation', 'Element', 'Attr', 'CharacterData',
+    'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'Node',
+    'NodeList', 'NodeFilter', 'NodeIterator', 'TreeWalker', 'HTMLCollection',
+    'NamedNodeMap', 'ShadowRoot', 'Range', 'StaticRange', 'AbstractRange',
+    'Selection', 'DOMParser', 'XMLSerializer', 'XSLTProcessor',
+    'XPathEvaluator', 'XPathResult', 'XPathExpression', 'DOMTokenList',
+    'DOMStringMap', 'DOMRect', 'DOMRectReadOnly', 'DOMRectList',
+    // Observers scoped to layout/DOM
+    'MutationObserver', 'MutationRecord', 'IntersectionObserver',
+    'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry',
+    // CSSOM
+    'CSS', 'CSSStyleDeclaration', 'CSSStyleSheet', 'CSSRule', 'CSSRuleList',
+    'StyleSheet', 'StyleSheetList', 'MediaQueryList', 'getComputedStyle',
+    'matchMedia',
+    // Element factory aliases
+    'Image', 'Audio', 'Option',
+    // Window instance state and methods
+    'localStorage', 'sessionStorage', 'history', 'screen', 'customElements',
+    'visualViewport', 'chrome', 'speechSynthesis', 'SpeechSynthesisUtterance',
+    'alert', 'confirm', 'prompt', 'print', 'open', 'close', 'focus', 'blur',
+    'stop', 'getSelection', 'scroll', 'scrollTo', 'scrollBy', 'moveTo',
+    'moveBy', 'resizeTo', 'resizeBy',
+    'requestAnimationFrame', 'cancelAnimationFrame',
+    'requestIdleCallback', 'cancelIdleCallback',
+    'devicePixelRatio', 'innerWidth', 'innerHeight', 'outerWidth',
+    'outerHeight', 'screenX', 'screenY', 'screenLeft', 'screenTop',
+    'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',
+    'onload', 'onunload', 'onbeforeunload', 'onpagehide', 'onpageshow',
+    'onhashchange', 'onpopstate', 'onstorage', 'onresize', 'onscroll',
+  ];
+  for (var i = 0; i < WINDOW_ONLY.length; i++) {
+    try { delete G[WINDOW_ONLY[i]]; } catch (e) {}
+  }
+  // Element interfaces are open-ended (HTMLDivElement, SVGPathElement, ...);
+  // matching the prefix covers the ones this build has and any added later.
+  var globalNames = getOwnPropertyNames(G);
+  for (var j = 0; j < globalNames.length; j++) {
+    var key = globalNames[j];
+    if (/^(HTML|SVG|MathML)[A-Za-z]*Element$/.test(key)
+        || /^HTML[A-Za-z]*Collection$/.test(key)) {
+      try { delete G[key]; } catch (e) {}
+    }
+  }
+  // Window-only `on*` handlers left over from the page bootstrap's bulk
+  // GlobalEventHandlers install. The worker keeps only its own set, added
+  // further down; anything else advertises DOM events a worker cannot fire.
+  var WORKER_HANDLERS = {
+    onmessage: 1, onmessageerror: 1, onerror: 1, onlanguagechange: 1,
+    onoffline: 1, ononline: 1, onrejectionhandled: 1, onunhandledrejection: 1,
   };
-  globalThis.removeEventListener = function (type, fn) {
+  var leftover = getOwnPropertyNames(G);
+  for (var k = 0; k < leftover.length; k++) {
+    var handler = leftover[k];
+    if (handler.length > 2 && handler.slice(0, 2) === 'on' && !WORKER_HANDLERS[handler]) {
+      try { delete G[handler]; } catch (e) {}
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 2. Brand the global as a DedicatedWorkerGlobalScope.
+  //
+  //   self -> DedicatedWorkerGlobalScope.prototype
+  //        -> WorkerGlobalScope.prototype
+  //        -> EventTarget.prototype
+  //
+  // This is what makes `self instanceof WorkerGlobalScope`,
+  // `self.constructor.name` and `Object.prototype.toString.call(self)` agree
+  // with a browser. Constructors throw on direct call, as the real ones do.
+  // ---------------------------------------------------------------------
+  function illegalConstructor(name) {
+    var ctor = function () { throw new TypeError('Illegal constructor'); };
+    defineProperty(ctor, 'name', { value: name, configurable: true });
+    return ctor;
+  }
+  var EventTargetProto = (typeof EventTarget === 'function' && EventTarget.prototype)
+    ? EventTarget.prototype : Object.prototype;
+  // Whatever the snapshot left on the global's prototype stays reachable:
+  // dropping it would take the runtime's own plumbing with it.
+  var inheritedProto = Object.getPrototypeOf(G);
+
+  var WorkerGlobalScope = illegalConstructor('WorkerGlobalScope');
+  WorkerGlobalScope.prototype = Object.create(EventTargetProto);
+  def(WorkerGlobalScope.prototype, 'constructor', WorkerGlobalScope);
+  defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
+    value: 'WorkerGlobalScope', configurable: true,
+  });
+  if (inheritedProto && inheritedProto !== Object.prototype
+      && inheritedProto !== EventTargetProto) {
+    var carried = getOwnPropertyNames(inheritedProto);
+    for (var c = 0; c < carried.length; c++) {
+      if (carried[c] === 'constructor') continue;
+      if (Object.prototype.hasOwnProperty.call(WorkerGlobalScope.prototype, carried[c])) continue;
+      var descriptor = Object.getOwnPropertyDescriptor(inheritedProto, carried[c]);
+      if (descriptor) {
+        try { defineProperty(WorkerGlobalScope.prototype, carried[c], descriptor); } catch (e) {}
+      }
+    }
+  }
+
+  var DedicatedWorkerGlobalScope = illegalConstructor('DedicatedWorkerGlobalScope');
+  DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
+  def(DedicatedWorkerGlobalScope.prototype, 'constructor', DedicatedWorkerGlobalScope);
+  defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
+    value: 'DedicatedWorkerGlobalScope', configurable: true,
+  });
+  try { Object.setPrototypeOf(G, DedicatedWorkerGlobalScope.prototype); } catch (e) {}
+
+  // The page bootstrap pins `constructor` as an own property of the global so
+  // framework environment gates see `self.constructor === Window`. In a worker
+  // that own property shadows the prototype's and keeps reporting Window;
+  // dropping it lets the DedicatedWorkerGlobalScope one through.
+  try { delete G.constructor; } catch (e) {}
+  if (Object.prototype.hasOwnProperty.call(G, 'constructor')) {
+    try { def(G, 'constructor', DedicatedWorkerGlobalScope); } catch (e) {}
+  }
+
+  // Window exposes its child browsing contexts as indexed properties; the
+  // bootstrap installs getters for 0..49 that read `document`. With the DOM
+  // stripped those getters throw on access, where a worker global simply has
+  // no indexed properties at all.
+  for (var idx = 0; idx < 50; idx++) {
+    try { delete G[idx]; } catch (e) {}
+  }
+
+  def(G, 'WorkerGlobalScope', WorkerGlobalScope);
+  def(G, 'DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+  // `self` is a getter-only attribute in a browser, not a data property.
+  defGet(G, 'self', function () { return G; }, true);
+
+  // ---------------------------------------------------------------------
+  // 3. WorkerLocation.
+  //
+  // `location` is pinned non-configurable by the page bootstrap, so the
+  // object is re-branded in place rather than replaced: same identity, new
+  // prototype, and the navigation methods removed -- a worker cannot
+  // navigate, and `typeof location.assign === 'function'` says Window.
+  // ---------------------------------------------------------------------
+  G.__virtualUrl = __OBSCURA_WORKER_URL__;
+  var WorkerLocation = illegalConstructor('WorkerLocation');
+  defineProperty(WorkerLocation.prototype, Symbol.toStringTag, {
+    value: 'WorkerLocation', configurable: true,
+  });
+  def(G, 'WorkerLocation', WorkerLocation);
+  try {
+    var loc = G.location;
+    if (loc && typeof loc === 'object') {
+      delete loc.assign;
+      delete loc.reload;
+      delete loc.replace;
+      Object.setPrototypeOf(loc, WorkerLocation.prototype);
+      // A blob:/data: worker inherits its creator's origin; deriving one from
+      // the script URL yields "null" and contradicts the page it runs for.
+      var inheritedOrigin = __OBSCURA_WORKER_ORIGIN__;
+      if (inheritedOrigin) {
+        defGet(loc, 'origin', function () { return inheritedOrigin; }, true);
+      }
+    }
+  } catch (e) {}
+
+  // ---------------------------------------------------------------------
+  // 4. WorkerNavigator.
+  //
+  // Built by allowlist, not by deletion: WorkerNavigator is a much smaller
+  // interface than Navigator, and the properties it omits are the ones that
+  // depend on a document or a viewport. `navigator.plugins` resolving inside
+  // a worker cannot happen in a browser.
+  // ---------------------------------------------------------------------
+  var WorkerNavigator = illegalConstructor('WorkerNavigator');
+  defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
+    value: 'WorkerNavigator', configurable: true,
+  });
+  def(G, 'WorkerNavigator', WorkerNavigator);
+  try {
+    var pageNav = G.navigator;
+    var workerNav = Object.create(WorkerNavigator.prototype);
+    // Exactly the mixins WorkerNavigator includes: NavigatorID,
+    // NavigatorLanguage, NavigatorOnLine, NavigatorConcurrentHardware,
+    // NavigatorDeviceMemory, NavigatorStorage, NavigatorLocks,
+    // NavigatorPermissions, NavigatorBeacon, plus userAgentData/connection/
+    // serviceWorker/mediaCapabilities.
+    var NAV_ALLOW = [
+      'appCodeName', 'appName', 'appVersion', 'platform', 'product',
+      'productSub', 'userAgent', 'vendor', 'vendorSub',
+      'language', 'languages', 'onLine',
+      'hardwareConcurrency', 'deviceMemory',
+      'userAgentData', 'connection', 'storage', 'locks', 'permissions',
+      'mediaCapabilities', 'serviceWorker', 'sendBeacon',
+    ];
+    for (var n = 0; n < NAV_ALLOW.length; n++) {
+      var prop = NAV_ALLOW[n];
+      // Accessors are re-installed as accessors so per-page overrides
+      // (hardwareConcurrency, deviceMemory) keep tracking their source.
+      var own = Object.getOwnPropertyDescriptor(pageNav, prop);
+      var proto = Object.getPrototypeOf(pageNav);
+      var inherited = (!own && proto) ? Object.getOwnPropertyDescriptor(proto, prop) : null;
+      var found = own || inherited;
+      if (!found) continue;
+      try { defineProperty(workerNav, prop, found); } catch (e) {}
+    }
+    defineProperty(G, 'navigator', {
+      get: function () { return workerNav; },
+      enumerable: true, configurable: true,
+    });
+  } catch (e) {}
+
+  // ---------------------------------------------------------------------
+  // 5. WorkerGlobalScope / DedicatedWorkerGlobalScope attributes.
+  // ---------------------------------------------------------------------
+  // Defined on the global itself, not on the prototypes. WebIDL relocates the
+  // members of a [Global] interface -- and of everything it inherits -- onto
+  // the global object, which is why `self.hasOwnProperty('addEventListener')`
+  // holds in a browser while the prototype chain carries only `constructor`.
+  var workerName = __OBSCURA_WORKER_NAME__;
+  var workerOrigin = __OBSCURA_WORKER_ORIGIN__;
+  defGet(G, 'name', function () { return workerName; }, true);
+  defGet(G, 'origin', function () {
+    return workerOrigin || (G.location ? G.location.origin : 'null');
+  }, true);
+  // Decided by the creator's scheme, not parsed back out of the origin: a
+  // file:// document is a secure context but serializes its origin to "null",
+  // so the string cannot answer this.
+  defGet(G, 'isSecureContext', function () { return __OBSCURA_WORKER_SECURE__; }, true);
+  defGet(G, 'crossOriginIsolated', function () { return false; }, true);
+
+  // ---------------------------------------------------------------------
+  // 6. Event plumbing.
+  //
+  // addEventListener and dispatchEvent must share one registry. The page
+  // bootstrap's dispatchEvent writes to the Window registry, so leaving it
+  // in place meant `dispatchEvent(new MessageEvent('message'))` reached
+  // nothing that `addEventListener('message', ...)` had registered.
+  // ---------------------------------------------------------------------
+  var listeners = Object.create(null);
+  def(G, 'addEventListener', function addEventListener(type, fn, options) {
+    if (!fn) return;
+    var handler = typeof fn === 'function' ? fn
+      : (typeof fn.handleEvent === 'function' ? fn.handleEvent.bind(fn) : null);
+    if (!handler) return;
+    var key = String(type);
+    var ls = listeners[key] || (listeners[key] = []);
+    for (var idx = 0; idx < ls.length; idx++) if (ls[idx].original === fn) return;
+    ls.push({ original: fn, handler: handler, once: !!(options && options.once) });
+  });
+  def(G, 'removeEventListener', function removeEventListener(type, fn) {
+    var ls = listeners[String(type)];
+    if (!ls) return;
+    for (var idx = 0; idx < ls.length; idx++) {
+      if (ls[idx].original === fn) { ls.splice(idx, 1); return; }
+    }
+  });
+  function fire(event, type) {
+    var handlerProp = G['on' + type];
+    if (typeof handlerProp === 'function') {
+      try { handlerProp.call(G, event); }
+      catch (e) { try { console.error('Worker on' + type + ' error:', e); } catch (_) {} }
+    }
     var ls = listeners[type];
-    if (ls) { var i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); }
-  };
-  globalThis.onmessage = null;
-  globalThis.onerror = null;
+    if (!ls || !ls.length) return;
+    var snapshot = ls.slice();
+    for (var idx = 0; idx < snapshot.length; idx++) {
+      var entry = snapshot[idx];
+      if (entry.once) removeEventListener(type, entry.original);
+      try { entry.handler.call(G, event); }
+      catch (e) { try { console.error('Worker ' + type + ' listener error:', e); } catch (_) {} }
+    }
+  }
+  def(G, 'dispatchEvent', function dispatchEvent(event) {
+    if (!event || typeof event.type !== 'string') {
+      throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+    }
+    try { defineProperty(event, 'target', { value: G, configurable: true }); } catch (e) {}
+    try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
+    fire(event, event.type);
+    return !event.defaultPrevented;
+  });
+  var HANDLER_NAMES = getOwnPropertyNames(WORKER_HANDLERS);
+  for (var h = 0; h < HANDLER_NAMES.length; h++) {
+    defEventHandler(G, HANDLER_NAMES[h]);
+  }
 
   // Structured clone, JSON-clonable subset; `{v: data}` envelope so an
   // `undefined` payload round-trips as an absent property.
   // TODO(phase 3.11 follow-up): full structured clone + transfer lists.
-  globalThis.postMessage = function postMessage(data) {
+  def(G, 'postMessage', function postMessage(data) {
     if (typeof data === 'function' || typeof data === 'symbol') {
       throw new DOMException('The object could not be cloned.', 'DataCloneError');
     }
@@ -444,12 +764,12 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
     if (payload === undefined) payload = '{}';
     Deno.core.ops.op_worker_post_to_page(payload);
-  };
+  });
 
-  globalThis.close = function close() {
-    globalThis.__obscura_worker_closed = true;
+  def(G, 'close', function close() {
+    G.__obscura_worker_closed = true;
     Deno.core.ops.op_worker_close();
-  };
+  });
 
   function decodeDataUrl(u) {
     var comma = u.indexOf(',');
@@ -466,10 +786,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // sources throw NetworkError.
   // TODO(phase 3.11 follow-up): http(s) importScripts through the page HTTP
   // client, resolved against the worker script URL; blob: URL store sharing.
-  globalThis.importScripts = function importScripts() {
+  def(G, 'importScripts', function importScripts() {
     for (var i = 0; i < arguments.length; i++) {
       var resolved;
-      try { resolved = new URL(String(arguments[i]), globalThis.location.href).href; }
+      try { resolved = new URL(String(arguments[i]), G.location.href).href; }
       catch (e) {
         throw new DOMException("Failed to execute 'importScripts': invalid URL", 'SyntaxError');
       }
@@ -481,22 +801,19 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
           'NetworkError');
       }
     }
-  };
+  });
 
-  globalThis.__obscura_worker_dispatch_message = function (payload) {
-    if (globalThis.__obscura_worker_closed) return;
+  // Entry point for the Rust side. Routed through the same `fire` path as
+  // dispatchEvent so `onmessage` and `addEventListener('message')` observe
+  // one ordering rather than two independent ones.
+  G.__obscura_worker_dispatch_message = function (payload) {
+    if (G.__obscura_worker_closed) return;
     var data;
     try { data = JSON.parse(payload).v; } catch (e) { return; }
-    var evt = new MessageEvent('message', { data: data });
-    if (typeof globalThis.onmessage === 'function') {
-      try { globalThis.onmessage(evt); }
-      catch (e) { console.error('Worker onmessage error:', e); }
-    }
-    var ls = listeners.message.slice();
-    for (var i = 0; i < ls.length; i++) {
-      try { ls[i].call(globalThis, evt); }
-      catch (e) { console.error('Worker message listener error:', e); }
-    }
+    var event = new MessageEvent('message', { data: data });
+    try { defineProperty(event, 'target', { value: G, configurable: true }); } catch (e) {}
+    try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
+    fire(event, 'message');
   };
 })();
 "#;
@@ -661,6 +978,208 @@ mod tests {
             &serde_json::json!("ok"),
         )
         .await;
+    }
+
+    /// The structural tells a fingerprinting payload reads first. Each of
+    /// these answered "Window" or "[object Object]" before the scope was
+    /// branded, which is not a shape any browser produces.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_is_branded_as_a_dedicated_worker_global_scope() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "postMessage({" +
+              "tag: Object.prototype.toString.call(self)," +
+              "ctor: self.constructor.name," +
+              "protoCtor: Object.getPrototypeOf(self).constructor.name," +
+              "isDedicated: self instanceof DedicatedWorkerGlobalScope," +
+              "isWorkerScope: self instanceof WorkerGlobalScope," +
+              "isEventTarget: self instanceof EventTarget," +
+              "name: self.name, ownName: Object.prototype.hasOwnProperty.call(self, 'name')," +
+              "origin: typeof origin, secure: typeof isSecureContext," +
+              "isolated: typeof crossOriginIsolated });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!(
+                r#"{"tag":"[object DedicatedWorkerGlobalScope]","ctor":"DedicatedWorkerGlobalScope","protoCtor":"DedicatedWorkerGlobalScope","isDedicated":true,"isWorkerScope":true,"isEventTarget":true,"name":"","ownName":true,"origin":"string","secure":"boolean","isolated":"boolean"}"#
+            ),
+        );
+    }
+
+    /// `new Worker(url, {name})` reaches `self.name`, and the default is the
+    /// empty string rather than an absent binding.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_name_option_reaches_the_worker_scope() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "postMessage(self.name);";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            const push = (e) => { globalThis.__got.push(e.data); };
+            new Worker(url, { name: 'pow-worker' }).onmessage = push;
+            new Worker(url).onmessage = push;
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(2.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got.slice().sort())").unwrap(),
+            serde_json::json!(r#"["","pow-worker"]"#),
+        );
+    }
+
+    /// A worker has no DOM. The runtime boots from the page snapshot, so every
+    /// one of these resolved until they were stripped -- and `typeof
+    /// HTMLElement` alone separates a worker from anything pretending to be
+    /// one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_exposes_no_dom_or_window_interfaces() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const names = ['document','window','Document','Element','HTMLElement',
+              'HTMLDivElement','Node','NodeList','ShadowRoot','DOMParser','Range',
+              'MutationObserver','IntersectionObserver','CSS','Image',
+              'localStorage','sessionStorage','history','screen','customElements',
+              'chrome','alert','matchMedia','getComputedStyle',
+              'requestAnimationFrame','innerWidth','devicePixelRatio',
+              'Window','Navigator','SharedWorker'];
+            const src = "const names = " + JSON.stringify(names) + ";" +
+              "postMessage({ leaked: names.filter((n) => typeof self[n] !== 'undefined')," +
+              " indexed: Object.getOwnPropertyNames(self).filter((k) => /^[0-9]+$/.test(k)).length });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(r#"{"leaked":[],"indexed":0}"#),
+        );
+    }
+
+    /// WorkerNavigator is a smaller interface than Navigator, and what it
+    /// leaves out is exactly what needs a document. `navigator.plugins`
+    /// resolving inside a worker cannot happen in a browser.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_navigator_and_location_are_worker_interfaces() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "postMessage({" +
+              "navCtor: navigator.constructor.name," +
+              "navTag: Object.prototype.toString.call(navigator)," +
+              "ua: typeof navigator.userAgent, cores: typeof navigator.hardwareConcurrency," +
+              "windowOnly: ['plugins','mimeTypes','geolocation','mediaDevices','clipboard'," +
+                "'doNotTrack','maxTouchPoints','cookieEnabled','webdriver','getBattery']" +
+                ".filter((k) => navigator[k] !== undefined)," +
+              "locCtor: location.constructor.name," +
+              "locTag: Object.prototype.toString.call(location)," +
+              "navMethods: ['assign','reload','replace'].filter((k) => typeof location[k] === 'function') });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"navCtor":"WorkerNavigator","navTag":"[object WorkerNavigator]","ua":"string","cores":"number","windowOnly":[],"locCtor":"WorkerLocation","locTag":"[object WorkerLocation]","navMethods":[]}"#
+            ),
+        );
+    }
+
+    /// addEventListener and dispatchEvent have to share one registry. They did
+    /// not: the prep script installed its own listener list while leaving the
+    /// page bootstrap's dispatchEvent in place, so a dispatched event reached
+    /// nothing that had been registered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_dispatch_event_reaches_listeners_and_handlers() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "const seen = [];" +
+              "self.onping = null;" +
+              "addEventListener('ping', () => seen.push('listener'));" +
+              "addEventListener('ping', () => seen.push('once'), { once: true });" +
+              "dispatchEvent(new Event('ping'));" +
+              "dispatchEvent(new Event('ping'));" +
+              "const evt = new Event('probe');" +
+              "let target = null;" +
+              "addEventListener('probe', (e) => { target = e.target === self; });" +
+              "dispatchEvent(evt);" +
+              "postMessage({ seen, target });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(r#"{"seen":["listener","once","listener"],"target":true}"#),
+        );
+    }
+
+    /// A message must reach `onmessage` and `addEventListener('message')`
+    /// alike; they run off one registry now, so ordering is single-valued.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_message_reaches_both_handler_and_listener() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "const seen = [];" +
+              "onmessage = (e) => { seen.push('handler:' + e.data); };" +
+              "addEventListener('message', (e) => {" +
+                "seen.push('listener:' + e.data); postMessage(seen); });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            const w = new Worker(url);
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.postMessage('x');
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(r#"["handler:x","listener:x"]"#),
+        );
+    }
+
+    /// `blob:<origin>/<uuid>` per the File API. The URL is the worker's script
+    /// URL, so its shape is what `location.href` reports and what
+    /// `location.origin` is parsed back out of.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_object_urls_use_the_browser_format() {
+        let mut rt = page_runtime();
+        let value = rt
+            .evaluate(
+                "(() => { const u = URL.createObjectURL(new Blob(['x'])); \
+                 return /^blob:http:\\/\\/example\\.com\\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u); })()",
+            )
+            .unwrap();
+        assert_eq!(value, serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

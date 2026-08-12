@@ -4648,16 +4648,35 @@ fn op_worker_spawn(
     #[string] source: String,
     #[string] url: String,
     #[string] kind: String,
+    #[string] name: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let environment = {
         let gs = shared.borrow();
+        // The worker's origin is the creator's, not its script's: a `blob:` or
+        // `data:` worker script has no origin of its own, and deriving one
+        // from the URL reports "null" for the page it was spawned by.
+        let creator = url::Url::parse(&gs.url).ok();
+        let origin = creator
+            .as_ref()
+            .filter(|parsed| parsed.scheme() != "data" && parsed.scheme() != "blob")
+            .map(|parsed| parsed.origin().ascii_serialization())
+            .unwrap_or_else(|| "null".to_string());
+        // "Potentially trustworthy origin": https/wss/file plus the loopback
+        // hosts. file:// qualifies despite its origin serializing to "null".
+        let secure_context = creator.as_ref().is_some_and(|parsed| {
+            matches!(parsed.scheme(), "https" | "wss" | "file")
+                || matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+        });
         crate::worker::WorkerEnvironment {
             cookie_jar: gs.cookie_jar.clone(),
             http_client: gs.http_client.clone(),
             callbacks: gs.callbacks.clone(),
             blocked_urls: gs.blocked_urls.clone(),
             page_in_flight: Arc::clone(&gs.page_in_flight),
+            name,
+            origin,
+            secure_context,
             #[cfg(feature = "stealth")]
             stealth_client: gs.stealth_client.clone(),
         }

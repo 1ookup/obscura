@@ -13138,6 +13138,9 @@ globalThis.Worker = class Worker {
     catch (e) {
       throw new DOMException("Failed to construct 'Worker': '" + href + "' is not a valid URL.", 'SyntaxError');
     }
+    // Surfaces as `self.name` in the worker; "" when none was supplied, which
+    // is what a browser reports -- an absent binding is not the same value.
+    this._name = options && options.name !== undefined ? String(options.name) : '';
     const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
     if (typeof blobSource === 'string') { this._spawn(blobSource, resolved, workerType); return; }
     if (resolved.startsWith('data:')) { this._spawn(_workerScriptFromDataUrl(resolved), resolved, workerType); return; }
@@ -13176,7 +13179,7 @@ globalThis.Worker = class Worker {
   _spawn(source, finalUrl, workerType = 'classic') {
     if (this._terminated) return;
     let id;
-    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType)); }
+    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType), String(this._name || '')); }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
     this._id = id;
     const queued = this._pending;
@@ -13264,9 +13267,35 @@ globalThis.Worker = class Worker {
 };
 
 globalThis.__blobStore = globalThis.__blobStore || {};
+// `blob:<serialized origin>/<uuid v4>`, per the File API's "generate a new blob
+// URL". The format is load-bearing beyond cosmetics: a blob-URL Worker takes
+// this string as its script URL, so it is what `location.href` reports inside
+// the worker, and `location.origin` is parsed back out of it. The previous
+// `blob:obscura/<base36>` named the engine outright and left workers reporting
+// a "null" origin for pages that had a real one.
+function _blobUrlId() {
+  let uuid;
+  try { uuid = globalThis.crypto && crypto.randomUUID && crypto.randomUUID(); } catch (e) {}
+  if (!uuid) {
+    const hex = [];
+    for (let i = 0; i < 36; i++) hex.push(Math.floor(Math.random() * 16).toString(16));
+    hex[8] = hex[13] = hex[18] = hex[23] = '-';
+    hex[14] = '4';
+    hex[19] = (parseInt(hex[19], 16) & 0x3 | 0x8).toString(16);
+    uuid = hex.join('');
+  }
+  // An opaque-origin document (file:, data:, sandboxed) serializes to "null",
+  // which is exactly what a browser puts here too.
+  let origin = 'null';
+  try {
+    const own = globalThis.location && globalThis.location.origin;
+    if (own && own !== 'null' && own !== 'about:blank') origin = own;
+  } catch (e) {}
+  return 'blob:' + origin + '/' + uuid;
+}
 URL.createObjectURL = function(blob) {
   if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+    const id = _blobUrlId();
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -13285,7 +13314,7 @@ URL.createObjectURL = function(blob) {
     }
     return id;
   }
-  return 'blob:obscura/fallback';
+  return _blobUrlId();
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
