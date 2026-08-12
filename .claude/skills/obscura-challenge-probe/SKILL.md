@@ -17,6 +17,24 @@ description: >
 方法论比脚本重要——这类排查里**最容易出错的是观测手段本身**，本文档大半篇幅在讲
 怎样不被自己的探针骗到。完整案例见 `docs/Cloudflare-challenge-profile.md`。
 
+## 维护 profile 文档（边查边写）
+
+每个目标站维护一份 profile 文档（模板即 `docs/Cloudflare-challenge-profile.md`），
+它是这次排查的**唯一事实源**，不是收尾时补的总结。规则：
+
+- **逐 step 追加，不要攒到最后写。** 每个 step 记四样：**假设 / 方法 / 证据 / 结论**。
+  当前正在验证的假设也先落成一个 step，结果出来再补「证伪 / 证实」——过程本身就是资产。
+- **每次有效修复立刻写入。** 定位到真因并改掉后，新开一个 step 记：改了什么、
+  提交号、修复前后的可量化对比（如 CDP 时间线的事件时刻）、以及配套回归测试的位置。
+  没有量化对比的「修复」不算数——它可能只是换了个症状。
+- **被证伪的假设一律保留**，标注「证伪」。它们标出了不必再走的路，比结论更省后人时间。
+- **观测手段自身的坑记进「测量盲区」表。** 凡是因为探针失真得出过错误结论的，
+  连同正确做法一起记——这是本类排查最高频的返工来源。
+- **文档顶部维护「当前状态」一行**（通过 / 未通过 + 卡在哪一步），和「未决」清单，
+  让任何时候接手的人一眼看到战线在哪。
+
+一句话：**修复先进文档，再进代码**——先把「假设→证据→结论」写清楚，改动才算闭环。
+
 ## 前置
 
 ```bash
@@ -37,8 +55,13 @@ REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/req
 ```bash
 SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
   obscura fetch <URL> --dump text --proxy http://127.0.0.1:9000 --stealth \
-  --timeout 90 --wait 40 --screenshot /tmp/run.png
+  --timeout 35 --wait 35 --screenshot /tmp/run.png
 ```
+
+**超时封顶 35s，别等更久。** Cloudflare 在首轮质询没过时会触发一次二次刷新
+（重新导航、重发质询），把 wait 拉到 40s+ 只会等到这一轮无意义的重来，既不产生
+新信息，还让每次观测多花一倍时间。首轮 35s 内没出结果，就是没过——去看断点，
+而不是加时间。
 
 对每条差异请求看三样：**主机对不对、状态码、Origin 头**。
 
@@ -126,6 +149,8 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 4. 若涉及消息：`cdp_probe.py messages` 拿完整内容与时间线
 5. 若怀疑 URL 解析：`realm_probe.sh`
 6. 结构性假设穷尽后**改用插桩**，不要继续猜
+7. 每验证一个假设、每修掉一处阻塞，立刻按上面「维护 profile 文档」追加 step——
+   全程边查边写，不要留到最后补
 
 第 6 步的教训：一轮排查里连续五个结构性假设（shadow root、iframe 属性、跨源、
 CSP、创建时机）全部用本地用例复现通过，真因是靠给队列入队/消费两端加日志找到的。

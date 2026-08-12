@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::Extension;
 #[cfg(feature = "render")]
 use deno_core::JsBuffer;
@@ -2203,6 +2204,75 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
     }
 }
 
+/// Evaluate a classic script body in the *calling* realm, named by its URL.
+///
+/// Indirect eval keeps the right realm but stamps every frame with an eval
+/// origin, so a stack captured inside the script names this engine's bootstrap
+/// file. `Deno.core.evalContext` gives a clean script origin but always
+/// evaluates in the main realm -- from a frame it would define the script's
+/// globals on the embedder's global object. This op is the combination the
+/// platform needs: `Script::compile` runs against the scope's current context,
+/// which is the realm that called in.
+///
+/// Returns an empty array on success, or a one-element array holding the thrown
+/// value; the JS side rethrows it so callers see the script's own exception.
+#[op2(reentrant)]
+fn op_run_classic_script<'a>(
+    scope: &mut v8::HandleScope<'a>,
+    #[string] source: &str,
+    #[string] url: &str,
+    realm_global: v8::Local<'a, v8::Object>,
+) -> v8::Local<'a, v8::Array> {
+    // Not the scope's current context. `Deno.core.ops` is shared across realms,
+    // so an op's callback scope reports the context the op function object was
+    // created in -- the main one -- no matter which realm called. The caller
+    // passes its own `globalThis`, whose creation context is the realm that
+    // must receive the script's declarations.
+    let context = match realm_global.get_creation_context(scope) {
+        Some(context) => context,
+        None => return v8::Array::new(scope, 0),
+    };
+
+    let thrown = {
+        let context_scope = &mut v8::ContextScope::new(scope, context);
+        let tc = &mut v8::TryCatch::new(context_scope);
+        let compiled = v8::String::new(tc, source)
+            .zip(v8::String::new(tc, url))
+            .and_then(|(body, name)| {
+                let origin = v8::ScriptOrigin::new(
+                    tc,
+                    name.into(),
+                    0,
+                    0,
+                    false,
+                    0,
+                    None,
+                    false,
+                    false,
+                    false,
+                    None,
+                );
+                v8::Script::compile(tc, body, Some(&origin))
+            });
+        if let Some(script) = compiled {
+            script.run(tc);
+        }
+        let caught = tc.exception().map(|thrown| v8::Global::new(tc, thrown));
+        // Leaving the TryCatch armed would rethrow on scope exit and bypass the
+        // JS-side reporting.
+        tc.reset();
+        caught
+    };
+
+    match thrown {
+        Some(thrown) => {
+            let thrown = v8::Local::new(scope, &thrown);
+            v8::Array::new_with_elements(scope, &[thrown])
+        }
+        None => v8::Array::new(scope, 0),
+    }
+}
+
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
@@ -3070,6 +3140,14 @@ async fn stealth_fetch_all(
             cbs.fire_response(&info, &resp).await;
         }
     }
+
+    tracing::debug!(
+        "stealth_fetch completed: {} {} -> {} ({} bytes)",
+        current_method,
+        url,
+        status,
+        resp_bytes.len()
+    );
 
     Ok(serde_json::json!({
         "status": status,
@@ -5057,6 +5135,7 @@ pub fn build_extension() -> Extension {
         op_shadow_attach(),
         op_shadow_root_info(),
         op_console_msg(),
+        op_run_classic_script(),
         op_fetch_url(),
         op_get_cookies(),
         op_get_cookies_for_url(),

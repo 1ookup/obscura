@@ -68,7 +68,13 @@
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
+// Suppressing the default action keeps a stray rejection from tearing the page
+// down, but a browser still prints it. Staying quiet here hides the most common
+// way a promise-driven page stops making progress.
+globalThis.onunhandledrejection = function(e) {
+  try { console.error("Unhandled rejection:", (e && (e.reason ?? e)) ?? e); } catch (_e) {}
+  if (e?.preventDefault) e.preventDefault();
+};
 
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
@@ -347,6 +353,27 @@ function __startDynClassicFetch(task) {
     error => ({ error }),
   );
 }
+// Run a classic script body under its own script name.
+//
+// Indirect eval would be the obvious way to get global-scope evaluation, but
+// V8 stamps every frame of an eval'd script with its eval origin, so a stack
+// captured inside the script reads
+//   at ki (eval at execute (<obscura:bootstrap>:374:28), <anonymous>:1:19216)
+// where a browser gives
+//   at ki (https://cdn.example/api.js:1:19216)
+// The engine's own file name therefore travels inside any stack the page
+// collects -- and challenge scripts do collect them and post them home.
+// op_run_classic_script compiles with a real script origin in the calling
+// realm, which removes the eval annotation and gives the script its URL.
+// Global-scope semantics (a top-level `var` becoming a property of the global
+// object) are unchanged. `Deno.core.evalContext` is not the answer here: it
+// gives a clean origin but always evaluates in the main realm, so a frame's
+// script would define its globals on the embedder.
+function __runClassicScript(source, url) {
+  const thrown = Deno.core.ops.op_run_classic_script(source, url || "about:blank", globalThis);
+  if (thrown.length) throw thrown[0];
+}
+
 async function __runDynScriptTask(task) {
   try {
     if (task.isModule) {
@@ -365,7 +392,7 @@ async function __runDynScriptTask(task) {
         await new Promise(resolve => {
           const execute = () => {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(body); }
+            try { __runClassicScript(body, task.url); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
             resolve();
@@ -766,6 +793,16 @@ globalThis.console = {
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
+// An event handler that throws does not cancel dispatch -- the remaining
+// handlers still run -- but the exception is *reported*, exactly as an uncaught
+// one is. Swallowing it silently is both a spec deviation and the reason a
+// page that dies inside its own XHR callback looks, from the outside, like a
+// page that simply stopped making requests.
+function __XHRDBG(xhr, where, e) {
+  _consoleFn("error", ["XHR handler threw in", where, "for",
+                       String(xhr && xhr._url || "?").slice(0, 120), e]);
+}
+
 let _tid = 0;
 const _clearedTimers = new Set();
 const _intervals = new Set();
@@ -818,14 +855,14 @@ const _scheduleAfter = (delay, fn) => {
 const _coerceTimerFn = (fn) => {
   if (typeof fn === "string") {
     // Per HTML, a string handler is compiled and run as a classic script in
-    // global scope *at fire time*. Indirect eval ((0, eval)) runs in the true
-    // global scope, so top-level var/function declarations become globals (a
-    // `new Function(fn)` wrapper kept them local); deferring to fire time also
+    // global scope *at fire time*, so top-level var/function declarations
+    // become globals (a `new Function(fn)` wrapper kept them local);
+    // deferring to fire time also
     // surfaces a SyntaxError when the timer elapses, matching a real browser,
     // instead of swallowing it eagerly at scheduling. The dynamic-script path
-    // uses the same indirect eval for the same reason.
+    // uses the same global-scope evaluation for the same reason.
     const src = fn;
-    return () => { (0, eval)(src); };
+    return () => { __runClassicScript(src, globalThis.location?.href); };
   }
   return typeof fn === "function" ? fn : null;
 };
@@ -1841,7 +1878,9 @@ function __prepareInsertedScript(script) {
     __processDynScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;
-    try { (0, eval)(code); }
+    // An inline script has no URL of its own; a browser attributes it to the
+    // document that contains it.
+    try { __runClassicScript(code, globalThis.location?.href); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
     finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
@@ -6423,9 +6462,9 @@ async function _frameMessageRecvLoop() {
       const evt = __obscura_markTrusted(new MessageEvent("message", {
         data, origin: entry.origin || "", source
       }));
-      try { globalThis.dispatchEvent(evt); } catch (e) {}
+      try { globalThis.dispatchEvent(evt); } catch (e) { console.error("message dispatch error:", e); }
       if (typeof globalThis.onmessage === "function") {
-        try { globalThis.onmessage.call(globalThis, evt); } catch (e) {}
+        try { globalThis.onmessage.call(globalThis, evt); } catch (e) { console.error("onmessage error:", e); }
       }
     }
   }
@@ -7551,17 +7590,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this.readyState = state;
     this._fireEvent('readystatechange');
     if (this.onreadystatechange) {
-      try { this.onreadystatechange(); } catch(e) {}
+      try { this.onreadystatechange(); } catch(e) { __XHRDBG(this, 'onreadystatechange', e); }
     }
   }
 
   _fireEvent(type) {
     const event = { type, target: this, currentTarget: this, bubbles: false };
     const handlers = this._listeners[type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
+    for (const h of handlers) { try { h.call(this, event); } catch(e) { __XHRDBG(this, type + ' listener', e); } }
     const prop = 'on' + type;
     if (type !== 'readystatechange' && typeof this[prop] === 'function') {
-      try { this[prop](event); } catch(e) {}
+      try { this[prop](event); } catch(e) { __XHRDBG(this, prop, e); }
     }
   }
 };

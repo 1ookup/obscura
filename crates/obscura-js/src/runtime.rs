@@ -15092,6 +15092,123 @@ mod tests {
         );
     }
 
+    /// A page that captures `new Error().stack` reads the engine's own file
+    /// names if scripts are evaluated with indirect eval, and challenge scripts
+    /// do capture stacks and post them off-box. Every frame belonging to the
+    /// script must name the script's URL, with no eval annotation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fetched_script_stack_names_its_url_and_not_the_engine() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    Deno.core.ops.op_fetch_url = (url) => Promise.resolve(JSON.stringify({
+                        status: 200,
+                        headers: {"content-type": "text/javascript"},
+                        body: "function inner() { return new Error().stack }\n"
+                            + "globalThis.__stack = inner();",
+                        url,
+                    }));
+                    try {
+                        await new Promise(resolve => {
+                            const script = document.createElement("script");
+                            script.src = "/vendor/widget.js";
+                            script.onload = resolve;
+                            script.onerror = resolve;
+                            document.head.appendChild(script);
+                        });
+                        const stack = String(globalThis.__stack || "");
+                        // Frames belonging to the script itself: everything up
+                        // to the first one that is not the script. What sits
+                        // below those is the engine's timer plumbing, still
+                        // visible -- see the profile doc's open items.
+                        const own = stack.split("\n").slice(1)
+                            .filter(line => line.includes("/vendor/widget.js"));
+                        return {
+                            ownFrames: own.length,
+                            hasEvalAnnotation: stack.includes("eval at"),
+                            namesTheEngineInOwnFrames:
+                                own.some(line => line.includes("obscura:bootstrap")),
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "ownFrames": 2,
+                "hasEvalAnnotation": false,
+                "namesTheEngineInOwnFrames": false,
+            })
+        );
+    }
+
+    /// An event handler that throws is reported, not swallowed. Without this a
+    /// page that dies inside its own XHR callback is indistinguishable from one
+    /// that simply stopped making requests -- which is how a stalled challenge
+    /// looked for an entire round of diagnosis.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_throwing_xhr_handler_is_reported_and_does_not_stop_the_others() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    Deno.core.ops.op_fetch_url = (url) => Promise.resolve(JSON.stringify({
+                        status: 200, headers: {}, body: "ok", url,
+                    }));
+                    // Hook the console op, not `console.error`: the reporting
+                    // path calls the internal formatter directly so a page
+                    // cannot silence its own diagnostics by replacing console.
+                    const reported = [];
+                    const originalConsoleOp = Deno.core.ops.op_console_msg;
+                    Deno.core.ops.op_console_msg = (level, msg) => { reported.push(msg); };
+                    try {
+                        const later = [];
+                        await new Promise(resolve => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("GET", "/probe");
+                            xhr.addEventListener("load", () => { throw new TypeError("first"); });
+                            xhr.addEventListener("load", () => { later.push("second ran"); });
+                            xhr.addEventListener("loadend", () => resolve());
+                            xhr.send();
+                        });
+                        return {
+                            later,
+                            reportedTheThrow: reported.some(m => m.includes("first")),
+                        };
+                    } finally {
+                        Deno.core.ops.op_console_msg = originalConsoleOp;
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "later": ["second ran"],
+                "reportedTheThrow": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
