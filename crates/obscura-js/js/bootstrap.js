@@ -830,16 +830,45 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
+// HTML's timer nesting level. A timer scheduled from inside a timer callback
+// nests one deeper, and past five levels the spec floors the delay at 4ms --
+// which is why a chain of `setTimeout(f, 0)` advances at ~4ms per step in a
+// browser rather than as fast as the event loop can turn.
+//
+// Worth having beyond conformance: the floor is measurable from script, so a
+// page that times a nesting chain reads an engine without it as not-a-browser.
+// Running faster than the platform is itself a tell.
+let _timerNesting = 0;
+const _TIMER_NESTING_FLOOR_LEVEL = 5;
+const _TIMER_NESTING_FLOOR_MS = 4;
+
+function _clampNestedDelay(delay) {
+  return (_timerNesting > _TIMER_NESTING_FLOOR_LEVEL && delay < _TIMER_NESTING_FLOOR_MS)
+    ? _TIMER_NESTING_FLOOR_MS
+    : delay;
+}
+
+// Runs `f` at the nesting level its own timer scheduled, so timers it starts
+// nest deeper while unrelated work on the task queue keeps counting from zero.
+function _runAtNesting(level, f, args) {
+  const previous = _timerNesting;
+  _timerNesting = level;
+  try { f(...args); }
+  catch (e) { console.error("Timer error:", e); }
+  finally { _timerNesting = previous; }
+}
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
-  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const nesting = _timerNesting + 1;
+  const normalizedDelay = _clampNestedDelay(Math.max(0, Number(delay) || 0));
   const nativeId = _scheduleAfter(normalizedDelay, () => {
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
     if (_clearedTimers.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
+    _runAtNesting(nesting, f, args);
   });
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
@@ -863,14 +892,22 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   if (f === null) return ++_tid;
   const id = ++_tid;
   _intervals.add(id);
+  // An interval nests one level below whatever scheduled it, and every tick
+  // repeats at that level -- so a sub-4ms interval started inside a timer is
+  // floored the same way a nested timeout is.
+  const nesting = _timerNesting + 1;
+  const normalizedDelay = (nesting > _TIMER_NESTING_FLOOR_LEVEL
+      && Math.max(0, Number(delay) || 0) < _TIMER_NESTING_FLOOR_MS)
+    ? _TIMER_NESTING_FLOOR_MS
+    : Math.max(0, Number(delay) || 0);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    _runAtNesting(nesting, f, args);
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
+    const nativeId = _scheduleAfter(normalizedDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  const nativeId = _scheduleAfter(delay, tick);
+  const nativeId = _scheduleAfter(normalizedDelay, tick);
   if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 };
