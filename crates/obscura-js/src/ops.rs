@@ -1358,6 +1358,20 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        // Every iframe host below a subtree, shadow trees included. Insertion
+        // steps need this rather than a selector query: `querySelectorAll`
+        // stops at a shadow boundary, so an iframe placed inside a shadow root
+        // is invisible to it and never gets a browsing context when its host
+        // is connected.
+        "iframe_hosts_including_shadow" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            let ids: Vec<i32> = dom
+                .iframe_hosts_in_shadow_including_subtree(NodeId::new(root_nid))
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
         "matches_selector" => {
             let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
             dom.matches_selector(nid, &arg2)

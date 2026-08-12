@@ -1497,7 +1497,14 @@ impl DomTree {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut stack = Vec::new();
-        Self::push_children_reversed(&inner, root, &mut stack);
+        // Seeded with `root` itself, not its children, so the walk below enters
+        // root's own shadow tree. A shadow root hangs off its host rather than
+        // appearing in the host's child list, so seeding with children reported
+        // no iframes at all for a subtree whose top node is the shadow host --
+        // which is how a widget embed is built. The original caller passes a
+        // document root, which has neither a shadow tree nor an iframe to miss,
+        // so nothing surfaced it.
+        stack.push(root);
 
         while let Some(current) = stack.pop() {
             if !visited.insert(current) {
@@ -2460,6 +2467,45 @@ mod tests {
         assert_eq!(
             tree.attach_shadow_root(host, ShadowRootMode::Open),
             Err(AttachShadowError::HostAlreadyHasShadowRoot)
+        );
+    }
+
+    /// Called with a shadow host rather than a document root. Insertion steps
+    /// pass the node that was just connected, and for a widget embed that node
+    /// is the host itself -- whose shadow tree hangs off it rather than
+    /// appearing among its children. Seeding the walk with the children skipped
+    /// that tree, so the iframe inside it was never discovered, never given a
+    /// browsing context, and never navigated.
+    #[test]
+    fn browser_iframe_discovery_enters_the_roots_own_shadow_tree() {
+        let tree = DomTree::new();
+        let document = tree.document();
+
+        let host = element(&tree, "div");
+        tree.append_child(document, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Closed)
+            .unwrap();
+        let framed = element(&tree, "iframe");
+        tree.append_child(root, framed);
+
+        assert_eq!(
+            tree.iframe_hosts_in_shadow_including_subtree(host),
+            vec![framed]
+        );
+        // Still reachable from the document root, and still exactly once.
+        assert_eq!(
+            tree.iframe_hosts_in_shadow_including_subtree(document),
+            vec![framed]
+        );
+
+        // An iframe passed as the root is itself a host, which is what the
+        // insertion steps want when the connected node is the iframe.
+        let direct = element(&tree, "iframe");
+        tree.append_child(document, direct);
+        assert_eq!(
+            tree.iframe_hosts_in_shadow_including_subtree(direct),
+            vec![direct]
         );
     }
 

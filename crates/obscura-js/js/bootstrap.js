@@ -1818,7 +1818,12 @@ function __prepareInsertedSubtree(root) {
   if (root.nodeType === 1 && root.localName === 'iframe') {
     Deno.core.ops.op_queue_iframe_navigation(root._nid);
   }
-  const iframeIds = _domParse("query_selector_all_scoped", root._nid, "iframe") || [];
+  // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
+  // so an iframe inside a shadow root -- how widget embeds are built, Turnstile
+  // among them -- was never queued when its host was connected, and the
+  // browsing context that its `src` had already asked for was dropped for
+  // having no frame yet. Nothing re-queued it, so the frame stayed empty.
+  const iframeIds = _domParse("iframe_hosts_including_shadow", root._nid, "") || [];
   for (const nid of iframeIds) Deno.core.ops.op_queue_iframe_navigation(+nid);
   const scripts = [];
   const seen = new Set();
