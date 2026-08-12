@@ -10474,15 +10474,39 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
+// The realm's time origin on the monotonic clock. Rebased when a time origin
+// is chosen for the document (see __obscura_rebasePerformanceOrigin), so
+// `performance.now()` and `Date.now() - performance.timeOrigin` agree.
+var _perfOriginMono = null;
+function _monoMs() {
+  // Absent while the startup snapshot is being built, and in any embedder that
+  // registers only deno_core's builtins.
+  var op = Deno.core.ops.op_monotonic_ms;
+  return typeof op === "function" ? op() : Date.now();
+}
+// Chrome floors a DOMHighResTimeStamp to 100 microseconds outside a
+// cross-origin isolated context. Deriving the value from `Date.now()` instead
+// yields whole milliseconds, which a page can measure directly: time two
+// consecutive `performance.now()` calls in a loop and the smallest positive
+// difference is 1 where a browser reports 0.1.
+const _PERF_CLAMP_MS = 0.1;
+globalThis.__obscura_rebasePerformanceOrigin = function(timeOrigin) {
+  var elapsed = Date.now() - timeOrigin;
+  _perfOriginMono = _monoMs() - (elapsed > 0 ? elapsed : 0);
+};
 globalThis.performance = globalThis.performance || {
   now: (function() {
-    // Monotonically non-decreasing: return the wall-clock offset, but never a
-    // value below the last one. Equal readings are allowed, and avoiding a
+    // Monotonically non-decreasing. Equal readings are allowed; avoiding a
     // synthetic per-call increment keeps tight loops from advancing the clock
     // faster than real elapsed time.
-    var _last = -Infinity;
+    var _last = 0;
     return function() {
-      var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
+      var mono = _monoMs();
+      // First reading in this realm establishes its origin.
+      if (_perfOriginMono === null) _perfOriginMono = mono;
+      var ms = mono - _perfOriginMono;
+      if (!(ms > 0)) ms = 0;
+      ms = Math.floor(ms / _PERF_CLAMP_MS) * _PERF_CLAMP_MS;
       if (ms < _last) return _last;
       _last = ms;
       return _last;
@@ -10492,7 +10516,9 @@ globalThis.performance = globalThis.performance || {
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
   getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
   setResourceTimingBufferSize(){},
-  timeOrigin: 0,
+  // A worker never runs __obscura_init, so this default has to be usable as
+  // it stands: an origin of 0 made `now()` report Unix epoch milliseconds.
+  timeOrigin: Date.now(),
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
   navigation: { type: 0, redirectCount: 0 },
   memory: {
@@ -15029,8 +15055,13 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // The time origin is when navigation started, so it is always in the past.
+  // Jittering it forward put `performance.timeOrigin` after `Date.now()`,
+  // which no browser does and which makes every elapsed-time computation on
+  // the page come out negative.
+  const t0 = Date.now() - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
+  globalThis.__obscura_rebasePerformanceOrigin?.(t0);
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {

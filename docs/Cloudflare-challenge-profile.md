@@ -5,8 +5,8 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
-已修掉五处真实缺陷（step 4、5、8、11、12）。当前断点是 worker 内对
-`brunhild.challenges.cloudflare.com` 的 `fetch` 报 Network error。
+已修掉六处真实缺陷（step 4、5、8、11、12、13）。失败模式已从「超时」
+变为「被判定需要交互」（`interactiveBegin`，见 step 13 末尾）。
 
 ## 复现
 
@@ -447,6 +447,73 @@ worker 里对 `brunhild.challenges.cloudflare.com` 的 `fetch` 失败。浏览�
 这个主机以两条 `CONNECT`（#9、#12）出现，正夹在 `/pat/` 前后。待查：是 worker 的
 fetch 没走 `--proxy` / 没带 CA，还是别的原因。
 
+### Step 13 — `performance.now()` 是整毫秒，worker 里还是 Unix 纪元
+
+step 12 打通 worker 后，回传里有一条一眼可疑的数据：
+
+```
+page->worker#4 {"v":"for(var a=1,b=1,c,d=0;5E3>d;d++){var e=performance.now(),
+                     f=performance.now();e<f&&(c=f-e,c>a&&c<b?b=c:c<a&&(b=a,a=c))}
+                     postMessage({vKfw0:a});"}
+worker#4 ->page {"vKfw0":1}
+```
+
+这段代码跑 5000 轮，取**两次连续 `performance.now()` 之间最小的正差值**——就是在测
+时钟分辨率。obscura 答 `1`。Chrome 在非 cross-origin-isolated 下把
+DOMHighResTimeStamp 向下取整到 **100 微秒**，答案是 `0.1`（带浮点误差）。
+
+直接量：
+
+```
+修复前  main   min=1                  samples=[11,11,11,11,11,11]
+        worker min=1  now=1786556774710          ← Unix 纪元毫秒
+修复后  main   min=0.09999999999999987 samples=[2.3000000000000003,2.4000000000000004,…]
+        worker min=0.09999999999999998 now=1
+```
+
+两个独立缺陷：
+
+1. `performance.now()` 由 `Date.now() - timeOrigin` 推导。`Date.now()` 是整毫秒，
+   于是每次读数都是整数。新增 `op_monotonic_ms()`（`Instant` 基准，f64 毫秒），
+   按 0.1 ms 向下取整，保持单调不减。
+2. `timeOrigin` 默认值是 `0`，而它只在 `__obscura_init` 里被赋值——**worker 从不跑
+   那段**，所以 worker 里 `now()` 直接返回 Unix 纪元毫秒。默认值改为 `Date.now()`，
+   并让每个 realm 首次读数时确立自己的单调起点。
+
+顺带修掉一处方向错误：时间原点原本按 `Date.now() + rand*100 - 50` 抖动，有一半概率
+落在**未来**。`performance.timeOrigin` 是导航开始时刻，任何浏览器都不会晚于
+`Date.now()`；落在未来会让页面上所有「已过去多久」的计算变成负数。改为只向过去抖。
+既有测试 `performance_now_does_not_outrun_elapsed_time` 正是被这一条抓出来的。
+
+回归测试：`crates/obscura-js/src/runtime.rs`
+（`performance_now_has_a_browsers_sub_millisecond_resolution`、
+`performance_time_origin_is_in_the_past_and_now_counts_from_it`）。
+
+**请求序列没有变化，仍是 5 条。** 这是一处被对方明确测量的指纹缺陷，修它是必要的，
+但它不是当前的阻塞点。
+
+### 当前断点：`interactiveBegin` 而不是 `complete`
+
+step 12 之后用 CDP 预注入重测 widget 时间线，失败模式**变了**：
+
+```
+  465 ms  init
+  466 ms  requestExtraParams
+ 1150 ms  translationInit
+ 4859 ms  interactiveBegin        ← 新出现
+ (food x31)；30 s 内没有 overrunBegin，也没有 complete
+```
+
+此前是等到超时（`overrunBegin`）；现在 Turnstile 在 4.9 s 主动判定「需要交互」。
+浏览器的成功链路是 managed 模式全自动、2.1 s 走完，从不进交互。所以现在是**被打分
+判定可疑**，而不是流程卡住——问题从「跑不下去」变成了「跑得下去但不被信任」。
+
+另外确认 `brunhild.challenges.cloudflare.com` 的 `fetch` 失败**不是**断点：浏览器
+HAR 里这个主机的两条 `CONNECT` 状态同样是 **0**（没连上），而 obscura 已经把
+`Error: Network error…` 如实回传给挑战。同源对照实测：worker 内
+`fetch("https://challenges.cloudflare.com/turnstile/v0/api.js")` → **200**，
+说明 worker 的网络栈本身通。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -472,8 +539,8 @@ fetch 没走 `--proxy` / 没带 CA，还是别的原因。
 
 按当前怀疑程度排序：
 
-- **worker 内 `fetch` 到 `brunhild.challenges.cloudflare.com` 报 Network error**
-  （step 12 结尾），是当前最前沿的断点。
+- **Turnstile 在 4.9 s 判定需要交互**（`interactiveBegin`），浏览器则全自动走完。
+  说明剩下的是打分问题，需要继续找被判为可疑的指纹面。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`

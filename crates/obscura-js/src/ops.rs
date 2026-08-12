@@ -2273,6 +2273,17 @@ fn op_run_classic_script<'a>(
     }
 }
 
+/// Milliseconds on a monotonic clock, with the sub-millisecond precision a
+/// `DOMHighResTimeStamp` is supposed to carry. `Date.now()` is whole
+/// milliseconds, so deriving `performance.now()` from it makes every reading an
+/// integer -- and a page timing two consecutive calls measures a 1 ms clock
+/// where Chrome shows 0.1 ms. Turnstile times exactly that loop.
+#[op2(fast)]
+fn op_monotonic_ms() -> f64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
@@ -5135,6 +5146,7 @@ pub fn build_extension() -> Extension {
         op_shadow_attach(),
         op_shadow_root_info(),
         op_console_msg(),
+        op_monotonic_ms(),
         op_run_classic_script(),
         op_fetch_url(),
         op_get_cookies(),

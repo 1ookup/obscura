@@ -4799,6 +4799,62 @@ mod tests {
         );
     }
 
+    /// A DOMHighResTimeStamp carries sub-millisecond precision, floored to
+    /// 100 microseconds. Deriving it from `Date.now()` makes every reading a
+    /// whole millisecond, and a page that times two consecutive calls reads a
+    /// 1 ms clock where a browser reports 0.1 -- Turnstile times exactly that
+    /// loop and sends the result home.
+    #[test]
+    fn performance_now_has_a_browsers_sub_millisecond_resolution() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let smallest_step = rt
+            .evaluate(
+                "(function () {
+                   let smallest = Infinity;
+                   for (let i = 0; i < 200000; i++) {
+                     const a = performance.now();
+                     const b = performance.now();
+                     if (b > a && b - a < smallest) smallest = b - a;
+                   }
+                   return smallest;
+                 })()",
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap();
+
+        // 0.1 with the float error a browser also shows; never a whole ms.
+        assert!(
+            (smallest_step - 0.1).abs() < 1e-6,
+            "smallest positive step between two readings was {smallest_step}, expected ~0.1"
+        );
+    }
+
+    /// `performance.timeOrigin` is when navigation started, so it is in the
+    /// past and `now()` counts from there. A worker never runs the page init
+    /// that assigns it, and a zero origin made `now()` report Unix epoch
+    /// milliseconds.
+    #[test]
+    fn performance_time_origin_is_in_the_past_and_now_counts_from_it() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let readings = rt
+            .evaluate(
+                "[performance.timeOrigin, Date.now(), performance.now()]",
+            )
+            .unwrap();
+        let values = readings.as_array().unwrap();
+        let origin = values[0].as_f64().unwrap();
+        let wall_clock = values[1].as_f64().unwrap();
+        let now = values[2].as_f64().unwrap();
+
+        assert!(
+            origin <= wall_clock && wall_clock - origin < 1000.0,
+            "time origin {origin} is not shortly before {wall_clock}"
+        );
+        // Counting from the origin, not from the epoch.
+        assert!(now >= 0.0 && now < 60_000.0, "performance.now() was {now}");
+    }
+
     #[test]
     fn performance_now_does_not_outrun_elapsed_time() {
         let mut rt = setup_runtime("<html><body></body></html>");
