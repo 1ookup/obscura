@@ -2210,6 +2210,48 @@ mod tests {
         );
     }
 
+    /// A window may address a message at itself, and HTML delivers it like any
+    /// other cross-document message. Scripts use this as a same-realm mailbox
+    /// -- post work to yourself, collect it in the one `message` listener that
+    /// also serves the frames -- and `window.postMessage` was a no-op stub, so
+    /// those posts vanished and the sender waited on a reply it had sent
+    /// itself. The frame directions above already worked; only self-delivery
+    /// was missing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_post_message_delivers_to_its_own_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let queued = rt
+            .evaluate(
+                r#"(() => {
+                globalThis.__got = [];
+                window.addEventListener('message', (e) => {
+                    globalThis.__got.push([e.data, e.origin, e.source === window,
+                        e.isTrusted, Array.isArray(e.ports), e.lastEventId,
+                        e.bubbles, e.cancelable, e.composed].join('|'));
+                });
+                postMessage('star', '*');
+                postMessage('matched', 'http://example.com');
+                postMessage('mismatched', 'http://other.example');
+                return globalThis.__got.length;
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(queued, serde_json::json!(0.0), "delivery must be a task");
+
+        rt.run_event_loop_bounded(500).await.unwrap();
+
+        // The sender's own origin and its own WindowProxy, a trusted event,
+        // and every other member at its default. The mismatched targetOrigin
+        // is dropped silently rather than delivered or thrown.
+        assert_eq!(
+            rt.evaluate("globalThis.__got").unwrap(),
+            serde_json::json!([
+                "star|http://example.com|true|true|true||false|false|false",
+                "matched|http://example.com|true|true|true||false|false|false",
+            ])
+        );
+    }
+
     #[test]
     fn nested_window_proxy_compares_child_origin_with_calling_frame() {
         let mut rt = setup_runtime(

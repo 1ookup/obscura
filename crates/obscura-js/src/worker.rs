@@ -1276,6 +1276,51 @@ mod tests {
         );
     }
 
+    /// A MessageEvent has to arrive with its whole IDL, not just `data`. A
+    /// Cloudflare challenge reads `bubbles`, `cancelable`, `composed`, `ports`
+    /// and `lastEventId` off every message it receives; while the constructor
+    /// filled in only `data` those five read back `undefined` and the
+    /// challenge discarded the message. Both directions are checked because
+    /// they build their events in different places -- the worker's inbound
+    /// event comes from `__obscura_worker_dispatch_message` here, the page's
+    /// from the receive loop in bootstrap.js -- and each has regressed alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_message_events_carry_the_whole_idl() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            function shape(e) {
+              return [e.constructor.name, JSON.stringify(e.origin),
+                      JSON.stringify(e.lastEventId), e.source === null,
+                      Array.isArray(e.ports), e.ports.length, e.bubbles,
+                      e.cancelable, e.composed, typeof e.composedPath].join('|');
+            }
+            const src = shape.toString() +
+              ";onmessage = (e) => { postMessage(shape(e)); };";
+            globalThis.__got = [];
+            const w = new Worker('data:text/javascript,' + encodeURIComponent(src));
+            w.onmessage = (e) => { globalThis.__got.push([e.data, shape(e)]); };
+            w.postMessage('x');
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        // A worker message has no sender origin, no source window and no
+        // transferred ports, so every optional member sits at its default.
+        let expected = r#"MessageEvent|""|""|true|true|0|false|false|false|function"#;
+        assert_eq!(
+            rt.evaluate("__got[0][0]").unwrap(),
+            serde_json::json!(expected),
+            "worker-side event"
+        );
+        assert_eq!(
+            rt.evaluate("__got[0][1]").unwrap(),
+            serde_json::json!(expected),
+            "page-side event"
+        );
+    }
+
     /// `blob:<origin>/<uuid>` per the File API. The URL is the worker's script
     /// URL, so its shape is what `location.href` reports and what
     /// `location.origin` is parsed back out of.

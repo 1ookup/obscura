@@ -9911,14 +9911,23 @@ globalThis.PopStateEvent = class extends Event {
   }
 };
 globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event {
+// Named class expression on purpose. An anonymous one leaves `.name` as ""
+// and `MessageEvent.toString()` as "function () { [native code] }" where a
+// real engine prints the name; worse, V8 derives a receiver's constructor
+// name from it, so every instance introspects as a plain "Object" -- the
+// property-lookup trace of a Cloudflare challenge labelled all of its
+// MessageEvent reads "Object.*" for exactly this reason.
+globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(t,o={}) {
     super(t,o);
     this.data = Object.prototype.hasOwnProperty.call(o, "data") ? o.data : null;
     this.origin = o.origin == null ? "" : String(o.origin);
     this.lastEventId = o.lastEventId == null ? "" : String(o.lastEventId);
     this.source = o.source == null ? null : o.source;
-    this.ports = Array.isArray(o.ports) ? o.ports.slice() : [];
+    // FrozenArray<MessagePort> in the IDL. Relay code that receives an event
+    // and appends its own port to `e.ports` must not observe the append
+    // sticking, which a plain array would let it do.
+    this.ports = Object.freeze(Array.isArray(o.ports) ? o.ports.slice() : []);
   }
 };
 globalThis.ProgressEvent = class ProgressEvent extends Event {
@@ -13460,7 +13469,41 @@ globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
+// Window.postMessage aimed at one's own window. HTML treats it as an ordinary
+// cross-document message that happens to have the same source and destination:
+// a queued task fires a trusted `message` event carrying the sender's own
+// origin and WindowProxy. Scripts use it as a same-realm mailbox -- post work
+// to yourself, pick it up in the shared `message` listener that also serves
+// the iframes -- and the previous no-op stub swallowed those posts, so the
+// listener never ran and the script sat waiting on a reply it had sent itself.
+// The frame-to-frame directions already work; only self-delivery was missing.
+globalThis.postMessage = function postMessage(message, targetOrigin) {
+  const to = _normalizeTargetOrigin(targetOrigin);
+  const selfOrigin = (globalThis.location && globalThis.location.origin) || "";
+  if (to !== "*" && to !== "/") {
+    // Compare serialized origins, so a targetOrigin carrying a path ("/x") or
+    // a trailing slash still matches. An opaque origin serializes to "null"
+    // and matches no parsed URL, which is the drop the spec asks for.
+    let wanted = to;
+    try { wanted = new URL(to).origin; } catch (e) {}
+    if (wanted !== selfOrigin) return;
+  }
+  // Serialize during the call, not in the task: a DataCloneError has to reach
+  // the caller, and a later mutation of `message` must not change what the
+  // listener eventually sees.
+  const data = globalThis.structuredClone(message);
+  _scheduleAfter(0, () => {
+    const evt = globalThis.__obscura_markTrusted(new MessageEvent("message", {
+      data, origin: selfOrigin, source: globalThis.window || globalThis,
+    }));
+    try { globalThis.dispatchEvent(evt); } catch (e) {}
+    // `onmessage` is not routed through dispatchEvent for the Window, so the
+    // handler slot is invoked here the same way the frame receive loop does.
+    if (typeof globalThis.onmessage === "function") {
+      try { globalThis.onmessage.call(globalThis, evt); } catch (e) {}
+    }
+  });
+}; _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
