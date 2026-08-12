@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。已修掉一处真实阻塞（step 4），流程推进但仍停在
+当前状态：**未通过**。已修掉两处真实阻塞（step 4、step 5），流程推进但仍停在
 `overrunBegin`。
 
 ## 复现
@@ -119,6 +119,66 @@ setTimeout(function () { document.body.appendChild(host); }, 800);  // ← 任�
 提交 `3e36fbe`。回归测试见 `crates/obscura-dom/src/tree.rs`
 （`browser_iframe_discovery_enters_the_roots_own_shadow_tree`）。
 
+### Step 5 — iframe 内 JS 确实执行，但相对 URL 解析到了顶层页面
+
+step 4 之后 obscura 自己的抓包显示 iframe 文档已被拉取
+（`GET .../turnstile/f/av0/rch/<widget>` → 200 text/html，268 KB），随后出现一条
+**400**：
+
+```
+POST zencare.co/cdn-cgi/challenge-platform/h/g/fo/<tokenB>   → 400
+     请求头 origin: https://challenges.cloudflare.com
+```
+
+`Origin` 头是对的——**iframe 内的脚本确实在自己的 realm 里执行**，不是没执行、
+也不是报错后 postMessage 通知父窗口。错的只是主机：浏览器把同一 `<tokenB>`
+POST 到 `challenges.cloudflare.com` 并得到 200。
+
+用跨源 iframe 逐个 API 发一次请求、看哪个服务器收到，定位到基准 URL 的分歧：
+
+| API | 修复前落点 | 修复后 |
+|-----|-----------|--------|
+| `location.href` / `document.URL` / `baseURI` | iframe 源 | — |
+| `fetch('/x')`、`<script src>` | iframe 源 | — |
+| `XMLHttpRequest.open(m, '/x')` | **页面源** | iframe 源 |
+| `<a href>` | **页面源** | iframe 源 |
+| `<form action>` | **页面源** | iframe 源 |
+| `new Image().src` | **页面源** | **仍是页面源** |
+
+成因：这几处都以 Rust 侧的 `document_url`（顶层页面 URL）为基准，而 `fetch`
+用的是 `location`，每个 frame realm 各有其一。挑战用 XHR 发 `/fo/` POST，于是
+打到了 embedder。提交 `d0043eb`。
+
+Image 仍未修：它走 `op_load_image_metadata`，在 Rust 侧由
+`document_base_url()` 按页面 URL 解析，那里拿不到 frame realm。浏览器流程中
+widget 会从 iframe 内取一张 `/ci/` 图，所以这条仍有影响。
+
+### v8 trace 取不到 postMessage 内容
+
+trace 的参数捕获靠 `frame->GetParameter(i)`，只对普通 JS 函数帧有效。
+`globalThis.postMessage` 是 native 绑定，帧上没有参数：
+
+```
+CALL  Window  globalThis.postMessage  pm.html  4:8   args=[]
+CALL  XMLHttpRequest  open  ...  string:"POST", string:"/cdn-cgi/..."   ← 对照，普通 JS 方法
+```
+
+对象负载即使被捕获也只会渲染成 `object:Object`（`TraceAppendValue` 不调用
+`toString`/accessor，无副作用是刻意的）。字符串负载同样为空——实测三种形态
+（对象 / 字符串 / JSON 字符串）在 trace 中均无内容。
+
+**要拿 postMessage 内容用 CDP 预注入**，本文件多处时间线即由此采集：
+
+```js
+// Page.addScriptToEvaluateOnNewDocument
+window.addEventListener('message', function (e) {
+  window.__pm.push({ t: Date.now() - window.__t0, origin: e.origin, data: e.data });
+});
+```
+
+这能拿到完整内容，例如
+`{"source":"cloudflare-challenge","widgetId":"...","event":"overrunBegin"}`。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -137,8 +197,10 @@ setTimeout(function () { document.body.appendChild(host); }, 800);  // ← 任�
 
 ## 未决
 
-- `overrunBegin` 仍在 ~11.6 s 出现，挑战不完成。widget 在等什么尚未定位。
-- HAR 中 iframe 内发起的 `/pat/`、`/ci/` 请求在 obscura 中仍未出现——需确认
-  iframe realm 内的挑战代码执行到哪一步。
+- `overrunBegin` 仍在 ~11.6 s 出现，挑战不完成。
+- `new Image().src` 在 frame realm 内仍解析到页面源（step 5），浏览器流程里的
+  `/ci/` 图片请求走这条路径。修它需要让 `document_base_url()` 能按节点定位所属
+  frame realm。
+- `/pat/` 请求仍未出现。
 - 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
   可被检测的差异，未修。
