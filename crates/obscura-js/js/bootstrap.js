@@ -1327,13 +1327,13 @@ function _messagePortScheduleDelivery(port) {
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
     const data = current.messageQueue.shift();
-    const event = new MessageEvent("message", {
+    const event = globalThis.__obscura_markTrusted(new MessageEvent("message", {
       data,
       origin: "",
       lastEventId: "",
       source: null,
       ports: [],
-    });
+    }));
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
   }, _schedulerPriorityRank["user-visible"] * 2);
@@ -12417,11 +12417,11 @@ class _IframeWindow {
   }
 
   postMessage(data, origin) {
-    const event = new MessageEvent('message', {
+    const event = globalThis.__obscura_markTrusted(new MessageEvent('message', {
       data: data,
       origin: this.location.origin,
       source: this,
-    });
+    }));
     Promise.resolve().then(() => {
       globalThis.dispatchEvent?.(event);
     });
@@ -13345,7 +13345,7 @@ globalThis.Worker = class Worker {
         if (entry.kind === 'error') { worker._dispatchError(entry.message || 'Worker error'); continue; }
         let data;
         try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
-        const evt = new MessageEvent('message', { data });
+        const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
         if (typeof worker.onmessage === 'function') {
           try { worker.onmessage(evt); } catch (e) { console.error('Worker onmessage error:', e); }
         }
@@ -14407,12 +14407,8 @@ if (typeof BroadcastChannel === 'undefined') {
         _scheduleAfter(0, () => {
           const recipientState = channelState.get(recipient);
           if (!recipientState || recipientState.closed) return;
-          _eventTargetDispatch(recipient, new MessageEvent('message', {
-            data,
-            origin,
-            source: null,
-            ports: [],
-          }));
+          _eventTargetDispatch(recipient, globalThis.__obscura_markTrusted(
+            new MessageEvent('message', { data, origin, source: null, ports: [] })));
         });
       }
     }

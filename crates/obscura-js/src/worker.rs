@@ -818,7 +818,13 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     if (G.__obscura_worker_closed) return;
     var data;
     try { data = JSON.parse(payload).v; } catch (e) { return; }
+    // The user agent dispatches this one, so it is trusted. Worker payloads
+    // routinely gate on the whole triple -- Turnstile ships a worker whose
+    // handler is `e.isTrusted && '' === e.origin && null === e.source && eval(...)`
+    // -- and an untrusted event makes such a worker sit silently forever:
+    // no eval, no reply, no error for anyone to see.
     var event = new MessageEvent('message', { data: data });
+    if (typeof G.__obscura_markTrusted === 'function') G.__obscura_markTrusted(event);
     try { defineProperty(event, 'target', { value: G, configurable: true }); } catch (e) {}
     try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
     fire(event, 'message');
@@ -1274,6 +1280,38 @@ mod tests {
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
             serde_json::json!(r#"["handler:x","listener:x"]"#),
         );
+    }
+
+    /// A worker payload that gates on the event being user-agent dispatched
+    /// gets nothing at all when the flag is wrong: no eval, no reply, no
+    /// error. Turnstile ships exactly such a worker --
+    /// `e.isTrusted && '' === e.origin && null === e.source && eval(e.data)`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workers_incoming_message_is_trusted_like_the_user_agent_dispatched_it() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage = function (e) { postMessage({"
+              + " isTrusted: e.isTrusted, origin: e.origin,"
+              + " sourceIsNull: e.source === null,"
+              + " gate: !!(e.isTrusted && '' === e.origin && null === e.source)"
+              + "}); };";
+            const w = new Worker('data:text/javascript,' + encodeURIComponent(src));
+            globalThis.__gate = null;
+            w.onmessage = (e) => { globalThis.__gate = e.data; };
+            w.postMessage('probe');
+            "#,
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "JSON.stringify(globalThis.__gate)",
+            &serde_json::json!(
+                r#"{"isTrusted":true,"origin":"","sourceIsNull":true,"gate":true}"#
+            ),
+        )
+        .await;
     }
 
     /// A MessageEvent has to arrive with its whole IDL, not just `data`. A

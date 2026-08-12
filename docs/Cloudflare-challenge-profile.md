@@ -4,9 +4,9 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。已修掉四处真实缺陷（step 4、5、8、11），流程推进到
-「iframe 内取回 822 KB JSVMP 载荷」后停住——浏览器在此之后还有 6 个请求，obscura
-一个都没发。当前最可疑的未修项是 **timer 早期迟发**（step 9）。
+当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
+已修掉五处真实缺陷（step 4、5、8、11、12）。当前断点是 worker 内对
+`brunhild.challenges.cloudflare.com` 的 `fetch` 报 Network error。
 
 ## 复现
 
@@ -369,6 +369,84 @@ Origin）同样改用它——Chrome 发的 `/ci/` 请求 Referer 是 widget 文
 默认 feature 下编译不过。`cargo build --features render,stealth` 是绿的，
 **必须另跑一次 `cargo check` 的默认 feature 组合**才会暴露。
 
+### Step 12 — 找到真正的阻塞点：Worker 收到的消息不是 trusted
+
+方向来自一条早先采样时瞥见、当时没追的线索：进程里有 `obscura-worker-2` /
+`obscura-worker-4` 线程。空白页对照组是 **0 个** —— 这些 worker 是挑战页建的。
+
+给 worker 生命周期四处打探针（spawn / page→worker / worker→page / error），
+一眼看出问题：
+
+```
+worker SPAWN  blob:https://zencare.co/…  srcLen=13   src="you"==="bot"
+worker SPAWN  blob:https://zencare.co/…  srcLen=291  src=var _p=null;if(self.trustedTypes)…
+page->worker#4 {"v":"var n=self.navigator;postMessage({KzOg4:n.platform,…})"}
+（worker→page：0 条。error：0 条。）
+```
+
+挑战把**指纹采集代码作为字符串发进 worker 让它 eval**，worker 一条都没回，
+也没有任何报错。取出那 291 字节的 worker 源码，最后一行就是答案：
+
+```js
+onmessage = function(e){
+  e.isTrusted && '' === e.origin && null === e.source && eval(_p ? _p.createScript(e.data) : e.data)
+}
+```
+
+直接量一下 obscura 投给 worker 的 `MessageEvent`：
+
+```
+{"isTrusted":false, "origin":"", "source":"null", "gate":false}
+                ↑ Chrome 是 true
+```
+
+`origin` 和 `source` 都对，**`isTrusted` 是 false**，短路发生在第一项。于是
+`eval` 从不执行 —— 没有回复、没有异常、没有任何可观测的痕迹，父窗口就一直等，
+550 ms 心跳跑满直到 `overrunBegin`。
+
+成因：worker 模板里 `new MessageEvent('message', {data})` 是**构造**出来的，
+构造出来的事件 `isTrusted` 必为 false（这是对的，见 issue #303）。缺的是把
+用户代理自己派发的那一份标记为 trusted —— 主 realm 的跨文档投递早就在用
+`__obscura_markTrusted`，worker 这条路径漏了。
+
+一并补上其余四处同样由用户代理派发却没标记的：`MessagePort` 投递、
+worker→page、`BroadcastChannel`、WindowProxy 的 postMessage 回退路径。
+
+效果（同一页面）：
+
+| | 修复前 | 修复后 |
+|---|--------|--------|
+| worker 的 gate | `false` | `true` |
+| worker→page 消息 | **0 条** | 6 条 |
+| 请求序列 | 4 条 | **5 条** |
+
+新出现的第 5 条正是浏览器 HAR 的 #13：`POST challenges.cloudflare.com/…/fo/<tokenB>`
+→ 200（127 KB）。**这是本次排查第一次让流程真正往前走。**
+
+worker 回传的内容也确认了指纹链路是通的：
+
+```
+worker#4 ->page {"KzOg4":"Win32","TzEx3":["en-US","en"],"Bwko4":8,"ycmYm0":8,
+                 "EhUAu5":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)…"}
+worker#5 ->page {"aacHi5":"Wgniq7"}      ← eval("debugger") 的探测，正常返回
+worker#4 ->page {"vKfw0":1}              ← performance.now() 分辨率探测
+```
+
+回归测试：`crates/obscura-js/src/worker.rs`
+（`a_workers_incoming_message_is_trusted_like_the_user_agent_dispatched_it`），
+直接断言那三项闸门。
+
+**下一个断点已经暴露出来**，就在同一批 worker 消息里：
+
+```
+page->worker#4 {"v":"try{fetch(\"https://brunhild.challenges.cloudflare.com/…\")…"}
+worker#4 ->page {"pmsnv8":1,"glWf6":"Error: Network error: https://brunhild…"}
+```
+
+worker 里对 `brunhild.challenges.cloudflare.com` 的 `fetch` 失败。浏览器 HAR 里
+这个主机以两条 `CONNECT`（#9、#12）出现，正夹在 `/pat/` 前后。待查：是 worker 的
+fetch 没走 `--proxy` / 没带 CA，还是别的原因。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -394,6 +472,8 @@ Origin）同样改用它——Chrome 发的 `/ci/` 请求 Referer 是 widget 文
 
 按当前怀疑程度排序：
 
+- **worker 内 `fetch` 到 `brunhild.challenges.cloudflare.com` 报 Network error**
+  （step 12 结尾），是当前最前沿的断点。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
