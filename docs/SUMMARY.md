@@ -26,9 +26,11 @@
 
 * [CLI reference](CLI-reference.md)
 * [Environment variables](Environment-variables.md)
+* [Anti-detection: real engine vs. JS environment patching](Anti-detection-vs-js-environment-patching.md)
 
 ## Contributing
 
 * [Architecture overview](Architecture-overview.md)
+* [Iframe support: design document](Iframe-support-design.md)
 * [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 * [Testing and debugging](Testing-and-debugging.md)
