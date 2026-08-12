@@ -32,5 +32,6 @@
 
 * [Architecture overview](Architecture-overview.md)
 * [Iframe support: design document](Iframe-support-design.md)
+* [Cloudflare challenge: diagnostic profile](Cloudflare-challenge-profile.md)
 * [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 * [Testing and debugging](Testing-and-debugging.md)
