@@ -13179,7 +13179,12 @@ globalThis.Worker = class Worker {
   _spawn(source, finalUrl, workerType = 'classic') {
     if (this._terminated) return;
     let id;
-    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType), String(this._name || '')); }
+    // The creator's URL, read from this realm's own `location`. A worker
+    // inherits the origin of the document that constructed it, so a worker
+    // built inside a cross-origin frame must not be handed the top-level
+    // page's origin -- frame realms each have their own `location`.
+    const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
+    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType), String(this._name || ''), creatorUrl); }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
     this._id = id;
     const queued = this._pending;

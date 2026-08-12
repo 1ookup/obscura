@@ -2085,6 +2085,53 @@ mod tests {
         );
     }
 
+    /// A worker's origin comes from the document that constructed it. When
+    /// that document is a cross-origin frame, reading the origin off the
+    /// top-level page hands the worker the wrong one -- and `self.origin` is
+    /// what a worker-hosted payload reads to decide who it is running for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_worker_inherits_the_frame_origin_not_the_page_origin() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://frame.example/embedded/page.html";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"globalThis.workerScope = null;
+               const source = "postMessage({origin: origin, secure: isSecureContext})";
+               const worker = new Worker('data:text/javascript,' + encodeURIComponent(source));
+               worker.onmessage = function (event) { workerScope = event.data; };"#,
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            let done = rt
+                .execute_script_in_frame_realm("frame-test", 1, "<probe>", "workerScope !== null")
+                .unwrap();
+            if done == serde_json::json!(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The page is http://example.com; the frame is https://frame.example.
+        // Taking the origin from the page would also report the frame as an
+        // insecure context, which it is not.
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[workerScope.origin, workerScope.secure]",
+            )
+            .unwrap(),
+            serde_json::json!(["https://frame.example", true]),
+        );
+    }
+
     // ---- Cross-document postMessage (Phase 4) ----
 
     #[tokio::test(flavor = "current_thread")]

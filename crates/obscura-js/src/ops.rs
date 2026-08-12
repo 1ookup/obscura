@@ -4649,6 +4649,7 @@ fn op_worker_spawn(
     #[string] url: String,
     #[string] kind: String,
     #[string] name: String,
+    #[string] creator_url: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let environment = {
@@ -4656,7 +4657,15 @@ fn op_worker_spawn(
         // The worker's origin is the creator's, not its script's: a `blob:` or
         // `data:` worker script has no origin of its own, and deriving one
         // from the URL reports "null" for the page it was spawned by.
-        let creator = url::Url::parse(&gs.url).ok();
+        //
+        // `creator_url` is the constructing realm's own `location.href`.
+        // `SharedState` is per-page and its `url` is the top-level document's,
+        // so a worker built inside a cross-origin frame would otherwise
+        // inherit the page's origin -- and, for an https frame under an http
+        // page, be told it is not a secure context.
+        let creator = url::Url::parse(&creator_url)
+            .ok()
+            .or_else(|| url::Url::parse(&gs.url).ok());
         let origin = creator
             .as_ref()
             .filter(|parsed| parsed.scheme() != "data" && parsed.scheme() != "blob")
