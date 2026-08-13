@@ -347,6 +347,37 @@ pub async fn handle(
                     );
                     evaluate_input_script(page, &target, &code);
                 }
+            } else if event_type == "mouseMoved" {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let target = input_dispatch_target(page, x, y);
+                    let target_js = input_target_js(
+                        &target,
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement"),
+                    );
+                    // A real pointer move precedes every click: pointerover/
+                    // enter/move and their legacy mouse counterparts. Widgets
+                    // that gate a click on seeing the pointer move first (the
+                    // Turnstile interactive checkbox listens for pointermove,
+                    // pointerover and mouseenter) never receive them otherwise.
+                    let code = format!(
+                        "(function() {{\
+                            var target = {target_js};\
+                            if (!target) return;\
+                            var over = {{bubbles:true,cancelable:false,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+                            var enter = {{bubbles:false,cancelable:false,composed:false,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerover', over)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerenter', enter)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', over)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', over)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', enter)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', over)));\
+                        }})()",
+                        x = target.x,
+                        y = target.y,
+                        target_js = target_js,
+                    );
+                    evaluate_input_script(page, &target, &code);
+                }
             }
 
             Ok(json!({}))

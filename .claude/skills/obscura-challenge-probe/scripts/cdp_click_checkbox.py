@@ -132,6 +132,8 @@ async def run(endpoint, url, offset, timeout, settle):
 
         if click_x is not None:
             await call(ws, "Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": click_x, "y": click_y}, session=session, msg_id=39)
+            await call(ws, "Input.dispatchMouseEvent", {
                 "type": "mousePressed", "x": click_x, "y": click_y,
                 "button": "left", "buttons": 1, "clickCount": 1}, session=session, msg_id=40)
             await call(ws, "Input.dispatchMouseEvent", {

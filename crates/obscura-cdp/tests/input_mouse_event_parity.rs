@@ -439,6 +439,50 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn mouse_moved_dispatches_pointer_and_mouse_move_events() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.mLog = [];
+            for (const type of ['pointerover','pointerenter','pointermove','mouseover','mouseenter','mousemove']) {
+                target.addEventListener(type, e => mLog.push({ type, composed: e.composed, x: e.clientX, trusted: e.isTrusted }));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseMoved", "x": 31.0, "y": 42.0}),
+        &sid,
+    )
+    .await;
+
+    let out = evaluate(&mut ctx, 4, "JSON.stringify(mLog)", &sid).await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    let types: Vec<&str> = out
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["pointerover", "pointerenter", "pointermove", "mouseover", "mouseenter", "mousemove"]
+    );
+    assert_eq!(out[2]["x"], 31.0);
+    assert_eq!(out[2]["trusted"], true);
+    assert_eq!(out[2]["composed"], true, "pointermove must compose across shadow boundaries");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn radio_release_selects_only_the_target_in_its_group() {
     let (mut ctx, sid) = setup().await;
     evaluate(
