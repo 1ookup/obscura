@@ -514,6 +514,31 @@ HAR 里这个主机的两条 `CONNECT` 状态同样是 **0**（没连上），�
 `fetch("https://challenges.cloudflare.com/turnstile/v0/api.js")` → **200**，
 说明 worker 的网络栈本身通。
 
+### Step 14 — 胶片式截图：确认屏幕上真的出现了「需要点击」
+
+`interactiveBegin` 只是一个事件名。要确认它对应的是不是真的交互控件，直接每 3 秒
+截一帧（新增 `scripts/cdp_filmstrip.py`，同时打印 iframe 的位置和尺寸）：
+
+| 时刻 | 画面 | 帧哈希 |
+|------|------|--------|
+| 3 s | 转圈动画 + `Verifying...` | — |
+| 6 s | **`Verify you are human`** | 变化 |
+| 9 s → 36 s | 完全不变 | 逐帧相同 |
+
+widget iframe 稳定在 `300x65 @ (192,304)` —— Turnstile 的**交互式**尺寸。
+
+结论：不是流程卡死，是被**降级成了需要人工点击**。真实浏览器的成功链路是 managed
+模式 2.1 秒全自动走完，从不进这一步。所以剩下的工作是**打分**，不是补功能。
+
+一个附带观察：交互框里左侧的复选框方框**没有被画出来**，只有文字。尚未确认这是
+obscura 的渲染缺口，还是 widget 在未就绪时本就不画。
+
+### 测量纪律：连续压测会让目标改变行为
+
+同一天里连续跑了十几轮之后，请求序列从 5 条掉到 3 条（iframe 都不再创建）。
+这不是代码回退——中间没有任何相关改动。**跨轮次比较请求条数前，必须确认目标
+没有因为压测而改变策略**；理想做法是换 Ray ID / 换出口 / 拉开间隔再复测。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -539,8 +564,9 @@ HAR 里这个主机的两条 `CONNECT` 状态同样是 **0**（没连上），�
 
 按当前怀疑程度排序：
 
-- **Turnstile 在 4.9 s 判定需要交互**（`interactiveBegin`），浏览器则全自动走完。
-  说明剩下的是打分问题，需要继续找被判为可疑的指纹面。
+- **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
+  `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
+  剩下的是打分问题，需要继续找被判为可疑的指纹面。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`

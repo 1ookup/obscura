@@ -84,6 +84,9 @@ scripts/cdp_probe.py messages <URL> --wait 35
 # 穿透 closed shadow root 列出 iframe（普通查询看不到）
 scripts/cdp_probe.py shadow <URL> --wait 25
 
+# 每 N 秒截一帧 + iframe 位置尺寸，判断是「还在算」还是「等你点」
+scripts/cdp_filmstrip.py <URL> --every 3 --for 33
+
 # 任意表达式
 scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("iframe").length'
 ```
