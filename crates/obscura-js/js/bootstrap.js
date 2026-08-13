@@ -9938,7 +9938,9 @@ globalThis.KeyboardEvent = class KeyboardEvent extends Event {
 globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class ErrorEvent extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class PointerEvent extends Event { constructor(t,o={}) { super(t,o); } };
+globalThis.PointerEvent = class PointerEvent extends MouseEvent {
+  constructor(t,o={}) { super(t,o); this.pointerId=o.pointerId||0; this.width=o.width||1; this.height=o.height||1; this.pressure=o.pressure||0; this.pointerType=o.pointerType||'mouse'; this.isPrimary=!!o.isPrimary; this.tiltX=o.tiltX||0; this.tiltY=o.tiltY||0; this.tangentialPressure=o.tangentialPressure||0; this.twist=o.twist||0; }
+};
 globalThis.AnimationEvent = class AnimationEvent extends Event {};
 globalThis.TransitionEvent = class TransitionEvent extends Event {};
 globalThis.UIEvent = class UIEvent extends Event {

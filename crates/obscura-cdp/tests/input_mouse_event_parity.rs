@@ -396,6 +396,49 @@ async fn press_release_orders_events_and_defers_click_activation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.pLog = [];
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                target.addEventListener(type, event => pLog.push({
+                    type, pointerType: event.pointerType, pointerId: event.pointerId,
+                    composed: event.composed, x: event.clientX, trusted: event.isTrusted
+                }));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(&mut ctx, 3, "JSON.stringify(pLog)", &sid).await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    let types: Vec<&str> = out
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]
+    );
+    assert_eq!(out[0]["pointerType"], "mouse");
+    assert_eq!(out[0]["pointerId"], 1);
+    assert_eq!(out[0]["composed"], true, "pointer events must compose across shadow boundaries");
+    assert_eq!(out[0]["x"], 31.0);
+    assert_eq!(out[0]["trusted"], true);
+    assert_eq!(out[4]["composed"], true, "click must compose across shadow boundaries");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn radio_release_selects_only_the_target_in_its_group() {
     let (mut ctx, sid) = setup().await;
     evaluate(
