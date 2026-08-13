@@ -243,7 +243,7 @@ fn input_hit_in_document(
 
     let mut fallback = None;
     let mut hit = None;
-    for node in dom.descendants(root) {
+    for node in dom.descendants_including_shadow(root) {
         let Some(is_root_element) = dom.get_node(node).and_then(|node| {
             node.as_element()
                 .map(|element| matches!(element.local.as_ref(), "html" | "body"))
@@ -3826,6 +3826,58 @@ mod tests {
         let frame = surfaces.get(&frame_host).expect("closed-shadow frame surface");
         let pixel = frame.pixel(50, 25).expect("frame center");
         assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn input_hit_test_reaches_elements_inside_closed_shadow_roots() {
+        // The Turnstile checkbox lives inside a closed shadow root hosted by the
+        // widget body. Paint reaches it (it is visible), but the input hit-test
+        // used to walk only the light DOM, so `Input.dispatchMouseEvent` landed
+        // on the shadow host instead of the checkbox. This pins the fix: a point
+        // over a closed-shadow child must resolve to that child, not the host.
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0"><div id="host" style="position:absolute;left:0;top:0;width:100px;height:100px"></div></body></html>"#,
+        );
+        let host = dom.query_selector("#host").unwrap().unwrap();
+        let root = dom
+            .attach_shadow_root(host, obscura_dom::ShadowRootMode::Closed)
+            .unwrap();
+        obscura_dom::parse_into_subtree(
+            &dom,
+            root,
+            r#"<div id="shadow-btn" style="position:absolute;left:10px;top:10px;width:20px;height:20px"></div>"#,
+        );
+        let shadow_btn = dom
+            .query_selector_from(root, "#shadow-btn")
+            .unwrap()
+            .unwrap();
+
+        // Author selectors stay tree-scoped: a document-level query never sees
+        // the shadow child, so it can only be reached by the browser-internal
+        // shadow-piercing traversal.
+        assert!(dom.query_selector("#shadow-btn").unwrap().is_none());
+
+        let mut resources = obscura_render::RenderResourceCache::default();
+        let prepared =
+            obscura_render::prepare_dom(&dom, (200.0, 100.0), None, &mut resources)
+                .expect("parent layout");
+        let scroll = prepared.resolve_scroll_state(&dom, (0.0, 0.0), &HashMap::new());
+
+        // (15,15) sits inside the shadow button's 10..30 x 10..30 box.
+        let hit = input_hit_in_document(
+            &dom,
+            dom.document(),
+            &prepared,
+            &scroll,
+            (15.0, 15.0),
+            &mut resources,
+            &HashMap::new(),
+            0,
+        );
+
+        let (_doc_root, hit_node, _local) = hit.expect("point hits the shadow child");
+        assert_eq!(hit_node, shadow_btn, "hit-test must pierce the closed shadow root");
     }
 
     #[test]

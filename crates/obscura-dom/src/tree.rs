@@ -1479,6 +1479,96 @@ impl DomTree {
         Some(self.descendants(root))
     }
 
+    /// Like [`Self::descendants`], but also enters every native open or closed
+    /// shadow tree (while still not crossing into iframe content documents).
+    ///
+    /// Input hit-testing needs this: the checkbox of a closed shadow root is
+    /// unreachable through [`Self::descendants`], which only follows light-DOM
+    /// `first_child`/`next_sibling`. Paint already pierces shadow, so an element
+    /// can be visible yet unclickable when the hit-test walks the light tree
+    /// only. The ShadowRoot nodes themselves appear in the result; callers that
+    /// only care about elements skip them the same way they skip text nodes.
+    pub fn descendants_including_shadow(&self, root: NodeId) -> Vec<NodeId> {
+        let inner = self.inner.borrow();
+        let mut result = Vec::new();
+        let mut stack = Vec::new();
+
+        let mut first = inner
+            .nodes
+            .get(root.index())
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.first_child);
+        let mut children_to_push = Vec::new();
+        while let Some(child_id) = first {
+            children_to_push.push(child_id);
+            if children_to_push.len() > inner.nodes.len() {
+                eprintln!(
+                    "obscura: sibling-chain cap hit at node {} - cycle",
+                    root.index()
+                );
+                break;
+            }
+            first = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|n| n.as_ref())
+                .and_then(|n| n.next_sibling);
+        }
+        for child_id in children_to_push.into_iter().rev() {
+            stack.push(child_id);
+        }
+        // A shadow root hangs off its host rather than appearing in the host's
+        // child list, so seed it explicitly — the same reason
+        // iframe_hosts_in_shadow_including_subtree seeds with `root` itself.
+        if let Some(shadow_root) = inner.shadow_roots_by_host.get(&root) {
+            stack.push(*shadow_root);
+        }
+
+        while let Some(current) = stack.pop() {
+            result.push(current);
+            // Same defense-in-depth cap as descendants(): a well-formed subtree
+            // has at most nodes.len() descendants, so exceeding that means the
+            // parent/child graph is cyclic.
+            if result.len() > inner.nodes.len() {
+                eprintln!(
+                    "obscura: descendants_including_shadow() cap hit at node {} - tree has a cycle",
+                    root.index()
+                );
+                break;
+            }
+
+            let mut child = inner
+                .nodes
+                .get(current.index())
+                .and_then(|n| n.as_ref())
+                .and_then(|n| n.first_child);
+            let mut children_to_push = Vec::new();
+            while let Some(child_id) = child {
+                children_to_push.push(child_id);
+                if children_to_push.len() > inner.nodes.len() {
+                    eprintln!(
+                        "obscura: sibling-chain cap hit at node {} - cycle",
+                        current.index()
+                    );
+                    break;
+                }
+                child = inner
+                    .nodes
+                    .get(child_id.index())
+                    .and_then(|n| n.as_ref())
+                    .and_then(|n| n.next_sibling);
+            }
+            for child_id in children_to_push.into_iter().rev() {
+                stack.push(child_id);
+            }
+            if let Some(shadow_root) = inner.shadow_roots_by_host.get(&current) {
+                stack.push(*shadow_root);
+            }
+        }
+
+        result
+    }
+
     /// Find iframe hosts below one document root, entering every native open
     /// or closed shadow tree while deliberately not entering iframe content
     /// documents. Document selectors remain tree-scoped; this traversal is
@@ -2458,6 +2548,14 @@ mod tests {
         let document_nodes = tree.descendants(document);
         assert!(!document_nodes.contains(&root));
         assert!(!document_nodes.contains(&shadow));
+
+        // The shadow-piercing traversal is the input hit-test's walk: it must
+        // reach the button inside the closed shadow root that `descendants`
+        // (light DOM only) skips.
+        let all_nodes = tree.descendants_including_shadow(document);
+        assert!(all_nodes.contains(&light));
+        assert!(all_nodes.contains(&root));
+        assert!(all_nodes.contains(&shadow));
         assert_eq!(tree.tree_scope_root(light), Some(document));
         assert_eq!(tree.tree_scope_root(root), Some(root));
         assert_eq!(tree.tree_scope_root(shadow), Some(root));
