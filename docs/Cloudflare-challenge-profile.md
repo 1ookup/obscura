@@ -4,36 +4,24 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**，但断点已连续前移。step 37 让 Turnstile 首次为 obscura 的点击发出
-`interactiveEnd`（点击被认定为真人交互），step 38 又修掉了 UA 分裂（JS 侧与请求头
-描述不同浏览器）。`interactiveEnd` 现已稳定复现，但仍卡在其自有错误码 `600010`，
-`complete` 始终为 0。step 30 找到并验证了真因：**obscura 没有实现
-`<label>` 的激活行为**，点击落在 label 里的 span 上，永远转发不到 Turnstile 把 click
-handler 绑住的那个 `<input type=checkbox>`。加上门控验证后，复选框第一次被接受、widget
-进入 `Verifying you are human`，随后因证明未通过而重置。现在的阻塞点是 **JSVMP 证明**，
-不再是输入链路。正式的 label activation 实现仍待做（见 step 30 待办）。
+当前状态：**未通过**。输入链路已全部打通：点击被 Turnstile 接受（`interactiveEnd` 稳定复现，
+commit `18e6f92` 修事件字段、`7521680` 补 label 激活、`86bb258` 修 UA 分裂），但证明提交后
+被当场判失败——`complete` 始终为 0，widget 以自有错误码 **`600010`** 重置，并下发**失败路径
+的无效票** `cf_clearance` + `cf_chl_rc_ni=1`（step 31）。当前阻塞点：①**`/pat/` 从不发出**
+（step 39，链路上更靠前，优先）；②**`600010`**（step 37）。
 
-step 31：obscura 拿到的 `cf_clearance` 是**失败路径的无效票**（伴随 `cf_chl_rc_ni=1`，
-长度与成功时一模一样），复访照样 403 —— **判成败一律看 `cf_chl_rc_ni`**。
-step 32：指纹面首个确凿差异 = **inline script 的栈帧行号**（obscura 用脚本内相对行号，
-Chrome 用文档绝对行号），正落在 Cloudflare 采集的 `Error.stack` 上；其余 19 种栈形态与
-Chrome 逐字一致。step 33：**推翻 step 22 的 IP 结论** —— 同一出口 IP 下 Chrome 免质询而
-obscura 被拦，差异只能来自客户端指纹。
+判据链：`interactiveBegin` → 点击 → `interactiveEnd` → `complete`+token → 站点真实 404。
+判成败一律看 `cf_chl_rc_ni` 是否出现。
 
-step 28 已用真实浏览器（走同一代理、同一脏 IP）**决定性证实**：这条路上过盾的唯一触发
-条件就是点击复选框——不点则同一 ray 静止 120 秒、自动刷新重来也没用；点了则 2 秒内提交
-证明并放行（`/1.txt` 返回站点真实 404）。所以「obscura 没继续推进是因为没点 checkbox」
-这个假设**成立**。
+关键结论演进（被推翻的假设就地标记，详见各 step）：
 
-但 step 29 用同一探针打 obscura 发现：光让它去点还不够。obscura 能正确渲染复选框、点击
-坐标也命中（step 24 插桩证实命中 frame 内的复选框 span），可点击后三张截图**字节数完全
-相同、像素零变化**。命中测试（22–23）、composed（24）、mouseMoved（25）、事件/控件一致性
-（26–27）都已修且有单测，仍驱动不了 handler。
-
-首要怀疑已收敛：**预注入/观测一直只在主文档 realm，而 handler 活在 widget iframe 自己的
-realm 里**——这也解释了 step 24/25 「抓不到任何 click 绑定」。下一步在 frame realm 内插桩
-`addEventListener` / `_eventTargetDispatch`，直接看点击有没有走到 handler。
-判据：点击后 ~2 秒内出现新的 `POST challenges.cloudflare.com/.../fo/<tokenB>`。
+| step | 当时结论 | 后来 |
+|------|----------|------|
+| 22 | 分流由 IP 干净程度决定 | 被 step 33 推翻（同 IP 下 Chrome 免质询而 obscura 被拦） |
+| 29 | 怀疑预注入/观测停在主文档 realm | 被 step 30 证伪（真因是缺 `<label>` 激活行为） |
+| 34 | 「心跳停止 = 失败信号」 | 被 step 36 作废（成功路径同样停止） |
+| 36 | 断点是交互确认失败 | step 37 修事件字段后 `interactiveEnd` 首次出现 |
+| 37 | 断点 = 错误码 `600010` | 现唯一实质阻塞（排在 `/pat/` 之后） |
 
 时序约束：**检测到复选框就要立刻点**。该页 129 秒会自动换 ray（用户经验 30s+ 即可能刷新），
 刷新会作废当前 widget 的 token，迟到的点击落在死 realm 上，表现和「点了没反应」一模一样。
@@ -862,6 +850,10 @@ innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发
 
 **结论**（经用户更正：managed vs interactive 的分流主要由 **IP 干净程度**决定）：
 
+> **本步的 IP 归因已被 step 33 推翻**：同一出口 IP 下 Chrome 免质询而 obscura 被拦，
+> 分流不由 IP 决定，差异只能来自客户端指纹。本步保留的价值：「需要点击」的结论经
+> step 28 量化证实成立；命中测试不穿透 shadow 的缺口经 step 23 修复。
+
 - HAR / js-reverse 里浏览器能一次性自动过，是因为当时出口 IP 干净 → 分流到托管
   （managed）分支，无需点击。obscura 走 Reqable 代理，出口 IP 不干净 → 被分流到
   **交互（interactive）分支、需要点击**。这是 Cloudflare 的正常行为，不是 obscura 的
@@ -1088,6 +1080,9 @@ managed 分支。本 step 起，代理场景的正确基线是「managed 走完 
 
 ### Step 29 — 同一探针对 obscura：点击命中却零反应（最新二进制复测）
 
+> **本步的归因已被 step 30 证伪**：「点击无效」的观察是对的（三张截图字节恒等），但
+> 「怀疑 realm 注入/观测错位」不成立——派发链路本身完全正常，真因是缺 `<label>` 激活行为。
+
 **假设**：step 26/27 的一致性修复之后，同样的 CDP 点击应当能在 obscura 上复现 step 28
 的放行链路。
 
@@ -1192,9 +1187,11 @@ click 绑定」，当时归因为 handler 用了 `onclick` 或缓存引用。但
 断点因此前移了一格：不再是「点击驱动不了 handler」，而是**「点击已被接受、Turnstile 进入
 verifying、但证明未通过而重置」**。这正是 step 22 预留的那条路——回到 JSVMP 指纹面。
 
-**待办**：当前只是门控 hack。正式实现要：①按规范在 click 派发后执行 label activation
-（含 `for=` 与包含式两种关联、interactive content 例外、已经是 labeled control 时不重复）；
-②`labels`/`htmlFor`/`control` 一并补真；③覆盖 `HTMLElement.click()` 路径；④加回归测试。
+**待办**：正式实现已落地（commit `7521680`：`for=` 按 tree scope 解析、否则首个 labelable
+后代，含 interactive content 例外、labeled control 自身不重复、disabled/hidden 跳过，
+回归测试见 `crates/obscura-cdp/tests/input_label_activation.rs`）。仍缺：`labels`/`control`
+IDL 补真（`htmlFor` 已有实现），以及 `HTMLElement.click()` 路径的 label 转发（程序化点击
+仍到不了 input）。
 
 ### Step 31 — 确认：拿到了 `cf_clearance`，但它是失败路径的无效票（`cf_chl_rc_ni=1`）
 
@@ -1341,6 +1338,10 @@ worker session 一律跳过：`Page.enable` 在 worker 上永不返回，十几�
 一致。真正的行为差异只有一处：**点击提交后 obscura 的 widget 心跳停了，Chrome 的还在跳**。
 结合 step 31 的 `cf_chl_rc_ni=1`，这说明 obscura 提交的证明被**当场判失败**、widget 随即收摊；
 Chrome 则继续保持会话。心跳停止因此是一个**比截图更快的失败信号**（点击后 ~2s 即可判定）。
+
+> **本判据已被 step 36 作废**：成功路径里 `food` 心跳同样在 `complete` 前后停止
+> （最后一次 7571ms），「心跳停止 = 失败信号」不成立。正确判据是
+> `interactiveEnd → complete`+token 链。
 
 **取 Chrome `cs` 的可复现配方**（第一次尝试失败，第二次成功）：每次都要**全新
 `--user-data-dir`**（旧 profile 捕获两次质询后即被放行）；OOPIF 注入必须**等
@@ -1657,24 +1658,22 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
 
 按当前怀疑程度排序：
 
-- **正式实现 `<label>` 激活行为**（step 30，现首要）：当前只有
-  `OBSCURA_LABEL_ACTIVATION` 门控的验证 hack。要按规范补 `for=`/包含式两种关联、
-  interactive content 例外、labeled control 自身不重复激活，并补 `labels`/`control`、
-  覆盖 `HTMLElement.click()` 路径与回归测试。
-- **`/pat/` 从不发出**（step 39，链路上更靠前，优先于 600010）：Chrome 在大载荷后
-  366ms 必发 `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`，`/ci/` 也只在托管分支
-  出现且延迟 2.24s。`hasPrivateToken` 探测假设已被 trace 证伪（但该 trace 仅 6MB，
-  证据不足）。下一步读 HaHaVM 的 `forwardLoader.js`。
+- **`/pat/` 从不发出**（step 39，现首要）：Chrome 在大载荷后 366ms 必发 `GET /pat/`(401)
+  再 `GET /ci/`；obscura 无 `/pat/`，`/ci/` 也只在托管分支出现且延迟 2.24s。
+  `hasPrivateToken` 探测假设已被 trace 证伪（但该 trace 仅 6MB，证据不足）。下一步读
+  HaHaVM 的 `forwardLoader.js`。
 - **缺 PAT 一族 Document API**（step 39）：`hasPrivateToken`/`hasRedemptionRecord`/
-  `hasStorageAccess` 均未实现，HaHaVM 照 Chrome 接口补齐了这一组。
-- **`fail code=600010`**（step 37）：事件字段对齐后，Turnstile 已经会为
-  obscura 的点击发出 `interactiveEnd`（交互被认定为真人），随即以自有错误码 `600010`
-  失败，并返回 `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表
-  里对应的分支。判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
+  `hasStorageAccess` 均未实现（grep 确认 0 处），HaHaVM 照 Chrome 接口补齐了这一组。
+- **`fail code=600010`**（step 37）：`interactiveEnd` 稳定后仍以此码失败，并返回
+  `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表对应的分支。
+  判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
 - **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
   行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
   `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始
   行/列偏移。（注意：本次 `cs` 的 10 帧全是外部脚本，尚未证明它就是判失败的直接原因。）
+- **label activation 剩余项**（step 30，正式实现已落地 `7521680`）：`labels`/`control`
+  IDL 补真（`htmlFor` 已有），`HTMLElement.click()` 路径的 label 转发（程序化点击仍到不了
+  input）。
 - **导航早期 `Runtime.evaluate` 清空文档**（step 30 发现）：可复现、与质询无关的真实
   缺陷，但会持续毒化任何早期轮询的探针，值得单独修 + 回归测试。
 - **obscura 不尊重 `no_proxy`/`NO_PROXY`**（step 32 顺带发现）：设了 `no_proxy='*'` 仍会把
@@ -1691,8 +1690,6 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
   缺失——后者是一行即可命中的检测点。
 - 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:894:9)`（step 8）。浏览器里
   setTimeout 回调的栈到回调那一帧就结束，下面没有引擎帧。
-- `overrunBegin` 仍出现，挑战不完成。
-- `/pat/` 请求仍未出现。
 - 父窗口是否回应了子窗口的 `requestExtraParams` 未证实。父→子通道本身已验证可用
   （step 6），需要一种不扰动流程的观测方式。
 - 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。

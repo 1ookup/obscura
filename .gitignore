@@ -2,3 +2,4 @@ target/
 .DS_Store
 vendor/rusty_v8/
 .v8trace-probe
+.dsh/
