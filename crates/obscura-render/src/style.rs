@@ -885,6 +885,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.size_expressions[1] = deferred_length_expression(value);
             style.height_set = true;
         }
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => {
+            // Only the on/off distinction matters here: obscura paints the
+            // platform look for checkbox and radio, and every other keyword
+            // (`auto`, `checkbox`, `menulist`, ...) keeps it.
+            style.appearance_none = value.trim().eq_ignore_ascii_case("none");
+        }
         "box-sizing" => {
             let value = value.trim();
             style.box_sizing = if value.eq_ignore_ascii_case("border-box") {
@@ -2201,6 +2207,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "content-box" | "border-box"
         ),
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => !value.trim().is_empty(),
         "table-layout" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "fixed"),
         "container-type" => parse_container_type(value).is_some(),
         "container-name" => parse_container_names(value).is_some(),

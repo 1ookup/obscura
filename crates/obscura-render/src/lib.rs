@@ -1023,6 +1023,10 @@ pub struct LayoutStyle {
     /// Which box edge `width`/`height` and min/max sizes describe. CSS starts
     /// at `content-box`; many modern reset sheets opt into `border-box`.
     pub box_sizing: BoxSizing,
+    /// `appearance: none` was asked for. A form control whose native look is
+    /// switched off is drawn entirely by the author's own CSS, so painting the
+    /// platform checkbox or radio on top of it would double-draw.
+    pub appearance_none: bool,
     /// Whether `width`/`height` was set by an author rule (including an explicit
     /// `auto`). Presentational `width`/`height` HTML attributes are a lower
     /// priority than author CSS, so they apply only when these are false; an

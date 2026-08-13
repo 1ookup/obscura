@@ -4778,6 +4778,30 @@ fn paint_laid_dom_scrolled(
             }
         }
 
+        // Checkbox and radio are theme-painted controls, not CSS boxes: the UA
+        // rules deliberately strip their border and padding (dom.rs), so
+        // without this they occupy 13x13 of layout and draw nothing at all --
+        // a challenge widget's "verify you are human" box came out blank.
+        if name.local.as_ref() == "input" && !style.appearance_none {
+            let input_type = node
+                .get_attribute("type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase();
+            let is_radio = input_type == "radio";
+            if (is_radio || input_type == "checkbox") && rect.width >= 4.0 && rect.height >= 4.0 {
+                paint_native_toggle(
+                    &mut pixmap,
+                    rect,
+                    is_radio,
+                    node.get_attribute("checked").is_some(),
+                    node.get_attribute("disabled").is_some(),
+                    raster_scale,
+                    element_clip_mask,
+                );
+            }
+        }
+
         // A closed native `<select>` paints only its selected option. Options
         // themselves are popup content (`display:none` in the layout tree),
         // so the label and disclosure arrow belong to the atomic control.
@@ -5599,6 +5623,94 @@ impl<'a> ScrollPaintState<'a> {
 /// (visually indistinguishable from true arcs at typical UI radii). The
 /// horizontal and vertical radii are scaled together when necessary, matching
 /// CSS's overlap rule while preserving percentage ellipses.
+/// Draw a checkbox or radio the way the platform theme does: a bordered box
+/// (rounded for a checkbox, circular for a radio) that fills with the accent
+/// colour and shows a check or a dot once it is on.
+///
+/// Chrome's light-theme values: #767676 border on white, #1A73E8 when checked,
+/// and a muted #DBDBDB on #EFEFEF while disabled.
+#[allow(clippy::too_many_arguments)]
+fn paint_native_toggle(
+    pixmap: &mut tiny_skia::Pixmap,
+    rect: crate::Rect,
+    is_radio: bool,
+    checked: bool,
+    disabled: bool,
+    raster_scale: f32,
+    clip_mask: Option<&tiny_skia::Mask>,
+) {
+    let size = rect.width.min(rect.height);
+    let x = rect.x + (rect.width - size) / 2.0;
+    let y = rect.y + (rect.height - size) / 2.0;
+    let radius = if is_radio { size / 2.0 } else { (size * 0.15).max(1.0) };
+
+    let border = if disabled {
+        [219, 219, 219, 255]
+    } else {
+        [118, 118, 118, 255]
+    };
+    let fill = match (checked, disabled) {
+        (true, false) => [26, 115, 232, 255],
+        (true, true) => [219, 219, 219, 255],
+        (false, true) => [239, 239, 239, 255],
+        (false, false) => [255, 255, 255, 255],
+    };
+
+    let Some(box_path) = rounded_rect_path(x, y, size, size, radius, radius) else {
+        return;
+    };
+    let transform = raster_transform(raster_scale);
+
+    let mut fill_paint = Paint::default();
+    fill_paint.anti_alias = true;
+    fill_paint.set_color(Color::from_rgba8(fill[0], fill[1], fill[2], fill[3]));
+    pixmap.fill_path(&box_path, &fill_paint, FillRule::Winding, transform, clip_mask);
+
+    // A checked control is a solid accent shape with no outline of its own.
+    if !checked {
+        let mut stroke_paint = Paint::default();
+        stroke_paint.anti_alias = true;
+        stroke_paint
+            .set_color(Color::from_rgba8(border[0], border[1], border[2], border[3]));
+        let stroke = tiny_skia::Stroke {
+            width: (size * 0.08).clamp(1.0, 2.0),
+            ..Default::default()
+        };
+        pixmap.stroke_path(&box_path, &stroke_paint, &stroke, transform, clip_mask);
+        return;
+    }
+
+    let mut mark_paint = Paint::default();
+    mark_paint.anti_alias = true;
+    mark_paint.set_color(Color::from_rgba8(255, 255, 255, 255));
+    if is_radio {
+        if let Some(dot) = rounded_rect_path(
+            x + size * 0.3,
+            y + size * 0.3,
+            size * 0.4,
+            size * 0.4,
+            size * 0.2,
+            size * 0.2,
+        ) {
+            pixmap.fill_path(&dot, &mark_paint, FillRule::Winding, transform, clip_mask);
+        }
+        return;
+    }
+
+    let mut check = PathBuilder::new();
+    check.move_to(x + size * 0.24, y + size * 0.52);
+    check.line_to(x + size * 0.42, y + size * 0.70);
+    check.line_to(x + size * 0.76, y + size * 0.31);
+    if let Some(check) = check.finish() {
+        let stroke = tiny_skia::Stroke {
+            width: (size * 0.14).max(1.2),
+            line_cap: tiny_skia::LineCap::Square,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&check, &mark_paint, &stroke, transform, clip_mask);
+    }
+}
+
 fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, rx: f32, ry: f32) -> Option<tiny_skia::Path> {
     rounded_rect_path_radii(
         x,
@@ -11500,6 +11612,82 @@ mod tests {
         fn frame_surface(&self, host: obscura_dom::tree::NodeId) -> Option<&Pixmap> {
             (host == self.host).then_some(&self.pixmap)
         }
+    }
+
+    fn paint_page(html: &str, viewport: (f32, f32)) -> Pixmap {
+        let tree = parse_html(html);
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, viewport, None, &mut resources).expect("prepare");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            [255, 255, 255, 255],
+            &EMPTY_CANVAS_SURFACES,
+        )
+        .expect("paint")
+    }
+
+    /// Checkbox and radio have no CSS box of their own -- the UA rules strip
+    /// their border and padding -- so nothing painted them and they came out
+    /// as blank gaps. A challenge widget's "verify you are human" control was
+    /// invisible for exactly this reason.
+    #[test]
+    fn a_checkbox_and_a_radio_paint_their_platform_look() {
+        let out = paint_page(
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <input type=\"checkbox\" style=\"position:absolute;left:0;top:0;width:20px;height:20px\">\
+             <input type=\"checkbox\" checked style=\"position:absolute;left:40px;top:0;width:20px;height:20px\">\
+             <input type=\"radio\" checked style=\"position:absolute;left:80px;top:0;width:20px;height:20px\">\
+             </body></html>",
+            (200.0, 60.0),
+        );
+
+        // Exact pixels depend on the UA margins these controls carry, so look
+        // for the expected colour anywhere in each control's cell.
+        let scan = |x0: u32, matches: &dyn Fn(u8, u8, u8) -> bool| {
+            (0..30u32).any(|dy| {
+                (0..30u32).any(|dx| {
+                    out.pixel(x0 + dx, dy)
+                        .is_some_and(|p| matches(p.red(), p.green(), p.blue()))
+                })
+            })
+        };
+
+        assert!(
+            scan(0, &|r, g, b| r < 200 && g < 200 && b < 200),
+            "unchecked checkbox drew no border"
+        );
+        assert!(
+            scan(40, &|r, g, b| b > 150 && b > r + 40 && g < b),
+            "checked checkbox is not accent-filled"
+        );
+        assert!(
+            scan(80, &|r, g, b| r > 240 && g > 240 && b > 240)
+                && scan(80, &|r, g, b| b > 150 && b > r + 40),
+            "checked radio is missing its accent ring or white dot"
+        );
+    }
+
+    /// `appearance: none` hands the control's look to the author. Painting the
+    /// platform checkbox underneath would show through their own box.
+    #[test]
+    fn appearance_none_suppresses_the_platform_checkbox() {
+        let out = paint_page(
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <input type=\"checkbox\" checked style=\"appearance:none;position:absolute;\
+             left:0;top:0;width:20px;height:20px;background:rgb(255,0,0);border:0\">\
+             </body></html>",
+            (100.0, 60.0),
+        );
+        let centre = out.pixel(10, 10).unwrap();
+        assert_eq!(
+            (centre.red(), centre.green(), centre.blue()),
+            (255, 0, 0),
+            "author background was overpainted by the platform control"
+        );
     }
 
     #[test]

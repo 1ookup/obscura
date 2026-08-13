@@ -539,6 +539,47 @@ obscura 的渲染缺口，还是 widget 在未就绪时本就不画。
 这不是代码回退——中间没有任何相关改动。**跨轮次比较请求条数前，必须确认目标
 没有因为压测而改变策略**；理想做法是换 Ray ID / 换出口 / 拉开间隔再复测。
 
+### Step 15 — 复选框根本没被绘制（渲染缺口，但不是 Turnstile 用的那个）
+
+step 14 的截图里，交互框只有 `Verify you are human` 文字，左边**空白**。先做最小对照，
+不碰 Turnstile：
+
+| 控件 | 修复前 |
+|------|--------|
+| `<input type="checkbox">`（含 `checked`） | **完全不画** |
+| `<input type="radio">` | **完全不画** |
+| `<input type="text">` / `<button>` / `<select>` | 正常 |
+| 自定义样式 span / SVG | 正常 |
+
+成因：`style.rs` 给所有 `input` 一份通用外观（2px 边框 + 白底），随后 `dom.rs` 对
+checkbox / radio **显式清空 border 和 padding**（这是对的，复选框不是带框的文本框），
+但没有任何代码补上平台自己的画法。于是它们占了 13x13 的布局却什么都不画。
+
+修复：按 `<select>` 画下拉箭头的既有套路，新增 `paint_native_toggle()`——圆角方框 /
+圆形、边框、选中时填充强调色并画对勾或圆点，disabled 用灰。同时补上 `appearance`
+属性解析（`none` 时不画平台外观），否则站点用 `appearance:none` 自绘时会被叠加两层。
+
+八种状态实测通过：未选 / 选中 / 禁用 / 选中+禁用 / radio 三态 / `appearance:none`
+（只显示作者的红框粉底，无叠加）/ 32x32 放大。
+
+回归测试：`crates/obscura-render/src/paint.rs`
+（`a_checkbox_and_a_radio_paint_their_platform_look`、
+`appearance_none_suppresses_the_platform_checkbox`）。
+
+**但 Turnstile 的框仍然是空的。** 说明 widget 用的不是原生 `<input type=checkbox>`，
+而是自绘元素（很可能 `appearance:none` + 自定义 CSS，或 div/svg）。这条修的是一个
+真实且独立的渲染缺口，不是 widget 空白的成因——下一步要读到 iframe 内的实际标记。
+
+### 又一次踩到 feature 门控
+
+`obscura-render` 的 `paint` feature **默认关闭**，所以
+`cargo check/test -p obscura-render` 从头到尾**没有编译 paint.rs**——期间那 17 个
+"既有失败"只是缺 feature 的产物，跟改动无关。带上 `--features paint` 后是
+**471 passed / 0 failed**。
+
+确认代码是否真被编译的最快办法：往里塞一行必然编译失败的语句，看构建是否报错。
+本次正是靠这一招才发现的。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -556,6 +597,7 @@ obscura 的渲染缺口，还是 widget 在未就绪时本就不画。
 | stealth 模式的 fetch/XHR 走 `stealth_fetch_all`，它**没有** `op_fetch_url` 的完成日志 | 看不到响应状态与大小，无法判断载荷是否送达 | 两条路径都要有完成日志 |
 | `console.error` 可被页面覆盖，但上报路径直接调内部格式化函数 | 测试里改 `console.error` 收不到消息，误判上报没生效 | 在 `op_console_msg` 这一层挂钩 |
 | `cargo build` 的输出用 `grep -E "^error"` 过滤会漏掉真正的失败行 | 拿着**没构建成功**的旧二进制跑了一轮，结论全错 | 过滤时必须同时匹配 `Finished` / `could not compile`，确认构建真的成功 |
+| 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
