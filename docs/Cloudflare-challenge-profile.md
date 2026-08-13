@@ -1560,6 +1560,64 @@ https + 代理路径。说明至少有两条 HTTP 出口，其 UA 来源不同�
 **修复后的真实质询**：`interactiveEnd` **稳定复现**（两次独立运行都有，此前从未出现），
 但仍以 `fail code=600010` 结束，`complete` 依旧为 0。即 UA 分裂不是 600010 的成因。
 
+### Step 39 — `/pat/` 缺失调查：参考 HaHaVM-General，假设未被 trace 证实
+
+**背景**：step 38 的 HAR 时序对齐显示，Chrome 的成功链路里 `POST /fo/`(822KB) 之后
+**366ms** 就发 `GET /pat/`(401)，再 `GET /ci/`(png)，最后 7KB 提交。obscura 从未发过
+`/pat/`；第二轮虽然发了 `/ci/`，也延迟到 2.24s（Chrome 366ms）。`/pat/` 是链路上更靠前
+的一环，因此优先于 `600010` 排查。
+
+**参考**：`/Users/l9h8/reverse/web/HaHaVM-General`（把 CF solver 重建在通用 JS 引擎
+框架上的项目）及其 `examples/cloudflare/`。
+
+**发现 1：obscura 缺 Private Access Token 一族 API**
+
+| API | HaHaVM | obscura |
+|---|---|---|
+| `document.hasPrivateToken` | 有（`core/env/Document.js:2062`） | **0 处** |
+| `document.hasRedemptionRecord` | 有 | **0 处** |
+| `document.hasStorageAccess` | 有（`Document.js:2155` 同组列出） | **0 处** |
+
+HaHaVM 是照真实 Chrome 的 Document 接口补齐的，这三个是同一组。这是确认的接口面差距。
+
+**发现 2：HaHaVM 为 `/pat/` 专门准备了 resource-timing 画像**
+
+```js
+// examples/cloudflare/lib/cfPerfProfiles.js
+if (url.indexOf("/pat/") !== -1) return { domainLookupEnd: 2, responseStart: 2, responseEnd: 6 };
+if (url.indexOf("/ci/")  !== -1) return { domainLookupEnd: 0, responseStart: 1, responseEnd: 3 };
+```
+
+它与 `/fo/`、widget 文档并列。说明在那个 solver 跑通的流程里 `/pat/` **确实会发生**，
+且 CF 会读它在 `performance.getEntriesByType('resource')` 里的时序 —— 这同时呼应了
+step 10 的未决项「Performance Timeline 全空」。
+
+**发现 3（证伪自己的假设）**：假设「CF 通过 `document.hasPrivateToken` 探测 PAT 支持，
+不存在就跳过 `/pat/`」。用 v8 trace 实测（`--trace-property-lookup`）：
+
+```
+hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageAccess 0
+```
+
+**CF 这次运行根本没查过这些属性**，假设不成立。也提示 `/pat/` 可能不是 JS 显式发起的，
+否则 trace 里应能看到对应调用。
+
+**证据强度限定**：这次 trace 只有 **6MB**，而本文档记录的完整质询 trace 是
+**140–220MB**，差两个数量级 —— 说明这轮远没跑到该跑的阶段就结束了。因此「0 次探测」
+不足以排除该假设，需要一次能产出 100MB+ trace 的完整运行再验。
+
+**下一步（按信息量排序）**：
+
+1. 读 HaHaVM `examples/cloudflare/lib/forwardLoader.js`：它既然为 `/pat/` 备了画像，
+   那份代码最可能直接说明该请求由谁、在什么条件下发起。
+2. 补齐 `hasPrivateToken`/`hasRedemptionRecord`/`hasStorageAccess`：成本低、是已确认的
+   接口差距，与 `/pat/` 是否相关都该做。
+3. 重跑一次完整质询（wait 40s+、确保走完交互分支）拿到 100MB+ trace 再验发现 3。
+
+**旁注**：HaHaVM 的 README 记了一条与本文 step 4 同源的经验 —— Turnstile 跑在子帧里，
+补丁必须注入**每一帧**，只在顶层打补丁会导致子帧崩溃、父页面收不到 token、不发最终
+提交。obscura 的 frame realm 预注入（page.rs:2379）已满足这一点。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -1603,7 +1661,13 @@ https + 代理路径。说明至少有两条 HTTP 出口，其 UA 来源不同�
   `OBSCURA_LABEL_ACTIVATION` 门控的验证 hack。要按规范补 `for=`/包含式两种关联、
   interactive content 例外、labeled control 自身不重复激活，并补 `labels`/`control`、
   覆盖 `HTMLElement.click()` 路径与回归测试。
-- **`fail code=600010`**（step 37，现唯一实质阻塞）：事件字段对齐后，Turnstile 已经会为
+- **`/pat/` 从不发出**（step 39，链路上更靠前，优先于 600010）：Chrome 在大载荷后
+  366ms 必发 `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`，`/ci/` 也只在托管分支
+  出现且延迟 2.24s。`hasPrivateToken` 探测假设已被 trace 证伪（但该 trace 仅 6MB，
+  证据不足）。下一步读 HaHaVM 的 `forwardLoader.js`。
+- **缺 PAT 一族 Document API**（step 39）：`hasPrivateToken`/`hasRedemptionRecord`/
+  `hasStorageAccess` 均未实现，HaHaVM 照 Chrome 接口补齐了这一组。
+- **`fail code=600010`**（step 37）：事件字段对齐后，Turnstile 已经会为
   obscura 的点击发出 `interactiveEnd`（交互被认定为真人），随即以自有错误码 `600010`
   失败，并返回 `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表
   里对应的分支。判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
