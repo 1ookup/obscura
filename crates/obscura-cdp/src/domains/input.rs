@@ -42,24 +42,65 @@ fn evaluate_input_script(page: &mut Page, target: &InputDispatchTarget, source: 
             .unwrap_or_else(|| page.url_string());
         if let Some(js) = page.js.as_mut() {
             if let Some(content_root) = content_root {
-                let _ = js.ensure_frame_realm(
-                    frame_id,
-                    *generation,
-                    content_root,
-                    &base_url,
-                );
+                if let Err(err) =
+                    js.ensure_frame_realm(frame_id, *generation, content_root, &base_url)
+                {
+                    tracing::warn!(
+                        "input: ensure_frame_realm({frame_id}, gen {generation}) failed: {err}"
+                    );
+                }
             }
-            let _ = js.execute_script_in_frame_realm(
+            // Swallowing this hid a whole failure mode once already: a frame
+            // realm that never ran the dispatch looks exactly like a click the
+            // page ignored.
+            if let Err(err) = js.execute_script_in_frame_realm(
                 frame_id,
                 *generation,
                 "<cdp-input>",
                 source,
-            );
+            ) {
+                tracing::warn!(
+                    "input: frame realm script failed in {frame_id} gen {generation}: {err}"
+                );
+            }
         }
     } else {
         page.evaluate(source);
     }
 }
+
+/// A `<label>`'s activation behavior: forward the activation to its labeled
+/// control. Without this, clicking anything inside a label never reaches the
+/// control a page bound its handler to -- Turnstile's checkbox is exactly that
+/// shape (a `<span>` inside a `<label>`, the `click` handler on the `<input>`).
+///
+/// Follows the HTML activation behavior: the control is `for=` resolved in the
+/// label's tree scope, else the first labelable descendant; a click that
+/// already landed on the control itself, or on unrelated interactive content
+/// inside the label, must not be forwarded.
+const LABEL_ACTIVATION_JS: &str = "\
+    var labelEl = clickTarget.closest ? clickTarget.closest('label') : null;\
+    if (labelEl) {\
+        var LABELABLE = 'button,input,meter,output,progress,select,textarea';\
+        var labeled = null;\
+        var forId = labelEl.getAttribute('for');\
+        if (forId) {\
+            var scope = labelEl.getRootNode ? labelEl.getRootNode() : document;\
+            if (scope && scope.getElementById) labeled = scope.getElementById(forId);\
+            if (labeled && !(labeled.matches && labeled.matches(LABELABLE))) labeled = null;\
+        } else if (labelEl.querySelector) {\
+            labeled = labelEl.querySelector(LABELABLE);\
+        }\
+        if (labeled\
+            && (!labeled.matches || !labeled.matches('input[type=hidden]'))\
+            && labeled !== clickTarget\
+            && !(labeled.contains && labeled.contains(clickTarget))\
+            && !(clickTarget.matches\
+                 && clickTarget.matches('a[href],' + LABELABLE))\
+            && (!labeled.matches || !labeled.matches(':disabled'))) {\
+            labeled.click();\
+        }\
+    }";
 
 fn input_target_js(target: &InputDispatchTarget, fallback: &str) -> String {
     target
@@ -344,6 +385,7 @@ pub async fn handle(
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
                             }}\
+                            {label_activation}\
                             var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
                             if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
                             if (link) {{\
@@ -361,6 +403,7 @@ pub async fn handle(
                                 else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
                             }}\
                         }})()",
+                        label_activation = LABEL_ACTIVATION_JS,
                         x = target.x,
                         y = target.y,
                         target_js = target_js,
