@@ -4,12 +4,14 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21）。
-frame 的几何、`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染。step 22 确认：
+当前状态：**未通过**。已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21），
+并在 step 26–27 收紧了事件、表单控件和 iframe 的浏览器一致性。frame 的几何、
+`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染。step 22 确认：
 managed vs interactive 的分流由 **IP 干净程度**决定——obscura 走 Reqable 代理（出口 IP
 不干净）被分流到交互分支，822KB 托管载荷后降级拉取 127KB 交互变体、发出
-`interactiveBegin`，之后**需要点击 checkbox** 而 obscura 从不点击、且命中测试不穿透
-closed shadow root（点不到）。下一步：打通「交互分支的点击」。
+`interactiveBegin`，之后**需要点击 checkbox**。closed shadow 命中测试与 move/click
+事件序列已补齐，但 fetch 流程仍不会主动执行交互。下一步：用 CDP 驱动一次确定性的
+checkbox 操作，验证点击后的证明链路。
 
 ## 复现
 
@@ -928,6 +930,80 @@ checkbox 的 handler 绑定在哪个元素、监听的是 click 还是 pointer �
 ②事件在 frame realm 里经 `_wrap(node)` 派发到 shadow 元素时 wrapper 不对。下一步要直接
 插桩 obscura 的 `_eventTargetDispatch` / `_wrap`，看 click 到底有没有落到 handler。
 
+### Step 26 — 修复事件/控件/iframe 一致性后重探：能力面通过，真实质询仍未完成
+
+**假设**：当前分支 review 找到的事件与渲染差异可能直接阻断 interactive widget：实时
+checkedness 没进入 paint/`:checked`、hover 边界事件重复、closed shadow retarget 泄漏、
+frame animation/viewport 状态陈旧、pointer compatibility mouse 语义和 `CSS.supports`
+指纹不一致。
+
+**方法**：逐项修复并加 release 回归测试；用本机 Chromium 校准 `appearance` 支持集合；
+运行完整 workspace nextest、release build、33 阶段 obstacle course；按
+`obscura-challenge-probe` 先跑跨源 realm probe，再用 Reqable 代理与 stealth 对
+`https://zencare.co/1.txt` 做一次 35 秒封顶实测。
+
+**证据**：
+
+1. checkbox/radio 的实时 checkedness 现在由 native DOM 保存，IDL、`:checked` 与 paint
+   共用同一状态；radio 按 tree root/form/name 互斥。
+2. `mouseMoved` 维护逐 page/realm hover 状态：同 target 只发 move，A→B 才发
+   out/leave/over/enter 并填 `relatedTarget`；取消 primary `pointerdown` 仅抑制
+   compatibility `mousedown`/`mouseup`，不错误吞掉 `click`。
+3. closed shadow 外 listener 的 `event.target` retarget 到 host，closed root 内部不会从
+   外部 `composedPath()` 泄漏。
+4. iframe stylesheet/animation timeline 按 content root 持久化，导航清理旧 root；
+   `innerWidth`/`innerHeight`/`visualViewport` 随 host resize 实时更新，0×0 不再保留
+   screen fallback。
+5. `new PointerEvent().pointerType === ""`；`appearance`/`-webkit-appearance` 的
+   `CSS.supports` 与本机 Chromium allowlist 对齐，`-moz-appearance` 不再误报支持。
+6. 验证结果：workspace release nextest **1542/1542**；obstacle course **33/33**；
+   render+stealth release build 成功。跨源 realm probe 的 fetch/XHR/image/script 全部落到
+   frame origin `:8902`，page origin `:8901` 为零。
+7. 真实探测仍以 `Just a moment...` 结束，35 秒内没有得到 `/1.txt` 的真实 404；因此按
+   本文判定口径仍是**未通过**，不能把 cookie 或截图生成当成成功。
+
+**结论**：这批修复消除了八类可观测差异且没有引入本地能力回退，但它们不是
+interactive challenge 的自动交互策略。当前 fetch 流程仍不会在 `interactiveBegin`
+后主动移动并点击 checkbox，所以真实质询不应预期仅靠本批一致性修复自动完成。
+
+### Step 27 — 独立复核初版修复：找到并消除负回归，真实质询状态不变
+
+**假设**：step 26 的定向测试不足以证明改动没有负修正，尤其是 shadow event 尾态、
+disabled 控件的物理输入、hover 顺序，以及 iframe 导航/viewport cache 的跨 realm 生命周期。
+
+**方法**：三个独立审查任务按事件、输入、form/render 分组，以本机 Chrome 146 headless
+为 oracle；给每个确定差异补 release 回归测试。随后重跑 workspace nextest、render 与
+render+stealth release build、33 阶 obstacle course、realm probe 和真实 35 秒质询；另以
+`611a72c` 的独立 release binary 与当前工作区交错跑 static、DOM 5000 rows 和三种 framework。
+
+**证据**：
+
+1. 初版确有负回归：disabled checkable 的 `.click()` 会激活，CDP 物理点击还会错误发送
+   `mousedown/up`；hover boundary pointer/mouse 顺序与 Chrome 不同。修后 disabled 只收到
+   `pointerdown/up`，不激活；hover 初入和 A→B 顺序与 Chrome 一致。
+2. shadow dispatcher 补齐 nested host 的 `AT_TARGET`、non-bubbling composed host listener、
+   per-listener `relatedTarget` retarget 和同端点 path suppression。派发结束会清理不可暴露的
+   internal endpoint；即使内部 `stopPropagation`，composed event 的尾态 target 仍是 host。
+3. iframe viewport 的首版 JS cache 使用子 realm 的 mutation epoch，父 realm resize 后稳定
+   返回旧 `[300,65]`。改用共享 native activity/task epoch 后返回
+   `[180,40,180,40]`，同一 epoch 的四个 getter 仍只复用一份 metrics。
+4. browser-driven frame navigation 曾用 `set_dom()` 归还临时借出的同一 DOM，错误清空 sibling
+   frame timeline；同时 nested frame state 泄漏。现在同文档归还保留 sibling，旧 parent 与
+   nested root 都定向清理，端到端测试覆盖三项断言。
+5. 最终门禁：workspace release nextest **1550/1550**（4 configured skipped）；render 和
+   render+stealth release build 成功；obstacle course **33/33**，跨阶段 median 3028.7ms；
+   realm probe 的 fetch/XHR/image/script 全落在 frame origin，page origin 为零。
+6. `611a72c` → 当前的同机三次 median 对照：static 3024.8→3030.8ms（+0.20%），DOM 5000 rows
+   3057.9→3057.1ms（-0.03%），React 3041.6→3028.2ms（-0.44%），Preact
+   3030.6→3035.3ms（+0.16%），Vue 3040.9→3045.6ms（+0.15%）。全部远低于 ±10% 噪声口径。
+7. 真实 zencare 仍停在 `Just a moment...` / `Verify you are human`，35 秒没有得到 `/1.txt`
+   的真实 404；截图显示交互 checkbox 已渲染。因此严格判定仍是未通过，并非修复后退化。
+
+**结论**：重新复核证明 step 26 初版不能直接宣称无回归；本 step 已修掉所有本轮确认的
+负回归并以 Chrome 对照、1550 个 workspace test、33/33 和性能对照闭环。在已覆盖范围内
+未见剩余 correctness 或 >10% 性能负增长。真实 Cloudflare 结果没有改善也没有退化，阻塞点
+仍是交互挑战需要调用方/CDP 执行点击，而不是 realm 请求归属或 checkbox 渲染。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -956,11 +1032,10 @@ checkbox 的 handler 绑定在哪个元素、监听的是 click 还是 pointer �
 
 按当前怀疑程度排序：
 
-- **打通交互分支的点击**（step 22 定为首要方向）：obscura 出口 IP 不干净，被分流到
-  interactive 分支、需要点击 checkbox。当前两个缺口：①从不发起点击；②命中测试
-  （`input_hit_in_document` 的 `dom.descendants`）不穿透 closed shadow root，点不到
-  shadow 里的 checkbox。先修命中测试穿透 shadow，再在 `interactiveBegin` 时自动点击，
-  实测点击后 127KB 交互 JSVMP 是否发出 `/pat/`。
+- **打通交互分支的点击**（step 22 定为首要方向）：closed shadow 命中测试和完整
+  move/click 输入序列已经具备；剩余缺口是 fetch 流程不会在 `interactiveBegin` 后主动
+  定位并操作 checkbox。先通过 CDP 驱动一次确定性的人工交互，实测 127KB 交互 JSVMP
+  是否发出 `/pat/`，再决定自动化策略应属于调用方还是 CLI 工作流。
 - **点击后 127KB 交互 JSVMP 能否算完证明**：未知，需实测。若点击后仍不发 `/pat/`，
   才回到「追 JSVMP 指纹面」这条路。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
