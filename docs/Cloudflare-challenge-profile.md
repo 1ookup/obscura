@@ -580,6 +580,44 @@ checkbox / radio **显式清空 border 和 padding**（这是对的，复选框�
 确认代码是否真被编译的最快办法：往里塞一行必然编译失败的语句，看构建是否报错。
 本次正是靠这一招才发现的。
 
+### Step 16 — 那个复选框画不出来，是因为 iframe 的绘制表面根本不跟随 DOM
+
+step 15 补了原生 checkbox 绘制后，Turnstile 的框**依旧是空的**。于是去读 widget
+frame 内部的真实标记——新增 `scripts/cdp_frame_dom.py`，用
+`Page.getFrameTree` + `Page.createIsolatedWorld` 在跨源 frame 内部求值（页面自己
+够不到，截图只反映画了什么，两者都答不了「那是个什么元素」）。
+
+三个 frame 的实测：
+
+| frame | body 子元素 | 含 `Verify you are human` | 文档大小 |
+|-------|------------|--------------------------|---------|
+| `zencare.co/1.txt`（父） | 3 | 否 | 27 KB |
+| Turnstile widget | **0** | 否 | 266 KB（内联脚本 246 KB + 样式 16 KB） |
+| `about:srcdoc` | 0 | 否 | 291 B |
+
+widget 的 body 在 6 s 和 14 s 都是空的，`readyState: complete`，标题
+`Checking your Browser…`，`document.body.getBoundingClientRect()` 是 **0×0**。
+父页面的 closed shadow root 里也只有那个 iframe（485 字节），同样不含该文案
+（用截获 `attachShadow` 的探针读的）。
+
+**这段文字在任何一份 DOM 里都不存在，却被画了出来。** 做因果测试：在 widget frame
+的 isolated world 里把 body 换成一个红色方块，确认 DOM 真的改了
+（`kids:1`、`innerHTML` 回读到 PROBE div），再截图——**画面纹丝不动**，红块没出现。
+
+与胶片对上了：step 14 里 9 s 到 36 s 的帧**逐帧哈希完全相同**。
+
+结论：**跨源 iframe 的绘制表面是陈旧的，不随��� DOM 更新**。我们一直在看一张早期
+快照，所以任何后续变化（包括那个复选框）都不可能出现在截图里。这同时意味着
+step 15 之前基于「框是空的」做的推断都不成立——它不是没画，是画的不是当前状态。
+
+未定：那张早期快照本身从何而来（widget 一度建过 UI 又清空？还是首帧合成后就没再
+更新？）。下一步应当给 frame surface 的合成路径插桩，而不是继续从截图反推。
+
+第一次做这个因果测试时 `Runtime.evaluate` 返回 `{}`，我差点据此断言「isolated world
+看到的不是被绘制的文档」。实际是表达式形式不被支持、求值**根本没执行**。包上
+`JSON.stringify(...)` 并回读确认后才拿到真结果——**探针没生效和被测对象没反应，
+表现完全一样**。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -597,6 +635,8 @@ checkbox / radio **显式清空 border 和 padding**（这是对的，复选框�
 | stealth 模式的 fetch/XHR 走 `stealth_fetch_all`，它**没有** `op_fetch_url` 的完成日志 | 看不到响应状态与大小，无法判断载荷是否送达 | 两条路径都要有完成日志 |
 | `console.error` 可被页面覆盖，但上报路径直接调内部格式化函数 | 测试里改 `console.error` 收不到消息，误判上报没生效 | 在 `op_console_msg` 这一层挂钩 |
 | `cargo build` 的输出用 `grep -E "^error"` 过滤会漏掉真正的失败行 | 拿着**没构建成功**的旧二进制跑了一轮，结论全错 | 过滤时必须同时匹配 `Finished` / `could not compile`，确认构建真的成功 |
+| 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
+| `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
@@ -606,6 +646,7 @@ checkbox / radio **显式清空 border 和 padding**（这是对的，复选框�
 
 按当前怀疑程度排序：
 
+- **跨源 iframe 的绘制表面不随 DOM 更新**（step 16），截图不能用来判断 frame 内状态。
 - **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
   `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
   剩下的是打分问题，需要继续找被判为可疑的指纹面。
