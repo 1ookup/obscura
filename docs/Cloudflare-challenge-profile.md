@@ -4,10 +4,12 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
-已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21）。frame 的几何、
-`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染，但挑战仍在
-`interactiveBegin`——真断点在 JSVMP 执行（`/pat/` 未发出）。
+当前状态：**未通过**。已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21）。
+frame 的几何、`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染。step 22 确认：
+managed vs interactive 的分流由 **IP 干净程度**决定——obscura 走 Reqable 代理（出口 IP
+不干净）被分流到交互分支，822KB 托管载荷后降级拉取 127KB 交互变体、发出
+`interactiveBegin`，之后**需要点击 checkbox** 而 obscura 从不点击、且命中测试不穿透
+closed shadow root（点不到）。下一步：打通「交互分支的点击」。
 
 ## 复现
 
@@ -805,6 +807,45 @@ frame 文档的动画永远停在第一个关键帧 `scale(0.01)` —— 复选�
 **挑战仍未通过**：`interactiveBegin` 仍在 9.9 s 出现，无 `complete`。复选框、几何、
 innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发 `/pat/`。
 
+### Step 22 — 关键修正：真实浏览器根本不点击；obscura 是「托管未过→降级交互」而非「没点 checkbox」
+
+**假设**（用户提出）：obscura 卡住是因为没有点击 checkbox。
+
+**方法**：js-reverse 连真实 Chrome 跑同一 URL，清空网络捕获后导航，读完整请求序列，
+逐条对齐 HAR；对比 obscura run24/run25 里 `/fo/<tokenB>` 的响应尺寸；追查 obscura
+输入命中测试是否穿透 closed shadow root。
+
+**证据**：
+
+1. **真实浏览器全程无点击、自动过盾**（js-reverse 捕获 + HAR 一致）：
+   `GET /fo/<tokenB>`(822KB JSVMP) 到达后 **366ms** 自动发 `GET /pat/`(401)，随后
+   `GET /ci/`(2300B png)、`POST /fo/<tokenB>`(7088B 提交证明)、`POST /1.txt`(404)。
+   中间没有任何 click 事件。
+2. **obscura 第二轮 `/fo/` 是「重新拉取挑战」不是「提交证明」**（run24/run25 可复现）：
+   822KB 载荷到达后，obscura **不发 `/pat/`**，而是再次 POST 同一个 `/fo/<tokenB>`
+   拿回 **127720B** 的新载荷。浏览器第二轮 `/fo/` 是 7088B 的最终提交；obscura 的
+   127KB 是另一种挑战载荷——这是**交互式变体**（与 `interactiveBegin` 同源）。几何修复
+   之前的旧 run（run15/run21）只有一条 822KB 就停住，修复后才走到这第二轮——证明
+   geometry/animation 修复确实让 JSVMP 前进了，但方向是「降级交互」而非「自动通过」。
+3. **obscura 的输入命中测试不穿透 closed shadow root**：`input_hit_in_document`
+   （`crates/obscura-js/src/runtime.rs:246`）用 `dom.descendants()`，只走
+   `first_child`/`next_sibling`，**不跟随 `shadow_roots_by_host`**；渲染路径（paint）
+   穿透 shadow。checkbox 挂在 frame 的 body 的 closed shadow root 里，所以**画得出来、
+   点不到**（命中会落在 body 而不是 shadow 里的 checkbox）。
+
+**结论**（经用户更正：managed vs interactive 的分流主要由 **IP 干净程度**决定）：
+
+- HAR / js-reverse 里浏览器能一次性自动过，是因为当时出口 IP 干净 → 分流到托管
+  （managed）分支，无需点击。obscura 走 Reqable 代理，出口 IP 不干净 → 被分流到
+  **交互（interactive）分支、需要点击**。这是 Cloudflare 的正常行为，不是 obscura 的
+  JSVMP「执行坏了」。
+- 因此「点击 checkbox」**不是兜底，而是代理 IP 场景下必须打通的正路**。用户原假设成立。
+- obscura 当前有两个缺口：①它从不发起点击（被动 fetch）；②即使想点也点不到——
+  `input_hit_in_document`（`runtime.rs:246`）用 `dom.descendants()`，不穿透 closed
+  shadow root，命中落在 body 而非 shadow 里的 checkbox（渲染路径穿透、输入路径不穿透）。
+- 下一步：修命中测试穿透 closed shadow root + 在 `interactiveBegin` 时自动点击，
+  实测点击后 127KB 交互 JSVMP 是否发出 `/pat/`。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -833,11 +874,13 @@ innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发
 
 按当前怀疑程度排序：
 
-- **JSVMP 执行没发出 `/pat/`**（step 20），浏览器成功链里它是 `/fo/` 之后的第一步。
-  这是当前最前沿的断点，几何类已修完。
-- **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
-  `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
-  剩下的是打分问题，需要继续找被判为可疑的指纹面。
+- **打通交互分支的点击**（step 22 定为首要方向）：obscura 出口 IP 不干净，被分流到
+  interactive 分支、需要点击 checkbox。当前两个缺口：①从不发起点击；②命中测试
+  （`input_hit_in_document` 的 `dom.descendants`）不穿透 closed shadow root，点不到
+  shadow 里的 checkbox。先修命中测试穿透 shadow，再在 `interactiveBegin` 时自动点击，
+  实测点击后 127KB 交互 JSVMP 是否发出 `/pat/`。
+- **点击后 127KB 交互 JSVMP 能否算完证明**：未知，需实测。若点击后仍不发 `/pat/`，
+  才回到「追 JSVMP 指纹面」这条路。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
