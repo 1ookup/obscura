@@ -5,8 +5,8 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
-已修掉六处真实缺陷（step 4、5、8、11、12、13）。失败模式已从「超时」
-变为「被判定需要交互」（`interactiveBegin`，见 step 13 末尾）。
+已修掉七处真实缺陷（step 4、5、8、11、12、13、19）。frame 几何已正确
+（body 300×65），但挑战仍在 `interactiveBegin`，未到 `complete`。
 
 ## 复现
 
@@ -687,6 +687,44 @@ frame）」的解析，永远查顶层布局。frame 内容只在画 surface 时
 全零 rect 会让它认为 widget 塌缩或不可见，很可能就是它走到 `interactiveBegin` 而不是
 自动通过的原因——这比「打分」更具体，是功能缺失。
 
+### Step 19 — 修复：frame 几何查询按节点所属文档分派布局
+
+step 18 定位到 `op_layout_geometry` 只查顶层 `prepared_render`。修复落地：
+
+- `op_layout_geometry` / `op_element_scroll_metrics` 先按 nid 用
+  `containing_document_root_shadow_including` 解析所属文档；是 frame 就现算那份
+  frame 布局再查询。
+- `op_layout_metrics`（文档级 client*/scroll*）加了一个 frame root 参数，JS 侧
+  `_renderScrollMetrics` 传 `_callingFrameRoot()`。
+- 新增 `prepared_for_frame_root`：从宿主 iframe 在父布局里的 content box 取 viewport，
+  递归支持嵌套 frame，然后 `prepare_frame_document` 布局该 frame——和绘制用的
+  `render_frame_tree_into` 同一套计算，但后者画完就丢弃，所以几何查不到。
+
+效果（同一 widget，修复前后）：
+
+| | 修复前 | 修复后 | Chrome |
+|---|--------|--------|--------|
+| `body.getBoundingClientRect()` | 0×0 | **300×65** | 300×65 |
+| `document.documentElement.scrollWidth/Height` | 1280×720（顶层） | **300×65** | 300×65 |
+
+回归测试：`crates/obscura-js/src/realm.rs`
+（`frame_elements_report_their_own_document_geometry`），另在 render 层补了
+`a_shadow_host_body_sizes_to_the_viewport_and_its_shadow_content` 证明布局引擎本身
+能给 shadow+body 定尺寸。
+
+**挑战仍未通过**：帧几何正确后，widget 依然在 ~14.4 s 进 `interactiveBegin`，没有
+`complete`。所以它是必要条件，不是充分条件。
+
+两个遗留项：
+
+1. **`window.innerWidth`/`innerHeight` 在 frame 里仍是屏幕尺寸**（2560×1360，应为
+   300×65）。它是 `__obscura_init` 里一次性赋值，frame realm 拿不到 frame viewport，
+   回退到 `screen`。与几何 op 是两条路，需单独修。
+2. **frame 布局每次几何查询都现算，无缓存**。Turnstile 会轮询几何，每次
+   `getBoundingClientRect` 都重跑一遍 CSS 解析 + taffy 布局，可能是这一轮
+   `interactiveBegin` 从 4.9 s 拖到 14.4 s 的原因。应按主文档 `prepared_render` 的
+   方式加 frame 布局缓存与失效。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -715,9 +753,8 @@ frame）」的解析，永远查顶层布局。frame 内容只在画 surface 时
 
 按当前怀疑程度排序：
 
-- **frame 内几何查询走顶层布局**（step 18）：`op_layout_geometry` 只查 `prepared_render`，
-  frame 内所有元素 `getBoundingClientRect` / `innerWidth` 全错。绘制和几何两条路径
-  用的布局不同。修复要按 nid 分派到所属 frame 的布局。
+- **frame 内 `window.innerWidth`/`innerHeight` 仍是屏幕尺寸**（step 19），是 `__obscura_init`
+  的一次性赋值、回退到 screen，与已修的几何 op 是两条路。
 - **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
   `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
   剩下的是打分问题，需要继续找被判为可疑的指纹面。

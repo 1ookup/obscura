@@ -6075,6 +6075,115 @@ fn clamp_scroll_offset_for_consumer(
 /// dimensions are the unscaled padding box used by CSSOM View, `clientRects`
 /// retains every inline continuation, and the top-level rect is their visual
 /// viewport-relative bounding union. Feature-gated.
+/// The content-box size of an iframe host inside a document's layout: the
+/// viewport of the child frame. Mirrors `frame_content_box` in runtime.rs so
+/// geometry ops can resolve a frame without reaching across modules.
+#[cfg(feature = "render")]
+fn frame_content_box_from_parent(
+    parent: &obscura_render::PreparedRender,
+    host: NodeId,
+) -> Option<(f32, f32)> {
+    let layout = parent.layout();
+    let rect = layout.rects.get(&host)?;
+    let style = layout.styles.get(&host)?;
+    let width = rect.width
+        - style.border.left
+        - style.border.right
+        - style.padding.left
+        - style.padding.right;
+    let height = rect.height
+        - style.border.top
+        - style.border.bottom
+        - style.padding.top
+        - style.padding.bottom;
+    (width >= 1.0 && height >= 1.0).then_some((width.floor(), height.floor()))
+}
+
+/// Lay out a frame document root on demand. `main_prepared` is the already
+/// prepared top-level document; a frame's viewport is its host iframe's content
+/// box, read from the parent document's layout (recursively for nested frames).
+/// The frame's own DOM/styles are then laid out at that viewport. This is the
+/// same computation `render_frame_tree_into` performs for painting, but that
+/// one discards the `PreparedRender` after compositing, so geometry reads could
+/// not reach frame content and reported 0x0 for every element in an iframe.
+#[cfg(feature = "render")]
+fn prepared_for_frame_root(
+    dom: &DomTree,
+    frame_root: NodeId,
+    main_prepared: &obscura_render::PreparedRender,
+    resources: &mut obscura_render::RenderResourceCache,
+    depth: usize,
+) -> Option<obscura_render::PreparedRender> {
+    if depth > 32 {
+        return None;
+    }
+    let host = dom.iframe_host(frame_root)?;
+    let parent_root = dom.containing_document_root_shadow_including(host)?;
+    let viewport = if parent_root == dom.document() {
+        frame_content_box_from_parent(main_prepared, host)?
+    } else {
+        let parent =
+            prepared_for_frame_root(dom, parent_root, main_prepared, resources, depth + 1)?;
+        frame_content_box_from_parent(&parent, host)?
+    };
+    let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
+    let mut stylesheet_cache = obscura_render::StylesheetCache::default();
+    let mut timeline = obscura_render::AnimationTimelineState::default();
+    obscura_render::prepare_frame_document(
+        dom,
+        frame_root,
+        viewport,
+        base_url.as_deref(),
+        resources,
+        &mut stylesheet_cache,
+        &mut timeline,
+    )
+}
+
+/// Serialize one node's viewport-relative geometry from a prepared layout, in
+/// the JSON shape `op_layout_geometry` returns. Shared by the top-document and
+/// frame paths so a frame's rect is byte-identical in structure to the main
+/// document's.
+#[cfg(feature = "render")]
+fn frame_geometry_json(
+    prepared: &obscura_render::PreparedRender,
+    nid: NodeId,
+    scroll: &obscura_render::ResolvedScrollState,
+) -> String {
+    let Some(rect) = prepared.viewport_rect_with_scroll(nid, scroll) else {
+        return String::new();
+    };
+    let Some((client_width, client_height)) = prepared.client_size(nid) else {
+        return String::new();
+    };
+    let Some(client_rects) = prepared.viewport_client_rects_with_scroll(nid, scroll) else {
+        return String::new();
+    };
+    let client_rects = client_rects
+        .into_iter()
+        .map(|rect| {
+            serde_json::json!({
+                "x": rect.x,
+                "y": rect.y,
+                "width": rect.width,
+                "height": rect.height,
+            })
+        })
+        .collect::<Vec<_>>();
+    let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+        "clientWidth": client_width,
+        "clientHeight": client_height,
+        "clientRects": client_rects,
+        "viewportFixed": viewport_fixed,
+    })
+    .to_string()
+}
+
 #[cfg(feature = "render")]
 #[op2]
 #[string]
@@ -6085,44 +6194,40 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_some() {
+        // A node inside an iframe content document is laid out separately from
+        // the top document; the top-level `prepared_render` does not contain it,
+        // which made every element in a frame report 0x0 geometry. Resolve the
+        // owning document and query that document's layout instead.
+        let frame_root = gs.dom.as_ref().and_then(|dom| {
+            dom.containing_document_root_shadow_including(nid)
+                .filter(|root| *root != dom.document())
+        });
+        if let Some(root) = frame_root {
+            let g = &mut *gs;
+            let Some(dom) = g.dom.as_ref() else {
+                return String::new();
+            };
+            let Some(main_prepared) = g.prepared_render.as_ref() else {
+                return String::new();
+            };
+            let resources = &mut g.render_resources;
+            let element_offsets = &g.element_scroll_offsets;
+            let Some(prepared) =
+                prepared_for_frame_root(dom, root, main_prepared, resources, 0)
+            else {
+                return String::new();
+            };
+            let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
+            return frame_geometry_json(&prepared, nid, &scroll);
+        }
+
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
             return String::new();
         };
         let Some(prepared) = gs.prepared_render.as_ref() else {
             return String::new();
         };
-        let Some(rect) = prepared.viewport_rect_with_scroll(nid, scroll) else {
-            return String::new();
-        };
-        let Some((client_width, client_height)) = prepared.client_size(nid) else {
-            return String::new();
-        };
-        let Some(client_rects) = prepared.viewport_client_rects_with_scroll(nid, scroll) else {
-            return String::new();
-        };
-        let client_rects = client_rects
-            .into_iter()
-            .map(|rect| {
-                serde_json::json!({
-                    "x": rect.x,
-                    "y": rect.y,
-                    "width": rect.width,
-                    "height": rect.height,
-                })
-            })
-            .collect::<Vec<_>>();
-        let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
-        return serde_json::json!({
-            "x": rect.x,
-            "y": rect.y,
-            "width": rect.width,
-            "height": rect.height,
-            "clientWidth": client_width,
-            "clientHeight": client_height,
-            "clientRects": client_rects,
-            "viewportFixed": viewport_fixed,
-        })
-        .to_string();
+        return frame_geometry_json(prepared, nid, scroll);
     }
     String::new()
 }
@@ -6302,14 +6407,40 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_metrics(state: &OpState) -> String {
+fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    let viewport = gs.viewport;
-    let content = ensure_prepared_geometry(&mut gs)
-        .map(|prepared| prepared.content_size())
-        .unwrap_or(viewport);
+    // The frame realm passes its own content root; the top document passes an
+    // empty string. Document-level metrics (client*/scroll*) must come from
+    // that document's layout, not the top-level page's -- a frame previously
+    // reported the embedder's viewport as its own innerWidth/scrollWidth.
+    let frame_root = NodeId::new(frame_root_str.parse().unwrap_or(0));
+    let is_frame = gs
+        .dom
+        .as_ref()
+        .is_some_and(|dom| dom.iframe_host(frame_root).is_some());
+    let (viewport, content) = if is_frame {
+        let g = &mut *gs;
+        let Some(dom) = g.dom.as_ref() else {
+            return String::new();
+        };
+        let Some(main_prepared) = g.prepared_render.as_ref() else {
+            return String::new();
+        };
+        let resources = &mut g.render_resources;
+        let Some(prepared) = prepared_for_frame_root(dom, frame_root, main_prepared, resources, 0)
+        else {
+            return String::new();
+        };
+        (prepared.viewport(), prepared.content_size())
+    } else {
+        let viewport = gs.viewport;
+        let content = ensure_prepared_geometry(&mut gs)
+            .map(|prepared| prepared.content_size())
+            .unwrap_or(viewport);
+        (viewport, content)
+    };
     format!(
         "{{\"scrollWidth\":{},\"scrollHeight\":{},\"clientWidth\":{},\"clientHeight\":{}}}",
         content.0, content.1, viewport.0, viewport.1
@@ -6327,14 +6458,38 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return String::new();
     }
-    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
-        return String::new();
+
+    let frame_root = gs.dom.as_ref().and_then(|dom| {
+        dom.containing_document_root_shadow_including(nid)
+            .filter(|root| *root != dom.document())
+    });
+
+    let metrics = if let Some(root) = frame_root {
+        let g = &mut *gs;
+        let Some(dom) = g.dom.as_ref() else {
+            return String::new();
+        };
+        let Some(main_prepared) = g.prepared_render.as_ref() else {
+            return String::new();
+        };
+        let resources = &mut g.render_resources;
+        let element_offsets = &g.element_scroll_offsets;
+        let Some(prepared) = prepared_for_frame_root(dom, root, main_prepared, resources, 0)
+        else {
+            return String::new();
+        };
+        let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
+        prepared.element_scroll_metrics(nid, &scroll)
+    } else {
+        let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+            return String::new();
+        };
+        gs.prepared_render
+            .as_ref()
+            .and_then(|prepared| prepared.element_scroll_metrics(nid, scroll))
     };
-    let Some(metrics) = gs
-        .prepared_render
-        .as_ref()
-        .and_then(|prepared| prepared.element_scroll_metrics(nid, scroll))
-    else {
+
+    let Some(metrics) = metrics else {
         // The op exists in render builds, so an unboxed/detached node must not
         // fall through to bootstrap's synthetic non-render metrics.
         return r#"{"scrollWidth":0,"scrollHeight":0,"clientWidth":0,"clientHeight":0,"x":0,"y":0,"maxX":0,"maxY":0,"hasBox":false}"#.to_string();

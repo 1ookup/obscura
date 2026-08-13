@@ -2122,6 +2122,60 @@ mod tests {
         );
     }
 
+    /// CSSOM geometry for a node inside an iframe must come from that frame's
+    /// own layout, not the top-level document's. Reading it from the top-level
+    /// `prepared_render` -- which does not contain frame content -- reported
+    /// 0x0 for every element in a frame, which is what made a challenge widget
+    /// read as invisible and fall into interactive mode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_elements_report_their_own_document_geometry() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            "<html><head><title>p</title></head><body>\
+             <iframe id=f style=\"display:block;width:300px;height:65px;border:0\"></iframe>\
+             </body></html>",
+        ));
+        rt.set_url("http://example.com/test");
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        let result = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"JSON.stringify((function () {
+                     const b = document.body.getBoundingClientRect();
+                     const h = document.documentElement.getBoundingClientRect();
+                     return [
+                       b.width, b.height, h.width, h.height,
+                       document.documentElement.clientWidth,
+                       document.documentElement.scrollWidth,
+                     ];
+                   })())"#,
+            )
+            .unwrap();
+
+        let values = serde_json::from_str::<Vec<f64>>(result.as_str().unwrap()).unwrap();
+        let [body_w, body_h, html_w, _html_h, client_w, scroll_w] = values[..] else {
+            panic!("unexpected shape");
+        };
+        // The frame viewport is the iframe's 300x65 content box. The body's
+        // height is its content (an 18px line here), its width the viewport
+        // minus the 16px default body margin -- the point is that neither is 0.
+        assert!(
+            body_w >= 250.0 && body_h > 0.0,
+            "frame body was {body_w}x{body_h}, expected it to fill the viewport width"
+        );
+        assert!(html_w >= 250.0, "frame html width was {html_w}");
+        assert!(client_w >= 250.0, "frame clientWidth was {client_w}");
+        assert!(scroll_w >= 250.0, "frame scrollWidth was {scroll_w}");
+    }
+
     /// A worker's origin comes from the document that constructed it. When
     /// that document is a cross-origin frame, reading the origin off the
     /// top-level page hands the worker the wrong one -- and `self.origin` is

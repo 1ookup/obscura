@@ -4251,7 +4251,10 @@ class Element extends Node {
   _renderScrollMetrics() {
     if (typeof Deno.core.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_metrics();
+      // A frame realm's document-level metrics (client*/scroll*) belong to the
+      // frame, not the embedder; pass its own content root so the op lays out
+      // the right document.
+      const raw = Deno.core.ops.op_layout_metrics(String(_callingFrameRoot() || ""));
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
