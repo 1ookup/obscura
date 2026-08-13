@@ -6136,6 +6136,7 @@ fn prepared_for_frame_root(
         base_url.as_deref(),
         resources,
         &mut stylesheet_cache,
+        main_prepared.animation_sample(),
         &mut timeline,
     )
 }

@@ -93,6 +93,7 @@ fn render_frame_tree_into(
     host: NodeId,
     root: NodeId,
     viewport: (f32, f32),
+    animation_sample: obscura_render::AnimationSample,
     resources: &mut obscura_render::RenderResourceCache,
     canvas: &HashMap<NodeId, crate::ops::CanvasBackingSurface>,
     out: &mut HashMap<NodeId, obscura_render::Pixmap>,
@@ -115,6 +116,7 @@ fn render_frame_tree_into(
         base_url.as_deref(),
         resources,
         &mut stylesheet_cache,
+        animation_sample,
         &mut timeline,
     ) else {
         return;
@@ -127,6 +129,7 @@ fn render_frame_tree_into(
                     nested_host,
                     nested_root,
                     nested_viewport,
+                    animation_sample,
                     resources,
                     canvas,
                     out,
@@ -163,7 +166,10 @@ fn build_frame_surfaces(
     for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
         if let Some(root) = dom.iframe_content_document(host) {
             if let Some(viewport) = frame_content_box(prepared.layout(), host) {
-                render_frame_tree_into(dom, host, root, viewport, resources, canvas, &mut out, 1);
+                render_frame_tree_into(
+                    dom, host, root, viewport, prepared.animation_sample(),
+                    resources, canvas, &mut out, 1,
+                );
             }
         }
     }
@@ -212,6 +218,7 @@ fn input_hit_in_document(
                 base_url.as_deref(),
                 resources,
                 &mut stylesheet_cache,
+                prepared.animation_sample(),
                 &mut timeline,
             ) {
                 let child_scroll = child.resolve_scroll_state(

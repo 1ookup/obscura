@@ -5,9 +5,9 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
-已修掉八处真实缺陷（step 4、5、8、11、12、13、19、20）。frame 几何与
-`innerWidth`/`innerHeight` 均已正确，但挑战仍在 `interactiveBegin`——真断点在
-JSVMP 执行（`/pat/` 未发出），见 step 20 末尾。
+已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21）。frame 的几何、
+`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染，但挑战仍在
+`interactiveBegin`——真断点在 JSVMP 执行（`/pat/` 未发出）。
 
 ## 复现
 
@@ -765,6 +765,45 @@ obscura：/fo/<tokenB> → 822KB JSVMP → interactiveBegin（没有 /pat/）
 
 已修的几何类缺陷（step 19、20）是 iframe 挑战的必要条件，但不是充分条件。下一步方向
 是追 JSVMP 执行：它到底在读什么、哪个返回值不对，导致没发 `/pat/`。
+
+### Step 21 — 修复：frame 文档的 CSS 动画采样冻结在 T=0，复选框因此不可见
+
+直接看截图回答「复选框渲染出来没有」：没有。文字和 logo 都在，复选框位置一片空白。
+用 js-reverse 读真实 Chrome 的 widget CSS，找到复选框：
+
+```css
+.yYpYJ6 .DuHyD8 { border: 2px solid rgb(74,74,74); background: #fff; width:24px;
+                 animation: 0.4s ... both running scale-up-center; }
+@keyframes scale-up-center { 0% { transform: scale(0.01); } 100% { transform: scale(1); } }
+```
+
+复选框有个**入场动画**，从 `scale(0.01)` 长到 `scale(1)`。真实浏览器 0.4s 跑完停住；
+obscura 的 `prepare_frame_document` 硬编码 `AnimationSample::default()` = T=0，所以
+frame 文档的动画永远停在第一个关键帧 `scale(0.01)` —— 复选框「长」不出来，几乎不可见。
+
+修复：把主文档的动画采样时间**传进 frame 准备**。`prepare_frame_document` /
+`render_frame_document` 各加一个 `animation_sample` 参数，`render_frame_tree_into`、
+`build_frame_surfaces`、`input_hit_in_document`、`prepared_for_frame_root` 都传
+`主文档 prepared.animation_sample()`（主文档时间靠 `sample_live_document_animations`
+按墙钟推进）。
+
+效果（像素级验证）：
+
+| | 修复前 | 修复后 |
+|---|--------|--------|
+| 复选框边框 `rgb(74,74,74)` | 0 px | **166 px** |
+| 复选框白底 `rgb(255,255,255)` | 0 px | **398 px** |
+| ASCII 渲染 | 空白 | 清晰的 24×24 白底深边框方框 |
+
+回归测试：`crates/obscura-render/src/paint.rs`
+（`a_frame_samples_its_animations_at_the_document_time`，断言 T=0 时 scale(0) 元素不可见、
+1s 时可见）。
+
+这是通用 bug：任何带入场动画的 iframe 内容在 obscura 里都会停在第一帧。复选框是它的
+一个具体受害者。
+
+**挑战仍未通过**：`interactiveBegin` 仍在 9.9 s 出现，无 `complete`。复选框、几何、
+innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发 `/pat/`。
 
 ## 测量盲区
 

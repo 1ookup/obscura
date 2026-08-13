@@ -2881,6 +2881,7 @@ pub fn prepare_frame_document(
     base_url: Option<&str>,
     resources: &mut RenderResourceCache,
     stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
@@ -2893,7 +2894,7 @@ pub fn prepare_frame_document(
         stylesheet_cache,
         None,
         crate::CssMediaType::Screen,
-        crate::AnimationSample::default(),
+        animation_sample,
         animation_timeline,
     )
 }
@@ -2909,6 +2910,7 @@ pub fn render_frame_document(
     base_url: Option<&str>,
     resources: &mut RenderResourceCache,
     stylesheet_cache: &mut crate::css::StylesheetCache,
+    animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
     canvas_surfaces: &dyn CanvasSurfaceSource,
 ) -> Option<Pixmap> {
@@ -2919,6 +2921,7 @@ pub fn render_frame_document(
         base_url,
         resources,
         stylesheet_cache,
+        animation_sample,
         animation_timeline,
     )?;
     paint_prepared_frame_document(tree, &mut prepared, resources, canvas_surfaces)
@@ -11719,6 +11722,7 @@ mod tests {
             None,
             &mut resources,
             &mut sheet_cache,
+            crate::AnimationSample::default(),
             &mut timeline,
             &EMPTY_CANVAS_SURFACES,
         )
@@ -11790,6 +11794,7 @@ mod tests {
             None,
             &mut resources,
             &mut sheet_cache,
+            crate::AnimationSample::default(),
             &mut timeline,
             &EMPTY_CANVAS_SURFACES,
         )
@@ -11813,6 +11818,66 @@ mod tests {
         .expect("parent paint");
         let inside = output.pixel(10, 10).unwrap();
         assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+    }
+
+    /// A frame document samples its CSS animations at the frame's own document
+    /// time, not at T=0. Sampling at T=0 left an entrance animation at its
+    /// `from` keyframe -- a challenge widget's checkbox used `scale-up-center`
+    /// (0% = scale(0.01)) and was invisible because the frame never advanced
+    /// past the first frame.
+    #[test]
+    fn a_frame_samples_its_animations_at_the_document_time() {
+        let tree = parse_html(
+            "<!DOCTYPE html><html><body style=\"margin:0\"><iframe style=\"display:block;border:0;width:40px;height:40px\"></iframe></body></html>",
+        );
+        let frame_host = tree.query_selector("iframe").unwrap().unwrap();
+        let (content_root, _) = tree.create_iframe_content_document(frame_host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &tree,
+            content_root,
+            "<!DOCTYPE html><html><body style=\"margin:0\">\
+             <style>@keyframes su { 0% { transform: scale(0); } 100% { transform: scale(1); } }</style>\
+             <div id=x style=\"width:20px;height:20px;background:rgb(255,0,0);animation:su 0.4s both\"></div>\
+             </body></html>",
+        );
+
+        let red_pixels = |sample: crate::AnimationSample| {
+            let mut resources = RenderResourceCache::default();
+            let mut sheet_cache = crate::css::StylesheetCache::default();
+            let mut timeline = crate::AnimationTimelineState::default();
+            let child = render_frame_document(
+                &tree,
+                content_root,
+                (40.0, 40.0),
+                None,
+                &mut resources,
+                &mut sheet_cache,
+                sample,
+                &mut timeline,
+                &EMPTY_CANVAS_SURFACES,
+            )
+            .expect("child paint");
+            (0..40u32)
+                .flat_map(|x| (0..40u32).map(move |y| (x, y)))
+                .filter(|&(x, y)| {
+                    child
+                        .pixel(x, y)
+                        .is_some_and(|p| p.red() > 200 && p.green() < 60 && p.blue() < 60)
+                })
+                .count()
+        };
+
+        // At T=0 the animation is at scale(0): no red box.
+        assert_eq!(
+            red_pixels(crate::AnimationSample::default()),
+            0,
+            "T=0 should leave the scale(0) entrance animation invisible"
+        );
+        // Past the 0.4s animation the box is at scale(1): a solid red 20x20.
+        assert!(
+            red_pixels(crate::AnimationSample::document(1000.0)) >= 300,
+            "a frame rendered at 1s should have advanced the animation to scale(1)"
+        );
     }
 
     #[test]
@@ -11850,6 +11915,7 @@ mod tests {
             None,
             &mut resources,
             &mut sheet_cache,
+            crate::AnimationSample::default(),
             &mut timeline,
             &EMPTY_CANVAS_SURFACES,
         )
