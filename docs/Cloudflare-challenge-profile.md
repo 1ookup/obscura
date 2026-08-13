@@ -1497,6 +1497,52 @@ widget d14sy: init → requestExtraParams → translationInit
 
 **下一步**：查 `600010` 的含义（api.js 字符串表里应有对应分支），它是目前唯一的阻塞点。
 
+### Step 38 — UA 分裂：JS 侧与 HTTP 头两个来源，`serve` 路径不同步
+
+**触发**（用户从 Reqable HAR 发现）：同一次运行里请求的 User-Agent 不一致。
+
+**证据**（`/tmp/3.har`，8 条请求）：
+
+| UA | 请求 |
+|---|---|
+| `Windows NT 10.0; Win64; x64 … Chrome/143.0.0.0` | 文档导航：`GET /1.txt`、widget iframe 文档 |
+| `X11; Linux x86_64 … Chrome/145.0.0.0` | chl_page、api.js、3 个 `POST /fo/` |
+
+操作系统与大版本都不同。后者正是 `obscura-net/src/client.rs:1058` 里
+`ObscuraHttpClient` 的**硬编码默认值**（`/json/version` 报的也是它）。
+
+**根因**（`obscura-browser/src/page.rs:1149-1166`）：
+
+```rust
+if self.stealth_client.is_some() {
+    rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);   // JS 侧
+} else {
+    if let Ok(ua) = self.http_client.user_agent.try_read() {
+        rt.set_user_agent(&ua);                            // 非 stealth 才跟随 http_client
+    }
+}
+```
+
+stealth 模式下 JS 侧改用 `STEALTH_USER_AGENT`，而 `http_client.user_agent` **从不同步**。
+`obscura fetch` 看不出问题，是因为 CLI 在 `main.rs:740` / `1090` 另外调了
+`page.http_client.set_user_agent(ua)` 把两边对齐；**`obscura serve`（CDP）没有这一步**，
+只有客户端显式调 `Network.setUserAgentOverride` 才会设置
+（`obscura-cdp/src/domains/network.rs:61`）。
+
+于是在 CDP 模式下：`navigator.userAgent` 报 stealth UA，而部分 HTTP 请求头报默认 UA。
+比对这两者是最基础的反自动化检查之一。
+
+**与最近改动的关系：无关。** 最近 6 个提交只碰了 `input.rs`、`bootstrap.js`、
+`input_label_activation.rs` 与文档/脚本，未触碰任何 UA / HTTP client / net 代码
+（`git log -6 -p` 对 `user_agent`/`client.rs` 零命中）。这是既有缺陷，只是此前一直用
+`obscura fetch` 跑、被 CLI 的对齐掩盖了；这几轮为了驱动点击改用 `serve`，才暴露出来。
+
+**尚未隔离的一步**：本地 http（无代理）测试里所有请求 UA 一致，HAR 里的分裂发生在
+https + 代理路径。说明至少有两条 HTTP 出口，其 UA 来源不同；具体分叉点待确认。
+
+**修法**：`serve` 启动时（以及任何创建 Page 的入口）把 stealth profile 的 UA 一并写入
+`page.http_client`，让 JS 侧与 HTTP 头共用同一个来源，而不是各自维护。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -1525,6 +1571,7 @@ widget d14sy: init → requestExtraParams → translationInit
 | **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
 | Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时换**全新 `--user-data-dir`**（最有效），或改用受控测试页 |
 | **`waitForDebuggerOnStart` 会暂停每一个新 target，包括 worker** | step 36：跳过 worker session 不 resume → Turnstile 的十几个 blob worker 全部挂起 → widget 永远 `Verifying...`。据此得出的「Chrome 也过不了盾」「IP 被惩罚」「overrunBegin 是真实判定」**三个结论全错** | 每个 attached target 都要 `runIfWaitingForDebugger`；worker 不发 `Page.*`，且 resume 用 fire-and-forget（worker session 可能永不回包） |
+| **把「页面没加载」当成「功能不工作」**（第二次犯） | step 38：受控页在 serve 路径下 DOM 为空、JS 未执行，据此得出「obscura 不加载图片」，复核后 4 个 png 请求全部正常 | 任何「某功能没发生」的结论，先断言页面真的加载了（`document.querySelectorAll('*').length` 或一个已知元素的文本） |
 | 过盾后页面**导航到新文档**，`window.__msgs` 随之清空 | 点击后 3 秒再 dump 就已经什么都读不到，成功样本连抓两次落空 | 让 hook 同时 `console.warn`，订阅 `Runtime.consoleAPICalled` **实时收流**，不依赖 dump 时机 |
 | 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
 
