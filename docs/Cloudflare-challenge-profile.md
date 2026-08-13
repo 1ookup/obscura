@@ -5,7 +5,9 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**，但断点已连续前移。step 37 让 Turnstile 首次为 obscura 的点击发出
-`interactiveEnd`（点击被认定为真人交互），当前卡在其自有错误码 `600010`。step 30 找到并验证了真因：**obscura 没有实现
+`interactiveEnd`（点击被认定为真人交互），step 38 又修掉了 UA 分裂（JS 侧与请求头
+描述不同浏览器）。`interactiveEnd` 现已稳定复现，但仍卡在其自有错误码 `600010`，
+`complete` 始终为 0。step 30 找到并验证了真因：**obscura 没有实现
 `<label>` 的激活行为**，点击落在 label 里的 span 上，永远转发不到 Turnstile 把 click
 handler 绑住的那个 `<input type=checkbox>`。加上门控验证后，复选框第一次被接受、widget
 进入 `Verifying you are human`，随后因证明未通过而重置。现在的阻塞点是 **JSVMP 证明**，
@@ -1540,8 +1542,23 @@ stealth 模式下 JS 侧改用 `STEALTH_USER_AGENT`，而 `http_client.user_agen
 **尚未隔离的一步**：本地 http（无代理）测试里所有请求 UA 一致，HAR 里的分裂发生在
 https + 代理路径。说明至少有两条 HTTP 出口，其 UA 来源不同；具体分叉点待确认。
 
-**修法**：`serve` 启动时（以及任何创建 Page 的入口）把 stealth profile 的 UA 一并写入
-`page.http_client`，让 JS 侧与 HTTP 头共用同一个来源，而不是各自维护。
+**根因（精确到两处，均已修 · commit 86bb258）**：
+
+1. `obscura-js/src/ops.rs` 的 `op_fetch_url` **硬编码**了
+   `X11; Linux x86_64 … Chrome/145`，与页面 UA 无关。它当初是为了补上"脚本请求没有
+   UA"而加的，但取了常量而非客户端的值 —— 这就是 HAR 里 XHR 那一组的来源。
+2. stealth 模式下 JS 侧报 `STEALTH_USER_AGENT`（Chrome145/Windows，与 wreq 的 TLS
+   模拟一致），而 `BrowserContext` 仍按 `select_profile()` 取轮换 profile 的 UA 写进
+   `http_client` —— 两者描述的浏览器不同，且 profile UA 还与 TLS 指纹自相矛盾。
+
+修法：`fetch()`/XHR 改读 HTTP 客户端的 UA；stealth context 直接采用
+`STEALTH_USER_AGENT`。于是 JS 侧、请求头、TLS 模拟三者同源。
+
+**验证**：本地受控页（导航 + fetch + XHR + script + img）五条请求与
+`navigator.userAgent` 完全一致；obscura-browser 82 / obscura-js 353 / obscura-cdp 173 全绿。
+
+**修复后的真实质询**：`interactiveEnd` **稳定复现**（两次独立运行都有，此前从未出现），
+但仍以 `fail code=600010` 结束，`complete` 依旧为 0。即 UA 分裂不是 600010 的成因。
 
 ## 测量盲区
 
