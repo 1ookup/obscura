@@ -846,6 +846,35 @@ innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发
 - 下一步：修命中测试穿透 closed shadow root + 在 `interactiveBegin` 时自动点击，
   实测点击后 127KB 交互 JSVMP 是否发出 `/pat/`。
 
+### Step 23 — 命中测试已穿透 shadow，但点击复选框仍不推进（疑似 srcdoc iframe 拦截）
+
+**方法**：修 `input_hit_in_document` 用 `descendants_including_shadow` 穿透 closed
+shadow root（commit 80ac9a2）；再补 pointer 事件派发 + `composed:true`（commit 见下）；
+用 CDP `Input.dispatchMouseEvent` 在 `interactiveBegin` 后点击复选框，观察消息时间线。
+
+**证据**：
+
+1. 复选框真实位置（截图像素定位）：widget iframe box=(192,304,300×65)，复选框 24×24
+   边框 rgb(74,74,74) 位于 (201..224, 325..348)，中心 ≈ (212,336) = iframe 相对 (20.5,32.5)。
+   点击 (216,336) 落在复选框内。
+2. 点击后消息时间线只有 `food` 心跳继续，**无 `complete`、无 `interactiveEnd`、无 `/pat/`**。
+3. `init` 消息确认 `"mode":"managed"`，~10–15s 被 IP 分流到 `interactiveBegin`。
+4. frame 树里 widget（frame-page-1-1）内还有一层 **`about:srcdoc` 空 frame**
+   （frame-page-1-2，body 为空）——很可能是叠在复选框上的透明 click 捕获层。
+
+**修复**（commit `80ac9a2` 命中测试 + `[pointer 事件]` 事件派发）：
+
+- `DomTree::descendants_including_shadow()` 穿透 native open/closed shadow tree。
+- `Input.dispatchMouseEvent` 现在按浏览器顺序派发 `pointerdown→mousedown→pointerup→mouseup→click`，
+  `PointerEvent` 改为继承 `MouseEvent`（带 clientX/Y、pointerId/pointerType/isPrimary），
+  mouse/click/pointer 事件全部 `composed:true`。各有回归测试。
+
+**结论**：命中测试与事件派发两项真实缺陷已修（各有单测），但**点击复选框仍不推进质询**。
+首要怀疑：嵌套的 `about:srcdoc` iframe（空、透明）叠在复选框上，把点击吞进了自己的空
+document，复选框的 handler 根本没收到事件。下一步：确认 srcdoc iframe 的位置/尺寸，若
+确实覆盖，则命中测试要跳过它（或点击要落到其下层的 checkbox）；顺带确认真实浏览器里
+checkbox 的 handler 绑定在哪个元素、监听的是 click 还是 pointer 事件。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
