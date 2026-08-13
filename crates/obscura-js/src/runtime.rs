@@ -14076,6 +14076,27 @@ mod tests {
     }
 
     #[test]
+    fn composed_event_crosses_shadow_boundary_to_the_host() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const child = document.createElement('button');
+            root.appendChild(child);
+            let hostClicks = 0, childClicks = 0;
+            host.addEventListener('click', () => { hostClicks += 1; });
+            child.addEventListener('click', () => { childClicks += 1; });
+            child.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+            return JSON.stringify({ hostClicks, childClicks });
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(r#"{"hostClicks":1,"childClicks":1}"#));
+    }
+
+    #[test]
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt

@@ -1761,6 +1761,12 @@ function _eventTargetDispatch(target, event) {
   }
   event.currentTarget = null;
   event.eventPhase = 0;
+  // A composed event crosses a shadow boundary: after the shadow root's own
+  // listeners run, continue to its host and bubble up the light tree. Without
+  // this a click inside a closed shadow root never reaches the host's handlers.
+  if (event.bubbles && event.composed && !event._propagationStopped && target._host) {
+    return target._host.dispatchEvent(event);
+  }
   return !event.defaultPrevented;
 }
 

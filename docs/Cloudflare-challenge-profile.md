@@ -875,6 +875,33 @@ document，复选框的 handler 根本没收到事件。下一步：确认 srcdo
 确实覆盖，则命中测试要跳过它（或点击要落到其下层的 checkbox）；顺带确认真实浏览器里
 checkbox 的 handler 绑定在哪个元素、监听的是 click 还是 pointer 事件。
 
+### Step 24 — 事件不跨 shadow 边界：`composed` 未实现；已修，但点击仍不推进
+
+**方法**：给 `input_target_at_point` 加临时日志，确认点击命中的真实元素；读
+`bootstrap.js` 的事件派发实现；补 `composed` 跨边界并加回归测试。
+
+**证据**：
+
+1. 命中测试日志（临时插桩）确认点击 (216,336) 命中 **frame-page-1-1 里的
+   `NodeId(457) tag=span`**（即复选框 `.DuHyD8`，local=(24,32)）——命中测试穿透
+   shadow 是正确的，也**不是 srcdoc iframe 拦截**（srcdoc frame 是 body 为空的旁支，
+   不在点击路径上）。
+2. **真因是事件派发不跨 shadow 边界**：`Element.prototype.dispatchEvent` 用
+   `parentNode` 冒泡，但 `ShadowRoot extends DocumentFragment` 走 `Node.dispatchEvent`
+   → `_eventTargetDispatch`，只触发 shadow root 自己的监听器、**不继续冒泡到 host**。
+   `composed` 标志根本没被派发逻辑使用——所以 host/body/document 上的 handler 收不到
+   shadow 内元素发出的 click。
+3. 修复：`_eventTargetDispatch` 在事件 `composed && target._host` 时继续
+   `host.dispatchEvent(event)`，跨出 shadow 边界。回归测试
+   `composed_event_crosses_shadow_boundary_to_the_host`（child 派发 composed click，
+   host 的监听器必须收到）。
+
+**结论**：命中测试、pointer 事件、composed 跨边界三项真实缺陷都已修（各有单测），
+点击也确认命中复选框 span，但 **`interactiveBegin` 后点击仍无 `interactiveEnd`/
+`complete`/`/pat/`**。下一步从「事件派发」转向「handler 到底绑定在哪个元素、怎么绑的」
+——预注入包 `addEventListener` 没抓到任何 click/pointer 绑定（可能用 `onclick` 属性、
+缓存引用、或监听的是别的 event），需直接读真实浏览器里该 widget 的监听器归属。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
