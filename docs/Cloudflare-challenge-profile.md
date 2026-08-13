@@ -4,7 +4,8 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**，但断点已前移两格。step 30 找到并验证了真因：**obscura 没有实现
+当前状态：**未通过**，但断点已连续前移。step 37 让 Turnstile 首次为 obscura 的点击发出
+`interactiveEnd`（点击被认定为真人交互），当前卡在其自有错误码 `600010`。step 30 找到并验证了真因：**obscura 没有实现
 `<label>` 的激活行为**，点击落在 label 里的 span 上，永远转发不到 Turnstile 把 click
 handler 绑住的那个 `<input type=checkbox>`。加上门控验证后，复选框第一次被接受、widget
 进入 `Verifying you are human`，随后因证明未通过而重置。现在的阻塞点是 **JSVMP 证明**，
@@ -1448,6 +1449,54 @@ fire-and-forget（worker session 可能永不回包，等它会拖死后续请�
 认定为一次完成的人类交互。所以下一步该查的是**交互本身的可信度**（鼠标轨迹只有 2 个
 move、按下/抬起间隔、事件时序），而不是 JSVMP 的指纹面。
 
+### Step 37 — 修复：鼠标事件字段与 Chrome 对齐，`interactiveEnd` 首次出现
+
+**假设**（step 36 收敛出的方向）：Chrome 用**完全相同**的 CDP 命令序列能过盾，obscura 不能，
+所以问题不在点击序列，而在这些命令**变成了什么样的事件**。
+
+**方法**：新脚本 `cdp_event_trace.py` 在 widget realm 内记录每个鼠标/指针事件及 Turnstile
+能读到的全部属性，两个引擎各跑一次逐字段对比（obscura 的 console 落在 serve 日志，
+Chrome 的经 `Runtime.consoleAPICalled` 实时收流）。
+
+**证据**：6 处差异，其中一处是全局性的：
+
+| 字段 | Chrome | obscura（修复前） | 修复后 |
+|---|---|---|---|
+| `timeStamp` | 4769 / 4857 / 4940 / 5022 | **1786637618868** | 8502 / 8588 / 8677 / 8764 |
+| `screenX/Y` | 195,453 | 0,0 | 213,335 |
+| `button`（pointer move/over/enter） | **-1** | 0 | -1 |
+| `button`（对应的 MouseEvent） | 0 | 0 | 0 |
+| `detail`（pointerdown/up） | 0 | 1 | 0 |
+| `pressure`（pointerdown） | 0 | 0.5 | 0 |
+| `cancelable`（over/move） | true | false | true |
+
+`Event.timeStamp` 是相对 time origin 的 `DOMHighResTimeStamp`，obscura 却用了
+`Date.now()`——**每个事件都带着 ~1.7e12 的时间戳**，而浏览器报的是几千。这是一行代码
+即可命中的破绽，且 Turnstile 恰好用事件时间戳判断交互时序。改走 `performance.now()`。
+
+其余是派发侧：没有按钮变化的 PointerEvent 报 `button:-1`（其兼容 MouseEvent 仍为 0）、
+pointerdown/up 不带 click 计数、over/move 可取消、`screenX/Y` 给页面坐标而非常量 0。
+
+**回归**：workspace 719 / obscura-js 446 / obscura-cdp 173，全绿。修复过程中发现兼容
+MouseEvent 的 init 不能提前快照——快照发生在 `relatedTarget` 赋值之前，会把边界事件的
+relatedTarget 悄悄丢掉（`consecutive_mouse_moves_only_cross_boundaries_when_the_target_changes`
+当场抓到）。
+
+**实测结果（决定性）**：
+
+```
+widget d14sy: init → requestExtraParams → translationInit
+            → interactiveBegin
+            → interactiveEnd                    ← 首次出现，此前恒缺失
+            → fail code="600010" + cfChlOut/cfChlOutS
+```
+
+**结论**：这批字段修复让 Turnstile **第一次把 obscura 的点击认定为一次完成的人类交互**
+（`interactiveEnd`）。断点随之从「交互确认失败」推进到**明确的失败码 `600010`**，
+且 Turnstile 现在会返回 `cfChlOut`/`cfChlOutS` 两个加密载荷。
+
+**下一步**：查 `600010` 的含义（api.js 字符串表里应有对应分支），它是目前唯一的阻塞点。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -1490,12 +1539,10 @@ move、按下/抬起间隔、事件时序），而不是 JSVMP 的指纹面。
   `OBSCURA_LABEL_ACTIVATION` 门控的验证 hack。要按规范补 `for=`/包含式两种关联、
   interactive content 例外、labeled control 自身不重复激活，并补 `labels`/`control`、
   覆盖 `HTMLElement.click()` 路径与回归测试。
-- **交互确认失败：拿不到 `interactiveEnd`**（step 36，现唯一实质阻塞）：成功路径是
-  `interactiveBegin` → 点击 → **`interactiveEnd`**（+1.3s）→ **`complete`+token**（+0.7s）
-  → 放行；obscura 点击后 widget 会进入 `Verifying`，但 `interactiveEnd` 与 `complete`
-  **从未出现**。即 Turnstile 没把这次点击认定为一次完成的人类交互。先查**交互可信度**
-  （鼠标轨迹只有 2 个 move、按下/抬起间隔、事件时序），而不是 JSVMP 指纹面。
-  判据：`interactiveEnd` → `complete`+token；辅以 `cf_chl_rc_ni`（step 31）。
+- **`fail code=600010`**（step 37，现唯一实质阻塞）：事件字段对齐后，Turnstile 已经会为
+  obscura 的点击发出 `interactiveEnd`（交互被认定为真人），随即以自有错误码 `600010`
+  失败，并返回 `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表
+  里对应的分支。判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
 - **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
   行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
   `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始
