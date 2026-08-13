@@ -2155,13 +2155,15 @@ mod tests {
                        b.width, b.height, h.width, h.height,
                        document.documentElement.clientWidth,
                        document.documentElement.scrollWidth,
+                       window.innerWidth, window.innerHeight,
                      ];
                    })())"#,
             )
             .unwrap();
 
         let values = serde_json::from_str::<Vec<f64>>(result.as_str().unwrap()).unwrap();
-        let [body_w, body_h, html_w, _html_h, client_w, scroll_w] = values[..] else {
+        let [body_w, body_h, html_w, _html_h, client_w, scroll_w, inner_w, inner_h] = values[..]
+        else {
             panic!("unexpected shape");
         };
         // The frame viewport is the iframe's 300x65 content box. The body's
@@ -2174,6 +2176,12 @@ mod tests {
         assert!(html_w >= 250.0, "frame html width was {html_w}");
         assert!(client_w >= 250.0, "frame clientWidth was {client_w}");
         assert!(scroll_w >= 250.0, "frame scrollWidth was {scroll_w}");
+        // window.innerWidth/Height must be the frame viewport, not the OS
+        // screen the __obscura_init fallback otherwise derives.
+        assert!(
+            inner_w >= 250.0 && inner_h >= 50.0,
+            "frame innerWidth/Height was {inner_w}x{inner_h}, expected ~300x65"
+        );
     }
 
     /// A worker's origin comes from the document that constructed it. When

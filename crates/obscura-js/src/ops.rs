@@ -6421,6 +6421,12 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
         .as_ref()
         .is_some_and(|dom| dom.iframe_host(frame_root).is_some());
     let (viewport, content) = if is_frame {
+        // The frame viewport is read from its host's box in the parent layout,
+        // so the top document must be prepared first. At frame-realm init time
+        // the main `prepared_render` is not built yet.
+        if ensure_prepared_geometry(&mut gs).is_none() {
+            return String::new();
+        }
         let g = &mut *gs;
         let Some(dom) = g.dom.as_ref() else {
             return String::new();

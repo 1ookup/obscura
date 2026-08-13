@@ -15051,6 +15051,28 @@ globalThis.__obscura_init = function() {
   // standalone runtime has the same 1x default as Obscura's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
+  // A frame realm's viewport is its iframe content box, not the OS screen the
+  // above fallback derives. `__obscura_viewport_w/h` are only ever set for the
+  // top-level document, so without this a widget inside an iframe read the
+  // screen size (2560x1360) as its own innerWidth, where a browser reports the
+  // frame's 300x65. Resolve the frame's document-level metrics and overwrite.
+  if (_callingFrameRoot()) {
+    try {
+      const m = Deno.core.ops.op_layout_metrics
+        && Deno.core.ops.op_layout_metrics(String(_callingFrameRoot()));
+      if (m) {
+        const parsed = JSON.parse(m);
+        if (Number.isFinite(parsed.clientWidth) && parsed.clientWidth > 0) {
+          globalThis.innerWidth = parsed.clientWidth;
+          globalThis.innerHeight = parsed.clientHeight;
+          if (globalThis.visualViewport) {
+            globalThis.visualViewport.width = parsed.clientWidth;
+            globalThis.visualViewport.height = parsed.clientHeight;
+          }
+        }
+      }
+    } catch (_e) {}
+  }
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];

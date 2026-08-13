@@ -5,8 +5,9 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**，但 step 12 让流程第一次真正前进：请求序列 4 条 → 5 条。
-已修掉七处真实缺陷（step 4、5、8、11、12、13、19）。frame 几何已正确
-（body 300×65），但挑战仍在 `interactiveBegin`，未到 `complete`。
+已修掉八处真实缺陷（step 4、5、8、11、12、13、19、20）。frame 几何与
+`innerWidth`/`innerHeight` 均已正确，但挑战仍在 `interactiveBegin`——真断点在
+JSVMP 执行（`/pat/` 未发出），见 step 20 末尾。
 
 ## 复现
 
@@ -725,6 +726,46 @@ step 18 定位到 `op_layout_geometry` 只查顶层 `prepared_render`。修复�
    `interactiveBegin` 从 4.9 s 拖到 14.4 s 的原因。应按主文档 `prepared_render` 的
    方式加 frame 布局缓存与失效。
 
+### Step 20 — 修复：frame 的 `window.innerWidth`/`innerHeight` 回退到屏幕尺寸
+
+step 19 修了几何 op，但 `window.innerWidth`/`innerHeight` 是**另一条路**：`__obscura_init`
+里一次性赋值，取 `__obscura_viewport_w/h`，这两个只对顶层文档设置，frame realm 拿不到，
+于是回退到 `screen`（2560×1360）。
+
+修复：`__obscura_init` 里若 `_callingFrameRoot()` 非零，就调 `op_layout_metrics(frame_root)`
+（此时已支持 frame）取 `clientWidth/clientHeight` 覆写 `innerWidth`/`innerHeight` 和
+`visualViewport`。`op_layout_metrics` 的 frame 分支补了先 `ensure_prepared_geometry`
+（frame 初 init 时主文档 `prepared_render` 还没建）。
+
+效果（同一 widget）：
+
+| | 修复前 | 修复后 | Chrome |
+|---|--------|--------|--------|
+| `window.innerWidth` | 2560 | **300** | 300 |
+| `window.innerHeight` | 1360 | **65** | 65 |
+
+回归测试并入 `frame_elements_report_their_own_document_geometry`（加了 innerWidth/
+innerHeight 断言）。
+
+**挑战仍未通过**：`interactiveBegin` 仍在 8.9 s 出现，无 `complete`。
+
+### 挑战真正的断点在 JSVMP：`/pat/` 从未发出
+
+把浏览器 HAR 的成功序列和 obscura 现状对齐，断点已经很清楚：
+
+```
+浏览器：/fo/<tokenB> → 822KB JSVMP → /pat/<id> 401 → /ci/<id> png → /fo/ → /1.txt 404
+obscura：/fo/<tokenB> → 822KB JSVMP → interactiveBegin（没有 /pat/）
+```
+
+`/pat/`（proof-of-attention）是 JSVMP 引擎算完证明后发的请求，浏览器发、obscura 不发。
+所以真正的问题在 **JSVMP（加密字节码 VM）的执行结果**——它没走到发 `/pat/` 那一步。
+之前的 step 8（栈名）、step 13（performance.now 分辨率）都是 JSVMP 会探测的面，但显然
+还有更多。
+
+已修的几何类缺陷（step 19、20）是 iframe 挑战的必要条件，但不是充分条件。下一步方向
+是追 JSVMP 执行：它到底在读什么、哪个返回值不对，导致没发 `/pat/`。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -753,8 +794,8 @@ step 18 定位到 `op_layout_geometry` 只查顶层 `prepared_render`。修复�
 
 按当前怀疑程度排序：
 
-- **frame 内 `window.innerWidth`/`innerHeight` 仍是屏幕尺寸**（step 19），是 `__obscura_init`
-  的一次性赋值、回退到 screen，与已修的几何 op 是两条路。
+- **JSVMP 执行没发出 `/pat/`**（step 20），浏览器成功链里它是 `/fo/` 之后的第一步。
+  这是当前最前沿的断点，几何类已修完。
 - **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
   `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
   剩下的是打分问题，需要继续找被判为可疑的指纹面。
