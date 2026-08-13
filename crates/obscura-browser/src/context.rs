@@ -110,7 +110,27 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         let profile = crate::profiles::select_profile();
-        let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
+        // In stealth mode the wire is emulated as Chrome145/Windows, and the JS
+        // side reports STEALTH_USER_AGENT to match. The HTTP client has to
+        // report the same thing: picking a rotating profile UA here left
+        // navigator.userAgent and the request header describing different
+        // browsers, which is a give-away on its own and also contradicts the
+        // TLS fingerprint.
+        let stealth_ua = if stealth {
+            #[cfg(feature = "stealth")]
+            {
+                Some(obscura_net::STEALTH_USER_AGENT.to_string())
+            }
+            #[cfg(not(feature = "stealth"))]
+            {
+                None
+            }
+        } else {
+            None
+        };
+        let resolved_ua = user_agent
+            .or(stealth_ua)
+            .unwrap_or_else(|| profile.user_agent.to_string());
         let platform = profile.platform.to_string();
         let ua_platform = profile.ua_platform.to_string();
         let ua_platform_version = profile.ua_platform_version.to_string();

@@ -2867,17 +2867,21 @@ async fn op_fetch_url(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
+        // fetch()/XHR must send the *page's* User-Agent. Hardcoding one here
+        // (which this did) split the identity in two: navigation went out with
+        // the profile's UA while every scripted request announced a different
+        // OS and Chrome version -- comparing those two is a basic bot check.
+        // Honor an explicit override.
         if !custom_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
         {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
+            if let Some(client) = http_client.as_ref() {
+                let ua = client.user_agent.read().await.clone();
+                if !ua.is_empty() {
+                    req = req.header("User-Agent", &ua);
+                }
+            }
         }
 
         for (k, v) in &custom_headers {
