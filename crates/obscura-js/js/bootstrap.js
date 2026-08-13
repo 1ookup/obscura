@@ -10009,8 +10009,18 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
 // constructor name from it, so every instance introspects as a plain "Object"
 // -- the property-lookup trace of a Cloudflare challenge labelled all of its
 // MessageEvent reads "Object.*" for exactly this reason.
+// `Event.timeStamp` is a DOMHighResTimeStamp measured from the time origin,
+// not a Unix epoch value. Handing out `Date.now()` here made every event carry
+// a ~1.7e12 stamp where a browser reports a few thousand -- a one-line tell.
+function _eventTimeStamp() {
+  try {
+    const now = globalThis.performance && globalThis.performance.now;
+    if (typeof now === "function") return globalThis.performance.now();
+  } catch (e) {}
+  return 0;
+}
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false;this._dispatching=false;this._eventPath=null;this._eventPathCurrentIndex=-1; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=_eventTimeStamp();this._propagationStopped=false;this._immediatePropagationStopped=false;this._dispatching=false;this._eventPath=null;this._eventPathCurrentIndex=-1; }
   get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
