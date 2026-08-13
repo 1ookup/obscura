@@ -4,14 +4,36 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。已修掉九处真实缺陷（step 4、5、8、11、12、13、19、20、21），
-并在 step 26–27 收紧了事件、表单控件和 iframe 的浏览器一致性。frame 的几何、
-`innerWidth`、CSS 动画采样全部正确，复选框已正常渲染。step 22 确认：
-managed vs interactive 的分流由 **IP 干净程度**决定——obscura 走 Reqable 代理（出口 IP
-不干净）被分流到交互分支，822KB 托管载荷后降级拉取 127KB 交互变体、发出
-`interactiveBegin`，之后**需要点击 checkbox**。closed shadow 命中测试与 move/click
-事件序列已补齐，但 fetch 流程仍不会主动执行交互。下一步：用 CDP 驱动一次确定性的
-checkbox 操作，验证点击后的证明链路。
+当前状态：**未通过**，但断点已前移两格。step 30 找到并验证了真因：**obscura 没有实现
+`<label>` 的激活行为**，点击落在 label 里的 span 上，永远转发不到 Turnstile 把 click
+handler 绑住的那个 `<input type=checkbox>`。加上门控验证后，复选框第一次被接受、widget
+进入 `Verifying you are human`，随后因证明未通过而重置。现在的阻塞点是 **JSVMP 证明**，
+不再是输入链路。正式的 label activation 实现仍待做（见 step 30 待办）。
+
+step 31：obscura 拿到的 `cf_clearance` 是**失败路径的无效票**（伴随 `cf_chl_rc_ni=1`，
+长度与成功时一模一样），复访照样 403 —— **判成败一律看 `cf_chl_rc_ni`**。
+step 32：指纹面首个确凿差异 = **inline script 的栈帧行号**（obscura 用脚本内相对行号，
+Chrome 用文档绝对行号），正落在 Cloudflare 采集的 `Error.stack` 上；其余 19 种栈形态与
+Chrome 逐字一致。step 33：**推翻 step 22 的 IP 结论** —— 同一出口 IP 下 Chrome 免质询而
+obscura 被拦，差异只能来自客户端指纹。
+
+step 28 已用真实浏览器（走同一代理、同一脏 IP）**决定性证实**：这条路上过盾的唯一触发
+条件就是点击复选框——不点则同一 ray 静止 120 秒、自动刷新重来也没用；点了则 2 秒内提交
+证明并放行（`/1.txt` 返回站点真实 404）。所以「obscura 没继续推进是因为没点 checkbox」
+这个假设**成立**。
+
+但 step 29 用同一探针打 obscura 发现：光让它去点还不够。obscura 能正确渲染复选框、点击
+坐标也命中（step 24 插桩证实命中 frame 内的复选框 span），可点击后三张截图**字节数完全
+相同、像素零变化**。命中测试（22–23）、composed（24）、mouseMoved（25）、事件/控件一致性
+（26–27）都已修且有单测，仍驱动不了 handler。
+
+首要怀疑已收敛：**预注入/观测一直只在主文档 realm，而 handler 活在 widget iframe 自己的
+realm 里**——这也解释了 step 24/25 「抓不到任何 click 绑定」。下一步在 frame realm 内插桩
+`addEventListener` / `_eventTargetDispatch`，直接看点击有没有走到 handler。
+判据：点击后 ~2 秒内出现新的 `POST challenges.cloudflare.com/.../fo/<tokenB>`。
+
+时序约束：**检测到复选框就要立刻点**。该页 129 秒会自动换 ray（用户经验 30s+ 即可能刷新），
+刷新会作废当前 widget 的 token，迟到的点击落在死 realm 上，表现和「点了没反应」一模一样。
 
 ## 复现
 
@@ -1004,6 +1026,378 @@ render+stealth release build、33 阶 obstacle course、realm probe 和真实 35
 未见剩余 correctness 或 >10% 性能负增长。真实 Cloudflare 结果没有改善也没有退化，阻塞点
 仍是交互挑战需要调用方/CDP 执行点击，而不是 realm 请求归属或 checkbox 渲染。
 
+### Step 28 — 黄金基线：真实浏览器同代理下，点击 checkbox 是过盾的**唯一**触发条件
+
+**假设**（用户原假设，step 22 已定为首要方向）：obscura 不再向后推进，就是因为没有点击
+checkbox。此前一直缺一个「点击确实能过」的正对照——不能排除 interactive 分支在这个出口 IP
+上本身就是死路。
+
+**方法**：用 js-reverse 连一个**走同一 Reqable 代理**（同一"脏"出口 IP）的独立 Chrome 146
+（`--user-data-dir=/tmp/jsrev-profile --proxy-server=http://127.0.0.1:9000`），对
+`https://zencare.co/1.txt` 做三次对照：
+
+1. **实验组**：等 checkbox 出现 → CDP `Input.dispatchMouseEvent` 派发 move→press→release。
+2. **对照组**：等 checkbox 出现 → **不点击**，静置 199 秒。
+3. **同 ray 前后对照**（最强）：在对照组已经卡死 120 秒的那一个 ray 上补一次点击。
+
+checkbox 坐标由截图定位：viewport 1200×739、dpr=2，widget 复选框中心 CSS ≈ (173, 311)。
+
+**证据**：
+
+1. **真实浏览器在同一代理下同样被分流到 interactive**——出现「请验证您是真人」复选框。
+   这独立复现了 step 22 的分流结论，且排除了「只有 obscura 会被降级」的可能。
+2. **第一轮 managed 阶段浏览器是走完的**：`POST /fo/<tokenB>` → `GET /pat/`(401) →
+   `GET /ci/`(200 png) → `POST /fo/<tokenB>`，然后**停住**并显示 checkbox。
+   对比 obscura：从不发 `/pat/`、不发 `/ci/`（step 22 证据 2），这是**另一处独立差异**。
+3. **对照组：不点击就永远不过**。ray `a2a80336` 起于 t=1786627178，最后一条质询请求在
+   t+3s，此后 **106 秒零新请求**；t+129s 页面自动换到新 ray `a2a8065c` 重来一轮，
+   同样走到 `fo→pat(401)→ci→fo` 后停住，到 t+199s 仍是「正在进行安全验证」。
+   → **自动二次刷新本身不会过盾**。
+4. **同 ray 前后对照（决定性）**：ray `a2a8065c` 自 t=1786627307 起静止 **120 秒零请求**；
+   t=1786627427 派发点击后：
+
+   | 相对点击 | 事件 |
+   |---|---|
+   | +0s | `Input.dispatchMouseEvent` move→press→release @ (173,311) |
+   | ~+1s | `POST challenges.cloudflare.com/.../fo/<tokenB>` ×2（提交交互证明） |
+   | ~+2s | `POST zencare.co/.../fo/<tokenA>`（回传主页面） |
+   | +8s | 页面标题 = `Find The Best Therapists & Psychiatrists Near You — Zencare`，正文 `404 Oops! We can't seem to find the page...` |
+
+   按本文判定口径，`/1.txt` 返回站点自己的真实 404 页 = **过盾成功**（不是靠 `cf_clearance`
+   出现来判定）。
+
+**结论**：**用户原假设成立且已量化证实**。在这个出口 IP 上，interactive 分支不是死路，
+点击 checkbox 是过盾的**唯一**触发条件——不点则 120 秒零请求、二次刷新也无用；一点则
+2 秒内提交证明并放行。因此 obscura 卡住的直接原因就是**它从不发起这个点击**。
+
+由此得到两条可直接用于 obscura 侧的判据与约束：
+
+- **成功判据（点击是否真的落到 handler）**：点击后 ~2 秒内必须出现一条**新的**
+  `POST challenges.cloudflare.com/.../fo/<tokenB>`。没有这条，就是事件没送达 handler，
+  与「点击了但被拒绝」无关。
+- **时序约束（用户提示 + 实测）**：**检测到 checkbox 渲染就必须立即点**，不能先等待观测。
+  实测该页 129 秒会自动换 ray 重来（用户经验是 30s+ 即可能刷新），刷新会作废当前
+  widget 的 token，迟到的点击落在已失效的 realm 上，看起来就像"点了没反应"。
+
+**遗留**：step 22 曾把「浏览器 HAR 一次过、无需点击」当作基线，那是**干净 IP** 下的
+managed 分支。本 step 起，代理场景的正确基线是「managed 走完 → 停在 checkbox → 点击 →
+放行」这条 interactive 链路。
+
+### Step 29 — 同一探针对 obscura：点击命中却零反应（最新二进制复测）
+
+**假设**：step 26/27 的一致性修复之后，同样的 CDP 点击应当能在 obscura 上复现 step 28
+的放行链路。
+
+**方法**：先 `V8_FROM_SOURCE=1 cargo build --release ... --features render,stealth` 重建
+（**注意**：工作区里的二进制比 `0d58c6c` 旧了一小时，直接跑会测到旧代码——这正是
+本文「测量盲区」里记过的坑，本轮先撞了一次）。然后用 step 28 在真实 Chrome 上验证过的
+同一个探针 `scripts/cdp_click_fast.py` 打 `obscura serve --stealth --proxy`。
+
+**证据**：
+
+1. **探针在真实 Chrome 上是好的**：t=6.3s 点击 →+2s 就拿到 Zencare 真实 404。
+2. **同一探针对 obscura 全程 `box=null`**——但这是**探针失真，不是 obscura 没渲染**。
+   单独诊断（单行表达式）证明 obscura 侧一切正常：closed shadow root 1 个、其中 iframe
+   1 个、**box=[192,304,300,65]**（与 step 23 一致）、`[id^=cf-chl-widget]` 存在、
+   27 条 postMessage（含 `init/mode:"managed"`）。真因是 obscura 的 `Runtime.evaluate`
+   对**多行 `JSON.stringify((function(){...})())` 形式静默不返回值**；改单行 IIFE 后正常。
+   已补进「测量盲区」。
+3. **改用截图做观测面**（不依赖 JS 求值）：等 14s 后 obscura 确实渲染出
+   `Verify you are human` 复选框，widget 在 (192,304)–(492,368)，复选框中心 ≈ (212,336)。
+4. **点击 (213,335) 后完全无反应**：`before` / `after4s` / `after10s` 三张 PNG
+   **字节数完全相同（32492）**，像素级零变化。对照 step 28 的真实浏览器：同样的点击
+   2 秒内就发出证明 POST 并放行。
+
+**结论**：**两件事都成立，必须分开说**——
+
+- 卡住的**直接原因**确实是没有点击（step 28 已量化证实：不点则静止，点则 2 秒放行）。
+- 但**光是「让 obscura 去点」并不够**：obscura 在正确坐标上派发完整
+  move→press→release 之后，Turnstile 零反应。命中测试（step 23）、composed
+  （step 24）、mouseMoved（step 25）都已修且有单测，事件也确认命中了 frame 内的
+  复选框 span（step 24 插桩），却仍然驱动不了 handler。
+
+**下一步（收敛后的首要怀疑）**：step 24/25 说「预注入包 `addEventListener` 抓不到任何
+click 绑定」，当时归因为 handler 用了 `onclick` 或缓存引用。但更可能是**注入错了 realm**
+——`Page.addScriptToEvaluateOnNewDocument` 只作用于主文档，而复选框的 handler 活在
+**widget iframe（challenges.cloudflare.com）自己的 realm** 里，主文档的钩子根本看不见它。
+所以要先验证 obscura 的预注入是否覆盖子 frame realm；若不覆盖，就在 frame realm 内插桩
+`addEventListener` / `_eventTargetDispatch`，直接看点击有没有走到 handler。
+
+**判据（沿用 step 28）**：点击后 ~2 秒内出现新的
+`POST challenges.cloudflare.com/.../fo/<tokenB>` 才算事件真正送达。
+
+### Step 30 — 真因：缺 `<label>` 激活行为，点击到不了 Turnstile 绑 handler 的 `<input>`
+
+**假设链**（本 step 连续证伪了三个自己的探针结论，过程比结论值钱）：
+
+1. 「事件没进 frame realm」——**证伪**。
+2. 「frame realm 里一个 listener 都没有」——**证伪，且是探针假象**。
+3. 「Turnstile 没注册 click handler」——**证伪**。
+
+**方法**：CDP 外部探针连续失真后转为 Rust 侧插桩（`OBSCURA_INPUT_PROBE` 门控），在
+**事件实际派发的那个 realm 内**打印 target 祖先链、派发结果，并在派发前挂真监听器做
+端到端验证；再用 `Page.addScriptToEvaluateOnNewDocument` 注入 `addEventListener` hook
+（page.rs:2379 确认 preload **会**在每个 frame realm、author script 之前执行）。
+
+**证据**：
+
+1. **事件派发链路完全正常**（推翻假设 1/2）：
+
+   ```
+   registryVisible=undefined
+   PROBE_LISTENERS_FIRED=[doc:pointerdown@#document target:pointerdown@SPAN win:pointerdown@?
+                          doc:mousedown@#document   target:mousedown@SPAN   win:mousedown@?]
+   pointerAllowed=true suppressMouse=false disabled=false  defaultView=self ownerDoc=self
+   ```
+
+   capture→target→bubble 三站齐全、顺序正确、未被取消。step 23–27 修的东西都生效了。
+   `registryVisible=undefined` 同时证明：先前那版探针读的 `_eventTargetListeners` 在
+   `<cdp-input>` 脚本里**根本不可见**（它是 bootstrap 的 script 作用域 `const`），所以
+   「整条链零 listener」是**纯假象**。
+
+2. **Turnstile 注册得很完整**（推翻假设 3）。widget realm 的 addEventListener hook：
+
+   ```
+   Element/HTMLElement + click on INPUT          ← click 绑在 <input> 上
+   HTMLElement + pointerdown/mousedown/pointerup/mouseup on SPAN.DuHyD8   ← span 上没有 click
+   Document + click on #document / mousemove on #document
+   window + click/mousedown/mouseup/pointerdown/pointerup/message/error
+   ```
+
+3. **错配就在这里**：命中的是 `span.DuHyD8`，它在 `label.yYpYJ6` 里；而 `click` handler
+   绑在 label 关联的 `<input type=checkbox>` 上。`input.rs` 的 click 派发路径处理了
+   checkbox/radio 自身、`a[href]`、`button`、`input[submit]`——**唯独没有 `<label>` 的
+   激活行为**（规范：点击 label 内的元素要对 labeled control 跑 synthetic click
+   activation steps）。bootstrap.js 那边 `get labels()` 也恒返回空列表（:9516）。
+   于是 INPUT 的 click handler 永远不被调用。
+
+4. **一次性验证**（`OBSCURA_LABEL_ACTIVATION` 门控，非正式修复）：click 派发后把激活
+   转发给 label 关联控件。日志 `[label-activation] forwarding to INPUT type=checkbox`，
+   页面**第一次动了**——此前每轮三张截图字节数恒等：
+
+   | t | 状态 |
+   |---|---|
+   | 14.2s | 点击 (213,335)，box=(192,304,300×65) |
+   | 17.4s | **`Verifying you are human. This may take a few seconds.`** ← 复选框被接受 |
+   | 19.6s | 退回 `Performing security verification`，widget 重置 |
+   | 21–34s | 稳定不再变化 |
+
+**结论**：**真因是 obscura 没有实现 `<label>` 的激活行为。** 这是一条规范级缺口，
+与 Cloudflare 无关，任何「label 包着自定义控件、handler 绑在隐藏 input 上」的页面都会
+中招——Turnstile 的复选框正是这个结构。
+
+断点因此前移了一格：不再是「点击驱动不了 handler」，而是**「点击已被接受、Turnstile 进入
+verifying、但证明未通过而重置」**。这正是 step 22 预留的那条路——回到 JSVMP 指纹面。
+
+**待办**：当前只是门控 hack。正式实现要：①按规范在 click 派发后执行 label activation
+（含 `for=` 与包含式两种关联、interactive content 例外、已经是 labeled control 时不重复）；
+②`labels`/`htmlFor`/`control` 一并补真；③覆盖 `HTMLElement.click()` 路径；④加回归测试。
+
+### Step 31 — 确认：拿到了 `cf_clearance`，但它是失败路径的无效票（`cf_chl_rc_ni=1`）
+
+**假设**（用户提出）：obscura 现在已经拿到 `cf_clearance`，只是这张票无效，所以最终访问
+又是 403。
+
+**方法**：`cf_clearance` 是 HttpOnly，`document.cookie` 看不见，改用 CDP
+`Network.getAllCookies`。又因为它绑定 TLS 指纹 + IP + UA，用 curl 重放什么也证明不了，
+所以复访必须在**同一个 obscura session** 内 re-navigate。三步：①点击前/后各 dump 一次
+cookie 定位下发时机；②同 session 复访 `/1.txt`；③与真实 Chrome 成功那次的 Set-Cookie
+流对照（js-reverse `list_network_requests --cookieName`）。
+
+**证据**：
+
+1. **下发时机 = 点击提交之后**，且与失败码同时到达：
+
+   ```
+   t=12s (点击前)     (none)
+   widget 渲染后      (none)
+   clicked
+   click +6s          cf_clearance@zencare.co(597) + cf_chl_rc_ni@zencare.co(=1)
+                      + cf_clearance@cloudflare.com(810)
+   ```
+
+2. **同 session 复访仍被拦**：带着这份 cookie 重新 navigate `/1.txt`，得到的仍是
+   `Just a moment...`（46 个元素的质询页），不是站点真实 404。CF 的质询页本身就是
+   HTTP 403，所以表现就是「再次 403」。
+
+3. **与成功路径对照**（真实 Chrome，走同一代理）：
+
+   | | `cf_clearance` | `cf_chl_rc_ni` |
+   |---|---|---|
+   | Chrome 成功 | 597 字节，由 `POST zencare.co/.../fo/<tokenA>` 下发 | **0 条，从不出现** |
+   | obscura 失败 | 597 字节，**长度完全相同** | **=1** |
+
+   Chrome 那次卡住的第一轮（reqid 97，ray `a2a80336`）**同样**下发了 `cf_clearance`——
+   再次印证本文判定口径：**cf_clearance 的存在与长度都不是过盾判据**。
+
+**结论**：**用户的判断正确。** obscura 确实拿到了 `cf_clearance`，长度与成功时一模一样，
+但它是**失败路径下发的无效票**，同批还带着 `cf_chl_rc_ni=1`；拿它复访照样被质询。
+
+因此现在的链路是：点击（需 label activation）→ Turnstile 接受 → 提交证明 →
+**CF 判定失败** → 下发无效 clearance + `cf_chl_rc_ni=1` → widget 重置。
+阻塞点确定落在**证明内容本身（JSVMP 指纹面）**，与输入链路、cookie 处理都无关。
+
+**判据更新**：今后一律用 `cf_chl_rc_ni` 是否出现来判成败，比「有没有 cf_clearance」
+可靠得多，也比等页面跳转快。
+
+### Step 32 — 双向 message 对比：找到 `cs` 栈指纹，并测出 inline script 行号偏移
+
+**方法**：只**添加** `message` 监听器、不包装 `postMessage`/`contentWindow`（step 6 的教训：
+包装会让握手消息整批消失）。preload 在每个 frame realm 都跑（page.rs:2379），一次注册即可
+覆盖两侧：`TOP <=` 即 widget→parent，`WIDGET <=` 即 parent→widget。
+
+**证据 1：完整的双向流量**（obscura，35s 封顶）
+
+| 方向 | 事件 |
+|---|---|
+| widget→parent | `init(mode:managed)` → `requestExtraParams` → `translationInit` → `food` seq 1..15 → **`interactiveBegin`@9019ms** |
+| parent→widget | `meow` seq 1..N（父侧心跳）、`init`、`extraParams`、`execute` |
+
+点击后 **没有任何新事件**，`food` 心跳在 seq 15 停止 —— 与 step 31 的
+`cf_chl_rc_ni=1` 对得上：证明被判失败，widget 直接收摊。
+
+**证据 2：父页面向 widget 发的 `cs` 就是 `Error.stack` 指纹**
+
+```
+{"cs":[[0,68,"Error
+    at ki (…/turnstile/v0/g/<ch>/api.js?onload=…&render=explicit:1:19216)
+    at ke (…api.js:1:19347)
+    at Object.I [as render] (…api.js:1:62948)
+    at Al.AV (…/chl_page/v1?ray=…:3:178541)
+    at Al.<computed>.<computed> [as run] (…:1:19257)
+    at AO (…:3:115818)
+    … 共 10 帧",1]], "event":"extraParams" }
+```
+
+10 帧全是页面自己的脚本，**没有 obscura 引擎帧**——step 8 的修复确实生效。
+
+**证据 3：受控对照（19 种栈形态，obscura vs Chrome 146）**
+
+真实 Chrome 在同一代理下已**不再触发质询**（cookie 用 `Network.clearBrowserCookies`
+清到 `total=0` 仍直接返回真实 404），拿不到实时 `cs` 对照，因此改用受控测试页：
+
+- **函数名/别名格式逐字一致**：`Object.I [as render]`、`Cls.<computed> [as k1]`、
+  `C2.k1`、`Array.map (<anonymous>)`、`JSON.stringify (<anonymous>)`、
+  `eval (eval at <anonymous> (FILE:41:41), <anonymous>:1:1)`、`Object.get` 全部相同。
+  `Error.toString`/`stackTraceLimit`/`prepareStackTrace`/`captureStackTrace` 也一致。
+  → 先前怀疑的 `Al.<computed>.<computed> [as run]` 是 **Turnstile 自身代码结构**导致的，
+  不是 obscura 的缺陷。
+- **唯一差异：inline script 的行号**。列号完全相同，行号 obscura 一律偏小，
+  偏移量 == `<script>` 标签前的 HTML 行数。专门构造的验证（`<script>` 在第 11 行）：
+
+  | | 栈帧 |
+  |---|---|
+  | Chrome | `at ki (FILE:12:23)` ← 文档**绝对**行号 |
+  | obscura | `at ki (FILE:2:23)` ← script **内部相对**行号 |
+
+**结论**：obscura 的 inline `<script>` 栈帧行号用的是脚本内相对行号，Chrome 用的是文档
+绝对行号（起始行 = `<script>` 所在行）。这是**一行代码即可检测**的指纹差异，且正落在
+Cloudflare 明确采集的 `Error.stack` 面上。
+
+**诚实边界**：本次 `cs` 里的 10 帧**全部来自外部脚本**（`api.js`、`chl_page/v1`），
+外部脚本行号从 1 起算、不受此偏移影响。所以这个差异是**真实且可检测的缺陷**，但
+**尚未证明**它就是本次判失败的直接原因。要坐实还需在质询页里找到一处 inline 栈采集。
+
+**修法**：V8 编译 inline script 时应传入起始行/列偏移（`ScriptOrigin` 的
+`resource_line_offset` / `resource_column_offset`），值取 `<script>` 标签在文档中的位置。
+
+### Step 33 — 修正 step 22：分流不是由 IP 决定的
+
+**证据**：真实 Chrome 与 obscura 走**同一个 Reqable 代理、同一出口 IP**。把 Chrome 的
+cookie 清到 `total=0` 后重新访问，Chrome **直接拿到真实 404，完全不触发质询**；而 obscura
+在同一时间、同一 IP 上仍被质询并分流到 interactive 分支。
+
+**结论**：step 22 记的「managed vs interactive 由 IP 干净程度决定」**不成立**，至少现在不是
+主因。同一 IP 下两者待遇不同，差异只能来自**客户端指纹**（TLS/HTTP2 指纹、JS 环境、
+Error.stack 这类面）。这把战线从"换个干净 IP"重新拉回到指纹一致性上。
+
+**副作用**：这也意味着 Chrome 侧暂时无法复现质询，实时对照要么换未被信任的出口，要么
+改用受控测试页（step 32 的做法）。
+
+### Step 34 — obscura vs Chrome 的 message/worker 逐项对比
+
+**方法**：Chrome 用全新 `--user-data-dir` 重启才重新触发质询（老 profile 即使 cookie 清到
+0 也直接放行，见 step 33）。OOPIF 侧用 `Target.setAutoAttach(waitForDebuggerOnStart)` 注入，
+且**必须等注入返回再 resume**——先 resume 会让 hook 落在页面脚本之后，什么都抓不到。
+worker session 一律跳过：`Page.enable` 在 worker 上永不返回，十几个 20s 超时会把 dump 阶段
+饿死（前一次整轮空结果就是这么来的）。
+
+**对比结果**：
+
+| 观测项 | obscura | Chrome 146 | 差异 |
+|---|---|---|---|
+| widget→parent 事件序列 | `init(managed)` → `requestExtraParams` → `translationInit` → `food` → `interactiveBegin` | 完全相同 | 无 |
+| `interactiveBegin` 时刻 | 9019ms | 6896ms | 无实质 |
+| parent→widget | `meow` 心跳、`init`、`extraParams`、`execute`（含 `cs` 栈） | 同类（`cs` 全文未取到） | — |
+| **点击后 `food` 心跳** | **seq 15 后停止** | **继续到 seq 25+（23.6s 仍在跳）** | **有** |
+| worker spawn | 24 次；同一 `src_len=291` blob 实例化 12 次 | 13+ session；同一 blob 实例化 11 次 | 无 |
+| `Error.stack` 19 种形态 | 与 Chrome 逐字一致 | — | 仅 inline 行号（step 32） |
+| `translationInit.displayLanguage` | `en-us` | `zh-cn` | 次要（Accept-Language 不同） |
+
+**结论**：握手、事件序列、worker 并行度这三块**都不是差异点**——obscura 在这些面上与 Chrome
+一致。真正的行为差异只有一处：**点击提交后 obscura 的 widget 心跳停了，Chrome 的还在跳**。
+结合 step 31 的 `cf_chl_rc_ni=1`，这说明 obscura 提交的证明被**当场判失败**、widget 随即收摊；
+Chrome 则继续保持会话。心跳停止因此是一个**比截图更快的失败信号**（点击后 ~2s 即可判定）。
+
+**取 Chrome `cs` 的可复现配方**（第一次尝试失败，第二次成功）：每次都要**全新
+`--user-data-dir`**（旧 profile 捕获两次质询后即被放行）；OOPIF 注入必须**等
+`addScriptToEvaluateOnNewDocument` 返回再 `runIfWaitingForDebugger`**；worker session 全部
+跳过。满足这三条才能拿到 `=== realm challenges.cloudflare.com… : 35 msgs ===`。
+
+### Step 35 — `cs` 栈逐帧对比：api.js 段完全一致，chl_page 段结构不同
+
+| | 帧数 | 栈底 |
+|---|---|---|
+| Chrome 146 | **9** | 回到 `api.js` 的两个匿名帧（`:1:40905`、`:1:81642`） |
+| obscura | **11** | 停在 `chl_page` 的 `Al.A8` |
+
+**完全一致的部分**（逐字，含行列号）：
+
+```
+Error
+  at ki (…/api.js?onload=mlyM5&render=explicit:1:19216)
+  at ke (…/api.js:1:19347)
+  at Object.I [as render] (…/api.js:1:62948)
+```
+
+→ obscura 在 **api.js 这一层的执行路径与 Chrome 完全相同**。
+
+**不同的部分**（`chl_page/v1` 段）：
+
+```
+chrome : at yD.yy (…chl_page:3:27206)
+         at yD.<computed>.<computed> [as run] (…:2:6925)
+         at yE (…:3:49754)
+         at …/api.js:1:40905          ← 回到 api.js
+         at …/api.js:1:81642
+obscura: at Al.AV (…chl_page:3:178541)
+         at Al.<computed>.<computed> [as run] (…:1:19257)
+         at AO (…:3:115818)
+         at Al.AV (…:3:178787)        ← 同一组三元组又来一轮
+         at Al.<computed>.<computed> [as run] (…:1:19257)
+         at AO (…:3:115818)
+         at Al.A8 (…:3:145297)
+```
+
+**重要限定**：`chl_page/v1` 是**每个 ray 重新混淆生成**的，函数名（`yD/yE` vs `Al/AO`）与
+行列号本来就不可比，**不能**据此直接判定 obscura 有问题。可比的是**结构**：
+
+1. `Al.<computed>.<computed> [as run]` 这种双 `<computed>` 格式 **Chrome 也产出**
+   （`yD.<computed>.<computed> [as run]`）→ 彻底排除 step 32 遗留的这个怀疑，是正常 V8 格式。
+2. obscura 的 `AV → run → AO` 三元组**重复了两轮**，Chrome 只有一轮；且 Chrome 的栈**回到
+   api.js**（说明是从 api.js 的回调进入），obscura 的栈**停在 chl_page 内部**。
+3. `cs` 的第二个字段（`[0,N,"Error…"]`）：**Chrome=1，obscura 观测到 7 / 68 / 116**。若它是
+   计数器或耗时，两边差一到两个数量级。
+
+**结论**：栈**内容**层面 obscura 与 Chrome 在可比的 api.js 段上一致；差异集中在
+chl_page 的调用结构——obscura 多一层重复调用、入口来源不同、`cs` 的 N 值大得多。这三者都
+指向「obscura 在 chl_page 里走了重试/额外一轮」，但**尚未证明**，因为混淆脚本每 ray 不同。
+
+**下一步验证**：同一侧多次采样，看 `N` 值与重复三元组是否稳定出现；若稳定，再用 v8 trace
+定位 `AV/AO` 对应的实际 API 调用，找出被重试的那一步。
+
+## 测量盲区
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -1023,6 +1417,14 @@ render+stealth release build、33 阶 obstacle course、realm probe 和真实 35
 | `cargo build` 的输出用 `grep -E "^error"` 过滤会漏掉真正的失败行 | 拿着**没构建成功**的旧二进制跑了一轮，结论全错 | 过滤时必须同时匹配 `Finished` / `could not compile`，确认构建真的成功 |
 | 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
+| **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
+| 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
+| **二进制比代码旧**（改完代码没重建就跑真实探测） | step 29 首轮拿 20:12 的二进制去测 21:10 的提交 | 每轮实测前 `stat` 二进制时间与 `git log -1` 对一下，并确认构建输出里有 `Finished` |
+| **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空** | step 30 的胶片探针从 t=1s 开始轮询，之后每帧都是 0 元素/0 字节截图，看着像「obscura 没渲染出页面」 | 同进程对照可复现：start=20 正常 → start=1 全空 → start=20 又正常。**探针首次求值必须延后**（脚本里 `--start`，默认 12s）。这本身是待修的真实缺陷 |
+| 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
+| 注入脚本读不到 bootstrap 的 script 作用域 `const` | 探针里 `_eventTargetListeners` 恒 undefined，被静默当成「没有监听器」，得出「整条链零 listener」的错误结论 | 任何读内部变量的探针都要先打印 `typeof`，确认它真的可见 |
+| **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
+| Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时改用**受控测试页**做对照，别硬等质询 |
 | 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
@@ -1032,12 +1434,28 @@ render+stealth release build、33 阶 obstacle course、realm probe 和真实 35
 
 按当前怀疑程度排序：
 
-- **打通交互分支的点击**（step 22 定为首要方向）：closed shadow 命中测试和完整
-  move/click 输入序列已经具备；剩余缺口是 fetch 流程不会在 `interactiveBegin` 后主动
-  定位并操作 checkbox。先通过 CDP 驱动一次确定性的人工交互，实测 127KB 交互 JSVMP
-  是否发出 `/pat/`，再决定自动化策略应属于调用方还是 CLI 工作流。
-- **点击后 127KB 交互 JSVMP 能否算完证明**：未知，需实测。若点击后仍不发 `/pat/`，
-  才回到「追 JSVMP 指纹面」这条路。
+- **正式实现 `<label>` 激活行为**（step 30，现首要）：当前只有
+  `OBSCURA_LABEL_ACTIVATION` 门控的验证 hack。要按规范补 `for=`/包含式两种关联、
+  interactive content 例外、labeled control 自身不重复激活，并补 `labels`/`control`、
+  覆盖 `HTMLElement.click()` 路径与回归测试。
+- **证明阶段仍不通过**（step 30/31 新断点，现唯一实质阻塞）：点击被接受后 widget 进入
+  `Verifying you are human`，约 2 秒后重置；同时下发**无效** `cf_clearance` 与
+  `cf_chl_rc_ni=1`（step 31）。已确定与输入链路、cookie 处理无关，问题在**证明内容
+  本身**，即 step 22 预留的 JSVMP 指纹面。判据：`cf_chl_rc_ni` 是否出现。
+- **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
+  行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
+  `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始
+  行/列偏移。（注意：本次 `cs` 的 10 帧全是外部脚本，尚未证明它就是判失败的直接原因。）
+- **导航早期 `Runtime.evaluate` 清空文档**（step 30 发现）：可复现、与质询无关的真实
+  缺陷，但会持续毒化任何早期轮询的探针，值得单独修 + 回归测试。
+- **obscura 不尊重 `no_proxy`/`NO_PROXY`**（step 32 顺带发现）：设了 `no_proxy='*'` 仍会把
+  `127.0.0.1` 的请求送进 `http_proxy`，且**静默失败**——CLI 照样打印 `Page loaded`，只是
+  内容为空。只能靠 `env -u http_proxy -u https_proxy -u all_proxy` 绕开。
+- **自动点击策略**（step 28 时序约束）：一旦上一条打通，fetch 流程需要在复选框渲染的
+  **第一时间**点击，不能先等待观测——129s 会换 ray，token 作废。归属（调用方 / CLI
+  工作流 / `--solve-interactive` 之类开关）待定。
+- **obscura `Runtime.evaluate` 的多行表达式静默失败**（step 29 发现）：与质询无关，但
+  会持续毒化探针，且是真实的 CDP 一致性缺陷，值得单独修 + 回归测试。
 - **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
