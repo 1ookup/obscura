@@ -653,6 +653,40 @@ frame 布局链路已定位到 `crates/obscura-js/src/runtime.rs` 的 `frame_con
 - js-reverse 的页面会因挑战自动刷新而换 frame，读完一个 frame 后别假设它还停在那儿；
   每次求值前重新 `select_frame` 并核对 URL。
 
+### Step 18 — 真因：frame 内几何查询走的是顶层布局，返回全零
+
+step 17 说「body 0×0」，进一步测量发现比这更广——widget frame 内**所有**元素
+（html / head / body / title）`getBoundingClientRect` 全是 0×0，且：
+
+```
+window.innerWidth = 1920, innerHeight = 1000   ← 不是 iframe 的 300×65
+scrollWidth = 1280, scrollHeight = 720          ← 顶层页面的视口
+```
+
+先排除「布局引擎不会给 shadow+body 定尺寸」：写了一个 render 层测试
+`a_shadow_host_body_sizes_to_the_viewport_and_its_shadow_content`，body 挂 closed
+shadow root + 200×50 内容，viewport 300×65 → body 正确得到 300×50+。**布局引擎本身
+没问题。**
+
+真因在两条路径分了家：
+
+| 路径 | 代码 | 用的布局 | 结果 |
+|------|------|---------|------|
+| 绘制 frame surface | `render_frame_tree_into`（runtime.rs:93） | `prepare_frame_document` 独立布局，画完丢弃 | 正常（spinner 能画） |
+| JS 几何查询 | `op_layout_geometry`（ops.rs:6081） | 只有 `gs.prepared_render`（**顶层**文档） | frame 内 nid 查不到 → 返回空 → 全零 rect |
+
+`op_layout_geometry` 只接受一个 nid，不做「这个 nid 属于哪个文档（主文档还是哪个
+frame）」的解析，永远查顶层布局。frame 内容只在画 surface 时被临时布局一次，事后
+丢弃，几何查询拿不到。
+
+**修复方向**：几何 op 需要按 nid 定位所属 frame，按该 frame 的 content box 尺寸现算
+（或缓存）那份 frame 布局再查询；`op_layout_metrics` 同理（innerWidth/scrollWidth
+也错了）。这是 frame 布局缓存 + 几何 op 分派两件事，量不小。
+
+对挑战的影响：Turnstile 的 JS 会读 widget 的几何来判定自己是否可见/尺寸是否正确。
+全零 rect 会让它认为 widget 塌缩或不可见，很可能就是它走到 `interactiveBegin` 而不是
+自动通过的原因——这比「打分」更具体，是功能缺失。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -681,8 +715,9 @@ frame 布局链路已定位到 `crates/obscura-js/src/runtime.rs` 的 `frame_con
 
 按当前怀疑程度排序：
 
-- **obscura 里 widget 的 `document.body` 是 0×0（Chrome 300×65）**，shadow 内容没盒子可排，
-  复选框画不出来（step 17）。待定位根元素/body 为何不按 viewport 撑开。
+- **frame 内几何查询走顶层布局**（step 18）：`op_layout_geometry` 只查 `prepared_render`，
+  frame 内所有元素 `getBoundingClientRect` / `innerWidth` 全错。绘制和几何两条路径
+  用的布局不同。修复要按 nid 分派到所属 frame 的布局。
 - **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
   `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
   剩下的是打分问题，需要继续找被判为可疑的指纹面。

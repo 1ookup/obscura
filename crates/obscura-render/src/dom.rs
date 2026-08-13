@@ -15706,6 +15706,46 @@ mod tests {
         assert!(child.frame_content_at_point(&tree, (150.0, 90.0)).is_none());
     }
 
+    /// A frame document whose body holds only a shadow tree must still size
+    /// that body from the viewport and its shadow content. The Turnstile
+    /// widget builds exactly this shape, and obscura left the body 0x0 where
+    /// Chrome reports 300x65 -- the shadow-hosted checkbox then had no box to
+    /// paint into.
+    #[test]
+    fn a_shadow_host_body_sizes_to_the_viewport_and_its_shadow_content() {
+        let tree = parse_html("<html><body></body></html>");
+        let root = tree.document();
+        // Simulate the frame document: an empty body whose whole content lives
+        // in a shadow root.
+        let body = tree.query_selector("body").unwrap().unwrap();
+        let shadow = tree
+            .attach_shadow_root(body, ShadowRootMode::Closed)
+            .expect("attach shadow root");
+        obscura_dom::parse_into_subtree(
+            &tree,
+            shadow,
+            "<div id=\"box\" style=\"width:200px;height:50px\"></div>",
+        );
+
+        let laid = layout_dom_from_root(&tree, root, (300.0, 65.0));
+        let body_rect = laid.rects.get(&body).copied();
+
+        assert!(body_rect.is_some(), "body received no layout rect");
+        let body_rect = body_rect.unwrap();
+        // Width: fills the viewport's initial containing block.
+        assert!(
+            body_rect.width >= 250.0,
+            "body width was {}, expected it to fill the 300px viewport",
+            body_rect.width
+        );
+        // Height: at least the shadow content's 50px.
+        assert!(
+            body_rect.height >= 50.0,
+            "body height was {}, expected at least the 50px shadow content",
+            body_rect.height
+        );
+    }
+
     #[test]
     fn root_and_body_inline_outer_geometry_matches_blockification_rules() {
         for display in ["inline-block", "inline-flex", "inline-grid"] {
