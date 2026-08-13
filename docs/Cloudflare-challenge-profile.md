@@ -1396,7 +1396,57 @@ chl_page 的调用结构——obscura 多一层重复调用、入口来源不同
 **下一步验证**：同一侧多次采样，看 `N` 值与重复三元组是否稳定出现；若稳定，再用 v8 trace
 定位 `AV/AO` 对应的实际 API 调用，找出被重试的那一步。
 
-## 测量盲区
+### Step 36 — 探针挂起了 worker：推翻本轮三个结论，并拿到成功样本的黄金基线
+
+**触发**（用户观察）：「Chrome 一直转圈」。
+
+**真因**：采集脚本对子 target 用了
+`Target.setAutoAttach(waitForDebuggerOnStart: true)`，它会**暂停每一个新 target**；
+后来为了躲开 worker session 上 `Page.enable` 永不返回的超时，我把 worker **整类跳过**
+——于是那十几个 `blob:challenges.cloudflare.com` worker **全部被挂起，永远没人 resume**。
+Turnstile 的证明就跑在这些 worker 里，它们不动，widget 自然永远停在 `Verifying...`。
+
+**被这个 bug 污染的结论，逐条更正**：
+
+| 之前写的 | 实际 |
+|---|---|
+| 「Chrome 在当前 IP 上也过不了盾了」 | **错**。修复后同一 IP、同一代理，Chrome 稳定过盾 |
+| 「出口 IP 已被 CF 惩罚到连真实浏览器都拦」 | **错**。是探针挂起 worker |
+| 多次 `overrunBegin` 是 CF 的真实判定 | **错**。是 worker 被挂起导致的超时 |
+
+**正确做法**：`waitForDebuggerOnStart` 下，**每个** attached target 都必须
+`Runtime.runIfWaitingForDebugger`；只是 worker 不要发 `Page.*`，且 resume 要
+fire-and-forget（worker session 可能永不回包，等它会拖死后续请求）。
+
+**成功样本（黄金基线）**：修复后 Chrome 稳定复现「等 `interactiveBegin` → 点击 → 过盾」：
+
+```
+1830ms  TOP    <= init (mode:managed)
+ 251ms  WIDGET <= init / extraParams / cs(栈指纹)
+2865ms  TOP    <= translationInit
+6122ms  TOP    <= interactiveBegin          ← 要求点击
+        [click @ 7.9s]
+7379ms  TOP    <= interactiveEnd            ← 点击被接受
+8047ms  TOP    <= complete + token=1.4TM7ap…  ← 验证通过
+        → 导航 → 站点真实 404
+```
+
+**判据修正**：成功路径里 `food` 心跳最后一次在 7571ms，也在 `complete` 前后停止。
+所以 step 34 写的「心跳停止 = 失败信号」**不成立**，就此作废。正确判据是
+**`interactiveEnd` → `complete`+`token`** 这条链。
+
+**obscura 对照**（正式 label activation 版本，点击 t=14.5s）：
+
+| 事件 | Chrome 成功 | obscura |
+|---|---|---|
+| `interactiveBegin` | ✓ 6122ms | ✓ 9369ms |
+| **`interactiveEnd`** | **✓ 7379ms** | **✗ 从未出现** |
+| **`complete` + token** | **✓ 8047ms** | **✗ 从未出现** |
+
+**结论**：断点从「证明失败」精确到了**「交互确认失败」**——obscura 的点击让 widget 进入了
+`Verifying`（step 30 截图），但 Turnstile **从不发 `interactiveEnd`**，即它没有把这次点击
+认定为一次完成的人类交互。所以下一步该查的是**交互本身的可信度**（鼠标轨迹只有 2 个
+move、按下/抬起间隔、事件时序），而不是 JSVMP 的指纹面。
 
 ## 测量盲区
 
@@ -1424,7 +1474,9 @@ chl_page 的调用结构——obscura 多一层重复调用、入口来源不同
 | 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
 | 注入脚本读不到 bootstrap 的 script 作用域 `const` | 探针里 `_eventTargetListeners` 恒 undefined，被静默当成「没有监听器」，得出「整条链零 listener」的错误结论 | 任何读内部变量的探针都要先打印 `typeof`，确认它真的可见 |
 | **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
-| Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时改用**受控测试页**做对照，别硬等质询 |
+| Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时换**全新 `--user-data-dir`**（最有效），或改用受控测试页 |
+| **`waitForDebuggerOnStart` 会暂停每一个新 target，包括 worker** | step 36：跳过 worker session 不 resume → Turnstile 的十几个 blob worker 全部挂起 → widget 永远 `Verifying...`。据此得出的「Chrome 也过不了盾」「IP 被惩罚」「overrunBegin 是真实判定」**三个结论全错** | 每个 attached target 都要 `runIfWaitingForDebugger`；worker 不发 `Page.*`，且 resume 用 fire-and-forget（worker session 可能永不回包） |
+| 过盾后页面**导航到新文档**，`window.__msgs` 随之清空 | 点击后 3 秒再 dump 就已经什么都读不到，成功样本连抓两次落空 | 让 hook 同时 `console.warn`，订阅 `Runtime.consoleAPICalled` **实时收流**，不依赖 dump 时机 |
 | 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
@@ -1438,10 +1490,12 @@ chl_page 的调用结构——obscura 多一层重复调用、入口来源不同
   `OBSCURA_LABEL_ACTIVATION` 门控的验证 hack。要按规范补 `for=`/包含式两种关联、
   interactive content 例外、labeled control 自身不重复激活，并补 `labels`/`control`、
   覆盖 `HTMLElement.click()` 路径与回归测试。
-- **证明阶段仍不通过**（step 30/31 新断点，现唯一实质阻塞）：点击被接受后 widget 进入
-  `Verifying you are human`，约 2 秒后重置；同时下发**无效** `cf_clearance` 与
-  `cf_chl_rc_ni=1`（step 31）。已确定与输入链路、cookie 处理无关，问题在**证明内容
-  本身**，即 step 22 预留的 JSVMP 指纹面。判据：`cf_chl_rc_ni` 是否出现。
+- **交互确认失败：拿不到 `interactiveEnd`**（step 36，现唯一实质阻塞）：成功路径是
+  `interactiveBegin` → 点击 → **`interactiveEnd`**（+1.3s）→ **`complete`+token**（+0.7s）
+  → 放行；obscura 点击后 widget 会进入 `Verifying`，但 `interactiveEnd` 与 `complete`
+  **从未出现**。即 Turnstile 没把这次点击认定为一次完成的人类交互。先查**交互可信度**
+  （鼠标轨迹只有 2 个 move、按下/抬起间隔、事件时序），而不是 JSVMP 指纹面。
+  判据：`interactiveEnd` → `complete`+token；辅以 `cf_chl_rc_ni`（step 31）。
 - **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
   行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
   `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始

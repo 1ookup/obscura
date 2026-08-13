@@ -32,8 +32,8 @@ HOOK = ("(function(){if(globalThis.__msgHooked)return;globalThis.__msgHooked=1;"
         "window.__msgs=[];window.__t0=Date.now();"
         "window.addEventListener('message',function(e){try{"
         "var d=e.data;var s=(typeof d==='object'&&d!==null)?JSON.stringify(d):String(d);"
-        "window.__msgs.push((Date.now()-window.__t0)+'ms '+tag+' <= '+(e.origin||'?')+' : '"
-        "+s.slice(0,4000));}catch(x){}},true);})()")
+        "var rec=(Date.now()-window.__t0)+'ms '+tag+' <= '+(e.origin||'?')+' : '+s.slice(0,4000);"
+        "window.__msgs.push(rec);console.warn('[msg] '+rec);}catch(x){}},true);})()")
 
 SHADOW = ("(function(){window.__roots=[];var a=Element.prototype.attachShadow;"
           "Element.prototype.attachShadow=function(i){var r=a.apply(this,arguments);"
@@ -67,6 +67,7 @@ async def run(endpoint, url, wait_interactive, settle, offset):
         n = [0]
         pending = {}
         sessions = []
+        live = []
 
         async def send(m, p=None, s=None):
             n[0] += 1
@@ -79,24 +80,29 @@ async def run(endpoint, url, wait_interactive, settle, offset):
             pending[mid] = fut
             return await asyncio.wait_for(fut, timeout=20)
 
-        async def setup(sid):
-            for src in (SHADOW, HOOK):
-                try:
-                    await send("Page.addScriptToEvaluateOnNewDocument", {"source": src}, s=sid)
-                except Exception:
-                    pass
-            for meth, params in (("Page.enable", {}), ("Runtime.enable", {}),
-                                 ("Target.setAutoAttach",
-                                  {"autoAttach": True, "waitForDebuggerOnStart": True,
-                                   "flatten": True})):
-                try:
-                    await send(meth, params, s=sid)
-                except Exception:
-                    pass
-            try:
-                await send("Runtime.runIfWaitingForDebugger", s=sid)
-            except Exception:
-                pass
+        async def setup(sid, kind="page"):
+            if kind in ("page", "iframe"):
+                for src in (SHADOW, HOOK):
+                    try:
+                        await send("Page.addScriptToEvaluateOnNewDocument",
+                                   {"source": src}, s=sid)
+                    except Exception:
+                        pass
+            if kind in ("page", "iframe"):
+                for meth, params in (("Page.enable", {}), ("Runtime.enable", {}),
+                                     ("Target.setAutoAttach",
+                                      {"autoAttach": True, "waitForDebuggerOnStart": True,
+                                       "flatten": True})):
+                    try:
+                        await send(meth, params, s=sid)
+                    except Exception:
+                        pass
+            # Fire-and-forget: a worker session may never answer, and waiting
+            # on it would delay the resume that unblocks the page.
+            n[0] += 1
+            await ws.send(json.dumps({"id": n[0],
+                                      "method": "Runtime.runIfWaitingForDebugger",
+                                      "sessionId": sid}))
 
         async def pump():
             while True:
@@ -106,12 +112,22 @@ async def run(endpoint, url, wait_interactive, settle, offset):
                     if not fut.done():
                         fut.set_result(m)
                     continue
+                if m.get("method") == "Runtime.consoleAPICalled":
+                    for arg in m["params"].get("args", []):
+                        v = arg.get("value")
+                        if isinstance(v, str) and v.startswith("[msg] "):
+                            live.append(v[6:])
+                    continue
                 if m.get("method") == "Target.attachedToTarget":
                     p = m["params"]
                     info = p.get("targetInfo", {})
                     sessions.append((p["sessionId"], info.get("type"), info.get("url", "")[:70]))
-                    if info.get("type") in ("page", "iframe"):
-                        asyncio.ensure_future(setup(p["sessionId"]))
+                    # EVERY attached target must be resumed. waitForDebugger
+                    # OnStart pauses workers too, and Turnstile runs its proof
+                    # in a dozen blob workers -- leaving them paused hangs the
+                    # widget on "Verifying..." forever and looks exactly like a
+                    # Cloudflare timeout.
+                    asyncio.ensure_future(setup(p["sessionId"], info.get("type")))
 
         task = asyncio.ensure_future(pump())
         try:
@@ -166,6 +182,32 @@ async def run(endpoint, url, wait_interactive, settle, offset):
             if clicked_at is None:
                 print("!! never clicked (no interactiveBegin within %.0fs)" % wait_interactive)
 
+            async def dump_realms(tag):
+                print("--- realms (%s) ---" % tag)
+
+                for sid, typ, u in sessions:
+                    if typ not in ("page", "iframe"):
+                        continue
+                    try:
+                        r = await send("Runtime.evaluate",
+                                       {"expression": DUMP, "returnByValue": True}, s=sid)
+                        val = json.loads(r["result"]["result"]["value"])
+                    except Exception:
+                        continue
+                    if not val.get("msgs"):
+                        continue
+                    print("=== %s : %d msgs ===" % (val["url"][:70], len(val["msgs"])))
+                    for m in val["msgs"]:
+                        if '"food"' in m or '"meow"' in m:
+                            continue
+                        print("   ", m[:1500])
+
+            # Passing navigates away and the fresh document resets __msgs, so
+            # the post-click window has to be read before that happens.
+            if clicked_at is not None:
+                await asyncio.sleep(3.0)
+                await dump_realms("3s after click, before navigation")
+
             end = loop.time() + settle
             while loop.time() < end:
                 await asyncio.sleep(2.0)
@@ -200,6 +242,14 @@ async def run(endpoint, url, wait_interactive, settle, offset):
                             if ('"food"' in m or '"meow"' in m)][-2:]
                     for m in tail:
                         print("    (last heartbeat)", m[:120])
+            print("--- live console stream: %d messages ---" % len(live))
+            for m in live:
+                if '"food"' in m or '"meow"' in m:
+                    continue
+                print("   ", m[:1600])
+            hb = [m for m in live if '"food"' in m or '"meow"' in m]
+            if hb:
+                print("   (heartbeats: %d, last: %s)" % (len(hb), hb[-1][:90]))
         finally:
             task.cancel()
 

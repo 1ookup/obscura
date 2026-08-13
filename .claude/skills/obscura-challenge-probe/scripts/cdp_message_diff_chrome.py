@@ -64,27 +64,31 @@ async def run(endpoint, url, cap, start, click):
             pending[mid] = fut
             return await asyncio.wait_for(fut, timeout=20)
 
-        async def setup_target(sid):
+        async def setup_target(sid, kind="page"):
             """Install the hook and only THEN resume: resuming first races the
             page's own scripts and the hook lands too late to see anything."""
-            for src in (SHADOW, HOOK):
-                try:
-                    await send("Page.addScriptToEvaluateOnNewDocument",
-                               {"source": src}, s=sid)
-                except Exception:
-                    pass
-            for meth, params in (("Page.enable", {}), ("Runtime.enable", {}),
-                                 ("Target.setAutoAttach",
-                                  {"autoAttach": True, "waitForDebuggerOnStart": True,
-                                   "flatten": True})):
-                try:
-                    await send(meth, params, s=sid)
-                except Exception:
-                    pass
-            try:
-                await send("Runtime.runIfWaitingForDebugger", s=sid)
-            except Exception:
-                pass
+            if kind in ("page", "iframe"):
+                for src in (SHADOW, HOOK):
+                    try:
+                        await send("Page.addScriptToEvaluateOnNewDocument",
+                                   {"source": src}, s=sid)
+                    except Exception:
+                        pass
+            if kind in ("page", "iframe"):
+                for meth, params in (("Page.enable", {}), ("Runtime.enable", {}),
+                                     ("Target.setAutoAttach",
+                                      {"autoAttach": True, "waitForDebuggerOnStart": True,
+                                       "flatten": True})):
+                    try:
+                        await send(meth, params, s=sid)
+                    except Exception:
+                        pass
+            # Fire-and-forget: a worker session may never answer, and waiting
+            # on it would delay the resume that unblocks the page.
+            n[0] += 1
+            await ws.send(json.dumps({"id": n[0],
+                                      "method": "Runtime.runIfWaitingForDebugger",
+                                      "sessionId": sid}))
 
         async def pump():
             while True:
@@ -102,8 +106,12 @@ async def run(endpoint, url, cap, start, click):
                     # Workers get no hook: Page.enable never answers on a
                     # worker session, and a dozen 20s timeouts starve the
                     # dump phase (which is how the last run came back empty).
-                    if info.get("type") in ("page", "iframe"):
-                        asyncio.ensure_future(setup_target(p["sessionId"]))
+                    # EVERY attached target must be resumed. waitForDebugger
+                    # OnStart pauses workers too, and Turnstile runs its proof
+                    # in a dozen blob workers -- leaving them paused hangs the
+                    # widget on "Verifying..." forever and looks exactly like a
+                    # Cloudflare timeout.
+                    asyncio.ensure_future(setup_target(p["sessionId"], info.get("type")))
 
         task = asyncio.ensure_future(pump())
         try:
