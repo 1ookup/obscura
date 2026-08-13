@@ -618,6 +618,41 @@ step 15 之前基于「框是空的」做的推断都不成立——它不是没
 `JSON.stringify(...)` 并回读确认后才拿到真结果——**探针没生效和被测对象没反应，
 表现完全一样**。
 
+### Step 17 — 用 js-reverse 对照真实浏览器：推翻 step 16，真因是 body 尺寸 0×0
+
+step 16 断言「跨源 iframe 的绘制表面陈旧、不随 DOM 更新」——**这是错的**。用 js-reverse
+连真实 Chrome 对同一 widget 做逐项对照（这是此前缺的一步：真实浏览器基线）：
+
+| 项 | Chrome | obscura |
+|----|--------|---------|
+| body 挂 closed shadow root | 是（`attachShadow` 抛「已存在」） | 是（同样抛） |
+| `body.shadowRoot` | null（closed） | null |
+| light DOM 子节点 | 0 | 0 |
+| 样式表 / 规则数 | 2 张，183 + 1 | 2 张，183 + 1 |
+| `elementFromPoint(复选框处)` | **BODY** | — |
+| **`body.getBoundingClientRect()`** | **300×65** | **0×0** |
+
+**整个 Turnstile UI（复选框 + `Verify you are human`）都在挂在 `document.body` 上的
+closed shadow root 里。** 所以：
+
+1. 我之前「往 `body.innerHTML` 塞红块、截图不变」的因果测试**什么都没测**——宿主有
+   shadow root 时，light DOM 子节点根本不参与渲染，截图不变是正确行为，不是「陈旧表面」。
+2. 真因是 **obscura 里这个 body 尺寸是 0×0**（Chrome 是 300×65）。body 没盒子，
+   它的 shadow 内容就没地方排，复选框自然画不出来。
+
+frame 布局链路已定位到 `crates/obscura-js/src/runtime.rs` 的 `frame_content_box()`：
+它从父布局取 iframe 的 content box 作为子文档 viewport（有 `>=1×1` 的门槛），喂给
+`prepare_frame_document`。父布局里 iframe 确实是 300×65，但子文档的 body 最终算成
+0×0——**根元素/body 没有按 viewport 撑开**，这层还没查到底，是下一个待定位点。
+
+### 这一轮新增的两个测量坑
+
+- `websockets` 客户端会读 `http_proxy`/`all_proxy` 环境变量，把连本地 CDP server 的
+  ws 握手也走了 Reqable（`socks5://127.0.0.1:7897`），直接 `InvalidMessage`。之前
+  `cdp_probe.py` 能跑是因为当时这些变量没设。连本地 server 要 `env -u ..._PROXY`。
+- js-reverse 的页面会因挑战自动刷新而换 frame，读完一个 frame 后别假设它还停在那儿；
+  每次求值前重新 `select_frame` 并核对 URL。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -646,7 +681,8 @@ step 15 之前基于「框是空的」做的推断都不成立——它不是没
 
 按当前怀疑程度排序：
 
-- **跨源 iframe 的绘制表面不随 DOM 更新**（step 16），截图不能用来判断 frame 内状态。
+- **obscura 里 widget 的 `document.body` 是 0×0（Chrome 300×65）**，shadow 内容没盒子可排，
+  复选框画不出来（step 17）。待定位根元素/body 为何不按 viewport 撑开。
 - **Turnstile 判定需要交互**：4.9 s 发 `interactiveBegin`，6 s 屏幕上出现
   `Verify you are human`（step 14 已用截图证实）。浏览器则全自动走完。
   剩下的是打分问题，需要继续找被判为可疑的指纹面。
