@@ -4564,7 +4564,7 @@ impl Page {
         if borrowed_from_js {
             if let Some(dom) = self.dom.take() {
                 if let Some(js) = self.js.as_ref() {
-                    js.set_dom(dom);
+                    js.return_borrowed_dom(dom);
                 }
             }
         }
@@ -5050,7 +5050,7 @@ impl Page {
         if borrowed_from_js {
             if let Some(dom) = self.dom.take() {
                 if let Some(js) = self.js.as_ref() {
-                    js.set_dom(dom);
+                    js.return_borrowed_dom(dom);
                 }
             }
         }
@@ -5301,6 +5301,10 @@ impl Page {
         // attach_iframe_content_document. Until Phase 2's wrapper-lifetime
         // work lands, no JS wrapper can retain it, so free it eagerly.
         if let Some(previous) = committed.previous_root {
+            #[cfg(feature = "render")]
+            if let Some(js) = self.js.as_ref() {
+                js.discard_frame_render_state(previous);
+            }
             dom.remove(previous);
         }
         // A browsing context survives its own navigation, but every child
@@ -5316,6 +5320,10 @@ impl Page {
             let removed = self.frames.detach(&child);
             if let Some(js) = self.js.as_mut() {
                 for context in removed {
+                    #[cfg(feature = "render")]
+                    if let Some(root) = context.active_document_root {
+                        js.discard_frame_render_state(root);
+                    }
                     js.destroy_frame_realm(&context.frame_id);
                 }
             }
@@ -5814,6 +5822,63 @@ mod tests {
         assert_eq!(
             page.js.as_mut().unwrap().evaluate("dynamicLoads").unwrap(),
             serde_json::json!(3.0),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_frame_navigation_drops_only_the_superseded_render_state() {
+        let mut page = frame_test_page(
+            r#"<html><body><iframe id="left" srcdoc="<iframe srcdoc='nested'></iframe>"></iframe><iframe id="right" srcdoc="right"></iframe></body></html>"#,
+        );
+        page.load_child_frames().await;
+        page.init_js();
+
+        let (left_id, old_left_root, old_nested_root, right_root) = {
+            let dom = page.js.as_ref().unwrap();
+            let left_host = dom
+                .with_dom(|tree| tree.query_selector("#left").unwrap().unwrap())
+                .unwrap();
+            let right_host = dom
+                .with_dom(|tree| tree.query_selector("#right").unwrap().unwrap())
+                .unwrap();
+            let left = page.frames.by_host(left_host).unwrap();
+            let right = page.frames.by_host(right_host).unwrap();
+            let nested = page.frames.get(left.children.first().unwrap()).unwrap();
+            (
+                left.frame_id.clone(),
+                left.active_document_root.unwrap(),
+                nested.active_document_root.unwrap(),
+                right.active_document_root.unwrap(),
+            )
+        };
+        let js = page.js.as_ref().unwrap();
+        js.ensure_frame_render_state_for_test(old_left_root);
+        js.ensure_frame_render_state_for_test(old_nested_root);
+        js.ensure_frame_render_state_for_test(right_root);
+
+        page.navigate_frame_for_cdp(
+            &left_id,
+            super::FrameNavigationRequest {
+                srcdoc: Some("new left".to_string()),
+                ..super::FrameNavigationRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let js = page.js.as_ref().unwrap();
+        assert!(
+            !js.has_frame_render_state(old_left_root),
+            "the superseded document retained its animation/style state"
+        );
+        assert!(
+            !js.has_frame_render_state(old_nested_root),
+            "a detached child document retained its animation/style state"
+        );
+        assert!(
+            js.has_frame_render_state(right_root),
+            "navigating one frame cleared an unaffected sibling timeline"
         );
     }
 

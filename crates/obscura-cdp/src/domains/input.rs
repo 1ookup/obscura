@@ -68,6 +68,79 @@ fn input_target_js(target: &InputDispatchTarget, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn mouse_hover_exit_js(x: f64, y: f64) -> String {
+    format!(
+        "(function() {{\
+            var old = globalThis.__obscura_hover_target;\
+            globalThis.__obscura_hover_target = null;\
+            if (!old) return;\
+            function path(node) {{\
+                var result = [];\
+                while (node) {{\
+                    result.push(node);\
+                    node = node.parentNode || node.host || node._host || null;\
+                }}\
+                return result;\
+            }}\
+            var pointer = {{bubbles:true,cancelable:false,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,relatedTarget:null,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+            var leavePointer = Object.assign({{}}, pointer, {{bubbles:false,composed:false}});\
+            old.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerout', pointer)));\
+            for (var p of path(old)) p.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerleave', leavePointer)));\
+            old.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseout', pointer)));\
+            for (var m of path(old)) m.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseleave', leavePointer)));\
+        }})()"
+    )
+}
+
+fn mouse_hover_move_js(target_js: &str, x: f64, y: f64) -> String {
+    format!(
+        "(function() {{\
+            var target = {target_js};\
+            if (!target) return;\
+            var old = globalThis.__obscura_hover_target || null;\
+            function path(node) {{\
+                var result = [];\
+                while (node) {{\
+                    result.push(node);\
+                    node = node.parentNode || node.host || node._host || null;\
+                }}\
+                return result;\
+            }}\
+            var pointer = {{bubbles:true,cancelable:false,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,relatedTarget:null,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+            var enterPointer = Object.assign({{}}, pointer, {{bubbles:false,composed:false}});\
+            if (old !== target) {{\
+                var oldPath = path(old), newPath = path(target);\
+                var oi = oldPath.length - 1, ni = newPath.length - 1;\
+                while (oi >= 0 && ni >= 0 && oldPath[oi] === newPath[ni]) {{ oi--; ni--; }}\
+                if (old) {{\
+                    pointer.relatedTarget = target;\
+                    enterPointer.relatedTarget = target;\
+                    old.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerout', pointer)));\
+                    for (var op = 0; op <= oi; op++) oldPath[op].dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerleave', enterPointer)));\
+                }}\
+                pointer.relatedTarget = old;\
+                enterPointer.relatedTarget = old;\
+                target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerover', pointer)));\
+                for (var np = ni; np >= 0; np--) newPath[np].dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerenter', enterPointer)));\
+                if (old) {{\
+                    pointer.relatedTarget = target;\
+                    enterPointer.relatedTarget = target;\
+                    old.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseout', pointer)));\
+                    for (var om = 0; om <= oi; om++) oldPath[om].dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseleave', enterPointer)));\
+                }}\
+                pointer.relatedTarget = old;\
+                enterPointer.relatedTarget = old;\
+                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', pointer)));\
+                for (var nm = ni; nm >= 0; nm--) newPath[nm].dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', enterPointer)));\
+                globalThis.__obscura_hover_target = target;\
+            }}\
+            pointer.relatedTarget = null;\
+            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', pointer)));\
+            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', pointer)));\
+        }})()"
+    )
+}
+
 // Insert `escaped_text` at the caret, replacing any non-collapsed selection
 // the way a real browser does when you type over selected text (for example
 // after a triple-click select-all). selectionStart is null during ordinary
@@ -188,9 +261,14 @@ pub async fn handle(
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
                             var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0.5}}));\
-                            target.dispatchEvent(pevt);\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            var disabledControl = target.matches && target.matches(':disabled');\
+                            var pointerAllowed = target.dispatchEvent(pevt);\
+                            var suppressMouse = disabledControl || !pointerAllowed;\
+                            globalThis.__obscura_mouse_down.suppressMouse = suppressMouse;\
+                            if (!suppressMouse) {{\
+                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                target.dispatchEvent(evt);\
+                            }}\
                         }})()",
                         x = target.x,
                         y = target.y,
@@ -220,14 +298,17 @@ pub async fn handle(
                             globalThis.__obscura_mouse_down = null;\
                             var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
                             target.dispatchEvent(pevt);\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            if (!down || !down.suppressMouse) {{\
+                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                target.dispatchEvent(evt);\
+                            }}\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
                                 clickTarget = clickTarget.parentElement;\
                             }}\
                             if (!clickTarget) return;\
+                            if (clickTarget.matches && clickTarget.matches(':disabled')) return;\
                             var tag = clickTarget.tagName;\
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
@@ -236,7 +317,8 @@ pub async fn handle(
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
                                 if (radioName) {{\
-                                    var candidates = document.querySelectorAll('input');\
+                                    var radioRoot = clickTarget.getRootNode();\
+                                    var candidates = radioRoot && radioRoot.querySelectorAll ? radioRoot.querySelectorAll('input') : [];\
                                     radioStates = [];\
                                     for (var ri = 0; ri < candidates.length; ri++) {{\
                                         var radio = candidates[ri];\
@@ -348,35 +430,39 @@ pub async fn handle(
                     evaluate_input_script(page, &target, &code);
                 }
             } else if event_type == "mouseMoved" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let page_id = session_id
+                    .as_ref()
+                    .and_then(|sid| ctx.sessions.get(sid))
+                    .cloned();
+                let old_realm = page_id
+                    .as_ref()
+                    .and_then(|id| ctx.input_hover_realms.get(id))
+                    .cloned();
+                let new_realm = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let target = input_dispatch_target(page, x, y);
                     let target_js = input_target_js(
                         &target,
                         &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement"),
                     );
-                    // A real pointer move precedes every click: pointerover/
-                    // enter/move and their legacy mouse counterparts. Widgets
-                    // that gate a click on seeing the pointer move first (the
-                    // Turnstile interactive checkbox listens for pointermove,
-                    // pointerover and mouseenter) never receive them otherwise.
-                    let code = format!(
-                        "(function() {{\
-                            var target = {target_js};\
-                            if (!target) return;\
-                            var over = {{bubbles:true,cancelable:false,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
-                            var enter = {{bubbles:false,cancelable:false,composed:false,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerover', over)));\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerenter', enter)));\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', over)));\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', over)));\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', enter)));\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', over)));\
-                        }})()",
-                        x = target.x,
-                        y = target.y,
-                        target_js = target_js,
-                    );
+                    if old_realm.as_ref().is_some_and(|old| old != &target.frame) {
+                        let old_target = InputDispatchTarget {
+                            frame: old_realm.clone().flatten(),
+                            node: None,
+                            x,
+                            y,
+                        };
+                        evaluate_input_script(page, &old_target, &mouse_hover_exit_js(x, y));
+                    }
+                    let code = mouse_hover_move_js(&target_js, target.x, target.y);
                     evaluate_input_script(page, &target, &code);
+                    Some(target.frame)
+                } else {
+                    None
+                };
+                if let Some(page_id) = page_id {
+                    if let Some(new_realm) = new_realm {
+                        ctx.input_hover_realms.insert(page_id, new_realm);
+                    }
                 }
             }
 

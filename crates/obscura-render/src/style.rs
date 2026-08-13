@@ -586,6 +586,29 @@ fn parse_overflow_declaration(
     }
 }
 
+fn appearance_value_supported(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        // CSS UI appearance plus the legacy compatibility values accepted by
+        // Chromium. The renderer only distinguishes `none` from the platform
+        // look today, but feature queries must still reject made-up idents.
+        "none"
+            | "auto"
+            | "base-select"
+            | "searchfield"
+            | "textfield"
+            | "textarea"
+            | "checkbox"
+            | "radio"
+            | "menulist"
+            | "menulist-button"
+            | "listbox"
+            | "meter"
+            | "progress-bar"
+            | "button"
+    )
+}
+
 pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     // CSS Overflow computed-value coupling: if exactly one axis is scrollable,
     // `visible` on the other computes to `auto` and `clip` computes to
@@ -885,11 +908,19 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.size_expressions[1] = deferred_length_expression(value);
             style.height_set = true;
         }
-        "appearance" | "-webkit-appearance" | "-moz-appearance" => {
+        "appearance" | "-webkit-appearance" => {
             // Only the on/off distinction matters here: obscura paints the
             // platform look for checkbox and radio, and every other keyword
             // (`auto`, `checkbox`, `menulist`, ...) keeps it.
-            style.appearance_none = value.trim().eq_ignore_ascii_case("none");
+            let value = value.trim();
+            if appearance_value_supported(value) {
+                style.appearance_none = value.eq_ignore_ascii_case("none");
+            } else if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "initial" | "unset" | "revert" | "revert-layer"
+            ) {
+                style.appearance_none = false;
+            }
         }
         "box-sizing" => {
             let value = value.trim();
@@ -1930,6 +1961,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "max-height"
             | "max-block-size"
             | "box-sizing"
+            | "appearance"
+            | "-webkit-appearance"
             | "container"
             | "container-type"
             | "container-name"
@@ -2207,7 +2240,9 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "content-box" | "border-box"
         ),
-        "appearance" | "-webkit-appearance" | "-moz-appearance" => !value.trim().is_empty(),
+        "appearance" | "-webkit-appearance" => {
+            appearance_value_supported(value)
+        }
         "table-layout" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "fixed"),
         "container-type" => parse_container_type(value).is_some(),
         "container-name" => parse_container_names(value).is_some(),
@@ -10729,6 +10764,40 @@ mod tests {
                 "{keyword} must not retain the preceding border-box value"
             );
         }
+    }
+
+    #[test]
+    fn appearance_feature_queries_reject_unknown_idents() {
+        for name in ["appearance", "-webkit-appearance"] {
+            for value in ["auto", "none", "checkbox", "button"] {
+                assert!(supports_declaration(name, value), "{name}: {value}");
+            }
+            for value in ["", "definitely-not-valid", "auto none", "url(x)"] {
+                assert!(!supports_declaration(name, value), "{name}: {value}");
+            }
+        }
+        for value in ["auto", "none", "initial", "var(--appearance)"] {
+            assert!(!supports_declaration("-moz-appearance", value));
+        }
+
+        let style = compute_style(
+            "input",
+            Some("appearance:none;appearance:definitely-not-valid"),
+        );
+        assert!(
+            style.appearance_none,
+            "an invalid later declaration must not override the valid value"
+        );
+        assert!(
+            !compute_style("input", Some("appearance:none;appearance:initial"))
+                .appearance_none,
+            "the CSS-wide initial value must restore the platform appearance"
+        );
+        assert!(
+            compute_style("input", Some("appearance:none;-moz-appearance:auto"))
+                .appearance_none,
+            "unsupported -moz-appearance must not alter the Chromium-compatible surface"
+        );
     }
 
     #[test]

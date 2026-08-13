@@ -354,6 +354,11 @@ pub struct Node {
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
+    /// Live checkedness for checkbox/radio controls after their IDL state has
+    /// diverged from the content attribute. `None` keeps the attribute as the
+    /// default; `Some` is deliberately separate so user interaction never
+    /// reflects the current state back into markup.
+    pub live_checked: Option<bool>,
     pub data: NodeData,
 }
 
@@ -399,6 +404,14 @@ impl Node {
                 None
             }
         })
+    }
+
+    /// Current checkedness used by selectors and native control painting.
+    /// Before the control becomes dirty it follows the content attribute;
+    /// afterwards the live IDL state wins without mutating that attribute.
+    pub fn checkedness(&self) -> bool {
+        self.live_checked
+            .unwrap_or_else(|| self.get_attribute("checked").is_some())
     }
 
     pub fn set_attribute(&mut self, name: &str, value: String) {
@@ -513,6 +526,7 @@ impl DomTree {
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
+            live_checked: None,
             data: NodeData::Document,
         };
         DomTree {
@@ -990,6 +1004,7 @@ impl DomTree {
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
+            live_checked: None,
             data,
         });
         id

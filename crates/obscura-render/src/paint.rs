@@ -4797,7 +4797,7 @@ fn paint_laid_dom_scrolled(
                     &mut pixmap,
                     rect,
                     is_radio,
-                    node.get_attribute("checked").is_some(),
+                    node.checkedness(),
                     node.get_attribute("disabled").is_some(),
                     raster_scale,
                     element_clip_mask,

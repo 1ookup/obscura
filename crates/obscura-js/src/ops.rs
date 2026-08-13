@@ -242,6 +242,13 @@ pub struct ObscuraState {
     pub animation_sample: obscura_render::AnimationSample,
     #[cfg(feature = "render")]
     pub animation_timeline: obscura_render::AnimationTimelineState,
+    /// Stylesheet and animation instance history owned by each active iframe
+    /// content document. Frame layouts are rebuilt for geometry, hit-testing,
+    /// and capture, but their document timeline must survive those rebuilds:
+    /// recreating it made dynamically inserted animations look as if they had
+    /// started at top-document T=0 on every read.
+    #[cfg(feature = "render")]
+    pub(crate) frame_render_states: HashMap<NodeId, FrameRenderState>,
     #[cfg(feature = "render")]
     pub animation_timeline_origin: std::time::Instant,
     /// Host/HTML task epoch for document-timeline sampling. Geometry and
@@ -328,6 +335,13 @@ pub struct ObscuraState {
     pub(crate) frame_message_notify: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(feature = "render")]
+#[derive(Default)]
+pub(crate) struct FrameRenderState {
+    pub stylesheet_cache: obscura_render::StylesheetCache,
+    pub animation_timeline: obscura_render::AnimationTimelineState,
+}
+
 impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
@@ -368,6 +382,8 @@ impl ObscuraState {
             animation_sample: obscura_render::AnimationSample::default(),
             #[cfg(feature = "render")]
             animation_timeline: obscura_render::AnimationTimelineState::default(),
+            #[cfg(feature = "render")]
+            frame_render_states: HashMap::new(),
             #[cfg(feature = "render")]
             animation_timeline_origin: std::time::Instant::now(),
             #[cfg(feature = "render")]
@@ -614,6 +630,25 @@ fn render_mutation_impact(
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
                 actual_change: existed,
+            }
+        }
+        "set_live_checked" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let Some(value) = (match arg2 {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }) else {
+                return RenderMutationImpact::default();
+            };
+            let old = dom
+                .with_node(target, |node| node.checkedness())
+                .unwrap_or(value);
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: old != value,
             }
         }
         "append_child" => {
@@ -931,6 +966,7 @@ fn is_render_mutation_command(cmd: &str) -> bool {
             | "remove_attribute"
             | "set_attribute_ns"
             | "remove_attribute_ns"
+            | "set_live_checked"
             | "append_child"
             | "remove_child"
             | "insert_before"
@@ -1150,6 +1186,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             state.scroll_generation = state.scroll_generation.wrapping_add(1);
             if invalidate {
                 state.animation_timeline.remove_subtree(reset_nodes.iter());
+                for frame_state in state.frame_render_states.values_mut() {
+                    frame_state
+                        .animation_timeline
+                        .remove_subtree(reset_nodes.iter());
+                }
             }
         }
         #[cfg(feature = "render")]
@@ -1169,6 +1210,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 | "remove_attribute"
                 | "set_attribute_ns"
                 | "remove_attribute_ns" => arg1.parse::<u32>().ok(),
+                "set_live_checked" => arg1.parse::<u32>().ok(),
                 _ => None,
             }
             .map(NodeId::new);
@@ -1182,9 +1224,26 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 })
                 .unwrap_or_default();
             for node in direct_nodes {
-                state
-                    .animation_timeline
-                    .note_start_candidate(node, mutation_time_ms);
+                let document_root = state
+                    .dom
+                    .as_ref()
+                    .and_then(|dom| dom.containing_document_root_shadow_including(node));
+                let is_main = state
+                    .dom
+                    .as_ref()
+                    .is_some_and(|dom| document_root == Some(dom.document()));
+                if let Some(root) = document_root.filter(|_| !is_main) {
+                    state
+                        .frame_render_states
+                        .entry(root)
+                        .or_default()
+                        .animation_timeline
+                        .note_start_candidate(node, mutation_time_ms);
+                } else {
+                    state
+                        .animation_timeline
+                        .note_start_candidate(node, mutation_time_ms);
+                }
             }
             let scope_root = match cmd.as_str() {
                 "append_child" => arg1.parse::<u32>().ok().map(NodeId::new),
@@ -1206,9 +1265,26 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => None,
             };
             if let Some(root) = scope_root {
-                state
-                    .animation_timeline
-                    .note_subtree_start_candidate(root, mutation_time_ms);
+                let document_root = state
+                    .dom
+                    .as_ref()
+                    .and_then(|dom| dom.containing_document_root_shadow_including(root));
+                let is_main = state
+                    .dom
+                    .as_ref()
+                    .is_some_and(|dom| document_root == Some(dom.document()));
+                if let Some(document_root) = document_root.filter(|_| !is_main) {
+                    state
+                        .frame_render_states
+                        .entry(document_root)
+                        .or_default()
+                        .animation_timeline
+                        .note_subtree_start_candidate(root, mutation_time_ms);
+                } else {
+                    state
+                        .animation_timeline
+                        .note_subtree_start_candidate(root, mutation_time_ms);
+                }
             }
             if let Some(mutation) = retained_style_mutation {
                 let retained = state.prepared_render.is_some()
@@ -1390,11 +1466,22 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 _ => return "null".into(),
             };
             match dom.create_iframe_content_document(NodeId::new(host)) {
-                Ok((root, previous)) => serde_json::json!({
-                    "root": root.index(),
-                    "previous": previous.map(|id| id.index()),
-                })
-                .to_string(),
+                Ok((root, previous)) => {
+                    // A navigation gives the iframe a new document timeline.
+                    // Retained wrappers may still expose the detached old DOM,
+                    // but its stylesheet/animation state must not remain in the
+                    // active renderer map indefinitely.
+                    #[cfg(feature = "render")]
+                    if let Some(previous) = previous {
+                        drop(gs);
+                        shared.borrow_mut().frame_render_states.remove(&previous);
+                    }
+                    serde_json::json!({
+                        "root": root.index(),
+                        "previous": previous.map(|id| id.index()),
+                    })
+                    .to_string()
+                }
                 Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
             }
         }
@@ -1742,6 +1829,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
+        "live_checked" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.with_node(NodeId::new(nid), |node| node.checkedness())
+                .unwrap_or(false)
+                .to_string()
+        }
         "attribute_names" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let names: Vec<String> = dom
@@ -1768,6 +1861,20 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 }
             }
             "true".into()
+        }
+        "set_live_checked" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let value = match arg2.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+            if let Some(value) = value {
+                dom.with_node_mut(NodeId::new(nid), |node| {
+                    node.live_checked = Some(value);
+                });
+            }
+            value.is_some().to_string()
         }
         "inner_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -5192,6 +5299,7 @@ pub fn build_extension() -> Extension {
     #[cfg(feature = "render")]
     {
         ops.push(op_begin_render_task());
+        ops.push(op_layout_metrics_epoch());
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
@@ -5558,6 +5666,22 @@ pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
 fn op_begin_render_task(state: &OpState) {
     let shared = state.borrow::<SharedState>().clone();
     begin_animation_task(&mut shared.borrow_mut());
+}
+
+/// Invalidation token for the frame-realm viewport cache. Parent-realm DOM
+/// mutations are invisible to the child's JS mutation epoch, while the shared
+/// native activity epoch observes both realms. The task epoch also refreshes
+/// host geometry driven by CSS animations between browser tasks.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_metrics_epoch(state: &OpState) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    format!(
+        "{}:{}",
+        state.activity_generation, state.animation_task_generation
+    )
 }
 
 #[cfg(feature = "render")]
@@ -6112,6 +6236,7 @@ fn prepared_for_frame_root(
     frame_root: NodeId,
     main_prepared: &obscura_render::PreparedRender,
     resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, FrameRenderState>,
     depth: usize,
 ) -> Option<obscura_render::PreparedRender> {
     if depth > 32 {
@@ -6123,21 +6248,27 @@ fn prepared_for_frame_root(
         frame_content_box_from_parent(main_prepared, host)?
     } else {
         let parent =
-            prepared_for_frame_root(dom, parent_root, main_prepared, resources, depth + 1)?;
+            prepared_for_frame_root(
+                dom,
+                parent_root,
+                main_prepared,
+                resources,
+                frame_states,
+                depth + 1,
+            )?;
         frame_content_box_from_parent(&parent, host)?
     };
     let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
-    let mut stylesheet_cache = obscura_render::StylesheetCache::default();
-    let mut timeline = obscura_render::AnimationTimelineState::default();
+    let frame_state = frame_states.entry(frame_root).or_default();
     obscura_render::prepare_frame_document(
         dom,
         frame_root,
         viewport,
         base_url.as_deref(),
         resources,
-        &mut stylesheet_cache,
+        &mut frame_state.stylesheet_cache,
         main_prepared.animation_sample(),
-        &mut timeline,
+        &mut frame_state.animation_timeline,
     )
 }
 
@@ -6212,9 +6343,10 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
                 return String::new();
             };
             let resources = &mut g.render_resources;
+            let frame_states = &mut g.frame_render_states;
             let element_offsets = &g.element_scroll_offsets;
             let Some(prepared) =
-                prepared_for_frame_root(dom, root, main_prepared, resources, 0)
+                prepared_for_frame_root(dom, root, main_prepared, resources, frame_states, 0)
             else {
                 return String::new();
             };
@@ -6436,7 +6568,15 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
             return String::new();
         };
         let resources = &mut g.render_resources;
-        let Some(prepared) = prepared_for_frame_root(dom, frame_root, main_prepared, resources, 0)
+        let frame_states = &mut g.frame_render_states;
+        let Some(prepared) = prepared_for_frame_root(
+            dom,
+            frame_root,
+            main_prepared,
+            resources,
+            frame_states,
+            0,
+        )
         else {
             return String::new();
         };
@@ -6480,8 +6620,10 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
             return String::new();
         };
         let resources = &mut g.render_resources;
+        let frame_states = &mut g.frame_render_states;
         let element_offsets = &g.element_scroll_offsets;
-        let Some(prepared) = prepared_for_frame_root(dom, root, main_prepared, resources, 0)
+        let Some(prepared) =
+            prepared_for_frame_root(dom, root, main_prepared, resources, frame_states, 0)
         else {
             return String::new();
         };

@@ -2182,6 +2182,26 @@ mod tests {
             inner_w >= 250.0 && inner_h >= 50.0,
             "frame innerWidth/Height was {inner_w}x{inner_h}, expected ~300x65"
         );
+
+        // Resizing the host does not recreate the frame realm. Window and
+        // VisualViewport metrics must therefore read the live content box,
+        // rather than keeping the values captured by __obscura_init.
+        rt.execute_script(
+            "<resize-host>",
+            "document.getElementById('f').setAttribute('style',\
+             'display:block;width:180px;height:40px;border:0')",
+        )
+        .unwrap();
+        let resized = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "JSON.stringify([innerWidth,innerHeight,visualViewport.width,visualViewport.height])",
+            )
+            .unwrap();
+        let resized = serde_json::from_str::<Vec<f64>>(resized.as_str().unwrap()).unwrap();
+        assert_eq!(resized, vec![180.0, 40.0, 180.0, 40.0]);
     }
 
     /// A worker's origin comes from the document that constructed it. When

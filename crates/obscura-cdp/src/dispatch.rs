@@ -59,6 +59,11 @@ pub struct ExecutionContextEntry {
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// Browsing-context realm containing the last CDP mouse hover target.
+    /// `None` is the main realm; an absent page key means the pointer has not
+    /// entered that page yet. The node itself stays in a realm-local JS slot
+    /// so navigation cannot leave a Rust-side dangling DOM id.
+    pub(crate) input_hover_realms: HashMap<String, Option<(String, u64)>>,
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
@@ -195,6 +200,7 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
+            input_hover_realms: HashMap::new(),
             current_loader_ids: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
@@ -329,6 +335,7 @@ impl CdpContext {
 
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
+        self.input_hover_realms.remove(id);
         self.current_loader_ids.remove(id);
         // Child frame ids are page-scoped ("frame-<page>-<n>"); drop their
         // advertised entries and execution contexts with the page.

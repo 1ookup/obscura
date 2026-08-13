@@ -475,11 +475,172 @@ async fn mouse_moved_dispatches_pointer_and_mouse_move_events() {
         .collect();
     assert_eq!(
         types,
-        ["pointerover", "pointerenter", "pointermove", "mouseover", "mouseenter", "mousemove"]
+        ["pointerover", "pointerenter", "mouseover", "mouseenter", "pointermove", "mousemove"]
     );
-    assert_eq!(out[2]["x"], 31.0);
-    assert_eq!(out[2]["trusted"], true);
-    assert_eq!(out[2]["composed"], true, "pointermove must compose across shadow boundaries");
+    let pointer_move = out
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == "pointermove")
+        .unwrap();
+    assert_eq!(pointer_move["x"], 31.0);
+    assert_eq!(pointer_move["trusted"], true);
+    assert_eq!(pointer_move["composed"], true, "pointermove must compose across shadow boundaries");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn consecutive_mouse_moves_only_cross_boundaries_when_the_target_changes() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const a = document.getElementById('check');
+            const b = document.getElementById('radio-b');
+            document.elementFromPoint = x => x < 50 ? a : b;
+            globalThis.hoverLog = [];
+            const types = [
+                'pointerover','mouseover','pointerenter','mouseenter',
+                'pointermove','mousemove','pointerout','mouseout',
+                'pointerleave','mouseleave'
+            ];
+            for (const node of [a, b]) for (const type of types) {
+                node.addEventListener(type, event => hoverLog.push({
+                    node: node.id, type,
+                    related: event.relatedTarget && event.relatedTarget.id,
+                    x: event.clientX, trusted: event.isTrusted
+                }));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    for (id, x) in [(3, 20.0), (4, 30.0), (5, 80.0)] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": 10.0}),
+            &sid,
+        )
+        .await;
+    }
+
+    let out = evaluate(&mut ctx, 6, "JSON.stringify(hoverLog)", &sid).await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    let events: Vec<String> = out
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| format!("{}:{}", entry["node"].as_str().unwrap(), entry["type"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "check:pointerover", "check:pointerenter", "check:mouseover", "check:mouseenter",
+            "check:pointermove", "check:mousemove",
+            "check:pointermove", "check:mousemove",
+            "check:pointerout", "check:pointerleave",
+            "radio-b:pointerover", "radio-b:pointerenter",
+            "check:mouseout", "check:mouseleave",
+            "radio-b:mouseover", "radio-b:mouseenter",
+            "radio-b:pointermove", "radio-b:mousemove",
+        ]
+    );
+    for entry in &out.as_array().unwrap()[8..16] {
+        let expected = if entry["node"] == "check" { "radio-b" } else { "check" };
+        assert_eq!(entry["related"], expected, "boundary event needs the opposite target: {entry}");
+        assert_eq!(entry["trusted"], true);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceling_primary_pointerdown_suppresses_compatibility_mouse_events() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.cancelledPointerLog = [];
+            for (const type of ['pointerdown','mousedown','pointerup','mouseup','click','input','change']) {
+                target.addEventListener(type, event => {
+                    cancelledPointerLog.push(type);
+                    if (type === 'pointerdown') event.preventDefault();
+                });
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(
+        &mut ctx,
+        3,
+        "JSON.stringify({events:cancelledPointerLog,checked:document.getElementById('check').checked})",
+        &sid,
+    )
+    .await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        out["events"],
+        json!(["pointerdown", "pointerup", "click", "input", "change"])
+    );
+    assert_eq!(
+        out["checked"],
+        true,
+        "click is not a compatibility mouse event and must still activate"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_checkable_does_not_activate_on_cdp_click() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            target.disabled = true;
+            document.elementFromPoint = () => target;
+            globalThis.disabledClickLog = [];
+            for (const type of ['pointerdown','mousedown','pointerup','mouseup','click','input','change']) {
+                target.addEventListener(type, () => disabledClickLog.push(type));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(
+        &mut ctx,
+        3,
+        "JSON.stringify({events:disabledClickLog,checked:check.checked})",
+        &sid,
+    )
+    .await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(out, json!({"events": ["pointerdown", "pointerup"], "checked": false}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn constructed_pointer_event_defaults_to_an_empty_pointer_type() {
+    let (mut ctx, sid) = setup().await;
+    let out = evaluate(
+        &mut ctx,
+        2,
+        "JSON.stringify({omitted:new PointerEvent('x').pointerType,empty:new PointerEvent('x',{pointerType:''}).pointerType,explicit:new PointerEvent('x',{pointerType:'pen'}).pointerType})",
+        &sid,
+    )
+    .await;
+    let out: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(out, json!({"omitted":"","empty":"","explicit":"pen"}));
 }
 
 #[tokio::test(flavor = "current_thread")]

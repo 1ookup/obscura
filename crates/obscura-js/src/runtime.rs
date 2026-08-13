@@ -95,6 +95,7 @@ fn render_frame_tree_into(
     viewport: (f32, f32),
     animation_sample: obscura_render::AnimationSample,
     resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, crate::ops::FrameRenderState>,
     canvas: &HashMap<NodeId, crate::ops::CanvasBackingSurface>,
     out: &mut HashMap<NodeId, obscura_render::Pixmap>,
     depth: usize,
@@ -103,21 +104,19 @@ fn render_frame_tree_into(
         return;
     }
     let base_url = dom.document_scope(root).map(|scope| scope.base_url);
-    // Per-root stylesheet cache and animation timeline (Phase 5.2): the
-    // parent's single-slot cache must not alternate with the child's.
-    // Surfaces are currently rebuilt per capture; retained per-frame caches
-    // are the Phase 5.5 follow-on.
-    let mut stylesheet_cache = obscura_render::StylesheetCache::default();
-    let mut timeline = obscura_render::AnimationTimelineState::default();
+    // Per-root stylesheet and animation state is retained across geometry,
+    // hit-test, and capture rebuilds. The prepared frame scene is disposable;
+    // the animation instance epoch is document state and is not.
+    let frame_state = frame_states.entry(root).or_default();
     let Some(mut prepared) = obscura_render::prepare_frame_document(
         dom,
         root,
         viewport,
         base_url.as_deref(),
         resources,
-        &mut stylesheet_cache,
+        &mut frame_state.stylesheet_cache,
         animation_sample,
-        &mut timeline,
+        &mut frame_state.animation_timeline,
     ) else {
         return;
     };
@@ -131,6 +130,7 @@ fn render_frame_tree_into(
                     nested_viewport,
                     animation_sample,
                     resources,
+                    frame_states,
                     canvas,
                     out,
                     depth + 1,
@@ -157,6 +157,7 @@ fn build_frame_surfaces(
     dom: Option<&obscura_dom::DomTree>,
     prepared: Option<&obscura_render::PreparedRender>,
     resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, crate::ops::FrameRenderState>,
     canvas: &HashMap<NodeId, crate::ops::CanvasBackingSurface>,
 ) -> HashMap<NodeId, obscura_render::Pixmap> {
     let mut out = HashMap::new();
@@ -168,7 +169,7 @@ fn build_frame_surfaces(
             if let Some(viewport) = frame_content_box(prepared.layout(), host) {
                 render_frame_tree_into(
                     dom, host, root, viewport, prepared.animation_sample(),
-                    resources, canvas, &mut out, 1,
+                    resources, frame_states, canvas, &mut out, 1,
                 );
             }
         }
@@ -184,6 +185,7 @@ fn input_hit_in_document(
     scroll: &obscura_render::ResolvedScrollState,
     point: (f32, f32),
     resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, crate::ops::FrameRenderState>,
     element_scroll_offsets: &HashMap<NodeId, (f32, f32)>,
     depth: usize,
 ) -> Option<(NodeId, NodeId, (f32, f32))> {
@@ -209,17 +211,16 @@ fn input_hit_in_document(
         if let Some((child_root, content)) = frame_hit {
             let viewport = (content.width.floor(), content.height.floor());
             let base_url = dom.document_scope(child_root).map(|scope| scope.base_url);
-            let mut stylesheet_cache = obscura_render::StylesheetCache::default();
-            let mut timeline = obscura_render::AnimationTimelineState::default();
+            let frame_state = frame_states.entry(child_root).or_default();
             if let Some(child) = obscura_render::prepare_frame_document(
                 dom,
                 child_root,
                 viewport,
                 base_url.as_deref(),
                 resources,
-                &mut stylesheet_cache,
+                &mut frame_state.stylesheet_cache,
                 prepared.animation_sample(),
-                &mut timeline,
+                &mut frame_state.animation_timeline,
             ) {
                 let child_scroll = child.resolve_scroll_state(
                     dom,
@@ -234,6 +235,7 @@ fn input_hit_in_document(
                     &child_scroll,
                     local,
                     resources,
+                    frame_states,
                     element_scroll_offsets,
                     depth + 1,
                 );
@@ -599,6 +601,7 @@ impl ObscuraJsRuntime {
             gs.prepared_render = None;
             gs.animation_sample = obscura_render::AnimationSample::default();
             gs.animation_timeline = obscura_render::AnimationTimelineState::default();
+            gs.frame_render_states.clear();
             gs.animation_timeline_origin = std::time::Instant::now();
             gs.animation_task_generation = 0;
             gs.animation_sampled_task_generation = 0;
@@ -830,6 +833,7 @@ impl ObscuraJsRuntime {
             scroll,
             (x, y),
             &mut state.render_resources,
+            &mut state.frame_render_states,
             &state.element_scroll_offsets,
             0,
         )
@@ -966,6 +970,7 @@ impl ObscuraJsRuntime {
                 dom,
                 prepared_render,
                 render_resources,
+                frame_render_states,
                 resolved_scroll,
                 canvas_surfaces,
                 ..
@@ -975,6 +980,7 @@ impl ObscuraJsRuntime {
                 dom.as_ref(),
                 prepared_render.as_ref(),
                 render_resources,
+                frame_render_states,
                 canvas_surfaces,
             );
             let source = RuntimeSurfaceSource {
@@ -1016,6 +1022,7 @@ impl ObscuraJsRuntime {
                 dom,
                 prepared_render,
                 render_resources,
+                frame_render_states,
                 resolved_scroll,
                 canvas_surfaces,
                 ..
@@ -1027,6 +1034,7 @@ impl ObscuraJsRuntime {
                 dom.as_ref(),
                 prepared_render.as_ref(),
                 render_resources,
+                frame_render_states,
                 canvas_surfaces,
             );
             let source = RuntimeSurfaceSource {
@@ -1063,6 +1071,7 @@ impl ObscuraJsRuntime {
                 dom,
                 prepared_render,
                 render_resources,
+                frame_render_states,
                 resolved_scroll,
                 canvas_surfaces,
                 ..
@@ -1074,6 +1083,7 @@ impl ObscuraJsRuntime {
                 dom.as_ref(),
                 prepared_render.as_ref(),
                 render_resources,
+                frame_render_states,
                 canvas_surfaces,
             );
             let source = RuntimeSurfaceSource {
@@ -1317,6 +1327,14 @@ impl ObscuraJsRuntime {
     /// realm creation records the content root's DocumentScope metadata.
     pub(crate) fn state_handle(&self) -> &Rc<RefCell<ObscuraState>> {
         &self.state
+    }
+
+    /// Drop renderer history owned by a superseded iframe document. The DOM
+    /// op path can do this inline, while browser-driven frame navigation calls
+    /// it after committing the replacement root.
+    #[cfg(feature = "render")]
+    pub fn discard_frame_render_state(&self, root: NodeId) {
+        self.state.borrow_mut().frame_render_states.remove(&root);
     }
 
     /// Override the coordinates the navigator.geolocation shim reports. The
@@ -3429,6 +3447,28 @@ impl ObscuraJsRuntime {
         state.dom.take()
     }
 
+    /// Return the same live document after a browser-owned operation borrowed
+    /// its `DomTree`. Unlike `set_dom`, this is not a top-level navigation and
+    /// must preserve document timelines, frame render state, and resources.
+    #[doc(hidden)]
+    pub fn return_borrowed_dom(&self, dom: DomTree) {
+        let mut state = self.state.borrow_mut();
+        debug_assert!(state.dom.is_none());
+        state.dom = Some(dom);
+    }
+
+    #[cfg(feature = "render")]
+    #[doc(hidden)]
+    pub fn has_frame_render_state(&self, root: NodeId) -> bool {
+        self.state.borrow().frame_render_states.contains_key(&root)
+    }
+
+    #[cfg(feature = "render")]
+    #[doc(hidden)]
+    pub fn ensure_frame_render_state_for_test(&self, root: NodeId) {
+        self.state.borrow_mut().frame_render_states.entry(root).or_default();
+    }
+
     /// Export document-owned script preparation state before the runtime realm
     /// is temporarily destroyed.  Page suspension keeps the DOM alive, so the
     /// HTML "already started" flags must travel with it rather than resetting
@@ -3817,10 +3857,12 @@ mod tests {
         let mut resources = obscura_render::RenderResourceCache::default();
         let prepared = obscura_render::prepare_dom(&dom, (200.0, 100.0), None, &mut resources)
             .expect("parent layout");
+        let mut frame_states = HashMap::new();
         let surfaces = build_frame_surfaces(
             Some(&dom),
             Some(&prepared),
             &mut resources,
+            &mut frame_states,
             &HashMap::new(),
         );
         let frame = surfaces.get(&frame_host).expect("closed-shadow frame surface");
@@ -3872,12 +3914,113 @@ mod tests {
             &scroll,
             (15.0, 15.0),
             &mut resources,
+            &mut HashMap::new(),
             &HashMap::new(),
             0,
         );
 
         let (_doc_root, hit_node, _local) = hit.expect("point hits the shadow child");
         assert_eq!(hit_node, shadow_btn, "hit-test must pierce the closed shadow root");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_animation_state_survives_rebuilds_and_keeps_its_mutation_epoch() {
+        let dom = parse_html(
+            r#"<html><body style="margin:0"><iframe style="display:block;border:0;width:40px;height:40px"></iframe></body></html>"#,
+        );
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = dom.create_iframe_content_document(host).unwrap();
+        obscura_dom::parse_into_subtree(
+            &dom,
+            root,
+            r#"<html><body style="margin:0"><style>@keyframes grow { from { transform:scale(0) } to { transform:scale(1) } }</style><div id=x style="width:20px;height:20px;animation:grow 1s both"></div></body></html>"#,
+        );
+        let target = dom.query_selector_from(root, "#x").unwrap().unwrap();
+        let mut resources = obscura_render::RenderResourceCache::default();
+        let parent = obscura_render::prepare_dom(&dom, (100.0, 100.0), None, &mut resources)
+            .expect("parent layout");
+        let viewport = frame_content_box(parent.layout(), host).unwrap();
+        let mut states = HashMap::new();
+
+        // This frame animation was introduced by a mutation at document T=500.
+        // At T=600 it must be 100ms old, not 600ms old and not restarted by
+        // each disposable frame layout.
+        states
+            .entry(root)
+            .or_insert_with(crate::ops::FrameRenderState::default)
+            .animation_timeline
+            .note_start_candidate(target, 500.0);
+        let frame_state = states.get_mut(&root).expect("frame state");
+        let first = obscura_render::prepare_frame_document(
+            &dom,
+            root,
+            viewport,
+            None,
+            &mut resources,
+            &mut frame_state.stylesheet_cache,
+            obscura_render::AnimationSample::document(600.0),
+            &mut frame_state.animation_timeline,
+        )
+        .expect("first frame layout");
+        assert_eq!(first.layout().styles[&target].animation_local_time_ms, 100.0);
+
+        let second = obscura_render::prepare_frame_document(
+            &dom,
+            root,
+            viewport,
+            None,
+            &mut resources,
+            &mut frame_state.stylesheet_cache,
+            obscura_render::AnimationSample::document(700.0),
+            &mut frame_state.animation_timeline,
+        )
+        .expect("second frame layout");
+        assert_eq!(second.layout().styles[&target].animation_local_time_ms, 200.0);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_navigation_discards_the_superseded_render_state() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            r#"<html><body><iframe id="frame"></iframe></body></html>"#,
+        ));
+        runtime.run_page_init();
+        let first_value = runtime
+            .evaluate(
+                r##"(function() { try {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    return JSON.parse(op("create_iframe_content_document", host)).root;
+                } catch (error) { return {error: String(error), stack: error.stack}; } })()"##,
+            )
+            .unwrap();
+        let first = first_value
+            .as_f64()
+            .unwrap_or_else(|| panic!("unexpected iframe op result: {first_value}")) as u32;
+        runtime
+            .state_handle()
+            .borrow_mut()
+            .frame_render_states
+            .insert(NodeId::new(first), crate::ops::FrameRenderState::default());
+
+        let second = runtime
+            .evaluate(
+                r##"(function() {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    return JSON.parse(op("create_iframe_content_document", host)).root;
+                })()"##,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        let state = runtime.state_handle().borrow();
+        assert_ne!(first, second);
+        assert!(!state.frame_render_states.contains_key(&NodeId::new(first)));
     }
 
     #[test]
@@ -7340,13 +7483,15 @@ mod tests {
                     CSS.supports("flex-flow", "column wrap"),
                     CSS.supports("flex-flow", "row column"),
                     CSS.supports("flex-flow", "nowrap wrap-reverse"),
-                    CSS.supports("(flex-flow:column)")
+                    CSS.supports("(flex-flow:column)"),
+                    CSS.supports("appearance", "auto"),
+                    CSS.supports("appearance", "definitely-not-valid")
                 ])"#,
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!("[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false,true,true,true,false,false,true]")
+            serde_json::json!("[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false,true,true,true,false,false,true,true,false]")
         );
     }
 
@@ -14097,6 +14242,344 @@ mod tests {
     }
 
     #[test]
+    fn shadow_event_retargets_and_exposes_the_right_composed_path() {
+        for mode in ["open", "closed"] {
+            let mut rt = setup_runtime(r#"<main><div id="host"></div></main>"#);
+            let result = rt
+                .evaluate(&format!(
+                    r#"
+                const host = document.getElementById('host');
+                const root = host.attachShadow({{ mode: '{mode}' }});
+                const child = document.createElement('button');
+                child.id = 'inside';
+                root.appendChild(child);
+                const seen = {{}};
+                const describe = event => event.composedPath().map(node =>
+                    node === child ? 'child' : node === root ? 'root' :
+                    node === host ? 'host' : node === document ? 'document' :
+                    node === window ? 'window' : node.localName);
+                child.addEventListener('probe', event => {{
+                    seen.childTarget = event.target === child;
+                    seen.childPath = describe(event);
+                }});
+                root.addEventListener('probe', event => {{
+                    seen.rootTarget = event.target === child;
+                    seen.rootPath = describe(event);
+                }});
+                host.addEventListener('probe', event => {{
+                    seen.hostTarget = event.target === host;
+                    seen.hostPath = describe(event);
+                }});
+                document.addEventListener('probe', event => {{
+                    seen.documentTarget = event.target === host;
+                    seen.documentPath = describe(event);
+                }});
+                child.dispatchEvent(new Event('probe', {{ bubbles: true, composed: true }}));
+                return seen;
+            "#
+                ))
+                .unwrap();
+
+            let expected_outer_path = if mode == "closed" {
+                serde_json::json!(["host", "main", "body", "html", "document", "window"])
+            } else {
+                serde_json::json!(["child", "root", "host", "main", "body", "html", "document", "window"])
+            };
+            assert_eq!(result["childTarget"], serde_json::json!(true));
+            assert_eq!(result["rootTarget"], serde_json::json!(true));
+            assert_eq!(result["hostTarget"], serde_json::json!(true));
+            assert_eq!(result["documentTarget"], serde_json::json!(true));
+            assert_eq!(
+                result["childPath"],
+                serde_json::json!(["child", "root", "host", "main", "body", "html", "document", "window"])
+            );
+            assert_eq!(result["rootPath"], result["childPath"]);
+            assert_eq!(result["hostPath"], expected_outer_path);
+            assert_eq!(result["documentPath"], expected_outer_path);
+        }
+    }
+
+    #[test]
+    fn shadow_event_propagation_stops_without_redispatching() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const child = document.createElement('button');
+            root.appendChild(child);
+            const calls = [];
+            child.addEventListener('blocked', () => calls.push('child'));
+            root.addEventListener('blocked', event => {
+                calls.push('root-first');
+                event.stopImmediatePropagation();
+            });
+            root.addEventListener('blocked', () => calls.push('root-second'));
+            host.addEventListener('blocked', () => calls.push('host'));
+            document.addEventListener('blocked', () => calls.push('document'));
+            const event = new Event('blocked', {
+                bubbles: true, composed: true, cancelable: true
+            });
+            root.addEventListener('blocked', event => event.preventDefault(), { capture: true });
+            const dispatchResult = child.dispatchEvent(event);
+            return JSON.stringify({ calls, dispatchResult, defaultPrevented: event.defaultPrevented });
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(
+                r#"{"calls":["child","root-first"],"dispatchResult":false,"defaultPrevented":true}"#
+            )
+        );
+
+        let stopped = rt
+            .evaluate(
+                r#"
+            const calls = [];
+            const secondHost = document.createElement('div');
+            document.body.appendChild(secondHost);
+            const secondRoot = secondHost.attachShadow({ mode: 'open' });
+            const child = document.createElement('button');
+            secondRoot.appendChild(child);
+            secondRoot.addEventListener('stopped', event => {
+                calls.push('root-first');
+                event.stopPropagation();
+            });
+            secondRoot.addEventListener('stopped', () => calls.push('root-second'));
+            secondHost.addEventListener('stopped', () => calls.push('host'));
+            child.dispatchEvent(new Event('stopped', { bubbles: true, composed: true }));
+            return calls;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(stopped, serde_json::json!(["root-first", "root-second"]));
+
+        let retargeted_after_stop = rt
+            .evaluate(
+                r#"
+            const thirdHost = document.createElement('div');
+            document.body.appendChild(thirdHost);
+            const thirdRoot = thirdHost.attachShadow({ mode: 'open' });
+            const child = document.createElement('i');
+            thirdRoot.appendChild(child);
+            thirdRoot.addEventListener('retarget-stop', event => event.stopPropagation());
+            const event = new Event('retarget-stop', { bubbles: true, composed: true });
+            child.dispatchEvent(event);
+            return [event.target === thirdHost, event.target === child];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(retargeted_after_stop, serde_json::json!([true, false]));
+    }
+
+    #[test]
+    fn non_composed_shadow_event_stays_inside_the_shadow_tree() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const child = document.createElement('button');
+            root.appendChild(child);
+            const calls = [];
+            root.addEventListener('local', event => calls.push([
+                'root', event.target === child, event.composedPath().length
+            ]));
+            host.addEventListener('local', () => calls.push(['host']));
+            child.dispatchEvent(new Event('local', { bubbles: true, composed: false }));
+            return JSON.stringify(calls);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(r#"[["root",true,2]]"#));
+    }
+
+    #[test]
+    fn non_bubbling_composed_event_invokes_shadow_host_at_target() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const child = document.createElement('i');
+            root.appendChild(child);
+            const calls = [];
+            for (const [node, label] of [[document, 'document'], [host, 'host'],
+                                         [root, 'root'], [child, 'child']]) {
+                for (const capture of [true, false]) {
+                    node.addEventListener('probe', event =>
+                        calls.push([label, capture, event.eventPhase, event.target === host]),
+                        capture);
+                }
+            }
+            child.dispatchEvent(new Event('probe', { composed: true, bubbles: false }));
+            return calls;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["document", true, 1, true],
+                ["host", true, 2, true],
+                ["root", true, 1, false],
+                ["child", true, 2, false],
+                ["child", false, 2, false],
+                ["host", false, 2, true]
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_shadow_hosts_are_at_target_for_non_bubbling_composed_events() {
+        let mut rt = setup_runtime(r#"<div id="outer"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const outer = document.getElementById('outer');
+            const outerRoot = outer.attachShadow({ mode: 'open' });
+            const inner = document.createElement('div');
+            outerRoot.appendChild(inner);
+            const innerRoot = inner.attachShadow({ mode: 'open' });
+            const leaf = document.createElement('i');
+            innerRoot.appendChild(leaf);
+            const calls = [];
+            for (const [node, label] of [[document, 'document'], [outer, 'outer'],
+                                         [outerRoot, 'outer-root'], [inner, 'inner'],
+                                         [innerRoot, 'inner-root'], [leaf, 'leaf']]) {
+                for (const capture of [true, false]) {
+                    node.addEventListener('nested', event => calls.push([
+                        label, capture, event.eventPhase,
+                        event.target === outer ? 'outer' :
+                        event.target === inner ? 'inner' : 'leaf'
+                    ]), capture);
+                }
+            }
+            leaf.dispatchEvent(new Event('nested', { composed: true, bubbles: false }));
+            return calls;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["document", true, 1, "outer"],
+                ["outer", true, 2, "outer"],
+                ["outer-root", true, 1, "inner"],
+                ["inner", true, 2, "inner"],
+                ["inner-root", true, 1, "leaf"],
+                ["leaf", true, 2, "leaf"],
+                ["leaf", false, 2, "leaf"],
+                ["inner", false, 2, "inner"],
+                ["outer", false, 2, "outer"]
+            ])
+        );
+    }
+
+    #[test]
+    fn mouse_related_target_is_retargeted_outside_closed_shadow() {
+        let mut rt = setup_runtime(r#"<div id="host"></div><div id="outside"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const outside = document.getElementById('outside');
+            const root = host.attachShadow({ mode: 'closed' });
+            const inside = document.createElement('i');
+            root.appendChild(inside);
+            const seen = [];
+            outside.addEventListener('mouseover', event =>
+                seen.push(['outside', event.relatedTarget === host,
+                           event.relatedTarget === inside]));
+            root.addEventListener('mouseover', event =>
+                seen.push(['root', event.relatedTarget === inside]));
+            outside.dispatchEvent(new MouseEvent('mouseover', {
+                bubbles: true, composed: true, relatedTarget: inside
+            }));
+            inside.dispatchEvent(new MouseEvent('mouseover', {
+                bubbles: true, composed: true, relatedTarget: outside
+            }));
+            return seen;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["outside", true, false],
+                ["root", false]
+            ])
+        );
+    }
+
+    #[test]
+    fn mouse_boundary_event_stops_when_retargeted_endpoints_match() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const inside = document.createElement('i');
+            root.appendChild(inside);
+            const calls = [];
+            for (const [node, label] of [[inside, 'inside'], [root, 'root'],
+                                         [host, 'host'], [document, 'document']]) {
+                node.addEventListener('mouseout', event => calls.push([
+                    label, event.target === inside, event.relatedTarget === host
+                ]));
+            }
+            const event = new MouseEvent('mouseout', {
+                bubbles: true, composed: true, relatedTarget: host
+            });
+            inside.dispatchEvent(event);
+            return { calls, targetCleared: event.target === null,
+                     relatedTargetCleared: event.relatedTarget === null };
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "calls": [
+                    ["inside", true, true],
+                    ["root", true, true]
+                ],
+                "targetCleared": true,
+                "relatedTargetCleared": true
+            })
+        );
+    }
+
+    #[test]
+    fn non_composed_event_clears_shadow_internal_target_after_dispatch() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const root = document.getElementById('host').attachShadow({ mode: 'open' });
+            const inside = document.createElement('i');
+            root.appendChild(inside);
+            const event = new Event('local', { bubbles: true, composed: false });
+            const seen = [];
+            inside.addEventListener('local', e => seen.push(e.target === inside));
+            root.addEventListener('local', e => seen.push(e.target === inside));
+            inside.dispatchEvent(event);
+            return { seen, targetCleared: event.target === null };
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({ "seen": [true, true], "targetCleared": true })
+        );
+    }
+
+    #[test]
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt
@@ -14487,6 +14970,106 @@ mod tests {
             .evaluate("document.getElementById('cb').checked")
             .unwrap();
         assert_eq!(checked2, serde_json::json!(false));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn live_checkbox_checkedness_drives_paint_without_reflecting_the_attribute() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><body style="margin:0">
+               <input id="cb" type="checkbox" checked style="position:absolute;left:0;top:0;width:20px;height:20px">
+               </body></html>"#,
+        );
+        rt.set_viewport(40.0, 40.0);
+
+        let has_accent = |png: Vec<u8>| {
+            let pixmap = obscura_render::Pixmap::decode_png(&png).expect("screenshot png");
+            (0..30u32).any(|y| {
+                (0..30u32).any(|x| {
+                    pixmap.pixel(x, y).is_some_and(|p| {
+                        p.blue() > 150 && p.blue() > p.red().saturating_add(40) && p.green() < p.blue()
+                    })
+                })
+            })
+        };
+
+        let initial = rt
+            .screenshot_prepared((40.0, 40.0), Some("http://example.com/test"))
+            .expect("initial screenshot");
+        assert!(has_accent(initial), "checked attribute did not paint checked");
+
+        assert_eq!(
+            rt.evaluate(
+                "(function(){ const cb=document.getElementById('cb'); cb.checked=false; return [cb.checked, cb.hasAttribute('checked'), cb.matches(':checked')]; })()",
+            )
+            .unwrap(),
+            serde_json::json!([false, true, false]),
+            "live checkedness must diverge from the content attribute"
+        );
+        let unchecked = rt
+            .screenshot_prepared((40.0, 40.0), Some("http://example.com/test"))
+            .expect("unchecked screenshot");
+        assert!(!has_accent(unchecked), "checked=false still painted checked");
+
+        rt.execute_script("check", "document.getElementById('cb').checked=true")
+            .unwrap();
+        let checked = rt
+            .screenshot_prepared((40.0, 40.0), Some("http://example.com/test"))
+            .expect("checked screenshot");
+        assert!(has_accent(checked), "checked=true did not repaint checked");
+
+        assert_eq!(
+            rt.evaluate(
+                "(function(){ const cb=document.getElementById('cb'); cb.click(); return [cb.checked, cb.hasAttribute('checked'), cb.matches(':checked')]; })()",
+            )
+            .unwrap(),
+            serde_json::json!([false, true, false]),
+        );
+        let clicked_off = rt
+            .screenshot_prepared((40.0, 40.0), Some("http://example.com/test"))
+            .expect("clicked-off screenshot");
+        assert!(!has_accent(clicked_off), "click did not repaint unchecked");
+    }
+
+    #[test]
+    fn radio_checked_setter_updates_the_group_without_reflecting_attributes() {
+        let mut rt = setup_runtime(
+            r#"<input id="a" type="radio" name="g" checked><input id="b" type="radio" name="g">"#,
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(function(){ const a=document.getElementById('a'), b=document.getElementById('b'); b.checked=true; return [a.checked,b.checked,a.hasAttribute('checked'),b.hasAttribute('checked')]; })()",
+            )
+            .unwrap(),
+            serde_json::json!([false, true, true, false]),
+        );
+    }
+
+    #[test]
+    fn disabled_checkable_click_is_inert() {
+        let mut rt = setup_runtime(
+            r#"<input id="check" type="checkbox" disabled>
+               <input id="radio" type="radio" name="group" disabled>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const events = [];
+                    for (const id of ['check', 'radio']) {
+                        const control = document.getElementById(id);
+                        for (const type of ['click', 'input', 'change']) {
+                            control.addEventListener(type, () => events.push(id + ':' + type));
+                        }
+                        control.click();
+                    }
+                    return { check: check.checked, radio: radio.checked, events };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"check": false, "radio": false, "events": []})
+        );
     }
 
     // Issue #324: React/Preact/Vue install a value tracker by redefining `value`

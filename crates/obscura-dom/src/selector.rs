@@ -489,10 +489,9 @@ impl<'a> Element for DomElement<'a> {
         match pc {
             PseudoClass::Link => self.is_link(),
             PseudoClass::Visited => false,
-            // :enabled/:disabled/:checked reflect real, static DOM state (the
-            // disabled/checked attributes), not live user interaction, so
-            // they resolve the same way against a static snapshot as they
-            // would in a browser that never received an input event. Modern
+            // :enabled/:disabled reflect static attributes. :checked starts
+            // from the content attribute but follows live checkedness after
+            // script or user interaction dirties a checkbox/radio. Modern
             // component systems (Codex, Material, Bootstrap, ...) lean on
             // :enabled constantly for their default/base styling, so
             // treating it as unconditionally false (as :hover/:active
@@ -500,7 +499,10 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
             PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
             PseudoClass::Checked => {
-                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+                self.tree
+                    .with_node(self.node_id, |node| node.checkedness())
+                    .unwrap_or(false)
+                    || self.has_boolean_attr("selected")
             }
             // Dynamic user-interaction pseudo-classes have no meaning against
             // a static DOM snapshot with no live user input.

@@ -81,19 +81,13 @@ globalThis.onerror = function(msg, src, line, col, error) {
 };
 globalThis.__windowListeners = {};
 globalThis.addEventListener = function(type, fn) {
-  if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+  _eventTargetAdd(globalThis, type, fn, arguments[2]);
 };
 globalThis.removeEventListener = function(type, fn) {
-  if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
-  }
+  _eventTargetRemove(globalThis, type, fn, arguments[2]);
 };
 globalThis.dispatchEvent = function(event) {
-  if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
-  return !event.defaultPrevented;
+  return _eventTargetDispatch(globalThis, event);
 };
 
 // A cross-context V8 GlobalProxy exposes built-in bindings but can miss
@@ -723,10 +717,8 @@ function _getFp() {
 function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
-globalThis._formChecked = globalThis._formChecked || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
-const _formChecked = globalThis._formChecked;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -1735,18 +1727,74 @@ function _eventTargetRemove(target, type, callback, options) {
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
 }
-function _eventTargetDispatch(target, event) {
-  if (!event || typeof event.type === "undefined") {
-    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+function _eventParent(target, composed) {
+  if (target instanceof ShadowRoot) return composed ? target.host : null;
+  if (target instanceof Document) return target.defaultView || null;
+  return target instanceof Node ? target.parentNode : null;
+}
+function _eventPathFor(target, composed) {
+  const path = [];
+  let adjustedTarget = target;
+  let current = target;
+  let hostAtTarget = false;
+  const seen = new Set();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    path.push({ invocationTarget: current, adjustedTarget, hostAtTarget });
+    hostAtTarget = false;
+    if (current instanceof ShadowRoot) {
+      adjustedTarget = current.host;
+      // A composed event crosses a shadow boundary through the host as if the
+      // host were an AT_TARGET tuple. This remains observable when bubbles is
+      // false and makes both capture and bubble listeners run at phase 2.
+      hostAtTarget = true;
+    }
+    current = _eventParent(current, composed);
   }
-  if (String(event.type) === "") {
-    throw new DOMException("The event's type was not specified.", "InvalidStateError");
+  return path;
+}
+function _eventRootIsShadow(node) {
+  return node instanceof Node && node.getRootNode() instanceof ShadowRoot;
+}
+function _eventRetarget(candidate, against) {
+  while (candidate instanceof Node) {
+    const root = candidate.getRootNode();
+    if (!(root instanceof ShadowRoot)) return candidate;
+    if (against instanceof Node && against.getRootNode() === root) return candidate;
+    candidate = root.host;
   }
-  if (!event.target) event.target = target;
+  return candidate;
+}
+function _eventInvoke(target, event, capture, atTarget, pathIndex) {
+  event.target = event._eventPath[pathIndex].adjustedTarget;
+  if (event._eventOriginalRelatedTarget !== undefined) {
+    event.relatedTarget = _eventRetarget(event._eventOriginalRelatedTarget, target);
+    // Mouse/pointer boundary events do not cross a scope where target and
+    // relatedTarget retarget to the same object (e.g. an internal node moving
+    // to its closed-shadow host). Such a tuple is absent from the DOM path.
+    if (event.relatedTarget === event.target) return;
+  }
   event.currentTarget = target;
-  event.eventPhase = 2;
+  event.eventPhase = atTarget ? 2 : (capture ? 1 : 3);
+  event._eventPathCurrentIndex = pathIndex;
+
+  // Content/IDL handlers run in the bubbling half at the target or on an
+  // ancestor. Keep the existing ordering (inline before addEventListener)
+  // while the listener registry is moved onto the shared dispatcher.
+  if (!capture && target instanceof Element) {
+    const handlerName = 'on' + event.type;
+    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    if (typeof inlineFn === 'function') {
+      try {
+        const ret = inlineFn.call(target, event);
+        if (ret === false) event.preventDefault();
+      } catch (error) { console.error(error); }
+    }
+  }
+
   const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
   for (const entry of listeners) {
+    if (entry.capture !== capture) continue;
     const current = _eventTargetListeners.get(target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
@@ -1759,14 +1807,78 @@ function _eventTargetDispatch(target, event) {
     }
     if (event._immediatePropagationStopped) break;
   }
+}
+function _eventTargetDispatch(target, event) {
+  if (!event || typeof event.type === "undefined") {
+    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+  }
+  if (String(event.type) === "") {
+    throw new DOMException("The event's type was not specified.", "InvalidStateError");
+  }
+  if (event._dispatching) {
+    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+  event._dispatching = true;
+  event._propagationStopped = false;
+  event._immediatePropagationStopped = false;
+  event._eventPath = _eventPathFor(target, event.composed);
+  event._eventPathCurrentIndex = -1;
+  event._eventOriginalRelatedTarget = 'relatedTarget' in event
+    ? event.relatedTarget : undefined;
+  // DOM dispatch clears endpoints after dispatch when the last reachable
+  // tuple would otherwise expose a node from a shadow tree. This also covers
+  // a boundary event whose target and relatedTarget collapse to one host:
+  // its outer tuples are suppressed and neither internal endpoint survives.
+  const lastTuple = event._eventPath[event._eventPath.length - 1];
+  const lastRelatedTarget = event._eventOriginalRelatedTarget === undefined
+    ? null : _eventRetarget(event._eventOriginalRelatedTarget, lastTuple.invocationTarget);
+  const clearTargets = _eventRootIsShadow(lastTuple.adjustedTarget)
+    || _eventRootIsShadow(lastRelatedTarget)
+    || (event._eventOriginalRelatedTarget !== undefined
+        && lastTuple.adjustedTarget === lastRelatedTarget);
+
+  const path = event._eventPath;
+  for (let i = path.length - 1; i > 0; i--) {
+    _eventInvoke(path[i].invocationTarget, event, true, path[i].hostAtTarget, i);
+    if (event._propagationStopped) break;
+  }
+  if (!event._propagationStopped) {
+    _eventInvoke(target, event, true, true, 0);
+    if (!event._immediatePropagationStopped) {
+      _eventInvoke(target, event, false, true, 0);
+    }
+  }
+  if (!event._propagationStopped) {
+    for (let i = 1; i < path.length; i++) {
+      if (path[i].hostAtTarget) {
+        _eventInvoke(path[i].invocationTarget, event, false, true, i);
+      } else if (event.bubbles) {
+        _eventInvoke(path[i].invocationTarget, event, false, false, i);
+      }
+      if (event._propagationStopped) break;
+    }
+  }
+
+  // The event path is observable only while dispatch is in progress. Preserve
+  // the target from the last invoked tuple, but clear currentTarget/path just
+  // as the DOM dispatch algorithm does.
+  if (clearTargets) {
+    event.target = null;
+    if (event._eventOriginalRelatedTarget !== undefined) event.relatedTarget = null;
+  } else {
+    // Cleanup uses the outermost shadow-adjusted endpoints even when
+    // propagation stopped before that tuple's listeners were invoked.
+    event.target = lastTuple.adjustedTarget;
+    if (event._eventOriginalRelatedTarget !== undefined) {
+      event.relatedTarget = lastRelatedTarget;
+    }
+  }
   event.currentTarget = null;
   event.eventPhase = 0;
-  // A composed event crosses a shadow boundary: after the shadow root's own
-  // listeners run, continue to its host and bubble up the light tree. Without
-  // this a click inside a closed shadow root never reaches the host's handlers.
-  if (event.bubbles && event.composed && !event._propagationStopped && target._host) {
-    return target._host.dispatchEvent(event);
-  }
+  event._eventPathCurrentIndex = -1;
+  event._eventPath = null;
+  event._eventOriginalRelatedTarget = undefined;
+  event._dispatching = false;
   return !event.defaultPrevented;
 }
 
@@ -3454,44 +3566,13 @@ class Element extends Node {
     return null;
   }
   addEventListener(type, handler, opts) {
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    _eventTargetAdd(this, type, handler, opts);
   }
-  removeEventListener(type, handler) {
-    const key = this._nid;
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
-    }
+  removeEventListener(type, handler, opts) {
+    _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    // Spec: inline `onclick="..."` content attributes are event handlers
-    // for the matching event type. Fire them alongside any
-    // addEventListener handlers. Also honor the IDL property
-    // `el.onclick = fn` if set. Without this, b.click() never invokes
-    // the inline handler and forms with onsubmit / buttons with onclick
-    // are silently dead.
-    const handlerName = 'on' + event.type;
-    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
-    if (typeof inlineFn === 'function') {
-      try {
-        const ret = inlineFn.call(this, event);
-        if (ret === false) event.preventDefault();
-      } catch(e) { console.error(e); }
-    }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
-      if (event._immediatePropagationStopped) break;
-    }
-    if (event.bubbles && !event._propagationStopped && this.parentNode) {
-      this.parentNode.dispatchEvent(event);
-    }
-    return !event.defaultPrevented;
+    return _eventTargetDispatch(this, event);
   }
   _resolveInlineHandler(name) {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
@@ -3508,7 +3589,41 @@ class Element extends Node {
     return cache[name];
   }
   click() {
+    // HTMLElement.click() performs no dispatch or activation for a disabled
+    // form control. In particular, the checkbox/radio pre-click action below
+    // must not transiently change checkedness before returning.
+    if (this.matches && this.matches(':disabled')) return;
+    const type = (this.getAttribute && this.getAttribute('type') || '').toLowerCase();
+    const checkable = this.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
+    const oldChecked = checkable ? !!this.checked : false;
+    let radioStates = null;
+    // Checkbox/radio activation is the legacy pre-click action: listeners see
+    // the new state, while cancellation restores the state that preceded it.
+    if (checkable && type === 'radio') {
+      const radioName = this.getAttribute('name') || '';
+      if (radioName) {
+        const root = this.getRootNode();
+        const candidates = root && root.querySelectorAll ? root.querySelectorAll('input') : [];
+        radioStates = [];
+        for (let i = 0; i < candidates.length; i++) {
+          const radio = candidates[i];
+          if ((radio.getAttribute('type') || '').toLowerCase() !== 'radio'
+              || (radio.getAttribute('name') || '') !== radioName
+              || radio.form !== this.form) continue;
+          radioStates.push([radio, !!radio.checked]);
+          if (radio !== this) radio.checked = false;
+        }
+      }
+      this.checked = true;
+    } else if (checkable) {
+      this.checked = !oldChecked;
+    }
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    if (cancelled && radioStates) {
+      for (const [radio, checked] of radioStates) radio.checked = checked;
+    } else if (cancelled && checkable) {
+      this.checked = oldChecked;
+    }
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
@@ -3531,6 +3646,10 @@ class Element extends Node {
         } else if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
+      }
+      if (checkable && this.checked !== oldChecked) {
+        this.dispatchEvent(new Event('input', {bubbles: true}));
+        this.dispatchEvent(new Event('change', {bubbles: true}));
       }
     }
   }
@@ -3827,10 +3946,29 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
-    return this.hasAttribute("checked");
+    return _dom("live_checked", this._nid, "") === "true";
   }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  set checked(v) {
+    const checked = !!v;
+    if (checked && this.localName === 'input'
+        && (this.getAttribute('type') || '').toLowerCase() === 'radio') {
+      const name = this.getAttribute('name') || '';
+      if (name) {
+        const root = this.getRootNode();
+        const candidates = root && root.querySelectorAll ? root.querySelectorAll('input') : [];
+        for (let i = 0; i < candidates.length; i++) {
+          const radio = candidates[i];
+          if (radio !== this
+              && (radio.getAttribute('type') || '').toLowerCase() === 'radio'
+              && (radio.getAttribute('name') || '') === name
+              && radio.form === this.form) {
+            _dom("set_live_checked", radio._nid, "false");
+          }
+        }
+      }
+    }
+    _dom("set_live_checked", this._nid, checked ? "true" : "false");
+  }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -5084,21 +5222,13 @@ class Document extends Node {
   }
   createRange() { return new Range(); }
   addEventListener(type, fn, opts) {
-    if (typeof fn !== 'function') return;
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+    _eventTargetAdd(this, type, fn, opts);
   }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
+  removeEventListener(type, fn, opts) {
+    _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
-    return !event.defaultPrevented;
+    return _eventTargetDispatch(this, event);
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -9880,17 +10010,23 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
 // -- the property-lookup trace of a Cloudflare challenge labelled all of its
 // MessageEvent reads "Object.*" for exactly this reason.
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false;this._dispatching=false;this._eventPath=null;this._eventPathCurrentIndex=-1; }
   get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
-    if (!this.target) return [];
-    const path = [];
-    let n = this.target;
-    while (n) { path.push(n); n = n.parentNode || null; }
-    if (typeof window !== "undefined" && window && path[path.length - 1] !== window) path.push(window);
-    return path;
+    const tuples = this._eventPath;
+    const currentIndex = this._eventPathCurrentIndex;
+    if (!tuples || currentIndex < 0) return [];
+    return tuples.filter((tuple, index) => {
+      for (let i = index; i < tuples.length; i++) {
+        const boundary = tuples[i].invocationTarget;
+        if (boundary instanceof ShadowRoot && boundary.mode === 'closed' && currentIndex > i) {
+          return false;
+        }
+      }
+      return true;
+    }).map(tuple => tuple.invocationTarget);
   }
 };
 _markNative(Event);
@@ -9945,7 +10081,7 @@ globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { s
 globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class ErrorEvent extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
-  constructor(t,o={}) { super(t,o); this.pointerId=o.pointerId||0; this.width=o.width||1; this.height=o.height||1; this.pressure=o.pressure||0; this.pointerType=o.pointerType||'mouse'; this.isPrimary=!!o.isPrimary; this.tiltX=o.tiltX||0; this.tiltY=o.tiltY||0; this.tangentialPressure=o.tangentialPressure||0; this.twist=o.twist||0; }
+  constructor(t,o={}) { super(t,o); this.pointerId=o.pointerId||0; this.width=o.width||1; this.height=o.height||1; this.pressure=o.pressure||0; this.pointerType=o.pointerType === undefined ? '' : String(o.pointerType); this.isPrimary=!!o.isPrimary; this.tiltX=o.tiltX||0; this.tiltY=o.tiltY||0; this.tangentialPressure=o.tangentialPressure||0; this.twist=o.twist||0; }
 };
 globalThis.AnimationEvent = class AnimationEvent extends Event {};
 globalThis.TransitionEvent = class TransitionEvent extends Event {};
@@ -13212,7 +13348,7 @@ _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(
 
 if (typeof PointerEvent === 'undefined') {
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
-    constructor(type, opts={}) { super(type, opts); this.pointerId = opts.pointerId || 0; this.width = opts.width || 1; this.height = opts.height || 1; this.pressure = opts.pressure || 0; this.pointerType = opts.pointerType || 'mouse'; }
+    constructor(type, opts={}) { super(type, opts); this.pointerId = opts.pointerId || 0; this.width = opts.width || 1; this.height = opts.height || 1; this.pressure = opts.pressure || 0; this.pointerType = opts.pointerType === undefined ? '' : String(opts.pointerType); }
   };
 }
 
@@ -15066,11 +15202,38 @@ globalThis.__obscura_init = function() {
   // frame's 300x65. Resolve the frame's document-level metrics and overwrite.
   if (_callingFrameRoot()) {
     try {
-      const m = Deno.core.ops.op_layout_metrics
-        && Deno.core.ops.op_layout_metrics(String(_callingFrameRoot()));
-      if (m) {
-        const parsed = JSON.parse(m);
-        if (Number.isFinite(parsed.clientWidth) && parsed.clientWidth > 0) {
+      const frameRoot = String(_callingFrameRoot());
+      let frameMetricsEpoch = null;
+      let frameMetricsCache = null;
+      const readFrameMetrics = function() {
+        // Host mutations happen in the parent realm, so the child's local DOM
+        // epoch cannot invalidate this cache. Use a shared native epoch to
+        // keep consecutive inner/visualViewport reads to one frame layout.
+        const epoch = Deno.core.ops.op_layout_metrics_epoch
+          ? Deno.core.ops.op_layout_metrics_epoch() : null;
+        if (frameMetricsCache && frameMetricsEpoch === epoch) {
+          return frameMetricsCache;
+        }
+        const raw = Deno.core.ops.op_layout_metrics
+          && Deno.core.ops.op_layout_metrics(frameRoot);
+        if (!raw) return null;
+        frameMetricsCache = JSON.parse(raw);
+        frameMetricsEpoch = epoch;
+        return frameMetricsCache;
+      };
+      const readFrameMetric = function(name, fallback) {
+        try {
+          const metrics = readFrameMetrics();
+          if (metrics) {
+            const value = metrics[name];
+            if (Number.isFinite(value) && value >= 0) return value;
+          }
+        } catch (_e) {}
+        return fallback;
+      };
+      const parsed = readFrameMetrics();
+      if (parsed) {
+        if (Number.isFinite(parsed.clientWidth) && parsed.clientWidth >= 0) {
           globalThis.innerWidth = parsed.clientWidth;
           globalThis.innerHeight = parsed.clientHeight;
           if (globalThis.visualViewport) {
@@ -15078,6 +15241,39 @@ globalThis.__obscura_init = function() {
             globalThis.visualViewport.height = parsed.clientHeight;
           }
         }
+      }
+      // A frame viewport can change without recreating its realm (responsive
+      // iframe CSS, display toggles, animation, or an embedder resize). Keep
+      // these Window surfaces live instead of freezing their initialization
+      // values. The fallbacks preserve the last usable value if layout is
+      // temporarily unavailable during navigation.
+      let frameWidthFallback = globalThis.innerWidth;
+      let frameHeightFallback = globalThis.innerHeight;
+      Object.defineProperty(globalThis, 'innerWidth', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return frameWidthFallback = readFrameMetric('clientWidth', frameWidthFallback);
+        },
+      });
+      Object.defineProperty(globalThis, 'innerHeight', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return frameHeightFallback = readFrameMetric('clientHeight', frameHeightFallback);
+        },
+      });
+      if (globalThis.visualViewport) {
+        Object.defineProperty(globalThis.visualViewport, 'width', {
+          configurable: true,
+          enumerable: true,
+          get() { return globalThis.innerWidth; },
+        });
+        Object.defineProperty(globalThis.visualViewport, 'height', {
+          configurable: true,
+          enumerable: true,
+          get() { return globalThis.innerHeight; },
+        });
       }
     } catch (_e) {}
   }
