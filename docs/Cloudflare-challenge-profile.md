@@ -902,6 +902,32 @@ checkbox 的 handler 绑定在哪个元素、监听的是 click 还是 pointer �
 ——预注入包 `addEventListener` 没抓到任何 click/pointer 绑定（可能用 `onclick` 属性、
 缓存引用、或监听的是别的 event），需直接读真实浏览器里该 widget 的监听器归属。
 
+### Step 25 — widget 监听 `click`+移动事件，不是 pointerdown；补 mouseMoved 后点击仍不推进
+
+**方法**：从 HAR 抽取 widget HTML（270KB）/api.js/chl_page 的**字符串表**，列出所有
+事件名；据此判断 checkbox 到底监听什么。
+
+**证据**：
+
+1. widget 字符串表里的**事件名**：`click`、`keydown`、`mouseenter`、`mouseleave`、
+   `mousemove`、`onclick`、`ontouchstart`、`pointermove`、`pointerover`、`touchcancel`、
+   `touchend`、`touchmove`、`touchstart`、`wheel`。
+   **没有** `pointerdown`/`pointerup`/`mousedown`/`mouseup`——step 23 补的 pointerdown/up
+   并不是该 widget 用的面。
+2. 它要的是 **`click` + 移动/进入事件（pointermove/pointerover/mousemove/mouseenter）**：
+   移动事件是「真人把鼠标挪到 widget 上」的信号，缺失时 click 可能被忽略。
+3. 修复：`Input.dispatchMouseEvent` 新增 `mouseMoved`，在按下前派发
+   `pointerover→pointerenter→pointermove→mouseover→mouseenter→mousemove`（各有 trusted，
+   pointermove/mouseover/mousemove composed）。回归测试
+   `mouse_moved_dispatches_pointer_and_mouse_move_events`。
+
+**结论**：event 派发已补到「move + click」完整序列，但点击后**仍无 `interactiveEnd`/
+`complete`/`/pat/`**。至此命中测试、pointer、composed、mouseMoved 四条真实缺陷都已修且
+单测覆盖，点击仍不触发 handler。剩下的怀疑收敛到两点：①handler 不是用 `addEventListener`
+绑的（预注入包 addEventListener 抓不到），而是 `onclick` 属性或**加载时缓存的引用**；
+②事件在 frame realm 里经 `_wrap(node)` 派发到 shadow 元素时 wrapper 不对。下一步要直接
+插桩 obscura 的 `_eventTargetDispatch` / `_wrap`，看 click 到底有没有落到 handler。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
