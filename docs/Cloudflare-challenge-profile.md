@@ -4,11 +4,13 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。输入链路已全部打通：点击被 Turnstile 接受（`interactiveEnd` 稳定复现，
-commit `18e6f92` 修事件字段、`7521680` 补 label 激活、`86bb258` 修 UA 分裂），但证明提交后
-被当场判失败——`complete` 始终为 0，widget 以自有错误码 **`600010`** 重置，并下发**失败路径
-的无效票** `cf_clearance` + `cf_chl_rc_ni=1`（step 31）。当前阻塞点：①**`/pat/` 从不发出**
-（step 39，链路上更靠前，优先）；②**`600010`**（step 37）。
+当前状态：**未通过**。P0 五项 parity 修复（step 40，2026-08-15 实测）后输入链路保持打通、
+时间线全面提速，但**断点未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39 结论维持），
+`complete` 依旧为 0。点击被接受（Verifying…）后证明仍被判失败，widget 重置并换 ray 重来；
+点击后的 4976B 提交与 3256B 主页面回传已出现（比 step 22 时代前进一步），但仍无 `/pat/`、
+无 `/ci/`、无 `interactiveEnd`。新可疑项：**`interactiveEnd` 消失**（step 37–38 时代稳定复现，
+怀疑被 43cb4d4 的 bootstrap.js 重写牵连）。当前阻塞点：①**`/pat/` 从不发出**（step 39/40）；
+②**`interactiveEnd` 缺失回归**（step 40 新发现）。
 
 判据链：`interactiveBegin` → 点击 → `interactiveEnd` → `complete`+token → 站点真实 404。
 判成败一律看 `cf_chl_rc_ni` 是否出现。
@@ -1628,6 +1630,142 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
 补丁必须注入**每一帧**，只在顶层打补丁会导致子帧崩溃、父页面收不到 token、不发最终
 提交。obscura 的 frame realm 预注入（page.rs:2379）已满足这一点。
 
+### Step 41 — TextEncoder 拦截实验：`/fo/` 明文不走 TextEncoder.encode；interactiveEnd 回归疑云澄清
+
+**假设**（用户提出）：参考 HaHaVM 的 TextEncoder hook（`envFunc.TextEncoder_encode` 覆盖），
+用 v8 trace 拿到 `/fo/` POST 加密前的原始 JSON 字符串。
+
+**先澄清 HaHaVM 的 hook 本意**：`lib/data/textEncoderPatch.js` 只特判 `value === "{}"`
+（把空对象替换成 CSS 属性名列表）——那是 **CSS.supports 探测输入的指纹对抗**，与 `/fo/`
+载荷明文无关。真正有价值的是它的拦截机制（hook 数据流入口），不是它拦截的内容。
+
+**v8 trace 结论：不可行，实测三个证据**：
+
+1. `String(TextEncoder.prototype.encode)` 实测 = `"function encode() { [native code] }"`
+   ——deno_core 注入的原生绑定，bootstrap.js:8408 的 JS 类分支（`typeof TextEncoder ===
+   'undefined'`）不生效。
+2. trace 参数捕获靠 `frame->GetParameter(i)`，只对普通 JS 函数帧有效；native 绑定帧
+   参数为空（postMessage 前例 `args=[]`）。TextEncoder.encode 同机制。
+3. 当前二进制**没有 trace 补丁**（`strings` 对 `TracePropertyLookupFile` 零命中、
+   `--trace-property-lookup-file` 报 unrecognized flag）——补丁构建必须带
+   `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'`，且 vendor 构建缓存为空，
+   重建需全量编译 ~30 分钟。
+
+**替代方案（HaHaVM 思路的 obscura 等价物）：预注入包装 `TextEncoder.prototype.encode`**
+——纯转发不改行为，只记录入参。实测：
+
+| 实验 | 结果 |
+|------|------|
+| 本地 enc.html：包装后 title 不变（`enc:32`），捕获完整明文 `{"proof":"hello-obscura","n":42}` | 包装无副作用、捕获有效 |
+| 真实目标完整流程（等 interactiveBegin → 点击 → 4s 后 dump） | `encCount=4`，**全在交互前**：`"you"==="bot"`（worker 探测）、trustedTypes worker 源码（72+214B）、`GAPH2`；**点击后提交阶段零调用** |
+
+**附带收获：interactiveEnd 回归疑云澄清**。点击时机修正（等 interactiveBegin 再点）后，
+事件链完整出现：
+
+```
+interactiveBegin@7326 → interactiveEnd@9361 → fail code="600010"@10056
+```
+
+step 40 记的「interactiveEnd 消失」是 **CF 端波动**（不同 ray 的 widget 版本差异），
+不是代码回归。`600010` 稳定复现，仍是唯一失败码。
+
+**结论**：`/fo/` 提交载荷的加密前明文在**主 realm 不走 TextEncoder.encode**——JSVMP
+用自实现的字符串→字节转换（混淆代码内部），没有标准 API hook 点。**已知盲区**：预注入
+（`Page.addScriptToEvaluateOnNewDocument`）只覆盖文档 realm，**worker realm 未覆盖**
+——若明文在 worker 里构造，本实验看不到。证明计算（822KB JSVMP）的归属（widget iframe
+主线程 vs 其 worker）尚未确认。
+
+**下一步（按信息量）**：
+1. 确认证明计算跑在哪个 realm：worker 消息流（step 12 的探针）或 Rust 插桩
+   `op_worker` 创建点看 JSVMP 是否把载荷 post 进 worker。
+2. 若在 worker：引擎侧给 worker realm 加预注入（worker.rs 的 blob 执行前），重跑本实验。
+3. 若确认两条路径都不走 TextEncoder：明文只能从 JSVMP 逆向或 op_fetch_url body
+   （加密后）+ 内存关联反推；或等 P1 #6（CDP Debugger 域）按帧读栈。
+
+## 测量盲区
+
+### Step 40 — P0 五项 parity 修复后的基线：断点未移动，`/pat/` 依旧从不发出
+
+**背景**：`feat/web-platform-parity` 分支合入五项 P0 修复（79e1238 Performance Timeline、
+f4a1201 PAT API 族、43cb4d4 指纹推导引擎、76b6ae5 Stack/realm/referrer、827028d 定时器保真），
+逐条对应本文「未决」清单（step 10 / 39 / 38 / 32 / 9）。roadmap 明确要求「补齐后回填
+step 39 验证」——本 step 就是回填。
+
+**方法**：`V8_FROM_SOURCE=1 cargo build --release --features render,stealth` 重建后，
+起新 serve（端口 9225，proxy+stealth）跑 messages 探针 + 点击探针 + `RUST_LOG=obscura_js=debug`
+请求日志。
+
+**证据**：
+
+1. **时间线全面提速，但形状不变**（旧进程 vs 新二进制，同一 URL）：
+
+   | 事件 | 旧二进制（8/14 构建） | 新二进制（P0 修复后） |
+   |------|----------------------|----------------------|
+   | `init` | 4803 ms | **2333 ms** |
+   | `translationInit` | 5381 ms | 2912 ms |
+   | `interactiveBegin` | 10614 ms | **7420 ms** |
+
+   定时器修复（step 9 回填）生效，但流程仍停在 interactive 分支，无 `complete`。
+
+2. **请求序列（点击流程，P0 修复后）**——与浏览器基线的差异一目了然：
+
+   ```
+   42.6s  GET  zencare.co/.../chl_page/v1 → 200 (230KB)
+   42.9s  GET  challenges.cloudflare.com/.../api.js → 200 (82KB)
+   43.0s  POST zencare.co/.../fo/<tokenA> → 200 (113KB)
+   45.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (822KB JSVMP)
+   46.6s  GET  brunhild.challenges.cloudflare.com/.../i/...      ← worker fetch（预期失败，浏览器同）
+   50.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (127KB 交互变体)   ← interactiveBegin 后拉取（step 22 归因）
+   54.1s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (4976B)             ← 点击后 ~5.4s
+   54.6s  POST zencare.co/.../fo/<tokenA> → 200 (3256B)          ← 回传主页面（结构对应成功链路的最后一步）
+   57.3s  GET  zencare.co/.../chl_page/v1（新 ray）              ← 换 ray 重来
+   ```
+
+   **`GET /pat/` 与 `GET /ci/` 依旧零出现。** 对比 step 28 浏览器交互基线
+   （`/fo/` 822KB → `/pat/` 401 → `/ci/` png → `/fo/` 7KB 提交）：P0 五项修复后 obscura
+   比 step 22 时代前进了一步（当时 127KB 交互变体后停滞；现在多出 4976B 提交与 3256B
+   主页面回传——后者结构上对应浏览器成功链路的回传步，但结果仍是失败），**证明仍被判
+   失败**（widget 重置 → 换 ray 重来），且 `/pat/` 这条链路上的前置环节依旧缺失。
+
+3. **`interactiveEnd` 未出现**（可疑回归）：step 37–38 时代旧二进制在点击后稳定出现
+   `interactiveEnd`（随后 `fail code=600010`）；本步点击后 postMessage 事件列表停在
+   `interactiveBegin`，无任何新事件——但页面状态确实进入了 `Verifying you are human`
+   （点击被接受，label activation 生效）再重置。43cb4d4 指纹推导引擎重写了 bootstrap.js
+   241 行，step 37 修的鼠标事件字段（timeStamp/screenX/button/detail/pressure/cancelable）
+   是否被牵连，待查。
+
+**测量坑（本轮新踩）**：
+
+- **9223 端口上是 8/14 01:15 启动的旧进程**（会话外遗留），我启动 serve 时静默绑定失败，
+  前两轮探针实际打在旧代码上。判据：`ps -o lstart -p <pid>` 与二进制 mtime 对比。
+  **这又是一次「进程比二进制旧」的盲区变体，已补进测量盲区表。**
+- `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询——踩中「导航早期 t≈1s
+  求值永久清空文档」的坑（测量盲区表已有），表现为 `box=null`、title/body 全空。改法：
+  首轮求值延迟 5s（`/tmp/cdp_click_fast_delayed.py`），随后一切正常。
+- `RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 的日志——它的 target 是模块路径
+  `obscura_js::ops`，不是 `obscura::js`。请求序列要用 `RUST_LOG=obscura_js=debug`。
+- 图片加载三模式对照（fetch / serve / MCP 同二进制）：本地页实测三者请求序列完全一致
+  （index.html + red.png + green.png，`naturalWidth: 64`）。**图片不加载与模式无关**，
+  是流程深度问题（`/ci/` 排在 `/pat/` 之后）。唯一真实的差异渠道是独立构建的 MCP
+  二进制不带 `--features render`（obscura-mcp `default = []`，图片 op 整组不注册）。
+  另：serve 不带 `OBSCURA_ALLOW_PRIVATE_NETWORK=1` 时本地导航直接被拒（
+  `Access to private/internal IP address`），会伪装成「serve 模式不加载」。
+
+**结论**：P0 五项修复（PAT API、Performance Timeline、指纹推导、栈/行号、定时器）
+**没有移动断点**——`/pat/` 依旧从不发出（首要阻塞，step 39 结论维持），`complete` 依旧为 0。
+`interactiveEnd` 的消失是新的可疑项（排在 `/pat/` 之后）。HaHaVM 侧确认：`/pat/` 由
+Turnstile widget JSVMP 自身发起（`sec-fetch-mode: cors, dest: empty`，即 fetch/XHR），
+HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式的 `/pat/` 打补丁——
+因此 `/pat/` 缺失 = JSVMP 在 822KB 载荷之后没走到「发证明请求」那一步。
+
+**下一步（按信息量）**：
+1. 重跑 `cdp_event_trace.py` 对比 Chrome/obscura 事件字段，确认 step 37 修复是否被
+   43cb4d4 的 bootstrap.js 重写牵连（interactiveEnd 缺失的根因）。
+2. v8 trace 追 JSVMP：822KB 载荷执行期间页面读到的差异面（trace 需 100MB+ 才算完整
+   一轮，step 39 的 6MB 不算数）。
+3. 用 `RUST_LOG=obscura_js=debug` 的请求序列作为后续每轮的固定观测面（URL+字节数，
+   比 postMessage 更直接）。
+
 ## 测量盲区
 
 排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
@@ -1659,6 +1797,9 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
 | **把「页面没加载」当成「功能不工作」**（第二次犯） | step 38：受控页在 serve 路径下 DOM 为空、JS 未执行，据此得出「obscura 不加载图片」，复核后 4 个 png 请求全部正常 | 任何「某功能没发生」的结论，先断言页面真的加载了（`document.querySelectorAll('*').length` 或一个已知元素的文本） |
 | 过盾后页面**导航到新文档**，`window.__msgs` 随之清空 | 点击后 3 秒再 dump 就已经什么都读不到，成功样本连抓两次落空 | 让 hook 同时 `console.warn`，订阅 `Runtime.consoleAPICalled` **实时收流**，不依赖 dump 时机 |
 | 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
+| **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
+| **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
+| `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
@@ -1667,10 +1808,18 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
 
 按当前怀疑程度排序：
 
-- **`/pat/` 从不发出**（step 39，现首要）：Chrome 在大载荷后 366ms 必发 `GET /pat/`(401)
-  再 `GET /ci/`；obscura 无 `/pat/`，`/ci/` 也只在托管分支出现且延迟 2.24s。
-  `hasPrivateToken` 探测假设已被 trace 证伪（但该 trace 仅 6MB，证据不足）。下一步读
-  HaHaVM 的 `forwardLoader.js`。
+- **`/pat/` 从不发出**（step 39/40，现首要）：Chrome 在大载荷后 366ms 必发 `GET /pat/`(401)
+  再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`（step 40 P0 修复后实测确认）。`hasPrivateToken`
+  探测假设已被 trace 证伪（但该 trace 仅 6MB，证据不足）。HaHaVM 侧已确认 `/pat/` 由 widget
+  JSVMP 自身发起（`sec-fetch-mode: cors, dest: empty`），HaHaVM 无显式打补丁——缺失 =
+  JSVMP 没走到发证明请求那一步。下一步：v8 trace 追 822KB 载荷执行期间的差异面（需
+  100MB+ 完整 trace），或先查 `interactiveEnd` 回归（见下）。
+- **`interactiveEnd` 疑云已澄清**（step 41）：step 40 记的「消失」是 CF 端波动——点击
+  时机修正（等 interactiveBegin 再点）后事件链完整出现（interactiveEnd@9361 →
+  fail 600010@10056）。**不是代码回归**。
+- **`/fo/` 明文获取**（step 41）：v8 trace 不可行（TextEncoder 是 deno_core native，
+  参数捕获只对 JS 帧有效）；预注入包装 TextEncoder.encode 实测主 realm 提交阶段零调用
+  ——明文不走 TextEncoder。待确认：证明计算是否跑在 worker（预注入不覆盖 worker realm）。
 - **缺 PAT 一族 Document API**（step 39）：`hasPrivateToken`/`hasRedemptionRecord`/
   `hasStorageAccess` 均未实现（grep 确认 0 处），HaHaVM 照 Chrome 接口补齐了这一组。
 - **`fail code=600010`**（step 37）：`interactiveEnd` 稳定后仍以此码失败，并返回
