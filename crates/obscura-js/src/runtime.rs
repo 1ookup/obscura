@@ -3081,6 +3081,30 @@ impl ObscuraJsRuntime {
         nearest
     }
 
+    /// Restore a live wake path after an embedder cancels a pending
+    /// run-to-idle poll. deno_core's mutable timer sleep can retain the waker
+    /// from that dropped future. When a browser timer is already overdue, a
+    /// yield-only async op wakes the next event-loop poll without changing the
+    /// timer's native deadline or ordering.
+    fn queue_overdue_timer_wake_repair(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let overdue_timer = self
+            .state
+            .borrow()
+            .browser_timer_deadlines
+            .values()
+            .any(|deadline| *deadline <= now);
+        if !overdue_timer {
+            return false;
+        }
+        tracing::trace!(target: "obscura::timers", "queued overdue timer wake repair");
+        let _ = self.execute_script(
+            "<obscura:timer-wake>",
+            "void Deno.core.ops.op_posted_task().catch(() => {});",
+        );
+        true
+    }
+
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
@@ -3199,6 +3223,21 @@ impl ObscuraJsRuntime {
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
+        let tick_started = std::time::Instant::now();
+        self.queue_overdue_timer_wake_repair();
+        if tracing::enabled!(target: "obscura::timers", tracing::Level::TRACE) {
+            let now_ms = self
+                .evaluate("performance.now()")
+                .ok()
+                .and_then(|value| value.as_f64());
+            let next_timeout_ms = self.next_pending_timeout_delay_ms();
+            tracing::trace!(
+                target: "obscura::timers",
+                now_ms = ?now_ms,
+                next_timeout_ms = ?next_timeout_ms,
+                "event loop tick started"
+            );
+        }
         self.begin_javascript_task();
         // Messages queued by the previous turn precede work polled in this
         // one. This also guarantees progress when recurring page work keeps
@@ -3219,9 +3258,15 @@ impl ObscuraJsRuntime {
                     "Event loop error: {error}"
                 ))),
                 std::task::Poll::Pending if waiting_for_wake => {
+                    tracing::trace!(
+                        target: "obscura::timers",
+                        elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
+                        "event loop wake returned pending"
+                    );
                     std::task::Poll::Ready(Ok(false))
                 }
                 std::task::Poll::Pending => {
+                    tracing::trace!(target: "obscura::timers", "event loop parked");
                     waiting_for_wake = true;
                     std::task::Poll::Pending
                 }
@@ -3235,6 +3280,14 @@ impl ObscuraJsRuntime {
             // resolves on the next tick, so callers must keep pumping.
             Ok(idle) => {
                 let delivered_after_poll = self.drain_frame_messages();
+                tracing::trace!(
+                    target: "obscura::timers",
+                    elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
+                    idle,
+                    delivered_before_poll,
+                    delivered_after_poll,
+                    "event loop tick complete"
+                );
                 Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
             }
             Err(error) => Err(error),
@@ -3257,6 +3310,7 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        let repair_queued = self.queue_overdue_timer_wake_repair();
         self.begin_javascript_task();
         // Preserve postMessage task ordering and make already-queued frame
         // traffic progress before a long-lived runtime poll can park.
@@ -3274,7 +3328,7 @@ impl ObscuraJsRuntime {
         }
 
         let isolate_handle = self.isolate_handle();
-        let mut waiting_for_wake = false;
+        let mut pending_polls = 0u8;
         let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
@@ -3295,12 +3349,15 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
-                }
                 std::task::Poll::Pending => {
-                    waiting_for_wake = true;
-                    std::task::Poll::Pending
+                    pending_polls = pending_polls.saturating_add(1);
+                    // The repair wake refreshes deno_core's timer sleep waker;
+                    // one further poll is needed to deliver the overdue timer.
+                    if pending_polls == 1 || (repair_queued && pending_polls == 2) {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(false))
+                    }
                 }
             }
         })
@@ -3376,11 +3433,19 @@ impl ObscuraJsRuntime {
             // are intentionally excluded, and distant one-shots are treated
             // like Chromium after `load`: callers needing an arbitrary fixed
             // delay can request strict settle.
-            let near_timeout = self
-                .next_pending_timeout_delay_ms()
+            let next_timeout_ms = self.next_pending_timeout_delay_ms();
+            let near_timeout = next_timeout_ms
                 .is_some_and(|delay| delay <= quiet.as_secs_f64() * 2_000.0);
             let external_work_pending = now < external_work_deadline
                 && (self.has_pending_network_requests() || self.has_pending_dynamic_scripts());
+            tracing::trace!(
+                target: "obscura::timers",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                next_timeout_ms = ?next_timeout_ms,
+                near_timeout,
+                external_work_pending,
+                "settle policy"
+            );
             if external_work_pending {
                 activity_deadline = deadline.min(external_work_deadline + activity_tail);
                 generation = next_generation;
@@ -3431,6 +3496,11 @@ impl ObscuraJsRuntime {
                 self.run_cooperative_event_loop_tick(),
             )
             .await;
+            tracing::trace!(
+                target: "obscura::timers",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "settle tick returned"
+            );
             let tick_fired = self.disarm_watchdog(tick_watchdog);
             if tick_fired {
                 break Ok(());
@@ -4808,6 +4878,38 @@ mod tests {
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timers_keep_their_deadline_after_an_interrupted_event_loop_poll() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "timer-deadline-after-interruption",
+            r#"
+                globalThis.__timerDeadlineProbe = [];
+                const started = performance.now();
+                [0, 50, 100].forEach(delay => setTimeout(() => {
+                    __timerDeadlineProbe.push([delay, performance.now() - started]);
+                }, delay));
+            "#,
+        )
+        .unwrap();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(10),
+            rt.run_event_loop(),
+        )
+        .await;
+        rt.run_event_loop_for_duration(140).await.unwrap();
+        let result = rt.evaluate("__timerDeadlineProbe").unwrap();
+        let values = result.as_array().expect("timer probe array");
+        assert_eq!(values.len(), 3, "all timers should fire: {result}");
+        for (value, expected) in values.iter().zip([0.0, 50.0, 100.0]) {
+            let elapsed = value[1].as_f64().expect("timer elapsed");
+            assert!(
+                elapsed >= expected && elapsed < expected + 35.0,
+                "timer {expected}ms fired at {elapsed}ms after an interrupted poll: {result}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -335,6 +335,15 @@ JS**，其中 `op_layout_geometry → ensure_prepared_geometry` 占 11%。所以
 100 ms，解释不了 650–2500 ms。下一步应当给 `run_cooperative_event_loop_tick` 的
 每次 poll 与 park 时长插桩，而不是继续猜。
 
+#### Step 9 回填(通用修复,2026-08-14)
+
+已定位并修复:导航或 CDP 命令取消 deno_core 的 run-to-idle poll 后,可变 timer
+sleep 会保留已失效的旧 waker。下一次 event-loop turn 看到已到期的真实单调 deadline
+时,内核通过 yield-only async op 重建当前 poll 的唤醒路径;timer deadline、任务排序与
+HTML nested floor 仍由通用 timer queue 决定。固定导航 fixture 中修复前 50/100ms
+均在约 103ms 批量触发,修复后分别约 52/103ms;autonomous CDP 路径同样覆盖。`RUST_LOG=obscura::timers=trace`
+可见 repair、park、wake 和 tick 边界证据。
+
 ### Step 10 — Performance Timeline 整体为空（实测）
 
 一次性把相关面全测了：

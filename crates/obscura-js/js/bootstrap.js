@@ -822,13 +822,17 @@ const _scheduleAfter = (delay, fn) => {
   }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
-  return Deno.core.queueUserTimer(0, false, d, () => {
+  let nativeId;
+  nativeId = Deno.core.queueUserTimer(0, false, d, () => {
+    Deno.core.ops.op_browser_timer_complete(nativeId);
     // HTML timer/observer/rAF delivery starts a new task. Freeze animation
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
     Deno.core.ops.op_begin_render_task?.();
     return fn();
   });
+  Deno.core.ops.op_browser_timer_schedule(nativeId, d);
+  return nativeId;
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -902,6 +906,7 @@ globalThis.clearTimeout = (id) => {
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
+    Deno.core.ops.op_browser_timer_complete(nativeId);
     Deno.core.cancelTimer(nativeId);
     _nativeTimerIds.delete(id);
   }

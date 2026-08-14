@@ -1,0 +1,27 @@
+{
+  "browser": "Google Chrome 146.0.7680.80 headless",
+  "captured": "2026-08-14",
+  "result": {
+    "events": [
+      {"kind": "microtask", "expected": 0, "elapsed": 0.1},
+      {"kind": "timeout", "expected": 0, "elapsed": 0.4},
+      {"kind": "timeout", "expected": 1, "elapsed": 1.8},
+      {"kind": "interval", "expected": 30, "elapsed": 31.7},
+      {"kind": "timeout", "expected": 50, "elapsed": 51.8},
+      {"kind": "timeout", "expected": 100, "elapsed": 101.2},
+      {"kind": "timeout", "expected": 250, "elapsed": 251.8},
+      {"kind": "timeout", "expected": 550, "elapsed": 552.0},
+      {"kind": "timeout", "expected": 1000, "elapsed": 1000.3}
+    ],
+    "intervalTicks": 3,
+    "chain": [0.3, 0.4, 0.4, 0.4, 0.4, 0.5, 4.6, 8.9]
+  },
+  "assertions": {
+    "microtaskPrecedesFirstTimerTask": true,
+    "oneShotTimersKeepInsertionAndDeadlineOrder": true,
+    "oneShotLatenessUpperBoundMs": 35,
+    "intervalFiresExactlyThreeTimes": true,
+    "nestedZeroDelayFloorStartsAfterFiveNestings": true
+  },
+  "note": "Elapsed values are one real capture. Verification uses ordering and bounded lateness rather than exact wall-clock equality."
+}

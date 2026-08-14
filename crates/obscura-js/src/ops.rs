@@ -229,6 +229,10 @@ pub struct ObscuraState {
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
     pub activity_generation: u64,
+    /// Native deno_core timer id to its real monotonic deadline. The runtime
+    /// uses this only to repair a stale event-loop waker after an embedder
+    /// cancels a pending poll; deno_core still owns timer ordering and firing.
+    pub(crate) browser_timer_deadlines: HashMap<u64, std::time::Instant>,
     /// Monotonic identity of the currently installed document. Async resource
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
@@ -381,6 +385,7 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
+            browser_timer_deadlines: HashMap::new(),
             document_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -4387,6 +4392,34 @@ fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
+#[op2(fast)]
+fn op_browser_timer_schedule(state: &OpState, native_id: f64, delay_ms: f64) {
+    if !native_id.is_finite() || native_id < 0.0 || !delay_ms.is_finite() {
+        return;
+    }
+    let delay = std::time::Duration::from_millis(delay_ms.max(0.0) as u64);
+    let Some(deadline) = std::time::Instant::now().checked_add(delay) else {
+        return;
+    };
+    let shared = state.borrow::<SharedState>().clone();
+    shared
+        .borrow_mut()
+        .browser_timer_deadlines
+        .insert(native_id as u64, deadline);
+}
+
+#[op2(fast)]
+fn op_browser_timer_complete(state: &OpState, native_id: f64) {
+    if !native_id.is_finite() || native_id < 0.0 {
+        return;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    shared
+        .borrow_mut()
+        .browser_timer_deadlines
+        .remove(&(native_id as u64));
+}
+
 /// Wake one browser posted task without routing through Tokio's timer wheel.
 /// `yield_now` guarantees the op cannot settle in the initiating JavaScript
 /// turn, while avoiding the roughly one-millisecond floor of a zero-duration
@@ -5505,6 +5538,8 @@ pub fn build_extension() -> Extension {
         op_queue_iframe_navigation(),
         op_navigate_iframe(),
         op_async_runtime_available(),
+        op_browser_timer_schedule(),
+        op_browser_timer_complete(),
         op_posted_task(),
         op_binding_called(),
         op_subtle_digest(),

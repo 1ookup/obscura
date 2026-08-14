@@ -9095,6 +9095,121 @@ mod tests {
         );
     }
 
+    fn spawn_timer_deadline_server() -> std::net::SocketAddr {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (content_type, body) = if path == "/probe.js" {
+                    (
+                        "text/javascript",
+                        r#"
+                            globalThis.__timerDeadlineProbe = { events: [], chain: [] };
+                            const started = performance.now();
+                            [50, 100].forEach(delay => setTimeout(() => {
+                                __timerDeadlineProbe.events.push([delay, performance.now() - started]);
+                            }, delay));
+                            let count = 0;
+                            const chain = () => {
+                                __timerDeadlineProbe.chain.push(performance.now() - started);
+                                if (++count < 8) setTimeout(chain, 0);
+                            };
+                            setTimeout(chain, 0);
+                        "#,
+                    )
+                } else {
+                    ("text/html", "<!doctype html><script src='/probe.js'></script>")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        address
+    }
+
+    fn timer_deadline_page(address: std::net::SocketAddr) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "timer-deadline-lifecycle".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(format!("timer-deadline-{address}"), context)
+    }
+
+    fn assert_timer_deadline_probe(result: &serde_json::Value) {
+        let events = result["events"].as_array().expect("timer event array");
+        assert_eq!(events.len(), 2, "both delayed timers must fire: {result}");
+        for (event, expected) in events.iter().zip([50.0, 100.0]) {
+            let elapsed = event[1].as_f64().expect("timer elapsed");
+            assert!(
+                elapsed >= expected && elapsed < expected + 35.0,
+                "timer {expected}ms crossed a poll boundary at {elapsed}ms: {result}"
+            );
+        }
+        let chain = result["chain"].as_array().expect("nested timer chain");
+        assert_eq!(chain.len(), 8, "nested timer chain must complete: {result}");
+        assert!(
+            chain.last().and_then(|value| value.as_f64()).is_some_and(|elapsed| elapsed < 60.0),
+            "an overdue nested timer must not wait for an embedder deadline: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_settle_delivers_timers_at_their_deadlines_after_navigation() {
+        let address = spawn_timer_deadline_server();
+        let mut page = timer_deadline_page(address);
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+        page.settle_for_duration(160).await;
+
+        let result = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("__timerDeadlineProbe")
+            .unwrap();
+        assert_timer_deadline_probe(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll() {
+        let address = spawn_timer_deadline_server();
+        let mut page = timer_deadline_page(address);
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(160);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, page.run_autonomous_event_loop_turn()).await {
+                Ok(Ok(true)) | Err(_) => break,
+                Ok(Ok(false)) => tokio::task::yield_now().await,
+                Ok(Err(error)) => panic!("autonomous timer pump failed: {error}"),
+            }
+        }
+        let result = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("__timerDeadlineProbe")
+            .unwrap();
+        assert_timer_deadline_probe(&result);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_module_graph_is_post_load_work_until_caller_settles() {
         use std::io::{Read as _, Write as _};

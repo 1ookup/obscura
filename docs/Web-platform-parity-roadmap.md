@@ -102,7 +102,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | ✅ 完成(`f4a1201`) |
 | 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | ✅ 完成(`c48fcb6`) |
 | 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | ✅ 完成(`1a544e2`) |
-| 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | 待开始 |
+| 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | ✅ 完成(本提交) |
 
 #### P0-1 实施记录:Performance Timeline 真实现
 
@@ -135,6 +135,14 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **实现**:html5ever tokenizer 行号写入 DOM parser 元数据,inline classic/module 脚本和 iframe realm 通过 `ScriptOrigin` 使用文档绝对行号;跨源 WindowProxy 的 `document`、location 读属性和 `frameElement` 统一抛 `SecurityError`,同源 iframe 保留真实 realm 与 `document.referrer`。网络层实现八种 Referrer-Policy,默认 `strict-origin-when-cross-origin`,响应头优先于 meta,并贯穿主导航、重定向、iframe、脚本/样式/module、fetch/XHR 及 stealth 客户端。值级策略仅来自文档元数据与 embedder 输入,没有站点特判。
 - **确定性验证**:`js-repros/stack-realm-referrer/` 覆盖 parser 行号、inline/external stack、同源继承、跨源安全异常、iframe `referrerpolicy` 和同源/跨源 fetch Referer;本地双 origin capture 成功,服务端收到两组真实 Referer,debug trace 含 navigation/frame/fetch 记录。`chrome-oracle.json` 固化 Google Chrome 146 的归一化实测语义;当前机器没有 Chrome 可执行文件,因此未重复本地 Chrome capture,限制已记录在 fixture README。
 - **测试与门禁**:`obscura-dom` 89/89、`obscura-net` 84/84、`obscura-js` 458/458、`obscura-browser` 100/100 release nextest 通过;普通 `render` release CLI build 通过,stealth 构建作为本项提交前门禁执行。新增 DOM source-line、stack、Referrer-Policy 矩阵与 document scope fixture 测试均为确定性断言。
+
+#### P0-5 实施记录:定时器保真
+
+- **状态**:✅ 完成(本提交)。
+- **实现**:定位到 deno_core 可变 timer sleep 在导航/协议抢占取消 run-to-idle poll 后保留旧 waker 的根因;所有浏览器 timer 在 Rust 状态层登记真实单调 deadline,新的 cooperative/autonomous event-loop turn 只在已有 timer 到期时通过 yield-only async op 重建唤醒路径。deadline、排序、HTML nested timer 4ms floor 和 callback 语义仍由 deno_core/bootstrap 内核实现,没有按 URL 或页面内容快进。
+- **确定性验证**:`js-repros/timer-fidelity/` 覆盖 microtask→timer 任务边界、0/1/50/100/250/550/1000ms 桶、interval 重排与 nested timeout floor;Chrome 146 headless oracle 的到期顺序与 Obscura 一致,修复前 50/100ms 在约 103ms 批量交付,修复后约 52/103ms 且不再跨 100ms settle slice。固定 settle 与 CDP autonomous pump 均有本地 HTTP 导航 fixture。
+- **测试与门禁**:`obscura-js` 459/459、`obscura-browser` 102/102、`obscura-cdp` 174/174(3 skipped) release nextest 通过;workspace release nextest 1580/1580(4 skipped)通过;精确 release CLI build 通过;obstacle course 33/33。最终 Obscura fixture 的 50/100/250/550/1000ms timer 分别约 51/103/252/553/1002ms。
+- **诊断证据**:`RUST_LOG=obscura::timers=trace` 记录 `queued overdue timer wake repair`、park/wake/tick 边界;修复后 overdue tick 的 wake 返回约 0.04–0.4ms,修复前同一 tick 约 101–102ms,与 fixture 的 50/100ms 聚集一一对应。
 
 ### P1 — 诊断底座 + 常见桩(次做,每项 1–2 周)
 
