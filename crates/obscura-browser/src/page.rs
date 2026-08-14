@@ -292,6 +292,11 @@ pub struct Page {
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
+    /// Monotonic and wall-clock representations of the current navigation
+    /// start. Performance entries use the former; Performance.timeOrigin uses
+    /// the latter.
+    performance_time_origin: std::time::Instant,
+    performance_time_origin_ms: f64,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -951,6 +956,12 @@ impl Page {
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
+            performance_time_origin: std::time::Instant::now(),
+            performance_time_origin_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1_000.0,
             navigation_timeout: None,
             history: Vec::new(),
             history_index: 0,
@@ -1145,6 +1156,7 @@ impl Page {
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
+        rt.set_performance_time_origin(self.performance_time_origin_ms);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -1219,6 +1231,90 @@ impl Page {
         );
 
         self.js = Some(rt);
+    }
+
+    fn record_performance_response(
+        &mut self,
+        response: &obscura_net::Response,
+        entry_type: &str,
+        initiator_type: &str,
+    ) {
+        if entry_type == "resource" && !matches!(response.url.scheme(), "http" | "https") {
+            return;
+        }
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        let transport_start = response
+            .timing
+            .start
+            .checked_duration_since(self.performance_time_origin)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
+        let start_time = if entry_type == "navigation" { 0.0 } else { transport_start };
+        let response_start = transport_start + response.timing.response_start.as_secs_f64() * 1_000.0;
+        let response_end = transport_start + response.timing.response_end.as_secs_f64() * 1_000.0;
+        let redirect_end = if response.redirected_from.is_empty() {
+            0.0
+        } else {
+            transport_start + response.timing.redirect_end.as_secs_f64() * 1_000.0
+        };
+        let body_size = response.body.len();
+        let document_origin = self
+            .url
+            .as_ref()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let same_origin = response.url.origin().ascii_serialization() == document_origin;
+        let timing_allowed = entry_type != "resource"
+            || same_origin
+            || response.header("timing-allow-origin").is_some_and(|value| {
+                value.split(',').map(str::trim).any(|allowed| {
+                    allowed == "*" || (!document_origin.is_empty() && allowed == document_origin)
+                })
+            });
+        let exposed_response_start = if timing_allowed { response_start } else { 0.0 };
+        let exposed_size = if timing_allowed { body_size } else { 0 };
+        let exposed_status = if timing_allowed { response.status } else { 0 };
+        let entry = serde_json::json!({
+            "name": response.url.as_str(),
+            "entryType": entry_type,
+            "initiatorType": initiator_type,
+            "startTime": start_time,
+            "duration": (response_end - start_time).max(0.0),
+            "redirectStart": if response.redirected_from.is_empty() { 0.0 } else { transport_start },
+            "redirectEnd": redirect_end,
+            "fetchStart": transport_start,
+            "domainLookupStart": if timing_allowed { transport_start } else { 0.0 },
+            "domainLookupEnd": if timing_allowed { transport_start } else { 0.0 },
+            "connectStart": if timing_allowed { transport_start } else { 0.0 },
+            "connectEnd": if timing_allowed { transport_start } else { 0.0 },
+            "requestStart": if timing_allowed { transport_start } else { 0.0 },
+            "responseStart": exposed_response_start,
+            "responseEnd": response_end,
+            "transferSize": exposed_size,
+            "encodedBodySize": exposed_size,
+            "decodedBodySize": exposed_size,
+            "responseStatus": exposed_status,
+            "redirectCount": response.redirected_from.len(),
+            "type": "navigate",
+        });
+        tracing::debug!(
+            target: "obscura::performance",
+            entry_type,
+            initiator_type,
+            url = %response.url,
+            start_time_ms = start_time,
+            response_start_ms = response_start,
+            response_end_ms = response_end,
+            body_size,
+            "recording Performance Timeline entry",
+        );
+        let _ = js.execute_script(
+            "<performance-entry>",
+            &format!("globalThis.__obscura_performance_record({entry});"),
+        );
     }
 
     /// Resolve the document base URL per HTML spec:
@@ -1379,6 +1475,7 @@ impl Page {
                     }
                 };
                 let response_url = response.url.clone();
+                self.record_performance_response(&response, "resource", "link");
                 self.record_network_event_with_body(
                     response_url.as_str(),
                     "GET",
@@ -1745,6 +1842,7 @@ impl Page {
                             headers,
                             body,
                             redirected_from: Vec::new(),
+                            timing: obscura_net::ResponseTiming::default(),
                         };
                         return Some((idx, url, resp));
                     }
@@ -1789,6 +1887,7 @@ impl Page {
             std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
+                self.record_performance_response(&resp, "resource", "script");
                 if !script_response_is_executable(resp.status) {
                     self.record_network_event_with_body(
                         &url,
@@ -2225,7 +2324,8 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                "try { globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); } catch(e) {}\n\
+                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
 
@@ -2244,7 +2344,8 @@ impl Page {
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -2612,6 +2713,7 @@ impl Page {
                             headers,
                             body,
                             redirected_from: Vec::new(),
+                            timing: obscura_net::ResponseTiming::default(),
                         };
                         return Some((index, url, resp));
                     }
@@ -3120,6 +3222,12 @@ impl Page {
         body: &str,
         referrer: &str,
     ) -> Result<(), PageError> {
+        self.performance_time_origin = std::time::Instant::now();
+        self.performance_time_origin_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         self.lifecycle = LifecycleState::Loading;
@@ -3190,6 +3298,7 @@ impl Page {
                 headers,
                 body: body_bytes,
                 redirected_from: Vec::new(),
+                timing: obscura_net::ResponseTiming::default(),
             })
         } else if method == "POST" {
             self.http_client
@@ -3269,6 +3378,7 @@ impl Page {
         self.frame_stylesheet_cache.clear();
         self.load_child_frames().await;
         self.init_js();
+        self.record_performance_response(&response, "navigation", "navigation");
         // The top Window's new-document scripts precede every child-frame and
         // top-document author script, just as they precede HTML parsing in a
         // browser. Child worlds receive their own injection below.
@@ -3674,6 +3784,14 @@ impl Page {
                 Ok(Some((raw, profile, kind, result))) => {
                     let outcome = match result {
                         Ok(response) => {
+                            self.record_performance_response(
+                                &response,
+                                "resource",
+                                match kind {
+                                    ResourceType::Font => "css",
+                                    _ => "img",
+                                },
+                            );
                             self.record_network_event_with_body(
                                 response.url.as_str(),
                                 "GET",
@@ -7854,6 +7972,85 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), request_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_timeline_uses_navigation_and_transport_milestones() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request_text = String::from_utf8_lossy(&request[..length]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, body) = if path == "/timed.js" {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    ("application/javascript", "globalThis.timelineScriptLoaded=true")
+                } else {
+                    ("text/html", "<!doctype html><script src='/timed.js'></script><p>timeline</p>")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "performance-timeline".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("performance-timeline".to_string(), context);
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+        let result = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const navigation = performance.getEntriesByType('navigation')[0];
+                    const resource = performance.getEntriesByName(location.origin + '/timed.js', 'resource')[0];
+                    return {
+                        navigationCount: performance.getEntriesByType('navigation').length,
+                        paintNames: performance.getEntriesByType('paint').map(entry => entry.name),
+                        navigationOrdered: navigation.startTime === 0
+                            && navigation.responseStart >= navigation.requestStart
+                            && navigation.responseEnd >= navigation.responseStart
+                            && navigation.loadEventEnd >= navigation.domContentLoadedEventEnd,
+                        resourceOrdered: resource.responseStart >= resource.requestStart
+                            && resource.responseEnd >= resource.responseStart,
+                        resourceDuration: resource.duration,
+                        responseStatus: resource.responseStatus,
+                        timeOriginAgreement: Math.abs((Date.now() - performance.timeOrigin) - performance.now()),
+                        scriptLoaded: globalThis.timelineScriptLoaded === true,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["navigationCount"], serde_json::json!(1));
+        assert_eq!(result["navigationOrdered"], serde_json::json!(true));
+        assert_eq!(result["resourceOrdered"], serde_json::json!(true));
+        assert_eq!(result["responseStatus"], serde_json::json!(200));
+        assert_eq!(result["scriptLoaded"], serde_json::json!(true));
+        assert_eq!(
+            result["paintNames"],
+            serde_json::json!(["first-paint", "first-contentful-paint"]),
+        );
+        assert!(result["resourceDuration"].as_f64().unwrap() >= 40.0);
+        assert!(result["timeOriginAgreement"].as_f64().unwrap() < 25.0);
     }
 
     fn spawn_script_resource_cache_server(

@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Performance Timeline fixture</title>
+<script src="resource.js"></script>
+<main>timeline fixture</main>
+<script>
+performance.mark('fixture-start', { startTime: 4 });
+performance.mark('fixture-end', { startTime: 10 });
+performance.measure('fixture-span', 'fixture-start', 'fixture-end');
+</script>

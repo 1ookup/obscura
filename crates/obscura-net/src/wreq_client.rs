@@ -5,7 +5,7 @@ use std::error::Error;
 #[cfg(feature = "stealth")]
 use std::sync::Arc;
 #[cfg(feature = "stealth")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "stealth")]
 use futures_util::StreamExt;
@@ -19,7 +19,7 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, cors_required, fetch_file_url, redirect_taints_origin,
+    ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
     request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
     validate_cors_response, validate_request_mode, validate_url,
 };
@@ -222,6 +222,7 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        let fetch_started = Instant::now();
         validate_url(url, false)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
@@ -239,6 +240,7 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    timing: ResponseTiming::default(),
                 });
             }
         }
@@ -246,6 +248,7 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut redirect_end = Duration::ZERO;
 
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
@@ -302,6 +305,7 @@ impl StealthHttpClient {
             let resp = req.send().await.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
+            let response_start = fetch_started.elapsed();
 
             let status = resp.status();
             validate_wreq_cors_response(
@@ -338,6 +342,7 @@ impl StealthHttpClient {
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
+                    redirect_end = fetch_started.elapsed();
                     current_url = next_url;
                     continue;
                 }
@@ -345,6 +350,7 @@ impl StealthHttpClient {
 
             let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
                 .await?;
+            let response_end = fetch_started.elapsed();
             drop(in_flight);
 
             let response = Response {
@@ -353,6 +359,12 @@ impl StealthHttpClient {
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
+                timing: ResponseTiming {
+                    start: fetch_started,
+                    response_start,
+                    response_end,
+                    redirect_end,
+                },
             };
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
@@ -375,6 +387,7 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let fetch_started = Instant::now();
         if let Some(host) = url.host_str() {
             if crate::blocklist::is_blocked(host) {
                 tracing::debug!("Blocked tracker: {}", url);
@@ -384,6 +397,7 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    timing: ResponseTiming::default(),
                 });
             }
         }
@@ -413,6 +427,7 @@ impl StealthHttpClient {
         let resp = req.send().await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, e))
         })?;
+        let response_start = fetch_started.elapsed();
 
         let status = resp.status();
         if store_cookies {
@@ -428,6 +443,7 @@ impl StealthHttpClient {
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        let response_end = fetch_started.elapsed();
         drop(in_flight);
 
         Ok(Response {
@@ -436,6 +452,12 @@ impl StealthHttpClient {
             headers: response_headers,
             body: resp_body,
             redirected_from: Vec::new(),
+            timing: ResponseTiming {
+                start: fetch_started,
+                response_start,
+                response_end,
+                redirect_end: Duration::ZERO,
+            },
         })
     }
 

@@ -1,0 +1,1 @@
+globalThis.performanceTimelineResourceLoaded = true;

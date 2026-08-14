@@ -659,6 +659,17 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().referrer = referrer.to_string();
     }
 
+    /// Set the Unix-epoch timestamp captured when the document navigation
+    /// started. The bootstrap uses this as Performance.timeOrigin.
+    pub fn set_performance_time_origin(&mut self, milliseconds: f64) {
+        if milliseconds.is_finite() && milliseconds > 0.0 {
+            let _ = self.runtime.execute_script(
+                "<performance-time-origin>",
+                format!("globalThis.__obscura_performance_time_origin_ms={milliseconds};"),
+            );
+        }
+    }
+
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
     }
@@ -5055,6 +5066,76 @@ mod tests {
         );
         // Counting from the origin, not from the epoch.
         assert!(now >= 0.0 && now < 60_000.0, "performance.now() was {now}");
+    }
+
+    #[test]
+    fn performance_timeline_buffers_user_and_resource_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    performance.mark('begin', { startTime: 4, detail: { source: 'fixture' } });
+                    performance.mark('end', { startTime: 10 });
+                    const measure = performance.measure('span', 'begin', 'end');
+                    __obscura_performance_record({
+                        name: 'https://example.test/app.js', entryType: 'resource',
+                        initiatorType: 'script', startTime: 12, duration: 8,
+                        fetchStart: 12, requestStart: 13, responseStart: 16,
+                        responseEnd: 20, transferSize: 7, encodedBodySize: 7,
+                        decodedBodySize: 7, responseStatus: 200,
+                    });
+                    const observer = new PerformanceObserver(() => {});
+                    observer.observe({ type: 'resource', buffered: true });
+                    const resource = performance.getEntriesByType('resource')[0];
+                    return {
+                        entryTypes: performance.getEntries().map(entry => entry.entryType),
+                        measure: [measure.startTime, measure.duration, measure instanceof PerformanceMeasure],
+                        resource: [resource.initiatorType, resource.requestStart,
+                            resource.responseStart, resource.responseEnd,
+                            resource.transferSize, resource.responseStatus,
+                            resource instanceof PerformanceResourceTiming],
+                        bufferedRecords: observer.takeRecords().length,
+                        supported: ['mark', 'measure', 'navigation', 'paint', 'resource']
+                            .every(type => PerformanceObserver.supportedEntryTypes.includes(type)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "entryTypes": ["mark", "measure", "mark", "resource"],
+                "measure": [4, 6, true],
+                "resource": ["script", 13, 16, 20, 7, 200, true],
+                "bufferedRecords": 1,
+                "supported": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_delivers_entries_at_a_microtask_checkpoint() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-fixture",
+            r#"
+                globalThis.__performanceObserved = [];
+                const observer = new PerformanceObserver((list, source) => {
+                    __performanceObserved.push({
+                        names: list.getEntries().map(entry => entry.name),
+                        sameObserver: source === observer,
+                    });
+                });
+                observer.observe({ entryTypes: ['mark'] });
+                performance.mark('observer-mark');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__performanceObserved").unwrap(),
+            serde_json::json!([{"names": ["observer-mark"], "sameObserver": true}]),
+        );
     }
 
     #[test]

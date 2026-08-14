@@ -7450,6 +7450,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = _environmentSettings().origin;
+  const performanceStart = performance.now();
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
@@ -7469,8 +7470,43 @@ globalThis.fetch = async (input, init = {}) => {
     headers: parsed.headers || {},
     type: respType,
     url: parsed.url || url,
-    redirected: false,
+    redirected: (parsed.timing?.redirectCount || 0) > 0,
   });
+  if (parsed.status !== 0 && globalThis.__obscura_performance_record) {
+    const timing = parsed.timing || {};
+    const responseEnd = performanceStart + Math.max(0, +timing.responseEnd || 0);
+    const bodySize = responseBody && Number.isFinite(responseBody.byteLength)
+      ? responseBody.byteLength : String(parsed.body || '').length;
+    let timingAllowed = true;
+    try {
+      const resourceOrigin = new URL(parsed.url || url).origin;
+      if (resourceOrigin !== pageOrigin) {
+        const tao = String((parsed.headers || {})['timing-allow-origin'] || '');
+        timingAllowed = tao.split(',').map(value => value.trim()).some(value => value === '*' || value === pageOrigin);
+      }
+    } catch (_error) {}
+    globalThis.__obscura_performance_record({
+      name: parsed.url || url,
+      entryType: 'resource',
+      initiatorType: 'fetch',
+      startTime: performanceStart,
+      duration: Math.max(0, responseEnd - performanceStart),
+      redirectStart: timing.redirectCount ? performanceStart : 0,
+      redirectEnd: timing.redirectCount ? performanceStart + Math.max(0, +timing.redirectEnd || 0) : 0,
+      fetchStart: performanceStart,
+      domainLookupStart: timingAllowed ? performanceStart : 0,
+      domainLookupEnd: timingAllowed ? performanceStart : 0,
+      connectStart: timingAllowed ? performanceStart : 0,
+      connectEnd: timingAllowed ? performanceStart : 0,
+      requestStart: timingAllowed ? performanceStart : 0,
+      responseStart: timingAllowed ? performanceStart + Math.max(0, +timing.responseStart || 0) : 0,
+      responseEnd,
+      transferSize: timingAllowed ? bodySize : 0,
+      encodedBodySize: timingAllowed ? bodySize : 0,
+      decodedBodySize: timingAllowed ? bodySize : 0,
+      responseStatus: timingAllowed ? parsed.status : 0,
+    });
+  }
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
@@ -9901,7 +9937,9 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class PerformanceObserver { constructor(){} observe(){} disconnect(){} };
+// Performance Timeline is installed after the monotonic clock below. Keep the
+// name reserved here because observer constructors are included in the native
+// surface pass later in this bootstrap.
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -10669,10 +10707,6 @@ globalThis.performance = globalThis.performance || {
       return _last;
     };
   })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
-  setResourceTimingBufferSize(){},
   // A worker never runs __obscura_init, so this default has to be usable as
   // it stands: an origin of 0 made `now()` report Unix epoch milliseconds.
   timeOrigin: Date.now(),
@@ -10683,6 +10717,249 @@ globalThis.performance = globalThis.performance || {
     totalJSHeapSize: 19321856,
     usedJSHeapSize: 16781520,
   },
+};
+const _performanceEventListeners = new Map();
+class Performance {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  addEventListener(type, callback) {
+    if (typeof callback !== 'function' && typeof callback?.handleEvent !== 'function') return;
+    type = String(type);
+    const listeners = _performanceEventListeners.get(type) || [];
+    if (!listeners.includes(callback)) listeners.push(callback);
+    _performanceEventListeners.set(type, listeners);
+  }
+  removeEventListener(type, callback) {
+    const listeners = _performanceEventListeners.get(String(type));
+    if (!listeners) return;
+    const index = listeners.indexOf(callback);
+    if (index >= 0) listeners.splice(index, 1);
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) throw new TypeError('Invalid event');
+    for (const callback of [...(_performanceEventListeners.get(String(event.type)) || [])]) {
+      try {
+        if (typeof callback === 'function') callback.call(this, event);
+        else callback.handleEvent.call(callback, event);
+      } catch (error) { queueMicrotask(() => { throw error; }); }
+    }
+    const handler = this['on' + event.type];
+    if (typeof handler === 'function') handler.call(this, event);
+    return !event.defaultPrevented;
+  }
+}
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: 'Performance' });
+Object.setPrototypeOf(globalThis.performance, Performance.prototype);
+globalThis.Performance = Performance;
+
+// W3C Performance Timeline / User Timing / Resource Timing. Entries are fed
+// by real transport and lifecycle milestones through the two internal hooks;
+// the JS-facing buffer and observer delivery follow the platform algorithms.
+const _performanceEntries = [];
+const _performanceObservers = new Set();
+const _supportedPerformanceEntryTypes = Object.freeze([
+  'element', 'event', 'first-input', 'largest-contentful-paint',
+  'layout-shift', 'long-animation-frame', 'longtask', 'mark', 'measure',
+  'navigation', 'paint', 'resource', 'visibility-state'
+]);
+let _resourceTimingBufferSize = 250;
+
+class PerformanceEntry {
+  constructor(init = {}) {
+    this.name = String(init.name || '');
+    this.entryType = String(init.entryType || '');
+    this.startTime = Number.isFinite(+init.startTime) ? Math.max(0, +init.startTime) : 0;
+    this.duration = Number.isFinite(+init.duration) ? Math.max(0, +init.duration) : 0;
+  }
+  toJSON() {
+    const out = {};
+    for (const key of Object.keys(this)) out[key] = this[key];
+    return out;
+  }
+}
+class PerformanceMark extends PerformanceEntry {
+  constructor(name, options = {}) {
+    super({ name, entryType: 'mark', startTime: options.startTime ?? performance.now(), duration: 0 });
+    this.detail = options.detail ?? null;
+  }
+}
+class PerformanceMeasure extends PerformanceEntry {
+  constructor(name, startTime, duration, detail = null) {
+    super({ name, entryType: 'measure', startTime, duration });
+    this.detail = detail;
+  }
+}
+class PerformanceResourceTiming extends PerformanceEntry {
+  constructor(init = {}) {
+    super({ ...init, entryType: init.entryType || 'resource' });
+    const start = this.startTime;
+    const responseEnd = Number.isFinite(+init.responseEnd) ? +init.responseEnd : start + this.duration;
+    this.initiatorType = String(init.initiatorType || 'other');
+    this.deliveryType = String(init.deliveryType || '');
+    this.nextHopProtocol = String(init.nextHopProtocol || '');
+    this.renderBlockingStatus = String(init.renderBlockingStatus || 'non-blocking');
+    this.workerStart = +init.workerStart || 0;
+    this.redirectStart = +init.redirectStart || 0;
+    this.redirectEnd = +init.redirectEnd || 0;
+    this.fetchStart = Number.isFinite(+init.fetchStart) ? +init.fetchStart : start;
+    this.domainLookupStart = Number.isFinite(+init.domainLookupStart) ? +init.domainLookupStart : this.fetchStart;
+    this.domainLookupEnd = Number.isFinite(+init.domainLookupEnd) ? +init.domainLookupEnd : this.domainLookupStart;
+    this.connectStart = Number.isFinite(+init.connectStart) ? +init.connectStart : this.domainLookupEnd;
+    this.secureConnectionStart = +init.secureConnectionStart || 0;
+    this.connectEnd = Number.isFinite(+init.connectEnd) ? +init.connectEnd : this.connectStart;
+    this.requestStart = Number.isFinite(+init.requestStart) ? +init.requestStart : this.connectEnd;
+    this.responseStart = Number.isFinite(+init.responseStart) ? +init.responseStart : this.requestStart;
+    this.firstInterimResponseStart = +init.firstInterimResponseStart || 0;
+    this.responseEnd = responseEnd;
+    this.transferSize = Math.max(0, +init.transferSize || 0);
+    this.encodedBodySize = Math.max(0, +init.encodedBodySize || 0);
+    this.decodedBodySize = Math.max(0, +init.decodedBodySize || 0);
+    this.responseStatus = Math.max(0, +init.responseStatus || 0);
+    this.serverTiming = Object.freeze(Array.isArray(init.serverTiming) ? init.serverTiming.slice() : []);
+  }
+}
+class PerformanceNavigationTiming extends PerformanceResourceTiming {
+  constructor(init = {}) {
+    super({ ...init, entryType: 'navigation', initiatorType: 'navigation' });
+    this.entryType = 'navigation';
+    this.type = String(init.type || 'navigate');
+    this.redirectCount = Math.max(0, +init.redirectCount || 0);
+    this.unloadEventStart = +init.unloadEventStart || 0;
+    this.unloadEventEnd = +init.unloadEventEnd || 0;
+    this.domInteractive = +init.domInteractive || 0;
+    this.domContentLoadedEventStart = +init.domContentLoadedEventStart || 0;
+    this.domContentLoadedEventEnd = +init.domContentLoadedEventEnd || 0;
+    this.domComplete = +init.domComplete || 0;
+    this.loadEventStart = +init.loadEventStart || 0;
+    this.loadEventEnd = +init.loadEventEnd || 0;
+    this.activationStart = 0;
+    this.criticalCHRestart = 0;
+  }
+}
+class PerformancePaintTiming extends PerformanceEntry {
+  constructor(name, startTime) { super({ name, entryType: 'paint', startTime, duration: 0 }); }
+}
+class PerformanceObserverEntryList {
+  constructor(entries) { this._entries = entries; }
+  getEntries() { return this._entries.slice().sort((a, b) => a.startTime - b.startTime); }
+  getEntriesByType(type) { return this.getEntries().filter(entry => entry.entryType === String(type)); }
+  getEntriesByName(name, type) {
+    return this.getEntries().filter(entry => entry.name === String(name) && (type === undefined || entry.entryType === String(type)));
+  }
+}
+class PerformanceObserver {
+  constructor(callback) {
+    if (typeof callback !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
+    this._callback = callback; this._types = new Set(); this._records = []; this._queued = false;
+  }
+  static get supportedEntryTypes() { return _supportedPerformanceEntryTypes.slice(); }
+  observe(options = {}) {
+    const hasTypes = Array.isArray(options.entryTypes);
+    const hasType = options.type !== undefined;
+    if (hasTypes === hasType) throw new TypeError("Failed to execute 'observe': specify either entryTypes or type.");
+    const types = hasTypes ? options.entryTypes.map(String) : [String(options.type)];
+    this._types = new Set(types.filter(type => _supportedPerformanceEntryTypes.includes(type)));
+    _performanceObservers.add(this);
+    if (!hasTypes && options.buffered) {
+      for (const entry of _performanceEntries) if (this._types.has(entry.entryType)) this._records.push(entry);
+      this._schedule();
+    }
+  }
+  disconnect() { _performanceObservers.delete(this); this._records.length = 0; this._types.clear(); }
+  takeRecords() { const records = this._records.slice(); this._records.length = 0; return records; }
+  _schedule() {
+    if (this._queued || !this._records.length) return;
+    this._queued = true;
+    queueMicrotask(() => {
+      this._queued = false;
+      const records = this.takeRecords();
+      if (records.length && _performanceObservers.has(this)) this._callback(new PerformanceObserverEntryList(records), this);
+    });
+  }
+}
+
+function _queuePerformanceEntry(entry) {
+  if (entry.entryType === 'resource'
+      && _performanceEntries.filter(value => value.entryType === 'resource').length >= _resourceTimingBufferSize) {
+    try { performance.dispatchEvent(new Event('resourcetimingbufferfull')); } catch (_error) {}
+    return entry;
+  }
+  _performanceEntries.push(entry);
+  for (const observer of _performanceObservers) {
+    if (observer._types.has(entry.entryType)) { observer._records.push(entry); observer._schedule(); }
+  }
+  return entry;
+}
+function _entries(type, name) {
+  return _performanceEntries
+    .filter(entry => (type === undefined || entry.entryType === type) && (name === undefined || entry.name === name))
+    .slice().sort((a, b) => a.startTime - b.startTime);
+}
+function _markTime(name) {
+  const marks = _entries('mark', String(name));
+  if (!marks.length) throw new DOMException("The mark '" + name + "' does not exist.", 'SyntaxError');
+  return marks[marks.length - 1].startTime;
+}
+
+Object.assign(globalThis.performance, {
+  mark(name, options = {}) { return _queuePerformanceEntry(new PerformanceMark(name, options)); },
+  measure(name, startOrOptions, endMark) {
+    let start = 0, end = performance.now(), detail = null;
+    if (startOrOptions && typeof startOrOptions === 'object') {
+      detail = startOrOptions.detail ?? null;
+      start = startOrOptions.start === undefined ? 0 : (typeof startOrOptions.start === 'number' ? startOrOptions.start : _markTime(startOrOptions.start));
+      end = startOrOptions.end === undefined ? (startOrOptions.duration === undefined ? performance.now() : start + Number(startOrOptions.duration))
+        : (typeof startOrOptions.end === 'number' ? startOrOptions.end : _markTime(startOrOptions.end));
+      if (startOrOptions.duration !== undefined && startOrOptions.start === undefined) start = end - Number(startOrOptions.duration);
+    } else {
+      if (startOrOptions !== undefined) start = _markTime(startOrOptions);
+      if (endMark !== undefined) end = _markTime(endMark);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) throw new TypeError('Invalid performance measure range');
+    return _queuePerformanceEntry(new PerformanceMeasure(name, start, end - start, detail));
+  },
+  clearMarks(name) { for (let i = _performanceEntries.length - 1; i >= 0; i--) if (_performanceEntries[i].entryType === 'mark' && (name === undefined || _performanceEntries[i].name === String(name))) _performanceEntries.splice(i, 1); },
+  clearMeasures(name) { for (let i = _performanceEntries.length - 1; i >= 0; i--) if (_performanceEntries[i].entryType === 'measure' && (name === undefined || _performanceEntries[i].name === String(name))) _performanceEntries.splice(i, 1); },
+  clearResourceTimings() { for (let i = _performanceEntries.length - 1; i >= 0; i--) if (_performanceEntries[i].entryType === 'resource') _performanceEntries.splice(i, 1); },
+  getEntries() { return _entries(); },
+  getEntriesByName(name, type) { return _entries(type === undefined ? undefined : String(type), String(name)); },
+  getEntriesByType(type) { return _entries(String(type)); },
+  setResourceTimingBufferSize(size) { size = Math.trunc(Number(size)); if (size >= 0) _resourceTimingBufferSize = size; },
+});
+globalThis.PerformanceEntry = PerformanceEntry;
+globalThis.PerformanceMark = PerformanceMark;
+globalThis.PerformanceMeasure = PerformanceMeasure;
+globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
+globalThis.PerformanceNavigationTiming = PerformanceNavigationTiming;
+globalThis.PerformancePaintTiming = PerformancePaintTiming;
+globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+globalThis.PerformanceObserver = PerformanceObserver;
+
+globalThis.__obscura_performance_record = function(init) {
+  if (!init || typeof init !== 'object') return null;
+  let entry;
+  if (init.entryType === 'navigation') {
+    entry = new PerformanceNavigationTiming(init);
+    const previous = _performanceEntries.findIndex(value => value.entryType === 'navigation');
+    if (previous >= 0) _performanceEntries.splice(previous, 1);
+  } else if (init.entryType === 'paint') entry = new PerformancePaintTiming(init.name, init.startTime);
+  else entry = new PerformanceResourceTiming(init);
+  return _queuePerformanceEntry(entry);
+};
+globalThis.__obscura_performance_lifecycle = function(phase, timestamp) {
+  const nav = _performanceEntries.find(value => value.entryType === 'navigation');
+  if (!nav) return;
+  const t = Number.isFinite(+timestamp) ? +timestamp : performance.now();
+  if (phase === 'dom-content-loaded') {
+    nav.domInteractive = t; nav.domContentLoadedEventStart = t; nav.domContentLoadedEventEnd = t;
+    performance.timing.domContentLoadedEventEnd = performance.timeOrigin + t;
+  } else if (phase === 'load') {
+    nav.domComplete = t; nav.loadEventStart = t; nav.loadEventEnd = t; nav.duration = t;
+    performance.timing.loadEventEnd = performance.timeOrigin + t;
+    if (!_performanceEntries.some(value => value.entryType === 'paint')) {
+      _queuePerformanceEntry(new PerformancePaintTiming('first-paint', t));
+      _queuePerformanceEntry(new PerformancePaintTiming('first-contentful-paint', t));
+    }
+  }
 };
 
 var _commonFonts = [
@@ -11850,6 +12127,13 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
 globalThis.EventTarget = Node;
+// Performance is not a DOM Node, but its Web IDL interface inherits
+// EventTarget. Link the prototype after EventTarget is installed so
+// `performance instanceof EventTarget` matches browsers while its listener
+// storage remains independent of the DOM tree.
+if (typeof Performance === 'function') {
+  try { Object.setPrototypeOf(Performance.prototype, EventTarget.prototype); } catch (_error) {}
+}
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -12338,6 +12622,13 @@ _markNative(globalThis.Selection);
   Notification, Notification.requestPermission,
   window.chrome?.csi, window.chrome?.loadTimes,
   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,
+  Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure,
+  PerformanceResourceTiming, PerformanceNavigationTiming, PerformancePaintTiming,
+  PerformanceObserverEntryList,
+  performance.now, performance.mark, performance.measure,
+  performance.clearMarks, performance.clearMeasures, performance.clearResourceTimings,
+  performance.getEntries, performance.getEntriesByName, performance.getEntriesByType,
+  performance.setResourceTimingBufferSize,
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
@@ -15298,7 +15589,9 @@ globalThis.__obscura_init = function() {
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,
   // which no browser does and which makes every elapsed-time computation on
   // the page come out negative.
-  const t0 = Date.now() - Math.floor(_fpRand(641) * 100);
+  const configuredTimeOrigin = Number(globalThis.__obscura_performance_time_origin_ms);
+  const t0 = Number.isFinite(configuredTimeOrigin) && configuredTimeOrigin > 0
+    ? configuredTimeOrigin : Date.now();
   globalThis.performance.timeOrigin = t0;
   globalThis.__obscura_rebasePerformanceOrigin?.(t0);
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };

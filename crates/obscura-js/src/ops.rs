@@ -2535,6 +2535,7 @@ async fn op_fetch_url(
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let performance_started = std::time::Instant::now();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -2843,7 +2844,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
-    let response = loop {
+    let mut redirect_end = std::time::Duration::ZERO;
+    let (response, response_start) = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
@@ -2902,6 +2904,7 @@ async fn op_fetch_url(
             }
             deno_error::JsErrorBox::generic(e.to_string())
         })?;
+        let current_response_start = performance_started.elapsed();
 
         if let Some(ref counter) = in_flight {
             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2920,7 +2923,7 @@ async fn op_fetch_url(
         }
 
         if !resp.status().is_redirection() {
-            break resp;
+            break (resp, current_response_start);
         }
 
         let location_header = resp
@@ -2930,16 +2933,16 @@ async fn op_fetch_url(
             .map(str::to_string);
         let Some(location) = location_header else {
             // 3xx without a Location header is not actually a redirect.
-            break resp;
+            break (resp, current_response_start);
         };
 
         let base = match url::Url::parse(&current_url) {
             Ok(b) => b,
-            Err(_) => break resp,
+            Err(_) => break (resp, current_response_start),
         };
         let next_url = match base.join(&location) {
             Ok(u) => u,
-            Err(_) => break resp,
+            Err(_) => break (resp, current_response_start),
         };
 
         // Re-validate every redirect target against the SSRF policy.
@@ -2956,6 +2959,7 @@ async fn op_fetch_url(
         }
 
         redirects_followed += 1;
+        redirect_end = performance_started.elapsed();
         if redirects_followed > FETCH_REDIRECT_LIMIT {
             return Ok(serde_json::json!({
                 "status": 0,
@@ -3024,6 +3028,7 @@ async fn op_fetch_url(
         .bytes()
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let response_end = performance_started.elapsed();
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -3098,8 +3103,14 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
+        "timing": {
+            "responseStart": response_start.as_secs_f64() * 1_000.0,
+            "responseEnd": response_end.as_secs_f64() * 1_000.0,
+            "redirectEnd": redirect_end.as_secs_f64() * 1_000.0,
+            "redirectCount": redirects_followed,
+        },
     })
     .to_string())
 }
@@ -3119,6 +3130,7 @@ fn fetch_response(
         headers,
         body,
         redirected_from: Vec::new(),
+        timing: obscura_net::ResponseTiming::default(),
     }
 }
 
@@ -3141,12 +3153,19 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirect_end = std::time::Duration::ZERO;
 
-    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+    let (status, resp_headers, resp_bytes, response_start): (
+        u16,
+        HashMap<String, String>,
+        Vec<u8>,
+        std::time::Duration,
+    ) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -3178,16 +3197,17 @@ async fn stealth_fetch_all(
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        let current_response_start = performance_started.elapsed();
 
         if !(300..400).contains(&r.status) {
-            break (r.status, r.headers, r.body);
+            break (r.status, r.headers, r.body, current_response_start);
         }
         let Some(location) = r.headers.get("location").cloned() else {
-            break (r.status, r.headers, r.body);
+            break (r.status, r.headers, r.body, current_response_start);
         };
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break (r.status, r.headers, r.body),
+            Err(_) => break (r.status, r.headers, r.body, current_response_start),
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -3200,6 +3220,7 @@ async fn stealth_fetch_all(
             .to_string());
         }
         redirects_followed += 1;
+        redirect_end = performance_started.elapsed();
         if redirects_followed > FETCH_REDIRECT_LIMIT {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
@@ -3249,6 +3270,7 @@ async fn stealth_fetch_all(
     }
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let response_end = performance_started.elapsed();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
@@ -3275,8 +3297,14 @@ async fn stealth_fetch_all(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
+        "timing": {
+            "responseStart": response_start.as_secs_f64() * 1_000.0,
+            "responseEnd": response_end.as_secs_f64() * 1_000.0,
+            "redirectEnd": redirect_end.as_secs_f64() * 1_000.0,
+            "redirectCount": redirects_followed,
+        },
     })
     .to_string())
 }

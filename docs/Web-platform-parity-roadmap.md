@@ -96,13 +96,21 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 ### P0 — 平台底座(先做,每项 ≤1 周)
 
-| 序 | 能力 | 关键收益 | 方案要点 |
-|---|---|---|---|
-| 1 | Performance Timeline 真实现(§3.1-#1) | 解锁 step 10;任何现代站点必查;真数据直接替换 HaHaVM 式伪造画像 | 网络层 timing 采集 → resource/navigation/paint 条目 → `getEntries*`/observer;`supportedEntryTypes` 全类型 |
-| 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 |
-| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) |
-| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 |
-| 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 |
+| 序 | 能力 | 关键收益 | 方案要点 | 状态 |
+|---|---|---|---|---|
+| 1 | Performance Timeline 真实现(§3.1-#1) | 解锁 step 10;任何现代站点必查;真数据直接替换 HaHaVM 式伪造画像 | 网络层 timing 采集 → resource/navigation/paint 条目 → `getEntries*`/observer;`supportedEntryTypes` 全类型 | ✅ 完成(`COMMIT_P0_1`) |
+| 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | 待开始 |
+| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | 待开始 |
+| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | 待开始 |
+| 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | 待开始 |
+
+#### P0-1 实施记录:Performance Timeline 真实现
+
+- **状态**:✅ 完成(`COMMIT_P0_1`)。
+- **实现**:普通与 stealth 传输统一记录请求起点、响应头到达和 body 完成时间;导航、脚本、样式、图片、字体及 fetch/XHR 生成真实 `navigation`/`resource` 条目。JS 层实现 Performance Timeline、User Timing、Resource Timing、Paint Timing 与 `PerformanceObserver`,并按 Timing-Allow-Origin 隐藏跨源细粒度数据。连接池未暴露的 DNS/connect 分段合并到真实 fetch 起点,不生成画像值。
+- **确定性验证**:`js-repros/performance-timeline/` 固化同一行为 probe;Google Chrome 146.0.7680.80 oracle 输出为 navigation/resource 各 1 条、阶段有序、HTTP 200、measure `[4,6]`,Obscura 输出一致。
+- **测试与门禁**:`obscura-net` 77/77、`obscura-js` 448/448、`obscura-browser` 99/99 release nextest 通过;`render,stealth` 编译检查通过;release CLI build 通过;obstacle course 33/33。workspace 全量 nextest 的二进制已编译完成,但 `obscura-cdp::input_label_activation --list` 在当前机器被系统 SIGKILL;未进入测试执行,相关三 crate 已分别全量通过。
+- **诊断证据**:`obscura::performance` 日志可见 navigation 与 resource 的 `start_time_ms`、`response_start_ms`、`response_end_ms`、URL 与 body size;本地 fixture 实测分别记录导航 `0/3.12/3.34ms` 与脚本资源 `7.42/8.22/8.41ms`。
 
 ### P1 — 诊断底座 + 常见桩(次做,每项 1–2 周)
 

@@ -85,6 +85,28 @@ pub struct Response {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,
+    /// Timing sampled by the transport. Durations are relative to `start` and
+    /// describe observable network milestones rather than a synthetic profile.
+    pub timing: ResponseTiming,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseTiming {
+    pub start: Instant,
+    pub response_start: Duration,
+    pub response_end: Duration,
+    pub redirect_end: Duration,
+}
+
+impl Default for ResponseTiming {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            response_start: Duration::ZERO,
+            response_end: Duration::ZERO,
+            redirect_end: Duration::ZERO,
+        }
+    }
 }
 
 impl Response {
@@ -705,6 +727,7 @@ pub(crate) async fn fetch_file_url(
     url: &Url,
     max_response_bytes: usize,
 ) -> Result<Response, ObscuraNetError> {
+    let started = Instant::now();
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
@@ -738,12 +761,19 @@ pub(crate) async fn fetch_file_url(
         headers.insert("content-type".to_string(), ct.to_string());
     }
 
+    let completed = started.elapsed();
     Ok(Response {
         url: url.clone(),
         status: 200,
         headers,
         body,
         redirected_from: Vec::new(),
+        timing: ResponseTiming {
+            start: started,
+            response_start: completed,
+            response_end: completed,
+            redirect_end: Duration::ZERO,
+        },
     })
 }
 
@@ -1373,6 +1403,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        let fetch_started = Instant::now();
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
@@ -1392,6 +1423,7 @@ impl ObscuraHttpClient {
                         headers: HashMap::new(),
                         body: Vec::new(),
                         redirected_from: Vec::new(),
+                        timing: ResponseTiming::default(),
                     });
                 }
             }
@@ -1402,6 +1434,7 @@ impl ObscuraHttpClient {
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut redirect_end = Duration::ZERO;
 
         for _redirect_count in 0..max_redirects {
             validate_request_mode(&request, &current_url)?;
@@ -1558,6 +1591,7 @@ impl ObscuraHttpClient {
             let resp = req_builder.send().await.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
+            let response_start = fetch_started.elapsed();
 
             let status = resp.status();
             validate_reqwest_cors_response(
@@ -1594,6 +1628,7 @@ impl ObscuraHttpClient {
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
+                    redirect_end = fetch_started.elapsed();
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
                         || status == reqwest::StatusCode::FOUND
@@ -1612,6 +1647,7 @@ impl ObscuraHttpClient {
                 request.max_response_bytes,
             )
             .await?;
+            let response_end = fetch_started.elapsed();
             drop(in_flight);
 
             let response = Response {
@@ -1620,6 +1656,12 @@ impl ObscuraHttpClient {
                 headers: response_headers,
                 body: body_bytes,
                 redirected_from: redirects,
+                timing: ResponseTiming {
+                    start: fetch_started,
+                    response_start,
+                    response_end,
+                    redirect_end,
+                },
             };
 
             if let Some(cbs) = callbacks {
