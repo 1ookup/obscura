@@ -74,7 +74,7 @@ async def call(ws, method, params=None, session=None, msg_id=1):
             return reply
 
 
-async def run(endpoint, url, every, duration, outdir):
+async def run(endpoint, url, every, duration, outdir, start):
     os.makedirs(outdir, exist_ok=True)
     async with websockets.connect(endpoint, max_size=256 * 1024 * 1024) as ws:
         reply = await call(ws, "Target.createTarget", {"url": "about:blank"}, msg_id=1)
@@ -93,7 +93,13 @@ async def run(endpoint, url, every, duration, outdir):
         shots = []
         elapsed = 0.0
         while elapsed <= duration:
-            await asyncio.sleep(every)
+            # Never evaluate in the first seconds after navigation: a
+            # Runtime.evaluate landing at t~=1s permanently blanks obscura's
+            # document (known, unfixed obscura defect; Chrome is unaffected).
+            # So the first frame is delayed to max(every, start), not `every`
+            # -- a small --every (e.g. 1s) would otherwise land in the danger
+            # window.
+            await asyncio.sleep(every if elapsed > 0.0 else max(every, start))
             elapsed += every
             msg_id += 1
             shot = await call(ws, "Page.captureScreenshot", {"format": "png"},
@@ -124,10 +130,14 @@ def main():
     parser.add_argument("--every", type=float, default=3.0)
     parser.add_argument("--for", dest="duration", type=float, default=35.0)
     parser.add_argument("--out", default="/tmp/filmstrip")
+    parser.add_argument("--start", type=float, default=3.0,
+                        help="seconds to wait after navigation before the first "
+                             "evaluation (early evaluation blanks obscura's "
+                             "document; Chrome is unaffected)")
     args = parser.parse_args()
 
     endpoint = "ws://127.0.0.1:%d/devtools/browser" % args.port
-    shots = asyncio.run(run(endpoint, args.url, args.every, args.duration, args.out))
+    shots = asyncio.run(run(endpoint, args.url, args.every, args.duration, args.out, args.start))
 
     previous = None
     for elapsed, path, digest, info in shots:

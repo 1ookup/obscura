@@ -153,6 +153,12 @@ async def run(endpoint, url, wait_interactive, settle, offset):
                 except Exception:
                     return {}
 
+            # Never evaluate in the first seconds after navigation: a
+            # Runtime.evaluate landing at t~=1s permanently blanks obscura's
+            # document (known, unfixed obscura defect; Chrome is unaffected),
+            # after which the widget never appears. 3s+ is safe.
+            await asyncio.sleep(3.0)
+
             # Wait for interactiveBegin -- clicking before it means this run was
             # never an interactive one.
             clicked_at = None

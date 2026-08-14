@@ -90,6 +90,13 @@ scripts/cdp_filmstrip.py <URL> --every 3 --for 33
 # 读跨源 iframe 内部的真实 DOM（isolated world；页面自己够不到）
 scripts/cdp_frame_dom.py <URL> --match challenges.cloudflare.com
 
+# 交互分支：等 interactiveBegin → 立刻点复选框 → 观察证明 POST 与事件链
+# （成功判据：点击后 ~2s 内出现新的 POST .../fo/<tokenB>）
+scripts/cdp_click_fast.py <URL> --port 9223 --deadline 40 --settle 20
+
+# 点击前后事件字段对拍（timeStamp/screenX/button/detail/pressure/cancelable）
+scripts/cdp_event_trace.py <URL> --port 9223
+
 # 任意表达式
 scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("iframe").length'
 ```
@@ -138,6 +145,9 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 | **包装 DOM 访问器会改变被测行为** | 包了 `contentWindow` getter 后握手消息直接消失，整轮数据作废 | 先用可控用例验证同一机制是否正常，再决定要不要在真实页面上挂钩 |
 | Cloudflare 失败路径也下发 `cf_clearance` | 误判「过盾成功」 | 判据是 `cf_chl_rc_ni` 等结果码，以及复用该 cookie 能否拿到真实内容 |
 | 自己加的日志截断字段 | 把截断后的 src 当成完整 URL，误判是另一个元素 | 日志里带上长度，或不截断关键字段 |
+| **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空**（obscura 缺陷，Chrome 无此行为） | 轮询类探针首轮求值落在危险窗口 → `box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值必须延迟到导航后 ≥3s（`cdp_click_fast.py --start`、`cdp_filmstrip.py --start` 默认已内置；不要用 `--start 0` 或 `--every 1` 试探边界）。此缺陷本身待修 |
+| **端口上可能跑着会话外遗留的旧 serve 进程**（新 serve 启动时静默绑定失败，日志只有一条 bind error） | 探针打在旧代码上，时间线/行为全是旧版，跨轮比较得出错误结论 | 每轮实测前核对 `/json/version` 的浏览器版本号与 `ps -o lstart -p <pid>`，和二进制 mtime 对比 |
+| `RUST_LOG=obscura::js=debug` 匹配不到请求日志（`op_fetch_url` 的 target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`，或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
 
 ## 判定口径
 
