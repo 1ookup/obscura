@@ -1,6 +1,6 @@
 # 浏览器通用能力对齐路线图(Web Platform Parity Roadmap)
 
-> 状态:评审稿 · 日期:2026-08-14 · 分支:`test/cf-challenge-overrun`
+> 状态:评审稿 · 日期:2026-08-14 · 分支:`feat/web-platform-parity`
 > 相关文档:[Cloudflare challenge 诊断记录](Cloudflare-challenge-profile.md)、[Trace 页面脚本](Trace-page-script.md)、[Anti-detection: real engine vs. JS patching](Anti-detection-vs-js-environment-patching.md)、[Iframe 设计](Iframe-support-design.md)
 > 外部参考:[HaHaVM-General](https://github.com/)(通用补环境框架,含 `examples/cloudflare/` 外置模式)
 
@@ -101,7 +101,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 1 | Performance Timeline 真实现(§3.1-#1) | 解锁 step 10;任何现代站点必查;真数据直接替换 HaHaVM 式伪造画像 | 网络层 timing 采集 → resource/navigation/paint 条目 → `getEntries*`/observer;`supportedEntryTypes` 全类型 | ✅ 完成(`79e1238`) |
 | 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | ✅ 完成(`f4a1201`) |
 | 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | ✅ 完成(`c48fcb6`) |
-| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | 待开始 |
+| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | ✅ 完成(`1a544e2`) |
 | 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | 待开始 |
 
 #### P0-1 实施记录:Performance Timeline 真实现
@@ -128,6 +128,13 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **策略边界**:身份值由 `obscura-net` 派生器和配置策略提供,realm 安全、生命周期与网络行为仍由内核实现;`Network.setUserAgentOverride` 的 platform/metadata 同步更新 live JS 与页级网络头,新建 frame realm 继承并同步 live fingerprint。无站点字符串、无固定 profile 选择表,日志 target `obscura::fingerprint` 记录 user agent、navigator/UA platform、browser version 与 mobile。
 - **确定性验证**:`js-repros/fingerprint-derivation/` 固化主 realm、同源 iframe、dedicated worker、screen/DPR、UA-CH 与 WebGL fixture。Google Chrome 146.0.7680.80 native headless oracle 固化跨 realm 一致性、Chromium 146/Not-A.Brand 24/Google Chrome 146 顺序及 `--disable-gpu` 下 WebGL 不可用;Obscura fixture 实测 `childMatchesMain=true`、`workerMatchesLowEntropy=true`、Windows Chrome 146 identity、1920x1080 DPR1、WebGL false。
 - **测试与门禁**:`obscura-net` 83/83、`obscura-js` 457/457、`obscura-browser` 99/99、`obscura-cdp` 174/174 release nextest 通过;普通 `render` 与 `render,stealth` release CLI build 通过。新增网络 trace/debug 字段记录 fingerprint user agent/platform/version/mobile;fixture 输出为确定性 JSON。workspace 全量 nextest 与 obstacle course 将在 P0-3 提交前的统一门禁阶段执行。
+
+#### P0-4 实施记录:Stack/行号 + realm 安全语义 + Referrer
+
+- **状态**:✅ 完成(`1a544e2`)。
+- **实现**:html5ever tokenizer 行号写入 DOM parser 元数据,inline classic/module 脚本和 iframe realm 通过 `ScriptOrigin` 使用文档绝对行号;跨源 WindowProxy 的 `document`、location 读属性和 `frameElement` 统一抛 `SecurityError`,同源 iframe 保留真实 realm 与 `document.referrer`。网络层实现八种 Referrer-Policy,默认 `strict-origin-when-cross-origin`,响应头优先于 meta,并贯穿主导航、重定向、iframe、脚本/样式/module、fetch/XHR 及 stealth 客户端。值级策略仅来自文档元数据与 embedder 输入,没有站点特判。
+- **确定性验证**:`js-repros/stack-realm-referrer/` 覆盖 parser 行号、inline/external stack、同源继承、跨源安全异常、iframe `referrerpolicy` 和同源/跨源 fetch Referer;本地双 origin capture 成功,服务端收到两组真实 Referer,debug trace 含 navigation/frame/fetch 记录。`chrome-oracle.json` 固化 Google Chrome 146 的归一化实测语义;当前机器没有 Chrome 可执行文件,因此未重复本地 Chrome capture,限制已记录在 fixture README。
+- **测试与门禁**:`obscura-dom` 89/89、`obscura-net` 84/84、`obscura-js` 458/458、`obscura-browser` 100/100 release nextest 通过;普通 `render` release CLI build 通过,stealth 构建作为本项提交前门禁执行。新增 DOM source-line、stack、Referrer-Policy 矩阵与 document scope fixture 测试均为确定性断言。
 
 ### P1 — 诊断底座 + 常见桩(次做,每项 1–2 周)
 

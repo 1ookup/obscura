@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Keep the generated snapshot coupled to bootstrap/op contract changes.
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=build.rs");
 

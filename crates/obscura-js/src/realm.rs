@@ -914,6 +914,24 @@ impl ObscuraJsRuntime {
         self.execute_script_in_frame_world_realm(frame_id, generation, MAIN_WORLD, name, source)
     }
 
+    pub fn execute_script_in_frame_realm_at_line(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        name: &str,
+        source: &str,
+        line: u64,
+    ) -> Result<serde_json::Value, String> {
+        self.execute_script_in_frame_world_realm_at_line(
+            frame_id,
+            generation,
+            MAIN_WORLD,
+            name,
+            source,
+            line,
+        )
+    }
+
     /// Merge a parser-discovered import map into one frame Document's module
     /// map. Resolution history is document-local, matching the browser model.
     pub fn add_frame_import_map(
@@ -1308,6 +1326,19 @@ impl ObscuraJsRuntime {
         self.execute_in_context(&context, name, source)
     }
 
+    pub fn execute_script_in_frame_world_realm_at_line(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        name: &str,
+        source: &str,
+        line: u64,
+    ) -> Result<serde_json::Value, String> {
+        let context = self.frame_world_context(frame_id, generation, world_id)?;
+        self.execute_in_context_at(&context, name, source, line)
+    }
+
     /// Clone the context handle for a frame world realm, or a no-realm error.
     pub(crate) fn frame_world_context(
         &self,
@@ -1487,6 +1518,16 @@ impl ObscuraJsRuntime {
         name: &str,
         source: &str,
     ) -> Result<serde_json::Value, String> {
+        self.execute_in_context_at(context, name, source, 0)
+    }
+
+    pub(crate) fn execute_in_context_at(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        name: &str,
+        source: &str,
+        line: u64,
+    ) -> Result<serde_json::Value, String> {
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let context = v8::Local::new(scope, context);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -1497,7 +1538,7 @@ impl ObscuraJsRuntime {
         let origin = v8::ScriptOrigin::new(
             scope,
             name.into(),
-            0,
+            line.saturating_sub(1).min(i32::MAX as u64) as i32,
             0,
             false,
             0,

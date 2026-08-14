@@ -139,29 +139,59 @@ fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     }
 }
 
-/// Compute the default `strict-origin-when-cross-origin` referrer value used
-/// for a document-initiated navigation. Direct navigations bypass this helper
-/// and use an empty referrer. Referrer-Policy overrides are not yet plumbed
-/// through the navigation request.
+/// Compute the referrer value used for a document-initiated navigation.
+/// Direct automation navigations pass an empty source; document-triggered
+/// navigations use the current document's policy.
+fn navigation_referrer_with_policy(
+    source: &Url,
+    target: &Url,
+    policy: obscura_net::ReferrerPolicy,
+) -> String {
+    obscura_net::referrer_value(
+        source,
+        target,
+        policy,
+    )
+    .unwrap_or_default()
+}
+
 fn navigation_referrer(source: &Url, target: &Url) -> String {
-    if !matches!(source.scheme(), "http" | "https")
-        || !matches!(target.scheme(), "http" | "https")
-        || (source.scheme() == "https" && target.scheme() == "http")
-    {
-        return String::new();
-    }
+    navigation_referrer_with_policy(
+        source,
+        target,
+        obscura_net::ReferrerPolicy::default(),
+    )
+}
 
-    if source.origin() == target.origin() {
-        let mut sanitized = source.clone();
-        sanitized.set_fragment(None);
-        let _ = sanitized.set_username("");
-        let _ = sanitized.set_password(None);
-        return sanitized.to_string();
-    }
+fn document_referrer_policy(
+    dom: &DomTree,
+    response_header: Option<&str>,
+) -> obscura_net::ReferrerPolicy {
+    document_referrer_policy_from_root(dom, dom.document(), response_header)
+}
 
-    let mut origin = source.origin().ascii_serialization();
-    origin.push('/');
-    origin
+fn document_referrer_policy_from_root(
+    dom: &DomTree,
+    root: obscura_dom::NodeId,
+    response_header: Option<&str>,
+) -> obscura_net::ReferrerPolicy {
+    if let Some(header) = response_header {
+        return obscura_net::ReferrerPolicy::parse_list(header);
+    }
+    for id in dom.query_selector_all_from(root, "meta").unwrap_or_default() {
+        let Some(node) = dom.get_node(id) else { continue; };
+        let name = node
+            .get_attribute("name")
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if name == "referrer" || name == "referrer-policy" {
+            if let Some(content) = node.get_attribute("content") {
+                return obscura_net::ReferrerPolicy::parse_list(content);
+            }
+        }
+    }
+    obscura_net::ReferrerPolicy::default()
 }
 
 /// Escape a value for safe inclusion inside a JavaScript template
@@ -268,6 +298,8 @@ pub struct Page {
     /// separate from `url`: direct automation navigations have no referrer,
     /// while a navigation requested by page script uses the previous document.
     pub referrer: String,
+    /// Referrer-Policy selected by the current response or document metadata.
+    pub referrer_policy: obscura_net::ReferrerPolicy,
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
@@ -957,6 +989,7 @@ impl Page {
             session_storage: new_storage_areas(),
             title: String::new(),
             referrer: String::new(),
+            referrer_policy: obscura_net::ReferrerPolicy::default(),
             viewport: (1280.0, 720.0),
             screen_size_override: None,
             screen_metrics_emulated: false,
@@ -1165,13 +1198,21 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
-    async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+    async fn do_fetch(
+        &self,
+        url: &Url,
+        referrer: &str,
+        policy: obscura_net::ReferrerPolicy,
+    ) -> Result<Response, ObscuraNetError> {
+        let referrer = Url::parse(referrer).ok();
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            return stealth
+                .fetch_document_with_referrer(url, referrer, policy, Some(&self.callbacks))
+                .await;
         }
         self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .fetch_document_with_referrer(url, referrer, policy, Some(&self.callbacks))
             .await
     }
     fn init_js(&mut self) {
@@ -1206,6 +1247,7 @@ impl Page {
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
+        rt.set_referrer_policy(self.referrer_policy.as_str());
         rt.set_performance_time_origin(self.performance_time_origin_ms);
 
         #[cfg(feature = "stealth")]
@@ -1440,6 +1482,7 @@ impl Page {
 
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
+        let referrer_policy = self.referrer_policy;
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
             let client = self.http_client.clone();
@@ -1455,9 +1498,11 @@ impl Page {
                     let stealth_client = stealth_client.clone();
                     let callbacks = callbacks.clone();
                     let initiator = initiator.clone();
+                    let referrer_policy = referrer_policy;
                     async move {
-                        let request =
+                        let mut request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        request.referrer_policy = referrer_policy;
                         #[cfg(feature = "stealth")]
                         let result = if let Some(stealth_client) = stealth_client {
                             stealth_client
@@ -1682,6 +1727,7 @@ impl Page {
             is_async: bool,
             kind: ScriptKind,
             nid: u32,
+            source_line: u64,
             /// Document base URL at this element's parser encounter point.
             base_url: String,
         }
@@ -1758,6 +1804,7 @@ impl Page {
                                     is_async,
                                     kind,
                                     nid: sid.raw(),
+                                    source_line: dom.source_line(sid).unwrap_or(1),
                                     base_url: bases_at_script
                                         .get(&sid.raw())
                                         .cloned()
@@ -1831,6 +1878,7 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let referrer_policy = self.referrer_policy;
         let script_initiator = self
             .url
             .clone()
@@ -1843,6 +1891,7 @@ impl Page {
                 let initiator = script_initiator.clone();
                 let url = url.clone();
                 let idx = *idx;
+                let referrer_policy = referrer_policy;
                 async move {
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
@@ -1871,7 +1920,8 @@ impl Page {
                         };
                         return Some((idx, url, resp));
                     }
-                    let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.referrer_policy = referrer_policy;
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
@@ -2073,7 +2123,11 @@ impl Page {
                             &format!("globalThis.__currentScriptNid={};", script.nid),
                         );
                         if let Err(error) =
-                            js.execute_script_guarded(&script.base_url, &script.inline)
+                            js.execute_script_guarded_at_line(
+                                &script.base_url,
+                                &script.inline,
+                                script.source_line,
+                            )
                         {
                             tracing::warn!("Inline script error: {}", error);
                         }
@@ -2502,6 +2556,15 @@ impl Page {
             tracing::warn!("frame realm creation failed ({frame_id}): {error}");
             return;
         }
+        let _ = js.execute_script_in_frame_realm(
+            frame_id,
+            generation,
+            "<frame-referrer-policy>",
+            &format!(
+                "globalThis.__obscura_referrer_policy={:?};",
+                scope.referrer_policy
+            ),
+        );
         // New-document scripts run in every matching frame world after the
         // browser bootstrap and before any author script, including when the
         // sandbox suppresses author execution.
@@ -2568,6 +2631,7 @@ impl Page {
             kind: FrameScriptKind,
             is_defer: bool,
             is_async: bool,
+            source_line: u64,
         }
         // Discovery mirrors the main document's scan, scoped to the content
         // root. Content documents are parentless subtrees, so descendants()
@@ -2639,6 +2703,7 @@ impl Page {
                                 src,
                                 inline,
                                 nid: sid.raw(),
+                                source_line: dom.source_line(sid).unwrap_or(1),
                                 kind,
                                 is_defer: node.get_attribute("defer").is_some(),
                                 is_async: node.get_attribute("async").is_some(),
@@ -2711,12 +2776,15 @@ impl Page {
         }
         let client = self.http_client.clone();
         let callbacks = self.callbacks.clone();
+        let referrer_policy = obscura_net::ReferrerPolicy::parse(&scope.referrer_policy)
+            .unwrap_or_default();
         let fetch_futures: Vec<_> = fetch_tasks
             .into_iter()
             .map(|(index, url)| {
                 let client = client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
+                let referrer_policy = referrer_policy;
                 async move {
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
@@ -2742,8 +2810,9 @@ impl Page {
                         };
                         return Some((index, url, resp));
                     }
-                    let request =
+                    let mut request =
                         ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.referrer_policy = referrer_policy;
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
                         .await
@@ -2813,12 +2882,23 @@ impl Page {
                             "<current-script>",
                             &format!("globalThis.__currentScriptNid={};", script.nid),
                         );
-                        if let Err(error) = js.execute_script_in_frame_realm(
-                            frame_id,
-                            generation,
-                            &execution_url,
-                            &code,
-                        ) {
+                        let result = if script.src.is_none() {
+                            js.execute_script_in_frame_realm_at_line(
+                                frame_id,
+                                generation,
+                                &execution_url,
+                                &code,
+                                script.source_line,
+                            )
+                        } else {
+                            js.execute_script_in_frame_realm(
+                                frame_id,
+                                generation,
+                                &execution_url,
+                                &code,
+                            )
+                        };
+                        if let Err(error) = result {
                             tracing::warn!(
                                 "Frame script error ({}): {}",
                                 execution_url,
@@ -3219,7 +3299,13 @@ impl Page {
                     .and_then(|source| {
                         Url::parse(&next_url)
                             .ok()
-                            .map(|target| navigation_referrer(source, &target))
+                            .map(|target| {
+                                navigation_referrer_with_policy(
+                                    source,
+                                    &target,
+                                    self.referrer_policy,
+                                )
+                            })
                     })
                     .unwrap_or_default();
                 current_url = next_url;
@@ -3257,6 +3343,7 @@ impl Page {
 
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
+        self.referrer_policy = obscura_net::ReferrerPolicy::default();
         self.document_origin = Some(obscura_dom::Origin::from_url(url.as_str()));
         self.document_csp = None;
         self.url = Some(url.clone());
@@ -3327,10 +3414,17 @@ impl Page {
             })
         } else if method == "POST" {
             self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .fetch_document_with_method_referrer(
+                    Method::POST,
+                    &url,
+                    Some(body.as_bytes().to_vec()),
+                    Url::parse(referrer).ok(),
+                    self.referrer_policy,
+                    Some(&self.callbacks),
+                )
                 .await
         } else {
-            self.do_fetch(&url).await
+            self.do_fetch(&url, referrer, self.referrer_policy).await
         }
         .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
@@ -3367,6 +3461,10 @@ impl Page {
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
         let dom = parse_html(&body_text);
+        self.referrer_policy = document_referrer_policy(
+            &dom,
+            response.header("referrer-policy"),
+        );
 
         self.title = dom
             .query_selector("title")
@@ -3762,6 +3860,7 @@ impl Page {
         let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
         let initiator = document_url.clone();
+        let referrer_policy = self.referrer_policy;
         use futures::StreamExt as _;
         let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
             let client = client.clone();
@@ -3769,9 +3868,11 @@ impl Page {
             let stealth_client = stealth_client.clone();
             let callbacks = callbacks.clone();
             let initiator = initiator.clone();
+            let referrer_policy = referrer_policy;
             async move {
                 let parsed = url::Url::parse(&raw).expect("validated render resource URL");
                 let mut request = ResourceRequest::subresource(kind, &initiator);
+                request.referrer_policy = referrer_policy;
                 match profile {
                     Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
                         request.mode = obscura_net::RequestMode::Cors;
@@ -4654,6 +4755,9 @@ impl Page {
                     .map(|node| FrameNavigationRequest {
                         url: node.get_attribute("src").map(str::to_string),
                         srcdoc: node.get_attribute("srcdoc").map(str::to_string),
+                        referrer_policy: node
+                            .get_attribute("referrerpolicy")
+                            .map(str::to_string),
                         sandbox: obscura_dom::SandboxFlags::parse(
                             node.get_attribute("sandbox"),
                         ),
@@ -4692,6 +4796,9 @@ impl Page {
                     .map(|node| FrameNavigationRequest {
                         url: node.get_attribute("src").map(str::to_string),
                         srcdoc: node.get_attribute("srcdoc").map(str::to_string),
+                        referrer_policy: node
+                            .get_attribute("referrerpolicy")
+                            .map(str::to_string),
                         sandbox,
                         ..FrameNavigationRequest::default()
                     })
@@ -5037,6 +5144,8 @@ pub struct FrameNavigationRequest {
     pub method: Option<String>,
     pub body: Option<Vec<u8>>,
     pub referrer: Option<String>,
+    /// Optional `iframe[referrerpolicy]` override for this navigation.
+    pub referrer_policy: Option<String>,
     /// Parsed `sandbox` attribute of the host element. Propagation from the
     /// parent scope happens inside the controller.
     pub sandbox: obscura_dom::SandboxFlags,
@@ -5109,11 +5218,17 @@ impl Page {
     }
 
     /// The parent document's scope pieces needed for inheritance: (base URL,
-    /// origin, sandbox, csp).
+    /// origin, sandbox, csp, referrer policy).
     fn frame_parent_inheritance(
         &self,
         frame_id: &str,
-    ) -> (String, obscura_dom::Origin, obscura_dom::SandboxFlags, Option<String>) {
+    ) -> (
+        String,
+        obscura_dom::Origin,
+        obscura_dom::SandboxFlags,
+        Option<String>,
+        String,
+    ) {
         let parent = self
             .frames
             .get(frame_id)
@@ -5130,6 +5245,7 @@ impl Page {
                         scope.origin.clone(),
                         scope.sandbox,
                         scope.csp.clone(),
+                        scope.referrer_policy.clone(),
                     );
                 }
             }
@@ -5151,6 +5267,7 @@ impl Page {
             origin,
             obscura_dom::SandboxFlags::default(),
             self.document_csp.clone(),
+            self.referrer_policy.as_str().to_string(),
         )
     }
 
@@ -5264,8 +5381,18 @@ impl Page {
             return Err(FrameNavigateError::DepthExceeded);
         }
 
-        let (parent_base, parent_origin, parent_sandbox, parent_csp) =
+        let (parent_base, parent_origin, parent_sandbox, parent_csp, parent_policy) =
             self.frame_parent_inheritance(frame_id);
+        let frame_policy = request
+            .referrer_policy
+            .as_deref()
+            .and_then(obscura_net::ReferrerPolicy::parse)
+            .unwrap_or_else(|| obscura_net::ReferrerPolicy::parse(&parent_policy).unwrap_or_default());
+        let inherited_referrer = request.referrer.clone().or_else(|| {
+            self.frame_ancestor_chain(frame_id)
+                .first()
+                .map(|(url, _)| url.clone())
+        });
         let sandbox = request.sandbox.merged_with_parent(parent_sandbox);
         let sandbox_forces_opaque =
             sandbox.active && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN);
@@ -5345,10 +5472,14 @@ impl Page {
                     };
                     let response = self
                         .http_client
-                        .fetch_with_method(
+                        .fetch_document_with_method_referrer(
                             method,
                             &resolved,
                             request.body.clone(),
+                            inherited_referrer
+                                .as_deref()
+                                .and_then(|value| Url::parse(value).ok()),
+                            frame_policy,
                             Some(&self.callbacks),
                         )
                         .await
@@ -5419,6 +5550,22 @@ impl Page {
         } else {
             obscura_dom::parse_into_subtree(dom, content_root, &html)
         };
+        let frame_referrer_policy = document_referrer_policy_from_root(
+            dom,
+            content_root,
+            document_csp.as_deref(),
+        );
+        let frame_referrer = match (
+            inherited_referrer.as_deref().and_then(|value| Url::parse(value).ok()),
+            Url::parse(&document_url),
+        ) {
+            (Some(source), Ok(target)) if matches!(target.scheme(), "http" | "https") => {
+                obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default()
+            }
+            // about:blank/srcdoc and other non-network documents inherit the
+            // creator's source URL as their environment referrer.
+            _ => inherited_referrer.unwrap_or_default(),
+        };
         let committed = self
             .frames
             .commit_document(frame_id, navigation_generation, Some(content_root))
@@ -5435,6 +5582,8 @@ impl Page {
                 base_url: base_url.clone(),
                 sandbox,
                 csp: document_csp,
+                referrer_policy: frame_referrer_policy.as_str().to_string(),
+                referrer: frame_referrer,
                 frame_id: frame_id.to_string(),
                 document_generation: committed.document_generation,
                 quirks,
@@ -5501,6 +5650,7 @@ impl Page {
                         FrameNavigationRequest {
                             url: attr("src"),
                             srcdoc: attr("srcdoc"),
+                            referrer_policy: attr("referrerpolicy"),
                             sandbox: obscura_dom::SandboxFlags::parse(
                                 attr("sandbox").as_deref(),
                             ),
@@ -5551,6 +5701,7 @@ impl Page {
                     FrameNavigationRequest {
                         url: attr("src"),
                         srcdoc: attr("srcdoc"),
+                        referrer_policy: attr("referrerpolicy"),
                         sandbox: obscura_dom::SandboxFlags::parse(attr("sandbox").as_deref()),
                         ..FrameNavigationRequest::default()
                     },
@@ -5595,6 +5746,8 @@ impl Page {
         let Ok(base) = Url::parse(&scope.base_url) else {
             return;
         };
+        let frame_policy = obscura_net::ReferrerPolicy::parse(&scope.referrer_policy)
+            .unwrap_or_default();
         let links: Vec<(obscura_dom::NodeId, String, Option<String>)> = {
             let Some(dom) = self.dom.as_ref() else {
                 return;
@@ -5624,7 +5777,9 @@ impl Page {
                 tracing::info!("Blocked frame stylesheet: {}", resolved);
                 continue;
             }
-            let Some(css) = self.materialize_frame_stylesheet(key, resolved, &base).await
+            let Some(css) = self
+                .materialize_frame_stylesheet(key, resolved, &base, frame_policy)
+                .await
             else {
                 continue;
             };
@@ -5693,6 +5848,7 @@ impl Page {
         root_key: String,
         root_url: Url,
         base: &Url,
+        referrer_policy: obscura_net::ReferrerPolicy,
     ) -> Option<String> {
         if let Some(cached) = self.frame_stylesheet_cache.get(&root_key) {
             return cached.clone();
@@ -5713,7 +5869,8 @@ impl Page {
                     requested_url.clone(),
                 )
             } else {
-                let request = ResourceRequest::subresource(ResourceType::Stylesheet, base);
+                let mut request = ResourceRequest::subresource(ResourceType::Stylesheet, base);
+                request.referrer_policy = referrer_policy;
                 let response = match self
                     .http_client
                     .fetch_resource_with_callbacks(&requested_url, request, Some(&callbacks))
@@ -5807,7 +5964,8 @@ mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
         materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
+        document_referrer_policy, parse_import_url, rebase_css_urls, script_response_is_executable,
+        split_css_imports,
         truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
     };
     #[cfg(feature = "render")]
@@ -7597,6 +7755,25 @@ mod tests {
 
         let data_source = url::Url::parse("data:text/html,source").unwrap();
         assert_eq!(navigation_referrer(&data_source, &cross_origin), "");
+    }
+
+    #[test]
+    fn referrer_policy_reads_meta_and_prefers_response_header() {
+        let dom = parse_html(
+            "<!doctype html><meta name=referrer content=origin-when-cross-origin>",
+        );
+        assert_eq!(
+            document_referrer_policy(&dom, None),
+            obscura_net::ReferrerPolicy::OriginWhenCrossOrigin
+        );
+        assert_eq!(
+            document_referrer_policy(&dom, Some("no-referrer")),
+            obscura_net::ReferrerPolicy::NoReferrer
+        );
+        assert_eq!(
+            document_referrer_policy(&dom, Some("invalid, strict-origin")),
+            obscura_net::ReferrerPolicy::StrictOrigin
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

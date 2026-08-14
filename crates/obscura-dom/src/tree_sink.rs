@@ -148,6 +148,7 @@ impl TreeSink for DomTree {
             template_contents: None,
             mathml_annotation_xml_integration_point: flags.mathml_annotation_xml_integration_point,
         });
+        self.record_source_line(id);
 
         if flags.template {
             let template_doc = self.new_node(NodeData::Document);
@@ -289,6 +290,10 @@ impl TreeSink for DomTree {
         // Only full quirks mode makes CSS class/id selectors case-insensitive;
         // limited-quirks behaves like no-quirks for selector matching.
         self.set_quirks(mode == QuirksMode::Quirks);
+    }
+
+    fn set_current_line(&self, line_number: u64) {
+        self.set_current_parse_line(line_number);
     }
 
     fn allow_declarative_shadow_roots(&self, intended_parent: &NodeId) -> bool {
@@ -745,5 +750,20 @@ mod tests {
             tree.shadow_root_info(contents).unwrap().mode,
             ShadowRootMode::Closed
         );
+    }
+
+    #[test]
+    fn parser_records_element_source_lines_without_marking_created_nodes() {
+        let tree = parse_html("<html>\n<head>\n<script>\nthrow 1\n</script>\n</head>\n</html>");
+        let script = tree.query_selector("script").unwrap().unwrap();
+        assert_eq!(tree.source_line(script), Some(3));
+
+        let created = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from("script")),
+            attrs: vec![],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        assert_eq!(tree.source_line(created), None);
     }
 }

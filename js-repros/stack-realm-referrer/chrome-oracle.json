@@ -1,0 +1,23 @@
+{
+  "browser": "Chrome 146.0.7680.80",
+  "normalized": true,
+  "documentReferrer": "",
+  "sameFrameReferrer": "<origin-a>/",
+  "crossFrameReferrer": "",
+  "securityErrorProperties": [
+    "document",
+    "location.href",
+    "location.origin",
+    "frameElement"
+  ],
+  "fetchReferers": {
+    "same": "<origin-a>/",
+    "cross": "<origin-a>/"
+  },
+  "stackInvariants": {
+    "inline": "<document>:11",
+    "externalUrl": "<origin-a>/external.js",
+    "engineFramesInOwnFrames": false,
+    "evalAnnotation": false
+  }
+}

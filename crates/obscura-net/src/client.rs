@@ -176,6 +176,63 @@ pub enum RequestCredentials {
     Include,
 }
 
+/// Fetch/HTML Referrer-Policy values shared by browser-owned and scripted
+/// requests. The wire representation stays a string so the network crate does
+/// not depend on browser document state.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum ReferrerPolicy {
+    NoReferrer,
+    NoReferrerWhenDowngrade,
+    Origin,
+    OriginWhenCrossOrigin,
+    SameOrigin,
+    StrictOrigin,
+    StrictOriginWhenCrossOrigin,
+    UnsafeUrl,
+}
+
+impl Default for ReferrerPolicy {
+    fn default() -> Self {
+        Self::StrictOriginWhenCrossOrigin
+    }
+}
+
+impl ReferrerPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "no-referrer" => Some(Self::NoReferrer),
+            "no-referrer-when-downgrade" => Some(Self::NoReferrerWhenDowngrade),
+            "origin" => Some(Self::Origin),
+            "origin-when-cross-origin" => Some(Self::OriginWhenCrossOrigin),
+            "same-origin" => Some(Self::SameOrigin),
+            "strict-origin" => Some(Self::StrictOrigin),
+            "strict-origin-when-cross-origin" => Some(Self::StrictOriginWhenCrossOrigin),
+            "unsafe-url" => Some(Self::UnsafeUrl),
+            _ => None,
+        }
+    }
+
+    pub fn parse_list(value: &str) -> Self {
+        value
+            .split(',')
+            .find_map(Self::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReferrer => "no-referrer",
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::Origin => "origin",
+            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            Self::SameOrigin => "same-origin",
+            Self::StrictOrigin => "strict-origin",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+            Self::UnsafeUrl => "unsafe-url",
+        }
+    }
+}
+
 impl RequestMode {
     pub(crate) fn header_value(self) -> &'static str {
         match self {
@@ -198,6 +255,8 @@ pub struct ResourceRequest {
     /// but a module dependency is referred by its importing module while its
     /// credentials mode is still relative to the owning document.
     pub referrer: Option<Url>,
+    /// Referrer-Policy in force for the environment settings object.
+    pub referrer_policy: ReferrerPolicy,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
     /// Hard limit for the decoded response body retained by this request.
@@ -211,6 +270,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Document,
             initiator: None,
             referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
@@ -240,6 +300,7 @@ impl ResourceRequest {
             resource_type,
             initiator: Some(initiator.clone()),
             referrer: Some(initiator.clone()),
+            referrer_policy: ReferrerPolicy::default(),
             mode,
             credentials,
             max_response_bytes: match resource_type {
@@ -262,6 +323,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Script,
             initiator: Some(initiator.clone()),
             referrer: Some(referrer.clone()),
+            referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
             max_response_bytes: 32 * 1024 * 1024,
@@ -448,20 +510,47 @@ pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Optio
         .referrer
         .as_ref()
         .or(request.initiator.as_ref())?;
+    referrer_value(source, target, request.referrer_policy)
+}
+
+pub fn referrer_value(
+    source: &Url,
+    target: &Url,
+    policy: ReferrerPolicy,
+) -> Option<String> {
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
-        || (source.scheme() == "https" && target.scheme() == "http")
     {
         return None;
     }
-    if source.origin() == target.origin() {
-        let mut value = source.clone();
-        let _ = value.set_username("");
-        let _ = value.set_password(None);
-        value.set_fragment(None);
-        Some(value.to_string())
-    } else {
-        Some(format!("{}/", source.origin().ascii_serialization()))
+    let same_origin = source.origin() == target.origin();
+    let downgrade = source.scheme() == "https" && target.scheme() == "http";
+    if matches!(policy, ReferrerPolicy::NoReferrer)
+        || matches!(policy, ReferrerPolicy::SameOrigin) && !same_origin
+        || matches!(policy, ReferrerPolicy::NoReferrerWhenDowngrade | ReferrerPolicy::StrictOrigin | ReferrerPolicy::StrictOriginWhenCrossOrigin) && downgrade
+    {
+        return None;
+    }
+    let mut origin = source.origin().ascii_serialization();
+    origin.push('/');
+    let mut full = source.clone();
+    let _ = full.set_username("");
+    let _ = full.set_password(None);
+    full.set_fragment(None);
+    match policy {
+        ReferrerPolicy::Origin | ReferrerPolicy::StrictOrigin => Some(origin),
+        ReferrerPolicy::OriginWhenCrossOrigin
+        | ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+            if same_origin {
+                Some(full.to_string())
+            } else {
+                Some(origin)
+            }
+        }
+        ReferrerPolicy::NoReferrerWhenDowngrade
+        | ReferrerPolicy::UnsafeUrl
+        | ReferrerPolicy::SameOrigin => Some(full.to_string()),
+        ReferrerPolicy::NoReferrer => None,
     }
 }
 
@@ -1191,6 +1280,40 @@ impl ObscuraHttpClient {
         .await
     }
 
+    pub async fn fetch_document_with_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<Url>,
+        policy: ReferrerPolicy,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_document_with_method_referrer(
+            Method::GET,
+            url,
+            None,
+            referrer,
+            policy,
+            callbacks,
+        )
+        .await
+    }
+
+    pub async fn fetch_document_with_method_referrer(
+        &self,
+        method: Method,
+        url: &Url,
+        body: Option<Vec<u8>>,
+        referrer: Option<Url>,
+        policy: ReferrerPolicy,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let mut request = ResourceRequest::navigation();
+        request.referrer = referrer;
+        request.referrer_policy = policy;
+        self.fetch_with_profile(method, url, body, callbacks, request)
+            .await
+    }
+
     /// Fetch a non-navigation resource through the same validated client,
     /// cookie jar, proxy, connection pool, interception and callback path as
     /// the owning page. The renderer can seed its byte cache from this result
@@ -1729,9 +1852,9 @@ pub enum ObscuraNetError {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        is_forbidden_ip, referrer_value, request_fetch_site, request_referrer, validate_url,
         validate_resolved_addresses, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
-        RequestCredentials, RequestMode, ResourceRequest, ResourceType,
+        ReferrerPolicy, RequestCredentials, RequestMode, ResourceRequest, ResourceType,
     };
     use crate::cookies::CookieJar;
     use std::collections::HashMap;
@@ -1862,6 +1985,54 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    #[test]
+    fn referrer_policy_matrix_matches_fetch_rules() {
+        let source = Url::parse("https://user:secret@app.example/path?q=1#frag").unwrap();
+        let same = Url::parse("https://app.example/next").unwrap();
+        let cross = Url::parse("https://cdn.example/next").unwrap();
+        let downgrade = Url::parse("http://cdn.example/next").unwrap();
+        let expected_full = "https://app.example/path?q=1";
+        let expected_origin = "https://app.example/";
+
+        for policy in [ReferrerPolicy::NoReferrer, ReferrerPolicy::SameOrigin] {
+            assert_eq!(referrer_value(&source, &cross, policy), None);
+        }
+        for policy in [ReferrerPolicy::Origin, ReferrerPolicy::StrictOrigin] {
+            assert_eq!(referrer_value(&source, &same, policy).as_deref(), Some(expected_origin));
+            assert_eq!(referrer_value(&source, &cross, policy).as_deref(), Some(expected_origin));
+        }
+        assert_eq!(
+            referrer_value(&source, &same, ReferrerPolicy::OriginWhenCrossOrigin)
+                .as_deref(),
+            Some(expected_full)
+        );
+        assert_eq!(
+            referrer_value(&source, &cross, ReferrerPolicy::OriginWhenCrossOrigin)
+                .as_deref(),
+            Some(expected_origin)
+        );
+        assert_eq!(
+            referrer_value(&source, &downgrade, ReferrerPolicy::OriginWhenCrossOrigin)
+                .as_deref(),
+            Some(expected_origin)
+        );
+        let policy = ReferrerPolicy::StrictOriginWhenCrossOrigin;
+        {
+            assert_eq!(referrer_value(&source, &same, policy).as_deref(), Some(expected_full));
+            assert_eq!(referrer_value(&source, &cross, policy).as_deref(), Some(expected_origin));
+            assert_eq!(referrer_value(&source, &downgrade, policy), None);
+        }
+        assert_eq!(
+            referrer_value(&source, &same, ReferrerPolicy::NoReferrerWhenDowngrade)
+                .as_deref(),
+            Some(expected_full)
+        );
+        assert_eq!(
+            referrer_value(&source, &cross, ReferrerPolicy::UnsafeUrl).as_deref(),
+            Some(expected_full)
+        );
     }
 
     async fn http_fixture(

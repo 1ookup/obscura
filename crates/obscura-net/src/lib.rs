@@ -11,7 +11,8 @@ pub mod wreq_client;
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
-    ResourceRequest, ResourceType, Response, ResponseCallback, ResponseTiming, SsrfGuardResolver,
+    ReferrerPolicy, ResourceRequest, ResourceType, Response, ResponseCallback, ResponseTiming,
+    SsrfGuardResolver, referrer_value,
 };
 // The HTTP method type accepted by `ObscuraHttpClient::fetch_with_method`,
 // re-exported so navigation callers do not need a direct reqwest dependency.

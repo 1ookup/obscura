@@ -317,13 +317,23 @@ function _decodeDataScriptUrl(url) {
 globalThis.__markParserScripts = function(nids) {
   for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
 };
+function _environmentReferrerPolicy() {
+  return String(globalThis.__obscura_referrer_policy || "strict-origin-when-cross-origin");
+}
+function _environmentReferrerContext() {
+  return JSON.stringify({
+    url: globalThis.location?.href || "",
+    policy: _environmentReferrerPolicy(),
+  });
+}
 async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin",
+      _environmentReferrerContext()
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -570,7 +580,8 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin",
+    _environmentReferrerContext()
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -6374,7 +6385,10 @@ class _ScopedDocument extends Document {
     const info = this._scopeInfo();
     return info && info.quirks ? "BackCompat" : "CSS1Compat";
   }
-  get referrer() { return ""; }
+  get referrer() {
+    const info = this._scopeInfo();
+    return (info && info.referrer) || "";
+  }
   // Wired by the contentDocument/contentWindow getters; null for a document
   // no longer presented in a frame.
   get defaultView() { return this._defaultViewProxy || null; }
@@ -7496,7 +7510,13 @@ globalThis.fetch = async (input, init = {}) => {
   }
   const pageOrigin = _environmentSettings().origin;
   const performanceStart = performance.now();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await Deno.core.ops.op_fetch_url(
+    url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
+    JSON.stringify({
+      url: _environmentSettings().url || globalThis.location?.href || "",
+      policy: _environmentReferrerPolicy(),
+    })
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -11086,7 +11106,7 @@ globalThis.Crypto = class Crypto {
 };
 globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
 // Real structured clone (not JSON). JSON.parse(JSON.stringify) silently drops
-// ArrayBuffer/TypedArray (they serialize to {}), so Cloudflare's turnstile
+// ArrayBuffer/TypedArray (they serialize to {}), so browser verification
 // orchestrate loses every byte it tries to round-trip through postMessage and
 // the challenge never completes (issue #389). Clone buffers, typed arrays,
 // maps/sets, dates, errors, and plain objects recursively; CryptoKey and other

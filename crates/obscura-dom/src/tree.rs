@@ -261,6 +261,10 @@ pub struct DocumentScope {
     pub base_url: String,
     pub sandbox: SandboxFlags,
     pub csp: Option<String>,
+    /// Referrer-Policy selected by the response/document metadata.
+    pub referrer_policy: String,
+    /// Referrer value exposed by this document's environment settings object.
+    pub referrer: String,
     /// Browsing-context id, stable across navigations of the same frame.
     pub frame_id: String,
     /// Increments for every committed cross-document navigation of the frame.
@@ -514,6 +518,10 @@ pub(crate) struct DomTreeInner {
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
+    /// HTML tokenizer line at which parser-created elements begin. This is
+    /// source metadata only; DOM-created nodes are deliberately absent.
+    source_lines: HashMap<NodeId, u64>,
+    current_parse_line: u64,
 }
 
 impl DomTree {
@@ -542,6 +550,8 @@ impl DomTree {
                 document_scopes: HashMap::new(),
                 allow_declarative_shadow_roots: false,
                 quirks: false,
+                source_lines: HashMap::new(),
+                current_parse_line: 1,
             }),
         }
     }
@@ -1010,6 +1020,27 @@ impl DomTree {
         id
     }
 
+    /// Record the parser's current source line for a node created by
+    /// html5ever. Kept separate from NodeData so cloned or script-created DOM
+    /// nodes do not acquire misleading document locations.
+    pub(crate) fn record_source_line(&self, node: NodeId) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.current_parse_line > 0 {
+            let line = inner.current_parse_line;
+            inner.source_lines.insert(node, line);
+        }
+    }
+
+    /// Update the line supplied by html5ever's TreeSink callback.
+    pub(crate) fn set_current_parse_line(&self, line: u64) {
+        self.inner.borrow_mut().current_parse_line = line.max(1);
+    }
+
+    /// Return the parser source line for a parser-created node, if available.
+    pub fn source_line(&self, node: NodeId) -> Option<u64> {
+        self.inner.borrow().source_lines.get(&node).copied()
+    }
+
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.borrow().nodes.get(id.index())?.clone()
     }
@@ -1335,6 +1366,7 @@ impl DomTree {
                 inner.iframe_content_documents_by_root.remove(&root_id);
             }
             inner.document_scopes.remove(&id);
+            inner.source_lines.remove(&id);
         }
 
         // Only free slots that are currently live. Freeing an out-of-range id
@@ -2100,6 +2132,9 @@ impl DomTree {
             };
 
             let new_id = self.new_node(node_data);
+            if let Some(line) = source.source_line(src_id) {
+                self.inner.borrow_mut().source_lines.insert(new_id, line);
+            }
             self.append_child(dest_parent, new_id);
 
             // A <template>'s children hang off a separate contents document, so
@@ -2385,6 +2420,8 @@ mod tests {
                 base_url: "https://frame.example/".into(),
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                referrer_policy: "strict-origin-when-cross-origin".into(),
+                referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,
@@ -2468,6 +2505,8 @@ mod tests {
                 base_url: "about:blank".into(),
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                referrer_policy: "strict-origin-when-cross-origin".into(),
+                referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,

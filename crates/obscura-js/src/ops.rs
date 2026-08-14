@@ -13,7 +13,7 @@ use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
+use obscura_net::{RequestCredentials, RequestMode, ReferrerPolicy, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
@@ -1611,6 +1611,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "url": scope.url,
                     "origin": scope.origin.serialize(),
                     "baseUrl": scope.base_url,
+                    "referrer": scope.referrer,
+                    "referrerPolicy": scope.referrer_policy,
                     "sandboxActive": scope.sandbox.active,
                     "allowScripts": scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS),
                     "allowSameOrigin": scope
@@ -1691,7 +1693,23 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .unwrap_or(0);
             let existing = dom.document_scope(root);
             let quirks = existing.as_ref().map(|scope| scope.quirks).unwrap_or(false);
-            let csp = existing.and_then(|scope| scope.csp);
+            let csp = existing.as_ref().and_then(|scope| scope.csp.clone());
+            let existing_referrer_policy = existing
+                .as_ref()
+                .map(|scope| scope.referrer_policy.clone());
+            let existing_referrer = existing.as_ref().map(|scope| scope.referrer.clone());
+            let referrer_policy = spec
+                .get("referrerPolicy")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_referrer_policy)
+                .unwrap_or_else(|| "strict-origin-when-cross-origin".to_string());
+            let referrer = spec
+                .get("referrer")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_referrer)
+                .unwrap_or_default();
             dom.set_document_scope(
                 root,
                 obscura_dom::DocumentScope {
@@ -1700,6 +1718,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     base_url,
                     sandbox,
                     csp,
+                    referrer_policy,
+                    referrer,
                     frame_id,
                     document_generation,
                     quirks,
@@ -2542,6 +2562,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let performance_started = std::time::Instant::now();
     tracing::debug!(
@@ -2740,6 +2761,19 @@ async fn op_fetch_url(
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
+    let referrer_context = serde_json::from_str::<serde_json::Value>(&referrer_context).ok();
+    let referrer_url = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("url"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let referrer_policy = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("policy"))
+        .and_then(|value| value.as_str())
+        .and_then(ReferrerPolicy::parse)
+        .unwrap_or_default();
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -2837,6 +2871,8 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                referrer_url.clone(),
+                referrer_policy,
                 callbacks.clone(),
                 allow_private_network,
             )
@@ -2863,6 +2899,14 @@ async fn op_fetch_url(
             .unwrap_or(false);
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
+        }
+        if let (Ok(source), Ok(target)) = (
+            url::Url::parse(&referrer_url),
+            url::Url::parse(&current_url),
+        ) {
+            if let Some(value) = obscura_net::referrer_value(&source, &target, referrer_policy) {
+                req = req.header("Referer", value);
+            }
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -3166,6 +3210,8 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    referrer_url: String,
+    referrer_policy: ReferrerPolicy,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
@@ -3196,6 +3242,12 @@ async fn stealth_fetch_all(
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        if let Some(value) = url::Url::parse(&referrer_url)
+            .ok()
+            .and_then(|source| obscura_net::referrer_value(&source, &parsed_current, referrer_policy))
+        {
+            req_headers.insert("referer".to_string(), value);
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
@@ -3559,6 +3611,8 @@ mod tests {
                 "url": "https://frame.example/page",
                 "origin": "https://frame.example",
                 "baseUrl": "https://frame.example/",
+                "referrer": "",
+                "referrerPolicy": "strict-origin-when-cross-origin",
                 "sandboxActive": true,
                 "allowScripts": true,
                 "allowSameOrigin": false,

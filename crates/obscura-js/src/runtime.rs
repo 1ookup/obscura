@@ -675,6 +675,16 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().referrer = referrer.to_string();
     }
 
+    /// Install the current document's Referrer-Policy for fetch/XHR and other
+    /// browser-owned requests initiated from this realm.
+    pub fn set_referrer_policy(&mut self, policy: &str) {
+        let escaped = policy.replace('\\', "\\\\").replace('\'', "\\'");
+        let _ = self.runtime.execute_script(
+            "<referrer-policy>",
+            format!("globalThis.__obscura_referrer_policy='{}';", escaped),
+        );
+    }
+
     /// Set the Unix-epoch timestamp captured when the document navigation
     /// started. The bootstrap uses this as Performance.timeOrigin.
     pub fn set_performance_time_origin(&mut self, milliseconds: f64) {
@@ -2624,6 +2634,15 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.execute_classic_script_at(name, source, 0)
+    }
+
+    fn execute_classic_script_at(
+        &mut self,
+        name: &str,
+        source: &str,
+        line_offset: i32,
+    ) -> Result<(), String> {
         self.begin_javascript_task();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
@@ -2637,7 +2656,7 @@ impl ObscuraJsRuntime {
         let origin = deno_core::v8::ScriptOrigin::new(
             scope,
             name.into(),
-            0,
+            line_offset,
             0,
             false,
             0,
@@ -2682,11 +2701,42 @@ impl ObscuraJsRuntime {
         self.execute_classic_script(name, source)
     }
 
+    /// Execute a classic script with the parser-provided document line of its
+    /// first source line. External scripts pass zero; inline scripts pass the
+    /// HTML start-tag line minus one.
+    pub fn execute_script_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        line_offset: u64,
+    ) -> Result<(), String> {
+        let line_offset = line_offset.saturating_sub(1).min(i32::MAX as u64) as i32;
+        self.execute_classic_script_at(name, source, line_offset)
+    }
+
     pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
         if source.len() < 10_000 {
             self.execute_script(name, source)
         } else {
             self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
+        }
+    }
+
+    pub fn execute_script_guarded_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        line: u64,
+    ) -> Result<(), String> {
+        if source.len() < 10_000 {
+            self.execute_script_at_line(name, source, line)
+        } else {
+            self.execute_script_with_timeout_at_line(
+                name,
+                source,
+                std::time::Duration::from_secs(5),
+                line,
+            )
         }
     }
 
@@ -2696,8 +2746,18 @@ impl ObscuraJsRuntime {
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        self.execute_script_with_timeout_at_line(name, source, timeout, 0)
+    }
+
+    fn execute_script_with_timeout_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        timeout: std::time::Duration,
+        line: u64,
+    ) -> Result<(), String> {
         if timeout.is_zero() {
-            return self.execute_classic_script(name, source);
+            return self.execute_script_at_line(name, source, line);
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -2725,7 +2785,7 @@ impl ObscuraJsRuntime {
             }
         });
 
-        let result = self.execute_classic_script(name, source);
+        let result = self.execute_script_at_line(name, source, line);
 
         {
             let (lock, cvar) = &*pair;
@@ -16251,6 +16311,23 @@ mod tests {
                 "namesTheEngineInOwnFrames": false,
             })
         );
+    }
+
+    #[test]
+    fn inline_script_stack_uses_document_absolute_line_offset() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script_at_line(
+            "https://example.test/page.html",
+            &("function capture() { return new Error().stack; }\n"
+                .to_owned()
+                + "globalThis.__inlineStack = capture();"),
+            12,
+        )
+        .unwrap();
+        let stack = rt.evaluate("globalThis.__inlineStack").unwrap();
+        let stack = stack.as_str().unwrap();
+        assert!(stack.contains("https://example.test/page.html:13"), "{stack}");
+        assert!(!stack.contains("obscura:bootstrap"), "{stack}");
     }
 
     /// An event handler that throws is reported, not swallowed. Without this a

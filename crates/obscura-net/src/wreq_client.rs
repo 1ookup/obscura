@@ -18,7 +18,7 @@ use url::Url;
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{
-    CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    CallbackRegistry, InFlightGuard, ObscuraNetError, ReferrerPolicy, RequestInfo, RequestMode,
     ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
     request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
     validate_cors_response, validate_request_mode, validate_url,
@@ -219,6 +219,19 @@ impl StealthHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
             .await
+    }
+
+    pub async fn fetch_document_with_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<Url>,
+        policy: ReferrerPolicy,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let mut request = ResourceRequest::navigation();
+        request.referrer = referrer;
+        request.referrer_policy = policy;
+        self.fetch_with_profile(url, request, callbacks).await
     }
 
     pub async fn fetch_resource_with_callbacks(
