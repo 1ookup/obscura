@@ -1203,6 +1203,8 @@ impl Page {
             self.context.local_storage.clone(),
             self.session_storage.clone(),
         );
+        rt.set_privacy_policy(self.context.privacy_policy.clone());
+        rt.set_private_token_query_state(self.context.private_token_query_state.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());

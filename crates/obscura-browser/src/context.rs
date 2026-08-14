@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use obscura_js::ops::{new_storage_areas, SharedStorageAreas};
+use obscura_js::{PrivateTokenQueryState, PrivacyPolicy};
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
@@ -9,6 +10,11 @@ pub struct BrowserContext {
     pub cookie_jar: Arc<CookieJar>,
     /// localStorage namespace shared by every page in this browser context.
     pub local_storage: SharedStorageAreas,
+    /// Origin-partitioned values surfaced by Private State Token and Storage
+    /// Access APIs. Empty by default; embedders explicitly configure facts
+    /// they can substantiate before creating a page.
+    pub privacy_policy: PrivacyPolicy,
+    pub(crate) private_token_query_state: PrivateTokenQueryState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -145,6 +151,8 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage: new_storage_areas(),
+            privacy_policy: PrivacyPolicy::new(),
+            private_token_query_state: PrivateTokenQueryState::new(),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -203,6 +211,8 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage: new_storage_areas(),
+            privacy_policy: self.privacy_policy.snapshot(),
+            private_token_query_state: PrivateTokenQueryState::new(),
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),

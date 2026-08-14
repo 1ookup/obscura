@@ -3,12 +3,14 @@ mod import_map;
 pub mod markdown;
 pub mod module_loader;
 pub mod ops;
+mod privacy;
 pub mod realm;
 pub mod runtime;
 pub mod v8_flags;
 pub mod worker;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
+pub use privacy::{PrivateTokenQueryState, PrivacyPolicy, PrivacyPolicyError};
 pub use v8_flags::set_v8_flags;
 
 // Screenshot rasterization (PNG bytes) from the render layer. Available when the

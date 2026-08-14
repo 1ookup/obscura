@@ -4947,6 +4947,37 @@ function _throwDocumentDomainSecurityError() {
   throw new DOMException("Failed to set the 'domain' property on 'Document'", "SecurityError");
 }
 
+const _detachedDocumentBrand = new WeakSet();
+function _documentPrivacyRoot(value, method) {
+  const branded = value instanceof Document
+    || _detachedDocumentBrand.has(value)
+    || (value && typeof value === "object" && value.nodeType === 9
+      && /Document$/.test(value.constructor && value.constructor.name || ""));
+  if (!branded) {
+    throw new TypeError("Failed to execute '" + method + "' on 'Document': Illegal invocation");
+  }
+  if (value === globalThis.document) return _callingFrameRoot();
+  if (typeof value._scopeRoot === "number" && value._scopeInfo && value._scopeInfo()) {
+    return value._scopeRoot;
+  }
+  return -1;
+}
+
+function _privateStateTokenError(method, status) {
+  if (status === "invalid-state") {
+    return new DOMException(
+      "Failed to execute '" + method + "' on 'Document': " + method
+        + ": Cannot execute in documents lacking top-frame origins.",
+      "InvalidStateError");
+  }
+  if (status === "quota") {
+    return new DOMException("Failed to retrieve " + method + " response.", "OperationError");
+  }
+  return new TypeError(
+    "Failed to execute '" + method + "' on 'Document': " + method
+      + ": Private Token issuer origins must be both HTTP(S) and secure (\"potentially trustworthy\").");
+}
+
 class Document extends Node {
   get timeline() {
     if (!this._timeline) {
@@ -5020,6 +5051,38 @@ class Document extends Node {
     this._effectiveDomain = candidate;
   }
   get referrer() { return _domParse("document_referrer") ?? ""; }
+  async hasPrivateToken(issuer) {
+    const root = _documentPrivacyRoot(this, "hasPrivateToken");
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'hasPrivateToken' on 'Document': 1 argument required, but only 0 present.");
+    }
+    const result = JSON.parse(Deno.core.ops.op_private_state_query(
+      "token", String(issuer), root));
+    if (result.status !== "ok") throw _privateStateTokenError("hasPrivateToken", result.status);
+    return !!result.value;
+  }
+  async hasRedemptionRecord(issuer) {
+    const root = _documentPrivacyRoot(this, "hasRedemptionRecord");
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'hasRedemptionRecord' on 'Document': 1 argument required, but only 0 present.");
+    }
+    const result = JSON.parse(Deno.core.ops.op_private_state_query(
+      "redemption", String(issuer), root));
+    if (result.status !== "ok") throw _privateStateTokenError("hasRedemptionRecord", result.status);
+    return !!result.value;
+  }
+  async hasStorageAccess() {
+    const root = _documentPrivacyRoot(this, "hasStorageAccess");
+    const result = JSON.parse(Deno.core.ops.op_has_storage_access(root));
+    if (result.status === "invalid-state") {
+      throw new DOMException(
+        "hasStorageAccess: Cannot be used unless the document is fully active.",
+        "InvalidStateError");
+    }
+    return !!result.value;
+  }
   get location() { return globalThis.location; }
   set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
@@ -10641,6 +10704,7 @@ globalThis.DOMParser = class DOMParser {
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
+    _detachedDocumentBrand.add(docNode);
     return docNode;
   }
 };
@@ -12094,6 +12158,13 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+for (const name of ["hasPrivateToken", "hasRedemptionRecord", "hasStorageAccess"]) {
+  const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+  if (descriptor) {
+    descriptor.enumerable = true;
+    Object.defineProperty(Document.prototype, name, descriptor);
+  }
+}
 // CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
 // pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
 // interfaces it had no value assignment, leaving `window.CSSStyleDeclaration`
@@ -12616,7 +12687,8 @@ _markNative(globalThis.Selection);
   Document.prototype.createTextNode, Document.prototype.createComment,
   Document.prototype.createCDATASection, Document.prototype.createProcessingInstruction,
   Document.prototype.createDocumentFragment, Document.prototype.createEvent,
-  Document.prototype.hasFocus,
+  Document.prototype.hasFocus, Document.prototype.hasPrivateToken,
+  Document.prototype.hasRedemptionRecord, Document.prototype.hasStorageAccess,
   Storage, Storage.prototype.getItem, Storage.prototype.setItem,
   Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,

@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+use crate::privacy::{normalize_private_token_issuer, PrivateTokenQueryState, PrivacyPolicy};
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -197,6 +198,11 @@ pub struct ObscuraState {
     /// order for Storage.key().
     pub local_storage: SharedStorageAreas,
     pub session_storage: SharedStorageAreas,
+    /// BrowserContext-owned values for origin-partitioned privacy APIs.
+    pub privacy_policy: PrivacyPolicy,
+    /// BrowserContext-owned issuer associations used by the Private State
+    /// Token information limit. Shared across same-context navigations.
+    pub private_token_query_state: PrivateTokenQueryState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -362,6 +368,8 @@ impl ObscuraState {
             pending_iframe_navigations: Vec::new(),
             local_storage: new_storage_areas(),
             session_storage: new_storage_areas(),
+            privacy_policy: PrivacyPolicy::new(),
+            private_token_query_state: PrivateTokenQueryState::new(),
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -3979,6 +3987,139 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+fn privacy_document_origins(
+    state: &ObscuraState,
+    document_root: i32,
+) -> Option<(obscura_dom::Origin, obscura_dom::Origin)> {
+    if document_root < 0 {
+        return None;
+    }
+    let top = state
+        .top_origin
+        .clone()
+        .unwrap_or_else(|| obscura_dom::Origin::from_url(&state.url));
+    let document = if document_root == 0 {
+        top.clone()
+    } else {
+        state
+            .dom
+            .as_ref()?
+            .document_scope(NodeId::new(document_root as u32))?
+            .origin
+    };
+    Some((top, document))
+}
+
+fn http_origin_serialization(origin: &obscura_dom::Origin) -> Option<String> {
+    match origin {
+        obscura_dom::Origin::Tuple { scheme, .. }
+            if matches!(scheme.as_str(), "http" | "https") =>
+        {
+            Some(origin.serialize())
+        }
+        _ => None,
+    }
+}
+
+/// Query Private State Token metadata. The result is a small status envelope
+/// because WebIDL requires all validation failures to become Promise
+/// rejections in JavaScript, including illegal issuer input and quota errors.
+#[op2]
+#[string]
+fn op_private_state_query(
+    state: &OpState,
+    #[string] operation: String,
+    #[string] issuer: String,
+    document_root: i32,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some((top, document)) = privacy_document_origins(&state, document_root) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let (Some(top_level_origin), Some(document_origin)) = (
+        http_origin_serialization(&top),
+        http_origin_serialization(&document),
+    ) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let Some(issuer_origin) = normalize_private_token_issuer(&issuer) else {
+        return r#"{"status":"invalid-issuer"}"#.to_string();
+    };
+
+    if operation == "token"
+        && !state
+            .private_token_query_state
+            .associate(&top_level_origin, &issuer_origin)
+    {
+        tracing::debug!(
+            target: "obscura::privacy",
+            api = "hasPrivateToken",
+            %top_level_origin,
+            %document_origin,
+            %issuer_origin,
+            status = "quota-exceeded",
+        );
+        return r#"{"status":"quota"}"#.to_string();
+    }
+
+    let value = match operation.as_str() {
+        "token" => state.privacy_policy.has_private_token(
+            &top_level_origin,
+            &document_origin,
+            &issuer_origin,
+        ),
+        "redemption" => state.privacy_policy.has_redemption_record(
+            &top_level_origin,
+            &document_origin,
+            &issuer_origin,
+        ),
+        _ => false,
+    };
+    let api = if operation == "token" {
+        "hasPrivateToken"
+    } else {
+        "hasRedemptionRecord"
+    };
+    tracing::debug!(
+        target: "obscura::privacy",
+        api,
+        %top_level_origin,
+        %document_origin,
+        %issuer_origin,
+        value,
+    );
+    serde_json::json!({ "status": "ok", "value": value }).to_string()
+}
+
+#[op2]
+#[string]
+fn op_has_storage_access(state: &OpState, document_root: i32) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some((top, document)) = privacy_document_origins(&state, document_root) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let Some(top_level_origin) = http_origin_serialization(&top) else {
+        return r#"{"status":"ok","value":false}"#.to_string();
+    };
+    let Some(document_origin) = http_origin_serialization(&document) else {
+        return r#"{"status":"ok","value":false}"#.to_string();
+    };
+    let value = top.same_origin(&document)
+        || state
+            .privacy_policy
+            .has_storage_access_grant(&top_level_origin, &document_origin);
+    tracing::debug!(
+        target: "obscura::privacy",
+        api = "hasStorageAccess",
+        %top_level_origin,
+        %document_origin,
+        value,
+    );
+    serde_json::json!({ "status": "ok", "value": value }).to_string()
+}
+
 #[op2]
 #[string]
 fn op_get_cookies(state: &OpState) -> String {
@@ -5288,6 +5429,8 @@ pub fn build_extension() -> Extension {
         op_monotonic_ms(),
         op_run_classic_script(),
         op_fetch_url(),
+        op_private_state_query(),
+        op_has_storage_access(),
         op_get_cookies(),
         op_get_cookies_for_url(),
         op_set_cookie(),

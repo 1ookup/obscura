@@ -571,6 +571,14 @@ impl ObscuraJsRuntime {
         state.session_storage = session_storage;
     }
 
+    pub fn set_privacy_policy(&self, policy: crate::PrivacyPolicy) {
+        self.state.borrow_mut().privacy_policy = policy;
+    }
+
+    pub fn set_private_token_query_state(&self, state: crate::PrivateTokenQueryState) {
+        self.state.borrow_mut().private_token_query_state = state;
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
     }
@@ -3822,6 +3830,204 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    fn setup_privacy_runtime() -> ObscuraJsRuntime {
+        let rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://top.example/page");
+        rt.set_top_origin(obscura_dom::Origin::from_url("https://top.example/page"));
+        rt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_privacy_apis_match_chrome_shape_defaults_and_failures() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const describe = name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        return {
+                            name: descriptor.value.name,
+                            length: descriptor.value.length,
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                            writable: descriptor.writable,
+                            string: String(descriptor.value),
+                        };
+                    };
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name }; }
+                    };
+                    const tokenPromise = document.hasPrivateToken("https://one.example/path");
+                    const tokenOne = await tokenPromise;
+                    const tokenTwo = await document.hasPrivateToken("https://two.example");
+                    return {
+                        descriptors: {
+                            token: describe("hasPrivateToken"),
+                            redemption: describe("hasRedemptionRecord"),
+                            storage: describe("hasStorageAccess"),
+                        },
+                        tokenPromise: tokenPromise instanceof Promise,
+                        tokenOne,
+                        tokenTwo,
+                        tokenThird: await outcome(() => document.hasPrivateToken("https://three.example")),
+                        redemptionThird: await outcome(() => document.hasRedemptionRecord("https://three.example")),
+                        invalidIssuer: await outcome(() => document.hasRedemptionRecord("http://issuer.example")),
+                        missingArgument: await outcome(() => document.hasRedemptionRecord()),
+                        illegalInvocation: await outcome(() => Document.prototype.hasPrivateToken.call({})),
+                        detached: await outcome(() => Document.prototype.hasPrivateToken.call(
+                            document.implementation.createHTMLDocument("detached"),
+                            "https://issuer.example")),
+                        storage: await document.hasStorageAccess(),
+                        detachedStorage: await outcome(() => Document.prototype.hasStorageAccess.call(
+                            document.implementation.createHTMLDocument("detached"))),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "descriptors": {
+                    "token": {
+                        "name": "hasPrivateToken", "length": 1, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasPrivateToken() { [native code] }",
+                    },
+                    "redemption": {
+                        "name": "hasRedemptionRecord", "length": 1, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasRedemptionRecord() { [native code] }",
+                    },
+                    "storage": {
+                        "name": "hasStorageAccess", "length": 0, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasStorageAccess() { [native code] }",
+                    },
+                },
+                "tokenPromise": true,
+                "tokenOne": false,
+                "tokenTwo": false,
+                "tokenThird": { "name": "OperationError" },
+                "redemptionThird": { "value": false },
+                "invalidIssuer": { "name": "TypeError" },
+                "missingArgument": { "name": "TypeError" },
+                "illegalInvocation": { "name": "TypeError" },
+                "detached": { "name": "InvalidStateError" },
+                "storage": true,
+                "detachedStorage": { "name": "InvalidStateError" },
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_privacy_api_values_come_from_the_origin_policy() {
+        let policy = crate::PrivacyPolicy::new();
+        policy
+            .set_private_token(
+                "https://top.example",
+                "https://top.example",
+                "https://issuer.example/path",
+                true,
+            )
+            .unwrap();
+        policy
+            .set_redemption_record(
+                "https://top.example",
+                "https://top.example",
+                "https://issuer.example",
+                true,
+            )
+            .unwrap();
+        let mut rt = setup_privacy_runtime();
+        rt.set_privacy_policy(policy);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"Promise.all([
+                    document.hasPrivateToken("https://issuer.example:443/other"),
+                    document.hasRedemptionRecord("https://issuer.example/record"),
+                    document.hasPrivateToken("https://unconfigured.example"),
+                ])"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_storage_access_uses_its_own_origin_partition() {
+        let policy = crate::PrivacyPolicy::new();
+        let mut rt = setup_privacy_runtime();
+        rt.set_privacy_policy(policy.clone());
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    document.body.innerHTML = '<iframe id="privacy-frame"></iframe>';
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("privacy-frame", "<html><body></body></html>",
+                        "https://frame.example/content");
+                }})()"#
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "test-frame",
+            1,
+            root,
+            "https://frame.example/content",
+        )
+        .unwrap();
+
+        let denied = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "document.hasStorageAccess()",
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(denied, serde_json::json!(false));
+
+        policy
+            .set_storage_access_grant(
+                "https://top.example",
+                "https://frame.example",
+                true,
+            )
+            .unwrap();
+        let granted = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "document.hasStorageAccess()",
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(granted, serde_json::json!(true));
     }
 
     #[cfg(feature = "render")]
