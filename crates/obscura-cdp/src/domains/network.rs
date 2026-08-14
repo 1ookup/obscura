@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use obscura_net::CookieJar;
+use obscura_net::{BrandVersion, BrowserFingerprint, CookieJar, FingerprintOverrides};
 
 use crate::cookie_params::{parse_cdp_cookie, parse_delete_cookies_params};
 use crate::dispatch::CdpContext;
@@ -57,8 +57,38 @@ pub async fn handle(
         }
         "setUserAgentOverride" => {
             let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
+            let metadata = params.get("userAgentMetadata").and_then(Value::as_object);
+            let brands = metadata.and_then(|values| values.get("brands"))
+                .and_then(Value::as_array)
+                .map(|values| parse_brands(values));
+            let full_version_list = metadata.and_then(|values| values.get("fullVersionList"))
+                .and_then(Value::as_array)
+                .map(|values| parse_brands(values));
+            let overrides = FingerprintOverrides {
+                browser_version: metadata
+                    .and_then(|values| values.get("fullVersion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                navigator_platform: params.get("platform").and_then(Value::as_str).map(str::to_string),
+                ua_platform: metadata.and_then(|values| values.get("platform"))
+                    .and_then(Value::as_str).map(str::to_string),
+                ua_platform_version: metadata.and_then(|values| values.get("platformVersion"))
+                    .and_then(Value::as_str).map(str::to_string),
+                architecture: metadata.and_then(|values| values.get("architecture"))
+                    .and_then(Value::as_str).map(str::to_string),
+                bitness: metadata.and_then(|values| values.get("bitness"))
+                    .and_then(Value::as_str).map(str::to_string),
+                wow64: metadata.and_then(|values| values.get("wow64")).and_then(Value::as_bool),
+                mobile: metadata.and_then(|values| values.get("mobile")).and_then(Value::as_bool),
+                model: metadata.and_then(|values| values.get("model"))
+                    .and_then(Value::as_str).map(str::to_string),
+                brands,
+                full_version_list,
+                ..FingerprintOverrides::default()
+            };
+            let fingerprint = BrowserFingerprint::from_user_agent(ua).with_overrides(&overrides);
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_browser_fingerprint(fingerprint).await;
             }
             Ok(json!({}))
         }
@@ -139,6 +169,15 @@ pub async fn handle(
         }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
+}
+
+fn parse_brands(values: &[Value]) -> Vec<BrandVersion> {
+    values.iter().filter_map(|value| {
+        Some(BrandVersion {
+            brand: value.get("brand")?.as_str()?.to_string(),
+            version: value.get("version")?.as_str()?.to_string(),
+        })
+    }).collect()
 }
 
 #[cfg(test)]
@@ -243,6 +282,60 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_agent_override_updates_live_js_and_page_network_identity() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("fingerprint-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.get_page_mut(&page_id).unwrap()
+            .navigate("data:text/html,<html><body></body></html>")
+            .await
+            .unwrap();
+
+        handle(
+            "setUserAgentOverride",
+            &json!({
+                "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                "platform": "MacIntel",
+                "userAgentMetadata": {
+                    "brands": [
+                        {"brand":"Chromium","version":"146"},
+                        {"brand":"Not-A.Brand","version":"24"},
+                        {"brand":"Google Chrome","version":"146"}
+                    ],
+                    "fullVersionList": [
+                        {"brand":"Chromium","version":"146.0.7680.80"},
+                        {"brand":"Not-A.Brand","version":"24.0.0.0"},
+                        {"brand":"Google Chrome","version":"146.0.7680.80"}
+                    ],
+                    "fullVersion": "146.0.7680.80",
+                    "platform": "macOS",
+                    "platformVersion": "26.3.2",
+                    "architecture": "arm",
+                    "model": "",
+                    "mobile": false,
+                    "bitness": "64",
+                    "wow64": false
+                }
+            }),
+            &mut ctx,
+            &session_id,
+        ).await.unwrap();
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        assert_eq!(page.fingerprint.browser_version, "146.0.7680.80");
+        assert_eq!(page.fingerprint.navigator_platform, "MacIntel");
+        assert_eq!(page.fingerprint.ua_platform_version, "26.3.2");
+        assert_eq!(page.fingerprint.architecture, "arm");
+        assert_eq!(page.http_client.browser_fingerprint().await, page.fingerprint);
+        assert_eq!(page.evaluate(
+            "JSON.stringify([navigator.userAgent,navigator.platform,navigator.userAgentData.toJSON()])"
+        ), json!(
+            r#"["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","MacIntel",{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"macOS"}]"#
+        ));
     }
 
     #[tokio::test]

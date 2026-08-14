@@ -13,19 +13,18 @@
   var _names = [
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
-    '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
+    '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
-    '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
-    '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
-    '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
+    '_fpCache', '_fingerprint', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
@@ -645,63 +644,43 @@ function _fpNoise(x, y, channel) {
 }
 
 var _fpCache = null;
+function _fingerprint() {
+  return globalThis.__obscura_fingerprint || {
+    userAgent: '', browserVersion: '', browserMajor: 0,
+    navigatorPlatform: '', uaPlatform: '', uaPlatformVersion: '',
+    architecture: '', bitness: '', wow64: false, mobile: false, model: '',
+    brands: [], fullVersionList: [], hardwareConcurrency: 8, deviceMemory: 8,
+    screen: {width:1920,height:1080,availWidth:1920,availHeight:1080,deviceScaleFactor:1},
+    gpu: {vendor:'',renderer:''},
+  };
+}
+globalThis.__obscura_set_fingerprint = function(value) {
+  if (!value || typeof value !== 'object') return;
+  const freezeBrands = list => Object.freeze((Array.isArray(list) ? list : []).map(item =>
+    Object.freeze({brand:String(item && item.brand || ''),version:String(item && item.version || '')})
+  ));
+  const installed = Object.assign({}, value, {
+    brands: freezeBrands(value.brands),
+    fullVersionList: freezeBrands(value.fullVersionList),
+    screen: Object.freeze(Object.assign({}, value.screen)),
+    gpu: Object.freeze(Object.assign({}, value.gpu)),
+  });
+  globalThis.__obscura_fingerprint = Object.freeze(installed);
+  _fpCache = null;
+  if (typeof globalThis.__obscura_apply_fingerprint === 'function') {
+    globalThis.__obscura_apply_fingerprint();
+  }
+};
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
-  const isMac = _uaPlat === 'macOS';
-  const isLinux = _uaPlat === 'Linux';
-  const gpuPool = isMac ? [
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)',
-    'ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)',
-  ] : isLinux ? [
-    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)',
-    'ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)',
-    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 770 (RPL-S), OpenGL 4.6)',
-    'ANGLE (AMD, AMD Radeon RX 580 (polaris10, LLVM 15.0.7, DRM 3.54, LLVM 15.0.7), OpenGL 4.6)',
-    'ANGLE (AMD, AMD Radeon RX 6700 XT (navi22, LLVM 16.0.6, DRM 3.54, LLVM 16.0.6), OpenGL 4.6)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 OpenGL 4.6)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 OpenGL 4.6)',
-  ] : [
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-  ];
-  const gpuVendorPool = isMac ? [
-    'Google Inc. (Apple)','Google Inc. (Apple)','Google Inc. (Apple)',
-    'Google Inc. (Apple)','Google Inc. (Apple)',
-    'Google Inc. (Intel Inc.)',
-  ] : isLinux ? [
-    'Google Inc. (Intel)','Google Inc. (Intel)','Google Inc. (Intel)',
-    'Google Inc. (AMD)','Google Inc. (AMD)',
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-  ] : [
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (Intel)',
-    'Google Inc. (AMD)','Google Inc. (AMD)',
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (AMD)','Google Inc. (NVIDIA)',
-  ];
-  const idx = Math.floor(_fpRand(42) * gpuPool.length);
-  const screenPool = [[1920,1080],[2560,1440],[1366,768],[1536,864],[1440,900],[1680,1050],[1280,720],[3840,2160]];
+  const fingerprint = _fingerprint();
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
   for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
   cfp += '==';
   _fpCache = {
-    gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
+    gpu: String(fingerprint.gpu && fingerprint.gpu.renderer || ''),
+    gpuVendor: String(fingerprint.gpu && fingerprint.gpu.vendor || ''),
     audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
     audioSampleRate: [44100, 48000][Math.floor(_fpRand(101) * 2)],
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
@@ -709,7 +688,8 @@ function _getFp() {
     compRatio: 12 + (_fpRand(104) - 0.5) * 4,
     batteryLevel: 0.5 + _fpRand(200) * 0.5,
     batteryCharging: _fpRand(201) > 0.3,
-    screen: screenPool[Math.floor(_fpRand(300) * screenPool.length)],
+    screen: [Number(fingerprint.screen && fingerprint.screen.width) || 1920,
+      Number(fingerprint.screen && fingerprint.screen.height) || 1080],
     canvasFingerprint: cfp,
   };
   return _fpCache;
@@ -7092,31 +7072,8 @@ globalThis.NetworkInformation = NetworkInformation;
 
 globalThis.ContentIndex = class ContentIndex {};
 
-function _chromeMajor() {
-  var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
-  return m ? (m[1] | 0) : 145;
-}
-// Chromium derives the sec-ch-ua GREASE brand, version, and brand order
-// deterministically from the Chrome major version
-// (components/embedder_support/user_agent_utils.cc). Replicating it keeps
-// sec-ch-ua and userAgentData exact for every profile version rather than
-// hardcoding one static token.
-var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
-var _GREASE_VER = ['8', '99', '24'];
-var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
 function _uaBrands() {
-  var seed = _chromeMajor();
-  var grease = {
-    brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
-    version: _GREASE_VER[seed % 3],
-  };
-  var ordered = [
-    grease,
-    {brand: 'Chromium', version: String(seed)},
-    {brand: 'Google Chrome', version: String(seed)},
-  ];
-  var p = _BRAND_PERMS[seed % 6];
-  return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
+  return (_fingerprint().brands || []).map(item => ({brand:item.brand,version:item.version}));
 }
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
@@ -7129,23 +7086,29 @@ globalThis.navigator = {
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   userAgentData: {
-    mobile: false,
+    get mobile() { return !!_fingerprint().mobile; },
     get brands() { return _uaBrands(); },
-    get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
+    get platform() { return _fingerprint().uaPlatform || ""; },
     getHighEntropyValues(hints) {
-      var brands = _uaBrands();
-      return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
-        brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
-        mobile: false,
-        model: "",
-        platform: globalThis.__obscura_ua_platform || "Windows",
-        platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
-        wow64: false,
-      });
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError("Failed to execute 'getHighEntropyValues' on 'NavigatorUAData': 1 argument required, but only 0 present."));
+      }
+      const requested = new Set(Array.from(hints, String));
+      const fingerprint = _fingerprint();
+      const result = {};
+      if (requested.has('architecture')) result.architecture = fingerprint.architecture || '';
+      if (requested.has('bitness')) result.bitness = fingerprint.bitness || '';
+      result.brands = _uaBrands();
+      if (requested.has('fullVersionList')) {
+        result.fullVersionList = (fingerprint.fullVersionList || []).map(item => ({brand:item.brand,version:item.version}));
+      }
+      result.mobile = !!fingerprint.mobile;
+      if (requested.has('model')) result.model = fingerprint.model || '';
+      result.platform = fingerprint.uaPlatform || '';
+      if (requested.has('platformVersion')) result.platformVersion = fingerprint.uaPlatformVersion || '';
+      if (requested.has('uaFullVersion')) result.uaFullVersion = fingerprint.browserVersion || '';
+      if (requested.has('wow64')) result.wow64 = !!fingerprint.wow64;
+      return Promise.resolve(result);
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
@@ -7229,17 +7192,13 @@ globalThis.navigator = {
 
   defGetter('webdriver', function() { return false; });
   defGetter('userAgent', function() {
-    return globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    return _fingerprint().userAgent || '';
   });
   defGetter('appVersion', function() {
-    return (globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
+    return (_fingerprint().userAgent || '').replace('Mozilla/', '');
   });
   defGetter('platform', function() {
-    return globalThis.__obscura_platform || "Win32";
+    return _fingerprint().navigatorPlatform || '';
   });
   defGetter('language', function() { return "en-US"; });
   defGetter('languages', function() { return ["en-US", "en"]; });
@@ -7260,8 +7219,8 @@ globalThis.navigator = {
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
   // Values set per-page by __obscura_init (avoids own data props on navigator).
-  defGetter('hardwareConcurrency', function() { return globalThis.__obscura_hw || 8; });
-  defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
+  defGetter('hardwareConcurrency', function() { return _fingerprint().hardwareConcurrency || 1; });
+  defGetter('deviceMemory', function() { return _fingerprint().deviceMemory || 0.25; });
 
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
@@ -7327,14 +7286,16 @@ class Screen {
 });
 globalThis.Screen = Screen;
 globalThis.screen = new Screen(1920, 1080);
-function _applyScreenSize(w, h, emulated) {
+function _applyScreenSize(w, h, emulated, availW, availH) {
+  const resolvedAvailW = Number.isFinite(availW) ? availW : w;
+  const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
   if (globalThis.screen instanceof Screen) {
     globalThis.screen._w = w;
     globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+    globalThis.screen._availW = resolvedAvailW;
+    globalThis.screen._availH = resolvedAvailH;
   } else {
-    globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
+    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH);
   }
 }
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
@@ -7347,8 +7308,29 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   }
   delete globalThis.__obscura_screen_w;
   delete globalThis.__obscura_screen_h;
-  const fallback = _fp('screen');
-  _applyScreenSize(fallback[0], fallback[1], !!emulated);
+  const fallback = _fingerprint().screen || {};
+  _applyScreenSize(
+    Number(fallback.width) || 1920,
+    Number(fallback.height) || 1080,
+    !!emulated,
+    Number(fallback.availWidth),
+    Number(fallback.availHeight),
+  );
+};
+globalThis.__obscura_apply_fingerprint = function() {
+  const fingerprint = _fingerprint();
+  const fallback = fingerprint.screen || {};
+  if (!(Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0)) {
+    _applyScreenSize(
+      Number(fallback.width) || 1920,
+      Number(fallback.height) || 1080,
+      !!globalThis.__obscura_screen_emulated,
+      Number(fallback.availWidth),
+      Number(fallback.availHeight),
+    );
+  }
+  const scale = Number(fallback.deviceScaleFactor);
+  if (Number.isFinite(scale) && scale > 0) globalThis.devicePixelRatio = scale;
 };
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
@@ -13855,7 +13837,16 @@ globalThis.Worker = class Worker {
     // built inside a cross-origin frame must not be handed the top-level
     // page's origin -- frame realms each have their own `location`.
     const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
-    try { id = Deno.core.ops.op_worker_spawn(String(source), String(finalUrl), String(workerType), String(this._name || ''), creatorUrl); }
+    try {
+      id = Deno.core.ops.op_worker_spawn(
+        String(source),
+        String(finalUrl),
+        String(workerType),
+        String(this._name || ''),
+        creatorUrl,
+        JSON.stringify(_fingerprint()),
+      );
+    }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
     this._id = id;
     const queued = this._pending;
@@ -15548,11 +15539,11 @@ globalThis.__obscura_init = function() {
   _registerWindowNamedTree(globalThis.document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
 
-  const scr = _fp('screen');
+  const fingerprintScreen = _fingerprint().screen || {};
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
-    ? globalThis.__obscura_screen_w : scr[0];
+    ? globalThis.__obscura_screen_w : (Number(fingerprintScreen.width) || 1920);
   const sh = Number.isFinite(globalThis.__obscura_screen_h) && globalThis.__obscura_screen_h > 0
-    ? globalThis.__obscura_screen_h : scr[1];
+    ? globalThis.__obscura_screen_h : (Number(fingerprintScreen.height) || 1080);
   // The OS screen and the page viewport are different browser concepts.
   // Keep the fingerprinted screen, but let the embedding browser provide the
   // actual CSS viewport so responsive JavaScript, layout, and screenshots all
@@ -15561,12 +15552,22 @@ globalThis.__obscura_init = function() {
     ? globalThis.__obscura_viewport_w : sw;
   const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
     ? globalThis.__obscura_viewport_h : sh - 80;
-  _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
+  const hasScreenOverride = Number.isFinite(globalThis.__obscura_screen_w)
+    && globalThis.__obscura_screen_w > 0;
+  _applyScreenSize(
+    sw,
+    sh,
+    !!globalThis.__obscura_screen_emulated,
+    hasScreenOverride ? undefined : Number(fingerprintScreen.availWidth),
+    hasScreenOverride ? undefined : Number(fingerprintScreen.availHeight),
+  );
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
-  globalThis.devicePixelRatio = 1;
+  const fingerprintScale = Number(fingerprintScreen.deviceScaleFactor);
+  globalThis.devicePixelRatio = Number.isFinite(fingerprintScale) && fingerprintScale > 0
+    ? fingerprintScale : 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
   // A frame realm's viewport is its iframe content box, not the OS screen the
   // above fallback derives. `__obscura_viewport_w/h` are only ever set for the
@@ -15652,11 +15653,6 @@ globalThis.__obscura_init = function() {
   }
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
-
   // The time origin is when navigation started, so it is always in the past.
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,
   // which no browser does and which makes every elapsed-time computation on
@@ -15675,9 +15671,8 @@ globalThis.__obscura_init = function() {
   };
   globalThis.Notification.permission = "default";
 
-  // userAgentData brands and getHighEntropyValues now derive the Chrome
-  // version from navigator.userAgent and read the platform from the page
-  // globals, so every stealth surface agrees without a per-mode override.
+  // Navigator, UA-CH, screen and request headers share the Rust-derived
+  // fingerprint contract installed before page initialization.
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

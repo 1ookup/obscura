@@ -257,6 +257,9 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// Page-local browser identity. Network and JavaScript consume this same
+    /// value, while CDP overrides remain isolated from sibling targets.
+    pub fingerprint: obscura_net::BrowserFingerprint,
     /// sessionStorage namespace for this top-level browsing context. It
     /// survives document navigations but is not shared with another Page.
     session_storage: SharedStorageAreas,
@@ -910,7 +913,11 @@ fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImp
 
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
-        let http_client = context.http_client.clone();
+        let fingerprint = context.fingerprint.clone();
+        let http_client = Arc::new(
+            context.http_client.fork_with_fingerprint(fingerprint.clone())
+        );
+        let device_scale_factor = fingerprint.screen.device_scale_factor as f32;
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
         // (via target._targetInfo.targetId), so any divergence here makes
@@ -925,9 +932,10 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            Some(Arc::new(StealthHttpClient::with_proxy_and_fingerprint(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                fingerprint.clone(),
             )))
         } else {
             None
@@ -945,6 +953,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            fingerprint,
             session_storage: new_storage_areas(),
             title: String::new(),
             referrer: String::new(),
@@ -952,7 +961,7 @@ impl Page {
             screen_size_override: None,
             screen_metrics_emulated: false,
             device_metrics_baseline: None,
-            device_scale_factor: 1.0,
+            device_scale_factor,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
@@ -1097,12 +1106,53 @@ impl Page {
         } else {
             device_scale_factor
         };
+        self.fingerprint.screen.device_scale_factor = self.device_scale_factor as f64;
         if let Some(js) = &mut self.js {
+            js.set_fingerprint(&self.fingerprint);
             let _ = js.execute_script(
                 "<device-metrics>",
                 &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
             );
         }
+    }
+
+    /// Install a complete value-level identity for this page. Navigator,
+    /// UA-CH, low-entropy request headers, and subsequently-created workers
+    /// all observe this same contract.
+    pub async fn set_browser_fingerprint(
+        &mut self,
+        fingerprint: obscura_net::BrowserFingerprint,
+    ) {
+        if self.device_metrics_baseline.is_none() {
+            self.device_scale_factor = fingerprint.screen.device_scale_factor as f32;
+        }
+        self.fingerprint = fingerprint;
+        self.http_client.set_fingerprint(self.fingerprint.clone()).await;
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            client.set_fingerprint(self.fingerprint.clone()).await;
+        }
+        if let Some(js) = &mut self.js {
+            js.set_fingerprint(&self.fingerprint);
+            js.set_screen_size_override(
+                self.screen_size_override
+                    .map(|(width, height)| (width as f64, height as f64)),
+                self.screen_metrics_emulated,
+            );
+            let _ = js.execute_script(
+                "<device-metrics>",
+                &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
+            );
+        }
+        tracing::debug!(
+            target: "obscura::fingerprint",
+            user_agent = %self.fingerprint.user_agent,
+            navigator_platform = %self.fingerprint.navigator_platform,
+            ua_platform = %self.fingerprint.ua_platform,
+            browser_version = %self.fingerprint.browser_version,
+            mobile = self.fingerprint.mobile,
+            "page fingerprint updated"
+        );
     }
 
     pub fn set_default_background_color_override(&mut self, color: Option<[u8; 4]>) {
@@ -1159,35 +1209,8 @@ impl Page {
         rt.set_performance_time_origin(self.performance_time_origin_ms);
 
         #[cfg(feature = "stealth")]
-        if self.stealth_client.is_some() {
-            rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-            rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
-            );
-        } else {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
-        }
-        #[cfg(not(feature = "stealth"))]
-        {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
-        }
+        rt.set_stealth(self.stealth_client.is_some());
+        rt.set_fingerprint(&self.fingerprint);
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
@@ -3254,7 +3277,7 @@ impl Page {
                                 self.context.robots_cache.parse_and_store(
                                     domain,
                                     &body,
-                                    &self.context.user_agent,
+                                    &self.fingerprint.user_agent,
                                 );
                             }
                         }

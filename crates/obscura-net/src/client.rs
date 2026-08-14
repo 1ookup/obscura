@@ -870,16 +870,18 @@ async fn read_reqwest_body_limited(
 }
 
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: Arc<tokio::sync::OnceCell<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
-    pub user_agent: RwLock<String>,
+    /// One identity shared by the User-Agent header and every UA client hint.
+    /// Callers replace it atomically so requests cannot observe a mixed pair.
+    pub fingerprint: RwLock<crate::fingerprint::BrowserFingerprint>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -1022,46 +1024,6 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
-/// User-Agent string, using Chromium's per-major-version GREASE algorithm so
-/// the non-stealth HTTP path agrees with navigator.userAgentData instead of
-/// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
-    let major: usize = ua
-        .split("Chrome/")
-        .nth(1)
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(145);
-    const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
-    const GREASE_VER: [&str; 3] = ["8", "99", "24"];
-    const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-    let grease_brand = format!(
-        "Not{}A{}Brand",
-        GREASE_CHARS[major % 11],
-        GREASE_CHARS[(major + 1) % 11]
-    );
-    let brands = [
-        (grease_brand, GREASE_VER[major % 3].to_string()),
-        ("Chromium".to_string(), major.to_string()),
-        ("Google Chrome".to_string(), major.to_string()),
-    ];
-    let p = PERMS[major % 6];
-    let sec_ch_ua = p
-        .iter()
-        .map(|&i| format!("\"{}\";v=\"{}\"", brands[i].0, brands[i].1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let platform = if ua.contains("Windows NT") {
-        "\"Windows\""
-    } else if ua.contains("Macintosh") {
-        "\"macOS\""
-    } else {
-        "\"Linux\""
-    };
-    (sec_ch_ua, platform.to_string())
-}
-
 impl ObscuraHttpClient {
     pub fn new() -> Self {
         Self::with_cookie_jar(Arc::new(CookieJar::new()))
@@ -1080,20 +1042,60 @@ impl ObscuraHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
+        Self::with_full_options_and_fingerprint(
+            cookie_jar,
+            proxy_url,
+            allow_private_network,
+            crate::fingerprint::BrowserFingerprint::default(),
+        )
+    }
+
+    pub fn with_full_options_and_fingerprint(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: Arc::new(tokio::sync::OnceCell::new()),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
+            fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
+        }
+    }
+
+    /// Create page-local mutable request policy while retaining the context's
+    /// transport pool and resource cache. UA/CDP overrides then cannot leak to
+    /// sibling pages, and opening a page does not forfeit connection reuse.
+    pub fn fork_with_fingerprint(
+        &self,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
+        let extra_headers = self.extra_headers.try_read()
+            .map(|headers| headers.clone())
+            .unwrap_or_default();
+        ObscuraHttpClient {
+            client: self.client.clone(),
+            proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            fingerprint: RwLock::new(fingerprint),
+            extra_headers: RwLock::new(extra_headers),
+            // The browser Page interception channel is page-owned separately;
+            // a boxed custom interceptor cannot be shared without changing its
+            // ownership contract.
+            interceptor: RwLock::new(None),
+            timeout: self.timeout,
+            in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(),
+            allow_private_network: self.allow_private_network,
         }
     }
 
@@ -1245,7 +1247,7 @@ impl ObscuraHttpClient {
             credentials: request.credentials,
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
-            user_agent: self.user_agent.read().await.clone(),
+            user_agent: self.fingerprint.read().await.user_agent.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
         })
@@ -1468,28 +1470,29 @@ impl ObscuraHttpClient {
                 request_callback_fired = true;
             }
 
-            let ua = self.user_agent.read().await.clone();
-            let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
+            let fingerprint = self.fingerprint.read().await.clone();
+            let ua = &fingerprint.user_agent;
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
             // accept-encoding/host after these, so accept-encoding lands after
             // accept-language rather than before it; the rest matches Chrome.)
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_str(&sec_ch_ua)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
-            );
-            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
-            headers.insert(
-                HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_str(&sec_ch_ua_platform)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
-            );
+            if !fingerprint.brands.is_empty() {
+                if let Ok(value) = HeaderValue::from_str(&fingerprint.sec_ch_ua()) {
+                    headers.insert(HeaderName::from_static("sec-ch-ua"), value);
+                }
+                headers.insert(
+                    HeaderName::from_static("sec-ch-ua-mobile"),
+                    HeaderValue::from_static(fingerprint.sec_ch_ua_mobile()),
+                );
+                if let Ok(value) = HeaderValue::from_str(&fingerprint.sec_ch_ua_platform()) {
+                    headers.insert(HeaderName::from_static("sec-ch-ua-platform"), value);
+                }
+            }
             if request.mode == RequestMode::Navigate {
                 headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
             }
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
+                HeaderValue::from_static(crate::fingerprint::DEFAULT_USER_AGENT)
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
@@ -1675,7 +1678,15 @@ impl ObscuraHttpClient {
     }
 
     pub async fn set_user_agent(&self, ua: &str) {
-        *self.user_agent.write().await = ua.to_string();
+        self.set_fingerprint(crate::fingerprint::BrowserFingerprint::from_user_agent(ua)).await;
+    }
+
+    pub async fn set_fingerprint(&self, fingerprint: crate::fingerprint::BrowserFingerprint) {
+        *self.fingerprint.write().await = fingerprint;
+    }
+
+    pub async fn browser_fingerprint(&self) -> crate::fingerprint::BrowserFingerprint {
+        self.fingerprint.read().await.clone()
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -1896,6 +1907,55 @@ mod ssrf_tests {
             "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn derived_fingerprint_drives_user_agent_and_low_entropy_hints() {
+        let (url, mut requests) = http_fixture(vec![ok_response("", "ok")]).await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.80 Safari/537.36",
+        );
+        let client = ObscuraHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint.clone(),
+        );
+
+        let response = client.fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+        let request = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains(&format!(
+            "\r\nuser-agent: {}\r\n",
+            fingerprint.user_agent.to_ascii_lowercase()
+        )), "{request}");
+        assert!(request.contains(
+            "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
+        ), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-platform: \"macos\"\r\n"), "{request}");
+        assert_eq!(client.browser_fingerprint().await, fingerprint);
+    }
+
+    #[tokio::test]
+    async fn page_fork_isolates_identity_but_reuses_transport_and_cache() {
+        let context_client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let mac = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        let page_client = context_client.fork_with_fingerprint(mac.clone());
+
+        assert!(Arc::ptr_eq(&context_client.client, &page_client.client));
+        assert!(Arc::ptr_eq(&context_client.resource_loader, &page_client.resource_loader));
+        assert_eq!(page_client.browser_fingerprint().await, mac);
+        assert_eq!(
+            context_client.browser_fingerprint().await,
+            crate::fingerprint::BrowserFingerprint::default(),
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use obscura_js::ops::{new_storage_areas, SharedStorageAreas};
 use obscura_js::{PrivateTokenQueryState, PrivacyPolicy};
-use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_net::{BrowserFingerprint, CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
@@ -16,10 +16,9 @@ pub struct BrowserContext {
     pub privacy_policy: PrivacyPolicy,
     pub(crate) private_token_query_state: PrivateTokenQueryState,
     pub http_client: Arc<ObscuraHttpClient>,
-    pub user_agent: String,
-    pub platform: String,
-    pub ua_platform: String,
-    pub ua_platform_version: String,
+    /// Value-level browser identity copied into each Page. All network and JS
+    /// surfaces consume this one contract rather than choosing profile rows.
+    pub fingerprint: BrowserFingerprint,
     pub proxy_url: Option<String>,
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
@@ -107,15 +106,7 @@ impl BrowserContext {
             }
         }
 
-        let mut client = ObscuraHttpClient::with_full_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-            allow_private_network,
-        );
-        if stealth {
-            client.block_trackers = true;
-        }
-        let profile = crate::profiles::select_profile();
+        let default_ua = obscura_net::DEFAULT_USER_AGENT;
         // In stealth mode the wire is emulated as Chrome145/Windows, and the JS
         // side reports STEALTH_USER_AGENT to match. The HTTP client has to
         // report the same thing: picking a rotating profile UA here left
@@ -136,15 +127,16 @@ impl BrowserContext {
         };
         let resolved_ua = user_agent
             .or(stealth_ua)
-            .unwrap_or_else(|| profile.user_agent.to_string());
-        let platform = profile.platform.to_string();
-        let ua_platform = profile.ua_platform.to_string();
-        let ua_platform_version = profile.ua_platform_version.to_string();
-        // Sync the http client's UA at construction so navigation requests pick it
-        // up before any async setup runs. The lock has no other holders here, so
-        // try_write always succeeds; we fall back silently if it ever fails.
-        if let Ok(mut guard) = client.user_agent.try_write() {
-            *guard = resolved_ua.clone();
+            .unwrap_or_else(|| default_ua.to_string());
+        let fingerprint = BrowserFingerprint::from_user_agent(resolved_ua);
+        let mut client = ObscuraHttpClient::with_full_options_and_fingerprint(
+            cookie_jar.clone(),
+            proxy_url.as_deref(),
+            allow_private_network,
+            fingerprint.clone(),
+        );
+        if stealth {
+            client.block_trackers = true;
         }
         let http_client = Arc::new(client);
         BrowserContext {
@@ -154,10 +146,7 @@ impl BrowserContext {
             privacy_policy: PrivacyPolicy::new(),
             private_token_query_state: PrivateTokenQueryState::new(),
             http_client,
-            user_agent: resolved_ua,
-            platform,
-            ua_platform,
-            ua_platform_version,
+            fingerprint,
             proxy_url,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -195,18 +184,15 @@ impl BrowserContext {
             cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
         }
 
-        let mut client = ObscuraHttpClient::with_full_options(
+        let mut client = ObscuraHttpClient::with_full_options_and_fingerprint(
             cookie_jar.clone(),
             self.proxy_url.as_deref(),
             self.allow_private_network,
+            self.fingerprint.clone(),
         );
         if self.stealth {
             client.block_trackers = true;
         }
-        if let Ok(mut guard) = client.user_agent.try_write() {
-            *guard = self.user_agent.clone();
-        }
-
         BrowserContext {
             id,
             cookie_jar,
@@ -214,10 +200,7 @@ impl BrowserContext {
             privacy_policy: self.privacy_policy.snapshot(),
             private_token_query_state: PrivateTokenQueryState::new(),
             http_client: Arc::new(client),
-            user_agent: self.user_agent.clone(),
-            platform: self.platform.clone(),
-            ua_platform: self.ua_platform.clone(),
-            ua_platform_version: self.ua_platform_version.clone(),
+            fingerprint: self.fingerprint.clone(),
             proxy_url: self.proxy_url.clone(),
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,
@@ -255,9 +238,10 @@ mod tests {
             false,
             Some("Custom-UA/1.0".to_string()),
         );
-        assert_eq!(ctx.user_agent, "Custom-UA/1.0");
-        let client_ua = ctx.http_client.user_agent.read().await.clone();
-        assert_eq!(client_ua, "Custom-UA/1.0");
+        assert_eq!(ctx.fingerprint.user_agent, "Custom-UA/1.0");
+        let client = ctx.http_client.browser_fingerprint().await;
+        assert_eq!(client.user_agent, "Custom-UA/1.0");
+        assert!(client.brands.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -268,16 +252,15 @@ mod tests {
             false,
             None,
         );
-        assert!(ctx.user_agent.contains("Chrome"));
-        let client_ua = ctx.http_client.user_agent.read().await.clone();
-        assert!(client_ua.contains("Chrome"));
-        assert_eq!(ctx.user_agent, client_ua);
+        assert!(ctx.fingerprint.user_agent.contains("Chrome"));
+        let client = ctx.http_client.browser_fingerprint().await;
+        assert_eq!(ctx.fingerprint, client);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_options_keeps_default_user_agent() {
         let ctx = BrowserContext::with_options("test".to_string(), None, false);
-        assert!(ctx.user_agent.contains("Chrome"));
+        assert!(ctx.fingerprint.user_agent.contains("Chrome"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -299,6 +282,6 @@ mod tests {
         persistent.http_client.set_user_agent("Changed-UA/2.0").await;
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
-        assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
+        assert_eq!(source.http_client.browser_fingerprint().await.user_agent, "Template-UA/1.0");
     }
 }

@@ -737,7 +737,7 @@ async fn run_fetch(
     }
 
     if let Some(ref ua) = user_agent {
-        page.http_client.set_user_agent(ua).await;
+        page.set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(ua)).await;
     }
 
     let wait_condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);

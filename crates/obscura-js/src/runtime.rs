@@ -311,6 +311,11 @@ pub struct RemoteObjectInfo {
 pub struct ObscuraJsRuntime {
     runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
+    /// The value-level browser identity installed in every Window/Worker
+    /// realm. Keeping it on the runtime lets lazily-created iframe realms
+    /// inherit the same contract as the main realm and live overrides update
+    /// already-existing realms.
+    pub(crate) fingerprint: obscura_net::BrowserFingerprint,
     object_store: HashMap<String, String>,
     /// Routing for RemoteObject handles that live in a frame world realm
     /// rather than the main context (Phase 6.2): objectId ->
@@ -530,9 +535,10 @@ impl ObscuraJsRuntime {
             (runtime, isolate_handle)
         };
 
-        ObscuraJsRuntime {
+        let mut runtime = ObscuraJsRuntime {
             runtime,
             state,
+            fingerprint: obscura_net::BrowserFingerprint::default(),
             object_store: HashMap::new(),
             object_realm: HashMap::new(),
             object_counter: 0,
@@ -542,7 +548,9 @@ impl ObscuraJsRuntime {
             frame_realms: crate::realm::FrameRealmHost::default(),
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
-        }
+        };
+        runtime.set_fingerprint(&obscura_net::BrowserFingerprint::default());
+        runtime
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -730,25 +738,42 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = enabled;
     }
 
-    pub fn set_user_agent(&mut self, ua: &str) {
-        let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
+    pub fn set_fingerprint(&mut self, fingerprint: &obscura_net::BrowserFingerprint) {
+        self.fingerprint = fingerprint.clone();
+        let Ok(json) = serde_json::to_string(fingerprint) else {
+            return;
+        };
         let _ = self.runtime.execute_script(
-            "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            "<set-fingerprint>",
+            format!("globalThis.__obscura_set_fingerprint({json});"),
         );
+        let frame_contexts: Vec<_> = self
+            .frame_realms
+            .realms
+            .values()
+            .map(|realm| realm.context.clone())
+            .collect();
+        for context in frame_contexts {
+            let _ = self.execute_in_context(
+                &context,
+                "<set-fingerprint>",
+                &format!("globalThis.__obscura_set_fingerprint({json});"),
+            );
+        }
+    }
+
+    /// Compatibility adapter for embedders which previously set only the UA.
+    /// New code should install a complete `BrowserFingerprint` contract.
+    pub fn set_user_agent(&mut self, ua: &str) {
+        self.set_fingerprint(&obscura_net::BrowserFingerprint::from_user_agent(ua));
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let p = platform.replace('\'', "\\'");
-        let uap = ua_platform.replace('\'', "\\'");
-        let uapv = ua_platform_version.replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
-            "<set-platform>",
-            format!(
-                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
-                p, uap, uapv
-            ),
-        );
+        let mut fingerprint = self.fingerprint.clone();
+        fingerprint.navigator_platform = platform.to_string();
+        fingerprint.ua_platform = ua_platform.to_string();
+        fingerprint.ua_platform_version = ua_platform_version.to_string();
+        self.set_fingerprint(&fingerprint);
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
@@ -6388,6 +6413,70 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_contract_drives_navigator_ua_ch_and_screen() {
+        let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.80 Safari/537.36",
+        ).with_overrides(&obscura_net::FingerprintOverrides {
+            architecture: Some("arm".to_string()),
+            hardware_concurrency: Some(12),
+            screen: Some(obscura_net::ScreenFingerprint {
+                width: 1512,
+                height: 982,
+                avail_width: 1512,
+                avail_height: 944,
+                device_scale_factor: 2.0,
+            }),
+            ..obscura_net::FingerprintOverrides::default()
+        });
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+              const high = await navigator.userAgentData.getHighEntropyValues([
+                'architecture','bitness','fullVersionList','model',
+                'platformVersion','uaFullVersion','wow64'
+              ]);
+              return {
+                ua:navigator.userAgent, appVersion:navigator.appVersion,
+                platform:navigator.platform, hardwareConcurrency:navigator.hardwareConcurrency,
+                deviceMemory:navigator.deviceMemory, low:navigator.userAgentData.toJSON(), high,
+                screen:[screen.width,screen.height,screen.availWidth,screen.availHeight,devicePixelRatio]
+              };
+            })()"#,
+            true,
+            true,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!({
+            "ua": fingerprint.user_agent,
+            "appVersion": fingerprint.user_agent.trim_start_matches("Mozilla/"),
+            "platform": "MacIntel",
+            "hardwareConcurrency": 12,
+            "deviceMemory": 8,
+            "low": {
+                "brands": fingerprint.brands,
+                "mobile": false,
+                "platform": "macOS"
+            },
+            "high": {
+                "architecture": "arm",
+                "bitness": "64",
+                "brands": fingerprint.brands,
+                "fullVersionList": fingerprint.full_version_list,
+                "mobile": false,
+                "model": "",
+                "platform": "macOS",
+                "platformVersion": "14.6.0",
+                "uaFullVersion": "146.0.7680.80",
+                "wow64": false
+            },
+            "screen": [1512,982,1512,944,2]
+        }));
+    }
+
     #[test]
     fn screen_override_is_independent_live_and_preserves_screen_identity() {
         let dom = parse_html("<html><body></body></html>");
@@ -6417,7 +6506,7 @@ mod tests {
             rt.evaluate(
                 "[innerWidth, innerHeight, screen.width === __screenSizeBefore[0],\
                   screen.height === __screenSizeBefore[1],\
-                  screen.availHeight === screen.height - 40,\
+                  screen.availHeight === screen.height,\
                   screen === __screenBefore]"
             )
             .unwrap(),
@@ -11090,16 +11179,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fingerprinted_screen_does_not_invent_a_device_scale_factor() {
         let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 2560,
+                    height: 1440,
+                    avail_width: 2560,
+                    avail_height: 1400,
+                    device_scale_factor: 1.0,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        rt.set_fingerprint(&fingerprint);
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_viewport(300.0, 200.0);
-        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
-        // That physical screen must not silently turn a 1x render surface into
-        // a 2x devicePixelContentBoxSize surface.
-        rt.execute_script(
-            "deterministic-high-resolution-screen",
-            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
-        )
-        .unwrap();
         rt.run_page_init();
 
         assert_eq!(

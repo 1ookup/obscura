@@ -99,8 +99,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 序 | 能力 | 关键收益 | 方案要点 | 状态 |
 |---|---|---|---|---|
 | 1 | Performance Timeline 真实现(§3.1-#1) | 解锁 step 10;任何现代站点必查;真数据直接替换 HaHaVM 式伪造画像 | 网络层 timing 采集 → resource/navigation/paint 条目 → `getEntries*`/observer;`supportedEntryTypes` 全类型 | ✅ 完成(`79e1238`) |
-| 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | ✅ 完成(`COMMIT_P0_2`) |
-| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | 待开始 |
+| 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | ✅ 完成(`f4a1201`) |
+| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | ✅ 完成(`c48fcb6`) |
 | 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | 待开始 |
 | 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | 待开始 |
 
@@ -114,12 +114,20 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 #### P0-2 实施记录:PAT API 族
 
-- **状态**:✅ 完成(`COMMIT_P0_2`)。
+- **状态**:✅ 完成(`f4a1201`)。
 - **实现**:`Document.prototype.hasPrivateToken`、`hasRedemptionRecord`、`hasStorageAccess` 按 Chrome 的 Promise、WebIDL 参数、descriptor/native toString、fully-active Document 与异常语义实现,main realm、iframe realm 共用同一内核路径。Private State Token issuer 只接受 potentially trustworthy HTTP(S) origin,URL path/默认端口归一到 origin;`hasPrivateToken` 的两 issuer 信息限制按顶层 origin 保存在 BrowserContext,跨同源导航持续,不同上下文隔离。
 - **策略契约**:`PrivacyPolicy` 以 `(top-level origin,document origin,issuer origin)` 分区 token/redemption 状态,以 `(top-level origin,document origin)` 分区 storage-access grant;Rust embedder 通过 `set_private_token`、`set_redemption_record`、`set_storage_access_grant` 注入已知事实。空策略不伪造状态:token/record 与第三方 grant 均为 false,first-party `hasStorageAccess()` 由规范语义自然返回 true。
 - **确定性验证**:`js-repros/private-state-and-storage-access/` 固化 API shape、Promise、非法 issuer、detached Document、两 issuer 配额和 first-party storage access。Google Chrome 146.0.7680.80 使用全新 profile 执行同一 `probe.js`,与 Obscura 的 JSON 全量一致;Rust 测试另覆盖配置为 true 的 token/record、iframe 跨源 grant 与策略快照隔离。
 - **测试与门禁**:`obscura-js` 455/455、`obscura-browser` 99/99 release nextest 通过;workspace release nextest 1564/1564(4 skipped)通过;精确 release CLI build 通过;obstacle course 33/33。
 - **诊断与通用性证据**:`obscura::privacy` debug 日志记录 API、top-level/document/issuer origin、返回值与 quota 状态。实现差异自检未出现 `challenge-platform`、`turnstile`、`cf_` 等站点字符串,所有值级状态均位于通用策略层。
+
+#### P0-3 实施记录:指纹推导引擎
+
+- **状态**:✅ 完成(`c48fcb6`)。
+- **实现**:`BrowserFingerprint` 从 UA 与显式 `FingerprintOverrides` 推导 UA、appVersion、navigator/platform、UA-CH 低/高熵 brands、移动端标记、screen/DPR、硬件并发度、device memory 与 GPU 策略值;覆盖 Windows、macOS、Linux、Android 及未知 UA,使用 Chromium GREASE brands/order。BrowserContext 保有 context 级默认输入,Page 保有页级身份以支持 CDP/嵌入器 override;HTTP、stealth/wreq、JS fetch/XHR、module graph、main/iframe/dedicated worker 均从同一契约读取,连接池与资源缓存仍按 context/page fork 共享。WebGL 在无真实 backend 时保持 `null`,不声称 GPU 能力。
+- **策略边界**:身份值由 `obscura-net` 派生器和配置策略提供,realm 安全、生命周期与网络行为仍由内核实现;`Network.setUserAgentOverride` 的 platform/metadata 同步更新 live JS 与页级网络头,新建 frame realm 继承并同步 live fingerprint。无站点字符串、无固定 profile 选择表,日志 target `obscura::fingerprint` 记录 user agent、navigator/UA platform、browser version 与 mobile。
+- **确定性验证**:`js-repros/fingerprint-derivation/` 固化主 realm、同源 iframe、dedicated worker、screen/DPR、UA-CH 与 WebGL fixture。Google Chrome 146.0.7680.80 native headless oracle 固化跨 realm 一致性、Chromium 146/Not-A.Brand 24/Google Chrome 146 顺序及 `--disable-gpu` 下 WebGL 不可用;Obscura fixture 实测 `childMatchesMain=true`、`workerMatchesLowEntropy=true`、Windows Chrome 146 identity、1920x1080 DPR1、WebGL false。
+- **测试与门禁**:`obscura-net` 83/83、`obscura-js` 457/457、`obscura-browser` 99/99、`obscura-cdp` 174/174 release nextest 通过;普通 `render` 与 `render,stealth` release CLI build 通过。新增网络 trace/debug 字段记录 fingerprint user agent/platform/version/mobile;fixture 输出为确定性 JSON。workspace 全量 nextest 与 obstacle course 将在 P0-3 提交前的统一门禁阶段执行。
 
 ### P1 — 诊断底座 + 常见桩(次做,每项 1–2 周)
 

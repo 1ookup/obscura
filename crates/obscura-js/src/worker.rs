@@ -43,6 +43,9 @@ pub(crate) struct WorkerEnvironment {
     /// opaque origin serializes to "null" and cannot be re-inspected for its
     /// scheme.
     pub secure_context: bool,
+    /// Immutable identity copied from the creator realm. The worker installs
+    /// it before any author source runs and uses it for its own fetch client.
+    pub fingerprint: obscura_net::BrowserFingerprint,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
@@ -261,19 +264,21 @@ fn worker_thread_main(
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
+            rt.set_fingerprint(&environment.fingerprint);
             // reqwest's pooled client is created inside the creator's Tokio
             // runtime. Build the worker's pool on this thread while retaining
             // the browser-context cookie jar, proxy and private-network
             // policy; moving the initialized pool across runtimes produces a
             // reqwest builder error on the first worker fetch.
             let worker_http_client = environment.http_client.as_ref().map(|creator| {
-                Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+                Arc::new(obscura_net::ObscuraHttpClient::with_full_options_and_fingerprint(
                     environment
                         .cookie_jar
                         .clone()
                         .unwrap_or_else(|| Arc::new(obscura_net::CookieJar::new())),
                     creator.proxy_url(),
                     creator.allow_private_network,
+                    environment.fingerprint.clone(),
                 ))
             });
             {
@@ -891,6 +896,41 @@ mod tests {
             ),
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_inherits_the_creator_fingerprint_contract() {
+        let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        ).with_overrides(&obscura_net::FingerprintOverrides {
+            hardware_concurrency: Some(12),
+            device_memory: Some(4.0),
+            ..obscura_net::FingerprintOverrides::default()
+        });
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/app/");
+        rt.run_page_init();
+        rt.execute_script(
+            "<fingerprint-worker>",
+            r#"
+            const source = `postMessage({
+              userAgent:navigator.userAgent,
+              platform:navigator.platform,
+              hardwareConcurrency:navigator.hardwareConcurrency,
+              deviceMemory:navigator.deviceMemory,
+              userAgentData:navigator.userAgentData.toJSON()
+            })`;
+            globalThis.__got = [];
+            new Worker(URL.createObjectURL(new Blob([source], {type:'text/javascript'})))
+              .onmessage = event => globalThis.__got.push(event.data);
+            "#,
+        ).unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(rt.evaluate("JSON.stringify(globalThis.__got[0])").unwrap(), serde_json::json!(
+            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"deviceMemory":4,"userAgentData":{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"Linux"}}"#
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

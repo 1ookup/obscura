@@ -123,6 +123,7 @@ async fn read_wreq_body_limited(
 pub struct StealthHttpClient {
     client: wreq::Client,
     pub cookie_jar: Arc<CookieJar>,
+    pub fingerprint: RwLock<crate::fingerprint::BrowserFingerprint>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -134,6 +135,18 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_proxy_and_fingerprint(
+            cookie_jar,
+            proxy_url,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT),
+        )
+    }
+
+    pub fn with_proxy_and_fingerprint(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -189,6 +202,7 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             cookie_jar,
+            fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
@@ -253,12 +267,20 @@ impl StealthHttpClient {
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
+            let fingerprint = self.fingerprint.read().await.clone();
 
             req = req
+                .header("user-agent", &fingerprint.user_agent)
                 .header("accept", request.accept())
                 .header("sec-fetch-site", request_fetch_site(&request, &current_url))
                 .header("sec-fetch-mode", request.mode.header_value())
                 .header("sec-fetch-dest", request.destination());
+            if !fingerprint.brands.is_empty() {
+                req = req
+                    .header("sec-ch-ua", fingerprint.sec_ch_ua())
+                    .header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile())
+                    .header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
+            }
             if request.mode == RequestMode::Navigate {
                 req = req
                     .header("upgrade-insecure-requests", "1")
@@ -406,6 +428,14 @@ impl StealthHttpClient {
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
+        let fingerprint = self.fingerprint.read().await.clone();
+        req = req.header("user-agent", &fingerprint.user_agent);
+        if !fingerprint.brands.is_empty() {
+            req = req
+                .header("sec-ch-ua", fingerprint.sec_ch_ua())
+                .header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile())
+                .header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
+        }
 
         if send_cookies {
             let cookie_header = self.cookie_jar.get_cookie_header(url);
@@ -465,6 +495,10 @@ impl StealthHttpClient {
         *self.extra_headers.write().await = headers;
     }
 
+    pub async fn set_fingerprint(&self, fingerprint: crate::fingerprint::BrowserFingerprint) {
+        *self.fingerprint.write().await = fingerprint;
+    }
+
     pub fn active_requests(&self) -> u32 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -522,6 +556,29 @@ mod tests {
         port
     }
 
+    async fn header_fixture() -> (Url, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 { break; }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+            ).await;
+            let _ = stream.shutdown().await;
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), rx)
+    }
+
     // The emulation profile advertises gzip, so origins compress. Without the
     // decoder the raw gzip bytes reach the HTML parser as document text.
     #[tokio::test]
@@ -533,5 +590,30 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    #[tokio::test]
+    async fn stealth_request_uses_the_same_derived_low_entropy_identity() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_proxy_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            fingerprint.clone(),
+        );
+        client.fetch(&url).await.expect("fixture must be reachable");
+
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains(&format!(
+            "\r\nuser-agent: {}\r\n",
+            fingerprint.user_agent.to_ascii_lowercase()
+        )), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-platform: \"macos\"\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
+        assert!(request.contains(
+            "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
+        ), "{request}");
     }
 }

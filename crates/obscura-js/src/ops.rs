@@ -2882,14 +2882,22 @@ async fn op_fetch_url(
         // the profile's UA while every scripted request announced a different
         // OS and Chrome version -- comparing those two is a basic bot check.
         // Honor an explicit override.
-        if !custom_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            if let Some(client) = http_client.as_ref() {
-                let ua = client.user_agent.read().await.clone();
-                if !ua.is_empty() {
-                    req = req.header("User-Agent", &ua);
+        if let Some(client) = http_client.as_ref() {
+            let fingerprint = client.browser_fingerprint().await;
+            if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("user-agent"))
+                && !fingerprint.user_agent.is_empty()
+            {
+                req = req.header("User-Agent", &fingerprint.user_agent);
+            }
+            if !fingerprint.brands.is_empty() {
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua")) {
+                    req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
+                }
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua-mobile")) {
+                    req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
+                }
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua-platform")) {
+                    req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
                 }
             }
         }
@@ -5051,6 +5059,7 @@ fn op_worker_spawn(
     #[string] kind: String,
     #[string] name: String,
     #[string] creator_url: String,
+    #[string] fingerprint_json: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let environment = {
@@ -5107,6 +5116,7 @@ fn op_worker_spawn(
             name,
             origin,
             secure_context,
+            fingerprint: serde_json::from_str(&fingerprint_json).unwrap_or_default(),
             #[cfg(feature = "stealth")]
             stealth_client: gs.stealth_client.clone(),
         }

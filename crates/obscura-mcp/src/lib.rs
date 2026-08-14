@@ -855,7 +855,7 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
     let ua = state.user_agent.clone();
     let page = state.page_mut();
     if let Some(ref ua) = ua {
-        page.http_client.set_user_agent(ua).await;
+        page.set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(ua)).await;
     }
 
     page.navigate_with_wait(url, condition).await
@@ -1671,7 +1671,7 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
         let ua = state.user_agent.clone();
         let page = state.page_mut();
         if let Some(ref ua) = ua {
-            page.http_client.set_user_agent(ua).await;
+            page.set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(ua)).await;
         }
         page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
             .await.map_err(|e| e.to_string())?;

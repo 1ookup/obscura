@@ -1,14 +1,23 @@
 use serde_json::{json, Value};
+use crate::dispatch::CdpContext;
 
-pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
+pub async fn handle(method: &str, _params: &Value, ctx: &CdpContext) -> Result<Value, String> {
     match method {
-        "getVersion" => Ok(json!({
-            "protocolVersion": "1.3",
-            "product": "Chrome/145.0.0.0",
-            "revision": "@0000000000000000000000000000000000000000",
-            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            "jsVersion": "14.5.0.0",
-        })),
+        "getVersion" => {
+            let fingerprint = &ctx.default_context.fingerprint;
+            let version = if fingerprint.browser_version.is_empty() {
+                obscura_net::BrowserFingerprint::default().browser_version
+            } else {
+                fingerprint.browser_version.clone()
+            };
+            Ok(json!({
+                "protocolVersion": "1.3",
+                "product": format!("Chrome/{version}"),
+                "revision": "@0000000000000000000000000000000000000000",
+                "userAgent": fingerprint.user_agent,
+                "jsVersion": "14.6.0.0",
+            }))
+        }
         "close" => {
             Ok(json!({}))
         }

@@ -648,10 +648,10 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/145.0.0.0",
+            "Browser": "Chrome/146.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            "V8-Version": "14.5.0.0",
+            "User-Agent": obscura_net::DEFAULT_USER_AGENT,
+            "V8-Version": "14.6.0.0",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
         }))?,
@@ -1488,15 +1488,6 @@ fn fast_path_response(text: &str) -> Option<String> {
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
         "Target.setAutoAttach" => {
             Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
-                "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-                "jsVersion": "14.5.0.0",
-            }))
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))

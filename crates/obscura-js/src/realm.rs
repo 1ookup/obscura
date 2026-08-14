@@ -51,7 +51,7 @@ pub struct SecondaryRealm {
 /// A managed frame Window realm: the context handle plus the metadata that
 /// identifies which document and world it serves.
 pub struct FrameRealm {
-    context: v8::Global<v8::Context>,
+    pub(crate) context: v8::Global<v8::Context>,
     /// Which world this realm is: [`MAIN_WORLD`] for the frame's own Window,
     /// higher ids for CDP isolated worlds.
     pub world_id: u64,
@@ -80,7 +80,7 @@ impl FrameRealm {
 /// empty on pages without iframes, so the main path never pays for it.
 #[derive(Default)]
 pub struct FrameRealmHost {
-    realms: HashMap<(String, u64, u64), FrameRealm>,
+    pub(crate) realms: HashMap<(String, u64, u64), FrameRealm>,
 }
 
 /// One frame Document's V8 module registry. V8 modules are context-bound, so
@@ -797,6 +797,16 @@ impl ObscuraJsRuntime {
             "<obscura:frame-realm-page-init>",
             "globalThis.__obscura_init();",
         )?;
+        // Frame realms are created lazily, after the main realm's identity was
+        // installed. Apply the runtime-owned fingerprint before author code
+        // can observe navigator, UA-CH, screen, or worker surfaces.
+        let fingerprint_json = serde_json::to_string(&self.fingerprint)
+            .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
+        self.execute_in_context(
+            &context,
+            "<obscura:frame-fingerprint>",
+            &format!("globalThis.__obscura_set_fingerprint({fingerprint_json});"),
+        )?;
 
         // Snapshot the content root's scope for later diagnostics/routing;
         // the scope may legitimately not exist yet (about:blank pre-commit).
@@ -1471,7 +1481,7 @@ impl ObscuraJsRuntime {
         self.execute_in_context(&context, name, source)
     }
 
-    fn execute_in_context(
+    pub(crate) fn execute_in_context(
         &mut self,
         context: &v8::Global<v8::Context>,
         name: &str,
