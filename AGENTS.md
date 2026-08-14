@@ -12,22 +12,43 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Build
 
+**Every build and test must use the trace-patched V8.** Always add
+`--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` (with `V8_FROM_SOURCE=1`)
+to every `cargo build` and `cargo nextest` invocation. A build without it
+relinks against the prebuilt V8 and **silently drops the trace patch**: the
+binary still works, but `--trace-property-lookup-file` stops being recognized
+and every trace run produces an empty file that reads like "the page did
+nothing". Verify the binary with `vendor/v8-trace.sh check` before any trace
+run. First compile with the vendor V8 takes ~30 minutes; incremental builds
+are seconds.
+
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  --features render \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
 
 # Rendering and stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  --features render,stealth \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
 
 # No rendering, with rustls or stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  --no-default-features \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  --no-default-features --features stealth \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
 ```
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.
   Incremental builds are seconds.
-- **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
-  `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
-  avoid touching it when you don't need to.
+- **Iterating on one crate? Scope it:** `V8_FROM_SOURCE=1 cargo build -p obscura-cli
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'`. A bare `cargo build` can
+  re-link the whole workspace; the V8 compile is the cost, so avoid touching it
+  when you don't need to. Never run a plain `cargo build` or `cargo nextest`
+  without the `--config` override: it relinks the prebuilt V8 and drops the
+  trace patch from every later build.
 - **Stealth:** `--features render,stealth` retains the complete rendering
   surface and adds the wreq/BoringSSL transport, fingerprint protections, and
   tracker blocklist. BoringSSL builds through CMake, so `cmake` must be
@@ -37,11 +58,15 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 
 ## Test
 
-Run tests with **`cargo nextest`, not `cargo test`**:
+Run tests with **`cargo nextest`, not `cargo test`**, and always with the
+trace-patched V8 (`--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` with
+`V8_FROM_SOURCE=1`) so a test run never replaces the patched binary:
 
 ```bash
-cargo nextest run --release --features render -p <crate>
-cargo nextest run --release --features render --no-fail-fast
+V8_FROM_SOURCE=1 cargo nextest run --release --features render -p <crate> \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+V8_FROM_SOURCE=1 cargo nextest run --release --features render --no-fail-fast \
+  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
 ```
 
 `cargo test` runs the whole test binary in one process, but the engine holds a
@@ -64,7 +89,8 @@ pass %, not whole-file pass.
 For any code change:
 
 1. Run focused release-mode nextest coverage for the crates and repro involved.
-2. Run `cargo nextest run --release --features render --no-fail-fast`.
+2. Run `V8_FROM_SOURCE=1 cargo nextest run --release --features render
+   --no-fail-fast --config 'patch.crates-io.v8.path="vendor/rusty_v8"'`.
 3. Run the exact release build shown above.
 4. The obstacle course still reports **33/33**.
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
