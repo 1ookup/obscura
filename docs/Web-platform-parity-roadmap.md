@@ -174,7 +174,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 16 | ServiceWorker fail-closed(§3.2-#11) | ✅ 完成(`8734846`) |
 | 17 | SharedWorker 真实现(§3.2-#11) | ✅ 完成(`871682b`) |
 | 18 | Trusted Types API 面(§3.2-#12) | ✅ 完成(`1f963b7`);**CSP 强制未实现**,需 CSP 解析器 |
-| 19 | worklet | ⛔ 仅 interface object,无 `CSS.paintWorklet`/`audioWorklet` 入口 |
+| 19 | worklet 入口(§3.2-#11) | ✅ 完成(`552715e`) |
 | 20 | 系统字体 / video 解码 / PDF 结构(§3.5) | ⛔ 未开始 |
 
 #### P3-16 实施记录:ServiceWorker fail-closed
@@ -215,6 +215,20 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   `self.onmessage` 由 worker prep 脚本自己派发,不走页面 bootstrap 的 EventTarget 实现。
 - **"共享"的范围**:指一个页面内多次构造之间的共享。obscura 的页面是互不共享 worker host 的
   独立文档,跨页面共享本就不可观测。
+
+#### P3-19 实施记录:worklet 入口
+
+- **状态**:✅ 完成(`552715e`)。
+- **问题**:`Worklet` interface object 存在,但下面什么都没挂——没有 `CSS.paintWorklet`,
+  `AudioContext` 上也没有 `audioWorklet`。两者在 Chrome 都存在,且都是一行就能做的特征检测。
+- **实现**:`CSS.paintWorklet`(稳定单例)、`AudioWorklet` 接口、`AudioContext.prototype` 上的
+  `audioWorklet` 访问器(按 context 各自持有,`OfflineAudioContext` 继承同一访问器)。
+  `addModule.length` 为 1,无参 reject TypeError。
+- **fail-closed 的形态**:这里没有 worklet 运行时,所以 `addModule` 永远失败,用的是 Chrome 对
+  「取不到或无法求值的模块」给出的 `AbortError: Unable to load a worklet's module.`(oracle 确认
+  404 与跨源两种情况 Chrome 都是它)。让它 resolve 才是撒谎:调用方会就此注册一个永远不会运行的
+  paint class 或 audio processor。
+- **验证**:`js-repros/worklet-entrypoints/` 固化 Chrome 146 oracle,**39 个观测点全部一致**。
 
 #### P3-18 实施记录:Trusted Types API 面
 
