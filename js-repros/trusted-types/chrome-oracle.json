@@ -1,0 +1,153 @@
+{
+  "factoryType": "object",
+  "interfaceObjects": {
+    "TrustedTypePolicyFactory": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'TrustedTypePolicyFactory': Illegal constructor"
+    },
+    "TrustedTypePolicy": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'TrustedTypePolicy': Illegal constructor"
+    },
+    "TrustedHTML": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'TrustedHTML': Illegal constructor"
+    },
+    "TrustedScript": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'TrustedScript': Illegal constructor"
+    },
+    "TrustedScriptURL": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'TrustedScriptURL': Illegal constructor"
+    }
+  },
+  "factoryTag": "[object TrustedTypePolicyFactory]",
+  "factoryCtorName": "TrustedTypePolicyFactory",
+  "factoryOwnProperty": true,
+  "emptyHTML": {
+    "tag": "[object TrustedHTML]",
+    "string": "",
+    "ctor": "TrustedHTML",
+    "json": "",
+    "typeofValue": "object"
+  },
+  "emptyScript": {
+    "tag": "[object TrustedScript]",
+    "string": "",
+    "ctor": "TrustedScript",
+    "json": "",
+    "typeofValue": "object"
+  },
+  "defaultPolicyBefore": null,
+  "memberTypes": {
+    "createPolicy": "function",
+    "isHTML": "function",
+    "isScript": "function",
+    "isScriptURL": "function",
+    "getAttributeType": "function",
+    "getPropertyType": "function"
+  },
+  "policyTag": "[object TrustedTypePolicy]",
+  "policyCtorName": "TrustedTypePolicy",
+  "policyName": "probe-policy",
+  "policyNameWritable": {
+    "accessor": true
+  },
+  "html": {
+    "tag": "[object TrustedHTML]",
+    "string": "&lt;img src=x>",
+    "ctor": "TrustedHTML",
+    "json": "&lt;img src=x>",
+    "typeofValue": "object"
+  },
+  "script": {
+    "tag": "[object TrustedScript]",
+    "string": "/*checked*/alert(1)",
+    "ctor": "TrustedScript",
+    "json": "/*checked*/alert(1)",
+    "typeofValue": "object"
+  },
+  "scriptUrl": {
+    "tag": "[object TrustedScriptURL]",
+    "string": "https://example.com/a.js?checked",
+    "ctor": "TrustedScriptURL",
+    "json": "https://example.com/a.js?checked",
+    "typeofValue": "object"
+  },
+  "brandChecks": {
+    "isHTML": true,
+    "isHTMLOnString": false,
+    "isHTMLOnScript": false,
+    "isScript": true,
+    "isScriptURL": true,
+    "instanceofHTML": true,
+    "instanceofScript": true,
+    "instanceofScriptURL": true
+  },
+  "forged": false,
+  "bareCreateHTML": {
+    "ok": false,
+    "name": "TypeError",
+    "message": "Failed to execute 'createHTML' on 'TrustedTypePolicy': Policy bare-policy's TrustedTypePolicyOptions did not specify a 'createHTML' member."
+  },
+  "duplicateName": {
+    "ok": true,
+    "value": {}
+  },
+  "emptyName": {
+    "ok": true,
+    "value": {}
+  },
+  "missingArgument": {
+    "ok": false,
+    "name": "TypeError",
+    "message": "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present."
+  },
+  "createHTMLNoArgs": {
+    "ok": false,
+    "name": "TypeError",
+    "message": "Failed to execute 'createHTML' on 'TrustedTypePolicy': 1 argument required, but only 0 present."
+  },
+  "attributeTypes": {
+    "scriptSrc": "TrustedScriptURL",
+    "divId": null,
+    "iframeSrcdoc": "TrustedHTML",
+    "embedSrc": "TrustedScriptURL",
+    "objectData": "TrustedScriptURL",
+    "objectCodebase": "TrustedScriptURL",
+    "divOnclick": "TrustedScript",
+    "upperCase": "TrustedScriptURL",
+    "imgSrc": null,
+    "missingArg": {
+      "ok": false,
+      "name": "TypeError",
+      "message": "Failed to execute 'getAttributeType' on 'TrustedTypePolicyFactory': 2 arguments required, but only 1 present."
+    }
+  },
+  "propertyTypes": {
+    "divInnerHTML": "TrustedHTML",
+    "divOuterHTML": "TrustedHTML",
+    "divTextContent": null,
+    "scriptText": "TrustedScript",
+    "scriptTextContent": "TrustedScript",
+    "scriptInnerText": "TrustedScript",
+    "scriptSrc": "TrustedScriptURL",
+    "divId": null,
+    "iframeSrcdoc": "TrustedHTML",
+    "embedSrc": "TrustedScriptURL",
+    "objectData": "TrustedScriptURL",
+    "upperCaseProperty": "TrustedHTML",
+    "unknownProperty": null
+  },
+  "sinkAcceptsString": {
+    "ok": true,
+    "value": "<b>plain</b>"
+  },
+  "sinkAcceptsTrusted": {
+    "ok": true,
+    "value": "&lt;i&gt;x&lt;/i&gt;"
+  },
+  "defaultPolicyAfter": "same-object",
+  "defaultPolicyName": "default"
+}

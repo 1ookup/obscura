@@ -4133,6 +4133,117 @@ mod tests {
         );
     }
 
+    /// Trusted Types shape, brand checks and sink tables. Pinned against
+    /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
+    /// enforcement is out of scope (no directive is parsed anywhere yet), so
+    /// this covers the surface a document with no CSP observes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_match_chrome_shape_brands_and_sink_tables() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const attempt = thunk => {
+                        try { return { ok: true, value: thunk() }; }
+                        catch (error) { return { ok: false, name: error.name, message: error.message }; }
+                    };
+                    const policy = trustedTypes.createPolicy("probe", {
+                        createHTML: input => input.replace(/</g, "&lt;"),
+                        createScript: input => "/*c*/" + input,
+                        createScriptURL: input => input + "?c",
+                    });
+                    const html = policy.createHTML("<img>");
+                    const bare = trustedTypes.createPolicy("bare", {});
+                    const fallback = trustedTypes.createPolicy(
+                        "default", { createHTML: input => "D:" + input });
+                    return {
+                        factoryTag: Object.prototype.toString.call(trustedTypes),
+                        factoryOwn: Object.prototype.hasOwnProperty.call(globalThis, "trustedTypes"),
+                        illegalFactory: attempt(() => new TrustedTypePolicyFactory()).message,
+                        illegalHtml: attempt(() => new TrustedHTML()).message,
+                        policyTag: Object.prototype.toString.call(policy),
+                        policyName: policy.name,
+                        htmlTag: Object.prototype.toString.call(html),
+                        htmlString: String(html),
+                        htmlJson: html.toJSON(),
+                        scriptString: String(policy.createScript("x")),
+                        scriptUrlString: String(policy.createScriptURL("https://a.example/s.js")),
+                        isHTML: trustedTypes.isHTML(html),
+                        isHTMLOnString: trustedTypes.isHTML("<b>"),
+                        // A prototype-only forgery must not pass the brand check.
+                        forged: trustedTypes.isHTML(Object.create(TrustedHTML.prototype)),
+                        instanceOf: html instanceof TrustedHTML,
+                        emptyHTML: String(trustedTypes.emptyHTML),
+                        emptyHTMLTag: Object.prototype.toString.call(trustedTypes.emptyHTML),
+                        bareCreateHTML: attempt(() => bare.createHTML("x")),
+                        noArgs: attempt(() => policy.createHTML()).message,
+                        defaultIsSame: trustedTypes.defaultPolicy === fallback,
+                        attributeTypes: [
+                            trustedTypes.getAttributeType("script", "src"),
+                            trustedTypes.getAttributeType("SCRIPT", "SRC"),
+                            trustedTypes.getAttributeType("iframe", "srcdoc"),
+                            trustedTypes.getAttributeType("div", "onclick"),
+                            trustedTypes.getAttributeType("img", "src"),
+                            trustedTypes.getAttributeType("div", "id"),
+                        ],
+                        propertyTypes: [
+                            trustedTypes.getPropertyType("div", "innerHTML"),
+                            trustedTypes.getPropertyType("DIV", "outerHTML"),
+                            trustedTypes.getPropertyType("script", "text"),
+                            trustedTypes.getPropertyType("script", "src"),
+                            trustedTypes.getPropertyType("div", "textContent"),
+                            trustedTypes.getPropertyType("div", "innerHTMLX"),
+                        ],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "factoryTag": "[object TrustedTypePolicyFactory]",
+                "factoryOwn": true,
+                "illegalFactory":
+                    "Failed to construct 'TrustedTypePolicyFactory': Illegal constructor",
+                "illegalHtml": "Failed to construct 'TrustedHTML': Illegal constructor",
+                "policyTag": "[object TrustedTypePolicy]",
+                "policyName": "probe",
+                "htmlTag": "[object TrustedHTML]",
+                "htmlString": "&lt;img>",
+                "htmlJson": "&lt;img>",
+                "scriptString": "/*c*/x",
+                "scriptUrlString": "https://a.example/s.js?c",
+                "isHTML": true,
+                "isHTMLOnString": false,
+                "forged": false,
+                "instanceOf": true,
+                "emptyHTML": "",
+                "emptyHTMLTag": "[object TrustedHTML]",
+                "bareCreateHTML": {
+                    "ok": false, "name": "TypeError",
+                    "message": "Failed to execute 'createHTML' on 'TrustedTypePolicy': \
+Policy bare's TrustedTypePolicyOptions did not specify a 'createHTML' member.",
+                },
+                "noArgs": "Failed to execute 'createHTML' on 'TrustedTypePolicy': \
+1 argument required, but only 0 present.",
+                "defaultIsSame": true,
+                "attributeTypes": [
+                    "TrustedScriptURL", "TrustedScriptURL", "TrustedHTML",
+                    "TrustedScript", null, null,
+                ],
+                "propertyTypes": [
+                    "TrustedHTML", "TrustedHTML", "TrustedScript",
+                    "TrustedScriptURL", null, null,
+                ],
+            })
+        );
+    }
+
     /// Service Workers are fail-closed, but everything observable without a
     /// worker must match Chrome. Values pinned against Chrome 146 in
     /// js-repros/service-worker-fail-closed/chrome-oracle.json.
