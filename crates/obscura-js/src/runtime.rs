@@ -4133,6 +4133,152 @@ mod tests {
         );
     }
 
+    /// Service Workers are fail-closed, but everything observable without a
+    /// worker must match Chrome. Values pinned against Chrome 146 in
+    /// js-repros/service-worker-fail-closed/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_worker_container_matches_chrome_shape_and_refuses_registration() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const sw = navigator.serviceWorker;
+                    const settle = async thunk => {
+                        try {
+                            const value = await thunk();
+                            return { settled: "fulfilled", isUndefined: value === undefined };
+                        } catch (error) {
+                            return {
+                                settled: "rejected",
+                                name: error.name,
+                                isDOMException: error instanceof DOMException,
+                                isTypeError: error instanceof TypeError,
+                                message: error.message,
+                            };
+                        }
+                    };
+                    // `ready` must never settle: drain the microtask queue far
+                    // past any resolution that a stub would have scheduled.
+                    let readyState = "pending";
+                    sw.ready.then(() => { readyState = "resolved"; },
+                                  () => { readyState = "rejected"; });
+                    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+                    const descriptor =
+                        Object.getOwnPropertyDescriptor(Navigator.prototype, "serviceWorker");
+                    return {
+                        tag: Object.prototype.toString.call(sw),
+                        constructorName: sw.constructor.name,
+                        instanceOfContainer: sw instanceof ServiceWorkerContainer,
+                        isEventTarget: sw instanceof EventTarget,
+                        ownOnNavigator:
+                            Object.prototype.hasOwnProperty.call(navigator, "serviceWorker"),
+                        descriptor: {
+                            isAccessor: typeof descriptor.get === "function",
+                            setter: descriptor.set === undefined,
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                        },
+                        identityStable: navigator.serviceWorker === navigator.serviceWorker,
+                        controller: sw.controller,
+                        registerLength: sw.register.length,
+                        registerString: String(sw.register),
+                        readyState,
+                        readyIdentityStable: sw.ready === sw.ready,
+                        startMessagesReturnsUndefined: sw.startMessages() === undefined,
+                        illegalConstruct: (() => {
+                            try { new ServiceWorkerContainer(); return "constructed"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        noArgs: await settle(() => sw.register()),
+                        crossOriginScript:
+                            await settle(() => sw.register("https://other.example/sw.js")),
+                        dataUrlScript:
+                            await settle(() => sw.register("data:text/javascript,//")),
+                        crossOriginScope: await settle(
+                            () => sw.register("/sw.js", { scope: "https://other.example/" })),
+                        sameOriginScript: await settle(() => sw.register("/sw.js")),
+                        getRegistration: await settle(() => sw.getRegistration()),
+                        crossOriginGetRegistration: await settle(
+                            () => sw.getRegistration("https://other.example/page")),
+                        registrations: await sw.getRegistrations(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object ServiceWorkerContainer]",
+                "constructorName": "ServiceWorkerContainer",
+                "instanceOfContainer": true,
+                "isEventTarget": true,
+                "ownOnNavigator": false,
+                "descriptor": {
+                    "isAccessor": true, "setter": true,
+                    "enumerable": true, "configurable": true,
+                },
+                "identityStable": true,
+                "controller": null,
+                "registerLength": 1,
+                "registerString": "function register() { [native code] }",
+                "readyState": "pending",
+                "readyIdentityStable": true,
+                "startMessagesReturnsUndefined": true,
+                "illegalConstruct":
+                    "Failed to construct 'ServiceWorkerContainer': Illegal constructor",
+                "noArgs": {
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to execute 'register' on 'ServiceWorkerContainer': \
+1 argument required, but only 0 present.",
+                },
+                "crossOriginScript": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to register a ServiceWorker: The origin of the provided \
+scriptURL ('https://other.example') does not match the current origin \
+('http://example.com').",
+                },
+                "dataUrlScript": {
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to register a ServiceWorker: The URL protocol of the \
+script ('data:text/javascript,//') is not supported.",
+                },
+                "crossOriginScope": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to register a ServiceWorker: The origin of the provided \
+scope ('https://other.example') does not match the current origin \
+('http://example.com').",
+                },
+                // No worker can run, so a spec-valid registration is refused
+                // rather than resolved with undefined.
+                "sameOriginScript": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to register a ServiceWorker: The user denied permission \
+to use Service Worker.",
+                },
+                "getRegistration": { "settled": "fulfilled", "isUndefined": true },
+                "crossOriginGetRegistration": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to get a ServiceWorkerRegistration: The origin of the \
+provided documentURL ('https://other.example') does not match the current origin \
+('http://example.com').",
+                },
+                "registrations": [],
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn document_privacy_api_values_come_from_the_origin_policy() {
         let policy = crate::PrivacyPolicy::new();

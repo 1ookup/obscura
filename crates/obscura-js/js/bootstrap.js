@@ -7261,7 +7261,8 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  // serviceWorker is an accessor on Navigator.prototype (see
+  // _installServiceWorkerInterfaces); Chrome has no own property here.
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -12377,6 +12378,221 @@ globalThis.EventTarget = Node;
 if (typeof Performance === 'function') {
   try { Object.setPrototypeOf(Performance.prototype, EventTarget.prototype); } catch (_error) {}
 }
+
+// Service Workers are deliberately not implemented (roadmap §3.2-#11 keeps
+// them fail-closed). What *is* implemented is everything a page observes
+// without a worker ever running, because the previous stub was wrong in ways
+// no browser is: `register()` resolved with undefined, so the universal
+// `register().then(reg => reg.scope)` threw a TypeError Chrome never produces,
+// and `ready` resolved immediately, so code gated on
+// `await navigator.serviceWorker.ready` proceeded where Chrome blocks forever.
+// Refusing is honest; faking success is not. Chrome 146 semantics are pinned
+// in js-repros/service-worker-fail-closed/chrome-oracle.json.
+(function _installServiceWorkerInterfaces() {
+  function _illegalConstructor(name) {
+    const ctor = function () {
+      throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+    };
+    Object.defineProperty(ctor, 'name', {value: name, configurable: true});
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+      value: name, configurable: true,
+    });
+    return _markNative(ctor);
+  }
+
+  // The interface objects exist even though no instance can be constructed;
+  // their absence is itself a fingerprint difference.
+  for (const name of [
+    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet',
+    'NavigationPreloadManager',
+  ]) {
+    if (typeof globalThis[name] === 'undefined') {
+      globalThis[name] = _illegalConstructor(name);
+    }
+  }
+
+  function _base() {
+    try { return globalThis.document?.baseURI || globalThis.location?.href || ''; }
+    catch (_error) { return ''; }
+  }
+  // An opaque or unavailable origin disables the cross-origin checks rather
+  // than rejecting everything: the refusal below is the outcome either way.
+  function _origin() {
+    try {
+      const value = globalThis.location?.origin;
+      return value && value !== 'null' ? value : '';
+    } catch (_error) { return ''; }
+  }
+
+  const _containerKey = Symbol('ServiceWorkerContainer');
+
+  class ServiceWorkerContainer {
+    constructor(key) {
+      if (key !== _containerKey) {
+        throw new TypeError(
+          "Failed to construct 'ServiceWorkerContainer': Illegal constructor");
+      }
+      // Listener storage is private to the container: its prototype is linked
+      // to EventTarget.prototype below for `instanceof`, but EventTarget is
+      // Node here and the DOM listener path expects a node id.
+      this._listeners = Object.create(null);
+      this._handlers = Object.create(null);
+      // The spec's [[ready promise]] resolves only once an active
+      // registration exists for this client. There is never one, so it stays
+      // pending for the document's lifetime, which is exactly what Chrome
+      // does on a page that has not registered a worker.
+      this._ready = new Promise(function () {});
+    }
+
+    get controller() { return null; }
+    get ready() { return this._ready; }
+
+    register(scriptURL, options = undefined) {
+      if (arguments.length < 1) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'register' on 'ServiceWorkerContainer': " +
+          '1 argument required, but only 0 present.'));
+      }
+      const base = _base();
+      let script;
+      try {
+        script = new URL(String(scriptURL), base);
+      } catch (_error) {
+        return Promise.reject(new TypeError(
+          "Failed to register a ServiceWorker: The URL protocol of the script ('" +
+          String(scriptURL) + "') is not supported."));
+      }
+      if (script.protocol !== 'http:' && script.protocol !== 'https:') {
+        return Promise.reject(new TypeError(
+          "Failed to register a ServiceWorker: The URL protocol of the script ('" +
+          script.href + "') is not supported."));
+      }
+      const origin = _origin();
+      if (origin && script.origin !== origin) {
+        return Promise.reject(new DOMException(
+          "Failed to register a ServiceWorker: The origin of the provided scriptURL ('" +
+          script.origin + "') does not match the current origin ('" + origin + "').",
+          'SecurityError'));
+      }
+      const rawScope = options == null ? undefined : options.scope;
+      if (rawScope !== undefined && rawScope !== null) {
+        let scope;
+        try {
+          scope = new URL(String(rawScope), base);
+        } catch (_error) {
+          return Promise.reject(new TypeError(
+            "Failed to register a ServiceWorker: The URL protocol of the scope ('" +
+            String(rawScope) + "') is not supported."));
+        }
+        if (origin && scope.origin !== origin) {
+          return Promise.reject(new DOMException(
+            "Failed to register a ServiceWorker: The origin of the provided scope ('" +
+            scope.origin + "') does not match the current origin ('" + origin + "').",
+            'SecurityError'));
+        }
+      }
+      // Every rejection the spec can reach without running a worker has been
+      // checked. The engine has no Service Worker implementation, so the
+      // registration is refused with the error Chrome itself surfaces when
+      // site data is blocked: callers' existing failure paths handle it.
+      return Promise.reject(new DOMException(
+        'Failed to register a ServiceWorker: ' +
+        'The user denied permission to use Service Worker.',
+        'SecurityError'));
+    }
+
+    getRegistration(clientURL = undefined) {
+      if (clientURL !== undefined) {
+        const origin = _origin();
+        let document_;
+        try { document_ = new URL(String(clientURL), _base()); }
+        catch (_error) { document_ = null; }
+        if (document_ && origin && document_.origin !== origin) {
+          return Promise.reject(new DOMException(
+            'Failed to get a ServiceWorkerRegistration: The origin of the ' +
+            "provided documentURL ('" + document_.origin +
+            "') does not match the current origin ('" + origin + "').",
+            'SecurityError'));
+        }
+      }
+      return Promise.resolve(undefined);
+    }
+
+    getRegistrations() { return Promise.resolve([]); }
+
+    // Buffered messages are delivered to `message` listeners once this is
+    // called. No worker can post one, so it is a no-op that returns undefined.
+    startMessages() {}
+
+    addEventListener(type, listener) {
+      if (typeof listener !== 'function') return;
+      const key = String(type);
+      (this._listeners[key] || (this._listeners[key] = [])).push(listener);
+    }
+    removeEventListener(type, listener) {
+      const list = this._listeners[String(type)];
+      if (list) {
+        const index = list.indexOf(listener);
+        if (index >= 0) list.splice(index, 1);
+      }
+    }
+    dispatchEvent(event) {
+      if (!event || !event.type) return true;
+      for (const listener of (this._listeners[event.type] || []).slice()) {
+        try { listener.call(this, event); } catch (error) { console.error(error); }
+      }
+      const handler = this._handlers[event.type];
+      if (typeof handler === 'function') {
+        try { handler.call(this, event); } catch (error) { console.error(error); }
+      }
+      return !event.defaultPrevented;
+    }
+  }
+
+  for (const type of ['controllerchange', 'message', 'messageerror']) {
+    Object.defineProperty(ServiceWorkerContainer.prototype, 'on' + type, {
+      get: _markNative(function () { return this._handlers[type] || null; }),
+      set: _markNative(function (value) {
+        this._handlers[type] = typeof value === 'function' ? value : null;
+      }),
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  for (const key of [
+    'register', 'getRegistration', 'getRegistrations', 'startMessages',
+    'addEventListener', 'removeEventListener', 'dispatchEvent',
+  ]) {
+    _markNative(ServiceWorkerContainer.prototype[key]);
+  }
+  for (const key of ['controller', 'ready']) {
+    const descriptor =
+      Object.getOwnPropertyDescriptor(ServiceWorkerContainer.prototype, key);
+    if (descriptor && descriptor.get) _markNative(descriptor.get);
+  }
+  Object.defineProperty(ServiceWorkerContainer.prototype, Symbol.toStringTag, {
+    value: 'ServiceWorkerContainer', configurable: true,
+  });
+  // `instanceof EventTarget` without inheriting Node's listener plumbing,
+  // the same trick Performance uses above.
+  try {
+    Object.setPrototypeOf(ServiceWorkerContainer.prototype, EventTarget.prototype);
+  } catch (_error) {}
+  _markNative(ServiceWorkerContainer);
+  globalThis.ServiceWorkerContainer = ServiceWorkerContainer;
+
+  // Chrome exposes the container through an accessor on Navigator.prototype,
+  // so `navigator` has no own 'serviceWorker' property and the descriptor is
+  // found one hop up. A data property on the instance is a bot tell.
+  const container = new ServiceWorkerContainer(_containerKey);
+  Object.defineProperty(Navigator.prototype, 'serviceWorker', {
+    get: _markNative(function serviceWorker() { return container; }),
+    set: undefined,
+    enumerable: true,
+    configurable: true,
+  });
+})();
+
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -15637,10 +15853,6 @@ if (typeof SharedWorker === 'undefined') {
     constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
   };
 }
-if (typeof ServiceWorkerContainer === 'undefined') {
-  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
-}
-
 if (typeof URLPattern === 'undefined') {
   globalThis.URLPattern = class URLPattern {
     constructor(pattern){this._pattern=pattern||{};} test(){return false;} exec(){return null;}
@@ -16559,6 +16771,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     // Workers and messaging
     'Worker', 'SharedWorker', 'MessageChannel', 'MessagePort',
     'BroadcastChannel', 'Scheduler', 'ServiceWorkerContainer',
+    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet',
+    'NavigationPreloadManager',
     // Graphics and geometry
     'CanvasRenderingContext2D', 'WebGLRenderingContext',
     'WebGL2RenderingContext', 'OffscreenCanvas', 'Path2D', 'ImageData',
