@@ -126,6 +126,13 @@ pub struct StealthHttpClient {
     pub fingerprint: RwLock<crate::fingerprint::BrowserFingerprint>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Mirrors `ObscuraHttpClient::allow_private_network`. `validate_url` ORs
+    /// this with `OBSCURA_ALLOW_PRIVATE_NETWORK`, so the CLI flag reaches this
+    /// client either way -- but only the env var did, because this field did
+    /// not exist and every call site passed a literal `false`. That left the
+    /// two transports with different APIs for the same policy, and left this
+    /// module's own loopback fixtures unreachable by its own tests.
+    allow_private_network: bool,
 }
 
 #[cfg(feature = "stealth")]
@@ -145,6 +152,15 @@ impl StealthHttpClient {
     pub fn with_proxy_and_fingerprint(
         cookie_jar: Arc<CookieJar>,
         proxy_url: Option<&str>,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
+        Self::with_full_options_and_fingerprint(cookie_jar, proxy_url, false, fingerprint)
+    }
+
+    pub fn with_full_options_and_fingerprint(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
         fingerprint: crate::fingerprint::BrowserFingerprint,
     ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
@@ -205,6 +221,7 @@ impl StealthHttpClient {
             fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network,
         }
     }
 
@@ -250,7 +267,7 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         let fetch_started = Instant::now();
-        validate_url(url, false)?;
+        validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes).await;
@@ -372,7 +389,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, false)?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -597,12 +614,37 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        // The fixture is on loopback, which the SSRF gate blocks by default.
+        // Opting in per-client rather than via OBSCURA_ALLOW_PRIVATE_NETWORK
+        // keeps the ssrf_tests in this crate -- which exist to prove loopback
+        // *is* blocked -- unaffected when the suite runs in one process.
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT),
+        );
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    // The opt-in above must stay opt-in. A default-constructed stealth client
+    // still refuses loopback, so the new parameter widened an API rather than
+    // the SSRF gate.
+    #[tokio::test]
+    async fn a_default_stealth_client_still_refuses_loopback() {
+        let port = gzip_fixture().await;
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let error = client.fetch(&url).await.expect_err("loopback must be refused");
+        assert!(
+            error.to_string().contains("private/internal IP address"),
+            "{error}",
+        );
     }
 
     #[tokio::test]
@@ -611,9 +653,10 @@ mod tests {
         let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         );
-        let client = StealthHttpClient::with_proxy_and_fingerprint(
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
             Arc::new(CookieJar::new()),
             None,
+            true,
             fingerprint.clone(),
         );
         client.fetch(&url).await.expect("fixture must be reachable");
