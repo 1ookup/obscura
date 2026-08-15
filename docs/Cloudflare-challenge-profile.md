@@ -5,15 +5,20 @@
 它们标出了不必再走的路。
 
 当前状态：**未通过**。P0 五项 parity 修复（step 40，2026-08-15 实测）后输入链路保持打通、
-时间线全面提速，但**断点未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39 结论维持），
-`complete` 依旧为 0。点击被接受（Verifying…）后证明仍被判失败，widget 重置并换 ray 重来；
-点击后的 4976B 提交与 3256B 主页面回传已出现（比 step 22 时代前进一步），但仍无 `/pat/`、
-无 `/ci/`、无 `interactiveEnd`。新可疑项：**`interactiveEnd` 消失**（step 37–38 时代稳定复现，
-怀疑被 43cb4d4 的 bootstrap.js 重写牵连）。当前阻塞点：①**`/pat/` 从不发出**（step 39/40）；
-②**`interactiveEnd` 缺失回归**（step 40 新发现）。
+时间线全面提速，但**断点未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40；step 44
+已修正其机制定位），`complete` 依旧为 0。点击被接受（Verifying…）→ 提交 4976B → 回传
+3256B → 仍被判失败（`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。事件链已完整：
+`interactiveBegin` → `interactiveEnd`（step 41 修正点击时机后稳定复现）→
+`fail code=600010`，`complete`+token 从未出现。step 41 已澄清：step 40 记的
+「interactiveEnd 消失」是 **CF 端波动**，非代码回归。当前阻塞点：①**`/pat/` 从不发出**
+（step 39/40；step 44 修正：非「822KB 后没走到」——JSVMP 执行路径完整走到 127KB，
+`/pat/` 触发机制排除 hasPrivateToken 探测与 privateToken 选项两项假设，下一步追点击后
+窗口）；②**`fail code=600010`**（step 37 起稳定，唯一失败码）。
 
-判据链：`interactiveBegin` → 点击 → `interactiveEnd` → `complete`+token → 站点真实 404。
-判成败一律看 `cf_chl_rc_ni` 是否出现。
+判据链：`interactiveBegin` → 点击（须在 interactiveBegin 之后 + 带 widget 外 pre-move，
+`cdp_click_fast --start 12`）→ 点击后 ~5s 的 **4976B 提交 POST** → 3256B 主页面回传 →
+`complete`+token → 站点真实 404。`interactiveEnd` 消息间歇性出现（CF 端波动，step 41），
+**不可作提交链判据**（step 43）。判成败一律看 `cf_chl_rc_ni` 是否出现。
 
 关键结论演进（被推翻的假设就地标记，详见各 step）：
 
@@ -1681,6 +1686,123 @@ step 40 记的「interactiveEnd 消失」是 **CF 端波动**（不同 ray 的 w
 3. 若确认两条路径都不走 TextEncoder：明文只能从 JSVMP 逆向或 op_fetch_url body
    （加密后）+ 内存关联反推；或等 P1 #6（CDP Debugger 域）按帧读栈。
 
+### Step 42 — realm 归属实验：JSVMP 载荷不进 worker；预注入钩子的真实安全边界（2026-08-15）
+
+**背景**：step 41 遗留问题——822KB/127KB JSVMP 载荷到底在 widget 主线程执行还是
+post 进 worker。先用 HEAD（fb75dbb，P1/P2）重建（增量 25s），新 serve（9227，
+`RUST_LOG='obscura_js=debug,obscura::console=info'`）。对照组（cdp_probe messages）
+在新二进制上完全正常（init@2302 → interactiveBegin@7096），P1/P2 无流程回归。
+
+**结论 1（首要）— JSVMP 载荷从不进 worker**：当时通过一次性 Rust 侧插桩
+`op_worker_post_message` / `op_worker_spawn`（target `obscura::worker_probe`）在 4 轮
+干净运行中记录全部 worker 活动。该插桩已在调查结束后移除，下面的数值是历史运行记录：
+
+- 所有 worker spawn 都是已知的小 blob：`src_len=13`（`"you"==="bot"`）、`src_len=291`
+  （trustedTypes gate），zencare 与 challenges 两侧各一。
+- 所有 page→worker post ≤ **3139B**（指纹查询脚本 202/557/150/94/67/69/70/3139 字节），
+  822KB / 127KB 载荷**从未**被 post 进任何 worker。
+
+→ 证明计算在 **widget iframe 主线程**执行（或载荷在该 realm 经 eval/Function/脚本注入
+执行）。step 41 的 TextEncoder 盲区结论维持：主 realm 提交阶段零 TextEncoder 调用，
+明文只能从 JSVMP 逆向或 op_fetch_url body 反推。这也提示 `/pat/` 缺失的下一步应在
+widget 主线程的执行路径上找（JSVMP 在 822KB 之后没走到发证明请求那一步）。
+
+**结论 2 — step 37 事件字段修复完好**（step 40 的「被 43cb4d4 牵连」怀疑排除）：
+cdp_event_trace 对新二进制实测，全部字段与 step 37 修复后基准一致：`timeStamp` 相对毫秒
+（9719-9978，非 1.7e12）、`screenX/Y=213,335`、pointer 无按钮事件 `button=-1`、
+pointerdown/up `detail=0`、`pressure=0`、over/move `cancelable=true`。
+点击事件 tgt=BODY 是 step 26 shadow retarget 的**正常**呈现（document 监听器视角，
+shadow 内目标重定向为宿主），不是命中测试回归——不可与 step 24 的 Rust 侧
+`input_target_at_point`（原始命中）直接比较。
+
+**结论 3 — interactiveEnd 缺失不是二进制差异**：同一点击流程（cdp_click_checkbox，
+等 interactiveBegin 后点）在旧 P0 二进制（9225）与新二进制（9227）上**同样**不出现
+interactiveEnd（food 在点击后即停）。step 41 的「CF 端波动」结论维持（本日 6+ 轮
+两二进制都拿不到 interactiveEnd→600010 链，step 41 当日可复现）。事件链这一观测面
+今天整体不稳定，不宜据此判回归。
+
+**结论 4 — 预注入钩子安全边界（修正第一版 step 42 的结论）**：第一版把多个钩子形态
+（eval/Function 替换、Worker 构造器替换、console.warn、通知 postMessage）都判为
+「流程停滞」，并据此推断「大载荷确实进过 worker」。**这一推断是错的**——Rust 探针
+证明不存在大载荷 post。逐项复核（同 serve 前后对照）后的真实边界：
+
+| 组合 | 结果 |
+|------|------|
+| **widget-realm 钩子 + 0.3s Runtime.evaluate 轮询** | **稳定停滞**（3/3，含不同钩子形态）；同一 preload 单次求值正常 |
+| widget-realm 方法包（postMessage）+ 无轮询 | **正常**（4/4：K/L/m/n 全部完整握手） |
+| 顶层无 wrap 的轮询（cdp_click_fast） | 正常（对照组） |
+| 全钩子（eval/Function/Worker 构造器/console）无轮询 | 04:5x 停滞 2 次、05:29 正常 —— **不可复现**，疑为 CF 窗口 |
+
+→ 首版 step 42 的「钩子 X 停滞流程」各行**全部作废**（无法与 CF 波动区分）。可复现的
+唯一规则：**widget-realm 预注入钩子存在时，不得以 ≤0.3s 间隔轮询 Runtime.evaluate**。
+机制未定位（两 realm 共用引擎线程，轮询求值叠加钩子延迟可能踩中 widget 握手超时）。
+
+**测量通道修正**（本轮新踩/澄清）：
+
+- 页面 console 的日志 target 是 **`obscura::console`**，不是 `obscura_js::ops`；
+  `RUST_LOG=obscura_js=debug` 里永远找不到页面 console 输出。
+- **obscura 不实现 `Runtime.consoleAPICalled`**（pump 全程零事件）；step 37 的
+  cdp_event_trace.py 对 obscura 侧实际读的是 serve 日志，Chrome 侧才走 consoleAPICalled。
+- `Runtime.executionContextCreated` 只报到顶层 context，无法按 contextId 在 widget
+  主世界求值（`Page.createIsolatedWorld` 是独立世界，读不到主世界 `__rl`）。
+- widget iframe 文档的 fetch 走 frame 导航路径，`op_fetch_url` 日志里**永不出现**
+  （盲区表已有，本轮再次踩到：一度据此误判「widget realm 不存在」）。
+- 连续 ~20 轮压测后目标开始不稳定（出现空事件轮：click 后 __pm 全空、页面反复重载），
+  与「测量纪律」一节所述一致。同轮对照必须紧跟目标行为漂移。
+
+**未决更新**：step 41 下一步 #1（证明计算 realm）已答：**widget 主线程**（无大载荷
+worker post）。step 41 下一步 #2（worker realm 预注入）不再必要。#3（明文获取）仍是
+JSVMP 逆向或加密后 body 反推。`/pat/` 缺失的下一步：v8 trace 追 822KB 载荷在 widget
+主线程的执行路径（100MB+ 完整 trace）。
+
+### Step 43 — 点击配方验证：第三个 `/fo/` 能触发，能力无回退（2026-08-15）
+
+**触发**（用户提问）：step 42 当天所有点击都没触发第三个 `/h/g/fo/` 提交，也没有
+interactiveEnd——是不是 P1/P2 之后能力回退了？图片 `/ci/` 为什么从来 0 次？
+
+**方法**：逐项对照今日请求日志（`stealth_fetch completed` 带字节数），把今日全部
+点击运行按「点击时刻 vs interactiveBegin、点击序列」分类，再补一次严格配方运行
+（`cdp_click_fast --start 12`：首轮求值延迟到 12s，保证点击落在 interactiveBegin
+之后，且带 widget 外→内的 pre-move）。
+
+**证据**：
+
+1. **今日所有运行请求序列（新二进制，9227）**：`chl_page → zencare /fo/ 113KB →
+   api.js → challenges /fo/ 822KB（JSVMP）→ challenges /fo/ 127KB（交互变体）`，
+   前 5 轮点击后**无任何新请求**。
+2. **严格配方运行（--start 12）**：interactiveBegin@8030 → 点击 (213,335)@12.3s →
+   +4s 页面进 `Verifying you are human` → **点击后 ~5s 出现 `POST challenges /fo/`
+   4976B（第三个 /fo/，即交互证明提交）** → +0.1s `POST zencare /fo/` 3256B（主页面
+   回传）→ widget 重置回 `Performing security verification`。与 step 40 记录的链
+   完全一致（step 40：点击后 ~5.4s 出 4976B + 3256B）。**点击→提交链路在新二进制
+   上完好，无回退。**
+3. **今日失败点击的归因**（同一日志）：
+
+   | 点击 | 时刻 vs interactiveBegin | pre-move | 结果 |
+   |------|-------------------------|----------|------|
+   | click_fast 默认（t≈6.2-6.5s） | **前**（interactiveBegin 在 7.8-9.9s） | 有 | `Verifying` → `Enable JavaScript and cookies` 错误 → 重置，无提交 |
+   | cdp_click_checkbox（t≈8.3s） | 后 | **无**（直接移到目标点） | food 即停，无任何反应，无提交 |
+   | click_fast --start 12（t≈12.3s） | **后** | 有 | `Verifying` → **4976B + 3256B** → 重置 |
+
+   → 点击要生效需同时满足：**在 interactiveBegin 之后**（提前点被 widget 硬拒，
+   页面显示 `Enable JavaScript and cookies` 错误文本——这是新观测到的失败呈现），
+   **且鼠标从 widget 外移入**（pre-move 产生 enter 信号，step 25 的结论再次印证）。
+   step 42 当天「点击无反应/无提交」全部是这两个条件不满足的探针问题，**不是能力
+   回退**。
+4. **interactiveEnd 依旧未出现，但提交链照样走完**——step 40 同样无 interactiveEnd
+   而有 4976B。**interactiveEnd 的有无与提交链无关**（CF 端间歇性消息，step 41 的
+   「波动」结论维持）。判据链修正：对 obscura 侧进度判定，用
+   **点击后 ~5s 的 4976B 提交**作可靠观测面，不要等 interactiveEnd。
+
+**结论**：① 无回退——点击→Verifying→4976B 提交→3256B 回传→失败的链在新二进制上
+完整复现；② `/ci/` 0% 是因为它与 `/pat/` 在同一 tick 由 JSVMP 发出（step 10），
+而 `/pat/` 从未发出（首要阻塞）——图片请求不是独立能力缺口（step 11 的 URL 解析
+修复正确但从未被走到）；③ 点击配方的两个必要条件（interactiveBegin 后、pre-move）
+已固化，`cdp_click_fast --start 12` 是当前可复现提交链的配方。
+
+**下一步（不变）**：`/pat/` 缺失 = JSVMP 在 822KB 后没走到证明请求步——v8 trace 追
+widget 主线程执行路径。
+
 ## 测量盲区
 
 ### Step 40 — P0 五项 parity 修复后的基线：断点未移动，`/pat/` 依旧从不发出
@@ -1791,6 +1913,9 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
 | 注入脚本读不到 bootstrap 的 script 作用域 `const` | 探针里 `_eventTargetListeners` 恒 undefined，被静默当成「没有监听器」，得出「整条链零 listener」的错误结论 | 任何读内部变量的探针都要先打印 `typeof`，确认它真的可见 |
 | **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
+| **widget-realm 预注入钩子 + 高频（≤0.3s）Runtime.evaluate 轮询 = widget 流程稳定停滞**（step 42，3/3 复现；同一 preload 单次求值 4/4 正常） | 一度把停滞归因于钩子形态（eval/Function 替换、console.warn 等），结论全错；「大载荷进 worker」的推断也由此而来，被 Rust 探针证伪 | wrap 存在时不要轮询：单次求值；或改用 Rust 侧插桩（零页面扰动）。钩子形态层面的结论需在无轮询条件下重新验证 |
+| 页面 console 日志 target 是 **`obscura::console`** 而非 `obscura_js::ops` | `RUST_LOG=obscura_js=debug` 下 grep 不到页面 console，误以为页面没输出 | `RUST_LOG='obscura_js=debug,obscura::console=info'` |
+| **obscura 不实现 `Runtime.consoleAPICalled`** | 脚本里订阅 consoleAPICalled 收零事件，误以为钩子没触发 | obscura 侧从 serve 日志读 console（Chrome 侧才用 consoleAPICalled） |
 | Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时换**全新 `--user-data-dir`**（最有效），或改用受控测试页 |
 | **`waitForDebuggerOnStart` 会暂停每一个新 target，包括 worker** | step 36：跳过 worker session 不 resume → Turnstile 的十几个 blob worker 全部挂起 → widget 永远 `Verifying...`。据此得出的「Chrome 也过不了盾」「IP 被惩罚」「overrunBegin 是真实判定」**三个结论全错** | 每个 attached target 都要 `runIfWaitingForDebugger`；worker 不发 `Page.*`，且 resume 用 fire-and-forget（worker session 可能永不回包） |
 | **把「页面没加载」当成「功能不工作」**（第二次犯） | step 38：受控页在 serve 路径下 DOM 为空、JS 未执行，据此得出「obscura 不加载图片」，复核后 4 个 png 请求全部正常 | 任何「某功能没发生」的结论，先断言页面真的加载了（`document.querySelectorAll('*').length` 或一个已知元素的文本） |
@@ -1807,12 +1932,15 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 
 按当前怀疑程度排序：
 
-- **`/pat/` 从不发出**（step 39/40，现首要）：Chrome 在大载荷后 366ms 必发 `GET /pat/`(401)
-  再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`（step 40 P0 修复后实测确认）。`hasPrivateToken`
-  探测假设已被 trace 证伪（但该 trace 仅 6MB，证据不足）。HaHaVM 侧已确认 `/pat/` 由 widget
-  JSVMP 自身发起（`sec-fetch-mode: cors, dest: empty`），HaHaVM 无显式打补丁——缺失 =
-  JSVMP 没走到发证明请求那一步。下一步：v8 trace 追 822KB 载荷执行期间的差异面（需
-  100MB+ 完整 trace），或先查 `interactiveEnd` 回归（见下）。
+- **`/pat/` 从不发出**（step 39/40，现首要；step 44 机制定位修正）：Chrome 在大载荷后
+  366ms 必发 `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`（step 40 P0
+  修复后实测确认）。step 44 完整流程 trace 修正旧定位：**不是「822KB 后 JSVMP 没走到」**
+  ——执行路径完整走到 127KB 交互变体（性能读取、canvas 指纹、python 桥检测全部执行），
+  `/pat/` 请求从未被构造。触发机制两项假设已证伪：①`hasPrivateToken` 探测（完整流程 CF
+  代码零访问，仅引擎 bootstrap 自检；step 39 发现 3 最终证伪）；②XHR/fetch `privateToken`
+  选项（trace 零命中）。`/pat/` 触发窗口大概率在**点击后**（浏览器交互基线：点击 →
+  /pat/ → /ci/ → 7KB 提交；obscura 点击后直接 4976B 提交跳过 /pat/+/ci/）。下一步：追
+  点击后 → 4976B 窗口（serve 支持 --v8-flags 或 fetch 自动点击）。
 - **`interactiveEnd` 疑云已澄清**（step 41）：step 40 记的「消失」是 CF 端波动——点击
   时机修正（等 interactiveBegin 再点）后事件链完整出现（interactiveEnd@9361 →
   fail 600010@10056）。**不是代码回归**。
@@ -1862,3 +1990,70 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 新增的 WebSocket、WebGL、indexedDB、HTTP/2、frame layout cache 与 Debugger/host trace
 均有独立 `js-repros/` fixture。当前主机没有 Chrome/Chromium 可执行文件，故没有伪造
 Chrome 146 oracle；各 fixture README 标明了这一验证边界。
+
+### Step 44 — v8 trace 追 822KB 后执行路径：/pat/ 触发机制排除两项假设；全量 --trace 在新二进制上不可用（2026-08-15）
+
+**背景**：step 42 已证 JSVMP 在 widget 主线程执行；step 43 判定下一步 = v8 trace 追 822KB 之后的执行路径。本 step 完成该调查，得到 /pat/ 缺失的机制级结论。
+
+**方法**：两种 trace 模式各跑一轮 fetch（wait 40s），并结合当时一次性 Rust 插桩留下的
+请求日志（`obscura_js=debug`）。该插桩当前不属于运行时能力。
+
+1. **全量 `--trace`**：576MB / 816 万行。**页面超时**（终页 "Enable JavaScript and cookies"），流程退化到 113KB——**822KB 从未到达**。83% 记录（676 万行）是 `<obscura:timer-wake>` 引擎脚本。
+2. **`OBSCURA_TRACE_MODE=lookups`（去 `--trace`）**：6MB / 32048 行。**流程完整**——8 秒走完 `chl_page 227KB → zencare /fo/ 113KB → api.js → challenges /fo/ 822KB → 交互变体 127KB`，与 step 43 序列完全一致。
+
+**证据**：
+
+1. **全量 trace 不可用的机制（新盲区）**：827028d 定时器保真引入 `queue_overdue_timer_wake_repair`（runtime.rs:3153）——定时器积压时**每次事件循环 poll 都 execute_script("<obscura:timer-wake>", ...)**。`--trace` 下每次执行都被完整记录，trace 越慢 → timer 积压越多 → wake 越多 → 更慢（恶性循环），页面在 113KB 后超时。8/12 的 140-220MB「完整」trace 当时无此机制（且当时流程断点本就在 113KB——`<page-eval>` 99.9% 是 JSVMP 主流程，但 XHR 只有 1 对 open/send）。**step 39 的「100MB+ 判据」在新二进制上无法用全量模式满足；lookups 模式 6MB 即完整一轮**。
+
+2. **822KB 之后的执行路径（lookups trace，物理行序重建）**：
+
+   ```
+   行 4541-4580   chl_page XHR open+send → 113KB 发起（Ha 函数）
+   行 4739-4742   <page-eval> Uint8Array+charCodeAt → 113KB 响应字节处理
+   行 14151-14186 widget iframe 文档 XHR open+send → 822KB 发起（Rr 函数）
+   行 14340-14343 <page-eval> 字节处理 → 822KB 响应被接收并解码
+   行 17183-21138 worker 指纹查询循环：navigator 采集（platform/languages/
+                 hardwareConcurrency/deviceMemory/userAgent）→ fetch 存在性
+                 检查（1 次属性访问，未产生请求）→ eval/_p → postMessage 回传
+   行 ~19500     Performance.getEntries（QB/Qe）→ PerformanceObserverEntryList.getEntries
+   行 23699      _Canvas2D.getImageData ← HH:1:69445（canvas 指纹收集）
+   行 23926-23969 <page-eval> Object.i + MISS module/global/pyimport + Function.call
+                 ← Hf:1:233014（**JSVMP python 桥检测**：探测 pyimport/module/global
+                 是否存在——CF 在对抗 HaHaVM 类通用框架；MISS=环境正常，非失败原因）
+   行 25357      widget iframe XHR send（第二次，Rr:1:153285 ← HH:1:69888 ←
+                 HL.<computed> ← Hv ← Ho:1:227482）→ **127KB 交互变体发起**
+   行 25413      <page-eval> charCodeAt → 127KB 响应处理
+   ```
+
+   JSVMP 从 822KB 到 127KB 的执行**路径完整**（性能读取、canvas 指纹、python 桥检测都执行了），`/pat/` 不在其中。
+
+3. **/pat/ 触发机制：两项假设证伪**：
+   - **hasPrivateToken 探测假设（step 39 发现 3）最终证伪**：完整流程（822KB+127KB 全走完）中 `hasPrivateToken`/`hasRedemptionRecord`/`hasStorageAccess`/`requestStorageAccess` 在 CF 代码名下**零访问**。仅 2 组 HIT（物理行 6973/21615）来自 `<obscura:frame-realm-bootstrap>`（f4a1201 实现后引擎 bootstrap 自检，Node.prototype 上方法存在）。注：lookups 模式有 IC 快速路径盲区（同一代码位置对同一对象形状的后续访问不记录）——但**每个代码位置首次访问必记录**，CF 调用必留痕。
+   - **XHR/fetch privateToken 选项假设证伪**：全 trace 搜 `privateToken` 零命中——CF 不给 XHR/fetch 设该选项。
+
+4. **脚本名分布变化（附带发现）**：`<page-eval>` 从 8/12 的 99.9% 降到 37 行（且全在 worker scope：DedicatedWorkerGlobalScope/WorkerNavigator）；JSVMP 主体现在以**真实 URL 脚本身份**执行（chl_page URL 138 万行 / widget iframe 文档 URL 9791 行）。P0 修复（76b6ae5 Stack/realm/referrer）改变了 eval 脚本的 ScriptOrigin 登记——**trace 的 realm 归属盲区在页面上意外消解**：脚本名现在能分辨 zencare 主文档 vs challenges iframe。
+
+5. **fetch 模式无点击**：127KB 之后无第三次 XHR（4976B 提交需点击才发，正常）。**点击后 → 4976B 提交之间的 JSVMP 窗口未覆盖**——浏览器交互基线里 `/pat/` + `/ci/` + 7KB 提交正是在这个窗口（step 28）。
+
+**结论**：
+
+1. 全量 `--trace` 与 P0 定时器保真机制恶性耦合，挑战页上不可用；**lookups 模式是唯一可用 trace 模式**（流程无退化，8s 全链）。「100MB+ 才算完整一轮」判据作废，替换为「lookups 6MB + 请求序列确认 822KB+127KB 到达」。
+2. `/pat/` 缺失**不是**「822KB 后 JSVMP 没走到证明请求步」——执行路径完整走到 127KB 交互变体，但**从未构造 /pat/ 请求**（无 XHR/fetch/Image 痕迹）。触发机制与 `hasPrivateToken` 探测无关、与 `privateToken` 选项无关。
+3. `/pat/` 触发窗口大概率在**点击后**（浏览器交互基线：点击 → /pat/ → /ci/ → 7KB 提交；obscura 点击后直接 4976B 提交，跳过 /pat/+/ci/——4976B vs 浏览器 7KB 的 2KB 差值可能正是缺失的证明输入）。该窗口当前不可 trace（fetch 无点击、serve 不支持 --v8-flags）。
+
+**下一步（按信息量）**：
+1. **追点击后窗口**：让 serve/CDP 路径支持 `--v8-flags`（查 CLI 参数透传，serve 不支持的原因），或给 fetch 模式加预注入自动点击；跑 lookups trace 覆盖 点击 → 4976B 窗口，确认该窗口 JSVMP 是否构造 /pat/。
+2. 对照 HaHaVM `core/env/Document.js:2062` 的 hasPrivateToken **实现与返回值**——若 HaHaVM 返回 true 且 CF 据此走 PAT 流程，则 obscura 的 f4a1201 返回值语义是下一个检查点（虽然 trace 显示 CF 没读该属性——两者矛盾时需要合理解释）。
+3. 若点击后窗口也无 /pat/ 构造：/pat/ 由 Chrome 原生 PAT 握手发出（非 JS），obscura 需实现浏览器级 PAT 支持——该方向工作量大，先确认前两条。
+
+**Step 44 补充（2026-08-15，trace 工具链升级后复测）**：全量 `--trace` 补丁升级
+（timer-wake 等引擎脚本过滤 + 队列异步写，见 Trace-page-script.md「2026-08-15 升级」）
+后重跑：`<obscura:timer-wake>` 676 万行 → 0，记录量 816 万 → 176 万（-78%），
+异步写出与退出 flush 正常。但 **822KB 依旧未到达**——chl_page 名下 JSVMP 执行了
+176 万次调用（CALL 87 万 + RET 89 万）却未走到发 822KB 的 XHR，终页停在
+"Verification successful. Waiting for zencare.co to respond"（托管等待态）。结论：
+`--trace` 的每函数进出 runtime 路由 + `--no-lazy-feedback-allocation` 是挑战页
+不可逾越的开销，**补丁已把记录成本优化到底，全量 trace 仍不适用于时序敏感页**；
+挑战页 trace 的实用模式 = lookups（8s 全链，step 44 主实验）。新盲区：trace 文件
+可含非法 UTF-8（JSVMP 二进制字符串参数原样写入），`awk`/`cut` 报 Illegal byte
+sequence，需 `LC_ALL=C`。

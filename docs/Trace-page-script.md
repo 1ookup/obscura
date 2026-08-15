@@ -440,3 +440,43 @@ SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
 这表明 Cloudflare 的检测分**两层**：
 1. **TLS 层** — `--stealth` 可以解决
 2. **JS 环境层** — 即使 TLS 和 API 调用都正确，Turnstile 内部的环境检测仍可能拒绝非标准浏览器
+
+## 2026-08-15 升级：引擎脚本过滤 + 异步写队列
+
+补丁 v2（`TraceEnqueueLine` 特征）：两个改动，兼容旧树（升级重打就地拼接，见脚本内
+"Pre-queue patch present" 分支）。
+
+### 1. 全量 `--trace` 模式自动跳过引擎脚本
+
+`--trace` 开启时，HIT/MISS 记录跳过以 `<` 开头（timer wakeups、frame bootstraps、
+注入 shim）及 `ext:`/`deno:` 前缀的脚本——CALL/RET 早已通过 `TraceDescribeFrame`
+的同款谓词过滤，HIT/MISS 此前没有。效果（zencare 挑战页实测）：816 万行 → 176 万行
+（-78%），`<obscura:timer-wake>` 从 676 万行 → 0。
+
+**lookups 模式（`--trace` 关）不过滤**：引擎证据（如 PAT-API 的 bootstrap 自检）量小
+且有时正是排查目标。
+
+### 2. 队列异步写
+
+记录行在主线程 append 到 1 MiB 分块缓冲，满块 swap 给后台 writer 线程 fwrite；
+writer 落后时主线程条件变量等待（背压，内存有界）；`atexit` 注册 flush + join。
+格式化仍在主线程（V8 对象只能在 isolate 线程渲染）。
+
+实现注意（重打补丁时易踩）：
+
+- 全局锁/条件变量必须 **`new` 成指针**——全局对象触发 Chromium
+  `-Wexit-time-destructors` 编译失败
+- `condition_variable::wait` 需要 `unique_lock`，不是 `lock_guard`
+- 前向声明 `TraceWriterLoop`/`TraceShutdown`（`TraceEnqueueLine` 引用它们）
+- `TraceCallEnterEnabled`/`TraceCallEnter`/`TraceCallExit` 定义在匿名 namespace 之外，
+  升级替换时以 `\n\nbool TraceCallEnterEnabled()` 为尾锚点拼接，避免与旧尾部重复
+
+### 3. 边界（实测确认）
+
+- **挑战页的全量 `--trace` 依然不可用**：过滤后 chl_page JSVMP 仍执行 176 万次调用
+  而未走到 822KB 请求（对比 lookups 模式 8s 全链）。瓶颈是 V8 `--trace` 的每函数进出
+  runtime 路由 + `--no-lazy-feedback-allocation`，非补丁写入成本。时序敏感页面的
+  trace 仍用 lookups 模式。
+- **trace 文件可能含非法 UTF-8 字节**（JSVMP 的二进制字符串参数经 `TraceAppendValue`
+  原样写入）。`awk`/`cut` 会报 `Illegal byte sequence`，用 `LC_ALL=C` 或 `grep -a`。
+- 队列在 `--trace-property-lookup-file` 未配置时不启动 writer（gate 不变）。

@@ -51,8 +51,14 @@ RT="$V8_DIR/src/runtime/runtime-test.cc"
 if grep -q "trace_property_lookup" "$IC" \
    && grep -q "trace_property_lookup" "$FLAGS" \
    && grep -q "TraceCallEnterEnabled" "$RT"; then
-  echo "already patched"
-  exit 0
+  if grep -q "TraceEnqueueLine" "$IC" \
+     && grep -q "#include <thread>" "$IC" \
+     && grep -q "A producer can have published one chunk" "$IC"; then
+    echo "already patched"
+    exit 0
+  fi
+  # Pre-queue patch present: the python pass replaces the reporter block in
+  # place when the new marker is absent. Fall through to let it.
 fi
 
 python3 - "$IC" "$FLAGS" "$RT" <<'PY'
@@ -118,6 +124,19 @@ if inc not in ic:
         1,
     )
     ic_dirty = True
+# Async-writer queue (std::thread, mutex, condition_variable) and the atexit
+# shutdown flush. Separate block: on an already-patched tree the js-objects.h
+# include above exists, so the guard above never runs -- this one keys off its
+# own marker.
+thread_inc = ('#include <condition_variable>\n'
+              '#include <cstdlib>\n'
+              '#include <mutex>\n'
+              '#include <thread>\n')
+if '#include <thread>' not in ic:
+    ic = ic.replace('#include "src/objects/shared-function-info.h"\n',
+                    '#include "src/objects/shared-function-info.h"\n' + thread_inc,
+                    1)
+    ic_dirty = True
 
 # --- 2. the reporter ---------------------------------------------------------
 REPORTER = r'''
@@ -151,6 +170,109 @@ FILE* TracePropertyLookupFile() {
     }
   }
   return file;
+}
+
+// Whether a script name is engine-internal. Named engine scripts all start
+// with '<' (timer wakeups, frame bootstraps, injected shims); ext:/deno: are
+// the runtime's own builtins. Page code that ran through eval has no script
+// name at all and is reported as <page-eval> instead of reaching here.
+bool TraceIsEngineScript(const char* name) {
+  if (name == nullptr || name[0] == '\0') return true;
+  return name[0] == '<' || strncmp(name, "ext:", 4) == 0 ||
+         strncmp(name, "deno:", 5) == 0;
+}
+
+// --- async writer -----------------------------------------------------------
+// Records are appended to a chunked in-memory queue on the isolate thread and
+// written to disk by one background thread. Writing synchronously put a FILE*
+// call on the property-lookup hot path, and the trace slowed the page enough
+// to change what it did before its deadline (on a Cloudflare challenge: 3
+// requests under the trace, 7 without). The queue moves the fwrite off the hot
+// path; formatting still happens on the isolate thread, where the V8 objects
+// it renders are only reachable.
+//
+// Chunks are 1 MiB. The main thread appends under the mutex and swaps a full
+// chunk into a pending slot; the writer drains it. If the writer is still on a
+// previous chunk the main thread waits -- backpressure keeps memory bounded,
+// and a chunk drains in a couple of milliseconds, so a stall means a stuck
+// disk rather than normal load. TraceShutdown flushes the tail and joins, and
+// is registered with atexit on first use.
+
+constexpr size_t kTraceChunkBytes = 1 << 20;
+
+// Heap-allocated, never freed: process-lifetime state. A global object would
+// trip Chromium's -Wexit-time-destructors; the writer is flushed and joined
+// at exit, and the OS reclaims the rest.
+std::mutex* g_trace_mu = new std::mutex();
+std::condition_variable* g_trace_cv = new std::condition_variable();
+std::string* g_trace_active = new std::string();
+std::string* g_trace_pending = nullptr;  // guarded by *g_trace_mu
+bool g_trace_shutdown = false;           // guarded by *g_trace_mu
+bool g_trace_started = false;            // guarded by *g_trace_mu
+std::thread* g_trace_writer = nullptr;   // guarded by *g_trace_mu
+
+void TraceWriterLoop();
+void TraceShutdown();
+
+void TraceEnqueueLine(const std::string& line) {
+  std::unique_lock<std::mutex> lock(*g_trace_mu);
+  if (!g_trace_started) {
+    g_trace_started = true;
+    g_trace_writer = new std::thread(TraceWriterLoop);
+    std::atexit(TraceShutdown);
+  }
+  if (g_trace_active->size() + line.size() > kTraceChunkBytes) {
+    g_trace_cv->wait(lock, [] { return g_trace_pending == nullptr; });
+    g_trace_pending = g_trace_active;
+    g_trace_active = new std::string();
+    g_trace_active->reserve(kTraceChunkBytes);
+    g_trace_cv->notify_one();
+  }
+  g_trace_active->append(line);
+}
+
+void TraceWriterLoop() {
+  FILE* out = TracePropertyLookupFile();
+  if (out == nullptr) return;
+  for (;;) {
+    std::string* chunk;
+    {
+      std::unique_lock<std::mutex> lock(*g_trace_mu);
+      g_trace_cv->wait(lock, [] {
+        return g_trace_pending != nullptr || g_trace_shutdown;
+      });
+      if (g_trace_pending == nullptr && g_trace_shutdown) break;
+      chunk = g_trace_pending;
+      g_trace_pending = nullptr;
+    }
+    if (!chunk->empty()) fwrite(chunk->data(), 1, chunk->size(), out);
+    delete chunk;
+    g_trace_cv->notify_one();
+  }
+  fclose(out);
+}
+
+void TraceShutdown() {
+  {
+    std::unique_lock<std::mutex> lock(*g_trace_mu);
+    // A producer can have published one chunk while the writer is between
+    // wakeup and lock acquisition. Wait for that slot before publishing the
+    // tail, otherwise the assignment below would discard the older chunk.
+    if (!g_trace_active->empty()) {
+      g_trace_cv->wait(lock, [] { return g_trace_pending == nullptr; });
+    }
+    if (!g_trace_active->empty()) {
+      g_trace_pending = g_trace_active;
+      g_trace_active = new std::string();
+    }
+    g_trace_shutdown = true;
+  }
+  g_trace_cv->notify_one();
+  if (g_trace_writer != nullptr) {
+    g_trace_writer->join();
+    delete g_trace_writer;
+    g_trace_writer = nullptr;
+  }
 }
 
 // Compact, side-effect-free rendering of one value. ShortPrint would be the
@@ -216,12 +338,8 @@ bool TraceDescribeFrame(Isolate* isolate, JavaScriptFrame* frame,
 
   if (IsString(script->name())) {
     std::unique_ptr<char[]> n = Cast<String>(script->name())->ToCString();
-    const char* name = n ? n.get() : "";
-    if (name[0] == '\0' || name[0] == '<' || strncmp(name, "ext:", 4) == 0 ||
-        strncmp(name, "deno:", 5) == 0) {
-      return false;
-    }
-    *where = name;
+    if (TraceIsEngineScript(n ? n.get() : "")) return false;
+    *where = n.get();
   } else {
     // Code the page ran through eval carries no script name of its own.
     *where = "<page-eval>";
@@ -280,8 +398,7 @@ bool TraceCallOrigin(Isolate* isolate, std::string* where, int* line, int* colum
 }
 
 void TraceCallEnterImpl(Isolate* isolate) {
-  FILE* out = TracePropertyLookupFile();
-  if (out == nullptr) return;
+  if (TracePropertyLookupFile() == nullptr) return;
 
   HandleScope scope(isolate);
   std::string where;
@@ -314,9 +431,10 @@ void TraceCallEnterImpl(Isolate* isolate) {
     TraceAppendValue(isolate, frame->GetParameter(i), &args);
   }
 
-  fprintf(out, "CALL\t%s\t%s\t%s\t%d\t%d\t%s\t%s\n", owner.c_str(),
-          fname ? fname.get() : "?", where.c_str(), line, column, args.c_str(),
-          stack.c_str());
+  std::string rec = "CALL\t" + owner + "\t" + (fname ? fname.get() : "?") +
+                    "\t" + where + "\t" + std::to_string(line) + "\t" +
+                    std::to_string(column) + "\t" + args + "\t" + stack + "\n";
+  TraceEnqueueLine(rec);
 }
 
 void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
@@ -377,9 +495,16 @@ void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
     }
   }
 
-  // Written to a file rather than stdout so it can be folded back into the same
-  // event stream as every other trace plane, instead of standing up a second
-  // reporting channel with its own format. stdout also belongs to --dump.
+  // Full --trace mode is the page view: engine-internal scripts (timer wakeups,
+  // frame bootstraps, injected shims) drown the page's own records -- one
+  // challenge run logged 6.77M timer-wake hits out of 8.16M total -- and can
+  // slow the page enough to change what it does. Skip them when the call/return
+  // hook is on. lookups mode (--trace off) keeps them: engine evidence (e.g.
+  // the PAT-API bootstrap self-checks) is small there and sometimes the point.
+  if (v8_flags.trace && script_name && TraceIsEngineScript(script_name.get())) {
+    return;
+  }
+
   FILE* out = TracePropertyLookupFile();
   if (out == nullptr) return;
   const char* where = script_name ? script_name.get()
@@ -398,13 +523,21 @@ void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
       kept++;
     }
   }
-  fprintf(out, "%s\t%s\t%s\t%s\t%d\t%d\t\t%s\n", found ? "HIT" : "MISS",
-          owner ? owner.get() : "?", prop ? prop.get() : "<symbol>", where,
-          line, column, stack.c_str());
+  std::string rec = std::string(found ? "HIT" : "MISS") + "\t" +
+                    (owner ? owner.get() : "?") + "\t" +
+                    (prop ? prop.get() : "<symbol>") + "\t" + where + "\t" +
+                    std::to_string(line) + "\t" + std::to_string(column) +
+                    "\t\t" + stack + "\n";
+  TraceEnqueueLine(rec);
 }
 
 }  // namespace
+'''
 
+# Tail of the reporter: definitions that live outside the anonymous namespace.
+# Kept separate so an upgrade of an already-patched tree can splice the new
+# core in front of the old tail instead of duplicating it.
+REPORTER_TAIL = r'''
 bool TraceCallEnterEnabled() {
   return TracePropertyLookupFile() != nullptr;
 }
@@ -417,23 +550,67 @@ void TraceCallEnter(Isolate* isolate) { TraceCallEnterImpl(isolate); }
 // rather than by identity: a reader matches a RET to the CALL above it, which is
 // what the indentation in V8's own output conveys.
 void TraceCallExit(Isolate* isolate, Tagged<Object> value) {
-  FILE* out = TracePropertyLookupFile();
-  if (out == nullptr) return;
+  if (TracePropertyLookupFile() == nullptr) return;
   HandleScope scope(isolate);
   std::string where;
   int line = 0, column = 0;
   if (!TraceCallOrigin(isolate, &where, &line, &column, nullptr)) return;
   std::string rendered;
   TraceAppendValue(isolate, value, &rendered);
-  fprintf(out, "RET\t\t\t%s\t%d\t%d\t%s\n", where.c_str(), line, column,
-          rendered.c_str());
+  std::string rec = "RET\t\t\t" + where + "\t" + std::to_string(line) + "\t" +
+                    std::to_string(column) + "\t" + rendered + "\n";
+  TraceEnqueueLine(rec);
 }
-
 '''
 
 anchor = "void IC::TraceIC(const char* type, DirectHandle<Object> name) {"
-if "TracePropertyLookupFile()" not in ic:
-    ic = ic.replace(anchor, REPORTER.lstrip("\n") + anchor, 1)
+if "TraceEnqueueLine" not in ic:
+    start_marker = "// Reports one property lookup: the receiver's JavaScript-visible constructor"
+    i_start = ic.find(start_marker)
+    if i_start == -1:
+        # Fresh tree: insert the reporter before TraceIC.
+        ic = ic.replace(anchor, REPORTER.lstrip("\n") + REPORTER_TAIL + anchor, 1)
+    else:
+        # Pre-queue patch present: splice the new core in front of the old
+        # tail. The core ends with its own "}  // namespace"; the old tail
+        # starts at the blank line before "bool TraceCallEnterEnabled()", so
+        # nothing is duplicated and the namespace closes exactly once.
+        i_end = ic.find("\n\nbool TraceCallEnterEnabled()", i_start)
+        tail_end = ic.find(anchor, i_end + 2) if i_end != -1 else -1
+        if i_end == -1 or tail_end == -1:
+            print("upgrade: reporter tail marker missing", file=sys.stderr)
+            sys.exit(1)
+        # Drop the old synchronous tail as well. Keeping it would leave RET
+        # on fprintf while CALL/HIT use the queue, so records could reorder and
+        # the full-trace hot path would still block on every return.
+        ic = ic[:i_start] + REPORTER.lstrip("\n") + REPORTER_TAIL + ic[tail_end:]
+    ic_dirty = True
+
+# Upgrade a tree that already has the queue but predates the shutdown race fix.
+# Keep this separate from the reporter replacement above: the queue marker
+# intentionally makes the main branch idempotent, while this marker lets a
+# previously generated tree receive the small lifecycle fix in place.
+if "TraceEnqueueLine" in ic and "A producer can have published one chunk" not in ic:
+    shutdown_anchor = """void TraceShutdown() {
+  {
+    std::unique_lock<std::mutex> lock(*g_trace_mu);
+    if (!g_trace_active->empty()) {
+"""
+    shutdown_replacement = """void TraceShutdown() {
+  {
+    std::unique_lock<std::mutex> lock(*g_trace_mu);
+    // A producer can have published one chunk while the writer is between
+    // wakeup and lock acquisition. Wait for that slot before publishing the
+    // tail, otherwise the assignment below would discard the older chunk.
+    if (!g_trace_active->empty()) {
+      g_trace_cv->wait(lock, [] { return g_trace_pending == nullptr; });
+    }
+    if (!g_trace_active->empty()) {
+"""
+    if shutdown_anchor not in ic:
+        print("upgrade: TraceShutdown anchor missing", file=sys.stderr)
+        sys.exit(1)
+    ic = ic.replace(shutdown_anchor, shutdown_replacement, 1)
     ic_dirty = True
 
 # --- 3. the call site --------------------------------------------------------
