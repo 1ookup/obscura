@@ -15,11 +15,14 @@ use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ReferrerPolicy, ResourceRequest};
+use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
+// ReferrerPolicy is used by op_fetch_url, which is not feature-gated: keeping
+// it in the render-only import broke the default feature set.
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    CallbackRegistry, CookieJar, ObscuraHttpClient, ReferrerPolicy, RequestInfo, ResourceType,
+    Response,
 };
 use tokio::sync::Mutex;
 use futures_util::{SinkExt, StreamExt};
