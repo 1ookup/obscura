@@ -221,8 +221,36 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   4 个数据点,猜测式复刻会用一个已知差异换来若干未知差异,故保持原样。新增 Rust 测试
   `service_worker_registration_fetches_the_script_before_refusing` 用本地 server 覆盖整条判定链,
   并断言 `/sw-ok.js` **不出现**在请求列表里(重定向未被跟随)。
-- **已知缺口**:`isSecureContext` 全库不存在,因此容器无条件暴露;Chrome 在非 secure context 的
-  普通 HTTP 源上让 `navigator.serviceWorker` 为 undefined。
+- **已知缺口**:已在下一节修复。
+
+#### P3-23:secure context——引擎自相矛盾
+
+- **状态**:✅ 完成。
+- **问题**:`isSecureContext` 在 worker scope 上**有**(`worker.rs:738`),在 window 上**完全没有**。
+  两行脚本就能读出引擎在自我矛盾:`self.isSecureContext` 返回 false,`window.isSecureContext`
+  返回 undefined。它还把着一批真实 API:Chrome 在非安全源上收起 `crypto.subtle`、
+  `navigator.serviceWorker`/`mediaDevices`/`storage`/`clipboard`/`wakeLock`/`credentials`/`locks`
+  和 `caches`,Obscura 在任何源上都无条件发放。顺带发现 `globalThis.origin` 也整个不存在。
+- **oracle 拦下的错误**:「把 secure-context API 全收起」的直觉会连 `navigator.geolocation` 和
+  `Notification` 一起删——这两个出现在每一份 secure-context-only 清单上。**Chrome 146 在非安全源
+  上保留这两个接口**,只在调用时拒绝。删了就是拿一个差异换另一个差异。这是本系列第二次「先采
+  oracle 再动手」拦住了回归。
+- **采集的坑**:`127.0.0.1` 和 `localhost` 本身就是 potentially trustworthy,所以 loopback fixture
+  **测不出**非安全源。oracle 必须从本机 LAN 地址采。
+- **时机的坑**:bootstrap 执行时 `location.href` 还是 `about:blank`,真实 URL 之后才到。首版在
+  bootstrap 顶层一次性判定,结果**完全反了**——LAN 源上不收起、loopback 上反而收起。改为
+  `isSecureContext` 每次读时求值,破坏性的收起动作推迟到 `__obscura_init`(URL 已知)。
+- **验证**:`js-repros/secure-context/` 固化 Chrome 146 oracle,三种源共 75 个观测点中 72 个一致。
+  剩 3 个是同一件事按源计数:`SharedArrayBuffer` 仍暴露(它要的是跨源隔离 COOP+COEP,比 secure
+  context 更严,Chrome 在 loopback 上也不给)。bootstrap 里 delete 确实成功(下一行 typeof 已是
+  undefined),但**之后被某处重新装回**,而全仓库没有 Rust 代码提到这个名字;成因未找到之前不绕
+  过,记为独立待查项。新增 `secure_context_gates_the_same_apis_chrome_gates`。
+- **暴露出的既有问题**:4 个测试因此失败,原因是**整个测试套件都跑在 `http://example.com`(非安全源)
+  上却假设所有 API 可用**——此前根本没有 secure context 概念。新增 `setup_secure_runtime` 供需要
+  安全源的测试使用;worker 测试的 `caches` 消失是正确的(其创建者是 http)。另有一个真实泄漏被
+  `same_origin_window_proxy_targets_the_live_frame_global` 抓到:我加的
+  `globalThis.__obscuraApplySecureContextGating__` 会出现在 `Object.getOwnPropertyNames(window)`
+  里,任何页面都能读到「obscura」字样。已改为闭包变量。
 
 #### P3-17 实施记录:SharedWorker 真实现
 

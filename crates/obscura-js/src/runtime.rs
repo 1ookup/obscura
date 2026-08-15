@@ -4038,6 +4038,22 @@ mod tests {
         rt
     }
 
+    /// `setup_runtime` on an origin that is a secure context. Chrome exposes
+    /// serviceWorker, crypto.subtle, caches, storage, clipboard, wakeLock,
+    /// credentials, locks and mediaDevices *only* there, so a test that
+    /// touches any of them has to say which kind of origin it means. The
+    /// plain `setup_runtime` origin is `http://example.com`, which is
+    /// insecure -- most of the suite predates the distinction existing.
+    fn setup_secure_runtime(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://example.com/test");
+        rt.set_title("Test Page");
+        rt.run_page_init();
+        rt
+    }
+
     fn setup_privacy_runtime() -> ObscuraJsRuntime {
         let rt = setup_runtime("<html><body></body></html>");
         rt.set_url("https://top.example/page");
@@ -4497,7 +4513,9 @@ Policy bare's TrustedTypePolicyOptions did not specify a 'createHTML' member.",
     /// js-repros/service-worker-fail-closed/chrome-oracle.json.
     #[tokio::test(flavor = "current_thread")]
     async fn service_worker_container_matches_chrome_shape_and_refuses_registration() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        // navigator.serviceWorker does not exist on an insecure origin at all,
+        // which is what setup_runtime's http:// origin is.
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
                 r#"(async () => {
@@ -4602,7 +4620,7 @@ Policy bare's TrustedTypePolicyOptions did not specify a 'createHTML' member.",
                     "isDOMException": true, "isTypeError": false,
                     "message": "Failed to register a ServiceWorker: The origin of the provided \
 scriptURL ('https://other.example') does not match the current origin \
-('http://example.com').",
+('https://example.com').",
                 },
                 "dataUrlScript": {
                     "settled": "rejected", "name": "TypeError",
@@ -4615,7 +4633,7 @@ script ('data:text/javascript,//') is not supported.",
                     "isDOMException": true, "isTypeError": false,
                     "message": "Failed to register a ServiceWorker: The origin of the provided \
 scope ('https://other.example') does not match the current origin \
-('http://example.com').",
+('https://example.com').",
                 },
                 // Fetching the script needs no worker, so it happens for real
                 // and the 404 is reported the way Chrome reports it. The
@@ -4626,7 +4644,7 @@ scope ('https://other.example') does not match the current origin \
                     "settled": "rejected", "name": "TypeError",
                     "isDOMException": false, "isTypeError": true,
                     "message": "Failed to register a ServiceWorker for scope \
-('http://example.com/') with script ('http://example.com/sw.js'): A bad HTTP response code \
+('https://example.com/') with script ('https://example.com/sw.js'): A bad HTTP response code \
 (404) was received when fetching the script.",
                 },
                 "getRegistration": { "settled": "fulfilled", "isUndefined": true },
@@ -4635,11 +4653,107 @@ scope ('https://other.example') does not match the current origin \
                     "isDOMException": true, "isTypeError": false,
                     "message": "Failed to get a ServiceWorkerRegistration: The origin of the \
 provided documentURL ('https://other.example') does not match the current origin \
-('http://example.com').",
+('https://example.com').",
                 },
                 "registrations": [],
             })
         );
+    }
+
+    /// `isSecureContext` existed on worker scopes (worker.rs) but not on the
+    /// window, so two lines of script caught the engine disagreeing with
+    /// itself -- and the powerful APIs it gates were handed out on every
+    /// origin. Values pinned against Chrome 146 in
+    /// js-repros/secure-context/chrome-oracle.json, captured over a LAN
+    /// address: 127.0.0.1 and localhost are potentially trustworthy, so a
+    /// loopback fixture cannot show what an insecure origin looks like.
+    #[test]
+    fn secure_context_gates_the_same_apis_chrome_gates() {
+        let probe = r#"(() => ({
+            isSecureContext: globalThis.isSecureContext,
+            origin: globalThis.origin,
+            subtle: typeof crypto.subtle,
+            serviceWorker: typeof navigator.serviceWorker,
+            mediaDevices: typeof navigator.mediaDevices,
+            storage: typeof navigator.storage,
+            clipboard: typeof navigator.clipboard,
+            wakeLock: typeof navigator.wakeLock,
+            credentials: typeof navigator.credentials,
+            locks: typeof navigator.locks,
+            caches: typeof globalThis.caches,
+            cachesIn: 'caches' in globalThis,
+            geolocation: typeof navigator.geolocation,
+            Notification: typeof globalThis.Notification,
+        }))()"#;
+
+        // http://example.com -- insecure.
+        let mut insecure = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            insecure.evaluate(probe).unwrap(),
+            serde_json::json!({
+                "isSecureContext": false,
+                "origin": "http://example.com",
+                "subtle": "undefined",
+                "serviceWorker": "undefined",
+                "mediaDevices": "undefined",
+                "storage": "undefined",
+                "clipboard": "undefined",
+                "wakeLock": "undefined",
+                "credentials": "undefined",
+                "locks": "undefined",
+                "caches": "undefined",
+                // Removed, not shadowed: Chrome leaves no trace of it.
+                "cachesIn": false,
+                // Chrome keeps both of these on an insecure origin and refuses
+                // at call time instead. Removing them would be a difference,
+                // not a fix -- the oracle is what stopped that.
+                "geolocation": "object",
+                "Notification": "function",
+            }),
+        );
+
+        // https://example.com -- secure. Everything comes back.
+        let mut secure = setup_secure_runtime("<html><body></body></html>");
+        assert_eq!(
+            secure.evaluate(probe).unwrap(),
+            serde_json::json!({
+                "isSecureContext": true,
+                "origin": "https://example.com",
+                "subtle": "object",
+                "serviceWorker": "object",
+                "mediaDevices": "object",
+                "storage": "object",
+                "clipboard": "object",
+                "wakeLock": "object",
+                "credentials": "object",
+                "locks": "object",
+                "caches": "object",
+                "cachesIn": true,
+                "geolocation": "object",
+                "Notification": "function",
+            }),
+        );
+
+        // Loopback is potentially trustworthy even over plain HTTP; a file URL
+        // is too, and serialises its origin to "null" while staying secure.
+        for (url, expected) in [
+            ("http://127.0.0.1:8080/page", true),
+            ("http://localhost:8080/page", true),
+            ("http://app.localhost/page", true),
+            ("https://example.com/page", true),
+            ("http://192.168.1.5/page", false),
+            ("http://example.com/page", false),
+        ] {
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(parse_html("<html><body></body></html>"));
+            rt.set_url(url);
+            rt.run_page_init();
+            assert_eq!(
+                rt.evaluate("globalThis.isSecureContext").unwrap(),
+                serde_json::json!(expected),
+                "{url}",
+            );
+        }
     }
 
     /// Fetching the worker script needs no worker, so every check that depends
@@ -18374,7 +18488,8 @@ never followed",
     /// "addEventListener is not a function".
     #[test]
     fn navigator_eventtarget_stubs_expose_add_event_listener() {
-        let mut rt = setup_runtime("<div></div>");
+        // Reads navigator.serviceWorker, which only exists on a secure origin.
+        let mut rt = setup_secure_runtime("<div></div>");
         let result = rt
             .evaluate(
                 r#"

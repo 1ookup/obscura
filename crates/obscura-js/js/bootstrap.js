@@ -164,6 +164,16 @@ Function.prototype.toString = function toString() {
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+// Captured once so structured clone does not depend on the global binding
+// still being there. Chrome exposes no SharedArrayBuffer without cross-origin
+// isolation; matching that is tracked separately (deleting it here does work,
+// but something re-installs it after bootstrap runs).
+const _SharedArrayBufferCtor = globalThis.SharedArrayBuffer;
+// Set by _installSecureContext at the very end of bootstrap and called from
+// __obscura_init. A closure variable rather than a global: any own property
+// name containing "obscura" leaks the engine's identity to a page that reads
+// Object.getOwnPropertyNames(window).
+let _applySecureContextGating = null;
 _nativeFns.add(Function.prototype.toString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
@@ -11441,7 +11451,7 @@ function _structuredClone(value, seen) {
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof SharedArrayBuffer) {
+  if (_SharedArrayBufferCtor && value instanceof _SharedArrayBufferCtor) {
     return value; // transferable, not copyable
   }
   if (value instanceof Date) return new Date(value.getTime());
@@ -16843,6 +16853,9 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 globalThis.__obscura_init = function() {
+  // First: the document URL is known now, and the gating below removes APIs
+  // that later init steps would otherwise hand out on an insecure origin.
+  try { _applySecureContextGating?.(); } catch (_e) {}
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
@@ -17720,6 +17733,99 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     try { val = globalThis[name]; } catch (e) { continue; }
     if (typeof val === 'function') { walk(val); }
   }
+})();
+
+// Secure contexts. Runs last: it takes away APIs the rest of bootstrap has
+// already installed, so anything registered after it would survive by accident.
+(function _installSecureContext() {
+  // https://w3c.github.io/webappsec-secure-contexts/. Loopback counts as
+  // trustworthy even over plain HTTP, which is why a 127.0.0.1 fixture cannot
+  // show what an insecure origin looks like -- the oracle for this had to be
+  // captured over the host's LAN address.
+  function _isPotentiallyTrustworthy(href) {
+    try {
+      const url = new URL(String(href));
+      if (url.protocol === 'https:' || url.protocol === 'wss:'
+        || url.protocol === 'file:') return true;
+      const host = url.hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+      if (host === 'localhost' || host.endsWith('.localhost')) return true;
+      if (host === '::1' || /^0*:0*:0*:0*:0*:0*:0*:0*1$/.test(host)) return true;
+      if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
+      return false;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  // Evaluated on every read rather than captured once: bootstrap runs while the
+  // document URL is still about:blank, and the real one arrives later.
+  function _secureNow() {
+    let href = '';
+    try { href = globalThis.location?.href || ''; } catch (_error) { href = ''; }
+    // No URL yet is the engine's own bootstrapping, not a page an insecure
+    // origin can observe.
+    return href === '' || href === 'about:blank' || _isPotentiallyTrustworthy(href);
+  }
+
+  Object.defineProperty(globalThis, 'isSecureContext', {
+    get: _markNativeAs(function isSecureContext() { return _secureNow(); },
+      'function get isSecureContext() { [native code] }'),
+    set: undefined,
+    enumerable: true,
+    configurable: true,
+  });
+
+  // `origin` is a WindowOrWorkerGlobalScope attribute that Chrome exposes on
+  // every global; it was missing here entirely. An opaque origin reads "null".
+  if (!('origin' in globalThis)) {
+    Object.defineProperty(globalThis, 'origin', {
+      get: _markNativeAs(function origin() {
+        try {
+          const value = globalThis.location?.origin;
+          return value === undefined || value === '' ? 'null' : value;
+        } catch (_error) { return 'null'; }
+      }, 'function get origin() { [native code] }'),
+      set: undefined,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  // Taking the APIs away is destructive and cannot be undone per read, so it
+  // waits for __obscura_init, which runs once the document URL is known.
+  _applySecureContextGating = function () {
+    if (_secureNow()) return;
+
+    // Deleting, not shadowing: Chrome leaves no trace of these on an insecure
+    // origin, so `'caches' in globalThis` is false and not merely undefined.
+    function _remove(target, name) {
+      // Walks the whole chain: `navigator.serviceWorker` is an accessor on
+      // Navigator.prototype rather than an own property, and the other gated
+      // members sit at different depths.
+      let object = target;
+      while (object) {
+        try {
+          if (Object.prototype.hasOwnProperty.call(object, name)) {
+            delete object[name];
+            return;
+          }
+        } catch (_error) { /* non-configurable: leave it rather than throw */ }
+        try { object = Object.getPrototypeOf(object); } catch (_error) { return; }
+      }
+    }
+
+    for (const name of ['caches', 'CacheStorage', 'Cache']) _remove(globalThis, name);
+    for (const name of [
+      'serviceWorker', 'mediaDevices', 'storage', 'clipboard', 'wakeLock',
+      'credentials', 'locks',
+    ]) _remove(globalThis.navigator, name);
+    _remove(globalThis.crypto, 'subtle');
+
+    // `geolocation` and `Notification` deliberately stay. Chrome keeps both
+    // interfaces on an insecure origin and refuses at call time instead, so
+    // removing them would be a difference, not a fix -- checked against Chrome
+    // 146 in js-repros/secure-context/chrome-oracle.json.
+  };
 })();
 
 })();

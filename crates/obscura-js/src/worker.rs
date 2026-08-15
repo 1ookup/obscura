@@ -910,6 +910,24 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
     fire(event, 'message');
   };
+
+  // A worker inherits its creator's secure-context status, and the same APIs
+  // go away here as on the page. Last in the prep script so it removes what
+  // the steps above have finished installing. `isSecureContext` matching while
+  // `crypto.subtle` still answered would be an engine-internal contradiction
+  // any script could read in two lines. Checked against Chrome 146 in
+  // js-repros/secure-context/chrome-oracle.json.
+  if (!__OBSCURA_WORKER_SECURE__) {
+    var gatedGlobals = ['caches', 'CacheStorage', 'Cache'];
+    for (var gi = 0; gi < gatedGlobals.length; gi++) {
+      try { delete G[gatedGlobals[gi]]; } catch (e) {}
+    }
+    var gatedOnNavigator = ['serviceWorker', 'storage', 'locks', 'mediaDevices'];
+    for (var ni = 0; ni < gatedOnNavigator.length; ni++) {
+      try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
+    }
+    try { if (G.crypto) delete G.crypto.subtle; } catch (e) {}
+  }
 })();
 "#;
 
@@ -1412,7 +1430,11 @@ mod tests {
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         assert_eq!(
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
-            serde_json::json!(r#"{"leaked":[],"dropped":[],"indexed":0}"#),
+            // `caches` is gone because this worker's creator is
+            // http://example.com -- an insecure origin, where Chrome exposes
+            // no CacheStorage either. The rest of the WorkerGlobalScope set is
+            // unaffected. See js-repros/secure-context/.
+            serde_json::json!(r#"{"leaked":[],"dropped":["caches"],"indexed":0}"#),
         );
     }
 
