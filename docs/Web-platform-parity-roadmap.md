@@ -240,11 +240,22 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **时机的坑**:bootstrap 执行时 `location.href` 还是 `about:blank`,真实 URL 之后才到。首版在
   bootstrap 顶层一次性判定,结果**完全反了**——LAN 源上不收起、loopback 上反而收起。改为
   `isSecureContext` 每次读时求值,破坏性的收起动作推迟到 `__obscura_init`(URL 已知)。
-- **验证**:`js-repros/secure-context/` 固化 Chrome 146 oracle,三种源共 75 个观测点中 72 个一致。
-  剩 3 个是同一件事按源计数:`SharedArrayBuffer` 仍暴露(它要的是跨源隔离 COOP+COEP,比 secure
-  context 更严,Chrome 在 loopback 上也不给)。bootstrap 里 delete 确实成功(下一行 typeof 已是
-  undefined),但**之后被某处重新装回**,而全仓库没有 Rust 代码提到这个名字;成因未找到之前不绕
-  过,记为独立待查项。新增 `secure_context_gates_the_same_apis_chrome_gates`。
+- **验证**:`js-repros/secure-context/` 固化 Chrome 146 oracle,三种源共 108 个观测点全部一致。
+  新增 `secure_context_gates_the_same_apis_chrome_gates`。
+- **续:`SharedArrayBuffer`(跨源隔离,另一条轴)**。它要的是 COOP+COEP,比 secure context 更严,
+  Chrome 在 loopback 上也不给。此前记为「delete 成功但之后被某处重新装回,全仓库没有 Rust 代码
+  提到这个名字」——成因是 **V8 自己**:bootstrap.js 是在 startup snapshot **创建时**执行的,而
+  `Genesis::InitializeGlobal_sharedarraybuffer`(`v8/src/init/bootstrapper.cc`)会给它构建的每个
+  context 都装上这个属性,包括从 snapshot **反序列化**出来的那个。所以没有 Rust 提到它。
+  用陷阱抓现行时 V8 的 `DCHECK(!it.IsFound())` 直接崩掉,反而坐实了机制。
+  扩采 oracle 又纠正了一处更要紧的预判:**Chrome 并没有移除构造器**,只是不装全局绑定 ——
+  `new WebAssembly.Memory({shared:true})` 在非隔离源上成功,其 `buffer.constructor.name` 仍是
+  `SharedArrayBuffer`、`toString` 仍是 `[object SharedArrayBuffer]`,只有
+  `constructor === globalThis.SharedArrayBuffer` 为 false。`delete` 会对上第一条、错开后三条。
+  正解是 V8 为此提供、Chrome 自己也在用的开关:`--enable-sharedarraybuffer-per-context` 把安装
+  改为询问 `SetSharedArrayBufferConstructorEnabledCallback`,不注册回调即为「不给」。在
+  `v8_flags.rs` 里于第一个 isolate 之前无条件施加。新增
+  `shared_array_buffer_is_withheld_the_way_chrome_withholds_it`。
 - **暴露出的既有问题**:4 个测试因此失败,原因是**整个测试套件都跑在 `http://example.com`(非安全源)
   上却假设所有 API 可用**——此前根本没有 secure context 概念。新增 `setup_secure_runtime` 供需要
   安全源的测试使用;worker 测试的 `caches` 消失是正确的(其创建者是 http)。另有一个真实泄漏被

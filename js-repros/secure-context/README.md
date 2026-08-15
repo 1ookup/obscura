@@ -56,18 +56,44 @@ read, and the destructive part -- removing the APIs -- runs from
 decided at bootstrap time got it exactly backwards, keeping the APIs on the
 insecure origin and removing them on loopback.
 
+## Cross-origin isolation is a different axis
+
+`SharedArrayBuffer` is gated on **cross-origin isolation** (COOP+COEP), not on
+a secure context -- it is `undefined` on loopback too. The capture was extended
+to cover it, and the answer is more specific than "Chrome removes it":
+
+```
+crossOriginIsolated                       false
+typeof SharedArrayBuffer                  undefined
+'SharedArrayBuffer' in getOwnPropertyNames(globalThis)   false
+typeof Atomics / Atomics.wait             object / function   <- kept
+new WebAssembly.Memory({shared: true})    succeeds
+  .buffer.constructor.name                "SharedArrayBuffer"
+  Object.prototype.toString.call(.buffer) "[object SharedArrayBuffer]"
+  .buffer.constructor === globalThis.SharedArrayBuffer     false
+```
+
+Chrome does not remove the constructor. It withholds the *global binding*, and
+the constructor stays reachable through a shared `WebAssembly.Memory`, still
+naming itself `SharedArrayBuffer`. `delete globalThis.SharedArrayBuffer` would
+have matched the first line and broken the last three.
+
+It could not have worked anyway. bootstrap.js runs while the V8 startup
+snapshot is being *created*; `Genesis::InitializeGlobal_sharedarraybuffer`
+(`v8/src/init/bootstrapper.cc`) adds the property to every context V8 builds,
+including one deserialized from that snapshot. That is what "something
+re-installs it after bootstrap runs" was -- no Rust in the tree mentions the
+name because none needs to.
+
+The fix is the flag V8 provides for exactly this, and that Chrome itself uses:
+`--enable-sharedarraybuffer-per-context` makes the install conditional on
+`SetSharedArrayBufferConstructorEnabledCallback`, and with no callback
+registered the answer is no. Applied unconditionally in
+`obscura-js/src/v8_flags.rs`, before the first isolate.
+
 ## Result
 
-72 of 75 observables match Chrome 146.0.7680.80 across all three origins.
-
-The 3 that differ are one issue counted once per origin: **`SharedArrayBuffer`
-is still exposed**. Chrome withholds it without cross-origin isolation
-(COOP+COEP), which is stricter than a secure context -- it is `undefined` on
-loopback too. `delete globalThis.SharedArrayBuffer` inside bootstrap does
-succeed (`typeof` reads `undefined` on the next line) and something re-installs
-it afterwards; no Rust in the tree mentions the name. Left alone rather than
-worked around, because cross-origin isolation is a separate axis from secure
-contexts and the re-installation needs finding first.
+All 108 observables match Chrome 146.0.7680.80 across all three origins.
 
 ## Also fixed here
 

@@ -33,6 +33,39 @@ globalThis.secureContextFixturePromise = (async () => {
   gated['SharedArrayBuffer'] = typeof globalThis.SharedArrayBuffer;
   out.gated = gated;
 
+  // SharedArrayBuffer sits on a different axis: Chrome withholds it without
+  // *cross-origin isolation* (COOP+COEP), which is stricter than a secure
+  // context, so it is absent on loopback too. Withholding the global binding
+  // is not enough on its own -- these are the ways a page can reach the same
+  // constructor, or detect that only the binding was hidden.
+  const isolation = {};
+  isolation.crossOriginIsolated = globalThis.crossOriginIsolated;
+  isolation.typeofCrossOriginIsolated = typeof globalThis.crossOriginIsolated;
+  isolation.hasOwnSAB =
+    Object.prototype.hasOwnProperty.call(globalThis, 'SharedArrayBuffer');
+  isolation.sabInDescriptor =
+    Object.getOwnPropertyDescriptor(globalThis, 'SharedArrayBuffer') !== undefined;
+  isolation.sabInGlobalNames =
+    Object.getOwnPropertyNames(globalThis).includes('SharedArrayBuffer');
+  // Atomics stays: it works on ordinary ArrayBuffers too.
+  isolation.typeofAtomics = typeof globalThis.Atomics;
+  isolation.typeofAtomicsWait = typeof globalThis.Atomics?.wait;
+  // The back door. A shared WebAssembly.Memory's buffer *is* a
+  // SharedArrayBuffer, so if this succeeds the constructor is reachable
+  // regardless of what the global binding says.
+  try {
+    const memory = new WebAssembly.Memory({initial: 1, maximum: 1, shared: true});
+    isolation.wasmSharedMemory = {
+      threw: false,
+      bufferCtorName: memory.buffer?.constructor?.name ?? null,
+      bufferTag: Object.prototype.toString.call(memory.buffer),
+      ctorIsGlobalSAB: memory.buffer?.constructor === globalThis.SharedArrayBuffer,
+    };
+  } catch (error) {
+    isolation.wasmSharedMemory = {threw: true, name: error?.name || null};
+  }
+  out.crossOriginIsolation = isolation;
+
   // A worker inherits the creator's secure-context status; a mismatch between
   // the two is an engine-internal contradiction visible to any script.
   out.worker = await new Promise(resolve => {

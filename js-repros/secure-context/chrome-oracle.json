@@ -25,6 +25,21 @@
       "navigator.locks": "undefined",
       "SharedArrayBuffer": "undefined"
     },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
+    },
     "worker": {
       "isSecureContext": false,
       "typeofValue": "boolean",
@@ -58,6 +73,21 @@
       "navigator.locks": "object",
       "SharedArrayBuffer": "undefined"
     },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
+    },
     "worker": {
       "isSecureContext": true,
       "typeofValue": "boolean",
@@ -90,6 +120,21 @@
       "navigator.credentials": "object",
       "navigator.locks": "object",
       "SharedArrayBuffer": "undefined"
+    },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
     },
     "worker": {
       "isSecureContext": true,

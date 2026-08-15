@@ -543,6 +543,11 @@ impl ObscuraJsRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+            // Must precede the first isolate: V8 ignores flag changes once the
+            // platform is up. Under the same lock so the check-then-set cannot
+            // race an isolate being built on another connection thread.
+            crate::v8_flags::apply_baseline_v8_flags();
+
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
@@ -5300,6 +5305,77 @@ RequestRedirect value",
                 "readback": "follow,error,manual",
             })
         );
+    }
+
+    /// `SharedArrayBuffer` is not a global, on any origin.
+    ///
+    /// Chrome gates it on cross-origin isolation (COOP+COEP), which is
+    /// stricter than a secure context -- it is absent on loopback too. It does
+    /// *not* remove the constructor: a shared `WebAssembly.Memory`'s buffer
+    /// still reports `SharedArrayBuffer` for its constructor name and its
+    /// `Symbol.toStringTag`, while `constructor === globalThis.SharedArrayBuffer`
+    /// is false because the global is undefined. Deleting the binding in
+    /// bootstrap.js would have matched the first half and broken the second --
+    /// and could not work anyway, because bootstrap runs while the snapshot is
+    /// created and V8's Genesis reinstalls the property when it is loaded.
+    /// Captured in js-repros/secure-context/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_array_buffer_is_withheld_the_way_chrome_withholds_it() {
+        const PROBE: &str = r#"({
+            typeofGlobal: typeof globalThis.SharedArrayBuffer,
+            hasOwn: Object.prototype.hasOwnProperty.call(
+                globalThis, 'SharedArrayBuffer'),
+            inGlobalNames: Object.getOwnPropertyNames(globalThis)
+                .includes('SharedArrayBuffer'),
+            hasDescriptor: Object.getOwnPropertyDescriptor(
+                globalThis, 'SharedArrayBuffer') !== undefined,
+            // Atomics stays -- it works on ordinary ArrayBuffers.
+            typeofAtomics: typeof globalThis.Atomics,
+            typeofAtomicsWait: typeof globalThis.Atomics?.wait,
+            wasm: (() => {
+                try {
+                    const memory = new WebAssembly.Memory(
+                        {initial: 1, maximum: 1, shared: true});
+                    return {
+                        threw: false,
+                        bufferCtorName: memory.buffer?.constructor?.name ?? null,
+                        bufferTag: Object.prototype.toString.call(memory.buffer),
+                        ctorIsGlobalSAB:
+                            memory.buffer?.constructor === globalThis.SharedArrayBuffer,
+                    };
+                } catch (error) {
+                    return {threw: true, name: error?.name || null};
+                }
+            })(),
+        })"#;
+
+        let expected = serde_json::json!({
+            "typeofGlobal": "undefined",
+            "hasOwn": false,
+            "inGlobalNames": false,
+            "hasDescriptor": false,
+            "typeofAtomics": "object",
+            "typeofAtomicsWait": "function",
+            // Chrome does not remove the constructor, only the global binding.
+            "wasm": {
+                "threw": false,
+                "bufferCtorName": "SharedArrayBuffer",
+                "bufferTag": "[object SharedArrayBuffer]",
+                "ctorIsGlobalSAB": false,
+            },
+        });
+
+        // One runtime at a time: two live isolates on one thread trip V8's
+        // current-isolate check.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let insecure = rt.evaluate_for_cdp(PROBE, true, true).await.unwrap().value.unwrap();
+        drop(rt);
+        assert_eq!(insecure, expected, "insecure origin");
+
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let secure = rt.evaluate_for_cdp(PROBE, true, true).await.unwrap().value.unwrap();
+        drop(rt);
+        assert_eq!(secure, expected, "secure origin");
     }
 
     #[tokio::test(flavor = "current_thread")]
