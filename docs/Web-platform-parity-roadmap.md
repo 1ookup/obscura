@@ -421,7 +421,20 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    ③`Cargo.lock` 前后哈希比对(第 5 条那个坑,本轮我自己踩了两次)。hook 内所有 cargo 命令都带
    `--config patch.crates-io.v8.path`——否则门禁本身就成了改写 `Cargo.lock` 的元凶。
    `SKIP_OBSCURA_PREPUSH=1 git push` 可显式跳过。
-5. **构建必须带 V8 补丁配置**。任何不带
+5. **js-repros fixture 已部分接入门禁**。12 个 fixture 共 577 个 Chrome 观测点,此前**没有任何代码
+   读过它们**——是「碰巧含有数据的文档」,只在有人记得照 README 敲命令时才被验证过(对比:
+   `render-repros` 是被 `layout_test.rs:314` 真正 `include_str!` 的)。已加
+   `assert_probe_matches_chrome_oracle`,直接 `include_str!` probe 与 oracle 并逐字段递归比对,
+   已接入 4 个 fixture 共 **226 个观测点**(trusted-types 96、media-capability 77、worklet 39、
+   private-state 14),耗时 0.029s。helper 同时兼容两代 fixture 约定(早期把观测值包在 `result`
+   里、外裹 `browser`/`captured` 元数据,后期直接放顶层),并会在「某条 known_difference 已经和
+   Chrome 一致」时报错,防止豁免清单变成回归的藏身处。
+   未接入的 4 个各有具体原因(已写进代码注释,不是「以后再说」):font-fingerprint 需要数值容差
+   (内嵌字体 vs 系统字体,98 个值全部差 ~2px,是设计决定);fingerprint-derivation 需要真实
+   iframe realm;service-worker 需要能按需返回特定状态码/MIME/重定向的 HTTP server(其判定链已由
+   `service_worker_registration_fetches_the_script_before_refusing` 覆盖);secure-context 需要一次
+   运行里三种不同源(已由 `secure_context_gates_the_same_apis_chrome_gates` 覆盖)。
+6. **构建必须带 V8 补丁配置**。任何不带
    `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` 的 `cargo build`/`nextest` 会静默把
    `target/release/obscura` 换成非 patched V8,trace 输出随之变空(见 `Trace-page-script.md`)。
    同时它会改写 `Cargo.lock` 里 `v8` 的 source/checksum——那两行的缺失是有意的,不要提交回去。

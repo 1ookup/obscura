@@ -4660,6 +4660,183 @@ provided documentURL ('https://other.example') does not match the current origin
         );
     }
 
+    /// Compares this engine against a Chrome capture stored in js-repros/.
+    ///
+    /// The fixtures hold 577 observables across twelve directories, and until
+    /// now nothing in the tree read any of them: they were documentation that
+    /// happened to contain data, verified only when someone remembered to run
+    /// the shell commands in their README. The hand-written assertions beside
+    /// this helper cover a deliberate subset; this reads the whole capture.
+    ///
+    /// `known_differences` is a list of JSON paths that are expected to differ,
+    /// each with the reason. An empty reason is not allowed -- a difference
+    /// worth keeping is worth explaining, and the fixture README has to say the
+    /// same thing.
+    async fn assert_probe_matches_chrome_oracle(
+        rt: &mut ObscuraJsRuntime,
+        probe: &str,
+        promise_global: &str,
+        oracle_json: &str,
+        known_differences: &[(&str, &str)],
+    ) {
+        fn walk(
+            chrome: &serde_json::Value,
+            ours: &serde_json::Value,
+            path: &str,
+            found: &mut Vec<(String, String, String)>,
+        ) {
+            if let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (chrome, ours) {
+                let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let next = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(
+                        a.get(key).unwrap_or(&serde_json::Value::Null),
+                        b.get(key).unwrap_or(&serde_json::Value::Null),
+                        &next,
+                        found,
+                    );
+                }
+                return;
+            }
+            if chrome != ours {
+                found.push((path.to_string(), chrome.to_string(), ours.to_string()));
+            }
+        }
+
+        rt.execute_script("<fixture-probe>", probe).unwrap();
+        let ours = rt
+            .evaluate_for_cdp(promise_global, true, true)
+            .await
+            .unwrap()
+            .value
+            .expect("probe promise produced no value");
+        let raw: serde_json::Value =
+            serde_json::from_str(oracle_json).expect("chrome-oracle.json is not valid JSON");
+        // The early fixtures wrap their capture in metadata -- `browser`,
+        // `captured`, `note` -- with the observables under `result`; the later
+        // ones put the observables at the top level. Unwrap the former so both
+        // conventions can be read the same way.
+        let chrome = match (raw.get("browser"), raw.get("result")) {
+            (Some(_), Some(result)) => result.clone(),
+            _ => raw,
+        };
+
+        let mut found = Vec::new();
+        walk(&chrome, &ours, "", &mut found);
+
+        let expected: std::collections::HashMap<&str, &str> =
+            known_differences.iter().copied().collect();
+        assert!(
+            !expected.values().any(|reason| reason.trim().is_empty()),
+            "every known difference needs a reason",
+        );
+
+        let mut unexpected = Vec::new();
+        for (path, chrome_value, our_value) in &found {
+            if !expected.contains_key(path.as_str()) {
+                unexpected.push(format!(
+                    "  {path}\n      chrome:  {chrome_value}\n      obscura: {our_value}"
+                ));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "{} observable(s) drifted from the Chrome capture:\n{}",
+            unexpected.len(),
+            unexpected.join("\n"),
+        );
+
+        // A known difference that has since been fixed must be removed from the
+        // list, or the list slowly becomes a place where regressions hide.
+        let still_differing: std::collections::HashSet<&str> =
+            found.iter().map(|(path, _, _)| path.as_str()).collect();
+        let stale: Vec<&str> = expected
+            .keys()
+            .copied()
+            .filter(|path| !still_differing.contains(path))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these paths match Chrome now -- drop them from known_differences: {stale:?}",
+        );
+    }
+
+    /// The Trusted Types capture, read in full rather than sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_matches_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/trusted-types/probe.js"),
+            "ttFixturePromise",
+            include_str!("../../../js-repros/trusted-types/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The worklet capture, read in full rather than sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worklet_entry_points_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/worklet-entrypoints/probe.js"),
+            "workletFixturePromise",
+            include_str!("../../../js-repros/worklet-entrypoints/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The media capability capture, read in full rather than sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capabilities_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/media-capability-honesty/probe.js"),
+            "mediaFixturePromise",
+            include_str!("../../../js-repros/media-capability-honesty/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The Private State Token / storage access capture.
+    #[tokio::test(flavor = "current_thread")]
+    async fn private_state_tokens_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/private-state-and-storage-access/probe.js"),
+            "privateStateFixturePromise",
+            include_str!("../../../js-repros/private-state-and-storage-access/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    // Four fixtures are not read this way, and the reason is not "later":
+    //
+    // - font-fingerprint compares text metrics that differ by design. Obscura
+    //   ships embedded fonts instead of scanning the host's, so widths land
+    //   within ~2px of Chrome rather than on it (948.87 vs 949). Reading it
+    //   here needs a numeric tolerance, not equality; all 98 values differ.
+    // - fingerprint-derivation drives a real iframe's contentWindow, which
+    //   needs a frame realm this helper does not set up.
+    // - service-worker-fail-closed needs an HTTP server that answers with
+    //   specific status codes, MIME types and redirects; its decision chain is
+    //   covered by service_worker_registration_fetches_the_script_before_refusing.
+    // - secure-context needs three different origins in one run, including a
+    //   non-loopback one; covered by secure_context_gates_the_same_apis_chrome_gates.
+
     /// `isSecureContext` existed on worker scopes (worker.rs) but not on the
     /// window, so two lines of script caught the engine disagreeing with
     /// itself -- and the powerful APIs it gates were handed out on every
