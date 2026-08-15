@@ -149,7 +149,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 序 | 能力 | 关键收益 | 状态 |
 |---|---|---|---|
 | 6 | CDP Debugger 域 + trace 增强(§3.4-#18/19) | 后续一切缺口定位从"几天对拍"降到"分钟级";Debugger 也是 Puppeteer 生态的硬需求 | ✅ 协议状态、scriptParsed 生命周期、Profiler/HeapProfiler 合同和 host-op TSV;rusty_v8 原生断点桥接待后续 |
-| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 | ⚠️ `--trace-op-file` 与单 worker `--v8-flags` 已贯通;**多 worker serve 仍丢失用户 flags**(`main.rs:577` 设 `OBSCURA_V8_FLAGS`,但 `main.rs:343` 只读 argv,从不读该 env),见 profile step 45 证据 1 |
+| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 | ✅ `--trace-op-file` 与 `--v8-flags` 在单 worker 与多 worker 下均贯通(`resolve_v8_flags`);父进程导出 `OBSCURA_V8_FLAGS`,子进程读它 —— 此前只有 `obscura-worker` 这个 bin 读,而它并不是 `--workers` 所 spawn 的那个 |
 | 8 | WebSocket 真实现(§3.2-#8) | 通用爬虫最大露馅点;走既有网络栈 | ✅ 本地 RFC 6455 echo fixture 通过;代理 CONNECT/TLS profile 复用待后续 |
 | 9 | 自动点击/自然输入策略(§3.3-#16) | 输入合成通用化;CF 交互挑战自动过(当前主线) | ✅ selector/timing policy、可信 pointer/mouse/click 序列和自然逐字符 input |
 

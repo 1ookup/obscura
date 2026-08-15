@@ -305,6 +305,30 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+/// The flags this process should run with, given its argv and its environment.
+///
+/// `--workers N` spawns this same binary re-invoked as `serve`, so the child
+/// re-parses argv and never sees the parent's `--v8-flags`. The parent hands
+/// them over in `OBSCURA_V8_FLAGS` (see `run_multi_worker_serve`) -- and until
+/// this function existed nothing on the receiving side read it. The only bin
+/// that did was `obscura-worker`, which is not what `--workers` spawns, so
+/// `obscura serve --workers 4 --v8-flags '--expose-gc'` silently ran all four
+/// workers on the defaults alone. Fail-silent: the flag was accepted, echoed
+/// in the debug log, and dropped.
+///
+/// The inherited value is already composed with `DEFAULT_V8_FLAGS` by the
+/// parent, so it is used as-is; composing again would just repeat them.
+fn resolve_v8_flags(user: Option<&str>, inherited: Option<&str>) -> String {
+    if user.is_some() {
+        return effective_v8_flags(user);
+    }
+    inherited
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| effective_v8_flags(None))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -340,7 +364,8 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
+    let inherited_v8_flags = std::env::var("OBSCURA_V8_FLAGS").ok();
+    let v8_flags = resolve_v8_flags(args.v8_flags.as_deref(), inherited_v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
     if let Some(path) = args.trace_op_file.as_ref() {
@@ -574,6 +599,9 @@ async fn run_multi_worker_serve(
         if stealth {
             cmd.arg("--stealth");
         }
+        // Already composed with DEFAULT_V8_FLAGS; the child reads it in
+        // resolve_v8_flags and uses it as-is. argv would work too, but the
+        // child would recompose the defaults onto it.
         cmd.env("OBSCURA_V8_FLAGS", &v8_flags);
         if let Some(path) = std::env::var_os("OBSCURA_TRACE_OP_FILE") {
             cmd.env("OBSCURA_TRACE_OP_FILE", path);
@@ -1897,7 +1925,8 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
+        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, resolve_v8_flags,
+        select_log_filter,
         write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
@@ -2226,6 +2255,45 @@ mod tests {
         let merged = effective_v8_flags(Some("--expose-gc"));
         assert!(merged.contains(DEFAULT_V8_FLAGS));
         assert!(merged.contains("--expose-gc"));
+    }
+
+    // `--workers N` spawns this binary again as `serve`, and the child parses
+    // its own argv -- which has no --v8-flags on it. The parent passes them in
+    // OBSCURA_V8_FLAGS, and nothing read that env: the only bin that did was
+    // obscura-worker, which is not what --workers spawns. Every worker ran on
+    // the defaults while the flag was accepted and logged.
+    #[test]
+    fn a_spawned_serve_worker_inherits_the_v8_flags_it_was_started_with() {
+        let parent = effective_v8_flags(Some("--expose-gc"));
+        let child = resolve_v8_flags(None, Some(&parent));
+        assert_eq!(child, parent, "the child must run on the parent's flags");
+        assert!(child.contains("--expose-gc"));
+    }
+
+    #[test]
+    fn an_inherited_v8_flag_string_is_not_composed_with_the_defaults_twice() {
+        let parent = effective_v8_flags(Some("--expose-gc"));
+        let child = resolve_v8_flags(None, Some(&parent));
+        assert_eq!(
+            child.matches("--max-old-space-size").count(),
+            1,
+            "the parent already composed the defaults in: {child}",
+        );
+    }
+
+    #[test]
+    fn an_explicit_v8_flag_outranks_an_inherited_one() {
+        let inherited = effective_v8_flags(Some("--expose-gc"));
+        let resolved = resolve_v8_flags(Some("--jitless"), Some(&inherited));
+        assert!(resolved.contains("--jitless"));
+        assert!(!resolved.contains("--expose-gc"), "argv must win: {resolved}");
+    }
+
+    #[test]
+    fn an_absent_or_blank_inherited_v8_flag_string_falls_back_to_the_defaults() {
+        assert_eq!(resolve_v8_flags(None, None), DEFAULT_V8_FLAGS);
+        assert_eq!(resolve_v8_flags(None, Some("")), DEFAULT_V8_FLAGS);
+        assert_eq!(resolve_v8_flags(None, Some("   ")), DEFAULT_V8_FLAGS);
     }
 
     #[test]
