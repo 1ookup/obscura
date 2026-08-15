@@ -3347,6 +3347,28 @@ class Element extends Node {
       this.setAttribute("for", String(v));
     }
   }
+  get control() {
+    if (this.localName !== 'label') return undefined;
+    const root = this.getRootNode ? this.getRootNode() : document;
+    const forId = this.getAttribute('for');
+    const labelable = 'button,input,meter,output,progress,select,textarea';
+    if (forId && root && root.getElementById) {
+      const target = root.getElementById(forId);
+      return target && target.matches && target.matches(labelable) && !target.matches('input[type=hidden]') ? target : null;
+    }
+    return this.querySelector ? this.querySelector(labelable) : null;
+  }
+  get labels() {
+    const labelable = 'button,input,meter,output,progress,select,textarea';
+    if (!this.matches || !this.matches(labelable) || this.matches('input[type=hidden]')) return undefined;
+    const root = this.getRootNode ? this.getRootNode() : document;
+    const labels = root && root.querySelectorAll ? root.querySelectorAll('label') : [];
+    const result = [];
+    for (const label of labels) {
+      if (label.control === this || (!label.getAttribute('for') && label.contains && label.contains(this))) result.push(label);
+    }
+    return _nodeList(result);
+  }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) {
@@ -3621,6 +3643,13 @@ class Element extends Node {
       this.checked = oldChecked;
     }
     if (!cancelled) {
+      // Label activation is a second, trusted click on the labeled control.
+      // Keep it in the element activation path so HTMLElement.click(), CDP,
+      // and user-like input share identical behavior.
+      if (this.localName === 'label' && this.control && this.control !== this) {
+        this.control.click();
+        return;
+      }
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
@@ -4720,6 +4749,62 @@ class Element extends Node {
     for (const n of converted) this.appendChild(n);
   }
 }
+
+// Generic, policy-driven interaction helpers. They are inert unless the
+// embedder installs `__obscura_input_strategy`; the core never matches page
+// text or hostnames. The click path uses the same trusted activation behavior
+// as CDP Input and the natural type helper emits one input event per code unit.
+globalThis.__obscura_schedule_input_strategy = function() {
+  const policy = globalThis.__obscura_input_strategy;
+  if (!policy || !policy.selector || globalThis.__obscura_input_strategy_done) return;
+  const run = () => {
+    let target;
+    try { target = document.querySelector(policy.selector); } catch (e) { return; }
+    if (!target || (target.matches && target.matches(':disabled'))) return;
+    globalThis.__obscura_input_strategy_done = true;
+    const activate = () => {
+      const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+      if (rect && rect.width > 0 && rect.height > 0) {
+        const opts = { bubbles: true, cancelable: true, composed: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', opts)));
+        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', opts)));
+        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', Object.assign({}, opts, { buttons: 0 }))));
+        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseup', Object.assign({}, opts, { buttons: 0 }))));
+      }
+      target.click();
+    };
+    const delay = Math.max(0, Number(policy.delayMs) || 0);
+    if (delay) setTimeout(activate, delay); else activate();
+  };
+  // The embedder installs the policy while the parsed document is already
+  // attached, but this runtime does not synthesize a DOMContentLoaded event
+  // for every navigation. Probe once immediately when the selector exists,
+  // while retaining the event/task path for genuinely late DOM insertion.
+  let present = false;
+  try { present = !!document.querySelector(policy.selector); } catch (e) {}
+  if (present || document.readyState !== 'loading') setTimeout(run, 0);
+  else {
+    document.addEventListener('DOMContentLoaded', run, { once: true });
+    setTimeout(run, 0);
+  }
+};
+globalThis.__obscura_natural_type = function(target, text, keyDelayMs) {
+  target = target || document.activeElement;
+  if (!target || !('value' in target)) return Promise.resolve(false);
+  const value = String(text), delay = Math.max(0, Number(keyDelayMs) || 0);
+  let index = 0;
+  return new Promise(resolve => {
+    const step = () => {
+      if (index >= value.length) { resolve(true); return; }
+      const ch = value[index++];
+      const before = String(target.value || '');
+      __obscura_setFieldValue(target, 'value', before + ch);
+      target.dispatchEvent(__obscura_markTrusted(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' })));
+      if (delay) setTimeout(step, delay); else _browserPostedTaskEnqueue(step, 0);
+    };
+    step();
+  });
+};
 
 // WHATWG "convert nodes into a node": a Node argument passes through, anything
 // else is stringified into a Text node, so e.g. append(null) inserts the text
@@ -7283,8 +7368,43 @@ globalThis.Notification = class Notification {
   constructor() {}
 };
 
-globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
-globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
+class _WebGLContext {
+  constructor(canvas, isWebGL2) {
+    this.canvas = canvas; this._isWebGL2 = !!isWebGL2; this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
+    this._lost = false; this._extensions = new Map();
+  }
+  getContextAttributes() { return { alpha: true, antialias: false, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false }; }
+  getParameter(name) {
+    const fp = _fingerprint(), gpu = fp.gpu || {};
+    const values = { 0x1F00: gpu.vendor || 'WebGL', 0x1F01: gpu.renderer || 'WebGL Renderer', 0x1F02: 'WebGL 1.0 (OpenGL ES 2.0 Chromium)', 0x1F03: 'WebGL GLSL ES 1.00 (OpenGL ES GLSL ES 1.0 Chromium)', 0x1F8B: 16, 0x8B4C: 8, 0x8B49: 8, 0x8B4A: 8, 0x846E: 16384, 0x0D33: 16384, 0x8869: 16, 0x8DFB: 8, 0x8D57: 4, 0x8D56: 4, 0x8B4D: 8, 0x8B4E: 8 };
+    return values[name] === undefined ? null : values[name];
+  }
+  getSupportedExtensions() { return ['ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_element_index_uint', 'OES_standard_derivatives', 'OES_texture_float', 'WEBGL_debug_renderer_info']; }
+  getExtension(name) {
+    if (!this.getSupportedExtensions().includes(String(name))) return null;
+    if (this._extensions.has(name)) return this._extensions.get(name);
+    let value = {};
+    if (name === 'WEBGL_debug_renderer_info') value = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    this._extensions.set(name, value); return value;
+  }
+  createShader(type) { return { type, source: '', compiled: true }; }
+  shaderSource(shader, source) { if (shader) shader.source = String(source); }
+  compileShader(shader) { if (shader) shader.compiled = true; }
+  getShaderParameter(shader, pname) { return pname === 0x8B81 ? !!shader?.compiled : null; }
+  getShaderInfoLog() { return ''; }
+  createProgram() { return { shaders: [], linked: true }; }
+  attachShader(program, shader) { if (program && shader) program.shaders.push(shader); }
+  linkProgram(program) { if (program) program.linked = true; }
+  getProgramParameter(program, pname) { return pname === 0x8B82 ? !!program?.linked : null; }
+  getProgramInfoLog() { return ''; }
+  useProgram() {} getAttribLocation() { return 0; } getUniformLocation() { return {}; }
+  viewport() {} clearColor() {} clear() {} enable() {} disable() {} drawArrays() {} drawElements() {} flush() {} finish() {}
+  createBuffer() { return {}; } bindBuffer() {} bufferData() {} createTexture() { return {}; } bindTexture() {} texImage2D() {} texParameteri() {}
+  readPixels(_x, _y, width, height, _format, _type, pixels) { if (pixels && pixels.fill) pixels.fill(0); return undefined; }
+  isContextLost() { return this._lost; }
+}
+globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLContext {};
+globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {};
 
 class Screen {
   constructor(w, h, availW, availH) {
@@ -13375,12 +13495,11 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    // The consistency layer is opt-in because it does not paint GPU pixels.
+    // Its values come from the same fingerprint policy as navigator.userAgent;
+    // callers that require a real GPU still receive the truthful null default.
+    if (!globalThis.__obscura_webgl_enabled) return null;
+    return type === 'webgl2' ? new globalThis.WebGL2RenderingContext(this, true) : new globalThis.WebGLRenderingContext(this, false);
   }
   return null;
 };
@@ -13587,11 +13706,33 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
-// but authentication libraries (Firebase, Supabase, dexie) hang forever on
-// the first `get` because their request's `onsuccess` is never called. Fire
-// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
-// most libraries treat as a cache miss and fall back to the network.
+// IndexedDB shim with an origin-keyed JSON backing store. The value layer is
+// JSON-clone only, while request and transaction callbacks remain asynchronous.
+const __obscura_idb = new Map();
+function _idbClone(value) {
+  if (value === undefined) return undefined;
+  try { return JSON.parse(JSON.stringify(value)); }
+  catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+}
+function _idbState(name) {
+  let state = __obscura_idb.get(name);
+  if (state) return state;
+  try { state = JSON.parse(Deno.core.ops.op_indexeddb_load(name) || '{}'); } catch (e) { state = {}; }
+  if (!state || typeof state !== 'object') state = {};
+  state.version = Number(state.version) || 0;
+  state.stores = state.stores && typeof state.stores === 'object' ? state.stores : {};
+  for (const key of Object.keys(state.stores)) {
+    const store = state.stores[key];
+    if (!store || typeof store !== 'object') state.stores[key] = { keyPath: null, records: {} };
+    else store.records = store.records && typeof store.records === 'object' ? store.records : {};
+  }
+  __obscura_idb.set(name, state);
+  return state;
+}
+function _idbPersist(name, state) {
+  try { Deno.core.ops.op_indexeddb_save(name, JSON.stringify(state)); } catch (e) {}
+}
+function _idbKey(key) { return JSON.stringify(key === undefined ? null : key); }
 function _idbRequest(produceResult) {
   const req = {
     result: undefined,
@@ -13601,6 +13742,7 @@ function _idbRequest(produceResult) {
     readyState: 'pending',
     onsuccess: null,
     onerror: null,
+    onupgradeneeded: null,
     addEventListener(type, fn) { req['on' + type] = fn; },
     removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
   };
@@ -13621,23 +13763,26 @@ function _idbRequest(produceResult) {
   return req;
 }
 
-function _idbObjectStore(name) {
-  const data = new Map();
+function _idbObjectStore(name, tx) {
+  const dbState = tx && tx._dbState;
+  const data = dbState && dbState.stores[name] ? dbState.stores[name].records : {};
+  const save = () => { if (tx && tx._dbName) _idbPersist(tx._dbName, tx._dbState); };
+  const keys = () => Object.keys(data).map(k => { try { return JSON.parse(k); } catch (e) { return k; } });
   return {
     name,
     keyPath: null,
     autoIncrement: false,
     indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
+    transaction: tx || null,
+    add(value, key) { const k = key ?? Date.now(); const id = _idbKey(k); if (Object.prototype.hasOwnProperty.call(data, id)) throw new DOMException('Key already exists.', 'ConstraintError'); data[id] = _idbClone(value); save(); return _idbRequest(() => k); },
+    put(value, key) { const k = key ?? Date.now(); data[_idbKey(k)] = _idbClone(value); save(); return _idbRequest(() => k); },
+    get(key) { return _idbRequest(() => _idbClone(data[_idbKey(key)])); },
+    getAll() { return _idbRequest(() => Object.values(data).map(_idbClone)); },
+    getAllKeys() { return _idbRequest(keys); },
+    getKey(key) { return _idbRequest(() => Object.prototype.hasOwnProperty.call(data, _idbKey(key)) ? key : undefined); },
+    delete(key) { return _idbRequest(() => { delete data[_idbKey(key)]; save(); return undefined; }); },
+    clear() { return _idbRequest(() => { for (const key of Object.keys(data)) delete data[key]; save(); return undefined; }); },
+    count() { return _idbRequest(() => Object.keys(data).length); },
     openCursor() { return _idbRequest(() => null); },
     openKeyCursor() { return _idbRequest(() => null); },
     createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
@@ -13646,19 +13791,22 @@ function _idbObjectStore(name) {
   };
 }
 
-function _idbTransaction(storeNames) {
+function _idbTransaction(dbState, dbName, storeNames, mode) {
   const stores = new Map();
   const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
+  const txState = { _dbState: dbState, _dbName: dbName };
+  for (const n of names) if (dbState.stores[String(n)]) stores.set(String(n), _idbObjectStore(String(n), txState));
   const tx = {
+    _dbState: dbState, _dbName: dbName,
     db: null,
-    mode: 'readonly',
+    mode: mode || 'readonly',
     objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
     onabort: null, oncomplete: null, onerror: null,
     error: null,
     objectStore(name) {
       let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
+      if (!s && dbState.stores[name]) { s = _idbObjectStore(name, tx); stores.set(name, s); }
+      if (!s) throw new DOMException('The object store does not exist.', 'NotFoundError');
       s.transaction = tx;
       return s;
     },
@@ -13676,16 +13824,16 @@ function _idbTransaction(storeNames) {
 }
 
 function _idbDatabase(name, version) {
+  const state = _idbState(name);
+  const objectStoreNames = { contains(n) { return Object.prototype.hasOwnProperty.call(state.stores, String(n)); }, get length() { return Object.keys(state.stores).length; }, item(i) { return Object.keys(state.stores)[i] || null; } };
   return {
     name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
+    version: state.version || version,
+    objectStoreNames,
+    createObjectStore(n, options) { const key = String(n); if (state.stores[key]) throw new DOMException('The object store already exists.', 'ConstraintError'); state.stores[key] = { keyPath: options?.keyPath ?? null, records: {} }; _idbPersist(name, state); return _idbObjectStore(key, { _dbState: state, _dbName: name }); },
+    deleteObjectStore(n) { delete state.stores[String(n)]; _idbPersist(name, state); },
     transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
+      return _idbTransaction(state, name, storeNames, mode);
     },
     close() {},
     onversionchange: null, onabort: null, onerror: null, onclose: null,
@@ -13695,10 +13843,29 @@ function _idbDatabase(name, version) {
 
 globalThis.indexedDB = {
   open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
+    const dbName = String(name);
+    const requested = version === undefined ? 1 : Number(version);
+    const state = _idbState(dbName);
+    const oldVersion = state.version;
+    const req = { result: undefined, error: null, source: null, transaction: null, readyState: 'pending', onsuccess: null, onerror: null, onupgradeneeded: null,
+      addEventListener(type, fn) { req['on' + type] = fn; },
+      removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; } };
+    Promise.resolve().then(() => {
+      if (requested > oldVersion) {
+        state.version = requested;
+        req.result = _idbDatabase(dbName, requested);
+        if (typeof req.onupgradeneeded === 'function') {
+          try { req.onupgradeneeded({ target: req, type: 'upgradeneeded', oldVersion, newVersion: requested }); } catch (e) {}
+        }
+        _idbPersist(dbName, state);
+      } else req.result = _idbDatabase(dbName, requested);
+      req.readyState = 'done';
+      if (typeof req.onsuccess === 'function') { try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {} }
+    });
+    return req;
   },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
+  deleteDatabase(name) { __obscura_idb.delete(String(name)); try { Deno.core.ops.op_indexeddb_delete(String(name)); } catch (e) {} return _idbRequest(() => undefined); },
+  databases() { return Promise.resolve([...__obscura_idb.keys()].map(name => ({ name, version: _idbState(name).version }))); },
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
 globalThis.IDBKeyRange = {
@@ -14848,23 +15015,66 @@ if (typeof WebSocket === 'undefined') {
       this.extensions = '';
       this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+      this._id = null; this._closedByUser = false; this._closeDispatched = false;
       _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
+      const open = Deno.core.ops.op_websocket_open?.(this.url, this.protocol);
+      Promise.resolve(open).then((id) => {
+        if (this._closedByUser) {
+          if (id != null) Deno.core.ops.op_websocket_close?.(Number(id), 1000, '');
+          this._dispatchClose(1000, '', true);
+          return;
+        }
+        this._id = Number(id); this.readyState = 1;
         const ev = new Event('open');
         if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
         try { this.dispatchEvent(ev); } catch (e) {}
+        this._pump();
+      }, (error) => {
+        this.readyState = 3;
+        const ev = new Event('error'); ev.error = error;
+        if (typeof this.onerror === 'function') { try { this.onerror(ev); } catch (e) {} }
+        try { this.dispatchEvent(ev); } catch (e) {}
+        this._dispatchClose(1006, '', false);
       });
     }
-    send(data) { /* drop; no real socket */ }
+    _dispatchClose(code, reason, wasClean) {
+      if (this._closeDispatched) return;
+      this._closeDispatched = true;
+      this.readyState = 3;
+      const close = new Event('close'); close.code = code || 1000; close.reason = reason || ''; close.wasClean = wasClean !== false;
+      if (typeof this.onclose === 'function') { try { this.onclose(close); } catch (e) {} }
+      try { this.dispatchEvent(close); } catch (e) {}
+    }
+    _pump() {
+      if (this._id == null || this.readyState >= 2) return;
+      Promise.resolve(Deno.core.ops.op_websocket_recv?.(this._id)).then((raw) => {
+        if (!raw || this.readyState >= 2) return;
+        let event; try { event = JSON.parse(raw); } catch (e) { event = { type: 'error', message: raw }; }
+        if (event.type === 'message') {
+          const msg = new MessageEvent('message', { data: event.data, origin: new URL(this.url).origin });
+          if (typeof this.onmessage === 'function') { try { this.onmessage(msg); } catch (e) {} }
+          try { this.dispatchEvent(msg); } catch (e) {}
+        } else if (event.type === 'error') {
+          const error = new Event('error'); error.message = event.message || '';
+          if (typeof this.onerror === 'function') { try { this.onerror(error); } catch (e) {} }
+          try { this.dispatchEvent(error); } catch (e) {}
+        } else if (event.type === 'close') {
+          this._dispatchClose(event.code || 1000, event.reason || '', event.wasClean !== false);
+          return;
+        }
+        this._pump();
+      });
+    }
+    send(data) {
+      if (this.readyState !== 1) throw new DOMException('WebSocket is not open: readyState ' + this.readyState, 'InvalidStateError');
+      const value = typeof data === 'string' ? data : (data instanceof ArrayBuffer ? new TextDecoder().decode(new Uint8Array(data)) : String(data));
+      if (!Deno.core.ops.op_websocket_send?.(this._id, value)) throw new DOMException('Failed to send WebSocket message.', 'NetworkError');
+    }
     close(code, reason) {
       if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      this._closedByUser = true; this.readyState = 2;
+      if (this._id != null) Deno.core.ops.op_websocket_close?.(this._id, code || 1000, reason || '');
+      this._dispatchClose(code || 1000, reason || '', true);
     }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };

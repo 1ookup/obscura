@@ -1,0 +1,14 @@
+<!doctype html><script>
+globalThis.indexedDbFixture = new Promise(resolve => {
+  const request = indexedDB.open('fixture', 1);
+  request.onupgradeneeded = () => request.result.createObjectStore('values');
+  request.onsuccess = () => {
+    const db = request.result;
+    const write = db.transaction('values', 'readwrite').objectStore('values').put({value:42}, 'answer');
+    write.onsuccess = () => {
+      const read = db.transaction('values').objectStore('values').get('answer');
+      read.onsuccess = () => resolve(read.result);
+    };
+  };
+});
+</script>

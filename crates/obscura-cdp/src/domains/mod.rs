@@ -2,6 +2,7 @@ pub mod accessibility;
 pub mod browser;
 pub mod dom;
 pub mod domsnapshot;
+pub mod debugger;
 pub mod emulation;
 pub mod fetch;
 pub mod input;

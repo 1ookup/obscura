@@ -1207,8 +1207,14 @@ impl ObscuraHttpClient {
             }
 
             if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
+                match reqwest::Proxy::all(proxy.as_str()) {
+                    Ok(p) => {
+                        // Explicit proxy rules do not automatically inherit
+                        // the process NO_PROXY list. Keep operator-selected
+                        // bypasses effective for local and private fixtures.
+                        builder = builder.proxy(p.no_proxy(reqwest::NoProxy::from_env()));
+                    }
+                    Err(error) => tracing::warn!(%error, proxy = %proxy, "ignoring invalid proxy URL"),
                 }
             }
 

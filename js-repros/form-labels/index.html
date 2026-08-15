@@ -1,0 +1,4 @@
+<!doctype html><label id="label" for="field">Field</label><input id="field"><script>
+const label = document.getElementById('label'), field = document.getElementById('field');
+globalThis.formLabelFixture = {control: label.control === field, labels: field.labels.length};
+</script>

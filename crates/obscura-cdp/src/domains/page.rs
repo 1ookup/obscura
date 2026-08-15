@@ -1512,6 +1512,10 @@ pub fn emit_navigation_events(
             session_id: es.clone(),
         },
     ];
+    // Debugger.scriptParsed is a lifecycle notification, not a response to a
+    // Runtime command. Emit it alongside the newly committed document so a
+    // debugger enabled before navigation sees the same ordering as Chrome.
+    super::debugger::emit_navigation_script(ctx, &es, page_id, page_url);
     // The default world is re-created as context id 2; re-register it. Isolated
     // worlds register themselves via next_isolated_context in the loop below.
     ctx.valid_context_ids.insert(2);

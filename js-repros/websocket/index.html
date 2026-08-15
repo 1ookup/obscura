@@ -1,0 +1,10 @@
+<!doctype html><script>
+globalThis.websocketFixture = new Promise(resolve => {
+  const ws = new WebSocket('ws://127.0.0.1:8765/echo');
+  const events = [];
+  ws.addEventListener('open', () => { events.push('open'); ws.send('hello'); });
+  ws.addEventListener('message', event => { events.push('message:' + event.data); ws.close(); });
+  ws.addEventListener('close', event => resolve({events, code:event.code}));
+  ws.addEventListener('error', () => events.push('error'));
+});
+</script>

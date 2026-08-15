@@ -103,21 +103,44 @@ fn render_frame_tree_into(
     if depth > 32 {
         return;
     }
-    let base_url = dom.document_scope(root).map(|scope| scope.base_url);
-    // Per-root stylesheet and animation state is retained across geometry,
-    // hit-test, and capture rebuilds. The prepared frame scene is disposable;
-    // the animation instance epoch is document state and is not.
-    let frame_state = frame_states.entry(root).or_default();
-    let Some(mut prepared) = obscura_render::prepare_frame_document(
-        dom,
-        root,
-        viewport,
-        base_url.as_deref(),
-        resources,
-        &mut frame_state.stylesheet_cache,
-        animation_sample,
-        &mut frame_state.animation_timeline,
-    ) else {
+    let scope = dom.document_scope(root);
+    let base_url = scope.as_ref().map(|scope| scope.base_url.clone());
+    let document_generation = scope.as_ref().map(|scope| scope.document_generation).unwrap_or(0);
+    // Retain one prepared scene per frame/document generation. DOM mutation
+    // invalidation clears this field; repeated geometry and paint reads reuse
+    // the same cascade/layout snapshot.
+    // Take the frame-owned caches out of the map while preparing this scene.
+    // Child traversal below needs mutable access to the same map, so keeping
+    // an entry borrow alive here would violate Rust's aliasing rules.
+    let (mut prepared, mut stylesheet_cache, mut animation_timeline) = {
+        let frame_state = frame_states.entry(root).or_default();
+        let cached = frame_state.prepared_render.take().filter(|cached| {
+            cached.viewport() == viewport
+                && cached.animation_sample() == animation_sample
+                && frame_state.cached_generation == document_generation
+        });
+        (
+            cached,
+            std::mem::take(&mut frame_state.stylesheet_cache),
+            std::mem::take(&mut frame_state.animation_timeline),
+        )
+    };
+    if prepared.is_none() {
+        prepared = obscura_render::prepare_frame_document(
+            dom,
+            root,
+            viewport,
+            base_url.as_deref(),
+            resources,
+            &mut stylesheet_cache,
+            animation_sample,
+            &mut animation_timeline,
+        );
+    }
+    let Some(mut prepared) = prepared else {
+        let frame_state = frame_states.entry(root).or_default();
+        frame_state.stylesheet_cache = stylesheet_cache;
+        frame_state.animation_timeline = animation_timeline;
         return;
     };
     for nested_host in dom.iframe_hosts_in_shadow_including_subtree(root) {
@@ -147,6 +170,11 @@ fn render_frame_tree_into(
     {
         out.insert(host, pixmap);
     }
+    let frame_state = frame_states.entry(root).or_default();
+    frame_state.stylesheet_cache = stylesheet_cache;
+    frame_state.animation_timeline = animation_timeline;
+    frame_state.cached_generation = document_generation;
+    frame_state.prepared_render = Some(prepared);
 }
 
 /// Render every active iframe content document of the page, deepest first,
@@ -569,6 +597,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Configure the persistent profile directory used by origin-keyed
+    /// IndexedDB files. The path is embedder-controlled and never inferred
+    /// from page URLs.
+    pub fn set_storage_dir(&self, dir: Option<std::path::PathBuf>) {
+        self.state.borrow_mut().storage_dir = dir;
+    }
+
     pub fn set_storage_areas(
         &self,
         local_storage: SharedStorageAreas,
@@ -700,6 +735,18 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().blocked_urls = patterns;
     }
 
+    /// Configure the generic selector/timing interaction policy. The policy
+    /// is installed before page scripts run and schedules only after the DOM
+    /// has had a chance to materialize the selected control.
+    pub fn set_input_strategy(&mut self, selector: Option<&str>, delay_ms: u64, key_delay_ms: u64) {
+        let Some(selector) = selector else { return };
+        let Ok(value) = serde_json::to_string(selector) else { return };
+        let _ = self.runtime.execute_script(
+            "<input-strategy>",
+            format!("globalThis.__obscura_input_strategy={{selector:{value},delayMs:{delay_ms},keyDelayMs:{key_delay_ms}}}; globalThis.__obscura_schedule_input_strategy?.();"),
+        );
+    }
+
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
     }
@@ -753,9 +800,13 @@ impl ObscuraJsRuntime {
         let Ok(json) = serde_json::to_string(fingerprint) else {
             return;
         };
+        let webgl_enabled = std::env::var("OBSCURA_WEBGL_PROFILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some();
         let _ = self.runtime.execute_script(
             "<set-fingerprint>",
-            format!("globalThis.__obscura_set_fingerprint({json});"),
+            format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
         );
         let frame_contexts: Vec<_> = self
             .frame_realms
@@ -767,7 +818,7 @@ impl ObscuraJsRuntime {
             let _ = self.execute_in_context(
                 &context,
                 "<set-fingerprint>",
-                &format!("globalThis.__obscura_set_fingerprint({json});"),
+                &format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
             );
         }
     }

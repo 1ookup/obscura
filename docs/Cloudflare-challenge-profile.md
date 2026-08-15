@@ -1198,11 +1198,10 @@ click 绑定」，当时归因为 handler 用了 `onclick` 或缓存引用。但
 断点因此前移了一格：不再是「点击驱动不了 handler」，而是**「点击已被接受、Turnstile 进入
 verifying、但证明未通过而重置」**。这正是 step 22 预留的那条路——回到 JSVMP 指纹面。
 
-**待办**：正式实现已落地（commit `7521680`：`for=` 按 tree scope 解析、否则首个 labelable
-后代，含 interactive content 例外、labeled control 自身不重复、disabled/hidden 跳过，
-回归测试见 `crates/obscura-cdp/tests/input_label_activation.rs`）。仍缺：`labels`/`control`
-IDL 补真（`htmlFor` 已有实现），以及 `HTMLElement.click()` 路径的 label 转发（程序化点击
-仍到不了 input）。
+**实现状态更新（2026-08-15）**：`for=` 按 tree scope 解析、首个 labelable 后代、
+disabled/hidden 排除、`labels`/`control` IDL 和 `HTMLElement.click()` 的 label 转发均已
+落地；`js-repros/form-labels/` 固化 `{control:true,labels:1}` 与程序化激活。该通用
+HTML 行为修复不包含站点字符串，Turnstile 的后续证明失败仍属于独立指纹/协议问题。
 
 ### Step 31 — 确认：拿到了 `cf_clearance`，但它是失败路径的无效票（`cf_chl_rc_ni=1`）
 
@@ -1852,3 +1851,14 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
   （step 6），需要一种不扰动流程的观测方式。
 - 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
   可被检测的差异，未修。
+
+### 通用能力回填（路线图 P1/P2，2026-08-15）
+
+本记录中的 `labels/control`、`NO_PROXY` 和“fetch 不自动交互”观察已分别回填为通用
+实现：表单 IDL/程序化 label 激活已完成；reqwest、脚本 fetch 与 stealth/wreq 现在遵守
+`NoProxy::from_env`；输入策略通过 embedder 提供 selector/timing policy，不读取挑战文案、
+主机名或 Cloudflare 状态。真实挑战仍以 `600010` 为独立未解决项。
+
+新增的 WebSocket、WebGL、indexedDB、HTTP/2、frame layout cache 与 Debugger/host trace
+均有独立 `js-repros/` fixture。当前主机没有 Chrome/Chromium 可执行文件，故没有伪造
+Chrome 146 oracle；各 fixture README 标明了这一验证边界。

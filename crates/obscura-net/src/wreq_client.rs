@@ -193,7 +193,7 @@ impl StealthHttpClient {
 
         if let Some(proxy) = proxy_url {
             if let Ok(p) = wreq::Proxy::all(proxy) {
-                builder = builder.proxy(p);
+                builder = builder.proxy(p.no_proxy(wreq::NoProxy::from_env()));
             }
         }
 

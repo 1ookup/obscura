@@ -49,7 +49,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 3 | **Stack/行号保真** | inline script 用脚本内相对行号(Chrome 用文档绝对行号);栈底残留 `_runAtNesting` 2 帧;eval 栈名曾泄漏(已修) | step 32、step 8 | 统一"文档绝对行号"来源;清理自举帧;对齐 `Error.stack` 与 `EvalError` 语义 |
 | 4 | **跨 realm 安全语义** | 跨源 `parent.location.origin` 返回 undefined 而非抛 `SecurityError`;`<page-eval>` 不辨 realm | step 未编号,iframes 调试实测 | 按 origin 检查统一抛 SecurityError;trace/CDP 记录 realm 归属(见 §3.4) |
 | 5 | **定时器/事件循环时序** | 早期 timer 迟发 600–2500ms 未定位,与 CF 的 timeTiefMs 吻合 | step 9 | 引擎级 timer 调度基准(事件循环 tick 保真),不做任何站点的快进/延时白名单 |
-| 6 | **表单与 label 激活剩余** | 主路径已修(click 转发、for=/tree scope),`labels`/`control` IDL 与程序化 `HTMLElement.click()` 转发未做 | step 30 待办 | 按 HTML 规范补全 IDL 与程序化激活路径 |
+| 6 | **表单与 label 激活剩余** | `HTMLLabelElement.control`、labelable `.labels`、嵌套/显式关联和 `label.click()` 激活已实现 | step 30 | 按 tree scope 查找并排除 hidden/disabled 控件;取消 label click 时不转发 |
 | 7 | **指纹推导引擎** | profiles.rs 8 个固定 profile;UA 分裂已修(step 38)但仍是"选表"而非"推导" | step 38;HaHaVM `config.js` 从 UA/sec-ch-ua 推导全表面 | 单一指纹输入源(UA)→ 自洽推导 navigator/platform/userAgentData/sec-ch-ua-*/GPU/DPR,替换固定表;对所有出站头/JS 面使用同一派生值 |
 | 8 | **Referrer 语义对齐** | 出站 `Referer` 头近似 `origin-when-cross-origin`(`request_referrer`,client.rs:424:同源全 URL/跨源仅 origin/HTTPS→HTTP 不发),但**无 `Referrer-Policy` 响应头解析、无 meta/`referrerpolicy` 属性、无 `rel=noreferrer`**;iframe 内容文档 `referrer` 硬编码空串(bootstrap.js:6334,Chrome 中同源 iframe 应继承父链);主文档与 DOMParser 文档(referrer=空,符合规范)正确 | HaHaVM `cfPatches.js` 给挑战页强制空 referrer(值级特化);反爬高频探测点 | 按 Fetch/HTML 规范的 Referrer Policy 实现:响应头/meta/attribute/`rel=noreferrer` 全路径 + 默认 `strict-origin-when-cross-origin`;iframe 继承语义。**自检:CF 挑战页的空 referrer 应是策略的自然结果,而非特判** |
 
@@ -57,9 +57,9 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 | # | 缺口 | 现状 | 通用化方案 |
 |---|---|---|---|
-| 8 | **WebSocket 纯桩** | 构造即 open、send 丢弃、无真实 socket | obscura-net 增加 ws 实现(socket2 + rustls 已有),走同一代理/TLS 栈;桩是目前通用爬虫最大露馅点 |
-| 9 | **WebGL/WebGL2 空 class** | 无后端,明确不伪造 GL 数据 | 二选一:轻量 GL(如 glow 软件渲染)或一致性指纹层(参照 HaHaVM `parameter_dic`:getParameter/getExtension/精度表全表面自洽,值级进配置) |
-| 10 | **indexedDB 不持久化** | 内存 Map,spec 形状正确 | 接 `--storage-dir` 持久化(与 cookies.json 同级),规范对齐 |
+| 8 | **WebSocket 纯桩** | 已接入真实 RFC 6455 socket;消息、错误、关闭事件与 `ws`/`wss` URL 校验已覆盖 | `tokio-tungstenite` 连接器、异步事件队列、同 fetch 的私网校验;代理 CONNECT/TLS 指纹复用仍是后续工作 |
+| 9 | **WebGL/WebGL2 空 class** | 默认仍诚实返回 `null`;显式 profile 开关提供一致性值层 | `OBSCURA_WEBGL_PROFILE=1` 从 fingerprint GPU 策略派生 vendor/renderer、扩展和基础对象生命周期;不声称真实 GPU 后端 |
+| 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
 | 11 | **Service Worker / SharedWorker / worklet** | 设计 non-goal(Iframe 文档),但现代站点普遍 | 中期补 SharedWorker(与 dedicated Worker 同构);SW/worklet 长期,保持 fail-closed |
 | 12 | **Trusted Types 建模** | 待核实(存疑项) | HaHaVM 有完整 TT(createPolicy/default policy/eval 闸门,CSP 抛错语义);按规范补齐,不做 CF 特化文案 |
 | 13 | **媒体/WebRTC/Notification** | 全桩(假实现或拒绝) | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准) |
@@ -68,8 +68,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 | # | 缺口 | 现状 | 通用化方案 |
 |---|---|---|---|
-| 14 | **HTTP/2** | 仅 HTTP/1.1(reqwest 未开 h2,wreq 未显式启用) | 开 h2(h2 feature + ALPN),现代站点占比高;完成后 TLS 指纹 profile 需重验 |
-| 15 | **no_proxy / 代理健壮性** | 不尊重 `no_proxy`,本机地址被送进代理且静默失败 | 标准 NO_PROXY 语义 + 代理失败可观测化(不吞错) |
+| 14 | **HTTP/2** | reqwest h2/ALPN feature 已开启;本机无 HTTPS/Chrome oracle,需外部 ALPN fixture 重验 | 开 h2(h2 feature + ALPN),现代站点占比高;完成后 TLS 指纹 profile 需重验 |
+| 15 | **no_proxy / 代理健壮性** | reqwest、脚本 fetch 和 stealth/wreq 显式使用 `NoProxy::from_env`;非法显式代理告警 | 标准 NO_PROXY 语义 + 代理失败可观测化(不吞错) |
 | 16 | **自动点击/自然输入策略** | fetch 流程不会在 interactiveBegin 后自动点击;现靠 CDP 驱动 | 通用输入合成器:仿人轨迹/时序库**配置化**(HaHaVM 轨迹模板外置为数据),"何时模拟点击"由策略 hook 决定,不做文案匹配 |
 | 17 | TLS 指纹 | wreq/BoringSSL Chrome145 已有 | 保持;随 h2 增加重验 |
 
@@ -100,8 +100,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 |---|---|---|---|---|
 | 1 | Performance Timeline 真实现(§3.1-#1) | 解锁 step 10;任何现代站点必查;真数据直接替换 HaHaVM 式伪造画像 | 网络层 timing 采集 → resource/navigation/paint 条目 → `getEntries*`/observer;`supportedEntryTypes` 全类型 | ✅ 完成(`79e1238`) |
 | 2 | PAT API 族(§3.1-#2) | 当前主线阻塞点之一(step 39 `/pat/`);规范 API,一补永逸 | 按规范实现 + per-origin 配置驱动 redemption 状态;补齐后回填 step 39 验证 | ✅ 完成(`f4a1201`) |
-| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | ✅ 完成(`c48fcb6`) |
-| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | ✅ 完成(`1a544e2`) |
+| 3 | 指纹推导引擎(§3.1-#7) | 防检测核心;消除"选表"与分裂风险;8 profile → 单推导器 | 单一输入(UA)→ 推导全表面;JS 面/出站头同源;吸收 HaHaVM config.js 设计(仅设计,不引代码) | ✅ 完成(`43cb4d4`) |
+| 4 | Stack/行号 + realm 安全语义 + Referrer(§3.1-#3/4/8) | 栈指纹、跨源语义、referrer 是高频探测面;工作量小 | 文档绝对行号统一;清理 `_runAtNesting`;SecurityError 语义;Referrer Policy 全路径解析 + iframe 继承 | ✅ 完成(`76b6ae5`) |
 | 5 | 定时器保真(§3.1-#5) | step 9 时序异常;时间戳堆叠是通用 bot tell | 定位迟发根因(事件循环基准),不做快进白名单 | ✅ 完成(本提交) |
 
 #### P0-1 实施记录:Performance Timeline 真实现
@@ -123,7 +123,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 #### P0-3 实施记录:指纹推导引擎
 
-- **状态**:✅ 完成(`c48fcb6`)。
+- **状态**:✅ 完成(`43cb4d4`)。
 - **实现**:`BrowserFingerprint` 从 UA 与显式 `FingerprintOverrides` 推导 UA、appVersion、navigator/platform、UA-CH 低/高熵 brands、移动端标记、screen/DPR、硬件并发度、device memory 与 GPU 策略值;覆盖 Windows、macOS、Linux、Android 及未知 UA,使用 Chromium GREASE brands/order。BrowserContext 保有 context 级默认输入,Page 保有页级身份以支持 CDP/嵌入器 override;HTTP、stealth/wreq、JS fetch/XHR、module graph、main/iframe/dedicated worker 均从同一契约读取,连接池与资源缓存仍按 context/page fork 共享。WebGL 在无真实 backend 时保持 `null`,不声称 GPU 能力。
 - **策略边界**:身份值由 `obscura-net` 派生器和配置策略提供,realm 安全、生命周期与网络行为仍由内核实现;`Network.setUserAgentOverride` 的 platform/metadata 同步更新 live JS 与页级网络头,新建 frame realm 继承并同步 live fingerprint。无站点字符串、无固定 profile 选择表,日志 target `obscura::fingerprint` 记录 user agent、navigator/UA platform、browser version 与 mobile。
 - **确定性验证**:`js-repros/fingerprint-derivation/` 固化主 realm、同源 iframe、dedicated worker、screen/DPR、UA-CH 与 WebGL fixture。Google Chrome 146.0.7680.80 native headless oracle 固化跨 realm 一致性、Chromium 146/Not-A.Brand 24/Google Chrome 146 顺序及 `--disable-gpu` 下 WebGL 不可用;Obscura fixture 实测 `childMatchesMain=true`、`workerMatchesLowEntropy=true`、Windows Chrome 146 identity、1920x1080 DPR1、WebGL false。
@@ -131,7 +131,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 #### P0-4 实施记录:Stack/行号 + realm 安全语义 + Referrer
 
-- **状态**:✅ 完成(`1a544e2`)。
+- **状态**:✅ 完成(`76b6ae5`)。
 - **实现**:html5ever tokenizer 行号写入 DOM parser 元数据,inline classic/module 脚本和 iframe realm 通过 `ScriptOrigin` 使用文档绝对行号;跨源 WindowProxy 的 `document`、location 读属性和 `frameElement` 统一抛 `SecurityError`,同源 iframe 保留真实 realm 与 `document.referrer`。网络层实现八种 Referrer-Policy,默认 `strict-origin-when-cross-origin`,响应头优先于 meta,并贯穿主导航、重定向、iframe、脚本/样式/module、fetch/XHR 及 stealth 客户端。值级策略仅来自文档元数据与 embedder 输入,没有站点特判。
 - **确定性验证**:`js-repros/stack-realm-referrer/` 覆盖 parser 行号、inline/external stack、同源继承、跨源安全异常、iframe `referrerpolicy` 和同源/跨源 fetch Referer;本地双 origin capture 成功,服务端收到两组真实 Referer,debug trace 含 navigation/frame/fetch 记录。`chrome-oracle.json` 固化 Google Chrome 146 的归一化实测语义;当前机器没有 Chrome 可执行文件,因此未重复本地 Chrome capture,限制已记录在 fixture README。
 - **测试与门禁**:`obscura-dom` 89/89、`obscura-net` 84/84、`obscura-js` 458/458、`obscura-browser` 100/100 release nextest 通过;普通 `render` release CLI build 通过,stealth 构建作为本项提交前门禁执行。新增 DOM source-line、stack、Referrer-Policy 矩阵与 document scope fixture 测试均为确定性断言。
@@ -146,27 +146,38 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 ### P1 — 诊断底座 + 常见桩(次做,每项 1–2 周)
 
-| 序 | 能力 | 关键收益 |
-|---|---|---|
-| 6 | CDP Debugger 域 + trace 增强(§3.4-#18/19) | 后续一切缺口定位从"几天对拍"降到"分钟级";Debugger 也是 Puppeteer 生态的硬需求 |
-| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 |
-| 8 | WebSocket 真实现(§3.2-#8) | 通用爬虫最大露馅点;走既有网络栈 |
-| 9 | 自动点击/自然输入策略(§3.3-#16) | 输入合成通用化;CF 交互挑战自动过(当前主线) |
+| 序 | 能力 | 关键收益 | 状态 |
+|---|---|---|---|
+| 6 | CDP Debugger 域 + trace 增强(§3.4-#18/19) | 后续一切缺口定位从"几天对拍"降到"分钟级";Debugger 也是 Puppeteer 生态的硬需求 | ✅ 协议状态、scriptParsed 生命周期、Profiler/HeapProfiler 合同和 host-op TSV;rusty_v8 原生断点桥接待后续 |
+| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 | ✅ `--trace-op-file`、`--v8-flags` 已贯通单 worker 与多 worker serve |
+| 8 | WebSocket 真实现(§3.2-#8) | 通用爬虫最大露馅点;走既有网络栈 | ✅ 本地 RFC 6455 echo fixture 通过;代理 CONNECT/TLS profile 复用待后续 |
+| 9 | 自动点击/自然输入策略(§3.3-#16) | 输入合成通用化;CF 交互挑战自动过(当前主线) | ✅ selector/timing policy、可信 pointer/mouse/click 序列和自然逐字符 input |
 
 ### P2 — API 完整性(每项 1–2 周)
 
-| 序 | 能力 |
-|---|---|
-| 10 | WebGL 一致性层(§3.2-#9) |
-| 11 | indexedDB 持久化(§3.2-#10) |
-| 12 | HTTP/2(§3.3-#14)+ TLS profile 重验 |
-| 13 | no_proxy/代理健壮性(§3.3-#15) |
-| 14 | 表单 IDL 剩余:labels/control、程序化 click 转发(§3.1-#6) |
-| 15 | frame 布局缓存(§3.4-#21) |
+| 序 | 能力 | 状态 |
+|---|---|---|
+| 10 | WebGL 一致性层(§3.2-#9) | ✅ 显式 profile 的值级一致性层;默认 fail-closed |
+| 11 | indexedDB 持久化(§3.2-#10) | ✅ profile 目录 JSON 持久化和基本异步 CRUD |
+| 12 | HTTP/2(§3.3-#14)+ TLS profile 重验 | ✅ feature/ALPN 已开启;外部 HTTPS fixture 重验待有环境时执行 |
+| 13 | no_proxy/代理健壮性(§3.3-#15) | ✅ reqwest、脚本 fetch、stealth/wreq 使用环境 NO_PROXY |
+| 14 | 表单 IDL 剩余:labels/control、程序化 click 转发(§3.1-#6) | ✅ |
+| 15 | frame 布局缓存(§3.4-#21) | ✅ paint、geometry、scroll metrics 共用 generation/viewport/sample cache |
 
 ### P3 — 长尾(待命)
 
 Trusted Types 补全(§3.2-#12)、SharedWorker(§3.2-#11)、系统字体/媒体(video)/PDF 结构(§3.5)、ServiceWorker/worklet(长期,fail-closed 保持)。
+
+### P1/P2 实施记录(序 6–15)
+
+- **序 6–7, Debugger/trace 管线**: `crates/obscura-cdp/src/domains/debugger.rs` now owns per-session Debugger, Profiler and HeapProfiler protocol state, emits `Debugger.scriptParsed` on enable/navigation, and returns the common breakpoint/coverage/heap contracts expected by CDP clients. `--trace-op-file` adds a timestamped TSV for DOM, fetch, indexedDB and WebSocket host operations; `--v8-flags` is forwarded to multi-worker serve processes. This is a protocol and diagnostics layer, not a claim that every breakpoint pauses the V8 isolate: the rusty_v8 inspector session bridge remains a follow-up because the current CdpContext dispatch is not inspector-session aware.
+- **序 8, WebSocket**: `tokio-tungstenite` provides asynchronous `ws`/`wss` connections, text/binary/close/error event queues, ready-state checks, client close events, and the same private-network host gate used by scripted fetch. The deterministic local echo fixture reports `open`, `message:hello`, and clean close. WebSocket proxy CONNECT and stealth TLS emulation are intentionally documented as remaining work rather than silently bypassing the configured proxy.
+- **序 9, configurable input**: `InputStrategy` is an embedder policy (`selector`, activation delay, per-character delay), with no hostname or visible-text matching. It emits trusted pointer/mouse activation and natural input events; `OBSCURA_AUTO_CLICK_SELECTOR` is the CLI default hook. The fixture serializes `pointerdown,click` after DOM-content-loaded scheduling.
+- **序 10–11, WebGL/indexedDB**: WebGL stays fail-closed (`null`) unless `OBSCURA_WEBGL_PROFILE=1` opts into a fingerprint-derived value layer. IndexedDB uses origin/name-keyed JSON files under `--storage-dir`, with asynchronous requests, version upgrades, object stores, basic CRUD, `deleteDatabase`, and `databases`.
+- **序 12–13, transport**: reqwest is built with HTTP/2 support and explicit proxy builders use `NoProxy::from_env`; the same bypass is applied to scripted fetch and stealth/wreq. Invalid explicit proxy URLs are surfaced as warnings. ALPN/TLS packet-level comparison requires an HTTPS fixture and Chrome oracle unavailable on this host.
+- **序 14–15, forms/layout**: label `control` and control `labels` follow tree scope and labelability rules, and uncanceled programmatic label activation forwards to the control. Retained frame `PreparedRender` snapshots are reused by paint, geometry and scroll metrics and invalidated by document generation, viewport, animation sample, or connected DOM mutation.
+
+**Verification boundary**: Chrome/Chromium executables are not installed on the current host, so the new `js-repros` READMEs explicitly mark Chrome 146 oracle capture as pending. Deterministic Obscura fixture probes and release `nextest` remain the local evidence; no synthetic Chrome oracle JSON is claimed.
 
 ## 5. 通用化方法论(六原则)
 

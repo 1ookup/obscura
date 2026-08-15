@@ -54,6 +54,12 @@ struct Args {
     /// Applied once at startup before any isolate is created.
     #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
     v8_flags: Option<String>,
+
+    /// Write native host-op calls (including fetch/DOM/WebSocket) to a TSV
+    /// while the CDP server remains connected. This is intentionally separate
+    /// from V8's property trace so both diagnostics can run in one process.
+    #[arg(long, global = true, value_name = "FILE")]
+    trace_op_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -337,6 +343,10 @@ async fn main() -> anyhow::Result<()> {
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
+    if let Some(path) = args.trace_op_file.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_OP_FILE", path); }
+    }
 
     // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
     // directly for its SSRF gate. Mirror the CLI flag into the env var so
@@ -352,6 +362,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    // Keep the top-level spelling usable when the command-local optional
+    // field is absent (`obscura --storage-dir DIR fetch ...`).
+    let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
 
     match args.command {
@@ -374,6 +387,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+            let storage_dir = storage_dir.or_else(|| global_storage_dir.clone());
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -395,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent, v8_flags.clone()).await?;
             } else {
                 obscura_cdp::start_with_serve_options_and_limit(
                     port,
@@ -460,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                 })?;
                 let wait_is_fixed = wait.is_some();
+                let storage_dir = storage_dir.or_else(|| global_storage_dir.clone());
                 run_fetch(
                     &url,
                     dump,
@@ -534,6 +549,7 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    v8_flags: String,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -557,6 +573,10 @@ async fn run_multi_worker_serve(
         }
         if stealth {
             cmd.arg("--stealth");
+        }
+        cmd.env("OBSCURA_V8_FLAGS", &v8_flags);
+        if let Some(path) = std::env::var_os("OBSCURA_TRACE_OP_FILE") {
+            cmd.env("OBSCURA_TRACE_OP_FILE", path);
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());

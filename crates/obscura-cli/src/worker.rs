@@ -42,6 +42,9 @@ impl WorkerResponse {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if let Ok(flags) = std::env::var("OBSCURA_V8_FLAGS") {
+        obscura_js::set_v8_flags(&flags);
+    }
     tracing_subscriber::fmt()
         .with_env_filter("warn")
         .with_writer(std::io::stderr)

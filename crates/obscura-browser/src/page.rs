@@ -352,6 +352,9 @@ pub struct Page {
     /// events continue in that realm until a main-document press replaces it.
     input_frame_target: Option<(String, u64)>,
     pub blocked_url_patterns: Vec<String>,
+    /// Optional embedder-owned interaction policy. It contains no site
+    /// knowledge: a caller supplies a selector and timing profile.
+    pub input_strategy: Option<InputStrategy>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
@@ -372,6 +375,19 @@ pub struct Page {
     frame_stylesheet_cache: std::collections::HashMap<String, Option<String>>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputStrategy {
+    pub selector: String,
+    pub delay_ms: u64,
+    pub key_delay_ms: u64,
+}
+
+impl InputStrategy {
+    pub fn selector(selector: impl Into<String>) -> Self {
+        Self { selector: selector.into(), delay_ms: 0, key_delay_ms: 25 }
+    }
 }
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
@@ -1015,6 +1031,10 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             input_frame_target: None,
             blocked_url_patterns: Vec::new(),
+            input_strategy: std::env::var("OBSCURA_AUTO_CLICK_SELECTOR")
+                .ok()
+                .filter(|selector| !selector.trim().is_empty())
+                .map(InputStrategy::selector),
             intercept_tx: None,
             preload_scripts: Vec::new(),
             suspended_started_script_ids: Vec::new(),
@@ -1030,6 +1050,13 @@ impl Page {
     /// not set it retain the existing environment-configurable 30s default.
     pub fn set_navigation_timeout(&mut self, timeout: std::time::Duration) {
         self.navigation_timeout = Some(timeout);
+    }
+
+    /// Install a generic selector-based interaction policy. The selector is
+    /// evaluated in the current document; no hostname or visible text is
+    /// inspected by the browser core.
+    pub fn set_input_strategy(&mut self, strategy: Option<InputStrategy>) {
+        self.input_strategy = strategy;
     }
 
     /// Return the effective end-to-end navigation deadline for this page.
@@ -1264,6 +1291,7 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_storage_dir(self.context.storage_dir.clone());
         rt.set_storage_areas(
             self.context.local_storage.clone(),
             self.session_storage.clone(),
@@ -1273,6 +1301,9 @@ impl Page {
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
+        if let Some(strategy) = &self.input_strategy {
+            rt.set_input_strategy(Some(&strategy.selector), strategy.delay_ms, strategy.key_delay_ms);
+        }
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             rt.set_stealth_client(stealth.clone());
@@ -2403,7 +2434,8 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); } catch(e) {}\n\
+                "try { globalThis.__obscura_schedule_input_strategy?.(); } catch(e) {}\n\
+                 try { globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); } catch(e) {}\n\
                  try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );

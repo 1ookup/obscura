@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,9 +22,13 @@ use obscura_net::{
     CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
 };
 use tokio::sync::Mutex;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Notify};
+use tokio_tungstenite::tungstenite::Message;
 
 #[cfg(feature = "render")]
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::import_map::ImportMap;
 use crate::privacy::{normalize_private_token_issuer, PrivateTokenQueryState, PrivacyPolicy};
@@ -182,6 +188,11 @@ pub struct ObscuraState {
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
     pub callbacks: Option<Arc<CallbackRegistry>>,
+    /// Optional persistent profile directory. IndexedDB uses an origin-keyed
+    /// JSON file here, alongside the existing cookie store.
+    pub storage_dir: Option<PathBuf>,
+    pub(crate) websockets: HashMap<u64, WebSocketState>,
+    pub websocket_counter: u64,
     /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
@@ -350,6 +361,8 @@ pub struct ObscuraState {
 pub(crate) struct FrameRenderState {
     pub stylesheet_cache: obscura_render::StylesheetCache,
     pub animation_timeline: obscura_render::AnimationTimelineState,
+    pub prepared_render: Option<obscura_render::PreparedRender>,
+    pub cached_generation: u64,
 }
 
 impl ObscuraState {
@@ -365,6 +378,9 @@ impl ObscuraState {
             cookie_jar: None,
             http_client: None,
             callbacks: None,
+            storage_dir: None,
+            websockets: HashMap::new(),
+            websocket_counter: 0,
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
@@ -540,6 +556,36 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+pub(crate) struct WebSocketState {
+    pub sender: mpsc::UnboundedSender<Message>,
+    pub events: Arc<Mutex<VecDeque<String>>>,
+    pub notify: Arc<Notify>,
+}
+
+/// Opt-in host-operation trace. Native deno ops do not always have a V8
+/// function frame, so this stream complements the V8 property trace.
+pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = TRACE.get_or_init(|| {
+        let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let _ = writeln!(file, "timestamp_us\toperation\targ1\targ2");
+        Some(std::sync::Mutex::new(file))
+    });
+    let Some(file) = sink else { return };
+    let timestamp = TRACE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let clean = |value: &str| value.replace(['\t', '\r', '\n'], " ").chars().take(2048).collect::<String>();
+    let arg1 = args.first().map_or_else(String::new, |value| clean(value));
+    let arg2 = args.get(1).map_or_else(String::new, |value| clean(value));
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{timestamp}\t{}\t{arg1}\t{arg2}", clean(name));
+        let _ = file.flush();
+    }
+}
+
+static TRACE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderMutationImpact {
@@ -1103,6 +1149,7 @@ fn op_dom(
     #[string] arg1: String,
     #[string] arg2: String,
 ) -> String {
+    trace_host_op("dom", &[&cmd, &arg1, &arg2]);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -1190,6 +1237,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
+            #[cfg(feature = "render")]
+            for frame_state in state.frame_render_states.values_mut() {
+                frame_state.prepared_render = None;
+            }
         }
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
@@ -2491,7 +2542,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
-        builder = builder.proxy(p);
+        builder = builder.proxy(p.no_proxy(reqwest::NoProxy::from_env()));
     }
     builder
         .build()
@@ -2569,6 +2620,7 @@ async fn op_fetch_url(
     #[string] credentials: String,
     #[string] referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    trace_host_op("fetch", &[&method, &url, &headers_json]);
     let performance_started = std::time::Instant::now();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
@@ -3178,6 +3230,112 @@ async fn op_fetch_url(
         },
     })
     .to_string())
+}
+
+#[op2(async)]
+#[string]
+async fn op_websocket_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[string] protocols: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    trace_host_op("websocket.open", &[&url, &protocols]);
+    let parsed = url::Url::parse(&url)
+        .map_err(|error| deno_error::JsErrorBox::generic(format!("WebSocket URL is invalid: {error}")))?;
+    if !matches!(parsed.scheme(), "ws" | "wss") {
+        return Err(deno_error::JsErrorBox::generic("WebSocket URL must use ws:// or wss://"));
+    }
+    // WebSocket connections share fetch's private-network policy. Reuse the
+    // same host validation after translating the transport scheme; this keeps
+    // loopback and RFC1918 literals out of the raw tungstenite connector.
+    let mut fetch_url = parsed.clone();
+    let _ = fetch_url.set_scheme(if parsed.scheme() == "wss" { "https" } else { "http" });
+    let allow_private_network = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let allowed = shared
+            .borrow()
+            .http_client
+            .as_ref()
+            .is_some_and(|client| client.allow_private_network);
+        allowed
+    };
+    validate_fetch_url(&fetch_url, allow_private_network)
+        .map_err(deno_error::JsErrorBox::generic)?;
+    let (socket, _) = tokio_tungstenite::connect_async(url.clone())
+        .await
+        .map_err(|error| deno_error::JsErrorBox::generic(format!("WebSocket connection failed: {error}")))?;
+    let shared = {
+        let state = state.borrow();
+        state.borrow::<SharedState>().clone()
+    };
+    let (sender, mut outgoing) = mpsc::unbounded_channel();
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let notify = Arc::new(Notify::new());
+    let events_task = events.clone();
+    let notify_task = notify.clone();
+    let (mut writer, mut reader) = socket.split();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(message) = outgoing.recv() => {
+                    if writer.send(message).await.is_err() { break; }
+                }
+                incoming = reader.next() => {
+                    match incoming {
+                        Some(Ok(Message::Text(text))) => { events_task.lock().await.push_back(json!({"type":"message","data":text.to_string()}).to_string()); notify_task.notify_waiters(); }
+                        Some(Ok(Message::Binary(bytes))) => { events_task.lock().await.push_back(json!({"type":"message","data":base64::engine::general_purpose::STANDARD.encode(bytes),"binary":true}).to_string()); notify_task.notify_waiters(); }
+                        Some(Ok(Message::Close(frame))) => { let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1000, String::new())); events_task.lock().await.push_back(json!({"type":"close","code":code,"reason":reason,"wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => { events_task.lock().await.push_back(json!({"type":"error","message":error.to_string()}).to_string()); notify_task.notify_waiters(); break; }
+                        None => { events_task.lock().await.push_back(json!({"type":"close","code":1000,"reason":"","wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                    }
+                }
+            }
+        }
+    });
+    let id = {
+        let mut gs = shared.borrow_mut();
+        gs.websocket_counter = gs.websocket_counter.wrapping_add(1).max(1);
+        let id = gs.websocket_counter;
+        gs.websockets.insert(id, WebSocketState { sender, events: events.clone(), notify: notify.clone() });
+        id
+    };
+    events.lock().await.push_back(json!({"type":"open","protocol":protocols,"extensions":""}).to_string());
+    notify.notify_waiters();
+    Ok(id.to_string())
+}
+
+#[op2(fast)]
+fn op_websocket_send(state: &OpState, id: u32, #[string] data: &str) -> bool {
+    trace_host_op("websocket.send", &[&id.to_string(), data]);
+    let shared = state.borrow::<SharedState>().clone();
+    let sender = shared.borrow().websockets.get(&(id as u64)).map(|socket| socket.sender.clone());
+    sender.map(|tx| tx.send(Message::Text(data.to_string().into())).is_ok()).unwrap_or(false)
+}
+
+#[op2(async)]
+#[string]
+async fn op_websocket_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    let shared = {
+        let state = state.borrow();
+        state.borrow::<SharedState>().clone()
+    };
+    let Some((events, notify)) = shared.borrow().websockets.get(&(id as u64)).map(|socket| (socket.events.clone(), socket.notify.clone())) else { return String::new() };
+    loop {
+        if let Some(event) = events.lock().await.pop_front() { return event; }
+        notify.notified().await;
+    }
+}
+
+#[op2(fast)]
+fn op_websocket_close(state: &OpState, id: u32, code: u16, #[string] reason: &str) {
+    trace_host_op("websocket.close", &[&id.to_string(), reason]);
+    let shared = state.borrow::<SharedState>().clone();
+    let socket = { shared.borrow_mut().websockets.remove(&(id as u64)) };
+    if let Some(socket) = socket {
+        let _ = socket.sender.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame { code: code.into(), reason: reason.to_string().into() })));
+    }
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -4308,6 +4466,48 @@ fn op_origin_storage(
         .unwrap_or_else(|_| "[]".to_string()),
         "length" => area.len().to_string(),
         _ => "null".to_string(),
+    }
+}
+
+fn indexed_db_path(state: &SharedState, name: &str) -> Option<PathBuf> {
+    let gs = state.borrow();
+    let dir = gs.storage_dir.as_ref()?.clone();
+    let origin = url::Url::parse(&gs.url).ok()?.origin().ascii_serialization();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    origin.hash(&mut hash);
+    name.hash(&mut hash);
+    Some(dir.join(format!("indexeddb-{:016x}.json", hash.finish())))
+}
+
+#[op2]
+#[string]
+fn op_indexeddb_load(state: &OpState, #[string] name: &str) -> String {
+    trace_host_op("indexeddb.load", &[name]);
+    let shared = state.borrow::<SharedState>().clone();
+    indexed_db_path(&shared, name)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+#[op2(fast)]
+fn op_indexeddb_save(state: &OpState, #[string] name: &str, #[string] value: &str) {
+    trace_host_op("indexeddb.save", &[name]);
+    let shared = state.borrow::<SharedState>().clone();
+    let Some(path) = indexed_db_path(&shared, name) else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() { return; }
+    let temporary = path.with_extension("json.tmp");
+    if std::fs::write(&temporary, value.as_bytes()).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+#[op2(fast)]
+fn op_indexeddb_delete(state: &OpState, #[string] name: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    if let Some(path) = indexed_db_path(&shared, name) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -5526,6 +5726,10 @@ pub fn build_extension() -> Extension {
         op_monotonic_ms(),
         op_run_classic_script(),
         op_fetch_url(),
+        op_websocket_open(),
+        op_websocket_send(),
+        op_websocket_recv(),
+        op_websocket_close(),
         op_private_state_query(),
         op_has_storage_access(),
         op_get_cookies(),
@@ -5533,6 +5737,9 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_set_cookie_for_url(),
         op_origin_storage(),
+        op_indexeddb_load(),
+        op_indexeddb_save(),
+        op_indexeddb_delete(),
         op_navigate(),
         op_navigate_frame(),
         op_queue_iframe_navigation(),
@@ -6521,29 +6728,68 @@ fn prepared_for_frame_root(
     let viewport = if parent_root == dom.document() {
         frame_content_box_from_parent(main_prepared, host)?
     } else {
-        let parent =
-            prepared_for_frame_root(
-                dom,
-                parent_root,
-                main_prepared,
-                resources,
-                frame_states,
-                depth + 1,
-            )?;
-        frame_content_box_from_parent(&parent, host)?
+        let parent = prepared_for_frame_root(
+            dom,
+            parent_root,
+            main_prepared,
+            resources,
+            frame_states,
+            depth + 1,
+        )?;
+        let result = frame_content_box_from_parent(&parent, host);
+        store_frame_prepared(dom, parent_root, parent, frame_states);
+        result?
     };
     let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
+    let generation = dom
+        .document_scope(frame_root)
+        .map(|scope| scope.document_generation)
+        .unwrap_or(0);
+    let (cached, mut stylesheet_cache, mut animation_timeline) = {
+        let frame_state = frame_states.entry(frame_root).or_default();
+        let cached = frame_state.prepared_render.take().filter(|prepared| {
+            prepared.viewport() == viewport
+                && prepared.animation_sample() == main_prepared.animation_sample()
+                && frame_state.cached_generation == generation
+        });
+        (
+            cached,
+            std::mem::take(&mut frame_state.stylesheet_cache),
+            std::mem::take(&mut frame_state.animation_timeline),
+        )
+    };
+    let prepared = cached.or_else(|| {
+        obscura_render::prepare_frame_document(
+            dom,
+            frame_root,
+            viewport,
+            base_url.as_deref(),
+            resources,
+            &mut stylesheet_cache,
+            main_prepared.animation_sample(),
+            &mut animation_timeline,
+        )
+    });
     let frame_state = frame_states.entry(frame_root).or_default();
-    obscura_render::prepare_frame_document(
-        dom,
-        frame_root,
-        viewport,
-        base_url.as_deref(),
-        resources,
-        &mut frame_state.stylesheet_cache,
-        main_prepared.animation_sample(),
-        &mut frame_state.animation_timeline,
-    )
+    frame_state.stylesheet_cache = stylesheet_cache;
+    frame_state.animation_timeline = animation_timeline;
+    prepared
+}
+
+#[cfg(feature = "render")]
+fn store_frame_prepared(
+    dom: &DomTree,
+    frame_root: NodeId,
+    prepared: obscura_render::PreparedRender,
+    frame_states: &mut HashMap<NodeId, FrameRenderState>,
+) {
+    let generation = dom
+        .document_scope(frame_root)
+        .map(|scope| scope.document_generation)
+        .unwrap_or(0);
+    let frame_state = frame_states.entry(frame_root).or_default();
+    frame_state.cached_generation = generation;
+    frame_state.prepared_render = Some(prepared);
 }
 
 /// Serialize one node's viewport-relative geometry from a prepared layout, in
@@ -6625,7 +6871,9 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
                 return String::new();
             };
             let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
-            return frame_geometry_json(&prepared, nid, &scroll);
+            let result = frame_geometry_json(&prepared, nid, &scroll);
+            store_frame_prepared(dom, root, prepared, frame_states);
+            return result;
         }
 
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
@@ -6854,7 +7102,9 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
         else {
             return String::new();
         };
-        (prepared.viewport(), prepared.content_size())
+        let result = (prepared.viewport(), prepared.content_size());
+        store_frame_prepared(dom, frame_root, prepared, frame_states);
+        result
     } else {
         let viewport = gs.viewport;
         let content = ensure_prepared_geometry(&mut gs)
@@ -6902,7 +7152,9 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
             return String::new();
         };
         let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
-        prepared.element_scroll_metrics(nid, &scroll)
+        let metrics = prepared.element_scroll_metrics(nid, &scroll);
+        store_frame_prepared(dom, root, prepared, frame_states);
+        metrics
     } else {
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
             return String::new();
