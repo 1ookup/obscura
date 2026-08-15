@@ -403,10 +403,25 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    而 `wreq_client.rs:253` 的 `validate_url(url, false)` 硬编码拒绝私网。此前记录的
    "obscura-net 83/83 通过"是**不带 stealth feature**跑出来的,那时这两条根本没被编译进去。
    与 P3 改动无关,但需要单独处理。
-3. **时序测试在并发负载下不稳**:`obscura-browser` 的
-   `autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll` 在 workspace 全量并发下
-   四次里失败两次,单独跑三次全过。属于负载敏感,不是确定性回归,但会污染门禁判读。
-4. **构建必须带 V8 补丁配置**。任何不带
+3. ~~**时序测试在并发负载下不稳**~~ **已修**。`autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll`
+   全量并发下约三次失败一次。抓到的失败形态是决定性的:
+   `events: [[50, 163.2], [100, 163.2]]`、`chain: [2.1, 2.8, 163.1]`——两个 timer 落在**同一时刻**、
+   嵌套链从 2.8ms 直接跳到 163ms,这不是 timer 迟到,是整个线程被抢占约 160ms 后所有 timer 一起补发。
+   放宽 35ms 容差会正好盖住这些测试要抓的回归(§3.1-#5 的 600–2500ms 迟发),所以修的是竞争而不是断言:
+   `.config/nextest.toml` 把时序敏感测试归入 `threads-required = "num-test-threads"` 的组,让它们独占机器。
+   连跑三次全量 744/744,代价是总耗时 8.5s → 11s。
+4. **本地门禁已落地(仓库无 CI 跑测试)**。`.github/workflows/` 只有 `docker.yml` 与 `release.yml`,
+   两者都只 `cargo build`,**没有任何自动化跑过这 744 个测试**。已加 `.githooks/pre-push`,一次安装:
+
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+
+   它跑三件事:①默认 feature 集 `cargo check`(第 1 条那个错误能长期存活的唯一原因);②全量 nextest;
+   ③`Cargo.lock` 前后哈希比对(第 5 条那个坑,本轮我自己踩了两次)。hook 内所有 cargo 命令都带
+   `--config patch.crates-io.v8.path`——否则门禁本身就成了改写 `Cargo.lock` 的元凶。
+   `SKIP_OBSCURA_PREPUSH=1 git push` 可显式跳过。
+5. **构建必须带 V8 补丁配置**。任何不带
    `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` 的 `cargo build`/`nextest` 会静默把
    `target/release/obscura` 换成非 patched V8,trace 输出随之变空(见 `Trace-page-script.md`)。
    同时它会改写 `Cargo.lock` 里 `v8` 的 source/checksum——那两行的缺失是有意的,不要提交回去。

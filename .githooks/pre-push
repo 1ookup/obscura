@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Local gate. There is no CI running tests on this repo -- the GitHub workflows
+# only build a Docker image and a release binary -- so this hook is the only
+# thing standing between a green local edit and a broken push.
+#
+# Install once:
+#     git config core.hooksPath .githooks
+#
+# Skip deliberately (rebases, doc-only pushes, a known-broken WIP branch):
+#     SKIP_OBSCURA_PREPUSH=1 git push
+set -uo pipefail
+
+if [ "${SKIP_OBSCURA_PREPUSH:-0}" = "1" ]; then
+  echo "pre-push: skipped via SKIP_OBSCURA_PREPUSH=1"
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root" || exit 1
+
+# EVERY cargo invocation below carries this. Without it cargo relinks stock V8,
+# silently dropping the trace patch, and rewrites Cargo.lock's `v8` source and
+# checksum lines -- whose absence is intentional (docs/Trace-page-script.md).
+# A gate that corrupts the thing it is guarding is worse than no gate.
+V8_PATCH=(--config 'patch.crates-io.v8.path="vendor/rusty_v8"')
+export V8_FROM_SOURCE=1
+
+fail() { printf '\n\033[31mpre-push: %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[36mpre-push: %s\033[0m\n' "$1"; }
+
+lock_before="$(git hash-object Cargo.lock 2>/dev/null || echo missing)"
+
+# 1. The default feature set. obscura-js and obscura-cli default to no features
+# and nothing else ever builds them that way, which is how a `cannot find type
+# ReferrerPolicy` error survived in ops.rs unnoticed: every build and every test
+# run passed --features render.
+step "checking the default feature set (nothing else builds it)"
+cargo check -p obscura-js -p obscura-cli "${V8_PATCH[@]}" >/dev/null 2>&1 \
+  || fail "default feature set does not compile -- rerun without >/dev/null to see it"
+
+# 2. The tests.
+step "running the workspace tests"
+if command -v cargo-nextest >/dev/null 2>&1; then
+  cargo nextest run --release --no-fail-fast \
+    -p obscura-js -p obscura-browser -p obscura-cdp \
+    --features render "${V8_PATCH[@]}" \
+    || fail "tests failed"
+else
+  cargo test --release -p obscura-js -p obscura-browser -p obscura-cdp \
+    --features render "${V8_PATCH[@]}" \
+    || fail "tests failed"
+fi
+
+# 3. Cargo.lock must come out byte-identical. If it moved, some command above
+# ran without the patch config and the pushed tree would build a V8 without the
+# trace patch.
+lock_after="$(git hash-object Cargo.lock 2>/dev/null || echo missing)"
+if [ "$lock_before" != "$lock_after" ]; then
+  git diff --stat Cargo.lock >&2
+  fail "Cargo.lock was rewritten -- restore it with 'git checkout Cargo.lock'"
+fi
+
+step "ok"
