@@ -60,7 +60,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 8 | **WebSocket 纯桩** | 已接入真实 RFC 6455 socket;消息、错误、关闭事件与 `ws`/`wss` URL 校验已覆盖 | `tokio-tungstenite` 连接器、异步事件队列、同 fetch 的私网校验;代理 CONNECT/TLS 指纹复用仍是后续工作 |
 | 9 | **WebGL/WebGL2 空 class** | 默认仍诚实返回 `null`;显式 profile 开关提供一致性值层 | `OBSCURA_WEBGL_PROFILE=1` 从 fingerprint GPU 策略派生 vendor/renderer、扩展和基础对象生命周期;不声称真实 GPU 后端 |
 | 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
-| 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 仅 interface object | SharedWorker 与 dedicated Worker 同构已落地;SW 保持 fail-closed 但形状与 Chrome 对齐;worklet 仍无入口 |
+| 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 入口已补(`CSS.paintWorklet`/`audioWorklet`) | SharedWorker 与 dedicated Worker 同构已落地;SW 与 worklet 保持 fail-closed,但形状与 Chrome 逐项对齐,失败用 Chrome 自己的错误形态 |
 | 12 | **Trusted Types 建模** | 核实结果:此前全库零实现(`window.trustedTypes` undefined,是 Firefox/Safari 答案)。API 面已按规范补齐,**CSP 强制未实现** | 工厂/策略/三个包装类型/sink 表已对齐 Chrome 146;`require-trusted-types-for` 需要 CSP 解析器与 sink 插桩,引擎目前不解析任何 CSP 指令 |
 | 13 | **媒体/WebRTC/Notification** | 全桩(假实现或拒绝) | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准) |
 
