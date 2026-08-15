@@ -13598,6 +13598,35 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+
+// Measure a text run with the engine's real text layout, so canvas metrics and
+// element metrics come from one source. Returns null when there is no document
+// to lay out in (OffscreenCanvas on a worker), where the caller falls back to
+// its own estimate rather than inventing a width.
+let _textMeasureHost = null;
+function _measureTextRun(text, font) {
+  try {
+    if (text === '') return 0;
+    const doc = globalThis.document;
+    if (!doc || !doc.body || !text) return null;
+    let host = _textMeasureHost;
+    if (!host || host.ownerDocument !== doc || !host.isConnected) {
+      host = doc.createElement('span');
+      host.setAttribute('aria-hidden', 'true');
+      host.style.cssText = 'position:absolute;left:-99999px;top:-99999px;' +
+        'white-space:pre;visibility:hidden;margin:0;padding:0;border:0;';
+      doc.body.appendChild(host);
+      _textMeasureHost = host;
+    }
+    // The canvas `font` string is CSS font shorthand, so it applies directly.
+    host.style.font = String(font || '10px sans-serif');
+    host.textContent = text;
+    const rect = host.getBoundingClientRect();
+    const width = rect && rect.width;
+    return typeof width === 'number' && width > 0 ? width : null;
+  } catch (_error) { return null; }
+}
+
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -13743,9 +13772,20 @@ class _Canvas2D {
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
+    const text = String(t);
+    const fontSize = parseFloat(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    // Route through the real text layout engine, which is what element
+    // measurement already uses. The previous `length * 6 * scale` ignored the
+    // font entirely, so every family measured identically -- a canvas font
+    // fingerprint with no variance at all, and one that contradicted the
+    // element widths the same engine produced next door.
+    const measured = _measureTextRun(text, this.font);
+    return {
+      width: measured !== null ? measured : text.length * 6 * scale,
+      actualBoundingBoxAscent: 7 * scale,
+      actualBoundingBoxDescent: 2 * scale,
+    };
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);

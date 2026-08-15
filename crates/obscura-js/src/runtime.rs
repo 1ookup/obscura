@@ -4133,6 +4133,71 @@ mod tests {
         );
     }
 
+    /// Canvas text metrics must come from the real layout engine, so they vary
+    /// with the font and agree with element measurement. They previously did
+    /// neither: `length * 6 * scale` ignored the font entirely, leaving the
+    /// canvas font fingerprint perfectly flat. See js-repros/font-fingerprint/.
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_text_metrics_vary_with_font_and_match_element_layout() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const TEXT = "mmmmmmmmmmlliWQ@%#";
+                    const ctx = document.createElement("canvas").getContext("2d");
+                    const width = font => {
+                        ctx.font = font;
+                        return ctx.measureText(TEXT).width;
+                    };
+                    const span = document.createElement("span");
+                    span.textContent = TEXT;
+                    span.style.cssText =
+                        "position:absolute;left:-9999px;white-space:pre;";
+                    document.body.appendChild(span);
+                    const elementWidth = font => {
+                        span.style.font = font;
+                        return span.getBoundingClientRect().width;
+                    };
+                    const mono = width("72px monospace");
+                    const sans = width('72px "Arial", monospace');
+                    const missing = width('72px "NonexistentFontXYZ123", monospace');
+                    return {
+                        // Different families must not measure the same.
+                        monoDiffersFromSans: mono !== sans,
+                        // An unresolvable family falls back to the generic.
+                        missingFallsBackToGeneric: missing === mono,
+                        // Longer text is wider; the metric tracks content.
+                        longerIsWider:
+                            width("72px monospace") <
+                            (ctx.font = "72px monospace", ctx.measureText(TEXT + TEXT).width),
+                        emptyIsZero: (ctx.font = "72px monospace",
+                                      ctx.measureText("").width) === 0,
+                        // Canvas and element layout are one source of truth.
+                        agreesWithElement: mono === elementWidth("72px monospace")
+                            && sans === elementWidth('72px "Arial", monospace'),
+                        positive: mono > 0 && sans > 0,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "monoDiffersFromSans": true,
+                "missingFallsBackToGeneric": true,
+                "longerIsWider": true,
+                "emptyIsZero": true,
+                "agreesWithElement": true,
+                "positive": true,
+            })
+        );
+    }
+
     /// Media capability reporting. The engine decodes nothing, but the
     /// capability *declaration* matches Chrome and — the point of this test —
     /// canPlayType and mediaCapabilities.decodingInfo cannot disagree, because
