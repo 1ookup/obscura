@@ -4133,6 +4133,88 @@ mod tests {
         );
     }
 
+    /// Worklet entry points exist and fail closed: no module can load, so
+    /// `addModule` always rejects with the error Chrome raises for a module it
+    /// cannot fetch. Pinned in js-repros/worklet-entrypoints/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worklet_entry_points_exist_and_fail_closed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const settle = async thunk => {
+                        try { await thunk(); return "fulfilled"; }
+                        catch (error) {
+                            return {
+                                name: error.name,
+                                isDOMException: error instanceof DOMException,
+                                message: error.message,
+                            };
+                        }
+                    };
+                    const paint = CSS.paintWorklet;
+                    const context = new AudioContext();
+                    return {
+                        paintTag: Object.prototype.toString.call(paint),
+                        paintCtor: paint.constructor.name,
+                        paintIsWorklet: paint instanceof Worklet,
+                        paintStable: CSS.paintWorklet === CSS.paintWorklet,
+                        addModuleLength: paint.addModule.length,
+                        audioTag: Object.prototype.toString.call(context.audioWorklet),
+                        audioCtor: context.audioWorklet.constructor.name,
+                        audioIsWorklet: context.audioWorklet instanceof Worklet,
+                        audioStable: context.audioWorklet === context.audioWorklet,
+                        // Each context owns its worklet.
+                        audioPerContext: context.audioWorklet !== new AudioContext().audioWorklet,
+                        illegalAudioWorklet: (() => {
+                            try { new AudioWorklet(); return "constructed"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        noArgs: await settle(() => paint.addModule()),
+                        withUrl: await settle(() => paint.addModule("/paint.js")),
+                        audioWithUrl: await settle(
+                            () => context.audioWorklet.addModule("/audio.js")),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "paintTag": "[object Worklet]",
+                "paintCtor": "Worklet",
+                "paintIsWorklet": true,
+                "paintStable": true,
+                "addModuleLength": 1,
+                "audioTag": "[object AudioWorklet]",
+                "audioCtor": "AudioWorklet",
+                "audioIsWorklet": true,
+                "audioStable": true,
+                "audioPerContext": true,
+                "illegalAudioWorklet":
+                    "Failed to construct 'AudioWorklet': Illegal constructor",
+                "noArgs": {
+                    "name": "TypeError", "isDOMException": false,
+                    "message": "Failed to execute 'addModule' on 'Worklet': \
+1 argument required, but only 0 present.",
+                },
+                "withUrl": {
+                    "name": "AbortError", "isDOMException": true,
+                    "message": "Unable to load a worklet's module.",
+                },
+                "audioWithUrl": {
+                    "name": "AbortError", "isDOMException": true,
+                    "message": "Unable to load a worklet's module.",
+                },
+            })
+        );
+    }
+
     /// Trusted Types shape, brand checks and sink tables. Pinned against
     /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
     /// enforcement is out of scope (no directive is parsed anywhere yet), so

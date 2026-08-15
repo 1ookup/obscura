@@ -1,0 +1,53 @@
+{
+  "workletInterface": "function",
+  "cssExists": "object",
+  "paintWorkletPresent": true,
+  "paintWorklet": {
+    "type": "object",
+    "tag": "[object Worklet]",
+    "ctor": "Worklet",
+    "instanceOfWorklet": true,
+    "addModuleType": "function",
+    "addModuleLength": 1
+  },
+  "paintWorkletStable": true,
+  "paintAddModuleMissingArg": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to execute 'addModule' on 'Worklet': 1 argument required, but only 0 present."
+  },
+  "paintAddModule404": {
+    "settled": "rejected",
+    "name": "AbortError",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Unable to load a worklet's module."
+  },
+  "paintAddModuleCrossOrigin": {
+    "settled": "rejected",
+    "name": "AbortError",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Unable to load a worklet's module."
+  },
+  "audioContextType": "function",
+  "audioWorkletPresent": true,
+  "audioWorklet": {
+    "type": "object",
+    "tag": "[object AudioWorklet]",
+    "ctor": "AudioWorklet",
+    "instanceOfWorklet": true,
+    "addModuleType": "function",
+    "addModuleLength": 1
+  },
+  "audioWorkletStable": true,
+  "audioAddModule404": {
+    "settled": "rejected",
+    "name": "AbortError",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Unable to load a worklet's module."
+  }
+}

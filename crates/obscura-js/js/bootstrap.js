@@ -16054,6 +16054,73 @@ _markNative(globalThis.SharedWorker);
 try {
   Object.setPrototypeOf(globalThis.SharedWorker.prototype, EventTarget.prototype);
 } catch (e) {}
+// Worklet entry points. The `Worklet` interface object existed with nothing
+// hanging off it: no `CSS.paintWorklet`, no `audioWorklet` on an AudioContext,
+// both of which Chrome exposes and both of which are one-line feature
+// detections. No worklet module can run here, so `addModule` always fails --
+// with the exact error Chrome raises when a module cannot be fetched
+// (`AbortError: Unable to load a worklet's module.`), so callers' existing
+// failure paths handle it rather than a shape no browser produces.
+(function _installWorkletEntryPoints() {
+  const Worklet = globalThis.Worklet;
+  if (typeof Worklet !== 'function') return;
+
+  Object.defineProperty(Worklet.prototype, 'addModule', {
+    // `options` carries a default so `addModule.length` is 1, as in Chrome.
+    value: _markNative(function addModule(moduleURL, options = undefined) {
+      if (arguments.length < 1) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'addModule' on 'Worklet': " +
+          '1 argument required, but only 0 present.'));
+      }
+      return Promise.reject(new DOMException(
+        "Unable to load a worklet's module.", 'AbortError'));
+    }),
+    writable: true, enumerable: false, configurable: true,
+  });
+
+  const AudioWorklet = function () {
+    throw new TypeError("Failed to construct 'AudioWorklet': Illegal constructor");
+  };
+  Object.defineProperty(AudioWorklet, 'name', {value: 'AudioWorklet', configurable: true});
+  AudioWorklet.prototype = Object.create(Worklet.prototype);
+  Object.defineProperty(AudioWorklet.prototype, 'constructor', {
+    value: AudioWorklet, writable: true, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(AudioWorklet.prototype, Symbol.toStringTag, {
+    value: 'AudioWorklet', configurable: true,
+  });
+  _markNative(AudioWorklet);
+  globalThis.AudioWorklet = AudioWorklet;
+
+  // Each entry point is one stable object, as in Chrome: `CSS.paintWorklet ===
+  // CSS.paintWorklet`, and one audioWorklet per AudioContext.
+  const paintWorklet = Object.create(Worklet.prototype);
+  if (globalThis.CSS && typeof globalThis.CSS === 'object') {
+    Object.defineProperty(globalThis.CSS, 'paintWorklet', {
+      get: _markNative(function paintWorklet_() { return paintWorklet; }),
+      enumerable: true, configurable: true,
+    });
+  }
+
+  const audioWorklets = new WeakMap();
+  if (typeof globalThis.AudioContext === 'function') {
+    // OfflineAudioContext extends AudioContext, so it inherits this accessor
+    // and gets its own worklet object through the same WeakMap.
+    Object.defineProperty(globalThis.AudioContext.prototype, 'audioWorklet', {
+      get: _markNative(function audioWorklet() {
+        let worklet = audioWorklets.get(this);
+        if (!worklet) {
+          worklet = Object.create(AudioWorklet.prototype);
+          audioWorklets.set(this, worklet);
+        }
+        return worklet;
+      }),
+      enumerable: true, configurable: true,
+    });
+  }
+})();
+
 // Trusted Types (W3C). Chrome ships the entire surface; `window.trustedTypes`
 // being undefined is a Firefox/Safari answer and contradicts every other
 // Chrome signal this build sends, which is why the roadmap lists it (§3.2-#12).
@@ -17196,7 +17263,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     // Workers and messaging
     'Worker', 'SharedWorker', 'MessageChannel', 'MessagePort',
     'BroadcastChannel', 'Scheduler', 'ServiceWorkerContainer',
-    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet',
+    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet', 'AudioWorklet',
     'NavigationPreloadManager',
     // Trusted Types
     'TrustedTypePolicyFactory', 'TrustedTypePolicy', 'TrustedHTML',
