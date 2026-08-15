@@ -384,7 +384,8 @@ HTML nested floor 仍由通用 timer queue 决定。固定导航 fixture 中修�
 `node_base_url()`，非空时用它，为空退回原行为。请求的 initiator（决定 Referer /
 Origin）同样改用它——Chrome 发的 `/ci/` 请求 Referer 是 widget 文档，不是嵌入页。
 
-效果（`scripts/realm_probe.sh`，与当初发现问题的是同一个探针）：
+效果（`scripts/realm_probe.sh`，与当初发现问题的是同一个探针。本文档 `scripts/` 均指
+`.claude/skills/obscura-challenge-probe/scripts/`）：
 
 | | 修复前 | 修复后 |
 |---|--------|--------|
@@ -1583,7 +1584,7 @@ https + 代理路径。说明至少有两条 HTTP 出口，其 UA 来源不同�
 `/pat/`；第二轮虽然发了 `/ci/`，也延迟到 2.24s（Chrome 366ms）。`/pat/` 是链路上更靠前
 的一环，因此优先于 `600010` 排查。
 
-**参考**：`/Users/l9h8/reverse/web/HaHaVM-General`（把 CF solver 重建在通用 JS 引擎
+**参考**：`/Volumes/ZHITAI/projects/HaHaVM-General`（把 CF solver 重建在通用 JS 引擎
 框架上的项目）及其 `examples/cloudflare/`。
 
 **发现 1：obscura 缺 Private Access Token 一族 API**

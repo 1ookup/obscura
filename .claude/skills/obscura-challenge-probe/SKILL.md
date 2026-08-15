@@ -38,12 +38,16 @@ description: >
 ## 前置
 
 ```bash
+# 探针脚本实际位于 .claude/skills/obscura-challenge-probe/scripts/。
+# 以下命令均从仓库根执行，用 $SKILL_DIR 定位脚本：
+SKILL_DIR=".claude/skills/obscura-challenge-probe"
+
 # 必须带 stealth feature 构建
 V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
   --features render,stealth \
   --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
 
-# MITM 代理的 CA 证书；不给这个则 TLS 校验失败，整轮观测为空
+# MITM 代理的 CA 证书（本机 Reqable 路径；换工具/机器时替换为你的 CA）
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 ```
 
@@ -79,26 +83,26 @@ SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
   obscura serve --port 9223 --proxy http://127.0.0.1:9000 --stealth &
 
 # postMessage 完整内容 + 时间线 + 页面错误
-scripts/cdp_probe.py messages <URL> --wait 35
+$SKILL_DIR/scripts/cdp_probe.py messages <URL> --wait 35
 
 # 穿透 closed shadow root 列出 iframe（普通查询看不到）
-scripts/cdp_probe.py shadow <URL> --wait 25
+$SKILL_DIR/scripts/cdp_probe.py shadow <URL> --wait 25
 
 # 每 N 秒截一帧 + iframe 位置尺寸，判断是「还在算」还是「等你点」
-scripts/cdp_filmstrip.py <URL> --every 3 --for 33
+$SKILL_DIR/scripts/cdp_filmstrip.py <URL> --every 3 --for 33
 
 # 读跨源 iframe 内部的真实 DOM（isolated world；页面自己够不到）
-scripts/cdp_frame_dom.py <URL> --match challenges.cloudflare.com
+$SKILL_DIR/scripts/cdp_frame_dom.py <URL> --match challenges.cloudflare.com
 
 # 交互分支：等 interactiveBegin → 立刻点复选框 → 观察证明 POST 与事件链
 # （成功判据：点击后 ~2s 内出现新的 POST .../fo/<tokenB>）
-scripts/cdp_click_fast.py <URL> --port 9223 --deadline 40 --settle 20
+$SKILL_DIR/scripts/cdp_click_fast.py <URL> --port 9223 --deadline 40 --settle 20
 
 # 点击前后事件字段对拍（timeStamp/screenX/button/detail/pressure/cancelable）
-scripts/cdp_event_trace.py <URL> --port 9223
+$SKILL_DIR/scripts/cdp_event_trace.py <URL> --port 9223
 
 # 任意表达式
-scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("iframe").length'
+$SKILL_DIR/scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("iframe").length'
 ```
 
 `messages` 模式能拿到 `{"source":"cloudflare-challenge","event":"overrunBegin",...}`
@@ -109,7 +113,7 @@ scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("iframe").leng
 跨源 iframe 里每个 API 发一次请求，看落到哪个服务器：
 
 ```bash
-scripts/realm_probe.sh
+$SKILL_DIR/scripts/realm_probe.sh
 ```
 
 正确的结果是所有 probe 都落在 frame 源。落在页面源的那些，说明该 API 的 URL

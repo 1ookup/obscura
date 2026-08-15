@@ -2,7 +2,7 @@
 
 > 状态:评审稿 · 日期:2026-08-14 · 分支:`feat/web-platform-parity`
 > 相关文档:[Cloudflare challenge 诊断记录](Cloudflare-challenge-profile.md)、[Trace 页面脚本](Trace-page-script.md)、[Anti-detection: real engine vs. JS patching](Anti-detection-vs-js-environment-patching.md)、[Iframe 设计](Iframe-support-design.md)
-> 外部参考:[HaHaVM-General](https://github.com/)(通用补环境框架,含 `examples/cloudflare/` 外置模式)
+> 外部参考:[HaHaVM-General](https://github.com/1ookup/HaHaVM-General)(通用补环境框架,含 `examples/cloudflare/` 外置模式)
 
 ## 1. 背景与动机
 
@@ -51,7 +51,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 5 | **定时器/事件循环时序** | 早期 timer 迟发 600–2500ms 未定位,与 CF 的 timeTiefMs 吻合 | step 9 | 引擎级 timer 调度基准(事件循环 tick 保真),不做任何站点的快进/延时白名单 |
 | 6 | **表单与 label 激活剩余** | `HTMLLabelElement.control`、labelable `.labels`、嵌套/显式关联和 `label.click()` 激活已实现 | step 30 | 按 tree scope 查找并排除 hidden/disabled 控件;取消 label click 时不转发 |
 | 7 | **指纹推导引擎** | profiles.rs 8 个固定 profile;UA 分裂已修(step 38)但仍是"选表"而非"推导" | step 38;HaHaVM `config.js` 从 UA/sec-ch-ua 推导全表面 | 单一指纹输入源(UA)→ 自洽推导 navigator/platform/userAgentData/sec-ch-ua-*/GPU/DPR,替换固定表;对所有出站头/JS 面使用同一派生值 |
-| 8 | **Referrer 语义对齐** | 出站 `Referer` 头近似 `origin-when-cross-origin`(`request_referrer`,client.rs:424:同源全 URL/跨源仅 origin/HTTPS→HTTP 不发),但**无 `Referrer-Policy` 响应头解析、无 meta/`referrerpolicy` 属性、无 `rel=noreferrer`**;iframe 内容文档 `referrer` 硬编码空串(bootstrap.js:6334,Chrome 中同源 iframe 应继承父链);主文档与 DOMParser 文档(referrer=空,符合规范)正确 | HaHaVM `cfPatches.js` 给挑战页强制空 referrer(值级特化);反爬高频探测点 | 按 Fetch/HTML 规范的 Referrer Policy 实现:响应头/meta/attribute/`rel=noreferrer` 全路径 + 默认 `strict-origin-when-cross-origin`;iframe 继承语义。**自检:CF 挑战页的空 referrer 应是策略的自然结果,而非特判** |
+| 8 | **Referrer 语义对齐** | 出站 `Referer` 头近似 `origin-when-cross-origin`(`request_referrer`,client.rs:同源全 URL/跨源仅 origin/HTTPS→HTTP 不发),但**无 `Referrer-Policy` 响应头解析、无 meta/`referrerpolicy` 属性、无 `rel=noreferrer`**;iframe 内容文档 `referrer` 硬编码空串(bootstrap.js,Chrome 中同源 iframe 应继承父链);主文档与 DOMParser 文档(referrer=空,符合规范)正确 | HaHaVM `cfPatches.js` 给挑战页强制空 referrer(值级特化);反爬高频探测点 | 按 Fetch/HTML 规范的 Referrer Policy 实现:响应头/meta/attribute/`rel=noreferrer` 全路径 + 默认 `strict-origin-when-cross-origin`;iframe 继承语义。**自检:CF 挑战页的空 referrer 应是策略的自然结果,而非特判** |
 
 ### 3.2 Web 平台 API 完整性
 
@@ -77,7 +77,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 | # | 缺口 | 现状 | 通用化方案 |
 |---|---|---|---|
-| 18 | **CDP Debugger/Profiler/HeapProfiler 域** | 全部 no-op(dispatch.rs:574);`runIfWaitingForDebugger` 空实现 | rusty_v8 `inspector.rs` 有完整 V8Inspector 绑定(现成),接 `Debugger.enable→scriptParsed`、`setBreakpointByUrl`、`schedulePauseOnNextStatement`;realm 隔离已有 ContextScope 支撑 |
+| 18 | **CDP Debugger/Profiler/HeapProfiler 域** | 全部 no-op(dispatch.rs);`runIfWaitingForDebugger` 空实现 | rusty_v8 `inspector.rs` 有完整 V8Inspector 绑定(现成),接 `Debugger.enable→scriptParsed`、`setBreakpointByUrl`、`schedulePauseOnNextStatement`;realm 隔离已有 ContextScope 支撑 |
 | 19 | **trace 增强** | 无 realm 区分、无时间戳、IC 快速路径盲区、native 绑定参数抓不到 | ① TSV 加 realm 列(GetScriptOrigin)与单调时钟列;② 条件属性断点(属性名/receiver 匹配即 DebugBreak,替代 140MB 全量 trace);③ **Rust op 层 API 序列日志**:171 个 op 是页面所有 host API 必经点,天然带 realm/参数,可覆盖 native 绑定死角 |
 | 20 | **trace 与 CDP 同跑** | `serve` 不支持 `--v8-flags`,两者互斥 | CLI 层打通,一条管线:preload 探针 + trace + 截图 + consoleAPICalled 收流 |
 | 21 | **frame 布局缓存** | 几何轮询(如 Turnstile)每次重跑 CSS+布局 | 按 (frame, doc generation) 缓存布局结果,无效化信号已具备 |
