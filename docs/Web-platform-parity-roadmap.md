@@ -62,7 +62,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
 | 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 入口已补(`CSS.paintWorklet`/`audioWorklet`) | SharedWorker 与 dedicated Worker 同构已落地;SW 与 worklet 保持 fail-closed,但形状与 Chrome 逐项对齐,失败用 Chrome 自己的错误形态 |
 | 12 | **Trusted Types 建模** | 核实结果:此前全库零实现(`window.trustedTypes` undefined,是 Firefox/Safari 答案)。API 面已按规范补齐,**CSP 强制未实现** | 工厂/策略/三个包装类型/sink 表已对齐 Chrome 146;`require-trusted-types-for` 需要 CSP 解析器与 sink 插桩,引擎目前不解析任何 CSP 指令 |
-| 13 | **媒体/WebRTC/Notification** | 全桩(假实现或拒绝) | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准) |
+| 13 | **媒体/WebRTC/Notification** | 媒体能力声明已自洽并对齐 Chrome(`3a61507`);WebRTC/Notification 仍是全桩 | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准);WebRTC/Notification 尚未按此复核 |
 
 ### 3.3 网络与传输
 
@@ -87,7 +87,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | # | 缺口 | 现状 | 通用化方案 |
 |---|---|---|---|
 | 22 | 系统字体对齐 | cosmic-text 内嵌字体、确定性布局,不扫系统字体 | 长期:可选扫描系统字体接入,注意字体指纹面要与 Chrome 对齐或可配置 |
-| 23 | video 解码 | 无 | 长期(封面帧/几何先支持) |
+| 23 | video 解码 | 无解码;**能力声明已对齐 Chrome 且与 decodingInfo 自洽**(`3a61507`),几何/readiness 保持空 | 长期(真解码);封面帧仍未支持 |
 | 24 | PDF 结构 | raster PDF,无可选文本/大纲 | 长期 |
 
 ## 4. 优先级路线图
@@ -175,7 +175,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 17 | SharedWorker 真实现(§3.2-#11) | ✅ 完成(`871682b`) |
 | 18 | Trusted Types API 面(§3.2-#12) | ✅ 完成(`1f963b7`);**CSP 强制未实现**,需 CSP 解析器 |
 | 19 | worklet 入口(§3.2-#11) | ✅ 完成(`552715e`) |
-| 20 | 系统字体 / video 解码 / PDF 结构(§3.5) | ⛔ 未开始 |
+| 20 | 媒体能力声明自洽(§3.5-#23 起步 / §3.2-#13) | ✅ 完成(`3a61507`) |
+| 21 | 系统字体(§3.5-#22) / video 真解码(§3.5-#23) / PDF 结构(§3.5-#24) | ⛔ 未开始 |
 
 #### P3-16 实施记录:ServiceWorker fail-closed
 
@@ -215,6 +216,28 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   `self.onmessage` 由 worker prep 脚本自己派发,不走页面 bootstrap 的 EventTarget 实现。
 - **"共享"的范围**:指一个页面内多次构造之间的共享。obscura 的页面是互不共享 worker host 的
   独立文档,跨页面共享本就不可观测。
+
+#### P3-20 实施记录:媒体能力声明自洽
+
+- **状态**:✅ 完成(`3a61507`)。这是 §3.5-#23 的起步(路线图原话「封面帧/几何先支持」),
+  同时兑现 §3.2-#13 的「不报假成功」。
+- **问题(自相矛盾)**:`canPlayType` 对包括 `video/mp4` 在内的每种类型返回 `""`——没有任何
+  Chrome 构建会这样,且会把站点推进「你的浏览器不能播放视频」的降级路径;而
+  `mediaCapabilities.decodingInfo` 却返回 `supported`/`smooth`/`powerEfficient` **全 true**,
+  宣称硬件加速解码(Chrome 对软件解码报 `powerEfficient: false`)。**同一个引擎两套相反答案,
+  比其中任何一个单独看都更像机器人。**
+- **方向(经确认)**:能力声明对齐 Chrome,播放行为一如既往地不发生。
+  - 声明侧:`canPlayType` 已知容器 → maybe、连 codecs 也已知 → probably、其余 → `""`
+    (含 Chrome 同样拒绝的 `video/ogg;codecs="theora"` 与 `video/quicktime`);
+    `decodingInfo`/`encodingInfo`/`MediaSource.isTypeSupported` 全部走**同一张表**,
+    两个 API 不可能再分家。
+  - 行为侧:`play()` 仍 reject(改用 `NotAllowedError`——拒绝是策略而非缺编解码器,也正是
+    无用户手势的 headless Chrome 报的错);`readyState` 仍 HAVE_NOTHING,几何仍 0。
+- **补齐的缺失成员**:`buffered`/`played`/`seekable`(此前属性根本不存在)、
+  `getVideoPlaybackQuality`、`requestVideoFrameCallback`、`MediaSource`。值都是空/零,
+  与「不解码」一致。TimeRanges/VideoPlaybackQuality 的属性按 WebIDL 设为 enumerable。
+- **验证**:`js-repros/media-capability-honesty/` 固化 Chrome 146 oracle,**77 个观测点全部一致**。
+  新增回归测试专门锁「canPlayType 与 decodingInfo 不得再分家」。
 
 #### P3-19 实施记录:worklet 入口
 
