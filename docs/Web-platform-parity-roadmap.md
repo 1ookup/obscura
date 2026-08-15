@@ -192,10 +192,35 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   上的 accessor,navigator 不再有自有属性;`ready` 是永不 settle 的缓存 promise;`register`
   按 Chrome 的检查顺序 reject。`ServiceWorker`/`ServiceWorkerRegistration`/`Worklet`/
   `NavigationPreloadManager` 补上 interface object。
-- **验证**:`js-repros/service-worker-fail-closed/` 固化 Chrome 146.0.7680.80 oracle,89 个观测点
-  中 83 个逐字一致。6 个差异是两处:①合法同源脚本的注册被拒绝而非伪造(fail-closed 的自觉代价,
-  用的是 Chrome 自己在站点数据被阻止时给出的 SecurityError);②Chrome 对 `http://[` 的 URL
-  序列化细节。均记录在 fixture README。
+- **验证**:`js-repros/service-worker-fail-closed/` 固化 Chrome 146.0.7680.80 oracle。
+- **续修(见下)**:首版把「取脚本」和「跑 worker」混为一谈,在取脚本之前就拒绝,漏掉了 5 类判定。
+
+#### P3-16 续:register 必须真的去取脚本
+
+- **状态**:✅ 完成。
+- **问题**:首版实现的注释写着「Every rejection the spec can reach without running a worker has
+  been checked」——这句话是错的。Chrome 的 `register()` 有 7 步,**只有最后一步(求值并安装脚本)
+  需要 worker**;取脚本、状态码、MIME、重定向、scope 上限全部不需要。首版在第 2 步就放弃,把 6 个
+  可判定的结果坍缩成一个错误答案。
+- **更重的那一半在服务端**:Chrome 取脚本时发的是 `GET /sw.js`,带 `Service-Worker: script` 与
+  `Sec-Fetch-Dest: serviceworker`——这组头没有任何其它请求类型会带。不发这个请求,等于在**每一个
+  部署了 SW 的站点**的访问日志里留下一个洞,而且**不需要页面侧任何检测代码**就能看见。这比 JS 侧的
+  错误字符串差异强得多。
+- **实现**:补齐 `%2f`/`%5c` 转义检查(本地),然后真的 fetch 脚本,按 Chrome 实测的优先级判定——
+  重定向 > 状态码 > MIME > scope 上限(含 `Service-Worker-Allowed`)。MIME 白名单用 fetch 规范的
+  JavaScript 集合,大小写不敏感、剥参数。fail-closed 的拒绝**移到全部检查之后**,只在「脚本确实取到
+  且合法可用」时触发。`op_fetch_url` 增加 fetch 的 `redirect` 语义:SW 脚本用 `error`,不跟随跳转
+  ——否则会在服务端日志里多出一个 Chrome 不会发的请求(参数挂在已是 JSON 的 `referrer_context` 上,
+  因为 deno_core 的 async op codegen 上限是 9 个参数)。
+- **顺序怎么定的**:不是照规范读的,是喂给 Chrome「同时违反两项检查」的输入试出来的——重定向到 404
+  报重定向,404 且无 MIME 报 404,scope 超范围且 MIME 错报 MIME。
+- **验证**:oracle 从 89 个观测点扩到 175,其中 150 个逐字一致,且**服务端收到的请求序列完全一致**
+  (`__serverSawScriptFetches` 已进 oracle,成为可回归断言而非一次性观察)。剩余 25 个:24 个是三处
+  「Chrome 会成功」的用例——这就是 fail-closed 本身,且现在精确收敛到这一个点(此前它连 404 路径
+  一起吞了,而那是每个 SW URL 过期的站点都会走的路径);1 个是 `http://[` 的 URL 序列化细节,只有
+  4 个数据点,猜测式复刻会用一个已知差异换来若干未知差异,故保持原样。新增 Rust 测试
+  `service_worker_registration_fetches_the_script_before_refusing` 用本地 server 覆盖整条判定链,
+  并断言 `/sw-ok.js` **不出现**在请求列表里(重定向未被跟随)。
 - **已知缺口**:`isSecureContext` 全库不存在,因此容器无条件暴露;Chrome 在非 secure context 的
   普通 HTTP 源上让 `navigator.serviceWorker` 为 undefined。
 

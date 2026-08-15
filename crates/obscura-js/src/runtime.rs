@@ -4617,13 +4617,17 @@ script ('data:text/javascript,//') is not supported.",
 scope ('https://other.example') does not match the current origin \
 ('http://example.com').",
                 },
-                // No worker can run, so a spec-valid registration is refused
-                // rather than resolved with undefined.
+                // Fetching the script needs no worker, so it happens for real
+                // and the 404 is reported the way Chrome reports it. The
+                // worker-less refusal now sits behind this, reachable only by
+                // a script that actually fetches with a JavaScript MIME type
+                // -- which is why this assertion is a 404 and not the refusal.
                 "sameOriginScript": {
-                    "settled": "rejected", "name": "SecurityError",
-                    "isDOMException": true, "isTypeError": false,
-                    "message": "Failed to register a ServiceWorker: The user denied permission \
-to use Service Worker.",
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to register a ServiceWorker for scope \
+('http://example.com/') with script ('http://example.com/sw.js'): A bad HTTP response code \
+(404) was received when fetching the script.",
                 },
                 "getRegistration": { "settled": "fulfilled", "isUndefined": true },
                 "crossOriginGetRegistration": {
@@ -4635,6 +4639,157 @@ provided documentURL ('https://other.example') does not match the current origin
                 },
                 "registrations": [],
             })
+        );
+    }
+
+    /// Fetching the worker script needs no worker, so every check that depends
+    /// on the *response* -- status, redirect, MIME type, scope cap -- is
+    /// reachable, and the refusal has to sit behind all of them. Refusing in
+    /// front of the fetch would also mean never requesting the script, which
+    /// shows up in any server's access log with no page-side check involved.
+    /// Values pinned against Chrome 146 in
+    /// js-repros/service-worker-fail-closed/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_worker_registration_fetches_the_script_before_refusing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            fn script(content_type: Option<&str>, extra: &str) -> String {
+                let body = "// service worker\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\n{}{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    content_type
+                        .map(|value| format!("Content-Type: {value}\r\n"))
+                        .unwrap_or_default(),
+                    body.len(),
+                )
+            }
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                // `Service-Worker: script` rides on no other kind of request,
+                // so recording it proves this is the worker script fetch and
+                // not some other path that happened to ask for the same URL.
+                let branded = request
+                    .to_ascii_lowercase()
+                    .contains("service-worker: script");
+                seen_thread.lock().unwrap().push(if branded {
+                    path.clone()
+                } else {
+                    format!("{path} (unbranded)")
+                });
+                let response = match path.as_str() {
+                    "/sw-500.js" => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: \
+text/javascript\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    "/sw-redirect.js" => "HTTP/1.1 302 Found\r\nLocation: /sw-ok.js\r\n\
+Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    "/sw-bad-mime.js" => script(Some("application/json"), ""),
+                    "/sw-no-mime.js" => script(None, ""),
+                    "/nested/sw-allowed.js" => {
+                        script(Some("text/javascript"), "Service-Worker-Allowed: /\r\n")
+                    }
+                    "/nested/sw-ok.js" | "/sw-ok.js" => script(Some("text/javascript"), ""),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: \
+close\r\n\r\n"
+                        .to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const sw = navigator.serviceWorker;
+                    const settle = async thunk => {
+                        try { await thunk(); return "RESOLVED"; }
+                        catch (error) { return error.name + ": " + error.message; }
+                    };
+                    return {
+                        serverError: await settle(() => sw.register("/sw-500.js")),
+                        redirected: await settle(() => sw.register("/sw-redirect.js")),
+                        badMime: await settle(() => sw.register("/sw-bad-mime.js")),
+                        noMime: await settle(() => sw.register("/sw-no-mime.js")),
+                        scopeTooBroad: await settle(
+                            () => sw.register("/nested/sw-ok.js", { scope: "/" })),
+                        allowedByHeader: await settle(
+                            () => sw.register("/nested/sw-allowed.js", { scope: "/" })),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "serverError": format!("TypeError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-500.js'): A bad HTTP response code (500) was \
+received when fetching the script."),
+                // The redirect outranks the status code of what it points at.
+                "redirected": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-redirect.js'): The script resource is behind a \
+redirect, which is disallowed."),
+                "badMime": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-bad-mime.js'): The script has an unsupported \
+MIME type ('application/json')."),
+                // A missing type is a different message from a wrong one.
+                "noMime": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-no-mime.js'): The script does not have a MIME \
+type."),
+                "scopeTooBroad": format!("SecurityError: Failed to register a ServiceWorker \
+for scope ('{origin}/') with script ('{origin}/nested/sw-ok.js'): The path of the provided \
+scope ('/') is not under the max scope allowed ('/nested/'). Adjust the scope, move the \
+Service Worker script, or use the Service-Worker-Allowed HTTP header to allow the scope."),
+                // Fetched, typed correctly and scoped legally: Chrome resolves
+                // here, and this is the one place the refusal belongs.
+                "allowedByHeader": "SecurityError: Failed to register a ServiceWorker: \
+The user denied permission to use Service Worker.",
+            })
+        );
+
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "/nested/sw-allowed.js",
+                "/nested/sw-ok.js",
+                "/sw-500.js",
+                "/sw-bad-mime.js",
+                "/sw-no-mime.js",
+                "/sw-redirect.js",
+            ],
+            "each register() fetches its script exactly once and carries the \
+Service-Worker header; /sw-ok.js must be absent because the redirect to it is \
+never followed",
         );
     }
 

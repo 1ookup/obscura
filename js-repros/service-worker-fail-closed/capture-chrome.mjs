@@ -4,31 +4,18 @@
 // serviceWorker` is only exposed on a potentially trustworthy origin with a
 // non-opaque origin, so the probe is served over loopback HTTP.
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { createFixtureServer } from './serve.mjs';
 
-const fixtureDir = dirname(fileURLToPath(import.meta.url));
-const probe = await readFile(join(fixtureDir, 'probe.js'), 'utf8');
 const chromeBin = process.env.CHROME_BIN || (
   process.platform === 'darwin'
     ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     : 'google-chrome'
 );
 
-const server = createServer((request, response) => {
-  if (request.url === '/' || request.url.startsWith('/index.html')) {
-    response.writeHead(200, {'content-type': 'text/html; charset=utf-8'});
-    response.end(`<!doctype html><meta charset="utf-8"><body><script>${probe}</script>`);
-    return;
-  }
-  // Every other path 404s on purpose, including /definitely-missing-sw.js:
-  // the probe uses it to observe the script-fetch failure rejection.
-  response.writeHead(404, {'content-type': 'text/plain; charset=utf-8'});
-  response.end('not found');
-});
+const server = await createFixtureServer();
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const fixtureUrl = `http://127.0.0.1:${server.address().port}/`;
 
@@ -120,7 +107,20 @@ try {
     returnByValue: true,
   }, sessionId);
   if (evaluated.exceptionDetails) throw new Error(JSON.stringify(evaluated.exceptionDetails));
-  console.log(JSON.stringify(evaluated.result.value, null, 2));
+  // The strongest signal this fixture pins is not in the page at all: it is
+  // which requests the server was asked for. A page that calls register() but
+  // never fetches the script is visible in any access log, with no client-side
+  // check involved -- so the request sequence is part of the oracle.
+  const result = evaluated.result.value;
+  result.__serverSawScriptFetches = server.requestsSeen
+    .filter(entry => entry.headers['service-worker'] === 'script')
+    .map(entry => entry.url);
+  result.__serverSawNonScriptFetches = server.requestsSeen
+    .filter(entry => entry.headers['service-worker'] !== 'script'
+      && entry.url !== '/' && !entry.url.startsWith('/index.html')
+      && entry.url !== '/favicon.ico')
+    .map(entry => entry.url);
+  console.log(JSON.stringify(result, null, 2));
   await cdp.send('Target.closeTarget', {targetId});
 } finally {
   cdp.socket.close();

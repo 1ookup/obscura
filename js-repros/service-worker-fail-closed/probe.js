@@ -136,6 +136,24 @@ globalThis.swFixturePromise = (async () => {
   out.registerMissingScript = await settle(() => sw.register('/definitely-missing-sw.js'));
   out.registerNoArgs = await settle(() => sw.register());
 
+  // Everything below needs the script to actually be fetched. None of it needs
+  // a worker to run, so a fail-closed engine has to reach these too -- and the
+  // order matters: each input below fails two checks at once, and which error
+  // comes back is what pins Chrome's precedence.
+  out.registerServerError = await settle(() => sw.register('/sw-500.js'));
+  out.registerRedirected = await settle(() => sw.register('/sw-redirect.js'));
+  out.registerRedirectToMissing = await settle(() => sw.register('/sw-redirect-404.js'));
+  out.registerBadMime = await settle(() => sw.register('/sw-bad-mime.js'));
+  out.registerNoMime = await settle(() => sw.register('/sw-no-mime.js'));
+  out.registerScopeTooBroad = await settle(
+    () => sw.register('/nested/sw-ok.js', {scope: '/'}));
+  out.registerScopeAllowedNarrower = await settle(
+    () => sw.register('/nested/sw-allowed-narrow.js', {scope: '/'}));
+  out.registerEscapedScript = await settle(() => sw.register('/a%2Fb-sw.js'));
+  out.registerEscapedBackslash = await settle(() => sw.register('/a%5Cb-sw.js'));
+  out.registerEscapedScope = await settle(
+    () => sw.register('/sw-ok.js', {scope: '/a%2Fb/'}));
+
   out.getRegistration = await settle(() => sw.getRegistration());
   out.getRegistrationCrossOrigin = await settle(
     () => sw.getRegistration('https://example.com/page'));
@@ -152,6 +170,16 @@ globalThis.swFixturePromise = (async () => {
     out.getRegistrations.isArray = Array.isArray(value);
     out.getRegistrations.length = Array.isArray(value) ? value.length : null;
   }
+
+  // Last on purpose. These three are the cases where Chrome *succeeds*, and a
+  // successful registration changes `getRegistrations()` and settles `ready`
+  // for every probe after it -- so they run once nothing is left to observe.
+  // They are the whole point of the fixture: a worker-less engine must refuse
+  // exactly here, and nowhere earlier.
+  out.registerMimeWithParams = await settle(() => sw.register('/sw-mime-params.js'));
+  out.registerScopeAllowedByHeader = await settle(
+    () => sw.register('/nested/sw-allowed.js', {scope: '/'}));
+  out.registerValidScript = await settle(() => sw.register('/sw-ok.js'));
 
   // The Chrome capture awaits the promise over CDP; the Obscura capture reads
   // the settled value with `--eval` after `--wait`.

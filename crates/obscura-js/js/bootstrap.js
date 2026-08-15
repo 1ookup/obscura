@@ -12555,6 +12555,148 @@ if (typeof Performance === 'function') {
     } catch (_error) { return ''; }
   }
 
+  // The JavaScript MIME types the fetch spec recognises. Chrome accepts
+  // exactly this set for a worker script, matched case-insensitively with
+  // parameters stripped, and rejects everything else including text/html.
+  const _SW_JS_MIME_TYPES = new Set([
+    'application/ecmascript', 'application/javascript',
+    'application/x-ecmascript', 'application/x-javascript',
+    'text/ecmascript', 'text/javascript', 'text/javascript1.0',
+    'text/javascript1.1', 'text/javascript1.2', 'text/javascript1.3',
+    'text/javascript1.4', 'text/javascript1.5', 'text/jscript',
+    'text/livescript', 'text/x-ecmascript', 'text/x-javascript',
+  ]);
+
+  // %2f / %5c stay escaped through URL parsing, so a scope could otherwise be
+  // widened past the directory the script lives in. Chrome refuses both, in
+  // either case, in the script URL and in the scope.
+  function _swDisallowedEscape(url) {
+    return /%2f|%5c/i.test(url.pathname);
+  }
+
+  // The default scope is the script's containing directory, and the same value
+  // caps how wide an explicit scope may be (absent Service-Worker-Allowed).
+  function _swScriptDirectory(script) {
+    try { return new URL('./', script).href; }
+    catch (_error) { return script.href; }
+  }
+
+  function _swHeader(headers, name) {
+    if (!headers || typeof headers !== 'object') return null;
+    const wanted = name.toLowerCase();
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === wanted) {
+        const value = headers[key];
+        return Array.isArray(value) ? value[0] : value;
+      }
+    }
+    return null;
+  }
+
+  // Chrome fetches the script with a header set nothing else produces:
+  // `Service-Worker: script` exists only on this request. Skipping the fetch
+  // would leave a server-visible hole -- a page that calls register() but
+  // never asks for the script -- that no page-side check is needed to spot.
+  async function _swFetchScript(script) {
+    const raw = await Deno.core.ops.op_fetch_url(
+      script.href,
+      'GET',
+      JSON.stringify({
+        'Service-Worker': 'script',
+        'Sec-Fetch-Dest': 'serviceworker',
+        'Sec-Fetch-Mode': 'same-origin',
+        'Sec-Fetch-Site': 'same-origin',
+        'Accept': '*/*',
+      }),
+      '',
+      _origin(),
+      'same-origin',
+      'same-origin',
+      // Chrome never takes the hop: a redirected worker script is an error,
+      // and following it would log a request Chrome does not send. `redirect`
+      // rides on the referrer context because the op is at deno_core's
+      // nine-argument ceiling.
+      JSON.stringify(Object.assign(
+        JSON.parse(_environmentReferrerContext() || '{}'),
+        {redirect: 'error'},
+      )),
+    );
+    return JSON.parse(raw);
+  }
+
+  // Every failure Chrome reports after the fetch names both URLs; every one it
+  // reports before the fetch names neither.
+  function _swFetchPrefix(scopeUrl, script) {
+    return "Failed to register a ServiceWorker for scope ('" + scopeUrl.href +
+      "') with script ('" + script.href + "'): ";
+  }
+
+  // The order below is not the spec's reading order, it is Chrome's observed
+  // one, pinned by feeding it inputs that fail two checks at once: a redirect
+  // to a 404 reports the redirect, a 404 with no MIME type reports the 404,
+  // and an over-broad scope with a bad MIME type reports the MIME type.
+  async function _swRegisterOverNetwork(script, scopeUrl) {
+    const prefix = _swFetchPrefix(scopeUrl, script);
+    let response = null;
+    try { response = await _swFetchScript(script); }
+    catch (_error) { response = null; }
+    // The redirect outranks the status code: a 302 to a 404 reports the
+    // redirect, not the 404.
+    if (response && response.redirected) {
+      throw new DOMException(
+        prefix + 'The script resource is behind a redirect, which is disallowed.',
+        'SecurityError');
+    }
+    if (!response || !response.status) {
+      throw new TypeError(
+        prefix + 'An unknown error occurred when fetching the script.');
+    }
+
+    if (!(response.status >= 200 && response.status <= 299)) {
+      throw new TypeError(prefix + 'A bad HTTP response code (' +
+        response.status + ') was received when fetching the script.');
+    }
+
+    const essence = String(_swHeader(response.headers, 'content-type') || '')
+      .split(';')[0].trim().toLowerCase();
+    if (!essence || essence.indexOf('/') < 0) {
+      throw new DOMException(prefix + 'The script does not have a MIME type.',
+        'SecurityError');
+    }
+    if (!_SW_JS_MIME_TYPES.has(essence)) {
+      throw new DOMException(
+        prefix + "The script has an unsupported MIME type ('" + essence + "').",
+        'SecurityError');
+    }
+
+    // A script may only claim a scope at or below its own directory, unless
+    // the response widens the cap with Service-Worker-Allowed.
+    const allowed = _swHeader(response.headers, 'service-worker-allowed');
+    let maxScope = null;
+    if (allowed !== null && allowed !== undefined && String(allowed) !== '') {
+      try { maxScope = new URL(String(allowed), script); } catch (_error) { maxScope = null; }
+    }
+    const capped = maxScope || new URL(_swScriptDirectory(script));
+    if (scopeUrl.href.indexOf(capped.href) !== 0) {
+      throw new DOMException(prefix + "The path of the provided scope ('" +
+        scopeUrl.pathname + "') is not under the max scope allowed (" +
+        (maxScope ? "set by Service-Worker-Allowed: '" + maxScope.pathname + "'"
+                  : "'" + capped.pathname + "'") +
+        '). Adjust the scope, move the Service Worker script, or use the ' +
+        'Service-Worker-Allowed HTTP header to allow the scope.',
+        'SecurityError');
+    }
+
+    // The script was fetched and every check that does not need a worker has
+    // passed. Running it does need one, and there is none -- so this is where
+    // the refusal belongs, using the error Chrome itself surfaces when site
+    // data is blocked so callers' existing failure paths handle it.
+    throw new DOMException(
+      'Failed to register a ServiceWorker: ' +
+      'The user denied permission to use Service Worker.',
+      'SecurityError');
+  }
+
   const _containerKey = Symbol('ServiceWorkerContainer');
 
   class ServiceWorkerContainer {
@@ -12606,8 +12748,8 @@ if (typeof Performance === 'function') {
           'SecurityError'));
       }
       const rawScope = options == null ? undefined : options.scope;
+      let scope = null;
       if (rawScope !== undefined && rawScope !== null) {
-        let scope;
         try {
           scope = new URL(String(rawScope), base);
         } catch (_error) {
@@ -12622,14 +12764,20 @@ if (typeof Performance === 'function') {
             'SecurityError'));
         }
       }
-      // Every rejection the spec can reach without running a worker has been
-      // checked. The engine has no Service Worker implementation, so the
-      // registration is refused with the error Chrome itself surfaces when
-      // site data is blocked: callers' existing failure paths handle it.
-      return Promise.reject(new DOMException(
-        'Failed to register a ServiceWorker: ' +
-        'The user denied permission to use Service Worker.',
-        'SecurityError'));
+      let scopeUrl;
+      try { scopeUrl = scope || new URL(_swScriptDirectory(script)); }
+      catch (_error) { scopeUrl = script; }
+      // Chrome runs the escape check after both URLs' protocol and origin and
+      // before it touches the network, and names both URLs in one message.
+      if (_swDisallowedEscape(script) || _swDisallowedEscape(scopeUrl)) {
+        return Promise.reject(new TypeError(
+          "Failed to register a ServiceWorker: The provided scope ('" +
+          scopeUrl.href + "') or scriptURL ('" + script.href +
+          "') includes a disallowed escape character."));
+      }
+      // Everything decidable without the network is decided. Fetching the
+      // script does not need a worker either, so it happens for real.
+      return _swRegisterOverNetwork(script, scopeUrl);
     }
 
     getRegistration(clientURL = undefined) {

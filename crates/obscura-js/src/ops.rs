@@ -2621,6 +2621,9 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    // Carries the referrer url/policy, and Fetch's RequestRedirect under
+    // `redirect`. The latter rides along here rather than as its own parameter
+    // because deno_core's async op codegen caps the argument count at nine.
     #[string] referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     trace_host_op("fetch", &[&method, &url, &headers_json]);
@@ -2834,6 +2837,14 @@ async fn op_fetch_url(
         .and_then(|value| value.as_str())
         .and_then(ReferrerPolicy::parse)
         .unwrap_or_default();
+    // Only "error" is distinguished from the default "follow": it is what a
+    // Service Worker script fetch uses, and taking the hop would put a request
+    // in the server's log that Chrome never sends.
+    let follow_redirects = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("redirect"))
+        .and_then(|value| value.as_str())
+        != Some("error");
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -3044,6 +3055,21 @@ async fn op_fetch_url(
 
         if !resp.status().is_redirection() {
             break (resp, current_response_start);
+        }
+
+        // Fetch redirect mode "error": the redirect itself is the outcome, and
+        // the hop is never taken. A Service Worker script is fetched this way,
+        // so following it here would put a request in the server's log that
+        // Chrome never sends -- visible without any client-side check.
+        if !follow_redirects {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+            })
+            .to_string());
         }
 
         let location_header = resp
