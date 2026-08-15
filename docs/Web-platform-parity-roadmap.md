@@ -60,8 +60,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 8 | **WebSocket 纯桩** | 已接入真实 RFC 6455 socket;消息、错误、关闭事件与 `ws`/`wss` URL 校验已覆盖 | `tokio-tungstenite` 连接器、异步事件队列、同 fetch 的私网校验;代理 CONNECT/TLS 指纹复用仍是后续工作 |
 | 9 | **WebGL/WebGL2 空 class** | 默认仍诚实返回 `null`;显式 profile 开关提供一致性值层 | `OBSCURA_WEBGL_PROFILE=1` 从 fingerprint GPU 策略派生 vendor/renderer、扩展和基础对象生命周期;不声称真实 GPU 后端 |
 | 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
-| 11 | **Service Worker / SharedWorker / worklet** | 设计 non-goal(Iframe 文档),但现代站点普遍 | 中期补 SharedWorker(与 dedicated Worker 同构);SW/worklet 长期,保持 fail-closed |
-| 12 | **Trusted Types 建模** | 待核实(存疑项) | HaHaVM 有完整 TT(createPolicy/default policy/eval 闸门,CSP 抛错语义);按规范补齐,不做 CF 特化文案 |
+| 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 仅 interface object | SharedWorker 与 dedicated Worker 同构已落地;SW 保持 fail-closed 但形状与 Chrome 对齐;worklet 仍无入口 |
+| 12 | **Trusted Types 建模** | 核实结果:此前全库零实现(`window.trustedTypes` undefined,是 Firefox/Safari 答案)。API 面已按规范补齐,**CSP 强制未实现** | 工厂/策略/三个包装类型/sink 表已对齐 Chrome 146;`require-trusted-types-for` 需要 CSP 解析器与 sink 插桩,引擎目前不解析任何 CSP 指令 |
 | 13 | **媒体/WebRTC/Notification** | 全桩(假实现或拒绝) | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准) |
 
 ### 3.3 网络与传输
@@ -149,7 +149,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 序 | 能力 | 关键收益 | 状态 |
 |---|---|---|---|
 | 6 | CDP Debugger 域 + trace 增强(§3.4-#18/19) | 后续一切缺口定位从"几天对拍"降到"分钟级";Debugger 也是 Puppeteer 生态的硬需求 | ✅ 协议状态、scriptParsed 生命周期、Profiler/HeapProfiler 合同和 host-op TSV;rusty_v8 原生断点桥接待后续 |
-| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 | ✅ `--trace-op-file`、`--v8-flags` 已贯通单 worker 与多 worker serve |
+| 7 | trace/CDP 同跑(§3.4-#20) | 一条管线完成排查,消除互斥绕路 | ⚠️ `--trace-op-file` 与单 worker `--v8-flags` 已贯通;**多 worker serve 仍丢失用户 flags**(`main.rs:577` 设 `OBSCURA_V8_FLAGS`,但 `main.rs:343` 只读 argv,从不读该 env),见 profile step 45 证据 1 |
 | 8 | WebSocket 真实现(§3.2-#8) | 通用爬虫最大露馅点;走既有网络栈 | ✅ 本地 RFC 6455 echo fixture 通过;代理 CONNECT/TLS profile 复用待后续 |
 | 9 | 自动点击/自然输入策略(§3.3-#16) | 输入合成通用化;CF 交互挑战自动过(当前主线) | ✅ selector/timing policy、可信 pointer/mouse/click 序列和自然逐字符 input |
 
@@ -164,9 +164,71 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 14 | 表单 IDL 剩余:labels/control、程序化 click 转发(§3.1-#6) | ✅ |
 | 15 | frame 布局缓存(§3.4-#21) | ✅ paint、geometry、scroll metrics 共用 generation/viewport/sample cache |
 
-### P3 — 长尾(待命)
+### P3 — 长尾
 
-Trusted Types 补全(§3.2-#12)、SharedWorker(§3.2-#11)、系统字体/媒体(video)/PDF 结构(§3.5)、ServiceWorker/worklet(长期,fail-closed 保持)。
+原本记为"待命",但其中三项在核实时发现不是"尚未做",而是**做错了**:实现存在且在报假成功,
+违反 §3.2-#13 自己写的"不报假成功"与 §3.2-#11 的"保持 fail-closed"。已按能力单元补齐。
+
+| 序 | 能力 | 状态 |
+|---|---|---|
+| 16 | ServiceWorker fail-closed(§3.2-#11) | ✅ 完成(`8734846`) |
+| 17 | SharedWorker 真实现(§3.2-#11) | ✅ 完成(`871682b`) |
+| 18 | Trusted Types API 面(§3.2-#12) | ✅ 完成(`1f963b7`);**CSP 强制未实现**,需 CSP 解析器 |
+| 19 | worklet | ⛔ 仅 interface object,无 `CSS.paintWorklet`/`audioWorklet` 入口 |
+| 20 | 系统字体 / video 解码 / PDF 结构(§3.5) | ⛔ 未开始 |
+
+#### P3-16 实施记录:ServiceWorker fail-closed
+
+- **状态**:✅ 完成(`8734846`)。
+- **问题**:`navigator.serviceWorker` 是个对象字面量,且在**报假成功**——`register()`
+  resolve(undefined),于是几乎所有站点都写的 `register().then(reg => reg.scope)` 抛出一个
+  真实浏览器永远不会抛的 TypeError;`ready` 立即 resolved,于是靠
+  `await navigator.serviceWorker.ready` 把关的代码,在 Chrome 会永久阻塞的地方径直往下走。
+- **实现**:Service Worker 仍然不实现,补的是「没有 worker 也能被观测到」的那一整面。容器成为
+  真正的 `ServiceWorkerContainer`(@@toStringTag、constructor.name、`instanceof EventTarget`,
+  走 `Performance` 同款 setPrototypeOf 而不继承 Node 的监听器管线);属性改为 `Navigator.prototype`
+  上的 accessor,navigator 不再有自有属性;`ready` 是永不 settle 的缓存 promise;`register`
+  按 Chrome 的检查顺序 reject。`ServiceWorker`/`ServiceWorkerRegistration`/`Worklet`/
+  `NavigationPreloadManager` 补上 interface object。
+- **验证**:`js-repros/service-worker-fail-closed/` 固化 Chrome 146.0.7680.80 oracle,89 个观测点
+  中 83 个逐字一致。6 个差异是两处:①合法同源脚本的注册被拒绝而非伪造(fail-closed 的自觉代价,
+  用的是 Chrome 自己在站点数据被阻止时给出的 SecurityError);②Chrome 对 `http://[` 的 URL
+  序列化细节。均记录在 fixture README。
+- **已知缺口**:`isSecureContext` 全库不存在,因此容器无条件暴露;Chrome 在非 secure context 的
+  普通 HTTP 源上让 `navigator.serviceWorker` 为 undefined。
+
+#### P3-17 实施记录:SharedWorker 真实现
+
+- **状态**:✅ 完成(`871682b`)。
+- **问题**:`SharedWorker` 是空壳类,`port.postMessage` 是空函数——消息发出去就没了,回复永远
+  不来,worker 脚本根本没有执行过。
+- **实现**:跑在真实 worker 线程上,按 (name, 解析后 URL) 一个线程,每次构造一条 `MessageChannel`,
+  远端桥接到该线程并带连接 id。**直接复用 `MessagePort`** 是关键:`ports[0] instanceof MessagePort`、
+  结构化克隆、`start()`/队列门控三件事因此天然正确。worker 侧 scope 品牌为
+  `SharedWorkerGlobalScope`,暴露 `onconnect` 而非 `onmessage`,并删掉 scope 级 `postMessage`。
+- **验证**:`js-repros/shared-worker/` 固化 Chrome 146 oracle,**40 个观测点全部一致,无已知差异**
+  ——覆盖形状、真实消息往返、scope 品牌、同名复用的连接计数、start() 前不投递/后投递,以及跨源
+  SecurityError 与非法 URL SyntaxError。
+- **顺带修掉的预先存在缺陷**:EventTarget 派发路径把 `ShadowRoot`/`Node`/`Document`/`Element`
+  当裸绑定引用,而 worker scope 删除这四个,于是 worker 里**任何 MessagePort 事件派发**都抛
+  `ReferenceError: ShadowRoot is not defined`。dedicated worker 从没踩到,是因为它的
+  `self.onmessage` 由 worker prep 脚本自己派发,不走页面 bootstrap 的 EventTarget 实现。
+- **"共享"的范围**:指一个页面内多次构造之间的共享。obscura 的页面是互不共享 worker host 的
+  独立文档,跨页面共享本就不可观测。
+
+#### P3-18 实施记录:Trusted Types API 面
+
+- **状态**:✅ 完成(`1f963b7`)。**CSP 强制未实现**。
+- **核实结果**:§3.2-#12 原记「待核实(存疑项)」——核实为全库零实现,`window.trustedTypes`
+  是 undefined,那是 Firefox/Safari 的答案,与这个构建发出的其他每一个 Chrome 信号矛盾。
+- **实现**:工厂、策略、三个包装类型和 sink 类型表。brand check 用 WeakMap 成员关系而非原型判定,
+  所以 `isHTML(Object.create(TrustedHTML.prototype))` 返回 false——与 Chrome 一致,而这正是这类
+  类型存在的意义。策略选项按 WebIDL dictionary 语义在 `createPolicy` 时读取一次。
+- **验证**:`js-repros/trusted-types/` 固化 Chrome 146 oracle,**101 个观测点全部一致,无差异**。
+- **未实现的部分(不伪装)**:`require-trusted-types-for` 与 `trusted-types` 指令都不生效,因为
+  引擎里没有任何 CSP 指令被解析或执行(响应头只是存进 `DocumentInfo.csp` 就结束了)。对不发这类
+  策略的文档不可观测——Chrome 那时的 sink 同样宽松,fixture 已确认双方一致。补上它需要 CSP 解析器
+  加 sink 插桩。
 
 ### P1/P2 实施记录(序 6–15)
 
@@ -178,6 +240,14 @@ Trusted Types 补全(§3.2-#12)、SharedWorker(§3.2-#11)、系统字体/媒体(
 - **序 14–15, forms/layout**: label `control` and control `labels` follow tree scope and labelability rules, and uncanceled programmatic label activation forwards to the control. Retained frame `PreparedRender` snapshots are reused by paint, geometry and scroll metrics and invalidated by document generation, viewport, animation sample, or connected DOM mutation.
 
 **Verification boundary**: Chrome/Chromium executables are not installed on the current host, so the new `js-repros` READMEs explicitly mark Chrome 146 oracle capture as pending. Deterministic Obscura fixture probes and release `nextest` remain the local evidence; no synthetic Chrome oracle JSON is claimed.
+
+> **更新(P3 阶段)**:本机现已装有 Google Chrome 146.0.7680.80
+> (`/Applications/Google Chrome.app`),P3 的三个 fixture 均已用它采到真实 oracle。
+> 上面这条边界是 P1/P2 提交当时的事实,其 fixture 的 oracle 仍标记为 pending——**它们现在可以补采了**,
+> 这是一项明确的后续工作。P0-4 记录(§P0-4)里"当前机器没有 Chrome 可执行文件"同理。
+>
+> 采集方式见 `js-repros/*/capture-chrome.mjs`:headless Chrome + CDP,
+> 需要真实 origin 的能力(ServiceWorker、SharedWorker)由脚本自带 loopback HTTP server。
 
 ## 5. 通用化方法论(六原则)
 
@@ -194,6 +264,26 @@ Trusted Types 补全(§3.2-#12)、SharedWorker(§3.2-#11)、系统字体/媒体(
 - **Chrome oracle**:js-reverse MCP(已在 CF 攻关中使用)固化进对照流程:同一 fixture 先在真实 Chrome 跑出期望,再对 obscura diff。
 - **CF 挑战降级为回归**:`Cloudflare-challenge-profile.md` 中的每步判据(事件序列、trace 信号、`cf_chl_rc_ni` 判成败)变为回归用例;新能力合入后回填对应 step 的结论,不再单独为 CF 加逻辑。
 - **trace 基线**:P1 完成后,每个新能力都要求"trace 里能看见"——诊断面与实现面同步演进。
+
+### 门禁盲区(P3 阶段发现)
+
+1. **默认 feature 集从未被编译验证**。门禁只跑 `render` 与 `render,stealth` 两种组合,于是
+   `obscura-js` 在不带任何 feature 时编译失败(`ReferrerPolicy` 的导入挂在 `#[cfg(feature = "render")]`
+   下,而用它的 `op_fetch_url` 不受门控)长期无人发现。已修(`86151f8`);建议门禁补一条
+   `cargo check -p obscura-js`(无 feature)。
+2. **带 stealth 时 `obscura-net` 有两条测试稳定失败**:`stealth_client_decodes_gzip_response` 与
+   `stealth_request_uses_the_same_derived_low_entropy_identity`,报
+   `Access to private/internal IP address 127.0.0.1 is not allowed`——它们用 loopback fixture server,
+   而 `wreq_client.rs:253` 的 `validate_url(url, false)` 硬编码拒绝私网。此前记录的
+   "obscura-net 83/83 通过"是**不带 stealth feature**跑出来的,那时这两条根本没被编译进去。
+   与 P3 改动无关,但需要单独处理。
+3. **时序测试在并发负载下不稳**:`obscura-browser` 的
+   `autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll` 在 workspace 全量并发下
+   四次里失败两次,单独跑三次全过。属于负载敏感,不是确定性回归,但会污染门禁判读。
+4. **构建必须带 V8 补丁配置**。任何不带
+   `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` 的 `cargo build`/`nextest` 会静默把
+   `target/release/obscura` 换成非 patched V8,trace 输出随之变空(见 `Trace-page-script.md`)。
+   同时它会改写 `Cargo.lock` 里 `v8` 的 source/checksum——那两行的缺失是有意的,不要提交回去。
 
 ## 7. 与现有工作的衔接
 
