@@ -86,9 +86,9 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 | # | 缺口 | 现状 | 通用化方案 |
 |---|---|---|---|
-| 22 | 系统字体对齐 | cosmic-text 内嵌字体、确定性布局,不扫系统字体;**canvas `measureText` 已改走真实布局**(`4060dc8`),不再方差为零 | 长期:可选扫描系统字体接入,暴露集合与所声称平台绑定 |
-| 23 | video 解码 | 无解码;**能力声明已对齐 Chrome 且与 decodingInfo 自洽**(`3a61507`),几何/readiness 保持空 | 长期(真解码);封面帧仍未支持 |
-| 24 | PDF 结构 | raster PDF,无可选文本/大纲 | 长期 |
+| 22 | 系统字体对齐 | cosmic-text 内嵌字体、确定性布局,不扫系统字体;**canvas `measureText` 已改走真实布局**(`4060dc8`),不再方差为零 | ⏸ 暂缓(见 P3-22):扫描会牺牲确定性对拍,需做成默认关闭的 opt-in 且与所声称平台绑定 |
+| 23 | video 解码 | 无解码;**能力声明已对齐 Chrome 且与 decodingInfo 自洽**(`3a61507`),几何/readiness 保持空 | ⏸ 暂缓(见 P3-22):真解码需引入解码器依赖;封面帧仍未支持 |
+| 24 | PDF 结构 | raster PDF,无可选文本/大纲 | ⏸ 暂缓(见 P3-22):无阻塞点,纯增量工程 |
 
 ## 4. 优先级路线图
 
@@ -177,7 +177,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 19 | worklet 入口(§3.2-#11) | ✅ 完成(`552715e`) |
 | 20 | 媒体能力声明自洽(§3.5-#23 起步 / §3.2-#13) | ✅ 完成(`3a61507`) |
 | 21 | canvas 文本度量走真实布局(§3.5-#22 起步) | ✅ 完成(`4060dc8`) |
-| 22 | 系统字体扫描(§3.5-#22) / video 真解码(§3.5-#23) / PDF 结构(§3.5-#24) | ⛔ 未开始 |
+| 22 | 系统字体扫描(§3.5-#22) / video 真解码(§3.5-#23) / PDF 结构(§3.5-#24) | ⏸ **暂缓**——等出现强依赖再做,见下方说明 |
 
 #### P3-16 实施记录:ServiceWorker fail-closed
 
@@ -217,6 +217,24 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   `self.onmessage` 由 worker prep 脚本自己派发,不走页面 bootstrap 的 EventTarget 实现。
 - **"共享"的范围**:指一个页面内多次构造之间的共享。obscura 的页面是互不共享 worker host 的
   独立文档,跨页面共享本就不可观测。
+
+#### P3-22:系统字体 / video 解码 / PDF 结构——暂缓(2026-08-16)
+
+这三项**不是被遗漏,是明确决定放一放**,等实际出现强依赖(某个必须过的站点真的卡在这里)再完善。
+记录各自的卡点,免得将来重新调研一遍:
+
+- **系统字体扫描(§3.5-#22)**:卡在一条有充分理由的既有约束——`crates/obscura-render/src/inline.rs`
+  的 `new_with_web_fonts` 明确注释「Never call load_system_fonts: a host's font set would make
+  layout differ machine to machine and add a multi-millisecond startup scan」。打开系统字体会让
+  布局随机器变化,`render-repros` 的 61 个确定性对拍将集体失效。要做的话正确形态是仿照 WebGL 的
+  `OBSCURA_WEBGL_PROFILE=1`,**默认关闭的显式 opt-in**,并接受开启后确定性对拍不适用;
+  暴露的字体集合还需与所声称平台绑定(现在 UA 是 Windows,而本机是 macOS 字体)。
+  当前状态已不是「方差为零」:canvas 度量已走真实布局(P3-21),内嵌字体给出 3 个 distinct 宽度,
+  是「装了很少字体的浏览器」的诚实样子。
+- **video 真解码(§3.5-#23)**:需要引入解码器依赖,是新的供应链与二进制体积决策。
+  能力**声明**面已对齐 Chrome 且自洽(P3-20),缺的是真解码与封面帧。
+- **PDF 结构(§3.5-#24)**:无阻塞点,纯增量工程——需要 PDF 内容流解析出文本层与大纲,
+  规模较大。raster 渲染现已可用。
 
 #### P3-21 实施记录:canvas 文本度量走真实布局引擎
 
