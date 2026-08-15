@@ -8,15 +8,16 @@ use std::io::{Read, Write};
 
 use obscura::Browser;
 
+const PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+    0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+    0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+    0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x05, 0x83, 0x02, 0x7f, 0x94, 0xff,
+    0x2f, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
 /// Minimal HTTP/1.1 server returning the test page and a valid 1x1 PNG.
 fn spawn_server(html: &'static str) -> String {
-    const PIXEL_PNG: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x05, 0x83, 0x02, 0x7f, 0x94, 0xff,
-        0x2f, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -110,6 +111,132 @@ async fn new_image_still_emulates_load_when_src_is_configurable() {
         text.as_str().unwrap_or(""),
         "loaded complete=true",
         "load emulation regressed for the normal (configurable src) path"
+    );
+}
+
+/// An image fetch is a network request and Chrome files it in the Performance
+/// Timeline like any other subresource. Cloudflare's managed challenge reads
+/// the resource timing of the image it loads, so an `<img>` that leaves no
+/// entry behind is an environment tell (see docs/Cloudflare-challenge-profile.md,
+/// step 46).
+#[cfg(feature = "render")]
+#[tokio::test]
+async fn image_load_records_a_resource_timing_entry() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(
+        r#"<!doctype html><html><body><div id="r">waiting</div>
+<script>
+  var img = new Image();
+  img.onload = function () { document.getElementById('r').textContent = 'loaded'; };
+  img.src = '/pixel.png';
+</script>
+</body></html>"#,
+    );
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    for _ in 0..10 {
+        page.settle(500).await;
+        let text = page.evaluate("document.getElementById('r').textContent");
+        if text.as_str().unwrap_or("") == "loaded" {
+            break;
+        }
+    }
+
+    let entry = page.evaluate(
+        "(() => {
+            const entry = performance.getEntriesByType('resource')
+                .find(candidate => candidate.name.endsWith('/pixel.png'));
+            if (!entry) return null;
+            return {
+                initiatorType: entry.initiatorType,
+                entryType: entry.entryType,
+                fetchStart: entry.fetchStart,
+                responseStart: entry.responseStart,
+                responseEnd: entry.responseEnd,
+                duration: entry.duration,
+                encodedBodySize: entry.encodedBodySize,
+                responseStatus: entry.responseStatus,
+            };
+        })()",
+    );
+    assert!(
+        !entry.is_null(),
+        "the image fetch left no resource timing entry: {entry:?}"
+    );
+    assert_eq!(
+        entry["initiatorType"].as_str(),
+        Some("img"),
+        "Resource Timing names the initiator after the element's local name",
+    );
+    let fetch_start = entry["fetchStart"].as_f64().unwrap_or(-1.0);
+    let response_start = entry["responseStart"].as_f64().unwrap_or(-1.0);
+    let response_end = entry["responseEnd"].as_f64().unwrap_or(-1.0);
+    assert!(
+        fetch_start > 0.0 && response_start >= fetch_start && response_end >= response_start,
+        "milestones are not monotonic: {entry:?}"
+    );
+    assert_eq!(
+        entry["encodedBodySize"].as_u64(),
+        Some(PIXEL_PNG.len() as u64),
+        "same-origin transfer sizes must be exposed: {entry:?}"
+    );
+    assert_eq!(entry["responseStatus"].as_u64(), Some(200), "{entry:?}");
+}
+
+/// The image a challenge loads belongs to a cross-origin widget frame, so its
+/// entry has to land in that frame's timeline -- the embedder never sees it,
+/// and neither does the frame if the entry is filed on the page's global.
+#[cfg(feature = "render")]
+#[tokio::test]
+async fn image_in_a_frame_records_timing_in_that_frames_timeline() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let child = spawn_server(
+        r#"<!doctype html><html><body><script>
+  var img = new Image();
+  img.onload = function () {
+    var entry = performance.getEntriesByType('resource').find(function (candidate) {
+      return candidate.name.indexOf('/pixel.png') >= 0;
+    });
+    parent.postMessage(entry
+      ? entry.initiatorType + ' ' + entry.encodedBodySize
+      : 'missing', '*');
+  };
+  img.src = '/pixel.png';
+</script></body></html>"#,
+    );
+    let parent: &'static str = Box::leak(
+        format!(
+            r#"<!doctype html><html><body><div id="r">waiting</div>
+<script>
+  window.addEventListener('message', function (event) {{
+    document.getElementById('r').textContent = String(event.data);
+  }});
+</script>
+<iframe src="{child}/frame.html"></iframe>
+</body></html>"#
+        )
+        .into_boxed_str(),
+    );
+    let base = spawn_server(parent);
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    for _ in 0..20 {
+        page.settle(500).await;
+        let text = page.evaluate("document.getElementById('r').textContent");
+        if text.as_str().unwrap_or("") != "waiting" {
+            break;
+        }
+    }
+
+    let text = page.evaluate("document.getElementById('r').textContent");
+    assert_eq!(
+        text.as_str().unwrap_or(""),
+        format!("img {}", PIXEL_PNG.len()),
+        "the frame's own timeline is missing the image it loaded"
     );
 }
 

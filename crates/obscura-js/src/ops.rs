@@ -6415,6 +6415,69 @@ fn finish_async_image_metadata(
     image_metadata_json(current_src, density, known, dimensions)
 }
 
+/// Transport milestones of an image response, in the shape the element's realm
+/// needs to file a `PerformanceResourceTiming` entry. Durations are relative to
+/// the start of the fetch -- the realm owns the time origin and adds its own
+/// `fetchStart`, so no page-level clock has to cross the op boundary.
+///
+/// Timing-Allow-Origin gating happens here rather than in JS because the op
+/// already knows the initiator's origin and the raw response headers. When it
+/// is denied, the caller only learns `responseEnd`, matching what Chrome
+/// exposes for an opaque cross-origin resource.
+#[cfg(feature = "render")]
+fn image_resource_timing_json(
+    response: &obscura_net::Response,
+    initiator_origin: &str,
+) -> serde_json::Value {
+    let same_origin = response.url.origin().ascii_serialization() == initiator_origin;
+    let timing_allowed = same_origin
+        || response.header("timing-allow-origin").is_some_and(|value| {
+            value.split(',').map(str::trim).any(|allowed| {
+                allowed == "*" || (!initiator_origin.is_empty() && allowed == initiator_origin)
+            })
+        });
+    let response_start = response.timing.response_start.as_secs_f64() * 1_000.0;
+    let response_end = response.timing.response_end.as_secs_f64() * 1_000.0;
+    tracing::debug!(
+        target: "obscura::performance",
+        initiator_type = "img",
+        url = %response.url,
+        response_start_ms = response_start,
+        response_end_ms = response_end,
+        body_size = response.body.len(),
+        timing_allowed,
+        "image transport timing handed to the element's realm",
+    );
+    serde_json::json!({
+        "url": response.url.as_str(),
+        "status": response.status,
+        "responseStart": response_start,
+        "responseEnd": response_end,
+        "redirectEnd": response.timing.redirect_end.as_secs_f64() * 1_000.0,
+        "redirectCount": response.redirected_from.len(),
+        "encodedBodySize": response.body.len(),
+        "timingAllowed": timing_allowed,
+    })
+}
+
+/// Attach transport timing to an image metadata payload without disturbing its
+/// lifecycle fields. Only the request's leader carries timing: followers that
+/// joined an in-flight fetch, and cache hits, produce no second network sample
+/// and therefore no duplicate entry.
+#[cfg(feature = "render")]
+fn with_image_resource_timing(metadata: String, timing: Option<serde_json::Value>) -> String {
+    let Some(timing) = timing else {
+        return metadata;
+    };
+    match serde_json::from_str::<serde_json::Value>(&metadata) {
+        Ok(serde_json::Value::Object(mut fields)) => {
+            fields.insert("timing".to_string(), timing);
+            serde_json::Value::Object(fields).to_string()
+        }
+        _ => metadata,
+    }
+}
+
 /// Load HTMLImageElement bytes through the owning page's async transport.
 /// Network runs after every RefCell borrow is released, requests for the same
 /// navigation/URL/profile share one fetch, and completion revalidates both the
@@ -6441,6 +6504,7 @@ async fn op_load_image_metadata(
         callbacks,
         page_in_flight,
         blocked,
+        initiator_origin,
     ) = {
         let gs = shared.borrow();
         let Some(dom) = gs.dom.as_ref() else {
@@ -6484,6 +6548,7 @@ async fn op_load_image_metadata(
         let blocked = gs.blocked_urls.iter().any(|pattern| {
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
+        let initiator_origin = initiator.origin().ascii_serialization();
         (
             gs.document_generation,
             selected_url,
@@ -6493,6 +6558,7 @@ async fn op_load_image_metadata(
             gs.callbacks.clone(),
             Arc::clone(&gs.page_in_flight),
             blocked,
+            initiator_origin,
         )
     };
 
@@ -6587,6 +6653,14 @@ async fn op_load_image_metadata(
                 .ok()
         }
     };
+    // Chrome exposes every image fetch in the Performance Timeline, including
+    // the ones whose bytes are never decoded. The entry is built here because
+    // this is the only place holding the transport timing; the element's realm
+    // records it (see `_runImageRequest`), so a frame's image lands in that
+    // frame's timeline rather than the embedder's.
+    let resource_timing = response
+        .as_ref()
+        .map(|response| image_resource_timing_json(response, &initiator_origin));
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -6625,14 +6699,15 @@ async fn op_load_image_metadata(
     for waiter in waiters {
         let _ = waiter.send(());
     }
-    finish_async_image_metadata(
+    let metadata = finish_async_image_metadata(
         &shared,
         node_id,
         document_generation,
         &selected_url,
         request_profile,
         &node_base,
-    )
+    );
+    with_image_resource_timing(metadata, resource_timing)
 }
 
 #[cfg(feature = "render")]

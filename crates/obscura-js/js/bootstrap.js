@@ -5853,6 +5853,46 @@ function _imageEncodingError() {
   return new DOMException("The source image cannot be decoded.", "EncodingError");
 }
 
+// File an image fetch in this realm's Performance Timeline. Only the request
+// that actually went to the network carries `timing`, so followers of an
+// in-flight fetch and cache hits add no duplicate entry. Without a
+// Timing-Allow-Origin grant a cross-origin image exposes only its response
+// end and no sizes, exactly like the fetch path above.
+function _recordImageResourceTiming(metadata, fetchStart) {
+  const timing = metadata && metadata.timing;
+  if (!timing || typeof timing !== "object") return;
+  const record = globalThis.__obscura_performance_record;
+  if (typeof record !== "function") return;
+  const allowed = timing.timingAllowed !== false;
+  const responseStart = fetchStart + Math.max(0, +timing.responseStart || 0);
+  const responseEnd = fetchStart + Math.max(0, +timing.responseEnd || 0);
+  const redirected = (+timing.redirectCount || 0) > 0;
+  const size = Math.max(0, +timing.encodedBodySize || 0);
+  record({
+    name: String(timing.url || ""),
+    entryType: "resource",
+    // Resource Timing names the initiator after the element's local name, so
+    // an <img> reports "img" -- not "image".
+    initiatorType: "img",
+    startTime: fetchStart,
+    duration: Math.max(0, responseEnd - fetchStart),
+    redirectStart: redirected && allowed ? fetchStart : 0,
+    redirectEnd: redirected && allowed ? fetchStart + Math.max(0, +timing.redirectEnd || 0) : 0,
+    fetchStart,
+    domainLookupStart: allowed ? fetchStart : 0,
+    domainLookupEnd: allowed ? fetchStart : 0,
+    connectStart: allowed ? fetchStart : 0,
+    connectEnd: allowed ? fetchStart : 0,
+    requestStart: allowed ? fetchStart : 0,
+    responseStart: allowed ? responseStart : 0,
+    responseEnd,
+    transferSize: allowed ? size : 0,
+    encodedBodySize: allowed ? size : 0,
+    decodedBodySize: allowed ? size : 0,
+    responseStatus: allowed ? (+timing.status || 0) : 0,
+  });
+}
+
 // HTMLImageElement is backed by the same retained resource cache used by
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
@@ -6036,6 +6076,7 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_load_image_metadata;
       if (typeof op === "function") {
+        const fetchStart = performance.now();
         // The node's own base, not the page's: an image created inside a
         // frame must be fetched from that frame's origin.
         Promise.resolve(op(this._nid >>> 0, String(this.baseURI || ""))).then(
@@ -6043,6 +6084,10 @@ class HTMLImageElement extends Element {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
             catch (_error) { metadata = { ok: false, currentSrc: this.src }; }
+            // Timing is filed before the lifecycle runs: a stale candidate
+            // still consumed the network, and Chrome's entry does not depend
+            // on whether the element ends up using the bytes.
+            _recordImageResourceTiming(metadata, fetchStart);
             finish(metadata);
           },
           () => finish({ ok: false, currentSrc: this.src }),

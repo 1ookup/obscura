@@ -4,16 +4,18 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。P0 五项 parity 修复（step 40，2026-08-15 实测）后输入链路保持打通、
-时间线全面提速，但**断点未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40；step 44
-已修正其机制定位），`complete` 依旧为 0。点击被接受（Verifying…）→ 提交 4976B → 回传
-3256B → 仍被判失败（`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。事件链已完整：
-`interactiveBegin` → `interactiveEnd`（step 41 修正点击时机后稳定复现）→
-`fail code=600010`，`complete`+token 从未出现。step 41 已澄清：step 40 记的
-「interactiveEnd 消失」是 **CF 端波动**，非代码回归。当前阻塞点：①**`/pat/` 从不发出**
-（step 39/40；step 44 修正：非「822KB 后没走到」——JSVMP 执行路径完整走到 127KB，
-`/pat/` 触发机制排除 hasPrivateToken 探测与 privateToken 选项两项假设，下一步追点击后
-窗口）；②**`fail code=600010`**（step 37 起稳定，唯一失败码）。
+当前状态：**未通过**。P0 五项 parity 修复（step 40）后输入链路保持打通、时间线全面提速，
+但**断点始终未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40/44/45/46/47），
+`complete` 依旧为 0。点击被接受（Verifying…）→ 提交 5052B → 回传 3256B → 仍被判失败
+（`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。机制定位已收敛（step 45/46）：`/pat/`
+**从未被 JS 构造**（网络钩子 + URL 构造器 + PAT API 三面全覆盖，零命中），`/ci/` 则
+**发出且 200**（step 45 追加修正作废了「op 吞请求」）；两者都在 **822KB→127KB 的 managed
+分流窗口**，不在点击后（step 44 的「点击后窗口」作废）。step 47（2026-08-15）修掉了
+Image 请求不记录 resource timing 这个确定缺陷（含两条回归测试），`/pat/` **仍未出现**
+——本轮 CF 在 `/ci/` 之后根本没读过 performance，该假设未被验证到。当前阻塞点：
+①**`/pat/` 从不发出**；②**frame 文档缺 navigation timing**（step 47 证据 3：CF 在两个
+widget realm 各读一次 `getEntriesByType('navigation')`，两次全空——当前唯一「已证实被
+读取且明确异常」的环境面，下一个修复目标）；③**`fail code=600010`**（step 37 起稳定）。
 
 判据链：`interactiveBegin` → 点击（须在 interactiveBegin 之后 + 带 widget 外 pre-move，
 `cdp_click_fast --start 12`）→ 点击后 ~5s 的 **4976B 提交 POST** → 3256B 主页面回传 →
@@ -1925,6 +1927,7 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
 | **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
 | `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
+| **包装 `performance.getEntries*` 的钩子只在页面主动读取时产生记录**（被动观测面） | step 47 修完 `/ci/` 的 entry 后日志里看不到它，差点误判「修复没生效」——实际是 CF 在 `/ci/` 之后再没读过 performance | 「日志里没有」只能证明**没被读**，不能证明**不存在**；条目是否真的写入必须用可控用例断言（本步落成两条回归测试），实测日志只用来判断 CF 读没读、读到什么 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
@@ -1933,15 +1936,21 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 
 按当前怀疑程度排序：
 
-- **`/pat/` 从不发出**（step 39/40，现首要；step 44 机制定位修正）：Chrome 在大载荷后
-  366ms 必发 `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`（step 40 P0
-  修复后实测确认）。step 44 完整流程 trace 修正旧定位：**不是「822KB 后 JSVMP 没走到」**
-  ——执行路径完整走到 127KB 交互变体（性能读取、canvas 指纹、python 桥检测全部执行），
-  `/pat/` 请求从未被构造。触发机制两项假设已证伪：①`hasPrivateToken` 探测（完整流程 CF
-  代码零访问，仅引擎 bootstrap 自检；step 39 发现 3 最终证伪）；②XHR/fetch `privateToken`
-  选项（trace 零命中）。`/pat/` 触发窗口大概率在**点击后**（浏览器交互基线：点击 →
-  /pat/ → /ci/ → 7KB 提交；obscura 点击后直接 4976B 提交跳过 /pat/+/ci/）。下一步：追
-  点击后 → 4976B 窗口（serve 支持 --v8-flags 或 fetch 自动点击）。
+- **`/pat/` 从不发出**（step 39/40/44/45，现首要）：Chrome 在大载荷后 366ms 必发
+  `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`。step 44/45 修正机制定位：
+  **执行路径完整走到 127KB 交互变体，但 `/pat/` 请求从未被构造**（step 45 trace：XHR
+  open/send 一一配对 5 次无第 5 次、页面脚本名下零 fetch）。触发机制三项假设已证伪：
+  ①`hasPrivateToken` 探测（step 39 发现 3）；②XHR/fetch `privateToken` 选项（step 44）；
+  ③**「点击后窗口」**（step 45：`/pat/` 缺失在 822KB→127KB 的 **managed 分流窗口**，
+  不在点击后——回读 step 28，浏览器 `/pat/` 在第一轮 managed 阶段）；④**PAT API 探测**
+  （step 46 补充：getter 包装下 `hasPrivateToken`/`hasRedemptionRecord`/`hasStorageAccess`
+  零读取）；⑤**`/ci/` 被吞**（step 45 追加修正：`/ci/` 发出且 200，不是缺陷）；
+  ⑥**Image 缺 resource timing**（step 47 已修，`/pat/` 仍不出现——且本轮 CF 在 `/ci/`
+  之后没读过 performance，该链路根本没被走到）。下一步见「frame 缺 navigation timing」。
+- **frame 文档缺 navigation timing**（step 47 证据 3，新增，仅次于 `/pat/`）：CF 在两个
+  widget realm 各读一次 `getEntriesByType('navigation')`，**两次都是 0 条**；主文档 realm
+  正常有条目。代码侧一致——`record_performance_response(.., "navigation", ..)` 只在
+  page.rs:3536 为顶层文档调用。这是当前唯一「已证实被 CF 读取、且读到异常值」的环境面。
 - **`interactiveEnd` 疑云已澄清**（step 41）：step 40 记的「消失」是 CF 端波动——点击
   时机修正（等 interactiveBegin 再点）后事件链完整出现（interactiveEnd@9361 →
   fail 600010@10056）。**不是代码回归**。
@@ -2058,3 +2067,269 @@ Chrome 146 oracle；各 fixture README 标明了这一验证边界。
 挑战页 trace 的实用模式 = lookups（8s 全链，step 44 主实验）。新盲区：trace 文件
 可含非法 UTF-8（JSVMP 二进制字符串参数原样写入），`awk`/`cut` 报 Illegal byte
 sequence，需 `LC_ALL=C`。
+
+### Step 45 — 点击后窗口 trace：/pat/ 从未构造；/ci/ 的 Image 被构造但 op 吞请求；step 44 窗口定位修正（2026-08-15）
+
+**背景**：step 44 下一步 #1 =「让 serve/CDP 支持 --v8-flags，追点击后窗口」。本 step
+完成该调查并推翻其中两个定位。
+
+**方法**：重建 trace 补丁二进制（带 vendor patch 全量，`strings` 验证 `TracePropertyLookupFile`
+= 0 是**符号表假象**——v8 静态库符号被优化隐藏，运行时验证 `--trace-property-lookup` 报
+`unrecognized flag` 与否才是可靠判据，本步新二进制 **PATCHED**，about:blank 产生 202 行
+trace）。起 lookups 模式 serve（`--trace-property-lookup --no-lazy-feedback-allocation
+--trace-property-lookup-file=/tmp/click-trace.tsv`），`cdp_click_fast --start 12` 驱动完整
+点击流程，trace + `RUST_LOG=obscura_js=debug` 请求日志双面分析。
+
+**证据**：
+
+1. **`serve --v8-flags` 支持确认（修正 Trace-page-script.md:359 的误判）**：`--v8-flags`
+   是**全局参数，必须放子命令前**（`obscura --v8-flags X serve`）。实测 V8 收到 flags
+   （`unrecognized flag` 报错证明透传）。step 44 记的「serve 不支持」是参数位置问题，非
+   能力缺失。**多 worker 是真遗留**：`run_multi_worker_serve` 用 env `OBSCURA_V8_FLAGS`
+   传给 spawn 的 `serve` 子进程，但 serve 子命令不读该 env（只有独立 worker binary 的
+   worker.rs:45 读），多 worker 下用户 flags 丢失。
+
+2. **请求序列（新二进制 + 点击流程，时间戳 UTC）**：
+   ```
+   08:42:54.9  GET  zencare.co chl_page                200 226KB
+   08:42:55.3  GET  challenges api.js                   200 82KB
+   08:42:55.6  POST zencare.co fo/<tokenA>              200 113KB
+   08:42:57.9  POST challenges fo/<tokenB>              200 845KB   ← 822KB JSVMP
+   08:43:01.2  POST challenges fo/<tokenB>              200 127KB   ← 交互变体
+   08:43:09.7  POST challenges fo/<tokenB>              200 5052B   ← 点击后提交
+   08:43:09.9  POST zencare.co fo/<tokenA>              200 3256B   ← 回传
+   08:43:12.4  GET  zencare.co chl_page (新 ray)                   ← 换 ray 重来
+   ```
+   **全程无 `/pat/`**。点击发生在 08:43:07 附近（`interactiveBegin` 后），点击后窗口
+   （08:43:01 → 09.7）同样零 /pat/。（`/ci/` 初判「无」是**观测盲区**：`stealth_fetch
+   completed` 只覆盖 XHR/fetch 路径，Image 走 wreq stealth_client 不打该日志——本步
+   后段 wreq 插桩证实 `/ci/` 发出且 200，见证据 6 修正。）
+
+3. **trace 物理行 → 请求一一对应（lookups 模式，40211 行）**：
+   ```
+   4679/4713   XHR open+send   zencare chl_page     → 113KB
+   14580/14613 XHR open+send   widget iframe        → 822KB
+   25995/26011 XHR open+send   widget iframe        → 127KB
+   33856/33870 XHR open+send   widget iframe        → 5052B（点击后提交）
+   35007/35041 XHR open+send   zencare chl_page     → 3256B（回传）
+   ```
+   **XHR.open/send 一一配对 5 次，无第 5 次 XHR 构造 /pat/**。fetch 属性访问全在引擎
+   脚本名下（`<obscura:frame-realm-bootstrap>`/`<obscura:bootstrap>`），页面脚本
+   （chl_page / widget iframe）名下**零 fetch** → JSVMP 走 XHR 不走 fetch（step 44 确认）。
+
+4. **/ci/ 的 Image 被 JSVMP 构造（trace 确凿），但「op 吞请求」的初判被 wreq 插桩推翻**：
+   物理行 22077 与 22117 各一次 `HTMLImageElement src` 设置，调用链指向 widget iframe
+   的 JSVMP VM 函数（`Cn:1:84370`/`Cn:1:83677` ← `Ci.<computed>.<computed>` ← `Ca`
+   ← `Ch` ← `Cw`，正是 822KB 载荷解码出的混淆 VM 函数名）。完整链执行到
+   `_runImageRequest` → `op_load_image_metadata(nid, baseURI)`。**插桩证伪「吞请求」**：
+   op 正常进入 fetch 分支（`[img-probe] will-fetch url=.../ci/...`），wreq stealth_client
+   发出请求并返回 **200 OK**（`[net-probe] wreq GET -> status=200 OK url=.../ci/...`）。
+   `/ci/` **在 obscura 里发出且成功**，与浏览器一致。此前「请求日志无 /ci/」纯属观测
+   盲区（`stealth_fetch completed` 只覆盖 op_fetch_url/XHR 路径）。同进程后续
+   `KNOWN`（缓存命中）是正常的二次构造走缓存。
+
+5. **窗口定位修正（推翻 step 44 结论 3 的一半）**：`/pat/`、`/ci/` 缺失发生在
+   **822KB→127KB 窗口（managed 阶段）**，不是点击后。回读 step 28 证据 2：浏览器
+   `/pat/` 出现在第一轮 managed 阶段（`fo 822KB → /pat/ → /ci/ → fo` 停住）；step 28
+   证据 4 的点击序列只有 `POST fo ×2`，无 /pat/。step 44 把 /pat/ 归到「点击后」是
+   误读。obscura 从 822KB **直接拉 127KB 交互变体**（被分流 interactive）——但 `/ci/`
+   已经在 822KB→127KB 窗口发出（证据 4），说明 JSVMP 确实执行到了 managed 证明流程的
+   `/ci/` 步，只是 `/pat/` 这一环缺失。
+
+**结论**：`/pat/` 请求从未被 JS 构造（请求层铁证 + trace 层无第 5 次 XHR、页面零
+fetch、无 Image 构造除 /ci/ 外的记录）；`/ci/` 的 Image 构造且请求发出、200 成功
+（wreq 插桩铁证）。因此 `/ci/` 不是缺陷，`/pat/` 是**唯一**缺失的网络环节，且与
+`/ci/` 不同机制（非 XHR/fetch/Image）。新问题浮现：`/ci/` 200 后 JSVMP 没有走向
+浏览器那样的「提交证明」（浏览器 7KB /fo/ 提交），而是拉了 127KB 交互变体——这条
+分叉是下一个待查点。
+
+**下一步（按信息量）**：
+1. **确认 `/pat/` 的构造机制**：既然非 XHR/fetch/Image 且页面零网络构造痕迹，最可能是
+   **Chrome 原生 PAT（Private Access Token）握手**（step 44 结论 3 的第三种可能）。
+   对照 HaHaVM `core/env/Document.js:2062` 的 `hasPrivateToken` 返回值语义（step 44
+   下一步 #2，此前因 trace 无 CF 访问而搁置）；若 HaHaVM 返回 true 且 CF 据此走 PAT
+   流程，则 obscura 的 f4a1201 实现返回值是检查点。
+2. **追 `/ci/` 200 后的 JSVMP 分叉**：`/ci/` 响应（2300B png）被 JSVMP 读取后，浏览器
+   走「发 7KB 提交」，obscura 走「拉 127KB 交互变体」。看 /ci/ 响应处理路径
+   （Image 的 onload 事件 → JSVMP 读什么）——obscura 的 Image `_applyImageMetadata`
+   是否给了 JSVMP 正确的 `naturalWidth`/`naturalHeight`（png 解码尺寸）。若尺寸为 0，
+   JSVMP 可能判定图片加载异常 → 走交互分支。
+3. 移除本 step 的临时插桩（`[img-probe]`/`[net-probe]`），跑基线确认无行为改变。
+
+**Step 45 追加修正（2026-08-15，wreq 插桩 + 解码插桩后）**：`/ci/` **完全正常，不是缺陷**。
+三项铁证：①`[net-probe] wreq GET -> status=200 OK url=.../ci/...`——请求发出且 200；
+②`[img-probe] op_load nid=306 bytes=2128 dims=Some((63.0, 32.0)) first8=[89,50,4e,47,...]`
+——响应 2128B 是合法 PNG（magic 正确），解码出 63×32 尺寸；③`_applyImageMetadata` 的
+`loaded` 判定成立 → dispatch `load` → JSVMP 拿到正确的 `naturalWidth=63`/`naturalHeight=32`。
+因此 step 43 的「/ci/ 0% 是独立能力缺口」与 step 45 初版「op 吞请求」**双双作废**。
+**下一个断点精确化**：`/pat/` 是**唯一**未发出的网络环节；它与 `/ci/` 在同一 tick 由
+同一段 JSVMP 代码发出（step 10 的 1ms 时间戳差），`/ci/` 的 Image 构造有 trace 记录而
+`/pat/` 的 XHR/fetch 构造无痕（IC 快速路径盲区或非 JS 构造）。**决定性实验**：CDP 预注入
+包 `XMLHttpRequest.prototype.open/send` + `fetch`（纯转发、只记录入参，无轮询——step 42
+已验证 widget-realm 钩子 + 无轮询 4/4 正常），看 `/pat/` 的构造是否发生、走 open 还是
+send 被 gate。
+
+### Step 46 — 预注入网络钩子：/pat/ 确凿从未被 JS 构造；发现 Image 请求不记录 resource timing（2026-08-15）
+
+**方法**：CDP 预注入纯转发钩子（`/tmp/cdp_xhr_hook.py`），覆盖
+`XMLHttpRequest.prototype.open/send`、`window.fetch`、`HTMLImageElement.src` setter、
+`navigator.sendBeacon`，`console.warn` 输出到 serve 日志（`obscura::console`）。**无轮询**
+（step 42 教训）。另用 `/tmp/cdp_perf_hook.py` 包 `performance.getEntries(ByType/ByName)`
+打印 resource timing 条目的细字段（fetchStart/domainLookupEnd/connectStart/responseStart/
+responseEnd）。
+
+**证据 1 — `/pat/` 确凿从未被 JS 构造（预注入无盲区）**：完整 20s 流程（覆盖 822KB→127KB
+窗口 + 交互）的 [net-hook] 记录：
+
+```
+08:58:33.9  xhr.open POST /fo/<tokenA> (zencare)      ← 113KB
+08:58:33.9  xhr.send；fetch 同 URL
+08:58:36.0  xhr.open POST /fo/<tokenB> (challenges)   ← 822KB（widget frame）
+08:58:36.0  xhr.send；fetch 同 URL
+08:58:37.6  img.src /cdn-cgi/.../ci/<token>/...       ← /ci/ Image（widget frame）
+08:58:38.9  xhr.open POST /fo/<tokenB>                ← 127KB 交互变体
+08:58:38.9  xhr.send；fetch 同 URL
+```
+
+**全程零 `/pat/`**（无 xhr.open、无 fetch、无 img.src、无 sendBeacon）。这是**决定性
+证明**——预注入是真实的钩子（`hook-installed` 确认在每个 realm 执行），不是 IC 盲区。
+step 45 的「IC 盲区可能掩盖 /pat/ 构造」假设排除。**/pat/ 从未被 JS 构造**（任何机制）。
+附带发现：JSVMP 每发一个 `/fo/` XHR 后紧跟一次同 URL 的 `fetch`（双通道探测，模式稳定）。
+
+**证据 2 — Image 请求不记录 resource timing（确定缺陷）**：[perf-hook] 的 widget frame
+`getEntries()` 只有 822KB `/fo/` 的 entry（`|fetch|d=626|fS=701|dL=701|cS=701|rS=1327|rE=1327`）
+加一个 `Qldo8a<ray>` 空条目（d=0，name 截断），**`/ci/` 完全不在 performance 里**。对照
+代码：`record_performance_response`（page.rs:1334）只在 link(1579)/script(1996)/navigation
+(3536)/XHR(3945) 路径调用，**Image 路径（op_load_image_metadata）无调用点**。perf-hook
+实证与代码一致。
+
+**证据 3 — resource timing 字段的异常形状**：822KB `/fo/` entry 的
+`domainLookupEnd=connectStart=fetchStart=701`（全部用 transport_start，无 DNS/连接区分），
+`responseStart=responseEnd=1327`（responseEnd 与 responseStart 相等，无读取耗时）。
+对比 HaHaVM 画像（step 39）：`/pat/ {domainLookupEnd:2, responseStart:2, responseEnd:6}`、
+`/ci/ {domainLookupEnd:0, responseStart:1, responseEnd:3}`——CF 期望这些字段有**真实且
+相互区分**的值。
+
+**结论**：`/pat/` 从未被 JS 构造已确凿（证据 1）。两条独立的环境真实性判定链浮现，都可能
+导致 JSVMP 走交互分支：①`/pat/` 触发前读 `/fo/` 的 resource timing（`/fo/` entry 存在但
+字段形状可疑，证据 3）；②`/ci/` 发出后 CF 读 `/ci/` 的 resource timing（**`/ci/` 条目
+完全缺失**，证据 2）。HaHaVM 专门为两者备了画像，说明 CF 在这两步都读时序。**Image 请求
+不记录 resource timing 是确定的事实缺陷，且是最可行动的修复点**——补上 `/ci/` 的 entry
+（含正确的 domainLookupEnd/responseStart/responseEnd 区分）是当前最有把握的下一步。
+
+**下一步（按信息量）**：
+1. **修 Image 请求的 resource timing**：`op_load_image_metadata` 成功加载后，把响应的
+   timing（wreq `Response.timing` 已有 start/response_start/response_end）经
+   `__obscura_performance_record` 记录为 resource entry（entryType=resource,
+   initiatorType=image）。这需要打通 ops.rs → page.rs 或让 bootstrap 在
+   `_applyImageMetadata` 时记录。修完重测 `/pat/` 是否出现。
+2. 同时修正 resource entry 的字段区分：`domainLookupEnd`/`connectStart`/`requestStart`
+   不应全部等于 `fetchStart`（HaHaVM 画像的 2/2/6 形态）；但先做 #1（条目缺失更严重）。
+3. 若补上 `/ci/` timing 后 `/pat/` 仍不出现：`/pat/` 触发读 `/fo/` timing 的假设需要
+   专门验证（hook `performance.getEntriesByName('/fo/...')` 的返回值），或 `/pat/` 确为
+   Chrome 原生 PAT 握手（step 44 结论 3），需实现浏览器级 PAT。
+4. 移除本 step 全部临时插桩（`[img-probe]`/`[net-probe]`/perf-hook），跑基线。
+
+**Step 46 补充（URL/PAT 钩子，`/tmp/cdp_xhr_hook2.py`）**：三个最终确认——
+
+1. **URL 构造器钩子**（`new URL`）：全程只记录 `/fo/` 的 URL 构造（`URL(/cdn-cgi/.../fo/...,base)`），
+   **零 `/pat/` URL 构造**。`/ci/` 的 img.src 是字符串直接赋值（不走 `new URL`）。
+2. **PAT API getter 包装**（`Document.prototype.hasPrivateToken/hasRedemptionRecord/
+   hasStorageAccess`）：**零 GETTER READ**。JSVMP 从未读这三个属性。step 39 发现 3 与
+   step 44 的证伪**最终坐实**（getter 包装覆盖 `in`/`typeof`/`LoadIC` 全部读取形态）。
+3. 网络钩子复现：3 次 XHR + 3 次 fetch + img.src（favicon、/ci/），零 `/pat/`。
+
+**战线收束**：`/pat/` 从未被 JS 构造（网络 + URL + PAT API 三种观测面全覆盖），分流
+判定**不依赖 PAT API**。但 HaHaVM 画像（`/pat/ {dL:2,rS:2,rE:6}`）与 step 28 浏览器实证
+（managed 阶段发 /pat/）共同说明 `/pat/` 是 **JS 构造**——因此 obscura 的 JSVMP 在
+822KB 后走了**不同的分流分支**（不发 /pat/ 直接拉 127KB），判定条件在 PAT API 之外。
+候选判定面：resource timing 形状（`/fo/` 读取耗时 0.55ms vs HaHaVM 2ms、dL=cS=fS 同值）、
+canvas 指纹、python 桥检测（step 44）、或 **TLS/HTTP2 指纹分流**（obscura 的 wreq
+Chrome145 emulation 与真实 Chrome 仍有差异——若分流发生在传输层，JS 环境面无法解决）。
+**HaHaVM 为 `/fo/`/`/pat/`/`/ci/` 全备 timing 画像**（`/fo/{dL:1,rS:5,rE:7}`、
+`/pat/{dL:2,rS:2,rE:6}`、`/ci/{dL:0,rS:1,rE:3}`）——CF 对这三个 URL 都读 resource
+timing，obscura 的 `/ci/` 无 entry、`/fo/` 形状异常仍是未消除的差异面。
+
+### Step 47 — 修 Image resource timing：缺陷已修且有回归测试，但 `/pat/` 未动；新断点 = frame 无 navigation timing（2026-08-15）
+
+**假设**（step 46 下一步 #1）：Image 请求不进 Performance Timeline，JSVMP 读 `/ci/` 的
+resource timing 读到空 → 判定环境异常 → 不走 managed 证明流程（不发 `/pat/`）。
+
+**方法**：
+1. 修复。`op_load_image_metadata` 在 fetch 返回后把 `wreq Response.timing`
+   （`response_start`/`response_end`/`redirect_end`）连同最终 URL、状态、字节数与
+   Timing-Allow-Origin 判定，一并塞进返回给 JS 的 metadata 的 `timing` 字段；
+   bootstrap 的 `_runImageRequest` 在 op 调用前取 `performance.now()` 作 `fetchStart`，
+   回来后用新的 `_recordImageResourceTiming()` 调 `globalThis.__obscura_performance_record`。
+   **entry 由元素所在 realm 记录**——frame 里的图片因此落进 frame 自己的时间线，
+   而不是 embedder 的（这正是 widget `/ci/` 需要的）。TAO 判定放在 Rust（op 已知发起方
+   origin 与原始响应头）；被拒时只暴露 `responseEnd`，与 Chrome 的不透明资源一致。
+   `initiatorType` 是 **`img`** 不是 `image`——Resource Timing 取元素 localName。
+   只有真正走网络的那一次带 `timing`：并发合流的 follower 与缓存命中不产生重复 entry。
+2. 回归测试 `crates/obscura/tests/image_shim.rs` 两条：
+   `image_load_records_a_resource_timing_entry`（主 realm，断言 initiatorType/里程碑单调/
+   尺寸/状态码）、`image_in_a_frame_records_timing_in_that_frames_timeline`（**跨源
+   iframe**，frame 内读自己的 `getEntriesByType('resource')` 再 postMessage 给父页）。
+3. 实测：新建 serve（17:17:27，二进制 17:14，`/json/version` 已核）+ 合并的预注入
+   net-hook + perf-hook（`/tmp/cdp_ci_timing_hook.py`，**无轮询**，step 42 教训），
+   `--wait 24` 覆盖 822KB→127KB 的 managed 分流窗口。
+
+**证据 1 — 修复生效，量化对比**：主文档 realm 的 `getEntriesByType('resource')` 修复前
+只有 `/fo/` 的 fetch 条目（step 46 证据 2），修复后多出 favicon 的 image 条目：
+
+```
+https://zencare.co/favicon.ico|img|d=209.74|fS=629.50|dL=629.50|cS=629.50|rS=838.52|rE=839.24|sz=5924
+```
+
+`responseStart(838.52) ≠ responseEnd(839.24)`——读取耗时不再被抹平（step 46 证据 3 记的
+`rS==rE` 是 page.rs 路径的问题，Image 路径天然带真实的两个采样点）。跨源 frame 路径由
+回归测试 2 证明（`img 70`，frame 自己的时间线）。
+
+**证据 2 — `/pat/` 依旧零构造，断点未移动**：完整 24s 流程的 [net-hook]：
+
+```
+09:17:54.868  img.src  /favicon.ico
+09:17:54.991  xhr.open POST /fo/<tokenA> (zencare)         ← 113KB
+09:17:57.278  xhr.open POST /fo/<tokenB> (challenges)      ← 822KB
+09:18:00.096  img.src  /cdn-cgi/.../ci/<token>/...         ← /ci/
+09:18:00.174  xhr.open POST /fo/<tokenB>                   ← 127KB 交互变体
+```
+
+零 `/pat/`（无 xhr.open、无 fetch、无 img.src、无 sendBeacon），与 step 46 逐字一致。
+**假设既未证实也未证伪**：本轮 CF 在 `/ci/` 之后**再没读过任何 performance 接口**
+（最后一次 `getEntries()` 在 09:17:59.519，早于 `/ci/` 的 09:18:00.096），所以补上的
+`/ci/` entry 根本没被读到。另注 `/ci/` 与其后 `/fo/` 只隔 **78ms**——JSVMP 不等图片
+加载完成就发了下一个 `/fo/`，「读 `/ci/` 时序再决定分流」在当前路径上不成立。
+
+**证据 3 — 新断点：widget frame 没有 navigation timing entry（本步最大信息量）**：
+CF 在两个 widget realm 里各查了一次 `getEntriesByType('navigation')`，**两次都是 0 条**：
+
+```
+09:17:58.294  [perf-hook] getEntriesByType(navigation)=0:[]     ← realm 2
+09:18:00.055  [perf-hook] getEntriesByType(navigation)=0:[]     ← realm 3（822KB 所在）
+```
+
+主文档 realm 有 navigation entry（`https://zencare.co/1.txt|navigation|d=605.70|fS=0.07|
+rS=392.69|rE=393.08|sz=5907`），frame realm 一条没有。代码侧一致：
+`record_performance_response(&response, "navigation", "navigation")` 只在 page.rs:3536
+为**顶层文档**调用，frame realm 无任何记录点。Chrome 里 iframe 文档必有自己的
+`PerformanceNavigationTiming`——**这是 CF 主动读取、且读到了空值的确定差异**，
+比 `/ci/` 的 resource entry（本轮根本没被读）证据链更硬。
+
+**结论**：Image resource timing 是确定缺陷，已修 + 双回归测试锁定；但它**不是
+`/pat/` 的 gate**——至少在当前分流路径上 CF 从未读过它。战线前移到
+**frame 文档缺 navigation timing**：CF 读了两次、两次全空，是当前唯一「已证实被读取
+且明确异常」的环境面。
+
+**下一步（按信息量）**：
+1. **给 frame 文档补 navigation timing entry**（证据 3）：frame 导航完成后在该 frame
+   realm 记录 `entryType=navigation`（含 `domInteractive`/`domContentLoadedEvent*`/
+   `loadEvent*`/`duration`，由 frame 自己的 lifecycle 驱动，而非顶层的）。修完重测
+   `getEntriesByType('navigation')` 是否非空、`/pat/` 是否出现。
+2. 修 page.rs 路径的字段区分（step 46 下一步 #2 未做）：`responseStart == responseEnd`
+   与 `dL==cS==fS` 同值；后者对复用连接是**正常**的（HaHaVM `/ci/{dL:0}` 即连接复用），
+   前者不是——`/fo/` 的读取耗时被抹成 0。
+3. `transferSize` 全路径等于 `encodedBodySize`；Chrome 是 `encodedBodySize + 300`
+   （头部近似）。三处路径（page.rs / fetch / 新的 image）要一起改才不会自相矛盾。
+4. 若 frame navigation timing 补齐后 `/pat/` 仍不出现：回到 step 46 收束的候选面
+   （canvas 指纹 / TLS-HTTP2 传输层分流），或直接实现浏览器级 PAT。
