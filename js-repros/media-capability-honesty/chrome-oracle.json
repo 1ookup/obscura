@@ -1,0 +1,93 @@
+{
+  "videoCtor": "HTMLVideoElement",
+  "videoTag": "[object HTMLVideoElement]",
+  "geometry": {
+    "videoWidth": 0,
+    "videoHeight": 0,
+    "duration": "NaN",
+    "currentTime": 0,
+    "readyState": 0,
+    "networkState": 0,
+    "paused": true,
+    "ended": false,
+    "error": "null",
+    "seeking": false,
+    "buffered": 0,
+    "played": 0,
+    "seekable": 0
+  },
+  "canPlayType": {
+    "video/mp4": "maybe",
+    "video/mp4; codecs=\"avc1.42E01E\"": "probably",
+    "video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\"": "probably",
+    "video/webm": "maybe",
+    "video/webm; codecs=\"vp8\"": "probably",
+    "video/webm; codecs=\"vp9\"": "probably",
+    "video/webm; codecs=\"vp8, vorbis\"": "probably",
+    "video/ogg": "maybe",
+    "video/ogg; codecs=\"theora\"": "",
+    "video/mp4; codecs=\"av01.0.05M.08\"": "probably",
+    "video/x-matroska": "maybe",
+    "video/quicktime": "",
+    "video/3gpp": "maybe",
+    "application/x-mpegURL": "maybe",
+    "application/vnd.apple.mpegurl": "maybe",
+    "video/nonsense": "",
+    "(empty)": "",
+    "video/mp4; codecs=\"nope\"": "",
+    "audio/mpeg": "probably",
+    "audio/mp4": "maybe",
+    "audio/mp4; codecs=\"mp4a.40.2\"": "probably",
+    "audio/aac": "probably",
+    "audio/wav": "maybe",
+    "audio/wav; codecs=\"1\"": "probably",
+    "audio/ogg": "maybe",
+    "audio/ogg; codecs=\"vorbis\"": "probably",
+    "audio/webm": "maybe",
+    "audio/webm; codecs=\"opus\"": "probably",
+    "audio/flac": "probably",
+    "audio/x-flac": "",
+    "audio/basic": ""
+  },
+  "timeRanges": {
+    "tag": "[object TimeRanges]",
+    "ctor": "TimeRanges",
+    "length": 0,
+    "startThrows": "IndexSizeError",
+    "sameObject": false
+  },
+  "playbackQuality": {
+    "tag": "[object VideoPlaybackQuality]",
+    "keys": 4,
+    "droppedVideoFrames": 0,
+    "totalVideoFrames": 0,
+    "creationTimeType": "number"
+  },
+  "mediaSourceShape": {
+    "isTypeSupportedType": "function",
+    "mp4": true,
+    "webm": true,
+    "nonsense": false,
+    "instanceTag": "[object MediaSource]",
+    "readyState": "closed"
+  },
+  "constants": {
+    "HAVE_NOTHING": 0,
+    "HAVE_METADATA": 1,
+    "NETWORK_EMPTY": 0,
+    "NETWORK_NO_SOURCE": 3
+  },
+  "playReturns": "promise",
+  "playSettles": "rejected:NotAllowedError",
+  "loadType": "function",
+  "requestVideoFrameCallback": "function",
+  "getVideoPlaybackQuality": "function",
+  "mediaCapabilities": "object",
+  "decodingInfo": {
+    "supported": true,
+    "smooth": true,
+    "powerEfficient": false
+  },
+  "mediaSource": "function",
+  "msSupported": true
+}

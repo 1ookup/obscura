@@ -4133,6 +4133,107 @@ mod tests {
         );
     }
 
+    /// Media capability reporting. The engine decodes nothing, but the
+    /// capability *declaration* matches Chrome and — the point of this test —
+    /// canPlayType and mediaCapabilities.decodingInfo cannot disagree, because
+    /// they read one table. Pinned in js-repros/media-capability-honesty/.
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capability_declarations_match_chrome_and_agree_with_each_other() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const video = document.createElement("video");
+                    const audio = document.createElement("audio");
+                    const ask = type => (type.startsWith("audio/") ? audio : video)
+                        .canPlayType(type);
+                    const decoding = async contentType =>
+                        (await navigator.mediaCapabilities.decodingInfo({
+                            type: "file",
+                            video: {contentType, width: 640, height: 480,
+                                    bitrate: 1000, framerate: 30},
+                        }));
+                    const mp4 = await decoding('video/mp4; codecs="avc1.42E01E"');
+                    const bogus = await decoding("video/nonsense");
+                    return {
+                        canPlay: [
+                            ask("video/mp4"),
+                            ask('video/mp4; codecs="avc1.42E01E"'),
+                            ask('video/webm; codecs="vp9"'),
+                            ask("video/ogg"),
+                            // Chrome answers "" for theora and quicktime.
+                            ask('video/ogg; codecs="theora"'),
+                            ask("video/quicktime"),
+                            ask("video/nonsense"),
+                            ask(""),
+                            ask("audio/mpeg"),
+                            ask("audio/wav"),
+                            ask('audio/wav; codecs="1"'),
+                        ],
+                        playRejects: await video.play().then(
+                            () => "fulfilled", error => error.name),
+                        readyStateStillZero: video.readyState,
+                        videoWidthStillZero: video.videoWidth,
+                        bufferedTag: Object.prototype.toString.call(video.buffered),
+                        bufferedLength: video.buffered.length,
+                        bufferedFresh: video.buffered !== video.buffered,
+                        bufferedStartThrows: (() => {
+                            try { video.buffered.start(0); return "no-throw"; }
+                            catch (error) { return error.name; }
+                        })(),
+                        qualityTag: Object.prototype.toString.call(
+                            video.getVideoPlaybackQuality()),
+                        qualityEnumerableKeys:
+                            Object.keys(VideoPlaybackQuality.prototype).length,
+                        frameCallbackHandle:
+                            typeof video.requestVideoFrameCallback(() => {}),
+                        // The declaration and the capability API agree.
+                        decodingSupported: mp4.supported,
+                        decodingSmooth: mp4.smooth,
+                        decodingPowerEfficient: mp4.powerEfficient,
+                        decodingBogus: bogus.supported,
+                        mediaSourceMp4:
+                            MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+                        mediaSourceBogus: MediaSource.isTypeSupported("video/nonsense"),
+                        mediaSourceReadyState: new MediaSource().readyState,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "canPlay": [
+                    "maybe", "probably", "probably", "maybe",
+                    "", "", "", "",
+                    "probably", "maybe", "probably",
+                ],
+                "playRejects": "NotAllowedError",
+                "readyStateStillZero": 0,
+                "videoWidthStillZero": 0,
+                "bufferedTag": "[object TimeRanges]",
+                "bufferedLength": 0,
+                "bufferedFresh": true,
+                "bufferedStartThrows": "IndexSizeError",
+                "qualityTag": "[object VideoPlaybackQuality]",
+                "qualityEnumerableKeys": 4,
+                "frameCallbackHandle": "number",
+                "decodingSupported": true,
+                "decodingSmooth": true,
+                "decodingPowerEfficient": false,
+                "decodingBogus": false,
+                "mediaSourceMp4": true,
+                "mediaSourceBogus": false,
+                "mediaSourceReadyState": "closed",
+            })
+        );
+    }
+
     /// Worklet entry points exist and fail closed: no module can load, so
     /// `addModule` always rejects with the error Chrome raises for a module it
     /// cannot fetch. Pinned in js-repros/worklet-entrypoints/chrome-oracle.json.
@@ -18361,8 +18462,14 @@ provided documentURL ('https://other.example') does not match the current origin
         );
     }
 
+    /// Renamed from `unsupported_media_capabilities_and_readiness_are_honest`:
+    /// the capability *declaration* now matches Chrome (see
+    /// `media_capability_declarations_match_chrome_and_agree_with_each_other`),
+    /// while readiness stays honest. What this pins is the second half — no
+    /// frame, no duration, no currentSrc, still paused — which is what
+    /// "nothing is decoded" actually looks like from JS.
     #[test]
-    fn unsupported_media_capabilities_and_readiness_are_honest() {
+    fn media_readiness_stays_empty_while_capabilities_are_declared() {
         let mut rt = setup_runtime(
             r#"<video id="media" src="https://example.test/movie.mp4"
                 poster="https://example.test/poster.png"></video>"#,
@@ -18388,8 +18495,9 @@ provided documentURL ('https://other.example') does not match the current origin
         assert_eq!(
             result,
             serde_json::json!([
-                "",
-                "",
+                // Declared support, as Chrome declares it; playback never happens.
+                "maybe",
+                "probably",
                 0,
                 0,
                 0,
