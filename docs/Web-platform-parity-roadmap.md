@@ -436,15 +436,25 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    读过它们**——是「碰巧含有数据的文档」,只在有人记得照 README 敲命令时才被验证过(对比:
    `render-repros` 是被 `layout_test.rs:314` 真正 `include_str!` 的)。已加
    `assert_probe_matches_chrome_oracle`,直接 `include_str!` probe 与 oracle 并逐字段递归比对,
-   已接入 4 个 fixture 共 **226 个观测点**(trusted-types 96、media-capability 77、worklet 39、
-   private-state 14),耗时 0.029s。helper 同时兼容两代 fixture 约定(早期把观测值包在 `result`
-   里、外裹 `browser`/`captured` 元数据,后期直接放顶层),并会在「某条 known_difference 已经和
-   Chrome 一致」时报错,防止豁免清单变成回归的藏身处。
-   未接入的 4 个各有具体原因(已写进代码注释,不是「以后再说」):font-fingerprint 需要数值容差
+   已接入 5 个 fixture 共 **248 个观测点**(trusted-types 96、media-capability 77、worklet 39、
+   shared-worker 22、private-state 14),耗时 &lt;1s。helper 同时兼容两代 fixture 约定(早期把观测值
+   包在 `result` 里、外裹 `browser`/`captured` 元数据,后期直接放顶层),并会在「某条
+   known_difference 已经和 Chrome 一致」时报错,防止豁免清单变成回归的藏身处。shared-worker 需要
+   HTTP 提供 `/shared-worker.js`(blob URL 测的是另一回事 —— 连接计数只有在同一个 URL 到达同一个
+   worker 时才证明复用),用内联 TCP server 供给,零 known difference 一次通过。
+   另有 timer-fidelity 以另一种方式接入:它的 `elapsed`/`chain` 是一次真实墙钟抓取,oracle 自己的
+   `note` 就写明不做精确比对——逐字段相等等于断言「这台机器和录制那台一样快」。改为读它真正固化的
+   性质:回调顺序与各自的 deadline、迟到上界(35ms,从 capture 里读出而非写死在测试里)、以及
+   嵌套零延迟地板的跳变位置。引擎与 Chrome 都在第 6 层之后开始被 clamp。该测试已加入
+   `.config/nextest.toml` 的 timing-sensitive 组。
+   仍未接入的 4 个各有具体原因(已写进代码注释,不是「以后再说」):font-fingerprint 需要数值容差
    (内嵌字体 vs 系统字体,98 个值全部差 ~2px,是设计决定);fingerprint-derivation 需要真实
    iframe realm;service-worker 需要能按需返回特定状态码/MIME/重定向的 HTTP server(其判定链已由
    `service_worker_registration_fetches_the_script_before_refusing` 覆盖);secure-context 需要一次
-   运行里三种不同源(已由 `secure_context_gates_the_same_apis_chrome_gates` 覆盖)。
+   运行里三种不同源(已由 `secure_context_gates_the_same_apis_chrome_gates` 与
+   `shared_array_buffer_is_withheld_the_way_chrome_withholds_it` 覆盖)。stack-realm-referrer 横跨
+   四个文档(same.html/cross.html/外部脚本/样式表),performance-timeline 需要「被服务的页面 + 被
+   服务的子资源」才能让 resource entry 有真实网络分段可报,且没有可 await 的 promise 全局。
 6. **构建必须带 V8 补丁配置**。任何不带
    `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` 的 `cargo build`/`nextest` 会静默把
    `target/release/obscura` 换成非 patched V8,trace 输出随之变空(见 `Trace-page-script.md`)。

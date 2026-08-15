@@ -32,6 +32,7 @@ filter = '''
   or test(posted_task_chains_complete_without_zero_delay_timer_floor)
   or test(fixed_settle_delivers_timers_at_their_deadlines_after_navigation)
   or test(load_delaying_script_driver_respects_absolute_deadline)
+  or test(timer_ordering_and_lateness_match_the_chrome_capture)
 '''
 test-group = 'timing-sensitive'
 threads-required = 'num-test-threads'

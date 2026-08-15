@@ -4828,7 +4828,175 @@ provided documentURL ('https://other.example') does not match the current origin
         .await;
     }
 
-    // Four fixtures are not read this way, and the reason is not "later":
+    /// The SharedWorker capture, read in full rather than sampled.
+    ///
+    /// Needs a server: the probe constructs `new SharedWorker('/shared-worker.js')`
+    /// four times, and the point of the fixture is that a message reaches a
+    /// real SharedWorkerGlobalScope and comes back. A blob URL would test a
+    /// different thing -- the connection counter only proves worker reuse if
+    /// the same url reaches the same worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_workers_match_the_full_chrome_capture() {
+        const WORKER_SOURCE: &str = include_str!("../../../js-repros/shared-worker/shared-worker.js");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let response = if path == "/shared-worker.js" {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: \
+{}\r\nConnection: close\r\n\r\n{WORKER_SOURCE}",
+                        WORKER_SOURCE.len(),
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("http://{address}/index.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/shared-worker/probe.js"),
+            "sharedWorkerFixturePromise",
+            include_str!("../../../js-repros/shared-worker/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The timer capture, read for the properties it actually pins.
+    ///
+    /// This one cannot go through `assert_probe_matches_chrome_oracle`: the
+    /// `elapsed` and `chain` values are one real wall-clock capture, and the
+    /// oracle says so in its own `note`. What is comparable is the *shape* --
+    /// which callback ran in which order, how late each was allowed to be, and
+    /// where the nested zero-delay floor kicks in. Every bound below is read
+    /// out of the capture rather than written here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_ordering_and_lateness_match_the_chrome_capture() {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../js-repros/timer-fidelity/chrome-oracle.json"
+        ))
+        .unwrap();
+        let chrome = &oracle["result"];
+        let assertions = &oracle["assertions"];
+        let lateness_bound = assertions["oneShotLatenessUpperBoundMs"]
+            .as_f64()
+            .expect("capture must state the lateness bound");
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "<timer-fixture-probe>",
+            include_str!("../../../js-repros/timer-fidelity/probe.js"),
+        )
+        .unwrap();
+        let ours = rt
+            .evaluate_for_cdp("timerFixturePromise", true, true)
+            .await
+            .unwrap()
+            .value
+            .expect("probe promise produced no value");
+
+        let shape = |value: &serde_json::Value| -> Vec<(String, f64)> {
+            value["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|event| {
+                    (
+                        event["kind"].as_str().unwrap().to_string(),
+                        event["expected"].as_f64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        // Which callback ran, in which order, at which deadline. The interval
+        // sits between the 1ms and 50ms timeouts in Chrome, and that placement
+        // is the whole point: it is a deadline ordering, not a queue ordering.
+        assert_eq!(
+            shape(&ours),
+            shape(chrome),
+            "callback order or deadlines drifted from the capture",
+        );
+        assert_eq!(
+            ours["intervalTicks"], chrome["intervalTicks"],
+            "setInterval must fire exactly as often before clearInterval",
+        );
+        assert_eq!(
+            ours["events"][0]["kind"],
+            serde_json::json!("microtask"),
+            "a microtask must run before the first timer task",
+        );
+
+        for event in ours["events"].as_array().unwrap() {
+            let lateness = event["elapsed"].as_f64().unwrap() - event["expected"].as_f64().unwrap();
+            assert!(
+                (0.0..=lateness_bound).contains(&lateness),
+                "{} timer for {}ms was {lateness:.1}ms late (bound {lateness_bound}ms); \
+a timer firing *early* is as wrong as one firing late",
+                event["kind"].as_str().unwrap(),
+                event["expected"],
+            );
+        }
+
+        // The nested zero-delay floor. Chrome clamps `setTimeout(f, 0)` to
+        // ~4ms once the chain is more than five deep, so the last steps are
+        // visibly slower than the first ones. An engine with no floor at all
+        // runs the whole chain at the same speed -- which is both a difference
+        // and a fingerprint.
+        let steps = |value: &serde_json::Value| -> Vec<f64> {
+            let chain: Vec<f64> = value["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap())
+                .collect();
+            chain.windows(2).map(|pair| pair[1] - pair[0]).collect()
+        };
+        let ours_steps = steps(&ours);
+        assert_eq!(
+            ours_steps.len(),
+            steps(chrome).len(),
+            "the chain must run to the same depth",
+        );
+        // Half the capture's floor: enough to tell "clamped" from "not
+        // clamped" without pinning a wall-clock value.
+        const FLOOR_EVIDENCE_MS: f64 = 3.5;
+        let (early, late) = ours_steps.split_at(5);
+        assert!(
+            late.iter().all(|step| *step >= FLOOR_EVIDENCE_MS),
+            "steps past the fifth nesting must be clamped, got {late:?} from {ours_steps:?}",
+        );
+        assert!(
+            early.iter().filter(|step| **step < FLOOR_EVIDENCE_MS).count() >= 4,
+            "the first five nestings must not be clamped, got {early:?}",
+        );
+    }
+
+    // Six fixtures are not read through the helper above, and the reason is
+    // not "later":
     //
     // - font-fingerprint compares text metrics that differ by design. Obscura
     //   ships embedded fonts instead of scanning the host's, so widths land
@@ -4840,7 +5008,20 @@ provided documentURL ('https://other.example') does not match the current origin
     //   specific status codes, MIME types and redirects; its decision chain is
     //   covered by service_worker_registration_fetches_the_script_before_refusing.
     // - secure-context needs three different origins in one run, including a
-    //   non-loopback one; covered by secure_context_gates_the_same_apis_chrome_gates.
+    //   non-loopback one; covered by secure_context_gates_the_same_apis_chrome_gates
+    //   and shared_array_buffer_is_withheld_the_way_chrome_withholds_it.
+    // - timer-fidelity's numbers are one wall-clock capture and the oracle says
+    //   so itself; equality would be asserting that this machine is as fast as
+    //   the one that recorded it. Its ordering, lateness bound and nested
+    //   zero-delay floor are read in
+    //   timer_ordering_and_lateness_match_the_chrome_capture, with the bounds
+    //   taken from the capture rather than written into the test.
+    // - stack-realm-referrer spans four documents (same.html, cross.html, an
+    //   external script, a stylesheet) and pins what each realm sees of the
+    //   others; one runtime with one document cannot stage it.
+    // - performance-timeline needs a served page plus a served subresource so
+    //   the resource entry has real network phases to report, and has no
+    //   promise global to await -- the probe writes into the document.
 
     /// `isSecureContext` existed on worker scopes (worker.rs) but not on the
     /// window, so two lines of script caught the engine disagreeing with
