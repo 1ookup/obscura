@@ -35,6 +35,10 @@ pub(crate) struct WorkerEnvironment {
     /// worker constructed without one -- not `undefined`, which is what an
     /// absent binding would report and what marks a scope as not-a-worker.
     pub name: String,
+    /// Brands the global as a SharedWorkerGlobalScope and routes messages
+    /// through connection ports instead of the scope's own `postMessage`,
+    /// which a shared scope does not have.
+    pub shared: bool,
     /// The creator's origin. A worker's origin is inherited from the document
     /// that created it, so a `blob:`/`data:` worker still reports the page's
     /// origin rather than deriving one from its own script URL.
@@ -263,6 +267,7 @@ fn worker_thread_main(
             let worker_name = std::mem::take(&mut environment.name);
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
+            let worker_shared = environment.shared;
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
             rt.set_fingerprint(&environment.fingerprint);
             // reqwest's pooled client is created inside the creator's Tokio
@@ -308,7 +313,13 @@ fn worker_thread_main(
             }
             if let Err(e) = rt.execute_script(
                 "<obscura:worker-prep>",
-                &worker_prep_script(&script_url, &worker_name, &worker_origin, worker_secure),
+                &worker_prep_script(
+                    &script_url,
+                    &worker_name,
+                    &worker_origin,
+                    worker_secure,
+                    worker_shared,
+                ),
             ) {
                 let _ = out_tx.send(error_entry(&format!("worker global setup failed: {e}")));
                 return;
@@ -417,13 +428,20 @@ fn dispatch_message(
     }
 }
 
-fn worker_prep_script(script_url: &str, name: &str, origin: &str, secure: bool) -> String {
+fn worker_prep_script(
+    script_url: &str,
+    name: &str,
+    origin: &str,
+    secure: bool,
+    shared: bool,
+) -> String {
     let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     WORKER_PREP_TEMPLATE
         .replace("__OBSCURA_WORKER_URL__", &json(script_url))
         .replace("__OBSCURA_WORKER_NAME__", &json(name))
         .replace("__OBSCURA_WORKER_ORIGIN__", &json(origin))
         .replace("__OBSCURA_WORKER_SECURE__", if secure { "true" } else { "false" })
+        .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
 }
 
 /// Executed in the fresh worker runtime before the worker source. The
@@ -440,6 +458,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
   var getOwnPropertyNames = Object.getOwnPropertyNames;
+  // A shared worker's scope is branded SharedWorkerGlobalScope, reaches its
+  // pages over connection ports rather than a scope-level `postMessage`, and
+  // exposes `onconnect` where a dedicated scope exposes `onmessage`.
+  var IS_SHARED = __OBSCURA_WORKER_SHARED__;
+  var SCOPE_NAME = IS_SHARED ? 'SharedWorkerGlobalScope' : 'DedicatedWorkerGlobalScope';
 
   function def(target, name, value, enumerable) {
     defineProperty(target, name, {
@@ -532,9 +555,15 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // GlobalEventHandlers install. The worker keeps only its own set, added
   // further down; anything else advertises DOM events a worker cannot fire.
   var WORKER_HANDLERS = {
-    onmessage: 1, onmessageerror: 1, onerror: 1, onlanguagechange: 1,
+    onerror: 1, onlanguagechange: 1,
     onoffline: 1, ononline: 1, onrejectionhandled: 1, onunhandledrejection: 1,
   };
+  if (IS_SHARED) {
+    WORKER_HANDLERS.onconnect = 1;
+  } else {
+    WORKER_HANDLERS.onmessage = 1;
+    WORKER_HANDLERS.onmessageerror = 1;
+  }
   var leftover = getOwnPropertyNames(G);
   for (var k = 0; k < leftover.length; k++) {
     var handler = leftover[k];
@@ -584,11 +613,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   }
 
-  var DedicatedWorkerGlobalScope = illegalConstructor('DedicatedWorkerGlobalScope');
+  var DedicatedWorkerGlobalScope = illegalConstructor(SCOPE_NAME);
   DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
   def(DedicatedWorkerGlobalScope.prototype, 'constructor', DedicatedWorkerGlobalScope);
   defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
-    value: 'DedicatedWorkerGlobalScope', configurable: true,
+    value: SCOPE_NAME, configurable: true,
   });
   try { Object.setPrototypeOf(G, DedicatedWorkerGlobalScope.prototype); } catch (e) {}
 
@@ -610,7 +639,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   }
 
   def(G, 'WorkerGlobalScope', WorkerGlobalScope);
-  def(G, 'DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+  def(G, SCOPE_NAME, DedicatedWorkerGlobalScope);
   // `self` is a getter-only attribute in a browser, not a data property.
   defGet(G, 'self', function () { return G; }, true);
 
@@ -768,16 +797,22 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // Structured clone, JSON-clonable subset; `{v: data}` envelope so an
   // `undefined` payload round-trips as an absent property.
   // TODO(phase 3.11 follow-up): full structured clone + transfer lists.
-  def(G, 'postMessage', function postMessage(data) {
-    if (typeof data === 'function' || typeof data === 'symbol') {
-      throw new DOMException('The object could not be cloned.', 'DataCloneError');
-    }
-    var payload;
-    try { payload = JSON.stringify({ v: data }); }
-    catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
-    if (payload === undefined) payload = '{}';
-    Deno.core.ops.op_worker_post_to_page(payload);
-  });
+  // A SharedWorkerGlobalScope has no `postMessage`: everything travels over
+  // the ports handed out by `connect` events.
+  if (!IS_SHARED) {
+    def(G, 'postMessage', function postMessage(data) {
+      if (typeof data === 'function' || typeof data === 'symbol') {
+        throw new DOMException('The object could not be cloned.', 'DataCloneError');
+      }
+      var payload;
+      try { payload = JSON.stringify({ v: data }); }
+      catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+      if (payload === undefined) payload = '{}';
+      Deno.core.ops.op_worker_post_to_page(payload);
+    });
+  } else {
+    try { delete G.postMessage; } catch (e) {}
+  }
 
   def(G, 'close', function close() {
     G.__obscura_worker_closed = true;
@@ -819,8 +854,49 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // Entry point for the Rust side. Routed through the same `fire` path as
   // dispatchEvent so `onmessage` and `addEventListener('message')` observe
   // one ordering rather than two independent ones.
+  // Shared workers: one MessageChannel per page-side connection. The page
+  // holds one end, the worker script gets the other through the `connect`
+  // event, and the bridge end forwards in both directions tagged with the
+  // connection id. Reusing MessagePort rather than inventing a port type
+  // keeps `ports[0] instanceof MessagePort`, structured cloning and the
+  // start()/queue semantics exactly as the page bootstrap implements them.
+  var SHARED_BRIDGES = IS_SHARED ? new Map() : null;
+
+  function sharedConnect(connectionId) {
+    if (SHARED_BRIDGES.has(connectionId)) return;
+    var channel = new MessageChannel();
+    var bridge = channel.port2;
+    SHARED_BRIDGES.set(connectionId, bridge);
+    bridge.onmessage = function (event) {
+      var payload;
+      try { payload = JSON.stringify({ v: event.data, c: connectionId }); }
+      catch (e) { return; }
+      if (payload === undefined) return;
+      Deno.core.ops.op_worker_post_to_page(payload);
+    };
+    var event = new MessageEvent('connect', {
+      data: '', origin: '', lastEventId: '', source: null,
+      ports: [channel.port1],
+    });
+    if (typeof G.__obscura_markTrusted === 'function') G.__obscura_markTrusted(event);
+    try { defineProperty(event, 'target', { value: G, configurable: true }); } catch (e) {}
+    try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
+    fire(event, 'connect');
+  }
+
   G.__obscura_worker_dispatch_message = function (payload) {
     if (G.__obscura_worker_closed) return;
+    if (IS_SHARED) {
+      var envelope;
+      try { envelope = JSON.parse(payload); } catch (e) { return; }
+      if (!envelope || typeof envelope.c !== 'number') return;
+      if (envelope.connect) { sharedConnect(envelope.c); return; }
+      var bridge = SHARED_BRIDGES.get(envelope.c);
+      // Delivering through the bridge end runs the page's own port queue and
+      // start() gating on the worker script's end.
+      if (bridge) { try { bridge.postMessage(envelope.v); } catch (e) {} }
+      return;
+    }
     var data;
     try { data = JSON.parse(payload).v; } catch (e) { return; }
     // The user agent dispatches this one, so it is trusted. Worker payloads
@@ -894,6 +970,119 @@ mod tests {
             &serde_json::json!(
                 r#"[{"echo":"hi"},{"echo":{"n":1,"arr":[1,2],"nested":{"s":"x"}}}]"#
             ),
+        )
+        .await;
+    }
+
+    /// A shared worker runs one thread per (name, url) within the page, hands
+    /// each construction its own MessagePort, and brands its scope
+    /// SharedWorkerGlobalScope with no scope-level postMessage. Pinned against
+    /// Chrome 146 in js-repros/shared-worker/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_worker_connects_reuses_one_thread_and_brands_its_scope() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "let seen = 0;"
+              + "self.onconnect = function (e) {"
+              + "  seen++;"
+              + "  const port = e.ports[0];"
+              + "  const connection = seen;"
+              + "  port.onmessage = function (m) {"
+              + "    port.postMessage({ echo: m.data, connection: connection,"
+              + "      tag: Object.prototype.toString.call(self),"
+              + "      post: typeof self.postMessage, name: self.name,"
+              + "      dom: typeof document });"
+              + "  };"
+              + "};";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            // Same name: one worker thread, two connections.
+            const first = new SharedWorker(url, { name: 'alpha' });
+            const second = new SharedWorker(url, { name: 'alpha' });
+            // Different name: a separate thread whose counter restarts.
+            const other = new SharedWorker(url, { name: 'beta' });
+            globalThis.__portIsMessagePort = first.port instanceof MessagePort;
+            globalThis.__distinct = first !== second;
+            globalThis.__hasTerminate = typeof first.terminate;
+            for (const [worker, tag] of [[first, 'a'], [second, 'b'], [other, 'c']]) {
+              worker.port.onmessage = (e) => {
+                globalThis.__got.push(tag + ':' + e.data.connection + ':' + e.data.echo
+                  + ':' + e.data.tag + ':' + e.data.post + ':' + e.data.name
+                  + ':' + e.data.dom);
+              };
+              worker.port.postMessage('ping');
+            }
+            globalThis.__crossOrigin = (() => {
+              try { new SharedWorker('https://other.example/w.js'); return 'constructed'; }
+              catch (error) { return error.name; }
+            })();
+            "#,
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "globalThis.__got.length === 3 ? JSON.stringify(globalThis.__got.slice().sort()) : ''",
+            &serde_json::json!(
+                r#"["a:1:ping:[object SharedWorkerGlobalScope]:undefined:alpha:undefined",\
+"b:2:ping:[object SharedWorkerGlobalScope]:undefined:alpha:undefined",\
+"c:1:ping:[object SharedWorkerGlobalScope]:undefined:beta:undefined"]"#
+                    .replace("\\\n", "")
+            ),
+        )
+        .await;
+        assert_eq!(rt.evaluate("globalThis.__portIsMessagePort").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("globalThis.__distinct").unwrap(), serde_json::json!(true));
+        assert_eq!(
+            rt.evaluate("globalThis.__hasTerminate").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__crossOrigin").unwrap(),
+            serde_json::json!("SecurityError")
+        );
+    }
+
+    /// A port the page never start()s queues its messages instead of
+    /// delivering them; start() then flushes the queue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_worker_port_delivery_waits_for_start() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "self.onconnect = function (e) {"
+              + "  const port = e.ports[0];"
+              + "  port.onmessage = function (m) { port.postMessage('reply:' + m.data); };"
+              + "};";
+            const worker = new SharedWorker(
+              'data:text/javascript,' + encodeURIComponent(src), { name: 'gated' });
+            globalThis.__delivered = [];
+            // addEventListener alone must not enable delivery.
+            worker.port.addEventListener('message', (e) => {
+              globalThis.__delivered.push(e.data);
+            });
+            worker.port.postMessage('one');
+            globalThis.__startPort = () => worker.port.start();
+            "#,
+        )
+        .unwrap();
+        // Give the round trip room to arrive at the unstarted port.
+        for _ in 0..40 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.evaluate("JSON.stringify(globalThis.__delivered)").unwrap(),
+            serde_json::json!("[]"),
+            "an unstarted port must queue, not deliver"
+        );
+        rt.execute_script("<start>", "globalThis.__startPort();").unwrap();
+        pump_until(
+            &mut rt,
+            "JSON.stringify(globalThis.__delivered)",
+            &serde_json::json!(r#"["reply:one"]"#),
         )
         .await;
     }

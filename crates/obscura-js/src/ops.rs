@@ -5350,6 +5350,7 @@ fn op_worker_spawn(
     #[string] name: String,
     #[string] creator_url: String,
     #[string] fingerprint_json: String,
+    shared_worker: bool,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let environment = {
@@ -5404,6 +5405,7 @@ fn op_worker_spawn(
             blocked_urls: gs.blocked_urls.clone(),
             page_in_flight: Arc::clone(&gs.page_in_flight),
             name,
+            shared: shared_worker,
             origin,
             secure_context,
             fingerprint: serde_json::from_str(&fingerprint_json).unwrap_or_default(),

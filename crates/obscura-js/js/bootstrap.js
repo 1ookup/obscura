@@ -1723,10 +1723,18 @@ function _eventTargetRemove(target, type, callback, options) {
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
 }
+// Worker scopes strip the whole Window-only DOM surface, so these interfaces
+// are unresolvable bindings there rather than merely unmatched. Dispatch runs
+// in a worker for every EventTarget that does exist in one -- MessagePort,
+// WebSocket, XMLHttpRequest -- so each check is guarded rather than assumed.
+function _isDomInstance(value, name) {
+  const ctor = globalThis[name];
+  return typeof ctor === 'function' && value instanceof ctor;
+}
 function _eventParent(target, composed) {
-  if (target instanceof ShadowRoot) return composed ? target.host : null;
-  if (target instanceof Document) return target.defaultView || null;
-  return target instanceof Node ? target.parentNode : null;
+  if (_isDomInstance(target, 'ShadowRoot')) return composed ? target.host : null;
+  if (_isDomInstance(target, 'Document')) return target.defaultView || null;
+  return _isDomInstance(target, 'Node') ? target.parentNode : null;
 }
 function _eventPathFor(target, composed) {
   const path = [];
@@ -1738,7 +1746,7 @@ function _eventPathFor(target, composed) {
     seen.add(current);
     path.push({ invocationTarget: current, adjustedTarget, hostAtTarget });
     hostAtTarget = false;
-    if (current instanceof ShadowRoot) {
+    if (_isDomInstance(current, 'ShadowRoot')) {
       adjustedTarget = current.host;
       // A composed event crosses a shadow boundary through the host as if the
       // host were an AT_TARGET tuple. This remains observable when bubbles is
@@ -1750,13 +1758,13 @@ function _eventPathFor(target, composed) {
   return path;
 }
 function _eventRootIsShadow(node) {
-  return node instanceof Node && node.getRootNode() instanceof ShadowRoot;
+  return _isDomInstance(node, 'Node') && _isDomInstance(node.getRootNode(), 'ShadowRoot');
 }
 function _eventRetarget(candidate, against) {
-  while (candidate instanceof Node) {
+  while (_isDomInstance(candidate, 'Node')) {
     const root = candidate.getRootNode();
-    if (!(root instanceof ShadowRoot)) return candidate;
-    if (against instanceof Node && against.getRootNode() === root) return candidate;
+    if (!_isDomInstance(root, 'ShadowRoot')) return candidate;
+    if (_isDomInstance(against, 'Node') && against.getRootNode() === root) return candidate;
     candidate = root.host;
   }
   return candidate;
@@ -1777,7 +1785,7 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
   // Content/IDL handlers run in the bubbling half at the target or on an
   // ancestor. Keep the existing ordering (inline before addEventListener)
   // while the listener registry is moved onto the shared dispatcher.
-  if (!capture && target instanceof Element) {
+  if (!capture && _isDomInstance(target, 'Element')) {
     const handlerName = 'on' + event.type;
     const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
     if (typeof inlineFn === 'function') {
@@ -15848,11 +15856,204 @@ if (typeof FontFace === 'undefined') {
   });
 }
 
-if (typeof SharedWorker === 'undefined') {
-  globalThis.SharedWorker = class SharedWorker {
-    constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
-  };
+// SharedWorker rides the dedicated-worker host: one worker thread per
+// (name, resolved URL) pair, and one MessageChannel per construction whose far
+// end is bridged to that thread with a connection id. The stub this replaces
+// had a `port` whose postMessage was an empty function, so every message was
+// dropped and no reply ever came back -- the worker script never even ran.
+//
+// "Shared" here means shared across constructions within one page. Obscura
+// pages are independent documents that never share a worker host, so no
+// cross-page sharing is observable to begin with; within a page the spec's
+// reuse rule, connection counting and per-port start() gating all hold.
+const _sharedWorkerEntries = new Map();
+
+// Worker -> page: {"kind":"message","data":"{\"v\":...,\"c\":<connection>}"}.
+async function _sharedWorkerReceive(entry) {
+  while (entry.id !== null) {
+    let batchJson;
+    try {
+      const pending = Deno.core.ops.op_worker_recv(entry.id);
+      if (typeof WorkerGlobalScope === 'undefined') Deno.core.unrefOpPromise(pending);
+      batchJson = await pending;
+    } catch (e) { break; }
+    if (!batchJson) break;
+    let items = [];
+    try { items = JSON.parse(batchJson); } catch (e) { continue; }
+    for (const item of items) {
+      if (!item) continue;
+      if (item.kind === 'error') { _sharedWorkerError(entry, item.message || 'Worker error'); continue; }
+      let envelope;
+      try { envelope = JSON.parse(item.data); } catch (e) { continue; }
+      const bridge = entry.connections.get(envelope && envelope.c);
+      // Posting into the bridge end runs the page port's own queue, so a port
+      // the page has not start()ed holds the message instead of delivering it.
+      if (bridge) { try { bridge.postMessage(envelope.v); } catch (e) {} }
+    }
+  }
 }
+
+function _sharedWorkerError(entry, message) {
+  entry.failed = true;
+  for (const worker of entry.workers.slice()) worker._dispatchError(message);
+}
+
+function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
+  if (entry.id !== null || entry.failed) return;
+  let id;
+  const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
+  try {
+    id = Deno.core.ops.op_worker_spawn(
+      String(source), String(finalUrl), String(workerType), String(entry.name),
+      creatorUrl, JSON.stringify(_fingerprint()), true,
+    );
+  } catch (e) { _sharedWorkerError(entry, e && e.message ? e.message : String(e)); return; }
+  entry.id = id;
+  const queued = entry.pending;
+  entry.pending = [];
+  for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
+  _sharedWorkerReceive(entry);
+}
+
+function _sharedWorkerSend(entry, payload) {
+  if (entry.failed) return;
+  if (entry.id === null) { entry.pending.push(payload); return; }
+  Deno.core.ops.op_worker_post_message(entry.id, payload);
+}
+
+globalThis.SharedWorker = class SharedWorker {
+  constructor(url, options) {
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+    }
+    this.onerror = null;
+    this._listeners = {};
+    const href = String(url);
+    // The second argument is a name shorthand or a SharedWorkerOptions.
+    const name = options == null ? ''
+      : (typeof options === 'object'
+          ? (options.name !== undefined ? String(options.name) : '')
+          : String(options));
+    const workerType = options && typeof options === 'object' && options.type !== undefined
+      ? String(options.type) : 'classic';
+    if (workerType !== 'classic' && workerType !== 'module') {
+      throw new TypeError(
+        "Failed to construct 'SharedWorker': '" + workerType + "' is not a valid WorkerType.");
+    }
+    let resolved;
+    try { resolved = new URL(href, globalThis.location?.href || 'about:blank').href; }
+    catch (e) {
+      throw new DOMException(
+        "Failed to construct 'SharedWorker': '" + href + "' is not a valid URL.", 'SyntaxError');
+    }
+    if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(resolved).origin
+          === new URL(globalThis.location?.href || 'about:blank').origin;
+      } catch (e) {}
+      if (!sameOrigin) {
+        throw new DOMException(
+          "Failed to construct 'SharedWorker': Script at '" + resolved
+            + "' cannot be accessed from origin '"
+            + (globalThis.location?.origin ?? 'null') + "'.",
+          'SecurityError');
+      }
+    }
+
+    const key = name + '\n' + resolved;
+    let entry = _sharedWorkerEntries.get(key);
+    const fresh = entry === undefined;
+    if (fresh) {
+      entry = {
+        id: null, name, failed: false, pending: [], nextConnection: 1,
+        connections: new Map(), workers: [],
+      };
+      _sharedWorkerEntries.set(key, entry);
+    }
+    entry.workers.push(this);
+    this._entry = entry;
+
+    // Each construction is its own connection, even to a reused worker.
+    const connectionId = entry.nextConnection++;
+    this._connectionId = connectionId;
+    const channel = new MessageChannel();
+    this.port = channel.port1;
+    const bridge = channel.port2;
+    entry.connections.set(connectionId, bridge);
+    bridge.onmessage = event => {
+      let payload;
+      try { payload = JSON.stringify({ v: event.data, c: connectionId }); }
+      catch (e) { return; }
+      if (payload === undefined) return;
+      _sharedWorkerSend(entry, payload);
+    };
+    _sharedWorkerSend(entry, JSON.stringify({ connect: true, c: connectionId }));
+
+    if (!fresh) return;
+    const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
+    if (typeof blobSource === 'string') {
+      _sharedWorkerSpawned(entry, blobSource, resolved, workerType);
+      return;
+    }
+    if (resolved.startsWith('data:')) {
+      _sharedWorkerSpawned(entry, _workerScriptFromDataUrl(resolved), resolved, workerType);
+      return;
+    }
+    if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
+      (async () => {
+        try {
+          const resp = await fetch(resolved, {
+            mode: workerType === 'module' ? 'cors' : 'same-origin',
+            credentials: 'same-origin',
+          });
+          if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 0));
+          _sharedWorkerSpawned(entry, await resp.text(), resp.url || resolved, workerType);
+        } catch (e) { _sharedWorkerError(entry, e && e.message ? e.message : String(e)); }
+      })();
+      return;
+    }
+    throw new DOMException(
+      "Failed to construct 'SharedWorker': unsupported script URL scheme.", 'SecurityError');
+  }
+  _dispatchError(message) {
+    const worker = this;
+    setTimeout(() => {
+      const evt = { type: 'error', message: String(message), target: worker };
+      const handlers = (worker._listeners['error'] || []).slice();
+      if (typeof worker.onerror === 'function') {
+        try { worker.onerror(evt); } catch (e) {}
+      } else if (!handlers.length) {
+        console.error('SharedWorker error:', String(message));
+      }
+      for (const handler of handlers) {
+        try { handler.call(worker, evt); } catch (e) {}
+      }
+    }, 0);
+  }
+  addEventListener(type, fn) {
+    if (typeof fn !== 'function') return;
+    const ls = this._listeners[type] || (this._listeners[type] = []);
+    if (ls.indexOf(fn) < 0) ls.push(fn);
+  }
+  removeEventListener(type, fn) {
+    const ls = this._listeners[type];
+    if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); }
+  }
+  dispatchEvent(evt) {
+    for (const handler of (this._listeners[(evt && evt.type) || ''] || []).slice()) {
+      try { handler.call(this, evt); } catch (e) {}
+    }
+    return true;
+  }
+  get [Symbol.toStringTag]() { return 'SharedWorker'; }
+};
+_markNative(globalThis.SharedWorker);
+// `instanceof EventTarget` without inheriting Node's listener plumbing.
+try {
+  Object.setPrototypeOf(globalThis.SharedWorker.prototype, EventTarget.prototype);
+} catch (e) {}
 if (typeof URLPattern === 'undefined') {
   globalThis.URLPattern = class URLPattern {
     constructor(pattern){this._pattern=pattern||{};} test(){return false;} exec(){return null;}
