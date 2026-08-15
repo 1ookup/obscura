@@ -5084,6 +5084,224 @@ never followed",
         );
     }
 
+    /// fetch()'s three redirect modes, against the js-repros/fetch-redirect-modes
+    /// capture of Chrome 146.
+    ///
+    /// `Request` recorded `init.redirect` from the day it was written and the
+    /// value went nowhere, so `error` and `manual` both silently behaved as
+    /// `follow`. The visible half of that is the response the page gets; the
+    /// invisible half is the request the *server* gets, which is why the hop
+    /// counts are asserted too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_redirect_modes_match_chrome() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            fn redirect(location: &str, body: &str) -> String {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: \
+text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+            }
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                seen_thread.lock().unwrap().push(path.clone());
+                let response = match path.as_str() {
+                    "/target.txt" => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Final: \
+yes\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfinal body"
+                        .to_string(),
+                    "/redirect-once" => redirect("/target.txt", ""),
+                    "/redirect-twice" => redirect("/redirect-once", ""),
+                    "/redirect-with-body" => redirect("/target.txt", "redirect body"),
+                    // A 3xx with no Location is not a redirect. `error` lets it
+                    // through; `manual` does not look, and still calls it one.
+                    "/redirect-no-location" => "HTTP/1.1 302 Found\r\nContent-Type: \
+text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nno location here"
+                        .to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: \
+9\r\nConnection: close\r\n\r\nnot found"
+                        .to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const scrub = value => String(value).split(location.origin).join("");
+                    const settle = async (path, init) => {
+                        try {
+                            const response = await fetch(path, init);
+                            return [
+                                response.status,
+                                response.type,
+                                scrub(response.url),
+                                response.redirected,
+                                await response.text(),
+                                [...response.headers.keys()].length,
+                            ].join("|");
+                        } catch (error) { return error.name + ": " + error.message; }
+                    };
+                    return {
+                        follow: await settle("/redirect-once"),
+                        followTwoHops: await settle("/redirect-twice", {redirect: "follow"}),
+                        errorOnRedirect: await settle("/redirect-once", {redirect: "error"}),
+                        errorOnTwoHops: await settle("/redirect-twice", {redirect: "error"}),
+                        errorOnPlain: await settle("/target.txt", {redirect: "error"}),
+                        errorOnNoLocation: await settle(
+                            "/redirect-no-location", {redirect: "error"}),
+                        manualOnRedirect: await settle("/redirect-once", {redirect: "manual"}),
+                        manualWithBody: await settle(
+                            "/redirect-with-body", {redirect: "manual"}),
+                        manualOnPlain: await settle("/target.txt", {redirect: "manual"}),
+                        manualOnNoLocation: await settle(
+                            "/redirect-no-location", {redirect: "manual"}),
+                        viaRequestObject: await settle(
+                            new Request(location.origin + "/redirect-once",
+                                {redirect: "error"})),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "follow": "200|basic|/target.txt|true|final body|4",
+                "followTwoHops": "200|basic|/target.txt|true|final body|4",
+                // A network error, carrying no more detail than any other one:
+                // the page must not learn where the hop pointed.
+                "errorOnRedirect": "TypeError: Failed to fetch",
+                "errorOnTwoHops": "TypeError: Failed to fetch",
+                "errorOnPlain": "200|basic|/target.txt|false|final body|4",
+                // No Location, so no redirect was meant, so `error` has
+                // nothing to fail on and the 3xx comes through as a response.
+                "errorOnNoLocation": "302|basic|/redirect-no-location|false|no location here|3",
+                // An opaque redirect: status, headers and body all withheld,
+                // the *requested* url reported, and `redirected` false because
+                // no hop was taken.
+                "manualOnRedirect": "0|opaqueredirect|/redirect-once|false||0",
+                "manualWithBody": "0|opaqueredirect|/redirect-with-body|false||0",
+                "manualOnPlain": "200|basic|/target.txt|false|final body|4",
+                // The asymmetry Chrome was asked about directly: `manual` is
+                // decided by the status code alone, so the same response
+                // `error` lets through becomes an opaque redirect here.
+                "manualOnNoLocation": "0|opaqueredirect|/redirect-no-location|false||0",
+                // fetch(request) honours what the Request was built with.
+                "viaRequestObject": "TypeError: Failed to fetch",
+            })
+        );
+
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "/redirect-no-location",
+                "/redirect-no-location",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-twice",
+                "/redirect-twice",
+                "/redirect-with-body",
+                "/target.txt",
+                "/target.txt",
+                "/target.txt",
+                "/target.txt",
+            ],
+            "the half of this no page-side check can see: /target.txt is \
+fetched only by the two `follow` cases and the two that ask for it directly, \
+and /redirect-twice never reaches /redirect-once except under `follow`",
+        );
+    }
+
+    /// An invalid RequestRedirect is a WebIDL failure, rejected before the
+    /// algorithm runs rather than treated as `follow`.
+    ///
+    /// The `Request` constructor throws where the value is read; `fetch()`
+    /// rejects, because Fetch has it construct a Request inside a promise.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_invalid_redirect_mode_is_refused_rather_than_ignored() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const settle = thunk => {
+                        try { thunk(); return "NO THROW"; }
+                        catch (error) {
+                            return (error instanceof TypeError) + ": " + error.message;
+                        }
+                    };
+                    const settleAsync = async thunk => {
+                        try { await thunk(); return "NO REJECT"; }
+                        catch (error) {
+                            return (error instanceof TypeError) + ": " + error.message;
+                        }
+                    };
+                    return {
+                        request: settle(
+                            () => new Request("https://example.com/", {redirect: "sideways"})),
+                        fetch: await settleAsync(
+                            () => fetch("https://example.com/", {redirect: "sideways"})),
+                        readback: [
+                            new Request("https://example.com/").redirect,
+                            new Request("https://example.com/", {redirect: "error"}).redirect,
+                            new Request("https://example.com/", {redirect: "manual"}).redirect,
+                        ].join(","),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "request": "true: Failed to construct 'Request': 'sideways' is not a valid \
+RequestRedirect value",
+                "fetch": "true: Failed to execute 'fetch': 'sideways' is not a valid \
+RequestRedirect value",
+                "readback": "follow,error,manual",
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn document_privacy_api_values_come_from_the_origin_policy() {
         let policy = crate::PrivacyPolicy::new();

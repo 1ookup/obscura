@@ -7762,6 +7762,10 @@ function _formDataToMultipart(fd) {
   return { boundary: bnd, body: out };
 }
 
+// Fetch's RequestRedirect enum. Anything else is a WebIDL failure, thrown
+// synchronously rather than rejected -- the value never reaches the algorithm.
+const _FETCH_REDIRECT_MODES = new Set(['follow', 'error', 'manual']);
+
 // Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
 function _serializeBody(initBody, headers) {
@@ -7820,6 +7824,12 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  const fetchRedirect = init.redirect !== undefined
+    ? String(init.redirect)
+    : (input instanceof Request ? input.redirect : "follow");
+  if (!_FETCH_REDIRECT_MODES.has(fetchRedirect)) {
+    throw new TypeError("Failed to execute 'fetch': '" + fetchRedirect + "' is not a valid RequestRedirect value");
+  }
   const pageOrigin = _environmentSettings().origin;
   const performanceStart = performance.now();
   const raw = await Deno.core.ops.op_fetch_url(
@@ -7827,6 +7837,7 @@ globalThis.fetch = async (input, init = {}) => {
     JSON.stringify({
       url: _environmentSettings().url || globalThis.location?.href || "",
       policy: _environmentReferrerPolicy(),
+      redirect: fetchRedirect,
     })
   );
   const parsed = JSON.parse(raw);
@@ -7838,6 +7849,24 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
+  }
+  // A redirect the op refused to take. "error" is a network error, and carries
+  // no more detail than any other one; "manual" is an opaque-redirect
+  // response: status, headers and body all withheld, so the page cannot learn
+  // where the hop pointed. Chrome reports the *requested* url on it, not an
+  // empty one, and leaves `redirected` false -- no hop was taken.
+  if (parsed.redirectMode === 'error') {
+    throw new TypeError('Failed to fetch');
+  }
+  if (parsed.redirectMode === 'manual') {
+    return new Response('', {
+      status: 0,
+      statusText: '',
+      headers: {},
+      type: 'opaqueredirect',
+      url: parsed.url || url,
+      redirected: false,
+    });
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
@@ -8277,7 +8306,10 @@ if (typeof Request === 'undefined') {
       if (this.credentials !== 'omit' && this.credentials !== 'same-origin' && this.credentials !== 'include') {
         throw new TypeError("Failed to construct 'Request': '" + this.credentials + "' is not a valid RequestCredentials value");
       }
-      this.redirect = init.redirect || 'follow';
+      this.redirect = init.redirect !== undefined ? String(init.redirect) : 'follow';
+      if (!_FETCH_REDIRECT_MODES.has(this.redirect)) {
+        throw new TypeError("Failed to construct 'Request': '" + this.redirect + "' is not a valid RequestRedirect value");
+      }
       this.referrer = init.referrer || '';
       this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
       this.cache = init.cache || 'default';
@@ -8325,7 +8357,12 @@ function _decodeBodyWithCharset(bytes, headers) {
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
+      this._bodyBytes = _bodyToUint8Array(body);
+      // `|| 200` would turn the one status that carries meaning into the one
+      // that does not: an opaque or opaque-redirect response is status 0, and
+      // reporting 200 for it claims a success that never happened.
+      this.status = init.status === undefined || init.status === null ? 200 : Number(init.status);
+      this.statusText = init.statusText || '';
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;

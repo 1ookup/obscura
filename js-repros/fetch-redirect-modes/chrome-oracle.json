@@ -1,0 +1,326 @@
+{
+  "defaultNoInit": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": true,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "explicitFollow": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": true,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "followTwoHops": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": true,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "followToMissing": {
+    "settled": "fulfilled",
+    "status": 404,
+    "statusText": "Not Found",
+    "ok": false,
+    "type": "basic",
+    "redirected": true,
+    "url": "<origin>/definitely-missing",
+    "bodyText": "not found",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding"
+    ],
+    "location": null
+  },
+  "errorOnRedirect": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "isTypeError": true,
+    "message": "Failed to fetch"
+  },
+  "errorOnTwoHops": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "isTypeError": true,
+    "message": "Failed to fetch"
+  },
+  "errorOnPlain": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": false,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "errorOnNoLocation": {
+    "settled": "fulfilled",
+    "status": 302,
+    "statusText": "Found",
+    "ok": false,
+    "type": "basic",
+    "redirected": false,
+    "url": "<origin>/redirect-no-location",
+    "bodyText": "no location here",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding"
+    ],
+    "location": null
+  },
+  "manualOnRedirect": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-once",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOnTwoHops": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-twice",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualWithBody": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-with-body",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOnPlain": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": false,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "manualOnNoLocation": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-no-location",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOn301": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-301",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOn303": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-303",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOn307": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-307",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "manualOn308": {
+    "settled": "fulfilled",
+    "status": 0,
+    "statusText": "",
+    "ok": false,
+    "type": "opaqueredirect",
+    "redirected": false,
+    "url": "<origin>/redirect-308",
+    "bodyText": "",
+    "bodyError": null,
+    "headerNames": [],
+    "location": null
+  },
+  "errorOn308": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "isTypeError": true,
+    "message": "Failed to fetch"
+  },
+  "viaRequestObject": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "isTypeError": true,
+    "message": "Failed to fetch"
+  },
+  "requestRedirectReadback": {
+    "default": "follow",
+    "error": "error",
+    "manual": "manual",
+    "follow": "follow"
+  },
+  "initOverridesRequest": {
+    "settled": "fulfilled",
+    "status": 200,
+    "statusText": "OK",
+    "ok": true,
+    "type": "basic",
+    "redirected": true,
+    "url": "<origin>/target.txt",
+    "bodyText": "final body",
+    "bodyError": null,
+    "headerNames": [
+      "connection",
+      "content-type",
+      "date",
+      "keep-alive",
+      "transfer-encoding",
+      "x-final"
+    ],
+    "location": null
+  },
+  "invalidRedirectValue": {
+    "threw": true,
+    "name": "TypeError",
+    "isTypeError": true
+  },
+  "__serverSaw": [
+    "/redirect-once",
+    "/target.txt",
+    "/redirect-once",
+    "/target.txt",
+    "/redirect-twice",
+    "/redirect-once",
+    "/target.txt",
+    "/redirect-to-404",
+    "/definitely-missing",
+    "/redirect-once",
+    "/redirect-twice",
+    "/target.txt",
+    "/redirect-no-location",
+    "/redirect-once",
+    "/redirect-twice",
+    "/redirect-with-body",
+    "/target.txt",
+    "/redirect-no-location",
+    "/redirect-301",
+    "/redirect-303",
+    "/redirect-307",
+    "/redirect-308",
+    "/redirect-once",
+    "/redirect-once",
+    "/target.txt"
+  ]
+}

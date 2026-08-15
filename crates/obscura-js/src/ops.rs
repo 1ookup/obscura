@@ -2837,14 +2837,19 @@ async fn op_fetch_url(
         .and_then(|value| value.as_str())
         .and_then(ReferrerPolicy::parse)
         .unwrap_or_default();
-    // Only "error" is distinguished from the default "follow": it is what a
-    // Service Worker script fetch uses, and taking the hop would put a request
-    // in the server's log that Chrome never sends.
-    let follow_redirects = referrer_context
+    // Fetch's RequestRedirect. "error" and "manual" both stop at the first 3xx
+    // -- taking the hop would put a request in the server's log that Chrome
+    // never sends -- but they disagree about a 3xx that carries no Location:
+    // "manual" decides on the status code alone and hands back an opaque
+    // redirect, while "error" only fails once a Location proves a hop was
+    // actually meant, and otherwise lets the 3xx through as an ordinary
+    // response. Chrome 146 was asked; see js-repros/fetch-redirect-modes.
+    let redirect_mode = referrer_context
         .as_ref()
         .and_then(|value| value.get("redirect"))
         .and_then(|value| value.as_str())
-        != Some("error");
+        .unwrap_or("follow")
+        .to_string();
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -3057,17 +3062,16 @@ async fn op_fetch_url(
             break (resp, current_response_start);
         }
 
-        // Fetch redirect mode "error": the redirect itself is the outcome, and
-        // the hop is never taken. A Service Worker script is fetched this way,
-        // so following it here would put a request in the server's log that
-        // Chrome never sends -- visible without any client-side check.
-        if !follow_redirects {
+        // "manual" is decided by the status code alone: no Location is read,
+        // so a 3xx without one still becomes an opaque redirect.
+        if redirect_mode == "manual" {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
                 "url": current_url,
                 "headers": {},
                 "redirected": true,
+                "redirectMode": "manual",
             })
             .to_string());
         }
@@ -3078,9 +3082,26 @@ async fn op_fetch_url(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let Some(location) = location_header else {
-            // 3xx without a Location header is not actually a redirect.
+            // 3xx without a Location header is not actually a redirect, so
+            // even "error" lets it through.
             break (resp, current_response_start);
         };
+
+        // "error": the redirect itself is the outcome, and the hop is never
+        // taken. A Service Worker script is fetched this way, so following it
+        // here would put a request in the server's log that Chrome never
+        // sends -- visible without any client-side check.
+        if redirect_mode == "error" {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+                "redirectMode": "error",
+            })
+            .to_string());
+        }
 
         let base = match url::Url::parse(&current_url) {
             Ok(b) => b,
