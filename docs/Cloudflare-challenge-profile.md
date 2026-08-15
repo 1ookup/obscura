@@ -2256,7 +2256,7 @@ timing，obscura 的 `/ci/` 无 entry、`/fo/` 形状异常仍是未消除的差
 resource timing 读到空 → 判定环境异常 → 不走 managed 证明流程（不发 `/pat/`）。
 
 **方法**：
-1. 修复。`op_load_image_metadata` 在 fetch 返回后把 `wreq Response.timing`
+1. 修复（提交 `709cb1b`）。`op_load_image_metadata` 在 fetch 返回后把 `wreq Response.timing`
    （`response_start`/`response_end`/`redirect_end`）连同最终 URL、状态、字节数与
    Timing-Allow-Origin 判定，一并塞进返回给 JS 的 metadata 的 `timing` 字段；
    bootstrap 的 `_runImageRequest` 在 op 调用前取 `performance.now()` 作 `fetchStart`，
