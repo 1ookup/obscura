@@ -1932,6 +1932,7 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
+| **`obscura fetch --eval` 不 await Promise**；CDP `Runtime.evaluate` 对**多行** async IIFE 也静默返回 `{}` | 异步探针（WebRTC / getCapabilities / fetch 链）一律读到空结果，看起来像「这个 API 什么都没返回」 | 走 CDP 且带 `awaitPromise: true`，并把表达式**压成单行**；先用 `Promise.resolve(42)` 自检一次求值路径是否真的 await |
 | **探针的预注入钩子本身会被写进指纹**（`cdp_click_fast.py` 的 PRELOAD 包 `attachShadow` 并定义 `__roots`/`__pm`/`__t0`） | step 66 第一轮里 CF 载荷的 `YIjU8` 记下了钩子函数源码、`fyCZH9` 多出 `o.__pm`/`o.__roots`/`o.__t0`——**测的是探针不是引擎**，整轮作废 | 凡是要拿载荷/指纹做对拍的轮次，用零注入探针（`/tmp/clean_click.py`）；只有需要穿透 closed shadow 定位 widget 时才用带钩子的版本，且不得用该轮数据下指纹结论 |
 | MITM 代理换机器后 **CA 也换了**（本机 `Sep 30, 2025` vs 远端 `Apr 4, 2026`） | 用旧 `SSL_CERT_FILE` 会在握手阶段就失败，症状像「代理不通」 | `curl -s http://<proxy-host>:<port>/ca` 直接取 PEM，再对 `openssl s_client -proxy` 看到的 issuer 核对 CN |
 | 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
@@ -3725,3 +3726,53 @@ Chrome 那一栏 28 全是页面自己加的全局。把 `about:blank` 子帧接
 另记：`Object.getOwnPropertyNames(anyElement)` 仍会列出约 30 个 `_` 开头的
 内部字段（`_nid`/`_lname`/`_treeParent`/…），Chrome 是空数组。本轮 CF 没有走到
 这一面，但属同一类问题。
+
+### Step 69 — `YIwy3` / `DrTW4`：SDP offer 与 ICE 候选（2026-08-17）
+
+**现状**：`RTCPeerConnection` 是个纯壳，`createOffer()` 返回 `{type:'offer', sdp:''}`,
+`addEventListener` 是空函数。载荷里 `YIwy3`（SDP）是 `""`、`DrTW4`（ICE 候选）是 `[]`,
+浏览器分别是 7277 B 和 1465 B。**空字符串是没有任何浏览器会产生的 SDP。**
+
+**方法**：把浏览器载荷里的 `YIwy3` 原样导出成 `/tmp/chrome_offer.sdp`（6821 字符、
+227 行），按 m-line 切成 audio / video / application 三段，把每段里
+**逐连接变化的部分**（session id、`ice-ufrag`、`ice-pwd`、`fingerprint`、`mid`、
+方向）抽成参数，其余（codec 表、`extmap` 列表、`rtcp-fb`、`fmtp`）作为常量原样搬进
+bootstrap.js。常量块由脚本从 SDP 生成，不手抄。
+
+**实现**：
+
+- 每个 `RTCPeerConnection` 在 WeakMap 里持有一份 slots：19 位 session id、
+  4 字符 ufrag、24 字符 pwd、32 字节 SHA-256 指纹，全部 `crypto.getRandomValues`
+  生成——Chrome 也是每个连接换一套。
+- `addTransceiver()` 与 `createOffer({offerToReceiveAudio/Video})` 决定 m-line 组成，
+  `createDataChannel()` 追加 `m=application`；`a=group:BUNDLE` 按实际段数生成。
+- `setLocalDescription()` 之后按 Chrome 的 trickle 节奏逐条抛 `icecandidate`,
+  每个网卡每个 m-line 一条，最后一条 `candidate: null` 并把
+  `iceGatheringState` 置为 `complete`。
+- 本机地址走 mDNS：每个「网卡」一个 UUID `.local` 名字，页面生命周期内稳定，
+  优先级用 Chrome 实测的 `2113937151` / `2113942271` 两个值。
+- 数字格式对齐：session id 与 candidate foundation 都是**定宽且首位非 0**
+  （第一版 `padStart(n,'0')` 产生了 `0125492767443864577` 这种前导零，Chrome 不会）。
+
+**刻意不做的一项**：Chrome 那 9 条候选里有 3 条是 `srflx`（公网地址
+`125.121.102.230`，优先级 1677729535），来自配置的 STUN 服务器。伪造一个公网 IP
+意味着它必然和请求真实的出口地址对不上——**那比没有这条候选更容易被查**。
+所以只发 6 条 mDNS host 候选。这是 `DrTW4` 985 vs 1465 的全部差额。
+
+**结果**：
+
+| 字段 | Chrome | 修复前 | 修复后 |
+|------|--------|--------|--------|
+| `YIwy3` | 7277 | 2 | **7277**（长度完全一致） |
+| `DrTW4` | 1465 | 2 | **985** |
+| 载荷总量 | 68342 | 38549 | **48950** |
+
+**回归测试**：`a_peer_connection_offers_a_browser_shaped_sdp_and_trickles_candidates`
+（obscura-js）——断言 m-line 顺序、BUNDLE、三段共用同一套凭据与指纹、
+session id 无前导零、7 条候选（6 + 终止 null）、全部是 mDNS host、
+`iceGatheringState` 收敛到 `complete`。
+
+**测量盲区（新增）**：`obscura fetch --eval` **不会 await Promise**——返回
+`Promise.resolve(42)` 得到的是 `{}`。异步探针必须走 CDP `Runtime.evaluate` 并带
+`awaitPromise: true`，而且表达式**必须压成单行**（多行 async IIFE 同样静默返回 `{}`,
+与已记录的多行 `JSON.stringify` 盲区同源）。

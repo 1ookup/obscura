@@ -18400,6 +18400,66 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_connection_offers_a_browser_shaped_sdp_and_trickles_candidates() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    const candidates = [];
+                    pc.onicecandidate = event => candidates.push(
+                        event.candidate ? event.candidate.candidate : null);
+                    await pc.setLocalDescription(offer);
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const lines = offer.sdp.split('\r\n');
+                    const line = prefix => lines.find(value => value.startsWith(prefix)) || '';
+                    return {
+                        kinds: lines.filter(value => value.startsWith('m='))
+                            .map(value => value.slice(2).split(' ')[0]),
+                        bundle: line('a=group:BUNDLE'),
+                        // Every m-section carries the same credentials and
+                        // fingerprint; three of each for three sections.
+                        ufrags: lines.filter(value => value.startsWith('a=ice-ufrag:')).length,
+                        fingerprints: new Set(
+                            lines.filter(value => value.startsWith('a=fingerprint:'))).size,
+                        sessionLeadingZero: line('o=- ').split(' ')[1].startsWith('0'),
+                        // One per interface per section, then a null to close
+                        // gathering.
+                        candidateCount: candidates.length,
+                        trailingNull: candidates[candidates.length - 1] === null,
+                        allMdnsHost: candidates.slice(0, -1).every(value =>
+                            / typ host /.test(value) && /\.local /.test(value)),
+                        gathering: pc.iceGatheringState,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "kinds": ["audio", "video", "application"],
+                "bundle": "a=group:BUNDLE 0 1 2",
+                "ufrags": 3,
+                "fingerprints": 1,
+                "sessionLeadingZero": false,
+                "candidateCount": 7,
+                "trailingNull": true,
+                "allMdnsHost": true,
+                "gathering": "complete",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_dynamic_script_files_a_resource_timing_entry() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
