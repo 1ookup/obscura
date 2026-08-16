@@ -4492,6 +4492,70 @@ mod tests {
         assert_eq!(result, serde_json::json!([]));
     }
 
+    /// `console.log` must not walk the objects handed to it.
+    ///
+    /// With devtools closed Chrome keeps a reference and formats lazily, so an
+    /// author-defined getter is never invoked by a bare `console.log`. That
+    /// asymmetry is what devtools-detection code tests for, and Cloudflare's
+    /// challenge runs it on every log line as
+    /// `console.log("%c%d", "font-size:0;color:transparent", probe)` where
+    /// `probe` carries accessors that record being read. The old formatter
+    /// called `JSON.stringify` on every object argument, which walks each
+    /// enumerable property, so the answer was "devtools is open" every time.
+    /// Verified against Chrome 146: both lists come back empty there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_log_does_not_invoke_getters_on_its_arguments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const hits = [];
+                    const probe = {};
+                    for (const key of ["id", "name", "length", "className", "_nid"]) {
+                        Object.defineProperty(probe, key, {
+                            get() { hits.push(key); return "x"; },
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                    console.log("%c%d", "font-size:0;color:transparent", probe);
+                    const element = document.createElement("div");
+                    const elementHits = [];
+                    Object.defineProperty(element, "__trap", {
+                        get() { elementHits.push("trap"); return 1; },
+                        enumerable: true, configurable: true,
+                    });
+                    console.log(element);
+                    // An Error argument must still report its stack: that path
+                    // reads no author property and diagnostics depend on it.
+                    let reportedError = false;
+                    const seen = [];
+                    const op = Deno.core.ops.op_console_msg;
+                    Deno.core.ops.op_console_msg = (level, msg) => { seen.push(msg); };
+                    try {
+                        console.error(new TypeError("boom-probe"));
+                        reportedError = seen.some(m => m.includes("boom-probe"));
+                    } finally {
+                        Deno.core.ops.op_console_msg = op;
+                    }
+                    return { hits, elementHits, reportedError };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "hits": [],
+                "elementHits": [],
+                "reportedError": true,
+            }),
+        );
+    }
+
     /// `measureText` must return a branded `TextMetrics` whose numbers live on
     /// the prototype, the way Chrome does. It used to hand back a plain object
     /// with three own properties, so `Object.prototype.toString.call(...)` read

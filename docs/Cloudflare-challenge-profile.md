@@ -2889,3 +2889,62 @@ widget 几何正常(`box={x:192,y:304,w:300,h:65}`),点击命中 `(213,335)`。
 `complete`。即 step 37 起就挂着的 `fail code=600010` 那一项,现在是**唯一**实质阻塞。
 失败码在加密响应体内,`RUST_LOG` 看不到,需要解开 `cfChlOut`/`cfChlOutS` 或在 api.js
 字符串表里定位 `600010` 分支。
+
+### Step 57 — 读 api.js 的通信层:`fail` 是本地合成的;并修掉 console.log 触发 getter（2026-08-16）
+
+**api.js 通信层结构**(82465B,事件名全是明文):
+
+- `window.addEventListener("message", Ve)`,`g.msgHandler=Ve`、`g.internalMsgHandler=ye`。
+- 允许的 event 白名单在一个 switch 里:`complete`/`fail`/`feedbackInit`/`food`/`init`/
+  `interactiveBegin`/`interactiveEnd`/`interactiveTimeout`/`languageUnsupported`/
+  `overrunBegin`/`overrunEnd`/`reject`/`reloadApiJsRequest`/`reloadRequest`/
+  `requestExtraParams`/`tokenExpired`/`translationInit`/`turnstileResults`/`widgetStale`。
+  每类还校验 `e.source` 必须等于对应的 targetWindow。
+- `complete` 分支:`o.response=i.token`,有 `sToken` 走一条回调,否则 `c(o,s,!1)`。
+  **token 由 widget 发来**,主页面只负责收。
+- `fail` 分支:读 `rcV`、`cfChlOut`、`cfChlOutS`,并 `i.code!==0 && (o.errorCode=i.code)`。
+
+**关键发现:`fail` 可以是主页面自己合成的,不一定来自服务器**。api.js 的 watchcat
+(`meow`/`food` 心跳)在判定 widget 失联时会走:
+
+```js
+var ae=function(V,o){console.log("Turnstile Widget seem to have ".concat(V,": "),o)};
+ae(E?"hung":"crashed",p);
+var te=E?Ut:Ht;                      // Ut=300030(hung) / Ht=300031(crashed)
+internalMsgHandler({code:te,event:"fail",rcV:...,widgetId:p});
+```
+
+这解释了为什么 postMessage 里从来抓不到 `fail`——它走 `internalMsgHandler`,不经过
+window 消息。**本轮实测 watchcat 未触发**:`Turnstile Widget seem to have` 这条
+console.log 一次都没出现,且 300030/300031 都不是 600010。**600010 不在 api.js 里**
+(全文零命中),它在 chl_page 的 `!` 分隔字符串表中(与 `apply`/`async`/`charAt`/
+`cookieEnabled`/`keys` 等混在一起),**表里有 ≠ 该分支被执行**(见测量盲区)。
+
+**修复:`console.log` 会遍历参数对象,触发作者 getter**。CF 每行日志都在探测:
+
+```
+[obscura::console] %c%d font-size:0;color:transparent wNEIG0
+[obscura::console] {"_nid":437,"_style":{"accentColor":"",...}}   ← 元素被序列化
+```
+
+`console.log("%c%d","font-size:0;color:transparent",probe)` 是标准的 devtools 探测:
+探针对象带访问器,**只有 devtools 展开它时才会被读**。obscura 的 `_consoleFn` 对每个
+object 参数做 `JSON.stringify`(并在结果为 `{}` 时再读一次 `.message`),把每个可枚举属性
+都走了一遍,等于每行日志都回答一次「devtools 开着」。
+
+与 Chrome 146 对拍(同一段探针):
+
+| | Chrome | obscura 修复前 | 修复后 |
+|---|---|---|---|
+| 普通对象上被触发的 getter | `[]` | `["id","name","_nid","length","className"]` | `[]` |
+| DOM 元素上的 trap | `[]` | `["el"]` | `[]` |
+
+改为 `Object.prototype.toString.call(a)`(只查 `Symbol.toStringTag`,探测代码用的是字符串
+键)。`Error` 参数仍走原有分支输出 stack,诊断能力不受影响,回归测试一并断言。
+
+**结果:确定缺陷已修,但未突破过盾**。修复后点击链路提交从 **5052B 变回 4976B**
+(少 76 字节),`/pat/` 401、3256B 回传、换 ray 重来全部照旧,终页仍是 `Just a moment...`。
+**4976B 不是成功标志**——step 40 记录的 obscura 提交就是 4976B 且同样失败;5052→4976
+只说明提交内容变了,很可能正是那个 devtools 标志位。
+
+回归测试 `console_log_does_not_invoke_getters_on_its_arguments`;obscura-js 482 通过。

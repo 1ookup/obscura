@@ -798,10 +798,20 @@ const _consoleFn = (level, args) => {
       return _s;
     }
     if (typeof a === "object") {
-      try {
-        const s = JSON.stringify(a);
-        return s === "{}" && a.message ? a.message : s;
-      } catch { return String(a); }
+      // Do not walk the object. Chrome keeps a reference and formats lazily
+      // when devtools is closed, so author-defined getters are never invoked
+      // by a bare console.log -- and that asymmetry is exactly what
+      // devtools-detection code tests for. Cloudflare's challenge runs it on
+      // every log line as
+      //   console.log("%c%d", "font-size:0;color:transparent", probeObject)
+      // where `probeObject` carries accessors that record being read.
+      // JSON.stringify walks every enumerable property and calls toJSON, so
+      // it answered "devtools is open" unconditionally; reading `.message` to
+      // salvage `{}` did the same for one more property.
+      // Object.prototype.toString only consults Symbol.toStringTag, which the
+      // detection above does not use, and matches how Chrome labels a value
+      // it has not expanded.
+      return Object.prototype.toString.call(a);
     }
     return String(a);
   }).join(" ")); } catch {}
