@@ -100,6 +100,44 @@ impl ContentSecurityPolicy {
             .iter()
             .any(|source| source_matches_url(source, url, &target, self_origin))
     }
+
+    /// Evaluate whether a script URL is allowed by the document policy.
+    /// `script-src-elem` takes precedence over `script-src`, followed by
+    /// `default-src`, matching the CSP fallback used for script elements.
+    pub fn script_src_allows(&self, url: &str, self_origin: &Origin) -> bool {
+        let sources = self
+            .directive("script-src-elem")
+            .or_else(|| self.directive("script-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else {
+            return true;
+        };
+        let target = Origin::from_url(url);
+        sources
+            .iter()
+            .any(|source| source_matches_url(source, url, &target, self_origin))
+    }
+
+    /// Evaluate an inline script element against the nonce/inline keywords.
+    /// Hash sources are deliberately rejected until CSP hash computation is
+    /// wired into the script loader.
+    pub fn inline_script_allows(&self, nonce: Option<&str>) -> bool {
+        let sources = self
+            .directive("script-src-elem")
+            .or_else(|| self.directive("script-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else {
+            return true;
+        };
+        sources.iter().any(|source| {
+            source.eq_ignore_ascii_case("'unsafe-inline'")
+                || nonce.is_some_and(|value| {
+                    source.strip_prefix("'nonce-")
+                        .and_then(|token| token.strip_suffix('\''))
+                        .is_some_and(|expected| expected == value)
+                })
+        })
+    }
 }
 
 /// Match one frame-ancestors source expression against an ancestor origin.
@@ -422,6 +460,27 @@ mod tests {
         // No applicable directive: allowed.
         let unrelated = ContentSecurityPolicy::parse("script-src 'self'");
         assert!(unrelated.frame_src_allows("https://anything.example/", &self_origin));
+    }
+
+    #[test]
+    fn script_src_and_inline_nonce_enforcement() {
+        let self_origin = origin("https://app.example/");
+        let policy = ContentSecurityPolicy::parse(
+            "default-src 'none'; script-src 'self' https://cdn.example 'nonce-abc'",
+        );
+        assert!(policy.script_src_allows("https://app.example/app.js", &self_origin));
+        assert!(policy.script_src_allows("https://cdn.example/app.js", &self_origin));
+        assert!(!policy.script_src_allows("https://evil.example/app.js", &self_origin));
+        assert!(policy.inline_script_allows(Some("abc")));
+        assert!(!policy.inline_script_allows(Some("wrong")));
+        assert!(!policy.inline_script_allows(None));
+
+        let elem = ContentSecurityPolicy::parse(
+            "script-src 'self' 'unsafe-inline'; script-src-elem https://cdn.example",
+        );
+        assert!(elem.script_src_allows("https://cdn.example/app.js", &self_origin));
+        assert!(!elem.script_src_allows("https://app.example/app.js", &self_origin));
+        assert!(!elem.inline_script_allows(None));
     }
 
     #[test]

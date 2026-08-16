@@ -1754,6 +1754,7 @@ impl Page {
         #[derive(Debug)]
         struct ScriptInfo {
             src: Option<String>,
+            nonce: Option<String>,
             inline: String,
             is_defer: bool,
             is_async: bool,
@@ -1803,6 +1804,7 @@ impl Page {
                     for sid in script_ids {
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
+                            let nonce = node.get_attribute("nonce").map(|s| s.to_string());
                             let script_type = node
                                 .get_attribute("type")
                                 .unwrap_or("")
@@ -1831,6 +1833,7 @@ impl Page {
                             {
                                 scripts.push(ScriptInfo {
                                     src,
+                                    nonce,
                                     inline: inline_code,
                                     is_defer,
                                     is_async,
@@ -1850,6 +1853,31 @@ impl Page {
                 .unwrap_or_default()
             }
             None => return,
+        };
+
+        let script_policy = self
+            .document_csp
+            .as_deref()
+            .map(crate::frame_policy::ContentSecurityPolicy::parse);
+        let script_self_origin = self
+            .document_origin
+            .clone()
+            .unwrap_or_else(|| obscura_dom::Origin::from_url(&self.url_string()));
+        let script_allowed = |script: &ScriptInfo| {
+            let Some(policy) = &script_policy else {
+                return true;
+            };
+            match &script.src {
+                Some(src) => {
+                    let resolved = url::Url::parse(&script.base_url)
+                        .ok()
+                        .and_then(|base| base.join(src).ok())
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| src.clone());
+                    policy.script_src_allows(&resolved, &script_self_origin)
+                }
+                None => policy.inline_script_allows(script.nonce.as_deref()),
+            }
         };
 
         // HTML scripts have an "already started" flag. Mark every
@@ -1873,6 +1901,10 @@ impl Page {
 
         for (i, script) in all_scripts.iter().enumerate() {
             if !matches!(script.kind, ScriptKind::Classic) {
+                continue;
+            }
+            if !script_allowed(script) {
+                tracing::warn!("Blocked script by Content-Security-Policy");
                 continue;
             }
             if let Some(src_url) = &script.src {
@@ -2117,7 +2149,7 @@ impl Page {
             (budget != 0).then_some(budget)
         };
 
-        let execute_classic =
+            let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
              fetched_script: Option<(String, String, obscura_net::Response)>| {
@@ -2181,6 +2213,10 @@ impl Page {
                     all_scripts.len() - index,
                 );
                 break;
+            }
+            if !script_allowed(script) {
+                tracing::warn!("Blocked script by Content-Security-Policy");
+                continue;
             }
 
             match script.kind {
