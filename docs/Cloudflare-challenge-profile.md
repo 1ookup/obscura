@@ -3923,3 +3923,22 @@ getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
 **症状是「第一次 `/fo/` 就 400」而不是任何一步的行为变化**。此时所有依赖 tokenB
 载荷的对拍全部失效。判据：拿**撤掉改动的同一份构建**再跑一轮；
 形态相同就是 CF 侧，不要往自己的改动上归因。
+
+### Step 73 — `Swui9`：键盘布局表（2026-08-17）
+
+`navigator.keyboard.getLayoutMap()` 之前 resolve 一个**空 Map**。
+真机浏览器从不这样：这张表描述当前布局下书写区各键产生什么字符，空表等于
+「没有键盘」。载荷里浏览器是 596 B，obscura 是 2 B。
+
+**实现**：`Keyboard` 与 `KeyboardLayoutMap` 两个真接口，表内容是 **US ANSI** 布局
+（47 键），与所声称的 Windows 身份一致。刻意**不含 `IntlBackslash`**——
+那是 ISO 键盘才有的那颗多出来的键，ANSI 板没有；参照载荷里有它是因为那台是 Mac,
+照抄会和 Windows 身份对撞。
+
+`KeyboardLayoutMap` 是 **maplike 且只读**：有 `get`/`has`/`size`/迭代，**没有 `set`**。
+直接返回 `new Map()` 会在 `set` 这一处露馅。
+
+本地实测：47 项、序列化 576 B（浏览器 596 B，多出的是 `IntlBackslash` 与 Mac 的
+`§` 字符）。CF 侧量测同 step 72，受 IP 升级影响本轮无法取得。
+
+**回归测试**：`the_keyboard_layout_map_describes_a_physical_ansi_board`。

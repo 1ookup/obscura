@@ -18419,6 +18419,47 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_keyboard_layout_map_describes_a_physical_ansi_board() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const map = await navigator.keyboard.getLayoutMap();
+                    return {
+                        size: map.size,
+                        // maplike and read-only: a plain Map would answer `set`.
+                        readOnly: typeof map.set === 'undefined',
+                        brand: String(map),
+                        letters: [map.get('KeyA'), map.get('KeyZ')],
+                        backslash: map.get('Backslash'),
+                        // The extra key an ISO board has and an ANSI one does
+                        // not; claiming it under a US layout is a mismatch.
+                        noIsoKey: map.has('IntlBackslash') === false,
+                        iterates: [...map].length,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "size": 47,
+                "readOnly": true,
+                "brand": "[object KeyboardLayoutMap]",
+                "letters": ["a", "z"],
+                "backslash": "\\",
+                "noIsoKey": true,
+                "iterates": 47,
+            })
+        );
+    }
+
     #[test]
     fn rtp_capabilities_are_derived_from_the_same_sdp_the_offer_uses() {
         let mut rt = setup_runtime("<html><body></body></html>");
