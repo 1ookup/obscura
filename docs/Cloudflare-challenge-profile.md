@@ -1933,6 +1933,10 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
 | 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
+| **只 grep `stealth_fetch completed`，把「没有完成」当成「没有调用」** | brunhild `/i/` 被判成「JS 从未构造」，真相是它有 `op_fetch_url called`、被 CSP 提前返回，整整一个 step 的归因作废 | 请求序列一律把 `op_fetch_url called` 与 completed **按时序一起列**；只有 CALL 没有 COMPLETE 正是被拦截的特征 |
+| **`serve` 日志含 ANSI 转义，`grep` 视其为二进制**（`file` 报 `data`） | `grep -c` 直接返回 0 匹配、无任何输出，误判「这一轮没有请求日志」 | 一律 `LC_ALL=C grep -a`；先用 `wc -l` 与 `tail` 确认文件确实有内容
+| **图片请求不经过 `op_fetch_url`**（走 render 的图像管线） | `/ci/` 被判成「当前版本缺失的请求」，其实一直正常加载 | 图片是否发出用元素的 `load`/`error` 事件与 `naturalWidth` 判定，不看 fetch 日志
+| 把「日志里没有」等同于「没发生」，而不先确认该路径是否在日志覆盖内 | 同上两条的共同根因 | 每次用日志缺失作论据前，先找一个**已知发生**的同类事件验证它确实会被记录
 | **二进制比代码旧**（改完代码没重建就跑真实探测） | step 29 首轮拿 20:12 的二进制去测 21:10 的提交 | 每轮实测前 `stat` 二进制时间与 `git log -1` 对一下，并确认构建输出里有 `Finished` |
 | **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空** | step 30 的胶片探针从 t=1s 开始轮询，之后每帧都是 0 元素/0 字节截图，看着像「obscura 没渲染出页面」 | 同进程对照可复现：start=20 正常 → start=1 全空 → start=20 又正常。**探针首次求值必须延后**（脚本里 `--start`，默认 12s）。这本身是待修的真实缺陷 |
 | 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
@@ -3036,3 +3040,183 @@ Step 58 中“仍缺少”的结论已过时，当前 HEAD 已完成以下运行
 仍存在的 CSP 缺口主要是报告机制和完整语法：CSP Report-Only、violation event 尚未接入；source-list 对
 端口、路径、nonce/hash（脚本 hash）等复杂语法也只是有限子集。挑战文档中的 CSP 结论应以
 这份状态表为准，后续复测需重新判断 `600010` 的实际原因。
+
+### Step 60 — 同 IP Chrome 对照通过，`/ci/` 缺失被证伪，分歧点前移到 tokenB（2026-08-16）
+
+**假设**：当前 HEAD（CSP + Trusted Types 全套落地后）与 Chrome 的请求序列差在
+「少了 `/ci/` 图片、多了 `/eb/`」，这两条差异即失败原因。
+
+**方法**：同一时段、同一出口 IP、同一 MITM 代理，Chrome 走真实交互并导出 HAR
+（`/tmp/har/zencare.co.har`，17 条）；obscura 用 `cdp_click_fast.py --start 12`
+跑 3 轮，另用 `cdp_comm_probe.py` 取全 realm 通信，并单独做了 `/ci/` 图片的
+load/error 探针、API 支持度扫描、`OBSCURA_WEBGL_PROFILE=1` 的 A/B、以及一次
+v8 property trace。
+
+**证据**：
+
+1. **Chrome 通过，obscura 3/3 未通过。** Chrome HAR 末条 `POST /1.txt -> 404
+   (43987B)`，即站点真实 404，符合判据。obscura 三轮终态均为 `Just a moment...`，
+   `"event":"complete"` 计数为 0，CF 重发 orchestrate 换 ray。**同 IP 对照成立，
+   这是 obscura 缺陷，不是 IP 信誉问题。**
+
+2. **`/ci/` 并不缺失，该结论作废。** 图片经 render 的图像管线加载，不走
+   `op_fetch_url`，因此不出现在 `stealth_fetch completed` 日志里。改用元素事件观测：
+
+   ```
+   2382|WIDGET|SRC  |<ci token 尾部>
+   3660|WIDGET|LOAD |natural=48x29 complete=true
+   ```
+
+   请求发出、解码成功、尺寸正常。「日志里没有」是观测覆盖不到，不是行为差异。
+
+3. **真正缺的是 brunhild。** Chrome 在 `/pat/` 401 之后向
+   `brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/i/<ray>/<token>`
+   发一条 GET fetch（HAR 里表现为两条 `CONNECT`，DevTools 里长时间 pending）。
+   obscura 三轮加 WebGL 轮共 4 轮，一次都没发过。`/eb/` 恰好占据同一槽位：
+
+   | 槽位 | Chrome | obscura |
+   |------|--------|---------|
+   | tokenB `/fo/` | 845776 | 822508 ~ 822652 |
+   | `/pat/` | 401 | 401 |
+   | 其后 | brunhild `/i/` | `/eb/…/chl_api_m` (2B) |
+   | `/ci/` | 200 (196B) | 已加载（不入日志） |
+   | 交互 `/fo/` | 127720 | 127712 ~ 127724 |
+   | 提交 `/fo/` | 7244 | 4960 ~ 4976 |
+   | 回传 `ZC/fo` | 3672 | 3256 |
+
+   `eb` 的通道名来自 widget 内联配置 `MEjdb0: 'chl_api_m'`（Chrome 侧同样有这份
+   配置却不触发），栈为 `H.<computed>` ← `Km.rD` ← `Km…[as run]` ← `rb` ←
+   `Object.Akngb`，全部落在 widget 自身 bundle。载荷是 CF 自有加密，不可直读。
+
+4. **三条假设被证伪**：
+
+   - **CSP `connect-src` 拦截**：拦截点 `csp_connect_allows` 在 `op_fetch_url`
+     **内部**（`crates/obscura-js/src/ops.rs:2712`），而 `op_fetch_url called`
+     的 debug 行在其之前打印。brunhild 连这条都没有，说明 JS 从未调用 fetch，
+     是分支没进去，不是被拦。（该函数确实只做精确 origin 匹配、不支持通配子域，
+     这是独立缺口，但不是本现象的原因。）
+   - **缺超时/中止类 API**：`AbortSignal.timeout/any/abort`、`fetch+signal`、
+     `Request(init)`、`URL.parse`、`URLPattern`、`Promise.withResolvers`、
+     `structuredClone`、`navigator.connection`、`reportError`、`scheduler`
+     全部存在。
+   - **WebGL 缺失**：`OBSCURA_WEBGL_PROFILE=1` 重跑，`/eb/` 依旧、brunhild 依旧
+     缺席、大小与终态均无变化。
+
+5. **分歧点其实更靠前。** tokenB `/fo/` 响应 obscura 稳定 822.5KB、Chrome 845.8KB，
+   差约 23KB，四轮一致，不是噪声；而它前一步的 `ZC/fo` 两边都是 113.55KB，交互变体
+   127.7KB 也一致。即**在拿到 tokenB 程序时 CF 已经给了 obscura 不同的程序**，其后
+   的 `/eb/` 与提交体积差都是下游结果。**注意反例**：obscura 第二轮（重试）拿到的是
+   845.8KB，与 Chrome 首轮同尺寸，所以尺寸不能简单等同于「可信/不可信」，只能确认
+   「首轮拿到的程序不同」。
+
+**结论（部分作废，见 Step 61）**：`/eb/` 与 brunhild `/i/` 是同一个下游症状、
+`/ci/` 差异不存在，这两条成立。但「brunhild 从未被 JS 调用、不是被拦」是**错的**：
+本步只 grep 了 `stealth_fetch completed`，而被 CSP 拦下的请求有 `op_fetch_url called`、
+没有完成日志。Step 61 给出真因。tokenB 822.5KB vs 845.8KB 的差异属实，但它是 CSP
+拦截的下游结果，不是独立的分歧点。
+
+**附带发现（未修）**：
+
+- **WebGL 的 fail-closed 组合自相矛盾。** `WebGLRenderingContext` /
+  `WebGL2RenderingContext` 类暴露为 `function`，但 `getContext('webgl'|
+  'experimental-webgl'|'webgl2'|'bitmaprenderer')` 一律返回 `null`
+  （`bootstrap.js:14275` 由 `__obscura_webgl_enabled` 门控，仅在设了
+  `OBSCURA_WEBGL_PROFILE` 时开）。Chrome 里这个组合只在 WebGL 被显式禁用时出现。
+- **2D 上下文的 brand 不对**：`Object.prototype.toString.call(ctx)` 为
+  `[object Object]`，Chrome 是 `[object CanvasRenderingContext2D]`。
+- **`window` 的 error 事件字段为空**：探针收到
+  `ERR|undefined @undefined:undefined`，Chrome 会给出 message/filename/lineno。
+
+**下一步**：比对两边 tokenB `/fo/` 的**请求体**（obscura 与 Chrome 各自 POST 上去的
+指纹载荷），而不是继续在 `/eb/` 槽位上找。
+
+### Step 61 — 真因：跨 realm 用错 CSP，widget 的 fetch 被顶层文档的 `connect-src` 拦掉（2026-08-16）
+
+**触发**（用户追问）：这跟当天下午的 CSP / Trusted Types 改动有关，此前会发 `/ci/`、
+不会发 `/eb/`。到底是不是被 CSP 拦了？如果是，为什么浏览器不拦？
+
+**方法**：把日志从「只看 `stealth_fetch completed`」改成「`op_fetch_url called` 与
+completed 一起按时序列出」，再取两边的 CSP 响应头对照。
+
+**证据 1 — 请求确实发起过，只是没有完成**：
+
+```
+CALL      POST CF/fo/…            COMPLETE -> 200 822780B
+CALL      GET  brunhild.CF/i/…    (无 COMPLETE)
+CALL      GET  CF/pat/…
+CALL      POST CF/eb/…            COMPLETE -> 200 2B
+```
+
+`op_fetch_url` 先打 `called` 再做 CSP 检查（`ops.rs:2702` 与 `:2712`），被拦时提前
+返回 `cspBlocked: true`，因此有 CALL 没有 COMPLETE。Step 60 只 grep 完成日志，
+据此得出「JS 从未调用」，**结论错误**。
+
+**证据 2 — 两份 CSP 在这一点上恰好不同**：
+
+顶层 `zencare.co/1.txt` 质询页（403 响应头）：
+
+```
+default-src 'none'; script-src 'nonce-…' 'unsafe-eval' https://challenges.cloudflare.com;
+img-src 'self' https://challenges.cloudflare.com;
+connect-src 'self' https://challenges.cloudflare.com;
+frame-src 'self' https://challenges.cloudflare.com blob:; …
+```
+
+widget 文档自己的 CSP（step 58 已从 Chrome 读到）：
+
+```
+… img-src 'self';
+connect-src 'self' https://hagen.challenges.cloudflare.com https://brunhild.challenges.cloudflare.com;
+… trusted-types GAPH2 default; require-trusted-types-for 'script'
+```
+
+CF **特意**给 widget 文档配了允许 `hagen` / `brunhild` 两个兄弟子域的 `connect-src`。
+
+**证据 3 — obscura 取错了哪一份**：
+
+| 路径 | CSP 来源 | 代码位置 |
+|------|----------|----------|
+| 图片加载 | 该节点**所属文档**的 `DocumentScope.csp` | `ops.rs:6902` `containing_document_root_shadow_including` → `document_scope(root).csp` |
+| fetch / XHR | `SharedState.document_csp`，**全 page 一份** | `ops.rs:2712` |
+
+`SharedState.document_csp` 只在**主文档**导航时写入（`page.rs:3524`）；frame 文档的
+CSP 写进 `DocumentScope`（`page.rs:5678`），fetch 路径从不读它。于是 widget realm 发出的
+fetch 被拿 **zencare.co 的策略**去校验。
+
+**根因**：`0ebf07f`（feat: enforce CSP connect-src for scripted fetches）引入
+`csp_connect_allows(gs.document_csp, …)`，把**页面级**的 CSP 应用到**所有 realm**。
+对 brunhild：
+
+- 目标 origin = `https://brunhild.challenges.cloudflare.com`
+- 传入的 `page_origin` = widget 自身 origin `https://challenges.cloudflare.com`
+- 顶层策略里 `'self'` 不匹配，显式项 `https://challenges.cloudflare.com` 也不匹配
+- → 拦截
+
+**为什么浏览器不拦**：Chrome 按规范用**发起请求的那个文档**的 CSP。widget 文档的
+`connect-src` 明确列了 brunhild，因此放行。这不是通配子域匹配的问题——widget 的策略是
+逐个主机写死的；obscura 只是用错了策略。
+
+**为什么 `/ci/` 没受影响**：图片路径本来就按文档 scope 取 CSP，而且 `/ci/` 在
+`challenges.cloudflare.com` 上，对 widget 是 `'self'`、对顶层是显式项，两份策略都放行。
+所以它在这次改动前后都正常，也解释了「以前发 ci、现在还发 ci」。
+
+**下游链条**：brunhild `/i/` 被拦 → widget 侧该步失败 → 走 `/eb/…/chl_api_m` 上报
+（Chrome 全程不发）→ 后续 tokenB 程序、提交体积（4976 vs 7244）与
+`fail code=600010` 都是这一拦截的下游结果。
+
+**结论**：`600010` 的当前直接成因是 **CSP 的 realm 归属错误**，不是 Trusted Types，
+也不是指纹面。
+
+**修法**：fetch 路径要拿发起 realm 所属文档的 CSP，而不是 `SharedState.document_csp`。
+钩子已经现成：frame realm 在 bootstrap 之前就定义了 `__obscura_frame_document_nid`
+（`realm.rs:763`），可以像图片路径那样用它取 `DocumentScope.csp`；主 realm 回退到
+现有的页面级值。同一处还应顺带修 `csp_connect_allows` 的两个已知子集缺口：不支持
+通配主机（`*.example.com`），不处理端口与路径。重定向路径（`ops.rs:3211`、`:3617`）
+用的是同一份 `document_csp`，要一并改。
+
+**修复状态（2026-08-16）**：已在 `feat: use frame CSP for scripted fetches` 中修复。
+bootstrap 现在把当前 realm 的 `__obscura_frame_document_nid` 放入 fetch/XHR 的
+`referrer_context`；`op_fetch_url` 按该 root 读取对应 `DocumentScope.csp`，主文档仍使用
+`SharedState.document_csp`。初始请求、普通客户端重定向和 stealth 客户端重定向统一使用这份
+realm-local 策略，因此 widget 到 `brunhild.challenges.cloudflare.com` 不再被顶层 CSP
+误拦截；顶层 realm 对同一目标仍会阻止。
