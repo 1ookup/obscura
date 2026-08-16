@@ -13,8 +13,11 @@ api = ["obscura-browser", "obscura-net", "tokio"]
 render = ["api", "obscura-browser/render"]
 
 [dependencies]
-obscura-browser = { path = "../obscura-browser", optional = true }
-obscura-net = { path = "../obscura-net", optional = true }
+# Not `workspace = true`, so these carry their own default-features = false --
+# same reason as the workspace entries: the facade's `stealth` feature has to be
+# the only thing that turns BoringSSL on, or downstream cannot turn it off.
+obscura-browser = { path = "../obscura-browser", optional = true, default-features = false }
+obscura-net = { path = "../obscura-net", optional = true, default-features = false }
 anyhow = "1"
 tokio = { version = "1", features = ["rt"], optional = true }
 thiserror = "1"

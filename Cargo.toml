@@ -19,13 +19,20 @@ license = "Apache-2.0"
 repository = "https://github.com/h4ckf0r0day/obscura"
 
 [workspace.dependencies]
-obscura-dom = { path = "crates/obscura-dom" }
-obscura-net = { path = "crates/obscura-net" }
-obscura-browser = { path = "crates/obscura-browser" }
-obscura-cdp = { path = "crates/obscura-cdp" }
-obscura-js = { path = "crates/obscura-js" }
-obscura-mcp = { path = "crates/obscura-mcp" }
-obscura-render = { path = "crates/obscura-render" }
+# Internal edges never inherit defaults. `default` carries `stealth`, so a single
+# edge left on defaults would pull BoringSSL back into the whole graph through
+# feature unification and make --no-default-features a no-op -- collapsing the
+# four release variants in .github/workflows/release.yml into two.
+# This must live here, not on the members: `{ workspace = true,
+# default-features = false }` is ignored (with a warning) unless the workspace
+# entry sets it.
+obscura-dom = { path = "crates/obscura-dom", default-features = false }
+obscura-net = { path = "crates/obscura-net", default-features = false }
+obscura-browser = { path = "crates/obscura-browser", default-features = false }
+obscura-cdp = { path = "crates/obscura-cdp", default-features = false }
+obscura-js = { path = "crates/obscura-js", default-features = false }
+obscura-mcp = { path = "crates/obscura-mcp", default-features = false }
+obscura-render = { path = "crates/obscura-render", default-features = false }
 
 html5ever = "0.39"
 markup5ever = "0.39"
