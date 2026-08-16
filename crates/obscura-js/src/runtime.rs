@@ -4753,10 +4753,6 @@ mod tests {
     /// enforcement is out of scope (no directive is parsed anywhere yet), so
     /// this covers the surface a document with no CSP observes.
     ///
-    /// Ignored while `_installTrustedTypes` returns early: the implementation
-    /// it asserts on is still correct and still compiled in, it just is not
-    /// installed. Re-enable together with that `return`.
-    #[ignore = "surface intentionally not installed; see _installTrustedTypes in bootstrap.js"]
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_types_match_chrome_shape_brands_and_sink_tables() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -5129,12 +5125,6 @@ provided documentURL ('https://other.example') does not match the current origin
 
     /// The Trusted Types capture, read in full rather than sampled.
     ///
-    /// Ignored for the same reason as
-    /// `trusted_types_match_chrome_shape_brands_and_sink_tables`: the surface is
-    /// implemented but not installed, because `eval(trustedScript)` needs an
-    /// engine-level host hook rusty_v8 does not expose. Re-enable together with
-    /// the early `return` in `_installTrustedTypes`.
-    #[ignore = "surface intentionally not installed; see _installTrustedTypes in bootstrap.js"]
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_types_matches_the_full_chrome_capture() {
         let mut rt = setup_runtime("<html><body></body></html>");
