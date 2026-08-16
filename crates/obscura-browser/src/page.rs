@@ -1464,6 +1464,14 @@ impl Page {
         let document_base = self
             .resolve_base_url()
             .unwrap_or_else(|| document_url.clone());
+        let style_policy = self
+            .document_csp
+            .as_deref()
+            .map(crate::frame_policy::ContentSecurityPolicy::parse);
+        let style_origin = self
+            .document_origin
+            .clone()
+            .unwrap_or_else(|| obscura_dom::Origin::from_url(document_url.as_str()));
         let mut roots = Vec::new();
         let mut scheduled = std::collections::HashSet::new();
         let mut pending = Vec::new();
@@ -1472,6 +1480,13 @@ impl Page {
                 continue;
             };
             let (key, resolved) = canonical_stylesheet_url(resolved);
+            if style_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.style_src_allows(resolved.as_str(), &style_origin))
+            {
+                tracing::info!("Blocked stylesheet by Content-Security-Policy: {}", resolved);
+                continue;
+            }
             if !subresource_allowed(Some(&document_url), resolved.as_str()) {
                 tracing::warn!(
                     "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
@@ -1496,6 +1511,13 @@ impl Page {
                 continue;
             };
             let (key, resolved) = canonical_stylesheet_url(resolved);
+            if style_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.style_src_allows(resolved.as_str(), &style_origin))
+            {
+                tracing::info!("Blocked stylesheet import by Content-Security-Policy: {}", resolved);
+                continue;
+            }
             if !subresource_allowed(Some(&document_url), resolved.as_str())
                 || self.should_block_url(resolved.as_str())
             {
@@ -5820,6 +5842,11 @@ impl Page {
         };
         let frame_policy = obscura_net::ReferrerPolicy::parse(&scope.referrer_policy)
             .unwrap_or_default();
+        let frame_csp = scope
+            .csp
+            .as_deref()
+            .map(crate::frame_policy::ContentSecurityPolicy::parse);
+        let frame_origin = scope.origin.clone();
         let links: Vec<(obscura_dom::NodeId, String, Option<String>)> = {
             let Some(dom) = self.dom.as_ref() else {
                 return;
@@ -5843,6 +5870,13 @@ impl Page {
                 continue;
             };
             let (key, resolved) = canonical_stylesheet_url(resolved);
+            if frame_csp
+                .as_ref()
+                .is_some_and(|policy| !policy.style_src_allows(resolved.as_str(), &frame_origin))
+            {
+                tracing::info!("Blocked frame stylesheet by Content-Security-Policy: {}", resolved);
+                continue;
+            }
             if !subresource_allowed(Some(&base), resolved.as_str())
                 || self.should_block_url(resolved.as_str())
             {
@@ -5850,7 +5884,14 @@ impl Page {
                 continue;
             }
             let Some(css) = self
-                .materialize_frame_stylesheet(key, resolved, &base, frame_policy)
+                .materialize_frame_stylesheet(
+                    key,
+                    resolved,
+                    &base,
+                    frame_policy,
+                    frame_csp.as_ref(),
+                    &frame_origin,
+                )
                 .await
             else {
                 continue;
@@ -5921,6 +5962,8 @@ impl Page {
         root_url: Url,
         base: &Url,
         referrer_policy: obscura_net::ReferrerPolicy,
+        csp: Option<&crate::frame_policy::ContentSecurityPolicy>,
+        frame_origin: &obscura_dom::Origin,
     ) -> Option<String> {
         if let Some(cached) = self.frame_stylesheet_cache.get(&root_key) {
             return cached.clone();
@@ -6012,6 +6055,9 @@ impl Page {
                 }
                 if !subresource_allowed(Some(base), import_url.as_str())
                     || self.should_block_url(import_url.as_str())
+                    || csp.is_some_and(|policy| {
+                        !policy.style_src_allows(import_url.as_str(), frame_origin)
+                    })
                 {
                     tracing::info!("Blocked frame stylesheet import: {}", import_url);
                     continue;

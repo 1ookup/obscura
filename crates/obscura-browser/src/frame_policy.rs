@@ -138,6 +138,21 @@ impl ContentSecurityPolicy {
                 })
         })
     }
+
+    /// Evaluate an external stylesheet URL using `style-src` then
+    /// `default-src`. Inline style handling is separate because this method
+    /// only applies to network-backed sheets and imports.
+    pub fn style_src_allows(&self, url: &str, self_origin: &Origin) -> bool {
+        let sources = self
+            .directive("style-src-elem")
+            .or_else(|| self.directive("style-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else { return true };
+        let target = Origin::from_url(url);
+        sources
+            .iter()
+            .any(|source| source_matches_url(source, url, &target, self_origin))
+    }
 }
 
 /// Match one frame-ancestors source expression against an ancestor origin.
@@ -481,6 +496,9 @@ mod tests {
         assert!(elem.script_src_allows("https://cdn.example/app.js", &self_origin));
         assert!(!elem.script_src_allows("https://app.example/app.js", &self_origin));
         assert!(!elem.inline_script_allows(None));
+        let style = ContentSecurityPolicy::parse("default-src 'none'; style-src https://cdn.example");
+        assert!(style.style_src_allows("https://cdn.example/theme.css", &self_origin));
+        assert!(!style.style_src_allows("https://evil.example/theme.css", &self_origin));
     }
 
     #[test]
