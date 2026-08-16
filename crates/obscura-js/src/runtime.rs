@@ -4559,6 +4559,20 @@ mod tests {
         assert_eq!(result, serde_json::json!([3, 3, "https://cdn.example/movie.mp4"]));
     }
 
+    #[test]
+    fn object_elements_use_object_src_csp_surface() {
+        let mut rt = setup_runtime("<html><body><object id='o' data='https://cdn.example/app.swf'></object></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; object-src 'self'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const o = document.querySelector('#o');
+                return [o instanceof HTMLObjectElement, o.data, o.contentDocument];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "https://cdn.example/app.swf", null]));
+    }
+
     /// `console.log` must not walk the objects handed to it.
     ///
     /// With devtools closed Chrome keeps a reference and formats lazily, so an

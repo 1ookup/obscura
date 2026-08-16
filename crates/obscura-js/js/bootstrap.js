@@ -6500,6 +6500,20 @@ class HTMLVideoElement extends HTMLMediaElement {
   }
 }
 class HTMLAudioElement extends HTMLMediaElement {}
+class HTMLObjectElement extends Element {
+  get data() {
+    const raw = this.getAttribute('data');
+    if (!raw) return '';
+    try { return new URL(raw, this.baseURI || globalThis.location?.href || 'about:blank').href; }
+    catch (_error) { return raw; }
+  }
+  set data(value) { this.setAttribute('data', value); }
+  get contentDocument() {
+    const resolved = this.data;
+    return resolved && _cspResourceAllows(resolved, 'object-src') ? null : null;
+  }
+  get contentWindow() { return null; }
+}
 class HTMLTrackElement extends Element {
   static NONE = 0;
   static LOADING = 1;
@@ -6526,6 +6540,7 @@ class HTMLTrackElement extends Element {
 globalThis.HTMLMediaElement = HTMLMediaElement;
 globalThis.HTMLVideoElement = HTMLVideoElement;
 globalThis.HTMLAudioElement = HTMLAudioElement;
+globalThis.HTMLObjectElement = HTMLObjectElement;
 globalThis.HTMLTrackElement = HTMLTrackElement;
 globalThis.TextTrack = TextTrack;
 globalThis.TextTrackList = TextTrackList;
@@ -6549,6 +6564,7 @@ function _elementClassFor(nid) {
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
+  if (tag === "OBJECT") return HTMLObjectElement;
   if (tag === "TRACK") return HTMLTrackElement;
   return Element;
 }
@@ -6568,6 +6584,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
+    if (tag === "OBJECT") return HTMLObjectElement;
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
@@ -17912,7 +17929,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     // HTML element interfaces that own their prototype. The rest are aliases
     // of Element and are filtered out by the constructor check below.
     'HTMLFormElement', 'HTMLImageElement', 'HTMLMediaElement',
-    'HTMLVideoElement', 'HTMLAudioElement', 'HTMLTrackElement',
+    'HTMLVideoElement', 'HTMLAudioElement', 'HTMLObjectElement', 'HTMLTrackElement',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement', 'SVGAnimatedString',
     // Text tracks
