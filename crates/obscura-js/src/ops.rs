@@ -2705,11 +2705,32 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, document_csp) = {
+    // Scripted requests are governed by the CSP of the document whose realm
+    // initiated them. The bootstrap carries that document root in the
+    // referrer context; resolve the policy before borrowing shared state for
+    // the rest of the request.
+    let referrer_context = serde_json::from_str::<serde_json::Value>(&referrer_context).ok();
+    let request_root = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("root"))
+        .and_then(|value| value.as_u64())
+        .and_then(|root| u32::try_from(root).ok())
+        .map(NodeId::new)
+        .unwrap_or_else(|| NodeId::new(0));
+
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, request_csp) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        if !csp_connect_allows(gs.document_csp.as_deref(), &url, &origin) {
+        let request_csp = if request_root.raw() == 0 {
+            gs.document_csp.clone()
+        } else {
+            gs.dom
+                .as_ref()
+                .and_then(|dom| dom.document_scope(request_root))
+                .and_then(|scope| scope.csp)
+        };
+        if !csp_connect_allows(request_csp.as_deref(), &url, &origin) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -2765,7 +2786,7 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
-            gs.document_csp.clone(),
+            request_csp,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -2906,7 +2927,6 @@ async fn op_fetch_url(
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
-    let referrer_context = serde_json::from_str::<serde_json::Value>(&referrer_context).ok();
     let referrer_url = referrer_context
         .as_ref()
         .and_then(|value| value.get("url"))
@@ -3034,7 +3054,7 @@ async fn op_fetch_url(
                 redirect_mode.clone(),
                 callbacks.clone(),
                 allow_private_network,
-                document_csp.clone(),
+                request_csp.clone(),
             )
             .await;
         }
@@ -3208,7 +3228,7 @@ async fn op_fetch_url(
             })
             .to_string());
         }
-        if !csp_connect_allows(document_csp.as_deref(), next_url.as_str(), &page_origin) {
+        if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true, "cspBlocked": true,
@@ -3518,7 +3538,7 @@ async fn stealth_fetch_all(
     redirect_mode: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
-    document_csp: Option<String>,
+    request_csp: Option<String>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
@@ -3614,7 +3634,7 @@ async fn stealth_fetch_all(
             })
             .to_string());
         }
-        if !csp_connect_allows(document_csp.as_deref(), next_url.as_str(), &page_origin) {
+        if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true, "cspBlocked": true,

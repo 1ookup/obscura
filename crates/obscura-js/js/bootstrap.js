@@ -364,6 +364,9 @@ function _environmentReferrerContext() {
   return JSON.stringify({
     url: globalThis.location?.href || "",
     policy: _environmentReferrerPolicy(),
+    root: typeof globalThis.__obscura_frame_document_nid === 'number'
+      ? globalThis.__obscura_frame_document_nid
+      : 0,
   });
 }
 async function __fetchDynClassicScript(task) {
