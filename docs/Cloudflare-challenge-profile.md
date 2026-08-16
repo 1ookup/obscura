@@ -2948,3 +2948,66 @@ object 参数做 `JSON.stringify`(并在结果为 `{}` 时再读一次 `.message
 只说明提交内容变了,很可能正是那个 devtools 标志位。
 
 回归测试 `console_log_does_not_invoke_getters_on_its_arguments`;obscura-js 482 通过。
+
+### Step 58 — 定位 600010:由 widget 经 postMessage 上报;widget 文档 CSP 强制 Trusted Types（2026-08-16）
+
+**触发**(用户追问):第三个 `challenges /fo/` 之后、`zencare /fo/` 之前的那次通信是什么。
+
+**方法**:预注入钩子把记录改走 `console.warn`(serve 日志收集**所有** realm),同时钩
+`XMLHttpRequest.open`、`window.fetch`、`navigator.sendBeacon` 并各记一段调用栈,再配合点击。
+此前的探针只 dump 主文档 realm 的数组、且只钩 XHR,所以既看不到 widget realm 也看不到
+fetch——这是本轮能拿到结果的原因。
+
+**证据 1 — 那条通信就是 `fail`,600010 由 widget 上报**:
+
+```
+14022|TOP|IN | {"event":"interactiveEnd"}                       ← 点击被接受
+14871|TOP|IN | {"source":"cloudflare-challenge","widgetId":"ri63c","event":"fail",
+                "code":"600010","rcV":"582ST9...","cfChlOut":"U9XWMfNIUA7k...$J0pjg4h5lAf2iSe9aOX0ig==",
+                "cfChlOutS":"mV/KoRm9kYo2u94msrCC..."}
+14888|TOP|XHR| POST zencare /fo/ :: at b (chl_page:2:146312) <- at Object.WISfF (chl_page ...)
+```
+
+**`fail` 是 widget 通过 postMessage 发给主页面的**,`code` 是字符串 `"600010"`,随行两个
+加密载荷。主页面收到后 **17ms** 内发出 `zencare /fo/`(就是那个 3256B),调用栈落在
+chl_page 的 `Object.WISfF`。**因此 3256B 不是独立判定,它只是把 widget 的失败结论转发给
+源站。**
+
+这同时纠正三点:①`fail` **不是**服务器下发;②**不是** api.js 的 watchcat 本地合成(那条路
+的码是 `Ut=300030` hung / `Ht=300031` crashed,且本轮 `Turnstile Widget seem to have` 一次
+未打印);③本轮 `interactiveEnd` **出现了**——点击被接受,失败发生在其之后的判定里。
+
+**证据 2 — widget 文档的 CSP 强制 Trusted Types**(Chrome 侧读取):
+
+```
+default-src 'none'; script-src 'nonce-...' 'unsafe-eval'; script-src-attr 'none';
+worker-src blob:; style-src 'unsafe-inline'; img-src 'self';
+connect-src 'self' https://hagen.challenges.cloudflare.com https://brunhild.challenges.cloudflare.com;
+frame-src 'self' blob:; child-src 'self' blob:; form-action 'none'; base-uri 'self';
+trusted-types GAPH2 default; require-trusted-types-for 'script'
+```
+
+`trusted-types GAPH2 default` 是**策略名白名单**,`require-trusted-types-for 'script'` 打开
+强制。实测(Chrome main world,isolated world 会绕开 CSP 因而给出错误答案):
+
+| 探针 | Chrome main world |
+|---|---|
+| `eval("1+1")` | **2**,不抛 |
+| `trustedTypes.defaultPolicy` | **present** |
+| `createPolicy("probe_csp_1")` | `TypeError: Policy "probe_csp_1" disallowed.` |
+
+即 **CF 自己创建了名为 `default` 的策略**;default policy 存在时,传给 script sink 的字符串
+会自动经它转换,所以 `eval(字符串)` 不但不抛,还会**回调 CF 自己的 `default.createScript`**。
+换言之:**在真实 Chrome 的 widget 文档里,每一次 `eval(字符串)` 都要过一遍 CF 的回调**。
+obscura 既不解析这条 CSP、也不暴露 `trustedTypes`,这个回调永远不发生。
+
+**结论与影响**:Trusted Types 在这里**不是可选的 parity 项,是 widget 文档的硬性运行条件**。
+完整对齐需要三件事一起到位:①CSP `trusted-types` / `require-trusted-types-for` 解析;
+②TT API 面(已实现,现被 step 52 关闭);③`eval`/`Function` 的宿主钩子(缺,见 step 52 的
+依赖分析)。只做其中一两件都会造出新的可检测矛盾——step 49-52 的回归正是「只做 ②」的后果。
+
+**当前断点**:`interactiveEnd` 之后,widget 内部判定失败并上报 `code=600010`。该码是
+chl_page/widget JSVMP 常量池里的条目(chl_page 中索引 31,邻居是 `apply`/`async`/
+`script error` 一类字面量),**静态定位其引用需要先解开 JSVMP 的索引机制**;`cfChlOut`/
+`cfChlOutS` 为加密载荷。下一步候选:①补齐上面三件套后复测;②在 widget realm 用可控钩子
+定位发出 `fail` 的那一帧。
