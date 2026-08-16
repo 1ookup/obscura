@@ -3026,9 +3026,13 @@ Step 58 中“仍缺少”的结论已过时，当前 HEAD 已完成以下运行
 | `script-src` / `style-src` / `img-src` | 顶层文档、frame 文档资源请求均检查；脚本支持 nonce 与 `unsafe-inline` |
 | `connect-src` | 初始 fetch/XHR 及普通、stealth 客户端的每个重定向目标均检查 |
 | `worker-src` | Dedicated Worker 与 SharedWorker 构造前检查，按 `worker-src` → `child-src` → `default-src` 回退 |
+| `font-src` | 同步渲染的 `@font-face` 与 font preload 检查，按 `font-src` → `default-src` 回退 |
+| `media-src` | `<audio>`/`<video>` 的资源状态检查；不允许的 URL 报告 `NETWORK_NO_SOURCE` |
+| `object-src` | `<object>` 已有独立接口面，并按 `object-src` → `default-src` 识别资源限制 |
+| `form-action` | 表单导航提交前检查，拒绝时不调用导航 op |
+| `base-uri` | `<base>` 在文档、节点和动态资源解析路径统一检查 |
 
 因此，Trusted Types 已不是当前实现缺口，`600010` 不能再直接归因于 TT API 或 eval 入口。
-仍存在的 CSP 缺口是资源指令覆盖面和完整语法：`font-src`、`media-src`、`object-src`、
-`form-action`、`base-uri`、报告/Report-Only 与 violation event 尚未接入；source-list 对
+仍存在的 CSP 缺口主要是报告机制和完整语法：CSP Report-Only、violation event 尚未接入；source-list 对
 端口、路径、nonce/hash（脚本 hash）等复杂语法也只是有限子集。挑战文档中的 CSP 结论应以
 这份状态表为准，后续复测需重新判断 `600010` 的实际原因。
