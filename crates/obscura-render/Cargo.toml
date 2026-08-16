@@ -12,6 +12,14 @@ default = []
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
 paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+# Alias, so that a workspace-wide `--features render` reaches this crate too.
+# This crate is itself a workspace member, and `render` is the name every other
+# member uses. Without the alias, `cargo test --features render` from the root
+# builds obscura-render's own targets with no features while obscura-js asks for
+# `paint`; the two do not unify, obscura-js links the paint-less copy, and
+# `CanvasTextMeasurer` goes missing (E0433/E0425) even though `cargo tree` shows
+# `[default,paint]`. Same class of breakage as d547f4a.
+render = ["paint"]
 
 [dependencies]
 taffy = { workspace = true }
