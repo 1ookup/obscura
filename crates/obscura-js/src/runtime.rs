@@ -4492,6 +4492,81 @@ mod tests {
         assert_eq!(result, serde_json::json!([]));
     }
 
+    /// Engine internals must not be enumerable on the global. `Deno` plus six
+    /// Rust-injected `__obscura_*` globals were missing from the pre-hide list,
+    /// so `Object.keys(window)` named the engine outright. Hiding them cannot
+    /// clear them either: `Deno` already holds a value by the time bootstrap
+    /// runs, and every op call goes through it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_internals_are_not_enumerable_on_the_global() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const internal = key => /^(Deno$|__obscura|__markParserScripts)/.test(key);
+                    const forIn = [];
+                    for (const key in globalThis) if (internal(key)) forIn.push(key);
+                    return {
+                        forIn: forIn.sort(),
+                        ownKeys: Object.keys(globalThis).filter(internal).sort(),
+                        denoStillWorks: typeof Deno?.core?.ops === "object",
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "forIn": [],
+                "ownKeys": [],
+                "denoStillWorks": true,
+            }),
+        );
+    }
+
+    /// `crossOriginIsolated` exists on every Chrome global and reads `false`
+    /// without COOP+COEP. Answering `undefined` while `SharedArrayBuffer` is
+    /// withheld is self-contradictory, and both are one line to check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_isolated_reads_false_rather_than_undefined() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const d = Object.getOwnPropertyDescriptor(
+                        globalThis, "crossOriginIsolated");
+                    return {
+                        value: globalThis.crossOriginIsolated,
+                        type: typeof globalThis.crossOriginIsolated,
+                        accessor: typeof d.get === "function" && d.set === undefined,
+                        enumerable: d.enumerable,
+                        sharedArrayBuffer: typeof globalThis.SharedArrayBuffer,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "value": false,
+                "type": "boolean",
+                "accessor": true,
+                "enumerable": true,
+                "sharedArrayBuffer": "undefined",
+            }),
+        );
+    }
+
     /// Trusted Types shape, brand checks and sink tables. Pinned against
     /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
     /// enforcement is out of scope (no directive is parsed anywhere yet), so

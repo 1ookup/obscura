@@ -2689,3 +2689,36 @@ Trusted Types 把这一步换成宿主钩子，Chrome 经 V8 `ModifyCodeGenerati
 只是 `typeof` 探测。本次 26 个 commit 里 API 面普遍更接近 Chrome
 (`ServiceWorker`/`Worklet`/`isSecureContext`/`SharedArrayBuffer` 收起均正确),唯独 TT 的
 行为没跟上,结果是整体退化。
+
+### Step 53 — 附带发现修复 1/2：引擎全局不再可枚举；`crossOriginIsolated` 补为 `false`（2026-08-16）
+
+**修复 A — 引擎全局对页面可枚举**（step 51 附带发现 1）。bootstrap 早就有
+`_preHideInternals` 把内部全局预声明为 non-enumerable,但**七个名字不在名单里**,
+`Object.keys(window)` 一行即可读出:`Deno`、`__obscura_webgl_enabled`、
+`__obscura_referrer_policy`、`__obscura_performance_time_origin_ms`、
+`__obscura_viewport_w`、`__obscura_viewport_h`、`__obscura_screen_emulated`。
+
+补名字之外还要改写法:原循环用 `{value: undefined}` 重定义,而 `Deno` 在 bootstrap
+运行前就由 deno_core 创建并持有值,照原样加进名单会**把它清空**,所有 op 调用随之失效。
+改为先读 `getOwnPropertyDescriptor` 保值(accessor 则只翻 `enumerable`)。
+
+`Deno` 只做到隐藏,没有删除:JS 侧 119 处引用,Rust 注入的片段(page.rs、realm.rs)也走
+`Deno.core.ops`。`'Deno' in window` 仍答 true,这一半留作未决。
+
+**修复 B — `crossOriginIsolated`**（step 51 附带发现 2）。Chrome 的每个全局都有它,无
+COOP+COEP 时读 `false`;obscura 答 `undefined`,而同时又(正确地)收起了
+`SharedArrayBuffer`——这两者在 Chrome 中配套,当前组合自相矛盾且一行可查。补为常量
+`false` 的 accessor(引擎不解析任何 COOP/COEP 头,隔离永不成立)。worker scope 早已有
+该属性(worker.rs:945),只有 window 缺。
+
+**验证**（同 IP 同代理）:
+
+```
+enumLeak=[] ownLeak=[] denoWorks=true
+crossOriginIsolated=false(boolean) SharedArrayBuffer=undefined isSecureContext=true
+trustedTypes=undefined viewport=[1280,720]      ← 保值写法未破坏 __obscura_viewport_w
+```
+
+回归测试两条:`engine_internals_are_not_enumerable_on_the_global`(同时断言 `Deno.core.ops`
+仍可用)、`cross_origin_isolated_reads_false_rather_than_undefined`。obscura-js 480 通过。
+质询流程复测 2 轮均为 `realm=3 xhr=3 /ci/=1`,step 52 的修复未被拖回。

@@ -11,6 +11,21 @@
 // writable:true and configurable:true.
 (function _preHideInternals() {
   var _names = [
+    // Created by deno_core before this script runs, so it is already present
+    // with a value: the loop below preserves it rather than clearing it.
+    // Chrome has no such global at all -- hiding it from enumeration is the
+    // cheap half of the fix; `'Deno' in window` still answers true. Removing
+    // it outright means routing all 119 JS uses plus the Rust-injected
+    // snippets (page.rs, realm.rs) through a non-global reference first.
+    'Deno',
+    // runtime-set by Rust (runtime.rs / page.rs) -- these were missing, and
+    // Object.keys(window) listed them verbatim:
+    //   __obscura_webgl_enabled, __obscura_referrer_policy,
+    //   __obscura_performance_time_origin_ms, __obscura_viewport_w/h,
+    //   __obscura_screen_emulated
+    '__obscura_webgl_enabled', '__obscura_referrer_policy',
+    '__obscura_performance_time_origin_ms',
+    '__obscura_viewport_w', '__obscura_viewport_h', '__obscura_screen_emulated',
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
@@ -58,9 +73,24 @@
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
   ];
-  var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
+  // Preserve whatever is already there. Most of these names do not exist yet
+  // at this point, but some do (`Deno`), and redefining those with
+  // `value: undefined` would wipe them.
   for (var _i = 0; _i < _names.length; _i++) {
-    try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
+    try {
+      var _prev = Object.getOwnPropertyDescriptor(globalThis, _names[_i]);
+      if (_prev && (_prev.get || _prev.set)) {
+        Object.defineProperty(globalThis, _names[_i], {
+          get: _prev.get, set: _prev.set,
+          enumerable: false, configurable: true,
+        });
+      } else {
+        Object.defineProperty(globalThis, _names[_i], {
+          value: _prev ? _prev.value : undefined,
+          writable: true, enumerable: false, configurable: true,
+        });
+      }
+    } catch (_e) {}
   }
 })();
 
@@ -17825,6 +17855,20 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   Object.defineProperty(globalThis, 'isSecureContext', {
     get: _markNativeAs(function isSecureContext() { return _secureNow(); },
       'function get isSecureContext() { [native code] }'),
+    set: undefined,
+    enumerable: true,
+    configurable: true,
+  });
+
+  // `crossOriginIsolated` is a WindowOrWorkerGlobalScope attribute Chrome
+  // always exposes; on a document without COOP+COEP it reads `false`, never
+  // `undefined`. Answering `undefined` while `SharedArrayBuffer` is withheld
+  // is self-contradictory: the two travel together, and the pair is one line
+  // to check. Isolation is never granted here because no COOP/COEP header is
+  // parsed anywhere in the engine, so this is a constant rather than a lookup.
+  Object.defineProperty(globalThis, 'crossOriginIsolated', {
+    get: _markNativeAs(function crossOriginIsolated() { return false; },
+      'function get crossOriginIsolated() { [native code] }'),
     set: undefined,
     enumerable: true,
     configurable: true,
