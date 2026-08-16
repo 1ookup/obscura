@@ -173,7 +173,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 |---|---|---|
 | 16 | ServiceWorker fail-closed(§3.2-#11) | ✅ 完成(`8734846`) |
 | 17 | SharedWorker 真实现(§3.2-#11) | ✅ 完成(`871682b`) |
-| 18 | Trusted Types API 面(§3.2-#12) | ⏸ **暂缓**:实现完成(`1f963b7`)但入口不暴露,卡在 `eval(trustedScript)` 需要引擎级宿主钩子;暴露半个面已实测造成回归,详见 §3.2-#12 与 Cloudflare-challenge-profile step 49-52 |
+| 18 | Trusted Types API 面(§3.2-#12) | ⏳ **部分完成**:入口、policy allowlist 和常用 script sinks 已启用，`eval(trustedScript)` 仍卡在引擎级宿主钩子；完整 oracle 继续 ignored |
 | 19 | worklet 入口(§3.2-#11) | ✅ 完成(`552715e`) |
 | 20 | 媒体能力声明自洽(§3.5-#23 起步 / §3.2-#13) | ✅ 完成(`3a61507`) |
 | 21 | canvas 文本度量走真实布局(§3.5-#22 起步) | ✅ 完成(`4060dc8`) |

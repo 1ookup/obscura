@@ -2671,7 +2671,8 @@ Trusted Types 把这一步换成宿主钩子，Chrome 经 V8 `ModifyCodeGenerati
 在不同构建方式下行为不同。覆盖 `globalThis.eval` 也不是替代:它会把每个 `eval(x)` 调用点
 变成 indirect eval，改掉真实页面依赖的作用域语义。
 
-**修复**（本步提交）：`_installTrustedTypes` 开头 early return,入口不暴露。实现全部保留,
+**历史修复**（后续已扩展）：`_installTrustedTypes` 曾以 early return 关闭入口；当前入口已恢复，
+策略白名单和常用 script sinks 已接入。实现全部保留，
 将来 eval 钩子可用时**删掉那一行 `return` 即可**。同步:
 `trusted_types_surface_is_not_exposed` 新回归测试(断言 6 个全局都不存在)、原形状测试标
 `#[ignore]` 并注明卡点、roadmap §3.2-#12 与 P3-18 改为「暂缓」、
@@ -2999,7 +3000,8 @@ trusted-types GAPH2 default; require-trusted-types-for 'script'
 即 **CF 自己创建了名为 `default` 的策略**;default policy 存在时,传给 script sink 的字符串
 会自动经它转换,所以 `eval(字符串)` 不但不抛,还会**回调 CF 自己的 `default.createScript`**。
 换言之:**在真实 Chrome 的 widget 文档里,每一次 `eval(字符串)` 都要过一遍 CF 的回调**。
-obscura 既不解析这条 CSP、也不暴露 `trustedTypes`,这个回调永远不发生。
+obscura 当前解析这条 CSP 的 Trusted Types 指令并暴露 `trustedTypes`，但仍缺少
+`eval(TrustedScript)` 的 V8 宿主钩子，因此完整 Chrome 行为尚未达成。
 
 **结论与影响**:Trusted Types 在这里**不是可选的 parity 项,是 widget 文档的硬性运行条件**。
 完整对齐需要三件事一起到位:①CSP `trusted-types` / `require-trusted-types-for` 解析;
