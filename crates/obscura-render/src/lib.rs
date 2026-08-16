@@ -158,13 +158,51 @@ impl CanvasTextMeasurer {
         if text.is_empty() {
             return 0.0;
         }
+        let style = self.style_for(font);
+        self.engine.measure_canvas_text(text, &style)
+    }
+
+    /// Advance width plus the grid-fitted font box for a canvas `font` string.
+    ///
+    /// The font box is the same one inline layout uses, so a TextMetrics answer
+    /// cannot contradict the element heights the engine produces next door.
+    pub fn measure_metrics(&mut self, text: &str, font: &str) -> CanvasTextMetrics {
+        let style = self.style_for(font);
+        let width = if text.is_empty() {
+            0.0
+        } else {
+            self.engine.measure_canvas_text(text, &style)
+        };
+        let (font_ascent, font_descent) = self.engine.inline_font_box_metrics(&style);
+        CanvasTextMetrics {
+            width,
+            font_ascent,
+            font_descent,
+        }
+    }
+
+    fn style_for(&self, font: &str) -> LayoutStyle {
         let mut style = LayoutStyle::default();
         style.font_size = Some(10.0);
         style.font_family = Some("sans-serif".to_string());
         style.white_space = Some(WhiteSpace::Pre);
         style::apply_font_shorthand(&mut style, font);
-        self.engine.measure_canvas_text(text, &style)
+        style
     }
+}
+
+/// What `CanvasRenderingContext2D.measureText` needs from the layout engine.
+///
+/// Only the two font-box numbers are reported alongside the width: they come
+/// from the face's horizontal header, grid-fitted the same way inline layout
+/// fits them, which is what makes them integers in Chrome too. Ink extents
+/// (the `actualBoundingBox*` family) would need per-glyph outlines and are
+/// derived from this box by the caller instead of being invented here.
+#[cfg(feature = "paint")]
+pub struct CanvasTextMetrics {
+    pub width: f32,
+    pub font_ascent: f32,
+    pub font_descent: f32,
 }
 
 #[cfg(feature = "paint")]

@@ -4492,6 +4492,88 @@ mod tests {
         assert_eq!(result, serde_json::json!([]));
     }
 
+    /// `measureText` must return a branded `TextMetrics` whose numbers live on
+    /// the prototype, the way Chrome does. It used to hand back a plain object
+    /// with three own properties, so `Object.prototype.toString.call(...)` read
+    /// `[object Object]` and six of Chrome 146's nine numbers were missing --
+    /// `fontBoundingBoxAscent` among them. The ascent/descent were also
+    /// constants derived from the font size alone, so they did not move when
+    /// the family did; they now come from the layout engine's grid-fitted font
+    /// box. Values pinned against Chrome 146 for 16px Arial, where the bundled
+    /// face metrics agree with it exactly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn measure_text_returns_a_branded_text_metrics_matching_chrome_members() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const ctx = document.createElement("canvas").getContext("2d");
+                    ctx.font = "16px Arial";
+                    const m = ctx.measureText("Mg");
+                    const round = v => Math.round(v * 1000) / 1000;
+                    return {
+                        tag: Object.prototype.toString.call(m),
+                        ownProps: Object.getOwnPropertyNames(m),
+                        members: Object.getOwnPropertyNames(Object.getPrototypeOf(m)),
+                        globalEnumerable: Object.getOwnPropertyDescriptor(
+                            globalThis, "TextMetrics").enumerable,
+                        illegalConstructor: (() => {
+                            try { new TextMetrics(); return "no-throw"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        fontBoundingBoxAscent: round(m.fontBoundingBoxAscent),
+                        fontBoundingBoxDescent: round(m.fontBoundingBoxDescent),
+                        hangingBaseline: round(m.hangingBaseline),
+                        alphabeticBaseline: round(m.alphabeticBaseline),
+                        ideographicBaseline: round(m.ideographicBaseline),
+                        // The font box must track the family, not just the size.
+                        movesWithFamily: (() => {
+                            ctx.font = "16px monospace";
+                            const mono = ctx.measureText("Mg");
+                            ctx.font = "16px Arial";
+                            return mono.fontBoundingBoxAscent !== m.fontBoundingBoxAscent
+                                || mono.width !== m.width;
+                        })(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object TextMetrics]",
+                "ownProps": [],
+                "members": [
+                    "constructor",
+                    "width",
+                    "actualBoundingBoxLeft",
+                    "actualBoundingBoxRight",
+                    "fontBoundingBoxAscent",
+                    "fontBoundingBoxDescent",
+                    "actualBoundingBoxAscent",
+                    "actualBoundingBoxDescent",
+                    "hangingBaseline",
+                    "alphabeticBaseline",
+                    "ideographicBaseline",
+                ],
+                "globalEnumerable": false,
+                "illegalConstructor":
+                    "Failed to construct 'TextMetrics': Illegal constructor",
+                "fontBoundingBoxAscent": 14,
+                "fontBoundingBoxDescent": 3,
+                "hangingBaseline": 11.2,
+                "alphabeticBaseline": 0,
+                "ideographicBaseline": -3,
+                "movesWithFamily": true,
+            }),
+        );
+    }
+
     /// Engine internals must not be enumerable on the global. `Deno` plus six
     /// Rust-injected `__obscura_*` globals were missing from the pre-hide list,
     /// so `Object.keys(window)` named the engine outright. Hiding them cannot

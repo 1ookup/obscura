@@ -2722,3 +2722,54 @@ trustedTypes=undefined viewport=[1280,720]      ← 保值写法未破坏 __obsc
 回归测试两条:`engine_internals_are_not_enumerable_on_the_global`(同时断言 `Deno.core.ops`
 仍可用)、`cross_origin_isolated_reads_false_rather_than_undefined`。obscura-js 480 通过。
 质询流程复测 2 轮均为 `realm=3 xhr=3 /ci/=1`,step 52 的修复未被拖回。
+
+### Step 54 — 附带发现修复 3：`TextMetrics` 补齐并接上真实字体度量（2026-08-16）
+
+**问题**（step 51 附带发现 3）。`measureText` 返回的是**普通对象**,只有三个 own 属性:
+
+```
+Object.prototype.toString.call(ctx.measureText('x'))  // [object Object],Chrome 是 [object TextMetrics]
+'fontBoundingBoxAscent' in ctx.measureText('x')       // false,Chrome 有九个数值
+```
+
+而且 `actualBoundingBoxAscent` 是 `7 * round(fontSize/10)` 这样的常量:**只随字号变,不随
+字族变**。同一字号下所有字体给出同一个上升高度,这在 canvas 指纹面上是自相矛盾的——
+宽度已经走真实排版引擎(`4060dc8`),高度却没有。
+
+**Chrome 146 基准**(js-reverse 实测,四组字体/字号):九个数值全部在 **prototype 上以
+getter 暴露**,own 属性为空;成员表无 `emHeight*`。两条规律在四组样本上全部成立:
+`hangingBaseline === 0.8 * fontBoundingBoxAscent`、`alphabeticBaseline === 0`;
+`ideographicBaseline === -fontBoundingBoxDescent` 在四组中吻合三组。
+
+**修复**:
+- `CanvasTextMeasurer::measure_metrics` 返回宽度加 grid-fitted 字体框,取自
+  `TextEngine::inline_font_box_metrics`——**与内联布局用的是同一个盒子**,所以
+  TextMetrics 不会和引擎隔壁给出的元素高度打架。新 op `op_canvas_text_metrics`
+  以 `"w,ascent,descent"` 平串返回(三个数,JSON 的解析开销就是全部开销)。
+- bootstrap 增加真正的 `TextMetrics` 接口:品牌构造器(非法构造抛 Chrome 的原话)、
+  九个数值作为 prototype getter、全局非可枚举。`measureText` 改为返回它。
+- 墨水范围(`actualBoundingBox*`)没有逐字形轮廓可用,退回字体框与 advance,是真实
+  墨水的**超集**而非编造值,且与并列上报的字体框自洽。这一限制写在代码注释里。
+
+**结果**(与 Chrome 146 对拍):
+
+| 用例 | Chrome | obscura |
+|---|---|---|
+| 16px Arial `Mg` | `fbbA=14 fbbD=3 hanging=11.2 ideo=-3` | **逐位相同** |
+| 32px Times `Mg` | `fbbA=29 fbbD=7 hanging=23.2 ideo=-7` | **逐位相同** |
+| 结构(tag / own props / 成员表与顺序 / 全局 enumerable / 非法构造) | — | **逐项相同** |
+| 10px sans-serif、10px monospace | `11/3`、`9/2` | `9/2`、`8/3` |
+
+后两行的差来自默认字族用的是 bundled face(跨机一致是既定取舍,见
+js-repros/font-fingerprint/),不是算法差异——同一算法在 Arial/Times 上与 Chrome 完全重合。
+
+**验证**:回归测试 `measure_text_returns_a_branded_text_metrics_matching_chrome_members`
+(结构 + 16px Arial 数值 + 断言字体框随字族变化)。全量 `cargo nextest` **1611 通过 /
+6 skipped**。质询流程复测 2 轮仍为 `realm=3 xhr=3 /ci/=1`。
+
+**顺带修好的门禁**:全量 nextest 此前在干净 HEAD 上就编译失败——`obscura-render` 自身是
+workspace member,而 `render` 是其他成员用的 feature 名,从根跑 `--features render` 时它
+自己的目标不带 feature,与 obscura-js 要的 `paint` 不统一,`CanvasTextMeasurer` 消失
+(E0433/E0425),而 `cargo tree` 却显示 `[default,paint]`。加 `render = ["paint"]` 别名修复
+(`0b09e33`)。另注:`obscura-cli::mcp_client` 的 `test_navigate_and_snapshot` /
+`test_wait_for_selector` 在并行满载下偶发失败,单独跑稳定通过,属既有 flaky。

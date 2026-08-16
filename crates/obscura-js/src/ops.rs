@@ -5428,6 +5428,25 @@ fn op_canvas_measure_text(
     width
 }
 
+/// Width plus the grid-fitted font box, as `"<width>,<ascent>,<descent>"`.
+///
+/// A flat string rather than JSON: three numbers on a path `measureText` calls
+/// per invocation, where the parse cost is the whole cost.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let metrics = shared
+        .borrow_mut()
+        .canvas_text_measurer
+        .measure_metrics(text, font);
+    format!(
+        "{},{},{}",
+        metrics.width, metrics.font_ascent, metrics.font_descent
+    )
+}
+
 // --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
 //
 // Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
@@ -6012,6 +6031,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_canvas_measure_text());
+        ops.push(op_canvas_text_metrics());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());

@@ -67,7 +67,7 @@
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
-    'Scheduler',
+    'Scheduler', 'TextMetrics',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
@@ -13836,6 +13836,69 @@ function _measureTextRun(text, font) {
   } catch (_error) { return null; }
 }
 
+// Advance width plus the grid-fitted font box, from the same engine element
+// measurement uses. Falls back to the old size-derived approximation only in a
+// build without the render layer, where there is no font engine to ask.
+function _measureTextBox(text, font) {
+  const fontString = String(font || '10px sans-serif');
+  try {
+    const op = Deno.core.ops.op_canvas_text_metrics;
+    if (typeof op === 'function') {
+      const parts = String(op(String(text), fontString)).split(',');
+      const width = Number(parts[0]);
+      const ascent = Number(parts[1]);
+      const descent = Number(parts[2]);
+      if (Number.isFinite(width) && Number.isFinite(ascent) && Number.isFinite(descent)) {
+        return { width, ascent, descent };
+      }
+    }
+  } catch (_error) {}
+  const fontSize = parseFloat(fontString) || 10;
+  const scale = Math.max(1, Math.round(fontSize / 10));
+  return { width: String(text).length * 6 * scale, ascent: 7 * scale, descent: 2 * scale };
+}
+
+// TextMetrics. Chrome exposes a branded interface whose numbers live on the
+// prototype as getters; measureText used to return a plain object carrying
+// three own properties, which is two separate tells:
+//   Object.prototype.toString.call(ctx.measureText('x'))  // was [object Object]
+//   'fontBoundingBoxAscent' in ctx.measureText('x')       // was false
+// Chrome 146 ships exactly these ten members (no emHeight*), in this order.
+const _textMetricsValues = new WeakMap();
+const TextMetrics = (function _defineTextMetrics() {
+  const TextMetrics = function () {
+    throw new TypeError("Failed to construct 'TextMetrics': Illegal constructor");
+  };
+  Object.defineProperty(TextMetrics, 'name', { value: 'TextMetrics', configurable: true });
+  Object.defineProperty(TextMetrics.prototype, Symbol.toStringTag, {
+    value: 'TextMetrics', configurable: true,
+  });
+  const _names = ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+    'fontBoundingBoxAscent', 'fontBoundingBoxDescent',
+    'actualBoundingBoxAscent', 'actualBoundingBoxDescent',
+    'hangingBaseline', 'alphabeticBaseline', 'ideographicBaseline'];
+  for (let _i = 0; _i < _names.length; _i++) {
+    const name = _names[_i];
+    Object.defineProperty(TextMetrics.prototype, name, {
+      get: _markNativeAs(function () {
+        const held = _textMetricsValues.get(this);
+        if (held === undefined) throw new TypeError('Illegal invocation');
+        return held[name];
+      }, 'function get ' + name + '() { [native code] }'),
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return _markNative(TextMetrics);
+})();
+globalThis.TextMetrics = TextMetrics;
+
+function _makeTextMetrics(values) {
+  const metrics = Object.create(TextMetrics.prototype);
+  _textMetricsValues.set(metrics, values);
+  return metrics;
+}
+
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -13981,20 +14044,35 @@ class _Canvas2D {
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
-    const text = String(t);
-    const fontSize = parseFloat(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
     // Route through the real text layout engine, which is what element
     // measurement already uses. The previous `length * 6 * scale` ignored the
     // font entirely, so every family measured identically -- a canvas font
     // fingerprint with no variance at all, and one that contradicted the
-    // element widths the same engine produced next door.
-    const measured = _measureTextRun(text, this.font);
-    return {
-      width: measured !== null ? measured : text.length * 6 * scale,
-      actualBoundingBoxAscent: 7 * scale,
-      actualBoundingBoxDescent: 2 * scale,
-    };
+    // element widths the same engine produced next door. The ascent/descent
+    // were worse: constants derived from the size alone, so they did not move
+    // when the family did.
+    const box = _measureTextBox(String(t), this.font);
+    return _makeTextMetrics({
+      width: box.width,
+      // No per-glyph outlines are available here, so the ink extents fall back
+      // to the font box and the advance. That is a superset of the real ink
+      // rather than an invented number, and it stays consistent with the
+      // font box reported beside it.
+      actualBoundingBoxLeft: 0,
+      actualBoundingBoxRight: box.width,
+      fontBoundingBoxAscent: box.ascent,
+      fontBoundingBoxDescent: box.descent,
+      actualBoundingBoxAscent: box.ascent,
+      actualBoundingBoxDescent: box.descent,
+      // Chrome puts the hanging baseline at 80% of the font ascent, the
+      // alphabetic one at the origin, and the ideographic one at the font
+      // descent. Checked against Chrome 146 for sans-serif, Arial, Times New
+      // Roman and monospace at 10/16/32px: hanging is 0.8 * ascent in all of
+      // them, alphabetic is 0 in all of them.
+      hangingBaseline: box.ascent * 0.8,
+      alphabeticBaseline: 0,
+      ideographicBaseline: -box.descent,
+    });
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
