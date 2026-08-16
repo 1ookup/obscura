@@ -30,14 +30,20 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN cargo build --release --features render --bin obscura --bin obscura-worker 2>/dev/null || true
+# --no-default-features is required, not cosmetic: `default` carries `stealth`,
+# which builds BoringSSL through btls-sys and needs cmake, clang and libclang --
+# none of which this builder installs. Adding them would also make the arm64 leg
+# compile C and assembly under QEMU emulation (docker.yml builds linux/arm64
+# that way), which is where the build time would actually go. Users who need the
+# stealth transport take the -stealth release archive.
+RUN cargo build --release --no-default-features --features render --bin obscura --bin obscura-worker 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
 RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
+    touch crates/*/src/*.rs && cargo build --release --no-default-features --features render --bin obscura --bin obscura-worker
 
 # ---
 

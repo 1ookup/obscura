@@ -23,21 +23,30 @@ cd "$repo_root" || exit 1
 # silently dropping the trace patch, and rewrites Cargo.lock's `v8` source and
 # checksum lines -- whose absence is intentional (docs/Trace-page-script.md).
 # A gate that corrupts the thing it is guarding is worse than no gate.
-V8_PATCH=(--config 'patch.crates-io.v8.path="vendor/rusty_v8"')
-export V8_FROM_SOURCE=1
+#
+# The file also sets V8_FROM_SOURCE=1 (force), so it no longer has to be
+# exported here -- the two have to travel together, and keeping them in one
+# place is why the file exists.
+V8_PATCH=(--config vendor/v8-source.toml)
 
 fail() { printf '\n\033[31mpre-push: %s\033[0m\n' "$1" >&2; exit 1; }
 step() { printf '\033[36mpre-push: %s\033[0m\n' "$1"; }
 
 lock_before="$(git hash-object Cargo.lock 2>/dev/null || echo missing)"
 
-# 1. The default feature set. obscura-js and obscura-cli default to no features
-# and nothing else ever builds them that way, which is how a `cannot find type
-# ReferrerPolicy` error survived in ops.rs unnoticed: every build and every test
-# run passed --features render.
-step "checking the default feature set (nothing else builds it)"
-cargo check -p obscura-js -p obscura-cli "${V8_PATCH[@]}" >/dev/null 2>&1 \
-  || fail "default feature set does not compile -- rerun without >/dev/null to see it"
+# 1. The feature set nothing else builds. This used to be the *default* set,
+# back when obscura-js and obscura-cli defaulted to no features -- that gap is
+# how a `cannot find type ReferrerPolicy` error survived in ops.rs unnoticed,
+# since every build and every test run passed --features render.
+#
+# `stealth` has since moved into `default`, so the exposure inverted: the
+# default set is now what release.yml builds on every tag, and the shape at risk
+# of rotting is the one WITHOUT it. Hence --no-default-features. It also keeps
+# this step free of the cmake/clang toolchain that BoringSSL would otherwise
+# demand on every push.
+step "checking the --no-default-features feature set (nothing else builds it)"
+cargo check -p obscura-js -p obscura-cli --no-default-features "${V8_PATCH[@]}" >/dev/null 2>&1 \
+  || fail "--no-default-features feature set does not compile -- rerun without >/dev/null to see it"
 
 # 2. The tests.
 step "running the workspace tests"

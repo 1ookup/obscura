@@ -42,14 +42,39 @@ description: >
 # 以下命令均从仓库根执行，用 $SKILL_DIR 定位脚本：
 SKILL_DIR=".claude/skills/obscura-challenge-probe"
 
-# 必须带 stealth feature 构建
-V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
-  --features render,stealth \
-  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+# 本技能只在 render + stealth 上有效，也就是当前的默认 feature 组合。
+# stealth 已在 default 里，所以 --features render 就拿到两者；--config 一并
+# 带上 V8 patch 与 V8_FROM_SOURCE=1（等价于别名 `cargo v8-build`）。
+cargo build --release -p obscura-cli --bins \
+  --features render \
+  --config vendor/v8-source.toml
 
 # MITM 代理的 CA 证书（本机 Reqable 路径；换工具/机器时替换为你的 CA）
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 ```
+
+**不要用 `cargo v8-build-lean`、`--no-default-features` 或任何去掉 stealth 的
+变体做质询诊断。** 质询在握手阶段就看 TLS 指纹，在首个请求就看 User-Agent：
+非 stealth 二进制走的是 rustls + `DEFAULT_USER_AGENT`，根本到不了质询逻辑本身。
+那种构建跑出来的「断点」是构建缺陷，不是页面行为——按它去改代码，改的是不
+存在的问题。
+
+**每轮实测前先自查当前二进制**（这行日志默认不打印，必须显式开 `RUST_LOG`；
+target 是 bin 名 `obscura`，写 `obscura_cli` 匹配不到）：
+
+```bash
+RUST_LOG=info ./target/release/obscura serve --port 9299 --stealth 2>&1 | grep 'Stealth mode'
+```
+
+```
+Stealth mode enabled (TLS fingerprint impersonation + tracker blocking)   ← 正确
+Stealth mode enabled (tracker blocking)                                   ← 缺 stealth，重新构建
+```
+
+两行都由 `--stealth` 触发，差别只在编译期：后者说明二进制里没有 wreq 传输，
+此时 `--stealth` 只剩 tracker 拦截。`target/release/obscura` 常被其他构建（Docker
+验证、release 变体、`v8-build-lean`）覆盖成非 stealth 版本，且覆盖后毫无提示，
+所以这一步不能省。
 
 ## 第一步：与浏览器 HAR 对比
 
@@ -143,6 +168,7 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 
 | 盲区 | 症状 | 正确做法 |
 |------|------|----------|
+| **二进制不带 stealth**（`--no-default-features` / `v8-build-lean` 构建） | 质询在 TLS 握手阶段就分流，请求序列比浏览器短一大截，看起来像「上游某步没触发」——而那个「断点」纯属构建缺陷 | 只用默认的 render + stealth 构建；起 serve 时确认日志是 `TLS fingerprint impersonation + tracker blocking` 而非仅 `tracker blocking` |
 | `querySelectorAll` 不穿透 shadow；closed root 的 `el.shadowRoot` 为 `null` | 误判「iframe 从未插入 DOM」 | 预注入截获 `attachShadow` 保留 root 引用（`cdp_probe.py shadow`） |
 | frame 导航不打印 URL | 误判「iframe 文档从未被请求」 | 看 `starting new connection` / `Cookie header for <host>`，或直接插桩 |
 | 混淆代码的字符串表会「返回」错误字符串 | 把 `unsupportedbrowser`、`invalidsitekey` 当成被触发的错误 | 看调用形态：`CALL Window.g(<数字>)` → `RET object:Array` → `RET string:"..."` 是查表 |

@@ -2,7 +2,13 @@
 
 - Rust 1.75+ ([rustup.rs](https://rustup.rs))
 - C compiler (gcc or clang)
+- CMake, Clang, and the libclang/LLVM development libraries
 - ~5 GB free disk space (V8 compiles from source on first build)
+
+CMake and libclang are required for the default build: stealth is part of the
+default feature set and compiles BoringSSL. A `--no-default-features` build
+uses rustls and needs none of them. See
+[BoringSSL toolchain](#boringssl-toolchain) for per-platform details.
 
 First build takes about 5 minutes. Incremental builds are seconds.
 
@@ -16,32 +22,36 @@ cargo build --release -p obscura-cli --bins --features render
 
 Binary is at `./target/release/obscura`.
 
-This produces the release binary with geometry, screenshots, screencasting,
-and PDF export.
+This is the complete build: geometry, screenshots, screencasting, and PDF
+export from `render`, plus the stealth wreq/BoringSSL transport, TLS
+fingerprint randomization, browser-identity protections, and tracker blocklist
+from the default feature set. See
+[Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
-## Rendering and stealth
+## Rendering only
 
 ```bash
-cargo build --release -p obscura-cli --bins --features render,stealth
+cargo build --release -p obscura-cli --bins --no-default-features --features render
 ```
 
-This is the complete rendering build with the stealth wreq/BoringSSL transport,
-TLS fingerprint randomization, browser-identity protections, and tracker
-blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+`--no-default-features` turns stealth off across the whole dependency chain, so
+this build uses rustls and needs neither CMake nor libclang.
 
 ## Without rendering
 
 ```bash
+cargo build --release -p obscura-cli --bins
 cargo build --release -p obscura-cli --bins --no-default-features
-cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
-The second command keeps stealth while excluding layout, screenshots,
-screencasting, and PDF export.
+The first command keeps stealth while excluding layout, screenshots,
+screencasting, and PDF export. The second excludes both.
 
-The stealth feature builds BoringSSL and generates Rust bindings. In addition
-to the default requirements, install CMake, Clang, and the libclang/LLVM
-development libraries. On Ubuntu/Debian:
+## BoringSSL toolchain
+
+The stealth feature builds BoringSSL and generates Rust bindings, so this
+applies to every build that does not pass `--no-default-features`. Install
+CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 
 ```bash
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
@@ -58,7 +68,7 @@ libc++ while compiling BoringSSL. Use the active SDK for that build:
 ```bash
 SDK_PATH="$(xcrun --show-sdk-path)"
 SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
-  cargo build --release -p obscura-cli --bins --features render,stealth
+  cargo build --release -p obscura-cli --bins --features render
 ```
 
 ## OpenSSL on older systems
@@ -98,3 +108,28 @@ python3 tests/test_all.py
 
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
 because the engine owns a single V8 isolate per process.
+
+## Building against a patched V8
+
+Only needed when working on the property tracer. `vendor/v8-source.toml` carries
+both the `[patch.crates-io]` entry pointing at `vendor/rusty_v8` and
+`V8_FROM_SOURCE=1`; passing one without the other fails on a missing
+`gen/src_binding_release_<target>.rs`, so they live in one file:
+
+```bash
+cargo build --release -p obscura-cli --bins --features render \
+  --config vendor/v8-source.toml
+```
+
+`.cargo/config.toml` defines aliases for the usual shapes:
+
+| Alias | Equivalent to |
+| --- | --- |
+| `cargo v8-build` | the command above |
+| `cargo v8-build-lean` | same, with `--no-default-features` |
+| `cargo v8-check` | `cargo check -p obscura-js -p obscura-cli` |
+| `cargo v8-test` | `cargo nextest run --release --no-fail-fast --features render` |
+
+These are opt-in: normal builds, the release workflow and the Docker image link
+the prebuilt `librusty_v8.a` and never compile V8 from source. Building it from
+source takes about 30 minutes the first time.

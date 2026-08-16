@@ -12,26 +12,36 @@ and stealth as first-class, complementary capabilities.
 
 ## Build variants
 
-Official release archives and Docker images include rendering. For a source
-checkout, build release mode with the render feature:
-
-```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
-```
+Official release archives and Docker images include rendering. In a source
+checkout `stealth` is a default feature and `render` is not, so opt into
+rendering with `--features render` and opt out of stealth with
+`--no-default-features`.
 
 Build rendering and stealth together for the wreq/BoringSSL transport,
 browser-identity protections, and tracker blocking:
 
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
+```
+
+Build rendering without stealth:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features render
 ```
 
 Build without rendering when only DOM, extraction, or CDP automation is needed:
 
 ```bash
+# Stealth, no rendering
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins
+# Neither
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
+
+Because stealth is on by default, a default build compiles BoringSSL and needs
+cmake, clang, libclang-dev, and llvm-dev. A `--no-default-features` build uses
+rustls and needs none of them.
 
 Use `./target/release/obscura` in the commands below when working from source.
 
@@ -51,7 +61,8 @@ obscura --stealth fetch https://example.com --screenshot page.png
 obscura serve --stealth --port 9222
 ```
 
-The runtime flag needs a `render,stealth` build for the wreq/BoringSSL transport.
+The runtime flag needs a build that kept the default `stealth` feature for the
+wreq/BoringSSL transport.
 
 ## Fetch, evaluate, and capture
 

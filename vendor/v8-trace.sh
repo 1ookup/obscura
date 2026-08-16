@@ -21,13 +21,19 @@
 # slowdown, and keeps property lookups. Use it when the page's own timing
 # matters -- anything gated on network round trips.
 #   vendor/v8-trace.sh check                     is the current binary patched?
+#
+# OBSCURA_NO_DEFAULT=1 builds without the default features -- no stealth, hence
+# no BoringSSL. Only useful when the traced page does not care about the
+# transport; challenge scripts usually do.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 V8_DIR="$ROOT/vendor/rusty_v8"
 BIN="$ROOT/target/release/obscura"
-PATCH_CONFIG='patch.crates-io.v8.path="vendor/rusty_v8"'
+# Carries both the [patch.crates-io] entry and V8_FROM_SOURCE=1; the same file
+# backs the cargo aliases and .githooks/pre-push, so the override is defined once.
+PATCH_CONFIG="vendor/v8-source.toml"
 
 # The flag combination, in one place. --trace drives the call and return hooks;
 # --no-lazy-feedback-allocation drives the property ones, because V8 withholds a
@@ -66,8 +72,20 @@ cmd_build() {
   "$ROOT/vendor/v8-property-trace.sh" "$V8_DIR/v8" >/dev/null
   echo "patched; building (first time takes ~30 minutes)"
   cd "$ROOT"
-  V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
-    --features "${OBSCURA_FEATURES:-render}" --config "$PATCH_CONFIG"
+
+  # --features adds to the default set rather than replacing it, and `default`
+  # now carries `stealth`, so OBSCURA_FEATURES=render means render AND stealth.
+  # That is the right default for tracing -- challenge scripts branch on the
+  # transport -- but OBSCURA_NO_DEFAULT=1 gives back the lean shape, which also
+  # skips the BoringSSL build.
+  local feature_args=(--features "${OBSCURA_FEATURES:-render}")
+  if [[ "${OBSCURA_NO_DEFAULT:-0}" == "1" ]]; then
+    feature_args=(--no-default-features "${feature_args[@]}")
+  fi
+
+  # V8_FROM_SOURCE=1 comes from the --config file (force = true).
+  cargo build --release -p obscura-cli --bins \
+    "${feature_args[@]}" --config "$PATCH_CONFIG"
   echo "built $BIN"
 }
 

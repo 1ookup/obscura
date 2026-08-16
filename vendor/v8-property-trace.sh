@@ -756,9 +756,14 @@ cat <<'EOF'
 
 Build obscura against the patched V8 without modifying Cargo.toml:
 
-  V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+  cargo v8-build
+
+That alias expands to the command below; vendor/v8-source.toml supplies both the
+patch and V8_FROM_SOURCE=1, which have to be passed together:
+
+  cargo build --release -p obscura-cli --bins \
     --features render \
-    --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+    --config vendor/v8-source.toml
 
 Run with both flags. The trace is silent without the first, and blind to page
 script without the second:

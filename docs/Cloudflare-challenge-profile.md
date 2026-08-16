@@ -406,6 +406,10 @@ Origin）同样改用它——Chrome 发的 `/ci/` 请求 Referer 是 widget 文
 默认 feature 下编译不过。`cargo build --features render,stealth` 是绿的，
 **必须另跑一次 `cargo check` 的默认 feature 组合**才会暴露。
 
+> 记录于 `stealth` 进入 `default` 之前，当时「默认 feature 组合」指的是空
+> feature 集。现在那个没人构建的形态是 `--no-default-features`，`.githooks/pre-push`
+> 的第 1 步也已相应改为守它。结论不变，只是命令换了。
+
 ### Step 12 — 找到真正的阻塞点：Worker 收到的消息不是 trusted
 
 方向来自一条早先采样时瞥见、当时没追的线索：进程里有 `obscura-worker-2` /

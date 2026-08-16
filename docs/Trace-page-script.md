@@ -20,6 +20,8 @@ arguments, what came back, and whether a property existed at all.
 |------|------|
 | `vendor/v8-property-trace.sh` | **核心。** 以锚点插入方式直接修改 V8 源码（3 个 hook 点 + 2 个 flag） |
 | `vendor/v8-trace.sh` | 便利 wrapper，封装 build / run / check 三步，防止 flag 配错或静默降级 |
+| `vendor/v8-source.toml` | `--config` 加载的 override 文件，同时携带 `[patch.crates-io]` 的 v8 路径与 `V8_FROM_SOURCE=1` |
+| `.cargo/config.toml` | `cargo v8-build` / `v8-build-lean` / `v8-check` / `v8-test` 四个别名，封装上面的 `--config` |
 | `.gitignore` | 忽略 `vendor/rusty_v8/`（数 GB 上游源码，仅通过 `--config` override 使用） |
 | `docs/Trace-page-script.md` | 本文档 |
 
@@ -99,16 +101,33 @@ DEFINE_STRING(trace_property_lookup_file, nullptr,
 ### 3. 编译
 
 ```bash
-V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
+cargo build --release -p obscura-cli --bins \
   --features render \
-  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+  --config vendor/v8-source.toml
 ```
+
+`stealth` 是默认 feature，所以 `--features render` 得到的是 render + stealth；
+要去掉 stealth 用 `--no-default-features --features render`。`.cargo/config.toml`
+里的 `cargo v8-build` 和 `cargo v8-build-lean` 分别是这两条的别名。
+
+**patch 与 `V8_FROM_SOURCE=1` 必须成对出现。** 只给 patch 而不设环境变量，rusty_v8
+会走预编译路径并报 `couldn't read .../gen/src_binding_release_<target>.rs`——一个
+和真实原因毫无关系的错误。`vendor/v8-source.toml` 把两者装进同一个文件正是为了
+消灭这个陷阱，因此用 `--config vendor/v8-source.toml`，不要再手写
+`--config 'patch.crates-io.v8.path=...'`。
+
+`vendor/v8-trace.sh build` 走同一条路径：`OBSCURA_NO_DEFAULT=1` 切到
+no-default-features（无 stealth、无 BoringSSL）。注意 `OBSCURA_FEATURES` 是**叠加**
+在 default 之上的，所以 `OBSCURA_FEATURES=render` 现在意味着 render **和** stealth，
+不再是「只有 render」。
 
 首次编译约 30 分钟。`--config` 是临时的：`Cargo.toml` 不变，普通构建继续使用预编译 V8。
 
 **这是最容易踩的坑：** 任何不带 `--config` 的 `cargo build` 或 `cargo nextest` 会
 重新链接预编译 V8，**静默丢弃补丁**。此时 `obscura fetch` 仍然成功，trace 输出文件
-为空——读起来像"页面什么都没做"，而不是"二进制已降级"。
+为空——读起来像"页面什么都没做"，而不是"二进制已降级"。它同时会把 `Cargo.lock` 里
+`v8` 条目的 `source` 和 `checksum` 两行写回去——那两行的缺失是有意的（patch 生效时
+v8 来自本地路径），不要提交这种改动。
 
 ### 4. 验证二进制
 
@@ -275,10 +294,10 @@ CALL/RET 记录。
 ### 前置条件
 
 ```bash
-# 1. 构建带 stealth feature 的二进制
-V8_FROM_SOURCE=1 cargo build --release -p obscura-cli --bins \
-  --features render,stealth \
-  --config 'patch.crates-io.v8.path="vendor/rusty_v8"'
+# 1. 构建带 stealth feature 的二进制（stealth 是默认 feature，无需显式列出）
+cargo build --release -p obscura-cli --bins \
+  --features render \
+  --config vendor/v8-source.toml
 
 # 2. 代理证书。Reqable 等 MITM 代理用自签证书，需传入根证书路径。
 #    证书路径取决于代理工具：

@@ -429,10 +429,11 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    git config core.hooksPath .githooks
    ```
 
-   它跑四件事:①默认 feature 集 `cargo check`(第 1 条那个错误能长期存活的唯一原因);②
-   obscura-js/browser/cdp 全量 nextest;③**obscura-render 的两种 feature 形态**(见下);
+   它跑四件事:①`--no-default-features` 的 `cargo check`(第 1 条那个错误能长期存活的唯一原因;
+   `stealth` 进入 `default` 后,没人构建的形态从「默认」变成了「显式关掉默认」,这一步已相应
+   反转);②obscura-js/browser/cdp 全量 nextest;③**obscura-render 的两种 feature 形态**(见下);
    ④`Cargo.lock` 前后哈希比对(第 5 条那个坑,本轮我自己踩了两次)。hook 内所有 cargo 命令都带
-   `--config patch.crates-io.v8.path`——否则门禁本身就成了改写 `Cargo.lock` 的元凶。
+   `--config vendor/v8-source.toml`——否则门禁本身就成了改写 `Cargo.lock` 的元凶。
    `SKIP_OBSCURA_PREPUSH=1 git push` 可显式跳过。
 
    **feature 形态错配(与第 1 条同源,方向相反)**。obscura-render 有 28 个测试断言真实文字排版
@@ -492,10 +493,12 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    `shared_array_buffer_is_withheld_the_way_chrome_withholds_it` 覆盖)。stack-realm-referrer 横跨
    四个文档(same.html/cross.html/外部脚本/样式表),performance-timeline 需要「被服务的页面 + 被
    服务的子资源」才能让 resource entry 有真实网络分段可报,且没有可 await 的 promise 全局。
-6. **构建必须带 V8 补丁配置**。任何不带
-   `--config 'patch.crates-io.v8.path="vendor/rusty_v8"'` 的 `cargo build`/`nextest` 会静默把
-   `target/release/obscura` 换成非 patched V8,trace 输出随之变空(见 `Trace-page-script.md`)。
-   同时它会改写 `Cargo.lock` 里 `v8` 的 source/checksum——那两行的缺失是有意的,不要提交回去。
+6. **构建必须带 V8 补丁配置**。任何不带 `--config vendor/v8-source.toml` 的
+   `cargo build`/`nextest` 会静默把 `target/release/obscura` 换成非 patched V8,trace 输出随之
+   变空(见 `Trace-page-script.md`)。同时它会改写 `Cargo.lock` 里 `v8` 的 source/checksum——
+   那两行的缺失是有意的,不要提交回去。该文件同时带 `[patch.crates-io]` 和 `V8_FROM_SOURCE=1`,
+   两者必须成对出现:只给 patch 不给环境变量会以 `gen/src_binding_release_<target>.rs` 缺失
+   报错,而那个报错和真实原因毫无关系。
 
 ## 7. 与现有工作的衔接
 

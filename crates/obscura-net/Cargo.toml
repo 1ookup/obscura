@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+# On by default: the wreq transport is what makes a request indistinguishable
+# from Chrome, and a scraper that silently lacks it fails in ways that look like
+# site bugs. Opting out (--no-default-features) drops the BoringSSL toolchain
+# requirement -- cmake, clang and libclang -- and is what the docker image and
+# the no-render release variants build.
+default = ["stealth"]
 stealth = ["wreq", "wreq-util", "futures-util"]
 
 [dependencies]
