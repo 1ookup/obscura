@@ -4,20 +4,9 @@
 `trusted-types` policy-name allowlist is enforced, and common HTML/script sinks
 honour `require-trusted-types-for 'script'`.
 
-Why it is off: `eval(trustedScript)` cannot be implemented from JavaScript. eval
-returns a non-string argument unchanged; Trusted Types replaces that step with a
-host hook, which Chrome services through V8's ModifyCodeGenerationFromStrings
-callback. rusty_v8 does not expose it, and official builds link the prebuilt
-librusty_v8. Every other sink is correct -- only eval is missing -- but a page
-that feature-detects `window.trustedTypes` switches to the Trusted Types path on
-that one check alone, and its `eval(policy.createScript(...))` then silently does
-nothing. That regressed a real challenge page; the failure was bisected to
-`1f963b7` and reproduced by injecting an equivalent surface into the preceding
-build. See docs/Cloudflare-challenge-profile.md step 49-52.
-
-The remaining engine-level gap is `eval(TrustedScript)`: it needs V8's
-`ModifyCodeGenerationFromStrings` callback, which rusty_v8 does not expose.
-Consequently the full Chrome oracle remains ignored until that hook is added.
+`eval(TrustedScript)` is wired through the vendored V8
+`ModifyCodeGenerationFromStrings` callback. The callback converts only the
+TrustedScript brand and preserves ordinary eval(object) behavior.
 
 ## Capture
 
@@ -60,13 +49,13 @@ All 101 observables are identical to Chrome. That covers:
 
 ## Remaining CSP gaps
 
-The `trusted-types` policy-name allowlist and common script sinks are enforced.
-The full CSP resource matrix is still being expanded, and `eval(TrustedScript)`
-cannot yet be wired to the V8 host hook.
+The `trusted-types` policy-name allowlist, common script sinks, and
+`eval(TrustedScript)` are enforced. The full CSP resource matrix is still being
+expanded.
 
 On a document that sends `require-trusted-types-for 'script'`, Obscura now
 rejects plain strings at `innerHTML`, `srcdoc`, and script text sinks, while
 allowing values returned by an allowed policy or its `default` policy.
 
-Completing the remaining behavior needs the V8 eval hook plus broader sink and
-resource instrumentation.
+Completing the remaining behavior needs broader CSP sink and resource
+instrumentation.

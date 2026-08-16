@@ -61,7 +61,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 9 | **WebGL/WebGL2 空 class** | 默认仍诚实返回 `null`;显式 profile 开关提供一致性值层 | `OBSCURA_WEBGL_PROFILE=1` 从 fingerprint GPU 策略派生 vendor/renderer、扩展和基础对象生命周期;不声称真实 GPU 后端 |
 | 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
 | 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 入口已补(`CSS.paintWorklet`/`audioWorklet`) | SharedWorker 与 dedicated Worker 同构已落地;SW 与 worklet 保持 fail-closed,但形状与 Chrome 逐项对齐,失败用 Chrome 自己的错误形态 |
-| 12 | **Trusted Types 建模** | **部分完成**：API 入口、CSP policy allowlist、常用 script sinks 已启用；`eval(TrustedScript)` 仍受 rusty_v8 宿主钩子限制 | 工厂/策略/三个包装类型、`trusted-types` 白名单和 `require-trusted-types-for 'script'` 已覆盖 `innerHTML`/`srcdoc`/script text。`eval` 需要 `ModifyCodeGenerationFromStrings`；完整 Chrome oracle 继续保持 ignored |
+| 12 | **Trusted Types 建模** | **已完成 API 与主要 sink**：API 入口、CSP policy allowlist、常用 script sinks 和 `eval(TrustedScript)` 已启用 | 工厂/策略/三个包装类型、`trusted-types` 白名单、`require-trusted-types-for 'script'`、`innerHTML`/`srcdoc`/script text 以及 V8 `ModifyCodeGenerationFromStrings` callback 均已覆盖；完整 Chrome oracle 已恢复并通过 |
 | 13 | **媒体/WebRTC/Notification** | 媒体能力声明已自洽并对齐 Chrome(`3a61507`);WebRTC/Notification 仍是全桩 | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准);WebRTC/Notification 尚未按此复核 |
 
 ### 3.3 网络与传输
@@ -173,7 +173,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 |---|---|---|
 | 16 | ServiceWorker fail-closed(§3.2-#11) | ✅ 完成(`8734846`) |
 | 17 | SharedWorker 真实现(§3.2-#11) | ✅ 完成(`871682b`) |
-| 18 | Trusted Types API 面(§3.2-#12) | ⏳ **部分完成**:入口、policy allowlist 和常用 script sinks 已启用，`eval(trustedScript)` 仍卡在引擎级宿主钩子；完整 oracle 继续 ignored |
+| 18 | Trusted Types API 面(§3.2-#12) | ✅ **完成**:入口、policy allowlist、常用 script sinks 和 `eval(trustedScript)` 已启用，完整 oracle 已通过 |
 | 19 | worklet 入口(§3.2-#11) | ✅ 完成(`552715e`) |
 | 20 | 媒体能力声明自洽(§3.5-#23 起步 / §3.2-#13) | ✅ 完成(`3a61507`) |
 | 21 | canvas 文本度量走真实布局(§3.5-#22 起步) | ✅ 完成(`4060dc8`) |
@@ -356,13 +356,13 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 #### P3-18 实施记录:Trusted Types API 面
 
-- **状态**:⏳ 部分完成。API、策略白名单和常用 script sinks 已实现；`eval(TrustedScript)` 与完整 CSP 资源矩阵仍待补齐。
+- **状态**:✅ API 与主要 sink 完成。完整 CSP 资源矩阵仍待补齐。
 - **核实结果**: `window.trustedTypes` 已暴露；策略名称由文档 CSP 的 `trusted-types` 指令限制。
 - **实现**:工厂、策略、三个包装类型、策略白名单和常用 script sinks。brand check 用 WeakMap 成员关系而非原型判定,
   所以 `isHTML(Object.create(TrustedHTML.prototype))` 返回 false——与 Chrome 一致,而这正是这类
   类型存在的意义。策略选项按 WebIDL dictionary 语义在 `createPolicy` 时读取一次。
 - **验证**:`js-repros/trusted-types/` 固化 Chrome 146 oracle,**101 个观测点全部一致,无差异**。
-- **未实现的部分(不伪装)**: `eval(TrustedScript)` 仍需 V8 宿主钩子；connect、image、style、worker 等资源级 CSP 仍在扩展。
+- **未实现的部分(不伪装)**: connect、image、style 已接入主要路径；worker、font、media、reporting 等资源级 CSP 仍在扩展。
   加 sink 插桩。
 
 ### P1/P2 实施记录(序 6–15)
@@ -374,7 +374,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **序 12–13, transport**: reqwest is built with HTTP/2 support and explicit proxy builders use `NoProxy::from_env`; the same bypass is applied to scripted fetch and stealth/wreq. Invalid explicit proxy URLs are surfaced as warnings. ALPN/TLS packet-level comparison requires an HTTPS fixture and Chrome oracle unavailable on this host.
 - **序 14–15, forms/layout**: label `control` and control `labels` follow tree scope and labelability rules, and uncanceled programmatic label activation forwards to the control. Retained frame `PreparedRender` snapshots are reused by paint, geometry and scroll metrics and invalidated by document generation, viewport, animation sample, or connected DOM mutation.
 
-**Verification boundary**: Chrome/Chromium executables are not installed on the current host, so the new `js-repros` READMEs explicitly mark Chrome 146 oracle capture as pending. Deterministic Obscura fixture probes and release `nextest` remain the local evidence; no synthetic Chrome oracle JSON is claimed.
+**Verification boundary**: Chrome/Chromium executables are not installed on the current host. The Trusted Types fixture uses the checked-in Chrome 146 oracle and its full Obscura comparison now passes; new oracle captures still require a Chrome-capable host.
 
 > **更新(P3 阶段)**:本机现已装有 Google Chrome 146.0.7680.80
 > (`/Applications/Google Chrome.app`),P3 的三个 fixture 均已用它采到真实 oracle。

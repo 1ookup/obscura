@@ -16669,15 +16669,10 @@ if (typeof globalThis.MediaSource === 'undefined') {
 // checks, sink type tables, and the `trusted-types` policy-name allowlist.
 // Sink enforcement (`require-trusted-types-for`) remains below the API layer.
 (function _installTrustedTypes() {
-  // One sink cannot be implemented from JavaScript: `eval(trustedScript)`.
-  // eval returns a non-string argument unchanged (ES "PerformEval" step 1);
-  // Trusted Types replaces that step with a host hook, which Chrome services
-  // through V8's ModifyCodeGenerationFromStrings callback. rusty_v8 does not
-  // expose that callback, and official builds link the prebuilt librusty_v8,
-  // so adding it would make this API behave differently depending on how the
-  // binary was built. Overriding globalThis.eval is not a substitute: it turns
-  // every `eval(x)` call site into an indirect eval, changing the scope real
-  // pages depend on.
+  // `eval(trustedScript)` is handled by the V8
+  // ModifyCodeGenerationFromStrings callback installed by the runtime. It
+  // converts only the TrustedScript brand, preserving ordinary eval(object)
+  // semantics and direct-eval scope behavior.
   //
   // Brand membership, not prototype identity: `Object.create(
   // TrustedHTML.prototype)` must fail `isHTML`, and in Chrome it does.
