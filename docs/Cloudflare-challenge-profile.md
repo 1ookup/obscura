@@ -1932,6 +1932,7 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
+| **同一 IP 反复跑质询会触发 CF 升级**：第一次 `/fo/` 直接 400 + `600010`，tokenB 不再下发 | 所有依赖大载荷的对拍突然全部失效，看起来像「刚才那次改动把链路打断了」 | 拿**撤掉该改动的同一份构建**再跑一轮；形态相同就是 CF 侧。另可对比失败轮与成功轮的**第一个**载荷：键集合一致就说明引擎侧没变 |
 | **`obscura fetch --eval` 不 await Promise**；CDP `Runtime.evaluate` 对**多行** async IIFE 也静默返回 `{}` | 异步探针（WebRTC / getCapabilities / fetch 链）一律读到空结果，看起来像「这个 API 什么都没返回」 | 走 CDP 且带 `awaitPromise: true`，并把表达式**压成单行**；先用 `Promise.resolve(42)` 自检一次求值路径是否真的 await |
 | **探针的预注入钩子本身会被写进指纹**（`cdp_click_fast.py` 的 PRELOAD 包 `attachShadow` 并定义 `__roots`/`__pm`/`__t0`） | step 66 第一轮里 CF 载荷的 `YIjU8` 记下了钩子函数源码、`fyCZH9` 多出 `o.__pm`/`o.__roots`/`o.__t0`——**测的是探针不是引擎**，整轮作废 | 凡是要拿载荷/指纹做对拍的轮次，用零注入探针（`/tmp/clean_click.py`）；只有需要穿透 closed shadow 定位 widget 时才用带钩子的版本，且不得用该轮数据下指纹结论 |
 | MITM 代理换机器后 **CA 也换了**（本机 `Sep 30, 2025` vs 远端 `Apr 4, 2026`） | 用旧 `SSL_CERT_FILE` 会在握手阶段就失败，症状像「代理不通」 | `curl -s http://<proxy-host>:<port>/ca` 直接取 PEM，再对 `openssl s_client -proxy` 看到的 issuer 核对 CN |
@@ -3886,3 +3887,39 @@ getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
 先断言非 stealth 时 `requestAdapter()` 仍返回 `null`，再断言 setlike 行为、
 无移动端压缩格式、device 限额低于 adapter 限额、品牌串是
 `[object GPUAdapter]` / `[object GPUSupportedLimits]` / `[object GPUDevice]`。
+
+### Step 72 — `ZpxzX5`：RTP 能力表由 SDP 反推；CF 侧升级导致本轮无法量测（2026-08-17）
+
+**现状**：`RTCRtpSender` / `RTCRtpReceiver` 两个接口在 obscura 里**根本不存在**,
+`RTCRtpSender.getCapabilities('audio')` 直接抛 TypeError,
+载荷里是 `[[],[]]`（7 B），浏览器是 1273 B。
+
+**做法**：不新写一份 codec 表，而是**从 step 69 已经搬进来的 SDP 段落里反推**——
+遍历 `a=rtpmap:` 取名字/时钟频率/声道数，配对 `a=fmtp:` 取格式参数，
+`a=extmap:` 取头扩展。这样 offer 与 `getCapabilities()` **不可能互相矛盾**:
+同一份数据的两种视图。
+
+两个细节：
+
+- `rtx` 无论有多少个 payload type，能力表里只出现一次，且**不带 fmtp**——
+  它的 `apt=` 指向被修复的那路流，是逐连接的属性而不是能力。
+- 去重键必须包含**时钟频率**：`telephone-event` 在 48000 和 8000 各有一条,
+  只按名字去重会把两条并成一条（第一版正是如此，8 条变 7 条）。
+
+**本地实测**：audio 8 条、video 21 条，**与浏览器载荷逐条同序同内容**
+（VP8 → rtx → VP9×4 → H264×8 → AV1×2 → H265×2 → red → ulpfec → flexfec-03）。
+
+**CF 侧量测未取得**，原因写清楚：从本步开始，`/fo/` 的**第一次**提交就返回
+**HTTP 400 + `dkQhH9: "600010"`**，tokenB 那一轮根本不再下发，
+所以 `ZpxzX5` 所在的大载荷这两轮都没产生。
+
+**这不是本次改动引起的**，做了对照实验：把本步的改动**从工作区撤掉、重新构建、
+再跑一轮**，失败形态完全相同（`[4516, 795, 4731, 795]`，两次 600010）。
+另外把失败轮的**第一个**载荷与上一轮成功的第一个载荷逐字段对比：47 个键一个不多一个不少,
+差异只有 token、时间戳和几个 DOM/时序计数。判定为**CF 对本出口 IP 的升级**
+（今天已经对同一目标跑了约 20 轮）。
+
+**测量盲区（新增）**：同一 IP 反复跑质询会把 CF 推到更严格的分流，
+**症状是「第一次 `/fo/` 就 400」而不是任何一步的行为变化**。此时所有依赖 tokenB
+载荷的对拍全部失效。判据：拿**撤掉改动的同一份构建**再跑一轮；
+形态相同就是 CF 侧，不要往自己的改动上归因。

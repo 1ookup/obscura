@@ -15373,6 +15373,73 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   getStats() { return Promise.resolve(new Map()); }
   get [Symbol.toStringTag]() { return 'RTCPeerConnection'; }
 };
+
+// `RTCRtpSender.getCapabilities(kind)` is a static query -- no peer connection
+// involved -- and an environment probe reads it as a codec fingerprint. Both
+// interfaces were absent, so the call threw.
+//
+// The answer is derived from the same SDP sections the offer is built from,
+// so the two can never disagree: a codec that appears in one appears in the
+// other, with the same clock rate and the same format parameters.
+function _rtcCapabilities(kind) {
+  if (kind !== 'audio' && kind !== 'video') return null;
+  const section = _RTC_SDP_SECTIONS[kind];
+  const formats = new Map();
+  for (const line of section.body) {
+    const match = /^a=fmtp:(\d+) (.*)$/.exec(line);
+    if (match) formats.set(match[1], match[2]);
+  }
+  const codecs = [];
+  const seen = new Set();
+  for (const line of section.body) {
+    const match = /^a=rtpmap:(\d+) ([^/]+)\/(\d+)(?:\/(\d+))?$/.exec(line);
+    if (!match) continue;
+    const name = match[2];
+    // Retransmission has one entry whatever the payload types; its fmtp only
+    // names the codec it repairs, which is per-connection rather than a
+    // capability.
+    const isRetransmission = name.toLowerCase() === 'rtx';
+    const parameters = isRetransmission ? undefined : formats.get(match[1]);
+    // The clock rate is part of a codec's identity: telephone-event is
+    // offered at both 48000 and 8000, and keying on the name alone collapsed
+    // them into one.
+    const key = name + '/' + match[3] + '|' + (parameters || '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const codec = { mimeType: kind + '/' + name, clockRate: +match[3] };
+    codec.channels = match[4] ? +match[4] : 1;
+    if (parameters !== undefined) codec.sdpFmtpLine = parameters;
+    codecs.push(codec);
+  }
+  const headerExtensions = section.extmaps
+    .map(line => /^a=extmap:\d+(?:\/\S+)? (\S+)$/.exec(line))
+    .filter(Boolean)
+    .map(match => ({ uri: match[1] }));
+  return { codecs, headerExtensions };
+}
+globalThis.RTCRtpSender = class RTCRtpSender {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  static getCapabilities(kind) { return _rtcCapabilities(String(kind)); }
+  get track() { return null; }
+  get transport() { return null; }
+  getParameters() { return { codecs: [], encodings: [], headerExtensions: [], rtcp: {} }; }
+  setParameters() { return Promise.resolve(); }
+  getStats() { return Promise.resolve(new Map()); }
+  replaceTrack() { return Promise.resolve(); }
+  get [Symbol.toStringTag]() { return 'RTCRtpSender'; }
+};
+globalThis.RTCRtpReceiver = class RTCRtpReceiver {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  static getCapabilities(kind) { return _rtcCapabilities(String(kind)); }
+  get track() { return null; }
+  get transport() { return null; }
+  getParameters() { return { codecs: [], headerExtensions: [], rtcp: {} }; }
+  getContributingSources() { return []; }
+  getSynchronizationSources() { return []; }
+  getStats() { return Promise.resolve(new Map()); }
+  get [Symbol.toStringTag]() { return 'RTCRtpReceiver'; }
+};
+
 globalThis.RTCSessionDescription = class RTCSessionDescription {
   constructor(init) {
     this.type = init && init.type ? String(init.type) : undefined;
@@ -15577,6 +15644,7 @@ _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
+_markNative(RTCRtpSender); _markNative(RTCRtpReceiver);
 
 // Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
 // so native Intl.DateTimeFormat and Date report the same zone. No JS override:

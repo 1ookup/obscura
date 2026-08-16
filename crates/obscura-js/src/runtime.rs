@@ -18419,6 +18419,50 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn rtp_capabilities_are_derived_from_the_same_sdp_the_offer_uses() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const audio = RTCRtpSender.getCapabilities('audio');
+                    const video = RTCRtpReceiver.getCapabilities('video');
+                    const name = codec => codec.mimeType
+                        + (codec.sdpFmtpLine ? ';' + codec.sdpFmtpLine : '');
+                    return {
+                        // telephone-event is offered at two clock rates; a
+                        // codec's identity includes the rate.
+                        audio: audio.codecs.map(codec => codec.mimeType + '/' + codec.clockRate),
+                        // Retransmission collapses to one entry however many
+                        // payload types carry it.
+                        rtxOnce: video.codecs.filter(c => c.mimeType === 'video/rtx').length,
+                        videoCount: video.codecs.length,
+                        h264Profiles: video.codecs.filter(c => c.mimeType === 'video/H264').length,
+                        firstVideo: name(video.codecs[0]),
+                        headerExtensions: [audio.headerExtensions.length,
+                            video.headerExtensions.length],
+                        // Only the two media kinds have capabilities.
+                        data: RTCRtpSender.getCapabilities('data'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "audio": ["audio/opus/48000", "audio/red/48000", "audio/G722/8000",
+                    "audio/PCMU/8000", "audio/PCMA/8000", "audio/CN/8000",
+                    "audio/telephone-event/48000", "audio/telephone-event/8000"],
+                "rtxOnce": 1,
+                "videoCount": 21,
+                "h264Profiles": 8,
+                "firstVideo": "video/VP8",
+                "headerExtensions": [4, 11],
+                "data": null,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
         let mut rt = setup_runtime("<html><body></body></html>");
