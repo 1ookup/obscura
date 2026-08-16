@@ -4,10 +4,11 @@ description: >
   诊断 obscura 跑不通某个页面的原因——尤其是 Cloudflare Turnstile / 5 秒盾这类
   依赖 iframe、closed shadow root、跨源 postMessage 与 realm 隔离的反检测质询。
   提供带 stealth + 代理 + V8 trace 的复现命令、CDP 预注入探针（拿 postMessage
-  完整内容、穿透 closed shadow root 找 iframe）、frame realm 相对 URL 归属探针，
-  以及与浏览器 HAR 逐条对比的方法。当用户问「obscura 为什么过不了这个盾 /
-  iframe 里的 JS 有没有执行 / 挑战卡在哪一步 / 帮我分析这个 HAR / 用 v8 trace
-  看看页面在干什么」时使用本技能。
+  完整内容、穿透 closed shadow root 找 iframe）、跨 realm 的通信与请求钩子
+  （XHR/fetch/sendBeacon + 调用栈，定位「哪条消息触发了哪个请求」）、frame realm
+  相对 URL 归属探针，以及与浏览器 HAR 逐条对比的方法。当用户问「obscura 为什么
+  过不了这个盾 / iframe 里的 JS 有没有执行 / 挑战卡在哪一步 / 这个请求是谁发的 /
+  帮我分析这个 HAR / 用 v8 trace 看看页面在干什么」时使用本技能。
 ---
 
 # obscura 质询页诊断
@@ -133,6 +134,45 @@ $SKILL_DIR/scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("if
 `messages` 模式能拿到 `{"source":"cloudflare-challenge","event":"overrunBegin",...}`
 这类完整负载。心跳类消息（`food`）自动折叠计数。
 
+## 通信内容与请求钩子：拿"哪条消息触发了哪个请求"
+
+要把「这两件事先后发生」变成「这个 handler 发起了那个请求」，三件事必须同时做到，
+少一件就会静默地看不见东西：
+
+```bash
+# 全 realm 通信 + 请求 + 调用栈，配合点击
+$SKILL_DIR/scripts/cdp_comm_probe.py <URL> --port 9223 --start 5 --settle 15
+grep -o '\[comm\].*' /tmp/serve.log        # 所有 realm 汇成一条时间线
+```
+
+1. **记录走 `console.warn`，不要 dump 每个 realm 的数组。**
+   `window.__ev` + `Runtime.evaluate` 只能取回**你 dump 的那一个 realm**，widget 侧的
+   事件完全不出现；而 obscura 把每个 realm 的 console 都汇进 serve 日志，一次 grep 全有。
+2. **XHR、fetch、sendBeacon（必要时 `img.src`）要一起钩。** 只钩 `XMLHttpRequest.open`
+   会漏掉页面直接用 `fetch` 发的那些，两者不重叠——实测点击后的请求因此一条都没抓到。
+3. **每个请求记一段 JS 调用栈**（`new Error().stack` 取 2..7 帧）。因果链就是靠它定的：
+
+```
+14871|TOP|IN | {"event":"fail","code":"600010","cfChlOut":"..."}      ← widget 上报
+14888|TOP|XHR| POST zencare /fo/ :: at b (chl_page:2:146312) <- at Object.WISfF (...)
+```
+
+17ms 的间隔加上落在 `chl_page` 的栈，才能断定后者是前者的转发，而不是各自独立。
+
+**钩子本身要挑安全的面**：`postMessage` 与 `contentWindow` 不要包装（包过一次，握手消息
+直接消失，整轮作废）；被动 `message` 监听、`XHR.open`、`fetch` 实测不扰动。传给
+`console.warn` 的必须是**字符串**——传对象会被质询的 getter 探针反过来利用。
+
+**这类 JS 钩子有一条硬边界**：直接从 `op_fetch_url` 发出的请求（debug 日志里
+`has_tx=false`）根本不经过这些 JS 入口，钩子永远看不到。判断「请求发出没有」只能用
+`RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` / `stealth_fetch completed`；
+JS 钩子只回答「由页面脚本的哪个 API 构造」。
+
+**失败消息可能有两个来源，别只盯一个**：质询自身的 `fail`（带 `code`/`cfChlOut`）确实走
+postMessage；而 api.js 的看门狗（`meow`/`food` 心跳失联）会**在主页面本地合成**一个
+`fail` 交给 `internalMsgHandler`，那条不经过 window 消息，钩子看不到，只能靠它同时打的
+`console.log("Turnstile Widget seem to have hung/crashed")` 认出来。
+
 ## 第三步：frame realm 相对 URL 归属
 
 跨源 iframe 里每个 API 发一次请求，看落到哪个服务器：
@@ -160,7 +200,7 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 |------|------|
 | postMessage 的内容 | 参数捕获读 JS 帧，`postMessage` 是 native 绑定，帧上无参数；对象也只会渲染成 `object:Object` |
 | 某段代码属于主页面还是 iframe | 动态脚本一律记为 `<page-eval>`，脚本名列不能分辨 realm |
-| 某请求发出没有 | frame 导航路径不打印 URL，只有 `op_fetch_url` 打印 |
+| 某请求发出没有 | frame 导航路径不打印 URL，只有 `op_fetch_url` 打印。注意预注入 JS 钩子同样答不了这个问题——`op_fetch_url` 直发的请求不经过 XHR/fetch/beacon，两者都只能靠 `RUST_LOG=obscura_js=debug` |
 
 ## 测量盲区（这一节最重要）
 
@@ -178,6 +218,14 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 | **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空**（obscura 缺陷，Chrome 无此行为） | 轮询类探针首轮求值落在危险窗口 → `box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值必须延迟到导航后 ≥3s（`cdp_click_fast.py --start`、`cdp_filmstrip.py --start` 默认已内置；不要用 `--start 0` 或 `--every 1` 试探边界）。此缺陷本身待修 |
 | **端口上可能跑着会话外遗留的旧 serve 进程**（新 serve 启动时静默绑定失败，日志只有一条 bind error） | 探针打在旧代码上，时间线/行为全是旧版，跨轮比较得出错误结论 | 每轮实测前核对 `/json/version` 的浏览器版本号与 `ps -o lstart -p <pid>`，和二进制 mtime 对比 |
 | `RUST_LOG=obscura::js=debug` 匹配不到请求日志（`op_fetch_url` 的 target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`，或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
+| **预注入 JS 钩子看不到 `op_fetch_url` 直发的请求**（日志里 `has_tx=false`） | 据此得出「某请求从未被 JS 构造」的结论——`/pat/` 正是这样被误判了六个 step，直到用 Rust 日志才看到它一直在发 | 「是否发出」以 `RUST_LOG=obscura_js=debug` 为准；JS 钩子只回答「由哪个 API 构造」。两个问题不要混用同一份证据 |
+| **只 dump 单个 realm 的数组**（`window.__ev` + `Runtime.evaluate`） | widget realm 的消息与请求完全不出现，误判「没有这条通信」 | 记录走 `console.warn`，obscura 把所有 realm 的 console 汇进 serve 日志 |
+| **只钩 `XMLHttpRequest`，漏掉 `fetch`/`sendBeacon`** | 点击后的请求一条都抓不到，误判「点击没有触发任何请求」 | 三个入口一起钩（必要时加 `img.src`），见 `cdp_comm_probe.py` |
+| **用不点击的探针判断提交链** | 点击之后的提交 POST 与回传永远不出现，却被当成「链路到此为止」 | 判据链凡涉及点击之后的部分，必须用会点击的探针；`--no-click` 的轮次只能看点击**之前**的阶段 |
+| **拿 Chrome 对拍时用了 isolated world** | isolated world 不受页面 CSP 约束：同一页面 `trustedTypes.defaultPolicy` 在 isolated 里读作 `null`、main world 里是 `present`，据此会得出完全相反的结论 | 凡是与 CSP、TT、nonce 相关的对拍，必须 `mainWorld: true` |
+| **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined；据此得出「移除了也没变化」的错误结论 | 要移除就只 `delete`，并当场用 `name in globalThis` 和 `getOwnPropertyNames` 复验，而不是用 `typeof` |
+| **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | HEAD 与目标 commit 之间还隔着几十个提交，干预结果说明不了那个 commit 的行为 | 干预实验跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 并复现 |
+| **单次测量当判据** | 同一二进制多轮里可能有一轮偏离（CF 端波动），单次结果会把二分带偏 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值 |
 
 ## 判定口径
 
@@ -193,9 +241,12 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 2. 差异处的请求：主机 / 状态码 / Origin
 3. 若涉及 iframe：`cdp_probe.py shadow` 确认它是否真的加载了文档
 4. 若涉及消息：`cdp_probe.py messages` 拿完整内容与时间线
-5. 若怀疑 URL 解析：`realm_probe.sh`
-6. 结构性假设穷尽后**改用插桩**，不要继续猜
-7. 每验证一个假设、每修掉一处阻塞，立刻按上面「维护 profile 文档」追加 step——
+5. 若要问「**哪条消息触发了哪个请求**」：`cdp_comm_probe.py`（全 realm + 三类请求入口
+   + 调用栈）。先用 `RUST_LOG=obscura_js=debug` 确认请求到底发没发，再用它定位构造方——
+   两个问题用两份证据
+6. 若怀疑 URL 解析：`realm_probe.sh`
+7. 结构性假设穷尽后**改用插桩**，不要继续猜
+8. 每验证一个假设、每修掉一处阻塞，立刻按上面「维护 profile 文档」追加 step——
    全程边查边写，不要留到最后补
 
 第 6 步的教训：一轮排查里连续五个结构性假设（shadow root、iframe 属性、跨源、
