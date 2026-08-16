@@ -1933,6 +1933,8 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
 | 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
+| **把「有 CALL、无 COMPLETE」直接判成被拦截** | 这个特征同时也是长轮询在飞的样子；据此把 brunhild 判成被 CSP 拦截，整个 Step 61 的根因认定作废 | 让被判定的分支自己发声：在拦截处打日志（url + 生效策略 + 策略来源），再用「有没有这条日志」判定，而不是用别的日志的缺失去反推 |
+| **资源被 CSP 拒绝只表现为元素的 `error` 事件** | 与网络失败完全同形；`/ci/` 的 error 一度被当成超时 | 图片/媒体等资源路径的拦截也要打日志，否则无法与网络失败区分 |
 | **只 grep `stealth_fetch completed`，把「没有完成」当成「没有调用」** | brunhild `/i/` 被判成「JS 从未构造」，真相是它有 `op_fetch_url called`、被 CSP 提前返回，整整一个 step 的归因作废 | 请求序列一律把 `op_fetch_url called` 与 completed **按时序一起列**；只有 CALL 没有 COMPLETE 正是被拦截的特征 |
 | **`serve` 日志含 ANSI 转义，`grep` 视其为二进制**（`file` 报 `data`） | `grep -c` 直接返回 0 匹配、无任何输出，误判「这一轮没有请求日志」 | 一律 `LC_ALL=C grep -a`；先用 `wc -l` 与 `tail` 确认文件确实有内容
 | **图片请求不经过 `op_fetch_url`**（走 render 的图像管线） | `/ci/` 被判成「当前版本缺失的请求」，其实一直正常加载 | 图片是否发出用元素的 `load`/`error` 事件与 `naturalWidth` 判定，不看 fetch 日志
@@ -3265,3 +3267,77 @@ tokenB 差异仍是未解释项。
 
 **未决**：①`/eb/` 的真实触发条件（Chrome 全程不发）；②提交体积 4976/5052 vs 7244；
 ③`csp_connect_allows` 仍不支持通配主机、端口与路径。
+
+### Step 63 — `/ci/` 确实被 CSP 拦了：指令优先级写反；同时推翻 Step 61 的根因（2026-08-16）
+
+**触发**（用户）：先查 iframe 里的 `/ci/` 图片为什么没发出，这是下午 CSP + Trusted Types
+落地后才有的；是 CSP 拦了，还是 TT 让 JS 没执行？
+
+**先排除 TT**：在每个 realm 里实测 `eval('1+1')`，全部返回 `2`；widget realm 的
+`trustedTypes.defaultPolicy` 存在（`tt=object/default`），与 Chrome main world 一致。
+JS 正常执行，`/ci/` 的 `img.src` 也确实被赋值。**不是 TT。**
+
+**是 CSP，且是指令优先级写反**。给图片路径补一行拦截日志后直接拿到：
+
+```
+image blocked by img-src: https://challenges.cloudflare.com/…/ci/…
+  csp-origin: https://challenges.cloudflare.com
+  csp       : default-src 'none'; …; img-src 'self'; …
+```
+
+`img-src 'self'` 明确允许这个同源请求。真因在 `csp_resource_allows`：它把「具体指令」与
+「`default-src` 回退」放进**同一次 `find_map` 扫描**
+
+```rust
+(name == directive || (directive == "img-src" && name == "default-src"))
+```
+
+于是**谁在 header 里排得靠前谁生效**。而 `default-src 'none'` 按惯例写在最前面，
+`img-src` 根本读不到，等于把所有资源指令变成 `'none'`。同一 header 下
+`zencare.co/favicon.ico` 也被误拦。受影响的是全部走这个函数的指令：`img-src`、
+`style-src`、`media-src`、`object-src`、`font-src`。`csp_connect_allows` 写法是对的
+（先找 `connect-src`，再 `or_else` `default-src`），JS 侧的 `_cspResourceAllows` 也对
+（命中具体指令即 `break` 覆盖），所以只有 Rust 这一处。
+
+**修法**：抽出 `csp_sources(header, directive)` 只查一个指令，具体指令优先、
+`default-src` 仅作回退；并用 `csp_falls_back_to_default` 排除 `base-uri`、`form-action`、
+`frame-ancestors`（规范里这些文档指令没有 `default-src` 回退，原实现顺带给错了）。
+回归测试 `ops.rs::a_specific_directive_replaces_default_src_whatever_the_header_order`。
+
+**同轮修掉的另外两处 CSP 缺陷**：
+
+- **顶层文档的 CSP 从未进入 JS runtime。** `page.rs` 在读到响应头时执行
+  `if let Some(js) = &self.js { js.set_content_security_policy(...) }`，但那一刻 runtime
+  还没建（`init_js()` 在其后），所以是空操作。页面侧的 `script-src`/`style-src` 在
+  page.rs 内判定，因此看起来正常；单元测试又都直接调 `set_content_security_policy`，
+  于是这个洞一直没被发现。改为在 `init_js()` 里安装，覆盖全部 9 个调用点。回归测试
+  `page.rs::a_documents_connect_src_reaches_scripted_fetches`。
+- **`about:blank` / `about:srcdoc` 子框架不继承创建者的 CSP**（`page.rs` 两处硬编码
+  `None`）。本地 scheme 文档没有自己的响应头，规范要求继承；不继承等于给子框架一份比
+  父文档更宽松的策略。
+
+**推翻 Step 61 的根因认定**。Step 61 把「brunhild 有 `op_fetch_url called`、没有完成日志」
+判成被 CSP 拦截。补上显式拦截日志后实测：**0 次拦截，brunhild 依然是 CALL 无 COMPLETE**。
+那个特征同样是**长轮询在飞**的样子，与 Chrome 里它长期 pending 完全一致。也就是说
+brunhild 从来没有被拦过，Step 61 的因果链不成立——它是在「测量盲区」表里已经写下的那条
+教训上，往反方向又栽了一次：不能用日志缺失反推行为，必须让被判定的分支自己发声。
+
+**顺带解开一个老谜题**：给 fetch 日志加上 `root=` 与生效策略来源后可见
+
+```
+root=69 csp=frame       POST CF/fo/…      root=69 csp=frame  POST CF/eb/…
+root=0  csp=page:none   GET  CF/pat/…     root=0  csp=page:none GET brunhild.CF/i/…
+```
+
+`/pat/` 与 brunhild 来自一个**独立 runtime**（widget CSP 里有 `worker-src blob:`，即
+CF 的 blob Worker）。这解释了为什么它们一直躲开页面各 realm 的 JS 钩子，也解释了
+step 45/46 里「`/pat/` 从未被 JS 构造」的假象。**Worker 不继承创建文档的 CSP**，是新的
+已知缺口。
+
+**实测结果（3 轮，带点击）**：`/ci/` 恢复加载（`LOAD 98x68`），CSP 拦截 0 次，链路完整
+（822.7KB → `/pat/` 401 → `/eb/` → 127.7KB → 提交 4960~5000B → 回传 3256B），
+**仍未通过**，`/eb/` 仍每轮发出。全量 1624 测试通过。
+
+**未决**：①`/eb/` 的触发条件（Chrome 全程不发）；②提交体积 4960/5000 vs Chrome 7244；
+③Worker 不继承 CSP；④`csp_connect_allows` / `csp_resource_allows` 仍不支持通配主机、
+端口与路径。

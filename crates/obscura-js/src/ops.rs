@@ -2629,21 +2629,30 @@ fn cors_response_allows(
     }
 }
 
+/// One directive's source list, or `None` when the header does not name it.
+///
+/// A specific directive replaces `default-src` outright, so the two must be
+/// looked up separately: a single scan that accepts either would let whichever
+/// appears first in the header win, and `default-src 'none'` is conventionally
+/// written first. That ordering silently turned every other directive into
+/// `'none'`.
+fn csp_sources(header: &str, directive: &str) -> Option<Vec<String>> {
+    header.split(';').find_map(|part| {
+        let mut tokens = part.split_ascii_whitespace();
+        let name = tokens.next()?.to_ascii_lowercase();
+        (name == directive).then(|| tokens.map(str::to_string).collect())
+    })
+}
+
+/// Fetch directives fall back to `default-src`; document directives do not.
+fn csp_falls_back_to_default(directive: &str) -> bool {
+    !matches!(directive, "base-uri" | "form-action" | "frame-ancestors")
+}
+
 fn csp_connect_allows(header: Option<&str>, request_url: &str, page_origin: &str) -> bool {
     let Some(header) = header else { return true };
-    let sources = header
-        .split(';')
-        .filter_map(|part| {
-            let mut tokens = part.split_ascii_whitespace();
-            let name = tokens.next()?.to_ascii_lowercase();
-            (name == "connect-src").then_some(tokens.map(str::to_string).collect::<Vec<_>>())
-        })
-        .next()
-        .or_else(|| header.split(';').find_map(|part| {
-            let mut tokens = part.split_ascii_whitespace();
-            let name = tokens.next()?.to_ascii_lowercase();
-            (name == "default-src").then_some(tokens.map(str::to_string).collect::<Vec<_>>())
-        }));
+    let sources = csp_sources(header, "connect-src")
+        .or_else(|| csp_sources(header, "default-src"));
     let Some(sources) = sources else { return true };
     let Ok(target) = url::Url::parse(request_url) else { return false };
     let target_origin = target.origin().ascii_serialization();
@@ -2663,11 +2672,10 @@ fn csp_resource_allows(
     page_origin: &str,
 ) -> bool {
     let Some(header) = header else { return true };
-    let sources = header.split(';').find_map(|part| {
-        let mut tokens = part.split_ascii_whitespace();
-        let name = tokens.next()?.to_ascii_lowercase();
-        (name == directive || (directive == "img-src" && name == "default-src"))
-            .then_some(tokens.map(str::to_string).collect::<Vec<_>>())
+    let sources = csp_sources(header, directive).or_else(|| {
+        csp_falls_back_to_default(directive)
+            .then(|| csp_sources(header, "default-src"))
+            .flatten()
     });
     let Some(sources) = sources else { return true };
     let Ok(target) = url::Url::parse(request_url) else { return false };
@@ -2699,11 +2707,6 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     trace_host_op("fetch", &[&method, &url, &headers_json]);
     let performance_started = std::time::Instant::now();
-    tracing::debug!(
-        "op_fetch_url called: {} {} (intercept check pending)",
-        method,
-        url
-    );
 
     // Scripted requests are governed by the CSP of the document whose realm
     // initiated them. The bootstrap carries that document root in the
@@ -2730,6 +2733,21 @@ async fn op_fetch_url(
                 .and_then(|dom| dom.document_scope(request_root))
                 .and_then(|scope| scope.csp)
         };
+        // `root` names the document whose policy governs this request. Without
+        // it a subframe request is indistinguishable from a top-document one,
+        // and the two are checked against different policies.
+        tracing::debug!(
+            "op_fetch_url called: {} {} (root={}, csp={}, intercept check pending)",
+            method,
+            url,
+            request_root.raw(),
+            match (request_root.raw(), request_csp.is_some()) {
+                (0, true) => "page",
+                (0, false) => "page:none",
+                (_, true) => "frame",
+                (_, false) => "frame:none",
+            }
+        );
         if !csp_connect_allows(request_csp.as_deref(), &url, &origin) {
             // A blocked request otherwise leaves no trace at all: it has an
             // `op_fetch_url called` line and no completion, which reads exactly
@@ -3771,11 +3789,46 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cors_response_allows, glob_match, is_potentially_trustworthy, validate_fetch_url,
-        FetchCredentials,
+        cors_response_allows, csp_connect_allows, csp_resource_allows, glob_match,
+        is_potentially_trustworthy, validate_fetch_url, FetchCredentials,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    /// `default-src 'none'` is conventionally written first. Accepting whichever
+    /// directive a single scan reached first therefore turned every later one
+    /// into `'none'`, which refused a same-origin image that `img-src 'self'`
+    /// plainly allows. The refusal only surfaced as an `error` event on the
+    /// element, indistinguishable from a network failure.
+    #[test]
+    fn a_specific_directive_replaces_default_src_whatever_the_header_order() {
+        let header = "default-src 'none'; img-src 'self'; connect-src 'self' https://api.example";
+        assert!(csp_resource_allows(
+            Some(header),
+            "img-src",
+            "https://app.example/a.png",
+            "https://app.example",
+        ));
+        assert!(csp_connect_allows(
+            Some(header),
+            "https://api.example/x",
+            "https://app.example",
+        ));
+        // A directive the header omits still falls back to default-src.
+        assert!(!csp_resource_allows(
+            Some(header),
+            "font-src",
+            "https://app.example/f.woff",
+            "https://app.example",
+        ));
+        // Document directives have no default-src fallback at all.
+        assert!(csp_resource_allows(
+            Some("default-src 'none'"),
+            "form-action",
+            "https://app.example/post",
+            "https://app.example",
+        ));
+    }
 
     #[cfg(feature = "render")]
     use super::{
@@ -6950,6 +7003,17 @@ async fn op_load_image_metadata(
             &selected_url,
             &csp_origin,
         );
+        if csp_blocked {
+            // Same reason as the connect-src log: a refused image only surfaces
+            // as an `error` event on the element, which is also what a network
+            // failure looks like. Name the policy and the document it came from.
+            tracing::debug!(
+                "image blocked by img-src: {} (csp-origin={}, csp={:?})",
+                selected_url,
+                csp_origin,
+                csp_header.as_deref().unwrap_or("<none>")
+            );
+        }
         (
             gs.document_generation,
             selected_url,

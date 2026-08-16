@@ -1318,6 +1318,13 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        // The document's policy has to be installed here rather than where the
+        // response headers are read: a navigation reads them before this
+        // runtime exists, so pushing it there is a no-op on a fresh page and is
+        // undone by the runtime this function replaces. Missing it leaves every
+        // scripted fetch unchecked while script-src and style-src still work,
+        // because those are evaluated on the browser side.
+        rt.set_content_security_policy(self.document_csp.as_deref());
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
@@ -5501,12 +5508,16 @@ impl Page {
             } else {
                 parent_origin.clone()
             };
+            // A local-scheme document has no response of its own to carry a
+            // policy, so it inherits the creator's. Leaving it empty gives a
+            // subframe a strictly weaker policy than the document that made it,
+            // which is the opposite of what CSP is for.
             (
                 "about:srcdoc".to_string(),
                 parent_base.clone(),
                 origin,
                 srcdoc,
-                None,
+                parent_csp.clone(),
             )
         } else {
             let raw_url = request.url.as_deref().unwrap_or("about:blank");
@@ -5521,7 +5532,7 @@ impl Page {
                     parent_base.clone(),
                     origin,
                     String::new(),
-                    None,
+                    parent_csp.clone(),
                 )
             } else {
                 // A relative URL resolves against the parent document's base.
@@ -6845,6 +6856,70 @@ mod tests {
         let scope = dom.document_scope(root).unwrap();
         assert_eq!(scope.url, "about:blank");
         assert!(!scope.origin.is_opaque());
+    }
+
+    /// The document's connect-src has to reach the JS runtime. A navigation
+    /// reads the response headers before that runtime exists, so the policy has
+    /// to be installed when the runtime is built. Miss it and scripted fetches
+    /// run unchecked while script-src and style-src still look correct, because
+    /// those are evaluated on the browser side and never consult the runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_documents_connect_src_reaches_scripted_fetches() {
+        let serve = |csp: Option<&'static str>, body: &'static str, count: usize| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                for _ in 0..count {
+                    let Ok((mut stream, _)) = listener.accept() else { break };
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let csp_header = csp
+                        .map(|value| format!("Content-Security-Policy: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{csp_header}Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            format!("http://{address}")
+        };
+        let other = serve(None, "ok", 1);
+        let origin = serve(
+            Some("default-src 'none'; connect-src 'self'"),
+            "<!doctype html><p>page</p>",
+            2,
+        );
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "connect-csp".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("connect-csp".to_string(), context);
+        page.navigate(&format!("{origin}/main")).await.unwrap();
+
+        let probe = format!(
+            r#"(async () => {{
+                const reach = async url => {{
+                    try {{ return "status:" + (await fetch(url)).status; }}
+                    catch (error) {{ return error.name; }}
+                }};
+                return [await reach("{origin}/ok"), await reach("{other}/ok")];
+            }})()"#
+        );
+        let result = page
+            .evaluate_for_cdp_with_timeout(&probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["status:200", "AbortError"]));
     }
 
     #[tokio::test(flavor = "current_thread")]
