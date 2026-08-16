@@ -2629,6 +2629,33 @@ fn cors_response_allows(
     }
 }
 
+fn csp_connect_allows(header: Option<&str>, request_url: &str, page_origin: &str) -> bool {
+    let Some(header) = header else { return true };
+    let sources = header
+        .split(';')
+        .filter_map(|part| {
+            let mut tokens = part.split_ascii_whitespace();
+            let name = tokens.next()?.to_ascii_lowercase();
+            (name == "connect-src").then_some(tokens.map(str::to_string).collect::<Vec<_>>())
+        })
+        .next()
+        .or_else(|| header.split(';').find_map(|part| {
+            let mut tokens = part.split_ascii_whitespace();
+            let name = tokens.next()?.to_ascii_lowercase();
+            (name == "default-src").then_some(tokens.map(str::to_string).collect::<Vec<_>>())
+        }));
+    let Some(sources) = sources else { return true };
+    let Ok(target) = url::Url::parse(request_url) else { return false };
+    let target_origin = target.origin().ascii_serialization();
+    sources.iter().any(|source| match source.to_ascii_lowercase().as_str() {
+        "'none'" => false,
+        "'self'" => target_origin == page_origin,
+        "*" => matches!(target.scheme(), "http" | "https" | "ws" | "wss"),
+        value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+        value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2657,6 +2684,16 @@ async fn op_fetch_url(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
+        if !csp_connect_allows(gs.document_csp.as_deref(), &url, &origin) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "cspBlocked": true,
+            }).to_string());
+        }
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
                 return Ok(serde_json::json!({
