@@ -3942,3 +3942,51 @@ getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
 `§` 字符）。CF 侧量测同 step 72，受 IP 升级影响本轮无法取得。
 
 **回归测试**：`the_keyboard_layout_map_describes_a_physical_ansi_board`。
+
+### Step 74 — `gqGB4`：字体列表里那台「不可能存在的机器」的成因（2026-08-17）
+
+step 66 记过：浏览器报 6 个字体，obscura 报 48+ 个，且**同时**包含 Windows
+（Bahnschrift / Segoe Fluent Icons / Ink Free）、Linux（Adwaita / DejaVu / Cantarell）
+和 macOS（Skia / PingFang HK Light）三套。这是本轮最典型的**矛盾类**信号——
+缺一个 API 只是「老浏览器」，同时装三套 OS 字体是「伪造」。
+
+**定位**：字体探测的标准做法是把一个字符串分别按
+`font-family: 'X', monospace` 和 `font-family: 'X', sans-serif` 测宽，
+**两次相等**即判定 X 已安装。直接用这个方法探 obscura：
+
+```
+ZZZ No Such Font 12345    mono=562  sans=648  -> absent   （正确）
+Totally Fake Mono 999     mono=562  sans=562  -> PRESENT  （错）
+Imaginary Sans 42         mono=648  sans=648  -> PRESENT  （错）
+```
+
+**任何自己编的、名字里带 "mono" 或 "sans" 的字体都被报成已安装。**
+根因在 `obscura-render/src/inline.rs` 的 `bundled_family_for_css_token`:
+它用的是**子串**规则——`token.contains("mono")`、`contains("sans")`、
+`contains("times")`、`contains("garamond")`、`contains("consol")`、
+`contains("courier")`。浏览器解析具名字体族从不这样：不认识就跳过，
+用列表里的下一个。于是 `Adwaita Mono`（Linux）、`Noto Sans`、`Liberation Sans`、
+`Free Sans`、`Source Code Pro`（命中 `"code"`）全都被算成「有」。
+
+**修复**：子串规则换成**精确匹配**的别名表，只列所声称平台上真实存在的族
+（generic 关键字 + Arial/Courier New/Georgia/Consolas/Times New Roman/Segoe UI/…）,
+其余一律 `None`，由 CSS 列表里的下一个 token 接手——这正是浏览器的行为。
+
+**修复后（同一探针）**：
+
+```
+Totally Fake Mono 999 / Imaginary Sans 42 / Adwaita Mono /
+Cantarell / Bahnschrift / PingFang HK Light   -> absent
+Arial / Courier New / Georgia / Consolas / Times New Roman -> PRESENT
+```
+
+**残留**：`DejaVu Sans` 仍报 present——它是引擎**真正打包**的族。一个自称 Windows
+的身份上出现 DejaVu 仍是个小矛盾，但比原来的「三套 OS」小一个数量级。
+彻底解决要让打包字体集随所声称的平台切换，属于渲染栈的改动，另记。
+
+**回归测试**：`an_unknown_named_family_is_skipped_rather_than_guessed_from_its_name`
+（obscura-render）——对五个不存在的名字断言它们**不能**盖过后面的 generic,
+且在 monospace / sans-serif 两种上下文里解析结果**必须不同**（相同即等于「已安装」）;
+同时断言真实存在的族仍然各自解析。
+
+**CF 侧量测**同 step 72，受 IP 升级影响本轮无法取得。

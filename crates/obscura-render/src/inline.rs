@@ -77,44 +77,39 @@ fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     if token.is_empty() {
         return None;
     }
-    if token == "system-ui" || token == "ui-sans-serif" {
-        return Some(SYSTEM_FAMILY);
-    }
-    if token == "monospace"
-        || token.contains("mono")
-        || token.contains("courier")
-        || token.contains("consol")
-        || token == "menlo"
-        || token == "monaco"
-        || token == "code"
-    {
-        return Some(MONO_FAMILY);
-    }
-    if token == "serif"
-        || token == "georgia"
-        || token.contains("times")
-        || token == "cambria"
-        || token.contains("garamond")
-        || token.contains("liberation serif")
-        || token == "roman"
-    {
-        return Some(SERIF_FAMILY);
-    }
-    if token == "sans-serif"
-        || token.contains("sans")
-        || token == "arial"
-        || token == "helvetica"
-        || token == "helvetica neue"
-        || token == "-apple-system"
-        || token == "roboto"
-        || token == "segoe ui"
-        || token == "inter"
-        || token == "verdana"
-        || token == "tahoma"
-    {
-        return Some(FAMILY);
-    }
-    None
+    // Generic keywords, then families that genuinely exist on the platform the
+    // engine reports. Matching is exact on purpose.
+    //
+    // These used to be substring rules -- any token containing "mono", "sans",
+    // "times" and so on resolved to a bundled face. That is not how a browser
+    // resolves a named family, and it is observable: the standard font-presence
+    // probe measures a string as `'X', monospace` and again as `'X', sans-serif`
+    // and calls X installed when the two agree. Under the substring rules
+    // `'Totally Fake Mono 999'` agreed (both monospace) and so did
+    // `'Imaginary Sans 42'` (both sans-serif), so the engine reported every
+    // invented name that happened to contain one of those words as an installed
+    // font -- which is how it came to claim a machine with Windows, Linux and
+    // macOS font sets installed at once.
+    let family = match token.as_str() {
+        "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => SYSTEM_FAMILY,
+
+        "monospace" | "ui-monospace" | "courier" | "courier new" | "consolas"
+        | "lucida console" | "menlo" | "monaco" | "cascadia mono" | "cascadia code"
+        | "dejavu sans mono" | "liberation mono" | "andale mono" => MONO_FAMILY,
+
+        "serif" | "ui-serif" | "times" | "times new roman" | "georgia" | "cambria"
+        | "garamond" | "book antiqua" | "palatino" | "palatino linotype"
+        | "baskerville" | "dejavu serif" | "liberation serif" | "noto serif" => SERIF_FAMILY,
+
+        "sans-serif" | "arial" | "arial black" | "arial narrow" | "helvetica"
+        | "helvetica neue" | "roboto" | "segoe ui" | "segoe ui variable"
+        | "inter" | "verdana" | "tahoma" | "trebuchet ms" | "calibri" | "candara"
+        | "microsoft sans serif" | "dejavu sans" | "liberation sans" | "noto sans"
+        | "gill sans" | "futura" | "lucida grande" => FAMILY,
+
+        _ => return None,
+    };
+    Some(family)
 }
 
 #[derive(Clone)]
@@ -3597,6 +3592,39 @@ mod tests {
             100,
             1.0,
         ));
+    }
+
+    #[test]
+    fn an_unknown_named_family_is_skipped_rather_than_guessed_from_its_name() {
+        // The standard font-presence probe measures a string as `'X',
+        // monospace` and again as `'X', sans-serif`, and calls X installed
+        // when the two agree. A name the engine does not have must therefore
+        // resolve to whichever generic follows it, never to a face picked by
+        // reading the name.
+        for invented in [
+            "Totally Fake Mono 999",
+            "Imaginary Sans 42",
+            "Nonexistent Serif 7",
+            "Adwaita Mono",
+            "Bahnschrift",
+        ] {
+            assert_eq!(
+                resolve_font_family(Some(&format!("'{invented}', monospace"))),
+                MONO_FAMILY,
+                "{invented} must not win over the generic that follows it",
+            );
+            assert_eq!(
+                resolve_font_family(Some(&format!("'{invented}', sans-serif"))),
+                FAMILY,
+                "{invented} resolved differently depending on the generic, \
+                 which is what makes it look installed",
+            );
+        }
+
+        // Families the platform genuinely has still resolve on their own.
+        assert_eq!(resolve_font_family(Some("Courier New")), MONO_FAMILY);
+        assert_eq!(resolve_font_family(Some("Georgia")), SERIF_FAMILY);
+        assert_eq!(resolve_font_family(Some("Arial")), FAMILY);
     }
 
     #[test]
