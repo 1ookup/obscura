@@ -555,6 +555,10 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
+            runtime
+                .v8_isolate()
+                .set_modify_code_generation_from_strings_callback();
+
             runtime.op_state().borrow_mut().put(state_clone);
 
             runtime
@@ -4506,7 +4510,7 @@ mod tests {
         assert_eq!(result, serde_json::json!(["x", true]));
 
         rt.set_content_security_policy(Some(
-            "default-src 'none'; trusted-types allowed default; require-trusted-types-for 'script'",
+            "default-src 'none'; trusted-types allowed default script; require-trusted-types-for 'script'",
         ));
         let result = rt
             .evaluate(r#"(() => {
@@ -4515,10 +4519,12 @@ mod tests {
                 try { div.innerHTML = '<b>x</b>'; } catch (error) { rejected = error.name === 'TypeError'; }
                 const policy = trustedTypes.createPolicy('default', {createHTML: x => x});
                 div.innerHTML = policy.createHTML('<i>ok</i>');
-                return [rejected, div.innerHTML];
+                const scriptPolicy = trustedTypes.createPolicy('script', {createScript: x => x});
+                const evalResult = eval(scriptPolicy.createScript('1 + 1'));
+                return [rejected, div.innerHTML, evalResult];
             })()"#)
             .unwrap();
-        assert_eq!(result, serde_json::json!([true, "<i>ok</i>"]));
+        assert_eq!(result, serde_json::json!([true, "<i>ok</i>", 2]));
     }
 
     /// `console.log` must not walk the objects handed to it.
