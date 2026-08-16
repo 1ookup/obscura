@@ -3776,3 +3776,71 @@ session id 无前导零、7 条候选（6 + 终止 null）、全部是 mDNS host
 `Promise.resolve(42)` 得到的是 `{}`。异步探针必须走 CDP `Runtime.evaluate` 并带
 `awaitPromise: true`，而且表达式**必须压成单行**（多行 async IIFE 同样静默返回 `{}`,
 与已记录的多行 `JSON.stringify` 盲区同源）。
+
+### Step 70 — WebGL 一组 8 个字段：一致性画像随 `--stealth` 生效，并补齐查询面（2026-08-17）
+
+**现状**：`FgjO3`/`CPWA9`/`WLCCn2`/`ZlnsY8`/`ULOAc2`/`qbitp7`/`bhWNV6`/`KbSE2`
+八个字段在 obscura 侧全是 CF 的 6 字符错误哨兵（`"Mylp5"`、`"dRVOa5"` …），
+合计 2594 B 的浏览器数据变成 60 B 的「这个探测抛了」。根因是
+`canvas.getContext('webgl')` 默认返回 `null`——一致性画像是 `OBSCURA_WEBGL_PROFILE`
+环境变量的 opt-in。
+
+**判断**：`--stealth` 的定义就是「呈现一台前后一致的普通浏览器」。一个
+`WebGLRenderingContext` 存在、`getContext` 却回 `null` 的引擎不是一台一致的机器，
+它是一台自相矛盾的机器。所以让画像**跟随 `--stealth`**，非 stealth 保持
+「没有 GPU 就没有上下文」的诚实默认不变。
+
+**修复**：
+
+1. `ObscuraJsRuntime` 记住 stealth 标志，`gpu_profile_enabled()` = stealth ‖ 环境变量；
+   `set_stealth` 与 `set_fingerprint` 都推这个标志，两种调用顺序都成立。
+2. **帧 realm 也要拿到它。** 第一版只改了主 realm，实测 CF 那八个字段**纹丝不动**——
+   `realm.rs` 创建帧 realm 时只推了 `__obscura_set_fingerprint`,
+   没推 `__obscura_stealth` / `__obscura_webgl_enabled`,而 CF 的探测跑在它自己建的
+   iframe realm 里。这是本轮第三次遇到同一形状的问题：**身份装到了主 realm,
+   没装到子 realm。**
+3. `getParameter` 重写：`VENDOR`/`RENDERER` 回 `"WebKit"`/`"WebKit WebGL"`
+   （所有 Chrome 都是这两个字符串，真实适配器**只**能通过
+   `WEBGL_debug_renderer_info` 拿到——原来直接把适配器串放在 `VENDOR` 上，正好反了,
+   是最容易一行查出来的 WebGL 破绽）；补齐 ANGLE/D3D11 的参数表，WebGL2 再叠一层
+   ES 3.0 的名字；数组类参数每次返回新实例。
+4. 扩展列表从 8 条补到 WebGL1 36 条 / WebGL2 34 条（ANGLE + Intel D3D11 的组合,
+   不含 ASTC/ETC/PVRTC 这些该机器本来就没有的格式）。
+5. 补 `getShaderPrecisionFormat`（桌面 GL 恒为 float `[127,127,23]` / int `[31,30,0]`）
+   以及整个查询面：`getInternalformatParameter`、`getError`、`isEnabled`、
+   `checkFramebufferStatus`、`getIndexedParameter` 等约 60 个方法。
+   补之前 `qbitp7` 里带回来的是
+   `"UbbsC6Cannot read properties of undefined (reading 'call')"`——
+   **抛异常比任何数值都更响亮。**
+6. `readPixels` 从 `fill(0)` 改成按指纹种子生成稳定像素：全零本身就是一个哈希,
+   而且是任何 GPU 都画不出来的那个。
+
+**结果**：
+
+| 字段 | Chrome | 修复前 | 修复后 |
+|------|--------|--------|--------|
+| `FgjO3` | 1246 | 7（哨兵） | **1200** |
+| `CPWA9` | 613 | 7 | **768** |
+| `WLCCn2` | 273 | 7 | **231** |
+| `ZlnsY8` | 156 | 8 | **126** |
+| `ULOAc2` | 136 | 8 | **126** |
+| `qbitp7` | 66 | 7 | **63** |
+| `KbSE2` | 38 | 8 | **38** |
+| `bhWNV6` | 66 | 7 | 7（仍是哨兵） |
+| **载荷总量** | 68327 | 38529 | **51582** |
+
+`ULOAc2` 现在是
+`[["WebKit","WebKit WebGL"],["Google Inc. (Intel)","ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"]]`,
+形状与 Chrome 完全一致，且适配器与 Windows UA 自洽。
+
+**刻意保留的差异**：参数表用的是 **ANGLE/D3D11 Intel** 的值，不是浏览器那份
+**Apple/Metal** 抓包的值。照抄 Metal 的 `MAX_VERTEX_ATTRIBS=30`、
+`MAX_VIEWPORT_DIMS=[16384,16384]` 到一个自称 Windows 的 UA 上，是制造新的矛盾。
+因此本字段组不追求与参照载荷逐值相等，只要求**自洽且合乎所声称的机器**。
+
+`bhWNV6` 仍是哨兵：它要求真正渲染一遍再取哈希，画像层不画像素。
+
+**回归测试**：`the_gpu_profile_follows_stealth_and_hides_the_adapter_behind_the_debug_extension`
+（obscura-js）——先断言**非 stealth 时 `getContext('webgl')` 仍是 `null`**，
+再断言 stealth 下的 `VENDOR`/`RENDERER`、unmasked 走扩展、着色语言版本、
+两种上下文的扩展数量与精度格式。

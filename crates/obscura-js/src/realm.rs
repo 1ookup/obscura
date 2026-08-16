@@ -799,13 +799,22 @@ impl ObscuraJsRuntime {
         )?;
         // Frame realms are created lazily, after the main realm's identity was
         // installed. Apply the runtime-owned fingerprint before author code
-        // can observe navigator, UA-CH, screen, or worker surfaces.
+        // can observe navigator, UA-CH, screen, or worker surfaces. The
+        // stealth and GPU-profile flags travel with it: a frame that got the
+        // identity but not the flags reported a different machine from its
+        // own parent, which is worse than either answer on its own.
         let fingerprint_json = serde_json::to_string(&self.fingerprint)
             .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
+        let stealth = self.stealth;
+        let webgl_enabled = self.gpu_profile_enabled();
         self.execute_in_context(
             &context,
             "<obscura:frame-fingerprint>",
-            &format!("globalThis.__obscura_set_fingerprint({fingerprint_json});"),
+            &format!(
+                "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
+                 globalThis.__obscura_stealth = {stealth}; \
+                 globalThis.__obscura_webgl_enabled = {webgl_enabled};"
+            ),
         )?;
 
         // Snapshot the content root's scope for later diagnostics/routing;

@@ -344,6 +344,10 @@ pub struct ObscuraJsRuntime {
     /// inherit the same contract as the main realm and live overrides update
     /// already-existing realms.
     pub(crate) fingerprint: obscura_net::BrowserFingerprint,
+    /// Whether this page runs with stealth on. The GPU consistency profile
+    /// follows it: stealth's whole purpose is presenting one coherent machine,
+    /// and a context that exists but answers nothing is not one.
+    pub(crate) stealth: bool,
     object_store: HashMap<String, String>,
     /// Routing for RemoteObject handles that live in a frame world realm
     /// rather than the main context (Phase 6.2): objectId ->
@@ -576,6 +580,7 @@ impl ObscuraJsRuntime {
             runtime,
             state,
             fingerprint: obscura_net::BrowserFingerprint::default(),
+            stealth: false,
             object_store: HashMap::new(),
             object_realm: HashMap::new(),
             object_counter: 0,
@@ -822,10 +827,7 @@ impl ObscuraJsRuntime {
         let Ok(json) = serde_json::to_string(fingerprint) else {
             return;
         };
-        let webgl_enabled = std::env::var("OBSCURA_WEBGL_PROFILE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some();
+        let webgl_enabled = self.gpu_profile_enabled();
         let _ = self.runtime.execute_script(
             "<set-fingerprint>",
             format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
@@ -859,10 +861,28 @@ impl ObscuraJsRuntime {
         self.set_fingerprint(&fingerprint);
     }
 
+    /// Whether the GPU consistency profile is on. Without stealth it stays
+    /// opt-in through the environment, because the truthful answer for an
+    /// engine that paints no GPU pixels is that there is no context.
+    pub(crate) fn gpu_profile_enabled(&self) -> bool {
+        self.stealth
+            || std::env::var("OBSCURA_WEBGL_PROFILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .is_some()
+    }
+
     pub fn set_stealth(&mut self, enabled: bool) {
+        self.stealth = enabled;
+        // set_fingerprint may have already run for this page, so push the
+        // profile flag from here too rather than relying on call order.
+        let webgl_enabled = self.gpu_profile_enabled();
         let _ = self.runtime.execute_script(
             "<set-stealth>",
-            format!("globalThis.__obscura_stealth = {};", enabled),
+            format!(
+                "globalThis.__obscura_stealth = {enabled}; \
+                 globalThis.__obscura_webgl_enabled = {webgl_enabled};"
+            ),
         );
     }
 
@@ -18395,6 +18415,62 @@ RequestRedirect value",
             serde_json::json!({
                 "outcome": "error",
                 "executed": false,
+            })
+        );
+    }
+
+    #[test]
+    fn the_gpu_profile_follows_stealth_and_hides_the_adapter_behind_the_debug_extension() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Without stealth the truthful answer is that there is no context.
+        assert_eq!(
+            rt.evaluate("document.createElement('canvas').getContext('webgl')")
+                .unwrap(),
+            serde_json::json!(null),
+        );
+
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                    const float = gl.getShaderPrecisionFormat(0x8B30, 0x8DF2);
+                    const int = gl.getShaderPrecisionFormat(0x8B30, 0x8DF5);
+                    return {
+                        // Every Chrome answers these two, whatever the adapter.
+                        vendor: gl.getParameter(0x1F00),
+                        renderer: gl.getParameter(0x1F01),
+                        unmaskedIsAdapter: gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+                            .includes('ANGLE'),
+                        shadingLanguage: gl.getParameter(0x1F03),
+                        version2: gl2.getParameter(0x1F02),
+                        hasDebugExtension: gl.getSupportedExtensions()
+                            .includes('WEBGL_debug_renderer_info'),
+                        // A context returning a handful of extensions is as
+                        // distinctive as one returning none.
+                        manyExtensions: gl.getSupportedExtensions().length > 30
+                            && gl2.getSupportedExtensions().length > 30,
+                        precision: [float.rangeMin, float.rangeMax, float.precision,
+                            int.rangeMin, int.rangeMax, int.precision],
+                        viewport: Array.from(gl.getParameter(0x0D3A)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "vendor": "WebKit",
+                "renderer": "WebKit WebGL",
+                "unmaskedIsAdapter": true,
+                "shadingLanguage": "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
+                "version2": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+                "hasDebugExtension": true,
+                "manyExtensions": true,
+                "precision": [127, 127, 23, 31, 30, 0],
+                "viewport": [32767, 32767],
             })
         );
     }

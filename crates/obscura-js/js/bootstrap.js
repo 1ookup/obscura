@@ -7757,6 +7757,147 @@ globalThis.Notification = class Notification {
   constructor() {}
 };
 
+
+// The WebGL consistency profile. No GPU work happens: the values describe the
+// ANGLE/D3D11 adapter the fingerprint already claims through
+// `navigator.userAgent` and the unmasked renderer string, so that a page
+// reading the WebGL surface sees one coherent machine rather than a context
+// that exists but answers nothing.
+//
+// `VENDOR` and `RENDERER` are "WebKit"/"WebKit WebGL" in every Chrome; the
+// real adapter is only reachable through WEBGL_debug_renderer_info. Reporting
+// the adapter strings from `getParameter(VENDOR)` -- which this did -- is
+// backwards, and is the single easiest WebGL tell to check.
+const _WEBGL1_EXTENSIONS = [
+  'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_clip_control',
+  'EXT_color_buffer_half_float', 'EXT_depth_clamp', 'EXT_disjoint_timer_query',
+  'EXT_float_blend', 'EXT_frag_depth', 'EXT_polygon_offset_clamp',
+  'EXT_shader_texture_lod', 'EXT_texture_compression_bptc',
+  'EXT_texture_compression_rgtc', 'EXT_texture_filter_anisotropic',
+  'EXT_texture_mirror_clamp_to_edge', 'EXT_sRGB', 'KHR_parallel_shader_compile',
+  'OES_element_index_uint', 'OES_fbo_render_mipmap', 'OES_standard_derivatives',
+  'OES_texture_float', 'OES_texture_float_linear', 'OES_texture_half_float',
+  'OES_texture_half_float_linear', 'OES_vertex_array_object',
+  'WEBGL_blend_func_extended', 'WEBGL_color_buffer_float',
+  'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb',
+  'WEBGL_debug_renderer_info', 'WEBGL_debug_shaders', 'WEBGL_depth_texture',
+  'WEBGL_draw_buffers', 'WEBGL_lose_context', 'WEBGL_multi_draw',
+  'WEBGL_polygon_mode', 'WEBGL_provoking_vertex',
+];
+const _WEBGL2_EXTENSIONS = [
+  'EXT_clip_control', 'EXT_color_buffer_float', 'EXT_color_buffer_half_float',
+  'EXT_conservative_depth', 'EXT_depth_clamp', 'EXT_disjoint_timer_query_webgl2',
+  'EXT_float_blend', 'EXT_polygon_offset_clamp', 'EXT_render_snorm',
+  'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc',
+  'EXT_texture_filter_anisotropic', 'EXT_texture_mirror_clamp_to_edge',
+  'EXT_texture_norm16', 'KHR_parallel_shader_compile',
+  'NV_shader_noperspective_interpolation', 'OES_draw_buffers_indexed',
+  'OES_sample_variables', 'OES_shader_multisample_interpolation',
+  'OES_texture_float_linear', 'OVR_multiview2', 'WEBGL_blend_func_extended',
+  'WEBGL_clip_cull_distance', 'WEBGL_compressed_texture_s3tc',
+  'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
+  'WEBGL_debug_shaders', 'WEBGL_draw_instanced_base_vertex_base_instance',
+  'WEBGL_lose_context', 'WEBGL_multi_draw',
+  'WEBGL_multi_draw_instanced_base_vertex_base_instance', 'WEBGL_polygon_mode',
+  'WEBGL_provoking_vertex', 'WEBGL_stencil_texturing',
+];
+// Every value a desktop ANGLE/D3D11 context reports. Shared by both context
+// versions; the WebGL 2 table below adds the ES 3.0 names on top.
+const _WEBGL1_PARAMETERS = {
+  0x1F00: 'WebKit',                        // VENDOR
+  0x1F01: 'WebKit WebGL',                  // RENDERER
+  0x1F02: 'WebGL 1.0 (OpenGL ES 2.0 Chromium)',
+  0x1F03: 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)',
+  0x0D33: 16384,   // MAX_TEXTURE_SIZE
+  0x851C: 16384,   // MAX_CUBE_MAP_TEXTURE_SIZE
+  0x84E8: 16384,   // MAX_RENDERBUFFER_SIZE
+  0x8869: 16,      // MAX_VERTEX_ATTRIBS
+  0x8DFB: 4096,    // MAX_VERTEX_UNIFORM_VECTORS
+  0x8DFD: 1024,    // MAX_FRAGMENT_UNIFORM_VECTORS
+  0x8DFC: 30,      // MAX_VARYING_VECTORS
+  0x8872: 16,      // MAX_TEXTURE_IMAGE_UNITS
+  0x8B4C: 16,      // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+  0x8B4D: 32,      // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+  0x0D50: 4,       // SUBPIXEL_BITS
+  0x0D52: 8, 0x0D53: 8, 0x0D54: 8, 0x0D55: 8,   // RED/GREEN/BLUE/ALPHA_BITS
+  0x0D56: 24,      // DEPTH_BITS
+  0x0D57: 0,       // STENCIL_BITS
+  0x80A8: 0,       // SAMPLE_BUFFERS
+  0x80A9: 0,       // SAMPLES
+  0x84FF: 16,      // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+  0x9240: true,    // UNPACK_FLIP_Y_WEBGL
+  0x9241: false,   // UNPACK_PREMULTIPLY_ALPHA_WEBGL
+  0x9243: 0x9244,  // UNPACK_COLORSPACE_CONVERSION_WEBGL -> BROWSER_DEFAULT_WEBGL
+  0x0B44: false,   // CULL_FACE
+  0x0BD0: true,    // DITHER
+  0x0BE2: false,   // BLEND
+  0x0B71: false,   // DEPTH_TEST
+  0x0B90: false,   // STENCIL_TEST
+  0x0C11: false,   // SCISSOR_TEST
+  0x0B21: 1,       // LINE_WIDTH
+  0x0B73: true,    // DEPTH_WRITEMASK
+  0x0D05: 4,       // PACK_ALIGNMENT
+  0x0CF5: 4,       // UNPACK_ALIGNMENT
+  0x0B12: 0x0201,  // STENCIL_FUNC -> LESS
+  0x8894: null, 0x8895: null,   // ARRAY_BUFFER_BINDING / ELEMENT_ARRAY_BUFFER_BINDING
+  0x8CA6: null,    // FRAMEBUFFER_BINDING
+  0x8CA7: null,    // RENDERBUFFER_BINDING
+  0x8B8D: null,    // CURRENT_PROGRAM
+  0x84E0: 0x84C0,  // ACTIVE_TEXTURE -> TEXTURE0
+};
+// Values that are arrays have to be fresh each call: a caller that mutates the
+// returned Int32Array must not change what the next caller sees.
+const _WEBGL1_ARRAY_PARAMETERS = {
+  0x0D3A: () => new Int32Array([32767, 32767]),  // MAX_VIEWPORT_DIMS
+  0x846D: () => new Float32Array([1, 1024]),     // ALIASED_POINT_SIZE_RANGE
+  0x846E: () => new Float32Array([1, 1]),        // ALIASED_LINE_WIDTH_RANGE
+};
+const _WEBGL2_PARAMETERS = {
+  0x1F02: 'WebGL 2.0 (OpenGL ES 3.0 Chromium)',
+  0x1F03: 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)',
+  0x8073: 2048,        // MAX_3D_TEXTURE_SIZE
+  0x88FF: 2048,        // MAX_ARRAY_TEXTURE_LAYERS
+  0x80E8: 2147483647,  // MAX_ELEMENTS_VERTICES
+  0x80E9: 2147483647,  // MAX_ELEMENTS_INDICES
+  0x84FD: 15,          // MAX_TEXTURE_LOD_BIAS
+  0x8824: 8,           // MAX_DRAW_BUFFERS
+  0x8CDF: 8,           // MAX_COLOR_ATTACHMENTS
+  0x8B49: 4096,        // MAX_FRAGMENT_UNIFORM_COMPONENTS
+  0x8B4A: 4096,        // MAX_VERTEX_UNIFORM_COMPONENTS
+  0x8B4B: 120,         // MAX_VARYING_COMPONENTS
+  0x9122: 120,         // MAX_VERTEX_OUTPUT_COMPONENTS
+  0x9125: 120,         // MAX_FRAGMENT_INPUT_COMPONENTS
+  0x8904: -8,          // MIN_PROGRAM_TEXEL_OFFSET
+  0x8905: 7,           // MAX_PROGRAM_TEXEL_OFFSET
+  0x8A2B: 12,          // MAX_VERTEX_UNIFORM_BLOCKS
+  0x8A2D: 12,          // MAX_FRAGMENT_UNIFORM_BLOCKS
+  0x8A2E: 24,          // MAX_COMBINED_UNIFORM_BLOCKS
+  0x8A2F: 24,          // MAX_UNIFORM_BUFFER_BINDINGS
+  0x8A30: 65536,       // MAX_UNIFORM_BLOCK_SIZE
+  0x8A34: 256,         // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+  0x8A31: 212992,      // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
+  0x8A33: 212992,      // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
+  0x8C8A: 120,         // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+  0x8C8B: 4,           // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+  0x8C80: 120,         // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+  0x9111: 2147483647,  // MAX_SERVER_WAIT_TIMEOUT
+  0x826E: 32,          // MAX_SAMPLES
+  0x8D57: 8,           // MAX_SAMPLES (renderbuffer)
+  0x9143: 0,           // MAX_ELEMENT_INDEX low word
+  0x821B: 3, 0x821C: 0,  // MAJOR_VERSION / MINOR_VERSION
+  0x8DFA: 1,           // SHADER_COMPILER
+  0x87FE: 0,           // NUM_PROGRAM_BINARY_FORMATS
+  0x8DF9: 0,           // NUM_SHADER_BINARY_FORMATS
+  0x8C2B: 65536,       // MAX_TEXTURE_BUFFER_SIZE
+  0x88FC: 0,           // MAX_VERTEX_UNIFORM_BLOCKS placeholder
+  0x8B4F: 0,           // SHADER_TYPE placeholder
+};
+// getShaderPrecisionFormat on any desktop GL: IEEE single precision for the
+// float formats and 32-bit two's complement for the integer ones, regardless
+// of the requested precision qualifier.
+const _WEBGL_PRECISION_FLOAT = { rangeMin: 127, rangeMax: 127, precision: 23 };
+const _WEBGL_PRECISION_INT = { rangeMin: 31, rangeMax: 30, precision: 0 };
+
 class _WebGLContext {
   constructor(canvas, isWebGL2) {
     this.canvas = canvas; this._isWebGL2 = !!isWebGL2; this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
@@ -7764,17 +7905,58 @@ class _WebGLContext {
   }
   getContextAttributes() { return { alpha: true, antialias: false, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false }; }
   getParameter(name) {
-    const fp = _fingerprint(), gpu = fp.gpu || {};
-    const values = { 0x1F00: gpu.vendor || 'WebGL', 0x1F01: gpu.renderer || 'WebGL Renderer', 0x1F02: 'WebGL 1.0 (OpenGL ES 2.0 Chromium)', 0x1F03: 'WebGL GLSL ES 1.00 (OpenGL ES GLSL ES 1.0 Chromium)', 0x1F8B: 16, 0x8B4C: 8, 0x8B49: 8, 0x8B4A: 8, 0x846E: 16384, 0x0D33: 16384, 0x8869: 16, 0x8DFB: 8, 0x8D57: 4, 0x8D56: 4, 0x8B4D: 8, 0x8B4E: 8 };
-    return values[name] === undefined ? null : values[name];
+    const key = +name;
+    // The adapter strings sit behind WEBGL_debug_renderer_info, never here.
+    if (key === 0x9245 || key === 0x9246) {
+      const gpu = _fingerprint().gpu || {};
+      return key === 0x9245 ? (gpu.vendor || '') : (gpu.renderer || '');
+    }
+    const arrays = _WEBGL1_ARRAY_PARAMETERS[key];
+    if (arrays) return arrays();
+    if (this._isWebGL2 && _WEBGL2_PARAMETERS[key] !== undefined) return _WEBGL2_PARAMETERS[key];
+    const value = _WEBGL1_PARAMETERS[key];
+    return value === undefined ? null : value;
   }
-  getSupportedExtensions() { return ['ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_element_index_uint', 'OES_standard_derivatives', 'OES_texture_float', 'WEBGL_debug_renderer_info']; }
+  getShaderPrecisionFormat(_shaderType, precisionType) {
+    // LOW/MEDIUM/HIGH_FLOAT are 0x8DF0..0x8DF2, the INT variants 0x8DF3..0x8DF5.
+    const key = +precisionType;
+    const source = key >= 0x8DF3 && key <= 0x8DF5 ? _WEBGL_PRECISION_INT : _WEBGL_PRECISION_FLOAT;
+    return Object.assign(Object.create(globalThis.WebGLShaderPrecisionFormat.prototype), source);
+  }
+  getSupportedExtensions() {
+    return (this._isWebGL2 ? _WEBGL2_EXTENSIONS : _WEBGL1_EXTENSIONS).slice();
+  }
   getExtension(name) {
-    if (!this.getSupportedExtensions().includes(String(name))) return null;
-    if (this._extensions.has(name)) return this._extensions.get(name);
+    const key = String(name);
+    if (!this.getSupportedExtensions().includes(key)) return null;
+    if (this._extensions.has(key)) return this._extensions.get(key);
     let value = {};
-    if (name === 'WEBGL_debug_renderer_info') value = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
-    this._extensions.set(name, value); return value;
+    if (key === 'WEBGL_debug_renderer_info') {
+      value = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    } else if (key === 'EXT_texture_filter_anisotropic') {
+      value = { TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF };
+    } else if (key === 'WEBGL_lose_context') {
+      const context = this;
+      value = {
+        loseContext() { context._lost = true; },
+        restoreContext() { context._lost = false; },
+      };
+    } else if (key === 'OES_vertex_array_object') {
+      value = {
+        VERTEX_ARRAY_BINDING_OES: 0x85B5,
+        createVertexArrayOES() { return {}; },
+        deleteVertexArrayOES() {},
+        isVertexArrayOES() { return false; },
+        bindVertexArrayOES() {},
+      };
+    } else if (key === 'WEBGL_compressed_texture_s3tc') {
+      value = {
+        COMPRESSED_RGB_S3TC_DXT1_EXT: 0x83F0, COMPRESSED_RGBA_S3TC_DXT1_EXT: 0x83F1,
+        COMPRESSED_RGBA_S3TC_DXT3_EXT: 0x83F2, COMPRESSED_RGBA_S3TC_DXT5_EXT: 0x83F3,
+      };
+    }
+    this._extensions.set(key, value);
+    return value;
   }
   createShader(type) { return { type, source: '', compiled: true }; }
   shaderSource(shader, source) { if (shader) shader.source = String(source); }
@@ -7789,9 +7971,80 @@ class _WebGLContext {
   useProgram() {} getAttribLocation() { return 0; } getUniformLocation() { return {}; }
   viewport() {} clearColor() {} clear() {} enable() {} disable() {} drawArrays() {} drawElements() {} flush() {} finish() {}
   createBuffer() { return {}; } bindBuffer() {} bufferData() {} createTexture() { return {}; } bindTexture() {} texImage2D() {} texParameteri() {}
-  readPixels(_x, _y, width, height, _format, _type, pixels) { if (pixels && pixels.fill) pixels.fill(0); return undefined; }
+  // A page that renders a probe triangle and hashes the pixels gets a stable
+  // per-profile digest. All zeroes -- what a plain `fill(0)` produces -- is as
+  // distinctive a hash as any, and it is the one no GPU ever draws.
+  readPixels(x, y, width, height, _format, _type, pixels) {
+    if (!pixels || typeof pixels.length !== 'number') return undefined;
+    const columns = Math.max(1, +width || 1);
+    for (let index = 0; index + 3 < pixels.length; index += 4) {
+      const pixel = index >> 2;
+      const px = (+x || 0) + (pixel % columns);
+      const py = (+y || 0) + Math.floor(pixel / columns);
+      pixels[index] = (_fpRand(px * 6151 + py * 8807 + 1) * 256) & 0xFF;
+      pixels[index + 1] = (_fpRand(px * 6151 + py * 8807 + 2) * 256) & 0xFF;
+      pixels[index + 2] = (_fpRand(px * 6151 + py * 8807 + 3) * 256) & 0xFF;
+      pixels[index + 3] = 255;
+    }
+    return undefined;
+  }
   isContextLost() { return this._lost; }
+
+  // The query surface a capability probe walks. Every one of these was
+  // missing, so a probe that called them got a TypeError instead of a value
+  // -- and a thrown exception is a louder signal than any number they could
+  // have returned.
+  getError() { return 0; }
+  isEnabled(capability) { return +capability === 0x0BD0; }  // DITHER is on by default
+  checkFramebufferStatus() { return 0x8CD5; }               // FRAMEBUFFER_COMPLETE
+  getInternalformatParameter(_target, _internalformat, pname) {
+    // SAMPLES for a renderbuffer format, most-capable first, as the spec
+    // requires and as ANGLE reports on D3D11.
+    return +pname === 0x80A9 ? new Int32Array([8, 4, 2, 1]) : null;
+  }
+  getIndexedParameter() { return null; }
+  getFramebufferAttachmentParameter() { return null; }
+  getRenderbufferParameter() { return 0; }
+  getBufferParameter() { return 0; }
+  getTexParameter() { return 0; }
+  getVertexAttrib() { return null; }
+  getVertexAttribOffset() { return 0; }
+  getUniform() { return null; }
+  getActiveAttrib() { return null; }
+  getActiveUniform() { return null; }
+  getAttachedShaders() { return []; }
+  getShaderSource(shader) { return shader ? shader.source : null; }
+  getUniformBlockIndex() { return 0xFFFFFFFF; }
+  getFragDataLocation() { return -1; }
+  createFramebuffer() { return {}; }
+  createRenderbuffer() { return {}; }
+  createVertexArray() { return {}; }
+  createSampler() { return {}; }
+  createQuery() { return {}; }
+  createTransformFeedback() { return {}; }
+  bindFramebuffer() {} bindRenderbuffer() {} bindVertexArray() {} bindSampler() {}
+  deleteBuffer() {} deleteFramebuffer() {} deleteProgram() {} deleteRenderbuffer() {}
+  deleteShader() {} deleteTexture() {} deleteVertexArray() {}
+  renderbufferStorage() {} renderbufferStorageMultisample() {}
+  framebufferTexture2D() {} framebufferRenderbuffer() {}
+  texStorage2D() {} texSubImage2D() {} compressedTexImage2D() {} generateMipmap() {}
+  activeTexture() {} blendFunc() {} blendFuncSeparate() {} blendEquation() {}
+  depthFunc() {} depthMask() {} cullFace() {} frontFace() {} scissor() {}
+  colorMask() {} clearDepth() {} clearStencil() {} lineWidth() {} pixelStorei() {}
+  hint() {} polygonOffset() {} sampleCoverage() {} stencilFunc() {} stencilMask() {}
+  stencilOp() {} bindAttribLocation() {} enableVertexAttribArray() {}
+  disableVertexAttribArray() {} vertexAttribPointer() {} validateProgram() {}
+  uniform1i() {} uniform1f() {} uniform2f() {} uniform3f() {} uniform4f() {}
+  uniform1fv() {} uniform2fv() {} uniform3fv() {} uniform4fv() {}
+  uniformMatrix2fv() {} uniformMatrix3fv() {} uniformMatrix4fv() {}
+  drawArraysInstanced() {} drawElementsInstanced() {} drawBuffers() {}
+  get [Symbol.toStringTag]() {
+    return this._isWebGL2 ? 'WebGL2RenderingContext' : 'WebGLRenderingContext';
+  }
 }
+globalThis.WebGLShaderPrecisionFormat = class WebGLShaderPrecisionFormat {
+  constructor() { throw new TypeError('Illegal constructor'); }
+};
 globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {};
 
