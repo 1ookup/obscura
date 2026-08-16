@@ -3967,6 +3967,7 @@ mod tests {
                 "frameId": "frame-1",
                 "documentGeneration": 3,
                 "quirks": false,
+                "csp": null,
             }),
         );
         // A doctype-less document parses in quirks mode; the parse writes the
