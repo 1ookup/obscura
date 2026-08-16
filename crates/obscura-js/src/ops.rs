@@ -6325,6 +6325,18 @@ pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
+    let csp_origin = state
+        .top_origin
+        .as_ref()
+        .map(|origin| origin.serialize())
+        .unwrap_or_else(|| {
+            url::Url::parse(&state.url)
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "null".to_string())
+        });
+    state
+        .render_resources
+        .set_font_csp(state.document_csp.as_deref(), &csp_origin);
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
@@ -7174,6 +7186,9 @@ fn prepared_for_frame_root(
         result?
     };
     let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
+    if let Some(scope) = dom.document_scope(frame_root) {
+        resources.set_font_csp(scope.csp.as_deref(), &scope.origin.serialize());
+    }
     let generation = dom
         .document_scope(frame_root)
         .map(|scope| scope.document_generation)

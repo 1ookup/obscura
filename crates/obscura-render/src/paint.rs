@@ -147,6 +147,7 @@ pub struct RenderResourceCache {
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
     loader: Box<dyn RenderResourceLoader>,
+    font_csp: Option<(String, String)>,
 }
 
 impl Default for RenderResourceCache {
@@ -186,6 +187,7 @@ impl RenderResourceCache {
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
             loader: Box::new(loader),
+            font_csp: None,
         }
     }
 
@@ -195,6 +197,40 @@ impl RenderResourceCache {
     /// unknown and can still be fetched by a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
+    }
+
+    /// Set the enforced CSP context used by synchronous @font-face loading.
+    /// The cache is shared by nested documents, so embedders refresh this
+    /// before preparing each document root.
+    pub fn set_font_csp(&mut self, header: Option<&str>, self_origin: &str) {
+        self.font_csp = header.map(|value| (value.to_string(), self_origin.to_string()));
+    }
+
+    fn font_src_allows(&self, request_url: &str) -> bool {
+        let Some((header, self_origin)) = self.font_csp.as_ref() else { return true };
+        let mut sources = None;
+        for part in header.split(';') {
+            let mut tokens = part.split_ascii_whitespace();
+            let Some(name) = tokens.next() else { continue };
+            let values = tokens.collect::<Vec<_>>();
+            if name.eq_ignore_ascii_case("font-src") {
+                sources = Some(values);
+                break;
+            }
+            if sources.is_none() && name.eq_ignore_ascii_case("default-src") {
+                sources = Some(values);
+            }
+        }
+        let Some(sources) = sources else { return true };
+        let Ok(target) = url::Url::parse(request_url) else { return false };
+        let target_origin = target.origin().ascii_serialization();
+        sources.into_iter().any(|source| match source.to_ascii_lowercase().as_str() {
+            "'none'" => false,
+            "'self'" => target_origin.eq_ignore_ascii_case(self_origin),
+            "*" => matches!(target.scheme(), "http" | "https"),
+            value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+            value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+        })
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -7267,6 +7303,9 @@ fn collect_web_fonts(
     }
     for src in preloads.iter().take(16) {
         let key = font_resource_key(src, base_url);
+        if !cache.font_src_allows(&key) {
+            continue;
+        }
         if !seen.insert(key.clone()) {
             continue;
         }
@@ -7286,6 +7325,9 @@ fn collect_web_fonts(
             break;
         }
         if !seen.insert(key) {
+            continue;
+        }
+        if !cache.font_src_allows(&font_resource_key(&src, base_url)) {
             continue;
         }
         if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
@@ -11602,6 +11644,22 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn font_resource_cache_enforces_font_src_with_default_fallback() {
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        resources.set_font_csp(
+            Some("default-src 'none'; font-src 'self' https://fonts.example data:"),
+            "https://app.example",
+        );
+        assert!(resources.font_src_allows("https://app.example/font.woff2"));
+        assert!(resources.font_src_allows("https://fonts.example/font.woff2"));
+        assert!(resources.font_src_allows("data:font/woff2;base64,AA=="));
+        assert!(!resources.font_src_allows("https://evil.example/font.woff2"));
+
+        resources.set_font_csp(Some("default-src 'none'"), "https://app.example");
+        assert!(!resources.font_src_allows("https://app.example/font.woff2"));
+    }
 
     struct StubFrameSurfaces {
         host: obscura_dom::tree::NodeId,
