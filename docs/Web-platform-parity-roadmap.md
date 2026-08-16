@@ -428,10 +428,46 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
    git config core.hooksPath .githooks
    ```
 
-   它跑三件事:①默认 feature 集 `cargo check`(第 1 条那个错误能长期存活的唯一原因);②全量 nextest;
-   ③`Cargo.lock` 前后哈希比对(第 5 条那个坑,本轮我自己踩了两次)。hook 内所有 cargo 命令都带
+   它跑四件事:①默认 feature 集 `cargo check`(第 1 条那个错误能长期存活的唯一原因);②
+   obscura-js/browser/cdp 全量 nextest;③**obscura-render 的两种 feature 形态**(见下);
+   ④`Cargo.lock` 前后哈希比对(第 5 条那个坑,本轮我自己踩了两次)。hook 内所有 cargo 命令都带
    `--config patch.crates-io.v8.path`——否则门禁本身就成了改写 `Cargo.lock` 的元凶。
    `SKIP_OBSCURA_PREPUSH=1 git push` 可显式跳过。
+
+   **feature 形态错配(与第 1 条同源,方向相反)**。obscura-render 有 28 个测试断言真实文字排版
+   几何,而形状化(cosmic-text)在 `paint` feature 后面、默认关闭。它们没加 `#[cfg(feature = "paint")]`,
+   于是在默认构建里被编译并运行,量到的是 fallback advance,必然失败——`canonical_inline_fragments_
+   shape_with_the_loaded_webfont` 的报错原文就是「the loaded face's advances must drive fallback
+   inline geometry / left: 176.0 right: 176.0」(断言的是 `!=`)。第 1 条是「某个 feature 组合从没
+   被构建过,于是编译错误存活」;这一条是「某个 feature 组合从没被构建过,于是测试常年红着」。
+   两者的根因同一个:没有任何东西按 feature 矩阵跑。
+   补 cfg 后默认 372/372、`paint` 586/586。而 `paint` 形态**从来没被跑过**这件事本身还藏着一个真
+   bug:`paint::tests::a_checkbox_and_a_radio_paint_their_platform_look` 的谓词写作 `b > r + 40`,
+   `r` 是 `u8`,扫到白像素就 `attempt to add with overflow`——debug 下 panic,release 下更糟,
+   wrap 成 39 之后这个谓词会匹配上它本该排除的像素,测试假通过。改用 `b.saturating_sub(r) > 40`。
+   hook 现在两种形态都跑,只跑一种会让另一半继续烂。
+
+   **把 render 加进门禁后立刻换来的第二个发现**:`page_transport_prefetches_once_and_capture_
+   reuses_the_bytes` 在并发下约每 10 次失败 1 次。它的 fixture 是个手写的 TCP 服务器,读一次、
+   写一次、`return`。三个独立缺陷叠在一起,失败形态都是 `loaded == 0`:
+   ① 一次 `read` 在忙机器上可能只拿到半个请求头,而带着未读字节 close socket,内核发的是 RST
+   不是 FIN,客户端于是把一个服务器确实应答了的请求报成失败(`prefetch connection: Ok(())` 但
+   `loaded` 0);② hyper 可能在同一连接上再发一个请求,而「应答一次之后只 drain」会让它收到
+   `received unexpected message from connection`;③ 非阻塞 `accept` 在忙机器上会返回 EINTR,而
+   `Err(_) => return` 在这个 errno 上把 listener 也丢了 —— 连带丢掉 backlog 里那个已经完成握手
+   的连接,客户端读到 EOF(`connection closed before message completed`),而服务器侧计数还是 0。
+   三个都修掉之后 40 轮 0 失败(修之前 40 轮 4 次)。定位靠的是把断言信息从 `loaded` 一个数字
+   扩成「服务器收到几个请求 / prefetch 用掉了 1000ms 预算里的多少」——1.6ms 用掉 1000ms 预算这
+   一条直接排除了「超时」这个最省事的解释。诊断信息已留在断言里。
+   **另有两个既有 flaky 未修,均未拿到失败输出,因此不臆断成因、也不往 timing-sensitive 组里
+   塞**(那个文件的注释明确警告过:不要为了消音而加豁免):
+   - `autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll`:40 轮里 2 次;
+     它**已经**在 timing-sensitive 组里,说明 `threads-required` 这一手没能完全消除竞争。
+     单独复现 25 轮未中。
+   - `intersection_observer_tracks_viewport_threshold_crossings`:一次 pre-push 里撞到 1 次。
+     它用 `setTimeout` 25/50/80ms 编排三个阶段,形态上像抢占(两次 scroll 合并进一次调度会让
+     中间那条 record 消失),但 obscura-js 单跑 12 轮、js+browser+cdp 同跑 10 轮都未复现,
+     没有输出就没有定论。
 5. **js-repros fixture 已部分接入门禁**。12 个 fixture 共 577 个 Chrome 观测点,此前**没有任何代码
    读过它们**——是「碰巧含有数据的文档」,只在有人记得照 README 敲命令时才被验证过(对比:
    `render-repros` 是被 `layout_test.rs:314` 真正 `include_str!` 的)。已加

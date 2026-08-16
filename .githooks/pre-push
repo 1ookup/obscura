@@ -52,6 +52,27 @@ else
     || fail "tests failed"
 fi
 
+# 2b. obscura-render, in BOTH feature shapes. Its text tests need `paint`
+# (cosmic-text shaping); without it they measured fallback advances and 28 of
+# them failed, which nobody saw because nothing ran this crate. They now carry
+# `#[cfg(feature = "paint")]`, so the default run must still be green AND the
+# paint run must actually exercise them -- checking only one shape would let
+# either half rot. The `paint` shape had never been run at all: it was hiding
+# `attempt to add with overflow` in a test predicate.
+step "running obscura-render (default, then paint)"
+if command -v cargo-nextest >/dev/null 2>&1; then
+  cargo nextest run --release --no-fail-fast -p obscura-render "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (default features)"
+  cargo nextest run --release --no-fail-fast -p obscura-render --features paint \
+    "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (--features paint)"
+else
+  cargo test --release -p obscura-render "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (default features)"
+  cargo test --release -p obscura-render --features paint "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (--features paint)"
+fi
+
 # 3. Cargo.lock must come out byte-identical. If it moved, some command above
 # ran without the patch config and the pushed tree would build a V8 without the
 # trace patch.

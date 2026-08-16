@@ -16103,6 +16103,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn auto_width_float_uses_its_own_bfc_for_nested_float_max_content() {
         // A float establishes a BFC. Its auto inline size must therefore be
@@ -18301,6 +18302,7 @@ mod tests {
         assert!((second.y - first.y - 100.0).abs() < 0.1, "{second:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn direct_flex_text_is_one_wrapping_anonymous_item() {
         // Chromium 140: the pseudo is one flex item and the direct text run
@@ -18321,6 +18323,7 @@ mod tests {
         assert!((quote.height - 60.0).abs() < 0.1, "{quote:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn auto_width_column_flex_text_uses_fit_content_width() {
         // Chromium 145: the outer row leaves 533px beside the fixed 203px
@@ -18367,6 +18370,7 @@ mod tests {
         assert!((logo.width - 203.0).abs() < 0.1, "{logo:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn column_flex_fit_content_preserves_unbreakable_min_content() {
         // Chromium 145 keeps the unbreakable quote at 2561.25px and lets the
@@ -18743,6 +18747,7 @@ mod tests {
         assert_eq!(width("border-cell"), 100.0);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_table_layout_uses_only_first_row_for_column_geometry() {
         let tree = parse_html(
@@ -18766,6 +18771,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_table_layout_accounts_for_separate_border_spacing() {
         let tree = parse_html(
@@ -18786,6 +18792,7 @@ mod tests {
         assert!((rect("second").width - 212.0).abs() < 0.1, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_content_box_table_keeps_border_spacing_inside_declared_width() {
         let tree = parse_html(
@@ -18804,6 +18811,7 @@ mod tests {
         assert!((rect("second").width - 220.0).abs() < 0.1, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_percentage_table_resolves_tracks_against_final_used_width() {
         let tree = parse_html(
@@ -18824,6 +18832,7 @@ mod tests {
         assert!((rect("second").width - 277.5).abs() <= 0.5, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_columns_win_over_first_row_spanning_cell_widths() {
         let tree = parse_html(
@@ -19142,6 +19151,7 @@ mod tests {
         assert!(auto_table_percentage_intrinsic_floor(&[16.0, 106.71875], &percentages) > 1000.0);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn white_space_inherits_into_a_block_descendant_inline_context() {
         let tree = parse_html(
@@ -19461,6 +19471,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn wrapped_decorated_inline_exposes_three_ordered_font_box_fragments() {
         let tree = parse_html(
@@ -19513,6 +19524,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_horizontal_edges_advance_adjacent_content_but_margins_stay_outside_rect() {
         let tree = parse_html(
@@ -19543,6 +19555,7 @@ mod tests {
         assert!((rect("after").x - (rect("token").x + rect("token").width) - 5.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_edges_participate_in_wrapping_and_slice_only_outer_continuation_sides() {
         let tree = parse_html(
@@ -19606,6 +19619,7 @@ mod tests {
         assert!((decorated_after - plain_after - 20.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_provenance_maps_repeated_multibyte_text_across_hard_breaks() {
         let tree = parse_html(
@@ -19630,6 +19644,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn relative_inline_offsets_move_canonical_fragments_in_pixels_and_percentages() {
         let tree = parse_html(
@@ -19672,6 +19687,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn canonical_inline_fragments_shape_with_the_loaded_webfont() {
         let tree = parse_html(
@@ -19763,6 +19779,7 @@ mod tests {
         assert!((crate::style::resolve_grid_calc(handle, 1000.0) - 136.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn positioned_pseudo_does_not_wrap_shrink_to_fit_host_text() {
         let tree = parse_html(

@@ -11663,13 +11663,18 @@ mod tests {
             scan(0, &|r, g, b| r < 200 && g < 200 && b < 200),
             "unchecked checkbox drew no border"
         );
+        // `b - r` saturating, not `b > r + 40`: these are u8s, and the scan
+        // walks over white pixels where `r + 40` overflows -- a panic in
+        // debug, and worse in release, where it wraps to 39 and makes the
+        // predicate match the very pixels it is meant to exclude.
+        let bluer_than_red_by = |r: u8, b: u8, margin: u8| b.saturating_sub(r) > margin;
         assert!(
-            scan(40, &|r, g, b| b > 150 && b > r + 40 && g < b),
+            scan(40, &|r, g, b| b > 150 && bluer_than_red_by(r, b, 40) && g < b),
             "checked checkbox is not accent-filled"
         );
         assert!(
             scan(80, &|r, g, b| r > 240 && g > 240 && b > 240)
-                && scan(80, &|r, g, b| b > 150 && b > r + 40),
+                && scan(80, &|r, g, b| b > 150 && bluer_than_red_by(r, b, 40)),
             "checked radio is missing its accent ring or white dot"
         );
     }

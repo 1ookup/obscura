@@ -90,6 +90,7 @@ fn hn_shaped_table_lays_out_without_site_hardcoding() {
     );
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
     let tree = parse_html(
@@ -560,6 +561,7 @@ fn absolute_auto_axes_preserve_static_position_after_reparenting() {
     );
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn legacy_center_keeps_block_flow_and_centers_descendants() {
     let tree = parse_html(include_str!("../../../render-repros/legacy-center.html"));
@@ -664,6 +666,7 @@ fn list_indentation_is_reset_from_the_container() {
     );
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn replaced_max_height_clamps_intrinsic_aspect_transfer() {
     let tree = parse_html(include_str!(
@@ -1632,6 +1635,7 @@ fn inline_svg_derives_auto_height_from_view_box() {
 /// during both intrinsic grid track sizing and the final percentage-width
 /// pass. The 270px track leaves 254px after the grid item's inline padding;
 /// the 320:96 viewBox then contributes 76.1875px of height.
+#[cfg(feature = "paint")]
 #[test]
 fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     let tree = parse_html(
@@ -2289,6 +2293,7 @@ fn mixed_float_run_shares_one_band() {
     );
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn right_float_navigation_shares_inline_band() {
     let tree = parse_html(include_str!(
@@ -3297,6 +3302,7 @@ fn authored_percentage_max_width_still_clamps_an_oversized_image() {
 /// `max-width:100%` is cyclic during intrinsic sizing. Each image contributes
 /// zero to its column's automatic minimum, so the row can flex-shrink the
 /// natural 303/200/500/200/293px bases into exactly 1184px including gaps.
+#[cfg(feature = "paint")]
 #[test]
 fn percentage_max_replaced_items_shrink_in_a_flex_row() {
     let tree = parse_html(
@@ -3369,6 +3375,7 @@ fn percentage_max_replaced_items_shrink_in_a_flex_row() {
 /// Functional percentage-only maximums have the same computed sizing type as
 /// a bare percentage. Framework and utility stylesheets emit both spellings,
 /// so the replaced-element intrinsic contribution cannot depend on syntax.
+#[cfg(feature = "paint")]
 #[test]
 fn functional_percentage_max_replaced_items_shrink_in_a_flex_row() {
     let tree = parse_html(
@@ -3548,6 +3555,7 @@ fn bare_and_functional_cyclic_image_percentages_use_the_final_flex_width() {
 
 /// The cyclic percentage affects only the min-content contribution. With
 /// positive free space, the same boxes retain their natural max-content bases.
+#[cfg(feature = "paint")]
 #[test]
 fn percentage_max_replaced_items_keep_natural_max_content_size() {
     let tree = parse_html(
@@ -3590,6 +3598,7 @@ fn percentage_max_replaced_items_keep_natural_max_content_size() {
 /// shaped advances before line breaking. At this exact Chromium oracle width,
 /// the heading is two 40px lines with -1.8px tracking and three lines at
 /// `normal`. This guards the general shaping path, not a framework selector.
+#[cfg(feature = "paint")]
 #[test]
 fn negative_letter_spacing_changes_intrinsic_line_breaks() {
     let tree = parse_html(
@@ -4284,6 +4293,7 @@ fn closed_details_content_does_not_paint() {
     );
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
     let tree = parse_html(
@@ -4373,6 +4383,7 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
     assert_eq!(item.x - layout.rects[&parent].x, 150.0);
 }
 
+#[cfg(feature = "paint")]
 #[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(

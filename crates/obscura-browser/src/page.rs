@@ -9457,32 +9457,105 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        // A real little HTTP server, because the client is a real HTTP client.
+        //
+        // The original answered exactly one request and returned. Under load
+        // that produced three distinct failures, all of which surfaced as
+        // `loaded == 0` -- the request never counted, for three different
+        // reasons:
+        //
+        //   * a single `read` can return a partial header, and closing a
+        //     socket that still has unread bytes makes the kernel send RST
+        //     rather than FIN;
+        //   * hyper may send a second request on the same connection, and a
+        //     server that answers once and then only drains fails it with
+        //     "received unexpected message from connection";
+        //   * a non-blocking `accept` can fail with EINTR on a busy machine,
+        //     and `Err(_) => return` dropped the listener on it -- taking the
+        //     already-handshaked connection sitting in the backlog with it.
+        //     The client saw EOF ("connection closed before message
+        //     completed") for a request the server never even accepted, which
+        //     is why `requests served` read 0.
+        //
+        // So: never abandon the listener on a transient accept error, read
+        // each request to its end, and answer every request on the connection.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_server = std::sync::Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-                            .unwrap();
-                        let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
-                        let _ = seen_tx.send(());
-                        let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        stream.write_all(response.as_bytes()).unwrap();
-                        stream.write_all(body).unwrap();
-                        return;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served = 0usize;
+            let stopping = |stop: &std::sync::atomic::AtomicBool| {
+                std::time::Instant::now() >= deadline
+                    || stop.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            while !stopping(&stop_server) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    // Every accept error is transient here: WouldBlock is the
+                    // normal poll result, and anything else (EINTR) must not
+                    // cost us the listener. The loop ends on the deadline or
+                    // the stop flag, never on an errno.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .unwrap();
+                let mut chunk = [0u8; 1024];
+                let mut served_here = 0usize;
+                loop {
+                    let mut request = Vec::new();
+                    let complete = loop {
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break true;
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break false,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                // Nothing buffered on a connection we have
+                                // already answered means the client is done
+                                // with it. Before the first request it just
+                                // means the client has not written yet.
+                                if request.is_empty() && served_here > 0 {
+                                    break false;
+                                }
+                                if stopping(&stop_server) {
+                                    break false;
+                                }
+                            }
+                            Err(_) => break false,
+                        }
+                    };
+                    if !complete {
+                        break;
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    let _ = seen_tx.send(());
+                    served += 1;
+                    served_here += 1;
+                    let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(response.as_bytes()).is_err()
+                        || stream.write_all(body).is_err()
+                    {
+                        break;
                     }
-                    Err(_) => return,
+                    let _ = stream.flush();
                 }
+                // Half-close, then drain, so the final close is a FIN.
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                while matches!(stream.read(&mut chunk), Ok(read) if read > 0) {}
             }
+            served
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
@@ -9509,7 +9582,9 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
+        let prefetch_started = std::time::Instant::now();
         let loaded = page.prepare_screenshot_resources(1_000).await;
+        let prefetch_elapsed = prefetch_started.elapsed();
         let current_src = page
             .js
             .as_mut()
@@ -9517,13 +9592,18 @@ mod tests {
             .evaluate("document.querySelector('img').currentSrc")
             .unwrap();
         let prefetch_connection = seen_rx.recv_timeout(std::time::Duration::from_secs(1));
-        server.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let served = server.join().unwrap();
         let cached = page.js.as_ref().unwrap().render_image_resource_is_known(
             &asset_network_url,
             obscura_js::ImageRequestProfile::NoCorsInclude,
         );
         let screenshot = page.screenshot(page.viewport);
-        assert_eq!(loaded, 1, "prefetch connection: {prefetch_connection:?}");
+        assert_eq!(
+            loaded, 1,
+            "prefetch connection: {prefetch_connection:?}, requests served: \
+{served}, prefetch took {prefetch_elapsed:?} of its 1000ms budget",
+        );
         assert_eq!(
             current_src,
             serde_json::json!(asset_url),
