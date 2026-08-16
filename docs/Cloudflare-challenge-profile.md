@@ -1932,6 +1932,8 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
 | `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
 | **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
+| **探针的预注入钩子本身会被写进指纹**（`cdp_click_fast.py` 的 PRELOAD 包 `attachShadow` 并定义 `__roots`/`__pm`/`__t0`） | step 66 第一轮里 CF 载荷的 `YIjU8` 记下了钩子函数源码、`fyCZH9` 多出 `o.__pm`/`o.__roots`/`o.__t0`——**测的是探针不是引擎**，整轮作废 | 凡是要拿载荷/指纹做对拍的轮次，用零注入探针（`/tmp/clean_click.py`）；只有需要穿透 closed shadow 定位 widget 时才用带钩子的版本，且不得用该轮数据下指纹结论 |
+| MITM 代理换机器后 **CA 也换了**（本机 `Sep 30, 2025` vs 远端 `Apr 4, 2026`） | 用旧 `SSL_CERT_FILE` 会在握手阶段就失败，症状像「代理不通」 | `curl -s http://<proxy-host>:<port>/ca` 直接取 PEM，再对 `openssl s_client -proxy` 看到的 issuer 核对 CN |
 | 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
 | **把「有 CALL、无 COMPLETE」直接判成被拦截** | 这个特征同时也是长轮询在飞的样子；据此把 brunhild 判成被 CSP 拦截，整个 Step 61 的根因认定作废 | 让被判定的分支自己发声：在拦截处打日志（url + 生效策略 + 策略来源），再用「有没有这条日志」判定，而不是用别的日志的缺失去反推 |
 | **资源被 CSP 拒绝只表现为元素的 `error` 事件** | 与网络失败完全同形；`/ci/` 的 error 一度被当成超时 | 图片/媒体等资源路径的拦截也要打日志，否则无法与网络失败区分 |
@@ -3434,3 +3436,215 @@ obscura 实测这两个 realm 里 `eval('1+1')` 返回 `2`。**但真机 Chrome 
 obscura 现在让 srcdoc 继承父文档 CSP，而 widget 的 CSP 含 `'unsafe-eval'`，按继承语义就不该
 抛；参考实现的说法则暗示该子帧实际是 nonce-only。两次在 Chrome 上取证都被 CF 反复重建
 iframe 打断。**照抄一个「强制抛错」会在真机不抛时制造新的可检测矛盾，故先不做。**
+
+### Step 66 — 首次拿到明文提交载荷：逐字段对拍锁定 9 类差异（2026-08-17）
+
+**换了目标站与观测面。** 目标 `https://www.thelancet.com/1.txt`（同一套 managed 质询），
+观测面是 `http://192.168.3.57:9000` 上的 MITM 代理：它改写了 CF 的挑战脚本，在提交前把
+构造好的载荷对象以 `console.log("payloadJSON: " + ...)` 打出来。obscura 把所有 realm 的
+console 汇进 serve 日志，所以一次 `LC_ALL=C grep` 就能拿到**解密后的完整提交体**——
+这是 step 56 以来一直只能量到「体积差 2.3KB」的那条链路，现在可以逐字段读。
+浏览器侧参照是 `/tmp/har/json/{1,2,3}.json`（同一代理下 Chrome 149/macOS 的三次提交）。
+
+代理 CA 与本机 Reqable 的 CA 不同（`Apr 4, 2026, 0D1CEBE3` vs `Sep 30, 2025, B5DB6D9D`），
+直接 `curl http://192.168.3.57:9000/ca` 取到 PEM 后用 `SSL_CERT_FILE` 指过去即可。
+
+**假设**：提交体的体积差来自若干具体环境面缺失，而不是整体结构不同。
+
+**方法**：
+
+```bash
+curl -s http://192.168.3.57:9000/ca -o /tmp/reqable-remote-ca.crt
+SSL_CERT_FILE=/tmp/reqable-remote-ca.crt OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+  RUST_LOG=obscura_js=debug,info \
+  ./target/release/obscura serve --port 9223 --proxy http://192.168.3.57:9000 --stealth
+# 点击探针必须是无注入版本，理由见下面的「证据 0」
+uv run --with websockets python /tmp/clean_click.py https://www.thelancet.com/1.txt --port 9223
+```
+
+**证据 0（先作废一轮数据）**：第一轮用的是 `cdp_click_fast.py`，它的 PRELOAD 会包装
+`Element.prototype.attachShadow` 并定义 `__roots`/`__pm`/`__t0`。CF **两个面都读**：
+
+- `YIjU8` 字段第 8 项本该是 `"function attachShadow() { [native code] }"`，那一轮里是
+  `"function(i){var r=a.apply(this,arguments);try{window.__roots.push(r);}catch(e){}return r;}"`
+- 全局枚举字段 `fyCZH9` 里多出 `o.__pm` / `o.__roots` / `o.__t0`
+
+也就是说**探针本身把自己写进了指纹**。改用无注入探针后 `YIjU8` 恢复原生文案。
+以下结论一律取自无注入轮次；只有点击后模块（浏览器 `3.json` 对应项）暂无干净样本，
+已在对应条目标注。
+
+**证据 1（体积构成）**：把载荷摊平成「字段 → 序列化字节数」再相减，
+2.json（tokenB 载荷）总量 browser 68342 / obscura 41017，差额集中在 9 个字段：
+
+| 字段 | browser | obscura | 含义 |
+|------|---------|---------|------|
+| `fyCZH9` | 30881 | 15078 | 全局属性枚举（见证据 2） |
+| `YIwy3` | 7277 | 2 | WebRTC SDP offer → `""` |
+| `EnxW1` | 2293 | 8 | WebGPU adapter/limits/features → 错误码 `"nJJze9"` |
+| `DrTW4` | 1465 | 2 | ICE candidates → `[]` |
+| `ZpxzX5` | 1273 | 7 | RTP send/recv capabilities → `[[],[]]` |
+| `FgjO3` | 1246 | 7 | WebGL 扩展列表 → 错误码 `"Mylp5"` |
+| `QCEE0` | 843 | 缺失 | 120 项特性探测数组，整个模块不存在 |
+| `CPWA9` | 613 | 7 | WebGL 采样点 → 错误码 `"WbDj2"` |
+| `Swui9` | 596 | 2 | `navigator.keyboard.getLayoutMap()` → `{}` |
+
+同族的还有 `WLCCn2`/`ZlnsY8`/`ULOAc2`/`qbitp7`/`bhWNV6`/`KbSE2`，obscura 一律回一个
+6 字符 token（`"UdMJ8"`、`"TsxTy8"`、`"dRVOa5"`、`"EXir7"`、`"jCHa2"`、`"HMMge1"`）。
+这些是 CF 的**错误哨兵常量**，等价于「该探测抛了/不可用」。浏览器那边是完整的
+WebGL2 参数表、`["WebKit","WebKit WebGL"]` / `["Google Inc. (Apple)", "ANGLE (...)"]`
+供应商对、以及两个哈希。**WebGL 在 obscura 上是 fail-closed，CF 明确记到了。**
+
+**证据 2（全局面只有 Chrome 的一半）**：`fyCZH9` 是「属性路径 → 值分组」的倒排表。
+把它拍平成属性集合：**browser 1666 项，obscura 861 项，缺 1284、多 479。**
+缺的整块是 Web API 构造器（`AudioNode`/`CSS*`/`Sensor`/`Bluetooth*`/`WebGPU*` …）。
+多出来的按前缀分：`o.` 467、`d.` 5、`s.` 4。其中：
+
+- `d._body` / `d._head` / `d._root` / `d._url` / `d._iframeEl`
+- `s._availH` / `s._availW` / `s._h` / `s._w`
+- `o.__currentScriptNid` / `_url`
+
+**这些是 bootstrap.js 的内部字段，作为可枚举自有属性暴露在 `document`/`screen`/`window`
+上。** 直接实测确认：
+
+```
+Object.getOwnPropertyNames(document) === ["_nid"]      # Chrome: []
+Object.keys(screen)  含 _w/_h/_availW/_availH          # Chrome: []（全在 Screen.prototype）
+Object.getOwnPropertyNames(Object.getPrototypeOf(globalThis)).length === 1   # Chrome: 数百
+Object.getOwnPropertyNames(globalThis).length === 496  # Chrome ≈ 1238
+Object.keys(globalThis).length === 339                 # Chrome ≈ 28
+```
+
+最后一行是遍历前缀分布倒挂的根源：browser 的 `<bare>`(window 自有) 1238 / `o.` 28，
+obscura 是 305 / 493。**obscura 把本该挂在 `Window.prototype` 上的成员全铺在全局对象
+自身，且大量是可枚举的**，于是 CF 的「意外全局」清单里 obscura 有 493 条、Chrome 只有 28 条。
+
+**证据 3（身份面自相矛盾 + 不可能的机器）**：
+
+| 面 | browser | obscura |
+|----|---------|---------|
+| `navigator.userAgent` | Chrome/149.0.0.0 macOS | Chrome/**145**.0.0.0 Windows |
+| CDP `/json/version` 的 `User-Agent` | — | Chrome/**146**.0.0.0 |
+| `userAgentData.brands` | Chromium 149 | Chromium/Google Chrome **145** |
+| `navigator.appName` / `appCodeName` | `Netscape` / `Mozilla` | **undefined** |
+| `document.designMode` | `off` | **undefined** |
+| `innerWidth`/`innerHeight` | 0 / 0（隐藏帧） | **300 / 150** |
+| `outerWidth`/`outerHeight` | 1200 / 1120 | **300 / 150** |
+
+CDP 报 146、页面报 145，是同一个二进制内部的版本不一致。字体列表 `gqGB4` 更直白：
+Chrome 报 6 个（`Apple Symbols`/`Galvji`/`Geneva`/`InaiMathi Bold`/`Luminari`/`PingFang HK Light`），
+obscura 报 48+ 个，**同时**包含 Windows（`Bahnschrift`/`Segoe Fluent Icons`/`Gadugi`/
+`Ink Free`/`Nirmala UI`）、Linux（`Adwaita`/`DejaVu`/`Liberation`/`Cantarell`/`KacstOne`）
+和 macOS（`Skia`/`Geneva`/`PingFang HK Light`）三套字体——一台不可能存在的机器。
+
+**证据 4（obscura 主动多报的东西）**：
+
+- `PvWp9`：`"TypeError: Cannot read properties of null (reading 'innerHTML')"`。
+  该字段在浏览器载荷里根本不存在，obscura 把一条真实异常报了上去。
+- `QvHgQ8`：browser `[]`，obscura 是几百个数字下标；`ldcgI8`：browser `[159,163]`，
+  obscura 71 个下标。两者都是「第几项探测偏离预期」的清单。
+- `tjDL4`：browser 是 18 个短哈希（`"2287fef"` …），obscura 是 18 条未经处理的
+  `"function hasOwnProperty() { [native code] }"` 原文。
+- `sxjgT3`（探测调用轨迹）：browser 是 `sqpVk4/rWUVg7`（开始/完成）成对的长序列，
+  obscura 大量位置是 `wNEIG0`——与 console 里那条 `%c%d font-size:0;color:transparent wNEIG0`
+  同一个哨兵，即该子探测走了异常分支。
+- `JWcE1`（PerformanceObserver 条目）：browser 有 navigate / first-paint /
+  first-contentful-paint / 多条 resource（`dHCMz9:"h2"`），obscura 只有 2 条，
+  且 `dHCMz9:""`（nextHopProtocol 为空）。**呼应「未决」里的 frame 缺 navigation timing。**
+
+**证据 5（点击这一环，数据来自受污染轮次，仅作方向）**：
+
+| 字段 | browser | obscura |
+|------|---------|---------|
+| `QVZJq9.rRXx6` / `.rdJQ0` | `"1.5707963267948966"` / `"0"` | `"undefined"` / `"undefined"` |
+| `dvBBM0.FkSaJ9.ViwxY3` | 多条指针采样 | 1 条 |
+| `EgwZP5` | `false` | `true` |
+| 顶层 `jWOLY8` | 2.json=0 → 3.json=**1** | 2.json=0 → 3.json=**0** |
+
+`1.5707963267948966` 是 π/2，配合 `0`——正是 Chrome 上鼠标类 `PointerEvent` 的
+`altitudeAngle`/`azimuthAngle` 默认值，obscura 的 PointerEvent 没有这两个属性。
+`jWOLY8` 在浏览器提交后翻成 1、在 obscura 保持 0，是目前**唯一一个能直接读到的
+「这次交互没被认可」的标志位**。
+
+**结论**：
+
+1. 体积差不是单一原因，是 9 类环境面同时缺失/报错。按字节从大到小：全局面残缺、
+   WebRTC 全空、WebGL/WebGPU fail-closed、`QCEE0` 模块缺席、键盘布局表空。
+2. 比缺失更致命的是**矛盾**：三个 Chrome 版本号、三套操作系统的字体、
+   `document._nid` / `screen._w` 这类引擎内部字段、以及一条真实的 `TypeError` 被上报。
+   缺一个 API 只是「老浏览器」，同时出现三套 OS 字体是「伪造」。
+3. `Window.prototype` 几乎为空、成员全部铺在全局自身且大量可枚举，是 `fyCZH9`
+   差异的结构性根源，一处改动能同时收敛 `o.` 多报（493→个位数）与部分分组错位。
+4. 本轮仍未通过：标题始终停在 `Just a moment...`，`jWOLY8` 保持 0。
+
+**下一步**（按性价比）：先修矛盾类——统一 UA/UA-CH/CDP 三处版本号、按宿主 OS 裁剪
+字体列表、把 `_nid`/`_w`/`_body` 等内部字段改为不可枚举或 Symbol 键、查 `PvWp9` 那条
+`innerHTML` 空指针。再考虑补面：`Window.prototype` 归位、PointerEvent 的
+`altitudeAngle`/`azimuthAngle`、`navigator.appName`/`appCodeName`/`document.designMode`。
+WebRTC 与 WebGL 是大工程，放最后。
+
+### Step 67 — 修 1.json：`yQYB9` 缺失的三个成因，resource timing 补齐（2026-08-17）
+
+**假设**：1.json 里唯一属于引擎缺陷的差异是 `yQYB9` 整个字段缺失（浏览器 2 条），
+其余（`kytBC0`/`WAiB1`/`XNan0` 时长、`NWUB3`/`gAMzq7`/`xRRo8`/`DoKk0` 计数）是页面
+差异——浏览器那份 HAR 抓的是 `/123.txt` 上的 `__warm_fiddle__` 测试页
+（`HsMRH3` = `api.js?render=explicit`、`FELcX1` 栈里有 `fiddle-client.js`），
+DOM 规模本来就不一样，不能拿来当引擎判据。
+
+**方法**：直接读页面 realm 的 `performance.getEntriesByType('resource')`，
+不经过 CF：
+
+```bash
+uv run --with websockets python /tmp/res_probe.py https://www.thelancet.com/1.txt
+```
+
+**证据（修复前）**：只有 3 条，全是 favicon 与一条 fetch。缺 api.js（脚本）、
+缺 widget iframe 文档；且 `transferSize === encodedBodySize`、`nextHopProtocol` 为空。
+浏览器那 2 条分别是 widget 文档（`aelS9` 94838 / `Zcgk7` 94538，**差 300**）与
+api.js（跨源无 TAO，`QUyj4`/`aelS9`/`Zcgk7` 全 0）。
+
+**三个独立成因**：
+
+1. **动态插入的 `<script src>` 不记条目。** `__fetchDynClassicScript` 直接调
+   `op_fetch_url` 后就把 body 交出去了，从不落 Performance 条目。解析器插入的脚本
+   走 page.rs:2058 有记，动态的没有——而质询页的 api.js 正是动态插入的。
+2. **子框架文档不记条目。** `navigate_frame_inner` 里的
+   `fetch_document_with_method_referrer` 没有配套的 `record_performance_response`。
+   补上之后仍然不出现，因为——
+3. **`load_child_frames()` 跑在 `init_js()` 之前**（page.rs:3622/3623）。init_js 会
+   **替换整个运行时**，所以子框架加载期间记进去的条目连同那个运行时一起被丢弃。
+   这与 step 63 的「顶层 CSP 到不了运行时」是同一类错误：**在运行时被替换之前
+   往运行时里写东西**。同理 `navigate_frame_for_cdp` 会把 DomTree 从运行时借出来，
+   借出期间也不该对它执行脚本。
+
+**修复**：
+- bootstrap.js 抽出 `_recordFetchResourceTiming()`，三处调用点（fetch / 动态脚本 /
+  图片）共用同一份 TAO 判定与相位时间戳；动态脚本新增条目，`initiatorType: 'script'`。
+- `transferSize = encodedBodySize + 300`（响应头字节，Chrome 实测就是这个常数），
+  `nextHopProtocol` 按 scheme 给 `h2` / `http/1.1`，TAO 被拒时才是 `''`。
+  参考实现同样是 `bodySize ? bodySize + 300 : 0`（`toolsFunc.js:1491`）。
+- page.rs 给子框架文档记 `initiatorType: "iframe"` 条目；新增
+  `deferred_performance_entries` 缓冲与 `performance_entries_deferred` 深度计数，
+  在「运行时还没建好」和「DomTree 借出中」两个窗口里缓冲，窗口结束后按序回放。
+
+**修复后（同一页面，同一探针）**：
+
+```
+script  .../orchestrate/chl_page  ts=228808 eb=228508 p=h2
+script  .../turnstile/v0/g/.../api.js  rs=0 ts=0 eb=0 p=""     ← 与浏览器 api.js 条目形状一致
+img     /favicon.ico              ts=6274  eb=5974  p=h2
+fetch   .../challenge-platform/h/g/fo/  ts=113852 eb=113552 p=h2
+iframe  .../turnstile/f/av0/rch/...                            ← 新增
+```
+
+CF 载荷侧：1.json 的 `yQYB9` 从缺失变成 1 条（api.js，`QUyj4`/`aelS9`/`Zcgk7` 全 0，
+与浏览器同形），2.json 从 1 条变成 3 条（api.js + `/fo/` + `/ci/`，浏览器 4 条）；
+`JWcE1` 的 `dHCMz9` 从 `""` 变成 `"h2"`；所有 `transferSize - encodedBodySize` 都是 300。
+
+**回归测试**：`a_dynamic_script_files_a_resource_timing_entry`、
+`resource_timing_transfer_size_covers_the_response_headers`（obscura-js）、
+`a_subframe_document_load_lands_in_the_parents_resource_timeline`（obscura-browser，
+已验证在缓冲修复前失败：`left: Null`）。
+
+**仍未对齐（记录，非本步范围）**：`DCkwl7` 130 vs 1952 是 widget 文档的加载时长，
+obscura 更快；`NWUB3`/`WpIu5` 28 vs 1849 等计数属于页面差异。要拿这些当判据，
+必须换成同一个 URL 的浏览器 HAR。

@@ -373,6 +373,15 @@ pub struct Page {
     /// (Phase 3.6). The same sheet referenced from several frames is fetched
     /// once per top-level navigation; None caches a failed fetch.
     frame_stylesheet_cache: std::collections::HashMap<String, Option<String>>,
+    /// Performance Timeline entries produced while no runtime can accept
+    /// them. Child frames load either before `init_js` builds the runtime
+    /// that answers `performance.getEntriesByType`, or with the DomTree on
+    /// loan out of the runtime; recording straight away in the first case
+    /// wrote into a runtime about to be discarded.
+    deferred_performance_entries: Vec<serde_json::Value>,
+    /// Nesting depth of the windows described above. A counter rather than a
+    /// flag because a frame navigation can start during page navigation.
+    performance_entries_deferred: usize,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -1040,6 +1049,8 @@ impl Page {
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             frame_stylesheet_cache: std::collections::HashMap::new(),
+            deferred_performance_entries: Vec::new(),
+            performance_entries_deferred: 0,
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -1348,9 +1359,6 @@ impl Page {
         if entry_type == "resource" && !matches!(response.url.scheme(), "http" | "https") {
             return;
         }
-        let Some(js) = self.js.as_mut() else {
-            return;
-        };
         let transport_start = response
             .timing
             .start
@@ -1383,6 +1391,24 @@ impl Page {
         let exposed_response_start = if timing_allowed { response_start } else { 0.0 };
         let exposed_size = if timing_allowed { body_size } else { 0 };
         let exposed_status = if timing_allowed { response.status } else { 0 };
+        // transferSize counts the response headers too, so it is always larger
+        // than encodedBodySize on a real connection; the gap is a flat 300
+        // bytes over h2. Reporting them equal is one subtraction away from
+        // being obvious. A denied Timing-Allow-Origin hides the protocol as
+        // well as the sizes, which is the only case where "" is correct.
+        const RESOURCE_HEADER_BYTES: usize = 300;
+        let transfer_size = if exposed_size > 0 {
+            exposed_size + RESOURCE_HEADER_BYTES
+        } else {
+            0
+        };
+        let next_hop_protocol = if !timing_allowed {
+            ""
+        } else if response.url.scheme() == "https" {
+            "h2"
+        } else {
+            "http/1.1"
+        };
         let entry = serde_json::json!({
             "name": response.url.as_str(),
             "entryType": entry_type,
@@ -1399,7 +1425,8 @@ impl Page {
             "requestStart": if timing_allowed { transport_start } else { 0.0 },
             "responseStart": exposed_response_start,
             "responseEnd": response_end,
-            "transferSize": exposed_size,
+            "nextHopProtocol": next_hop_protocol,
+            "transferSize": transfer_size,
             "encodedBodySize": exposed_size,
             "decodedBodySize": exposed_size,
             "responseStatus": exposed_status,
@@ -1417,10 +1444,36 @@ impl Page {
             body_size,
             "recording Performance Timeline entry",
         );
+        self.record_performance_entry(entry);
+    }
+
+    /// File one built Performance Timeline entry, or hold it until a runtime
+    /// exists to file it into.
+    fn record_performance_entry(&mut self, entry: serde_json::Value) {
+        if self.performance_entries_deferred > 0 || self.js.is_none() {
+            self.deferred_performance_entries.push(entry);
+            return;
+        }
+        let Some(js) = self.js.as_mut() else { return };
         let _ = js.execute_script(
             "<performance-entry>",
             &format!("globalThis.__obscura_performance_record({entry});"),
         );
+    }
+
+    /// Replay entries recorded before the runtime existed, oldest first.
+    fn flush_deferred_performance_entries(&mut self) {
+        if self.deferred_performance_entries.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred_performance_entries);
+        let Some(js) = self.js.as_mut() else { return };
+        for entry in pending {
+            let _ = js.execute_script(
+                "<performance-entry>",
+                &format!("globalThis.__obscura_performance_record({entry});"),
+            );
+        }
     }
 
     /// Resolve the document base URL per HTML spec:
@@ -3600,9 +3653,16 @@ impl Page {
             }
         }
         self.frame_stylesheet_cache.clear();
+        // The runtime these frames' timing entries belong to does not exist
+        // yet; `init_js` below builds it.
+        self.performance_entries_deferred += 1;
         self.load_child_frames().await;
         self.init_js();
+        self.performance_entries_deferred -= 1;
         self.record_performance_response(&response, "navigation", "navigation");
+        // After the navigation entry, so the timeline starts with it the way
+        // a browser's does.
+        self.flush_deferred_performance_entries();
         // The top Window's new-document scripts precede every child-frame and
         // top-document author script, just as they precede HTML parsing in a
         // browser. Child worlds receive their own injection below.
@@ -5407,6 +5467,9 @@ impl Page {
         } else {
             false
         };
+        // The tree is on loan out of the runtime for the duration of the
+        // commit, so nothing may run script against it until it is back.
+        self.performance_entries_deferred += 1;
         let result = self.navigate_frame(frame_id, request).await;
         if borrowed_from_js {
             if let Some(dom) = self.dom.take() {
@@ -5415,6 +5478,8 @@ impl Page {
                 }
             }
         }
+        self.performance_entries_deferred -= 1;
+        self.flush_deferred_performance_entries();
         if result.is_ok() {
             self.execute_frame_subtree_scripts(frame_id).await;
         }
@@ -5618,6 +5683,12 @@ impl Page {
                         &ancestor_origins,
                     )
                     .map_err(FrameNavigateError::Blocked)?;
+
+                    // A subframe's document load is a resource of the embedding
+                    // document, so it belongs in the parent's timeline under
+                    // the element's local name. Skipping it left a page that
+                    // counts its own resources one entry short of a browser.
+                    self.record_performance_response(&response, "resource", "iframe");
 
                     let final_url = response.url.to_string();
                     let document_csp = response
@@ -6920,6 +6991,64 @@ mod tests {
             .value
             .unwrap();
         assert_eq!(result, serde_json::json!(["status:200", "AbortError"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subframe_document_load_lands_in_the_parents_resource_timeline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let frame_body = "<!doctype html><p>frame</p>";
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..length]).to_string();
+                let body = if head.contains("/frame") {
+                    frame_body.to_string()
+                } else {
+                    "<!doctype html><iframe src=\"/frame\"></iframe>".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTiming-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-timing".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-timing".to_string(), context);
+        page.navigate(&format!("{origin}/main")).await.unwrap();
+
+        let probe = r#"(() => {
+            const entry = performance.getEntriesByType("resource")
+                .find(value => value.name.endsWith("/frame"));
+            return entry
+                ? [entry.initiatorType, entry.nextHopProtocol,
+                   entry.transferSize - entry.encodedBodySize]
+                : null;
+        })()"#;
+        let result = page
+            .evaluate_for_cdp_with_timeout(probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["iframe", "http/1.1", 300]),
+            "a subframe's document is a resource of the embedding document",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

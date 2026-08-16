@@ -382,11 +382,19 @@ async function __fetchDynClassicScript(task) {
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
+    // A `data:` script has no network request behind it and therefore no
+    // Resource Timing entry, so only this branch files one.
+    const fetchStart = performance.now();
     const raw = await Deno.core.ops.op_fetch_url(
       task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin",
       _environmentReferrerContext()
     );
     const parsed = JSON.parse(raw);
+    // A browser records the response before deciding whether it is executable,
+    // so a 404 script still appears in the timeline.
+    _recordFetchResourceTiming(
+      { ...parsed, url: parsed.url || task.url }, 'script', fetchStart, task.pageOrigin,
+      String(parsed.body || '').length);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
     // as a network error. Evaluating its response body is both observably
     // unlike browsers and dangerous: JSON error payloads and diagnostic HTML
@@ -5947,6 +5955,71 @@ function _imageEncodingError() {
   return new DOMException("The source image cannot be decoded.", "EncodingError");
 }
 
+// A Resource Timing entry's transferSize counts the response headers as well
+// as the body, so it always exceeds encodedBodySize on a real connection --
+// by a flat 300 bytes on the h2 links these responses arrive over. Reporting
+// the two as equal is a one-subtraction tell.
+const _RESOURCE_HEADER_BYTES = 300;
+
+// The protocol a response arrived over. The transport does not surface the
+// negotiated ALPN value, and every https origin the engine talks to serves
+// h2, so derive it from the scheme rather than leave the attribute empty --
+// no browser ever reports "" for a resource whose timing is exposed.
+function _nextHopProtocolFor(url) {
+  try {
+    return new URL(url).protocol === 'https:' ? 'h2' : 'http/1.1';
+  } catch (_error) {
+    return '';
+  }
+}
+
+// File a response that came back through `op_fetch_url` in this realm's
+// Performance Timeline. Callers used to inline their own copy of the
+// Timing-Allow-Origin check and the phase timestamps, and only some of them
+// filed an entry at all: a dynamically inserted <script src> left no trace,
+// so a page that counts its own resources saw one where a browser sees three.
+function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigin, bodySize) {
+  const record = globalThis.__obscura_performance_record;
+  if (typeof record !== 'function' || !parsed || !parsed.status) return;
+  const url = String(parsed.url || '');
+  const timing = parsed.timing || {};
+  const responseEnd = fetchStart + Math.max(0, +timing.responseEnd || 0);
+  let allowed = true;
+  try {
+    const origin = new URL(url).origin;
+    if (origin !== pageOrigin) {
+      const tao = String((parsed.headers || {})['timing-allow-origin'] || '');
+      allowed = tao.split(',').map(value => value.trim())
+        .some(value => value === '*' || value === pageOrigin);
+    }
+  } catch (_error) {}
+  const size = allowed ? Math.max(0, +bodySize || 0) : 0;
+  record({
+    name: url,
+    entryType: 'resource',
+    initiatorType,
+    // A denied Timing-Allow-Origin hides the protocol along with the phase
+    // timestamps and the sizes.
+    nextHopProtocol: allowed ? _nextHopProtocolFor(url) : '',
+    startTime: fetchStart,
+    duration: Math.max(0, responseEnd - fetchStart),
+    redirectStart: timing.redirectCount ? fetchStart : 0,
+    redirectEnd: timing.redirectCount ? fetchStart + Math.max(0, +timing.redirectEnd || 0) : 0,
+    fetchStart,
+    domainLookupStart: allowed ? fetchStart : 0,
+    domainLookupEnd: allowed ? fetchStart : 0,
+    connectStart: allowed ? fetchStart : 0,
+    connectEnd: allowed ? fetchStart : 0,
+    requestStart: allowed ? fetchStart : 0,
+    responseStart: allowed ? fetchStart + Math.max(0, +timing.responseStart || 0) : 0,
+    responseEnd,
+    transferSize: size ? size + _RESOURCE_HEADER_BYTES : 0,
+    encodedBodySize: size,
+    decodedBodySize: size,
+    responseStatus: allowed ? parsed.status : 0,
+  });
+}
+
 // File an image fetch in this realm's Performance Timeline. Only the request
 // that actually went to the network carries `timing`, so followers of an
 // in-flight fetch and cache hits add no duplicate entry. Without a
@@ -5980,7 +6053,8 @@ function _recordImageResourceTiming(metadata, fetchStart) {
     requestStart: allowed ? fetchStart : 0,
     responseStart: allowed ? responseStart : 0,
     responseEnd,
-    transferSize: allowed ? size : 0,
+    nextHopProtocol: allowed ? _nextHopProtocolFor(timing.url || "") : '',
+    transferSize: allowed && size ? size + _RESOURCE_HEADER_BYTES : 0,
     encodedBodySize: allowed ? size : 0,
     decodedBodySize: allowed ? size : 0,
     responseStatus: allowed ? (+timing.status || 0) : 0,
@@ -7986,40 +8060,11 @@ globalThis.fetch = async (input, init = {}) => {
     url: parsed.url || url,
     redirected: (parsed.timing?.redirectCount || 0) > 0,
   });
-  if (parsed.status !== 0 && globalThis.__obscura_performance_record) {
-    const timing = parsed.timing || {};
-    const responseEnd = performanceStart + Math.max(0, +timing.responseEnd || 0);
+  if (parsed.status !== 0) {
     const bodySize = responseBody && Number.isFinite(responseBody.byteLength)
       ? responseBody.byteLength : String(parsed.body || '').length;
-    let timingAllowed = true;
-    try {
-      const resourceOrigin = new URL(parsed.url || url).origin;
-      if (resourceOrigin !== pageOrigin) {
-        const tao = String((parsed.headers || {})['timing-allow-origin'] || '');
-        timingAllowed = tao.split(',').map(value => value.trim()).some(value => value === '*' || value === pageOrigin);
-      }
-    } catch (_error) {}
-    globalThis.__obscura_performance_record({
-      name: parsed.url || url,
-      entryType: 'resource',
-      initiatorType: 'fetch',
-      startTime: performanceStart,
-      duration: Math.max(0, responseEnd - performanceStart),
-      redirectStart: timing.redirectCount ? performanceStart : 0,
-      redirectEnd: timing.redirectCount ? performanceStart + Math.max(0, +timing.redirectEnd || 0) : 0,
-      fetchStart: performanceStart,
-      domainLookupStart: timingAllowed ? performanceStart : 0,
-      domainLookupEnd: timingAllowed ? performanceStart : 0,
-      connectStart: timingAllowed ? performanceStart : 0,
-      connectEnd: timingAllowed ? performanceStart : 0,
-      requestStart: timingAllowed ? performanceStart : 0,
-      responseStart: timingAllowed ? performanceStart + Math.max(0, +timing.responseStart || 0) : 0,
-      responseEnd,
-      transferSize: timingAllowed ? bodySize : 0,
-      encodedBodySize: timingAllowed ? bodySize : 0,
-      decodedBodySize: timingAllowed ? bodySize : 0,
-      responseStatus: timingAllowed ? parsed.status : 0,
-    });
+    _recordFetchResourceTiming(
+      { ...parsed, url: parsed.url || url }, 'fetch', performanceStart, pageOrigin, bodySize);
   }
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {

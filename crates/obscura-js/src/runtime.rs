@@ -18400,6 +18400,100 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_dynamic_script_files_a_resource_timing_entry() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "text/javascript" },
+                            body: "globalThis.__ran = true",
+                            url: "https://cdn.example/widget.js",
+                            timing: { responseStart: 4, responseEnd: 9, redirectCount: 0 },
+                        });
+                        const script = document.createElement("script");
+                        script.src = "https://cdn.example/widget.js";
+                        await new Promise(resolve => {
+                            script.onload = resolve;
+                            script.onerror = resolve;
+                            document.head.appendChild(script);
+                        });
+                        const entry = performance.getEntriesByType("resource")
+                            .find(value => value.name === "https://cdn.example/widget.js");
+                        return entry && [
+                            entry.initiatorType,
+                            entry.nextHopProtocol,
+                            entry.encodedBodySize,
+                            entry.transferSize,
+                            entry.responseStatus,
+                        ];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // A cross-origin response without Timing-Allow-Origin exposes neither
+        // sizes nor protocol, so the fixture grants nothing and the entry is
+        // still expected to exist -- its presence is the point.
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["script", "", 0, 0, 0])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_transfer_size_covers_the_response_headers() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 200,
+                            headers: { "timing-allow-origin": "*" },
+                            body: "0123456789",
+                            url: "https://cdn.example/data.json",
+                            timing: { responseStart: 2, responseEnd: 5, redirectCount: 0 },
+                        });
+                        await fetch("https://cdn.example/data.json");
+                        const entry = performance.getEntriesByType("resource")
+                            .find(value => value.name === "https://cdn.example/data.json");
+                        return entry && [
+                            entry.initiatorType,
+                            entry.nextHopProtocol,
+                            entry.encodedBodySize,
+                            entry.transferSize,
+                        ];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["fetch", "h2", 10, 310])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
