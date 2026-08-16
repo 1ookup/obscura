@@ -2656,6 +2656,31 @@ fn csp_connect_allows(header: Option<&str>, request_url: &str, page_origin: &str
     })
 }
 
+fn csp_resource_allows(
+    header: Option<&str>,
+    directive: &str,
+    request_url: &str,
+    page_origin: &str,
+) -> bool {
+    let Some(header) = header else { return true };
+    let sources = header.split(';').find_map(|part| {
+        let mut tokens = part.split_ascii_whitespace();
+        let name = tokens.next()?.to_ascii_lowercase();
+        (name == directive || (directive == "img-src" && name == "default-src"))
+            .then_some(tokens.map(str::to_string).collect::<Vec<_>>())
+    });
+    let Some(sources) = sources else { return true };
+    let Ok(target) = url::Url::parse(request_url) else { return false };
+    let target_origin = target.origin().ascii_serialization();
+    sources.iter().any(|source| match source.to_ascii_lowercase().as_str() {
+        "'none'" => false,
+        "'self'" => target_origin == page_origin,
+        "*" => matches!(target.scheme(), "http" | "https" | "data" | "blob"),
+        value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+        value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -6801,6 +6826,7 @@ async fn op_load_image_metadata(
         page_in_flight,
         blocked,
         initiator_origin,
+        csp_blocked,
     ) = {
         let gs = shared.borrow();
         let Some(dom) = gs.dom.as_ref() else {
@@ -6845,6 +6871,26 @@ async fn op_load_image_metadata(
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
         let initiator_origin = initiator.origin().ascii_serialization();
+        let (csp_header, csp_origin) = dom
+            .containing_document_root_shadow_including(node_id)
+            .and_then(|root| {
+                dom.document_scope(root).map(|scope| (scope.csp, scope.origin.serialize()))
+            })
+            .unwrap_or_else(|| {
+                (
+                    gs.document_csp.clone(),
+                    gs.top_origin
+                        .as_ref()
+                        .map(|origin| origin.serialize())
+                        .unwrap_or_else(|| initiator_origin.clone()),
+                )
+            });
+        let csp_blocked = !csp_resource_allows(
+            csp_header.as_deref(),
+            "img-src",
+            &selected_url,
+            &csp_origin,
+        );
         (
             gs.document_generation,
             selected_url,
@@ -6855,6 +6901,7 @@ async fn op_load_image_metadata(
             Arc::clone(&gs.page_in_flight),
             blocked,
             initiator_origin,
+            csp_blocked,
         )
     };
 
@@ -6907,7 +6954,7 @@ async fn op_load_image_metadata(
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let response = if blocked || csp_blocked || parsed_url.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
