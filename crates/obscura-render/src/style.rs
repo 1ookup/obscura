@@ -7113,7 +7113,7 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// We do not model variant/stretch, but still accept their keywords before
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
-fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+pub(crate) fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {

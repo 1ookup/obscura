@@ -1214,6 +1214,16 @@ impl TextEngine {
         )
     }
 
+    pub(crate) fn measure_canvas_text(&mut self, text: &str, style: &LayoutStyle) -> f32 {
+        let previous_len = self.items.len();
+        let width = self
+            .push_generated_text(text, style)
+            .map(|idx| self.measure(idx, None).0)
+            .unwrap_or(0.0);
+        self.items.truncate(previous_len);
+        width
+    }
+
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
     /// spans into a cosmic-text buffer under `base`'s font metrics and
     /// alignment, and store it as a new inline item.

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deno_core::v8::IsolateHandle;
@@ -214,6 +214,212 @@ impl WorkerHost {
             }
         }
         true
+    }
+}
+
+pub type SharedWorkerRegistryHandle = Arc<Mutex<SharedWorkerRegistry>>;
+
+pub fn new_shared_worker_registry() -> SharedWorkerRegistryHandle {
+    Arc::new(Mutex::new(SharedWorkerRegistry::default()))
+}
+
+#[derive(Default)]
+pub struct SharedWorkerRegistry {
+    workers: HashMap<String, SharedWorkerProcess>,
+}
+
+struct SharedWorkerProcess {
+    to_worker: UnboundedSender<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    next_connection: u64,
+    isolate_handle: IsolateHandle,
+    worker_join: Option<std::thread::JoinHandle<()>>,
+    router_join: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(crate) struct SharedWorkerConnection {
+    to_worker: UnboundedSender<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    connection_id: u64,
+    outbox_rx: Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>,
+}
+
+impl Drop for SharedWorkerConnection {
+    fn drop(&mut self) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&self.connection_id);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SharedWorkerPageHost {
+    next_id: u32,
+    connections: HashMap<u32, SharedWorkerConnection>,
+}
+
+impl SharedWorkerPageHost {
+    pub(crate) fn insert(&mut self, connection: SharedWorkerConnection) -> u32 {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.connections.insert(id, connection);
+        id
+    }
+
+    pub(crate) fn post_message(&self, id: u32, payload: &str) -> bool {
+        let Some(connection) = self.connections.get(&id) else { return false };
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return false;
+        };
+        let Some(_object) = envelope.as_object() else { return false };
+        // The page-side connection id is preserved in the envelope. A page
+        // normally has one native connection per SharedWorker entry; when
+        // several JS ports share that connection, the single-route fallback
+        // below still delivers the envelope so bootstrap can select its port.
+        connection.to_worker.send(envelope.to_string()).is_ok()
+    }
+
+    pub(crate) fn outbox(
+        &self,
+        id: u32,
+    ) -> Option<Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>> {
+        self.connections.get(&id).map(|connection| connection.outbox_rx.clone())
+    }
+}
+
+impl SharedWorkerRegistry {
+    pub(crate) fn connect(
+        &mut self,
+        key: String,
+        source: String,
+        script_url: String,
+        kind: String,
+        environment: WorkerEnvironment,
+    ) -> Result<SharedWorkerConnection, String> {
+        if !self.workers.contains_key(&key) {
+            if self.workers.len() >= MAX_WORKERS {
+                return Err(format!("shared worker limit reached ({MAX_WORKERS} per context)"));
+            }
+            self.workers.insert(
+                key.clone(),
+                spawn_shared_worker_process(source, script_url, kind, environment)?,
+            );
+        }
+        let process = self.workers.get_mut(&key).expect("shared worker inserted");
+        let connection_id = process.next_connection;
+        process.next_connection = process.next_connection.wrapping_add(1).max(1);
+        let (outbox_tx, outbox_rx) = unbounded_channel();
+        process
+            .routes
+            .lock()
+            .map_err(|_| "shared worker route registry poisoned".to_string())?
+            .insert(connection_id, outbox_tx);
+        if process
+            .to_worker
+            .send(serde_json::json!({ "connect": true, "c": connection_id }).to_string())
+            .is_err()
+        {
+            if let Ok(mut routes) = process.routes.lock() {
+                routes.remove(&connection_id);
+            }
+            return Err("shared worker thread exited".to_string());
+        }
+        Ok(SharedWorkerConnection {
+            to_worker: process.to_worker.clone(),
+            routes: Arc::clone(&process.routes),
+            connection_id,
+            outbox_rx: Rc::new(tokio::sync::Mutex::new(outbox_rx)),
+        })
+    }
+}
+
+fn spawn_shared_worker_process(
+    source: String,
+    script_url: String,
+    kind: String,
+    environment: WorkerEnvironment,
+) -> Result<SharedWorkerProcess, String> {
+    let (msg_tx, msg_rx) = unbounded_channel::<String>();
+    let (out_tx, out_rx) = unbounded_channel::<String>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<IsolateHandle, String>>();
+    let worker_thread = std::thread::Builder::new()
+        .name("obscura-shared-worker".to_string())
+        .spawn(move || {
+            worker_thread_main(
+                source,
+                script_url,
+                kind,
+                environment,
+                msg_rx,
+                out_tx,
+                ready_tx,
+            )
+        })
+        .map_err(|error| format!("failed to spawn shared worker thread: {error}"))?;
+    let isolate_handle = match ready_rx.recv_timeout(SPAWN_READY_TIMEOUT) {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(message)) => {
+            let _ = worker_thread.join();
+            return Err(message);
+        }
+        Err(_) => return Err("shared worker runtime did not start in time".to_string()),
+    };
+    let routes = Arc::new(Mutex::new(HashMap::new()));
+    let router_routes = Arc::clone(&routes);
+    let router_thread = std::thread::Builder::new()
+        .name("obscura-shared-worker-router".to_string())
+        .spawn(move || route_shared_worker_outbox(out_rx, router_routes))
+        .map_err(|error| format!("failed to spawn shared worker router: {error}"))?;
+    Ok(SharedWorkerProcess {
+        to_worker: msg_tx,
+        routes,
+        next_connection: 1,
+        isolate_handle,
+        worker_join: Some(worker_thread),
+        router_join: Some(router_thread),
+    })
+}
+
+fn route_shared_worker_outbox(
+    mut outbox: UnboundedReceiver<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+) {
+    while let Some(entry) = outbox.blocking_recv() {
+        let parsed = serde_json::from_str::<serde_json::Value>(&entry).ok();
+        let connection_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("data"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .and_then(|envelope| envelope.get("c").and_then(serde_json::Value::as_u64));
+        let Ok(routes) = routes.lock() else { return };
+        if let Some(connection_id) = connection_id {
+            if let Some(route) = routes.get(&connection_id) {
+                let _ = route.send(entry);
+            } else if routes.len() == 1 {
+                if let Some(route) = routes.values().next() {
+                    let _ = route.send(entry);
+                }
+            }
+        } else {
+            for route in routes.values() {
+                let _ = route.send(entry.clone());
+            }
+        }
+    }
+}
+
+impl Drop for SharedWorkerProcess {
+    fn drop(&mut self) {
+        self.isolate_handle.terminate_execution();
+        // Do not synchronously join isolate threads during page/context
+        // teardown. V8 termination is asynchronous and an isolate parked in
+        // its event loop may take a scheduling turn before observing it;
+        // blocking here can wedge the owning page indefinitely. Dropping the
+        // handles detaches the threads, which then exit when their channels
+        // close (the same lifecycle used by dedicated workers).
+        self.worker_join.take();
+        self.router_join.take();
     }
 }
 

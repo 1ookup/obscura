@@ -631,6 +631,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().http_client = Some(client);
     }
 
+    pub fn set_shared_worker_registry(
+        &self,
+        registry: crate::worker::SharedWorkerRegistryHandle,
+    ) {
+        self.state.borrow_mut().shared_worker_registry = registry;
+    }
+
     /// Install the owning page's passive on_request/on_response callback
     /// registry so scripted fetch()/XHR observation is page-scoped (issue #408).
     pub fn set_callbacks(&self, callbacks: std::sync::Arc<obscura_net::CallbackRegistry>) {
@@ -4175,6 +4182,7 @@ mod tests {
                     span.style.cssText =
                         "position:absolute;left:-9999px;white-space:pre;";
                     document.body.appendChild(span);
+                    const nodesBefore = document.querySelectorAll("*").length;
                     const elementWidth = font => {
                         span.style.font = font;
                         return span.getBoundingClientRect().width;
@@ -4182,6 +4190,7 @@ mod tests {
                     const mono = width("72px monospace");
                     const sans = width('72px "Arial", monospace');
                     const missing = width('72px "NonexistentFontXYZ123", monospace');
+                    const nodesAfterCanvas = document.querySelectorAll("*").length;
                     return {
                         // Different families must not measure the same.
                         monoDiffersFromSans: mono !== sans,
@@ -4197,6 +4206,7 @@ mod tests {
                         agreesWithElement: mono === elementWidth("72px monospace")
                             && sans === elementWidth('72px "Arial", monospace'),
                         positive: mono > 0 && sans > 0,
+                        canvasLeavesDomUntouched: nodesAfterCanvas === nodesBefore,
                     };
                 })()"#,
                 true,
@@ -4215,6 +4225,7 @@ mod tests {
                 "emptyIsZero": true,
                 "agreesWithElement": true,
                 "positive": true,
+                "canvasLeavesDomUntouched": true,
             })
         );
     }
@@ -4325,7 +4336,40 @@ mod tests {
     /// cannot fetch. Pinned in js-repros/worklet-entrypoints/chrome-oracle.json.
     #[tokio::test(flavor = "current_thread")]
     async fn worklet_entry_points_exist_and_fail_closed() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                seen_thread.lock().unwrap().push(
+                    request.split_whitespace().nth(1).unwrap_or("/").to_string(),
+                );
+                let body = "registerPaint('x', class {});";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/index.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
         let result = rt
             .evaluate_for_cdp(
                 r#"(async () => {
@@ -4400,6 +4444,26 @@ mod tests {
                 },
             })
         );
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(requested, vec!["/audio.js", "/paint.js"]);
+    }
+
+    #[test]
+    fn shared_worker_sync_failure_does_not_poison_the_registry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const attempt = () => {
+                        try { new SharedWorker("ftp://example.com/worker.js"); return "ok"; }
+                        catch (error) { return error.name; }
+                    };
+                    return [attempt(), attempt()];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
     }
 
     /// Trusted Types shape, brand checks and sink tables. Pinned against
@@ -4422,6 +4486,8 @@ mod tests {
                         createScriptURL: input => input + "?c",
                     });
                     const html = policy.createHTML("<img>");
+                    const reparented = policy.createHTML("<b>");
+                    Object.setPrototypeOf(reparented, null);
                     const bare = trustedTypes.createPolicy("bare", {});
                     const fallback = trustedTypes.createPolicy(
                         "default", { createHTML: input => "D:" + input });
@@ -4438,6 +4504,7 @@ mod tests {
                         scriptString: String(policy.createScript("x")),
                         scriptUrlString: String(policy.createScriptURL("https://a.example/s.js")),
                         isHTML: trustedTypes.isHTML(html),
+                        brandSurvivesPrototypeChange: trustedTypes.isHTML(reparented),
                         isHTMLOnString: trustedTypes.isHTML("<b>"),
                         // A prototype-only forgery must not pass the brand check.
                         forged: trustedTypes.isHTML(Object.create(TrustedHTML.prototype)),
@@ -4487,7 +4554,8 @@ mod tests {
                 "htmlJson": "&lt;img>",
                 "scriptString": "/*c*/x",
                 "scriptUrlString": "https://a.example/s.js?c",
-                "isHTML": true,
+                        "isHTML": true,
+                        "brandSurvivesPrototypeChange": true,
                 "isHTMLOnString": false,
                 "forged": false,
                 "instanceOf": true,
@@ -4790,9 +4858,13 @@ provided documentURL ('https://other.example') does not match the current origin
     #[tokio::test(flavor = "current_thread")]
     async fn worklet_entry_points_match_the_full_chrome_capture() {
         let mut rt = setup_runtime("<html><body></body></html>");
+        // Keep the fetch-before-reject behavior deterministic and offline.
+        rt.set_url("http://127.0.0.1:9/index.html");
+        let probe = include_str!("../../../js-repros/worklet-entrypoints/probe.js")
+            .replace("https://example.com/worklet.js", "http://127.0.0.1:9/worklet.js");
         assert_probe_matches_chrome_oracle(
             &mut rt,
-            include_str!("../../../js-repros/worklet-entrypoints/probe.js"),
+            &probe,
             "workletFixturePromise",
             include_str!("../../../js-repros/worklet-entrypoints/chrome-oracle.json"),
             &[],

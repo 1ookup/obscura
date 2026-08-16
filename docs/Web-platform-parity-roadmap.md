@@ -268,7 +268,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **状态**:✅ 完成(`871682b`)。
 - **问题**:`SharedWorker` 是空壳类,`port.postMessage` 是空函数——消息发出去就没了,回复永远
   不来,worker 脚本根本没有执行过。
-- **实现**:跑在真实 worker 线程上,按 (name, 解析后 URL) 一个线程,每次构造一条 `MessageChannel`,
+- **实现**:跑在真实 worker 线程上,由 `BrowserContext` 按创建者 origin、name、解析后 URL 和 worker type
+  注册并复用一个线程;每个页面构造一条 `MessageChannel`,
   远端桥接到该线程并带连接 id。**直接复用 `MessagePort`** 是关键:`ports[0] instanceof MessagePort`、
   结构化克隆、`start()`/队列门控三件事因此天然正确。worker 侧 scope 品牌为
   `SharedWorkerGlobalScope`,暴露 `onconnect` 而非 `onmessage`,并删掉 scope 级 `postMessage`。
@@ -279,8 +280,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
   当裸绑定引用,而 worker scope 删除这四个,于是 worker 里**任何 MessagePort 事件派发**都抛
   `ReferenceError: ShadowRoot is not defined`。dedicated worker 从没踩到,是因为它的
   `self.onmessage` 由 worker prep 脚本自己派发,不走页面 bootstrap 的 EventTarget 实现。
-- **"共享"的范围**:指一个页面内多次构造之间的共享。obscura 的页面是互不共享 worker host 的
-  独立文档,跨页面共享本就不可观测。
+- **"共享"的范围**:同一 `BrowserContext` 内跨页面共享;不同 context 保持隔离。连接 id 在 native
+  registry 中路由到各页面，页面关闭时自动移除连接。
 
 #### P3-22:系统字体 / video 解码 / PDF 结构——暂缓(2026-08-16)
 

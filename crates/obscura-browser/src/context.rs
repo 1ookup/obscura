@@ -10,6 +10,7 @@ pub struct BrowserContext {
     pub cookie_jar: Arc<CookieJar>,
     /// localStorage namespace shared by every page in this browser context.
     pub local_storage: SharedStorageAreas,
+    pub shared_worker_registry: obscura_js::worker::SharedWorkerRegistryHandle,
     /// Origin-partitioned values surfaced by Private State Token and Storage
     /// Access APIs. Empty by default; embedders explicitly configure facts
     /// they can substantiate before creating a page.
@@ -143,6 +144,7 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage: new_storage_areas(),
+            shared_worker_registry: obscura_js::worker::new_shared_worker_registry(),
             privacy_policy: PrivacyPolicy::new(),
             private_token_query_state: PrivateTokenQueryState::new(),
             http_client,
@@ -197,6 +199,7 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage: new_storage_areas(),
+            shared_worker_registry: obscura_js::worker::new_shared_worker_registry(),
             privacy_policy: self.privacy_policy.snapshot(),
             private_token_query_state: PrivateTokenQueryState::new(),
             http_client: Arc::new(client),

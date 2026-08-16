@@ -143,6 +143,37 @@ pub use paint::{
 #[cfg(feature = "paint")]
 pub mod inline;
 
+#[cfg(feature = "paint")]
+pub struct CanvasTextMeasurer {
+    engine: inline::TextEngine,
+}
+
+#[cfg(feature = "paint")]
+impl CanvasTextMeasurer {
+    pub fn new() -> Self {
+        Self { engine: inline::TextEngine::new() }
+    }
+
+    pub fn measure(&mut self, text: &str, font: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let mut style = LayoutStyle::default();
+        style.font_size = Some(10.0);
+        style.font_family = Some("sans-serif".to_string());
+        style.white_space = Some(WhiteSpace::Pre);
+        style::apply_font_shorthand(&mut style, font);
+        self.engine.measure_canvas_text(text, &style)
+    }
+}
+
+#[cfg(feature = "paint")]
+impl Default for CanvasTextMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(not(feature = "paint"))]
 pub mod inline {
     use obscura_dom::tree::{DomTree, NodeId};

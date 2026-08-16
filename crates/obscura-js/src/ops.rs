@@ -311,6 +311,8 @@ pub struct ObscuraState {
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
+    pub(crate) canvas_text_measurer: obscura_render::CanvasTextMeasurer,
+    #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
     /// clamped against the cached document overflow and is the single source
@@ -336,6 +338,8 @@ pub struct ObscuraState {
     /// Dedicated Worker registry (src/worker.rs, Phase 3.11). Lazily created
     /// on the first `new Worker(...)`, so pages without workers pay nothing.
     pub(crate) worker_host: Option<crate::worker::WorkerHost>,
+    pub(crate) shared_worker_registry: crate::worker::SharedWorkerRegistryHandle,
+    pub(crate) shared_worker_host: crate::worker::SharedWorkerPageHost,
     /// Set only inside a worker's own runtime: channel back to the page,
     /// drained by the page-side Worker recv loop (op_worker_recv).
     pub(crate) worker_outbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -435,6 +439,8 @@ impl ObscuraState {
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
+            canvas_text_measurer: obscura_render::CanvasTextMeasurer::new(),
+            #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
@@ -447,6 +453,8 @@ impl ObscuraState {
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
             worker_host: None,
+            shared_worker_registry: crate::worker::new_shared_worker_registry(),
+            shared_worker_host: crate::worker::SharedWorkerPageHost::default(),
             worker_outbox: None,
             inherited_origin: None,
             inherited_secure_context: false,
@@ -2949,6 +2957,7 @@ async fn op_fetch_url(
                 credentials,
                 referrer_url.clone(),
                 referrer_policy,
+                redirect_mode.clone(),
                 callbacks.clone(),
                 allow_private_network,
             )
@@ -3425,6 +3434,7 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     referrer_url: String,
     referrer_policy: ReferrerPolicy,
+    redirect_mode: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
@@ -3483,9 +3493,31 @@ async fn stealth_fetch_all(
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body, current_response_start);
         }
+        if redirect_mode == "manual" {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+                "redirectMode": "manual",
+            })
+            .to_string());
+        }
         let Some(location) = r.headers.get("location").cloned() else {
             break (r.status, r.headers, r.body, current_response_start);
         };
+        if redirect_mode == "error" {
+            return Ok(serde_json::json!({
+                "status": r.status,
+                "body": "",
+                "url": current_url,
+                "headers": r.headers,
+                "redirected": true,
+                "redirectMode": "error",
+            })
+            .to_string());
+        }
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
             Err(_) => break (r.status, r.headers, r.body, current_response_start),
@@ -3619,7 +3651,10 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, glob_match, is_potentially_trustworthy, validate_fetch_url,
+        FetchCredentials,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -3672,6 +3707,18 @@ mod tests {
 
         assert!(FetchCredentials::Include.allows(page_origin, same_origin_url));
         assert!(FetchCredentials::Include.allows(page_origin, cross_origin_url));
+    }
+
+    #[test]
+    fn worker_secure_context_requires_a_real_trustworthy_host() {
+        assert!(is_potentially_trustworthy("http://localhost:8080"));
+        assert!(is_potentially_trustworthy("http://dev.localhost:8080"));
+        assert!(is_potentially_trustworthy("http://127.42.1.9:8080"));
+        assert!(is_potentially_trustworthy("http://[::1]:8080"));
+        assert!(is_potentially_trustworthy("https://example.com"));
+        assert!(!is_potentially_trustworthy("http://localhost.evil"));
+        assert!(!is_potentially_trustworthy("http://notlocalhost"));
+        assert!(!is_potentially_trustworthy("http://192.168.1.10"));
     }
 
     #[test]
@@ -5369,6 +5416,18 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_measure_text(
+    state: &OpState,
+    #[string] text: &str,
+    #[string] font: &str,
+) -> f64 {
+    let shared = state.borrow::<SharedState>().clone();
+    let width = shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64;
+    width
+}
+
 // --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
 //
 // Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
@@ -5381,11 +5440,72 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 /// Whether a serialized origin is a "potentially trustworthy origin" in the
 /// sense the secure-context definition uses: TLS-backed, or loopback.
 fn is_potentially_trustworthy(origin: &str) -> bool {
-    origin.starts_with("https://")
-        || origin.starts_with("wss://")
-        || origin.starts_with("http://localhost")
-        || origin.starts_with("http://127.0.0.1")
-        || origin.starts_with("http://[::1]")
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if matches!(parsed.scheme(), "https" | "wss" | "file") {
+        return true;
+    }
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn worker_environment(
+    shared: &SharedState,
+    name: String,
+    creator_url: &str,
+    fingerprint_json: &str,
+    shared_worker: bool,
+) -> crate::worker::WorkerEnvironment {
+    let gs = shared.borrow();
+    let tuple_origin = url::Url::parse(creator_url)
+        .ok()
+        .map(|parsed| parsed.origin())
+        .filter(url::Origin::is_tuple);
+    let (origin, secure_context) = match tuple_origin {
+        Some(parsed) => {
+            let serialized = parsed.ascii_serialization();
+            let secure = is_potentially_trustworthy(&serialized);
+            (serialized, secure)
+        }
+        None => match gs.inherited_origin.clone() {
+            Some(inherited) => (inherited, gs.inherited_secure_context),
+            None => {
+                let page = url::Url::parse(&gs.url).ok();
+                let origin = page.as_ref().map(|parsed| parsed.origin())
+                    .filter(url::Origin::is_tuple)
+                    .map(|parsed| parsed.ascii_serialization())
+                    .unwrap_or_else(|| "null".to_string());
+                let secure = is_potentially_trustworthy(&origin)
+                    || page.as_ref().is_some_and(|parsed| parsed.scheme() == "file");
+                (origin, secure)
+            }
+        },
+    };
+    crate::worker::WorkerEnvironment {
+        cookie_jar: gs.cookie_jar.clone(),
+        http_client: gs.http_client.clone(),
+        callbacks: gs.callbacks.clone(),
+        blocked_urls: gs.blocked_urls.clone(),
+        page_in_flight: Arc::clone(&gs.page_in_flight),
+        name,
+        shared: shared_worker,
+        origin,
+        secure_context,
+        fingerprint: serde_json::from_str(fingerprint_json).unwrap_or_default(),
+        #[cfg(feature = "stealth")]
+        stealth_client: gs.stealth_client.clone(),
+    }
 }
 
 #[op2(fast)]
@@ -5400,9 +5520,12 @@ fn op_worker_spawn(
     shared_worker: bool,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
-    let environment = {
-        let gs = shared.borrow();
-        // A worker's origin is its creator's. `creator_url` is the
+    let environment = worker_environment(&shared, name.clone(), &creator_url, &fingerprint_json, shared_worker);
+    let mut gs = shared.borrow_mut();
+    if shared_worker {
+        return Err(deno_error::JsErrorBox::generic("shared workers use op_shared_worker_connect"));
+    }
+        /*
         // constructing realm's own `location.href`: frame realms each have
         // their own, and `SharedState.url` is the top-level document's, so
         // reading the state would give a cross-origin frame's worker the
@@ -5459,8 +5582,7 @@ fn op_worker_spawn(
             #[cfg(feature = "stealth")]
             stealth_client: gs.stealth_client.clone(),
         }
-    };
-    let mut gs = shared.borrow_mut();
+        */
     let host = gs
         .worker_host
         .get_or_insert_with(crate::worker::WorkerHost::new);
@@ -5482,6 +5604,56 @@ fn op_worker_post_message(state: &OpState, id: u32, #[string] payload: &str) -> 
     gs.worker_host
         .as_ref()
         .is_some_and(|host| host.post_message(id, payload))
+}
+
+#[op2(fast)]
+fn op_shared_worker_connect(
+    state: &OpState,
+    #[string] source: String,
+    #[string] url: String,
+    #[string] kind: String,
+    #[string] name: String,
+    #[string] creator_url: String,
+    #[string] fingerprint_json: String,
+) -> Result<u32, deno_error::JsErrorBox> {
+    let shared = state.borrow::<SharedState>().clone();
+    let environment = worker_environment(&shared, name.clone(), &creator_url, &fingerprint_json, true);
+    let key = format!("{}\n{}\n{}\n{}", environment.origin, name, url, kind);
+    let connection = {
+        let registry = { shared.borrow().shared_worker_registry.clone() };
+        let mut registry = registry.lock().map_err(|_| deno_error::JsErrorBox::generic("shared worker registry poisoned"))?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.connect(key, source, url, kind, environment)
+        }))
+        .map_err(|_| deno_error::JsErrorBox::generic("shared worker connect panicked"))?
+        .map_err(deno_error::JsErrorBox::generic)?
+    };
+    let id = shared.borrow_mut().shared_worker_host.insert(connection);
+    Ok(id)
+}
+
+#[op2(fast)]
+fn op_shared_worker_post_message(state: &OpState, id: u32, #[string] payload: &str) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let result = shared.borrow().shared_worker_host.post_message(id, payload);
+    result
+}
+
+#[op2(async)]
+#[string]
+async fn op_shared_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    let outbox = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let result = shared.borrow().shared_worker_host.outbox(id);
+        result
+    };
+    let Some(outbox) = outbox else { return String::new() };
+    let mut rx = outbox.lock().await;
+    let Some(first) = rx.recv().await else { return String::new() };
+    let mut entries = vec![first];
+    while let Ok(next) = rx.try_recv() { entries.push(next); }
+    format!("[{}]", entries.join(","))
 }
 
 /// Await the worker's next outbox batch. Returns a JSON array of entries, or
@@ -5821,6 +5993,9 @@ pub fn build_extension() -> Extension {
         op_worker_post_message(),
         op_worker_recv(),
         op_worker_terminate(),
+        op_shared_worker_connect(),
+        op_shared_worker_post_message(),
+        op_shared_worker_recv(),
         op_worker_post_to_page(),
         op_worker_close(),
         op_post_to_frame(),
@@ -5836,6 +6011,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
+        ops.push(op_canvas_measure_text());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());

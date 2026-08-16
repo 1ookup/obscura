@@ -13794,30 +13794,14 @@ globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields 
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
 
-// Measure a text run with the engine's real text layout, so canvas metrics and
-// element metrics come from one source. Returns null when there is no document
-// to lay out in (OffscreenCanvas on a worker), where the caller falls back to
-// its own estimate rather than inventing a width.
-let _textMeasureHost = null;
+// Measure without manufacturing a selector-visible DOM node. The native
+// measurer owns the same deterministic cosmic-text engine as element layout.
 function _measureTextRun(text, font) {
   try {
     if (text === '') return 0;
-    const doc = globalThis.document;
-    if (!doc || !doc.body || !text) return null;
-    let host = _textMeasureHost;
-    if (!host || host.ownerDocument !== doc || !host.isConnected) {
-      host = doc.createElement('span');
-      host.setAttribute('aria-hidden', 'true');
-      host.style.cssText = 'position:absolute;left:-99999px;top:-99999px;' +
-        'white-space:pre;visibility:hidden;margin:0;padding:0;border:0;';
-      doc.body.appendChild(host);
-      _textMeasureHost = host;
-    }
-    // The canvas `font` string is CSS font shorthand, so it applies directly.
-    host.style.font = String(font || '10px sans-serif');
-    host.textContent = text;
-    const rect = host.getBoundingClientRect();
-    const width = rect && rect.width;
+    const measure = Deno.core.ops.op_canvas_measure_text;
+    if (typeof measure !== 'function') return null;
+    const width = measure(String(text), String(font || '10px sans-serif'));
     return typeof width === 'number' && width > 0 ? width : null;
   } catch (_error) { return null; }
 }
@@ -16232,16 +16216,9 @@ if (typeof FontFace === 'undefined') {
   });
 }
 
-// SharedWorker rides the dedicated-worker host: one worker thread per
-// (name, resolved URL) pair, and one MessageChannel per construction whose far
-// end is bridged to that thread with a connection id. The stub this replaces
-// had a `port` whose postMessage was an empty function, so every message was
-// dropped and no reply ever came back -- the worker script never even ran.
-//
-// "Shared" here means shared across constructions within one page. Obscura
-// pages are independent documents that never share a worker host, so no
-// cross-page sharing is observable to begin with; within a page the spec's
-// reuse rule, connection counting and per-port start() gating all hold.
+// SharedWorker processes are owned by the BrowserContext. Each page keeps a
+// local connection id while the native registry reuses one worker isolate for
+// the same origin/name/script tuple across pages.
 const _sharedWorkerEntries = new Map();
 
 // Worker -> page: {"kind":"message","data":"{\"v\":...,\"c\":<connection>}"}.
@@ -16249,7 +16226,7 @@ async function _sharedWorkerReceive(entry) {
   while (entry.id !== null) {
     let batchJson;
     try {
-      const pending = Deno.core.ops.op_worker_recv(entry.id);
+      const pending = Deno.core.ops.op_shared_worker_recv(entry.id);
       if (typeof WorkerGlobalScope === 'undefined') Deno.core.unrefOpPromise(pending);
       batchJson = await pending;
     } catch (e) { break; }
@@ -16275,11 +16252,11 @@ function _sharedWorkerError(entry, message) {
 }
 
 function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
-  if (entry.id !== null || entry.failed) return;
+  if (entry.failed) return;
   let id;
   const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
   try {
-    id = Deno.core.ops.op_worker_spawn(
+    id = Deno.core.ops.op_shared_worker_connect(
       String(source), String(finalUrl), String(workerType), String(entry.name),
       creatorUrl, JSON.stringify(_fingerprint()), true,
     );
@@ -16287,14 +16264,14 @@ function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
   entry.id = id;
   const queued = entry.pending;
   entry.pending = [];
-  for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
+  for (const payload of queued) Deno.core.ops.op_shared_worker_post_message(id, payload);
   _sharedWorkerReceive(entry);
 }
 
 function _sharedWorkerSend(entry, payload) {
   if (entry.failed) return;
   if (entry.id === null) { entry.pending.push(payload); return; }
-  Deno.core.ops.op_worker_post_message(entry.id, payload);
+  Deno.core.ops.op_shared_worker_post_message(entry.id, payload);
 }
 
 globalThis.SharedWorker = class SharedWorker {
@@ -16338,6 +16315,13 @@ globalThis.SharedWorker = class SharedWorker {
       }
     }
 
+    const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
+    if (!(resolved.startsWith('http:') || resolved.startsWith('https:')
+          || resolved.startsWith('data:') || typeof blobSource === 'string')) {
+      throw new DOMException(
+        "Failed to construct 'SharedWorker': unsupported script URL scheme.", 'SecurityError');
+    }
+
     const key = name + '\n' + resolved;
     let entry = _sharedWorkerEntries.get(key);
     const fresh = entry === undefined;
@@ -16368,7 +16352,6 @@ globalThis.SharedWorker = class SharedWorker {
     _sharedWorkerSend(entry, JSON.stringify({ connect: true, c: connectionId }));
 
     if (!fresh) return;
-    const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
     if (typeof blobSource === 'string') {
       _sharedWorkerSpawned(entry, blobSource, resolved, workerType);
       return;
@@ -16390,8 +16373,6 @@ globalThis.SharedWorker = class SharedWorker {
       })();
       return;
     }
-    throw new DOMException(
-      "Failed to construct 'SharedWorker': unsupported script URL scheme.", 'SecurityError');
   }
   _dispatchError(message) {
     const worker = this;
@@ -16494,8 +16475,18 @@ if (typeof globalThis.MediaSource === 'undefined') {
           "Failed to execute 'addModule' on 'Worklet': " +
           '1 argument required, but only 0 present.'));
       }
-      return Promise.reject(new DOMException(
-        "Unable to load a worklet's module.", 'AbortError'));
+      let url;
+      try { url = new URL(String(moduleURL), globalThis.location?.href || 'about:blank').href; }
+      catch (error) { return Promise.reject(error); }
+      return (async () => {
+        try {
+          const response = await fetch(url, {
+            mode: 'cors', credentials: 'same-origin', redirect: 'follow',
+          });
+          if (response && response.ok) await response.text();
+        } catch (_error) {}
+        throw new DOMException("Unable to load a worklet's module.", 'AbortError');
+      })();
     }),
     writable: true, enumerable: false, configurable: true,
   });
@@ -16590,13 +16581,15 @@ if (typeof globalThis.MediaSource === 'undefined') {
   const TrustedScript = _trustedTypeInterface('TrustedScript');
   const TrustedScriptURL = _trustedTypeInterface('TrustedScriptURL');
 
+  const _trustedKind = new WeakMap();
   function _mint(ctor, text) {
     const object = Object.create(ctor.prototype);
     _trustedValue.set(object, String(text));
+    _trustedKind.set(object, ctor);
     return object;
   }
   const _isKind = (ctor, value) =>
-    value != null && _trustedValue.has(value) && value instanceof ctor;
+    value != null && _trustedValue.has(value) && _trustedKind.get(value) === ctor;
 
   const _policyName = new WeakMap();
   const _policyRules = new WeakMap();
