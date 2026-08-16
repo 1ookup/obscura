@@ -3013,3 +3013,22 @@ chl_page/widget JSVMP 常量池里的条目(chl_page 中索引 31,邻居是 `app
 `script error` 一类字面量),**静态定位其引用需要先解开 JSVMP 的索引机制**;`cfChlOut`/
 `cfChlOutS` 为加密载荷。下一步候选:①补齐上面三件套后复测;②在 widget realm 用可控钩子
 定位发出 `fail` 的那一帧。
+
+### Step 59 — CSP / Trusted Types 当前实现校正（2026-08-16）
+
+Step 58 中“仍缺少”的结论已过时，当前 HEAD 已完成以下运行时能力：
+
+| 能力 | 当前状态 |
+|------|----------|
+| `trusted-types` 策略名白名单、重复策略拒绝、`defaultPolicy` | 已实现，并按文档 CSP 生效 |
+| `require-trusted-types-for 'script'` | 已覆盖 `innerHTML`、`DocumentFragment.innerHTML`、`iframe.srcdoc`、script `text`/`textContent` 等 sink |
+| `eval(TrustedScript)` | 已通过 V8 `ModifyCodeGenerationFromStrings` 宿主回调执行，并保留普通 `eval(object)` 语义 |
+| `script-src` / `style-src` / `img-src` | 顶层文档、frame 文档资源请求均检查；脚本支持 nonce 与 `unsafe-inline` |
+| `connect-src` | 初始 fetch/XHR 及普通、stealth 客户端的每个重定向目标均检查 |
+| `worker-src` | Dedicated Worker 与 SharedWorker 构造前检查，按 `worker-src` → `child-src` → `default-src` 回退 |
+
+因此，Trusted Types 已不是当前实现缺口，`600010` 不能再直接归因于 TT API 或 eval 入口。
+仍存在的 CSP 缺口是资源指令覆盖面和完整语法：`font-src`、`media-src`、`object-src`、
+`form-action`、`base-uri`、报告/Report-Only 与 violation event 尚未接入；source-list 对
+端口、路径、nonce/hash（脚本 hash）等复杂语法也只是有限子集。挑战文档中的 CSP 结论应以
+这份状态表为准，后续复测需重新判断 `600010` 的实际原因。
