@@ -2705,7 +2705,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, document_csp) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -2765,6 +2765,7 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.document_csp.clone(),
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -3033,6 +3034,7 @@ async fn op_fetch_url(
                 redirect_mode.clone(),
                 callbacks.clone(),
                 allow_private_network,
+                document_csp.clone(),
             )
             .await;
         }
@@ -3205,6 +3207,12 @@ async fn op_fetch_url(
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
             .to_string());
+        }
+        if !csp_connect_allows(document_csp.as_deref(), next_url.as_str(), &page_origin) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true, "cspBlocked": true,
+            }).to_string());
         }
 
         redirects_followed += 1;
@@ -3510,6 +3518,7 @@ async fn stealth_fetch_all(
     redirect_mode: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    document_csp: Option<String>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
@@ -3604,6 +3613,12 @@ async fn stealth_fetch_all(
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
             .to_string());
+        }
+        if !csp_connect_allows(document_csp.as_deref(), next_url.as_str(), &page_origin) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true, "cspBlocked": true,
+            }).to_string());
         }
         redirects_followed += 1;
         redirect_end = performance_started.elapsed();
