@@ -493,6 +493,7 @@ function _resolveResourceUrl(src) {
   let baseUrl;
   try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
   catch(e) { baseUrl = docUrl; }
+  if (baseHref && !_cspBaseUriAllows(baseUrl)) baseUrl = docUrl;
   try {
     return src.startsWith('http') || src.startsWith('data:')
       ? src
@@ -2183,7 +2184,8 @@ class Node {
       if (baseEl) {
         const href = baseEl.getAttribute("href");
         if (href) {
-          return docUrl ? new URL(href, docUrl).href : href;
+          const resolved = docUrl ? new URL(href, docUrl).href : href;
+          if (_cspBaseUriAllows(resolved)) return resolved;
         }
       }
       return docUrl;
@@ -6731,7 +6733,12 @@ class _ScopedDocument extends Document {
     const base = this.querySelector("base[href]");
     if (base) {
       const href = base.getAttribute("href");
-      if (href) { try { return new URL(href, docUrl).href; } catch (e) {} }
+      if (href) {
+        try {
+          const resolved = new URL(href, docUrl).href;
+          if (_cspBaseUriAllows(resolved)) return resolved;
+        } catch (e) {}
+      }
     }
     return docUrl;
   }
@@ -14783,6 +14790,32 @@ function _cspResourceAllows(url, directive) {
     if (value === "'none'") return false;
     if (value === "'self'") return target.origin === selfOrigin;
     if (value === '*') return target.protocol !== 'data:';
+    if (value.endsWith(':')) return target.protocol === value;
+    return target.origin.toLowerCase() === value.replace(/\/$/, '');
+  });
+}
+
+function _cspBaseUriAllows(url) {
+  const root = _callingFrameRoot();
+  const info = _domParse("document_scope_info", root) || {};
+  const header = info.csp;
+  if (!header) return true;
+  let sources = null;
+  for (const part of String(header).split(';')) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const name = tokens.shift().toLowerCase();
+    if (name === 'base-uri') { sources = tokens; break; }
+  }
+  if (!sources) return true;
+  let target;
+  try { target = new URL(String(url)); } catch (e) { return false; }
+  const selfOrigin = info.origin || 'null';
+  return sources.some(source => {
+    const value = source.toLowerCase();
+    if (value === "'none'") return false;
+    if (value === "'self'") return target.origin === selfOrigin;
+    if (value === '*') return true;
     if (value.endsWith(':')) return target.protocol === value;
     return target.origin.toLowerCase() === value.replace(/\/$/, '');
   });

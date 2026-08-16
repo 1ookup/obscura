@@ -4587,6 +4587,15 @@ mod tests {
         assert_eq!(result, serde_json::json!("https://app.example/index.html"));
     }
 
+    #[test]
+    fn base_uri_csp_ignores_disallowed_base_element() {
+        let mut rt = setup_runtime("<html><head><base href='https://evil.example/assets/'></head><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; base-uri 'self'"));
+        let result = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
     /// `console.log` must not walk the objects handed to it.
     ///
     /// With devtools closed Chrome keeps a reference and formats lazily, so an
