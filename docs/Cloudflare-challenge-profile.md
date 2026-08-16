@@ -3341,3 +3341,49 @@ step 45/46 里「`/pat/` 从未被 JS 构造」的假象。**Worker 不继承创
 **未决**：①`/eb/` 的触发条件（Chrome 全程不发）；②提交体积 4960/5000 vs Chrome 7244；
 ③Worker 不继承 CSP；④`csp_connect_allows` / `csp_resource_allows` 仍不支持通配主机、
 端口与路径。
+
+### Step 64 — `/eb/` 的成因：Trusted Types 默认策略的返回值判定写反（2026-08-16）
+
+**触发**（用户）：`/eb/` 在真实浏览器里不会发送，它也是今天 CSP + TT 改动之后才出现的。
+
+**定位**：`/eb/` 是 error beacon，widget 捕获到异常才发。今天的
+`a6e6e55 feat: enforce Trusted Types script sinks` 给 `innerHTML`、`srcdoc`、
+script 的 `text`/`textContent` 装上了 sink 强制。widget 文档的 CSP 恰好带
+`require-trusted-types-for 'script'`，且 CF 自己建了 `default` 策略（实测该 realm
+`trustedTypes.defaultPolicy` 存在），所以这条路径每次赋值都会走到。
+
+**真因**（`bootstrap.js` 的 `_enforceSink`）：
+
+```js
+const converted = rule(String(value));          // rule 是用户回调，返回字符串
+if (_isKind(TrustedHTML, converted)) { ... }    // 却要求它返回已加壳的对象
+throw new TypeError(...);                       // 于是必然走到这里
+```
+
+按规范，策略回调返回的是**普通字符串**，加壳是策略的职责——同文件的
+`_policyFactoryMethod` 正是这样做的：`_mint(ctor, callback(String(input)))`。
+`_enforceSink` 直接调原始回调再用 `_isKind` 检查那个字符串，结果恒为假，
+**只要文档要求 TT 且存在默认策略，每一次 sink 赋值都抛 TypeError**。CF 捕获后上报
+`/eb/`。Chrome 接受回调的字符串返回，因此从不发这条。
+
+原有的 TT 测试没能发现它，因为那个用例只赋值 `policy.createHTML(...)` 的**已加壳**结果，
+从未走过「默认策略接收原始字符串」这条唯一需要该分支的路径。
+
+**修法**：只在回调返回 `null`/`undefined` 时拒绝，否则取其字符串返回值。回归测试
+`runtime.rs::a_default_policy_converts_plain_strings_at_trusted_type_sinks`，覆盖
+`innerHTML` 与 `srcdoc` 两个 sink 并断言转换确实生效。
+
+**实测（3 轮，带点击）**：`/eb/` **3 轮全部消失**，请求序列与 Chrome 在该槽位同形：
+
+```
+ZC/orchestrate → ZC/fo → api.js → CF/fo(822.6~845.9KB) → CF/pat 401
+  → CF/fo 127720 → CF/fo 4976~5052 → ZC/fo 3256 → 重发 orchestrate
+```
+
+**仍未通过。** 提交体积 4976/5052 与 Chrome 的 7244 仍有差距，`complete` 仍为 0。
+tokenB 三轮分别是 822572 / 845644 / 845884，两种尺寸都出现，仍不能说已对齐。
+
+**教训**：本轮三条 CSP/TT 缺陷（指令优先级、顶层策略未进 runtime、默认策略返回值）
+有一个共同点——**它们各自的单元测试都通过**，因为测试构造的是「策略已加壳」「直接调
+set_content_security_policy」这类**绕开真实路径**的输入。规范类特性的测试必须走用户
+代码真正会走的那条路，否则通过率与正确性无关。

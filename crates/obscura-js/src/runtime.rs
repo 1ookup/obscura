@@ -4527,6 +4527,40 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, "<i>ok</i>", 2]));
     }
 
+    /// With `require-trusted-types-for 'script'` and a default policy, a plain
+    /// string at a sink is passed to that policy's callback, and the callback
+    /// returns a string: the policy is what brands it. Demanding a branded
+    /// value back from the callback made every sink throw whenever a default
+    /// policy existed, which is the only case this path exists to serve. The
+    /// test above never caught it because it only ever assigned values the
+    /// policy had already branded.
+    #[test]
+    fn a_default_policy_converts_plain_strings_at_trusted_type_sinks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                trustedTypes.createPolicy('default', {
+                    createHTML: value => value.replace('RAW', 'converted'),
+                });
+                const div = document.createElement('div');
+                div.innerHTML = '<b>RAW</b>';
+                const iframe = document.createElement('iframe');
+                iframe.srcdoc = '<p>RAW</p>';
+                return [div.innerHTML, iframe.getAttribute('srcdoc')];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["<b>converted</b>", "<p>converted</p>"])
+        );
+    }
+
     #[test]
     fn worker_src_csp_blocks_dedicated_and_shared_workers() {
         let mut rt = setup_runtime("<html><body></body></html>");

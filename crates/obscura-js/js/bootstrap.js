@@ -16972,11 +16972,13 @@ if (typeof globalThis.MediaSource === 'undefined') {
         : kind === 'TrustedScript' ? 'createScript' : 'createScriptURL';
       const rule = _policyRules.get(_defaultPolicy)[method];
       if (rule) {
-        const converted = rule(String(value == null ? '' : value));
-        if (_isKind(kind === 'TrustedHTML' ? TrustedHTML
-          : kind === 'TrustedScript' ? TrustedScript : TrustedScriptURL, converted)) {
-          return String(converted);
-        }
+        // A policy callback returns a plain string; the policy is what brands
+        // it (see _policyFactoryMethod). Demanding a branded value back from
+        // the callback made every sink throw whenever a default policy
+        // existed, which is the case this branch is here to serve. Only a
+        // null or undefined result rejects the assignment.
+        const converted = rule(String(value == null ? '' : value), kind);
+        if (converted != null) return String(converted);
       }
     }
     throw new TypeError('This document requires Trusted Types for script sinks.');
