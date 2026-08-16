@@ -4504,6 +4504,21 @@ mod tests {
             })()"#)
             .unwrap();
         assert_eq!(result, serde_json::json!(["x", true]));
+
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types allowed default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(r#"(() => {
+                const div = document.createElement('div');
+                let rejected = false;
+                try { div.innerHTML = '<b>x</b>'; } catch (error) { rejected = error.name === 'TypeError'; }
+                const policy = trustedTypes.createPolicy('default', {createHTML: x => x});
+                div.innerHTML = policy.createHTML('<i>ok</i>');
+                return [rejected, div.innerHTML];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "<i>ok</i>"]));
     }
 
     /// `console.log` must not walk the objects handed to it.

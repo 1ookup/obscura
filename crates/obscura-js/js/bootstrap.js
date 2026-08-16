@@ -2193,6 +2193,9 @@ class Node {
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    if (this.localName === 'script') {
+      v = globalThis.__obscura_tt_enforce('TrustedScript', v);
+    }
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
@@ -3285,6 +3288,7 @@ class Element extends Node {
   // side (issue #463), so this needs no template special case.
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
+    v = globalThis.__obscura_tt_enforce('TrustedHTML', v);
     if (this.localName === 'template') {
       this.content.innerHTML = v;
       return;
@@ -4073,7 +4077,9 @@ class Element extends Node {
   }
   set text(v) {
     if (['option', 'script', 'title', 'a'].includes(this.localName)) {
-      this.textContent = String(v);
+      this.textContent = this.localName === 'script'
+        ? globalThis.__obscura_tt_enforce('TrustedScript', v)
+        : String(v);
       return;
     }
     // Most elements have no platform `text` reflector. Preserve ordinary
@@ -4172,7 +4178,11 @@ class Element extends Node {
     this.setAttribute("src", v);
   }
   get srcdoc() { return this.localName === 'iframe' ? (this.getAttribute('srcdoc') || '') : undefined; }
-  set srcdoc(v) { if (this.localName === 'iframe') this.setAttribute('srcdoc', v); }
+  set srcdoc(v) {
+    if (this.localName === 'iframe') {
+      this.setAttribute('srcdoc', globalThis.__obscura_tt_enforce('TrustedHTML', v));
+    }
+  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     const nativeRoot = +_dom("iframe_content_document_root", this._nid);
@@ -5753,7 +5763,7 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
-    const html = String(v ?? "");
+    const html = globalThis.__obscura_tt_enforce('TrustedHTML', v);
     if (this._fragmentContext) {
       _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
     } else {
@@ -16811,6 +16821,32 @@ if (typeof globalThis.MediaSource === 'undefined') {
     return match ? match.slice(1) : null;
   }
 
+  function _requiredScriptSink() {
+    const values = _cspDirective('require-trusted-types-for');
+    return !!values && values.some(value => value === "'script'");
+  }
+
+  function _enforceSink(kind, value) {
+    if (!_requiredScriptSink()) return String(value == null ? '' : value);
+    if (_isKind(kind === 'TrustedHTML' ? TrustedHTML
+      : kind === 'TrustedScript' ? TrustedScript : TrustedScriptURL, value)) {
+      return String(value);
+    }
+    if (_defaultPolicy) {
+      const method = kind === 'TrustedHTML' ? 'createHTML'
+        : kind === 'TrustedScript' ? 'createScript' : 'createScriptURL';
+      const rule = _policyRules.get(_defaultPolicy)[method];
+      if (rule) {
+        const converted = rule(String(value == null ? '' : value));
+        if (_isKind(kind === 'TrustedHTML' ? TrustedHTML
+          : kind === 'TrustedScript' ? TrustedScript : TrustedScriptURL, converted)) {
+          return String(converted);
+        }
+      }
+    }
+    throw new TypeError('This document requires Trusted Types for script sinks.');
+  }
+
   _defineHidden(_factoryProto, 'createPolicy', _markNative(function createPolicy(policyName, policyOptions) {
     if (arguments.length < 1) {
       throw new TypeError(
@@ -16905,6 +16941,9 @@ if (typeof globalThis.MediaSource === 'undefined') {
   Object.defineProperty(globalThis, 'trustedTypes', {
     value: Object.create(_factoryProto),
     writable: false, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, '__obscura_tt_enforce', {
+    value: _enforceSink, writable: false, enumerable: false, configurable: false,
   });
 })();
 
