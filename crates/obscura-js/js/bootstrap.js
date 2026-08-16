@@ -14693,7 +14693,44 @@ globalThis.opener = null;
 // the JSON-clonable subset of structured clone (a {"v": data} envelope, so an
 // undefined payload round-trips as an absent property).
 // TODO(phase 3.11 follow-up): full structured clone, transfer lists,
-// worker-src CSP, options.name, and http(s) importScripts.
+// and http(s) importScripts.
+function _workerCspAllows(url) {
+  const root = _callingFrameRoot();
+  const info = _domParse("document_scope_info", root) || {};
+  const header = info.csp;
+  if (!header) return true;
+  let sources = null;
+  for (const part of String(header).split(';')) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const name = tokens.shift().toLowerCase();
+    if (name === 'worker-src') { sources = tokens; break; }
+    if (!sources && name === 'child-src') sources = tokens;
+    if (!sources && name === 'default-src') sources = tokens;
+  }
+  if (!sources) return true;
+  let target;
+  try { target = new URL(String(url)); } catch (e) { return false; }
+  const targetOrigin = target.origin;
+  let selfOrigin = info.origin || 'null';
+  try { selfOrigin = new URL(globalThis.location?.href || info.url || 'about:blank').origin; } catch (e) {}
+  return sources.some(source => {
+    const value = source.toLowerCase();
+    if (value === "'none'") return false;
+    if (value === "'self'") return targetOrigin === selfOrigin;
+    if (value === '*') return target.protocol !== 'data:';
+    if (value.endsWith(':')) return target.protocol === value;
+    return targetOrigin.toLowerCase() === value.replace(/\/$/, '');
+  });
+}
+
+function _assertWorkerCspAllowed(url, kind) {
+  if (!_workerCspAllows(url)) {
+    throw new DOMException(
+      "Refused to create a " + kind + " from '" + url + "' because it violates the document's Content Security Policy.",
+      'SecurityError');
+  }
+}
 function _workerScriptFromDataUrl(url) {
   const comma = url.indexOf(',');
   if (comma < 0) throw new DOMException("Failed to construct 'Worker': invalid data: URL", 'SyntaxError');
@@ -14740,6 +14777,7 @@ globalThis.Worker = class Worker {
     catch (e) {
       throw new DOMException("Failed to construct 'Worker': '" + href + "' is not a valid URL.", 'SyntaxError');
     }
+    _assertWorkerCspAllowed(resolved, 'Worker');
     // Surfaces as `self.name` in the worker; "" when none was supplied, which
     // is what a browser reports -- an absent binding is not the same value.
     this._name = options && options.name !== undefined ? String(options.name) : '';
@@ -16428,6 +16466,7 @@ globalThis.SharedWorker = class SharedWorker {
       throw new DOMException(
         "Failed to construct 'SharedWorker': '" + href + "' is not a valid URL.", 'SyntaxError');
     }
+    _assertWorkerCspAllowed(resolved, 'SharedWorker');
     if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
       let sameOrigin = false;
       try {

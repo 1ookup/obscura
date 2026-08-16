@@ -4527,6 +4527,24 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, "<i>ok</i>", 2]));
     }
 
+    #[test]
+    fn worker_src_csp_blocks_dedicated_and_shared_workers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; worker-src 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const attempt = Ctor => {
+                    try { new Ctor('data:text/javascript,postMessage(1)'); return 'allowed'; }
+                    catch (error) { return error.name; }
+                };
+                return [attempt(Worker), attempt(SharedWorker)];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
+
+    }
+
     /// `console.log` must not walk the objects handed to it.
     ///
     /// With devtools closed Chrome keeps a reference and formats lazily, so an
