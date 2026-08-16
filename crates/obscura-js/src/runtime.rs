@@ -4573,6 +4573,20 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, "https://cdn.example/app.swf", null]));
     }
 
+    #[test]
+    fn form_action_csp_blocks_form_navigation() {
+        let mut rt = setup_runtime("<html><body><form id='f' action='https://evil.example/submit'><input name='x' value='1'></form></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; form-action 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                document.querySelector('#f').submit();
+                return location.href;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
     /// `console.log` must not walk the objects handed to it.
     ///
     /// With devtools closed Chrome keeps a reference and formats lazily, so an

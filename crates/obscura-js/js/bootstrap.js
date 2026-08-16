@@ -4340,6 +4340,8 @@ class Element extends Node {
     let targetUrl;
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
 
+    if (!_cspResourceAllows(targetUrl, 'form-action')) return;
+
     const encoded = pairs.join('&');
     if (method === 'POST') {
       _navigateCurrentContext(targetUrl, 'POST', encoded);
