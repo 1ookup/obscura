@@ -1,9 +1,8 @@
 # Trusted Types fixture
 
-**Status: on hold. The surface is implemented but not installed**, so this
-fixture currently reproduces the pre-`1f963b7` answer (`typeof trustedTypes ===
-"undefined"`) rather than the oracle below. Re-run it after removing the early
-`return` in `_installTrustedTypes` (crates/obscura-js/js/bootstrap.js).
+**Status: partially enabled.** The API surface is installed, the CSP
+`trusted-types` policy-name allowlist is enforced, and common HTML/script sinks
+honour `require-trusted-types-for 'script'`.
 
 Why it is off: `eval(trustedScript)` cannot be implemented from JavaScript. eval
 returns a non-string argument unchanged; Trusted Types replaces that step with a
@@ -16,9 +15,9 @@ nothing. That regressed a real challenge page; the failure was bisected to
 `1f963b7` and reproduced by injecting an equivalent surface into the preceding
 build. See docs/Cloudflare-challenge-profile.md step 49-52.
 
-`window.trustedTypes` did not exist at all. That is a Firefox/Safari answer, and
-it contradicts every other Chrome signal this build sends -- a page that reads
-`typeof trustedTypes` gets "undefined" from something claiming to be Chrome 146.
+The remaining engine-level gap is `eval(TrustedScript)`: it needs V8's
+`ModifyCodeGenerationFromStrings` callback, which rusty_v8 does not expose.
+Consequently the full Chrome oracle remains ignored until that hook is added.
 
 ## Capture
 
@@ -59,20 +58,15 @@ All 101 observables are identical to Chrome. That covers:
   case-insensitive element and attribute names, case-*sensitive* property
   names, and `on*` content attributes reporting `TrustedScript`.
 
-## Not implemented: CSP enforcement
+## Remaining CSP gaps
 
-`require-trusted-types-for 'script'` is **not** enforced, and neither is the
-`trusted-types` directive's policy-name allowlist. Nothing in the engine parses
-or enforces any CSP directive yet: `Content-Security-Policy` is read off the
-response and stored on the document (`DocumentInfo.csp`), and no further.
+The `trusted-types` policy-name allowlist and common script sinks are enforced.
+The full CSP resource matrix is still being expanded, and `eval(TrustedScript)`
+cannot yet be wired to the V8 host hook.
 
-This is invisible to a document that sends no such policy, which is what the
-oracle above covers -- Chrome's sinks are permissive then too, and the fixture
-confirms Obscura's are as well, for both plain strings and trusted values. On a
-document that *does* send `require-trusted-types-for 'script'`, Chrome refuses a
-plain string at `innerHTML` and Obscura accepts it. Sites that ship such a
-policy do their own work through a policy object, so their code path still runs;
-what is missing is the refusal, not the mechanism.
+On a document that sends `require-trusted-types-for 'script'`, Obscura now
+rejects plain strings at `innerHTML`, `srcdoc`, and script text sinks, while
+allowing values returned by an allowed policy or its `default` policy.
 
-Closing this needs a CSP parser and sink instrumentation, which is a larger
-piece of work than the API surface and is deliberately not faked here.
+Completing the remaining behavior needs the V8 eval hook plus broader sink and
+resource instrumentation.

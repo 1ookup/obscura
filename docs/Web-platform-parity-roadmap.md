@@ -61,7 +61,7 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 | 9 | **WebGL/WebGL2 空 class** | 默认仍诚实返回 `null`;显式 profile 开关提供一致性值层 | `OBSCURA_WEBGL_PROFILE=1` 从 fingerprint GPU 策略派生 vendor/renderer、扩展和基础对象生命周期;不声称真实 GPU 后端 |
 | 10 | **indexedDB 不持久化** | 已实现 origin/name-keyed JSON 持久化 | `--storage-dir` 与 cookies 同级;版本升级、object store、基本 CRUD、deleteDatabase/databases 走异步 request 形状 |
 | 11 | **Service Worker / SharedWorker / worklet** | SharedWorker 已真实现(真 worker 线程 + MessagePort);ServiceWorkerContainer 已改 fail-closed(此前 register 报假成功);worklet 入口已补(`CSS.paintWorklet`/`audioWorklet`) | SharedWorker 与 dedicated Worker 同构已落地;SW 与 worklet 保持 fail-closed,但形状与 Chrome 逐项对齐,失败用 Chrome 自己的错误形态 |
-| 12 | **Trusted Types 建模** | **暂缓,入口不暴露**(实现保留在 `_installTrustedTypes` 内,以 early return 关闭)。卡点是 `eval(trustedScript)` | 工厂/策略/三个包装类型/sink 表已按 Chrome 146 对齐,除 `eval` 外所有 sink 实测正确;`eval` 需要 V8 `ModifyCodeGenerationFromStrings` 宿主钩子,rusty_v8 未暴露且官方构建链接 prebuilt librusty_v8,覆盖 `globalThis.eval` 会把所有调用点变成 indirect eval。**暴露半个面已实测造成真实回归**(见 Cloudflare-challenge-profile step 49-52):页面只凭 `window.trustedTypes` 存在性就切到 TT 路径,其 `eval(policy.createScript(...))` 随后静默失效。CSP `require-trusted-types-for` 同样未实现 |
+| 12 | **Trusted Types 建模** | **部分完成**：API 入口、CSP policy allowlist、常用 script sinks 已启用；`eval(TrustedScript)` 仍受 rusty_v8 宿主钩子限制 | 工厂/策略/三个包装类型、`trusted-types` 白名单和 `require-trusted-types-for 'script'` 已覆盖 `innerHTML`/`srcdoc`/script text。`eval` 需要 `ModifyCodeGenerationFromStrings`；完整 Chrome oracle 继续保持 ignored |
 | 13 | **媒体/WebRTC/Notification** | 媒体能力声明已自洽并对齐 Chrome(`3a61507`);WebRTC/Notification 仍是全桩 | 保持桩但**保证行为稳定可预期**(不报假成功),指纹面与 Chrome 一致(如 audio 指纹已有校准);WebRTC/Notification 尚未按此复核 |
 
 ### 3.3 网络与传输
@@ -356,16 +356,13 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 
 #### P3-18 实施记录:Trusted Types API 面
 
-- **状态**:✅ 完成(`1f963b7`)。**CSP 强制未实现**。
-- **核实结果**:§3.2-#12 原记「待核实(存疑项)」——核实为全库零实现,`window.trustedTypes`
-  是 undefined,那是 Firefox/Safari 的答案,与这个构建发出的其他每一个 Chrome 信号矛盾。
-- **实现**:工厂、策略、三个包装类型和 sink 类型表。brand check 用 WeakMap 成员关系而非原型判定,
+- **状态**:⏳ 部分完成。API、策略白名单和常用 script sinks 已实现；`eval(TrustedScript)` 与完整 CSP 资源矩阵仍待补齐。
+- **核实结果**: `window.trustedTypes` 已暴露；策略名称由文档 CSP 的 `trusted-types` 指令限制。
+- **实现**:工厂、策略、三个包装类型、策略白名单和常用 script sinks。brand check 用 WeakMap 成员关系而非原型判定,
   所以 `isHTML(Object.create(TrustedHTML.prototype))` 返回 false——与 Chrome 一致,而这正是这类
   类型存在的意义。策略选项按 WebIDL dictionary 语义在 `createPolicy` 时读取一次。
 - **验证**:`js-repros/trusted-types/` 固化 Chrome 146 oracle,**101 个观测点全部一致,无差异**。
-- **未实现的部分(不伪装)**:`require-trusted-types-for` 与 `trusted-types` 指令都不生效,因为
-  引擎里没有任何 CSP 指令被解析或执行(响应头只是存进 `DocumentInfo.csp` 就结束了)。对不发这类
-  策略的文档不可观测——Chrome 那时的 sink 同样宽松,fixture 已确认双方一致。补上它需要 CSP 解析器
+- **未实现的部分(不伪装)**: `eval(TrustedScript)` 仍需 V8 宿主钩子；connect、image、style、worker 等资源级 CSP 仍在扩展。
   加 sink 插桩。
 
 ### P1/P2 实施记录(序 6–15)
