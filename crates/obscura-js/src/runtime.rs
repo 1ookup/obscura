@@ -4545,6 +4545,94 @@ mod tests {
 
     }
 
+    /// A subframe's fetch is governed by the CSP of that frame's document, not
+    /// the page's. The two genuinely differ in the wild: a Cloudflare challenge
+    /// page allows only its own challenge host, while the widget document it
+    /// embeds names the sibling hosts the widget needs. Resolving the page's
+    /// policy for a frame request blocked a request Chrome sends, and the block
+    /// was invisible in the request log because a rejected request produces an
+    /// `op_fetch_url called` line and no completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subframe_fetch_uses_its_own_document_csp_rather_than_the_pages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        let origin = format!("http://{address}");
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("http://top.example/index.html");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        // The page forbids every connection; the frame allows its own origin.
+        rt.set_content_security_policy(Some("default-src 'none'; connect-src 'none'"));
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("f", "<html><body></body></html>",
+                        "{origin}/frame", "default-src 'none'; connect-src 'self'");
+                }})()"#
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, &format!("{origin}/frame"))
+            .unwrap();
+
+        let probe = format!(
+            r#"(async () => {{
+                try {{
+                    const response = await fetch("{origin}/ok");
+                    return "status:" + response.status;
+                }} catch (error) {{ return error.name; }}
+            }})()"#
+        );
+        let from_frame = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                &probe,
+                true,
+                true,
+                5_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let from_page = rt
+            .evaluate_for_cdp_with_timeout(&probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            (from_frame, from_page),
+            (
+                serde_json::json!("status:200"),
+                serde_json::json!("AbortError")
+            )
+        );
+    }
+
     #[test]
     fn media_src_csp_marks_blocked_media_as_no_source() {
         let mut rt = setup_runtime("<html><body><video id='v' src='https://cdn.example/movie.mp4'></video></body></html>");
@@ -6354,7 +6442,7 @@ RequestRedirect value",
     const FRAME_OPS_PRELUDE: &str = r#"
         const op = (cmd, a1, a2) =>
             Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-        const setupFrame = (hostId, html, originUrl) => {
+        const setupFrame = (hostId, html, originUrl, csp) => {
             const host = document.getElementById(hostId)._nid;
             const created = JSON.parse(op("create_iframe_content_document", host));
             if (html) op("parse_into_subtree", created.root, html);
@@ -6363,6 +6451,7 @@ RequestRedirect value",
                 originUrl,
                 frameId: "test-frame",
                 documentGeneration: 1,
+                csp: csp ?? null,
             }));
             return created.root;
         };

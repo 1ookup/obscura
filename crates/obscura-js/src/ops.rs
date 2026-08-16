@@ -2731,6 +2731,17 @@ async fn op_fetch_url(
                 .and_then(|scope| scope.csp)
         };
         if !csp_connect_allows(request_csp.as_deref(), &url, &origin) {
+            // A blocked request otherwise leaves no trace at all: it has an
+            // `op_fetch_url called` line and no completion, which reads exactly
+            // like a request still in flight. Say which policy rejected it and
+            // which document that policy came from.
+            tracing::debug!(
+                "op_fetch_url blocked by connect-src: {} (origin={}, root={}, csp={:?})",
+                url,
+                origin,
+                request_root.raw(),
+                request_csp.as_deref().unwrap_or("<none>")
+            );
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",

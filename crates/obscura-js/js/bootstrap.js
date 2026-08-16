@@ -360,13 +360,21 @@ globalThis.__markParserScripts = function(nids) {
 function _environmentReferrerPolicy() {
   return String(globalThis.__obscura_referrer_policy || "strict-origin-when-cross-origin");
 }
+// The document root of the realm making a request. `op_fetch_url` resolves the
+// governing CSP from it, because a policy belongs to the document that issued
+// the request rather than to the page. Every op_fetch_url call site has to
+// carry it: a missing root falls back to the top-level policy, which silently
+// applies the wrong CSP to subframe requests.
+function _environmentDocumentRoot() {
+  return typeof globalThis.__obscura_frame_document_nid === 'number'
+    ? globalThis.__obscura_frame_document_nid
+    : 0;
+}
 function _environmentReferrerContext() {
   return JSON.stringify({
     url: globalThis.location?.href || "",
     policy: _environmentReferrerPolicy(),
-    root: typeof globalThis.__obscura_frame_document_nid === 'number'
-      ? globalThis.__obscura_frame_document_nid
-      : 0,
+    root: _environmentDocumentRoot(),
   });
 }
 async function __fetchDynClassicScript(task) {
@@ -7926,6 +7934,7 @@ globalThis.fetch = async (input, init = {}) => {
       url: _environmentSettings().url || globalThis.location?.href || "",
       policy: _environmentReferrerPolicy(),
       redirect: fetchRedirect,
+      root: _environmentDocumentRoot(),
     })
   );
   const parsed = JSON.parse(raw);

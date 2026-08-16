@@ -3214,9 +3214,54 @@ fetch 被拿 **zencare.co 的策略**去校验。
 通配主机（`*.example.com`），不处理端口与路径。重定向路径（`ops.rs:3211`、`:3617`）
 用的是同一份 `document_csp`，要一并改。
 
-**修复状态（2026-08-16）**：已在 `feat: use frame CSP for scripted fetches` 中修复。
-bootstrap 现在把当前 realm 的 `__obscura_frame_document_nid` 放入 fetch/XHR 的
-`referrer_context`；`op_fetch_url` 按该 root 读取对应 `DocumentScope.csp`，主文档仍使用
-`SharedState.document_csp`。初始请求、普通客户端重定向和 stealth 客户端重定向统一使用这份
-realm-local 策略，因此 widget 到 `brunhild.challenges.cloudflare.com` 不再被顶层 CSP
-误拦截；顶层 realm 对同一目标仍会阻止。
+**修复状态（2026-08-16）**：见 Step 62。`feat: use frame CSP for scripted fetches`
+只完成了 Rust 侧与一部分调用点，`fetch`/XHR 这条路径当时并没有带上 root，因此实测
+毫无变化；补齐后才生效。
+
+### Step 62 — CSP realm 修复补齐并实测生效；`/eb/` 另有成因（2026-08-16）
+
+**背景**：Step 61 定位的真因（fetch 用页面级 CSP 校验 frame realm 的请求）由
+`31e86b4 feat: use frame CSP for scripted fetches` 首次尝试修复，但**实测无任何变化**：
+brunhild 依旧只有 `op_fetch_url called`、没有完成，`/eb/` 照发。
+
+**漏掉的那一处**：该提交只把 `root` 加进 `_environmentReferrerContext()`。四个
+`op_fetch_url` 调用点里，只有 classic script（`bootstrap.js:377`）、stylesheet（`:626`）
+和 service worker（`:12736`）走这个函数；**`fetch` 自己在 `:7923` 内联拼 context**，
+而 XHR 的底层就是它。于是 `root` 缺失 → Rust 侧 `request_root = NodeId::new(0)` →
+命中 `raw() == 0` 分支 → 回退 `SharedState.document_csp`，与修复前完全等价。
+
+realm 侧的钩子本身是好的，单独验过：
+
+```
+[nid] WIDGET nid=69 type=number href=https://challenges.cloudflare.com/…
+[nid] TOP    nid=undefined type=undefined href=https://zencare.co/1.txt
+```
+
+**补齐**：抽出 `_environmentDocumentRoot()` 作为单一来源，`_environmentReferrerContext()`
+与 `fetch` 都用它，注释写明「每个 op_fetch_url 调用点都必须带上，漏掉会静默退回顶层策略」。
+
+**插桩**：被 CSP 拦下的请求此前不留任何痕迹（有 `called`、无完成），读起来和「请求还在飞」
+一模一样，这正是 Step 60 归因错误的直接原因。现在 `op_fetch_url` 在拦截时打一行
+debug，带上 url / origin / root / 实际生效的 csp。
+
+**实测（3 轮，带点击）**：
+
+| 观测点 | 修复前 | 修复后 |
+|--------|--------|--------|
+| `blocked by connect-src` 记录 | brunhild 每轮被拦 | **0 次 / 3 轮** |
+| brunhild `/i/` | 提前返回，无完成 | 发出并保持在飞（与 Chrome 的 pending 一致）|
+| `/eb/` | 每轮发出 | **仍每轮发出** |
+| 提交 `/fo/` | 4976B | 4976 ~ 5052B（Chrome 7244）|
+| 终态 | 未通过 | **仍未通过** |
+
+**结论**：CSP 的 realm 归属缺陷已修复并有回归测试
+（`runtime.rs::a_subframe_fetch_uses_its_own_document_csp_rather_than_the_pages`，
+去掉修复即 FAIL）。但 **`/eb/` 不是它的下游症状**——brunhild 不再被拦之后 `/eb/` 照发，
+Step 61 中「brunhild 被拦 → widget 上报 `/eb/`」这条因果链**证伪**。
+
+**一处需要收回的读数**：修复后第 1 轮 tokenB `/fo/` 为 845784，与 Chrome 的 845776 对上，
+当时据此说「已对齐」；第 2、3 轮是 822704 / 822832。**单轮采样不成立**，两种尺寸都会出现，
+tokenB 差异仍是未解释项。
+
+**未决**：①`/eb/` 的真实触发条件（Chrome 全程不发）；②提交体积 4976/5052 vs 7244；
+③`csp_connect_allows` 仍不支持通配主机、端口与路径。
