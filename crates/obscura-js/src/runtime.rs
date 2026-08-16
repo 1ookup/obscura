@@ -4466,10 +4466,41 @@ mod tests {
         assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
     }
 
+    /// The Trusted Types entrance must stay absent for as long as
+    /// `eval(trustedScript)` cannot execute. Pages feature-detect
+    /// `window.trustedTypes` and switch to the Trusted Types path on the
+    /// strength of that one check; on this engine their
+    /// `eval(policy.createScript(...))` then silently does nothing. Shipping
+    /// the entrance regressed a real challenge page, bisected to the commit
+    /// that added it (docs/Cloudflare-challenge-profile.md step 52).
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_surface_is_not_exposed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => ["trustedTypes", "TrustedHTML", "TrustedScript",
+                           "TrustedScriptURL", "TrustedTypePolicy",
+                           "TrustedTypePolicyFactory"]
+                          .filter(name => name in globalThis))()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
     /// Trusted Types shape, brand checks and sink tables. Pinned against
     /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
     /// enforcement is out of scope (no directive is parsed anywhere yet), so
     /// this covers the surface a document with no CSP observes.
+    ///
+    /// Ignored while `_installTrustedTypes` returns early: the implementation
+    /// it asserts on is still correct and still compiled in, it just is not
+    /// installed. Re-enable together with that `return`.
+    #[ignore = "surface intentionally not installed; see _installTrustedTypes in bootstrap.js"]
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_types_match_chrome_shape_brands_and_sink_tables() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -4841,6 +4872,13 @@ provided documentURL ('https://other.example') does not match the current origin
     }
 
     /// The Trusted Types capture, read in full rather than sampled.
+    ///
+    /// Ignored for the same reason as
+    /// `trusted_types_match_chrome_shape_brands_and_sink_tables`: the surface is
+    /// implemented but not installed, because `eval(trustedScript)` needs an
+    /// engine-level host hook rusty_v8 does not expose. Re-enable together with
+    /// the early `return` in `_installTrustedTypes`.
+    #[ignore = "surface intentionally not installed; see _installTrustedTypes in bootstrap.js"]
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_types_matches_the_full_chrome_capture() {
         let mut rt = setup_runtime("<html><body></body></html>");

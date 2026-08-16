@@ -16545,6 +16545,31 @@ if (typeof globalThis.MediaSource === 'undefined') {
 // too, which is exactly what this matches -- and is recorded in
 // js-repros/trusted-types/README.md rather than faked.
 (function _installTrustedTypes() {
+  // NOT INSTALLED, deliberately. Removing this `return` is the only change
+  // needed to turn it back on; everything below is complete and Chrome-shaped.
+  //
+  // One sink cannot be implemented from JavaScript: `eval(trustedScript)`.
+  // eval returns a non-string argument unchanged (ES "PerformEval" step 1);
+  // Trusted Types replaces that step with a host hook, which Chrome services
+  // through V8's ModifyCodeGenerationFromStrings callback. rusty_v8 does not
+  // expose that callback, and official builds link the prebuilt librusty_v8,
+  // so adding it would make this API behave differently depending on how the
+  // binary was built. Overriding globalThis.eval is not a substitute: it turns
+  // every `eval(x)` call site into an indirect eval, changing the scope real
+  // pages depend on.
+  //
+  // Exposing the entrance regardless is worse than leaving it absent. A page
+  // that feature-detects `window.trustedTypes` switches to the Trusted Types
+  // path, and its `eval(policy.createScript(...))` then silently does nothing.
+  // Measured, not hypothetical: A/B binaries bisected the regression to this
+  // block, and injecting an equivalent surface into the build that predates it
+  // reproduced the failure exactly. See docs/Cloudflare-challenge-profile.md
+  // step 52. Every other sink (script.text/textContent/innerText/src,
+  // innerHTML, outerHTML, srcdoc, setAttribute, insertAdjacentHTML,
+  // createContextualFragment, new Worker, new Function) already accepts the
+  // wrapper types correctly.
+  return;
+
   // Brand membership, not prototype identity: `Object.create(
   // TrustedHTML.prototype)` must fail `isHTML`, and in Chrome it does.
   const _trustedValue = new WeakMap();

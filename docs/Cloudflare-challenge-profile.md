@@ -16,6 +16,17 @@ Image 请求不记录 resource timing 这个确定缺陷（含两条回归测试
 ①**`/pat/` 从不发出**；②**frame 文档缺 navigation timing**（step 47 证据 3：CF 在两个
 widget realm 各读一次 `getEntriesByType('navigation')`，两次全空——当前唯一「已证实被
 读取且明确异常」的环境面，下一个修复目标）；③**`fail code=600010`**（step 37 起稳定）。
+**2026-08-16 回归警报（step 49/50/51）**：HEAD 相对 step 47 出现**代码回归**，已二分定位到
+唯一根因 **`1f963b7`（Trusted Types API 面按规范补齐）**。该 commit 补齐了 TT 的 API 外壳
+但没给 `eval` 接入 TT——`eval(TrustedScript)` 不执行代码（Chrome 返回 `2`，obscura 返回
+`"1+1"`）。CF 探测到 `trustedTypes` 存在就切到 TT 路径，JSVMP 静默停摆，流程从
+`realm=3/xhr=3//ci/=1` 退到 `realm=2/xhr=1//ci/=0`。**修 TT 的 eval 行为（或暂不暴露该入口）
+是当前第一优先级**，在此之前其他质询结论都跑在退化的基线上。
+
+step 48（2026-08-16）用双向被动 message 对拍**结掉一条长期未决项**：父窗口**确实回应了**
+`requestExtraParams`（widget 在自身 realm 的 41ms 收到完整 managed 配置，`food`/`meow`
+心跳 32 对双向闭环）——**断点不在 postMessage 通道，在 widget realm 内部**。同轮复现了
+`cs` 栈底的 `<obscura:bootstrap>` 两帧（step 8 未决项，CF 主动采集并传输的指纹面）。
 
 判据链：`interactiveBegin` → 点击（须在 interactiveBegin 之后 + 带 widget 外 pre-move，
 `cdp_click_fast --start 12`）→ 点击后 ~5s 的 **4976B 提交 POST** → 3256B 主页面回传 →
@@ -1931,7 +1942,12 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
 | **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
 | `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
+| **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined。据此得出「删掉 TT 仍不恢复 → 还有第二处回归」的错误结论（step 51/52） | 要真正移除就只 `delete`，并当场用 `name in globalThis` 和 `Object.getOwnPropertyNames` 复验，而不是用 `typeof` |
+| **单次测量当判据**（本页多数 A/B 结论早期只测 1-2 次） | step 52 实测同一二进制 5 轮里有 1 轮偏离（`xhr=1` vs `3`），说明判据存在 CF 端偶发波动 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值；差异要在多轮上稳定才算数 |
+| **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | step 52 一度在 HEAD（距目标 commit 还有 22 个提交）上删 TT，用结果推断该 commit 的行为 | 干预实验必须跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 复现 |
 | **包装 `performance.getEntries*` 的钩子只在页面主动读取时产生记录**（被动观测面） | step 47 修完 `/ci/` 的 entry 后日志里看不到它，差点误判「修复没生效」——实际是 CF 在 `/ci/` 之后再没读过 performance | 「日志里没有」只能证明**没被读**，不能证明**不存在**；条目是否真的写入必须用可控用例断言（本步落成两条回归测试），实测日志只用来判断 CF 读没读、读到什么 |
+| **出口 IP 决定拿到哪种页面，1020 硬封锁态下一切诊断无效**（step 48 证据 4） | 封锁页会加载源站的 `rocket-loader.min.js` 与 `cloudflareinsights` beacon，serve 日志看着像「正常站点资源」，一度误判为过盾；而它既不是质询也不是真实响应 | 每轮开跑探针前先看 `Page loaded` 的 title：`Just a moment...` = 质询可诊断，`Attention Required! \| Cloudflare` = 1020 封锁需换 IP，其余才可能是真实响应 |
+| **质询页 DOM 里预置了全部状态文案** | `--dump text` 出现 "Verification successful. Waiting for zencare.co to respond"，误读为已通过 | 该串是静态文案不是状态；判据仍为目标 URL 返回真实 404（`/1.txt` 本就不存在） |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
@@ -1987,10 +2003,13 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
   吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
 - **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
   缺失——后者是一行即可命中的检测点。
-- 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:894:9)`（step 8）。浏览器里
-  setTimeout 回调的栈到回调那一帧就结束，下面没有引擎帧。
-- 父窗口是否回应了子窗口的 `requestExtraParams` 未证实。父→子通道本身已验证可用
-  （step 6），需要一种不扰动流程的观测方式。
+- 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:890:9)` + `<obscura:bootstrap>:905:5`
+  （step 8 提出，step 48 复现，行号随 bootstrap 变动）。浏览器里 setTimeout 回调的栈到
+  回调那一帧就结束，下面没有引擎帧。CF 经 `{"event":"execute"}` 的 `cs` 字段主动采集并
+  传输该栈，是确定被读取、且与 Chrome 确定有差异的指纹面。
+- ~~父窗口是否回应了子窗口的 `requestExtraParams` 未证实。~~ **step 48 已证实：回应了。**
+  双向被动监听对拍显示 widget 在自身 realm 的 41ms 即收到完整 managed 配置，且 `food`/`meow`
+  心跳 32 对双向闭环。断点不在 postMessage 通道，在 widget realm 内部。
 - 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
   可被检测的差异，未修。
 
@@ -2337,3 +2356,336 @@ rS=392.69|rE=393.08|sz=5907`），frame realm 一条没有。代码侧一致：
    （头部近似）。三处路径（page.rs / fetch / 新的 image）要一起改才不会自相矛盾。
 4. 若 frame navigation timing 补齐后 `/pat/` 仍不出现：回到 step 46 收束的候选面
    （canvas 指纹 / TLS-HTTP2 传输层分流），或直接实现浏览器级 PAT。
+
+### Step 48 — 双向 message 对拍：父窗口确实回应了 `requestExtraParams`，通道两向全通（2026-08-16）
+
+**假设**（用户提出）：widget iframe 加载后其内部没有执行，原因是 ①主窗口没给 iframe 发
+`postMessage`，或 ②发了但 iframe 没收到。
+
+**方法**：
+1. 先自查二进制。`target/release/obscura`（mtime 08-16 12:38）起 serve 打出
+   `Stealth mode enabled (tracker blocking)`——**缺 wreq，是非 stealth 构建**。按
+   `--features render --config vendor/v8-source.toml` 重建（3m29s），重测得
+   `TLS fingerprint impersonation + tracker blocking`，`vendor/v8-trace.sh check` 报
+   `patched`。代码基线核对：HEAD `aeb81f7`，step 47 的修复 `709cb1b` 在其祖先中，
+   工作树无改动——**本轮与 step 47 是同一份代码**。
+2. `cdp_message_diff.py --no-click --start 12 --cap 30`。它只在每个 realm **追加**一个
+   被动 `message` 监听，不包装 `postMessage`、不包装 `contentWindow`（step 6 教训），
+   即未决清单要求的「不扰动流程的观测方式」。两个方向分别落在两个 realm 的 inbound 日志：
+   `TOP <=` 为 widget→parent，`WIDGET <=` 为 parent→widget。
+3. 另跑 `/tmp/cdp_ci_timing_hook.py`（net-hook + perf-hook）与 `cdp_probe.py messages`。
+
+**证据 1 — 两个方向都通，且父窗口回应了 `requestExtraParams`**：
+
+| 方向 | 条数 | 内容 |
+|---|---|---|
+| TOP ← WIDGET | 36 | `init`(managed) / `requestExtraParams` / `translationInit` / `food`×32 / `overrunBegin` |
+| WIDGET ← TOP | 35 | `init` / `{"action":"managed",...,"au":"https://challenges.cloudflare.com/turnstile/v0/g/aae2b9a1c261..."}` / `cs` 栈 / `meow`×32 |
+
+widget 在自己 realm 的 **41ms** 就收到了 `init` 与完整 managed 配置（`action`/`appearance`/
+`au`/`apiJsMismatchReload*` 等），即 `requestExtraParams` 的应答。心跳为双向闭环：
+widget 发 `food` seq N，父页回 `meow` seq N，32 对无一缺失，一直应答到观测结束。
+（两侧时间戳不同源：WIDGET 的 41ms 是其自身 realm 起点，约当 TOP 侧的 1595ms。）
+
+**结论 A（用户两个假设均证伪）**：主窗口发了（35 条），iframe 也收到了（时间戳齐全）。
+断点不在 postMessage 通道，而在 **widget realm 内部**——它拿齐配置、心跳正常，却从不发出
+第二个 `/fo/`（到 `challenges.cloudflare.com`），11.7s 后自报 `overrunBegin`。
+
+**结论 B（结掉一条未决项）**：未决清单「父窗口是否回应了子窗口的 `requestExtraParams`
+未证实」——**已证实：回应了**。step 6 留下的这条就此关闭。
+
+**证据 2 — 本轮 CF 分流比 step 47 更浅**：`hook-installed` 只有 2 个 realm（step 47 为 3 个），
+net-hook 全部请求仅 `img.src /favicon.ico` 与 tokenA 的 `xhr.open POST /cdn-cgi/challenge-platform/h/g/fo/...`
+（zencare 源）。**无 822KB 的 challenges `/fo/`、无 `/ci/`、无 `/pat/`、无 `interactiveBegin`**。
+perf-hook 因此只在主文档 realm 触发（`getEntries()=3` 含 navigation 条目），
+**widget realm 的 `getEntriesByType('navigation')` 本轮一次都没被调用**——step 47 证据 3
+指出的那个断点，本轮 CF 还没走到就 overrun 了。故 step 47 的「frame 缺 navigation timing」
+本轮既未复现也未被否定。
+
+**证据 3 — `cs` 栈底的引擎帧仍在（step 8 未决项复现）**：父页发给 widget 的
+`{"event":"execute"}` 消息携带 CF 采集的调用栈，栈底两帧为：
+
+```
+at _runAtNesting (<obscura:bootstrap>:890:9)
+at <obscura:bootstrap>:905:5
+```
+
+上面 8 帧均为真实 URL（api.js / chl_page），即 step 8 的修复仍然有效；未修的是栈底这两帧
+（行号由当时的 894 变为 890/905，泄漏原样保留）。浏览器里 setTimeout 回调的栈到回调那帧
+即止，宿主调度帧不出现在 JS 栈中，因此这两帧**在 Chrome 中不存在**。它落在 CF 明确采集并
+经 postMessage 传输的指纹面上。step 36 的 Chrome 黄金基线同样有 `WIDGET <= cs`（251ms），
+差别只在内容。
+
+**证据 4 — IP 状态三态（测量前提，非引擎行为）**：同一二进制同一代码，同日三种出口 IP 得到
+三种分流：①旧 IP → **CF 1020 硬封锁**（`Attention Required! | Cloudflare` /
+`Sorry, you have been blocked`，`h1` 与 title 双证，非质询页，此状态下任何诊断都无效）；
+②新 IP → 质询页但更浅（本 step 证据 2）；③历史 IP → 质询页。判定分流状态必须先看
+`Page loaded` 的 title，再决定是否开跑探针。另注：质询页 `--dump text` 中出现的
+"Verification successful. Waiting for zencare.co to respond" 是 DOM 内**预置的静态文案**
+（各状态文案均在 HTML 中），**不是成功信号**——判据仍为目标 URL 返回真实 404。
+
+**下一步**：断点在 widget realm 内部的 JSVMP，而非通道。按信息量：
+1. step 47 下一步 #1（给 frame 文档补 navigation timing）仍然有效，但需在能走到
+   822KB→127KB managed 窗口的分流上复测，否则读不到该面。
+2. 修 `cs` 栈底的 `_runAtNesting` 两帧（step 8 未决）：使 setTimeout/嵌套 timer 回调的栈
+   在回调帧终止，不暴露 `<obscura:bootstrap>`。这是 CF 确定采集且确定与 Chrome 有差异的面。
+3. v8 trace 对 widget realm 的执行路径无法单独归属（动态脚本一律记为 `<page-eval>`，
+   见「trace 的用途与边界」），若要看 widget 内部执行需继续用预注入钩子或插桩。
+
+### Step 49 — 同 IP Chrome 对照推翻 step 48 的「CF 分流波动」归因：回退在 obscura 侧（2026-08-16）
+
+**触发**（用户质疑）：「当前的进度为什么回退了」。step 48 把「本轮比 step 47 走得浅」
+归因为 CF 端分流差异，该归因**本步证伪**。
+
+**方法**：
+1. `git log 709cb1b..HEAD` — step 47 实测（08-15 17:17，二进制 17:14，代码即 `709cb1b`）
+   之后共 **26 个 commit**，其中大量直接改 JS 环境面：`6b9b8a0`（secure context 并收起
+   被把守的 API）、`d7e7a7f`（收起 SharedArrayBuffer）、`4060dc8`（canvas 文本度量走真实
+   布局）、`871682b`/`8734846`/`becb3db`（SharedWorker/ServiceWorker）、`552715e`/`1f963b7`
+   （worklet/Trusted Types fail-closed）、`d547f4a`/`e58e212`（feature 错配与不继承 default）、
+   `aeb81f7`（stealth 进 default）。
+2. 同 IP 对照：先用 `api.ipify.org` 确认 js-reverse 控制的 Chrome 与 obscura 走同一代理、
+   同一出口 IP（**均为 8.220.195.225**），再让 Chrome 走同一 URL。
+
+**证据 1 — 同 IP、同代理、同一分钟内的请求序列对照**（Chrome ray `a2be386f397dc9fd`）：
+
+| 阶段 | Chrome | obscura |
+|---|---|---|
+| `GET /1.txt` 307 → 403 → 质询 | ✓ | ✓ |
+| `chl_page/v1` + `api.js` | ✓ | ✓ |
+| `POST /fo/` (zencare, tokenA) | ✓ 200 | ✓ 200 |
+| widget 文档 `turnstile/f/av0/rch/...` | ✓ 200 | ✓ |
+| **`POST /fo/` (challenges, tokenB)** | **✓ 200** | **✗ 从不发出** |
+| **`GET /pat/`** | **✓ 401** | **✗ 从不发出** |
+| **`GET /ci/`** | **✓ 200 image** | **✗** |
+| 第二个 `POST /fo/` (challenges) | ✓ 200 | ✗ |
+| 终态 | 等待点击（interactive 分流） | 11.7s `overrunBegin` |
+
+**结论 A（推翻 step 48 归因）**：同一 IP 同一时刻 Chrome 能走完整 managed 链路，
+**obscura 走不深不是 CF 波动、不是 IP 信誉**，差异在 obscura 侧。step 48「本轮 CF 分流
+更浅」的写法就此作废。
+
+**结论 B（`/pat/` 的性质修正）**：`/pat/` 在当前 IP 上 Chrome **发得出来**（401）。它不是
+无法企及的能力面，obscura 是**根本没走到那个阶段**。挂在未决首位的「`/pat/` 从不发出」
+应重新表述为「obscura 在 822KB 之前就停了」。
+
+**证据 2 — 四个便宜假设逐个证伪**（都用当前二进制实测）：
+
+| 假设 | 方法 | 结果 |
+|---|---|---|
+| `6b9b8a0` 的 secure context 误伤 widget realm，`crypto.subtle` 被 delete | 每 realm 只读探针（不包装任何东西） | **证伪**。两 realm 均 `isSecureContext=true`、`subtle=object`、`Worker/SharedWorker=function` |
+| 新收起的 API 被 CF 探测到缺失 | lookups trace 的 MISS 面统计（650 条 MISS） | **证伪**。无一条落在 `crypto.subtle`/`caches`/`serviceWorker`/`SharedArrayBuffer` 上 |
+| `d547f4a`/`e58e212` 让 render 失效，几何回零（step 17/18 旧病） | CDP 量 widget 几何 | **证伪**。`docSize/bodyRect=1280×720`，widget iframe `x=192 y=304 w=300 h=65`，`roots=1` |
+| IP 信誉跌到底 | 同 IP Chrome 对照 | **证伪**。见证据 1 |
+
+**证据 3 — 顺带发现的确定 parity 缺陷**：`crossOriginIsolated=undefined`。Chrome 里它是
+`WindowOrWorkerGlobalScope` 属性，非隔离环境下为**布尔 `false`**，绝不是 `undefined`。
+`d7e7a7f` 收起了 `SharedArrayBuffer` 却未同步暴露 `crossOriginIsolated=false`——两者在
+Chrome 中配套，当前组合自相矛盾，且一行即可命中。
+
+**证据 4 — 流程深度的量化对比**：lookups trace 本轮 **2.3MB / 14772 行**，step 44 的
+同模式基线为 **6MB / 32048 行**（走完 822KB→127KB）。不到一半。
+
+**下一步**：便宜假设已穷尽，转入 A/B 二分（用户已授权回退代码）。做法是把主树的
+`vendor/v8-source.toml` 改写为绝对路径版（`/tmp/v8-source-abs.toml`，因 `vendor/rusty_v8`
+被 gitignore、只存在于主树），旧 worktree 用 `--features render,stealth`（当时 `default=[]`）
+并共享 `CARGO_TARGET_DIR`，从而免掉 30 分钟 V8 重编，单轮增量约 3.5 分钟，26 个 commit
+二分约 5 轮。
+
+### Step 50 — 根因之一定位：`1f963b7` 的 Trusted Types 只有 API 外壳，`eval(TrustedScript)` 不执行（2026-08-16）
+
+**假设**：step 49 已证回退在 obscura 侧且落在 `709cb1b..HEAD` 的 26 个 commit 内。本步
+用 A/B + 因果干预定位具体 commit。
+
+**方法**：
+1. **A/B 二进制**。旧 worktree checkout `709cb1b`，patch 指向主树 `vendor/rusty_v8` 的绝对
+   路径 config（`/tmp/v8-source-abs.toml`），`--features render,stealth`（当时 `default=[]`），
+   共享 `CARGO_TARGET_DIR` 免 V8 重编，单轮增量 4 分钟。两个二进制均核过
+   `TLS fingerprint impersonation`。
+2. 同一 IP、同一代理，用同一个 net-hook 探针**交替**四轮。
+3. 因果干预：在新版二进制上预注入 `delete globalThis.trustedTypes`，其余不变，重测。
+
+**证据 1 — A/B 交替四轮，100% 一致**：
+
+| 轮次 | realm | xhr.open | `/ci/` |
+|---|---|---|---|
+| OLD1 (`709cb1b`) | **3** | **3** | **1** |
+| NEW1 (HEAD) | 2 | 1 | 0 |
+| OLD2 (`709cb1b`) | **3** | **3** | **1** |
+| NEW2 (HEAD) | 2 | 1 | 0 |
+
+**证据 2 — CF 确实在用 Trusted Types，且就在 widget realm**（新版 lookups trace）：
+
+```
+HIT  Window.trustedTypes                     ← 先探测存在性
+HIT  TrustedTypePolicyFactory.createPolicy   x3
+HIT  TrustedTypePolicy.createHTML        栈: window.KQlAt3 <- qG <- CU <- CS <- BBGfx <- q8 <- q9 <- qn
+HIT  TrustedTypePolicy.createScriptURL   栈: window.MfEvo2 <- ql <- qY <- t0 <- tL <- tN
+HIT  TrustedTypePolicy.createScript      栈: window.ZHfDS6 <- Cj <- Cg <- Ca <- pgOAv <- t0 <- tL <- tN
+```
+
+全部发自 `challenges.cloudflare.com/.../turnstile/f/av0/rch/...`（widget 文档）。
+
+**证据 3 — 缺陷本体，与 Chrome 对拍**（同一段 probe）：
+
+| | Chrome | obscura (HEAD) |
+|---|---|---|
+| `p.createScript('1+1')` 的 `constructor.name` | `TrustedScript` | `TrustedScript` |
+| `String(s)` | `1+1` | `1+1` |
+| **`eval(s)`** | **`2`（number，代码被执行）** | **`"1+1"`（原样返回，未执行）** |
+| `div.innerHTML = h` | `<b>x</b>` | `<b>x</b>` |
+
+`1f963b7` 补齐了 TT 的 API 面（`createPolicy`/`createHTML`/`createScript`/`createScriptURL`
+均返回正确的包装类型），但**没有给 `eval` 打 TT 补丁**。普通 JS 语义下 `eval(非字符串)`
+原样返回，而 Trusted Types 规范要求 `eval()` 接到 `TrustedScript` 时将其作为代码执行
+（Chrome 经 `SetModifyCodeGenerationFromStringsCallback` 实现）。于是：**旧版
+`trustedTypes` 不存在，CF 走 fallback 直接赋字符串，一切正常；新版存在，CF 切到 TT 路径，
+`eval(createScript(...))` 静默地什么也不做**，JSVMP 停摆。这是「补一半的 API 面比不补更
+危险」的典型：存在性探测通过，行为却不符。
+
+**证据 4 — 因果干预（不是相关性）**：新版二进制 + 预注入 `delete globalThis.trustedTypes`
+（探针自报 `tt-now=undefined`），其余完全不变：
+
+```
+NEW 原样            realm=2  xhr.open=1  /ci/=0
+NEW 删 trustedTypes  realm=2  xhr.open=2  /ci/=0   ← 822KB 的 challenges /fo/ 恢复发出
+OLD (709cb1b)       realm=3  xhr.open=3  /ci/=1
+```
+
+删 TT 后的序列与旧版**前 5 条逐字一致**（含 822KB `/fo/`）。
+
+**结论**：`1f963b7`（Trusted Types API 面按规范补齐）是**回退的根因之一**，已由因果干预确认。
+修法二选一：①给 `eval`/`Function` 接入 TT（V8 `SetModifyCodeGenerationFromStringsCallback`，
+把 `TrustedScript` 解包成源码），这是与 Chrome 对齐的正确做法；②在 ① 落地前，不暴露
+`globalThis.trustedTypes`——半个 API 面比没有更糟。
+
+**未完**：删 TT 后仍停在 `/ci/` 之前（`realm` 仍为 2，缺第三个 realm 与 `/ci/`），
+**26 个 commit 里还有第二处回归**，位于 822KB → `/ci/` 之间。待查。
+
+### Step 51 — 二分收敛：`1f963b7` 是唯一回归根因，且造成两级退化（2026-08-16）
+
+**方法**：step 50 留下「还有第二处回归」的判断，本步用 A/B 二分证伪它。旧 worktree 逐个
+checkout + 共享 `CARGO_TARGET_DIR` 增量构建（单轮约 2.5 分钟），统一判据
+`realm>=3 && xhr>=3 && /ci/>=1`，统一探针（删 TT 版，中和已知的第一处），
+每轮都核 `TLS fingerprint impersonation` 与端口占用。
+
+**证据 — 二分过程**（`709cb1b..HEAD` 共 27 个 commit，按时间序号）：
+
+| 序号 | commit | 内容 | realm | xhr | `/ci/` | 判定 |
+|---|---|---|---|---|---|---|
+| 0 | `709cb1b` | step 47 基线 | 3 | 3 | 2 | **好** |
+| 4 | `871682b` | SharedWorker 真实现 | 3 | 3 | 1 | **好** |
+| 5 | `1f963b7` | **Trusted Types** | 2 | 2 | 0 | **坏** |
+| 7 | `552715e` | worklet fail-closed | 2 | 2 | 0 | 坏 |
+| 16 | `6b9b8a0` | secure context | 2 | 2 | 0 | 坏 |
+| 27 | `aeb81f7` | HEAD | 2 | 2 | 0 | 坏 |
+
+第 4 与第 5 之间只有 `1f963b7` 一个 commit。**「第二处回归」不存在**——step 50 结尾的
+那句判断就此作废。
+
+**两级退化**（同一个二进制 `1f963b7`，只换探针）：
+
+```
+原样（trustedTypes 存在）      realm=2  xhr=1  /ci/=0
+删 globalThis.trustedTypes     realm=2  xhr=2  /ci/=0
+第 4 个 commit（无 TT）        realm=3  xhr=3  /ci/=1
+```
+
+删掉 `globalThis.trustedTypes` 只救回一级。说明该 commit 的影响不止这一个全局属性——它
+还改了 `runtime.rs`（111 行）与 bootstrap 的其他部分，widget realm 侧仍有残留路径。
+**修复必须回到行为正确，而不是靠藏掉入口。**
+
+**结论**：`1f963b7`（Trusted Types API 面按规范补齐）是本次回退的**唯一根因**。缺陷本体见
+step 50 证据 3：API 外壳齐全（类型、`String()` 均与 Chrome 一致），但 `eval(TrustedScript)`
+不执行代码（Chrome 返回 `2`，obscura 返回 `"1+1"`）。CF 先探测 `Window.trustedTypes`
+存在性，存在就切到 TT 路径调用 `createHTML`/`createScript`/`createScriptURL`（trace 中三者
+均命中，栈在 JSVMP 主链上），于是 JSVMP 静默停摆。
+
+**修法（按正确性排序）**：
+1. 给 `eval`/`Function` 接入 Trusted Types：V8
+   `SetModifyCodeGenerationFromStringsCallback` 把 `TrustedScript` 解包成源码后编译，
+   与 Chrome 对齐。同时补 `TrustedScriptURL` 在 `script.src`、`TrustedHTML` 在
+   `innerHTML`/`srcdoc` 上的接受路径的行为一致性测试。
+2. 在 1 落地前 revert `1f963b7` 的入口暴露部分（不暴露 `globalThis.trustedTypes`）。
+   **半个 API 面比不实现更危险**：存在性探测通过，行为却不符，页面因此走上一条它以为
+   受支持、实际静默失败的路径。
+
+**这条教训是通用的，不限于 Cloudflare**：任何「按规范补齐 API 面」的 parity 改动，只要
+新暴露了一个特性入口，就必须同时保证该入口背后的**行为**成立；否则 parity 改动本身会把
+原本走 fallback 而正常工作的页面推进死路。本次 26 个 commit 里 API 面普遍更接近 Chrome
+（`ServiceWorker`/`Worklet`/`isSecureContext`/`SharedArrayBuffer` 收起均与 Chrome 一致），
+唯独 TT 的行为没跟上，结果是整体退化。建议给这类 commit 加一条门禁：新暴露的入口必须
+带一个「实际使用它」的用例，而不只是 `typeof` 探测。
+
+**附带发现（与本回归无关，两版一致，独立缺陷）**：
+
+1. **引擎全局对页面可枚举**。`for...in globalThis` / `Object.keys(window)` 直接列出
+   `Deno`、`__obscura_webgl_enabled`、`__obscura_referrer_policy`、
+   `__obscura_performance_time_origin_ms`、`__obscura_viewport_w`、`__obscura_viewport_h`、
+   `__obscura_screen_emulated`。一行即可命中的引擎身份泄漏，优先级应高于多数指纹面细节。
+   （注：step 51 中途一度以为这些是 CF 主动读取，核对 trace 的来源列后更正——读取方全是
+   引擎自己的脚本 `<obscura:bootstrap>` / `<set-fingerprint>` / `<eval>` /
+   `<obscura:frame-realm-bootstrap>`。可枚举性本身仍是真缺陷。）
+2. **`crossOriginIsolated` 为 `undefined`**，Chrome 为布尔 `false`（实测同页对拍）。
+   与已收起的 `SharedArrayBuffer` 配套关系不自洽。
+3. `measureText('Mg').width`：Chrome 14.73 / 新版 14 / 旧版 12（新版更接近）；
+   `fontBoundingBoxAscent` 在 obscura 两版均为 `undefined`，Chrome 为 number。
+
+### Step 52 — 修复：Trusted Types 入口不再暴露（`eval(TrustedScript)` 无法实现）（2026-08-16）
+
+**定位收敛过程**（step 51 的「eval 是根因」一度动摇过，这里是完整的收敛）：
+
+1. **反向验证（决定性）**：在 `871682b`（回归前、稳定 `xhr=3`）上**预注入一个等效的
+   TT 表面**（纯 JS：三个包装类型 + 工厂 + policy 返回包装对象），流程立刻掉到
+   `realm=2 xhr=1`——与 HEAD 原样一模一样。**在好的构建上凭空造出这个回归**，因果闭环。
+2. **sink 逐个实测**（HEAD 二进制，policy 恒等回调）：
+
+   | sink | 结果 |
+   |---|---|
+   | `script.text` / `textContent` / `innerText` | ✓（append 后真的执行，`ran=1`） |
+   | `script.src` / `setAttribute('src')` | ✓ |
+   | `innerHTML` / `outerHTML` / `srcdoc` / `insertAdjacentHTML` / `createContextualFragment` | ✓ |
+   | `new Worker(TrustedScriptURL)` / `new Function(TrustedScript)` | ✓ |
+   | **`eval(TrustedScript)`** | **✗ `ret=object ran=0`**（Chrome：`2`） |
+
+   **唯一的洞就是 `eval`**，其余全部正确接受包装类型。
+3. 被证伪的中间假设，一并记录：`delete globalThis.trustedTypes` 只把 `xhr` 从 1 救到 2，
+   救不回 3，一度让我以为「还有第二处回归」。**原因是我自己的探针有 bug**——它
+   `delete` 之后又 `Object.defineProperty(..., {value: undefined})`，属性其实还在
+   （`'trustedTypes' in window === true`）。改成只 delete 后复测仍是 2，最终由上面的
+   反向注入实验给出干净结论。教训见「测量盲区」新增条目。
+
+**为什么不能实现 `eval`**：eval 对非字符串参数原样返回（ES `PerformEval` 第 1 步）；
+Trusted Types 把这一步换成宿主钩子，Chrome 经 V8 `ModifyCodeGenerationFromStrings`
+回调实现。rusty_v8 没有暴露该回调（只在 `v8/include/v8-callbacks.h` 的 C++ 侧），而官方
+构建（Dockerfile / release.yml）链接 **prebuilt librusty_v8**，加 binding 会让同一个 API
+在不同构建方式下行为不同。覆盖 `globalThis.eval` 也不是替代:它会把每个 `eval(x)` 调用点
+变成 indirect eval，改掉真实页面依赖的作用域语义。
+
+**修复**（本步提交）：`_installTrustedTypes` 开头 early return,入口不暴露。实现全部保留,
+将来 eval 钩子可用时**删掉那一行 `return` 即可**。同步:
+`trusted_types_surface_is_not_exposed` 新回归测试(断言 6 个全局都不存在)、原形状测试标
+`#[ignore]` 并注明卡点、roadmap §3.2-#12 与 P3-18 改为「暂缓」、
+`js-repros/trusted-types/README.md` 顶部标注状态。
+
+**修复前后对比**(同 IP、同代理、交替测量、原样探针无任何干预):
+
+| 二进制 | 轮次结果 (`xhr`) | 判据 `realm>=3 && xhr>=3 && /ci/>=1` |
+|---|---|---|
+| HEAD 未修复 | 1, 1, 1, 1, 1 | **0/5 通过** |
+| HEAD + 本修复 | 1, 3, 3, 3, 3 | **4/5 通过** |
+
+首轮那次未通过如实记录:判据存在偶发波动(CF 端),**不是 100% 确定性判据**。这条本身
+是重要的测量纪律——step 51 的二分建立在单次或少数几次测量上,结论虽被反向注入实验独立
+证实,但今后二分必须每点重复 3 次以上。
+
+**结论**:回归已修复,流程恢复到 step 47 的深度(`realm=3 xhr=3 /ci/=1`,822KB `/fo/` +
+`/ci/` + 127KB 交互变体)。**这不等于过盾**——step 47 时同样走到这里仍以 `overrunBegin`
+告终,`/pat/` 依旧从不发出。质询本身的断点回到 step 47/49 描述的位置。
+
+**通用教训(已回填 roadmap)**:任何「按规范补齐 API 面」的改动,只要新暴露一个特性入口,
+就必须保证该入口背后的**行为**成立。半个 API 面比不实现更危险:存在性探测通过,页面据此
+选择代码路径,然后静默失败。建议门禁:新暴露的入口必须带一个**实际使用它**的用例,而不
+只是 `typeof` 探测。本次 26 个 commit 里 API 面普遍更接近 Chrome
+(`ServiceWorker`/`Worklet`/`isSecureContext`/`SharedArrayBuffer` 收起均正确),唯独 TT 的
+行为没跟上,结果是整体退化。

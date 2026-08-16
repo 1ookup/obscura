@@ -1,5 +1,21 @@
 # Trusted Types fixture
 
+**Status: on hold. The surface is implemented but not installed**, so this
+fixture currently reproduces the pre-`1f963b7` answer (`typeof trustedTypes ===
+"undefined"`) rather than the oracle below. Re-run it after removing the early
+`return` in `_installTrustedTypes` (crates/obscura-js/js/bootstrap.js).
+
+Why it is off: `eval(trustedScript)` cannot be implemented from JavaScript. eval
+returns a non-string argument unchanged; Trusted Types replaces that step with a
+host hook, which Chrome services through V8's ModifyCodeGenerationFromStrings
+callback. rusty_v8 does not expose it, and official builds link the prebuilt
+librusty_v8. Every other sink is correct -- only eval is missing -- but a page
+that feature-detects `window.trustedTypes` switches to the Trusted Types path on
+that one check alone, and its `eval(policy.createScript(...))` then silently does
+nothing. That regressed a real challenge page; the failure was bisected to
+`1f963b7` and reproduced by injecting an equivalent surface into the preceding
+build. See docs/Cloudflare-challenge-profile.md step 49-52.
+
 `window.trustedTypes` did not exist at all. That is a Firefox/Safari answer, and
 it contradicts every other Chrome signal this build sends -- a page that reads
 `typeof trustedTypes` gets "undefined" from something claiming to be Chrome 146.
