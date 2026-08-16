@@ -1,6 +1,14 @@
 "use strict";
 (function () {
 
+// Everything the JavaScript engine put on the global before this file runs.
+// Their prototypes follow ECMAScript rules (members non-enumerable) and must
+// not be touched by the WebIDL enumerability pass at the bottom of this file;
+// everything added below is a Web platform interface, which follows the
+// opposite rule. Snapshotting is the only way to tell the two apart that does
+// not need a hand-maintained list of 300 names to drift out of date.
+const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
+
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
 // declarations or property assignments below: once a property is defined
@@ -37,6 +45,9 @@
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__documentReadyState__', '__currentUrl',
+    // Assigned only once a dynamically inserted script runs, which is why it
+    // was missed here and showed up in a challenge page's window enumeration.
+    '__currentScriptNid',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_fingerprint', '_getFp', '_fp', '_splitAsciiWhitespace',
@@ -4231,19 +4242,20 @@ class Element extends Node {
     }
     // Legacy shim below: dynamically created iframes the Rust loader has not
     // handled. Its string-origin compare retires with Phase 3.5 unification.
-    if (this._iframeDoc) {
+    if (_iframeShimFor(this).doc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
       if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
-        return this._iframeDoc;
+        return _iframeShimFor(this).doc;
       }
       return null; // Cross-origin: blocked
     }
-    if (!this._iframeDoc) {
-      this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    const shim = _iframeShimFor(this);
+    if (!shim.doc) {
+      shim.doc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+      shim.win = new _IframeWindow(shim.doc, 'about:blank');
     }
-    return this._iframeDoc;
+    return shim.doc;
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
@@ -4252,11 +4264,11 @@ class Element extends Node {
     if (+_dom("iframe_content_document_root", this._nid) >= 0) {
       return _frameWindowProxyFor(this);
     }
-    if (!this._iframeWin) {
+    if (!_iframeShimFor(this).win) {
       if (this.parentNode === null) return null;
       this.contentDocument;
     }
-    return this._iframeWin;
+    return _iframeShimFor(this).win;
   }
   get action() {
     const base = _anchorBase();
@@ -6842,6 +6854,11 @@ class _ScopedDocument extends Document {
     const info = this._scopeInfo();
     return info && info.quirks ? "BackCompat" : "CSS1Compat";
   }
+  // Editing the whole document is not implemented, but the attribute is not
+  // optional: every browser reports "off" here, and `undefined` is not a
+  // value any of them produce.
+  get designMode() { return "off"; }
+  set designMode(_value) {}
   get referrer() {
     const info = this._scopeInfo();
     return (info && info.referrer) || "";
@@ -7552,6 +7569,10 @@ function _uaBrands() {
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
+  // Legacy Navigator attributes every browser still reports verbatim. Their
+  // absence read as `undefined` in an environment probe's value map, which is
+  // a value no browser produces for them.
+  appName: "Netscape", appCodeName: "Mozilla", vendorSub: "",
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   connection: new NetworkInformation(),
@@ -7774,22 +7795,81 @@ class _WebGLContext {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {};
 
+// `screen.orientation` used to be an object literal with three no-op methods.
+// A probe that walks it saw 5 members where Chrome has 9, and `lock` -- which
+// pages call and which Chrome rejects outside fullscreen -- was simply absent.
+const _screenOrientationKey = Symbol('ScreenOrientation');
+const _screenOrientationHandlers = new WeakMap();
+class ScreenOrientation {
+  constructor(key) {
+    if (key !== _screenOrientationKey) throw new TypeError('Illegal constructor');
+  }
+  get type() { return 'landscape-primary'; }
+  get angle() { return 0; }
+  get onchange() { return _screenOrientationHandlers.get(this) || null; }
+  set onchange(value) {
+    _screenOrientationHandlers.set(this, typeof value === 'function' ? value : null);
+  }
+  // Chrome rejects with NotSupportedError unless the document is fullscreen,
+  // which is the state a headless page is always in.
+  lock() {
+    return Promise.reject(new DOMException(
+      'screen.orientation.lock() is not available on this device.', 'NotSupportedError'));
+  }
+  unlock() {}
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  get [Symbol.toStringTag]() { return 'ScreenOrientation'; }
+}
+globalThis.ScreenOrientation = _markNative(ScreenOrientation);
+
+// A symbol key, not `_w`: a probe reads own property *names* as well as
+// running `for..in`, so a non-enumerable `_w` is still one
+// `Object.getOwnPropertyNames(screen)` away from being visible. A browser's
+// screen object has no own string-keyed properties at all.
+const _screenSlots = Symbol('Screen slots');
 class Screen {
   constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    // Every observable value lives behind this one symbol. `colorDepth` and
+    // friends used to be own data properties, which put them in
+    // `Object.getOwnPropertyNames(screen)` -- a list that is empty in a
+    // browser, where all of Screen is prototype accessors.
+    this[_screenSlots] = {
+      w, h,
+      availW: availW === undefined ? w : availW,
+      availH: availH === undefined ? h - 40 : availH,
+      orientation: new ScreenOrientation(_screenOrientationKey),
+      onchange: null,
+    };
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get width() { return this[_screenSlots].w; }
+  get height() { return this[_screenSlots].h; }
+  get availWidth() { return this[_screenSlots].availW; }
+  get availHeight() { return this[_screenSlots].availH; }
+  get availTop() { return 0; }
+  get availLeft() { return 0; }
+  get colorDepth() { return 24; }
+  get pixelDepth() { return 24; }
+  get orientation() { return this[_screenSlots].orientation; }
+  // Chrome reports false unless the window spans several displays, which a
+  // headless engine never does.
+  get isExtended() { return false; }
+  get onchange() { return this[_screenSlots].onchange; }
+  set onchange(value) { this[_screenSlots].onchange = typeof value === 'function' ? value : null; }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  get [Symbol.toStringTag]() { return 'Screen'; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
+['width','height','availWidth','availHeight','availTop','availLeft','colorDepth',
+ 'pixelDepth','orientation','isExtended','onchange'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
   if (d && d.get) _markNative(d.get);
+  if (d && d.set) _markNative(d.set);
+});
+['addEventListener','removeEventListener','dispatchEvent'].forEach(function(k) {
+  _markNative(Screen.prototype[k]);
 });
 globalThis.Screen = Screen;
 globalThis.screen = new Screen(1920, 1080);
@@ -7797,10 +7877,11 @@ function _applyScreenSize(w, h, emulated, availW, availH) {
   const resolvedAvailW = Number.isFinite(availW) ? availW : w;
   const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
   if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = resolvedAvailW;
-    globalThis.screen._availH = resolvedAvailH;
+    const slots = globalThis.screen[_screenSlots];
+    slots.w = w;
+    slots.h = h;
+    slots.availW = resolvedAvailW;
+    slots.availH = resolvedAvailH;
   } else {
     globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH);
   }
@@ -13571,23 +13652,40 @@ _markNative(globalThis.Selection);
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
+// The shim document/window a dynamically created iframe gets before the Rust
+// frame loader has committed a real one. A WeakMap rather than `el._iframeDoc`
+// because an HTMLIFrameElement in a browser has no own properties at all, and
+// a probe reads `Object.getOwnPropertyNames` on the element.
+const _iframeShims = new WeakMap();
+function _iframeShimFor(element) {
+  let shim = _iframeShims.get(element);
+  if (!shim) {
+    shim = { doc: null, win: null };
+    _iframeShims.set(element, shim);
+  }
+  return shim;
+}
+
+// A browser's Document has no own string-keyed properties: every member is a
+// prototype accessor. This one used to keep `_root`, `_url`, `nodeType` and
+// the rest as own data properties, so a probe reading
+// `Object.getOwnPropertyNames(iframe.contentDocument)` got the engine's
+// internals by name. One symbol-keyed slot object hides all of it, and the
+// members move to the prototype where WebIDL puts them.
+const _iframeDocumentSlots = Symbol('Document slots');
+
 class _IframeDocument {
   constructor(html, url, iframeEl) {
-    this._url = url;
-    this._iframeEl = iframeEl;
-    this.nodeType = 9;
-    this.nodeName = '#document';
-    this.readyState = 'complete';
-    this.characterSet = 'UTF-8';
-    this.contentType = 'text/html';
-    this.visibilityState = 'visible';
-    this.hidden = false;
+    const slots = {
+      url, iframeEl, root: null, head: null, body: null, title: '', listeners: null,
+    };
+    this[_iframeDocumentSlots] = slots;
 
-    this._root = document.createElement('html');
-    this._head = document.createElement('head');
-    this._body = document.createElement('body');
-    this._root.appendChild(this._head);
-    this._root.appendChild(this._body);
+    slots.root = document.createElement('html');
+    slots.head = document.createElement('head');
+    slots.body = document.createElement('body');
+    slots.root.appendChild(slots.head);
+    slots.root.appendChild(slots.body);
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
@@ -13595,43 +13693,52 @@ class _IframeDocument {
       .replace(/<\/?body[^>]*>/gi, '')
       .replace(/^\s+/, ''); // trim leading whitespace (before <body> content)
     if (bodyContent) {
-      this._body.innerHTML = bodyContent;
+      slots.body.innerHTML = bodyContent;
     }
 
-    this._title = '';
-    if (this._head) {
-      const titleEl = this._head.querySelector('title');
-      if (titleEl) this._title = titleEl.textContent;
-    }
+    const titleEl = slots.head.querySelector('title');
+    if (titleEl) slots.title = titleEl.textContent;
   }
 
-  get documentElement() { return this._root; }
-  get head() { return this._head; }
-  get body() { return this._body; }
-  get title() { return this._title; }
-  set title(v) { this._title = v; }
-  get URL() { return this._url; }
-  get documentURI() { return this._url; }
-  get location() { return this._iframeEl?.contentWindow?.location; }
-  get defaultView() { return this._iframeEl?.contentWindow; }
+  get nodeType() { return 9; }
+  get nodeName() { return '#document'; }
+  get readyState() { return 'complete'; }
+  get characterSet() { return 'UTF-8'; }
+  get charset() { return 'UTF-8'; }
+  get inputEncoding() { return 'UTF-8'; }
+  get contentType() { return 'text/html'; }
+  get visibilityState() { return 'visible'; }
+  get hidden() { return false; }
+  get designMode() { return 'off'; }
+  set designMode(_value) {}
+  get [Symbol.toStringTag]() { return 'Document'; }
+  get documentElement() { return this[_iframeDocumentSlots].root; }
+  get head() { return this[_iframeDocumentSlots].head; }
+  get body() { return this[_iframeDocumentSlots].body; }
+  get title() { return this[_iframeDocumentSlots].title; }
+  set title(v) { this[_iframeDocumentSlots].title = v; }
+  get URL() { return this[_iframeDocumentSlots].url; }
+  get documentURI() { return this[_iframeDocumentSlots].url; }
+  get location() { return this[_iframeDocumentSlots].iframeEl?.contentWindow?.location; }
+  get defaultView() { return this[_iframeDocumentSlots].iframeEl?.contentWindow; }
   get ownerDocument() { return null; }
   get compatMode() { return 'CSS1Compat'; }
-  get activeElement() { return this._body; }
+  get activeElement() { return this[_iframeDocumentSlots].body; }
 
   getElementById(id) {
-    return this._root.querySelector('#' + id);
+    return this[_iframeDocumentSlots].root.querySelector('#' + id);
   }
   querySelector(sel) {
-    return this._root.querySelector(sel);
+    return this[_iframeDocumentSlots].root.querySelector(sel);
   }
   querySelectorAll(sel) {
-    return this._root.querySelectorAll(sel);
+    return this[_iframeDocumentSlots].root.querySelectorAll(sel);
   }
   getElementsByTagName(tag) {
-    return this._root.querySelectorAll(tag);
+    return this[_iframeDocumentSlots].root.querySelectorAll(tag);
   }
   getElementsByClassName(cls) {
-    return _getElementsByClassName(this._root, cls);
+    return _getElementsByClassName(this[_iframeDocumentSlots].root, cls);
   }
   createElement(tag) { return document.createElement(tag); }
   createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
@@ -13649,12 +13756,14 @@ class _IframeDocument {
 
   addEventListener(type, listener) {
     if (typeof listener !== 'function') return;
-    if (!this._listeners) this._listeners = Object.create(null);
-    const list = this._listeners[type] || (this._listeners[type] = []);
+    const slots = this[_iframeDocumentSlots];
+    if (!slots.listeners) slots.listeners = Object.create(null);
+    const list = slots.listeners[type] || (slots.listeners[type] = []);
     if (!list.includes(listener)) list.push(listener);
   }
   removeEventListener(type, listener) {
-    const list = this._listeners && this._listeners[type];
+    const list = this[_iframeDocumentSlots].listeners
+      && this[_iframeDocumentSlots].listeners[type];
     if (!list) return;
     const index = list.indexOf(listener);
     if (index !== -1) list.splice(index, 1);
@@ -13662,7 +13771,8 @@ class _IframeDocument {
   dispatchEvent(event) {
     const type = event && event.type;
     if (!type) return true;
-    const list = this._listeners && this._listeners[type];
+    const list = this[_iframeDocumentSlots].listeners
+      && this[_iframeDocumentSlots].listeners[type];
     if (list) {
       for (const listener of list.slice()) {
         try { listener.call(this, event); } catch (error) { console.error(error); }
@@ -13676,10 +13786,10 @@ class _IframeDocument {
   }
 
   write(html) {
-    if (this._body) this._body.innerHTML += html;
+    if (this[_iframeDocumentSlots].body) this[_iframeDocumentSlots].body.innerHTML += html;
   }
   writeln(html) { this.write(html + '\n'); }
-  open() { if (this._body) this._body.innerHTML = ''; }
+  open() { if (this[_iframeDocumentSlots].body) this[_iframeDocumentSlots].body.innerHTML = ''; }
   close() {}
 }
 
@@ -13786,10 +13896,14 @@ const _iframeWindowProxyHandler = {
   },
 };
 
+// `Object.getOwnPropertyNames(iframe.contentWindow)` lists these, so the
+// backing URL cannot be a string-keyed own property: no browser's window has
+// one.
+const _iframeWindowUrl = Symbol('document URL');
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
-    this._url = url;
+    this[_iframeWindowUrl] = url;
     this.top = globalThis;
     this.parent = globalThis;
     this.frameElement = null;
@@ -18255,6 +18369,52 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     // removing them would be a difference, not a fix -- checked against Chrome
     // 146 in js-repros/secure-context/chrome-oracle.json.
   };
+})();
+
+// WebIDL puts every interface member on the prototype as enumerable; an ES
+// class puts them there as non-enumerable. That single difference is the
+// whole reason `for (const key in document)` answered 13 names here against
+// Chrome's 295, and 9 against 15 for `screen` -- a ratio no browser version
+// gap explains, and one an environment probe reads in a three-line loop.
+//
+// The pass runs last so it covers every interface, whenever it was defined,
+// and it only ever flips `enumerable`: a member that is absent stays absent.
+// `constructor` is the documented exception -- WebIDL keeps it
+// non-enumerable, as does ECMAScript.
+(function _applyWebIdlEnumerability() {
+  const skipOnPrototype = new Set(['constructor']);
+  const seen = new Set();
+  const promote = proto => {
+    if (!proto || typeof proto !== 'object' || seen.has(proto)) return;
+    seen.add(proto);
+    let names;
+    try { names = Object.getOwnPropertyNames(proto); } catch (_error) { return; }
+    for (const key of names) {
+      if (skipOnPrototype.has(key)) continue;
+      let descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(proto, key); }
+      catch (_error) { continue; }
+      if (!descriptor || descriptor.enumerable || !descriptor.configurable) continue;
+      descriptor.enumerable = true;
+      try { Object.defineProperty(proto, key, descriptor); } catch (_error) {}
+    }
+  };
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (_ecmaScriptGlobals.has(name)) continue;
+    let value;
+    // Reading a global can throw (cross-origin Location) and can have side
+    // effects; neither is worth a member's enumerability.
+    try { value = globalThis[name]; } catch (_error) { continue; }
+    if (typeof value !== 'function') continue;
+    let proto;
+    try { proto = value.prototype; } catch (_error) { continue; }
+    if (!proto || proto === Object.prototype || proto === Function.prototype) continue;
+    promote(proto);
+  }
+  // Interfaces a page can reach without the constructor being on the global.
+  // `iframe.contentDocument` for an about:blank frame is one, and it is
+  // exactly the object Cloudflare walks.
+  promote(_IframeDocument.prototype);
 })();
 
 })();

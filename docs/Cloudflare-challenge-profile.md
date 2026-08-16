@@ -3648,3 +3648,80 @@ CF 载荷侧：1.json 的 `yQYB9` 从缺失变成 1 条（api.js，`QUyj4`/`aelS
 **仍未对齐（记录，非本步范围）**：`DCkwl7` 130 vs 1952 是 widget 文档的加载时长，
 obscura 更快；`NWUB3`/`WpIu5` 28 vs 1849 等计数属于页面差异。要拿这些当判据，
 必须换成同一个 URL 的浏览器 HAR。
+
+### Step 68 — `fyCZH9` 的枚举语义查清：`for..in` ∪ 自有属性名；引擎内部字段全部下线（2026-08-17）
+
+`fyCZH9` 是 2.json 里最大的一个字段（Chrome 30881 B / obscura 14187 B）。它是
+一张「属性路径 → 值」的倒排表，路径带前缀 `d.` `n.` `s.` `so.`，以及不带前缀的一批。
+
+**先确定它到底在枚举什么。** 用本地探针逐一比对计数（`obscura fetch --eval`，
+建一个隐藏 iframe 再走它的 `contentWindow`）：
+
+| 对象 | `Object.keys` | `for..in` | 载荷里的条数 |
+|------|---------------|-----------|--------------|
+| screen | 9 | 9 | **9** |
+| screen.orientation | 5 | 5 | **5** |
+| document | 13 | 13 | **12** |
+| navigator | 25 | 38 | **37** |
+
+`for..in` 全中，`Object.keys` 在 navigator 上差 13——**枚举是 `for..in`**。
+但修完可枚举性后载荷里 `s.` 是 18 而本地 `for..in` 只有 14，多出的正是
+`_w/_h/_availW/_availH`：**它同时读 `Object.getOwnPropertyNames`**。
+所以把内部字段改成 `enumerable: false` 不够，必须让它**根本不是字符串键的自有属性**。
+
+**三个成因**：
+
+1. **WebIDL 成员必须可枚举，ES class 的原型成员不可枚举。** 这一条差异就解释了
+   `for (const k in document)` 在 obscura 是 13、Chrome 是 295。Chrome 的
+   `d.` 列表里明确有 `onclick`、`addEventListener`、`querySelector`。
+   bootstrap.js 里原本还有一处反向的注释（「在 Document 和 Element 上设成
+   不可枚举，免得在 `for..in` 里冒出来」）——与 Chrome 正好相反。
+2. **引擎内部字段是自有字符串属性。** `screen._w/_h/_availW/_availH`、
+   `_IframeDocument` 的 `_url/_iframeEl/_root/_head/_body/_title`、
+   `_IframeWindow._url`、以及动态脚本跑过之后才出现的 `__currentScriptNid`。
+   浏览器里 `Object.getOwnPropertyNames(screen)` 是**空数组**——Screen 的每个成员
+   都是原型访问器。
+3. **`screen.orientation` 是个对象字面量**，只有 5 个成员（Chrome 9），
+   `lock`/`unlock`/`onchange` 直接不存在。
+
+**修复（全部在 bootstrap.js）**：
+
+- 文件开头快照一次 `Object.getOwnPropertyNames(globalThis)`，那就是 ECMAScript
+  内置；文件末尾对**所有不在快照里的全局构造器**的原型做一遍
+  `enumerable = true`（`constructor` 除外，WebIDL 同样保持不可枚举）。
+  快照法避免了手工维护一张 300 个名字、必然过期的清单。
+  `_IframeDocument.prototype` 不挂在全局上，单独补一次。
+- `Screen` 的全部状态收进一个 Symbol 槽，`colorDepth`/`pixelDepth`/`availTop`/
+  `availLeft`/`orientation` 从自有数据属性改成原型访问器，补
+  `isExtended`/`onchange`/`addEventListener`/`removeEventListener`/`dispatchEvent`。
+- 新增真正的 `ScreenOrientation` 类，补 `lock`（按 Chrome 抛
+  `NotSupportedError`）/`unlock`/`onchange`。
+- `_IframeDocument` 同样收进 Symbol 槽，`nodeType`/`readyState`/`characterSet`
+  等从自有数据属性改成原型访问器，并补 `designMode`。
+- iframe 元素上的 `_iframeDoc`/`_iframeWin` 改用 WeakMap（元素在浏览器里没有
+  任何自有属性）。
+- `navigator.appName`/`appCodeName`/`vendorSub` 与 `document.designMode` 补齐——
+  它们此前读作 `undefined`，是没有任何浏览器会产生的值。
+
+**结果（同一探针、同一目标站）**：
+
+| | Chrome | 修复前 | 修复后 |
+|---|---|---|---|
+| `d.` | 295 | 12 | **43** |
+| `s.` | 15 | 9 | **14** |
+| `so.` | 9 | 5 | **8** |
+| `n.` | 81 | 37 | **39** |
+| 内部字段泄漏 | 0 | **11 条** | **0** |
+
+**仍未对齐（下一步的根因，已定位）**：`<bare>` 305 vs 1238、`o.` 493 vs 28
+都出自同一个东西——**动态创建的 iframe 在 Rust 帧加载器提交之前，
+`contentWindow`/`contentDocument` 返回的是 bootstrap.js 里的
+`_IframeWindow`/`_IframeDocument` 兼容垫片**（page.rs 的 `about:blank` 分支是
+异步排队的，而 CF 是同步读的）。垫片的 window 只有约 25 个自有属性、没有原型链，
+所以「干净 realm 的全局名单」只有 305 个，而顶层真实 window 比它多出 493 个——
+Chrome 那一栏 28 全是页面自己加的全局。把 `about:blank` 子帧接到真实 realm 上
+（代码里标为 Phase 3.5 unification）才是这一项的解。
+
+另记：`Object.getOwnPropertyNames(anyElement)` 仍会列出约 30 个 `_` 开头的
+内部字段（`_nid`/`_lname`/`_treeParent`/…），Chrome 是空数组。本轮 CF 没有走到
+这一面，但属同一类问题。
