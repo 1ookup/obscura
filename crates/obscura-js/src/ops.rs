@@ -169,6 +169,7 @@ pub(crate) struct PendingFrameMessage {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    pub document_csp: Option<String>,
     /// Typed origin of the top-level document, derived exactly once per
     /// committed document. Same-origin checks against frame scopes must use
     /// this instance: re-deriving from `url` would mint a fresh opaque id on
@@ -377,6 +378,7 @@ impl ObscuraState {
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            document_csp: None,
             top_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
@@ -1673,6 +1675,14 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "document_scope_info" => {
             let root = arg1.parse::<u32>().unwrap_or(0);
+            if root == 0 {
+                return serde_json::json!({
+                    "url": gs.url,
+                    "origin": gs.top_origin.as_ref().map(|origin| origin.serialize()),
+                    "csp": gs.document_csp,
+                })
+                .to_string();
+            }
             match dom.document_scope(NodeId::new(root)) {
                 Some(scope) => serde_json::json!({
                     "url": scope.url,
@@ -1688,6 +1698,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "frameId": scope.frame_id,
                     "documentGeneration": scope.document_generation,
                     "quirks": scope.quirks,
+                    "csp": scope.csp,
                 })
                 .to_string(),
                 None => "null".into(),

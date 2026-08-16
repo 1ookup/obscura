@@ -3502,6 +3502,9 @@ impl Page {
         self.document_csp = response
             .header("content-security-policy")
             .map(str::to_string);
+        if let Some(js) = &self.js {
+            js.set_content_security_policy(self.document_csp.as_deref());
+        }
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store

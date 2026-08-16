@@ -703,6 +703,12 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Set the enforced CSP header for the top-level document. Frame realms
+    /// read their own policy from `document_scope_info`.
+    pub fn set_content_security_policy(&self, csp: Option<&str>) {
+        self.state.borrow_mut().document_csp = csp.map(str::to_string);
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -4466,15 +4472,9 @@ mod tests {
         assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
     }
 
-    /// The Trusted Types entrance must stay absent for as long as
-    /// `eval(trustedScript)` cannot execute. Pages feature-detect
-    /// `window.trustedTypes` and switch to the Trusted Types path on the
-    /// strength of that one check; on this engine their
-    /// `eval(policy.createScript(...))` then silently does nothing. Shipping
-    /// the entrance regressed a real challenge page, bisected to the commit
-    /// that added it (docs/Cloudflare-challenge-profile.md step 52).
+    /// The Trusted Types API is exposed, including CSP policy-name checks.
     #[tokio::test(flavor = "current_thread")]
-    async fn trusted_types_surface_is_not_exposed() {
+    async fn trusted_types_surface_is_exposed() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
@@ -4489,7 +4489,21 @@ mod tests {
             .unwrap()
             .value
             .unwrap();
-        assert_eq!(result, serde_json::json!([]));
+        assert_eq!(result, serde_json::json!([
+            "trustedTypes", "TrustedHTML", "TrustedScript", "TrustedScriptURL",
+            "TrustedTypePolicy", "TrustedTypePolicyFactory"
+        ]));
+
+        rt.set_content_security_policy(Some("default-src 'none'; trusted-types allowed default"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const ok = trustedTypes.createPolicy('allowed', {createHTML: x => x});
+                let rejected = false;
+                try { trustedTypes.createPolicy('probe', {}); } catch (_) { rejected = true; }
+                return [String(ok.createHTML('x')), rejected];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["x", true]));
     }
 
     /// `console.log` must not walk the objects handed to it.

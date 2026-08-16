@@ -16656,16 +16656,9 @@ if (typeof globalThis.MediaSource === 'undefined') {
 // Chrome signal this build sends, which is why the roadmap lists it (§3.2-#12).
 //
 // Implemented: the factory, policies, the three wrapper types with real brand
-// checks, and the attribute/property sink type tables. NOT implemented: CSP
-// enforcement (`require-trusted-types-for`), because no CSP directive is
-// parsed or enforced anywhere in the engine yet. That gap is invisible to a
-// document that sends no such policy -- Chrome's sinks are permissive then
-// too, which is exactly what this matches -- and is recorded in
-// js-repros/trusted-types/README.md rather than faked.
+// checks, sink type tables, and the `trusted-types` policy-name allowlist.
+// Sink enforcement (`require-trusted-types-for`) remains below the API layer.
 (function _installTrustedTypes() {
-  // NOT INSTALLED, deliberately. Removing this `return` is the only change
-  // needed to turn it back on; everything below is complete and Chrome-shaped.
-  //
   // One sink cannot be implemented from JavaScript: `eval(trustedScript)`.
   // eval returns a non-string argument unchanged (ES "PerformEval" step 1);
   // Trusted Types replaces that step with a host hook, which Chrome services
@@ -16676,18 +16669,6 @@ if (typeof globalThis.MediaSource === 'undefined') {
   // every `eval(x)` call site into an indirect eval, changing the scope real
   // pages depend on.
   //
-  // Exposing the entrance regardless is worse than leaving it absent. A page
-  // that feature-detects `window.trustedTypes` switches to the Trusted Types
-  // path, and its `eval(policy.createScript(...))` then silently does nothing.
-  // Measured, not hypothetical: A/B binaries bisected the regression to this
-  // block, and injecting an equivalent surface into the build that predates it
-  // reproduced the failure exactly. See docs/Cloudflare-challenge-profile.md
-  // step 52. Every other sink (script.text/textContent/innerText/src,
-  // innerHTML, outerHTML, srcdoc, setAttribute, insertAdjacentHTML,
-  // createContextualFragment, new Worker, new Function) already accepts the
-  // wrapper types correctly.
-  return;
-
   // Brand membership, not prototype identity: `Object.create(
   // TrustedHTML.prototype)` must fail `isHTML`, and in Chrome it does.
   const _trustedValue = new WeakMap();
@@ -16813,7 +16794,22 @@ if (typeof globalThis.MediaSource === 'undefined') {
   });
 
   let _defaultPolicy = null;
+  const _policyNames = new Set();
   const _factoryProto = TrustedTypePolicyFactory.prototype;
+
+  function _cspDirective(name) {
+    let header = '';
+    try {
+      const root = typeof __obscura_frame_document_nid === 'number'
+        ? __obscura_frame_document_nid : 0;
+      const raw = Deno.core.ops.op_dom('document_scope_info', String(root), '');
+      const info = raw && JSON.parse(raw);
+      header = info && info.csp || '';
+    } catch (_) {}
+    const match = header.split(';').map(part => part.trim().split(/\s+/))
+      .find(tokens => tokens[0] === name);
+    return match ? match.slice(1) : null;
+  }
 
   _defineHidden(_factoryProto, 'createPolicy', _markNative(function createPolicy(policyName, policyOptions) {
     if (arguments.length < 1) {
@@ -16822,6 +16818,15 @@ if (typeof globalThis.MediaSource === 'undefined') {
         '1 argument required, but only 0 present.');
     }
     const name = String(policyName);
+    const allowed = _cspDirective('trusted-types');
+    if (allowed) {
+      if (!name || (!allowed.includes(name) && !allowed.includes('*'))) {
+        throw new TypeError('Policy "' + name + '" disallowed.');
+      }
+      if (_policyNames.has(name) && !allowed.includes('allow-duplicates')) {
+        throw new TypeError('Policy "' + name + '" already exists.');
+      }
+    }
     const policy = Object.create(TrustedTypePolicy.prototype);
     // The options are a WebIDL dictionary of callbacks: read once here, so a
     // later mutation of the caller's object cannot change the policy.
@@ -16833,6 +16838,7 @@ if (typeof globalThis.MediaSource === 'undefined') {
       }
     }
     _policyName.set(policy, name);
+    _policyNames.add(name);
     _policyRules.set(policy, rules);
     // Without a CSP `trusted-types` directive, duplicate and empty names are
     // both accepted -- the directive is what makes them errors.
