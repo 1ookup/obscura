@@ -2207,7 +2207,8 @@ class Node {
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     if (this.localName === 'script') {
-      v = globalThis.__obscura_tt_enforce('TrustedScript', v);
+      v = globalThis.__obscura_tt_enforce(
+        'TrustedScript', v, 'HTMLScriptElement textContent');
     }
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
@@ -3301,7 +3302,7 @@ class Element extends Node {
   // side (issue #463), so this needs no template special case.
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
-    v = globalThis.__obscura_tt_enforce('TrustedHTML', v);
+    v = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
     if (this.localName === 'template') {
       this.content.innerHTML = v;
       return;
@@ -4090,9 +4091,13 @@ class Element extends Node {
   }
   set text(v) {
     if (['option', 'script', 'title', 'a'].includes(this.localName)) {
-      this.textContent = this.localName === 'script'
-        ? globalThis.__obscura_tt_enforce('TrustedScript', v)
-        : String(v);
+      // A script's text is a Trusted Types sink, but this delegates to
+      // textContent, which is one too. Enforcing here as well would run the
+      // policy twice for a single assignment, where Chrome runs it once, so
+      // leave it to textContent. The value must not be stringified on the way
+      // through or an already-branded TrustedScript would lose its brand and
+      // be converted a second time.
+      this.textContent = this.localName === 'script' ? v : String(v);
       return;
     }
     // Most elements have no platform `text` reflector. Preserve ordinary
@@ -4188,12 +4193,18 @@ class Element extends Node {
     catch (e) { return v; }
   }
   set src(v) {
-    this.setAttribute("src", v);
+    // Only a script's src is a Trusted Types sink; an image or iframe src is
+    // not, so the other elements sharing this reflector must not be routed
+    // through a policy.
+    this.setAttribute("src", this.localName === 'script'
+      ? globalThis.__obscura_tt_enforce('TrustedScriptURL', v, 'HTMLScriptElement src')
+      : v);
   }
   get srcdoc() { return this.localName === 'iframe' ? (this.getAttribute('srcdoc') || '') : undefined; }
   set srcdoc(v) {
     if (this.localName === 'iframe') {
-      this.setAttribute('srcdoc', globalThis.__obscura_tt_enforce('TrustedHTML', v));
+      this.setAttribute('srcdoc', globalThis.__obscura_tt_enforce(
+        'TrustedHTML', v, 'HTMLIFrameElement srcdoc'));
     }
   }
   get contentDocument() {
@@ -5778,7 +5789,7 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
-    const html = globalThis.__obscura_tt_enforce('TrustedHTML', v);
+    const html = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
     if (this._fragmentContext) {
       _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
     } else {
@@ -16961,7 +16972,11 @@ if (typeof globalThis.MediaSource === 'undefined') {
     return !!values && values.some(value => value === "'script'");
   }
 
-  function _enforceSink(kind, value) {
+  // `sink` is the spec's sink name ("Element innerHTML", "HTMLScriptElement
+  // src", ...). It is passed to the default policy as the third argument, as
+  // Chrome does, because a policy is allowed to branch on which sink it is
+  // covering and cannot tell them apart from the value alone.
+  function _enforceSink(kind, value, sink) {
     if (!_requiredScriptSink()) return String(value == null ? '' : value);
     if (_isKind(kind === 'TrustedHTML' ? TrustedHTML
       : kind === 'TrustedScript' ? TrustedScript : TrustedScriptURL, value)) {
@@ -16977,7 +16992,7 @@ if (typeof globalThis.MediaSource === 'undefined') {
         // the callback made every sink throw whenever a default policy
         // existed, which is the case this branch is here to serve. Only a
         // null or undefined result rejects the assignment.
-        const converted = rule(String(value == null ? '' : value), kind);
+        const converted = rule(String(value == null ? '' : value), kind, sink);
         if (converted != null) return String(converted);
       }
     }

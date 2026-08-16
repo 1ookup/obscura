@@ -4561,6 +4561,84 @@ mod tests {
         );
     }
 
+    /// Chrome hands the default policy three arguments: the value, the expected
+    /// type, and the name of the sink being covered. A policy is allowed to
+    /// branch on the sink, and cannot tell them apart from the value alone.
+    /// `script.src` is a sink as well; leaving it out meant `createScriptURL`
+    /// never ran, so a policy that records which of its rules fired saw a
+    /// different set than it does in a browser.
+    #[test]
+    fn sinks_hand_the_default_policy_the_expected_type_and_the_sink_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const seen = [];
+                const record = rule => (value, expectedType, sink) => {
+                    seen.push([rule, expectedType, sink]);
+                    return value;
+                };
+                trustedTypes.createPolicy('default', {
+                    createHTML: record('createHTML'),
+                    createScript: record('createScript'),
+                    createScriptURL: record('createScriptURL'),
+                });
+                document.createElement('div').innerHTML = '<b>x</b>';
+                const script = document.createElement('script');
+                script.textContent = 'void 0';
+                script.src = 'https://cdn.example/a.js';
+                document.createElement('iframe').srcdoc = '<p>x</p>';
+                // An image src is not a sink and must not reach the policy.
+                document.createElement('img').src = 'https://cdn.example/a.png';
+                return seen;
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["createHTML", "TrustedHTML", "Element innerHTML"],
+                ["createScript", "TrustedScript", "HTMLScriptElement textContent"],
+                ["createScriptURL", "TrustedScriptURL", "HTMLScriptElement src"],
+                ["createHTML", "TrustedHTML", "HTMLIFrameElement srcdoc"],
+            ])
+        );
+    }
+
+    /// `script.text` delegates to textContent, which is itself a sink. Chrome
+    /// runs the policy once per assignment; enforcing at both layers ran it
+    /// twice, and stringifying on the way through discarded the brand on a
+    /// value the caller had already made trusted.
+    #[test]
+    fn assigning_script_text_runs_the_default_policy_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default keep; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                let calls = 0;
+                trustedTypes.createPolicy('default', {
+                    createScript: value => { calls += 1; return value; },
+                });
+                const plain = document.createElement('script');
+                plain.text = 'void 0';
+                const viaPolicy = trustedTypes.createPolicy('keep', {createScript: v => v});
+                const trusted = document.createElement('script');
+                trusted.text = viaPolicy.createScript('void 1');
+                return [calls, plain.textContent, trusted.textContent];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, "void 0", "void 1"]));
+    }
+
     #[test]
     fn worker_src_csp_blocks_dedicated_and_shared_workers() {
         let mut rt = setup_runtime("<html><body></body></html>");

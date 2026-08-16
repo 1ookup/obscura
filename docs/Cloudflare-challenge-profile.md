@@ -3387,3 +3387,50 @@ tokenB 三轮分别是 822572 / 845644 / 845884，两种尺寸都出现，仍不
 有一个共同点——**它们各自的单元测试都通过**，因为测试构造的是「策略已加壳」「直接调
 set_content_security_policy」这类**绕开真实路径**的输入。规范类特性的测试必须走用户
 代码真正会走的那条路，否则通过率与正确性无关。
+
+### Step 65 — 对照参考实现补齐两处 TT 差异：`script.src` sink 与默认策略回调参数（2026-08-16）
+
+**触发**（用户）：与 `HaHaVM-General`（Node vm 补环境框架，抽离自 CF 专用引擎）的
+CSP / Trusted Types 建模逐条对比。
+
+**路线差异（不是缺陷，记录以便判断哪些能借鉴）**：该框架**完全不解析 CSP 响应头**
+（全库 grep `content-security-policy` 零命中），CSP 与 TT 全靠硬编码与启发式：
+`trustedTypesEnforced` 由「页面调用过任意 `createPolicy`」置位（`envFunc.js:8480`），
+子帧是否拦 `eval` 由 `outGlobal.name === "iframe"` 这一个字符串决定。obscura 按真实响应头
+执行，这几处更接近真机；其 `createHTML`/`createScriptURL` 返回**原始字符串**而非加壳对象
+（`envFunc.js:8489-8494`）也是为迁就自身 cheerio DOM，Chrome 三者都返回 `Trusted*` 对象。
+
+**借鉴并修复的两处**：
+
+1. **`script.src` 从来不是 sink。** obscura 的 `__obscura_tt_enforce` 五个调用点全是
+   `TrustedScript`/`TrustedHTML`，**没有一个 `TrustedScriptURL`**，因此默认策略的
+   `createScriptURL` 永远不会被调用。参考实现专门接了这条（`envFunc.js:4846`），注释写明
+   用途是「对齐 XyfR4 位掩码(createHTML=1, createScript=2, createScriptURL=4)」——即 CF
+   会统计**哪几个默认策略回调被触发过**。已在 `src` 反射器里按 `localName === 'script'`
+   接入（图片、iframe 的 `src` 不是 sink，不能一并路由）。
+
+2. **回调参数少传了 sink 名。** 规范与 Chrome 传 `(input, expectedType, sink)`，`sink` 是
+   `"Element innerHTML"` 这类字符串；策略允许据此分支，而仅凭值无法分辨。step 64 的修复
+   只传了 `(value, kind)`。已补全，五个 sink 分别给出 Chrome 的名字：`Element innerHTML`、
+   `HTMLScriptElement textContent`、`HTMLScriptElement src`、`HTMLIFrameElement srcdoc`。
+
+**顺带收敛的一处重复触发**：`script.text` 委托给 `textContent`，而后者本身也是 sink，
+两层都强制会让一次赋值触发两次策略（Chrome 只触发一次）；且中间的 `String(v)` 会把调用方
+已经加壳的 `TrustedScript` 打回字符串再转换一次。改为只由 `textContent` 这一层强制，
+中转不做 stringify。
+
+**回归测试**：`runtime.rs::sinks_hand_the_default_policy_the_expected_type_and_the_sink_name`
+（断言四个 sink 的 `(rule, expectedType, sink)` 三元组，并断言 `img.src` **不**进策略）、
+`runtime.rs::assigning_script_text_runs_the_default_policy_once`（断言调用次数为 1，
+且已加壳的值不被二次转换）。
+
+**实测（3 轮，带点击）**：CSP 拦截 0、`/eb/` 0、链路完整、无回归，**仍未通过**；
+提交体积 4976~5016 对 Chrome 的 7244 仍有差距。全量 1627 测试通过。
+
+**未采纳（需先取证）**：参考实现在 srcdoc / about:blank 子 realm 里**强制**字符串 `eval`
+抛 Chrome 文案的 `EvalError`（`envFunc.js:8447`），注释称 CF 用
+`iframe.contentWindow.eval('this')` 做跨 realm 身份探测并依赖该抛错回退父 realm 值。
+obscura 实测这两个 realm 里 `eval('1+1')` 返回 `2`。**但真机 Chrome 是否在那里抛未验证**：
+obscura 现在让 srcdoc 继承父文档 CSP，而 widget 的 CSP 含 `'unsafe-eval'`，按继承语义就不该
+抛；参考实现的说法则暗示该子帧实际是 nonce-only。两次在 Chrome 上取证都被 CF 反复重建
+iframe 打断。**照抄一个「强制抛错」会在真机不抛时制造新的可检测矛盾，故先不做。**
