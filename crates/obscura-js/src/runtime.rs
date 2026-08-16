@@ -4545,6 +4545,20 @@ mod tests {
 
     }
 
+    #[test]
+    fn media_src_csp_marks_blocked_media_as_no_source() {
+        let mut rt = setup_runtime("<html><body><video id='v' src='https://cdn.example/movie.mp4'></video></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; media-src 'self'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const v = document.querySelector('#v');
+                return [v.networkState, HTMLMediaElement.NETWORK_NO_SOURCE, v.src];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([3, 3, "https://cdn.example/movie.mp4"]));
+    }
+
     /// `console.log` must not walk the objects handed to it.
     ///
     /// With devtools closed Chrome keeps a reference and formats lazily, so an

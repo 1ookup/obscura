@@ -6429,7 +6429,16 @@ class HTMLMediaElement extends Element {
   get HAVE_ENOUGH_DATA() { return HTMLMediaElement.HAVE_ENOUGH_DATA; }
   get paused() { return true; }
   get ended() { return false; }
-  get networkState() { return HTMLMediaElement.NETWORK_EMPTY; }
+  get networkState() {
+    const raw = this.getAttribute("src");
+    if (raw) {
+      let resolved = raw;
+      try { resolved = new URL(raw, this.baseURI || globalThis.location?.href || "about:blank").href; }
+      catch (_error) {}
+      if (!_cspResourceAllows(resolved, 'media-src')) return HTMLMediaElement.NETWORK_NO_SOURCE;
+    }
+    return HTMLMediaElement.NETWORK_EMPTY;
+  }
   get readyState() { return HTMLMediaElement.HAVE_NOTHING; }
   get error() { return null; }
   get seeking() { return false; }
@@ -14730,6 +14739,34 @@ function _assertWorkerCspAllowed(url, kind) {
       "Refused to create a " + kind + " from '" + url + "' because it violates the document's Content Security Policy.",
       'SecurityError');
   }
+}
+
+function _cspResourceAllows(url, directive) {
+  const root = _callingFrameRoot();
+  const info = _domParse("document_scope_info", root) || {};
+  const header = info.csp;
+  if (!header) return true;
+  let sources = null;
+  for (const part of String(header).split(';')) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const name = tokens.shift().toLowerCase();
+    if (name === directive) { sources = tokens; break; }
+    if (!sources && name === 'default-src') sources = tokens;
+  }
+  if (!sources) return true;
+  let target;
+  try { target = new URL(String(url)); } catch (e) { return false; }
+  let selfOrigin = info.origin || 'null';
+  try { selfOrigin = new URL(globalThis.location?.href || info.url || 'about:blank').origin; } catch (e) {}
+  return sources.some(source => {
+    const value = source.toLowerCase();
+    if (value === "'none'") return false;
+    if (value === "'self'") return target.origin === selfOrigin;
+    if (value === '*') return target.protocol !== 'data:';
+    if (value.endsWith(':')) return target.protocol === value;
+    return target.origin.toLowerCase() === value.replace(/\/$/, '');
+  });
 }
 function _workerScriptFromDataUrl(url) {
   const comma = url.indexOf(',');
