@@ -3844,3 +3844,45 @@ session id 无前导零、7 条候选（6 + 终止 null）、全部是 mDNS host
 （obscura-js）——先断言**非 stealth 时 `getContext('webgl')` 仍是 `null`**，
 再断言 stealth 下的 `VENDOR`/`RENDERER`、unmasked 走扩展、着色语言版本、
 两种上下文的扩展数量与精度格式。
+
+### Step 71 — `EnxW1`：WebGPU 适配器描述（2026-08-17）
+
+**现状**：`navigator.gpu = { requestAdapter() { return Promise.resolve(null); } }`。
+探测拿到 `null` 之后再读 `adapter.info` 就抛异常，载荷里是错误哨兵 `"nJJze9"`,
+浏览器是 2293 B 的适配器画像。
+
+**结构**（从浏览器载荷反推，9 项）：
+`[adapter.info, adapter.limits 的 37 个值, adapter.features 20 项,
+getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
+三次 requestAdapter 的 info, [device.features, device.limits], canvas 上下文配置]`。
+
+**实现**：`GPU` / `GPUAdapter` / `GPUAdapterInfo` / `GPUDevice` /
+`GPUSupportedLimits` / `GPUSupportedFeatures` 六个接口，挂在 step 70 引入的同一个
+`__obscura_webgl_enabled` 开关后面——**没有 GPU 画像时仍然诚实地返回 `null`**,
+那也是 Chrome 在 GPU 不可用时的答案。
+
+要点：
+
+- `GPUSupportedFeatures` 是 **setlike**，`has()` / 迭代 / `size` 都要能用；
+  返回数组会在这三处全部露馅。
+- `GPUSupportedLimits` 的 37 个名字反射在**原型**上，枚举它的探测看到的列表
+  与浏览器一致。
+- 适配器是 **Intel / D3D12 / gen-9**，与 step 70 的 WebGL renderer 串
+  （`ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 …)`）指同一块卡。
+  参照载荷里的 `"apple"` 不能照抄——那会和 Windows UA 直接对撞。
+  同理 features 里去掉 `texture-compression-astc` / `etc2`（移动端与 Apple 的格式）,
+  保留 `texture-compression-bc`。
+- `device.limits` 用 WebGPU **规范默认值**（不申请就给默认，且默认低于适配器上限）,
+  这一组是跨适配器恒定的，可以逐值照搬。
+- `wgslLanguageFeatures` 是 Chrome 版本属性而非适配器属性，原样照搬 9 项。
+
+**结果**：`EnxW1` 8 → **2176**（Chrome 2293）。
+顺带 step 70 的 `readPixels` 改动生效：`KbSE2` 从 `["000…0", 1]` 变成
+`["f8b8aeff6b5910ffa0f1d8ff8da145ff", 1]`——稳定、非零、与指纹种子绑定。
+
+**载荷总量**：38529 → **53275**（Chrome 68327），从 56% 到 **78%**。
+
+**回归测试**：`webgpu_describes_the_same_adapter_the_webgl_renderer_claims`——
+先断言非 stealth 时 `requestAdapter()` 仍返回 `null`，再断言 setlike 行为、
+无移动端压缩格式、device 限额低于 adapter 限额、品牌串是
+`[object GPUAdapter]` / `[object GPUSupportedLimits]` / `[object GPUDevice]`。

@@ -18419,6 +18419,69 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // No profile, no adapter -- which is also Chrome's answer when the GPU
+        // is unavailable.
+        let without = rt
+            .call_function_on_for_cdp(
+                "async () => (await navigator.gpu.requestAdapter()) === null",
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(without.value.unwrap(), serde_json::json!(true));
+
+        rt.set_stealth(true);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    return {
+                        vendor: adapter.info.vendor,
+                        // setlike, not an array: `has` and iteration both work.
+                        featuresAreSetlike: typeof adapter.features.has === 'function'
+                            && adapter.features.has('texture-compression-bc')
+                            && [...adapter.features].length > 10,
+                        // No ASTC or ETC2 on a desktop Intel part.
+                        noMobileFormats: ![...adapter.features]
+                            .some(name => name.includes('astc') || name.includes('etc2')),
+                        // A device that asks for nothing gets the spec defaults,
+                        // which are below what the adapter itself reports.
+                        deviceBelowAdapter: device.limits.maxTextureDimension2D
+                            < adapter.limits.maxTextureDimension2D,
+                        preferredFormat: navigator.gpu.getPreferredCanvasFormat(),
+                        wgslCount: [...navigator.gpu.wgslLanguageFeatures].length,
+                        brands: [String(adapter), String(adapter.limits), String(device)],
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "vendor": "intel",
+                "featuresAreSetlike": true,
+                "noMobileFormats": true,
+                "deviceBelowAdapter": true,
+                "preferredFormat": "bgra8unorm",
+                "wgslCount": 9,
+                "brands": ["[object GPUAdapter]", "[object GPUSupportedLimits]",
+                    "[object GPUDevice]"],
+            })
+        );
+    }
+
     #[test]
     fn the_gpu_profile_follows_stealth_and_hides_the_adapter_behind_the_debug_extension() {
         let mut rt = setup_runtime("<html><body></body></html>");
