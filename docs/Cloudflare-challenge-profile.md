@@ -4,7 +4,14 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态：**未通过**。P0 五项 parity 修复（step 40）后输入链路保持打通、时间线全面提速，
+当前状态：**未通过,但断点已前移到最后一步**(2026-08-16,step 55/56)。`/pat/`(401)与
+`/ci/`(200)均已发出且状态码与 Chrome 一致,`interactiveBegin` → 点击 → **5052B 提交** →
+**3256B 回传**全链路打通;唯一没走通的是最后的判定——CF 不发 `complete`,直接换 ray 重来。
+**`fail code=600010` 现在是唯一实质阻塞**,失败码在加密响应体内。挂了六个 step 的
+「`/pat/` 从不发出」已解除:它来自 `709cb1b..HEAD` 的 parity 改进,此前被 `1f963b7` 的
+Trusted Types 回归挡住(step 49-52 定位并修复)。
+
+以下为 2026-08-15 及以前的状态记录:**未通过**。P0 五项 parity 修复（step 40）后输入链路保持打通、时间线全面提速，
 但**断点始终未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40/44/45/46/47），
 `complete` 依旧为 0。点击被接受（Verifying…）→ 提交 5052B → 回传 3256B → 仍被判失败
 （`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。机制定位已收敛（step 45/46）：`/pat/`
@@ -1942,6 +1949,8 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
 | **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
 | `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
+| **用不点击的探针判断提交链**（step 52-55 全部轮次） | `cdp_ci_timing_hook.py` 只导航加等待,点击之后的 5052B 提交与 3256B 回传因此永远不出现,却被当成「链路到此为止」 | 判据链凡是涉及点击之后的部分,必须用 `cdp_click_fast.py`(`--start` 要落在 `interactiveBegin` 之后);不点击的轮次只能用来看点击**之前**的阶段 |
+| **预注入 net-hook 看不到 `op_fetch_url` 直发的请求**（`has_tx=false`） | step 45/46 据此得出「`/pat/` 从未被 JS 构造」,而 `/pat/` 恰好走这条路;step 55 用 Rust 日志才看到它 | 判断「某请求是否发出」以 `RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` / `stealth_fetch completed` 为准,JS 钩子只能回答「由页面脚本的哪个 API 构造」 |
 | **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined。据此得出「删掉 TT 仍不恢复 → 还有第二处回归」的错误结论（step 51/52） | 要真正移除就只 `delete`，并当场用 `name in globalThis` 和 `Object.getOwnPropertyNames` 复验，而不是用 `typeof` |
 | **单次测量当判据**（本页多数 A/B 结论早期只测 1-2 次） | step 52 实测同一二进制 5 轮里有 1 轮偏离（`xhr=1` vs `3`），说明判据存在 CF 端偶发波动 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值；差异要在多轮上稳定才算数 |
 | **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | step 52 一度在 HEAD（距目标 commit 还有 22 个提交）上删 TT，用结果推断该 commit 的行为 | 干预实验必须跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 复现 |
@@ -2773,3 +2782,110 @@ workspace member,而 `render` 是其他成员用的 feature 名,从根跑 `--fea
 (E0433/E0425),而 `cargo tree` 却显示 `[default,paint]`。加 `render = ["paint"]` 别名修复
 (`0b09e33`)。另注:`obscura-cli::mcp_client` 的 `test_navigate_and_snapshot` /
 `test_wait_for_selector` 在并行满载下偶发失败,单独跑稳定通过,属既有 flaky。
+
+### Step 55 — `/pat/` 首次发出（401,与 Chrome 同码):挂了六个 step 的首要阻塞解除（2026-08-16）
+
+**结论先行**:`/pat/` **发出了**,状态码 **401**,与 Chrome 逐字一致;`brunhild.../i/` 也在。
+**但仍未过盾**——目标 URL 仍返回 `Just a moment...` 而非真实 404,判据未变。断点前移,不是通关。
+
+**证据 1 — 完整请求序列**(HEAD 二进制,`RUST_LOG=obscura_js=debug`,同 IP 同代理):
+
+```
+08:19:01.912  GET  zencare /orchestrate/chl_page   -> 200 (229136 bytes)
+08:19:02.190  GET  challenges /turnstile/.../api.js
+08:19:02.323  POST zencare /fo/ (tokenA)           -> 200 (113560 bytes)
+08:19:04.568  POST challenges /fo/ (tokenB)        -> 200
+08:19:05.829  GET  brunhild.challenges /i/                        ← Chrome 序列 #9
+08:19:05.832  GET  challenges /pat/                -> 401         ← Chrome 序列 #10,同码
+08:19:08.507  POST challenges /fo/                 -> 200         ← Chrome 序列 #12
+```
+
+对照 step 49 采集的 Chrome 黄金序列,`#6`→`#12` 已逐条对上(`/ci/` 走 Image 路径,net-hook
+计数为 1)。
+
+**证据 2 — A/B 排除「一直如此,只是没看到」**。这一条必须先做:`/pat/` 走
+`op_fetch_url` 直发(日志 `has_tx=false`),**不经过 JS 的 XHR/fetch/img.src**,所以
+step 46 赖以定论的预注入 net-hook 天然看不见它。同一 IP、同一探针、同一日志级别:
+
+| 二进制 | 轮次 | `/pat/` | challenges `/fo/` |
+|---|---|---|---|
+| `709cb1b`(step 47 代码) | 2 轮 | **0** | 7 |
+| HEAD(含本日四项修复) | 6 轮 | **2** | 7 |
+
+`709cb1b` 流程同样走完(`chFO=7`)却零 `/pat/`,所以不是「旧版也发只是没观测到」,是真差异。
+
+**证据 3 — 归因:不是本日那三项指纹修复,而是 26 个 parity commit 被 TT 修复解锁**。
+三项运行时干预逐个回退,`/pat/` **全部仍为 2**:
+
+| 干预(预注入,HEAD 二进制) | `/pat/` |
+|---|---|
+| 不干预(基线,2 轮) | 2 |
+| `delete crossOriginIsolated`(退回 undefined) | 2 |
+| 恢复引擎全局为可枚举 | 2 |
+| `measureText` 退回普通对象 + 三属性 | 2 |
+
+再看两个中间点:
+
+| 二进制 | `/pat/` | challenges `/fo/` | 说明 |
+|---|---|---|---|
+| `6b9b8a0`(前 16 个 commit,TT 回归在) | 0 | **0** | TT 回归把流程卡在最早期,根本走不到 PAT 阶段 |
+| `fix2`(TT 修复 + 全局 + coi,**无** TextMetrics) | **2** | 7 | 已经有 `/pat/` |
+
+合起来:`/pat/` 既不来自 `crossOriginIsolated`、也不来自引擎全局隐藏或 TextMetrics
+(三者回退后依然发出,且 `fix2` 缺 TextMetrics 也照发)。它来自 **`709cb1b..HEAD` 的 26 个
+parity commit**(secure context、Worklet、SharedWorker、SharedArrayBuffer 按 Chrome 收起
+等),而这些改进此前**被 `1f963b7` 的 TT 回归挡在门外**——流程停在 `xhr=1`,连 822KB 都发
+不出,自然到不了 PAT 阶段。step 52 修掉 TT 之后它们才第一次真正生效。
+
+这也回答了 step 49 留下的那个反直觉现象:那 26 个 commit 让 API 面普遍更接近 Chrome,
+却整体退化——因为其中一个补了半截的 API 面(TT)把其余全部收益吃掉了。
+
+**证据 4 — 仍未过盾**。`fetch --wait 30` 终页仍是 `Just a moment...`,非真实 404。
+
+**测量盲区(新增,重要)**:预注入 net-hook 只覆盖 JS 层的 `XMLHttpRequest.open`/`fetch`/
+`img.src`/`sendBeacon`,**看不到 `op_fetch_url` 直发的请求**(`has_tx=false`)。step 45/46
+「`/pat/` 从未被 JS 构造」的零命中结论建立在该钩子上,**其覆盖面小于当时的表述**。判断
+「某请求是否发出」必须以 Rust 侧 `RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` /
+`stealth_fetch completed` 为准,JS 钩子只能用来判断「是否由页面脚本的哪个 API 构造」。
+另注 `/pat/` 与 `brunhild /i/` 相邻且同为 `has_tx=false`,两者可能来自同一个预注入未覆盖
+的上下文,待查。
+
+**未决清单变更**:`/pat/ 从不发出` 从首要阻塞**移除**。当前首要阻塞回到
+**`interactiveBegin` 之后的交互确认与 `fail code=600010`**,以及 step 47 提出的
+**frame 文档缺 navigation timing**(本轮未复验)。
+
+### Step 56 — 补上点击这一环:提交链完整,断点回到「提交后被判失败」（2026-08-16）
+
+**测量缺陷先记**(用户追问才发现):step 52-55 的**所有**轮次用的都是
+`/tmp/cdp_ci_timing_hook.py`,它只导航加等待,**从不点击**。判据链里点击之后的那两个请求
+因此不可能出现,而我在 step 55 里只对照到 Chrome 序列的 `#12` 就收尾了。**没有点击的轮次
+不能用来判断提交链是否通**,这条补进「测量盲区」。
+
+**带点击的完整序列**(`cdp_click_fast.py --start 6 --deadline 40 --settle 18`,
+`RUST_LOG=obscura_js=debug`,同 IP 同代理):
+
+```
+08:32:42.643  GET  zencare /orchestrate      -> 200 (229565)
+08:32:43.064  POST zencare /fo/  (tokenA)    -> 200 (113560)
+08:32:46.276  POST challenges /fo/ (tokenB)  -> 200 (845720)   ← 822KB 大载荷
+08:32:47.094  GET  challenges /pat/          -> 401 (1)        ← step 55 的突破
+08:32:50.120  POST challenges /fo/           -> 200 (127720)   ← 127KB 交互变体
+              [click @ t=6.9s,interactiveBegin 在 6.68s,点击落在其后 0.2s]
+08:32:52.404  POST challenges /fo/           -> 200 (5052)     ← 提交 POST
+08:32:52.730  POST zencare /fo/              -> 200 (3256)     ← 主页面回传
+08:32:55.229  GET  zencare /orchestrate      -> 200 (227898)   ← 换 ray 重来 = 判失败
+```
+
+widget 几何正常(`box={x:192,y:304,w:300,h:65}`),点击命中 `(213,335)`。
+
+**结论**:**判据链除最后一步外全部走通**——`interactiveBegin` → 点击 → **5052B 提交** →
+**3256B 回传**,量级与 step 40/43 记录的一致。之后没有 `complete`、没有 token,CF 直接
+重新下发 orchestrate 换 ray,即判失败。postMessage 只有四条
+(`init`/`requestExtraParams`/`translationInit`/`interactiveBegin`),
+**`interactiveEnd` 本轮未出现**——与 step 41 记的「间歇性、不可作判据」一致。
+
+**当前断点**(相对 step 40 的净变化):`/pat/` 与 `/ci/` 都已发出且状态码与 Chrome 一致,
+822KB→127KB→5052B→3256B 全链路打通,**唯一没有变的是最后的判定**:提交被接受但不发
+`complete`。即 step 37 起就挂着的 `fail code=600010` 那一项,现在是**唯一**实质阻塞。
+失败码在加密响应体内,`RUST_LOG` 看不到,需要解开 `cfChlOut`/`cfChlOutS` 或在 api.js
+字符串表里定位 `600010` 分支。
