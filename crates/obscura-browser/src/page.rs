@@ -2149,7 +2149,7 @@ impl Page {
             (budget != 0).then_some(budget)
         };
 
-            let execute_classic =
+        let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
              fetched_script: Option<(String, String, obscura_net::Response)>| {
