@@ -4071,3 +4071,57 @@ obscura: DejaVu Sans, Liberation Mono, Liberation Sans, Lucida Console, Noto San
 **教训**：step 74 是「修了一个真实缺陷，但它不是本字段的成因」。
 **改完必须回到那个字段本身复测**，不能因为本地探针变好就认为字段会跟着变——
 本字段修前修后逐字节相同，正是这条的代价。
+
+### Step 76 — `qOeu1`：引擎自己的内部选择器泄漏进了页面的观测（2026-08-17）
+
+`qOeu1` 是 CF 钩住 `querySelector`/`querySelectorAll` 后记下的**选择器序列**。
+浏览器 34 条，全是 CF 自己的（`.oEtkm22`、`#cfIz02`、`#sDsJ6` …）；
+obscura **74 条**，其中大半是这三个反复出现的：
+
+```
+[id],embed[name],form[name],iframe[name],img[name],object[name]
+style
+link[rel~="stylesheet"]
+title
+```
+
+**这些不是页面查的，是 bootstrap.js 自己查的**——具名 window 访问
+（`window.foo` 的候选枚举）、样式表发现、`title` getter、
+`label.control` / `element.labels`。它们走的是**页面可见的**
+`querySelector`/`querySelectorAll`，于是每一次内部查询都进了 CF 的日志。
+浏览器里这些都是原生实现，不会经过任何页面能钩到的入口。
+
+这与 `document._nid` / `screen._w` 是同一类问题：**引擎内部动作对页面可见**。
+区别在于前者是「静态字段」，这个是「运行时行为」，而且**每次内部操作都会再记一条**,
+所以它同时暴露了引擎的内部调用频率。
+
+**修复**：加一条内部通道 `_internalQuerySelector(All)`，直接走
+`_domParse('query_selector_all_scoped', nid, sel)` 这个 DOM op,
+绕开公开方法。把上述全部调用点切过去。
+
+**结果**：
+
+| | Chrome | 修前 | 修后 |
+|---|---|---|---|
+| `qOeu1` 条数 | 34 | 74 | **18** |
+| `qOeu1` 字节 | 373 | 2221 | **~200** |
+
+修后的 18 条**全部是 CF 自己的选择器**，与浏览器同性质：
+
+```
+window.frameElement, #sDsJ6 … #undefined, #BIsX1, .Oycad8, .DywTL2, .pFfL9, .FWHsC3,
+button,input,meter,output,progress,select,textarea
+```
+
+**残留两点**：
+
+1. 最后那条 `button,input,...` 来自 `element.labels` 的实现里的 `this.matches(...)`,
+   Chrome 是原生的。要一并消掉得给 `matches` 也开内部通道。
+2. 浏览器列表里 `.oEtkm2x` / `#cfIz0x` 那 22 条 obscura **完全没有**——
+   那是 CF 建好自己的 DOM 之后在遍历它。obscura 走不到那一步,
+   与 `PvWp9`（`TypeError: Cannot read properties of null (reading 'innerHTML')`）
+   大概率是同一处失败。**这是下一个目标。**
+
+**排查手记**：`PvWp9` 那条异常**抓不到**——CDP 的 `Runtime.exceptionThrown` 只报
+未捕获异常，而 CF 自己 try/catch 了。改从 `qOeu1` 这条「CF 查了什么」的轨迹入手,
+才看出两边在查完全不同的东西。**当一个异常被对方吞掉时，去看它吞掉之前做了什么。**

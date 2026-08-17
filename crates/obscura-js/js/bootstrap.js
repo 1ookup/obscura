@@ -3336,7 +3336,7 @@ class Element extends Node {
     // Native fragment replacement bypasses Node.removeChild. Disassociate
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
-    for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
+    for (const style of _internalQuerySelectorAll(this, "style")) _detachStyleSheet(style);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -3451,13 +3451,15 @@ class Element extends Node {
       const target = root.getElementById(forId);
       return target && target.matches && target.matches(labelable) && !target.matches('input[type=hidden]') ? target : null;
     }
-    return this.querySelector ? this.querySelector(labelable) : null;
+    // Chrome resolves a label's control internally; issuing the query
+    // through the public method puts this selector in any log the page keeps.
+    return _internalQuerySelector(this, labelable);
   }
   get labels() {
     const labelable = 'button,input,meter,output,progress,select,textarea';
     if (!this.matches || !this.matches(labelable) || this.matches('input[type=hidden]')) return undefined;
     const root = this.getRootNode ? this.getRootNode() : document;
-    const labels = root && root.querySelectorAll ? root.querySelectorAll('label') : [];
+    const labels = root && root.querySelectorAll ? _internalQuerySelectorAll(root, 'label') : [];
     const result = [];
     for (const label of labels) {
       if (label.control === this || (!label.getAttribute('for') && label.contains && label.contains(this))) result.push(label);
@@ -5207,7 +5209,7 @@ class Document extends Node {
   get title() { return _domParse("document_title") ?? ""; }
   set title(v) {
     const value = String(v);
-    let title = this.querySelector("title");
+    let title = _internalQuerySelector(this, "title");
     if (!title) {
       let head = this.head;
       const root = this.documentElement;
@@ -6825,7 +6827,7 @@ class _ScopedDocument extends Document {
     return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, sel));
   }
   get title() {
-    const t = this.querySelector("title");
+    const t = _internalQuerySelector(this, "title");
     if (!t) return "";
     return (t.textContent || "").split(/[\t\n\f\r ]+/).filter(Boolean).join(" ");
   }
@@ -10005,8 +10007,8 @@ function _detachStyleSheetsInSubtree(root) {
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
   if (!root.querySelectorAll) return;
-  for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
-  for (const link of root.querySelectorAll('link[rel~="stylesheet"]')) {
+  for (const style of _internalQuerySelectorAll(root, "style")) _detachStyleSheet(style);
+  for (const link of _internalQuerySelectorAll(root, 'link[rel~="stylesheet"]')) {
     _detachLinkedStyleSheet(link);
   }
 }
@@ -10031,7 +10033,7 @@ class StyleSheetList {
   }
   _sheets() {
     const nodes = this._root.querySelectorAll
-      ? this._root.querySelectorAll('style, link[rel~="stylesheet"]')
+      ? _internalQuerySelectorAll(this._root, 'style, link[rel~="stylesheet"]')
       : [];
     const out = [];
     for (const style of nodes) {
@@ -13493,11 +13495,42 @@ function _windowNamedSupportedNames(element) {
   return names;
 }
 
+
+// Engine-internal selector queries.
+//
+// `querySelector`/`querySelectorAll` are page-visible and pages hook them --
+// a challenge script logs every selector it sees pass through. Routing the
+// engine's own lookups (named window access, stylesheet discovery, the title
+// getter) through the public methods put those selectors in the page's log:
+// where a browser showed 34 selectors, all the page's own, this showed 74,
+// most of them `[id],embed[name],...` and `link[rel~="stylesheet"]`. The
+// internals go straight to the DOM op instead, which no page can observe.
+function _internalQuerySelectorAll(root, selector) {
+  const nid = root && typeof root._nid === 'number'
+    ? root._nid
+    : (root === globalThis.document ? _documentRootNid() : null);
+  if (nid === null) return [];
+  const ids = _domParse('query_selector_all_scoped', nid, selector) || [];
+  const out = [];
+  for (const id of ids) {
+    const element = _wrapEl(id);
+    if (element) out.push(element);
+  }
+  return out;
+}
+function _internalQuerySelector(root, selector) {
+  return _internalQuerySelectorAll(root, selector)[0] || null;
+}
+function _documentRootNid() {
+  const scoped = globalThis.__obscura_frame_document_nid;
+  return typeof scoped === 'number' ? scoped : 0;
+}
+
 function _windowNamedCandidates(name) {
   const doc = globalThis.document;
   if (!doc || !name) return [];
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+  const elements = _internalQuerySelectorAll(
+    doc, "[id],embed[name],form[name],iframe[name],img[name],object[name]"
   );
   const matches = [];
   for (let i = 0; i < elements.length; i++) {
@@ -13550,8 +13583,8 @@ function _windowNamedNamesInTree(root) {
     for (const name of _windowNamedSupportedNames(root)) names.add(name);
   }
   if (typeof root.querySelectorAll === "function") {
-    const elements = root.querySelectorAll(
-      "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+    const elements = _internalQuerySelectorAll(
+      root, "[id],embed[name],form[name],iframe[name],img[name],object[name]"
     );
     for (let i = 0; i < elements.length; i++) {
       for (const name of _windowNamedSupportedNames(elements[i])) names.add(name);
@@ -13575,8 +13608,8 @@ function _reconcileWindowNamedProperties(names) {
   const doc = globalThis.document;
   if (!doc) return;
   const present = new Set();
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
+  const elements = _internalQuerySelectorAll(
+    doc, "[id],embed[name],form[name],iframe[name],img[name],object[name]"
   );
   for (let i = 0; i < elements.length; i++) {
     for (const name of _windowNamedSupportedNames(elements[i])) {
@@ -13949,7 +13982,7 @@ class _IframeDocument {
       slots.body.innerHTML = bodyContent;
     }
 
-    const titleEl = slots.head.querySelector('title');
+    const titleEl = _internalQuerySelector(slots.head, 'title');
     if (titleEl) slots.title = titleEl.textContent;
   }
 
@@ -17419,7 +17452,7 @@ if (typeof FontFace === 'undefined') {
   };
   const _fontFaceAuthoredRules = doc => {
     const out = [];
-    for (const style of doc.querySelectorAll('style')) {
+    for (const style of _internalQuerySelectorAll(doc, 'style')) {
       const css = style.textContent || '';
       const pattern = /@font-face\s*\{([\s\S]*?)\}/gi;
       let match;
