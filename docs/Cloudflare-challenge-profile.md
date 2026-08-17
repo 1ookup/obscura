@@ -4125,3 +4125,58 @@ button,input,meter,output,progress,select,textarea
 **排查手记**：`PvWp9` 那条异常**抓不到**——CDP 的 `Runtime.exceptionThrown` 只报
 未捕获异常，而 CF 自己 try/catch 了。改从 `qOeu1` 这条「CF 查了什么」的轨迹入手,
 才看出两边在查完全不同的东西。**当一个异常被对方吞掉时，去看它吞掉之前做了什么。**
+
+### Step 77 — 追 `PvWp9` / `QCEE0`：找到并修掉 `outerHTML` setter 与 `offsetParent`（2026-08-17）
+
+**模块对应关系先坐实**：Chrome 的模块 24 只产 `QCEE0`（843 B，120 个探测值）,
+obscura 对应的模块只产 `PvWp9`（那条 TypeError）。一个模块一个键，
+**说明整个模块在第一步就抛了**。
+
+**抓不到栈的两次尝试**：
+
+1. CDP `Runtime.exceptionThrown` —— 只报**未捕获**异常，CF 自己 try/catch 了，0 命中。
+2. CDP `Debugger.setPauseOnExceptions` —— obscura 的 `Debugger.enable`
+   在 `server.rs:1487` 只是个空壳，整个域没实现，0 次 pause。
+
+**改用矩阵法**：既然消息是 `reading 'innerHTML' of null`，就把「什么情况下会拿到
+null」逐个试出来。先测**插入路径**（9 种），再测**查询面**（12 种）:
+
+| 插入路径 | 结果 |
+|---|---|
+| innerHTML / insertAdjacentHTML / createContextualFragment / DOMParser+importNode / template.content / createElement / setAttribute / replaceChildren | 都能查到 |
+| **`el.outerHTML = '...'`** | **查不到，宿主内容纹丝不动** |
+
+**根因之一**：`outerHTML` **只有 getter 没有 setter**。非严格模式下（页面代码通常是）
+给只读访问器赋值**既不报错也不生效**——元素原地不动，页面随后去找那个替换进来的
+元素自然是 null。已按规范补上 setter（无父节点 / 父节点是 Document 时抛
+`NoModificationAllowedError`，DocumentFragment 父节点按 `<body>` 上下文解析）。
+
+**顺带修掉**：`offsetParent` **整个属性不存在**，读出来是 `undefined`——
+浏览器里它永远是元素或 `null`。已补（display:none / position:fixed / body / html
+返回 null，否则向上找第一个 positioned 祖先或 td/th/table 或 body）。
+
+**但 `PvWp9` 仍在，`QCEE0` 仍缺**。12 种查询面（脱离文档的子树、closed/open shadow、
+DocumentFragment、template.content、SVG、多 class、三层嵌套、iframe 文档、
+自定义元素、style 元素）**全部正常**。
+
+**一次性诊断构建**（未提交）：给所有可能返回 null 的访问器/方法加返回值钩子,
+只在调用栈里含 `cloudflare`/`challenge` 时打栈。产出：
+
+- `el.querySelector('#cf-chl-widget-XXX-fr')` → null ×6（chl_page 轮询）
+- `doc.querySelector('#cf-chl-widget-XXX_response')` → null ×2
+- `shadowRoot` → null（closed root，两边都一样，非缺陷）
+- `previousElementSibling` / `closest('form')` → null（正常）
+
+前两条**是轮询早于 widget 渲染**，不是缺陷——事后查页面 DOM,
+`INPUT#cf-chl-widget-XXX_response[name=cf-turnstile-response]` 确实存在,
+widget iframe 在 closed shadow 里（`querySelectorAll('*')` 穿不透）。
+
+**所以 `PvWp9` 的 null 不来自这批访问器。** 还没收敛。剩余候选（未验证）：
+`document.all`（obscura **完全没有**，Chrome 有；但它的 `[[IsHTMLDDA]]` falsy 语义
+**在 JS 层无法伪造**——`typeof document.all === 'undefined'` 是 V8 的规范级特性,
+补一个半成品只会制造新的可检测差异，**故意不做**，需要 V8 侧支持）、
+`elementsFromPoint` 只返回 1 个（Chrome 至少 2 个：body 与 html）。
+
+**方法论**：对方 try/catch 掉异常时，`Runtime.exceptionThrown` 和空壳 Debugger 都指望不上,
+**给「可能返回 null 的东西」加返回值钩子**比给「抛异常的地方」加钩子有效——
+前者能在异常发生**之前**把嫌疑对象点出来。

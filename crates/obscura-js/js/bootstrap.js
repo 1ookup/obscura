@@ -3354,6 +3354,33 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  // Assigning outerHTML replaces the element with the parsed markup. There was
+  // only a getter, so in sloppy mode -- which page code usually is -- the
+  // assignment did nothing at all and no error was raised: the element stayed
+  // put, and the replacement a page then went looking for was never there.
+  set outerHTML(v) {
+    const parent = this.parentNode;
+    if (!parent) {
+      throw new DOMException(
+        'This element has no parent node.', 'NoModificationAllowedError');
+    }
+    if (parent.nodeType === 9) {
+      throw new DOMException(
+        'This element has no parent node.', 'NoModificationAllowedError');
+    }
+    const markup = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element outerHTML');
+    // A DocumentFragment parent cannot be a parsing context, so the fragment is
+    // parsed as if for <body>, per the spec's fragment parsing algorithm.
+    const context = parent.nodeType === 1 ? parent : null;
+    const replacements = _parseHTMLFragment(markup, context);
+    const oldChildren = _domParse("child_nodes", parent._nid) || [];
+    for (const node of replacements) parent.insertBefore(node, this);
+    parent.removeChild(this);
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation(
+        'childList', parent._nid, _domParse("child_nodes", parent._nid) || [], oldChildren);
+    }
+  }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
@@ -4432,6 +4459,27 @@ class Element extends Node {
   }
   get offsetTop() { return this.getBoundingClientRect().top; }
   get offsetLeft() { return this.getBoundingClientRect().left; }
+  // The offset parent is the ancestor those two are measured against. It was
+  // absent entirely, so reading it gave `undefined` -- a value the attribute
+  // never has in a browser, which returns an element or null.
+  get offsetParent() {
+    const name = this.localName;
+    if (name === 'body' || name === 'html' || !this.isConnected) return null;
+    const styleOf = element => {
+      try { return globalThis.getComputedStyle(element); } catch (_error) { return null; }
+    };
+    const own = styleOf(this);
+    // A box that is not rendered, and a fixed box, have no offset parent.
+    if (own && (own.display === 'none' || own.position === 'fixed')) return null;
+    for (let node = this.parentElement; node; node = node.parentElement) {
+      const local = node.localName;
+      if (local === 'body') return node;
+      const style = styleOf(node);
+      if (style && style.position && style.position !== 'static') return node;
+      if (local === 'td' || local === 'th' || local === 'table') return node;
+    }
+    return null;
+  }
   // In standards mode documentElement exposes viewport client geometry.
   // Puppeteer's #clickableBox clips boxes to those dimensions; returning the
   // non-render fallback 100x20 there makes every element appear off-screen.

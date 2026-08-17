@@ -18419,6 +18419,55 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn assigning_outer_html_replaces_the_element_and_offset_parent_resolves() {
+        let mut rt = setup_runtime(
+            "<html><body><div id=host><span id=old></span></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const host = document.getElementById('host');
+                    // Only a getter existed, so in sloppy mode this assignment
+                    // silently did nothing and the replacement was never there
+                    // for the next query to find.
+                    document.getElementById('old').outerHTML =
+                        '<span class="fresh">replaced</span>';
+                    const fresh = document.querySelector('.fresh');
+                    let detachedThrew = '';
+                    try { document.createElement('i').outerHTML = '<b></b>'; }
+                    catch (error) { detachedThrew = error.name; }
+                    const positioned = document.createElement('div');
+                    positioned.style.position = 'relative';
+                    const child = document.createElement('span');
+                    positioned.appendChild(child);
+                    document.body.appendChild(positioned);
+                    return {
+                        replaced: fresh ? fresh.innerHTML : null,
+                        oldIsGone: document.getElementById('old') === null,
+                        hostHtml: host.innerHTML,
+                        // A parentless element cannot be replaced.
+                        detachedThrew,
+                        // Never `undefined`: a browser answers an element or null.
+                        offsetParent: child.offsetParent === positioned,
+                        bodyHasNone: document.body.offsetParent,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "replaced": "replaced",
+                "oldIsGone": true,
+                "hostHtml": "<span class=\"fresh\">replaced</span>",
+                "detachedThrew": "NoModificationAllowedError",
+                "offsetParent": true,
+                "bodyHasNone": null,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_local_font_source_fails_for_a_family_this_machine_does_not_have() {
         let mut rt = setup_runtime("<html><body></body></html>");
