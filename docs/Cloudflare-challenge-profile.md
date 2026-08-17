@@ -4244,3 +4244,74 @@ all.namedItem('probe')   该元素           document.all === all true
 | `gqGB4` 字体 | 83 | 738 | **93** |
 | `qOeu1` 选择器 | 373 | 2221 | **147** |
 | 载荷总量 | 68327 | 38529 | **52034** |
+
+### Step 79 — `fyCZH9`：先把这个字段的**结构**搞清楚，之前的读法是错的（2026-08-18）
+
+**假设**：`fyCZH9` 差 15KB 的根因是动态 iframe 的 `_IframeWindow` 垫片
+（step 78 结尾记的「Phase 3.5 统一」）。
+
+**方法**：不再猜，直接解析浏览器基线 `/tmp/har/json/2.json` 的 `fyCZH9`。
+
+**证据**：它不是「属性名列表」，而是一张**值 → 属性名数组**的映射：
+
+```
+"N": ["alert","atob","blur",...]          1164 条，native 函数
+"x": ["opener","onabort","onblur",...]     266 条，null
+"o": ["window","self","document",...]      122 条，object
+"F"/"T"/"u"：false / true / undefined
+其余：值本身当 key（数字、字符串）
+```
+
+前缀规则确认为：裸名 = `Object.getOwnPropertyNames(window)`；
+`d.`/`n.`/`s.`/`so.` = 对 document/navigator/screen/screen.orientation 的 `for..in`；
+`o.` = 页面 window 上、干净 iframe window 上没有的名字（只有 28 条，
+基本是 `angular`、`runProgram` 和 CF 自己的混淆全局）。
+
+**结论（推翻两处旧记录）**：
+
+1. **方向记反了。** 30881 是 **Chrome** 的，obscura 是 15390。obscura 不是多报，
+   是**少报一半**。`o.` 只值 28 条，iframe 垫片根本不是这 15KB 的来源——
+   来源是 obscura 的平台面比 Chrome 小：`N` 386 vs 1164、`d.` 212 vs 295、
+   `n.` 34 vs 81。
+2. **step 68 记的「泄漏 11 → 0」不成立。** 用同一套分桶在本地复算，还剩五处：
+
+   | 泄漏 | 表现 |
+   |------|------|
+   | `Deno` | hide list 的三条模式（`_` 开头 / 含 obscura / 含 Obscura）一条都不匹配 |
+   | `window[0]`..`window[49]` | 无条件定义 50 个，而 `window.length` 是 0 |
+   | `d._nid` / `d._scopeRoot` | `Node` 与 `_ScopedDocument` 构造里的普通赋值，`for..in` 直接列出 |
+   | `window.onerror` / `onunhandledrejection` | 槽位里坐着引擎函数，读到的是**函数源码** |
+   | 4 个 window 方法未标 native | `addEventListener` 等，585 字节引擎源码 |
+
+   当时的「0」是拿 CF 载荷里的 `o.` 一项当全部看的——`o.` 只覆盖
+   「页面 window 比干净 iframe 多出来的名字」，而 `Deno`、数字下标、
+   函数源码全部落在**裸名**那一类，不在 `o.` 里。
+
+**修复**（`ef59440`、`2ca045c`）：
+
+| 项 | 修前 | 修后 |
+|----|------|------|
+| `Object.getOwnPropertyNames(window)` 里的 `Deno` | 有 | 无 |
+| 数字下标 | 恒 50 个 | 等于 `window.length`，连接/断开时同步 |
+| `for (k in document)` 的引擎字段 | `_nid`、`_scopeRoot` | 无 |
+| 非 native 函数（值即源码） | 6 个 / 585 字节 | 0 |
+| window 事件处理器 | 86，缺 42 多 3 | **125 / 125，零缺零多** |
+| document 事件处理器 | 86，缺 47 多 16 | **117 / 117，零缺零多** |
+
+事件处理器拆成四组（GlobalEventHandlers / WindowEventHandlers / 剪贴板 /
+Document 专有），名单取自 Chrome 149 的实际枚举而不是规范文本——Chrome 有
+`onmousewheel`、四个 `onwebkit*` 别名和 `onsearch`，规范里都没有。
+
+`window.length` 同时改走内部选择器通道，不再进入 `qOeu1` 的观测。
+
+**未做**：裸名仍差 698 个**接口构造器**（`AudioBuffer`、`XRSession` 这类
+obscura 确实没实现的），`n.` 差 49（`mediaDevices`、`clipboard`、
+`serviceWorker` 等），`d.` 差 53。构造器要不要凭空补是个真实的取舍，
+补了会让特性检测走进一条随后就失败的分支，没在无人值守里替用户决定。
+
+**测量盲区新增两条**：
+
+| 盲区 | 症状 | 正确做法 |
+|------|------|----------|
+| **只看载荷里某一个子类就断言「泄漏清零」** | `o.` 干净，就以为整个字段干净；`Deno`、`window[0..49]`、函数源码全在裸名类里，一条没查 | 先把字段的**结构**解析清楚（有几类、各类怎么来的），再对每一类分别复算 |
+| **把「obscura 比 Chrome 多」和「少」记反** | 照着「多报」的方向去找泄漏，真因是平台面缺了一半 | 对比表里两列都写清楚哪列是谁，数字旁边标基线 |
