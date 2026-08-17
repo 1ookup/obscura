@@ -18547,6 +18547,49 @@ RequestRedirect value",
         );
     }
 
+    /// Window and Document expose different event-handler mixins. One shared
+    /// list used to put both sets on both objects, which is why Document
+    /// answered to `onbeforeunload`.
+    #[test]
+    fn the_event_handler_attributes_follow_the_interface_that_defines_them() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => ({
+                    // WindowEventHandlers: Window only.
+                    windowOnlyOnWindow: 'onbeforeunload' in window && 'onhashchange' in window,
+                    windowOnlyOnDocument: 'onbeforeunload' in document || 'onhashchange' in document,
+                    // Document-specific.
+                    documentOnlyOnDocument: 'onreadystatechange' in document
+                        && 'onvisibilitychange' in document,
+                    documentOnlyOnWindow: 'onreadystatechange' in window
+                        || 'onvisibilitychange' in window,
+                    // DocumentAndElementEventHandlers: not on Window.
+                    clipboardOnDocument: 'oncopy' in document && 'onpaste' in document,
+                    clipboardOnWindow: 'oncopy' in window || 'onpaste' in window,
+                    // GlobalEventHandlers: all three.
+                    sharedEverywhere: 'onclick' in window && 'onclick' in document
+                        && 'onclick' in document.body && 'onanimationend' in window,
+                    // Still null until assigned, and still a working slot.
+                    initial: window.onhashchange,
+                }))()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "windowOnlyOnWindow": true,
+                "windowOnlyOnDocument": false,
+                "documentOnlyOnDocument": true,
+                "documentOnlyOnWindow": false,
+                "clipboardOnDocument": true,
+                "clipboardOnWindow": false,
+                "sharedEverywhere": true,
+                "initial": null,
+            })
+        );
+    }
+
     /// Removing the last iframe takes `window[0]` with it; the indices are not
     /// a high-water mark.
     #[test]

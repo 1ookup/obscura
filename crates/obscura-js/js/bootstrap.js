@@ -7448,27 +7448,76 @@ globalThis.length = 0;
 // never fires onChange for controlled inputs (issue #324). Initialising these to
 // null on all three targets makes the checks match real browsers. On Document and
 // Element they are non-enumerable so they don't surface in `for..in` over nodes.
-for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
-  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
-  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
-  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
-  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
-  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
-  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
-  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
-  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
-  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
-  "unload","volumechange","waiting","wheel",
-]) {
+// The event-handler IDL attributes, split the way the mixins are: one set
+// shared by Window, Document and Element, one only on Window, one only on
+// Document, and the clipboard pair that Document and Element share.
+//
+// The names come from enumerating window and document in Chrome 149, not from
+// spec text. Chrome ships several that no spec lists (`onmousewheel`, the four
+// `onwebkit*` aliases, `onsearch`) and omits some a reading of the spec would
+// add, so the enumeration is the only source that matches what a page sees.
+// Getting the split wrong is visible in one line: the previous single list put
+// `onbeforeunload`, `onhashchange`, `onmessage` and eleven more Window-only
+// handlers on Document, where Chrome has none of them.
+const _GLOBAL_EVENT_HANDLERS = [
+  "abort","animationcancel","animationend","animationiteration",
+  "animationstart","auxclick","beforeinput","beforematch","beforetoggle",
+  "beforexrselect","blur","cancel","canplay","canplaythrough","change","click",
+  "close","command","contentvisibilityautostatechange","contextlost",
+  "contextmenu","contextrestored","cuechange","dblclick","drag","dragend",
+  "dragenter","dragleave","dragover","dragstart","drop","durationchange",
+  "emptied","ended","error","focus","formdata","gotpointercapture","input",
+  "invalid","keydown","keypress","keyup","load","loadeddata","loadedmetadata",
+  "loadstart","lostpointercapture","mousedown","mouseenter","mouseleave",
+  "mousemove","mouseout","mouseover","mouseup","mousewheel","pause","play",
+  "playing","pointercancel","pointerdown","pointerenter","pointerleave",
+  "pointermove","pointerout","pointerover","pointerrawupdate","pointerup",
+  "progress","ratechange","reset","resize","scroll","scrollend",
+  "scrollsnapchange","scrollsnapchanging","search","securitypolicyviolation",
+  "seeked","seeking","select","selectionchange","selectstart","slotchange",
+  "stalled","submit","suspend","timeupdate","toggle","transitioncancel",
+  "transitionend","transitionrun","transitionstart","volumechange","waiting",
+  "webkitanimationend","webkitanimationiteration","webkitanimationstart",
+  "webkittransitionend","wheel",
+];
+const _WINDOW_EVENT_HANDLERS = [
+  "afterprint","appinstalled","beforeinstallprompt","beforeprint",
+  "beforeunload","devicemotion","deviceorientation","deviceorientationabsolute",
+  "gamepadconnected","gamepaddisconnected","hashchange","languagechange",
+  "message","messageerror","offline","online","pagehide","pagereveal",
+  "pageshow","pageswap","popstate","rejectionhandled","storage",
+  "unhandledrejection","unload",
+];
+// DocumentAndElementEventHandlers, plus Chrome's three `before*` extensions.
+const _CLIPBOARD_EVENT_HANDLERS = [
+  "beforecopy","beforecut","beforepaste","copy","cut","paste",
+];
+const _DOCUMENT_EVENT_HANDLERS = [
+  "freeze","fullscreenchange","fullscreenerror","pointerlockchange",
+  "pointerlockerror","prerenderingchange","readystatechange","resume",
+  "visibilitychange","webkitfullscreenchange","webkitfullscreenerror",
+];
+for (const _ev of _GLOBAL_EVENT_HANDLERS.concat(_WINDOW_EVENT_HANDLERS)) {
   const _on = "on" + _ev;
   if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
-    }
+}
+for (const _ev of _GLOBAL_EVENT_HANDLERS
+  .concat(_CLIPBOARD_EVENT_HANDLERS, _DOCUMENT_EVENT_HANDLERS)) {
+  const _on = "on" + _ev;
+  if (!(_on in Document.prototype)) {
+    Object.defineProperty(Document.prototype, _on,
+      { value: null, writable: true, configurable: true, enumerable: false });
+  }
+}
+// No Element enumeration in the reference capture, so this set is the one
+// Element already had, extended with the shared additions rather than
+// rebuilt: `focusin`/`focusout` stay because jQuery's event path reads them.
+for (const _ev of _GLOBAL_EVENT_HANDLERS
+  .concat(_CLIPBOARD_EVENT_HANDLERS, ["focusin", "focusout"])) {
+  const _on = "on" + _ev;
+  if (!(_on in Element.prototype)) {
+    Object.defineProperty(Element.prototype, _on,
+      { value: null, writable: true, configurable: true, enumerable: false });
   }
 }
 
