@@ -2109,6 +2109,7 @@ function __prepareInsertedSubtree(root) {
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
   if (root.nodeType === 1 && root.localName === 'iframe') {
+    _dom("create_blank_iframe_document", root._nid);
     Deno.core.ops.op_queue_iframe_navigation(root._nid);
   }
   // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
@@ -2117,7 +2118,10 @@ function __prepareInsertedSubtree(root) {
   // browsing context that its `src` had already asked for was dropped for
   // having no frame yet. Nothing re-queued it, so the frame stayed empty.
   const iframeIds = _domParse("iframe_hosts_including_shadow", root._nid, "") || [];
-  for (const nid of iframeIds) Deno.core.ops.op_queue_iframe_navigation(+nid);
+  for (const nid of iframeIds) {
+    _dom("create_blank_iframe_document", +nid);
+    Deno.core.ops.op_queue_iframe_navigation(+nid);
+  }
   _syncWindowFrameIndices();
   const scripts = [];
   const seen = new Set();
@@ -4281,25 +4285,13 @@ class Element extends Node {
       const realmGlobal = _frameRealmGlobalFor(nativeRoot);
       if (realmGlobal && realmGlobal.document) return realmGlobal.document;
       const doc = _scopedDocumentFor(nativeRoot);
-      doc._defaultViewProxy = _frameWindowProxyFor(this);
+      _hideOwnProperty(doc, '_defaultViewProxy', _frameWindowProxyFor(this));
       return doc;
     }
-    // Legacy shim below: dynamically created iframes the Rust loader has not
-    // handled. Its string-origin compare retires with Phase 3.5 unification.
-    if (_iframeShimFor(this).doc) {
-      const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
-      const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
-      if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
-        return _iframeShimFor(this).doc;
-      }
-      return null; // Cross-origin: blocked
-    }
-    const shim = _iframeShimFor(this);
-    if (!shim.doc) {
-      shim.doc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      shim.win = new _IframeWindow(shim.doc, 'about:blank');
-    }
-    return shim.doc;
+    // No content root means no browsing context, which is what a detached
+    // <iframe> has. A connected one is given its initial about:blank document
+    // by the insertion steps, so it never reaches here.
+    return null;
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
@@ -4308,11 +4300,7 @@ class Element extends Node {
     if (+_dom("iframe_content_document_root", this._nid) >= 0) {
       return _frameWindowProxyFor(this);
     }
-    if (!_iframeShimFor(this).win) {
-      if (this.parentNode === null) return null;
-      this.contentDocument;
-    }
-    return _iframeShimFor(this).win;
+    return null;
   }
   get action() {
     const base = _anchorBase();
@@ -6978,6 +6966,91 @@ function _frameRealmOwnDescriptor(realmGlobal, key) {
   catch (e) { return Reflect.getOwnPropertyDescriptor(realmGlobal, key); }
 }
 
+// Realm-local views of this realm's globals, one set per frame WindowProxy.
+//
+// A browser gives every frame its own realm, so `frame.Object !== Object` and
+// an object built in one frame fails `instanceof` in the other. obscura runs
+// the initial about:blank frame in this realm, so the constructors have to be
+// made distinct here: a wrapper that constructs through the real one but
+// carries its own identity and its own prototype, with the statics inherited
+// rather than copied.
+const _iframeRealmGlobalCache = new WeakMap();
+
+function _iframeSourceIsConstructor(value) {
+  try {
+    Reflect.construct(Object, [], value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function _iframeRealmFunction(target, name, source) {
+  let wrapped;
+  if (_iframeSourceIsConstructor(source)) {
+    wrapped = function (...args) {
+      if (new.target) return Reflect.construct(source, args, new.target);
+      return Reflect.apply(source, this === target ? globalThis : this, args);
+    };
+    if (source.prototype && (typeof source.prototype === 'object' || typeof source.prototype === 'function')) {
+      const prototype = Object.create(source.prototype);
+      Object.defineProperty(prototype, 'constructor', {
+        value: wrapped,
+        writable: true,
+        configurable: true,
+      });
+      wrapped.prototype = prototype;
+    }
+  } else {
+    wrapped = (...args) => Reflect.apply(source, globalThis, args);
+  }
+  // Inherit static members such as Promise.resolve, Object.keys, and
+  // Array.isArray while keeping the constructor identity realm-local.
+  try { Object.setPrototypeOf(wrapped, source); } catch (e) {}
+  try { Object.defineProperty(wrapped, 'name', { value: name, configurable: true }); } catch (e) {}
+  try { Object.defineProperty(wrapped, 'length', { value: source.length, configurable: true }); } catch (e) {}
+  return _markNative(wrapped);
+}
+
+function _iframeRealmGlobal(target, name) {
+  let cache = _iframeRealmGlobalCache.get(target);
+  if (!cache) {
+    cache = new Map();
+    _iframeRealmGlobalCache.set(target, cache);
+  }
+  if (cache.has(name)) return cache.get(name);
+
+  const source = globalThis[name];
+  let value = source;
+  if (typeof source === 'function') {
+    value = _iframeRealmFunction(target, name, source);
+  } else if (source && typeof source === 'object') {
+    // Namespace objects such as Math, JSON, Reflect, and Intl belong to the
+    // child global too. A lightweight facade gives each iframe a stable,
+    // distinct object without copying large immutable tables.
+    value = Object.create(source);
+  }
+  cache.set(name, value);
+  return value;
+}
+
+// The window surface of a same-origin frame whose realm the loader has not
+// built yet -- the initial about:blank, read on the line after the iframe was
+// appended.
+//
+// That window is real and its platform surface comes from the engine, not
+// from either document, so it is this realm's. What it must not carry is
+// anything the *page* put on its own global: the difference between a fresh
+// frame's window and the page's is exactly what a fingerprinting probe
+// measures, and answering with the page's globals would erase a signal a
+// browser does produce. `_pristineGlobalNames` is the set as it stood when
+// bootstrap finished, before any page script ran.
+// Assigned at the very bottom of this file, once every interface is installed.
+let _pristineGlobalNames = new Set();
+function _blankFrameSurfaceHas(key) {
+  return typeof key === "string" && _pristineGlobalNames.has(key);
+}
+
 function _frameWindowProxyFor(hostEl) {
   const hostNid = hostEl._nid;
   const existing = _frameWindowProxies.get(hostNid);
@@ -7039,7 +7112,7 @@ function _frameWindowProxyFor(hostEl) {
       const realmGlobal = _frameRealmGlobalFor(root);
       if (realmGlobal && realmGlobal.document) return realmGlobal.document;
       const doc = _scopedDocumentFor(root);
-      doc._defaultViewProxy = proxy;
+      _hideOwnProperty(doc, '_defaultViewProxy', proxy);
       return doc;
     },
     get location() {
@@ -7094,7 +7167,9 @@ function _frameWindowProxyFor(hostEl) {
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      return realmGlobal ? Reflect.get(realmGlobal, key, realmGlobal) : undefined;
+      if (realmGlobal) return Reflect.get(realmGlobal, key, realmGlobal);
+      if (key === "globalThis") return proxy;
+      return _blankFrameSurfaceHas(key) ? _iframeRealmGlobal(t, key) : undefined;
     },
     set(t, key, value) {
       if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
@@ -7110,17 +7185,20 @@ function _frameWindowProxyFor(hostEl) {
       if (Reflect.has(t, key)) return true;
       if (typeof key === "string" && !sameOrigin()) return false;
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      return !!realmGlobal && Reflect.has(realmGlobal, key);
+      if (realmGlobal) return Reflect.has(realmGlobal, key);
+      return key === "globalThis" || _blankFrameSurfaceHas(key);
     },
     ownKeys(t) {
       const keys = Reflect.ownKeys(t);
       if (!sameOrigin()) return keys;
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      if (!realmGlobal) return keys;
       const seen = new Set(keys);
-      for (const key of _frameRealmOwnKeys(realmGlobal)) {
-        if (!seen.has(key)) keys.push(key);
+      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const source = realmGlobal
+        ? _frameRealmOwnKeys(realmGlobal) : _pristineGlobalNames;
+      for (const key of source) {
+        if (!seen.has(key)) { seen.add(key); keys.push(key); }
       }
+      if (!realmGlobal && !seen.has("globalThis")) keys.push("globalThis");
       return keys;
     },
     getOwnPropertyDescriptor(t, key) {
@@ -7128,8 +7206,19 @@ function _frameWindowProxyFor(hostEl) {
       if (own) return own;
       if (typeof key === "string" && !sameOrigin()) return undefined;
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      const descriptor = realmGlobal
-        ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
+      let descriptor;
+      if (realmGlobal) {
+        descriptor = _frameRealmOwnDescriptor(realmGlobal, key);
+      } else if (key === "globalThis") {
+        descriptor = { value: proxy, writable: true, enumerable: false };
+      } else if (_blankFrameSurfaceHas(key)) {
+        const source = Reflect.getOwnPropertyDescriptor(globalThis, key);
+        descriptor = source && {
+          value: _iframeRealmGlobal(t, key),
+          writable: source.writable !== false,
+          enumerable: source.enumerable,
+        };
+      }
       if (!descriptor) return undefined;
       descriptor.configurable = true;
       return descriptor;
@@ -14170,338 +14259,6 @@ _markNative(globalThis.Selection);
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
-// The shim document/window a dynamically created iframe gets before the Rust
-// frame loader has committed a real one. A WeakMap rather than `el._iframeDoc`
-// because an HTMLIFrameElement in a browser has no own properties at all, and
-// a probe reads `Object.getOwnPropertyNames` on the element.
-const _iframeShims = new WeakMap();
-function _iframeShimFor(element) {
-  let shim = _iframeShims.get(element);
-  if (!shim) {
-    shim = { doc: null, win: null };
-    _iframeShims.set(element, shim);
-  }
-  return shim;
-}
-
-// A browser's Document has no own string-keyed properties: every member is a
-// prototype accessor. This one used to keep `_root`, `_url`, `nodeType` and
-// the rest as own data properties, so a probe reading
-// `Object.getOwnPropertyNames(iframe.contentDocument)` got the engine's
-// internals by name. One symbol-keyed slot object hides all of it, and the
-// members move to the prototype where WebIDL puts them.
-const _iframeDocumentSlots = Symbol('Document slots');
-
-class _IframeDocument {
-  constructor(html, url, iframeEl) {
-    const slots = {
-      url, iframeEl, root: null, head: null, body: null, title: '', listeners: null,
-    };
-    this[_iframeDocumentSlots] = slots;
-
-    slots.root = document.createElement('html');
-    slots.head = document.createElement('head');
-    slots.body = document.createElement('body');
-    slots.root.appendChild(slots.head);
-    slots.root.appendChild(slots.body);
-    var bodyContent = html
-      .replace(/^<!DOCTYPE[^>]*>/i, '')
-      .replace(/<\/?html[^>]*>/gi, '')
-      .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
-      .replace(/<\/?body[^>]*>/gi, '')
-      .replace(/^\s+/, ''); // trim leading whitespace (before <body> content)
-    if (bodyContent) {
-      slots.body.innerHTML = bodyContent;
-    }
-
-    const titleEl = _internalQuerySelector(slots.head, 'title');
-    if (titleEl) slots.title = titleEl.textContent;
-  }
-
-  get nodeType() { return 9; }
-  get nodeName() { return '#document'; }
-  get readyState() { return 'complete'; }
-  get characterSet() { return 'UTF-8'; }
-  get charset() { return 'UTF-8'; }
-  get inputEncoding() { return 'UTF-8'; }
-  get contentType() { return 'text/html'; }
-  get visibilityState() { return 'visible'; }
-  get hidden() { return false; }
-  get designMode() { return 'off'; }
-  set designMode(_value) {}
-  get [Symbol.toStringTag]() { return 'Document'; }
-  get documentElement() { return this[_iframeDocumentSlots].root; }
-  get head() { return this[_iframeDocumentSlots].head; }
-  get body() { return this[_iframeDocumentSlots].body; }
-  get title() { return this[_iframeDocumentSlots].title; }
-  set title(v) { this[_iframeDocumentSlots].title = v; }
-  get URL() { return this[_iframeDocumentSlots].url; }
-  get documentURI() { return this[_iframeDocumentSlots].url; }
-  get location() { return this[_iframeDocumentSlots].iframeEl?.contentWindow?.location; }
-  get defaultView() { return this[_iframeDocumentSlots].iframeEl?.contentWindow; }
-  get ownerDocument() { return null; }
-  get compatMode() { return 'CSS1Compat'; }
-  get activeElement() { return this[_iframeDocumentSlots].body; }
-
-  getElementById(id) {
-    return this[_iframeDocumentSlots].root.querySelector('#' + id);
-  }
-  querySelector(sel) {
-    return this[_iframeDocumentSlots].root.querySelector(sel);
-  }
-  querySelectorAll(sel) {
-    return this[_iframeDocumentSlots].root.querySelectorAll(sel);
-  }
-  getElementsByTagName(tag) {
-    return this[_iframeDocumentSlots].root.querySelectorAll(tag);
-  }
-  getElementsByClassName(cls) {
-    return _getElementsByClassName(this[_iframeDocumentSlots].root, cls);
-  }
-  createElement(tag) { return document.createElement(tag); }
-  createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
-  createTextNode(text) { return document.createTextNode(text); }
-  createComment(text) { return document.createComment(text); }
-  createDocumentFragment() { return document.createDocumentFragment(); }
-  createEvent(type) { return document.createEvent(type); }
-  createRange() { return new Range(); }
-  hasFocus() { return false; }
-
-  get cookie() { return ''; }
-  set cookie(v) {}
-  get implementation() { return document.implementation; }
-  get styleSheets() { return []; }
-
-  addEventListener(type, listener) {
-    if (typeof listener !== 'function') return;
-    const slots = this[_iframeDocumentSlots];
-    if (!slots.listeners) slots.listeners = Object.create(null);
-    const list = slots.listeners[type] || (slots.listeners[type] = []);
-    if (!list.includes(listener)) list.push(listener);
-  }
-  removeEventListener(type, listener) {
-    const list = this[_iframeDocumentSlots].listeners
-      && this[_iframeDocumentSlots].listeners[type];
-    if (!list) return;
-    const index = list.indexOf(listener);
-    if (index !== -1) list.splice(index, 1);
-  }
-  dispatchEvent(event) {
-    const type = event && event.type;
-    if (!type) return true;
-    const list = this[_iframeDocumentSlots].listeners
-      && this[_iframeDocumentSlots].listeners[type];
-    if (list) {
-      for (const listener of list.slice()) {
-        try { listener.call(this, event); } catch (error) { console.error(error); }
-      }
-    }
-    const handler = this['on' + type];
-    if (typeof handler === 'function') {
-      try { handler.call(this, event); } catch (error) { console.error(error); }
-    }
-    return !event.defaultPrevented;
-  }
-
-  write(html) {
-    if (this[_iframeDocumentSlots].body) this[_iframeDocumentSlots].body.innerHTML += html;
-  }
-  writeln(html) { this.write(html + '\n'); }
-  open() { if (this[_iframeDocumentSlots].body) this[_iframeDocumentSlots].body.innerHTML = ''; }
-  close() {}
-}
-
-const _iframeRealmGlobalCache = new WeakMap();
-let _iframeRealmGlobalNames = [];
-let _iframeRealmGlobalNameSet = new Set();
-
-function _iframeSourceIsConstructor(value) {
-  try {
-    Reflect.construct(Object, [], value);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-function _iframeRealmFunction(target, name, source) {
-  let wrapped;
-  if (_iframeSourceIsConstructor(source)) {
-    wrapped = function (...args) {
-      if (new.target) return Reflect.construct(source, args, new.target);
-      return Reflect.apply(source, this === target ? globalThis : this, args);
-    };
-    if (source.prototype && (typeof source.prototype === 'object' || typeof source.prototype === 'function')) {
-      const prototype = Object.create(source.prototype);
-      Object.defineProperty(prototype, 'constructor', {
-        value: wrapped,
-        writable: true,
-        configurable: true,
-      });
-      wrapped.prototype = prototype;
-    }
-  } else {
-    wrapped = (...args) => Reflect.apply(source, globalThis, args);
-  }
-  // Inherit static members such as Promise.resolve, Object.keys, and
-  // Array.isArray while keeping the constructor identity realm-local.
-  try { Object.setPrototypeOf(wrapped, source); } catch (e) {}
-  try { Object.defineProperty(wrapped, 'name', { value: name, configurable: true }); } catch (e) {}
-  try { Object.defineProperty(wrapped, 'length', { value: source.length, configurable: true }); } catch (e) {}
-  return _markNative(wrapped);
-}
-
-function _iframeRealmGlobal(target, name) {
-  let cache = _iframeRealmGlobalCache.get(target);
-  if (!cache) {
-    cache = new Map();
-    _iframeRealmGlobalCache.set(target, cache);
-  }
-  if (cache.has(name)) return cache.get(name);
-
-  const source = globalThis[name];
-  let value = source;
-  if (typeof source === 'function') {
-    value = _iframeRealmFunction(target, name, source);
-  } else if (source && typeof source === 'object') {
-    // Namespace objects such as Math, JSON, Reflect, and Intl belong to the
-    // child global too. A lightweight facade gives each iframe a stable,
-    // distinct object without copying large immutable tables.
-    value = Object.create(source);
-  }
-  cache.set(name, value);
-  return value;
-}
-
-const _iframeWindowProxyHandler = {
-  get(target, key, receiver) {
-    if (key === 'globalThis') return receiver;
-    if (Reflect.has(target, key)) return Reflect.get(target, key, receiver);
-    if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
-      return _iframeRealmGlobal(target, key);
-    }
-    return undefined;
-  },
-  has(target, key) {
-    return key === 'globalThis'
-      || Reflect.has(target, key)
-      || (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key));
-  },
-  ownKeys(target) {
-    const keys = Reflect.ownKeys(target);
-    const seen = new Set(keys);
-    for (const name of _iframeRealmGlobalNames) {
-      if (!seen.has(name)) keys.push(name);
-    }
-    if (!seen.has('globalThis')) keys.push('globalThis');
-    return keys;
-  },
-  getOwnPropertyDescriptor(target, key) {
-    const own = Reflect.getOwnPropertyDescriptor(target, key);
-    if (own) return own;
-    if (key === 'globalThis') {
-      return { value: target.self, writable: true, enumerable: false, configurable: true };
-    }
-    if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
-      return {
-        value: _iframeRealmGlobal(target, key),
-        writable: true,
-        enumerable: false,
-        configurable: true,
-      };
-    }
-    return undefined;
-  },
-};
-
-// `Object.getOwnPropertyNames(iframe.contentWindow)` lists these, so the
-// backing URL cannot be a string-keyed own property: no browser's window has
-// one.
-const _iframeWindowUrl = Symbol('document URL');
-class _IframeWindow {
-  constructor(doc, url) {
-    this.document = doc;
-    this[_iframeWindowUrl] = url;
-    this.top = globalThis;
-    this.parent = globalThis;
-    this.frameElement = null;
-    this.length = 0;
-    this.name = '';
-    this.closed = false;
-    this.navigator = globalThis.navigator;
-    this.screen = globalThis.screen;
-    this.innerWidth = 300;
-    this.innerHeight = 150;
-    this.outerWidth = 300;
-    this.outerHeight = 150;
-    this.devicePixelRatio = globalThis.devicePixelRatio;
-    this.localStorage = globalThis.localStorage;
-    this.sessionStorage = globalThis.sessionStorage;
-    this.performance = globalThis.performance;
-    this.crypto = globalThis.crypto;
-    this.console = globalThis.console;
-    this.chrome = globalThis.chrome;
-
-    try {
-      const u = new URL(url);
-      this.location = {
-        href: url, origin: u.origin, protocol: u.protocol,
-        host: u.host, hostname: u.hostname, port: u.port,
-        pathname: u.pathname, search: u.search, hash: u.hash,
-        toString() { return url; }, assign(){}, reload(){}, replace(){},
-      };
-    } catch(e) {
-      this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
-    }
-
-    const proxy = new Proxy(this, _iframeWindowProxyHandler);
-    this.self = proxy;
-    this.window = proxy;
-    this.frames = proxy;
-    return proxy;
-  }
-
-  postMessage(data, origin) {
-    const event = globalThis.__obscura_markTrusted(new MessageEvent('message', {
-      data: data,
-      origin: this.location.origin,
-      source: this,
-    }));
-    Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
-    });
-  }
-
-  setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
-  clearTimeout(id) { globalThis.clearTimeout(id); }
-  setInterval(fn, ms) { return globalThis.setInterval(fn, ms); }
-  clearInterval(id) { globalThis.clearInterval(id); }
-  requestAnimationFrame(fn) { return globalThis.requestAnimationFrame(fn); }
-
-  addEventListener(type, fn) {
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(fn);
-  }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
-  }
-  dispatchEvent(event) {
-    const handlers = this._listeners?.[event?.type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
-    return true;
-  }
-
-  getComputedStyle(el) { return globalThis.getComputedStyle(el); }
-  matchMedia(q) { return globalThis.matchMedia(q); }
-  getSelection() { return globalThis.getSelection(); }
-  fetch(input, init) { return globalThis.fetch(input, init); }
-  close() { this.closed = true; }
-  focus() {}
-  blur() {}
-}
 
 // Encode an RGBA pixel buffer into a valid PNG data URL.
 // Uses stored-block DEFLATE (no compression) wrapped in zlib.
@@ -18781,7 +18538,7 @@ globalThis.__obscura_init = function() {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root.
     globalThis.document = _scopedDocumentFor(frameRootNid);
-    globalThis.document._defaultViewProxy = globalThis;
+    _hideOwnProperty(globalThis.document, '_defaultViewProxy', globalThis);
     // Ancestor window wiring (Phase 4): `parent` addresses the direct parent
     // document's realm, `top` the main Window; frameElement follows the
     // same-origin-with-parent rule (a cross-origin container reads null).
@@ -18955,6 +18712,14 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  // Re-taken per page, before any page script runs. The snapshot-time capture
+  // at the bottom of this file misses the globals V8 installs per isolate
+  // rather than into the snapshot (Temporal, Float16Array, WebAssembly and the
+  // explicit-resource-management set), which then read as page additions.
+  // Indices are excluded on purpose: they are this window's child frames, and
+  // a fresh frame has none.
+  _pristineGlobalNames = new Set(
+    Object.getOwnPropertyNames(globalThis).filter(name => !/^\d+$/.test(name)));
   // Iframes the parser produced never run the insertion steps, so this is the
   // only place the initial window[i] set gets built. It runs last: the
   // document nid this realm binds to is set further up in this function.
@@ -19463,36 +19228,6 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
 
-// tamperedFunctions: obscura reimplements much of the DOM/Web platform in JS.
-// Real Chrome reports "[native code]" from toString() for every builtin method,
-// accessor, and constructor; any JS-backed member that leaks its source is a
-// detection tell (pixelscan's tamperedFunctions check flags e.g.
-// Element.prototype.nodeType, whose getter returned "get nodeType() {...}").
-// Individual _markNative calls throughout this file cover methods but miss the
-// property accessors and several constructors. Sweep every builtin constructor
-// reachable from the global object and mark its prototype members (methods and
-// accessors) plus the constructor itself native. This runs once at snapshot
-// build time, so it costs nothing per page, and genuinely-native V8 builtins
-// already report native, so only the JS-backed members are affected.
-(function _collectIframeRealmGlobals() {
-  const standardGlobals = [
-    'Infinity', 'NaN', 'undefined',
-    'eval', 'isFinite', 'isNaN', 'parseFloat', 'parseInt',
-    'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
-    'escape', 'unescape',
-    'Atomics', 'Intl', 'JSON', 'Math', 'Reflect', 'WebAssembly',
-    'atob', 'btoa', 'queueMicrotask', 'reportError', 'structuredClone',
-  ];
-  const constructors = Object.getOwnPropertyNames(globalThis).filter(name => {
-    if (!/^[A-Z]/.test(name)) return false;
-    try { return typeof globalThis[name] === 'function'; }
-    catch (e) { return false; }
-  });
-  _iframeRealmGlobalNames = Array.from(new Set(constructors.concat(standardGlobals)))
-    .filter(name => name in globalThis);
-  _iframeRealmGlobalNameSet = new Set(_iframeRealmGlobalNames);
-})();
-
 // WebIDL requires every interface prototype object to carry @@toStringTag with
 // the interface identifier, as {writable:false, enumerable:false,
 // configurable:true}, and the interface object's `.name` to be that same
@@ -19774,6 +19509,10 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     try { names = Object.getOwnPropertyNames(proto); } catch (_error) { return; }
     for (const key of names) {
       if (skipOnPrototype.has(key)) continue;
+      // Engine helpers on an otherwise Web-facing prototype (`_scopeInfo` on
+      // _ScopedDocument). Making those enumerable would put them in the page's
+      // `for..in` over the object, which is the opposite of the point.
+      if (key.startsWith('_')) continue;
       let descriptor;
       try { descriptor = Object.getOwnPropertyDescriptor(proto, key); }
       catch (_error) { continue; }
@@ -19794,10 +19533,20 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (!proto || proto === Object.prototype || proto === Function.prototype) continue;
     promote(proto);
   }
-  // Interfaces a page can reach without the constructor being on the global.
-  // `iframe.contentDocument` for an about:blank frame is one, and it is
-  // exactly the object Cloudflare walks.
-  promote(_IframeDocument.prototype);
+  // An interface a page reaches without the constructor being on the global,
+  // and exactly the object a challenge script walks: `iframe.contentDocument`.
+  // Its class members are non-enumerable by ECMAScript rules, and a
+  // non-enumerable override *shadows* the enumerable Document.prototype member
+  // of the same name, so leaving this out drops twelve names -- querySelector,
+  // documentElement, title and the rest -- out of `for (k in doc)` entirely.
+  promote(_ScopedDocument.prototype);
 })();
+
+// The global's own property names as the engine leaves them, before any page
+// script runs. This is the surface a fresh same-origin frame's window has, so
+// the WindowProxy answers from it while the frame is still on its initial
+// about:blank and has no realm of its own. Captured last, after every
+// interface above is installed and after the enumerability pass.
+_pristineGlobalNames = new Set(Object.getOwnPropertyNames(globalThis));
 
 })();

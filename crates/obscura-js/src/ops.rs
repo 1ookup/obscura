@@ -1568,6 +1568,101 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        // The initial about:blank document, committed synchronously when the
+        // <iframe> is connected.
+        //
+        // HTML gives an iframe that document before the insertion steps
+        // return, so `iframe.contentDocument` is a real Document on the very
+        // next line. The Rust frame loader runs on the event loop and cannot
+        // meet that deadline, and until it did the getters answered with a
+        // hand-written stand-in whose surface was nothing like a Document's --
+        // 43 enumerable names against a browser's 295. A page that creates an
+        // iframe and enumerates it reads that difference directly.
+        //
+        // The loader's own commit replaces this root a moment later through
+        // the ordinary navigation path; that is exactly what a browser does to
+        // the initial about:blank as well.
+        "create_blank_iframe_document" => {
+            let host = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => NodeId::new(n),
+                _ => return "-1".into(),
+            };
+            if dom.iframe_content_document(host).is_some() {
+                return "-1".into();
+            }
+            // A sandboxed frame without allow-same-origin gets a fresh opaque
+            // origin, so it must not read as same-origin with its embedder.
+            let sandbox = dom
+                .get_node(host)
+                .map(|node| obscura_dom::SandboxFlags::parse(node.get_attribute("sandbox")))
+                .unwrap_or_default();
+            // Shadow-including: a widget that builds itself inside a closed
+            // shadow root -- Turnstile among them -- puts the <iframe> in a
+            // tree scope that is not the content document. Resolving only the
+            // node's own tree scope answered "no containing document" there
+            // and fell back to the top origin, which made the frame read
+            // cross-origin to the very document that created it.
+            let parent_scope = dom
+                .containing_document_root_shadow_including(host)
+                .and_then(|root| dom.document_scope(root));
+            let (parent_origin, base_url, csp, referrer, referrer_policy) = match parent_scope {
+                Some(scope) => (
+                    scope.origin,
+                    scope.base_url,
+                    scope.csp,
+                    scope.referrer,
+                    scope.referrer_policy,
+                ),
+                None => (
+                    gs.top_origin
+                        .clone()
+                        .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url)),
+                    gs.url.clone(),
+                    gs.document_csp.clone(),
+                    gs.referrer.clone(),
+                    // The top document's policy is not on the shared state;
+                    // the loader's commit records the real one moments later.
+                    String::new(),
+                ),
+            };
+            let origin = if sandbox.active
+                && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+            {
+                obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
+            } else {
+                parent_origin
+            };
+            let Ok((root, _previous)) = dom.create_iframe_content_document(host) else {
+                return "-1".into();
+            };
+            // An empty body is not what about:blank is: it has a documentElement,
+            // a head and a body, and scripts read all three.
+            obscura_dom::parse_into_subtree(
+                dom,
+                root,
+                "<html><head></head><body></body></html>",
+            );
+            dom.set_document_scope(
+                root,
+                obscura_dom::DocumentScope {
+                    url: "about:blank".to_string(),
+                    origin,
+                    base_url,
+                    sandbox,
+                    csp,
+                    referrer_policy,
+                    referrer,
+                    // The frame registry names the browsing context when the
+                    // loader commits. Until then this document belongs to no
+                    // registered frame, which is what an empty id means to
+                    // every reader of the scope.
+                    frame_id: String::new(),
+                    document_generation: 0,
+                    quirks: false,
+                },
+            );
+            root.index().to_string()
+        }
         // Parse a complete HTML document and graft it under a content root.
         // Returns the parsed document's quirks bool, which is also recorded on
         // the root's DocumentScope when one exists.

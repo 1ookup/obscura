@@ -18547,6 +18547,101 @@ RequestRedirect value",
         );
     }
 
+    /// HTML gives a connected iframe its initial about:blank document before
+    /// the insertion steps return. It used to get a hand-written stand-in
+    /// instead, whose surface a probe could tell from a Document's in one
+    /// `for..in`.
+    #[test]
+    fn a_connected_iframe_has_its_initial_about_blank_document_at_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    // No browsing context until it is connected, so no window.
+                    const beforeInsert = frame.contentWindow;
+                    document.body.appendChild(frame);
+                    const doc = frame.contentDocument;
+                    const win = frame.contentWindow;
+                    const documentKeys = [];
+                    for (const key in doc) documentKeys.push(key);
+                    const pageKeys = [];
+                    for (const key in document) pageKeys.push(key);
+                    return {
+                        beforeInsert,
+                        url: doc.URL,
+                        brand: Object.prototype.toString.call(doc),
+                        // about:blank is not an empty document.
+                        skeleton: [doc.documentElement.tagName, !!doc.head, !!doc.body],
+                        // The same enumeration surface the page's document
+                        // has, give or take `designMode`, which _ScopedDocument
+                        // implements and Document.prototype still does not.
+                        missingFromFrame: pageKeys.filter(k => !documentKeys.includes(k)),
+                        defaultView: doc.defaultView === win,
+                        windowDocument: win.document === doc,
+                        // A frame is its own realm: constructors are distinct,
+                        // but they still construct and still carry statics.
+                        distinctIntrinsics: win.Object !== Object && win.Promise !== Promise,
+                        constructs: new win.Object() instanceof win.Object,
+                        statics: win.Object.keys({ first: 1 })[0] === 'first',
+                        selfReference: win.globalThis === win,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "beforeInsert": null,
+                "url": "about:blank",
+                "brand": "[object Document]",
+                "skeleton": ["HTML", true, true],
+                "missingFromFrame": [],
+                "defaultView": true,
+                "windowDocument": true,
+                "distinctIntrinsics": true,
+                "constructs": true,
+                "statics": true,
+                "selfReference": true,
+            })
+        );
+    }
+
+    /// What a fresh frame's window must NOT have is whatever the page put on
+    /// its own global: that difference is what a fingerprinting probe reads.
+    #[test]
+    fn a_blank_frames_window_carries_the_platform_surface_and_not_the_pages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    globalThis.__pageOwnGlobal = 1;
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const frameNames = Object.getOwnPropertyNames(frame.contentWindow);
+                    const pageNames = Object.getOwnPropertyNames(globalThis);
+                    return {
+                        pageAdditionStaysOnThePage:
+                            pageNames.includes('__pageOwnGlobal')
+                            && !frameNames.includes('__pageOwnGlobal'),
+                        platformIsShared: ['XMLHttpRequest', 'MutationObserver', 'fetch',
+                            'Promise', 'setTimeout'].every(n => frameNames.includes(n)),
+                        // window[0] is this window's child frame; the child has none.
+                        extraOnPage: pageNames.filter(n => !frameNames.includes(n)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "pageAdditionStaysOnThePage": true,
+                "platformIsShared": true,
+                "extraOnPage": ["0", "__pageOwnGlobal"],
+            })
+        );
+    }
+
     /// Window and Document expose different event-handler mixins. One shared
     /// list used to put both sets on both objects, which is why Document
     /// answered to `onbeforeunload`.
