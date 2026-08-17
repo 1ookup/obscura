@@ -18492,6 +18492,87 @@ RequestRedirect value",
         );
     }
 
+    /// The window enumeration a challenge script collects: every own name on
+    /// the global paired with its value. Anything the engine leaves there in
+    /// its own shape is reported verbatim, so the engine has to leave nothing.
+    #[test]
+    fn enumerating_the_global_reveals_no_engine_internals() {
+        let mut rt = setup_runtime("<html><body><iframe></iframe></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = Object.getOwnPropertyNames(globalThis);
+                    const documentKeys = [];
+                    for (const key in document) documentKeys.push(key);
+                    // A function whose source is not `[native code]` puts that
+                    // source into the report as a value.
+                    const sources = [];
+                    for (const name of names) {
+                        let value;
+                        try { value = globalThis[name]; } catch (e) { continue; }
+                        if (typeof value !== 'function') continue;
+                        if (!/\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(value))) {
+                            sources.push(name);
+                        }
+                    }
+                    return {
+                        deno: names.includes('Deno'),
+                        // Indexed properties are the child browsing contexts,
+                        // so there are exactly `length` of them. A fixed block
+                        // of 50 used to sit here next to a length of 0.
+                        indices: names.filter(n => /^\d+$/.test(n)),
+                        length: window.length,
+                        indexedIsFrame: window[0] === document.querySelector('iframe').contentWindow,
+                        openSources: sources,
+                        // Null until the page assigns them, as in a browser.
+                        onerror: window.onerror,
+                        onunhandledrejection: window.onunhandledrejection,
+                        documentInternals: documentKeys.filter(k => k.startsWith('_')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "deno": false,
+                "indices": ["0"],
+                "length": 1,
+                "indexedIsFrame": true,
+                "openSources": [],
+                "onerror": null,
+                "onunhandledrejection": null,
+                "documentInternals": [],
+            })
+        );
+    }
+
+    /// Removing the last iframe takes `window[0]` with it; the indices are not
+    /// a high-water mark.
+    #[test]
+    fn the_window_indices_follow_the_frames_in_both_directions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const seen = [];
+                    const snapshot = () => seen.push([
+                        window.length,
+                        Object.getOwnPropertyNames(globalThis).filter(n => /^\d+$/.test(n)).length,
+                    ]);
+                    snapshot();
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    snapshot();
+                    frame.remove();
+                    snapshot();
+                    return seen;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([[0, 0], [1, 1], [0, 0]]));
+    }
+
     #[test]
     fn assigning_outer_html_replaces_the_element_and_offset_parent_resolves() {
         let mut rt = setup_runtime(

@@ -35,7 +35,7 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     '__obscura_performance_time_origin_ms',
     '__obscura_viewport_w', '__obscura_viewport_h', '__obscura_screen_emulated',
     // runtime-set by Rust (runtime.rs / page.rs)
-    '__obscura_errors', '__obscura_init', '__obscura_hide_list',
+    '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
@@ -108,28 +108,24 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
   }
 })();
 
-globalThis.__obscura_errors = [];
-
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-// Suppressing the default action keeps a stray rejection from tearing the page
-// down, but a browser still prints it. Staying quiet here hides the most common
-// way a promise-driven page stops making progress.
-globalThis.onunhandledrejection = function(e) {
-  try { console.error("Unhandled rejection:", (e && (e.reason ?? e)) ?? e); } catch (_e) {}
-  if (e?.preventDefault) e.preventDefault();
-};
-
-globalThis.onerror = function(msg, src, line, col, error) {
-  globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
-};
+// `window.onerror` and `window.onunhandledrejection` are null in a browser
+// until the page assigns them, and a script that reads them gets the source of
+// whatever is there. Two engine handlers used to sit in those slots; neither
+// was reachable. Nothing dispatched `unhandledrejection` at all, and the
+// `onerror` one only appended to `__obscura_errors`, which no Rust or JS
+// caller ever read. The event-handler loop further down leaves both null now,
+// which is what a browser reports.
 globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
+// Marked native below, next to _markNative itself: the set it writes to is
+// still in its temporal dead zone here.
+globalThis.addEventListener = function addEventListener(type, fn) {
   _eventTargetAdd(globalThis, type, fn, arguments[2]);
 };
-globalThis.removeEventListener = function(type, fn) {
+globalThis.removeEventListener = function removeEventListener(type, fn) {
   _eventTargetRemove(globalThis, type, fn, arguments[2]);
 };
-globalThis.dispatchEvent = function(event) {
+globalThis.dispatchEvent = function dispatchEvent(event) {
   return _eventTargetDispatch(globalThis, event);
 };
 
@@ -206,6 +202,14 @@ Function.prototype.toString = function toString() {
   return _origToString.call(this);
 };
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+// An engine-internal slot on an object a page enumerates. Assignment would
+// make it enumerable, which is how the DOM handles ended up in
+// `for (k in document)`.
+function _hideOwnProperty(obj, name, value) {
+  Object.defineProperty(obj, name, {
+    value, writable: true, enumerable: false, configurable: true,
+  });
+}
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
 // Captured once so structured clone does not depend on the global binding
@@ -219,6 +223,13 @@ const _SharedArrayBufferCtor = globalThis.SharedArrayBuffer;
 // Object.getOwnPropertyNames(window).
 let _applySecureContextGating = null;
 _nativeFns.add(Function.prototype.toString);
+// Defined above, before this set existed. A script that enumerates the global
+// and reads each value gets the function source back for anything unmarked,
+// so an unmarked EventTarget method on `window` is engine source in the page's
+// hands.
+_markNative(globalThis.addEventListener);
+_markNative(globalThis.removeEventListener);
+_markNative(globalThis.dispatchEvent);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
@@ -2107,6 +2118,7 @@ function __prepareInsertedSubtree(root) {
   // having no frame yet. Nothing re-queued it, so the frame stayed empty.
   const iframeIds = _domParse("iframe_hosts_including_shadow", root._nid, "") || [];
   for (const nid of iframeIds) Deno.core.ops.op_queue_iframe_navigation(+nid);
+  _syncWindowFrameIndices();
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
@@ -2235,7 +2247,7 @@ class Node {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
-      if (child) _detachStyleSheetsInSubtree(child);
+      if (child) _subtreeDisconnected(child);
       _dom("remove_child", c);
     }
     let added = [];
@@ -2300,7 +2312,7 @@ class Node {
       return c;
     }
     if (c._shadowParent) c._shadowParent.removeChild(c);
-    else if (c.parentNode) _detachStyleSheetsInSubtree(c);
+    else if (c.parentNode) _subtreeDisconnected(c);
     const parentConnected = this.isConnected;
     const inserted = _dom("append_child", this._nid, c._nid) === "true";
     if (!inserted) {
@@ -2344,7 +2356,7 @@ class Node {
     }
     _seedUnchangedConnection(this, parentConnected);
     _seedDetachedTreeState(c);
-    _detachStyleSheetsInSubtree(c);
+    _subtreeDisconnected(c);
     _reconcileWindowNamedProperties(removedWindowNames);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
@@ -2365,7 +2377,7 @@ class Node {
       return oldChild;
     }
     if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
-    else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
+    else if (newChild.parentNode) _subtreeDisconnected(newChild);
     const parentConnected = this.isConnected;
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
     const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
@@ -2380,7 +2392,7 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(newChild, this, parentConnected);
     _seedDetachedTreeState(oldChild);
-    _detachStyleSheetsInSubtree(oldChild);
+    _subtreeDisconnected(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
     __prepareInsertedSubtree(newChild);
@@ -2402,7 +2414,7 @@ class Node {
       return n;
     }
     if (n._shadowParent) n._shadowParent.removeChild(n);
-    else if (n.parentNode) _detachStyleSheetsInSubtree(n);
+    else if (n.parentNode) _subtreeDisconnected(n);
     const parentConnected = this.isConnected;
     const inserted = _dom("insert_before", n._nid, ref._nid) === "true";
     if (!inserted) {
@@ -5227,6 +5239,14 @@ function _privateStateTokenError(method, status) {
 }
 
 class Document extends Node {
+  constructor(nid) {
+    super(nid);
+    // `for (k in document)` is a standard fingerprinting probe, and Node's
+    // plain `this._nid = nid` put the engine's own tree handle in its output.
+    // Redefining is only affordable here: there is one document per realm,
+    // while element wrappers are built by the thousand and keep the fast store.
+    _hideOwnProperty(this, '_nid', nid);
+  }
   get timeline() {
     if (!this._timeline) {
       this._timeline = new DocumentTimeline();
@@ -6858,7 +6878,7 @@ function _scopedDocumentFor(rootNid) {
 class _ScopedDocument extends Document {
   constructor(rootNid) {
     super(rootNid);
-    this._scopeRoot = rootNid;
+    _hideOwnProperty(this, '_scopeRoot', rootNid);
   }
   _scopeInfo() { return _domParse("document_scope_info", this._scopeRoot); }
   get documentElement() {
@@ -7470,28 +7490,40 @@ Object.defineProperty(globalThis, 'constructor', {
 });
 
 
-// Remove the static _iframeRegistry and replace with dynamic getters.
+// The child browsing contexts, exposed as `window.length` and `window[i]`.
+//
+// The query runs through the internal channel: `window.length` is read on
+// nearly every page, and a challenge script that has hooked
+// `document.querySelectorAll` sees each read as a selector the page ran.
+function _childBrowsingContexts() {
+  return _internalQuerySelectorAll(globalThis.document, 'iframe');
+}
+
 Object.defineProperty(globalThis, 'length', {
-  get() {
-    return document.querySelectorAll('iframe').length;
-  },
+  get() { return _childBrowsingContexts().length; },
   configurable: true,
   enumerable: true
 });
 
-// Since we cannot define a Proxy on globalThis easily, we'll define a reasonable number of indexed getters.
-for (let i = 0; i < 50; i++) {
-  Object.defineProperty(globalThis, i, {
-    get() {
-      const iframes = document.querySelectorAll('iframe');
-      if (i < iframes.length) {
-        return iframes[i].contentWindow;
-      }
-      return undefined;
-    },
-    configurable: true,
-    enumerable: false
-  });
+// A browser has exactly `length` of these and no more. There used to be a
+// fixed 50, which put "0".."49" in Object.getOwnPropertyNames(window) on every
+// page -- 50 names Chrome does not have there, contradicting a `length` of 0
+// standing right next to them. globalThis cannot be a Proxy, so the set is
+// resynchronised at the points where a subtree connects or disconnects.
+function _syncWindowFrameIndices() {
+  const count = _childBrowsingContexts().length;
+  for (let i = 0; i < count; i++) {
+    if (Object.getOwnPropertyDescriptor(globalThis, i)) continue;
+    Object.defineProperty(globalThis, i, {
+      get() { return _childBrowsingContexts()[i]?.contentWindow; },
+      configurable: true,
+      // Chrome's indexed window properties show up in for-in.
+      enumerable: true
+    });
+  }
+  for (let i = count; Object.getOwnPropertyDescriptor(globalThis, i); i++) {
+    delete globalThis[i];
+  }
 }
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
@@ -10053,8 +10085,12 @@ function _detachLinkedStyleSheet(link) {
   sheet._sourceNode = null;
   _linkElementSheets.delete(link);
 }
-function _detachStyleSheetsInSubtree(root) {
+// Called wherever a subtree stops being connected. Two things are keyed on
+// that: its stylesheets leave document.styleSheets, and any iframe it took
+// with it leaves window[i].
+function _subtreeDisconnected(root) {
   if (!root) return;
+  _syncWindowFrameIndices();
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
   if (!root.querySelectorAll) return;
@@ -17506,7 +17542,9 @@ if (typeof Path2D === 'undefined') {
 
 if (typeof ImageBitmap === 'undefined') {
   globalThis.ImageBitmap = class ImageBitmap { constructor(){this.width=0;this.height=0;} close(){} };
-  globalThis.createImageBitmap = function() { return Promise.resolve(new ImageBitmap()); };
+  globalThis.createImageBitmap = _markNative(function createImageBitmap() {
+    return Promise.resolve(new ImageBitmap());
+  });
 }
 
 if (typeof Selection === 'undefined') {
@@ -18868,6 +18906,10 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  // Iframes the parser produced never run the insertion steps, so this is the
+  // only place the initial window[i] set gets built. It runs last: the
+  // document nid this realm binds to is set further up in this function.
+  try { _syncWindowFrameIndices(); } catch(e) {}
   delete globalThis.__obscura_init;
 };
 
@@ -18882,6 +18924,13 @@ globalThis.__obscura_init = function() {
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  // deno_core's binding object. It matches none of the patterns above and was
+  // therefore the one internal name left in Object.getOwnPropertyNames(window)
+  // -- a global no browser has, sitting in plain sight next to the ones this
+  // list was written to remove. It stays reachable by name for the ~119 call
+  // sites and the Rust-injected snippets that use it; only the enumeration
+  // hides it.
+  || k === 'Deno'
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
