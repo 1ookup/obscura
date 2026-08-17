@@ -783,6 +783,10 @@ impl ObscuraJsRuntime {
                 .ok_or_else(|| alloc_err("key"))?;
             let gen_val = v8::Number::new(scope, generation as f64);
             global.set(scope, gen_key.into(), gen_val.into());
+            // `document.all` is built through the V8 API, so each realm needs
+            // its own; the bootstrap below installs it on this realm's
+            // Document.prototype.
+            crate::document_all::install(scope, context);
         }
         // Bootstrap runs first, matching the main context (its bootstrap is
         // baked into the snapshot, then `<obscura:init>` runs). REALM_INIT must

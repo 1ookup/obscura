@@ -30,6 +30,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 V8_DIR="$ROOT/vendor/rusty_v8"
+# Bindings rusty_v8 leaves unbound that the engine needs; see the script.
+RUSTY_EXTRAS="$ROOT/vendor/v8-rusty-extras.sh"
 BIN="$ROOT/target/release/obscura"
 # Carries both the [patch.crates-io] entry and V8_FROM_SOURCE=1; the same file
 # backs the cargo aliases and .githooks/pre-push, so the override is defined once.
@@ -70,6 +72,9 @@ cmd_build() {
   git clone --recurse-submodules https://github.com/denoland/rusty_v8 $V8_DIR"
 
   "$ROOT/vendor/v8-property-trace.sh" "$V8_DIR/v8" >/dev/null
+  # Independent of the trace patch: these are ObjectTemplate bindings the engine
+  # needs (document.all), and they live in rusty_v8 rather than in V8.
+  "$RUSTY_EXTRAS" "$V8_DIR" >/dev/null
   echo "patched; building (first time takes ~30 minutes)"
   cd "$ROOT"
 

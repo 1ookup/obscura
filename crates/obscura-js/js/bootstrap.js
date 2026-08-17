@@ -45,6 +45,9 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__documentReadyState__', '__currentUrl',
+    '__obscura_document_all', '__obscura_document_all_resolve',
+    '_installDocumentAll', '_documentAllElements', '_documentAllNamed',
+    '_HTML_ALL_OWN_KEYS',
     // Assigned only once a dynamically inserted script runs, which is why it
     // was missed here and showed up in a challenge page's window enumeration.
     '__currentScriptNid',
@@ -11914,6 +11917,102 @@ globalThis.__obscura_performance_lifecycle = function(phase, timestamp) {
   }
 };
 
+
+// `document.all`. The object itself is built by the V8 API (src/document_all.rs)
+// because its `[[IsHTMLDDA]]` behaviour -- `typeof document.all` answering
+// "undefined" while the collection still resolves and is still callable -- has
+// no JavaScript expression. Everything it contains is decided here.
+//
+// The contract with the native interceptors: return `[value]` to answer a
+// lookup, `undefined` to decline it. A bare `undefined` return cannot mean
+// "the answer is undefined", because declining is how the prototype's own
+// members stay reachable.
+const _HTML_ALL_OWN_KEYS = new Set(['length', 'item', 'namedItem']);
+globalThis.HTMLAllCollection = class HTMLAllCollection {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'HTMLAllCollection'; }
+};
+function _documentAllElements() {
+  // Document order, starting at <html>, which is what the collection is.
+  return _internalQuerySelectorAll(globalThis.document, '*');
+}
+// A name matches an element's id, or its name attribute on the elements where
+// that is a named-access surface.
+function _documentAllNamed(elements, key) {
+  const named = [];
+  for (const element of elements) {
+    if (element.getAttribute('id') === key) { named.push(element); continue; }
+    const local = element.localName;
+    if ((local === 'a' || local === 'applet' || local === 'area' || local === 'embed'
+      || local === 'form' || local === 'frame' || local === 'frameset'
+      || local === 'iframe' || local === 'img' || local === 'object')
+      && element.getAttribute('name') === key) {
+      named.push(element);
+    }
+  }
+  if (!named.length) return undefined;
+  // One match answers with the element; several answer with a collection, as
+  // named access does everywhere else.
+  return named.length === 1 ? named[0] : HTMLCollection._from(named);
+}
+globalThis.__obscura_document_all_resolve = function (kind, key) {
+  try {
+    if (kind === 'index') {
+      const elements = _documentAllElements();
+      const index = +key;
+      return index >= 0 && index < elements.length ? [elements[index]] : undefined;
+    }
+    if (kind === 'call') {
+      // `document.all(x)` is `document.all[x]` for an index, and named access
+      // otherwise; with no argument at all it is null.
+      if (key === undefined) return [null];
+      const elements = _documentAllElements();
+      if (typeof key === 'number' || /^[0-9]+$/.test(String(key))) {
+        const index = +key;
+        return [index >= 0 && index < elements.length ? elements[index] : null];
+      }
+      const named = _documentAllNamed(elements, String(key));
+      return [named === undefined ? null : named];
+    }
+    const name = String(key);
+    if (name === 'length') return [_documentAllElements().length];
+    if (name === 'item') {
+      return [_markNative(function item(index) {
+        const elements = _documentAllElements();
+        if (arguments.length === 0) {
+          throw new TypeError(
+            "Failed to execute 'item' on 'HTMLAllCollection': 1 argument required, but only 0 present.");
+        }
+        if (typeof index === 'string' && !/^[0-9]+$/.test(index)) {
+          const named = _documentAllNamed(elements, index);
+          return named === undefined ? null : named;
+        }
+        const at = +index;
+        return at >= 0 && at < elements.length ? elements[at] : null;
+      })];
+    }
+    if (name === 'namedItem') {
+      return [_markNative(function namedItem(key2) {
+        const named = _documentAllNamed(_documentAllElements(), String(key2));
+        return named === undefined ? null : named;
+      })];
+    }
+    // A digit string is an index however it arrives.
+    if (/^(?:0|[1-9][0-9]*)$/.test(name)) {
+      const elements = _documentAllElements();
+      const index = +name;
+      return index < elements.length ? [elements[index]] : undefined;
+    }
+    // Anything the collection does not own is left to the prototype chain, so
+    // `constructor`, `toString` and the rest keep working.
+    if (_HTML_ALL_OWN_KEYS.has(name)) return undefined;
+    const named = _documentAllNamed(_documentAllElements(), name);
+    return named === undefined ? undefined : [named];
+  } catch (_error) {
+    return undefined;
+  }
+};
+
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
   'Baskerville', 'Book Antiqua',
@@ -18545,6 +18644,27 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+
+// Hang the native collection off Document.prototype. It is absent in a build
+// that links the prebuilt V8 rather than the vendored source, and then
+// `document.all` stays undefined -- which is this engine's behaviour today.
+// Substituting an ordinary object would answer `typeof` wrongly and be a
+// louder difference than the absence.
+function _installDocumentAll() {
+  const collection = globalThis.__obscura_document_all;
+  // `!collection` would be true here: the object is deliberately falsy. Strict
+  // comparison is the only test that separates "absent" from "undetectable",
+  // because `== undefined` is true for both.
+  if (collection === undefined) return;
+  try { Object.setPrototypeOf(collection, globalThis.HTMLAllCollection.prototype); }
+  catch (_error) {}
+  if (Object.getOwnPropertyDescriptor(Document.prototype, 'all')) return;
+  Object.defineProperty(Document.prototype, 'all', {
+    get() { return collection; },
+    enumerable: true, configurable: true,
+  });
+}
+
 globalThis.__obscura_init = function() {
   // First: the document URL is known now, and the gating below removes APIs
   // that later init steps would otherwise hand out on an insecure origin.
@@ -18556,6 +18676,7 @@ globalThis.__obscura_init = function() {
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
+  _installDocumentAll();
 
   // Frame wrappers belong to the replaced document; the Rust loader creates
   // fresh content roots for the new page.

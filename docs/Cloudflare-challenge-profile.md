@@ -4180,3 +4180,67 @@ widget iframe 在 closed shadow 里（`querySelectorAll('*')` 穿不透）。
 **方法论**：对方 try/catch 掉异常时，`Runtime.exceptionThrown` 和空壳 Debugger 都指望不上,
 **给「可能返回 null 的东西」加返回值钩子**比给「抛异常的地方」加钩子有效——
 前者能在异常发生**之前**把嫌疑对象点出来。
+
+### Step 78 — `document.all`：只能在 V8 层做的那一个（2026-08-17）
+
+step 77 记过：`document.all` 在 obscura 里完全没有，而它的 falsy 语义
+**JS 层伪造不了**，所以当时**故意没做**。参考实现
+（`课程/core/native/document-all`，一个 Node 原生插件）证实了这个判断——
+它的核心就两行：
+
+```cpp
+templ->InstanceTemplate()->MarkAsUndetectable();
+templ->InstanceTemplate()->SetCallAsFunctionHandler(DocumentAllCallback);
+```
+
+`MarkAsUndetectable` 就是规范里的 `[[IsHTMLDDA]]`：`typeof` 答 `"undefined"`、
+对象为 falsy、`== null` 与 `== undefined` 都为真，**而 `===` 两者都为假**——
+因为对象确实在那儿。没有任何 JS 表达式能让 `typeof` 撒谎。
+
+**障碍**：V8 有这两个 API（`v8-template.h:983/994`），**rusty_v8 v137.3.0 没绑定**。
+
+**做法**：照项目已有的先例（`vendor/v8-property-trace.sh` 用一个**已提交的脚本**
+去打 gitignore 的 vendor 树），新增 `vendor/v8-rusty-extras.sh`,
+往 `binding.cc` / `template.rs` 里补 `MarkAsUndetectable` 与
+`SetCallAsFunctionHandler` 的绑定，幂等，并接进 `vendor/v8-trace.sh build`。
+
+**分工**：Rust（`crates/obscura-js/src/document_all.rs`）只负责 undetectable 模板、
+三个拦截器（named / indexed / call-as-function）和实例化；
+**集合里有什么全部留在 JS**。协议是 `__obscura_document_all_resolve(kind, key)`
+返回 `[value]` 表示接管、返回 `undefined` 表示不接管——
+不能用裸 `undefined` 表示「答案是 undefined」，否则原型链上的成员就够不着了。
+主 realm 与每个 frame realm 各装一份。
+
+**实测（与 Chrome 逐条一致）**：
+
+```
+typeof document.all      "undefined"      !document.all        true
+document.all == null     true             == undefined         true
+=== null                 false            === undefined        false
+'all' in document        true             toString             [object HTMLAllCollection]
+all[0]/all[1]            HTML / HEAD      all[99999]           undefined
+all(0)                   HTML             all('probe')         该元素
+all('absent')            null             all.item(0)          HTML
+all.namedItem('probe')   该元素           document.all === all true
+```
+
+**一个坑**：安装时的守卫原本写的是 `if (!collection) return;`——
+**对 undetectable 对象恒为真**，正好把要装的东西挡掉了。
+只有 `=== undefined` 能区分「不存在」与「undetectable」。
+
+**限制（写清楚）**：绑定只存在于**从源码构建**的 V8。Dockerfile 与 release 工作流
+链接的是预编译 `librusty_v8.a`，没有这些符号，安装器拿不到对象,
+`document.all` 保持 undefined——**就是这些构建今天的行为，不是回退**。
+放一个普通对象上去会让 `typeof` 答 `"object"`，用一个矛盾换掉一个缺失，更糟。
+
+**没能解决的**：`QCEE0` 仍然缺失、`PvWp9` 仍是那条 `innerHTML` 的 TypeError。
+**`document.all` 不是那个模块的成因。** 本步的收益是补上了一个真实且无法在 JS 层
+实现的平台面，不是修好了那个模块。
+
+**本轮 CF 侧复测**（同一目标、同一代理）：
+
+| 字段 | Chrome | 原始 | 现在 |
+|------|--------|------|------|
+| `gqGB4` 字体 | 83 | 738 | **93** |
+| `qOeu1` 选择器 | 373 | 2221 | **147** |
+| 载荷总量 | 68327 | 38529 | **52034** |

@@ -31,6 +31,13 @@ compile with the vendor V8 takes ~30 minutes; incremental builds are seconds.
 The aliases in `.cargo/config.toml` wrap the common shapes: `cargo v8-build`,
 `cargo v8-build-lean`, `cargo v8-check`, `cargo v8-test`.
 
+Two committed scripts patch the gitignored vendor tree, and `vendor/v8-trace.sh
+build` runs both: `vendor/v8-property-trace.sh` (the trace patch, in V8 itself)
+and `vendor/v8-rusty-extras.sh` (two `ObjectTemplate` bindings rusty_v8 leaves
+unbound, which `document.all` needs). Both are idempotent. The extras are
+absent from a prebuilt-V8 build, and `document.all` is then simply undefined --
+the behaviour those builds have today, not a regression.
+
 ```bash
 # Rendering and stealth. `stealth` is in the default feature set, so --features
 # render adds to it rather than replacing it.

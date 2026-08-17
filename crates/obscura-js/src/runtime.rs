@@ -1458,10 +1458,22 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        // Before __obscura_init, which is where the bootstrap picks the
+        // collection up and hangs it off Document.prototype.
+        self.install_document_all();
         let _ = self.runtime.execute_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+    }
+
+    /// Put `document.all`'s backing object on the main realm's global. It has
+    /// to be built through the V8 API -- see crate::document_all -- so it
+    /// cannot come from the bootstrap like the rest of the DOM.
+    pub(crate) fn install_document_all(&mut self) {
+        let scope = &mut self.runtime.handle_scope();
+        let context = scope.get_current_context();
+        crate::document_all::install(scope, context);
     }
 
     /// Direct access to the deno_core runtime for the realm host
@@ -18415,6 +18427,67 @@ RequestRedirect value",
             serde_json::json!({
                 "outcome": "error",
                 "executed": false,
+            })
+        );
+    }
+
+    #[test]
+    fn document_all_is_undetectable_and_still_a_collection() {
+        let mut rt = setup_runtime("<html><head></head><body><div id=probe></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const all = document.all;
+                    return {
+                        // The [[IsHTMLDDA]] behaviour, which is why this cannot
+                        // be built from JavaScript: typeof lies, the object is
+                        // falsy, and loose comparison against both null and
+                        // undefined succeeds -- while strict comparison fails,
+                        // because the object is really there.
+                        typeofIs: typeof all,
+                        falsy: !all,
+                        looseNull: all == null,
+                        looseUndefined: all == undefined,
+                        strictNull: all === null,
+                        strictUndefined: all === undefined,
+                        present: 'all' in document,
+                        brand: Object.prototype.toString.call(all),
+                        // A collection in document order, starting at <html>.
+                        head: [all[0].tagName, all[1].tagName],
+                        outOfRange: all[99999] === undefined,
+                        // Callable, which no ordinary object is.
+                        callIndex: all(0).tagName,
+                        callNamed: all('probe').id,
+                        callMissing: all('absent'),
+                        item: all.item(0).tagName,
+                        namedItem: all.namedItem('probe').id,
+                        named: all.probe.id,
+                        // Same object every read, as a live collection is.
+                        identity: document.all === all,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "typeofIs": "undefined",
+                "falsy": true,
+                "looseNull": true,
+                "looseUndefined": true,
+                "strictNull": false,
+                "strictUndefined": false,
+                "present": true,
+                "brand": "[object HTMLAllCollection]",
+                "head": ["HTML", "HEAD"],
+                "outOfRange": true,
+                "callIndex": "HTML",
+                "callNamed": "probe",
+                "callMissing": null,
+                "item": "HTML",
+                "namedItem": "probe",
+                "named": "probe",
+                "identity": true,
             })
         );
     }
