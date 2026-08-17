@@ -4364,3 +4364,38 @@ obscura 确实没实现的），`n.` 差 49（`mediaDevices`、`clipboard`、
 | 盲区 | 症状 | 正确做法 |
 |------|------|----------|
 | **本地复算枚举了页面对象，而 CF 枚举的是新建 iframe 的对象** | 页面 window 的 `for..in` 是 242 项，CF 收到的 `d.` 只有 43；据此对「补了多少」「还差多少」的估计全部偏离，并把根因判反 | 复算前先从真实载荷反推**被枚举的是哪个对象**（看类别的成员和顺序像谁），再在同一个对象上复算 |
+
+### Step 81 — iframe 初始 about:blank 文档改由 Rust 同步提交（2026-08-18）
+
+**修复**（`bc0e0cf`）：`op_dom` 新增 `create_blank_iframe_document`，在插入步骤里同步
+建内容根、解析 `<html><head></head><body></body>` 骨架、按**穿透 shadow** 的方式
+继承创建者文档的源。`_IframeWindow` / `_IframeDocument` 两个垫片连同 332 行删除；
+未插入 DOM 的 iframe 现在 `contentWindow` 为 `null`（与浏览器一致）。
+
+**一处踩坑值得记**：第一版用 `containing_iframe_content_document` 取父文档源，它只看
+节点自己的 tree scope。Turnstile 把 widget 建在**闭合 shadow root** 里，于是取不到父
+文档、回退到顶层源，widget realm 访问自己刚建的 frame 直接抛 SecurityError，
+链路从 6 个请求掉到 3 个。换成 `containing_document_root_shadow_including` 后恢复。
+
+**CF 实测（同目标同代理）**：
+
+| | 修前 | 修后 | Chrome |
+|---|------|------|--------|
+| `for..in` 帧文档 | 43 | **243** | 295 |
+| `fyCZH9` | 15925 | **19867** | 30881 |
+| 载荷 2 | 94258 | **98410** | 109065 |
+| `o.` | 493 | 339 | 28 |
+
+**并且搞清了 `o.` 的真正语义（之前理解错了）**：它不是「iframe window 上没有的名字」，
+而是「**取值与 iframe window 不同**的名字」。证据：obscura 的 `o.` 与裸名重叠 316 项，
+Chrome 重叠 5 项（`innerHeight`/`innerWidth`/`event`/`frameElement`/`Array`）。
+
+那 316 项全部是同一种差异：**页面 window 上桶为 `N`，空白帧 window 上桶为 `f`**。
+它们是 `_iframeRealmGlobal` 为每个帧造的 realm 局部包装（浏览器里
+`frame.Object !== Object`，这层不能省）。在本机顶层 realm 里这些包装的
+`Function.prototype.toString` 返回的就是 `[native code]`，所以 CF 区分二者用的不是
+toString。**下一步先查这个**：一个可疑点是包装用 `Object.setPrototypeOf(wrapped, source)`
+继承静态成员，于是 `Object.getPrototypeOf(frame.Event) === Event` 而不是
+`frame.Function.prototype`——真实浏览器不是这样。**尚未验证，不要当结论用。**
+
+**未决**：裸名 499 vs 1238（缺 698 个接口构造器）、`n.` 39 vs 81、`QCEE0` 仍缺失。
