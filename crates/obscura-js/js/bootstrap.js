@@ -17519,12 +17519,70 @@ if (typeof FontFace === 'undefined') {
       const loaded = this.loaded;
       Promise.resolve().then(() => {
         if (this._status !== 'loading') return;
+        // A `local()` source names a font the machine either has or does not.
+        // Resolving unconditionally answers "installed" for every name a
+        // caller can invent, which is how the engine came to claim it had
+        // Windows, Linux and macOS font sets at the same time -- this is the
+        // probe that produced that list, not text measurement.
+        const missing = _fontFaceLocalSourceMissing(this._source);
+        if (missing !== null) {
+          this._status = 'error';
+          const error = new DOMException(
+            `A network error occurred loading font "${missing}".`, 'NetworkError');
+          this._rejectLoaded?.(error);
+          // The rejection is delivered through `loaded`; without a sink here
+          // an unobserved probe would report an unhandled rejection.
+          loaded.catch(() => {});
+          this._changed();
+          return;
+        }
         this._status = 'loaded';
         this._resolveLoaded?.(this);
         this._changed();
       });
       return loaded;
     }
+  };
+
+  // The first `local()` family in a source that this machine does not have,
+  // or null when every one of them is available.
+  //
+  // Availability is decided by measuring rather than by a second list: the
+  // renderer already resolves an unknown named family by skipping it, so a
+  // family that survives being measured against two different generics is one
+  // the renderer actually has. Keeping the answer on that side means the two
+  // can never disagree about which fonts exist.
+  const _fontFaceLocalSourceMissing = source => {
+    const text = String(source == null ? '' : source);
+    const locals = text.match(/local\(\s*(?:"[^"]*"|'[^']*'|[^)]*)\s*\)/gi);
+    if (!locals) return null;
+    for (const entry of locals) {
+      const family = entry
+        .replace(/^local\(\s*/i, '').replace(/\s*\)$/, '').trim()
+        .replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
+      if (family && !_localFontAvailable(family)) return family;
+    }
+    return null;
+  };
+  const _localFontCache = new Map();
+  const _localFontAvailable = family => {
+    const key = family.toLowerCase();
+    if (_localFontCache.has(key)) return _localFontCache.get(key);
+    let available = false;
+    try {
+      const context = (_localFontAvailable._canvas
+        || (_localFontAvailable._canvas = document.createElement('canvas'))).getContext('2d');
+      const quoted = '"' + family.replace(/"/g, '\\"') + '"';
+      const width = generic => {
+        context.font = '72px ' + quoted + ', ' + generic;
+        return context.measureText('mmmmmmmmmmlli').width;
+      };
+      // An absent family falls through to whichever generic follows it, so the
+      // two measurements differ. A present one overrides both, so they agree.
+      available = width('monospace') === width('sans-serif');
+    } catch (_error) {}
+    _localFontCache.set(key, available);
+    return available;
   };
 
   const _fontFaceSelection = font => {

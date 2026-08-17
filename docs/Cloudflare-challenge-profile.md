@@ -4021,3 +4021,53 @@ Arial / Courier New / Georgia / Consolas / Times New Roman -> PRESENT
 同时断言真实存在的族仍然各自解析。
 
 **CF 侧量测**同 step 72,因代理 JS 的加密 key 过期本轮无法取得。
+
+### Step 75 — `gqGB4` 的真正探测路径：`FontFace` 的 `local()` 源（2026-08-17）
+
+代理的 JS 更新后 CF 恢复正常，先把 step 72-74 欠的三项量测补齐：
+
+| 字段 | Chrome | 修前 | 修后 |
+|------|--------|------|------|
+| `ZpxzX5` RTP 能力表 | 1273 | 7 | **1281** |
+| `Swui9` 键盘布局 | 596 | 2 | **576** |
+| `gqGB4` 字体列表 | 83（6 个） | 738（54 个） | **738（54 个），没变** |
+
+**`gqGB4` 完全没动**——修前修后的 54 个名字逐字节相同。说明 step 74 修的
+`bundled_family_for_css_token` 虽然本身是对的，但**不在 CF 走的那条路上**。
+
+**逐路径排除**：
+
+1. DOM 测宽（`span.offsetWidth`，`'X',monospace` vs `'X',sans-serif`）→ step 74 之后已正确
+2. canvas `measureText` → 同样已正确（两条路共用渲染侧解析）
+3. `document.fonts.check()` → 对任何名字都回 `true`——但**Chrome 也是**
+   （规范里未匹配到 FontFace 的族直接跳过），不是判据
+4. **`new FontFace('p', 'local("X")').load()`** → obscura **对任何名字都 resolve**;
+   Chrome 对未安装的字体 **reject `NetworkError`**。**这才是那条路。**
+
+**修复**：`FontFace.load()` 解析源里的每个 `local(...)`，家族不可用就把 `status`
+置为 `'error'` 并以 Chrome 的文案 reject `NetworkError`。
+
+「可不可用」**不另立一张表**，而是**用测量来判定**——同一个字符串分别按
+`"X", monospace` 和 `"X", sans-serif` 走 canvas `measureText`，**两次相等即存在**。
+渲染侧对不认识的具名族已经是「跳过、用下一个 generic」，所以这个判据与渲染器
+**不可能不一致**；另写一张可用字体表则必然随时间漂移。结果按小写族名缓存。
+
+**结果**：`gqGB4` 从 **54 个名字降到 6 个**，与 Chrome 的数量一致，
+且不再有 Windows/Linux/macOS 三套并存：
+
+```
+chrome: Apple Symbols, Galvji, Geneva, InaiMathi Bold, Luminari, PingFang HK Light
+obscura: DejaVu Sans, Liberation Mono, Liberation Sans, Lucida Console, Noto Sans, Noto Serif
+```
+
+**残留**：这 6 个里有 5 个是 Linux 族——它们是引擎**真正打包**的字体。
+自称 Windows 却装着 DejaVu/Liberation/Noto 仍是个矛盾，但已经从「三套 OS」
+收敛成「一套错的 OS」。彻底解决要让打包字体集随所声称的平台切换（渲染栈改动），另记。
+
+**回归测试**：`a_local_font_source_fails_for_a_family_this_machine_does_not_have`——
+断言真实存在的族 `loaded`，Windows/macOS 的族与一个编造的名字都 `NetworkError`,
+且不含 `local()` 的 `url()` 源不受影响。
+
+**教训**：step 74 是「修了一个真实缺陷，但它不是本字段的成因」。
+**改完必须回到那个字段本身复测**，不能因为本地探针变好就认为字段会跟着变——
+本字段修前修后逐字节相同，正是这条的代价。

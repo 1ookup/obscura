@@ -18420,6 +18420,56 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_local_font_source_fails_for_a_family_this_machine_does_not_have() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const probe = async family => {
+                        try {
+                            await new FontFace('p', `local("${family}")`).load();
+                            return 'loaded';
+                        } catch (error) { return error.name; }
+                    };
+                    return {
+                        // Present: a family the renderer actually resolves.
+                        present: await probe('Courier New'),
+                        // Absent: fonts from other platforms, and a name that
+                        // cannot exist anywhere. Resolving these is how the
+                        // engine came to claim Windows, Linux and macOS font
+                        // sets at once.
+                        windows: await probe('Segoe Fluent Icons'),
+                        mac: await probe('Skia'),
+                        invented: await probe('ZZZ No Such Font 12345'),
+                        // A source with no local() is unaffected.
+                        remote: await (async () => {
+                            try {
+                                await new FontFace('p', 'url(https://example.test/f.woff2)').load();
+                                return 'loaded';
+                            } catch (error) { return error.name; }
+                        })(),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "present": "loaded",
+                "windows": "NetworkError",
+                "mac": "NetworkError",
+                "invented": "NetworkError",
+                "remote": "loaded",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn the_keyboard_layout_map_describes_a_physical_ansi_board() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
