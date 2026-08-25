@@ -251,7 +251,17 @@ _markNative(globalThis.dispatchEvent);
     _cacheLen = list.length;
     return _cache;
   }
-  function _isGlobal(t) { return t === globalThis; }
+  function _isGlobal(t) {
+    if (t === globalThis) return true;
+    // A frame realm's global object is a distinct V8 global, not this realm's
+    // `globalThis`. Fingerprinting scripts reach it through
+    // `iframe.contentWindow.eval('globalThis')` and then enumerate it with the
+    // *main* realm's Object.getOwnPropertyNames, whose filter would otherwise
+    // skip it (t !== globalThis) and leak every __obscura_* / _* / Deno global
+    // the frame carries. A V8 global always answers `globalThis === t`; a plain
+    // object does not, so this is a cheap, side-effect-free discriminator.
+    try { return !!t && t.globalThis === t; } catch (_e) { return false; }
+  }
   function _filter(t, names) {
     if (!_isGlobal(t)) { return names; }
     var set = _set();
@@ -4282,8 +4292,12 @@ class Element extends Node {
       // same-origin gate compares typed DocumentScope origins in Rust, never
       // serialized origin strings; cross-origin content reads as null.
       if (!_frameSameOrigin(nativeRoot)) return null;
+      _materializeFrameRealm(this._nid);
       const realmGlobal = _frameRealmGlobalFor(nativeRoot);
-      if (realmGlobal && realmGlobal.document) return realmGlobal.document;
+      if (realmGlobal && realmGlobal.document) {
+        _hideOwnProperty(realmGlobal.document, '_defaultViewProxy', _frameWindowProxyFor(this));
+        return realmGlobal.document;
+      }
       const doc = _scopedDocumentFor(nativeRoot);
       _hideOwnProperty(doc, '_defaultViewProxy', _frameWindowProxyFor(this));
       return doc;
@@ -6957,6 +6971,25 @@ function _frameRealmGlobalFor(rootNid) {
   const globals = globalThis.__obscura_frame_realm_globals;
   return globals ? (globals[String(rootNid)] || null) : null;
 }
+
+// Materialize a real realm for a freshly-connected same-origin frame whose
+// realm the async loader has not built yet. contentDocument and contentWindow
+// must both see the same document, so both getters route through here before
+// they consult _frameRealmGlobalFor. Only the initial about:blank document
+// (empty frameId) needs this: a document the async loader committed already has
+// a frameId and will get its realm from ensure_frame_realm on the event loop.
+function _materializeFrameRealm(hostNid) {
+  const root = +_dom("iframe_content_document_root", hostNid);
+  if (root < 0 || !_frameSameOrigin(root) || _frameRealmGlobalFor(root)) return;
+  const info = _domParse("document_scope_info", root);
+  if (info && info.frameId) return;
+  const bridge = Deno.core.ops.op_ensure_frame_realm(hostNid);
+  if (bridge) {
+    const globals = globalThis.__obscura_frame_realm_globals ||
+      (globalThis.__obscura_frame_realm_globals = {});
+    globals[String(root)] = bridge;
+  }
+}
 function _frameRealmOwnKeys(realmGlobal) {
   try { return realmGlobal.Reflect.ownKeys(realmGlobal); }
   catch (e) { return Reflect.ownKeys(realmGlobal); }
@@ -7056,6 +7089,12 @@ function _frameWindowProxyFor(hostEl) {
   const existing = _frameWindowProxies.get(hostNid);
   if (existing) return existing;
 
+  // A same-origin frame whose realm the async loader has not built yet (the
+  // freshly-appended about:blank) must still expose a real realm: a probe reads
+  // contentWindow on the line after append and enumerates it, and the wrapper
+  // fallback reads as tampered.
+  _materializeFrameRealm(hostNid);
+
   const contentRoot = () => +_dom("iframe_content_document_root", hostNid);
   const sameOrigin = () => {
     const root = contentRoot();
@@ -7110,7 +7149,10 @@ function _frameWindowProxyFor(hostEl) {
       if (root < 0) return null;
       if (!_frameSameOrigin(root)) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(root);
-      if (realmGlobal && realmGlobal.document) return realmGlobal.document;
+      if (realmGlobal && realmGlobal.document) {
+        _hideOwnProperty(realmGlobal.document, '_defaultViewProxy', proxy);
+        return realmGlobal.document;
+      }
       const doc = _scopedDocumentFor(root);
       _hideOwnProperty(doc, '_defaultViewProxy', proxy);
       return doc;
@@ -7156,14 +7198,31 @@ function _frameWindowProxyFor(hostEl) {
     focus() {},
     close() {},
   };
+  // A probe that reads frame.contentWindow.postMessage gets the source of a
+  // plain function back unless it is marked native; Chrome answers
+  // `[native code]` for these WindowProxy members.
+  _markNative(target.postMessage);
+  _markNative(target.blur);
+  _markNative(target.focus);
+  _markNative(target.close);
   Object.defineProperty(target, "self", { get: () => proxy, configurable: true });
   Object.defineProperty(target, "window", { get: () => proxy, configurable: true });
   Object.defineProperty(target, "frames", { get: () => proxy, configurable: true });
+  Object.defineProperty(target, "globalThis", { get: () => proxy, configurable: true });
 
   const proxy = new Proxy(target, {
     // Access checks run per property operation, not only on contentDocument:
     // cross-origin callers get the HTML allowlist; anything else throws.
     get(t, key) {
+      // `constructor` is inherited off the target's Object.prototype, which
+      // would answer the *main* realm's Object. A browser answers the frame's
+      // own Window, so route it through the frame realm like every other
+      // Window member instead of the target's prototype chain.
+      if (key === "constructor") {
+        if (!sameOrigin()) throw securityError();
+        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+        return realmGlobal ? Reflect.get(realmGlobal, "constructor", realmGlobal) : Object;
+      }
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
@@ -7182,6 +7241,11 @@ function _frameWindowProxyFor(hostEl) {
         : Reflect.set(t, key, value);
     },
     has(t, key) {
+      if (key === "constructor") {
+        if (!sameOrigin()) return false;
+        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+        return realmGlobal ? Reflect.has(realmGlobal, "constructor") : true;
+      }
       if (Reflect.has(t, key)) return true;
       if (typeof key === "string" && !sameOrigin()) return false;
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
@@ -7386,11 +7450,22 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     focus() {},
     close() {},
   };
+  // Same WindowProxy-member marking as _frameWindowProxyFor, for the
+  // parent/top facades a nested frame sees.
+  _markNative(target.postMessage);
+  _markNative(target.blur);
+  _markNative(target.focus);
+  _markNative(target.close);
   Object.defineProperty(target, "self", { get: () => ref, configurable: true });
   Object.defineProperty(target, "window", { get: () => ref, configurable: true });
   Object.defineProperty(target, "frames", { get: () => ref, configurable: true });
   const ref = new Proxy(target, {
     get(t, key) {
+      if (key === "constructor") {
+        if (!sameOrigin()) throw securityError();
+        const realmGlobal = targetGlobal();
+        return realmGlobal ? Reflect.get(realmGlobal, "constructor", realmGlobal) : Object;
+      }
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = targetGlobal();
@@ -7407,6 +7482,11 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
         : Reflect.set(t, key, value);
     },
     has(t, key) {
+      if (key === "constructor") {
+        if (!sameOrigin()) return false;
+        const realmGlobal = targetGlobal();
+        return realmGlobal ? Reflect.has(realmGlobal, "constructor") : true;
+      }
       if (Reflect.has(t, key)) return true;
       if (typeof key === "string" && !sameOrigin()) return false;
       const realmGlobal = targetGlobal();
@@ -18746,6 +18826,16 @@ globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k
   // hides it.
   || k === 'Deno'
 );
+// The four frame-realm identity globals are set by Rust (realm.rs / ops.rs) on
+// a fresh frame context *before* its bootstrap runs, so they never exist on the
+// main global and the pattern above misses them. The main realm's reflection
+// filter (see _hideInternalsFromReflection) reads this list when a probe
+// enumerates the frame global across realms, so append them explicitly rather
+// than let a frame's own identity leak through Object.getOwnPropertyNames.
+for (const _frameFlag of ['__obscura_frame_document_nid', '__obscura_frame_base_url',
+    '__obscura_frame_id', '__obscura_frame_generation']) {
+  globalThis.__obscura_hide_list.push(_frameFlag);
+}
 
 /* ===== WPT conformance shims: batch 2 ===== */
 

@@ -1599,6 +1599,158 @@ impl ObscuraJsRuntime {
     }
 }
 
+/// Compile and run `source` in the scope's current context, discarding the
+/// completion value. Scope-based twin of `execute_in_context_at`, for the
+/// synchronous realm path where only an op's own scope is available.
+fn run_script(scope: &mut v8::HandleScope, name: &str, source: &str) -> Result<(), String> {
+    let source = v8::String::new(scope, source).ok_or_else(|| alloc_err("source"))?;
+    let name = v8::String::new(scope, name).ok_or_else(|| alloc_err("script URL"))?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let scope = &mut v8::TryCatch::new(scope);
+    let Some(script) = v8::Script::compile(scope, source, Some(&origin)) else {
+        return Err(realm_error(scope, "compilation"));
+    };
+    if script.run(scope).is_none() {
+        return Err(realm_error(scope, "execution"));
+    }
+    Ok(())
+}
+
+/// Synchronously create and register a frame main-world realm, the op-callable
+/// twin of `ensure_frame_world_realm`. It takes the op's own `v8::HandleScope`
+/// and a borrowed `FrameRealmHost` instead of `&mut self`, so a freshly-appended
+/// iframe can materialize its Window realm before the event loop runs. Returns
+/// the new realm's bridge object (for the JS side to cache), or `Ok(None)` when
+/// the realm already exists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_frame_realm(
+    scope: &mut v8::HandleScope,
+    frame_realms: &mut FrameRealmHost,
+    frame_id: &str,
+    generation: u64,
+    content_root: u32,
+    base_url: &str,
+    fingerprint_json: &str,
+    stealth: bool,
+    webgl_enabled: bool,
+    scope_url: Option<String>,
+    scope_origin: Option<String>,
+) -> Result<Option<v8::Global<v8::Object>>, String> {
+    if frame_realms.contains_world(frame_id, generation, MAIN_WORLD) {
+        return Ok(None);
+    }
+
+    // An op's scope reports the main context (Deno.core.ops is shared across
+    // realms), so the current context carries the main realm's Deno binding,
+    // security token and embedder slots. Read them here; the new context copies
+    // all three, exactly as the async path does.
+    let current = scope.get_current_context();
+    let deno_val = {
+        let key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
+        current
+            .global(scope)
+            .get(scope, key.into())
+            .filter(|value| value.is_object())
+            .ok_or_else(|| "realm: no Deno binding object".to_string())?
+    };
+    let deno_val = v8::Global::new(scope, deno_val);
+    let token = current.get_security_token(scope);
+    let context_state =
+        current.get_aligned_pointer_from_embedder_data(deno_core::CONTEXT_STATE_SLOT_INDEX);
+    let module_map =
+        current.get_aligned_pointer_from_embedder_data(deno_core::MODULE_MAP_SLOT_INDEX);
+
+    let context = v8::Context::new(scope, v8::ContextOptions::default());
+    context.set_security_token(token);
+    unsafe {
+        context.set_aligned_pointer_in_embedder_data(
+            deno_core::CONTEXT_STATE_SLOT_INDEX,
+            context_state,
+        );
+        context.set_aligned_pointer_in_embedder_data(
+            deno_core::MODULE_MAP_SLOT_INDEX,
+            module_map,
+        );
+    }
+
+    let bridge = {
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
+        let deno_local = v8::Local::new(scope, &deno_val);
+        global.set(scope, deno_key.into(), deno_local.into());
+
+        let nid_key = v8::String::new(scope, "__obscura_frame_document_nid")
+            .ok_or_else(|| alloc_err("key"))?;
+        let nid_val = v8::Number::new(scope, f64::from(content_root));
+        global.set(scope, nid_key.into(), nid_val.into());
+        let url_key = v8::String::new(scope, "__obscura_frame_base_url")
+            .ok_or_else(|| alloc_err("key"))?;
+        let url_val = v8::String::new(scope, base_url).ok_or_else(|| alloc_err("value"))?;
+        global.set(scope, url_key.into(), url_val.into());
+        let fid_key =
+            v8::String::new(scope, "__obscura_frame_id").ok_or_else(|| alloc_err("key"))?;
+        let fid_val = v8::String::new(scope, frame_id).ok_or_else(|| alloc_err("value"))?;
+        global.set(scope, fid_key.into(), fid_val.into());
+        let gen_key = v8::String::new(scope, "__obscura_frame_generation")
+            .ok_or_else(|| alloc_err("key"))?;
+        let gen_val = v8::Number::new(scope, generation as f64);
+        global.set(scope, gen_key.into(), gen_val.into());
+
+        crate::document_all::install(scope, context);
+
+        run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        run_script(
+            scope,
+            "<obscura:frame-realm-page-init>",
+            "globalThis.__obscura_init();",
+        )?;
+        let fingerprint_src = format!(
+            "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
+             globalThis.__obscura_stealth = {stealth}; \
+             globalThis.__obscura_webgl_enabled = {webgl_enabled};"
+        );
+        run_script(scope, "<obscura:frame-fingerprint>", &fingerprint_src)?;
+
+        let bridge_key = v8::String::new(scope, "__obscura_realm_bridge")
+            .ok_or_else(|| alloc_err("key"))?;
+        match global.get(scope, bridge_key.into()) {
+            Some(value) if value.is_object() => {
+                let bridge = value.to_object(scope).ok_or_else(|| alloc_err("bridge"))?;
+                Some(v8::Global::new(scope, bridge))
+            }
+            _ => None,
+        }
+    };
+
+    frame_realms.realms.insert(
+        (frame_id.to_string(), generation, MAIN_WORLD),
+        FrameRealm {
+            context: v8::Global::new(scope, context),
+            world_id: MAIN_WORLD,
+            world_name: None,
+            content_root,
+            base_url: base_url.to_string(),
+            scope_url,
+            scope_origin,
+        },
+    );
+    Ok(bridge)
+}
+
 fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String {
     if scope.is_execution_terminating() {
         scope.cancel_terminate_execution();
@@ -1845,6 +1997,99 @@ mod tests {
 
     const FRAME_HTML: &str = "<html><head><title>Frame Title</title></head>\
         <body><div id=\"inner\">frame text</div></body></html>";
+
+    #[test]
+    fn frame_realm_globals_stay_hidden_from_cross_realm_enumeration() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const win = frame.contentWindow;
+                    const internal = n =>
+                        n.includes('obscura') || n.startsWith('_') || n === 'Deno';
+                    // The normal path (the WindowProxy facade) filters its own keys.
+                    const viaProxy = Object.getOwnPropertyNames(win).filter(internal);
+                    // A fingerprinting script can reach the frame realm's *real*
+                    // global object through eval and enumerate it with the main
+                    // realm's Object.getOwnPropertyNames. That filter must also
+                    // hide the frame's internals, not just the main global's.
+                    const viaRealGlobal = Object.getOwnPropertyNames(win.eval('globalThis'))
+                        .filter(internal);
+                    return {
+                        viaProxy,
+                        viaRealGlobal,
+                        // The frame is its own realm: the eval'd global is not the page's.
+                        distinct: win.eval('globalThis') !== globalThis,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "viaProxy": [],
+                "viaRealGlobal": [],
+                "distinct": true,
+            })
+        );
+    }
+
+    #[test]
+    fn frame_window_proxy_methods_read_as_native_code() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const win = frame.contentWindow;
+                    const native = name =>
+                        /\{\s*\[native code\]\s*\}/
+                            .test(Function.prototype.toString.call(win[name]));
+                    return {
+                        postMessage: native('postMessage'),
+                        blur: native('blur'),
+                        focus: native('focus'),
+                        close: native('close'),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "postMessage": true,
+                "blur": true,
+                "focus": true,
+                "close": true,
+            })
+        );
+    }
+
+    #[test]
+    fn frame_window_proxy_constructor_is_the_frames_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const win = frame.contentWindow;
+                    return {
+                        // A browser answers the frame's own Window, not the
+                        // main realm's Object off the target's prototype chain.
+                        isFramesWindow: win.constructor === win.Window,
+                        isNotMainObject: win.constructor !== Object,
+                        name: win.constructor.name,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "isFramesWindow": true,
+                "isNotMainObject": true,
+                "name": "Window",
+            })
+        );
+    }
 
     #[test]
     fn frame_realm_document_binds_frame_content_root() {

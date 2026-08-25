@@ -168,6 +168,16 @@ pub(crate) struct PendingFrameMessage {
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    /// Stable pointer to the runtime's frame-realm registry (a heap Box), so the
+    /// synchronous realm op can register a realm it creates inside an op. Null
+    /// until the runtime installs it at construction.
+    pub(crate) frame_realms_ptr: *mut crate::realm::FrameRealmHost,
+    /// Serialized browser identity installed into every lazily-created frame
+    /// realm. Mirrors the runtime's fingerprint/stealth contract so the
+    /// synchronous realm op can apply it without reaching the runtime.
+    pub(crate) fingerprint_json: String,
+    pub(crate) stealth: bool,
+    pub(crate) webgl_enabled: bool,
     pub url: String,
     pub document_csp: Option<String>,
     /// Typed origin of the top-level document, derived exactly once per
@@ -377,6 +387,10 @@ impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
             dom: None,
+            frame_realms_ptr: std::ptr::null_mut(),
+            fingerprint_json: String::new(),
+            stealth: false,
+            webgl_enabled: false,
             url: "about:blank".to_string(),
             document_csp: None,
             top_origin: None,
@@ -2509,6 +2523,83 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
         -1
     } else {
         1
+    }
+}
+
+/// Synchronously materialize the Window realm for a freshly-connected iframe.
+///
+/// The Rust frame loader builds realms on the event loop, but a page can read
+/// `iframe.contentWindow` on the line after appending it, and a fingerprinting
+/// probe then enumerates the JS wrapper fallback instead of a real realm. This
+/// op creates the realm inside the op's own handle scope so the getter has a
+/// real (V8-native constructor surface) realm to return. Returns the realm's
+/// bridge object, or `undefined` when the host has no content document yet.
+#[op2(reentrant)]
+fn op_ensure_frame_realm<'a>(
+    scope: &mut v8::HandleScope<'a>,
+    state: &OpState,
+    host_nid: u32,
+) -> v8::Local<'a, v8::Value> {
+    // Collect inputs and drop the state borrow before the realm bootstrap runs
+    // below: bootstrap's __obscura_init calls back into op_dom, and a held
+    // RefCell borrow would panic that re-entrant dispatch.
+    let (frame_realms_ptr, content_root, base_url, frame_id, fingerprint_json, stealth, webgl_enabled, scope_url, scope_origin) = {
+        let shared = state.borrow::<SharedState>().clone();
+        let shared = shared.borrow();
+        let content = shared.dom.as_ref().and_then(|dom| {
+            dom.iframe_content_document(obscura_dom::NodeId::new(host_nid))
+        });
+        let scope = content.and_then(|root| {
+            shared.dom.as_ref().and_then(|dom| dom.document_scope(root))
+        });
+        let (base_url, scope_url, scope_origin) = match &scope {
+            Some(s) => (
+                s.base_url.clone(),
+                Some(s.url.clone()),
+                Some(s.origin.serialize()),
+            ),
+            None => ("about:blank".to_string(), None, None),
+        };
+        (
+            shared.frame_realms_ptr,
+            content.map(|root| root.index() as u32),
+            base_url,
+            format!("blank-{host_nid}"),
+            shared.fingerprint_json.clone(),
+            shared.stealth,
+            shared.webgl_enabled,
+            scope_url,
+            scope_origin,
+        )
+    };
+
+    if frame_realms_ptr.is_null() {
+        return v8::undefined(scope).into();
+    }
+    let Some(content_root) = content_root else {
+        return v8::undefined(scope).into();
+    };
+    let frame_realms = unsafe { &mut *frame_realms_ptr };
+
+    match crate::realm::spawn_frame_realm(
+        scope,
+        frame_realms,
+        &frame_id,
+        0,
+        content_root,
+        &base_url,
+        &fingerprint_json,
+        stealth,
+        webgl_enabled,
+        scope_url,
+        scope_origin,
+    ) {
+        Ok(Some(bridge)) => v8::Local::new(scope, &bridge).into(),
+        Ok(None) => v8::undefined(scope).into(),
+        Err(err) => {
+            tracing::warn!("op_ensure_frame_realm failed: {err}");
+            v8::undefined(scope).into()
+        }
     }
 }
 
@@ -6236,6 +6327,7 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_monotonic_ms(),
         op_run_classic_script(),
+        op_ensure_frame_realm(),
         op_fetch_url(),
         op_websocket_open(),
         op_websocket_send(),

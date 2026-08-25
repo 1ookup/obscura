@@ -366,8 +366,10 @@ pub struct ObscuraJsRuntime {
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
-    /// pages without iframes; the main-context path never touches it.
-    pub(crate) frame_realms: crate::realm::FrameRealmHost,
+    /// pages without iframes; the main-context path never touches it. Boxed so
+    /// a raw pointer to it can be shared into `ObscuraState` and used from ops
+    /// for the synchronous realm path, without moving the runtime.
+    pub(crate) frame_realms: Box<crate::realm::FrameRealmHost>,
     /// Per-document ES module maps for frame realms. These are separate from
     /// deno_core's top-level module map because each Window realm has its own
     /// module identities and import-map resolution state.
@@ -587,10 +589,17 @@ impl ObscuraJsRuntime {
             import_map,
             module_load_activity,
             isolate_handle,
-            frame_realms: crate::realm::FrameRealmHost::default(),
+            frame_realms: Box::new(crate::realm::FrameRealmHost::default()),
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
         };
+        {
+            // Share a stable pointer to the realm registry into the op-visible
+            // state. The Box pointee is heap-allocated, so its address survives
+            // the runtime moving into its final owner.
+            let mut state = runtime.state.borrow_mut();
+            state.frame_realms_ptr = runtime.frame_realms.as_mut() as *mut crate::realm::FrameRealmHost;
+        }
         runtime.set_fingerprint(&obscura_net::BrowserFingerprint::default());
         runtime
     }
@@ -828,6 +837,12 @@ impl ObscuraJsRuntime {
             return;
         };
         let webgl_enabled = self.gpu_profile_enabled();
+        {
+            let mut state = self.state.borrow_mut();
+            state.fingerprint_json = json.clone();
+            state.stealth = self.stealth;
+            state.webgl_enabled = webgl_enabled;
+        }
         let _ = self.runtime.execute_script(
             "<set-fingerprint>",
             format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
@@ -874,6 +889,11 @@ impl ObscuraJsRuntime {
 
     pub fn set_stealth(&mut self, enabled: bool) {
         self.stealth = enabled;
+        {
+            let mut state = self.state.borrow_mut();
+            state.stealth = enabled;
+            state.webgl_enabled = self.gpu_profile_enabled();
+        }
         // set_fingerprint may have already run for this page, so push the
         // profile flag from here too rather than relying on call order.
         let webgl_enabled = self.gpu_profile_enabled();

@@ -4399,3 +4399,177 @@ toString。**下一步先查这个**：一个可疑点是包装用 `Object.setPr
 `frame.Function.prototype`——真实浏览器不是这样。**尚未验证，不要当结论用。**
 
 **未决**：裸名 499 vs 1238（缺 698 个接口构造器）、`n.` 39 vs 81、`QCEE0` 仍缺失。
+
+### Step 82 — `o.` 那 316 项是「JS 包装过不了 CF 的原生检测」，两个假设被证伪（2026-08-19）
+
+**假设**：step 81 末尾留下的两个候选——①包装用 `Object.setPrototypeOf(wrapped, source)`
+导致 `Object.getPrototypeOf(frame.Event) === Event`；②`_markNative` 的 `_nativeFns` Set 是
+per-realm 的，主 realm 的包装在 frame realm 里 toString 会漏出 JS 源码。
+
+**方法**：逐条实现最小修复、重跑同一目标同一代理、看 `o.` 和裸名 `f` 桶变不变。
+
+**证据**：
+
+先把 316 项的桶归属钉死。obscura 载荷里这 316 个名字**裸名桶全是 `f`、`o.` 桶全是
+`N`**（`Object`、`Event`、`addEventListener`、`fetch` 等一律如此）。也就是说：被枚举的
+两个窗口里，一个是「非原生函数」`f`，另一个是「原生函数」`N`。前者是新建 iframe 的
+`contentWindow` 表面（realm 还没建、由 `_iframeRealmGlobal` 包装兜底），后者是页面自己的
+V8 原生构造器。Chrome 里这两者都是 `N`，所以没有 `o.` 前缀。
+
+两个假设**逐一证伪**：
+
+1. **`getPrototypeOf` 不是判据。** 把 `setPrototypeOf(wrapped, source)` 换成「静态成员
+   拷贝 + `[[Prototype]]` 留在 `Function.prototype`」，本地复验
+   `Object.getPrototypeOf(frame.Object) === Function.prototype` 成立、`frame.Object !== Object`
+   成立、静态成员（`Object.keys`/`Array.isArray`/`Promise.resolve`）照常。CF 实测 `o.` 仍
+   339、裸名 `f` 仍 314，**一字未动**。
+2. **跨 realm 的 `toString` 也不是。** 先写了个跨 realm 探针确认这个 bug 真实存在：
+   `Function.prototype.toString.call(__main.Event)` 在 frame realm 里返回 `class Event { …`
+   的源码而不是 `[native code]`（V8 原生 `Object` 则正常返回 `[native code]`）。然后把
+   `_nativeFns`/`_nativeStr` 挪到 `Deno` 上共享（`Deno` 是各 realm 同一个对象、且已从
+   枚举面隐藏），跨 realm toString 修复、回归测试通过。CF 实测 `o.` 仍 339、`f` 仍 314，
+   **一字未动**。
+
+两个修复都已回退，树保持干净。
+
+**结论**：CF 区分 `N`/`f` 用的既不是 `getPrototypeOf` 也不是 `Function.prototype.toString`
+（无论同 realm 还是跨 realm）。它是一层**靠 JS 无法伪造的 V8 原生检测**（比如
+`%FunctionGetScript` 或内置函数才有而普通 `function(...){}` 拿不到的内部槽）。因此
+`_iframeRealmGlobal` 造的 JS 包装**永远**过不了这关，`o.` 的 316 项不是靠把包装改得更像
+原生能消掉的。
+
+**真正的方向**：让新建 iframe 在 `append` 当刻拿到**真 realm**（V8 原生 `Object`/`Event`
+表面），而不是 JS 包装。`bc0e0cf` 只把**文档**改成了同步提交，window 面仍是包装兜底；
+这正是代码里标注的「Phase 3.7 per-frame realm」。这块是同步建 context 的架构改动，不是
+一行 JS 能补的，留作下一步。
+
+**测量盲区新增一条**：
+
+| 盲区 | 症状 | 正确做法 |
+|------|------|----------|
+| **把「改包装让它更像原生」当修复方向** | 连续改 `getPrototypeOf`、跨 realm toString 两处，`o.` 都一字未动——包装是 JS 函数，CF 的原生检测在 V8 内部层，JS 层面改不动 | 先确认判据在哪一层（JS 可伪造 vs V8 内部），再决定是「改包装」还是「建真 realm」 |
+
+**附带发现（真实 bug，但与 `o.` 无关，已回退留档）**：`_markNative` 的 `_nativeFns`/`_nativeStr`
+是 per-realm 的，主 realm 标记为原生的函数（`Event`、`addEventListener`、iframe 包装）在
+frame realm 里 toString 会漏 JS 源码。修法是把这两个集合挪到 `Deno`（跨 realm 共享）上。
+这不是本步目标，但任何「引擎内部源码泄漏」的排查都会撞到它，先记在这里。
+
+### Step 83 — 同步建 frame realm：`o.` 339 → 165，裸名 `f` 314 → 5（2026-08-19）
+
+**假设**：step 82 结论是「JS 包装过不了 CF 的原生检测，只能建真 realm」。这一假设**方向对了、
+机制说错了**——真 realm 之所以能修，不是因为「V8 原生」，而是因为真 realm 里的 `frame.Event`
+是**和页面 Event 结构一致的 bootstrap class**，而包装是 `function(){}` + `Object.create(prototype)`。
+
+**方法**：实现 Phase 3.7 的同步建 realm。`op_ensure_frame_realm`（`#[op2(reentrant)]`，拿
+`scope: &mut v8::HandleScope`）在 op 内 `v8::Context::new` 建 context、跑满 bootstrap + init +
+fingerprint、注册进 `frame_realms`、返回 realm bridge。`contentWindow`/`contentDocument` 两个
+getter 在首次访问时惰性触发，bridge 缓存进 `__obscura_frame_realm_globals`。
+
+**关键实现点**（每个都踩过坑）：
+
+1. **re-entrancy**：bootstrap 的 `__obscura_init` 会调 op_dom。若 `op_ensure_frame_realm` 用
+   `state: &mut OpState`，op2 宏对 `OpState` 的 `borrow_mut` 会一直持到函数返回，嵌套的 op_dom
+   再 `borrow` 直接 panic（`panic_cannot_unwind` + SIGABRT）。改成 `state: &OpState`（共享借用），
+   且把输入读齐后立刻 drop `ObscuraState` 的 `Ref`，嵌套 op 才能正常派发。
+2. **frame 身份可达性**：`frame_realms` 原本在 `ObscuraJsRuntime` 上，op 够不到。改成
+   `Box<FrameRealmHost>`（堆上稳定地址），`ObscuraState` 存一个 `*mut FrameRealmHost` 指针。
+3. **惰性 + 只对 about:blank**：只在 `document_scope` 的 `frameId` 为空（即
+   `create_blank_iframe_document` 造的初始文档）时同步建 realm；异步 loader 已经 commit 的
+   文档（frameId 非空）照旧走 `ensure_frame_realm`，否则会把有 frameId 的文档的 realm 建错 id。
+4. **`contentDocument` 与 `contentWindow` 一致性**：两个 getter 都要先 `_materializeFrameRealm`，
+   否则先读 `contentDocument` 再读 `contentWindow` 会拿到两个不同的 document。
+5. **`defaultView`/`globalThis` 身份**：真 realm 的 `document.defaultView` 指向 realm 自己的
+   globalThis，不是页面的 WindowProxy。两个 getter 返回 realm document 前要把它的
+   `_defaultViewProxy` 指到页面 proxy；proxy 的 `globalThis` 和 `self`/`window`/`frames` 一样
+   返回 proxy 本身。
+
+**CF 实测（同目标同代理）**：
+
+| | 修前 | 修后 | Chrome |
+|---|------|------|--------|
+| `o.` | 339 | **165** | 28 |
+| 裸名桶 `f` | 314 | **5** | 0 |
+| `o.` 桶 `N` | 330 | **48** | ~17 |
+| `fyCZH9` bytes | 19867 | 20072 | 30881 |
+
+`o.` 从 493（step 81 前）一路降到 165。裸名 `f` 只剩 5 个：`postMessage`/`blur`/`focus`/`close`
+（WindowProxy 自己的方法，还是 JS 函数没标 native）+ `constructor`。
+
+**剩余 `o.` 的构成**（165 项）：大头是**frame realm 的引擎内部泄漏**——`__obscura_*`/`_*`
+bootstrap 全局（`__obscura_frame_document_nid`、`Deno`、`__obscura_hide_list`、`_markNative`、
+`_wrap` 等约 140 项）+ 4 个 frame 标志（`__obscura_frame_document_nid` 等）+ CF 自己的混淆全局
+（`FtIMT8` 等 ~20 项，Chrome 也有）+ `innerWidth`/`innerHeight`（viewport 差，Chrome 也有）。
+也就是说：**主 realm 的 `_preHideInternals` 把这些内部藏住了，但同步建的 frame realm 没藏干净**。
+
+**修正 step 82 的结论**：step 82 说「JS 包装永远过不了 CF 的原生检测，判据在 V8 内部层」——
+**证伪**。真 realm 的 `frame.Event` 同样是 bootstrap JS class（不是 V8 原生），照样桶 `N`。判据
+不是「V8 原生 vs JS」，是「bootstrap class vs 包装 `function(){}`」之间的结构差（`.prototype`
+与 class 形态）。所以正确的修法确实是用真 realm 替换包装，但理由不是「更原生」，而是「结构与
+页面一致」。
+
+**下一步**：①把 frame realm 的内部字段藏干净（对齐主 realm 的 `_preHideInternals`）；②给
+WindowProxy 的 `postMessage`/`blur`/`focus`/`close` 标 native。这两处都是小改，改完 `o.` 应该
+能再往 28 靠一截。
+
+**回归测试**：`spawn_frame_realm` 走的是新 op 路径，现有 509 个 obscura-js 测试全绿（含
+`iframe_content_window_exposes_realm_globals`、`a_connected_iframe_has_its_initial_about_blank_document_at_once`
+两个 iframe 测试）。
+
+### Step 84 — 藏干净 frame realm 的内部字段：跨 realm 枚举 131 项 → 0（2026-08-25）
+
+**根因**：step 83 说「frame realm 的内部字段没藏干净」，但 `Object.getOwnPropertyNames(contentWindow)`
+这条路径是干净的（WindowProxy 的 ownKeys trap 走 `_frameRealmOwnKeys`，最终落在 frame realm 自己的
+`Reflect.ownKeys` 上，被 `_hideInternalsFromReflection` 过滤）。真正的漏点不在 Proxy，而在
+`iframe.contentWindow.eval('globalThis')`：这一步把 frame realm 的**真实 global 对象**交回主 realm，CF
+再用**主 realm**的 `Object.getOwnPropertyNames` 去枚举它。过滤器的 `_isGlobal` 只认
+`t === globalThis`（本 realm 的 global），跨 realm 的 frame global 不匹配，于是 `Deno`、`__obscura_*`、
+`_*` 共 131 个内部字段全部漏出。
+
+**修复**（两处，都在 `bootstrap.js`）：
+
+1. `_isGlobal` 加一个判别：`t.globalThis === t`。V8 的 global 对象（主 realm 和每个 frame realm）都
+   自引用 `globalThis`，普通对象不自引用，所以这是零副作用的判据。跨 realm 枚举 frame global 时，
+   过滤器现在也认得它是 global 并按 hide list 过滤。
+2. hide list 显式补齐 4 个 frame 标志（`__obscura_frame_document_nid` / `__obscura_frame_base_url` /
+   `__obscura_frame_id` / `__obscura_frame_generation`）。它们是 Rust 在 bootstrap 前设到 frame global
+   上的，主 realm 的 `Object.getOwnPropertyNames(globalThis)` 扫不到，模式匹配也就漏掉了。
+
+**本地验证**：`Object.getOwnPropertyNames(iframe.contentWindow.eval('globalThis'))` 里的内部字段
+从 131 项降到 0。CF 实测未跑（需同一目标同一代理），预期 `o.` 再往 28 靠一截。
+
+**回归**：新增 `frame_realm_globals_stay_hidden_from_cross_realm_enumeration`；5 个 iframe/枚举测试
+全绿。全量 419 个 obscura-js 测试里 5 个失败（`frame_elements_report_their_own_document_geometry`、
+3 个字体相关、`css_supports_matches_capabilities_and_boolean_conditions`），stash 本改动后依旧失败，
+均为预先存在的环境相关失败，与本步无关。
+
+### Step 85 — WindowProxy 方法标 native：裸名 `f` 剩下的 4 个方法清掉（2026-08-25）
+
+**根因**：step 83 裸名 `f` 里剩下 `postMessage`/`blur`/`focus`/`close`，它们是 `_frameWindowProxyFor`
+和 `_ancestorWindowRef` 的 `target` 对象字面量里的普通 JS 函数，没进 `_nativeFns`。CF 枚举
+`frame.contentWindow` 读到它们时拿到的是函数源码而不是 `[native code]`。
+
+**修复**：两处 WindowProxy 的 `target` 定义后各加 `_markNative(target.postMessage / blur / focus /
+close)`。`_markNative` 把函数加进主 realm 的 `_nativeFns`，主 realm 的 `Function.prototype.toString`
+对它们返回 `function <name>() { [native code] }`，与 Chrome 一致。
+
+**回归**：新增 `frame_window_proxy_methods_read_as_native_code`，4 个方法的 toString 都含
+`[native code]`。相关 iframe/枚举测试全绿。
+
+### Step 86 — WindowProxy 的 constructor 身份：返回 frame 自己的 Window（2026-08-25）
+
+**根因**：`frame.contentWindow.constructor` 走 Proxy get trap 的 `Reflect.has(t, 'constructor')`
+分支，沿 `target` 对象字面量的 `Object.prototype` 原型链取到主 realm 的 `Object`。Chrome 返回
+iframe 自己的 `Window`，所以 CF 读到的是身份错误的 constructor。
+
+**修复**：`_frameWindowProxyFor` 和 `_ancestorWindowRef` 两处 Proxy 的 get/has trap 里，对
+`constructor` 单独处理，委托给 frame realm 的 `globalThis.constructor`（= 该 frame 的 `Window`），
+不再走 target 的原型链。跨 origin 时 `constructor` 不在 HTML allowlist，get 抛 SecurityError、
+has 返回 false，与 WindowProxy 规范一致。
+
+**回归**：新增 `frame_window_proxy_constructor_is_the_frames_window`，验证
+`win.constructor === win.Window` 且 `!== Object`。7 个 WindowProxy 同源/跨源测试全绿。
+
+**未做**：`win.constructor`（frame 的 `Window`）在**主 realm**视角下 `Function.prototype.toString`
+仍返回 `class Window {...}` 源码而非 `[native code]`。这是 step 82 已探索过的跨 realm toString 问题
+（把 `_nativeFns` 挪到 `Deno` 共享可修，但 CF 实测 `o.` 不变，已回退），不属于 constructor 身份修复，
+留作独立项。至此 step 83 的「下一步①藏内部字段 + ②标 native」连同 constructor 身份都已落地。
