@@ -4,7 +4,12 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-08-17,step 67-74）：**未通过**。战线从「链路走不通」转成
+当前状态（2026-08-26,step 87）：**未通过**。窗口内部字段已藏干净（step 83–86），
+但 step 87 在 thelancet.com 实测发现 **document 仍泄漏 `_nid`/`_scopeRoot`/
+`_defaultViewProxy` 等引擎自有属性**（Chrome 实例 own keys 为空），根因是
+`_hideInternalsFromReflection` 只过滤 global、不滤 DOM 实例。下一步藏 document/Node 的 `_*`。
+
+以下为 step 67–74 的状态记录。战线从「链路走不通」转成
 「**提交载荷的内容对不上**」——`http://192.168.3.57:9000` 上的 MITM 代理把 CF 的
 提交对象以明文打了出来，第一次可以逐字段对拍（step 66）。本轮按字段修了 8 处,
 tokenB 载荷从 Chrome 的 **56% 提到 78%**（38529 → 53275 B）,
@@ -4573,3 +4578,67 @@ has 返回 false，与 WindowProxy 规范一致。
 仍返回 `class Window {...}` 源码而非 `[native code]`。这是 step 82 已探索过的跨 realm toString 问题
 （把 `_nativeFns` 挪到 `Deno` 共享可修，但 CF 实测 `o.` 不变，已回退），不属于 constructor 身份修复，
 留作独立项。至此 step 83 的「下一步①藏内部字段 + ②标 native」连同 constructor 身份都已落地。
+
+### Step 87 — thelancet.com 实测：窗口已藏干净，document 的 `_*` 自有属性仍泄漏（2026-08-26）
+
+**假设**：step 83–86 把 frame realm 窗口内部字段藏干净后，obscura 的 CF 指纹应与 Chrome
+更接近；用 `thelancet.com/1.txt` 对拍验证（以 Chrome 的三个 payload 为基准）。
+
+**方法**：
+- 信任代理 CA：正确下载点是 `http://cert.reqable.com/ca`（经代理访问），拿到
+  `CN=Reqable CA (Apr 4, 2026, 0D1CEBE3)`。`http://mitm.it/cert/pem` 返回占位 mitmproxy
+  证书、`http://reqable.com/ssl` 被 EdgeOne 拦成 567，都不是代理实际用于 MITM 的 CA，
+  用错导致首次 `CERTIFICATE_VERIFY_FAILED`。
+- `SSL_CERT_FILE=/tmp/reqable-ca.crt OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura serve
+  --proxy http://192.168.3.57:9000 --stealth`。
+- CDP 预注入被动 hook：postMessage 全文 + XHR/fetch/beacon body + 各 realm 的
+  `Object.getOwnPropertyNames(globalThis/document/navigator/screen)`，经 `console.warn`
+  汇总到 serve 日志一次 grep 全拿。
+
+**证据**：
+- 挑战跑到 `interactiveBegin`（12.4 s），3 个 POST 与 Chrome 同构：页面 `/fo/`(2327 B)、
+  widget `/g/fo/`(4642 B → 79180 B 的第二次大载荷，即指纹提交)。
+- widget 窗口 `getOwnPropertyNames` 已无 `_obscura*`/`Deno`/`_*` 全局（step 83–84 生效，
+  与 step 83 的裸名 `f` 314→5、step 85 的 5→0 一致）。
+- **document 仍泄漏引擎自有内部字段**：frame realm document 的 own keys =
+  `["_nid","_scopeRoot","_defaultViewProxy"]`；主 realm =
+  `["_nid","_treeParent","_treeParentEpoch","_styleSheetList"]`（widget 晚快照还多 `_fonts`）。
+  Chrome 把这些属性放在 `Document.prototype` 上，实例 own keys 为空。
+- navigator 缺约 23 个 Chrome 有的属性：`scheduling`/`userActivation`/`plugins`/`mimeTypes`/
+  `serviceWorker`/`virtualKeyboard`/`managed`/`bluetooth`/`hid`/`serial`/`usb`/`xr` 等。
+
+**结论**：
+- **是 obscura 的缺陷，不是页面正常行为。** `_hideInternalsFromReflection` 的 `_filter`
+  只对 `_isGlobal(t)` 过滤，document/Node 实例不是 global，`Object.getOwnPropertyNames(document)`
+  原样返回 `_nid` 等。这是 step 83–84 修窗口同类问题的下一个实例：内部字段以可枚举自有属性
+  `this._nid = nid` 挂在 DOM 实例上，而 Chrome 用原型访问器。
+- **下一步**：把 document（含 Node 实例）的 `_*` 自有属性也藏掉。两个方向：① `_filter` 对
+  DOM 实例（`t instanceof Node` 或 `t._nid !== undefined`）也过滤 `_*` 前缀；② 更彻底，内部
+  字段改存 Symbol/WeakMap，不走可枚举自有属性。前者快、后者根治。
+- navigator 缺口是独立的「能力面缺失」，与本步 document 泄漏不同类，另计。
+
+### Step 88 — document 的 `_*` 自有属性改 Symbol 键：`getOwnPropertyNames(document)` 泄漏归零（2026-08-26）
+
+**根因**：`_hideOwnProperty` 只把字段降成 `enumerable: false`，挡得住 `Object.keys`/`for-in`，
+挡不住 `Object.getOwnPropertyNames`（它返回非枚举自有属性）。而 `_hideInternalsFromReflection` 的
+`_filter` 只对 global 生效，document/Node 实例不是 global，`getOwnPropertyNames(document)` 原样
+返回 `_nid` 等引擎自有字段。
+
+**修复**：把 8 个引擎内部字段从字符串自有属性改成 `Symbol.for` 键——`_nid`、`_scopeRoot`、
+`_defaultViewProxy`、`_treeParent`、`_treeParentEpoch`、`_ownerDocRoot`、`_styleSheetList`、
+`_fonts`。symbol 键不出现在 `getOwnPropertyNames`/`Object.keys`/`for-in`，`document._nid` 直接读
+返回 `undefined`，与 Chrome 一致（Chrome 把这些槽位放在 WebIDL 原型 / C++ backing store）。
+`Symbol.for` 保证主 realm 与每个 frame realm 拿到同一个键，且 Rust 注入的 JS 片段
+（obscura-js 的 realm.rs/runtime.rs、obscura-browser 的 page.rs、obscura-cdp 的 dom.rs、
+obscura 的 page.rs）统一用 `Symbol.for('obscura.nid')` 读回，无需暴露全局。顺带删掉已死的
+`_hideOwnProperty`（它的 `defineProperty` 慢路径对「一个 document 一个 realm」才划算，symbol 纯赋值
+对成千上万的 element 也零开销，正好取代它）。
+
+**回归**：新增 `document_does_not_leak_engine_internals_via_own_property_names`，断言主 document、
+frame document、element 的 `getOwnPropertyNames` 都不含这 8 个字段，且 `document._nid === undefined`。
+obscura-js 513、obscura-browser 105 全绿。
+
+**未做（独立项）**：element 上还有 **215 个** `_` 前缀自有字段（`_style`/`_tagName`/`_ns`/`_lname`/
+`_nullNamespaceAttrs`/`_treeConnected`/`_treeConnectedEpoch`/`_treeDetachedExact` 等），是同一类泄漏的
+更大面。CF 当前的 `fyCZH9` 用选择性 `d.` 列表、不枚举 element 自有属性，所以暂不阻塞；若后续指纹
+升级为 `Object.getOwnPropertyNames(element)`，再按同一 Symbol 手法批量转换。

@@ -3878,7 +3878,7 @@ impl ObscuraJsRuntime {
                     st = 'array'; cn = 'Array';
                     desc = 'Array(' + v.length + ')';
                 }}
-                else if (t === 'object' && typeof v._nid === 'number') {{
+                else if (t === 'object' && typeof v[Symbol.for('obscura.nid')] === 'number') {{
                     st = 'node';
                     cn = v.constructor ? v.constructor.name : 'Node';
                     if (v.nodeType === 9) cn = 'HTMLDocument';
@@ -6607,7 +6607,7 @@ RequestRedirect value",
         const op = (cmd, a1, a2) =>
             Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
         const setupFrame = (hostId, html, originUrl, csp) => {
-            const host = document.getElementById(hostId)._nid;
+            const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));
             if (html) op("parse_into_subtree", created.root, html);
             op("set_document_scope", created.root, JSON.stringify({
@@ -6743,7 +6743,7 @@ RequestRedirect value",
         let script = format!(
             r#"(() => {{
                 {FRAME_OPS_PRELUDE}
-                const host = document.getElementById("f")._nid;
+                const host = document.getElementById("f")[Symbol.for('obscura.nid')];
                 const created = JSON.parse(op("create_iframe_content_document", host));
                 op("parse_into_subtree", created.root, "<html><body></body></html>");
                 op("set_document_scope", created.root, JSON.stringify({{
@@ -21027,7 +21027,7 @@ RequestRedirect value",
                 var scriptTestSetup = true;
                 globalThis.__cloneScriptRuns = 0;
                 const parser = document.getElementById("parser");
-                globalThis.__markParserScripts([parser._nid]);
+                globalThis.__markParserScripts([parser[Symbol.for('obscura.nid')]]);
                 document.head.appendChild(parser);
                 document.body.appendChild(parser.cloneNode(true));
 

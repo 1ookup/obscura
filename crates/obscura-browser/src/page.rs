@@ -8816,7 +8816,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                "var setup = true; const old = document.getElementById('old'); globalThis.__markParserScripts([old._nid]); return old._nid;",
+                "var setup = true; const old = document.getElementById('old'); globalThis.__markParserScripts([old[Symbol.for('obscura.nid')]]); return old[Symbol.for('obscura.nid')];",
             )
             .unwrap();
         page.suspend_js();

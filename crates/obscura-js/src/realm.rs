@@ -1980,7 +1980,7 @@ mod tests {
             r#"(() => {{
                 const op = (cmd, a1, a2) =>
                     Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-                const host = document.getElementById({host_id:?})._nid;
+                const host = document.getElementById({host_id:?})[Symbol.for('obscura.nid')];
                 const created = JSON.parse(op("create_iframe_content_document", host));
                 op("parse_into_subtree", created.root, {html:?});
                 op("set_document_scope", created.root, JSON.stringify({{
@@ -2087,6 +2087,47 @@ mod tests {
                 "isFramesWindow": true,
                 "isNotMainObject": true,
                 "name": "Window",
+            })
+        );
+    }
+
+    #[test]
+    fn document_does_not_leak_engine_internals_via_own_property_names() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    // The engine's tree/scope/document slots, which used to be
+                    // own string-keyed properties a fingerprint could read with
+                    // Object.getOwnPropertyNames(document). Chrome keeps these
+                    // on WebIDL prototypes / the C++ backing store.
+                    const fields = ['_nid', '_scopeRoot', '_defaultViewProxy',
+                        '_treeParent', '_treeParentEpoch', '_ownerDocRoot',
+                        '_styleSheetList', '_fonts'];
+                    const leaked = obj => {
+                        const names = new Set(Object.getOwnPropertyNames(obj));
+                        return fields.filter(f => names.has(f));
+                    };
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const div = document.createElement('div');
+                    return {
+                        mainDoc: leaked(document),
+                        frameDoc: leaked(frame.contentWindow.eval('document')),
+                        element: leaked(div),
+                        // Direct access is gone too, not just enumeration.
+                        nidGone: document._nid === undefined,
+                        scopeRootGone: document._scopeRoot === undefined,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "mainDoc": [],
+                "frameDoc": [],
+                "element": [],
+                "nidGone": true,
+                "scopeRootGone": true,
             })
         );
     }
@@ -2923,7 +2964,7 @@ mod tests {
                 r#"(() => {
                     const op = (cmd, a1, a2) =>
                         Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-                    const host = document.getElementById("f")._nid;
+                    const host = document.getElementById("f")[Symbol.for('obscura.nid')];
                     const created = JSON.parse(op("create_iframe_content_document", host));
                     op("parse_into_subtree", created.root, "<html><body><p>s</p></body></html>");
                     op("set_document_scope", created.root, JSON.stringify({

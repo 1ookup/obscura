@@ -49,7 +49,7 @@ impl Page {
     pub fn query_selector(&mut self, selector: &str) -> Option<Element> {
         let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
         let js = format!(
-            "(function() {{ var el = document.querySelector('{}'); return el ? el._nid : null; }})()",
+            "(function() {{ var el = document.querySelector('{}'); return el ? el[Symbol.for('obscura.nid')] : null; }})()",
             escaped
         );
         let val = self.evaluate(&js);
@@ -66,7 +66,7 @@ impl Page {
         let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
         loop {
             let js = format!(
-                "(function() {{ var el = document.querySelector('{}'); return el ? el._nid : null; }})()",
+                "(function() {{ var el = document.querySelector('{}'); return el ? el[Symbol.for('obscura.nid')] : null; }})()",
                 escaped
             );
             let val = self.evaluate(&js);

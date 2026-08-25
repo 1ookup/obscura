@@ -202,16 +202,25 @@ Function.prototype.toString = function toString() {
   return _origToString.call(this);
 };
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
-// An engine-internal slot on an object a page enumerates. Assignment would
-// make it enumerable, which is how the DOM handles ended up in
-// `for (k in document)`.
-function _hideOwnProperty(obj, name, value) {
-  Object.defineProperty(obj, name, {
-    value, writable: true, enumerable: false, configurable: true,
-  });
-}
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+// DOM instance internals live under isolate-global symbols rather than own
+// string-keyed properties. `Object.getOwnPropertyNames(document)` returns
+// non-enumerable own properties too, so a non-enumerable string slot still
+// leaks through it (and Reflect.ownKeys). A symbol-keyed slot drops out of
+// Object.getOwnPropertyNames, Object.keys and for-in entirely, matching Chrome
+// where these slots live on WebIDL prototypes or in the C++ backing store.
+// Symbol.for keeps the same key across the main realm
+// and every frame realm (the string form, and a plain per-realm Symbol, would
+// not), and is what Rust-injected snippets read back with.
+const _nidSym = Symbol.for('obscura.nid');
+const _scopeRootSym = Symbol.for('obscura.scopeRoot');
+const _defaultViewProxySym = Symbol.for('obscura.defaultViewProxy');
+const _treeParentSym = Symbol.for('obscura.treeParent');
+const _treeParentEpochSym = Symbol.for('obscura.treeParentEpoch');
+const _ownerDocRootSym = Symbol.for('obscura.ownerDocRoot');
+const _styleSheetListSym = Symbol.for('obscura.styleSheetList');
+const _fontsSym = Symbol.for('obscura.fonts');
 // Captured once so structured clone does not depend on the global binding
 // still being there. Chrome exposes no SharedArrayBuffer without cross-origin
 // isolation; matching that is tracked separately (deleting it here does work,
@@ -1999,7 +2008,7 @@ function _eventTargetDispatch(target, event) {
 const _customElementConstructionStack = [];
 
 function __prepareInsertedScript(script) {
-  if (!Deno.core.ops.op_script_try_start(script._nid)) return;
+  if (!Deno.core.ops.op_script_try_start(script[_nidSym])) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -2056,7 +2065,7 @@ function __prepareInsertedScript(script) {
     const task = {
       url: fullUrl,
       isModule,
-      nid: script._nid,
+      nid: script[_nidSym],
       prevNid,
       pageOrigin,
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
@@ -2094,7 +2103,7 @@ function __prepareInsertedScript(script) {
     const task = {
       url: dataUrl,
       isModule: true,
-      nid: script._nid,
+      nid: script[_nidSym],
       prevNid,
       pageOrigin: "",
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
@@ -2104,7 +2113,7 @@ function __prepareInsertedScript(script) {
     __dynScriptQueue.push(task);
     __processDynScriptQueue();
   } else {
-    globalThis.__currentScriptNid = script._nid;
+    globalThis.__currentScriptNid = script[_nidSym];
     // An inline script has no URL of its own; a browser attributes it to the
     // document that contains it.
     try { __runClassicScript(code, globalThis.location?.href); }
@@ -2119,15 +2128,15 @@ function __prepareInsertedSubtree(root) {
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
   if (root.nodeType === 1 && root.localName === 'iframe') {
-    _dom("create_blank_iframe_document", root._nid);
-    Deno.core.ops.op_queue_iframe_navigation(root._nid);
+    _dom("create_blank_iframe_document", root[_nidSym]);
+    Deno.core.ops.op_queue_iframe_navigation(root[_nidSym]);
   }
   // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
   // so an iframe inside a shadow root -- how widget embeds are built, Turnstile
   // among them -- was never queued when its host was connected, and the
   // browsing context that its `src` had already asked for was dropped for
   // having no frame yet. Nothing re-queued it, so the frame stayed empty.
-  const iframeIds = _domParse("iframe_hosts_including_shadow", root._nid, "") || [];
+  const iframeIds = _domParse("iframe_hosts_including_shadow", root[_nidSym], "") || [];
   for (const nid of iframeIds) {
     _dom("create_blank_iframe_document", +nid);
     Deno.core.ops.op_queue_iframe_navigation(+nid);
@@ -2137,14 +2146,14 @@ function __prepareInsertedSubtree(root) {
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
     scripts.push(root);
-    seen.add(root._nid);
+    seen.add(root[_nidSym]);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = _domParse("query_selector_all_scoped", root[_nidSym], "script") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
-    if (script && !seen.has(script._nid)) {
+    if (script && !seen.has(script[_nidSym])) {
       scripts.push(script);
-      seen.add(script._nid);
+      seen.add(script[_nidSym]);
     }
   }
   for (const script of scripts) __prepareInsertedScript(script);
@@ -2152,26 +2161,26 @@ function __prepareInsertedSubtree(root) {
 
 function _seedDetachedTreeState(node) {
   node._treeDetachedExact = true;
-  node._treeParent = null;
-  node._treeParentEpoch = _treeMutationEpoch;
+  node[_treeParentSym] = null;
+  node[_treeParentEpochSym] = _treeMutationEpoch;
   node._treeConnected = false;
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
   node._treeDetachedExact = false;
-  node._treeParent = parent;
-  node._treeParentEpoch = _treeMutationEpoch;
+  node[_treeParentSym] = parent;
+  node[_treeParentEpochSym] = _treeMutationEpoch;
   node._treeConnected = !!connected;
   node._treeConnectedEpoch = _treeMutationEpoch;
   // Insertion adopts the node into the parent's document. Restamp only the
   // moved root; descendants re-resolve lazily (weak consistency, see
   // Node#ownerDocument). Free while no iframe content document exists.
   if (_iframeContentDocsSeen) {
-    node._ownerDocRoot = parent
-      ? (parent._scopeRoot !== undefined
-          ? parent._scopeRoot
-          : (parent instanceof Document ? parent._nid : parent._ownerDocRoot))
+    node[_ownerDocRootSym] = parent
+      ? (parent[_scopeRootSym] !== undefined
+          ? parent[_scopeRootSym]
+          : (parent instanceof Document ? parent[_nidSym] : parent[_ownerDocRootSym]))
       : undefined;
   }
 }
@@ -2201,9 +2210,9 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
-  get nodeType() { return +_dom("node_type", this._nid); }
-  get nodeName() { return _domParse("node_name", this._nid) || ""; }
+  constructor(nid) { this[_nidSym] = nid; }
+  get nodeType() { return +_dom("node_type", this[_nidSym]); }
+  get nodeName() { return _domParse("node_name", this[_nidSym]) || ""; }
   get ownerDocument() {
     // Owner-document scope cache (design 2.3). The stamp is the owning
     // document root nid; creation and insertion paths stamp it when they know
@@ -2213,13 +2222,13 @@ class Node {
     // Pages that never create an iframe content document take the constant
     // no-op path below.
     const main = globalThis.document;
-    const cached = this._ownerDocRoot;
+    const cached = this[_ownerDocRootSym];
     if (cached !== undefined) {
-      return (main === null || cached === main._nid) ? main : _scopedDocumentFor(cached);
+      return (main === null || cached === main[_nidSym]) ? main : _scopedDocumentFor(cached);
     }
     if (!_iframeContentDocsSeen) return main;
-    const mainNid = main ? main._nid : 0;
-    const root = +_dom("document_root", this._nid);
+    const mainNid = main ? main[_nidSym] : 0;
+    const root = +_dom("document_root", this[_nidSym]);
     // A detached subtree's scope root is its own top ancestor, not a document
     // node; ownership stays with the main document unless the root is an
     // iframe content-document root (the only non-main document nodes in the
@@ -2228,7 +2237,7 @@ class Node {
         && (_scopedDocs.has(root) || +_dom("node_type", root) === 9))
       ? root
       : mainNid;
-    this._ownerDocRoot = owner;
+    this[_ownerDocRootSym] = owner;
     return owner === mainNid ? main : _scopedDocumentFor(owner);
   }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
@@ -2252,13 +2261,13 @@ class Node {
       return "";
     }
   }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() { return _domParse("text_content", this[_nidSym]) ?? ""; }
   set textContent(v) {
     if (this.localName === 'script') {
       v = globalThis.__obscura_tt_enforce(
         'TrustedScript', v, 'HTMLScriptElement textContent');
     }
-    const oldChildren = _domParse("child_nodes", this._nid) || [];
+    const oldChildren = _domParse("child_nodes", this[_nidSym]) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
       if (child) _subtreeDisconnected(child);
@@ -2267,48 +2276,48 @@ class Node {
     let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
-      _dom("append_child", this._nid, tn);
+      _dom("append_child", this[_nidSym], tn);
       added = [tn];
     }
     // Real MutationObserver fires childList for the children swap.
     // Without this React 18+ hydration mismatch detection and many polling
     // libs (intersection-driven lazy load, content sync) silently stall.
     if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
+      globalThis.__notifyMutation('childList', this[_nidSym], added, oldChildren);
     }
   }
   get nodeValue() {
     const t = this.nodeType;
-    if (t === 3 || t === 8) return _domParse("text_content", this._nid) ?? "";
+    if (t === 3 || t === 8) return _domParse("text_content", this[_nidSym]) ?? "";
     return null;
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t === 3 || t === 8) _dom("set_text_content", this[_nidSym], String(v ?? ""));
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
     if (this._treeDetachedExact) return null;
-    if (this._treeParentEpoch === _treeMutationEpoch) return this._treeParent;
-    const parent = _wrap(+_dom("parent_node", this._nid));
-    this._treeParent = parent;
-    this._treeParentEpoch = _treeMutationEpoch;
+    if (this[_treeParentEpochSym] === _treeMutationEpoch) return this[_treeParentSym];
+    const parent = _wrap(+_dom("parent_node", this[_nidSym]));
+    this[_treeParentSym] = parent;
+    this[_treeParentEpochSym] = _treeMutationEpoch;
     return parent;
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
-    const ids = _domParse("child_nodes", this._nid) || [];
+    const ids = _domParse("child_nodes", this[_nidSym]) || [];
     return _nodeList(ids.map(_wrap).filter(Boolean));
   }
-  get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
-  get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
+  get firstChild() { return _wrap(+_dom("first_child", this[_nidSym])); }
+  get lastChild() { return _wrap(+_dom("last_child", this[_nidSym])); }
   get nextSibling() {
     if (this._shadowParent) {
       const children = this._shadowParent.childNodes;
       const index = children.indexOf(this);
       return index >= 0 ? (children[index + 1] || null) : null;
     }
-    return _wrap(+_dom("next_sibling", this._nid));
+    return _wrap(+_dom("next_sibling", this[_nidSym]));
   }
   get previousSibling() {
     if (this._shadowParent) {
@@ -2316,7 +2325,7 @@ class Node {
       const index = children.indexOf(this);
       return index > 0 ? children[index - 1] : null;
     }
-    return _wrap(+_dom("prev_sibling", this._nid));
+    return _wrap(+_dom("prev_sibling", this[_nidSym]));
   }
   appendChild(c) {
     if (!c) return c;
@@ -2328,7 +2337,7 @@ class Node {
     if (c._shadowParent) c._shadowParent.removeChild(c);
     else if (c.parentNode) _subtreeDisconnected(c);
     const parentConnected = this.isConnected;
-    const inserted = _dom("append_child", this._nid, c._nid) === "true";
+    const inserted = _dom("append_child", this[_nidSym], c[_nidSym]) === "true";
     if (!inserted) {
       throw new DOMException(
         "Failed to execute 'appendChild' on 'Node': The new child would create an invalid tree.",
@@ -2338,7 +2347,7 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(c, this, parentConnected);
     _registerWindowNamedTree(c);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this[_nidSym], [c[_nidSym]], []);
     __prepareInsertedSubtree(c);
     if (c instanceof Element && c.tagName === 'LINK') {
       _loadLinkedStylesheet(c);
@@ -2357,11 +2366,11 @@ class Node {
       ? _linkedStylesheetNodes.get(c)
       : null;
     if (linkedStyle?.parentNode === this) {
-      _dom("remove_child", linkedStyle._nid);
+      _dom("remove_child", linkedStyle[_nidSym]);
       _linkedStylesheetNodes.delete(c);
     }
     const parentConnected = this.isConnected;
-    const removed = _dom("remove_child", c._nid) === "true";
+    const removed = _dom("remove_child", c[_nidSym]) === "true";
     if (!removed) {
       throw new DOMException(
         "Failed to execute 'removeChild' on 'Node': The node is not a child of this node.",
@@ -2372,7 +2381,7 @@ class Node {
     _seedDetachedTreeState(c);
     _subtreeDisconnected(c);
     _reconcileWindowNamedProperties(removedWindowNames);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this[_nidSym], [], [c[_nidSym]]);
     return c;
   }
   replaceChild(newChild, oldChild) {
@@ -2394,14 +2403,14 @@ class Node {
     else if (newChild.parentNode) _subtreeDisconnected(newChild);
     const parentConnected = this.isConnected;
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
-    const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
+    const inserted = _dom("insert_before", newChild[_nidSym], oldChild[_nidSym]) === "true";
     if (!inserted) {
       throw new DOMException(
         "Failed to execute 'replaceChild' on 'Node': The new child would create an invalid tree.",
         "HierarchyRequestError",
       );
     }
-    const removed = _dom("remove_child", oldChild._nid) === "true";
+    const removed = _dom("remove_child", oldChild[_nidSym]) === "true";
     if (!removed) throw new DOMException("The node could not be replaced.", "NotFoundError");
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(newChild, this, parentConnected);
@@ -2430,7 +2439,7 @@ class Node {
     if (n._shadowParent) n._shadowParent.removeChild(n);
     else if (n.parentNode) _subtreeDisconnected(n);
     const parentConnected = this.isConnected;
-    const inserted = _dom("insert_before", n._nid, ref._nid) === "true";
+    const inserted = _dom("insert_before", n[_nidSym], ref[_nidSym]) === "true";
     if (!inserted) {
       throw new DOMException(
         "Failed to execute 'insertBefore' on 'Node': The new child would create an invalid tree.",
@@ -2443,12 +2452,12 @@ class Node {
     __prepareInsertedSubtree(n);
     return n;
   }
-  contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
-  hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
+  contains(o) { return o ? _dom("contains", this[_nidSym], o[_nidSym]) === "true" : false; }
+  hasChildNodes() { return _dom("has_child_nodes", this[_nidSym]) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 1) {
-      return _wrap(+_dom("clone_node", this._nid, deep ? "true" : "false"));
+      return _wrap(+_dom("clone_node", this[_nidSym], deep ? "true" : "false"));
     }
     // Clone structurally via real DOM nodes rather than round-tripping through a
     // throwaway <div>.innerHTML: the fragment parser discards elements that are
@@ -2485,20 +2494,20 @@ class Node {
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
-    if (this._nid === other._nid) return 0;
+    if (this[_nidSym] === other[_nidSym]) return 0;
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
-    if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
-      return 1 | 32 | ((this._nid < other._nid) ? 4 : 2);
+    if (+_dom("node_root", this[_nidSym]) !== +_dom("node_root", other[_nidSym])) {
+      return 1 | 32 | ((this[_nidSym] < other[_nidSym]) ? 4 : 2);
     }
     if (this.contains(other)) return 16 | 4;          // CONTAINED_BY | FOLLOWING
     if (other.contains && other.contains(this)) return 8 | 2; // CONTAINS | PRECEDING
     // Same root, neither contains the other: real tree order (compare_order op:
     // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
-    return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
+    return (+_dom("compare_order", this[_nidSym], other[_nidSym]) < 0) ? 4 : 2;
   }
   getRootNode(options) {
-    const root = _wrap(+_dom("node_root", this._nid));
+    const root = _wrap(+_dom("node_root", this[_nidSym]));
     if (options?.composed && root instanceof ShadowRoot) {
       return root.host.getRootNode(options);
     }
@@ -2507,7 +2516,7 @@ class Node {
   get isConnected() {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
-    const connected = _dom("is_connected", this._nid) === "true";
+    const connected = _dom("is_connected", this[_nidSym]) === "true";
     this._treeConnected = connected;
     this._treeConnectedEpoch = _treeMutationEpoch;
     return connected;
@@ -2532,7 +2541,7 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this._nid === other._nid) return true;
+    if (this[_nidSym] === other[_nidSym]) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -2552,7 +2561,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this._nid === other._nid; }
+  isSameNode(other) { return other && this[_nidSym] === other[_nidSym]; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -2565,13 +2574,13 @@ class Node {
 }
 class CharacterData extends Node {
   get data() {
-    return _domParse("text_content", this._nid) ?? "";
+    return _domParse("text_content", this[_nidSym]) ?? "";
   }
   set data(v) {
-    const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    const oldValue = _domParse("text_content", this[_nidSym]) ?? "";
+    _dom("set_text_content", this[_nidSym], String(v ?? ""));
     if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
+      globalThis.__notifyMutation('characterData', this[_nidSym], [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
@@ -2949,7 +2958,7 @@ class NamedNodeMap {
     });
   }
   _names() {
-    return _domParse("attribute_names", this._element._nid) || [];
+    return _domParse("attribute_names", this._element[_nidSym]) || [];
   }
   _attr(name) {
     const value = this._element.getAttribute(name);
@@ -3154,7 +3163,7 @@ class Animation {
     if (this._registered || !this.effect) return this._registered;
     const input = {
       id: this._nativeId,
-      node: this.effect.target._nid,
+      node: this.effect.target[_nidSym],
       keyframes: this.effect._keyframes,
       ...this.effect._timing,
       // JSON has no Infinity literal and would silently turn it into null.
@@ -3279,7 +3288,7 @@ class Element extends Node {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
     const matchesUpgrade = entry && new.target === entry.constructor;
     const upgrading = matchesUpgrade && !entry.constructed ? entry.element : null;
-    super(upgrading ? upgrading._nid : nid);
+    super(upgrading ? upgrading[_nidSym] : nid);
     if (matchesUpgrade && entry.constructed) {
       throw new TypeError("Custom element is already being constructed");
     }
@@ -3302,7 +3311,7 @@ class Element extends Node {
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
     // for every comparison adds thousands of calls on modern component trees.
     if (this._tagName !== undefined) return this._tagName;
-    this._tagName = _domParse("tag_name", this._nid) || "";
+    this._tagName = _domParse("tag_name", this[_nidSym]) || "";
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
@@ -3311,7 +3320,7 @@ class Element extends Node {
     // component directly preserves case-sensitive SVG/MathML names such as
     // `linearGradient`; deriving this from HTML's uppercased tagName loses it.
     if (this._lname !== undefined) return this._lname;
-    const ln = _domParse("local_name", this._nid)
+    const ln = _domParse("local_name", this[_nidSym])
       || (this.tagName || "").toLowerCase();
     if (ln) this._lname = ln;
     return ln;
@@ -3340,7 +3349,7 @@ class Element extends Node {
     // instead of an SVGAnimatedString. An element's namespace never changes,
     // so cache it like _lname.
     if (this._nsCache !== undefined) return this._nsCache;
-    let ns = _domParse("namespace_uri", this._nid) || "";
+    let ns = _domParse("namespace_uri", this[_nidSym]) || "";
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
     this._nsCache = ns;
@@ -3348,7 +3357,7 @@ class Element extends Node {
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _domParse("inner_html", this[_nidSym]) ?? ""; }
   set innerHTML(v) {
     v = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
     if (this.localName === 'template') {
@@ -3369,20 +3378,20 @@ class Element extends Node {
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
-      oldChildren = _domParse("child_nodes", this._nid) || [];
+      oldChildren = _domParse("child_nodes", this[_nidSym]) || [];
     }
-    _dom("set_inner_html", this._nid, String(v ?? ""));
+    _dom("set_inner_html", this[_nidSym], String(v ?? ""));
     // HTML fragment parsing can introduce IDs without calling the JS
     // setAttribute path. Register those elements for Window named access
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
     if (globalThis.__mutationObservers?.length) {
-      newChildren = _domParse("child_nodes", this._nid) || [];
-      globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
+      newChildren = _domParse("child_nodes", this[_nidSym]) || [];
+      globalThis.__notifyMutation('childList', this[_nidSym], newChildren, oldChildren);
     }
   }
-  get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  get outerHTML() { return _domParse("outer_html", this[_nidSym]) ?? ""; }
   // Assigning outerHTML replaces the element with the parsed markup. There was
   // only a getter, so in sloppy mode -- which page code usually is -- the
   // assignment did nothing at all and no error was raised: the element stayed
@@ -3402,18 +3411,18 @@ class Element extends Node {
     // parsed as if for <body>, per the spec's fragment parsing algorithm.
     const context = parent.nodeType === 1 ? parent : null;
     const replacements = _parseHTMLFragment(markup, context);
-    const oldChildren = _domParse("child_nodes", parent._nid) || [];
+    const oldChildren = _domParse("child_nodes", parent[_nidSym]) || [];
     for (const node of replacements) parent.insertBefore(node, this);
     parent.removeChild(this);
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation(
-        'childList', parent._nid, _domParse("child_nodes", parent._nid) || [], oldChildren);
+        'childList', parent[_nidSym], _domParse("child_nodes", parent[_nidSym]) || [], oldChildren);
     }
   }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
+    const ids = _domParse("element_children", this[_nidSym]) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get content() {
@@ -3429,7 +3438,7 @@ class Element extends Node {
       // instead of under the element, so without this the getter handed back a
       // fabricated empty fragment and the parsed markup was unreachable.
       // `template_contents` allocates one on demand for created templates.
-      const nid = +_dom("template_contents", this._nid);
+      const nid = +_dom("template_contents", this[_nidSym]);
       if (nid >= 0) {
         // Cache by node id so `.content` keeps a stable identity across reads —
         // frameworks stash the fragment and compare it later.
@@ -3534,7 +3543,7 @@ class Element extends Node {
         ? this._nullNamespaceAttrs.get(n)
         : null;
     }
-    return _domParse("get_attribute", this._nid, n);
+    return _domParse("get_attribute", this[_nidSym], n);
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
@@ -3543,7 +3552,7 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     const value = String(v);
-    _dom("set_attribute", this._nid, n + "\0" + value);
+    _dom("set_attribute", this[_nidSym], n + "\0" + value);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
@@ -3558,9 +3567,9 @@ class Element extends Node {
     if (n === "style") this._style._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
-      Deno.core.ops.op_queue_iframe_navigation(this._nid);
+      Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
     }
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this[_nidSym], [], [], n);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3577,7 +3586,7 @@ class Element extends Node {
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
-    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    _dom("set_attribute_ns", this[_nidSym], ns + "\0" + n + "\0" + value);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
@@ -3590,7 +3599,7 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
-    _dom("remove_attribute", this._nid, n);
+    _dom("remove_attribute", this[_nidSym], n);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
@@ -3601,7 +3610,7 @@ class Element extends Node {
     if (n === "style") this._style._replaceFromAttribute("");
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
-      Deno.core.ops.op_queue_iframe_navigation(this._nid);
+      Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
     }
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -3617,21 +3626,21 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
-    _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    _dom("remove_attribute_ns", this[_nidSym], ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
-  getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
+  getAttributeNames() { return _domParse("attribute_names", this[_nidSym]) || []; }
   get attributes() {
     if (!this._attributes) this._attributes = new NamedNodeMap(this);
     return this._attributes;
   }
-  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this[_nidSym], String(ns == null ? "" : ns) + "\0" + String(n)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this[_nidSym], s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _domParse("query_selector_all_scoped", this[_nidSym], s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -3654,7 +3663,7 @@ class Element extends Node {
       if (rest === "") return true;
       return this.matches(rest);
     }
-    return _dom("matches_selector", this._nid, String(s)) === "true";
+    return _dom("matches_selector", this[_nidSym], String(s)) === "true";
   }
   closest(s) {
     let el = this;
@@ -3842,7 +3851,7 @@ class Element extends Node {
   _popoverAttrValue() {
     const v = this.getAttribute("popover");
     if (v !== null) return v;
-    const names = _domParse("attribute_names", this._nid) || [];
+    const names = _domParse("attribute_names", this[_nidSym]) || [];
     for (let i = 0; i < names.length; i++) {
       if (names[i].toLowerCase() === "popover") return this.getAttribute(names[i]);
     }
@@ -3865,7 +3874,7 @@ class Element extends Node {
   }
   _popoverRemoveAttr() {
     if (this.getAttribute("popover") !== null) { this.removeAttribute("popover"); return; }
-    const names = _domParse("attribute_names", this._nid) || [];
+    const names = _domParse("attribute_names", this[_nidSym]) || [];
     for (let i = 0; i < names.length; i++) {
       if (names[i].toLowerCase() === "popover") { this.removeAttribute(names[i]); return; }
     }
@@ -3996,7 +4005,7 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (_formValues[this[_nidSym]] !== undefined) return _formValues[this[_nidSym]];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4046,7 +4055,7 @@ class Element extends Node {
       if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
       return;
     }
-    _formValues[this._nid] = String(v);
+    _formValues[this[_nidSym]] = String(v);
     if (tag === 'textarea') {
       this.textContent = String(v);
     }
@@ -4124,7 +4133,7 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    return _dom("live_checked", this._nid, "") === "true";
+    return _dom("live_checked", this[_nidSym], "") === "true";
   }
   set checked(v) {
     const checked = !!v;
@@ -4140,12 +4149,12 @@ class Element extends Node {
               && (radio.getAttribute('type') || '').toLowerCase() === 'radio'
               && (radio.getAttribute('name') || '') === name
               && radio.form === this.form) {
-            _dom("set_live_checked", radio._nid, "false");
+            _dom("set_live_checked", radio[_nidSym], "false");
           }
         }
       }
     }
-    _dom("set_live_checked", this._nid, checked ? "true" : "false");
+    _dom("set_live_checked", this[_nidSym], checked ? "true" : "false");
   }
   get selected() {
     if (this._selected !== undefined) return this._selected;
@@ -4286,20 +4295,20 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
-    const nativeRoot = +_dom("iframe_content_document_root", this._nid);
+    const nativeRoot = +_dom("iframe_content_document_root", this[_nidSym]);
     if (nativeRoot >= 0) {
       // Native content document committed by the Rust frame loader. The
       // same-origin gate compares typed DocumentScope origins in Rust, never
       // serialized origin strings; cross-origin content reads as null.
       if (!_frameSameOrigin(nativeRoot)) return null;
-      _materializeFrameRealm(this._nid);
+      _materializeFrameRealm(this[_nidSym]);
       const realmGlobal = _frameRealmGlobalFor(nativeRoot);
       if (realmGlobal && realmGlobal.document) {
-        _hideOwnProperty(realmGlobal.document, '_defaultViewProxy', _frameWindowProxyFor(this));
+        realmGlobal.document[_defaultViewProxySym] = _frameWindowProxyFor(this);
         return realmGlobal.document;
       }
       const doc = _scopedDocumentFor(nativeRoot);
-      _hideOwnProperty(doc, '_defaultViewProxy', _frameWindowProxyFor(this));
+      doc[_defaultViewProxySym] = _frameWindowProxyFor(this);
       return doc;
     }
     // No content root means no browsing context, which is what a detached
@@ -4311,7 +4320,7 @@ class Element extends Node {
     if (this.localName !== 'iframe') return undefined;
     // A native content document gets the stable WindowProxy regardless of
     // origin; per-property access checks live on the proxy itself.
-    if (+_dom("iframe_content_document_root", this._nid) >= 0) {
+    if (+_dom("iframe_content_document_root", this[_nidSym]) >= 0) {
       return _frameWindowProxyFor(this);
     }
     return null;
@@ -4516,7 +4525,7 @@ class Element extends Node {
   _renderClientMetrics() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(String(this[_nidSym] | 0));
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4541,7 +4550,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(String(this[_nidSym] | 0));
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4613,7 +4622,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof Deno.core.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = Deno.core.ops.op_element_scroll_metrics(String(this[_nidSym] | 0));
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -4642,7 +4651,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof Deno.core.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = Deno.core.ops.op_element_scroll_to(String(this[_nidSym] | 0), +x || 0, +y || 0);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4756,7 +4765,7 @@ class Element extends Node {
     // Every nid maps to a unique cell in a 12-column grid for a 1280x720 viewport.
     const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
     const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
-    const cell = this._nid | 0;
+    const cell = this[_nidSym] | 0;
     const col = ((cell * 7) | 0) % COLS;
     const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
     const x = 10 + col * GX;
@@ -4995,7 +5004,7 @@ function _convertNodes(nodes) {
   const out = [];
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
-    if (n && typeof n._nid === "number") out.push(n);
+    if (n && typeof n[_nidSym] === "number") out.push(n);
     else out.push(document.createTextNode(String(n)));
   }
   return out;
@@ -5219,8 +5228,8 @@ function _documentPrivacyRoot(value, method) {
     throw new TypeError("Failed to execute '" + method + "' on 'Document': Illegal invocation");
   }
   if (value === globalThis.document) return _callingFrameRoot();
-  if (typeof value._scopeRoot === "number" && value._scopeInfo && value._scopeInfo()) {
-    return value._scopeRoot;
+  if (typeof value[_scopeRootSym] === "number" && value._scopeInfo && value._scopeInfo()) {
+    return value[_scopeRootSym];
   }
   return -1;
 }
@@ -5242,12 +5251,10 @@ function _privateStateTokenError(method, status) {
 
 class Document extends Node {
   constructor(nid) {
+    // Node's constructor stores the handle under _nidSym already, which keeps
+    // it out of Object.getOwnPropertyNames / Object.keys / for-in without the
+    // per-document defineProperty this used to need.
     super(nid);
-    // `for (k in document)` is a standard fingerprinting probe, and Node's
-    // plain `this._nid = nid` put the engine's own tree handle in its output.
-    // Redefining is only affordable here: there is one document per realm,
-    // while element wrappers are built by the thousand and keep the fast store.
-    _hideOwnProperty(this, '_nid', nid);
   }
   get timeline() {
     if (!this._timeline) {
@@ -5364,7 +5371,7 @@ class Document extends Node {
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
-  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get characterSet() { return (this[_nidSym] === undefined || this[_nidSym] === null) ? "UTF-8" : _docEncoding(); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -5373,7 +5380,7 @@ class Document extends Node {
     // `new Document()` (the WHATWG constructor, no backing node id) creates an
     // XML document, so createCDATASection/etc. must not throw. Live documents
     // wrapped from the tree carry a real nid and fall through to URL-derived.
-    if (this._nid === undefined || this._nid === null) return "application/xml";
+    if (this[_nidSym] === undefined || this[_nidSym] === null) return "application/xml";
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -5427,7 +5434,7 @@ class Document extends Node {
     _seedDetachedTreeState(el);
     // Creation knows its scope: stamp the owner-document root (scoped
     // documents carry _scopeRoot, the main document its own nid).
-    el._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    el[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _cache.set(nid, el);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
@@ -5461,7 +5468,7 @@ class Document extends Node {
     el._ns = effectiveNamespace;
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
-    el._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    el[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _cache.set(nid, el);
     return el;
   }
@@ -5469,7 +5476,7 @@ class Document extends Node {
     const nid = +_dom("create_text_node", String(t));
     const n = new Text(nid);
     _seedDetachedTreeState(n);
-    n._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    n[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _cache.set(nid, n);
     return n;
   }
@@ -5477,7 +5484,7 @@ class Document extends Node {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
     _seedDetachedTreeState(n);
-    n._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    n[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _cache.set(nid, n);
     return n;
   }
@@ -5518,7 +5525,7 @@ class Document extends Node {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
     _seedDetachedTreeState(frag);
-    frag._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    frag[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _cache.set(nid, frag);
     return frag;
   }
@@ -5588,14 +5595,14 @@ class Document extends Node {
       },
       _accept(node) { return this._filter(node) === 1; },
       nextNode() {
-        let node = _wrap(+_dom("next_in_subtree", this.root._nid, this.currentNode._nid));
+        let node = _wrap(+_dom("next_in_subtree", this.root[_nidSym], this.currentNode[_nidSym]));
         while (node) {
           const verdict = this._filter(node);
           if (verdict === 1) { this.currentNode = node; return node; }
           // FILTER_REJECT skips the node AND its subtree; FILTER_SKIP (and any
           // other non-accept value) skips only the node.
           const step = verdict === 2 ? "next_after_subtree" : "next_in_subtree";
-          node = _wrap(+_dom(step, this.root._nid, node._nid));
+          node = _wrap(+_dom(step, this.root[_nidSym], node[_nidSym]));
         }
         return null;
       },
@@ -5742,7 +5749,7 @@ class Document extends Node {
             before = !before;
           } else {
             const step = forward ? "next_in_subtree" : "prev_in_subtree";
-            const next = _wrap(+_dom(step, this.root._nid, node._nid));
+            const next = _wrap(+_dom(step, this.root[_nidSym], node[_nidSym]));
             // A failed traversal leaves referenceNode and the pointer
             // untouched, so the iterator can be resumed in either direction.
             if (!next) return null;
@@ -5825,8 +5832,8 @@ class Document extends Node {
     };
   }
   get styleSheets() {
-    if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
-    return this._styleSheetList;
+    if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);
+    return this[_styleSheetListSym];
   }
   get forms() { return this.querySelectorAll("form"); }
   get images() { return this.querySelectorAll("img"); }
@@ -5853,7 +5860,7 @@ class Document extends Node {
     var body = this.body;
     if (!body) return;
     var temp = this.createDocumentFragment();
-    _dom("set_fragment_html_executable", temp._nid, _fragmentContextPayload('body', html));
+    _dom("set_fragment_html_executable", temp[_nidSym], _fragmentContextPayload('body', html));
     var children = Array.from(temp.childNodes);
     for (var i = 0; i < children.length; i++) {
       body.appendChild(children[i]);
@@ -5882,22 +5889,22 @@ class DocumentFragment extends Node {
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _domParse("inner_html", this[_nidSym]) ?? ""; }
   set innerHTML(v) {
     const html = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
     if (this._fragmentContext) {
-      _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
+      _dom("set_inner_html_context", this[_nidSym], _fragmentContextPayload(this._fragmentContext, html));
     } else {
-      _dom("set_inner_html", this._nid, html);
+      _dom("set_inner_html", this[_nidSym], html);
     }
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this[_nidSym], s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _domParse("query_selector_all_scoped", this[_nidSym], s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
+    const ids = _domParse("element_children", this[_nidSym]) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get firstElementChild() { return this.children[0] || null; }
@@ -5915,7 +5922,7 @@ class DocumentFragment extends Node {
     return null;
   }
   cloneNode(deep) {
-    const nid = +_dom("clone_node", this._nid, deep ? "true" : "false");
+    const nid = +_dom("clone_node", this[_nidSym], deep ? "true" : "false");
     const frag = new DocumentFragment(nid);
     _cache.set(nid, frag);
     return frag;
@@ -6334,7 +6341,7 @@ class HTMLImageElement extends Element {
         const fetchStart = performance.now();
         // The node's own base, not the page's: an image created inside a
         // frame must be fetched from that frame's origin.
-        Promise.resolve(op(this._nid >>> 0, String(this.baseURI || ""))).then(
+        Promise.resolve(op(this[_nidSym] >>> 0, String(this.baseURI || ""))).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -6362,7 +6369,7 @@ class HTMLImageElement extends Element {
     try {
       const op = Deno.core.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true, String(this.baseURI || "")));
+      const metadata = JSON.parse(op(this[_nidSym] >>> 0, true, String(this.baseURI || "")));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -6788,7 +6795,7 @@ function _wrap(nid) {
     // The only non-main document nodes in the arena are iframe content-
     // document roots; hand back the scoped wrapper so queries stay in-frame.
     const main = globalThis.document;
-    n = (main && nid !== main._nid) ? _scopedDocumentFor(nid) : new Document(nid);
+    n = (main && nid !== main[_nidSym]) ? _scopedDocumentFor(nid) : new Document(nid);
   }
   else n = new Node(nid);
   _cache.set(nid, n);
@@ -6880,24 +6887,24 @@ function _scopedDocumentFor(rootNid) {
 class _ScopedDocument extends Document {
   constructor(rootNid) {
     super(rootNid);
-    _hideOwnProperty(this, '_scopeRoot', rootNid);
+    this[_scopeRootSym] = rootNid;
   }
-  _scopeInfo() { return _domParse("document_scope_info", this._scopeRoot); }
+  _scopeInfo() { return _domParse("document_scope_info", this[_scopeRootSym]); }
   get documentElement() {
-    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, "html"));
+    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], "html"));
   }
   querySelector(s) {
-    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, s));
+    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], s));
   }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._scopeRoot, s) || [];
+    const ids = _domParse("query_selector_all_scoped", this[_scopeRootSym], s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementById(id) {
     // CSS.escape is an identity stub in this runtime; use the same
     // attribute-selector escape as the native get_element_by_id fallback.
     const sel = '[id="' + String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
-    return _wrapEl(+_dom("query_selector_scoped", this._scopeRoot, sel));
+    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], sel));
   }
   get title() {
     const t = _internalQuerySelector(this, "title");
@@ -6940,11 +6947,11 @@ class _ScopedDocument extends Document {
   }
   // Wired by the contentDocument/contentWindow getters; null for a document
   // no longer presented in a frame.
-  get defaultView() { return this._defaultViewProxy || null; }
-  get location() { return this._defaultViewProxy ? this._defaultViewProxy.location : null; }
+  get defaultView() { return this[_defaultViewProxySym] || null; }
+  get location() { return this[_defaultViewProxySym] ? this[_defaultViewProxySym].location : null; }
   set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get doctype() {
-    const ids = _domParse("child_nodes", this._scopeRoot) || [];
+    const ids = _domParse("child_nodes", this[_scopeRootSym]) || [];
     for (const cid of ids) {
       if (+_dom("node_type", cid) === 10) return _wrap(+cid);
     }
@@ -7085,7 +7092,7 @@ function _blankFrameSurfaceHas(key) {
 }
 
 function _frameWindowProxyFor(hostEl) {
-  const hostNid = hostEl._nid;
+  const hostNid = hostEl[_nidSym];
   const existing = _frameWindowProxies.get(hostNid);
   if (existing) return existing;
 
@@ -7150,11 +7157,11 @@ function _frameWindowProxyFor(hostEl) {
       if (!_frameSameOrigin(root)) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(root);
       if (realmGlobal && realmGlobal.document) {
-        _hideOwnProperty(realmGlobal.document, '_defaultViewProxy', proxy);
+        realmGlobal.document[_defaultViewProxySym] = proxy;
         return realmGlobal.document;
       }
       const doc = _scopedDocumentFor(root);
-      _hideOwnProperty(doc, '_defaultViewProxy', proxy);
+      doc[_defaultViewProxySym] = proxy;
       return doc;
     },
     get location() {
@@ -9312,9 +9319,9 @@ function _roNodeDepth(target) {
 function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   let geometry = suppliedGeometry ?? null;
   const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
-  if (!suppliedByBatch && hasRenderer && target?._nid != null) {
+  if (!suppliedByBatch && hasRenderer && target?.[_nidSym] != null) {
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(String(target[_nidSym] | 0));
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -9414,9 +9421,9 @@ function _roMeasurements(targets) {
   if (!targets.length) return measurements;
   const bulk = Deno.core.ops.op_resize_observer_measurements;
   if (typeof bulk === "function"
-      && targets.every(target => target?._nid != null)) {
+      && targets.every(target => target?.[_nidSym] != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(JSON.stringify(targets.map(target => target[_nidSym] | 0)));
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -9830,9 +9837,9 @@ globalThis.getComputedStyle = (el) => {
     if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
     snapshot.epoch = _domMutationEpoch;
     snapshot.rendered = null;
-    if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
+    if (typeof Deno.core.ops.op_computed_style === 'function' && el?.[_nidSym] != null) {
       try {
-        const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+        const raw = Deno.core.ops.op_computed_style(String(el[_nidSym] | 0));
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -10545,12 +10552,12 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
-      if (root._nid === target_nid) { matched = true; break; }
+      if (root[_nidSym] === target_nid) { matched = true; break; }
       if (t.options.subtree) {
         // Walk parents until we hit the observed root or run off the tree.
         let cur = target.parentNode;
         while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
+          if (cur[_nidSym] === root[_nidSym]) { matched = true; break; }
           cur = cur.parentNode;
         }
         if (matched) break;
@@ -10627,8 +10634,8 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   }
   get activeElement() { return null; }
   get styleSheets() {
-    if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
-    return this._styleSheetList;
+    if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);
+    return this[_styleSheetListSym];
   }
   cloneNode() {
     throw new DOMException(
@@ -10886,10 +10893,10 @@ function _ioMeasurements(elements) {
   const measurements = new Map();
   if (!elements.length) return measurements;
   const bulk = Deno.core.ops.op_intersection_observer_measurements;
-  const nativeElements = elements.filter(element => element?._nid != null);
+  const nativeElements = elements.filter(element => element?.[_nidSym] != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element[_nidSym] | 0)));
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {
@@ -13907,8 +13914,8 @@ function _windowNamedSupportedNames(element) {
 // most of them `[id],embed[name],...` and `link[rel~="stylesheet"]`. The
 // internals go straight to the DOM op instead, which no page can observe.
 function _internalQuerySelectorAll(root, selector) {
-  const nid = root && typeof root._nid === 'number'
-    ? root._nid
+  const nid = root && typeof root[_nidSym] === 'number'
+    ? root[_nidSym]
     : (root === globalThis.document ? _documentRootNid() : null);
   if (nid === null) return [];
   const ids = _domParse('query_selector_all_scoped', nid, selector) || [];
@@ -14061,18 +14068,18 @@ function _rngNodeLength(n) {
 // whole childNodes list per call: the Range matrices call this heavily.
 function _rngNodeIndex(n) {
   if (!n.parentNode) return 0;
-  return +_dom("node_index", n._nid);
+  return +_dom("node_index", n[_nidSym]);
 }
-function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
-// Root nid in one op (callers only read ._nid), instead of an O(depth) walk.
-function _rngRoot(n) { return { _nid: +_dom("node_root", n._nid) }; }
+function _rngSame(a, b) { return a === b || (!!a && !!b && a[_nidSym] === b[_nidSym]); }
+// Root nid in one op (callers only read [_nidSym]), instead of an O(depth) walk.
+function _rngRoot(n) { return { _nid: +_dom("node_root", n[_nidSym]) }; }
 function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
 // document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
 // Computed in Rust (one op) rather than walking ancestor chains over per-step
 // DOM ops, which made the large dom/ranges matrices time out.
 function _rngOrder(a, b) {
   if (_rngSame(a, b)) return 0;
-  return +_dom("compare_order", a._nid, b._nid) || 0;
+  return +_dom("compare_order", a[_nidSym], b[_nidSym]) || 0;
 }
 // Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
 function _rngCmp(nA, oA, nB, oB) {
@@ -14080,8 +14087,8 @@ function _rngCmp(nA, oA, nB, oB) {
   if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
   if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
     let child = nB;
-    while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
-    if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
+    while (child && child.parentNode && child.parentNode[_nidSym] !== nA[_nidSym]) child = child.parentNode;
+    if (child && child.parentNode && child.parentNode[_nidSym] === nA[_nidSym] && _rngNodeIndex(child) < oA) return 1;
     return -1;
   }
   return -1;
@@ -14102,13 +14109,13 @@ globalThis.Range = class Range {
   get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
   get commonAncestorContainer() {
     if (!this._sc || !this._ec) return null;
-    const setA = new Set(_rngAncestors(this._sc).map(n => n._nid));
+    const setA = new Set(_rngAncestors(this._sc).map(n => n[_nidSym]));
     let c = this._ec;
-    while (c) { if (setA.has(c._nid)) return c; c = c.parentNode; }
+    while (c) { if (setA.has(c[_nidSym])) return c; c = c.parentNode; }
     return null;
   }
-  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)._nid !== _rngRoot(this._ec)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
-  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
+  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)[_nidSym] !== _rngRoot(this._ec)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
+  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
   setStartBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n)); }
   setStartAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n) + 1); }
   setEndBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n)); }
@@ -14118,7 +14125,7 @@ globalThis.Range = class Range {
   selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
   comparePoint(n, o) {
     o = o >>> 0; // offset is a WebIDL unsigned long: -1 -> 4294967295 -> IndexSizeError
-    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) throw new DOMException("nodes are in different trees", "WrongDocumentError");
+    if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym]) throw new DOMException("nodes are in different trees", "WrongDocumentError");
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
     if (_rngCmp(n, o, this._sc, this._so) < 0) return -1;
@@ -14127,7 +14134,7 @@ globalThis.Range = class Range {
   }
   isPointInRange(n, o) {
     o = o >>> 0;
-    if (!this._sc || _rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (!this._sc || _rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym]) return false;
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
     return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
@@ -14149,13 +14156,13 @@ globalThis.Range = class Range {
     // Different roots -> WrongDocumentError. Guard so a null/foreign container
     // raises that DOMException rather than a raw TypeError from _rngRoot.
     let differ;
-    try { differ = _rngRoot(a[0])._nid !== _rngRoot(b[0])._nid; }
+    try { differ = _rngRoot(a[0])[_nidSym] !== _rngRoot(b[0])[_nidSym]; }
     catch (e) { differ = true; }
     if (differ) throw new DOMException("The two Ranges are not in the same tree.", "WrongDocumentError");
     return _rngCmp(a[0], a[1], b[0], b[1]);
   }
   intersectsNode(n) {
-    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym]) return false;
     const p = n.parentNode;
     if (!p) return true;
     const o = _rngNodeIndex(n);
@@ -14172,7 +14179,7 @@ globalThis.Range = class Range {
     if (context && context.localName === 'html') context = null;
     _dom(
       "set_fragment_html_executable",
-      frag._nid,
+      frag[_nidSym],
       _fragmentContextPayload(context || 'body', html),
     );
     return frag;
@@ -14266,10 +14273,10 @@ globalThis.Selection = class Selection {
   setPosition(node, offset) { this.collapse(node, offset); }
   collapseToStart() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.startContainer, this._range.startOffset); r.setEnd(this._range.startContainer, this._range.startOffset); this._setRange(r, 'forwards'); }
   collapseToEnd() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.endContainer, this._range.endOffset); r.setEnd(this._range.endContainer, this._range.endOffset); this._setRange(r, 'forwards'); }
-  extend(node, offset) { if (!this._range) throw new DOMException('There is no selection to extend.', 'InvalidStateError'); if (!this._inDoc(node)) return; offset = offset >>> 0; _rngCheckOffset(node, offset); const a = this._anchor; const r = new Range(); if (_rngRoot(node)._nid !== _rngRoot(a[0])._nid) { r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); return; } if (_rngCmp(a[0], a[1], node, offset) <= 0) { r.setStart(a[0], a[1]); r.setEnd(node, offset); this._setRange(r, 'forwards'); } else { r.setStart(node, offset); r.setEnd(a[0], a[1]); this._setRange(r, 'backwards'); } }
+  extend(node, offset) { if (!this._range) throw new DOMException('There is no selection to extend.', 'InvalidStateError'); if (!this._inDoc(node)) return; offset = offset >>> 0; _rngCheckOffset(node, offset); const a = this._anchor; const r = new Range(); if (_rngRoot(node)[_nidSym] !== _rngRoot(a[0])[_nidSym]) { r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); return; } if (_rngCmp(a[0], a[1], node, offset) <= 0) { r.setStart(a[0], a[1]); r.setEnd(node, offset); this._setRange(r, 'forwards'); } else { r.setStart(node, offset); r.setEnd(a[0], a[1]); this._setRange(r, 'backwards'); } }
   setBaseAndExtent(aN, aO, fN, fO) { if (arguments.length < 4) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required."); if (aN == null || fN == null) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': nodes must not be null."); aO = +aO; fO = +fO; if (aO < 0 || aO > _rngNodeLength(aN)) throw new DOMException('anchor offset out of range', 'IndexSizeError'); if (fO < 0 || fO > _rngNodeLength(fN)) throw new DOMException('focus offset out of range', 'IndexSizeError'); if (!this._inDoc(aN) || !this._inDoc(fN)) { this.removeAllRanges(); return; } const r = new Range(); if (_rngCmp(aN, aO, fN, fO) <= 0) { r.setStart(aN, aO); r.setEnd(fN, fO); this._setRange(r, 'forwards'); } else { r.setStart(fN, fO); r.setEnd(aN, aO); this._setRange(r, 'backwards'); } }
   selectAllChildren(node) { if (node && node.nodeType === 10) throw new DOMException('cannot selectAllChildren of a DocumentType', 'InvalidNodeTypeError'); if (!this._inDoc(node)) return; const len = _rngNodeLength(node); const r = new Range(); r.setStart(node, 0); r.setEnd(node, len); this._setRange(r, 'forwards'); }
-  containsNode(node, allowPartial) { const r = this._range; if (!r || !node) return false; if (_rngRoot(node)._nid !== _rngRoot(r.startContainer)._nid) return false; const len = _rngNodeLength(node); if (allowPartial) return _rngCmp(node, len, r.startContainer, r.startOffset) > 0 && _rngCmp(node, 0, r.endContainer, r.endOffset) < 0; return _rngCmp(node, 0, r.startContainer, r.startOffset) >= 0 && _rngCmp(node, len, r.endContainer, r.endOffset) <= 0; }
+  containsNode(node, allowPartial) { const r = this._range; if (!r || !node) return false; if (_rngRoot(node)[_nidSym] !== _rngRoot(r.startContainer)[_nidSym]) return false; const len = _rngNodeLength(node); if (allowPartial) return _rngCmp(node, len, r.startContainer, r.startOffset) > 0 && _rngCmp(node, 0, r.endContainer, r.endOffset) < 0; return _rngCmp(node, 0, r.startContainer, r.startOffset) >= 0 && _rngCmp(node, len, r.endContainer, r.endOffset) <= 0; }
   deleteFromDocument() { if (this._range) this._range.deleteContents(); }
   toString() { return this._range ? this._range.toString() : ''; }
   modify() {}
@@ -14533,7 +14540,7 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      if (!register(this.canvas[_nidSym], this._w, this._h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
@@ -14544,7 +14551,7 @@ class _Canvas2D {
     queueMicrotask(() => {
       this._damageQueued = false;
       const damage = Deno.core.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      if (typeof damage === 'function') damage(this.canvas[_nidSym]);
     });
   }
   _parseColor(css) {
@@ -14849,18 +14856,18 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
-  if (Deno.core.ops.op_shadow_root_info(this._nid)) {
+  if (Deno.core.ops.op_shadow_root_info(this[_nidSym])) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const rootNid = Deno.core.ops.op_shadow_attach(this._nid, _mode);
+  const rootNid = Deno.core.ops.op_shadow_attach(this[_nidSym], _mode);
   if (rootNid < 0) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
   shadow._treeDetachedExact = false;
-  shadow._treeParent = null;
-  shadow._treeParentEpoch = _treeMutationEpoch;
+  shadow[_treeParentSym] = null;
+  shadow[_treeParentEpochSym] = _treeMutationEpoch;
   shadow._treeConnected = this.isConnected;
   shadow._treeConnectedEpoch = _treeMutationEpoch;
   _cache.set(rootNid, shadow);
@@ -14871,7 +14878,7 @@ _markNative(Element.prototype.attachShadow);
 
 function _shadowRootForHost(host, includeClosed) {
   if (!host) return null;
-  const info = Deno.core.ops.op_shadow_root_info(host._nid);
+  const info = Deno.core.ops.op_shadow_root_info(host[_nidSym]);
   if (!info) return null;
   const parts = info.split('\0');
   if (!includeClosed && parts[1] !== 'open') return null;
@@ -17833,8 +17840,8 @@ if (typeof FontFace === 'undefined') {
   };
   Object.defineProperty(Document.prototype, 'fonts', {
     get() {
-      if (!this._fonts) this._fonts = new FontFaceSet([], this);
-      return this._fonts;
+      if (!this[_fontsSym]) this[_fontsSym] = new FontFaceSet([], this);
+      return this[_fontsSym];
     },
     configurable: true
   });
@@ -18463,8 +18470,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // insertion, see Node#ownerDocument).
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
   Document.prototype.adoptNode = function(node) {
-    if (node && node._nid !== undefined) {
-      node._ownerDocRoot = this._scopeRoot !== undefined ? this._scopeRoot : this._nid;
+    if (node && node[_nidSym] !== undefined) {
+      node[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     }
     return node || null;
   };
@@ -18548,7 +18555,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
+        var nid = el[_nidSym] | 0;
         if (nid > bestNid) { best = el; bestNid = nid; }
       }
     }
@@ -18618,7 +18625,7 @@ globalThis.__obscura_init = function() {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root.
     globalThis.document = _scopedDocumentFor(frameRootNid);
-    _hideOwnProperty(globalThis.document, '_defaultViewProxy', globalThis);
+    globalThis.document[_defaultViewProxySym] = globalThis;
     // Ancestor window wiring (Phase 4): `parent` addresses the direct parent
     // document's realm, `top` the main Window; frameElement follows the
     // same-origin-with-parent rule (a cross-origin container reads null).
