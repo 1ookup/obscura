@@ -12784,6 +12784,7 @@ globalThis.scrollX = 0; globalThis.scrollY = 0;
 // select legacy-browser fallbacks, which can replace their modern cascade.
 const _CSS_SUPPORTED_DECLARATIONS = new Set((
   "display width height min-width min-height max-width max-height box-sizing aspect-ratio content " +
+  "appearance -webkit-appearance " +
   "margin margin-top margin-right margin-bottom margin-left margin-inline margin-inline-start " +
   "margin-inline-end margin-block margin-block-start margin-block-end padding padding-top " +
   "padding-right padding-bottom padding-left padding-inline padding-inline-start padding-inline-end " +
@@ -12919,6 +12920,12 @@ function _cssSupportsDeclaration(name, value) {
     return ["fill", "contain", "cover", "none", "scale-down"].includes(lower);
   }
   if (name === "visibility") return ["visible", "hidden", "collapse"].includes(lower);
+  if (name === "appearance" || name === "-webkit-appearance") {
+    // CSS UI appearance plus Chromium's legacy compatibility idents; mirrors
+    // the renderer's appearance_value_supported list so both build shapes
+    // answer feature queries identically.
+    return ["none", "auto", "base-select", "searchfield", "textfield", "textarea", "checkbox", "radio", "menulist", "menulist-button", "listbox", "meter", "progress-bar", "button"].includes(lower);
+  }
   if (name === "scrollbar-gutter") {
     return lower === "auto" || lower === "stable" || lower === "stable both-edges";
   }
