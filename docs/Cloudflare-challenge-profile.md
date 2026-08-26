@@ -4,10 +4,14 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-08-26,step 87）：**未通过**。窗口内部字段已藏干净（step 83–86），
-但 step 87 在 thelancet.com 实测发现 **document 仍泄漏 `_nid`/`_scopeRoot`/
-`_defaultViewProxy` 等引擎自有属性**（Chrome 实例 own keys 为空），根因是
-`_hideInternalsFromReflection` 只过滤 global、不滤 DOM 实例。下一步藏 document/Node 的 `_*`。
+当前状态（2026-08-27,step 89）：**未通过**。step 88 把 document 的 8 个内部字段改 Symbol 键后，
+本轮实测 `Object.getOwnPropertyNames(document)` 泄漏归零（主/frame realm 均 `[]`，晚快照只剩
+合法的 `lang`/`dir`）。但 step 89 对拍 Chrome 三 payload 后确认还有**比 document 泄漏更大的错配**：
+①**默认 stealth 指纹是 Windows Chrome 145/146，参考是 macOS Chrome 149**（`--user-agent` 可即时
+对齐 UA/platform，但默认值错）；②**navigator 缺 42 个 Chrome 有的属性**（`bluetooth`/`hid`/
+`serial`/`usb`/`xr`/`mediaSession`/`presentation`/`managed`/`virtualKeyboard`/`userActivation`
+等对象 + `getUserMedia`/`runAdAuction`/`vibrate` 等 native 方法）；③`__obscura_click_target`
+运行时泄漏到 `globalThis`。下一步：补 navigator 42 个 API 外壳 + 对齐默认 UA。
 
 以下为 step 67–74 的状态记录。战线从「链路走不通」转成
 「**提交载荷的内容对不上**」——`http://192.168.3.57:9000` 上的 MITM 代理把 CF 的
@@ -4642,3 +4646,70 @@ obscura-js 513、obscura-browser 105 全绿。
 `_nullNamespaceAttrs`/`_treeConnected`/`_treeConnectedEpoch`/`_treeDetachedExact` 等），是同一类泄漏的
 更大面。CF 当前的 `fyCZH9` 用选择性 `d.` 列表、不枚举 element 自有属性，所以暂不阻塞；若后续指纹
 升级为 `Object.getOwnPropertyNames(element)`，再按同一 Symbol 手法批量转换。
+
+### Step 89 — 重验证：document 泄漏归零，但默认 UA 错配 + navigator 缺 42 属性才是更大错配（2026-08-27）
+
+**假设**：step 88 把 document 内部字段改 Symbol 键后，obscura 的 CF 指纹应与 Chrome 更接近；
+用 thelancet.com/1.txt 对拍 Chrome 三 payload 验证，并量化剩余缺口。
+
+**方法**：
+- `SSL_CERT_FILE=/tmp/reqable-ca.crt OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura serve
+  --proxy http://192.168.3.57:9000 --stealth --port 9223`，先不带 `--user-agent`（默认指纹）。
+- `enum_realm.py`（预注入各 realm 的 `Object.getOwnPropertyNames(globalThis/document/
+  navigator/screen)`，经 console.warn 汇入 serve.log）确认 document 泄漏归零 + 抓 navigator 枚举面。
+- `capture_challenge.py` 确认挑战进展 + 提交载荷大小。
+- 与 Chrome payload-2/3 的 `fyCZH9` 对拍：正则提取 Chrome 读的 81 个 `n.*` 路径，逐一在 obscura
+  求 `typeof navigator[p]`，得出缺失集合。
+
+**证据**：
+
+1. **document 泄漏归零**（step 88 生效）：主 realm `getOwnPropertyNames(document)` = `[]`，
+   frame realm = `[]`；晚快照（t=9s）主/frame 均只剩 `["lang","dir"]`（合法 document 内容属性；
+   Chrome 把它们放 `Document.prototype`，obscura 作为 own 属性——同一类小残留，非引擎内部字段）。
+2. **默认 UA 错配**：`/json/version` 报告 `Chrome/146.0.0.0` + Windows NT 10.0 UA；而 Chrome
+   payload 是 `Chrome/149.0.0.0` + `MacIntel`。加 `--user-agent "Mozilla/5.0 (Macintosh; Intel
+   Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"` 后
+   `navigator.platform=MacIntel`、`vendor=Google Inc.`、`appVersion`/`userAgent` 全对齐。根因：
+   `fingerprint.rs` 的 `DEFAULT_USER_AGENT` 与 `wreq_client.rs` 的 `STEALTH_USER_AGENT` 都硬编码
+   Windows Chrome 145/146。
+3. **navigator 缺 42 属性**（step 87 说 ~23，实测 42）：Chrome 读 81 个 `n.*`，obscura 39 存在、
+   42 个 `typeof undefined`。缺的拆两类——
+   - 对象类（20 个，Chrome 落 `o` 桶）：`bluetooth`/`hid`/`serial`/`usb`/`xr`/`mediaSession`/
+     `presentation`/`managed`/`virtualKeyboard`/`userActivation`/`devicePosture`/
+     `windowControlsOverlay`/`webkitPersistentStorage`/`webkitTemporaryStorage`/`storageBuckets`/
+     `modelContext`/`login`/`ink`/`protectedAudience`/`scheduling`；
+   - native 方法类（22 个，Chrome 落 `N` 桶）：`getUserMedia`/`requestMIDIAccess`/
+     `requestMediaKeySystemAccess`/`runAdAuction`/`joinAdInterestGroup`/`leaveAdInterestGroup`/
+     `updateAdInterestGroups`/`createAuctionNonce`/`registerProtocolHandler`/
+     `unregisterProtocolHandler`/`clearAppBadge`/`setAppBadge`/`vibrate`/
+     `getInstalledRelatedApps`/`getInterestGroupAdAuctionData`/`adAuctionComponents`/
+     `canLoadAdAuctionFencedFrame`/`clearOriginJoinedAdInterestGroups`/`webkitGetUserMedia`/
+     `deprecatedReplaceInURN`/`deprecatedURNToURL`/`deprecatedRunAdAuctionEnforcesKAnonymity`。
+   这 42 个在 Chrome 是有值/函数，在 obscura 是 undefined，CF 的 `fyCZH9` 会把它们从 `o`/`N` 桶
+   移到 `x` 桶——真实 Chrome 恒有这些 API，是明确的 bot 信号。
+4. **次级值错配**：`navigator.languages=["en-US","en"]`（Chrome `["zh-CN"]`）、
+   `hardwareConcurrency=8`（Chrome 6）、`deviceMemory=8`（Chrome 16）。均不在 `--user-agent`
+   推导范围内，需 `FingerprintOverrides` 覆盖。
+5. **`__obscura_click_target` 泄漏**：晚快照主/frame realm 的 window own keys 各多一个
+   `__obscura_click_target`（同源还有 `__obscura_focused`）。它是 bootstrap.js 的 focus/点击处理
+   （`globalThis.__obscura_click_target = this`，行 3843/4735/4819）运行时设上去的，不在
+   `__obscura_hide_list`（那列表是 bootstrap 期静态名，`_hideInternalsFromReflection` 按名过滤
+   而非前缀），所以漏出。`_cf_chl_opt`/`__wfEmit` 是 CF 自己的全局，Chrome 也有，不算泄漏。
+6. **挑战进展不变**：仍跑到 `interactiveBegin`（t=14.3s），三次提交同构——页面 `/fo/` 2359B、
+   widget `/g/fo/` 4610B → 79319B（大指纹，与 step 87 的 79180B 同量级）。
+
+**结论**：
+- document 泄漏已根治（step 88 验证通过）。
+- 但**更大的错配是默认 UA + navigator 42 属性缺口**——step 87 把它们当次要项，实为指纹对不上的
+  主因之一。UA 是配置（`--user-agent` 即时对齐），navigator 42 属性是代码缺口（需补 API 外壳）。
+- `__obscura_click_target` 是 step 83–88 同类内部字段泄漏的又一处，但只在交互后出现，影响小于
+  navigator 缺口。
+
+**下一步（按影响排序）**：
+1. 补 navigator 42 个属性外壳：对象类返回带权限检查的空接口对象，native 方法类返回抛
+   `NotAllowedError` 的原生函数，与 Chrome 的形状一致（无真实实现）。这是当前指纹最大缺口。
+2. 对齐默认 UA：`DEFAULT_USER_AGENT`/`STEALTH_USER_AGENT` 是否应默认 macOS Chrome 149，或加显式
+   配置入口，避免每次 serve 都带 `--user-agent`。
+3. `__obscura_click_target`/`__obscura_focused` 改 Symbol 键或加进 hide list。
+4. `FingerprintOverrides` 暴露 languages/hardwareConcurrency/deviceMemory 的 CLI 覆盖，
+   以匹配参考 Chrome 的 zh-CN/6/16。
