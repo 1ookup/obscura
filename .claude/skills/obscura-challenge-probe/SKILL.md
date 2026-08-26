@@ -6,7 +6,8 @@ description: >
   提供带 stealth + 代理 + V8 trace 的复现命令、CDP 预注入探针（拿 postMessage
   完整内容、穿透 closed shadow root 找 iframe）、跨 realm 的通信与请求钩子
   （XHR/fetch/sendBeacon + 调用栈，定位「哪条消息触发了哪个请求」）、frame realm
-  相对 URL 归属探针，以及与浏览器 HAR 逐条对比的方法。当用户问「obscura 为什么
+  相对 URL 归属探针、与浏览器 HAR 逐条对比，以及把 Chrome 解密 payload 的枚举面
+  （navigator/document/screen 属性名清单）与 obscura 逐一对拍的方法。当用户问「obscura 为什么
   过不了这个盾 / iframe 里的 JS 有没有执行 / 挑战卡在哪一步 / 这个请求是谁发的 /
   帮我分析这个 HAR / 用 v8 trace 看看页面在干什么」时使用本技能。
 ---
@@ -54,6 +55,19 @@ cargo build --release -p obscura-cli --bins \
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 ```
 
+**代理跑在别的机器/端口时，先信任代理 CA。** 本机 Reqable 的 CA 就是 `REQABLE_CA`。若代理在
+局域网另一台机器（如 `http://192.168.3.57:9000`），正确下载点是**经该代理访问**
+`http://cert.reqable.com/ca`（拿到 `CN=Reqable CA`）。两个坑：`http://mitm.it/cert/pem` 返回
+占位 mitmproxy 证书、`http://reqable.com/ssl` 会被 EdgeOne 拦成 567，都不是代理实际用于 MITM
+的 CA，用错会 `CERTIFICATE_VERIFY_FAILED`。下载后装进 keychain，并把 `SSL_CERT_FILE` 指过去：
+
+```bash
+curl -x http://192.168.3.57:9000 http://cert.reqable.com/ca -o /tmp/reqable-ca.crt
+openssl x509 -in /tmp/reqable-ca.crt -noout -subject   # 确认 CN=Reqable CA，而非 mitmproxy
+security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db /tmp/reqable-ca.crt
+export SSL_CERT_FILE=/tmp/reqable-ca.crt
+```
+
 **不要用 `cargo v8-build-lean`、`--no-default-features` 或任何去掉 stealth 的
 变体做质询诊断。** 质询在握手阶段就看 TLS 指纹，在首个请求就看 User-Agent：
 非 stealth 二进制走的是 rustls + `DEFAULT_USER_AGENT`，根本到不了质询逻辑本身。
@@ -76,6 +90,24 @@ Stealth mode enabled (tracker blocking)                                   ← �
 此时 `--stealth` 只剩 tracker 拦截。`target/release/obscura` 常被其他构建（Docker
 验证、release 变体、`v8-build-lean`）覆盖成非 stealth 版本，且覆盖后毫无提示，
 所以这一步不能省。
+
+**探针脚本用 Python `websockets` 连 CDP。** 仓库根没有固定 Python 环境，用 uv 建临时 venv
+（`uv venv /tmp/probe-venv --python 3.13 && uv pip install --python /tmp/probe-venv/bin/python websockets`），
+之后所有脚本用 `/tmp/probe-venv/bin/python` 跑；裸 `python3` 会 `ModuleNotFoundError`。
+
+**质询诊断前必须对齐 UA 到参考 Chrome。** 默认 stealth 指纹硬编码 Windows Chrome 145/146
+（`fingerprint.rs` 的 `DEFAULT_USER_AGENT`、`wreq_client.rs` 的 `STEALTH_USER_AGENT`），而参考
+Chrome（你导 HAR/payload 的那台）很可能是 macOS Chrome 149。UA 错配会让 `navigator.platform`
+/`userAgent`/`appVersion` 从第一步就对不上，后续对拍全跑在错误基线上。`serve` 与 `fetch` 都
+支持 `--user-agent`，显式对齐：
+
+```bash
+REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
+obscura serve --port 9223 --proxy http://127.0.0.1:9000 --stealth --user-agent "$REF_UA"
+```
+
+对拍前用 `Runtime.evaluate` 自查 `navigator.platform`/`navigator.userAgent` 与参考一致，
+否则你看到的差异是 UA 没对齐，不是引擎行为。
 
 ## 第一步：与浏览器 HAR 对比
 
@@ -133,6 +165,46 @@ $SKILL_DIR/scripts/cdp_probe.py eval <URL> --expr 'document.querySelectorAll("if
 
 `messages` 模式能拿到 `{"source":"cloudflare-challenge","event":"overrunBegin",...}`
 这类完整负载。心跳类消息（`food`）自动折叠计数。
+
+## 与 Chrome 解密 payload 对拍枚举面
+
+加密的 `fo` 提交体无法直接 diff（opaque body）。但如果你有 Chrome 的**解密** payload（用
+DevTools 在加密前截下的 `fo` 对象），就能反向提取 CF 实际读取的属性名清单，把「载荷不可 diff」
+转成「枚举面可 diff」——这是本类排查里最高杠杆的一步：
+
+1. **正则提取 CF 读的属性名**：payload 里的 `fyCZH9` 桶表把「值 → 属性路径」都列出来了，
+   前缀 `n.` = navigator、`d.` = document、`s.` = screen、`so.` = screen.orientation，
+   无前缀裸标识符 = window/globalThis；`o.` = widget 自己的混淆全局（CF 代码设的，跳过）。
+   提取去重后就是 CF 逐一对拍的那份清单（如 Chrome 读 81 个 `n.*`）。
+2. **逐一 `typeof` 对拍 obscura**：对每个提取的属性，在 obscura 里求 `typeof navigator[p]`
+   （或 `document[p]`/`screen[p]`），分「存在 / `typeof undefined` / 值类型」三档。`undefined`
+   的那批就是缺失集合——真实 Chrome 恒有这些 API（WebBluetooth/WebHID/WebSerial/WebUSB/WebXR
+   等），obscura 缺了会被 CF 从 `o`/`N` 桶挪到 `x` 桶，是明确的 bot 信号。
+3. **顺便量内部字段泄漏**：`enum_realm.py` 抓各 realm 的
+   `Object.getOwnPropertyNames(globalThis/document/navigator/screen)`，一眼看出 `_nid`/
+   `_scopeRoot`/`__obscura_*` 这类 Chrome 没有的自有字段——验证「内部字段改 Symbol 键」这类
+   修复有没有生效的直接手段。
+
+```bash
+# 抓各 realm 的枚举面（window/document/navigator/screen 的 own keys），经 console.warn 汇入 serve.log
+/tmp/probe-venv/bin/python $SKILL_DIR/scripts/enum_realm.py <URL> --port 9223 --wait 14
+grep '\[ENUM\]' /tmp/serve.log        # 注意 serve stdout 有缓冲，grep 前等一下让它落盘
+
+# 抓挑战载荷全文（postMessage + XHR/fetch/sendBeacon body），看挑战跑到哪一步、提交了多大的 fo
+/tmp/probe-venv/bin/python $SKILL_DIR/scripts/capture_challenge.py <URL> --port 9223 --wait 35
+# Chrome 的完整挑战是三个提交（render + 初始 fo + 点击后的 proof fo）；不点击只抓到前两个。
+# 要复现第三个（proof）fo，加 --click：等 interactiveBegin 后点复选框再继续抓
+/tmp/probe-venv/bin/python $SKILL_DIR/scripts/capture_challenge.py <URL> --port 9223 --click --wait 45
+
+# 从 Chrome 解密 payload 提取属性名清单，逐一 typeof 对拍 obscura，直接得「缺失集合」
+/tmp/probe-venv/bin/python $SKILL_DIR/scripts/diff_payload_enum.py \
+  /tmp/chrome/payload-2.json /tmp/chrome/payload-3.json --port 9223 --obj navigator
+# --obj 可选 all / navigator / document / screen / orientation / window；默认 all
+```
+
+`enum_realm.py` 的晚快照（t=9s）再打一轮，区分「导航早期」与「settle 后」两个时刻。`capture_challenge.py`
+的 stdout dump 只有 TOP realm，widget realm 的记录走 serve.log 的 `[CAP]` 行。`diff_payload_enum.py`
+不导航、只连已经起来的 serve 逐个 `typeof` 对拍，跑之前 serve 得先起着（且带对齐过的 `--user-agent`）。
 
 ## 通信内容与请求钩子：拿"哪条消息触发了哪个请求"
 
@@ -208,6 +280,7 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 
 | 盲区 | 症状 | 正确做法 |
 |------|------|----------|
+| **默认 stealth 指纹是 Windows Chrome 145/146，没对齐参考 Chrome 的 UA** | `navigator.platform`/`userAgent`/`appVersion` 从第一步就错，后续对拍跑在错误基线，看起来像「引擎缺一堆属性」 | `serve`/`fetch` 都加 `--user-agent` 显式对齐参考 Chrome；对拍前 `Runtime.evaluate` 自查 `navigator.platform` 与参考一致 |
 | **二进制不带 stealth**（`--no-default-features` / `v8-build-lean` 构建） | 质询在 TLS 握手阶段就分流，请求序列比浏览器短一大截，看起来像「上游某步没触发」——而那个「断点」纯属构建缺陷 | 只用默认的 render + stealth 构建；起 serve 时确认日志是 `TLS fingerprint impersonation + tracker blocking` 而非仅 `tracker blocking` |
 | `querySelectorAll` 不穿透 shadow；closed root 的 `el.shadowRoot` 为 `null` | 误判「iframe 从未插入 DOM」 | 预注入截获 `attachShadow` 保留 root 引用（`cdp_probe.py shadow`） |
 | frame 导航不打印 URL | 误判「iframe 文档从未被请求」 | 看 `starting new connection` / `Cookie header for <host>`，或直接插桩 |
@@ -222,6 +295,7 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 | **只 dump 单个 realm 的数组**（`window.__ev` + `Runtime.evaluate`） | widget realm 的消息与请求完全不出现，误判「没有这条通信」 | 记录走 `console.warn`，obscura 把所有 realm 的 console 汇进 serve 日志 |
 | **只钩 `XMLHttpRequest`，漏掉 `fetch`/`sendBeacon`** | 点击后的请求一条都抓不到，误判「点击没有触发任何请求」 | 三个入口一起钩（必要时加 `img.src`），见 `cdp_comm_probe.py` |
 | **用不点击的探针判断提交链** | 点击之后的提交 POST 与回传永远不出现，却被当成「链路到此为止」 | 判据链凡涉及点击之后的部分，必须用会点击的探针；`--no-click` 的轮次只能看点击**之前**的阶段 |
+| **用模拟点击（`element.click()`/`dispatchEvent`，或 obscura `Input.dispatchMouseEvent` 的 JS 合成后端）过不了 CF 的真实输入检测** | 点击后 proof fo 不出现，被误判为「点击链路断了」；实际是 `isTrusted=false` 或缺 `sourceCapabilities`，CF 判定非真实输入而忽略 | 点击必须走 CDP `Input.dispatchMouseEvent`（Chrome 里 `isTrusted=true`）。注意 obscura 的 Input 后端是 JS 合成 + `__obscura_markTrusted` 伪造 `isTrusted`，`sourceCapabilities`/`InputDeviceCapabilities` 完全未实现、`pointerId` 硬编码 1——真实输入缺这些特征，引擎缺陷待修 |
 | **拿 Chrome 对拍时用了 isolated world** | isolated world 不受页面 CSP 约束：同一页面 `trustedTypes.defaultPolicy` 在 isolated 里读作 `null`、main world 里是 `present`，据此会得出完全相反的结论 | 凡是与 CSP、TT、nonce 相关的对拍，必须 `mainWorld: true` |
 | **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined；据此得出「移除了也没变化」的错误结论 | 要移除就只 `delete`，并当场用 `name in globalThis` 和 `getOwnPropertyNames` 复验，而不是用 `typeof` |
 | **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | HEAD 与目标 commit 之间还隔着几十个提交，干预结果说明不了那个 commit 的行为 | 干预实验跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 并复现 |
