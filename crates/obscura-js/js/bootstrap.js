@@ -39,7 +39,7 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
-    '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_pointer_id',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -4955,7 +4955,7 @@ globalThis.__obscura_schedule_input_strategy = function() {
     const activate = () => {
       const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
       if (rect && rect.width > 0 && rect.height > 0) {
-        const opts = { bubbles: true, cancelable: true, composed: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+        const opts = { bubbles: true, cancelable: true, composed: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1, pointerId: __obscura_pointer_id(true), pointerType: 'mouse', isPrimary: true };
         target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', opts)));
         target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', opts)));
         target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', Object.assign({}, opts, { buttons: 0 }))));
@@ -11200,7 +11200,36 @@ globalThis.DOMException = (function () {
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+// Device input (mouse, keyboard) additionally reports the capabilities of the
+// device it came from through Event.sourceCapabilities; script-built events
+// report null. Same WeakMap discipline as isTrusted: page JS can neither read
+// nor forge the association.
+const _eventSourceCapabilities = new WeakMap();
+let _mouseInputCaps = null;
+globalThis.__obscura_markTrusted = function(ev) {
+  try {
+    if (ev) {
+      _trustedEvents.add(ev);
+      // MouseEvent covers PointerEvent/WheelEvent; MessageEvent and bare
+      // Event stay out, matching Chrome where e.g. a synthetic element.click()
+      // activation has sourceCapabilities === null.
+      if (ev instanceof MouseEvent || ev instanceof KeyboardEvent || ev instanceof InputEvent) {
+        if (!_mouseInputCaps) _mouseInputCaps = new InputDeviceCapabilities({ firesTouchEvents: false });
+        _eventSourceCapabilities.set(ev, _mouseInputCaps);
+      }
+    }
+  } catch (_e) {}
+  return ev;
+};
+// Chrome assigns a fresh pointerId per pointer activation (each press cycle)
+// and reuses it for the matching up/move/hover events; a constant 1 on every
+// event is a fingerprint. `acquire` starts a new activation sequence; without
+// it the current id is reused, and the very first call mints id 1.
+let _pointerIdSeq = 0;
+globalThis.__obscura_pointer_id = function(acquire) {
+  if (acquire || _pointerIdSeq === 0) _pointerIdSeq++;
+  return _pointerIdSeq;
+};
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -11275,6 +11304,7 @@ function _eventTimeStamp() {
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=_eventTimeStamp();this._propagationStopped=false;this._immediatePropagationStopped=false;this._dispatching=false;this._eventPath=null;this._eventPathCurrentIndex=-1; }
   get isTrusted() { return _trustedEvents.has(this); }
+  get sourceCapabilities() { return _eventSourceCapabilities.has(this) ? _eventSourceCapabilities.get(this) : null; }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
@@ -11293,6 +11323,16 @@ globalThis.Event = class Event {
   }
 };
 _markNative(Event);
+// Chrome surfaces the physical device behind trusted input events through
+// Event.sourceCapabilities. The class itself is a window global there, so its
+// absence is a detectable difference; flags live in a WeakMap so instances
+// introspect with no own keys, like the C++-backed originals.
+const _inputCapsFlags = new WeakMap();
+globalThis.InputDeviceCapabilities = class InputDeviceCapabilities {
+  constructor(init) { _inputCapsFlags.set(this, !!(init && init.firesTouchEvents)); }
+  get firesTouchEvents() { return _inputCapsFlags.has(this) && _inputCapsFlags.get(this); }
+};
+_markNative(InputDeviceCapabilities);
 globalThis.CustomEvent = class CustomEvent extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older

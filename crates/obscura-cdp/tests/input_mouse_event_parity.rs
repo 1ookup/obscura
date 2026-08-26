@@ -775,3 +775,93 @@ async fn clipped_iframe_content_does_not_receive_mouse_events() {
     let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(log, json!([]));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn click_pointer_ids_increment_per_activation_and_pair_within_a_cycle() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.pidLog = [];
+            for (const type of ['pointerdown', 'pointerup']) {
+                target.addEventListener(type, e => pidLog.push([type, e.pointerId]));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(&mut ctx, 3, "JSON.stringify(pidLog)", &sid).await;
+    let log: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log,
+        json!([["pointerdown", 1], ["pointerup", 1], ["pointerdown", 2], ["pointerup", 2]]),
+        "each press cycle mints a fresh pointerId shared by its down/up pair: {log}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trusted_input_events_carry_mouse_source_capabilities() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.capsLog = [];
+            for (const type of ['mousedown', 'click']) {
+                target.addEventListener(type, e => capsLog.push(
+                    e.sourceCapabilities instanceof InputDeviceCapabilities
+                        ? ['caps', e.sourceCapabilities.firesTouchEvents]
+                        : ['bare', String(e.sourceCapabilities)]));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(&mut ctx, 3, "JSON.stringify(capsLog)", &sid).await;
+    let log: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log,
+        json!([["caps", false], ["caps", false]]),
+        "CDP mouse input reports a mouse InputDeviceCapabilities: {log}"
+    );
+
+    let out = evaluate(
+        &mut ctx,
+        4,
+        r#"JSON.stringify({
+            scriptMouseEventIsNull: new MouseEvent('click').sourceCapabilities === null,
+            scriptEventIsNull: new Event('x').sourceCapabilities === null,
+            scriptKeyEventIsNull: new KeyboardEvent('keydown').sourceCapabilities === null,
+            ctorIsFunction: typeof InputDeviceCapabilities === 'function',
+            ctorName: InputDeviceCapabilities.name,
+            ctorNative: String(InputDeviceCapabilities).includes('[native code]'),
+            defaultFiresTouch: new InputDeviceCapabilities().firesTouchEvents,
+            touchCtorFiresTouch: new InputDeviceCapabilities({firesTouchEvents: true}).firesTouchEvents,
+            instanceOwnKeys: Object.keys(new InputDeviceCapabilities({firesTouchEvents: true}))
+        })"#,
+        &sid,
+    )
+    .await;
+    let intro: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(intro["scriptMouseEventIsNull"], true, "{intro}");
+    assert_eq!(intro["scriptEventIsNull"], true, "{intro}");
+    assert_eq!(intro["scriptKeyEventIsNull"], true, "{intro}");
+    assert_eq!(intro["ctorIsFunction"], true, "{intro}");
+    assert_eq!(intro["ctorName"], "InputDeviceCapabilities", "{intro}");
+    assert_eq!(intro["ctorNative"], true, "{intro}");
+    assert_eq!(intro["defaultFiresTouch"], false, "{intro}");
+    assert_eq!(intro["touchCtorFiresTouch"], true, "{intro}");
+    assert_eq!(intro["instanceOwnKeys"], json!([]), "{intro}");
+}
