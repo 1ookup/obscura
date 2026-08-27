@@ -1213,9 +1213,29 @@ impl TextEngine {
         let previous_len = self.items.len();
         let width = self
             .push_generated_text(text, style)
-            .map(|idx| self.measure(idx, None).0)
+            .map(|idx| self.measure_canvas_width(idx))
             .unwrap_or(0.0);
         self.items.truncate(previous_len);
+        width
+    }
+
+    /// Subpixel width for `measureText`/TextMetrics: the fractional line
+    /// width quantized to 1/64 px, the resolution Chrome's 26.6 fixed-point
+    /// pipeline reports. The layout path keeps its ceiled line width; only
+    /// the canvas measurement channel carries the fraction.
+    fn measure_canvas_width(&mut self, idx: usize) -> f32 {
+        let TextEngine {
+            font_system, items, ..
+        } = self;
+        let Some(item) = items.get_mut(idx) else {
+            return 0.0;
+        };
+        let wrap = item.layout_wrap;
+        shape_with_text_indent(font_system, item, None, wrap);
+        let mut width = 0.0f32;
+        for run in item.buffer.layout_runs() {
+            width = width.max((run.line_w.max(0.0) * 64.0).round() / 64.0);
+        }
         width
     }
 

@@ -4252,6 +4252,7 @@ mod tests {
                     const mono = width("72px monospace");
                     const sans = width('72px "Arial", monospace');
                     const missing = width('72px "NonexistentFontXYZ123", monospace');
+                    const probe = width("10px sans-serif");
                     const nodesAfterCanvas = document.querySelectorAll("*").length;
                     return {
                         // Different families must not measure the same.
@@ -4264,9 +4265,16 @@ mod tests {
                             (ctx.font = "72px monospace", ctx.measureText(TEXT + TEXT).width),
                         emptyIsZero: (ctx.font = "72px monospace",
                                       ctx.measureText("").width) === 0,
-                        // Canvas and element layout are one source of truth.
-                        agreesWithElement: mono === elementWidth("72px monospace")
-                            && sans === elementWidth('72px "Arial", monospace'),
+                        // Canvas carries subpixel advances quantized to 1/64
+                        // (Chrome's 26.6 pipeline); element layout stays on the
+                        // ceiled line, so they agree after ceiling.
+                        agreesWithElement:
+                            Math.ceil(mono) === elementWidth("72px monospace")
+                            && Math.ceil(sans) === elementWidth('72px "Arial", monospace'),
+                        // The 10px probe string must land on a fractional
+                        // 1/64 boundary, not an integer pixel.
+                        subpixel: probe % 1 !== 0
+                            && Math.abs(probe * 64 - Math.round(probe * 64)) < 1e-6,
                         positive: mono > 0 && sans > 0,
                         canvasLeavesDomUntouched: nodesAfterCanvas === nodesBefore,
                     };
@@ -4286,6 +4294,7 @@ mod tests {
                 "longerIsWider": true,
                 "emptyIsZero": true,
                 "agreesWithElement": true,
+                "subpixel": true,
                 "positive": true,
                 "canvasLeavesDomUntouched": true,
             })
@@ -8786,7 +8795,9 @@ RequestRedirect value",
                 "mobile": false,
                 "model": "",
                 "platform": "macOS",
-                "platformVersion": "14.6.0",
+                // The 14_6 UA token is frozen Chrome boilerplate; the claimed
+                // platform version is the macOS constant, not the token.
+                "platformVersion": obscura_net::MACOS_UA_PLATFORM_VERSION,
                 "uaFullVersion": "146.0.7680.80",
                 "wow64": false
             },
@@ -13575,7 +13586,9 @@ RequestRedirect value",
                 "contentRect": [7, 5, 102, 66],
                 "content": [102, 66],
                 "border": [120, 80],
-                "device": [102, 66],
+                // Device pixels are CSS size times the fingerprint's
+                // devicePixelRatio, 2.0 under the default macOS identity.
+                "device": [204, 132],
             }])
         );
 
