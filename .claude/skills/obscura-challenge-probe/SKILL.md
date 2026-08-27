@@ -300,6 +300,11 @@ trace 用法见 `docs/Trace-page-script.md`。在这类排查里它能回答的�
 | **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined；据此得出「移除了也没变化」的错误结论 | 要移除就只 `delete`，并当场用 `name in globalThis` 和 `getOwnPropertyNames` 复验，而不是用 `typeof` |
 | **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | HEAD 与目标 commit 之间还隔着几十个提交，干预结果说明不了那个 commit 的行为 | 干预实验跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 并复现 |
 | **单次测量当判据** | 同一二进制多轮里可能有一轮偏离（CF 端波动），单次结果会把二分带偏 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值 |
+| **`fetch` 模式不转发页面 console** | fetch 轮的 payloadJSON/探针 console 全部静默丢弃，会误判成「质询没跑完」 | 凡要读页面 console（payloadJSON 等）必须起 `serve`，从 serve 日志拿 |
+| **全量 `--trace` 让质询在窗口内跑不完** | trace 把页面拖慢数倍：fetch 轮 35s 到不了提交；serve 轮页面任务被 `autonomous browser task exceeded its task budget` 杀掉，payloadJSON=0 | trace 轮只用于看调用形态/MISS，不用于拿提交体；两轮分开跑。另：`--v8-flags` 是顶层参数，必须放在子命令之前（`obscura --v8-flags "…" serve …`） |
+| **V8 property-lookup trace 不覆盖普通 JS 对象的属性访问** | trace 的 MISS 极少（一轮 19 条），据此会误判「CF 没探测缺失 API」；bootstrap 的 navigator 等 JS shim 的 typeof/in 走 V8 fast path 不进 hook | 枚举面/缺 API 类结论用 `enum_realm.py`/`diff_payload_enum.py` 对拍；trace 的 MISS 只回答 window 级全局查找失败 |
+| **对拍脚本不先做同侧 sanity check** | 摊平脚本「后片覆盖前片」bug 曾把两边完全相同的 Math 指纹误报成「缺失」 | 对拍脚本先跑相邻批自比（chrome-2 vs chrome-3、obsc-2 vs obsc-3 应≈零差）再跨侧对比 |
+| **按分片号（part N）对齐两边 payload** | 同一探针在 chrome 落 part 27、obscura 落 part 20；且第二批提交是增量的（payload-3 = payload-2 + 新 part），按 part diff 全是假差异 | 对拍一律按探针字段名（混淆名跨边稳定）对齐，跨 part 合并同名值 |
 
 ## 判定口径
 

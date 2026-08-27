@@ -4,14 +4,23 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-08-27,step 89）：**未通过**。step 88 把 document 的 8 个内部字段改 Symbol 键后，
-本轮实测 `Object.getOwnPropertyNames(document)` 泄漏归零（主/frame realm 均 `[]`，晚快照只剩
-合法的 `lang`/`dir`）。但 step 89 对拍 Chrome 三 payload 后确认还有**比 document 泄漏更大的错配**：
-①**默认 stealth 指纹是 Windows Chrome 145/146，参考是 macOS Chrome 149**（`--user-agent` 可即时
-对齐 UA/platform，但默认值错）；②**navigator 缺 42 个 Chrome 有的属性**（`bluetooth`/`hid`/
-`serial`/`usb`/`xr`/`mediaSession`/`presentation`/`managed`/`virtualKeyboard`/`userActivation`
-等对象 + `getUserMedia`/`runAdAuction`/`vibrate` 等 native 方法）；③`__obscura_click_target`
-运行时泄漏到 `globalThis`。下一步：补 navigator 42 个 API 外壳 + 对齐默认 UA。
+当前状态（2026-08-27,step 90）：**未通过**。step 90 用 MITM 代理注入的 `console.log("payloadJSON:…")`
+拿到 obscura 全部三轮**明文提交体**（含点击后 proof 轮），与 Chrome 三 payload 按「探针字段名」对拍
+（分片号两边错位，不能按 part 对齐）。结论：navigator 42 缺口只是冰山一角——枚举桶里 **N 桶（window
+构造器）缺 773 个、o 桶缺 49 个**；**UA-CH 高熵字段错**（x86/10.15.7 vs arm/26.4.0，brands 多一个
+"Google Chrome"）；**WebGPU adapter 报 intel gen-9**（参考 macOS Chrome 是 apple）；iframe 内
+`document.domain` 报顶层域、`compatMode` 应为 BackCompat、`innerWidth/innerHeight` 应为 0；
+WebGL 少 4 个 Apple GPU 压缩纹理扩展、limits 表多值不同；canvas 像素全 255、文本测量无亚像素；
+ICE 缺 srflx。此前 step 89 的三个缺口（默认 UA、navigator 42 API、`__obscura_click_target`）
+依然成立。step 90 补充调查确认 **`/ci/` 打点没有回归**（HEAD 多数轮次第一轮 widget 早期
+就发，~1/3 轮次推迟是 CF 端波动；iframe 修复排除），顺带发现动态 iframe about:blank
+`body=null` 的老缺陷。下一步按本 step 的影响排序表推进。
+
+step 89 存档：step 88 把 document 的 8 个内部字段改 Symbol 键后，实测
+`Object.getOwnPropertyNames(document)` 泄漏归零（主/frame realm 均 `[]`，晚快照只剩合法的
+`lang`/`dir`）。step 89 对拍 Chrome 三 payload 确认：①默认 stealth 指纹是 Windows Chrome
+145/146，参考是 macOS Chrome 149（`--user-agent` 可即时对齐）；②navigator 缺 42 个 Chrome 有的
+属性；③`__obscura_click_target` 运行时泄漏到 `globalThis`。
 
 以下为 step 67–74 的状态记录。战线从「链路走不通」转成
 「**提交载荷的内容对不上**」——`http://192.168.3.57:9000` 上的 MITM 代理把 CF 的
@@ -2001,6 +2010,13 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | **包装 `performance.getEntries*` 的钩子只在页面主动读取时产生记录**（被动观测面） | step 47 修完 `/ci/` 的 entry 后日志里看不到它，差点误判「修复没生效」——实际是 CF 在 `/ci/` 之后再没读过 performance | 「日志里没有」只能证明**没被读**，不能证明**不存在**；条目是否真的写入必须用可控用例断言（本步落成两条回归测试），实测日志只用来判断 CF 读没读、读到什么 |
 | **出口 IP 决定拿到哪种页面，1020 硬封锁态下一切诊断无效**（step 48 证据 4） | 封锁页会加载源站的 `rocket-loader.min.js` 与 `cloudflareinsights` beacon，serve 日志看着像「正常站点资源」，一度误判为过盾；而它既不是质询也不是真实响应 | 每轮开跑探针前先看 `Page loaded` 的 title：`Just a moment...` = 质询可诊断，`Attention Required! \| Cloudflare` = 1020 封锁需换 IP，其余才可能是真实响应 |
 | **质询页 DOM 里预置了全部状态文案** | `--dump text` 出现 "Verification successful. Waiting for zencare.co to respond"，误读为已通过 | 该串是静态文案不是状态；判据仍为目标 URL 返回真实 404（`/1.txt` 本就不存在） |
+| **`fetch` 模式不转发页面 console**（step 90） | fetch 轮本地测 ICE（console.log 6 条）与质询页 payloadJSON 全部静默丢弃，一度把「fetch 轮 0 条 payloadJSON」归因成「质询没跑完」——两个原因里真正致命的是这个 | 凡要读页面 console（payloadJSON/探针 console.warn）必须起 `serve`，从 serve 日志拿 |
+| **全量 `--trace` 让质询在窗口内跑不完**（step 90） | trace 轮 90 万 CALL 把页面拖慢数倍：fetch 轮 35s 到不了提交；serve 轮页面任务直接被 `autonomous browser task exceeded its task budget` 杀掉，payloadJSON=0 | trace 轮只用于看调用形态/MISS，**不用于拿提交体**；提交体用无 trace 轮，两轮分开跑 |
+| **V8 property-lookup trace 不覆盖普通 JS 对象的属性访问**（step 90） | trace 的 MISS 仅 19 条，据此会误判「CF 没探测不存在的属性」；实际 bootstrap 的 navigator 等 JS shim 的 typeof/in 走 V8 fast path，根本不进 hook——step 89 的 42 个 navigator 缺口在 trace 里不可见 | 枚举面/缺 API 类结论只能用 `enum_realm.py`/`diff_payload_enum.py` 对拍；trace 的 MISS 只回答「window 级全局查找失败」 |
+| **`console.log` 等 native 绑定不产生 CALL 行**（postMessage 同理，step 90 复证） | 想从 trace 里读 console.log 的参数（payloadJSON），CALL/HIT 里 0 条，像「没调用过」 | payloadJSON 靠 serve 日志；trace 只见 JS→JS 与 bootstrap 实现的 API 调用 |
+| **对拍脚本不先做同侧 sanity check**（step 90） | 摊平脚本「后片覆盖前片」的 bug 把 Math 指纹 184 项**完全相同**的值误报成「144→0 缺失」，差点写进文档成为假缺口 | 任何对拍脚本先跑「自己 vs 自己」的相邻批（chrome-2 vs chrome-3、obsc-2 vs obsc-3 应≈零差）再跑跨侧对比，覆盖 bug 立刻暴露 |
+| **按分片号（part N）对齐两边 payload**（step 90） | 同一探针在 chrome 落 part 27、obscura 落 part 20，按 part 号 diff 全是假差异；第二批提交还是**增量**的（payload-3 = payload-2 + part 40），字段集合随批增长 | 对拍一律按**探针字段名**（混淆名跨边稳定）对齐，跨 part 合并同名值；先认清「增量批」语义再解释 only-字段 |
+| **`capture_challenge.py` 的 attachShadow 注入仍在污染指纹**（step 66 证据 0 重演，step 90） | `__roots`/`__cap`/`__capHooked` 进了 ZokK1 枚举桶，包装后的 attachShadow 源码进了 payload 尾部 | 该脚本抓通信可用；凡涉及枚举面/函数源码的字段要用无注入轮次（如纯 Input domain 的导航+点击），或先给脚本去注入 |
 
 另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
 （见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
@@ -4713,3 +4729,144 @@ obscura-js 513、obscura-browser 105 全绿。
 3. `__obscura_click_target`/`__obscura_focused` 改 Symbol 键或加进 hide list。
 4. `FingerprintOverrides` 暴露 languages/hardwareConcurrency/deviceMemory 的 CLI 覆盖，
    以匹配参考 Chrome 的 zh-CN/6/16。
+
+### Step 90 — 全三轮明文对拍：N 桶缺 773 构造器 + UA-CH/WebGPU/iframe 几何错配（2026-08-27）
+
+**假设**：step 89 的三个缺口（默认 UA、navigator 42 API、click_target 泄漏）之外，
+提交体其余字段已基本对齐；用 `thelancet.com/1.txt` 全三轮明文对拍验证。
+
+**方法**：
+- 代理 `http://192.168.3.57:9000`（Reqable，CA 经代理取 `http://cert.reqable.com/ca`，CN=Reqable
+  CA，`SSL_CERT_FILE` 指向它）。该代理**改写 CF 挑战脚本，在提交前把载荷对象以
+  `console.log("payloadJSON: " + …)` 打出**；obscura 把所有 realm 的 console 汇进 serve 日志。
+- serve：`--stealth --proxy … --user-agent <macOS Chrome 149>`（UA 已对齐 step 89 教训）。
+  `capture_challenge.py --click` 触发 proof 轮（该脚本的 attachShadow 注入会污染指纹字段，
+  本轮数据中凡涉及枚举面/函数源码的字段已打折，见盲区表）。
+- `grep payloadJSON` 提取 5 条：2× `chl_api_m` + 3× 分片提交（第 3 条是点击后 proof）。
+  Chrome 基线 `/tmp/chrome/payload-{1,2,3}.json`。obscura 侧存
+  `/tmp/lancet-run/obscura-payload-{1..5}.json`，对拍脚本 `compare4.py`（按**探针字段名**对齐，
+  不按分片号）。
+- V8 trace 轮（用户点名）：`--v8-flags "--trace --trace-property-lookup
+  --no-lazy-feedback-allocation --trace-property-lookup-file=…"`。
+
+**证据**：
+
+1. **提交结构对齐**：chl_api_m 字段 47/47 同名零差集；分片提交 chrome 184 字段 / obscura 170，
+   仅 15 个 chrome-only（其中 13 个是 chrome 第二批增量 part 的探针，属批对齐差，非缺失）+
+   `hGgWW0`/`lNCr3` 两个真缺失。**Math 指纹 `mAoOT1` 184 项仅 2 项末位 ULP 差**
+   （0.6043677771171635/…36、0.664036770267849/…91，V8 版本差的 transcendental 末位，实不可修）。
+   SDP offer `xrGz9` 形状已对（v=0/o=-/a=group:BUNDLE 全套）。
+2. **枚举桶 `ZokK1`（62 桶 vs 65）的大缺口**（比 step 89 的「42 个 navigator」大一个量级）：
+   - **N 桶（window 构造器/native 函数）1164 → 399，缺 773 个**（AbsoluteOrientationSensor、
+     AudioBufferSourceNode、AnimationEffect 等——真实 Chrome 恒有的 DOM/WebAudio/SVG 构造器）；
+   - o 桶 121 → 75（缺 GPUBufferUsage/GPUColorWrite/GPUMapMode/GPUShaderStage/GPUTextureUsage、
+     clientInformation、cookieStore、crashReport、d.anchors、d.applets、d.children 等 49 个）；
+   - x 桶 266 → 255（缺 d.activeViewTransition/d.fullscreenElement/fence 等 11 个）；
+   - F 桶 13 → 5（缺 credentialless/d.fullscreen/d.prerendering/d.wasDiscarded/d.webkitHidden/
+     d.webkitIsFullScreen/d.xmlStandalone/n.deprecatedRunAdAuctionEnforcesKAnonymity）；
+   - T 桶 11 → 6。
+3. **iframe 几何/文档属性错配**（枚举在 widget iframe 里做，值桶即答案）：
+   - `innerWidth/innerHeight` 应为 **0**（chrome 桶 0），obscura 报 1920/1000（顶层值泄漏进 iframe
+     realm）；`screenX/screenY/screenLeft/screenTop` chrome 22/52，obscura 全 0；outer*/screen*
+     桶整体错位（chrome outer 1200×1120、screen 1720×1284，obscura 1920×1040、1440×900）；
+   - **`d.domain` 应为 `challenges.cloudflare.com`，obscura 报顶层域 `www.thelancet.com`**；
+   - **`d.compatMode` 应为 `BackCompat`**（widget 文档无 DOCTYPE），obscura 报 `CSS1Compat`；
+   - `d.lastModified`/`d.adoptedStyleSheets`/`d.webkitVisibilityState`/`d.referrer` 缺；
+   - `n.language(s)` chrome `zh-CN`，obscura `en-US,en`，且 obscura 同 payload 里 zh-CN 与
+     en-US 并存（内部矛盾）。
+4. **UA-CH 高熵 `iqypc0` 错**：chrome `architecture=arm, platformVersion=26.4.0, brands=
+   [Chromium 149, Not)A;Brand 24]`（仅 2 brand）；obscura `x86 / 10.15.7 / [Google Chrome,
+   Chromium, Not)A;Brand]`。UA 字符串对齐了，UA-CH 没跟着变。
+5. **WebGPU `Bpqf7`**：adapter 应报 `["apple","",…]`（macOS Chrome），obscura 报
+   `["intel","gen-9",…]`（dd592e8 模板写死）——UA=Mac 但 GPU=intel，自相矛盾。
+6. **WebGL**：扩展 39→36（缺 Apple GPU 的 `WEBGL_compressed_texture_{astc,etc,etc1,pvrtc}`，
+   多 `WEBGL_provoking_vertex`）；limits `mYHfU0` 多值不同（120,120,120 vs 4,128,4、65536 vs
+   16384 等）；能力位 `JlnK7` `[[4,2]]` vs `[[8,4,2,1]]`。
+7. **渲染类指纹**：文本测量 `qSsL2` 无亚像素（29 vs 28.9375）；canvas 像素 `nMlxj2` 全 255
+   （chrome 有真实像素 192,192,192/53 等）；键盘布局 `QyyA4` 表内容不同。
+8. **WebRTC**：ICE `JeSBM4` 缺 srflx（chrome 9 条含 STUN 公网 36.24.58.28，obscura 仅 6 条
+   host/mDNS）；SDP codec `IMOh8` 的 `audio/red/48000` 多 `;111/111` 尾巴。本地复证明 ICE
+   收集本身 3ms 完成（不慢），缺的是 srflx 生成。
+9. **探针行为差异**：`DZSw4` chrome `[]` vs obscura `[208,209,218,…]`、`Djlp6` chrome
+   `[159,163]` vs obscura `[0,1,…,174]`（obscura 把过滤循环的输入全记了，计数器泄漏形状）；
+   `hGgWW0`（`[true,…]` 断言数组+DOM 序列化）三轮全空 = 该探针在 obscura 完全失败；
+   `YySko4` 事件序列形状不同；performance timeline `OIFb8` 缺 navigate 记录、多自身 fo 提交的
+   fetch 记录。
+10. **V8 trace 边界实测**（本轮主要观测发现，详见盲区表）：`console.log` 是 native 绑定，
+    CALL 行不记（payloadJSON 实际靠 serve 日志拿）；MISS 仅 19 条——property-lookup hook 只覆盖
+    V8 interceptor/slow path，bootstrap 的 JS 对象（navigator shim）的属性访问不进 trace，
+    **42 个 navigator 缺口在 trace 里不可见**；rAF 56fps、idle 3ms 正常（「探针批推进慢」的
+    调度假设证伪——批内耗时 obscura 反而更快 2-38ms vs chrome 22-94ms，缺的探针是**根本没产出**
+    而非没跑完）。
+
+**结论**：
+- 提交链路、信封结构、Math 指纹、SDP 形状已对齐；剩余错配集中在**枚举面广度**（N 桶 773 个
+  构造器是最大单一缺口）、**UA 联动面**（UA-CH/WebGPU/iframe 几何没有跟着 UA 变）和**渲染指纹**
+  （亚像素/canvas）。
+- step 89 的 navigator 42 缺口是 N/o 桶缺口的子集，修法相同（补外壳）但规模要按 773 估。
+
+**下一步（按影响排序）**：
+1. **N 桶构造器广度**：批量补 window 构造器外壳（可从 Chrome `Object.getOwnPropertyNames(
+   window)` 快照生成清单，N 桶缺的 773 个一次对齐；对象类给带 toString 的空接口，函数类给
+   抛合规格异常的 native）。
+2. **UA 联动**：UA-CH（brands/architecture/platformVersion 跟随 UA 与参考 Chrome 对齐）、
+   WebGPU adapter 按 UA 平台选（macOS→apple）、WebGL 扩展/limits 按 Apple GPU 模板。
+3. **iframe realm 隔离**：iframe window 的 innerWidth/innerHeight/screenX… 应取 iframe 语义
+   （跨源 iframe 中 chrome 报 0/窗口位）；`d.domain`/`d.compatMode`/`d.lastModified` 修正。
+4. **languages 统一 zh-CN**（并消除 en-US/zh-CN 并存的内部矛盾）。
+5. **渲染指纹**：measureText 亚像素、canvas 像素（nMlxj2 全 255 说明测试 canvas 没画上）。
+6. ICE srflx：给 stealth 的候选生成加 srflx（与出口公网 IP 一致）。
+7. `hGgWW0`/`lNCr3` 探针失败原因（结合 trace 找抛错点）与 `DZSw4`/`Djlp6` 的计数器泄漏。
+
+### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
+
+**假设**（用户提出）：`/ci/` 是 CF 用动态 img 打的点（`sec-fetch-dest: image` + `new
+Image().src`，读 naturalWidth/naturalHeight 验真实解码），**必须发**；之前 obscura 一直发，
+step 90 轮 A 里第一个 widget 全程不发（拖到点击后第二个 widget，12:54:18）——疑似最近的
+iframe 修复（bc0e0cf 同步 about:blank / 4ed91e1 同步 realm）导致 iframe 内标签解析出问题、
+图片无法创建。
+
+**方法**：机制三环逐环验证 + 跨版本对照（每版 `--user-agent` 对齐、同代理、同探针
+`capture_challenge --click`，判据 = 前 3 条 `payloadJSON`（约前 15s）的 jdnfg5 里有无
+`/cdn-cgi/challenge-platform/h/g/ci/`）。
+
+**证据**：
+
+1. **机制三环全部正常**（当前 HEAD 二进制）：
+   - 顶层 `new Image()` + HTTP src：onload 265ms、`naturalWidth=48x48`（challenges.cloudflare.com
+     favicon）——加载/解码/宽高三环正常；
+   - **iframe 上下文** `new w.Image()`：onload、48×48——iframe realm 的图片创建与解析正常
+     （初次测得 `Connect` 失败是 serve 忘带 `SSL_CERT_FILE`，观测环境错，非引擎问题）；
+   - data: 1×1 PNG：onload 5ms、1×1。
+2. **「无 ci 轮」里 CF 根本没构造 img**：184 万行 V8 trace 中 widget realm 的
+   `HTMLImageElement set src` **零条**（仅主页面 chl_page 的 `/favicon.ico` 探测两条）——
+   不是「img 创建了但解析失败」，是 CF 的 JSVMP 分支没走到 `set src` 那一步。
+3. **跨版本对照**（ci 是否在前 3 条上报内出现）：
+   | 二进制 | 轮次 | 结果 |
+   |---|---|---|
+   | a0071cf（8-17，对拍轮代码） | 1 | 第 2 条（4s）有 ci |
+   | bc0e0cf（同步 about:blank） | 1 | 第 2 条（4s）有 ci —— **用户假设的提交排除** |
+   | 4ed91e1（同步 frame realm） | 1 | 第 2 条（10s）有 ci —— **排除** |
+   | e487e85（Symbol 键隐藏内部字段） | 2 | 轮 1 推迟到第 5 条（24s）；**轮 2 第 2 条就有**——单轮差点定罪，复测推翻 |
+   | HEAD（9244312） | 4 | 轮 A 与 r1 推迟/不发；**r2（4s）、r3（6s）第 2 条就有** |
+4. **HEAD 大多数轮次早期就发 ci**（3 轮里 2 轮），代理侧同期也能看到（用户确认）。各版本
+   均出现约 1/3 的「推迟轮」——**ci 发送时机存在轮间波动，非回归**。旧版全 ✓ 是小样本运气。
+5. **独立真缺陷（本轮新发现）**：动态 `createElement('iframe')`（无 src，about:blank）在
+   onload 时 **`contentDocument.body === null`**（`d.body.innerHTML` 抛 TypeError）——
+   a0071cf 与 HEAD **都有**（早于 bc0e0cf，非新回归），Chrome 中动态 iframe 的 about:blank
+   文档必有 `<body>`。若 CF 的 JSVMP 在自建辅助 iframe 里碰 body 会静默炸掉——与
+   `hGgWW0` 探针三轮全空、ci 推迟轮的同族嫌疑，值得单独修。
+
+**结论**：
+- 「/ci/ 不发了」不成立：没有回归，HEAD 上多数轮次第一轮 widget 早期（4-6s）就打点，
+  机制三环（构造/加载/宽高）全部正常；约 1/3 轮次推迟/不发是 CF 端分支波动（与 step 41
+  `interactiveEnd` 间歇出现同族）。
+- bc0e0cf/4ed91e1（iframe 修复）与 ci 行为无关，排除。
+- 顺带发现的 `body=null` 是确凿的 iframe parity 缺陷（但非新引入），列入修复清单。
+- 「单次测量当判据」盲区在本轮两次立功：e487e85 单轮异常差点被定为回归根因，HEAD 单轮
+  （轮 A）差点被当成稳定退化——**行为判据必须多轮**。
+
+**下一步**：
+1. 修动态 iframe about:blank 的 `body` 缺失（应同步建 `<html><head></head><body></body>`）。
+2. 若要进一步压 ci 波动：对比「早发轮 vs 推迟轮」的 payloadJSON 差异（错误序列 `YySko4`
+   / `QqYk7`），找 CF 分流的观测点。
