@@ -14739,6 +14739,7 @@ class _Canvas2D {
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
+    this._transform = [1, 0, 0, 1, 0, 0];
   }
   _resizeFromCanvas() {
     const requestedWidth = this._canvasDimension('width', 300);
@@ -14804,6 +14805,15 @@ class _Canvas2D {
     }
   }
   fillRect(x, y, w, h) {
+    const t = this._transform;
+    const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
+      && t[4] === 0 && t[5] === 0;
+    if (!identity || (this.fillStyle && this.fillStyle._stops)) {
+      this.beginPath();
+      this.rect(x, y, w, h);
+      this.fill();
+      return;
+    }
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
@@ -14835,11 +14845,16 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   fillText(text, x, y) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    // A gradient fill under text uses the gradient's first stop; per-glyph
+    // gradient evaluation stays out of the dot-matrix rasterizer.
+    const fill = this.fillStyle;
+    const [r,g,b,a] = fill && fill._stops && fill._stops.length
+      ? fill._stops[0][1] : this._parseColor(fill);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = String(text);
-    let cx = Math.round(x);
+    const [tx, ty] = this._applyTransform(+x || 0, +y || 0);
+    let cx = Math.round(tx);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
       for (let row = 0; row < 7; row++) {
@@ -14850,7 +14865,7 @@ class _Canvas2D {
           if (on) {
             for (let sy = 0; sy < scale; sy++) {
               for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
+                this._setPixel(cx + col*scale + sx, Math.round(ty) - 7*scale + row*scale + sy, r, g, b, a);
               }
             }
           }
@@ -14908,7 +14923,15 @@ class _Canvas2D {
         }
       }
     }
-    return { data, width: w, height: h };
+    // Chrome hands back a branded ImageData, not a plain object.
+    const image = Object.create(globalThis.ImageData.prototype);
+    Object.defineProperties(image, {
+      data: { value: data, enumerable: true, writable: false, configurable: true },
+      width: { value: w, enumerable: true, writable: false, configurable: true },
+      height: { value: h, enumerable: true, writable: false, configurable: true },
+      colorSpace: { value: 'srgb', enumerable: true, writable: false, configurable: true },
+    });
+    return image;
   }
   putImageData(imageData, dx, dy) {
     dx=Math.round(dx); dy=Math.round(dy);
@@ -14928,7 +14951,17 @@ class _Canvas2D {
     }
     this._markPaintDamage();
   }
-  createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
+  createImageData(w, h) {
+    const data = new Uint8ClampedArray(w*h*4);
+    const image = Object.create(globalThis.ImageData.prototype);
+    Object.defineProperties(image, {
+      data: { value: data, enumerable: true, configurable: true },
+      width: { value: w, enumerable: true, configurable: true },
+      height: { value: h, enumerable: true, configurable: true },
+      colorSpace: { value: 'srgb', enumerable: true, configurable: true },
+    });
+    return image;
+  }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
     if (img && img._ctx && img._ctx._buf) {
       const src = img._ctx;
@@ -14947,38 +14980,288 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   beginPath() { this._path = []; }
-  closePath() {}
-  moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
-  lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
-  bezierCurveTo() {} quadraticCurveTo() {}
-  arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
+  closePath() { if (this._path) this._path.push({t:'Z'}); }
+  moveTo(x, y) { if (this._path) this._path.push({t:'M', x:+x, y:+y}); }
+  lineTo(x, y) { if (this._path) this._path.push({t:'L', x:+x, y:+y}); }
+  bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+    if (!this._path || !this._path.length) this._path.push({t:'M', x:cp1x, y:cp1y});
+    const last = this._path[this._path.length - 1];
+    this._path.push({t:'C', x0:last.x, y0:last.y, x1:+cp1x, y1:+cp1y,
+      x2:+cp2x, y2:+cp2y, x:+x, y:+y});
+  }
+  quadraticCurveTo(cpx, cpy, x, y) {
+    if (!this._path || !this._path.length) this._path.push({t:'M', x:cpx, y:cpy});
+    const last = this._path[this._path.length - 1];
+    this._path.push({t:'Q', x0:last.x, y0:last.y, x1:+cpx, y1:+cpy, x:+x, y:+y});
+  }
+  arc(x, y, r, startAngle, endAngle) {
+    if (this._path) this._path.push({t:'A', x:+x, y:+y, r:+r,
+      s:+(startAngle || 0), e:+(endAngle === undefined ? Math.PI * 2 : endAngle)});
+  }
   arcTo() {}
-  rect(x, y, w, h) { this.fillRect(x, y, w, h); }
-  fill() {
+  rect(x, y, w, h) {
     if (!this._path) return;
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
-    for (const seg of this._path) {
-      if (seg.t === 'A') {
-        const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
-        const r2 = rad * rad;
-        for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
-          for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
-            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
-          }
+    const x0 = +x, y0 = +y, ww = +w, hh = +h;
+    this._path.push({t:'M', x:x0, y:y0}, {t:'L', x:x0 + ww, y:y0},
+      {t:'L', x:x0 + ww, y:y0 + hh}, {t:'L', x:x0, y:y0 + hh}, {t:'Z'});
+  }
+  ellipse(x, y, rx, ry) {
+    if (this._path) this._path.push({t:'E', x:+x, y:+y, rx:+rx, ry:+ry === 0 ? +rx : +ry});
+  }
+  roundRect(x, y, w, h) { this.rect(x, y, w, h); }
+  // Path commands are recorded in user space and mapped through the current
+  // transform, so the rasterizer only ever sees device pixels.
+  _applyTransform(x, y) {
+    const [a, b, c, d, e, f] = this._transform;
+    return [a * x + c * y + e, b * x + d * y + f];
+  }
+  _flattenPath() {
+    const subpaths = [];
+    let current = null;
+    const finish = () => { if (current && current.length >= 3) subpaths.push(current); current = null; };
+    const push = (x, y) => {
+      const [px, py] = this._applyTransform(x, y);
+      if (!current) current = [[px, py]];
+      else current.push([px, py]);
+    };
+    const arcSteps = r => Math.max(8, Math.min(64, Math.ceil(r * 2)));
+    for (const seg of this._path || []) {
+      if (seg.t === 'M') { finish(); push(seg.x, seg.y); }
+      else if (seg.t === 'L') push(seg.x, seg.y);
+      else if (seg.t === 'Z') { finish(); }
+      else if (seg.t === 'C' || seg.t === 'Q') {
+        const cubic = seg.t === 'C'
+          ? [seg.x0, seg.y0, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y]
+          : [ // quadratic as the equivalent cubic
+            seg.x0, seg.y0,
+            seg.x0 + 2 / 3 * (seg.x1 - seg.x0), seg.y0 + 2 / 3 * (seg.y1 - seg.y0),
+            seg.x + 2 / 3 * (seg.x1 - seg.x), seg.y + 2 / 3 * (seg.y1 - seg.y),
+            seg.x, seg.y];
+        for (let step = 1; step <= 16; step++) {
+          const t = step / 16, u = 1 - t;
+          push(
+            u * u * u * cubic[0] + 3 * u * u * t * cubic[2] + 3 * u * t * t * cubic[4] + t * t * t * cubic[6],
+            u * u * u * cubic[1] + 3 * u * u * t * cubic[3] + 3 * u * t * t * cubic[5] + t * t * t * cubic[7]);
+        }
+      } else if (seg.t === 'A') {
+        let sweep = seg.e - seg.s;
+        if (sweep < 0) sweep += Math.PI * 2;
+        const steps = arcSteps(seg.r);
+        for (let step = 0; step <= steps; step++) {
+          const angle = seg.s + sweep * step / steps;
+          push(seg.x + seg.r * Math.cos(angle), seg.y + seg.r * Math.sin(angle));
+        }
+      } else if (seg.t === 'E') {
+        const steps = arcSteps(Math.max(seg.rx, seg.ry));
+        for (let step = 0; step <= steps; step++) {
+          const angle = Math.PI * 2 * step / steps;
+          push(seg.x + seg.rx * Math.cos(angle), seg.y + seg.ry * Math.sin(angle));
         }
       }
     }
+    finish();
+    return subpaths;
+  }
+  // Nonzero winding number at a device-space point.
+  _windingAt(subpaths, x, y) {
+    let winding = 0;
+    for (const poly of subpaths) {
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+          winding += yj > yi ? 1 : -1;
+        }
+      }
+    }
+    return winding;
+  }
+  // Paint source at a device-space pixel: either a flat color or a gradient
+  // evaluated in its own user space (device point unmapped through the
+  // transform inverse).
+  _paintAt(px, py) {
+    const fill = this.fillStyle;
+    if (fill && fill._stops && fill._stops.length) {
+      const inv = this._transformInverse();
+      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
+      return this._gradientColorAt(fill, ux, uy);
+    }
+    const color = this._parseColor(fill);
+    color.gradient = false;
+    return color;
+  }
+  _transformInverse() {
+    const [a, b, c, d, e, f] = this._transform;
+    const det = a * d - b * c;
+    if (!det) return [1, 0, 0, 1, 0, 0];
+    return [d / det, -b / det, -c / det, a / det,
+      (c * f - d * e) / det, (b * e - a * f) / det];
+  }
+  _gradientColorAt(grad, x, y) {
+    let t;
+    if (grad._type === 'linear') {
+      const dx = grad._x1 - grad._x0, dy = grad._y1 - grad._y0;
+      const len = dx * dx + dy * dy;
+      t = len ? ((x - grad._x0) * dx + (y - grad._y0) * dy) / len : 0;
+    } else if (grad._type === 'radial') {
+      const dist = Math.hypot(x - grad._x1, y - grad._y1);
+      t = grad._r1 > grad._r0 ? (dist - grad._r0) / (grad._r1 - grad._r0) : 0;
+    } else {
+      t = ((Math.atan2(y - grad._y0, x - grad._x0) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2);
+      if (grad._startAngle) t = (t + grad._startAngle / (Math.PI * 2)) % 1;
+    }
+    t = Math.min(1, Math.max(0, t));
+    const stops = grad._stops;
+    if (t <= stops[0][0]) return stops[0][1].slice();
+    const lastStop = stops[stops.length - 1];
+    if (t >= lastStop[0]) return lastStop[1].slice();
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
+        const span = t1 - t0 || 1;
+        const f = (t - t0) / span;
+        return [0, 1, 2, 3].map(k => Math.round(c0[k] + (c1[k] - c0[k]) * f));
+      }
+    }
+    return lastStop[1].slice();
+  }
+  fill() {
+    if (!this._path) return;
+    const subpaths = this._flattenPath();
     this._path = [];
+    if (!subpaths.length) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const poly of subpaths) for (const [x, y] of poly) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
+    const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
+    // 2x2 supersampling gives the antialiased edge coverage a real canvas
+    // shows; a hard edge is itself a fingerprint.
+    for (let py = y0; py <= y1; py++) {
+      for (let px = x0; px <= x1; px++) {
+        let coverage = 0;
+        for (const [ox, oy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
+          if (this._windingAt(subpaths, px + ox, py + oy) !== 0) coverage++;
+        }
+        if (!coverage) continue;
+        const [r, g, b, a] = this._paintAt(px + 0.5, py + 0.5);
+        this._blendPixel(px, py, r, g, b, a, coverage / 4);
+      }
+    }
     this._markPaintDamage();
   }
-  stroke() {}
+  stroke() {
+    if (!this._path) return;
+    const subpaths = this._flattenPath();
+    this._path = [];
+    if (!subpaths.length) return;
+    const half = Math.max(0.5, +this.lineWidth / 2 || 0.5);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const poly of subpaths) for (const [x, y] of poly) {
+      if (x - half < minX) minX = x - half; if (x + half > maxX) maxX = x + half;
+      if (y - half < minY) minY = y - half; if (y + half > maxY) maxY = y + half;
+    }
+    const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
+    const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
+    for (let py = y0; py <= y1; py++) {
+      for (let px = x0; px <= x1; px++) {
+        let inside = 0;
+        for (const [ox, oy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
+          const sx = px + ox, sy = py + oy;
+          for (const poly of subpaths) {
+            for (let i = 1; i < poly.length; i++) {
+              if (this._distanceToSegment(sx, sy, poly[i - 1], poly[i]) <= half) { inside++; break; }
+            }
+          }
+        }
+        if (!inside) continue;
+        const [r, g, b, a] = this._paintStrokeAt(px + 0.5, py + 0.5);
+        this._blendPixel(px, py, r, g, b, a, inside / 4);
+      }
+    }
+    this._markPaintDamage();
+  }
+  _paintStrokeAt(px, py) {
+    const stroke = this.strokeStyle;
+    if (stroke && stroke._stops && stroke._stops.length) {
+      const inv = this._transformInverse();
+      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
+      return this._gradientColorAt(stroke, ux, uy);
+    }
+    return this._parseColor(stroke);
+  }
+  _distanceToSegment(px, py, a, b) {
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = dx * dx + dy * dy;
+    const t = len ? Math.min(1, Math.max(0, ((px - a[0]) * dx + (py - a[1]) * dy) / len)) : 0;
+    return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
+  }
+  _blendPixel(x, y, r, g, b, a, coverage) {
+    const alpha = (a / 255) * coverage * this.globalAlpha;
+    if (alpha <= 0) return;
+    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
+    const idx = (y * this._w + x) * 4;
+    this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
+    this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
+    this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
+    this._buf[idx+3] = Math.min(255, Math.round(255 * alpha + this._buf[idx+3] * (1 - alpha)));
+  }
   clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
-  restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
-  translate() {} rotate() {} scale() {}
-  setTransform() {} resetTransform() {} transform() {}
-  createLinearGradient(x0,y0,x1,y1) { return { addColorStop(){}, _x0:x0,_y0:y0,_x1:x1,_y1:y1 }; }
-  createRadialGradient() { return { addColorStop(){} }; }
+  save() {
+    this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle,
+      globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth,
+      _transform: this._transform.slice()});
+  }
+  restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); this._transform = t; } }
+  translate(x, y) { this.transform(1, 0, 0, 1, +x, +y); }
+  rotate(angle) {
+    const c = Math.cos(+angle), s = Math.sin(+angle);
+    this.transform(c, s, -s, c, 0, 0);
+  }
+  scale(x, y) { this.transform(+x, 0, 0, y === undefined ? +x : +y, 0, 0); }
+  setTransform(a, b, c, d, e, f) { this._transform = [+a, +b, +c, +d, +e || 0, +f || 0]; }
+  resetTransform() { this._transform = [1, 0, 0, 1, 0, 0]; }
+  getTransform() {
+    const [a, b, c, d, e, f] = this._transform;
+    return {a, b, c, d, e, f, is2D: true, isIdentity: a === 1 && b === 0 && c === 0
+      && d === 1 && e === 0 && f === 0,
+      get [Symbol.toStringTag]() { return 'DOMMatrix'; },
+      multiplySelf() { return this; }, scaleSelf() { return this; },
+      translateSelf() { return this; }};
+  }
+  transform(a, b, c, d, e, f) {
+    const [a0, b0, c0, d0, e0, f0] = this._transform;
+    this._transform = [
+      +a * a0 + +c * b0, +b * a0 + +d * b0,
+      +a * c0 + +c * d0, +b * c0 + +d * d0,
+      +a * e0 + +c * f0 + (+e || 0), +b * e0 + +d * f0 + (+f || 0)];
+  }
+  createLinearGradient(x0, y0, x1, y1) {
+    return this._makeGradient('linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
+  }
+  createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    return this._makeGradient('radial', {_x0:+x0, _y0:+y0, _r0:+r0, _x1:+x1, _y1:+y1, _r1:+r1});
+  }
+  createConicGradient(startAngle, x, y) {
+    return this._makeGradient('conic', {_startAngle:+startAngle, _x0:+x, _y0:+y});
+  }
+  _makeGradient(type, params) {
+    const ctx = this;
+    const grad = Object.assign({
+      _type: type, _stops: [],
+      addColorStop(offset, color) {
+        offset = +offset;
+        if (!(offset >= 0 && offset <= 1)) {
+          throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
+        }
+        this._stops.push([offset, ctx._parseColor(color)]);
+        this._stops.sort((a, b) => a[0] - b[0]);
+      },
+      get [Symbol.toStringTag]() { return 'CanvasGradient'; },
+    }, params);
+    return grad;
+  }
   createPattern() { return {}; }
   isPointInPath() { return false; }
   isPointInStroke() { return false; }
@@ -14987,9 +15270,6 @@ class _Canvas2D {
   // "is not a function" from a timer each tick, spamming errors (#258).
   setLineDash() {}
   getLineDash() { return []; }
-  ellipse() {}
-  roundRect() {}
-  createConicGradient() { return { addColorStop(){} }; }
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
