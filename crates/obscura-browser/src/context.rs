@@ -129,7 +129,8 @@ impl BrowserContext {
         let resolved_ua = user_agent
             .or(stealth_ua)
             .unwrap_or_else(|| default_ua.to_string());
-        let fingerprint = BrowserFingerprint::from_user_agent(resolved_ua);
+        let fingerprint = BrowserFingerprint::from_user_agent(resolved_ua)
+            .with_overrides(&obscura_net::fingerprint_overrides_from_env());
         let mut client = ObscuraHttpClient::with_full_options_and_fingerprint(
             cookie_jar.clone(),
             proxy_url.as_deref(),

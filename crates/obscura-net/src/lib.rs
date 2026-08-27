@@ -23,13 +23,11 @@ pub use encoding::{
     url_encode_query,
 };
 pub use fingerprint::{
-    BrandVersion, BrowserFingerprint, FingerprintOverrides, GpuFingerprint,
-    ScreenFingerprint, DEFAULT_USER_AGENT,
+    fingerprint_overrides_from_env, BrandVersion, BrowserFingerprint, FingerprintOverrides,
+    GpuFingerprint, ScreenFingerprint, DEFAULT_USER_AGENT, MACOS_UA_PLATFORM_VERSION,
+    WINDOWS_UA_PLATFORM_VERSION,
 };
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
-pub use wreq_client::{
-    StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
-    STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
-};
+pub use wreq_client::{StealthHttpClient, STEALTH_USER_AGENT};

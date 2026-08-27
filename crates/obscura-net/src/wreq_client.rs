@@ -24,20 +24,10 @@ use crate::client::{
     validate_cors_response, validate_request_mode, validate_url,
 };
 
+// The default stealth identity is the same macOS Chrome 149 the fingerprint
+// derives; the wire layer and the JS layer must never disagree on it.
 #[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
-#[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+pub const STEALTH_USER_AGENT: &str = crate::fingerprint::DEFAULT_USER_AGENT;
 
 #[cfg(feature = "stealth")]
 fn wreq_response_header_value<'a>(
@@ -145,7 +135,8 @@ impl StealthHttpClient {
         Self::with_proxy_and_fingerprint(
             cookie_jar,
             proxy_url,
-            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT),
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT)
+                .with_overrides(&crate::fingerprint::fingerprint_overrides_from_env()),
         )
     }
 
@@ -163,9 +154,13 @@ impl StealthHttpClient {
         allow_private_network: bool,
         fingerprint: crate::fingerprint::BrowserFingerprint,
     ) -> Self {
+        // Chrome148 is the closest profile wreq-util ships to 149; the macOS
+        // platform matches the default fingerprint identity. Requests carry an
+        // explicit UA and sec-ch-ua from the fingerprint, so the emulation
+        // mostly contributes TLS and HTTP/2 framing.
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
+            .profile(wreq_util::Profile::Chrome148)
+            .platform(wreq_util::Platform::MacOS)
             .build();
 
         let mut builder = wreq::Client::builder()

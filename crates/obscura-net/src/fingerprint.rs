@@ -43,15 +43,25 @@ pub struct ScreenFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GpuFingerprint {
     pub vendor: String,
     pub renderer: String,
+    /// Which canned adapter/extension table bootstrap.js serves for WebGPU and
+    /// WebGL queries: "apple" for Apple-silicon Macs, "intel" for the D3D11
+    /// and Metal x86 shapes. Empty lets bootstrap infer it from `ua_platform`.
+    #[serde(default)]
+    pub webgpu_profile: String,
 }
 
 /// Explicit value-level policy for facts which are not fully represented in a
 /// User-Agent. Keeping this separate from derivation makes the injection
 /// contract auditable and prevents behavior code from selecting random values.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Deserialize (camelCase) backs the `--fingerprint` CLI flag so operators can
+/// pin the values a reduced UA cannot carry, e.g. a Chromium-shaped brand
+/// list or an Intel-Mac GPU string.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct FingerprintOverrides {
     pub browser_version: Option<String>,
     pub navigator_platform: Option<String>,
@@ -71,7 +81,31 @@ pub struct FingerprintOverrides {
 }
 
 pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+/// Overrides from `OBSCURA_FINGERPRINT_JSON`, the transport the `--fingerprint`
+/// CLI flag uses to reach every worker process without threading a new
+/// argument through each entry point. Malformed JSON yields empty overrides
+/// with the parse error on stderr rather than aborting a running pipeline.
+pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
+    let Ok(raw) = std::env::var("OBSCURA_FINGERPRINT_JSON") else {
+        return FingerprintOverrides::default();
+    };
+    match serde_json::from_str(&raw) {
+        Ok(overrides) => overrides,
+        Err(err) => {
+            eprintln!("obscura: ignoring invalid OBSCURA_FINGERPRINT_JSON: {err}");
+            FingerprintOverrides::default()
+        }
+    }
+}
+
+/// UA-CH platform-version claims a reduced User-Agent cannot encode: the UA
+/// string froze the macOS token at 10_15_7 and the Windows token at NT 10.0,
+/// and every real Chrome reports the actual OS version here instead. These are
+/// mainstream-value claims, overridable through `FingerprintOverrides`.
+pub const MACOS_UA_PLATFORM_VERSION: &str = "26.4.0";
+pub const WINDOWS_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 impl Default for BrowserFingerprint {
     fn default() -> Self {
@@ -127,22 +161,20 @@ impl BrowserFingerprint {
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Qualcomm)".to_string(),
                     renderer: "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)".to_string(),
+                    webgpu_profile: String::new(),
                 },
             }
         } else if user_agent.contains("Windows NT") {
             let wow64 = user_agent.contains("WOW64");
             let arm64 = user_agent.contains("ARM64");
             let bitness = if wow64 { "32" } else if user_agent.contains("Win64") || arm64 { "64" } else { "32" };
-            let platform_version = token_after(&user_agent, "Windows NT ")
-                .map(normalize_version)
-                .unwrap_or_default();
             BrowserFingerprint {
                 user_agent,
                 browser_version,
                 browser_major,
                 navigator_platform: "Win32".to_string(),
                 ua_platform: "Windows".to_string(),
-                ua_platform_version: platform_version,
+                ua_platform_version: WINDOWS_UA_PLATFORM_VERSION.to_string(),
                 architecture: if arm64 { "arm" } else { "x86" }.to_string(),
                 bitness: bitness.to_string(),
                 wow64,
@@ -156,20 +188,22 @@ impl BrowserFingerprint {
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Intel)".to_string(),
                     renderer: "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)".to_string(),
+                    webgpu_profile: "intel".to_string(),
                 },
             }
         } else if user_agent.contains("Macintosh") {
-            let platform_version = token_after(&user_agent, "Mac OS X ")
-                .map(normalize_version)
-                .unwrap_or_default();
+            // The macOS UA token is frozen at 10_15_7 on every Chrome,
+            // Apple Silicon included, so it is not parsed back out. Apple
+            // silicon is the mainstream shape and pairs with the apple GPU
+            // profile; an Intel Mac identity is a FingerprintOverrides job.
             BrowserFingerprint {
                 user_agent,
                 browser_version,
                 browser_major,
                 navigator_platform: "MacIntel".to_string(),
                 ua_platform: "macOS".to_string(),
-                ua_platform_version: platform_version,
-                architecture: "x86".to_string(),
+                ua_platform_version: MACOS_UA_PLATFORM_VERSION.to_string(),
+                architecture: "arm".to_string(),
                 bitness: "64".to_string(),
                 wow64: false,
                 mobile: false,
@@ -186,8 +220,9 @@ impl BrowserFingerprint {
                     device_scale_factor: 2.0,
                 },
                 gpu: GpuFingerprint {
-                    vendor: "Google Inc. (Intel Inc.)".to_string(),
-                    renderer: "ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)".to_string(),
+                    vendor: "Google Inc. (Apple)".to_string(),
+                    renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)".to_string(),
+                    webgpu_profile: "apple".to_string(),
                 },
             }
         } else if user_agent.contains("Linux") || user_agent.contains("X11") {
@@ -212,6 +247,7 @@ impl BrowserFingerprint {
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Intel)".to_string(),
                     renderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)".to_string(),
+                    webgpu_profile: "intel".to_string(),
                 },
             }
         } else {
@@ -232,7 +268,7 @@ impl BrowserFingerprint {
                 hardware_concurrency: 8,
                 device_memory: 8.0,
                 screen: desktop_screen(1.0),
-                gpu: GpuFingerprint { vendor: String::new(), renderer: String::new() },
+                gpu: GpuFingerprint { vendor: String::new(), renderer: String::new(), webgpu_profile: String::new() },
             }
         };
 
@@ -267,7 +303,8 @@ impl BrowserFingerprint {
         replace!(gpu);
         if let Some(value) = &overrides.full_version_list {
             self.full_version_list = value.clone();
-        } else if overrides.browser_version.is_some() && !self.brands.is_empty() {
+        } else if (overrides.browser_version.is_some() || overrides.brands.is_some())
+            && !self.brands.is_empty() {
             self.full_version_list = self.brands.iter().map(|brand| BrandVersion {
                 brand: brand.brand.clone(),
                 version: if brand.brand.starts_with("Not") {
@@ -377,38 +414,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_chrome_146_windows_identity_and_headers() {
+    fn default_is_a_macos_chrome_149_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
+        assert_eq!(fingerprint.navigator_platform, "MacIntel");
+        assert_eq!(fingerprint.ua_platform, "macOS");
+        assert_eq!(fingerprint.ua_platform_version, MACOS_UA_PLATFORM_VERSION);
+        assert_eq!(fingerprint.architecture, "arm");
+        assert_eq!(fingerprint.gpu.webgpu_profile, "apple");
+        assert!(fingerprint.gpu.vendor.contains("Apple"));
+        assert!(fingerprint.gpu.renderer.contains("ANGLE Metal Renderer"));
+        assert_eq!(fingerprint.sec_ch_ua_platform(), "\"macOS\"");
+        assert_eq!(fingerprint.sec_ch_ua_mobile(), "?0");
+    }
+
+    #[test]
+    fn derives_windows_identity_with_claimed_platform_version() {
+        let fingerprint = BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
         assert_eq!(fingerprint.navigator_platform, "Win32");
-        assert_eq!(fingerprint.ua_platform, "Windows");
-        assert_eq!(fingerprint.ua_platform_version, "10.0.0");
+        assert_eq!(fingerprint.ua_platform_version, WINDOWS_UA_PLATFORM_VERSION);
         assert_eq!(fingerprint.architecture, "x86");
-        assert_eq!(fingerprint.bitness, "64");
+        assert_eq!(fingerprint.gpu.webgpu_profile, "intel");
         assert_eq!(fingerprint.brands, vec![
-            BrandVersion { brand: "Chromium".to_string(), version: "146".to_string() },
-            BrandVersion { brand: "Not-A.Brand".to_string(), version: "24".to_string() },
-            BrandVersion { brand: "Google Chrome".to_string(), version: "146".to_string() },
+            BrandVersion { brand: "Google Chrome".to_string(), version: "149".to_string() },
+            BrandVersion { brand: "Chromium".to_string(), version: "149".to_string() },
+            BrandVersion { brand: "Not)A;Brand".to_string(), version: "24".to_string() },
         ]);
         assert_eq!(fingerprint.sec_ch_ua(),
-            "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"");
-        assert_eq!(fingerprint.sec_ch_ua_platform(), "\"Windows\"");
-        assert_eq!(fingerprint.sec_ch_ua_mobile(), "?0");
+            "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"");
     }
 
     #[test]
     fn derives_mac_linux_android_and_unknown_without_cross_platform_values() {
         let mac = BrowserFingerprint::from_user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.80 Safari/537.36");
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7680.80 Safari/537.36");
+        // The 10_15_7-style token is frozen in every macOS UA, so the UA-CH
+        // version stays the claimed constant regardless of the token.
         assert_eq!((mac.navigator_platform.as_str(), mac.ua_platform.as_str(), mac.ua_platform_version.as_str()),
-            ("MacIntel", "macOS", "14.6.0"));
-        assert_eq!(mac.browser_version, "146.0.7680.80");
+            ("MacIntel", "macOS", MACOS_UA_PLATFORM_VERSION));
+        assert_eq!(mac.browser_version, "149.0.7680.80");
+        assert_eq!(mac.architecture, "arm");
 
         let linux = BrowserFingerprint::from_user_agent(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36");
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
         assert_eq!((linux.navigator_platform.as_str(), linux.ua_platform.as_str()), ("Linux x86_64", "Linux"));
 
         let android = BrowserFingerprint::from_user_agent(
-            "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36");
+            "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36");
         assert_eq!((android.ua_platform.as_str(), android.ua_platform_version.as_str(), android.model.as_str()),
             ("Android", "15.0.0", "Pixel 9"));
         assert!(android.mobile);
@@ -423,7 +475,7 @@ mod tests {
     #[test]
     fn explicit_policy_overrides_only_value_layer() {
         let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
-            browser_version: Some("146.0.7680.80".to_string()),
+            browser_version: Some("149.0.7827.0".to_string()),
             ua_platform_version: Some("19.0.0".to_string()),
             architecture: Some("arm".to_string()),
             hardware_concurrency: Some(12),
@@ -436,8 +488,8 @@ mod tests {
             }),
             ..FingerprintOverrides::default()
         });
-        assert_eq!(fingerprint.browser_version, "146.0.7680.80");
-        assert_eq!(fingerprint.full_version_list[0].version, "146.0.7680.80");
+        assert_eq!(fingerprint.browser_version, "149.0.7827.0");
+        assert_eq!(fingerprint.full_version_list[0].version, "149.0.7827.0");
         assert_eq!(fingerprint.ua_platform_version, "19.0.0");
         assert_eq!(fingerprint.architecture, "arm");
         assert_eq!(fingerprint.hardware_concurrency, 12);
@@ -445,10 +497,30 @@ mod tests {
     }
 
     #[test]
+    fn brand_overrides_rederive_the_full_version_list() {
+        // A Chromium-shaped brands override without an explicit
+        // fullVersionList must not leave the 3-brand full list behind.
+        let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
+            browser_version: Some("149.0.7827.0".to_string()),
+            brands: Some(vec![
+                BrandVersion { brand: "Chromium".to_string(), version: "149".to_string() },
+                BrandVersion { brand: "Not)A;Brand".to_string(), version: "24".to_string() },
+            ]),
+            ..FingerprintOverrides::default()
+        });
+        assert_eq!(fingerprint.brands.len(), 2);
+        assert_eq!(fingerprint.full_version_list, vec![
+            BrandVersion { brand: "Chromium".to_string(), version: "149.0.7827.0".to_string() },
+            BrandVersion { brand: "Not)A;Brand".to_string(), version: "24.0.0.0".to_string() },
+        ]);
+    }
+
+    #[test]
     fn serializes_the_javascript_injection_contract() {
         let value = serde_json::to_value(BrowserFingerprint::default()).unwrap();
-        assert_eq!(value["navigatorPlatform"], "Win32");
-        assert_eq!(value["screen"]["deviceScaleFactor"], 1.0);
-        assert_eq!(value["brands"][0]["brand"], "Chromium");
+        assert_eq!(value["navigatorPlatform"], "MacIntel");
+        assert_eq!(value["screen"]["deviceScaleFactor"], 2.0);
+        assert_eq!(value["brands"][0]["brand"], "Google Chrome");
+        assert_eq!(value["gpu"]["webgpuProfile"], "apple");
     }
 }

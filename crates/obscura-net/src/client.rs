@@ -1807,7 +1807,10 @@ impl ObscuraHttpClient {
     }
 
     pub async fn set_user_agent(&self, ua: &str) {
-        self.set_fingerprint(crate::fingerprint::BrowserFingerprint::from_user_agent(ua)).await;
+        self.set_fingerprint(
+            crate::fingerprint::BrowserFingerprint::from_user_agent(ua)
+                .with_overrides(&crate::fingerprint::fingerprint_overrides_from_env()),
+        ).await;
     }
 
     pub async fn set_fingerprint(&self, fingerprint: crate::fingerprint::BrowserFingerprint) {

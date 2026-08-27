@@ -647,14 +647,22 @@ fn handle_http_json_blocking(
     let _ = stream.read(&mut buf)?;
 
     let body = match endpoint {
-        "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/146.0.0.0",
-            "Protocol-Version": "1.3",
-            "User-Agent": obscura_net::DEFAULT_USER_AGENT,
-            "V8-Version": "14.6.0.0",
-            "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
-        }))?,
+        "version" => {
+            // Derived from the same contract as navigator so DevTools clients
+            // see the same browser version the page reports.
+            let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+                obscura_net::DEFAULT_USER_AGENT,
+            )
+            .with_overrides(&obscura_net::fingerprint_overrides_from_env());
+            serde_json::to_string_pretty(&json!({
+                "Browser": format!("Chrome/{}", fingerprint.browser_version),
+                "Protocol-Version": "1.3",
+                "User-Agent": obscura_net::DEFAULT_USER_AGENT,
+                "V8-Version": "14.6.0.0",
+                "WebKit-Version": "537.36",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+            }))?
+        }
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
             "devtoolsFrontendUrl": "",

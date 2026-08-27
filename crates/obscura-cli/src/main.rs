@@ -55,6 +55,14 @@ struct Args {
     #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
     v8_flags: Option<String>,
 
+    /// Value-level fingerprint overrides as JSON (camelCase keys, same shape
+    /// as the JS injection contract) or `@file` to read from a path. Pins the
+    /// facts a reduced User-Agent cannot carry (brand list shape, full
+    /// version, Intel-Mac GPU strings). Propagates to every worker through
+    /// OBSCURA_FINGERPRINT_JSON.
+    #[arg(long, global = true, value_name = "JSON")]
+    fingerprint: Option<String>,
+
     /// Write native host-op calls (including fetch/DOM/WebSocket) to a TSV
     /// while the CDP server remains connected. This is intentionally separate
     /// from V8's property trace so both diagnostics can run in one process.
@@ -391,6 +399,30 @@ async fn main() -> anyhow::Result<()> {
     // field is absent (`obscura --storage-dir DIR fetch ...`).
     let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
+
+    // `--fingerprint` only sets an env var; every from_user_agent() site picks
+    // it up, including worker processes spawned by multi-worker serve.
+    if let Some(ref spec) = args.fingerprint {
+        let raw = match spec.strip_prefix('@') {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(err) => {
+                    eprintln!("obscura: --fingerprint: cannot read {path}: {err}");
+                    std::process::exit(2);
+                }
+            },
+            None => spec.clone(),
+        };
+        if let Err(err) = serde_json::from_str::<obscura_net::FingerprintOverrides>(&raw) {
+            eprintln!("obscura: --fingerprint: invalid JSON: {err}");
+            std::process::exit(2);
+        }
+        // SAFETY: set_var is unsafe in newer rustc; this runs before any
+        // spawned worker exists, so nothing races on the environment.
+        unsafe {
+            std::env::set_var("OBSCURA_FINGERPRINT_JSON", raw);
+        }
+    }
 
     match args.command {
         Some(Command::Serve {
@@ -785,7 +817,8 @@ async fn run_fetch(
     }
 
     if let Some(ref ua) = user_agent {
-        page.set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(ua)).await;
+        page.set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(ua)
+            .with_overrides(&obscura_net::fingerprint_overrides_from_env())).await;
     }
 
     let wait_condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
