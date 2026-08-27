@@ -4818,6 +4818,11 @@ obscura-js 513、obscura-browser 105 全绿。
 6. ICE srflx：给 stealth 的候选生成加 srflx（与出口公网 IP 一致）。
 7. `hGgWW0`/`lNCr3` 探针失败原因（结合 trace 找抛错点）与 `DZSw4`/`Djlp6` 的计数器泄漏。
 
+**后续**：上述六组缺陷的完整修复计划（六份独立调研的合并版，含文件:行定位、对拍数据表、
+实施批次 B0-B7 与依赖关系）见 `Challenge-fingerprint-fix-plans.md`。核心合并结论：UA-CH/
+WebGL/WebGPU 三组的共同根因是 `fingerprint.rs::from_user_agent` 的 macOS 分支
+（architecture:"x86" + Intel GPU 串），必须一个提交内原子翻转。
+
 ### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
 
 **假设**（用户提出）：`/ci/` 是 CF 用动态 img 打的点（`sec-fetch-dest: image` + `new
