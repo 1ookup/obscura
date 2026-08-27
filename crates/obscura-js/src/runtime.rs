@@ -18944,8 +18944,9 @@ RequestRedirect value",
                         featuresAreSetlike: typeof adapter.features.has === 'function'
                             && adapter.features.has('texture-compression-bc')
                             && [...adapter.features].length > 10,
-                        // No ASTC or ETC2 on a desktop Intel part.
-                        noMobileFormats: ![...adapter.features]
+                        // The default macOS identity is Apple silicon, whose
+                        // adapter carries the ASTC/ETC2 compression formats.
+                        appleFormats: [...adapter.features]
                             .some(name => name.includes('astc') || name.includes('etc2')),
                         // A device that asks for nothing gets the spec defaults,
                         // which are below what the adapter itself reports.
@@ -18953,6 +18954,12 @@ RequestRedirect value",
                             < adapter.limits.maxTextureDimension2D,
                         preferredFormat: navigator.gpu.getPreferredCanvasFormat(),
                         wgslCount: [...navigator.gpu.wgslLanguageFeatures].length,
+                        // Apple GPUs expose no subgroup sizes.
+                        subgroupNull: adapter.limits.minSubgroupSize === null
+                            && device.limits.maxSubgroupSize === null,
+                        // No SwiftShader behind the hardware profile.
+                        fallbackNull: (await navigator.gpu.requestAdapter(
+                            {forceFallbackAdapter: true})) === null,
                         brands: [String(adapter), String(adapter.limits), String(device)],
                     };
                 }"#,
@@ -18966,12 +18973,14 @@ RequestRedirect value",
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!({
-                "vendor": "intel",
+                "vendor": "apple",
                 "featuresAreSetlike": true,
-                "noMobileFormats": true,
+                "appleFormats": true,
                 "deviceBelowAdapter": true,
                 "preferredFormat": "bgra8unorm",
                 "wgslCount": 9,
+                "subgroupNull": true,
+                "fallbackNull": true,
                 "brands": ["[object GPUAdapter]", "[object GPUSupportedLimits]",
                     "[object GPUDevice]"],
             })
@@ -19014,6 +19023,20 @@ RequestRedirect value",
                         precision: [float.rangeMin, float.rangeMax, float.precision,
                             int.rangeMin, int.rangeMax, int.precision],
                         viewport: Array.from(gl.getParameter(0x0D3A)),
+                        // The Apple shape carries the mobile compression
+                        // extensions and tops out at 4x MSAA.
+                        appleCompression: gl.getSupportedExtensions()
+                            .includes('WEBGL_compressed_texture_astc')
+                            && !gl.getSupportedExtensions()
+                                .includes('WEBGL_provoking_vertex'),
+                        samples: [
+                            Array.from(gl2.getInternalformatParameter(0x8D41, 0x8058, 0x80A9)),
+                            gl2.getInternalformatParameter(0x8D41, 0x8229, 0x80A9) === null,
+                        ],
+                        attrsEcho: document.createElement('canvas')
+                            .getContext('webgl2', {powerPreference: 'low-power', antialias: false})
+                            .getContextAttributes(),
+                        colorSpace: gl.drawingBufferColorSpace,
                     };
                 })()"#,
             )
@@ -19029,7 +19052,16 @@ RequestRedirect value",
                 "hasDebugExtension": true,
                 "manyExtensions": true,
                 "precision": [127, 127, 23, 31, 30, 0],
-                "viewport": [32767, 32767],
+                "viewport": [16384, 16384],
+                "appleCompression": true,
+                "samples": [[4, 2], false],
+                "attrsEcho": {
+                    "alpha": true, "antialias": false, "depth": true,
+                    "desynchronized": false, "failIfMajorPerformanceCaveat": false,
+                    "powerPreference": "low-power", "premultipliedAlpha": true,
+                    "preserveDrawingBuffer": false, "stencil": false, "xrCompatible": false,
+                },
+                "colorSpace": "srgb",
             })
         );
     }

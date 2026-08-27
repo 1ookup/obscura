@@ -8202,6 +8202,144 @@ const _WEBGL2_PARAMETERS = {
   0x88FC: 0,           // MAX_VERTEX_UNIFORM_BLOCKS placeholder
   0x8B4F: 0,           // SHADER_TYPE placeholder
 };
+// Static parameter answers every desktop Chrome reports and the
+// tables above used to omit; state defaults and capability limits that
+// do not differ between the D3D11 and Apple/Metal shapes. Captured from
+// the Chrome oracle in js-repros/window-surface. Array-valued answers
+// stay in the factory tables above so callers cannot mutate shared state.
+Object.assign(_WEBGL1_PARAMETERS, {
+  0x80C8: 0,  // BLEND_DST_RGB
+  0x80C9: 1,  // BLEND_SRC_RGB
+  0x80CA: 0,  // BLEND_DST_ALPHA
+  0x80CB: 1,  // BLEND_SRC_ALPHA
+  0x8037: false,  // POLYGON_OFFSET_FILL
+  0xB45: 1029,  // CULL_FACE_MODE
+  0xB46: 2305,  // FRONT_FACE
+  0xB97: 0,  // STENCIL_REF
+  0x8CA3: 0,  // STENCIL_BACK_REF
+  0xD53: 8,  // GREEN_BITS
+  0xD54: 8,  // BLUE_BITS
+  0xD55: 8,  // ALPHA_BITS
+  0x2A00: 0,  // POLYGON_OFFSET_UNITS
+  0x8038: 0,  // POLYGON_OFFSET_FACTOR
+  0x8192: 4352,  // GENERATE_MIPMAP_HINT
+  0x8B8C: "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",  // SHADING_LANGUAGE_VERSION
+  0x8B9A: 5121,  // IMPLEMENTATION_COLOR_READ_TYPE
+  0x8B9B: 6408,  // IMPLEMENTATION_COLOR_READ_FORMAT
+});
+Object.assign(_WEBGL2_PARAMETERS, {
+  0x80C8: 0,  // BLEND_DST_RGB
+  0x80C9: 1,  // BLEND_SRC_RGB
+  0x80CA: 0,  // BLEND_DST_ALPHA
+  0x80CB: 1,  // BLEND_SRC_ALPHA
+  0xB44: false,  // CULL_FACE
+  0x8037: false,  // POLYGON_OFFSET_FILL
+  0xB45: 1029,  // CULL_FACE_MODE
+  0xB46: 2305,  // FRONT_FACE
+  0xB97: 0,  // STENCIL_REF
+  0x8CA3: 0,  // STENCIL_BACK_REF
+  0xCF5: 4,  // UNPACK_ALIGNMENT
+  0xD05: 4,  // PACK_ALIGNMENT
+  0xD33: 16384,  // MAX_TEXTURE_SIZE
+  0xD50: 4,  // SUBPIXEL_BITS
+  0xD52: 8,  // RED_BITS
+  0xD53: 8,  // GREEN_BITS
+  0xD54: 8,  // BLUE_BITS
+  0xD55: 8,  // ALPHA_BITS
+  0xD56: 24,  // DEPTH_BITS
+  0xD57: 0,  // STENCIL_BITS
+  0x2A00: 0,  // POLYGON_OFFSET_UNITS
+  0x8038: 0,  // POLYGON_OFFSET_FACTOR
+  0x80A8: 1,  // SAMPLE_BUFFERS
+  0x80A9: 4,  // SAMPLES
+  0x8192: 4352,  // GENERATE_MIPMAP_HINT
+  0x8869: 16,  // MAX_VERTEX_ATTRIBS
+  0x8DFB: 1024,  // MAX_VERTEX_UNIFORM_VECTORS
+  0x8DFC: 30,  // MAX_VARYING_VECTORS
+  0x8B4D: 32,  // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+  0x8B4C: 16,  // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+  0x8872: 16,  // MAX_TEXTURE_IMAGE_UNITS
+  0x8DFD: 1024,  // MAX_FRAGMENT_UNIFORM_VECTORS
+  0x8B8C: "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",  // SHADING_LANGUAGE_VERSION
+  0x1F00: "WebKit",  // VENDOR
+  0x1F01: "WebKit WebGL",  // RENDERER
+  0x851C: 16384,  // MAX_CUBE_MAP_TEXTURE_SIZE
+  0x8B9A: 5121,  // IMPLEMENTATION_COLOR_READ_TYPE
+  0x8B9B: 6408,  // IMPLEMENTATION_COLOR_READ_FORMAT
+  0x84E8: 16384,  // MAX_RENDERBUFFER_SIZE
+  0xC02: 1029,  // READ_BUFFER
+  0xCF2: 0,  // UNPACK_ROW_LENGTH
+  0xCF3: 0,  // UNPACK_SKIP_ROWS
+  0xCF4: 0,  // UNPACK_SKIP_PIXELS
+  0xD02: 0,  // PACK_ROW_LENGTH
+  0xD03: 0,  // PACK_SKIP_ROWS
+  0xD04: 0,  // PACK_SKIP_PIXELS
+  0x806D: 0,  // UNPACK_SKIP_IMAGES
+  0x806E: 0,  // UNPACK_IMAGE_HEIGHT
+  0x8825: 1029,  // DRAW_BUFFER0
+  0x8826: 1029,  // DRAW_BUFFER1
+  0x8827: 1029,  // DRAW_BUFFER2
+  0x8828: 1029,  // DRAW_BUFFER3
+  0x8829: 1029,  // DRAW_BUFFER4
+  0x882A: 1029,  // DRAW_BUFFER5
+  0x882B: 1029,  // DRAW_BUFFER6
+  0x882C: 1029,  // DRAW_BUFFER7
+  0x8B8B: 4352,  // FRAGMENT_SHADER_DERIVATIVE_HINT
+  0x8C89: false,  // RASTERIZER_DISCARD
+  0x8E23: false,  // TRANSFORM_FEEDBACK_PAUSED
+  0x8E24: false,  // TRANSFORM_FEEDBACK_ACTIVE
+  0x8D6B: 4294967294,  // MAX_ELEMENT_INDEX
+  0x9247: 0,  // MAX_CLIENT_WAIT_TIMEOUT_WEBGL
+});
+Object.assign(_WEBGL1_ARRAY_PARAMETERS, {
+  0xB70: () => new Float32Array([0, 1]),  // DEPTH_RANGE
+  0x86A3: () => new Int32Array([]),  // COMPRESSED_TEXTURE_FORMATS (until an extension enables them)
+});
+
+// The Apple/Metal capability shape for macOS fingerprints. Values the D3D11
+// tables already carry (most of the surface) are inherited; only the answers
+// that differ are listed here. Order of the extension lists is part of the
+// observable fingerprint, so it is transcribed as captured, never sorted.
+const _WEBGL_APPLE = {
+  webgl1Params: {
+    0xD52: 8,  // RED_BITS
+    0x80A8: 1,  // SAMPLE_BUFFERS
+    0x80A9: 4,  // SAMPLES
+    0x8DFB: 1024,  // MAX_VERTEX_UNIFORM_VECTORS
+  },
+  webgl2Params: {
+    0x8C80: 4,  // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+    0x8C8A: 128,  // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+    0x8D57: 4,  // MAX_SAMPLES
+    0x8A2B: 16,  // MAX_VERTEX_UNIFORM_BLOCKS
+    0x8A2D: 16,  // MAX_FRAGMENT_UNIFORM_BLOCKS
+    0x8A2E: 32,  // MAX_COMBINED_UNIFORM_BLOCKS
+    0x8A30: 16384,  // MAX_UNIFORM_BLOCK_SIZE
+    0x8A31: 69632,  // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
+    0x8A33: 69632,  // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
+    0x8A34: 16,  // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+    0x9111: 0,  // MAX_SERVER_WAIT_TIMEOUT
+  },
+  webgl1Extensions: ["ANGLE_instanced_arrays","EXT_blend_minmax","EXT_clip_control","EXT_color_buffer_half_float","EXT_depth_clamp","EXT_disjoint_timer_query","EXT_float_blend","EXT_frag_depth","EXT_polygon_offset_clamp","EXT_shader_texture_lod","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_texture_mirror_clamp_to_edge","EXT_sRGB","KHR_parallel_shader_compile","OES_element_index_uint","OES_fbo_render_mipmap","OES_standard_derivatives","OES_texture_float","OES_texture_float_linear","OES_texture_half_float","OES_texture_half_float_linear","OES_vertex_array_object","WEBGL_blend_func_extended","WEBGL_color_buffer_float","WEBGL_compressed_texture_astc","WEBGL_compressed_texture_etc","WEBGL_compressed_texture_etc1","WEBGL_compressed_texture_pvrtc","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_depth_texture","WEBGL_draw_buffers","WEBGL_lose_context","WEBGL_multi_draw","WEBGL_polygon_mode"],
+  webgl2Extensions: ["EXT_clip_control","EXT_color_buffer_float","EXT_color_buffer_half_float","EXT_conservative_depth","EXT_depth_clamp","EXT_disjoint_timer_query_webgl2","EXT_float_blend","EXT_polygon_offset_clamp","EXT_render_snorm","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_texture_mirror_clamp_to_edge","EXT_texture_norm16","KHR_parallel_shader_compile","NV_shader_noperspective_interpolation","OES_draw_buffers_indexed","OES_sample_variables","OES_shader_multisample_interpolation","OES_texture_float_linear","WEBGL_blend_func_extended","WEBGL_clip_cull_distance","WEBGL_compressed_texture_astc","WEBGL_compressed_texture_etc","WEBGL_compressed_texture_etc1","WEBGL_compressed_texture_pvrtc","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_lose_context","WEBGL_multi_draw","WEBGL_polygon_mode","WEBGL_provoking_vertex","WEBGL_render_shared_exponent","WEBGL_stencil_texturing"],
+  arrayParams: {
+    0x0D3A: () => new Int32Array([16384, 16384]),  // MAX_VIEWPORT_DIMS
+    0x846D: () => new Float32Array([1, 511]),      // ALIASED_POINT_SIZE_RANGE
+  },
+  // getInternalformatParameter(SAMPLES) answers: Apple GPUs top out at 4x
+  // MSAA and only for these renderbuffer formats, everything else is null.
+  samplesFormats: new Set([0x8229, 0x822B, 0x8051, 0x8058, 0x8C43, 0x8059, 0x81A5, 0x81A6, 0x8CAC, 0x8D48, 0x88F0, 0x8CAD, 0x8056, 0x8057, 0x8D62]),
+};
+
+// Which canned capability shape the WebGL/WebGPU surface serves. The GPU
+// fingerprint tags it explicitly; otherwise it follows the UA platform.
+function _webglProfile() {
+  const fingerprint = _fingerprint() || {};
+  const tag = (fingerprint.gpu && fingerprint.gpu.webgpuProfile) || '';
+  if (tag === 'apple' || tag === 'intel') return tag;
+  return (fingerprint.uaPlatform || '') === 'macOS' ? 'apple' : 'intel';
+}
+
 // getShaderPrecisionFormat on any desktop GL: IEEE single precision for the
 // float formats and 32-bit two's complement for the integer ones, regardless
 // of the requested precision qualifier.
@@ -8209,17 +8347,43 @@ const _WEBGL_PRECISION_FLOAT = { rangeMin: 127, rangeMax: 127, precision: 23 };
 const _WEBGL_PRECISION_INT = { rangeMin: 31, rangeMax: 30, precision: 0 };
 
 class _WebGLContext {
-  constructor(canvas, isWebGL2) {
+  constructor(canvas, isWebGL2, attrs) {
     this.canvas = canvas; this._isWebGL2 = !!isWebGL2; this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
     this._lost = false; this._extensions = new Map();
+    // Chrome echoes back the attributes the caller passed, filling defaults.
+    this._attrs = (attrs && typeof attrs === 'object') ? attrs : {};
   }
-  getContextAttributes() { return { alpha: true, antialias: false, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false }; }
+  get drawingBufferColorSpace() { return 'srgb'; }
+  get unpackColorSpace() { return 'srgb'; }
+  getContextAttributes() {
+    return {
+      alpha: this._attrs.alpha !== undefined ? !!this._attrs.alpha : true,
+      // Chrome's default context is antialiased; the D3D11 table used to
+      // claim false, which contradicted the SAMPLES answer.
+      antialias: this._attrs.antialias !== undefined ? !!this._attrs.antialias : true,
+      depth: this._attrs.depth !== undefined ? !!this._attrs.depth : true,
+      desynchronized: false,
+      failIfMajorPerformanceCaveat: !!this._attrs.failIfMajorPerformanceCaveat,
+      powerPreference: this._attrs.powerPreference || 'default',
+      premultipliedAlpha: this._attrs.premultipliedAlpha !== undefined ? !!this._attrs.premultipliedAlpha : true,
+      preserveDrawingBuffer: !!this._attrs.preserveDrawingBuffer,
+      stencil: !!this._attrs.stencil,
+      xrCompatible: false,
+    };
+  }
   getParameter(name) {
     const key = +name;
     // The adapter strings sit behind WEBGL_debug_renderer_info, never here.
     if (key === 0x9245 || key === 0x9246) {
       const gpu = _fingerprint().gpu || {};
       return key === 0x9245 ? (gpu.vendor || '') : (gpu.renderer || '');
+    }
+    const apple = _webglProfile() === 'apple' ? _WEBGL_APPLE : null;
+    if (apple) {
+      const appleArrays = apple.arrayParams[key];
+      if (appleArrays) return appleArrays();
+      const override = (this._isWebGL2 ? apple.webgl2Params : apple.webgl1Params)[key];
+      if (override !== undefined) return override;
     }
     const arrays = _WEBGL1_ARRAY_PARAMETERS[key];
     if (arrays) return arrays();
@@ -8234,6 +8398,9 @@ class _WebGLContext {
     return Object.assign(Object.create(globalThis.WebGLShaderPrecisionFormat.prototype), source);
   }
   getSupportedExtensions() {
+    if (_webglProfile() === 'apple') {
+      return (this._isWebGL2 ? _WEBGL_APPLE.webgl2Extensions : _WEBGL_APPLE.webgl1Extensions).slice();
+    }
     return (this._isWebGL2 ? _WEBGL2_EXTENSIONS : _WEBGL1_EXTENSIONS).slice();
   }
   getExtension(name) {
@@ -8307,10 +8474,15 @@ class _WebGLContext {
   getError() { return 0; }
   isEnabled(capability) { return +capability === 0x0BD0; }  // DITHER is on by default
   checkFramebufferStatus() { return 0x8CD5; }               // FRAMEBUFFER_COMPLETE
-  getInternalformatParameter(_target, _internalformat, pname) {
-    // SAMPLES for a renderbuffer format, most-capable first, as the spec
-    // requires and as ANGLE reports on D3D11.
-    return +pname === 0x80A9 ? new Int32Array([8, 4, 2, 1]) : null;
+  getInternalformatParameter(_target, internalformat, pname) {
+    if (+pname !== 0x80A9) return null;
+    if (_webglProfile() === 'apple') {
+      // Apple GPUs answer 4x/2x MSAA for exactly these renderbuffer formats
+      // and nothing else; the D3D11 shape answers 8/4/2/1 everywhere.
+      return _WEBGL_APPLE.samplesFormats.has(+internalformat)
+        ? new Int32Array([4, 2]) : null;
+    }
+    return new Int32Array([8, 4, 2, 1]);
   }
   getIndexedParameter() { return null; }
   getFramebufferAttachmentParameter() { return null; }
@@ -14851,10 +15023,10 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
+HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
   if (type === '2d') {
     if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
+      try { this._ctx = new _Canvas2D(this, attrs); }
       catch (_error) { return null; }
     }
     return this._ctx;
@@ -14864,7 +15036,14 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     // Its values come from the same fingerprint policy as navigator.userAgent;
     // callers that require a real GPU still receive the truthful null default.
     if (!globalThis.__obscura_webgl_enabled) return null;
-    return type === 'webgl2' ? new globalThis.WebGL2RenderingContext(this, true) : new globalThis.WebGLRenderingContext(this, false);
+    return type === 'webgl2'
+      ? new globalThis.WebGL2RenderingContext(this, true, attrs)
+      : new globalThis.WebGLRenderingContext(this, false, attrs);
+  }
+  if (type === 'webgpu') {
+    if (!globalThis.__obscura_webgl_enabled || !globalThis.GPUCanvasContext) return null;
+    if (!this._webgpuCtx) this._webgpuCtx = new globalThis.GPUCanvasContext(this);
+    return this._webgpuCtx;
   }
   return null;
 };
@@ -15984,6 +16163,63 @@ const _GPU_ADAPTER_FEATURES = [
   'texture-formats-tier2', 'shader-f16', 'clip-distances',
   'texture-component-swizzle', 'subgroups',
 ];
+// The Apple/Metal adapter a macOS fingerprint claims. Feature order is the
+// captured order; subgroup limits are absent (null) on Apple GPUs.
+const _GPU_APPLE = {
+  limits: {
+    maxTextureDimension1D: 16384,
+    maxTextureDimension2D: 16384,
+    maxTextureDimension3D: 2048,
+    maxTextureArrayLayers: 2048,
+    maxBindGroups: 4,
+    maxBindGroupsPlusVertexBuffers: 24,
+    maxBindingsPerBindGroup: 1000,
+    maxDynamicUniformBuffersPerPipelineLayout: 10,
+    maxDynamicStorageBuffersPerPipelineLayout: 8,
+    maxSampledTexturesPerShaderStage: 48,
+    maxSamplersPerShaderStage: 16,
+    maxStorageBuffersPerShaderStage: 10,
+    maxStorageTexturesPerShaderStage: 8,
+    maxUniformBuffersPerShaderStage: 12,
+    maxUniformBufferBindingSize: 65536,
+    maxStorageBufferBindingSize: 4294967292,
+    minUniformBufferOffsetAlignment: 256,
+    minStorageBufferOffsetAlignment: 256,
+    maxVertexBuffers: 8,
+    maxBufferSize: 4294967292,
+    maxVertexAttributes: 30,
+    maxVertexBufferArrayStride: 2048,
+    maxInterStageShaderVariables: 28,
+    maxColorAttachments: 8,
+    maxColorAttachmentBytesPerSample: 128,
+    maxComputeWorkgroupStorageSize: 32768,
+    maxComputeInvocationsPerWorkgroup: 1024,
+    maxComputeWorkgroupSizeX: 1024,
+    maxComputeWorkgroupSizeY: 1024,
+    maxComputeWorkgroupSizeZ: 64,
+    maxComputeWorkgroupsPerDimension: 65535,
+    minSubgroupSize: null,
+    maxSubgroupSize: null,
+    maxStorageBuffersInFragmentStage: 10,
+    maxStorageTexturesInFragmentStage: 8,
+    maxStorageBuffersInVertexStage: 10,
+    maxStorageTexturesInVertexStage: 8,
+  },
+  features: [
+    'core-features-and-limits', 'depth-clip-control', 'indirect-first-instance',
+    'shader-f16', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
+    'float32-filterable', 'float32-blendable', 'clip-distances', 'dual-source-blending',
+    'texture-compression-bc', 'texture-compression-bc-sliced-3d',
+    'texture-compression-astc', 'texture-compression-astc-sliced-3d',
+    'texture-compression-etc2', 'texture-formats-tier1', 'texture-formats-tier2',
+    'texture-component-swizzle', 'depth32float-stencil8', 'subgroups',
+  ],
+};
+function _gpuAdapterProfile() {
+  return _webglProfile() === 'apple' ? _GPU_APPLE : {
+    limits: _GPU_LIMITS, features: _GPU_ADAPTER_FEATURES,
+  };
+}
 // A property of the Chrome build, not of the adapter.
 const _GPU_WGSL_FEATURES = [
   'packed_4x8_integer_dot_product', 'subgroup_uniformity', 'subgroup_id',
@@ -16034,19 +16270,27 @@ globalThis.GPUSupportedFeatures = class GPUSupportedFeatures {
 };
 globalThis.GPUAdapterInfo = class GPUAdapterInfo {
   constructor() { throw new TypeError('Illegal constructor'); }
-  get vendor() { return 'intel'; }
-  get architecture() { return 'gen-9'; }
+  get vendor() { return _webglProfile() === 'apple' ? 'apple' : 'intel'; }
+  get architecture() { return _webglProfile() === 'apple' ? '' : 'gen-9'; }
   get device() { return ''; }
   get description() { return ''; }
-  get subgroupMinSize() { return 8; }
-  get subgroupMaxSize() { return 32; }
+  // Apple GPUs do not expose subgroups through the adapter info.
+  get subgroupMinSize() { return _webglProfile() === 'apple' ? null : 8; }
+  get subgroupMaxSize() { return _webglProfile() === 'apple' ? null : 32; }
   get isFallbackAdapter() { return false; }
   get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
 };
 globalThis.GPUDevice = class GPUDevice {
   constructor() { throw new TypeError('Illegal constructor'); }
   get features() { return _gpuSupportedFeatures(['core-features-and-limits']); }
-  get limits() { return _gpuSupportedLimits(_GPU_DEFAULT_LIMITS); }
+  get limits() {
+    const base = _gpuSupportedLimits(_GPU_DEFAULT_LIMITS);
+    if (_webglProfile() === 'apple') {
+      Object.defineProperty(base, 'minSubgroupSize', { value: null, enumerable: false, configurable: true });
+      Object.defineProperty(base, 'maxSubgroupSize', { value: null, enumerable: false, configurable: true });
+    }
+    return base;
+  }
   get adapterInfo() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
   get label() { return ''; }
   get lost() { return new Promise(() => {}); }
@@ -16056,8 +16300,8 @@ globalThis.GPUDevice = class GPUDevice {
 };
 globalThis.GPUAdapter = class GPUAdapter {
   constructor() { throw new TypeError('Illegal constructor'); }
-  get features() { return _gpuSupportedFeatures(_GPU_ADAPTER_FEATURES); }
-  get limits() { return _gpuSupportedLimits(_GPU_LIMITS); }
+  get features() { return _gpuSupportedFeatures(_gpuAdapterProfile().features); }
+  get limits() { return _gpuSupportedLimits(_gpuAdapterProfile().limits); }
   get info() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
   get isFallbackAdapter() { return false; }
   requestAdapterInfo() { return Promise.resolve(this.info); }
@@ -16068,10 +16312,13 @@ globalThis.GPUAdapter = class GPUAdapter {
 };
 globalThis.GPU = class GPU {
   constructor() { throw new TypeError('Illegal constructor'); }
-  requestAdapter() {
+  requestAdapter(options) {
     // Without the consistency profile there is no adapter to describe, which
-    // is also what Chrome answers when the GPU is unavailable.
+    // is also what Chrome answers when the GPU is unavailable. A fallback
+    // request resolves null as well: there is no SwiftShader behind the
+    // hardware profile.
     if (!globalThis.__obscura_webgl_enabled) return Promise.resolve(null);
+    if (options && options.forceFallbackAdapter) return Promise.resolve(null);
     return Promise.resolve(Object.create(globalThis.GPUAdapter.prototype));
   }
   getPreferredCanvasFormat() { return 'bgra8unorm'; }
@@ -16079,6 +16326,59 @@ globalThis.GPU = class GPU {
   get [Symbol.toStringTag]() { return 'GPU'; }
 };
 navigator.gpu = Object.create(globalThis.GPU.prototype);
+
+// The WebGPU usage/stage constants Chrome hangs off the global. Spec values,
+// identical across implementations.
+globalThis.GPUBufferUsage = { MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008, INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080, INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200 };
+globalThis.GPUColorWrite = { RED: 0x1, GREEN: 0x2, BLUE: 0x4, ALPHA: 0x8, ALL: 0xF };
+globalThis.GPUMapMode = { READ: 0x1, WRITE: 0x2 };
+globalThis.GPUShaderStage = { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
+globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
+
+// The canvas half of the WebGPU surface: enough for a probe that configures
+// a context and reads the configuration back. No texture contents exist.
+globalThis.GPUCanvasContext = class GPUCanvasContext {
+  constructor(canvas) { this.canvas = canvas; this._configuration = null; }
+  configure(configuration) {
+    const config = configuration || {};
+    this._configuration = {
+      device: config.device,
+      format: config.format || 'bgra8unorm',
+      usage: typeof config.usage === 'number' ? config.usage : 0x10,
+      alphaMode: config.alphaMode || 'premultiplied',
+      colorSpace: 'srgb',
+      toneMapping: { mode: 'standard' },
+      viewFormats: Array.isArray(config.viewFormats) ? config.viewFormats.slice() : [],
+    };
+  }
+  unconfigure() { this._configuration = null; }
+  getConfiguration() {
+    if (!this._configuration) return null;
+    const config = this._configuration;
+    return {
+      device: config.device,
+      format: config.format,
+      usage: config.usage,
+      alphaMode: config.alphaMode,
+      colorSpace: config.colorSpace,
+      toneMapping: { mode: config.toneMapping.mode },
+      viewFormats: config.viewFormats.slice(),
+    };
+  }
+  getCurrentTexture() {
+    if (!this._configuration) {
+      throw new DOMException('Failed to execute \'getCurrentTexture\' on \'GPUCanvasContext\': context is not configured.', 'InvalidStateError');
+    }
+    return {
+      get [Symbol.toStringTag]() { return 'GPUTexture'; },
+      createView() { return { get [Symbol.toStringTag]() { return 'GPUTextureView'; } }; },
+      destroy() {},
+      width: this.canvas.width,
+      height: this.canvas.height,
+    };
+  }
+  get [Symbol.toStringTag]() { return 'GPUCanvasContext'; }
+};
 
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
