@@ -12947,6 +12947,7 @@ globalThis.atob = globalThis.atob || ((s) => {
 
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
+globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
@@ -19342,6 +19343,9 @@ globalThis.__obscura_init = function() {
         try {
           const metrics = readFrameMetrics();
           if (metrics) {
+            // An unrendered frame (display:none, 0x0, no layout yet) reports
+            // zero, exactly as Chrome does -- never the screen fallback.
+            if (metrics.rendered === false) return 0;
             const value = metrics[name];
             if (Number.isFinite(value) && value >= 0) return value;
           }
@@ -19350,12 +19354,13 @@ globalThis.__obscura_init = function() {
       };
       const parsed = readFrameMetrics();
       if (parsed) {
-        if (Number.isFinite(parsed.clientWidth) && parsed.clientWidth >= 0) {
-          globalThis.innerWidth = parsed.clientWidth;
-          globalThis.innerHeight = parsed.clientHeight;
+        const zeroViewport = parsed.rendered === false;
+        if (zeroViewport || (Number.isFinite(parsed.clientWidth) && parsed.clientWidth >= 0)) {
+          globalThis.innerWidth = zeroViewport ? 0 : parsed.clientWidth;
+          globalThis.innerHeight = zeroViewport ? 0 : parsed.clientHeight;
           if (globalThis.visualViewport) {
-            globalThis.visualViewport.width = parsed.clientWidth;
-            globalThis.visualViewport.height = parsed.clientHeight;
+            globalThis.visualViewport.width = globalThis.innerWidth;
+            globalThis.visualViewport.height = globalThis.innerHeight;
           }
         }
       }
@@ -19394,7 +19399,20 @@ globalThis.__obscura_init = function() {
       }
     } catch (_e) {}
   }
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  // Window-level geometry every frame shares with its top window. The claim
+  // is a maximized window: outer bounds fill the working area, the window
+  // origin sits at the working area's top-left. Deterministic from the screen
+  // fingerprint, and plausible next to any screen a profile claims.
+  const availW = hasScreenOverride ? sw
+    : (Number.isFinite(Number(fingerprintScreen.availWidth)) && Number(fingerprintScreen.availWidth) > 0
+      ? Number(fingerprintScreen.availWidth) : sw);
+  const availH = hasScreenOverride ? sh
+    : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
+      ? Number(fingerprintScreen.availHeight) : sh);
+  const windowTop = Math.max(0, sh - availH);
+  globalThis.outerWidth = availW; globalThis.outerHeight = availH;
+  globalThis.screenX = 0; globalThis.screenY = windowTop;
+  globalThis.screenLeft = 0; globalThis.screenTop = windowTop;
 
   // The time origin is when navigation started, so it is always in the past.
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,

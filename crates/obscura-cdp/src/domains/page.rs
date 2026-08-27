@@ -2649,6 +2649,15 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // The screenshot raster scales with the fingerprint's devicePixelRatio
+        // (2.0 under the default macOS identity). These dimension assertions
+        // pin a 1x fingerprint so the pixel expectations stay stable.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((100.0, 80.0));
@@ -2675,6 +2684,14 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // 1x fingerprint so clip rasters keep their pixel dimensions; see
+        // the comment in screenshot_fixture.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((100.0, 80.0));
@@ -3388,6 +3405,15 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // Pin a 1x fingerprint: the default macOS identity doubles every
+        // raster through devicePixelRatio and pushes this 17000px body past
+        // the striped-capture pixel limit.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((1000.0, 700.0));

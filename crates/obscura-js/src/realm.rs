@@ -796,17 +796,13 @@ impl ObscuraJsRuntime {
         // missing in the realm.
         self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
         self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
-        self.execute_in_context(
-            &context,
-            "<obscura:frame-realm-page-init>",
-            "globalThis.__obscura_init();",
-        )?;
-        // Frame realms are created lazily, after the main realm's identity was
-        // installed. Apply the runtime-owned fingerprint before author code
-        // can observe navigator, UA-CH, screen, or worker surfaces. The
-        // stealth and GPU-profile flags travel with it: a frame that got the
-        // identity but not the flags reported a different machine from its
-        // own parent, which is worse than either answer on its own.
+        // The runtime-owned fingerprint lands before `__obscura_init`, the
+        // same order the main realm uses: init derives innerWidth/outer* from
+        // the screen it can already see, so seeding the identity afterwards
+        // left every frame reporting the bootstrap defaults (1920x1000) next
+        // to a correctly re-seeded screen. The stealth and GPU-profile flags
+        // travel with it: a frame that got the identity but not the flags
+        // reported a different machine from its own parent.
         let fingerprint_json = serde_json::to_string(&self.fingerprint)
             .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
         let stealth = self.stealth;
@@ -819,6 +815,11 @@ impl ObscuraJsRuntime {
                  globalThis.__obscura_stealth = {stealth}; \
                  globalThis.__obscura_webgl_enabled = {webgl_enabled};"
             ),
+        )?;
+        self.execute_in_context(
+            &context,
+            "<obscura:frame-realm-page-init>",
+            "globalThis.__obscura_init();",
         )?;
 
         // Snapshot the content root's scope for later diagnostics/routing;
@@ -1713,17 +1714,19 @@ pub(crate) fn spawn_frame_realm(
 
         run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
         run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
-        run_script(
-            scope,
-            "<obscura:frame-realm-page-init>",
-            "globalThis.__obscura_init();",
-        )?;
+        // Fingerprint before init, matching the main realm's order (see the
+        // comment in ensure_frame_world_realm).
         let fingerprint_src = format!(
             "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
              globalThis.__obscura_stealth = {stealth}; \
              globalThis.__obscura_webgl_enabled = {webgl_enabled};"
         );
         run_script(scope, "<obscura:frame-fingerprint>", &fingerprint_src)?;
+        run_script(
+            scope,
+            "<obscura:frame-realm-page-init>",
+            "globalThis.__obscura_init();",
+        )?;
 
         let bridge_key = v8::String::new(scope, "__obscura_realm_bridge")
             .ok_or_else(|| alloc_err("key"))?;

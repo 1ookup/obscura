@@ -7802,23 +7802,29 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
     // that document's layout, not the top-level page's -- a frame previously
     // reported the embedder's viewport as its own innerWidth/scrollWidth.
     let frame_root = NodeId::new(frame_root_str.parse().unwrap_or(0));
-    let is_frame = gs
-        .dom
-        .as_ref()
-        .is_some_and(|dom| dom.iframe_host(frame_root).is_some());
+    let top_root = gs.dom.as_ref().map(|dom| dom.document());
+    // Decide by caller identity, not by resolving the host: a detached or
+    // navigated-away frame root used to fall into the top-level branch and
+    // leak the page viewport into the frame realm.
+    let is_frame = frame_root.raw() != 0 && Some(frame_root) != top_root;
+    // A frame whose layout cannot be resolved reports an explicit unrendered
+    // zero: Chrome gives a display:none or 0x0 iframe a 0x0 viewport, while an
+    // empty string told bootstrap to fall back to the screen-derived value.
+    let unrendered = "\
+        {\"scrollWidth\":0,\"scrollHeight\":0,\"clientWidth\":0,\"clientHeight\":0,\"rendered\":false}";
     let (viewport, content) = if is_frame {
         // The frame viewport is read from its host's box in the parent layout,
         // so the top document must be prepared first. At frame-realm init time
         // the main `prepared_render` is not built yet.
         if ensure_prepared_geometry(&mut gs).is_none() {
-            return String::new();
+            return unrendered.to_string();
         }
         let g = &mut *gs;
         let Some(dom) = g.dom.as_ref() else {
-            return String::new();
+            return unrendered.to_string();
         };
         let Some(main_prepared) = g.prepared_render.as_ref() else {
-            return String::new();
+            return unrendered.to_string();
         };
         let resources = &mut g.render_resources;
         let frame_states = &mut g.frame_render_states;
@@ -7831,7 +7837,7 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
             0,
         )
         else {
-            return String::new();
+            return unrendered.to_string();
         };
         let result = (prepared.viewport(), prepared.content_size());
         store_frame_prepared(dom, frame_root, prepared, frame_states);
