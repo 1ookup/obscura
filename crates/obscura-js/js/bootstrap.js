@@ -5379,6 +5379,20 @@ class Document extends Node {
     } catch (_e) {}
     return "CSS1Compat";
   }
+  get lastModified() {
+    // No Last-Modified header is plumbed through; Chrome falls back to the
+    // document's creation time, so the first read pins it for this document
+    // object. en-US, 24h clock, zero-padded, the format Chrome uses.
+    let stamp = this[_lastModifiedSym];
+    if (!stamp) {
+      stamp = new Date();
+      try { Object.defineProperty(this, _lastModifiedSym, { value: stamp, configurable: true }); }
+      catch (_e) { this[_lastModifiedSym] = stamp; }
+    }
+    const p2 = n => String(n).padStart(2, '0');
+    return `${p2(stamp.getMonth() + 1)}/${p2(stamp.getDate())}/${stamp.getFullYear()} `
+      + `${p2(stamp.getHours())}:${p2(stamp.getMinutes())}:${p2(stamp.getSeconds())}`;
+  }
   // The document's character encoding, detected from the response charset
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
@@ -6966,20 +6980,6 @@ class _ScopedDocument extends Document {
     const candidate = Deno.core.ops.op_document_domain_candidate(current, input);
     if (!candidate) _throwDocumentDomainSecurityError();
     this[_effectiveDomainSym] = candidate;
-  }
-  get lastModified() {
-    // No Last-Modified header is recorded per scope; Chrome falls back to
-    // the document's creation time, so the first read pins it for this
-    // document object. en-US, 24h clock, zero-padded, as Chrome formats it.
-    let stamp = this[_lastModifiedSym];
-    if (!stamp) {
-      stamp = new Date();
-      try { Object.defineProperty(this, _lastModifiedSym, { value: stamp }); }
-      catch (_e) { this[_lastModifiedSym] = stamp; }
-    }
-    const p2 = n => String(n).padStart(2, '0');
-    return `${p2(stamp.getMonth() + 1)}/${p2(stamp.getDate())}/${stamp.getFullYear()} `
-      + `${p2(stamp.getHours())}:${p2(stamp.getMinutes())}:${p2(stamp.getSeconds())}`;
   }
   get compatMode() {
     const info = this._scopeInfo();
