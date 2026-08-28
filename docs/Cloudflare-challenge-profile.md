@@ -4,7 +4,11 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-08-27,step 90）：**未通过**。step 90 用 MITM 代理注入的 `console.log("payloadJSON:…")`
+当前状态（2026-08-28,step 91）：**未通过，核心指纹面已收敛**。B0-B7 全批次落地
+（见 step 91 与 `Challenge-fingerprint-fix-plans.md`）：UA-CH arm/26.4.0、WebGL 39 项逐项
+一致、WebGPU apple 档、SAMPLES 15 格式、N 桶 399→1137（Chrome 1164）。质询三轮提交链路
+正常（600010 回退已修）。剩余长尾：N 桶 27、o 桶 14、x/F 桶、brands 形态、sans-serif 字体
+残差、ICE srflx；障碍课程未跑（本机无 companion 仓库）。step 90 存档：step 90 用 MITM 代理注入的 `console.log("payloadJSON:…")`
 拿到 obscura 全部三轮**明文提交体**（含点击后 proof 轮），与 Chrome 三 payload 按「探针字段名」对拍
 （分片号两边错位，不能按 part 对齐）。结论：navigator 42 缺口只是冰山一角——枚举桶里 **N 桶（window
 构造器）缺 773 个、o 桶缺 49 个**；**UA-CH 高熵字段错**（x86/10.15.7 vs arm/26.4.0，brands 多一个
@@ -4822,6 +4826,58 @@ obscura-js 513、obscura-browser 105 全绿。
 实施批次 B0-B7 与依赖关系）见 `Challenge-fingerprint-fix-plans.md`。核心合并结论：UA-CH/
 WebGL/WebGPU 三组的共同根因是 `fingerprint.rs::from_user_agent` 的 macOS 分支
 （architecture:"x86" + Intel GPU 串），必须一个提交内原子翻转。
+
+### Step 91 — B0-B7 全批次落地：核心指纹面收敛到 149 基线（2026-08-28）
+
+**假设**：step 90 的六组缺陷按 `Challenge-fingerprint-fix-plans.md` 的批次全部修复后，
+质询载荷的核心指纹面应收敛到 Chrome 149 基线。
+
+**方法**：七批实现（每批独立提交、全量 `cargo nextest --features render` 门 + release 构建），
+最后 thelancet.com/1.txt 真实质询三轮复测（无注入导航点击 + serve 日志 payloadJSON）。
+
+**提交清单**：`1f9aad1` B0 oracle 采集 / `829201b` B1 默认身份翻转 / `6c6a8ee` B2 WebGL+WebGPU
+平台档 / `43fc4fc` B3 frame realm 顺序 / `b26800f` B4 接口面 / `d2f8d10` B7 canvas /
+`c173ea0` B6 亚像素 / `09ec3eb` B5 frame 文档属性 / `38e5d7a` lastModified 回退修复。
+
+**证据（最终对拍，Chrome149 vs 修前 vs 修后）**：
+
+| 指标 | Chrome149 | 修前 | 修后 |
+|---|---|---|---|
+| UA-CH architecture / platformVersion | arm / 26.4.0 | x86 / 10.15.7 | **arm / 26.4.0** |
+| UA-CH brands | 2（Chromium 形态） | 3 | 3（默认品牌 Chrome 形态，2-brand 走 `--fingerprint` 覆盖，设计如此） |
+| ZokK1 N 桶（window 构造器） | 1164 | 399 | **1137** |
+| ZokK1 o 桶 | 121 | 75 | **107** |
+| wShvj2 WebGL 扩展 | 39 | 36 | **39（逐项一致）** |
+| Bpqf7 WebGPU info / features | apple / 20 | intel / 17 | **apple / 20** |
+| JlnK7 SAMPLES 非空格式 | 15 | 34 | **15** |
+| mAoOT1 Math 指纹 | 184 项 | 184 项（step 90 复核后确认本就对齐） | 184 项 |
+
+本地端到端（跨源 frame）：innerWidth=iframe 自身盒、display:none 帧 0×0、
+domain=自身 host、referrer=嵌入方 origin、lastModified 格式正确、
+`getOwnPropertyNames(document)` 零 `_` 泄漏。measureText 亚像素落 1/64 边界
+（16px Arial 与 Chrome 逐位一致）；canvas 渐变条与 Chrome oracle 逐字节一致。
+
+**过程中证伪/回退的教训（新增盲区）**：
+- **B4 的 pass-1 父链链接曾把真实 `TextTrackList`（extends Array）的 prototype 强接到
+  EventTarget 上**——链接必须只作用于本安装器装的外壳（Set 记录），不能对全表执行。
+- **snapshot 烘焙环境里 V8 的惰性全局（WebAssembly/Temporal 等）是 undefined**，typeof
+  守卫会放行外壳、随后与运行时真实注册冲突（deno_core "unable to convert" panic）；
+  `_ecmaScriptGlobals` 捕获不到它们（惰性），需硬编排除名单。
+- **B5 的 lastModified 只加在 `_ScopedDocument`，顶层 Document 答 undefined**——CF 在主文档
+  读它，unexpected-undefined 直接把三轮提交打成 `fail 600010`（step 67 的老错误码换了张脸
+  回来）。靠对 committed 批次的二分（43fc4fc 过 → b26800f 过 → 09ec3eb 挂）定位到该提交，
+  再本地冒烟发现字段缺失。**新增到顶文档接口的属性必须同时落在基类与 scoped 子类。**
+- 质询复测必须至少两轮：第一轮 600010 时一度怀疑 CF 端波动，第二轮同败才确认是回归。
+
+**剩余差异（后续项，均已记录在 plans 文档）**：N 桶 27 个（V8-vs-Chrome 内建差 +
+147-only 面，钉 149 UA 下有意不装）、o 桶 14、x 桶 11、F 桶 7、brands 形态、
+sans-serif 字体选择残差（Helvetica vs Liberation）、canvas AA 边缘值、`nMlxj2` 的
+统计位、ICE srflx（B2 外的独立项）。障碍课程 33/33 未跑（本机无 obscura-benchmark
+companion 仓库），全量 nextest 1652/1652 与 release 构建、`--no-default-features`
+check 均过。
+
+**结论**：step 90 六组缺陷全部落地，质询从「指纹大面积错配」收敛到「核心面与 149 基线
+逐项一致，剩余为记录在案的长尾」。未过盾状态不变（判定口径仍以真实 404 为准）。
 
 ### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
 
