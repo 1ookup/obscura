@@ -215,6 +215,10 @@ function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(f
 // not), and is what Rust-injected snippets read back with.
 const _nidSym = Symbol.for('obscura.nid');
 const _scopeRootSym = Symbol.for('obscura.scopeRoot');
+const _effectiveDomainSym = Symbol.for('obscura.effectiveDomain');
+const _lastModifiedSym = Symbol.for('obscura.lastModified');
+const _adoptedSheetsSym = Symbol.for('obscura.adoptedStyleSheets');
+const _adoptedNodesSym = Symbol.for('obscura.adoptedStyleNodes');
 const _defaultViewProxySym = Symbol.for('obscura.defaultViewProxy');
 const _treeParentSym = Symbol.for('obscura.treeParent');
 const _treeParentEpochSym = Symbol.for('obscura.treeParentEpoch');
@@ -5366,7 +5370,15 @@ class Document extends Node {
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
-  get compatMode() { return "CSS1Compat"; }
+  get compatMode() {
+    // The top document's parse mode comes from the DOM; about:blank and
+    // doctypeless documents are BackCompat.
+    try {
+      const info = _domParse("document_scope_info", 0);
+      if (info && info.quirks !== undefined) return info.quirks ? "BackCompat" : "CSS1Compat";
+    } catch (_e) {}
+    return "CSS1Compat";
+  }
   // The document's character encoding, detected from the response charset
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
@@ -5404,6 +5416,8 @@ class Document extends Node {
   }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
+  get webkitVisibilityState() { return this.visibilityState; }
+  get webkitHidden() { return this.hidden; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
@@ -6931,6 +6945,41 @@ class _ScopedDocument extends Document {
       }
     }
     return docUrl;
+  }
+  get domain() {
+    // The frame document's own host, not the embedder's: the base class
+    // routes non-top documents through the incumbent (top) document.
+    const info = this._scopeInfo();
+    if (!info || !info.url) return '';
+    if (info.sandboxActive && !info.allowSameOrigin) return '';
+    try {
+      const host = new URL(info.url).hostname;
+      return host || '';
+    } catch (_e) { return ''; }
+  }
+  set domain(value) {
+    // Same candidate walk as the top-level setter, anchored on this frame's
+    // own current host.
+    const input = String(value);
+    const current = this.domain;
+    if (!current) _throwDocumentDomainSecurityError();
+    const candidate = Deno.core.ops.op_document_domain_candidate(current, input);
+    if (!candidate) _throwDocumentDomainSecurityError();
+    this[_effectiveDomainSym] = candidate;
+  }
+  get lastModified() {
+    // No Last-Modified header is recorded per scope; Chrome falls back to
+    // the document's creation time, so the first read pins it for this
+    // document object. en-US, 24h clock, zero-padded, as Chrome formats it.
+    let stamp = this[_lastModifiedSym];
+    if (!stamp) {
+      stamp = new Date();
+      try { Object.defineProperty(this, _lastModifiedSym, { value: stamp }); }
+      catch (_e) { this[_lastModifiedSym] = stamp; }
+    }
+    const p2 = n => String(n).padStart(2, '0');
+    return `${p2(stamp.getMonth() + 1)}/${p2(stamp.getDate())}/${stamp.getFullYear()} `
+      + `${p2(stamp.getHours())}:${p2(stamp.getMinutes())}:${p2(stamp.getSeconds())}`;
   }
   get compatMode() {
     const info = this._scopeInfo();
@@ -10587,9 +10636,9 @@ function _adoptedStyleTarget(root) {
 }
 
 function _syncAdoptedStyles(root) {
-  const sheets = root._adoptedStyleSheets || [];
+  const sheets = root[_adoptedSheetsSym] || [];
   _reconcileAdoptedStyleSheetAdopters(root, sheets);
-  const nodes = root._adoptedStyleNodes || (root._adoptedStyleNodes = new Map());
+  const nodes = root[_adoptedNodesSym] || (root[_adoptedNodesSym] = new Map());
   for (const [sheet, node] of Array.from(nodes.entries())) {
     if (!sheets.includes(sheet)) {
       node.remove();
@@ -10636,10 +10685,10 @@ function _makeAdoptedSheetList(root, values) {
 }
 
 function _adoptedStyleSheetsFor(root) {
-  if (!root._adoptedStyleSheets) {
-    root._adoptedStyleSheets = _makeAdoptedSheetList(root, []);
+  if (!root[_adoptedSheetsSym]) {
+    root[_adoptedSheetsSym] = _makeAdoptedSheetList(root, []);
   }
-  return root._adoptedStyleSheets;
+  return root[_adoptedSheetsSym];
 }
 
 function _replaceAdoptedStyleSheets(root, sheets) {

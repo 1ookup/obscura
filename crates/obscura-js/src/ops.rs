@@ -1789,6 +1789,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "url": gs.url,
                     "origin": gs.top_origin.as_ref().map(|origin| origin.serialize()),
                     "csp": gs.document_csp,
+                    // The top document's parse mode: doctypeless and
+                    // about:blank documents are BackCompat in Chrome.
+                    "quirks": dom.is_quirks(),
                 })
                 .to_string();
             }
