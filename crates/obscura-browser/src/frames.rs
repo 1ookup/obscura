@@ -35,6 +35,9 @@ pub struct BrowsingContext {
     pub navigation_generation: u64,
     /// CDP loader id for the active document.
     pub loader_id: String,
+    /// Navigation timing for the active document, installed into its Window
+    /// realm before preload and author scripts run.
+    pub navigation_timing: Option<serde_json::Value>,
     /// Child frame ids in creation order.
     pub children: Vec<String>,
 }
@@ -63,6 +66,7 @@ impl FrameRegistry {
                 document_generation: 0,
                 navigation_generation: 0,
                 loader_id: "1".to_string(),
+                navigation_timing: None,
                 children: Vec::new(),
             },
         );
@@ -137,6 +141,7 @@ impl FrameRegistry {
                 document_generation: 0,
                 navigation_generation: 0,
                 loader_id,
+                navigation_timing: None,
                 children: Vec::new(),
             },
         );

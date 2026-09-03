@@ -47,6 +47,10 @@ pub(crate) struct WorkerEnvironment {
     /// opaque origin serializes to "null" and cannot be re-inspected for its
     /// scheme.
     pub secure_context: bool,
+    /// The enforced CSP of the document that created this worker. Worker
+    /// fetches are governed by the creator document's `connect-src`; a frame
+    /// worker must not silently fall back to the top-level page policy.
+    pub document_csp: Option<String>,
     /// Immutable identity copied from the creator realm. The worker installs
     /// it before any author source runs and uses it for its own fetch client.
     pub fingerprint: obscura_net::BrowserFingerprint,
@@ -473,6 +477,7 @@ fn worker_thread_main(
             let worker_name = std::mem::take(&mut environment.name);
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
+            let worker_csp = environment.document_csp.take();
             let worker_shared = environment.shared;
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
             rt.set_fingerprint(&environment.fingerprint);
@@ -502,6 +507,7 @@ fn worker_thread_main(
                 // URL, which describes no origin to inherit from.
                 gs.inherited_origin = Some(worker_origin.clone());
                 gs.inherited_secure_context = worker_secure;
+                gs.document_csp = worker_csp;
                 gs.cookie_jar = environment.cookie_jar;
                 gs.http_client = worker_http_client;
                 gs.callbacks = environment.callbacks;
@@ -919,6 +925,197 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (!found) continue;
       try { defineProperty(workerNav, prop, found); } catch (e) {}
     }
+    if (__OBSCURA_WORKER_SECURE__ && typeof G.StorageManager === 'function'
+        && typeof G.FileSystemHandle === 'function'
+        && typeof G.FileSystemDirectoryHandle === 'function'
+        && typeof G.FileSystemFileHandle === 'function') {
+      var storageBrands = new WeakSet();
+      var handleState = new WeakMap();
+      var syncAccessState = new WeakMap();
+      var rootNode = { kind: 'directory', name: '', parent: null, children: new Map() };
+      var storageManager = Object.create(G.StorageManager.prototype);
+      storageBrands.add(storageManager);
+      var nativeRegistry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+      function nativeMethod(proto, name, length, fn) {
+        try { defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+        try { defineProperty(fn, 'length', { value: length, configurable: true }); } catch (e) {}
+        try { if (nativeRegistry) nativeRegistry.fns.add(fn); } catch (e) {}
+        defineProperty(proto, name, {
+          value: fn, writable: true, enumerable: true, configurable: true,
+        });
+      }
+      function nativeGetter(proto, name, fn) {
+        try { defineProperty(fn, 'name', { value: 'get ' + name, configurable: true }); } catch (e) {}
+        try {
+          if (nativeRegistry) {
+            nativeRegistry.fns.add(fn);
+            nativeRegistry.strings.set(fn, 'function get ' + name + '() { [native code] }');
+          }
+        } catch (e) {}
+        defGet(proto, name, fn, true);
+      }
+      function storageData(value) {
+        if (!storageBrands.has(value)) throw new TypeError('Illegal invocation');
+      }
+      function handleData(value) {
+        var state = handleState.get(value);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+      }
+      function makeHandle(node) {
+        var proto = node.kind === 'directory'
+          ? G.FileSystemDirectoryHandle.prototype : G.FileSystemFileHandle.prototype;
+        var handle = Object.create(proto);
+        handleState.set(handle, node);
+        return handle;
+      }
+      function validName(value) {
+        var name = String(value);
+        if (!name || name === '.' || name === '..' || name.indexOf('/') !== -1) {
+          throw new TypeError('Name is not allowed.');
+        }
+        return name;
+      }
+      var rootHandle = makeHandle(rootNode);
+      var storageCtorDescriptor = Object.getOwnPropertyDescriptor(
+        G.StorageManager.prototype, 'constructor');
+      for (var smi = 0; smi < 4; smi++) {
+        try { delete G.StorageManager.prototype[
+          ['constructor', 'estimate', 'persisted', 'getDirectory'][smi]]; } catch (e) {}
+      }
+      try { delete G.StorageManager.prototype.persist; } catch (e) {}
+      nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
+        storageData(this); return { quota: 5000000000, usage: 0, usageDetails: {} };
+      });
+      nativeMethod(G.StorageManager.prototype, 'persisted', 0, async function () {
+        storageData(this); return false;
+      });
+      if (storageCtorDescriptor) {
+        defineProperty(G.StorageManager.prototype, 'constructor', storageCtorDescriptor);
+      }
+      nativeMethod(G.StorageManager.prototype, 'getDirectory', 0, async function () {
+        storageData(this); return rootHandle;
+      });
+      nativeGetter(G.FileSystemHandle.prototype, 'kind', function () {
+        return handleData(this).kind;
+      });
+      nativeGetter(G.FileSystemHandle.prototype, 'name', function () {
+        return handleData(this).name;
+      });
+      nativeMethod(G.FileSystemHandle.prototype, 'isSameEntry', 1, async function (other) {
+        return handleData(this) === handleData(other);
+      });
+      function child(directory, value, kind, options) {
+        var parent = handleData(directory);
+        if (parent.kind !== 'directory') throw new TypeError('Illegal invocation');
+        var name = validName(value);
+        var node = parent.children.get(name);
+        if (node && node.kind !== kind) throw new DOMException('', 'TypeMismatchError');
+        if (!node) {
+          if (!(options && options.create === true)) throw new DOMException('', 'NotFoundError');
+          node = kind === 'directory'
+            ? { kind: kind, name: name, parent: parent, children: new Map() }
+            : { kind: kind, name: name, parent: parent, bytes: new Uint8Array(0) };
+          parent.children.set(name, node);
+        }
+        return makeHandle(node);
+      }
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', 1,
+        async function (name, options) { return child(this, name, 'directory', options); });
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getFileHandle', 1,
+        async function (name, options) { return child(this, name, 'file', options); });
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'resolve', 1, async function (possible) {
+        var directory = handleData(this), node = handleData(possible), path = [];
+        while (node && node !== directory) { path.unshift(node.name); node = node.parent; }
+        return node === directory ? path : null;
+      });
+      nativeMethod(G.FileSystemFileHandle.prototype, 'getFile', 0, async function () {
+        var node = handleData(this);
+        if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+        return new File([node.bytes], node.name);
+      });
+      var SyncAccessHandle = G.FileSystemSyncAccessHandle;
+      if (typeof SyncAccessHandle !== 'function') {
+        SyncAccessHandle = illegalConstructor('FileSystemSyncAccessHandle');
+        defineProperty(SyncAccessHandle.prototype, Symbol.toStringTag, {
+          value: 'FileSystemSyncAccessHandle', configurable: true,
+        });
+        def(G, 'FileSystemSyncAccessHandle', SyncAccessHandle);
+      }
+      try { if (nativeRegistry) nativeRegistry.fns.add(SyncAccessHandle); } catch (e) {}
+      var syncCtorDescriptor = Object.getOwnPropertyDescriptor(
+        SyncAccessHandle.prototype, 'constructor');
+      for (var sai = 0; sai < 8; sai++) {
+        try { delete SyncAccessHandle.prototype[
+          ['constructor', 'close', 'flush', 'getSize', 'read', 'truncate', 'write', 'mode'][sai]]; }
+        catch (e) {}
+      }
+      function syncData(value) {
+        var state = syncAccessState.get(value);
+        if (!state || state.closed) throw new DOMException('', 'InvalidStateError');
+        return state;
+      }
+      function byteView(value) {
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) {
+          return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        throw new TypeError('The provided value is not of type BufferSource.');
+      }
+      nativeMethod(SyncAccessHandle.prototype, 'close', 0, function () {
+        var state = syncData(this);
+        state.closed = true;
+        state.node.syncOpen = false;
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'flush', 0, function () {
+        syncData(this);
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'getSize', 0, function () {
+        return syncData(this).node.bytes.length;
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'read', 1, function (buffer, options) {
+        var state = syncData(this), out = byteView(buffer);
+        var at = options && options.at !== undefined
+          ? Math.max(0, Number(options.at) || 0) : state.position;
+        var count = Math.min(out.length, Math.max(0, state.node.bytes.length - at));
+        out.set(state.node.bytes.subarray(at, at + count));
+        state.position = at + count;
+        return count;
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'truncate', 1, function (size) {
+        var state = syncData(this);
+        size = Math.max(0, Math.trunc(Number(size) || 0));
+        var next = new Uint8Array(size);
+        next.set(state.node.bytes.subarray(0, size));
+        state.node.bytes = next;
+        state.position = Math.min(state.position, size);
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'write', 1, function (buffer, options) {
+        var state = syncData(this), input = byteView(buffer);
+        var at = options && options.at !== undefined
+          ? Math.max(0, Number(options.at) || 0) : state.position;
+        var size = Math.max(state.node.bytes.length, at + input.length);
+        var next = new Uint8Array(size);
+        next.set(state.node.bytes); next.set(input, at);
+        state.node.bytes = next; state.position = at + input.length;
+        return input.length;
+      });
+      nativeGetter(SyncAccessHandle.prototype, 'mode', function () { syncData(this); return 'readwrite'; });
+      if (syncCtorDescriptor) {
+        defineProperty(SyncAccessHandle.prototype, 'constructor', syncCtorDescriptor);
+      }
+      nativeMethod(G.FileSystemFileHandle.prototype, 'createSyncAccessHandle', 0,
+        async function () {
+          var node = handleData(this);
+          if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+          if (node.syncOpen) throw new DOMException('', 'NoModificationAllowedError');
+          node.syncOpen = true;
+          var access = Object.create(SyncAccessHandle.prototype);
+          syncAccessState.set(access, { node: node, position: 0, closed: false });
+          return access;
+        });
+      nativeGetter(WorkerNavigator.prototype, 'storage', function () { return storageManager; });
+    }
     defineProperty(G, 'navigator', {
       get: function () { return workerNav; },
       enumerable: true, configurable: true,
@@ -971,6 +1168,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   });
   function fire(event, type) {
+    var previousEvent;
+    try { previousEvent = G.event; G.event = event; } catch (_) { previousEvent = undefined; }
+    try {
     var handlerProp = G['on' + type];
     if (typeof handlerProp === 'function') {
       try { handlerProp.call(G, event); }
@@ -984,6 +1184,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (entry.once) removeEventListener(type, entry.original);
       try { entry.handler.call(G, event); }
       catch (e) { try { console.error('Worker ' + type + ' listener error:', e); } catch (_) {} }
+    }
+    } finally {
+      try { G.event = previousEvent; } catch (_) {}
     }
   }
   def(G, 'dispatchEvent', function dispatchEvent(event) {
@@ -1674,6 +1877,52 @@ mod tests {
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
             serde_json::json!(
                 r#"{"navCtor":"WorkerNavigator","navTag":"[object WorkerNavigator]","ua":"string","cores":"number","windowOnly":[],"locCtor":"WorkerLocation","locTag":"[object WorkerLocation]","navMethods":[]}"#
+            ),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn secure_worker_storage_exposes_branded_origin_private_root() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/app/index.html");
+        rt.run_page_init();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage=async()=>{try{" +
+              "const storage=navigator.storage;const root=await storage.getDirectory();" +
+              "const child=await root.getDirectoryHandle('sub',{create:true});" +
+              "const file=await root.getFileHandle('probe.bin',{create:true});" +
+              "const access=await file.createSyncAccessHandle();" +
+              "const written=access.write(new Uint8Array([7,8,9]),{at:0});access.flush();" +
+              "const readBytes=new Uint8Array(3);const read=access.read(readBytes,{at:0});" +
+              "postMessage({navOwn:Object.prototype.hasOwnProperty.call(navigator,'storage')," +
+              "storageTag:Object.prototype.toString.call(storage)," +
+              "storageInstance:storage instanceof StorageManager," +
+              "storageProto:Object.getOwnPropertyNames(StorageManager.prototype)," +
+              "rootTag:Object.prototype.toString.call(root),kind:root.kind,name:root.name," +
+              "directory:root instanceof FileSystemDirectoryHandle," +
+              "handle:root instanceof FileSystemHandle,stable:storage===navigator.storage," +
+              "resolve:await root.resolve(child),syncTag:Object.prototype.toString.call(access)," +
+              "syncInstance:access instanceof FileSystemSyncAccessHandle," +
+              "syncOwn:Object.getOwnPropertyNames(access)," +
+              "syncProto:Object.getOwnPropertyNames(FileSystemSyncAccessHandle.prototype)," +
+              "written,read,bytes:Array.from(readBytes),size:access.getSize(),mode:access.mode});" +
+              "access.close();}catch(error){postMessage({error:error.name+': '+error.message})}}";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            const worker = new Worker(url);
+            worker.onmessage = (event) => { globalThis.__got.push(event.data); };
+            worker.postMessage(1);
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"navOwn":false,"storageTag":"[object StorageManager]","storageInstance":true,"storageProto":["estimate","persisted","constructor","getDirectory"],"rootTag":"[object FileSystemDirectoryHandle]","kind":"directory","name":"","directory":true,"handle":true,"stable":true,"resolve":["sub"],"syncTag":"[object FileSystemSyncAccessHandle]","syncInstance":true,"syncOwn":[],"syncProto":["close","flush","getSize","read","truncate","write","mode","constructor"],"written":3,"read":3,"bytes":[7,8,9],"size":3,"mode":"readwrite"}"#
             ),
         );
     }

@@ -11,6 +11,8 @@ struct InputDispatchTarget {
 }
 
 fn input_dispatch_target(page: &mut Page, x: f64, y: f64) -> InputDispatchTarget {
+    #[cfg(not(feature = "render"))]
+    let _ = page;
     #[cfg(feature = "render")]
     if let Some((Some(frame), node, local_x, local_y)) =
         page.input_target_at_point(x as f32, y as f32)
@@ -109,11 +111,17 @@ fn input_target_js(target: &InputDispatchTarget, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+// Turnstile (and ordinary accessible controls) may put an aria-hidden visual
+// layer inside a label above the actual form control. CSS pointer-events:none
+// makes the control the hit target in Chromium; resolve the same relationship
+// for renderer hit-tests that cannot see computed pointer-events yet.
+const LABEL_CONTROL_TARGET_JS: &str = "if (target && target.getAttribute && target.getAttribute('aria-hidden') === 'true') { var label = target.closest ? target.closest('label') : null; var LABELABLE = 'input,button,select,textarea'; var control = label && label.querySelector ? label.querySelector(LABELABLE) : null; /* Closed-shadow trees can expose the composed parent as label while keeping the control in the sibling chain. */ if (!control) { var sibling = target; for (var si = 0; si < 8 && sibling; si++) { sibling = sibling.nextElementSibling || sibling.nextSibling || null; if (sibling && sibling.matches && sibling.matches(LABELABLE)) { control = sibling; break; } } } if (!control && label && label.parentElement && label.parentElement.querySelector) control = label.parentElement.querySelector(LABELABLE); if (control && !(control.matches && control.matches(':disabled'))) target = control; }";
+
 fn mouse_hover_exit_js(x: f64, y: f64, sx: f64, sy: f64) -> String {
     format!(
         "(function() {{\
-            var old = globalThis.__obscura_hover_target;\
-            globalThis.__obscura_hover_target = null;\
+            var old = globalThis[Symbol.for('obscura.inputHoverTarget')];\
+            globalThis[Symbol.for('obscura.inputHoverTarget')] = null;\
             if (!old) return;\
             function path(node) {{\
                 var result = [];\
@@ -134,11 +142,13 @@ fn mouse_hover_exit_js(x: f64, y: f64, sx: f64, sy: f64) -> String {
 }
 
 fn mouse_hover_move_js(target_js: &str, x: f64, y: f64, sx: f64, sy: f64) -> String {
+    let click_through = LABEL_CONTROL_TARGET_JS;
     format!(
         "(function() {{\
             var target = {target_js};\
+            {click_through}\
             if (!target) return;\
-            var old = globalThis.__obscura_hover_target || null;\
+            var old = globalThis[Symbol.for('obscura.inputHoverTarget')] || null;\
             function path(node) {{\
                 var result = [];\
                 while (node) {{\
@@ -173,7 +183,7 @@ fn mouse_hover_move_js(target_js: &str, x: f64, y: f64, sx: f64, sy: f64) -> Str
                 enterPointer.relatedTarget = old;\
                 target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, pointer, {{button:0}}))));\
                 for (var nm = ni; nm >= 0; nm--) newPath[nm].dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, enterPointer, {{button:0}}))));\
-                globalThis.__obscura_hover_target = target;\
+                globalThis[Symbol.for('obscura.inputHoverTarget')] = target;\
             }}\
             pointer.relatedTarget = null;\
             target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', pointer)));\
@@ -277,6 +287,8 @@ pub async fn handle(
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let screen_x = x;
+            let screen_y = y;
             let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
             let button_code = mouse_button_code(button);
             let buttons = params
@@ -290,22 +302,34 @@ pub async fn handle(
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let target = input_dispatch_target(page, x, y);
+                    tracing::debug!(
+                        global_x = x,
+                        global_y = y,
+                        frame = ?target.frame,
+                        node = ?target.node,
+                        local_x = target.x,
+                        local_y = target.y,
+                        "input mouse press hit-test"
+                    );
                     page.set_input_frame_target(target.frame.clone());
                     let target_js = input_target_js(
                         &target,
-                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body"),
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis[Symbol.for('obscura.inputClickTarget')] || document.activeElement || document.body"),
                     );
+                    let down_node = target.node.map(i64::from).unwrap_or(-1);
+                    let click_through = LABEL_CONTROL_TARGET_JS;
                     let code = format!(
                         "(function() {{\
                             var target = {target_js};\
+                            {click_through}\
                             if (!target) return;\
-                            globalThis.__obscura_click_target = target;\
-                            globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
+                            globalThis[Symbol.for('obscura.inputClickTarget')] = target;\
+                            globalThis[Symbol.for('obscura.inputMouseDown')] = {{target:target,nodeId:{down_node},button:{button_code},clickCount:{click_count}}};\
                             var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(true),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
                             var disabledControl = target.matches && target.matches(':disabled');\
                             var pointerAllowed = target.dispatchEvent(pevt);\
                             var suppressMouse = disabledControl || !pointerAllowed;\
-                            globalThis.__obscura_mouse_down.suppressMouse = suppressMouse;\
+                            globalThis[Symbol.for('obscura.inputMouseDown')].suppressMouse = suppressMouse;\
                             if (!suppressMouse) {{\
                                 var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
@@ -313,9 +337,10 @@ pub async fn handle(
                         }})()",
                         x = target.x,
                         y = target.y,
-                        sx = x,
-                        sy = y,
+                        sx = screen_x,
+                        sy = screen_y,
                         target_js = target_js,
+                        click_through = click_through,
                         button_code = button_code,
                         buttons = buttons,
                         click_count = click_count,
@@ -323,32 +348,51 @@ pub async fn handle(
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        down_node = down_node,
                     );
                     evaluate_input_script(page, &target, &code);
                 }
             } else if event_type == "mouseReleased" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let target = input_dispatch_target(page, x, y);
+                    tracing::debug!(
+                        global_x = x,
+                        global_y = y,
+                        frame = ?target.frame,
+                        node = ?target.node,
+                        local_x = target.x,
+                        local_y = target.y,
+                        "input mouse release hit-test"
+                    );
                     let target_js = input_target_js(
                         &target,
-                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body"),
+                        &format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis[Symbol.for('obscura.inputClickTarget')] || document.activeElement || document.body"),
                     );
+                    let release_node = target.node.map(i64::from).unwrap_or(-1);
+                    let click_through = LABEL_CONTROL_TARGET_JS;
                     let code = format!(
                         "(function() {{\
                             var target = {target_js};\
+                            {click_through}\
                             if (!target) return;\
-                            var down = globalThis.__obscura_mouse_down;\
-                            globalThis.__obscura_mouse_down = null;\
+                            var down = globalThis[Symbol.for('obscura.inputMouseDown')];\
+                            globalThis[Symbol.for('obscura.inputMouseDown')] = null;\
                             var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:0,detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
                             target.dispatchEvent(pevt);\
+                            if (globalThis.__obscura_pointer_release) globalThis.__obscura_pointer_release();\
                             if (!down || !down.suppressMouse) {{\
                                 var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                             }}\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
-                            while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
-                                clickTarget = clickTarget.parentElement;\
+                            /* Wrappers from separate Rust-to-JS projections may not share JS\
+                               identity even when they represent the same DOM node. Compare the\
+                               stable node id first so a frame click does not climb to <body>. */\
+                            if (!(down.nodeId >= 0 && down.nodeId === {release_node})) {{\
+                                while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
+                                    clickTarget = clickTarget.parentElement;\
+                                }}\
                             }}\
                             if (!clickTarget) return;\
                             if (clickTarget.matches && clickTarget.matches(':disabled')) return;\
@@ -374,7 +418,7 @@ pub async fn handle(
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
                             }}\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var click = globalThis.__obscura_markTrusted(new PointerEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:false,width:1,height:1,pressure:0,tiltX:0,tiltY:0,twist:0,altitudeAngle:1.5707963267948966,azimuthAngle:0,tangentialPressure:0}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
@@ -408,15 +452,17 @@ pub async fn handle(
                         label_activation = LABEL_ACTIVATION_JS,
                         x = target.x,
                         y = target.y,
-                        sx = x,
-                        sy = y,
+                        sx = screen_x,
+                        sy = screen_y,
                         target_js = target_js,
+                        click_through = click_through,
                         button_code = button_code,
                         click_count = click_count,
                         alt_key = alt_key,
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        release_node = release_node,
                     );
                     evaluate_input_script(page, &target, &code);
                     page.process_pending_navigation().await.map_err(|e| e.to_string())?;

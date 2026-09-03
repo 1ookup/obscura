@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct BrowserFingerprint {
     pub user_agent: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default = "default_languages")]
+    pub languages: Vec<String>,
     pub browser_version: String,
     pub browser_major: u32,
     pub navigator_platform: String,
@@ -39,7 +43,23 @@ pub struct ScreenFingerprint {
     pub height: u32,
     pub avail_width: u32,
     pub avail_height: u32,
+    /// Optional screen work-area origin. Zero preserves the historical
+    /// headless fallback; embedders can provide the host menu-bar offset.
+    #[serde(default)]
+    pub avail_top: i32,
+    #[serde(default)]
+    pub avail_left: i32,
     pub device_scale_factor: f64,
+    /// Optional top-level window metrics. Zero keeps the historical derived
+    /// values; non-zero values let an embedder mirror its actual host window.
+    #[serde(default)]
+    pub outer_width: u32,
+    #[serde(default)]
+    pub outer_height: u32,
+    #[serde(default)]
+    pub screen_x: i32,
+    #[serde(default)]
+    pub screen_y: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +83,8 @@ pub struct GpuFingerprint {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FingerprintOverrides {
+    pub language: Option<String>,
+    pub languages: Option<Vec<String>>,
     pub browser_version: Option<String>,
     pub navigator_platform: Option<String>,
     pub ua_platform: Option<String>,
@@ -83,21 +105,54 @@ pub struct FingerprintOverrides {
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
+fn default_language() -> String {
+    "en-US".to_string()
+}
+
+fn default_languages() -> Vec<String> {
+    vec!["en-US".to_string(), "en".to_string()]
+}
+
 /// Overrides from `OBSCURA_FINGERPRINT_JSON`, the transport the `--fingerprint`
 /// CLI flag uses to reach every worker process without threading a new
 /// argument through each entry point. Malformed JSON yields empty overrides
 /// with the parse error on stderr rather than aborting a running pipeline.
 pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
-    let Ok(raw) = std::env::var("OBSCURA_FINGERPRINT_JSON") else {
-        return FingerprintOverrides::default();
+    let mut overrides = match std::env::var("OBSCURA_FINGERPRINT_JSON") {
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(overrides) => overrides,
+            Err(err) => {
+                eprintln!("obscura: ignoring invalid OBSCURA_FINGERPRINT_JSON: {err}");
+                FingerprintOverrides::default()
+            }
+        },
+        Err(_) => FingerprintOverrides::default(),
     };
-    match serde_json::from_str(&raw) {
-        Ok(overrides) => overrides,
-        Err(err) => {
-            eprintln!("obscura: ignoring invalid OBSCURA_FINGERPRINT_JSON: {err}");
-            FingerprintOverrides::default()
+    // Language is deliberately a separate, small override because it is a
+    // common per-session setting and must stay synchronized across JS realms,
+    // workers, and HTTP headers. OBSCURA_FINGERPRINT_JSON still wins when no
+    // dedicated environment value is supplied.
+    if let Ok(language) = std::env::var("OBSCURA_LANGUAGE") {
+        let language = language.trim().to_string();
+        if !language.is_empty() {
+            overrides.language = Some(language.clone());
+            if std::env::var("OBSCURA_LANGUAGES").is_err() {
+                overrides.languages = Some(vec![language]);
+            }
         }
     }
+    if let Ok(raw) = std::env::var("OBSCURA_LANGUAGES") {
+        let languages: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !languages.is_empty() {
+            overrides.languages = Some(languages);
+        }
+    }
+    overrides
 }
 
 /// UA-CH platform-version claims a reduced User-Agent cannot encode: the UA
@@ -137,6 +192,8 @@ impl BrowserFingerprint {
             let model = android_model(&user_agent);
             BrowserFingerprint {
                 user_agent,
+                language: default_language(),
+                languages: default_languages(),
                 browser_version,
                 browser_major,
                 navigator_platform: "Linux armv81".to_string(),
@@ -156,7 +213,13 @@ impl BrowserFingerprint {
                     height: 915,
                     avail_width: 412,
                     avail_height: 915,
+                    avail_top: 0,
+                    avail_left: 0,
                     device_scale_factor: 2.625,
+                    outer_width: 0,
+                    outer_height: 0,
+                    screen_x: 0,
+                    screen_y: 0,
                 },
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Qualcomm)".to_string(),
@@ -170,6 +233,8 @@ impl BrowserFingerprint {
             let bitness = if wow64 { "32" } else if user_agent.contains("Win64") || arm64 { "64" } else { "32" };
             BrowserFingerprint {
                 user_agent,
+                language: default_language(),
+                languages: default_languages(),
                 browser_version,
                 browser_major,
                 navigator_platform: "Win32".to_string(),
@@ -198,6 +263,8 @@ impl BrowserFingerprint {
             // profile; an Intel Mac identity is a FingerprintOverrides job.
             BrowserFingerprint {
                 user_agent,
+                language: default_language(),
+                languages: default_languages(),
                 browser_version,
                 browser_major,
                 navigator_platform: "MacIntel".to_string(),
@@ -217,7 +284,13 @@ impl BrowserFingerprint {
                     height: 900,
                     avail_width: 1440,
                     avail_height: 900,
+                    avail_top: 0,
+                    avail_left: 0,
                     device_scale_factor: 2.0,
+                    outer_width: 0,
+                    outer_height: 0,
+                    screen_x: 0,
+                    screen_y: 0,
                 },
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Apple)".to_string(),
@@ -229,6 +302,8 @@ impl BrowserFingerprint {
             let arm64 = user_agent.contains("aarch64") || user_agent.contains("arm64");
             BrowserFingerprint {
                 user_agent,
+                language: default_language(),
+                languages: default_languages(),
                 browser_version,
                 browser_major,
                 navigator_platform: if arm64 { "Linux aarch64" } else { "Linux x86_64" }.to_string(),
@@ -253,6 +328,8 @@ impl BrowserFingerprint {
         } else {
             BrowserFingerprint {
                 user_agent,
+                language: default_language(),
+                languages: default_languages(),
                 browser_version,
                 browser_major,
                 navigator_platform: String::new(),
@@ -280,6 +357,8 @@ impl BrowserFingerprint {
     }
 
     pub fn with_overrides(mut self, overrides: &FingerprintOverrides) -> Self {
+        let language_overridden = overrides.language.is_some();
+        let languages_overridden = overrides.languages.is_some();
         macro_rules! replace {
             ($field:ident) => {
                 if let Some(value) = &overrides.$field {
@@ -287,6 +366,8 @@ impl BrowserFingerprint {
                 }
             };
         }
+        replace!(language);
+        replace!(languages);
         replace!(browser_version);
         replace!(navigator_platform);
         replace!(ua_platform);
@@ -314,7 +395,44 @@ impl BrowserFingerprint {
                 },
             }).collect();
         }
+        if language_overridden && !languages_overridden {
+            self.languages = vec![self.language.clone()];
+        } else if languages_overridden && !language_overridden {
+            if let Some(first) = self.languages.first().filter(|value| !value.is_empty()) {
+                self.language = first.clone();
+            }
+        }
+        if self.language.trim().is_empty() {
+            self.language = default_language();
+        }
+        if self.languages.is_empty() {
+            self.languages = vec![self.language.clone()];
+        }
         self
+    }
+
+    /// Serialize the browser's language preference in the same order as
+    /// `navigator.languages`. The first entry is unweighted; later entries
+    /// use Chrome's conventional descending q-values.
+    pub fn accept_language(&self) -> String {
+        let languages = if self.languages.is_empty() {
+            std::slice::from_ref(&self.language)
+        } else {
+            &self.languages
+        };
+        languages
+            .iter()
+            .enumerate()
+            .map(|(index, language)| {
+                if index == 0 {
+                    language.clone()
+                } else {
+                    let quality = (10_u32.saturating_sub(index as u32)).max(1);
+                    format!("{language};q=0.{}", quality)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn sec_ch_ua(&self) -> String {
@@ -338,7 +456,13 @@ fn desktop_screen(device_scale_factor: f64) -> ScreenFingerprint {
         height: 1080,
         avail_width: 1920,
         avail_height: 1080,
+        avail_top: 0,
+        avail_left: 0,
         device_scale_factor,
+        outer_width: 0,
+        outer_height: 0,
+        screen_x: 0,
+        screen_y: 0,
     }
 }
 
@@ -416,6 +540,9 @@ mod tests {
     #[test]
     fn default_is_a_macos_chrome_149_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
+        assert_eq!(fingerprint.language, "en-US");
+        assert_eq!(fingerprint.languages, vec!["en-US", "en"]);
+        assert_eq!(fingerprint.accept_language(), "en-US,en;q=0.9");
         assert_eq!(fingerprint.navigator_platform, "MacIntel");
         assert_eq!(fingerprint.ua_platform, "macOS");
         assert_eq!(fingerprint.ua_platform_version, MACOS_UA_PLATFORM_VERSION);
@@ -484,7 +611,13 @@ mod tests {
                 height: 1440,
                 avail_width: 2560,
                 avail_height: 1400,
+                avail_top: 0,
+                avail_left: 0,
                 device_scale_factor: 2.0,
+                outer_width: 0,
+                outer_height: 0,
+                screen_x: 0,
+                screen_y: 0,
             }),
             ..FingerprintOverrides::default()
         });
@@ -494,6 +627,24 @@ mod tests {
         assert_eq!(fingerprint.architecture, "arm");
         assert_eq!(fingerprint.hardware_concurrency, 12);
         assert_eq!(fingerprint.screen.device_scale_factor, 2.0);
+    }
+
+    #[test]
+    fn language_override_keeps_navigator_and_request_header_in_sync() {
+        let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
+            language: Some("zh-CN".to_string()),
+            ..FingerprintOverrides::default()
+        });
+        assert_eq!(fingerprint.language, "zh-CN");
+        assert_eq!(fingerprint.languages, vec!["zh-CN"]);
+        assert_eq!(fingerprint.accept_language(), "zh-CN");
+
+        let languages = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
+            languages: Some(vec!["zh-CN".to_string(), "en-US".to_string()]),
+            ..FingerprintOverrides::default()
+        });
+        assert_eq!(languages.language, "zh-CN");
+        assert_eq!(languages.accept_language(), "zh-CN,en-US;q=0.9");
     }
 
     #[test]

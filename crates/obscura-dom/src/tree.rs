@@ -259,8 +259,13 @@ pub struct DocumentScope {
     pub url: String,
     pub origin: Origin,
     pub base_url: String,
+    /// Raw Last-Modified response header for this committed document.
+    pub last_modified: Option<String>,
     pub sandbox: SandboxFlags,
     pub csp: Option<String>,
+    /// Raw Permissions-Policy header for this document, used by the JS
+    /// FeaturePolicy/PermissionsPolicy wrappers and frame inheritance.
+    pub permissions_policy: Option<String>,
     /// Referrer-Policy selected by the response/document metadata.
     pub referrer_policy: String,
     /// Referrer value exposed by this document's environment settings object.
@@ -271,6 +276,10 @@ pub struct DocumentScope {
     pub document_generation: u64,
     /// Whether this content document was parsed in (full) quirks mode.
     pub quirks: bool,
+    /// Whether this document's own response grants cross-origin isolation.
+    /// about:blank and srcdoc documents inherit the creator's value; network
+    /// documents derive it from their COOP/COEP response headers.
+    pub cross_origin_isolated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2418,13 +2427,16 @@ mod tests {
                 url: "https://frame.example/".into(),
                 origin: Origin::from_url("https://frame.example/"),
                 base_url: "https://frame.example/".into(),
+                last_modified: None,
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                permissions_policy: None,
                 referrer_policy: "strict-origin-when-cross-origin".into(),
                 referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,
+                cross_origin_isolated: false,
             },
         );
 
@@ -2503,13 +2515,16 @@ mod tests {
                 url: "about:blank".into(),
                 origin: Origin::Opaque(OpaqueOriginId::new()),
                 base_url: "about:blank".into(),
+                last_modified: None,
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                permissions_policy: None,
                 referrer_policy: "strict-origin-when-cross-origin".into(),
                 referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,
+                cross_origin_isolated: false,
             },
         );
 

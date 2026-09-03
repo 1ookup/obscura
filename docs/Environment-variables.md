@@ -58,6 +58,19 @@ Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`
 OBSCURA_TIMEZONE=America/New_York obscura serve
 ```
 
+### `OBSCURA_LANGUAGE` / `OBSCURA_LANGUAGES` / `OBSCURA_LOCALE`
+
+Set the browser language preference consistently across `navigator.language`,
+`navigator.languages`, iframe and worker realms, and the `Accept-Language`
+request header and V8/ICU's default locale. `OBSCURA_LANGUAGE` sets a single preferred language; use the
+comma-separated `OBSCURA_LANGUAGES` form when the browser advertises fallbacks.
+The default remains `en-US,en`. `OBSCURA_LOCALE` can pin an explicit host locale
+when the language tag is not one of the built-in mappings.
+
+```bash
+OBSCURA_LANGUAGE=zh-CN OBSCURA_TIMEZONE=Asia/Shanghai obscura serve
+```
+
 ### `OBSCURA_GEOLOCATION`
 
 Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`. Without it the shim reports a fixed default. Keep it consistent with `OBSCURA_TIMEZONE` and the proxy region.

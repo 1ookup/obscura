@@ -307,6 +307,9 @@ pub struct DomLayout {
     /// per-document render roots can coexist on one arena.
     pub root: NodeId,
     pub rects: HashMap<NodeId, Rect>,
+    /// Unrounded Taffy border boxes exposed only through CSSOM View. Paint,
+    /// hit testing, scroll extents, and layout convergence keep using rects.
+    pub cssom_rects: HashMap<NodeId, Rect>,
     /// Per-line border-box fragments for ordinary non-replaced inline
     /// elements. `rects` retains their union for `getBoundingClientRect()`;
     /// this list is the source for background/border painting and
@@ -4736,6 +4739,7 @@ fn layout_dom_once(
         .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
 
     let mut rects = HashMap::new();
+    let mut cssom_rects = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
     // Final absolute rects of anonymous inline-run leaves, keyed by the
@@ -6978,6 +6982,35 @@ fn layout_dom_once(
                 &generated_nodes,
                 &mut generated_rects,
             );
+            compute_absolute_unrounded_rects(
+                &taffy_tree,
+                taffy_root,
+                initial_cb_x,
+                0.0,
+                &id_map,
+                &mut cssom_rects,
+            );
+            // Taffy intentionally keeps the engine's established rounded
+            // intrinsic sizing for reflow and paint. CSSOM View, however,
+            // exposes the shaped 26.6 advance for auto-sized inline formatting
+            // contexts. Replace only the matching rounded text width.
+            for (&nid, &idx) in &ifc_items.whole {
+                let Some(rect) = cssom_rects.get_mut(&nid) else {
+                    continue;
+                };
+                let Some(style) = styles.get(&nid) else {
+                    continue;
+                };
+                let advance = engine.measure_canvas_width(idx);
+                let edges = style.padding.left
+                    + style.padding.right
+                    + style.border.left
+                    + style.border.right;
+                let rounded = rects.get(&nid).map(|value| value.width).unwrap_or(rect.width);
+                if (rounded - (advance.ceil() + edges)).abs() <= 0.01 {
+                    rect.width = advance + edges;
+                }
+            }
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
             synthesize_row_rects(tree, layout_root, &mut rects);
         }
@@ -7175,6 +7208,7 @@ fn layout_dom_once(
         DomLayout {
             root: layout_root,
             rects,
+            cssom_rects,
             inline_fragments,
             styles,
             custom_properties,
@@ -8199,6 +8233,35 @@ fn resolve_named_placement(
             start: line(s),
             end: taffy::GridPlacement::Auto,
         })
+    }
+}
+
+fn compute_absolute_unrounded_rects(
+    taffy_tree: &TaffyTree<usize>,
+    taffy_id: taffy::NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    rects: &mut HashMap<NodeId, Rect>,
+) {
+    let layout = taffy_tree.unrounded_layout(taffy_id);
+    let x = abs_x + layout.location.x;
+    let y = abs_y + layout.location.y;
+    if let Some(dom_id) = id_map.get(&taffy_id) {
+        rects.insert(
+            *dom_id,
+            Rect {
+                x,
+                y,
+                width: layout.size.width,
+                height: layout.size.height,
+            },
+        );
+    }
+    for child_id in taffy_tree.children(taffy_id).unwrap_or_default() {
+        compute_absolute_unrounded_rects(
+            taffy_tree, child_id, x, y, id_map, rects,
+        );
     }
 }
 

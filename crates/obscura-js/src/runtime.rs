@@ -9,6 +9,18 @@ use obscura_dom::{DomTree, NodeId};
 /// isolate handle without taking a direct dependency on deno_core.
 pub use deno_core::v8::IsolateHandle;
 
+#[derive(Clone, Debug)]
+pub struct DebuggerScript {
+    pub script_id: String,
+    pub url: String,
+    pub start_line: i64,
+    pub start_column: i64,
+    pub end_line: i64,
+    pub end_column: i64,
+    pub hash: String,
+    pub length: u64,
+}
+
 use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
@@ -21,6 +33,50 @@ use crate::ops::{
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
+
+fn callsite_source_name<'s>(
+    scope: &mut deno_core::v8::HandleScope<'s>,
+    callsite: deno_core::v8::Local<'s, deno_core::v8::Object>,
+) -> Option<String> {
+    for method_name in ["getScriptNameOrSourceURL", "getFileName"] {
+        let key = deno_core::v8::String::new(scope, method_name)?;
+        let method = callsite
+            .get(scope, key.into())
+            .and_then(|value| deno_core::v8::Local::<deno_core::v8::Function>::try_from(value).ok());
+        let Some(method) = method else { continue };
+        let value = method.call(scope, callsite.into(), &[])?;
+        if !value.is_null_or_undefined() {
+            return Some(value.to_rust_string_lossy(scope));
+        }
+    }
+    None
+}
+
+fn obscura_prepare_stack_trace_callback<'s>(
+    scope: &mut deno_core::v8::HandleScope<'s>,
+    error: deno_core::v8::Local<'s, deno_core::v8::Value>,
+    callsites: deno_core::v8::Local<'s, deno_core::v8::Array>,
+) -> deno_core::v8::Local<'s, deno_core::v8::Value> {
+    let mut visible = Vec::with_capacity(callsites.length() as usize);
+    for index in 0..callsites.length() {
+        let Some(callsite) = callsites
+            .get_index(scope, index)
+            .and_then(|value| deno_core::v8::Local::<deno_core::v8::Object>::try_from(value).ok())
+        else {
+            continue;
+        };
+        let internal = callsite_source_name(scope, callsite).is_some_and(|source| {
+            source.starts_with("<obscura:")
+                || source.starts_with("ext:")
+                || source.starts_with("deno:")
+        });
+        if !internal {
+            visible.push(callsite.into());
+        }
+    }
+    let callsites = deno_core::v8::Array::new_with_elements(scope, &visible);
+    deno_core::error::prepare_stack_trace_callback(scope, error, callsites)
+}
 
 #[cfg(feature = "render")]
 struct RuntimeCanvasSurfaceSource<'a>(
@@ -564,6 +620,16 @@ impl ObscuraJsRuntime {
             runtime
                 .v8_isolate()
                 .set_modify_code_generation_from_strings_callback();
+            // Route every eval()/Function string through the callback so the
+            // realm-local CSP `unsafe-eval` flag can be enforced. The callback
+            // explicitly allows ordinary strings when no policy blocks them.
+            runtime
+                .handle_scope()
+                .get_current_context()
+                .set_allow_generation_from_strings(false);
+            runtime
+                .v8_isolate()
+                .set_prepare_stack_trace_callback(obscura_prepare_stack_trace_callback);
 
             runtime.op_state().borrow_mut().put(state_clone);
 
@@ -725,6 +791,23 @@ impl ObscuraJsRuntime {
     /// read their own policy from `document_scope_info`.
     pub fn set_content_security_policy(&self, csp: Option<&str>) {
         self.state.borrow_mut().document_csp = csp.map(str::to_string);
+    }
+
+    /// Set the raw Permissions-Policy header for the top-level document.
+    /// Frame documents keep their own value in DocumentScope.
+    pub fn set_permissions_policy(&self, policy: Option<&str>) {
+        self.state.borrow_mut().document_permissions_policy = policy.map(str::to_string);
+    }
+
+    pub fn set_cross_origin_isolated(&self, isolated: bool) {
+        self.state.borrow_mut().cross_origin_isolated = isolated;
+    }
+
+    /// Set the raw Last-Modified response header for the top-level document.
+    /// The JS getter parses it in the realm's local timezone and falls back to
+    /// document creation time when the value is absent or invalid.
+    pub fn set_last_modified(&self, value: Option<&str>) {
+        self.state.borrow_mut().document_last_modified = value.map(str::to_string);
     }
 
     /// Set the document's character encoding (WHATWG canonical name). Backs
@@ -1341,7 +1424,9 @@ impl ObscuraJsRuntime {
     /// browser layer can then fetch them concurrently through the page-owned
     /// transport before synchronous layout or paint observes the cache.
     #[cfg(feature = "render")]
-    pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
+    pub fn pending_render_image_urls(
+        &self,
+    ) -> Vec<(String, crate::ops::ImageRequestProfile, obscura_dom::NodeId)> {
         let state = self.state.borrow();
         let base_url = document_base_url(&state);
         let Some(dom) = state.dom.as_ref() else {
@@ -1406,11 +1491,15 @@ impl ObscuraJsRuntime {
                     continue;
                 };
                 if !known && !url.starts_with("data:") {
-                    urls.push((url, profile));
+                    urls.push((url, profile, root));
                 }
             }
         }
-        urls.sort();
+        urls.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.2.raw().cmp(&right.2.raw()))
+        });
         urls.dedup();
         urls
     }
@@ -2826,6 +2915,86 @@ impl ObscuraJsRuntime {
         self.execute_classic_script(name, source)
     }
 
+    async fn inspector_post_message(
+        &mut self,
+        session: &mut deno_core::LocalInspectorSession,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let request = Box::pin(session.post_message(method, params));
+        self.runtime
+            .with_event_loop_future(request, deno_core::PollEventLoopOptions::default())
+            .await
+            .map_err(|error| format!("inspector {method} failed: {error}"))
+    }
+
+    fn local_inspector_session(&mut self) -> deno_core::LocalInspectorSession {
+        self.runtime.maybe_init_inspector();
+        self.runtime
+            .inspector()
+            .borrow()
+            .create_local_session(deno_core::InspectorSessionOptions {
+                kind: deno_core::InspectorSessionKind::NonBlocking {
+                    wait_for_disconnect: false,
+                },
+            })
+    }
+
+    pub fn enable_debugger(&mut self) {
+        self.runtime.maybe_init_inspector();
+    }
+
+    /// Snapshot every script V8 currently retains in this isolate. This also
+    /// includes scripts compiled through page `eval()`/`Function`, which do not
+    /// pass through the embedder's classic-script execution methods.
+    pub async fn debugger_scripts(&mut self) -> Result<Vec<DebuggerScript>, String> {
+        let mut session = self.local_inspector_session();
+        let mut notifications = session.take_notification_rx();
+        self.inspector_post_message(&mut session, "Debugger.enable", None)
+            .await?;
+
+        let mut scripts = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if notification.get("method").and_then(serde_json::Value::as_str)
+                != Some("Debugger.scriptParsed")
+            {
+                continue;
+            }
+            let Some(params) = notification.get("params") else { continue };
+            let Some(script_id) = params.get("scriptId").and_then(serde_json::Value::as_str)
+            else { continue };
+            scripts.push(DebuggerScript {
+                script_id: script_id.to_string(),
+                url: params.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                start_line: params.get("startLine").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                start_column: params.get("startColumn").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                end_line: params.get("endLine").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                end_column: params.get("endColumn").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                hash: params.get("hash").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                length: params.get("length").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            });
+        }
+        Ok(scripts)
+    }
+
+    pub async fn debugger_script_source(&mut self, script_id: &str) -> Result<String, String> {
+        let mut session = self.local_inspector_session();
+        self.inspector_post_message(&mut session, "Debugger.enable", None)
+            .await?;
+        let result = self
+            .inspector_post_message(
+                &mut session,
+                "Debugger.getScriptSource",
+                Some(serde_json::json!({"scriptId": script_id})),
+            )
+            .await?;
+        result
+            .get("scriptSource")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "inspector response did not contain scriptSource".to_string())
+    }
+
     /// Execute a classic script with the parser-provided document line of its
     /// first source line. External scripts pass zero; inline scripts pass the
     /// HTML start-tag line minus one.
@@ -4223,6 +4392,873 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_legacy_and_capability_methods_match_chrome_shape_and_defaults() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const lengths = {
+                        ariaNotify: 1, browsingTopics: 0,
+                        hasUnpartitionedCookieAccess: 0,
+                        captureEvents: 0, releaseEvents: 0, clear: 0,
+                        exitPointerLock: 0, webkitCancelFullScreen: 0,
+                        webkitExitFullscreen: 0, queryCommandEnabled: 1,
+                        queryCommandIndeterm: 1, queryCommandState: 1,
+                        queryCommandSupported: 1, queryCommandValue: 1,
+                    };
+                    const descriptors = Object.entries(lengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        let constructError = null;
+                        try { Reflect.construct(descriptor.value, []); }
+                        catch (error) { constructError = error.name; }
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                            Function.prototype.toString.call(descriptor.value), constructError];
+                    });
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    const syncNames = ['captureEvents', 'releaseEvents', 'clear',
+                        'exitPointerLock', 'webkitCancelFullScreen', 'webkitExitFullscreen'];
+                    const sync = Object.fromEntries(syncNames.map(name => [name, [
+                        typeof document[name](),
+                        (() => { try { Document.prototype[name].call({}); return null; }
+                                  catch (error) { return error.name; } })(),
+                    ]]));
+                    const idle = {
+                        bold: [document.queryCommandEnabled('bold'),
+                            document.queryCommandState('bold'),
+                            document.queryCommandValue('bold')],
+                        selectAll: document.queryCommandEnabled('selectAll'),
+                        styleWithCSS: document.queryCommandEnabled('styleWithCSS'),
+                        unknown: [document.queryCommandEnabled('unknown'),
+                            document.queryCommandSupported('unknown'),
+                            document.queryCommandValue('unknown')],
+                    };
+                    const editable = document.createElement('div');
+                    editable.contentEditable = 'true';
+                    editable.innerHTML = '<b>bold</b> plain';
+                    document.body.appendChild(editable);
+                    editable.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(editable.firstChild);
+                    const selection = document.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return {
+                        descriptors,
+                        sync,
+                        topics: await document.browsingTopics(),
+                        topicsPromise: document.browsingTopics() instanceof Promise,
+                        unpartitioned: await document.hasUnpartitionedCookieAccess(),
+                        unpartitionedPromise:
+                            document.hasUnpartitionedCookieAccess() instanceof Promise,
+                        aria: typeof document.ariaNotify('updated'),
+                        ariaMissing: await outcome(() => document.ariaNotify()),
+                        syncBadReceiver: await outcome(() =>
+                            Document.prototype.clear.call({})),
+                        asyncBadReceiver: await outcome(() =>
+                            Document.prototype.browsingTopics.call({})),
+                        queryMissing: await outcome(() => document.queryCommandEnabled()),
+                        idle,
+                        editable: {
+                            bold: [document.queryCommandEnabled('bold'),
+                                document.queryCommandState('bold'),
+                                document.queryCommandValue('bold')],
+                            italic: document.queryCommandEnabled('italic'),
+                            insertText: document.queryCommandEnabled('insertText'),
+                            createLink: document.queryCommandEnabled('createLink'),
+                            indeterm: document.queryCommandIndeterm('bold'),
+                            supported: document.queryCommandSupported('bold'),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            ("ariaNotify", 1), ("browsingTopics", 0),
+            ("hasUnpartitionedCookieAccess", 0), ("captureEvents", 0),
+            ("releaseEvents", 0), ("clear", 0), ("exitPointerLock", 0),
+            ("webkitCancelFullScreen", 0), ("webkitExitFullscreen", 0),
+            ("queryCommandEnabled", 1), ("queryCommandIndeterm", 1),
+            ("queryCommandState", 1), ("queryCommandSupported", 1),
+            ("queryCommandValue", 1),
+        ];
+        let descriptors = names.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true, true, true,
+            format!("function {name}() {{ [native code] }}"), "TypeError"
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "descriptors": descriptors,
+                "sync": {
+                    "captureEvents": ["undefined", "TypeError"],
+                    "releaseEvents": ["undefined", "TypeError"],
+                    "clear": ["undefined", "TypeError"],
+                    "exitPointerLock": ["undefined", "TypeError"],
+                    "webkitCancelFullScreen": ["undefined", "TypeError"],
+                    "webkitExitFullscreen": ["undefined", "TypeError"],
+                },
+                "topics": [], "topicsPromise": true,
+                "unpartitioned": true, "unpartitionedPromise": true,
+                "aria": "undefined",
+                "ariaMissing": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'ariaNotify' on 'Document': 1 argument required, but only 0 present.",
+                },
+                "syncBadReceiver": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'clear' on 'Document': Illegal invocation",
+                },
+                "asyncBadReceiver": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'browsingTopics' on 'Document': Illegal invocation",
+                },
+                "queryMissing": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'queryCommandEnabled' on 'Document': 1 argument required, but only 0 present.",
+                },
+                "idle": {
+                    "bold": [false, false, "false"],
+                    "selectAll": true, "styleWithCSS": true,
+                    "unknown": [false, false, ""],
+                },
+                "editable": {
+                    "bold": [true, true, "true"], "italic": true,
+                    "insertText": true, "createLink": true,
+                    "indeterm": false, "supported": true,
+                },
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_target_when_and_observable_match_chrome_shape_and_delivery() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const methodLengths = {
+                        catch: 1, drop: 1, every: 1, filter: 1, finally: 1,
+                        find: 1, first: 0, flatMap: 1, forEach: 1, inspect: 0,
+                        last: 0, map: 1, reduce: 1, some: 1, subscribe: 0,
+                        switchMap: 1, take: 1, takeUntil: 1, toArray: 0,
+                    };
+                    const methodShapes = Object.entries(methodLengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Observable.prototype, name);
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.enumerable,
+                            Function.prototype.toString.call(descriptor.value)];
+                    });
+                    let constructorError = null, subscriberError = null;
+                    try { new Observable(); } catch (error) { constructorError = [error.name, error.message]; }
+                    try { new Subscriber(); } catch (error) { subscriberError = [error.name, error.message]; }
+                    const run = {};
+                    const values = new Observable(subscriber => {
+                        run.subscriber = [Object.prototype.toString.call(subscriber),
+                            subscriber.active, subscriber.signal instanceof AbortSignal,
+                            Object.getOwnPropertyNames(subscriber)];
+                        subscriber.addTeardown(() => { run.teardown = (run.teardown || 0) + 1; });
+                        subscriber.next(1); subscriber.next(2); subscriber.next(3);
+                        subscriber.complete();
+                    });
+                    run.subscribeReturn = typeof values.subscribe({
+                        next(value) { (run.values || (run.values = [])).push(value); },
+                        complete() { run.complete = true; },
+                    });
+                    run.toArray = await values.toArray();
+                    run.mapFilterTake = await values.map(value => value * 2)
+                        .filter(value => value > 2).take(1).toArray();
+                    run.first = await values.first();
+                    run.last = await values.last();
+                    run.reduce = await values.reduce((sum, value) => sum + value, 0);
+                    const eventResults = [];
+                    const observable = document.when('oracle-event');
+                    const subscribeReturn = observable.subscribe(event =>
+                        eventResults.push([event.type, event.target === document]));
+                    document.dispatchEvent(new Event('oracle-event'));
+                    const controller = new AbortController();
+                    let abortedDeliveries = 0;
+                    document.when('abort-event').subscribe(() => abortedDeliveries++,
+                        { signal: controller.signal });
+                    controller.abort();
+                    document.dispatchEvent(new Event('abort-event'));
+                    const outcome = callback => {
+                        try { callback(); return null; }
+                        catch (error) { return [error.name, error.message]; }
+                    };
+                    return {
+                        constructors: {
+                            observable: [Observable.name, Observable.length,
+                                Function.prototype.toString.call(Observable), constructorError],
+                            subscriber: [Subscriber.name, Subscriber.length,
+                                Function.prototype.toString.call(Subscriber), subscriberError],
+                        },
+                        methodShapes,
+                        observableKeys: Object.getOwnPropertyNames(Observable.prototype).sort(),
+                        subscriberKeys: Object.getOwnPropertyNames(Subscriber.prototype).sort(),
+                        run,
+                        event: {
+                            tag: Object.prototype.toString.call(observable),
+                            subscribeReturn: typeof subscribeReturn,
+                            eventResults, abortedDeliveries,
+                            paths: [typeof globalThis.when, typeof document.when,
+                                typeof screen.when, typeof screen.orientation.when],
+                            own: [Object.prototype.hasOwnProperty.call(globalThis, 'when'),
+                                Object.prototype.hasOwnProperty.call(document, 'when'),
+                                Object.prototype.hasOwnProperty.call(screen, 'when'),
+                                Object.prototype.hasOwnProperty.call(screen.orientation, 'when')],
+                            shape: [document.when.name, document.when.length,
+                                Function.prototype.toString.call(document.when)],
+                            missing: outcome(() => document.when()),
+                            badReceiver: outcome(() => Node.prototype.when.call({}, 'x')),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let method_lengths = [
+            ("catch", 1), ("drop", 1), ("every", 1), ("filter", 1),
+            ("finally", 1), ("find", 1), ("first", 0), ("flatMap", 1),
+            ("forEach", 1), ("inspect", 0), ("last", 0), ("map", 1),
+            ("reduce", 1), ("some", 1), ("subscribe", 0), ("switchMap", 1),
+            ("take", 1), ("takeUntil", 1), ("toArray", 0),
+        ];
+        let method_shapes = method_lengths.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true,
+            format!("function {name}() {{ [native code] }}")
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructors": {
+                    "observable": ["Observable", 1,
+                        "function Observable() { [native code] }",
+                        ["TypeError", "Failed to construct 'Observable': 1 argument required, but only 0 present."]],
+                    "subscriber": ["Subscriber", 0,
+                        "function Subscriber() { [native code] }",
+                        ["TypeError", "Failed to construct 'Subscriber': Illegal constructor"]],
+                },
+                "methodShapes": method_shapes,
+                "observableKeys": ["catch", "constructor", "drop", "every", "filter",
+                    "finally", "find", "first", "flatMap", "forEach", "inspect", "last",
+                    "map", "reduce", "some", "subscribe", "switchMap", "take", "takeUntil",
+                    "toArray"],
+                "subscriberKeys": ["active", "addTeardown", "complete", "constructor",
+                    "error", "next", "signal"],
+                "run": {
+                    "subscriber": ["[object Subscriber]", true, true, []],
+                    "teardown": 6, "values": [1, 2, 3], "complete": true,
+                    "subscribeReturn": "undefined", "toArray": [1, 2, 3],
+                    "mapFilterTake": [4], "first": 1, "last": 3, "reduce": 6,
+                },
+                "event": {
+                    "tag": "[object Observable]", "subscribeReturn": "undefined",
+                    "eventResults": [["oracle-event", true]], "abortedDeliveries": 0,
+                    "paths": ["function", "function", "function", "function"],
+                    "own": [false, false, false, false],
+                    "shape": ["when", 1, "function when() { [native code] }"],
+                    "missing": ["TypeError",
+                        "Failed to execute 'when' on 'EventTarget': 1 argument required, but only 0 present."],
+                    "badReceiver": ["TypeError", "Illegal invocation"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn xpath_expression_and_namespace_resolver_match_chrome_shape_and_results() {
+        let mut rt = setup_runtime("<html><body><p>one</p><p>two</p></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+                const describe = name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                    return [descriptor.value.name, descriptor.value.length,
+                        descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                        Function.prototype.toString.call(descriptor.value)];
+                };
+                const error = callback => {
+                    try { callback(); return null; }
+                    catch (value) { return [value.name, value.message]; }
+                };
+                const expression = document.createExpression('//p', null);
+                const evaluated = expression.evaluate(
+                    document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                const resolver = document.createNSResolver(document.documentElement);
+                return {
+                    constructor: [XPathExpression.name, XPathExpression.length,
+                        Function.prototype.toString.call(XPathExpression),
+                        error(() => new XPathExpression())],
+                    methods: {
+                        expression: describe('createExpression'),
+                        resolver: describe('createNSResolver'),
+                        evaluate: [XPathExpression.prototype.evaluate.name,
+                            XPathExpression.prototype.evaluate.length,
+                            Object.getOwnPropertyDescriptor(
+                                XPathExpression.prototype, 'evaluate').enumerable,
+                            Function.prototype.toString.call(
+                                XPathExpression.prototype.evaluate)],
+                    },
+                    expression: [Object.prototype.toString.call(expression),
+                        Object.getOwnPropertyNames(expression),
+                        Object.getOwnPropertyNames(XPathExpression.prototype).sort()],
+                    result: [evaluated.resultType, evaluated.snapshotLength,
+                        evaluated.snapshotItem(0).tagName,
+                        evaluated.snapshotItem(1).textContent],
+                    resolver: [resolver === document.documentElement, resolver.nodeName],
+                    missingExpression: error(() => document.createExpression()),
+                    missingResolver: error(() => document.createNSResolver()),
+                    badDocument: error(() =>
+                        Document.prototype.createExpression.call({}, '//p')),
+                    badExpression: error(() =>
+                        XPathExpression.prototype.evaluate.call({}, document)),
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["XPathExpression", 0,
+                    "function XPathExpression() { [native code] }",
+                    ["TypeError", "Failed to construct 'XPathExpression': Illegal constructor"]],
+                "methods": {
+                    "expression": ["createExpression", 1, true, true, true,
+                        "function createExpression() { [native code] }"],
+                    "resolver": ["createNSResolver", 1, true, true, true,
+                        "function createNSResolver() { [native code] }"],
+                    "evaluate": ["evaluate", 1, true,
+                        "function evaluate() { [native code] }"],
+                },
+                "expression": ["[object XPathExpression]", [],
+                    ["constructor", "evaluate"]],
+                "result": [7, 2, "P", "two"],
+                "resolver": [true, "HTML"],
+                "missingExpression": ["TypeError",
+                    "Failed to execute 'createExpression' on 'Document': 1 argument required, but only 0 present."],
+                "missingResolver": ["TypeError",
+                    "Failed to execute 'createNSResolver' on 'Document': 1 argument required, but only 0 present."],
+                "badDocument": ["TypeError",
+                    "Failed to execute 'createExpression' on 'Document': Illegal invocation"],
+                "badExpression": ["TypeError", "Illegal invocation"],
+            })
+        );
+    }
+
+    #[test]
+    fn caret_position_and_legacy_range_match_chrome_shape_and_invariants() {
+        let mut rt = setup_runtime("<html><body><p>caret text</p></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+                const shape = name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                    return [descriptor.value.name, descriptor.value.length,
+                        descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                        Function.prototype.toString.call(descriptor.value)];
+                };
+                const error = callback => {
+                    try { callback(); return null; }
+                    catch (value) { return [value.name, value.message]; }
+                };
+                const position = document.caretPositionFromPoint(1, 1);
+                const range0 = document.caretRangeFromPoint();
+                const range = document.caretRangeFromPoint(1, 1);
+                const nodeLength = position.offsetNode.nodeType === 3
+                    ? position.offsetNode.data.length : position.offsetNode.childNodes.length;
+                const offsetGetter = Object.getOwnPropertyDescriptor(
+                    CaretPosition.prototype, 'offset').get;
+                return {
+                    constructor: [CaretPosition.name, CaretPosition.length,
+                        Function.prototype.toString.call(CaretPosition),
+                        error(() => new CaretPosition())],
+                    methods: {
+                        position: shape('caretPositionFromPoint'),
+                        range: shape('caretRangeFromPoint'),
+                        rect: [CaretPosition.prototype.getClientRect.name,
+                            CaretPosition.prototype.getClientRect.length,
+                            Object.getOwnPropertyDescriptor(
+                                CaretPosition.prototype, 'getClientRect').enumerable,
+                            Function.prototype.toString.call(
+                                CaretPosition.prototype.getClientRect)],
+                    },
+                    position: [Object.prototype.toString.call(position),
+                        Object.getOwnPropertyNames(position),
+                        Object.getOwnPropertyNames(CaretPosition.prototype).sort(),
+                        position.offsetNode.nodeType,
+                        position.offset >= 0 && position.offset <= nodeLength,
+                        Object.prototype.toString.call(position.getClientRect())],
+                    ranges: [range0 instanceof Range, range0.collapsed,
+                        range instanceof Range, range.collapsed,
+                        range.startContainer === range.endContainer,
+                        range.startOffset === range.endOffset],
+                    missing: error(() => document.caretPositionFromPoint()),
+                    badDocument: error(() =>
+                        Document.prototype.caretRangeFromPoint.call({})),
+                    badPosition: error(() => offsetGetter.call({})),
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["CaretPosition", 0,
+                    "function CaretPosition() { [native code] }",
+                    ["TypeError", "Failed to construct 'CaretPosition': Illegal constructor"]],
+                "methods": {
+                    "position": ["caretPositionFromPoint", 2, true, true, true,
+                        "function caretPositionFromPoint() { [native code] }"],
+                    "range": ["caretRangeFromPoint", 0, true, true, true,
+                        "function caretRangeFromPoint() { [native code] }"],
+                    "rect": ["getClientRect", 0, true,
+                        "function getClientRect() { [native code] }"],
+                },
+                "position": ["[object CaretPosition]", [],
+                    ["constructor", "getClientRect", "offset", "offsetNode"],
+                    3, true, "[object DOMRect]"],
+                "ranges": [true, true, true, true, true, true],
+                "missing": ["TypeError",
+                    "Failed to execute 'caretPositionFromPoint' on 'Document': 2 arguments required, but only 0 present."],
+                "badDocument": ["TypeError",
+                    "Failed to execute 'caretRangeFromPoint' on 'Document': Illegal invocation"],
+                "badPosition": ["TypeError", "Illegal invocation"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_transition_storage_exit_and_move_before_match_chrome() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const lengths = {
+                        requestStorageAccess: 0, requestStorageAccessFor: 1,
+                        exitFullscreen: 0, exitPictureInPicture: 0,
+                        startViewTransition: 0, moveBefore: 2,
+                    };
+                    const shapes = Object.entries(lengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        let constructError = null;
+                        try { Reflect.construct(descriptor.value, []); }
+                        catch (error) { constructError = error.name; }
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                            Function.prototype.toString.call(descriptor.value), constructError];
+                    });
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    let callbackCount = 0;
+                    const transition = document.startViewTransition({
+                        update() { callbackCount++; return Promise.resolve('done'); },
+                        types: ['alpha'],
+                    });
+                    const callbackBefore = callbackCount;
+                    transition.waitUntil(Promise.resolve());
+                    transition.types.add('beta');
+                    const promises = [transition.ready, transition.updateCallbackDone,
+                        transition.finished].map(value => value instanceof Promise);
+                    await transition.updateCallbackDone;
+                    await transition.ready;
+                    await transition.finished;
+                    const skipped = document.startViewTransition();
+                    skipped.skipTransition();
+                    await skipped.finished;
+                    const moved = document;
+                    const first = document.createComment('first');
+                    const second = document.createComment('second');
+                    moved.insertBefore(first, moved.documentElement);
+                    moved.insertBefore(second, moved.documentElement);
+                    const moveReturn = moved.moveBefore(second, first);
+                    const badMove = await outcome(() =>
+                        moved.moveBefore(moved.body, moved.head));
+                    const finishedGetter = Object.getOwnPropertyDescriptor(
+                        ViewTransition.prototype, 'finished').get;
+                    return {
+                        shapes,
+                        storage: {
+                            request: await outcome(() => document.requestStorageAccess()),
+                            same: await outcome(() =>
+                                document.requestStorageAccessFor(document.location.origin)),
+                            other: await outcome(() =>
+                                document.requestStorageAccessFor('https://other.example')),
+                            missing: await outcome(() => document.requestStorageAccessFor()),
+                        },
+                        exits: {
+                            fullscreen: await outcome(() => document.exitFullscreen()),
+                            picture: await outcome(() => document.exitPictureInPicture()),
+                        },
+                        transition: {
+                            constructor: [ViewTransition.name, ViewTransition.length,
+                                Function.prototype.toString.call(ViewTransition)],
+                            tag: Object.prototype.toString.call(transition),
+                            own: Object.getOwnPropertyNames(transition),
+                            keys: Object.getOwnPropertyNames(ViewTransition.prototype).sort(),
+                            callbackBefore, callbackAfter: callbackCount, promises,
+                            root: transition.transitionRoot === document.documentElement,
+                            types: [Object.prototype.toString.call(transition.types),
+                                transition.types.size, Array.from(transition.types.values())],
+                            skipped: await outcome(() => skipped.finished),
+                            badGetter: await outcome(() => finishedGetter.call({})),
+                        },
+                        move: {
+                            returnType: typeof moveReturn,
+                            children: Array.from(moved.childNodes)
+                                .map(node => [node.nodeType, node.nodeValue || node.nodeName]),
+                            sameParents: first.parentNode === moved && second.parentNode === moved,
+                            bad: badMove,
+                            badReceiver: await outcome(() =>
+                                Document.prototype.moveBefore.call({}, first, null)),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            ("requestStorageAccess", 0), ("requestStorageAccessFor", 1),
+            ("exitFullscreen", 0), ("exitPictureInPicture", 0),
+            ("startViewTransition", 0), ("moveBefore", 2),
+        ];
+        let shapes = names.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true, true, true,
+            format!("function {name}() {{ [native code] }}"), "TypeError"
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "shapes": shapes,
+                "storage": {
+                    "request": {}, "same": {},
+                    "other": {"name": "NotAllowedError",
+                        "message": "requestStorageAccessFor not allowed"},
+                    "missing": {"name": "TypeError",
+                        "message": "Failed to execute 'requestStorageAccessFor' on 'Document': 1 argument required, but only 0 present."},
+                },
+                "exits": {
+                    "fullscreen": {"name": "TypeError",
+                        "message": "Failed to execute 'exitFullscreen' on 'Document': Document not active"},
+                    "picture": {"name": "InvalidStateError",
+                        "message": "Failed to execute 'exitPictureInPicture' on 'Document': There is no Picture-in-Picture element in this document."},
+                },
+                "transition": {
+                    "constructor": ["ViewTransition", 0,
+                        "function ViewTransition() { [native code] }"],
+                    "tag": "[object ViewTransition]", "own": [],
+                    "keys": ["constructor", "finished", "ready", "skipTransition",
+                        "transitionRoot", "types", "updateCallbackDone", "waitUntil"],
+                    "callbackBefore": 0, "callbackAfter": 1,
+                    "promises": [true, true, true], "root": true,
+                    "types": ["[object ViewTransitionTypeSet]", 2, ["alpha", "beta"]],
+                    "skipped": {}, "badGetter": {"name": "TypeError", "message": "Illegal invocation"},
+                },
+                "move": {
+                    "returnType": "undefined",
+                    "children": [[8, "second"], [8, "first"], [1, "HTML"]],
+                    "sameParents": true,
+                    "bad": {"name": "NotFoundError",
+                        "message": "Failed to execute 'moveBefore' on 'Document': The node before which the new node is to be inserted is not a child of this node."},
+                    "badReceiver": {"name": "TypeError",
+                        "message": "Failed to execute 'moveBefore' on 'Document': Illegal invocation"},
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn zok_non_native_object_and_state_buckets_match_chrome() {
+        let mut rt = setup_runtime(
+            "<html><body><a name=anchor-name></a><applet></applet>\
+             <embed id=plugin name=plugin></embed></body></html>",
+        );
+        let result = rt.evaluate(
+            r#"(() => {
+                const groups = {
+                    o: ['d.anchors','d.applets','d.children','d.customElementRegistry',
+                        'd.embeds','d.featurePolicy','d.fragmentDirective','d.plugins',
+                        'external','locationbar','menubar','personalbar','scrollbars',
+                        'statusbar','styleMedia','toolbar'],
+                    x: ['d.activeViewTransition','d.fullscreenElement',
+                        'd.pictureInPictureElement','d.pointerLockElement','d.rootElement',
+                        'd.textContent','d.webkitCurrentFullScreenElement',
+                        'd.webkitFullscreenElement','d.xmlEncoding','d.xmlVersion','fence'],
+                    F: ['credentialless','d.fullscreen','d.prerendering','d.wasDiscarded',
+                        'd.webkitIsFullScreen','d.xmlStandalone',
+                        'n.deprecatedRunAdAuctionEnforcesKAnonymity'],
+                    T: ['d.fullscreenEnabled','d.pictureInPictureEnabled',
+                        'd.webkitFullscreenEnabled','offscreenBuffering','originAgentCluster'],
+                };
+                const resolve = path => path.startsWith('d.')
+                    ? document[path.slice(2)]
+                    : path.startsWith('n.') ? navigator[path.slice(2)] : globalThis[path];
+                const classify = value => value == null
+                    ? (value === null ? 'x' : 'u')
+                    : Array.isArray(value) ? 'a'
+                    : value === true ? 'T'
+                    : value === false ? 'F'
+                    : typeof value === 'function' ? 'f'
+                    : typeof value === 'object' ? 'o' : typeof value;
+                const bucketFailures = Object.entries(groups).flatMap(([bucket, paths]) =>
+                    paths.flatMap(path => classify(resolve(path)) === bucket
+                        ? [] : [[path, classify(resolve(path))]]));
+                const collection = document.children;
+                let constructorError = null;
+                try { new HTMLCollection(); } catch (error) { constructorError = [error.name, error.message]; }
+                return {
+                    bucketCounts: Object.fromEntries(
+                        Object.entries(groups).map(([bucket, paths]) => [bucket, paths.length])),
+                    bucketFailures,
+                    collection: {
+                        tag: Object.prototype.toString.call(collection),
+                        array: Array.isArray(collection),
+                        instance: collection instanceof HTMLCollection,
+                        constructor: [HTMLCollection.name, HTMLCollection.length,
+                            Function.prototype.toString.call(HTMLCollection), constructorError],
+                        prototype: Object.getOwnPropertyNames(HTMLCollection.prototype).sort(),
+                        own: Object.getOwnPropertyNames(collection),
+                        keys: Object.keys(collection),
+                        item: collection.item(0) === document.documentElement,
+                        index: collection[0] === document.documentElement,
+                        repeated: collection === document.children,
+                        anchor: [document.anchors.length,
+                            document.anchors.namedItem('anchor-name') === document.querySelector('a'),
+                            document.anchors['anchor-name'] === document.querySelector('a')],
+                        embeds: [document.embeds.length, document.plugins === document.embeds,
+                            document.plugins.namedItem('plugin') === document.querySelector('embed')],
+                        iterable: Array.from(document.children).length,
+                    },
+                    documentObjects: {
+                        registry: document.customElementRegistry === customElements,
+                        policy: [Object.prototype.toString.call(document.featurePolicy),
+                            Object.getOwnPropertyNames(FeaturePolicy.prototype).sort(),
+                            document.featurePolicy.allowsFeature('geolocation'),
+                            document.featurePolicy.getAllowlistForFeature('geolocation')],
+                        fragment: [Object.prototype.toString.call(document.fragmentDirective),
+                            Object.getOwnPropertyNames(document.fragmentDirective),
+                            Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(document.fragmentDirective)).sort()],
+                    },
+                    windowObjects: {
+                        external: [Object.prototype.toString.call(external),
+                            Object.getOwnPropertyNames(external),
+                            Object.getOwnPropertyNames(External.prototype).sort()],
+                        bars: [locationbar, menubar, personalbar, scrollbars, statusbar, toolbar]
+                            .map(value => [Object.prototype.toString.call(value), value.visible,
+                                Object.getOwnPropertyNames(value)]),
+                        distinctBars: new Set(
+                            [locationbar, menubar, personalbar, scrollbars, statusbar, toolbar]).size,
+                        styleMedia: [Object.prototype.toString.call(styleMedia), styleMedia.type,
+                            styleMedia.matchMedium('screen'),
+                            Object.getOwnPropertyNames(Object.getPrototypeOf(styleMedia)).sort()],
+                    },
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bucketCounts": {"o": 16, "x": 11, "F": 7, "T": 5},
+                "bucketFailures": [],
+                "collection": {
+                    "tag": "[object HTMLCollection]", "array": false, "instance": true,
+                    "constructor": ["HTMLCollection", 0,
+                        "function HTMLCollection() { [native code] }",
+                        ["TypeError", "Failed to construct 'HTMLCollection': Illegal constructor"]],
+                    "prototype": ["constructor", "item", "length", "namedItem"],
+                    "own": ["0"], "keys": ["0"], "item": true, "index": true,
+                    "repeated": true, "anchor": [1, true, true],
+                    "embeds": [1, true, true], "iterable": 1,
+                },
+                "documentObjects": {
+                    "registry": true,
+                    "policy": ["[object FeaturePolicy]",
+                        ["allowedFeatures", "allowsFeature", "constructor", "features",
+                            "getAllowlistForFeature"], true, ["http://example.com"]],
+                    "fragment": ["[object FragmentDirective]", [], ["constructor"]],
+                },
+                "windowObjects": {
+                    "external": ["[object External]", [],
+                        ["AddSearchProvider", "IsSearchProviderInstalled", "constructor"]],
+                    "bars": [
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                    ],
+                    "distinctBars": 6,
+                    "styleMedia": ["[object StyleMedia]", "screen", true,
+                        ["matchMedium", "type"]],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn window_storage_constants_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const descriptor = (object, name) => {
+                        const d = Object.getOwnPropertyDescriptor(object, name);
+                        return d && [d.value, d.writable, d.enumerable, d.configurable];
+                    };
+                    return {
+                        values: [Window.TEMPORARY, Window.PERSISTENT,
+                            window.TEMPORARY, window.PERSISTENT],
+                        constructor: [descriptor(Window, 'TEMPORARY'),
+                            descriptor(Window, 'PERSISTENT')],
+                        prototype: [descriptor(Window.prototype, 'TEMPORARY'),
+                            descriptor(Window.prototype, 'PERSISTENT')],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": [0, 1, 0, 1],
+                "constructor": [[0, false, true, false], [1, false, true, false]],
+                "prototype": [[0, false, true, false], [1, false, true, false]],
+            })
+        );
+    }
+
+    #[test]
+    fn iframe_elements_use_the_dedicated_chrome_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(
+                            HTMLIFrameElement.prototype, name);
+                        return d ? {
+                            enumerable: d.enumerable,
+                            configurable: d.configurable,
+                            getter: d.get ? [d.get.name, d.get.length,
+                                Function.prototype.toString.call(d.get)] : null,
+                            setter: d.set ? [d.set.name, d.set.length,
+                                Function.prototype.toString.call(d.set)] : null,
+                            value: d.value ? [d.value.name, d.value.length,
+                                Function.prototype.toString.call(d.value)] : null,
+                        } : null;
+                    };
+                    frame.allow = 'camera *';
+                    frame.allowFullscreen = true;
+                    frame.allowPaymentRequest = true;
+                    frame.loading = 'lazy';
+                    frame.align = 'left';
+                    frame.scrolling = 'no';
+                    frame.frameBorder = '2';
+                    frame.longDesc = '/frame-desc';
+                    frame.marginHeight = '3';
+                    frame.marginWidth = '4';
+                    frame.credentialless = true;
+                    frame.csp = "connect-src 'none'";
+                    return {
+                        constructor: [HTMLIFrameElement.name, HTMLIFrameElement.length,
+                            Function.prototype.toString.call(HTMLIFrameElement)],
+                        brand: Object.prototype.toString.call(frame),
+                        instances: [frame instanceof HTMLIFrameElement,
+                            frame instanceof HTMLElement, frame instanceof Element],
+                        prototype: Object.getOwnPropertyNames(HTMLIFrameElement.prototype),
+                        descriptors: {
+                            csp: descriptor('csp'), allow: descriptor('allow'),
+                            sandbox: descriptor('sandbox'), loading: descriptor('loading'),
+                            contentWindow: descriptor('contentWindow'),
+                            getSVGDocument: descriptor('getSVGDocument'),
+                        },
+                        values: [frame.allow, frame.allowFullscreen,
+                            frame.allowPaymentRequest, frame.loading, frame.align,
+                            frame.scrolling, frame.frameBorder, frame.longDesc,
+                            frame.marginHeight, frame.marginWidth, frame.credentialless,
+                            frame.csp],
+                        elementIframeMembers: Object.getOwnPropertyNames(Element.prototype)
+                            .filter(name => ['sandbox', 'srcdoc', 'csp', 'contentDocument',
+                                'contentWindow'].includes(name)),
+                        featurePolicy: {
+                            tag: Object.prototype.toString.call(frame.featurePolicy),
+                            own: Object.getOwnPropertyNames(frame.featurePolicy),
+                            prototype: Object.getOwnPropertyNames(PermissionsPolicy.prototype),
+                            constructor: [PermissionsPolicy.name, PermissionsPolicy.length,
+                                Function.prototype.toString.call(PermissionsPolicy)],
+                        },
+                        featurePolicySame: frame.featurePolicy === frame.featurePolicy,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["HTMLIFrameElement", 0,
+                    "function HTMLIFrameElement() { [native code] }"],
+                "brand": "[object HTMLIFrameElement]",
+                "instances": [true, true, true],
+                "prototype": [
+                    "src", "srcdoc", "name", "sandbox", "allowFullscreen", "width",
+                    "height", "contentDocument", "contentWindow", "referrerPolicy", "csp",
+                    "allow", "featurePolicy", "loading", "align", "scrolling", "frameBorder",
+                    "longDesc", "marginHeight", "marginWidth", "getSVGDocument", "credentialless",
+                    "allowPaymentRequest", "constructor",
+                ],
+                "descriptors": {
+                    "csp": {"enumerable": true, "configurable": true,
+                        "getter": ["get csp", 0, "function get csp() { [native code] }"],
+                        "setter": ["set csp", 1, "function set csp() { [native code] }"],
+                        "value": null},
+                    "allow": {"enumerable": true, "configurable": true,
+                        "getter": ["get allow", 0, "function get allow() { [native code] }"],
+                        "setter": ["set allow", 1, "function set allow() { [native code] }"],
+                        "value": null},
+                    "sandbox": {"enumerable": true, "configurable": true,
+                        "getter": ["get sandbox", 0, "function get sandbox() { [native code] }"],
+                        "setter": ["set sandbox", 1, "function set sandbox() { [native code] }"],
+                        "value": null},
+                    "loading": {"enumerable": true, "configurable": true,
+                        "getter": ["get loading", 0, "function get loading() { [native code] }"],
+                        "setter": ["set loading", 1, "function set loading() { [native code] }"],
+                        "value": null},
+                    "contentWindow": {"enumerable": true, "configurable": true,
+                        "getter": ["get contentWindow", 0, "function get contentWindow() { [native code] }"],
+                        "setter": null, "value": null},
+                    "getSVGDocument": {"enumerable": true, "configurable": true,
+                        "getter": null, "setter": null,
+                        "value": ["getSVGDocument", 0, "function getSVGDocument() { [native code] }"]},
+                },
+                "values": ["camera *", true, true, "lazy", "left", "no", "2", "/frame-desc", "3", "4", true, "connect-src 'none'"],
+                "elementIframeMembers": [],
+                "featurePolicy": {
+                    "tag": "[object PermissionsPolicy]",
+                    "own": [],
+                    "prototype": ["allowedFeatures", "allowsFeature", "features",
+                        "getAllowlistForFeature", "constructor"],
+                    "constructor": ["PermissionsPolicy", 0,
+                        "function PermissionsPolicy() { [native code] }"],
+                },
+                "featurePolicySame": true,
+            }),
+        );
+    }
+
     /// Canvas text metrics must come from the real layout engine, so they vary
     /// with the font and agree with element measurement. They previously did
     /// neither: `length * 6 * scale` ignored the font entirely, leaving the
@@ -4265,12 +5301,12 @@ mod tests {
                             (ctx.font = "72px monospace", ctx.measureText(TEXT + TEXT).width),
                         emptyIsZero: (ctx.font = "72px monospace",
                                       ctx.measureText("").width) === 0,
-                        // Canvas carries subpixel advances quantized to 1/64
-                        // (Chrome's 26.6 pipeline); element layout stays on the
-                        // ceiled line, so they agree after ceiling.
+                        // Canvas and DOMRect expose the same 26.6 subpixel
+                        // advance. Integer CSSOM metrics such as offsetWidth
+                        // round separately at their API boundary.
                         agreesWithElement:
-                            Math.ceil(mono) === elementWidth("72px monospace")
-                            && Math.ceil(sans) === elementWidth('72px "Arial", monospace'),
+                            Math.abs(mono - elementWidth("72px monospace")) <= 1 / 64
+                            && Math.abs(sans - elementWidth('72px "Arial", monospace')) <= 1 / 64,
                         // The 10px probe string must land on a fractional
                         // 1/64 boundary, not an integer pixel.
                         subpixel: probe % 1 !== 0
@@ -4301,12 +5337,12 @@ mod tests {
         );
     }
 
-    /// Media capability reporting. The engine decodes nothing, but the
-    /// capability *declaration* matches Chrome and — the point of this test —
-    /// canPlayType and mediaCapabilities.decodingInfo cannot disagree, because
-    /// they read one table. Pinned in js-repros/media-capability-honesty/.
+    /// Media capability reporting. Chrome applies API-specific format rules:
+    /// canPlayType, MediaSource and MediaCapabilities intentionally disagree
+    /// for formats such as Ogg. Keep those rules and the WebIDL object shape
+    /// aligned while playback itself remains unavailable.
     #[tokio::test(flavor = "current_thread")]
-    async fn media_capability_declarations_match_chrome_and_agree_with_each_other() {
+    async fn media_capability_declarations_match_chrome_api_specific_rules() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
@@ -4321,8 +5357,15 @@ mod tests {
                             video: {contentType, width: 640, height: 480,
                                     bitrate: 1000, framerate: 30},
                         }));
+                    const decodingAudio = async contentType =>
+                        (await navigator.mediaCapabilities.decodingInfo({
+                            type: "file",
+                            audio: {contentType, channels: "2", bitrate: 128000,
+                                    samplerate: 48000},
+                        }));
                     const mp4 = await decoding('video/mp4; codecs="avc1.42E01E"');
                     const bogus = await decoding("video/nonsense");
+                    const ogg = await decodingAudio('audio/ogg; codecs="vorbis"');
                     return {
                         canPlay: [
                             ask("video/mp4"),
@@ -4337,6 +5380,8 @@ mod tests {
                             ask("audio/mpeg"),
                             ask("audio/wav"),
                             ask('audio/wav; codecs="1"'),
+                            ask('audio/mp4; codecs="ac-3"'),
+                            ask('video/mp4; codecs="hev1.1.6.L93.B0"'),
                         ],
                         playRejects: await video.play().then(
                             () => "fulfilled", error => error.name),
@@ -4355,14 +5400,51 @@ mod tests {
                             Object.keys(VideoPlaybackQuality.prototype).length,
                         frameCallbackHandle:
                             typeof video.requestVideoFrameCallback(() => {}),
-                        // The declaration and the capability API agree.
                         decodingSupported: mp4.supported,
                         decodingSmooth: mp4.smooth,
                         decodingPowerEfficient: mp4.powerEfficient,
                         decodingBogus: bogus.supported,
+                        decodingOgg: ogg.supported,
+                        decodingKeys: Object.keys(mp4),
+                        mediaCapabilitiesShape: {
+                            tag: Object.prototype.toString.call(
+                                navigator.mediaCapabilities),
+                            own: Object.getOwnPropertyNames(
+                                navigator.mediaCapabilities),
+                            proto: Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(navigator.mediaCapabilities)),
+                            navigatorOwn: Object.hasOwn(navigator, "mediaCapabilities"),
+                            stable: navigator.mediaCapabilities === navigator.mediaCapabilities,
+                            constructorError: (() => {
+                                try { new MediaCapabilities(); return "no-throw"; }
+                                catch (error) { return error.name; }
+                            })(),
+                        },
                         mediaSourceMp4:
                             MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
                         mediaSourceBogus: MediaSource.isTypeSupported("video/nonsense"),
+                        mediaSourceAudio: [
+                            'audio/mp4; codecs="mp4a.40.2"',
+                            'audio/mp4; codecs="ac-3"',
+                            'audio/mp4; codecs="ec-3"',
+                            'audio/mp4; codecs="opus"',
+                            'audio/webm; codecs="opus"',
+                            'audio/webm; codecs="vorbis"',
+                            'audio/ogg; codecs="vorbis"',
+                            'audio/ogg; codecs="flac"',
+                        ].map(type => MediaSource.isTypeSupported(type)),
+                        mediaSourceVideo: [
+                            'video/mp4; codecs="avc1.42E01E"',
+                            'video/mp4; codecs="avc1.4D401E"',
+                            'video/mp4; codecs="avc1.64001E"',
+                            'video/mp4; codecs="hev1.1.6.L93.B0"',
+                            'video/mp4; codecs="av01.0.01M.08"',
+                            'video/mp4; codecs="vp09.00.10.08"',
+                            'video/webm; codecs="vp8"',
+                            'video/webm; codecs="vp09.00.10.08"',
+                            'video/webm; codecs="av01.0.01M.08"',
+                            'video/ogg; codecs="theora"',
+                        ].map(type => MediaSource.isTypeSupported(type)),
                         mediaSourceReadyState: new MediaSource().readyState,
                     };
                 })()"#,
@@ -4380,6 +5462,7 @@ mod tests {
                     "maybe", "probably", "probably", "maybe",
                     "", "", "", "",
                     "probably", "maybe", "probably",
+                    "", "probably",
                 ],
                 "playRejects": "NotAllowedError",
                 "readyStateStillZero": 0,
@@ -4395,9 +5478,295 @@ mod tests {
                 "decodingSmooth": true,
                 "decodingPowerEfficient": false,
                 "decodingBogus": false,
+                "decodingOgg": true,
+                "decodingKeys": [
+                    "powerEfficient", "smooth", "supported", "keySystemAccess"
+                ],
+                "mediaCapabilitiesShape": {
+                    "tag": "[object MediaCapabilities]",
+                    "own": [],
+                    "proto": ["decodingInfo", "encodingInfo", "constructor"],
+                    "navigatorOwn": false,
+                    "stable": true,
+                    "constructorError": "TypeError",
+                },
                 "mediaSourceMp4": true,
                 "mediaSourceBogus": false,
+                "mediaSourceAudio": [
+                    true, false, false, true, true, true, false, false
+                ],
+                "mediaSourceVideo": [
+                    true, true, true, true, true, true, true, true, true, false
+                ],
                 "mediaSourceReadyState": "closed",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_and_performance_memory_share_fresh_branded_wrappers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const consoleDescriptor = Object.getOwnPropertyDescriptor(
+                        console, "memory");
+                    const performanceDescriptor = Object.getOwnPropertyDescriptor(
+                        Performance.prototype, "memory");
+                    const consoleFirst = console.memory;
+                    const consoleSecond = console.memory;
+                    const performanceFirst = performance.memory;
+                    const performanceSecond = performance.memory;
+                    const prototype = Object.getPrototypeOf(consoleFirst);
+                    const valueNames = [
+                        "totalJSHeapSize", "usedJSHeapSize", "jsHeapSizeLimit"
+                    ];
+                    const values = value => valueNames.map(name => value[name]);
+                    const getterDescriptors = valueNames.map(name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+                        return [
+                            descriptor.get.name,
+                            descriptor.get.length,
+                            Function.prototype.toString.call(descriptor.get),
+                            descriptor.set === undefined,
+                            descriptor.enumerable,
+                            descriptor.configurable,
+                        ];
+                    });
+                    let invalidReceiver;
+                    try {
+                        Object.getOwnPropertyDescriptor(
+                            prototype, "totalJSHeapSize").get.call({});
+                        invalidReceiver = "no-throw";
+                    } catch (error) {
+                        invalidReceiver = error.name + ":" + error.message;
+                    }
+                    console.memory = { fake: true };
+                    const consoleValues = values(consoleFirst);
+                    return {
+                        consoleDescriptor: {
+                            getName: consoleDescriptor.get.name,
+                            getLength: consoleDescriptor.get.length,
+                            getText: Function.prototype.toString.call(consoleDescriptor.get),
+                            setName: consoleDescriptor.set.name,
+                            setLength: consoleDescriptor.set.length,
+                            setText: Function.prototype.toString.call(consoleDescriptor.set),
+                            enumerable: consoleDescriptor.enumerable,
+                            configurable: consoleDescriptor.configurable,
+                        },
+                        performanceOwn: Object.hasOwn(performance, "memory"),
+                        performanceDescriptor: {
+                            getName: performanceDescriptor.get.name,
+                            getLength: performanceDescriptor.get.length,
+                            getText: Function.prototype.toString.call(
+                                performanceDescriptor.get),
+                            noSetter: performanceDescriptor.set === undefined,
+                            enumerable: performanceDescriptor.enumerable,
+                            configurable: performanceDescriptor.configurable,
+                        },
+                        fresh: consoleFirst !== consoleSecond
+                            && performanceFirst !== performanceSecond,
+                        crossFresh: consoleFirst !== performanceFirst,
+                        samePrototype: prototype === Object.getPrototypeOf(performanceFirst),
+                        ownNames: Object.getOwnPropertyNames(consoleFirst),
+                        prototypeNames: Object.getOwnPropertyNames(prototype),
+                        prototypeParent: Object.getPrototypeOf(prototype) === Object.prototype,
+                        tag: Object.prototype.toString.call(consoleFirst),
+                        constructorName: consoleFirst.constructor.name,
+                        globalConstructor: typeof globalThis.MemoryInfo,
+                        getterDescriptors,
+                        invalidReceiver,
+                        valuesMatch: JSON.stringify(consoleValues)
+                            === JSON.stringify(values(performanceFirst)),
+                        valuesSane: consoleValues.every(Number.isFinite)
+                            && consoleValues[1] <= consoleValues[0]
+                            && consoleValues[0] <= consoleValues[2],
+                        heapLimit: consoleValues[2],
+                        assignmentIgnored: Object.prototype.toString.call(console.memory),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "consoleDescriptor": {
+                    "getName": "", "getLength": 0,
+                    "getText": "function () { [native code] }",
+                    "setName": "", "setLength": 1,
+                    "setText": "function () { [native code] }",
+                    "enumerable": true, "configurable": true,
+                },
+                "performanceOwn": false,
+                "performanceDescriptor": {
+                    "getName": "get memory", "getLength": 0,
+                    "getText": "function get memory() { [native code] }",
+                    "noSetter": true, "enumerable": true, "configurable": true,
+                },
+                "fresh": true,
+                "crossFresh": true,
+                "samePrototype": true,
+                "ownNames": [],
+                "prototypeNames": [
+                    "totalJSHeapSize", "usedJSHeapSize", "jsHeapSizeLimit"
+                ],
+                "prototypeParent": true,
+                "tag": "[object MemoryInfo]",
+                "constructorName": "Object",
+                "globalConstructor": "undefined",
+                "getterDescriptors": [
+                    ["get totalJSHeapSize", 0,
+                     "function get totalJSHeapSize() { [native code] }",
+                     true, true, true],
+                    ["get usedJSHeapSize", 0,
+                     "function get usedJSHeapSize() { [native code] }",
+                     true, true, true],
+                    ["get jsHeapSizeLimit", 0,
+                     "function get jsHeapSizeLimit() { [native code] }",
+                     true, true, true],
+                ],
+                "invalidReceiver": "TypeError:Illegal invocation",
+                "valuesMatch": true,
+                "valuesSane": true,
+                "heapLimit": 4395630592i64,
+                "assignmentIgnored": "[object MemoryInfo]",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_methods_context_and_tasks_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const expectedNames = [
+                        "debug", "error", "info", "log", "warn", "dir", "dirxml",
+                        "table", "trace", "group", "groupCollapsed", "groupEnd",
+                        "clear", "count", "countReset", "assert", "profile",
+                        "profileEnd", "time", "timeLog", "timeEnd", "timeStamp",
+                        "context", "createTask", "memory",
+                    ];
+                    const methodShape = (object, names) => names.map(name => {
+                        const method = object[name];
+                        const descriptor = Object.getOwnPropertyDescriptor(object, name);
+                        return [name, method.name, method.length,
+                            Function.prototype.toString.call(method),
+                            descriptor.writable, descriptor.enumerable,
+                            descriptor.configurable];
+                    });
+                    const methods = expectedNames.slice(0, -1);
+                    const context = console.context("fixture");
+                    const contextNames = [
+                        "dir", "dirXml", "table", "groupEnd", "clear", "count",
+                        "countReset", "profile", "profileEnd", "debug", "error",
+                        "info", "log", "warn", "trace", "group", "groupCollapsed",
+                        "assert", "time", "timeLog", "timeEnd", "timeStamp",
+                    ];
+                    const task = console.createTask("fixture");
+                    let callbackThis;
+                    let callbackArgs;
+                    const taskResult = task.run(function() {
+                        callbackThis = this;
+                        callbackArgs = arguments.length;
+                        return 42;
+                    }, "ignored");
+                    let nonFunction;
+                    try { task.run(1); } catch (error) {
+                        nonFunction = error.name + ":" + error.message;
+                    }
+                    let invalidReceiver;
+                    try { task.run.call({}, () => {}); } catch (error) {
+                        invalidReceiver = error.name + ":" + error.message;
+                    }
+                    return {
+                        names: Object.getOwnPropertyNames(console),
+                        methodShape: methodShape(console, methods),
+                        tag: Object.prototype.toString.call(console),
+                        context: {
+                            names: Object.getOwnPropertyNames(context),
+                            shape: methodShape(context, contextNames),
+                            noContext: !("context" in context),
+                            noMemory: !("memory" in context),
+                            independent: context.log !== console.log,
+                        },
+                        task: {
+                            tag: Object.prototype.toString.call(task),
+                            names: Object.getOwnPropertyNames(task),
+                            prototypeNames: Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(task)),
+                            run: methodShape(task, ["run"])[0],
+                            result: taskResult,
+                            callbackThisIsWindow: callbackThis === window,
+                            callbackArgs,
+                            nonFunction,
+                            invalidReceiver,
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            "debug", "error", "info", "log", "warn", "dir", "dirxml", "table",
+            "trace", "group", "groupCollapsed", "groupEnd", "clear", "count",
+            "countReset", "assert", "profile", "profileEnd", "time", "timeLog",
+            "timeEnd", "timeStamp", "context", "createTask",
+        ];
+        let method_shape = names.iter().map(|name| {
+            serde_json::json!([name, name, if *name == "context" { 1 } else { 0 },
+                format!("function {}() {{ [native code] }}", name), true, true, true])
+        }).collect::<Vec<_>>();
+        let context_names = [
+            "dir", "dirXml", "table", "groupEnd", "clear", "count", "countReset",
+            "profile", "profileEnd", "debug", "error", "info", "log", "warn",
+            "trace", "group", "groupCollapsed", "assert", "time", "timeLog",
+            "timeEnd", "timeStamp",
+        ];
+        let context_shape = context_names.iter().map(|name| {
+            serde_json::json!([name, name, 1,
+                format!("function {}() {{ [native code] }}", name), true, true, true])
+        }).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "names": [
+                    "debug", "error", "info", "log", "warn", "dir", "dirxml",
+                    "table", "trace", "group", "groupCollapsed", "groupEnd",
+                    "clear", "count", "countReset", "assert", "profile",
+                    "profileEnd", "time", "timeLog", "timeEnd", "timeStamp",
+                    "context", "createTask", "memory"
+                ],
+                "methodShape": method_shape,
+                "tag": "[object console]",
+                "context": {
+                    "names": context_names,
+                    "shape": context_shape,
+                    "noContext": true,
+                    "noMemory": true,
+                    "independent": true,
+                },
+                "task": {
+                    "tag": "[object Object]",
+                    "names": ["run"],
+                    "prototypeNames": ["constructor"],
+                    "run": ["run", "run", 0,
+                        "function run() { [native code] }", true, true, true],
+                    "result": 42,
+                    "callbackThisIsWindow": true,
+                    "callbackArgs": 0,
+                    "nonFunction": "Error:First argument must be a function.",
+                    "invalidReceiver": "Error:'run' called with illegal receiver.",
+                },
             })
         );
     }
@@ -4573,19 +5942,63 @@ mod tests {
         rt.set_content_security_policy(Some(
             "default-src 'none'; trusted-types allowed default script; require-trusted-types-for 'script'",
         ));
+        rt.execute_script(
+            "<refresh-csp>",
+            "globalThis.__obscura_csp_allows_unsafe_eval=false;",
+        )
+            .unwrap();
         let result = rt
             .evaluate(r#"(() => {
                 const div = document.createElement('div');
                 let rejected = false;
                 try { div.innerHTML = '<b>x</b>'; } catch (error) { rejected = error.name === 'TypeError'; }
+                let plainEval = 'allowed';
+                try { eval('1 + 1'); } catch (error) { plainEval = error.name; }
+                let functionCtor = 'allowed';
+                try { new Function('return 1'); } catch (error) { functionCtor = error.name; }
                 const policy = trustedTypes.createPolicy('default', {createHTML: x => x});
                 div.innerHTML = policy.createHTML('<i>ok</i>');
                 const scriptPolicy = trustedTypes.createPolicy('script', {createScript: x => x});
                 const evalResult = eval(scriptPolicy.createScript('1 + 1'));
-                return [rejected, div.innerHTML, evalResult];
+                return [rejected, plainEval, functionCtor, div.innerHTML, evalResult];
             })()"#)
             .unwrap();
-        assert_eq!(result, serde_json::json!([true, "<i>ok</i>", 2]));
+        assert_eq!(result, serde_json::json!([true, "EvalError", "EvalError", "<i>ok</i>", 2]));
+    }
+
+    #[test]
+    fn script_src_attr_controls_inline_event_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'none'",
+        ));
+        let blocked = rt
+            .evaluate(r#"(() => {
+                globalThis.__clicked = 0;
+                const button = document.createElement('button');
+                button.setAttribute('onclick', 'globalThis.__clicked = 1');
+                document.body.appendChild(button);
+                button.click();
+                return globalThis.__clicked;
+            })()"#)
+            .unwrap();
+        assert_eq!(blocked, serde_json::json!(0.0));
+
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'unsafe-inline'",
+        ));
+        let allowed = rt
+            .evaluate(r#"(() => {
+                globalThis.__clicked = 0;
+                const button = document.createElement('button');
+                button.setAttribute('onclick', 'globalThis.__clicked = 1');
+                document.body.appendChild(button);
+                button.click();
+                return globalThis.__clicked;
+            })()"#)
+            .unwrap();
+        assert_eq!(allowed, serde_json::json!(1.0));
     }
 
     /// With `require-trusted-types-for 'script'` and a default policy, a plain
@@ -4743,7 +6156,7 @@ mod tests {
         let origin = format!("http://{address}");
 
         let mut rt = ObscuraJsRuntime::new();
-        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe><iframe id=g></iframe></body></html>"));
         rt.set_url("http://top.example/index.html");
         rt.set_http_client(std::sync::Arc::new(
             obscura_net::ObscuraHttpClient::with_full_options(
@@ -4940,6 +6353,42 @@ mod tests {
                     ctx.font = "16px Arial";
                     const m = ctx.measureText("Mg");
                     const round = v => Math.round(v * 1000) / 1000;
+                    const ink = value => ({
+                        width: value.width,
+                        left: value.actualBoundingBoxLeft,
+                        right: value.actualBoundingBoxRight,
+                        ascent: value.actualBoundingBoxAscent,
+                        descent: value.actualBoundingBoxDescent,
+                    });
+                    ctx.textAlign = 'left';
+                    const blank = ink(ctx.measureText(''));
+                    const spaceLeft = ink(ctx.measureText(' '));
+                    ctx.textAlign = 'center';
+                    const spaceCenter = ink(ctx.measureText(' '));
+                    ctx.textAlign = 'right';
+                    const spaceRight = ink(ctx.measureText(' '));
+                    ctx.direction = 'rtl';
+                    ctx.textAlign = 'start';
+                    const spaceRtlStart = ink(ctx.measureText(' '));
+                    ctx.save();
+                    ctx.direction = 'ltr';
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'top';
+                    ctx.restore();
+                    const restoredState = [ctx.direction, ctx.textAlign, ctx.textBaseline];
+                    const alignmentMatchesChrome =
+                        blank.width === 0 && blank.left === 0 && blank.right === 0
+                        && blank.ascent === 0 && blank.descent === 0
+                        && spaceLeft.left === 0 && spaceLeft.right === 0
+                        && spaceLeft.ascent === 0 && spaceLeft.descent === 0
+                        && spaceCenter.left === spaceCenter.width / 2
+                        && spaceCenter.right === -spaceCenter.width / 2
+                        && spaceRight.left === spaceRight.width
+                        && spaceRight.right === -spaceRight.width
+                        && spaceRtlStart.left === spaceRtlStart.width
+                        && spaceRtlStart.right === -spaceRtlStart.width;
+                    ctx.direction = 'inherit';
+                    ctx.textAlign = 'start';
                     return {
                         tag: Object.prototype.toString.call(m),
                         ownProps: Object.getOwnPropertyNames(m),
@@ -4955,6 +6404,8 @@ mod tests {
                         hangingBaseline: round(m.hangingBaseline),
                         alphabeticBaseline: round(m.alphabeticBaseline),
                         ideographicBaseline: round(m.ideographicBaseline),
+                        alignmentMatchesChrome,
+                        restoredState,
                         // The font box must track the family, not just the size.
                         movesWithFamily: (() => {
                             ctx.font = "16px monospace";
@@ -4998,7 +6449,170 @@ mod tests {
                 "hangingBaseline": 11.2,
                 "alphabeticBaseline": 0,
                 "ideographicBaseline": -3,
+                "alignmentMatchesChrome": true,
+                "restoredState": ["rtl", "start", "alphabetic"],
                 "movesWithFamily": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_manager_and_origin_private_file_system_match_chrome_shape() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    const method = (prototype, name) => {
+                        const value = Object.getOwnPropertyDescriptor(prototype, name).value;
+                        return [value.name, value.length,
+                            /\{\s*\[native code\]\s*\}/.test(
+                                Function.prototype.toString.call(value))];
+                    };
+                    const storageDescriptor = Object.getOwnPropertyDescriptor(
+                        Navigator.prototype, 'storage');
+                    const storage = navigator.storage;
+                    const estimate = await storage.estimate();
+                    const root = await storage.getDirectory();
+                    const directory = await root.getDirectoryHandle('sub', { create: true });
+                    const file = await directory.getFileHandle('probe.txt', { create: true });
+                    const writable = await file.createWritable();
+                    await writable.write('abc');
+                    await writable.seek(1);
+                    await writable.write('Z');
+                    await writable.close();
+                    const snapshot = await file.getFile();
+                    const entries = [];
+                    for await (const [name, handle] of root) {
+                        entries.push([name, handle.kind]);
+                    }
+                    const construct = constructor => {
+                        try { new constructor(); return null; }
+                        catch (error) { return [error.name, error.message]; }
+                    };
+                    return {
+                        storage: {
+                            own: Object.prototype.hasOwnProperty.call(navigator, 'storage'),
+                            stable: storage === navigator.storage,
+                            instance: storage instanceof StorageManager,
+                            tag: Object.prototype.toString.call(storage),
+                            getter: [storageDescriptor.get.name, storageDescriptor.get.length,
+                                Function.prototype.toString.call(storageDescriptor.get)],
+                            keys: Object.getOwnPropertyNames(StorageManager.prototype).sort(),
+                            methods: ['estimate', 'persisted', 'getDirectory', 'persist']
+                                .map(name => method(StorageManager.prototype, name)),
+                            estimate: [estimate.quota > 0, estimate.usage,
+                                Object.keys(estimate.usageDetails)],
+                        },
+                        root: {
+                            tag: Object.prototype.toString.call(root),
+                            own: Object.getOwnPropertyNames(root),
+                            kind: root.kind,
+                            name: root.name,
+                            directory: root instanceof FileSystemDirectoryHandle,
+                            handle: root instanceof FileSystemHandle,
+                            same: await root.isSameEntry(root),
+                            resolveRoot: await root.resolve(root),
+                            resolveDirectory: await root.resolve(directory),
+                            entries,
+                        },
+                        file: {
+                            tag: Object.prototype.toString.call(file),
+                            kind: file.kind,
+                            name: file.name,
+                            file: file instanceof FileSystemFileHandle,
+                            handle: file instanceof FileSystemHandle,
+                            text: await snapshot.text(),
+                            size: snapshot.size,
+                            type: snapshot.type,
+                        },
+                        methods: {
+                            directory: Object.getOwnPropertyNames(
+                                FileSystemDirectoryHandle.prototype).sort(),
+                            file: Object.getOwnPropertyNames(
+                                FileSystemFileHandle.prototype).sort(),
+                            handle: Object.getOwnPropertyNames(
+                                FileSystemHandle.prototype).sort(),
+                        },
+                        errors: {
+                            constructors: [StorageManager, FileSystemHandle,
+                                FileSystemDirectoryHandle, FileSystemFileHandle].map(construct),
+                            badStorage: await outcome(() =>
+                                StorageManager.prototype.getDirectory.call({})),
+                            badHandle: await outcome(() =>
+                                FileSystemHandle.prototype.isSameEntry.call({}, root)),
+                            missing: await outcome(() =>
+                                root.getFileHandle('missing.txt')),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "storage": {
+                    "own": false,
+                    "stable": true,
+                    "instance": true,
+                    "tag": "[object StorageManager]",
+                    "getter": ["get storage", 0, "function get storage() { [native code] }"],
+                    "keys": ["constructor", "estimate", "getDirectory", "persist", "persisted"],
+                    "methods": [
+                        ["estimate", 0, true], ["persisted", 0, true],
+                        ["getDirectory", 0, true], ["persist", 0, true]
+                    ],
+                    "estimate": [true, 0, []],
+                },
+                "root": {
+                    "tag": "[object FileSystemDirectoryHandle]",
+                    "own": [],
+                    "kind": "directory",
+                    "name": "",
+                    "directory": true,
+                    "handle": true,
+                    "same": true,
+                    "resolveRoot": [],
+                    "resolveDirectory": ["sub"],
+                    "entries": [["sub", "directory"]],
+                },
+                "file": {
+                    "tag": "[object FileSystemFileHandle]",
+                    "kind": "file",
+                    "name": "probe.txt",
+                    "file": true,
+                    "handle": true,
+                    "text": "aZc",
+                    "size": 3,
+                    "type": "text/plain",
+                },
+                "methods": {
+                    "directory": ["constructor", "entries", "getDirectoryHandle",
+                        "getFileHandle", "keys", "removeEntry", "resolve", "values"],
+                    "file": ["constructor", "createWritable", "getFile", "move"],
+                    "handle": ["constructor", "isSameEntry", "kind", "name",
+                        "queryPermission", "remove", "requestPermission"],
+                },
+                "errors": {
+                    "constructors": [
+                        ["TypeError", "Failed to construct 'StorageManager': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemHandle': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemDirectoryHandle': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemFileHandle': Illegal constructor"],
+                    ],
+                    "badStorage": {"name": "TypeError", "message": "Illegal invocation"},
+                    "badHandle": {"name": "TypeError", "message": "Illegal invocation"},
+                    "missing": {"name": "NotFoundError",
+                        "message": "A requested file or directory could not be found."},
+                },
             }),
         );
     }
@@ -5015,11 +6629,20 @@ mod tests {
             .evaluate_for_cdp(
                 r#"(() => {
                     const internal = key => /^(Deno$|__obscura|__markParserScripts)/.test(key);
+                    const button = document.createElement('button');
+                    document.body.appendChild(button);
+                    button.focus();
+                    button.getBoundingClientRect();
+                    button.scrollIntoView();
                     const forIn = [];
                     for (const key in globalThis) if (internal(key)) forIn.push(key);
                     return {
                         forIn: forIn.sort(),
                         ownKeys: Object.keys(globalThis).filter(internal).sort(),
+                        legacyInputNames: Object.getOwnPropertyNames(globalThis).filter(
+                            key => ['__obscura_focused','__obscura_click_target',
+                                '__obscura_hover_target','__obscura_mouse_down'].includes(key)),
+                        focused: document.activeElement === button,
                         denoStillWorks: typeof Deno?.core?.ops === "object",
                     };
                 })()"#,
@@ -5035,6 +6658,8 @@ mod tests {
             serde_json::json!({
                 "forIn": [],
                 "ownKeys": [],
+                "legacyInputNames": [],
+                "focused": true,
                 "denoStillWorks": true,
             }),
         );
@@ -5076,6 +6701,99 @@ mod tests {
                 "sharedArrayBuffer": "undefined",
             }),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_isolation_restores_shared_array_buffer_in_page_and_frame_realms() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://isolated.example/page");
+        rt.set_cross_origin_isolated(true);
+        rt.run_page_init();
+        let main = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        globalThis, 'SharedArrayBuffer');
+                    const buffer = new SharedArrayBuffer(16);
+                    return [crossOriginIsolated, typeof SharedArrayBuffer,
+                        buffer.byteLength, descriptor.enumerable,
+                        descriptor.writable, descriptor.configurable,
+                        Object.prototype.toString.call(buffer)];
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(main, serde_json::json!([
+            true, "function", 16, false, true, true, "[object SharedArrayBuffer]",
+        ]));
+
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://isolated.example/frame', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "isolated-frame",
+            1,
+            root,
+            "https://isolated.example/frame",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm(
+                "isolated-frame",
+                1,
+                "<isolation>",
+                "[crossOriginIsolated, typeof SharedArrayBuffer, new SharedArrayBuffer(8).byteLength]",
+        )
+        .unwrap();
+        assert_eq!(frame, serde_json::json!([true, "function", 8]));
+
+        let nonisolated_root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    const root = {root};
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ''), String(a2 ?? ''));
+                    op('set_document_scope', root, JSON.stringify({{
+                        url: 'https://isolated.example/child',
+                        originUrl: 'https://isolated.example/child',
+                        frameId: 'test-frame-child', documentGeneration: 2,
+                        crossOriginIsolated: false,
+                    }}));
+                    return root;
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "nonisolated-frame",
+            1,
+            nonisolated_root,
+            "https://isolated.example/child",
+        )
+        .unwrap();
+        let nonisolated = rt
+            .execute_script_in_frame_realm(
+                "nonisolated-frame",
+                1,
+                "<isolation>",
+                "[crossOriginIsolated, typeof SharedArrayBuffer]",
+            )
+            .unwrap();
+        assert_eq!(nonisolated, serde_json::json!([false, "undefined"]));
     }
 
     /// Trusted Types shape, brand checks and sink tables. Pinned against
@@ -6615,7 +8333,7 @@ RequestRedirect value",
     const FRAME_OPS_PRELUDE: &str = r#"
         const op = (cmd, a1, a2) =>
             Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-        const setupFrame = (hostId, html, originUrl, csp) => {
+        const setupFrame = (hostId, html, originUrl, csp, isolated) => {
             const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));
             if (html) op("parse_into_subtree", created.root, html);
@@ -6625,6 +8343,7 @@ RequestRedirect value",
                 frameId: "test-frame",
                 documentGeneration: 1,
                 csp: csp ?? null,
+                ...(isolated === undefined ? {} : {crossOriginIsolated: !!isolated}),
             }));
             return created.root;
         };
@@ -6683,6 +8402,36 @@ RequestRedirect value",
                 "locationHref": "http://example.com/frame",
                 "createdTag": "SPAN",
             })
+        );
+    }
+
+    #[test]
+    fn scoped_document_domain_persists_the_relaxed_value() {
+        let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://deep.assets.example.co.uk/page");
+        rt.run_page_init();
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                setupFrame("f", '<html><body></body></html>',
+                    "https://deep.assets.example.co.uk/frame");
+                const doc = document.getElementById("f").contentDocument;
+                const initial = doc.domain;
+                doc.domain = "assets.example.co.uk";
+                const relaxed = doc.domain;
+                doc.domain = "example.co.uk";
+                return [initial, relaxed, doc.domain];
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!([
+                "deep.assets.example.co.uk",
+                "assets.example.co.uk",
+                "example.co.uk",
+            ])
         );
     }
 
@@ -7021,6 +8770,90 @@ RequestRedirect value",
         assert_eq!(
             rt.evaluate("globalThis.__ticks").unwrap(),
             serde_json::json!(2.0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_callback_stacks_hide_the_browser_scheduler() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/timer-stack.js",
+            r#"
+                globalThis.__timerStackProbe = { intervalTicks: 0 };
+                setTimeout(function timeoutCapture(first, second) {
+                    __timerStackProbe.timeoutStack = new Error().stack;
+                    __timerStackProbe.timeoutThis = this === window;
+                    __timerStackProbe.timeoutArgs = [first, second];
+                }, 0, "alpha", 7);
+                const intervalId = setInterval(function intervalCapture() {
+                    __timerStackProbe.intervalTicks++;
+                    __timerStackProbe.intervalStack = new Error().stack;
+                    __timerStackProbe.intervalThis = this === window;
+                    clearInterval(intervalId);
+                }, 0);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        let result = rt.evaluate("__timerStackProbe").unwrap();
+        assert_eq!(result["timeoutThis"], serde_json::json!(true));
+        assert_eq!(result["timeoutArgs"], serde_json::json!(["alpha", 7]));
+        assert_eq!(result["intervalThis"], serde_json::json!(true));
+        assert_eq!(result["intervalTicks"], serde_json::json!(1));
+        for key in ["timeoutStack", "intervalStack"] {
+            let stack = result[key].as_str().expect("timer stack string");
+            assert!(
+                stack.contains("https://example.test/timer-stack.js"),
+                "{key} lost the page script origin: {stack}",
+            );
+            assert!(
+                !stack.contains("_runAtNesting")
+                    && !stack.contains("obscura:bootstrap")
+                    && !stack.contains("ext:core"),
+                "{key} leaked browser scheduler frames: {stack}",
+            );
+        }
+    }
+
+    #[test]
+    fn custom_prepare_stack_trace_receives_filtered_callsites() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/custom-stack.js",
+            r#"
+                const savedPrepareStackTrace = Error.prepareStackTrace;
+                Error.prepareStackTrace = function(error, callsites) {
+                    return {
+                        marker: error.message,
+                        files: callsites.map(site => site.getScriptNameOrSourceURL()),
+                    };
+                };
+                function customStackCapture() { return new Error('custom').stack; }
+                globalThis.__customPreparedStack = customStackCapture();
+                Error.prepareStackTrace = savedPrepareStackTrace;
+            "#,
+        )
+        .unwrap();
+
+        let result = rt.evaluate("__customPreparedStack").unwrap();
+        assert_eq!(result["marker"], serde_json::json!("custom"));
+        let files = result["files"].as_array().expect("custom callsite files");
+        assert!(
+            files.iter().any(|file| {
+                file.as_str() == Some("https://example.test/custom-stack.js")
+            }),
+            "custom prepareStackTrace lost page callsites: {result}",
+        );
+        assert!(
+            files.iter().all(|file| {
+                !file.as_str().is_some_and(|name| {
+                    name.starts_with("<obscura:")
+                        || name.starts_with("ext:")
+                        || name.starts_with("deno:")
+                })
+            }),
+            "custom prepareStackTrace received browser callsites: {result}",
         );
     }
 
@@ -8073,9 +9906,14 @@ RequestRedirect value",
     fn dom_parser_accepts_well_formed_xml() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ok = rt
-            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return [d.querySelector('parsererror') ? 'ERR' : 'OK',Object.prototype.toString.call(d),d.constructor.name,d instanceof Document,d instanceof XMLDocument,Object.getPrototypeOf(d)===XMLDocument.prototype,d.documentElement.ownerDocument===d];})()")
             .unwrap();
-        assert_eq!(ok, serde_json::json!("OK"));
+        assert_eq!(
+            ok,
+            serde_json::json!([
+                "OK", "[object XMLDocument]", "XMLDocument", true, true, true, true
+            ]),
+        );
     }
 
     #[test]
@@ -8086,6 +9924,154 @@ RequestRedirect value",
             .evaluate("(function(){var d=new DOMParser().parseFromString('<div><p>hi</a>','text/html'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
             .unwrap();
         assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
+    fn dom_parser_html_builds_a_document_skeleton_and_body_content() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const empty = new DOMParser().parseFromString('', 'text/html');
+                    const fragment = new DOMParser().parseFromString(
+                        '<p>Rqaf3</p><p>XGKq7</p>', 'text/html');
+                    const attribute = new DOMParser().parseFromString(
+                        `<div data-foo='"'></div>`, 'text/html');
+                    const full = new DOMParser().parseFromString(
+                        '<!doctype html><html><head><title>T</title></head>' +
+                        '<body><p>B</p></body></html>', 'text/html');
+                    return {
+                        empty: [empty.documentElement.tagName, empty.head.tagName,
+                                empty.body.tagName, empty.body.innerHTML],
+                        fragment: fragment.body.innerHTML,
+                        attribute: attribute.body.innerHTML,
+                        full: [full.title, full.head.innerHTML, full.body.innerHTML],
+                        identity: [
+                            Object.prototype.toString.call(fragment),
+                            fragment.constructor.name,
+                            fragment instanceof Document,
+                            fragment instanceof HTMLDocument,
+                            Object.getPrototypeOf(fragment) === HTMLDocument.prototype,
+                            fragment.documentElement.ownerDocument === fragment,
+                            fragment.body.ownerDocument === fragment,
+                            fragment.createElement('div').ownerDocument === fragment,
+                            Document.prototype.querySelector.call(fragment, 'p').textContent,
+                            Document.prototype.createElement.call(fragment, 'i').ownerDocument === fragment,
+                            Object.getOwnPropertyNames(fragment).join(','),
+                            fragment.location,
+                            (() => {
+                                const descriptor = Object.getOwnPropertyDescriptor(fragment, 'location');
+                                return [descriptor.enumerable, descriptor.configurable,
+                                        typeof descriptor.get, typeof descriptor.set];
+                            })(),
+                            [
+                                'createTreeWalker', 'createNodeIterator', 'querySelector',
+                                'querySelectorAll', 'getElementById', 'getElementsByTagName',
+                                'getElementsByClassName', 'getElementsByName', 'createElement',
+                                'createElementNS', 'createTextNode', 'createComment',
+                                'createDocumentFragment', 'createRange', 'createEvent',
+                                'createCDATASection', 'createProcessingInstruction',
+                                'adoptNode', 'importNode', 'addEventListener',
+                                'removeEventListener', 'dispatchEvent',
+                            ].every(name => fragment[name] === Document.prototype[name]),
+                            fragment.documentElement.parentNode === fragment,
+                            fragment.documentElement.getRootNode() === fragment,
+                            fragment.body.getRootNode() === fragment,
+                            fragment.contains(fragment.documentElement),
+                            fragment.compareDocumentPosition(fragment.documentElement),
+                            fragment.documentElement.compareDocumentPosition(fragment),
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "empty": ["HTML", "HEAD", "BODY", ""],
+                "fragment": "<p>Rqaf3</p><p>XGKq7</p>",
+                "attribute": "<div data-foo=\"&quot;\"></div>",
+                "full": ["T", "<title>T</title>", "<p>B</p>"],
+                "identity": [
+                    "[object HTMLDocument]", "HTMLDocument", true, true, true,
+                    true, true, true, "Rqaf3", true,
+                    "location", null, [true, false, "function", "function"],
+                    true, true, true, true, true, 20, 10,
+                ],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debugger_reads_sources_compiled_through_eval() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.enable_debugger();
+        const EVAL_SOURCE: &str = "globalThis.__debugger_eval_marker = 611;";
+        rt.execute_script(
+            "https://example.test/author.js",
+            &format!("eval({});", serde_json::to_string(EVAL_SOURCE).unwrap()),
+        )
+        .unwrap();
+
+        let scripts = rt.debugger_scripts().await.unwrap();
+        let eval_script = scripts
+            .iter()
+            .find(|script| script.length == EVAL_SOURCE.len() as u64)
+            .unwrap_or_else(|| panic!("eval script should be reported by V8 inspector: {scripts:#?}"));
+        let source = rt
+            .debugger_script_source(&eval_script.script_id)
+            .await
+            .unwrap();
+        assert_eq!(source, EVAL_SOURCE);
+    }
+
+    #[test]
+    fn create_html_document_reuses_one_skeleton_and_converts_optional_title() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const run = source => {
+                        const doc = document.implementation.createHTMLDocument('');
+                        const root = doc.documentElement;
+                        const before = Array.from(root.children, child => child.tagName);
+                        root.lastElementChild.innerHTML = source;
+                        return [before, doc.body === root.lastElementChild,
+                                doc.body.innerHTML, root.lastElementChild.innerHTML];
+                    };
+                    const titleCases = [
+                        document.implementation.createHTMLDocument(),
+                        document.implementation.createHTMLDocument(''),
+                        document.implementation.createHTMLDocument(null),
+                        document.implementation.createHTMLDocument(0),
+                    ].map(doc => [doc.title, doc.head.innerHTML]);
+                    return {
+                        fragment: run('<p>Rqaf3</p><p>XGKq7</p>'),
+                        attribute: run(`<div data-foo='"'></div>`),
+                        titleCases,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "fragment": [
+                    ["HEAD", "BODY"], true,
+                    "<p>Rqaf3</p><p>XGKq7</p>",
+                    "<p>Rqaf3</p><p>XGKq7</p>",
+                ],
+                "attribute": [
+                    ["HEAD", "BODY"], true,
+                    "<div data-foo=\"&quot;\"></div>",
+                    "<div data-foo=\"&quot;\"></div>",
+                ],
+                "titleCases": [
+                    ["", ""], ["", "<title></title>"],
+                    ["null", "<title>null</title>"], ["0", "<title>0</title>"],
+                ],
+            }),
+        );
     }
 
     #[test]
@@ -8501,6 +10487,83 @@ RequestRedirect value",
     }
 
     #[test]
+    fn scoped_custom_element_registry_matches_chrome_initialize_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const registry = new CustomElementRegistry();
+                    const host = document.createElement('div');
+                    document.body.appendChild(host);
+                    const shadow = host.attachShadow({
+                        mode: 'open', customElementRegistry: registry,
+                    });
+                    shadow.innerHTML = '<scope-probe></scope-probe><div id=scoped-div></div>';
+                    document.body.insertAdjacentHTML('beforeend',
+                        '<scope-probe id=global-probe></scope-probe>');
+                    let constructors = 0, connected = 0;
+                    class ScopeProbe extends HTMLElement {
+                        constructor() { super(); constructors++; }
+                        connectedCallback() { connected++; }
+                    }
+                    registry.define('scope-probe', ScopeProbe);
+                    const before = [constructors, connected];
+                    registry.initialize(shadow);
+                    let missing;
+                    try { registry.initialize(); missing = null; }
+                    catch (error) { missing = error.name; }
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        CustomElementRegistry.prototype, 'initialize');
+                    const elementRegistryDescriptor = Object.getOwnPropertyDescriptor(
+                        Element.prototype, 'customElementRegistry');
+                    return {
+                        own: Object.getOwnPropertyNames(registry),
+                        tag: Object.prototype.toString.call(registry),
+                        prototype: Object.getOwnPropertyNames(
+                            CustomElementRegistry.prototype),
+                        initialize: [descriptor.value.name, descriptor.value.length,
+                            descriptor.enumerable, descriptor.configurable,
+                            descriptor.writable,
+                            Function.prototype.toString.call(descriptor.value)],
+                        rootRegistry: shadow.customElementRegistry === registry,
+                        elementRegistry: [
+                            shadow.querySelector('#scoped-div').customElementRegistry === registry,
+                            host.customElementRegistry === customElements,
+                            document.getElementById('global-probe').customElementRegistry === customElements,
+                            elementRegistryDescriptor.get.name,
+                            elementRegistryDescriptor.get.length,
+                            elementRegistryDescriptor.enumerable,
+                            elementRegistryDescriptor.configurable,
+                            Function.prototype.toString.call(elementRegistryDescriptor.get),
+                        ],
+                        before, after: [constructors, connected], missing,
+                        scoped: shadow.querySelector('scope-probe').constructor.name,
+                        globalNotScoped:
+                            !(document.getElementById('global-probe') instanceof ScopeProbe),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "own": [],
+            "tag": "[object CustomElementRegistry]",
+            "prototype": ["define", "get", "getName", "upgrade", "whenDefined",
+                "initialize", "constructor"],
+            "initialize": ["initialize", 1, true, true, true,
+                "function initialize() { [native code] }"],
+            "rootRegistry": true,
+            "elementRegistry": [true, true, true, "get customElementRegistry", 0,
+                true, true,
+                "function get customElementRegistry() { [native code] }"],
+            "before": [1, 1],
+            "after": [1, 1],
+            "missing": "TypeError",
+            "scoped": "ScopeProbe",
+            "globalNotScoped": true,
+        }));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
@@ -8608,6 +10671,46 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!([true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn window_legacy_attributes_and_event_target_shape_match_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(window, name);
+                        return d && [d.get.name, d.set && d.set.name,
+                            d.enumerable, d.configurable];
+                    };
+                    window.name = 42;
+                    window.status = 7;
+                    return {
+                        values: [window.name, window.status, window.closed],
+                        own: Object.getOwnPropertyNames(window).filter(name =>
+                            ['name', 'status', 'closed', 'addEventListener',
+                             'removeEventListener', 'dispatchEvent'].includes(name)),
+                        descriptors: [descriptor('name'), descriptor('status'),
+                            descriptor('closed')],
+                        eventTarget: window instanceof EventTarget,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": ["42", "7", false],
+                "own": ["name", "status", "closed"],
+                "descriptors": [
+                    ["get name", "set name", true, true],
+                    ["get status", "set status", true, true],
+                    ["get closed", null, true, true],
+                ],
+                "eventTarget": true,
+            })
         );
     }
 
@@ -8739,6 +10842,122 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn navigator_has_no_own_idl_members() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const prototype = Object.getPrototypeOf(navigator);
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(prototype, name);
+                        return d && [d.get ? d.get.name : null, d.enumerable, d.configurable];
+                    };
+                    return {
+                        own: Object.getOwnPropertyNames(navigator),
+                        members: ['connection', 'permissions', 'gpu', 'geolocation', 'getBattery']
+                            .map(descriptor),
+                        values: [navigator.connection !== undefined,
+                            navigator.permissions !== undefined,
+                            navigator.gpu !== undefined,
+                            navigator.geolocation !== undefined],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "own": [],
+                "members": [
+                    ["get connection", true, true],
+                    ["get permissions", true, true],
+                    ["get gpu", true, true],
+                    ["get geolocation", true, true],
+                    [null, true, true],
+                ],
+                "values": [true, true, true, true],
+            })
+        );
+    }
+
+    #[test]
+    fn link_elements_use_their_own_interface_and_resolve_urls() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const link = document.createElement('link');
+                    link.href = '/assets/app.css';
+                    link.rel = 'stylesheet';
+                    link.media = 'print';
+                    link.fetchPriority = 'high';
+                    link.crossOrigin = 'anonymous';
+                    return {
+                        ctor: link.constructor.name,
+                        instance: link instanceof HTMLLinkElement,
+                        elementInstance: link instanceof Element,
+                        href: link.href,
+                        media: link.media,
+                        fetchPriority: link.fetchPriority,
+                        crossOrigin: link.crossOrigin,
+                        illegal: (() => { try { new HTMLLinkElement(); return false; }
+                            catch (error) { return error.name; } })(),
+                        own: Object.getOwnPropertyNames(link),
+                        proto: Object.getOwnPropertyNames(HTMLLinkElement.prototype).filter(
+                            name => ['href', 'media', 'as', 'type', 'crossOrigin',
+                                'referrerPolicy', 'fetchPriority', 'integrity', 'blocking']
+                                .includes(name)),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "ctor": "HTMLLinkElement",
+                "instance": true,
+                "elementInstance": true,
+                "href": "http://example.com/assets/app.css",
+                "media": "print",
+                "fetchPriority": "high",
+                "crossOrigin": "anonymous",
+                "illegal": "TypeError",
+                "own": [],
+                "proto": [
+                    "href", "crossOrigin", "media", "as", "type",
+                    "referrerPolicy", "fetchPriority", "integrity", "blocking",
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn chrome149_payload_interfaces_are_present_on_secure_documents() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => ({
+                    modelContext: typeof navigator.modelContext,
+                    modelContextTag: Object.prototype.toString.call(navigator.modelContext),
+                    modelContextCtor: typeof ModelContext,
+                    webMcpEvent: typeof WebMCPEvent,
+                    designMode: document.designMode,
+                    navigatorOwn: Object.getOwnPropertyNames(navigator),
+                }))()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "modelContext": "object",
+                "modelContextTag": "[object ModelContext]",
+                "modelContextCtor": "function",
+                "webMcpEvent": "function",
+                "designMode": "off",
+                "navigatorOwn": [],
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fingerprint_contract_drives_navigator_ua_ch_and_screen() {
         let mut rt = ObscuraJsRuntime::new();
@@ -8752,7 +10971,13 @@ RequestRedirect value",
                 height: 982,
                 avail_width: 1512,
                 avail_height: 944,
+                avail_top: 30,
+                avail_left: 0,
                 device_scale_factor: 2.0,
+                outer_width: 1200,
+                outer_height: 1120,
+                screen_x: 22,
+                screen_y: 51,
             }),
             ..obscura_net::FingerprintOverrides::default()
         });
@@ -8770,7 +10995,8 @@ RequestRedirect value",
                 ua:navigator.userAgent, appVersion:navigator.appVersion,
                 platform:navigator.platform, hardwareConcurrency:navigator.hardwareConcurrency,
                 deviceMemory:navigator.deviceMemory, low:navigator.userAgentData.toJSON(), high,
-                screen:[screen.width,screen.height,screen.availWidth,screen.availHeight,devicePixelRatio]
+                screen:[screen.width,screen.height,screen.availWidth,screen.availHeight,screen.availTop,screen.availLeft,devicePixelRatio],
+                window:[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]
               };
             })()"#,
             true,
@@ -8801,7 +11027,8 @@ RequestRedirect value",
                 "uaFullVersion": "146.0.7680.80",
                 "wow64": false
             },
-            "screen": [1512,982,1512,944,2]
+            "screen": [1512,982,1512,944,30,0,2],
+            "window": [1200,1120,22,51,22,51]
         }));
     }
 
@@ -8840,6 +11067,69 @@ RequestRedirect value",
             .unwrap(),
             serde_json::json!([1024, 768, true, true, true, true])
         );
+    }
+
+    #[test]
+    fn callback_key_range_and_window_methods_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+              const constructError = value => {
+                try { Reflect.construct(value, []); return null; }
+                catch (error) { return error.name; }
+              };
+              const globals = Object.fromEntries(
+                ['blur', 'close', 'focus', 'postMessage'].map(name => {
+                  const value = globalThis[name];
+                  return [name, [value.name, value.length, 'prototype' in value,
+                    Object.getOwnPropertyDescriptor(globalThis, name).enumerable,
+                    Function.prototype.toString.call(value), constructError(value)]];
+                }));
+              const range = IDBKeyRange.bound(1, 3, true, false);
+              const lowerGetter = Object.getOwnPropertyDescriptor(
+                IDBKeyRange.prototype, 'lower').get;
+              let invalidGetterError = null;
+              try { lowerGetter.call({}); }
+              catch (error) { invalidGetterError = [error.name, error.message]; }
+              return {
+                webkitAudioContext: typeof webkitAudioContext,
+                nodeFilter: [typeof NodeFilter, NodeFilter.name, NodeFilter.length,
+                  'prototype' in NodeFilter,
+                  Object.getOwnPropertyDescriptor(globalThis, 'NodeFilter').enumerable,
+                  Function.prototype.toString.call(NodeFilter), constructError(NodeFilter),
+                  NodeFilter.FILTER_ACCEPT, NodeFilter.SHOW_ALL],
+                keyRange: [typeof IDBKeyRange, IDBKeyRange.name, IDBKeyRange.length,
+                  Object.getOwnPropertyDescriptor(globalThis, 'IDBKeyRange').enumerable,
+                  Function.prototype.toString.call(IDBKeyRange), constructError(IDBKeyRange),
+                  Object.getOwnPropertyNames(IDBKeyRange.prototype).sort(),
+                  Object.prototype.toString.call(range), range.lower, range.upper,
+                  range.lowerOpen, range.upperOpen, range.includes(1), range.includes(2),
+                  invalidGetterError],
+                globals,
+              };
+            })()"#,
+        ).unwrap();
+
+        assert_eq!(result, serde_json::json!({
+            "webkitAudioContext": "undefined",
+            "nodeFilter": ["function", "NodeFilter", 0, false, false,
+                "function NodeFilter() { [native code] }", "TypeError", 1, 4294967295u64],
+            "keyRange": ["function", "IDBKeyRange", 0, false,
+                "function IDBKeyRange() { [native code] }", "TypeError",
+                ["constructor", "includes", "lower", "lowerOpen", "upper", "upperOpen"],
+                "[object IDBKeyRange]", 1, 3, true, false, false, true,
+                ["TypeError", "Illegal invocation"]],
+            "globals": {
+                "blur": ["blur", 0, false, true,
+                    "function blur() { [native code] }", "TypeError"],
+                "close": ["close", 0, false, true,
+                    "function close() { [native code] }", "TypeError"],
+                "focus": ["focus", 0, false, true,
+                    "function focus() { [native code] }", "TypeError"],
+                "postMessage": ["postMessage", 1, false, true,
+                    "function postMessage() { [native code] }", "TypeError"],
+            }
+        }));
     }
 
     #[test]
@@ -11520,7 +13810,7 @@ RequestRedirect value",
         assert_eq!(initial["box"][0], serde_json::json!(116));
         assert_eq!(initial["box"][1], serde_json::json!(62));
         assert!((initial["box"][2].as_f64().unwrap() - 123.0).abs() < 0.05);
-        assert_eq!(initial["box"][3], serde_json::json!(67));
+        assert!((initial["box"][3].as_f64().unwrap() - 66.6).abs() < 0.05);
 
         // Attribute-backed inline-style changes invalidate the retained
         // render. Borders do not change the padding box; padding does.
@@ -11542,7 +13832,7 @@ RequestRedirect value",
             .unwrap();
         assert_eq!(mutated[0], serde_json::json!(100));
         assert_eq!(mutated[1], serde_json::json!(126));
-        assert_eq!(mutated[2], serde_json::json!(143));
+        assert!((mutated[2].as_f64().unwrap() - 142.7).abs() < 0.05);
 
         // A later CDP/emulation viewport update invalidates the layout too;
         // both the root special case and an ordinary 100vh box are live.
@@ -13514,7 +15804,13 @@ RequestRedirect value",
                     height: 1440,
                     avail_width: 2560,
                     avail_height: 1400,
+                    avail_top: 0,
+                    avail_left: 0,
                     device_scale_factor: 1.0,
+                    outer_width: 0,
+                    outer_height: 0,
+                    screen_x: 0,
+                    screen_y: 0,
                 }),
                 ..obscura_net::FingerprintOverrides::default()
             },
@@ -13529,6 +15825,51 @@ RequestRedirect value",
                 .unwrap(),
             serde_json::json!([2560, 1440, 1])
         );
+    }
+
+    #[test]
+    fn fingerprint_language_reaches_main_and_initial_frame_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                language: Some("zh-CN".to_string()),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        rt.set_fingerprint(&fingerprint);
+        let values = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    return [
+                        navigator.language,
+                        navigator.languages,
+                        frame.contentWindow.navigator.language,
+                        frame.contentWindow.navigator.languages,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            values,
+            serde_json::json!(["zh-CN", ["zh-CN"], "zh-CN", ["zh-CN"]])
+        );
+    }
+
+    #[test]
+    fn initial_about_blank_iframe_is_back_compat_synchronously() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    return [frame.contentDocument.compatMode, frame.contentDocument.doctype === null];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["BackCompat", true]));
     }
 
     #[cfg(feature = "render")]
@@ -15356,6 +17697,358 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn canvas_paths_capture_transforms_and_rects_preserve_the_current_path() {
+        let mut rt = setup_runtime("<html><body><canvas width=40 height=24></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    const hasInk = (x0, y0, width, height) => {
+                        const data = ctx.getImageData(x0, y0, width, height).data;
+                        return Array.from(data).some((value, index) => index % 4 === 3 && value > 0);
+                    };
+                    ctx.strokeStyle = 'red';
+                    ctx.beginPath(); ctx.moveTo(1, 2); ctx.lineTo(8, 2); ctx.stroke();
+                    const twoPointStroke = hasInk(0, 0, 10, 5);
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.resetTransform(); ctx.translate(10, 0); ctx.scale(2, 2);
+                    const matrix = ctx.getTransform();
+                    ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 1, 1);
+                    const transformedRect = [hasInk(10, 0, 2, 2), hasInk(20, 0, 2, 2)];
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.resetTransform(); ctx.beginPath(); ctx.moveTo(1, 8);
+                    ctx.translate(10, 0); ctx.lineTo(1, 8); ctx.resetTransform(); ctx.stroke();
+                    const pathCapturedTransform = hasInk(0, 6, 13, 5);
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.beginPath(); ctx.moveTo(1, 14); ctx.lineTo(9, 14);
+                    ctx.lineTo(5, 20); ctx.closePath(); ctx.translate(20, 0);
+                    ctx.fillStyle = 'blue'; ctx.fillRect(0, 0, 1, 1);
+                    ctx.resetTransform(); ctx.strokeStyle = 'red'; ctx.stroke();
+                    const fillRectPreservedPath = hasInk(0, 12, 12, 10);
+                    return {
+                        twoPointStroke,
+                        matrix: [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f],
+                        transformedRect, pathCapturedTransform, fillRectPreservedPath,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "twoPointStroke": true,
+                "matrix": [2, 0, 0, 2, 10, 0],
+                "transformedRect": [true, false],
+                "pathCapturedTransform": true,
+                "fillRectPreservedPath": true,
+            })
+        );
+    }
+
+    #[test]
+    fn image_data_settings_color_spaces_and_float16_match_chrome() {
+        let mut rt = setup_runtime("<html><body><canvas width=1 height=1></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summary = image => [image.width, image.height, image.colorSpace,
+                        image.pixelFormat, image.data.constructor.name, ...image.data];
+                    const canvas = document.querySelector('canvas');
+                    const ctx = canvas.getContext('2d',
+                        {colorSpace: 'display-p3', willReadFrequently: true});
+                    const read = (colorSpace, pixelFormat, color) => {
+                        ctx.clearRect(0, 0, 1, 1);
+                        ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
+                        const values = summary(ctx.getImageData(0, 0, 1, 1,
+                            {colorSpace, pixelFormat}));
+                        if (pixelFormat === 'rgba-float16') {
+                            for (let index = 5; index < values.length; index++)
+                                values[index] = Math.round(values[index] * 1000) / 1000;
+                        }
+                        return values;
+                    };
+                    const error = callback => {
+                        try { callback(); return null; }
+                        catch (caught) { return caught.name; }
+                    };
+                    const floatContextRead = colorSpace => {
+                        const surface = new OffscreenCanvas(2, 2);
+                        const context = surface.getContext('2d', {
+                            colorSpace, colorType: 'float16', willReadFrequently: true,
+                        });
+                        context.fillStyle = 'color(display-p3 1 0.25 0.5)';
+                        context.fillRect(0, 0, 2, 2);
+                        const attrs = context.getContextAttributes();
+                        return [attrs.colorSpace, attrs.colorType, ...context.getImageData(
+                            0, 0, 1, 1, {colorSpace, pixelFormat: 'rgba-float16'}).data];
+                    };
+                    return {
+                        basic: summary(new ImageData(1, 1)),
+                        p3: summary(new ImageData(new Uint8ClampedArray(
+                            [255, 64, 127, 255]), 1, 1, {colorSpace: 'display-p3'})),
+                        float: summary(new ImageData(new Float16Array([1, .25, .5, 1]),
+                            1, 1, {colorSpace: 'display-p3', pixelFormat: 'rgba-float16'})),
+                        attrs: ctx.getContextAttributes(),
+                        created: summary(ctx.createImageData(1, 1,
+                            {colorSpace: 'display-p3', pixelFormat: 'rgba-float16'})),
+                        reads: [
+                            read('srgb', 'rgba-unorm8', 'color(srgb 1.1 0.1 0.5)'),
+                            read('display-p3', 'rgba-unorm8', 'color(display-p3 1 0.25 0.5)'),
+                            read('srgb', 'rgba-float16', 'color(srgb 1.1 0.1 0.5)'),
+                            read('display-p3', 'rgba-float16', 'color(display-p3 1 0.25 0.5)'),
+                        ],
+                        floatContexts: [floatContextRead('srgb'),
+                            floatContextRead('display-p3')],
+                        errors: [
+                            error(() => new ImageData(0, 1)),
+                            error(() => new ImageData(new Uint8ClampedArray(4), 1, 1,
+                                {pixelFormat: 'rgba-float16'})),
+                            error(() => ctx.getImageData(0, 0, 1, 1, {pixelFormat: 'bogus'})),
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "basic": [1, 1, "srgb", "rgba-unorm8", "Uint8ClampedArray", 0, 0, 0, 0],
+                "p3": [1, 1, "display-p3", "rgba-unorm8", "Uint8ClampedArray",
+                    255, 64, 127, 255],
+                "float": [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                    1, 0.25, 0.5, 1],
+                "attrs": {
+                    "alpha": true, "colorSpace": "display-p3", "colorType": "unorm8",
+                    "desynchronized": false, "toneMapping": {"mode": "standard"},
+                    "willReadFrequently": true,
+                },
+                "created": [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                    0, 0, 0, 0],
+                "reads": [
+                    [1, 1, "srgb", "rgba-unorm8", "Uint8ClampedArray", 255, 28, 127, 255],
+                    [1, 1, "display-p3", "rgba-unorm8", "Uint8ClampedArray", 255, 64, 127, 255],
+                    [1, 1, "srgb", "rgba-float16", "Float16Array",
+                        1.089, 0.108, 0.499, 1],
+                    [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                        1, 0.251, 0.498, 1],
+                ],
+                "floatContexts": [
+                    ["srgb", "float16", 1.0888671875, 0.10601806640625,
+                        0.497314453125, 1],
+                    ["display-p3", "float16", 1, 0.25, 0.5, 1],
+                ],
+                "errors": ["IndexSizeError", "InvalidStateError", "TypeError"],
+            }),
+        );
+    }
+
+    #[test]
+    fn canvas_text_preparation_replaces_c1_controls_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(80, 24);
+                    const context = canvas.getContext('2d');
+                    context.font = '16px sans-serif';
+                    const binary = String.fromCodePoint(240, 159, 152, 128);
+                    const replacement = String.fromCodePoint(240, 65533, 65533, 65533);
+                    const pixels = text => {
+                        context.clearRect(0, 0, 80, 24);
+                        context.fillText(text, 2, 18);
+                        return Array.from(context.getImageData(0, 0, 80, 24).data);
+                    };
+                    return {
+                        widths: [context.measureText(binary).width,
+                            context.measureText(replacement).width],
+                        samePixels: JSON.stringify(pixels(binary))
+                            === JSON.stringify(pixels(replacement)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["widths"][0], result["widths"][1]);
+        assert_eq!(result["samePixels"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn inline_rects_keep_chromes_subpixel_width_while_offset_width_rounds() {
+        let mut rt = setup_runtime(
+            r#"<html><body style="margin:0"><span id="probe"
+               style="display:inline-block;margin:0;padding:0;border:0;font:16px Arial">Cloudflare</span>
+               <canvas></canvas></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const probe = document.getElementById('probe');
+                    const context = document.querySelector('canvas').getContext('2d');
+                    context.font = '16px Arial';
+                    return [probe.getBoundingClientRect().width, probe.offsetWidth,
+                        context.measureText(probe.textContent).width];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([72.9375, 73, 72.9375]));
+    }
+
+    #[test]
+    fn canvas_multiply_evenodd_and_edge_alpha_match_browser_semantics() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(49, 44);
+                    const context = canvas.getContext('2d');
+                    context.scale(0.4, 0.4);
+                    context.fillStyle = '#f2f';
+                    context.beginPath();
+                    context.arc(40, 40, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.globalCompositeOperation = 'multiply';
+                    context.fillStyle = '#2ff';
+                    context.beginPath();
+                    context.arc(80, 40, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.fillStyle = '#ff2';
+                    context.beginPath();
+                    context.arc(60, 80, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.globalCompositeOperation = 'source-over';
+                    context.fillStyle = '#fff';
+                    context.beginPath();
+                    context.arc(61, 53, 20, 0, Math.PI * 2, true);
+                    context.arc(61, 53, 10, 0, Math.PI * 2, true);
+                    context.fill('evenodd');
+
+                    const directionCanvas = new OffscreenCanvas(2, 2);
+                    const directionContext = directionCanvas.getContext('2d');
+                    directionContext.fillStyle = '#000';
+                    directionContext.fillRect(0, 0, 2, 2);
+                    directionContext.fillStyle = '#fff';
+                    directionContext.beginPath();
+                    directionContext.arc(0, 0, 2, 0, 1, true);
+                    directionContext.closePath();
+                    directionContext.fill();
+                    const directionPixels = Array.from(
+                        directionContext.getImageData(0, 0, 2, 2).data);
+                    let negativeRadius = null;
+                    try { directionContext.arc(0, 0, -1, 0, 1); }
+                    catch (error) { negativeRadius = error.name; }
+
+                    const data = context.getImageData(0, 0, 49, 44).data;
+                    const pixel = (x, y) => Array.from(
+                        data.slice((y * 49 + x) * 4, (y * 49 + x) * 4 + 4));
+                    let edge = null;
+                    for (let index = 0; index < data.length && !edge; index += 4) {
+                        if (data[index + 3] > 0 && data[index + 3] < 255) {
+                            edge = Array.from(data.slice(index, index + 4));
+                        }
+                    }
+                    context.globalCompositeOperation = 'multiply';
+                    context.save();
+                    context.globalCompositeOperation = 'source-over';
+                    context.restore();
+                    return {
+                        pixels: [pixel(8, 8), pixel(16, 16), pixel(24, 24),
+                            pixel(24, 32), pixel(40, 16)],
+                        edge,
+                        directionPixels,
+                        negativeRadius,
+                        restoredComposite: context.globalCompositeOperation,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result["pixels"],
+            serde_json::json!([
+                [255, 34, 255, 255],
+                [34, 34, 255, 255],
+                [34, 34, 34, 255],
+                [255, 255, 34, 255],
+                [34, 255, 255, 255],
+            ]),
+        );
+        let edge = result["edge"].as_array().expect("partial edge pixel");
+        assert_eq!(edge[0], serde_json::json!(255));
+        assert_eq!(edge[1], serde_json::json!(34));
+        assert_eq!(edge[2], serde_json::json!(255));
+        let alpha = edge[3].as_u64().unwrap();
+        assert!(alpha > 0 && alpha < 255);
+        assert_eq!(
+            result["directionPixels"],
+            serde_json::json!([
+                255, 255, 255, 255,
+                191, 191, 191, 255,
+                239, 239, 239, 255,
+                48, 48, 48, 255,
+            ]),
+        );
+        assert_eq!(result["negativeRadius"], serde_json::json!("IndexSizeError"));
+        assert_eq!(result["restoredComposite"], serde_json::json!("multiply"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offscreen_canvas_exports_and_transfers_its_real_backing_store() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const canvas = new OffscreenCanvas(49, 44);
+                    const context = canvas.getContext('2d');
+                    context.fillStyle = 'rgb(255, 64, 127)';
+                    context.fillRect(0, 0, 49, 44);
+                    const blob = await canvas.convertToBlob();
+                    const bytes = new Uint8Array(await blob.arrayBuffer());
+                    const decoded = await createImageBitmap(blob);
+                    const transferred = canvas.transferToImageBitmap();
+                    const after = Array.from(context.getImageData(0, 0, 1, 1).data);
+                    const fromImageData = await createImageBitmap(new ImageData(3, 2));
+                    let missingContextError = null;
+                    try { await new OffscreenCanvas(1, 1).convertToBlob(); }
+                    catch (error) { missingContextError = error.name; }
+                    return {
+                        tags: [Object.prototype.toString.call(canvas),
+                            Object.prototype.toString.call(context),
+                            Object.prototype.toString.call(decoded),
+                            Object.prototype.toString.call(transferred)],
+                        blob: [blob.size > 0, blob.type, Array.from(bytes.slice(0, 8))],
+                        decoded: [decoded.width, decoded.height],
+                        transferred: [transferred.width, transferred.height],
+                        after, imageData: [fromImageData.width, fromImageData.height],
+                        sameContext: context === canvas.getContext('2d'),
+                        missingContextError,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "tags": ["[object OffscreenCanvas]",
+                    "[object OffscreenCanvasRenderingContext2D]",
+                    "[object ImageBitmap]", "[object ImageBitmap]"],
+                "blob": [true, "image/png", [137, 80, 78, 71, 13, 10, 26, 10]],
+                "decoded": [49, 44], "transferred": [49, 44],
+                "after": [0, 0, 0, 0], "imageData": [3, 2],
+                "sameContext": true, "missingContextError": "InvalidStateError",
+            }),
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
@@ -15680,7 +18373,7 @@ RequestRedirect value",
                     el.style.fontSize = '14px';
                     el.dataset.foo = 'bar';
                     const keys = Object.keys(el.style);
-                    return JSON.stringify({
+                    return {
                         colorInStyle: 'color' in el.style,
                         objectFitInStyle: 'object-fit' in el.style,
                         keysHasSet: keys.includes('color') && keys.includes('fontSize'),
@@ -15691,11 +18384,14 @@ RequestRedirect value",
                         length: el.style.length,
                         getByDash: el.style.getPropertyValue('font-size'),
                         reflectedAttribute: el.getAttribute('style')
-                    });
+                    };
                 })()"#,
             )
             .unwrap();
-        let p: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        let p: serde_json::Value = match result {
+            serde_json::Value::String(value) => serde_json::from_str(&value).unwrap(),
+            value => value,
+        };
         assert_eq!(p["colorInStyle"], true);
         assert_eq!(p["objectFitInStyle"], true);
         assert_eq!(p["keysHasSet"], true);
@@ -15706,6 +18402,69 @@ RequestRedirect value",
         assert_eq!(p["length"], 2);
         assert_eq!(p["getByDash"], "14px");
         assert_eq!(p["reflectedAttribute"], "color: red; font-size: 14px;");
+    }
+
+    #[test]
+    fn css_style_declaration_matches_chrome_named_and_computed_enumeration() {
+        let mut rt = setup_runtime(
+            "<html><head><style>#x { display:block }</style></head><body>\
+             <div id=x style='color:red;margin-top:2px'></div><div id=e></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summarize = style => {
+                        const own = Object.getOwnPropertyNames(style);
+                        const numeric = own.filter(name => /^\d+$/.test(name));
+                        return {
+                            tag: Object.prototype.toString.call(style),
+                            length: style.length,
+                            ownCount: own.length,
+                            numericCount: numeric.length,
+                            namedCount: own.length - numeric.length,
+                            ownHas: ['anchorName', 'fieldSizing', 'webkitAlignContent', 'zoom']
+                                .every(name => Object.prototype.hasOwnProperty.call(style, name)),
+                        };
+                    };
+                    const rule = document.styleSheets[0].cssRules[0];
+                    const inline = document.getElementById('x').style;
+                    inline.cssFloat = 'left';
+                    return {
+                        empty: summarize(document.getElementById('e').style),
+                        inline: summarize(inline),
+                        computed: summarize(getComputedStyle(document.getElementById('x'))),
+                        prototype: Object.getOwnPropertyNames(CSSStyleDeclaration.prototype),
+                        cssFloat: [inline.cssFloat, inline.getPropertyValue('float')],
+                        parentRule: rule.style.parentRule === rule,
+                        noInternalOwn: !Object.getOwnPropertyNames(inline)
+                            .some(name => name.startsWith('_')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "empty": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 0,
+                    "ownCount": 745, "numericCount": 0, "namedCount": 745, "ownHas": true,
+                },
+                "inline": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 3,
+                    "ownCount": 748, "numericCount": 3, "namedCount": 745, "ownHas": true,
+                },
+                "computed": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 475,
+                    "ownCount": 1220, "numericCount": 475, "namedCount": 745, "ownHas": true,
+                },
+                "prototype": ["cssText", "length", "parentRule", "cssFloat",
+                    "getPropertyPriority", "getPropertyValue", "item", "removeProperty",
+                    "setProperty", "constructor"],
+                "cssFloat": ["left", "left"],
+                "parentRule": true,
+                "noInternalOwn": true,
+            })
+        );
     }
 
     #[test]
@@ -16240,6 +18999,32 @@ RequestRedirect value",
         assert_eq!(
             *requests.lock().unwrap(),
             vec!["http://example.com/page/promoted.png".to_string()]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_image_src_fetches_without_a_lifecycle_observer() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<html><body></body></html>",
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "create-unobserved-image",
+            "const image = new Image(); image.src = 'dynamic.png';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "setting Image.src must start the fetch before complete/load is observed",
         );
     }
 
@@ -16932,6 +19717,33 @@ RequestRedirect value",
     }
 
     #[test]
+    fn window_event_is_current_only_during_dispatch() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const button = document.getElementById('go');
+            const idle = [typeof event, event === undefined, 'event' in window];
+            let during;
+            button.addEventListener('click', e => {
+                during = [event === e, event.type, Object.prototype.toString.call(event)];
+            });
+            button.dispatchEvent(new MouseEvent('click'));
+            return { idle, during, after: event === undefined };
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "idle": ["undefined", true, true],
+                "during": [true, "click", "[object MouseEvent]"],
+                "after": true,
+            })
+        );
+    }
+
+    #[test]
     fn composed_event_crosses_shadow_boundary_to_the_host() {
         let mut rt = setup_runtime(r#"<div id="host"></div>"#);
         let result = rt
@@ -17350,6 +20162,24 @@ RequestRedirect value",
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
+        let gamepads = rt
+            .evaluate(
+                r#"(() => {
+                    const first = navigator.getGamepads();
+                    const second = navigator.getGamepads();
+                    return [Object.prototype.toString.call(first), Array.isArray(first),
+                        first.length, Array.from(first), first === second,
+                        navigator.getGamepads.name, navigator.getGamepads.length,
+                        Function.prototype.toString.call(navigator.getGamepads)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            gamepads,
+            serde_json::json!(["[object Array]", true, 4,
+                [null, null, null, null], false, "getGamepads", 0,
+                "function getGamepads() { [native code] }"])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -18216,6 +21046,337 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn url_and_search_params_hide_internal_slots_and_stay_bound() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const url = new URL('https://user:pass@example.com:8443/a?x=1#h');
+                    const params = url.searchParams;
+                    const errors = [];
+                    for (const callback of [
+                        () => URL.prototype.toString.call({}),
+                        () => URLSearchParams.prototype.append.call({}, 'x', '1'),
+                    ]) {
+                        try { callback(); errors.push(null); }
+                        catch (error) { errors.push(error.name); }
+                    }
+                    const before = url.href;
+                    params.append('y', '2');
+                    const mutated = url.href;
+                    url.search = '?z=3';
+                    return {
+                        urlOwn: Object.getOwnPropertyNames(url),
+                        paramsOwn: Object.getOwnPropertyNames(params),
+                        urlPrototype: Object.getOwnPropertyNames(URL.prototype),
+                        paramsPrototype: Object.getOwnPropertyNames(URLSearchParams.prototype),
+                        tags: [Object.prototype.toString.call(url),
+                            Object.prototype.toString.call(params)],
+                        stable: url.searchParams === params,
+                        before, mutated, refreshed: params.toString(), errors,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "urlOwn": [],
+                "paramsOwn": [],
+                "urlPrototype": ["origin", "protocol", "username", "password",
+                    "host", "hostname", "port", "pathname", "search", "searchParams",
+                    "hash", "href", "toJSON", "toString", "constructor"],
+                "paramsPrototype": ["size", "append", "delete", "get", "getAll",
+                    "has", "set", "sort", "toString", "entries", "forEach", "keys",
+                    "values", "constructor"],
+                "tags": ["[object URL]", "[object URLSearchParams]"],
+                "stable": true,
+                "before": "https://user:pass@example.com:8443/a?x=1#h",
+                "mutated": "https://user:pass@example.com:8443/a?x=1&y=2#h",
+                "refreshed": "z=3",
+                "errors": ["TypeError", "TypeError"],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_objects_use_internal_slots_and_webidl_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const headers = new Headers([['X-Test', 'one'], ['x-test', 'two']]);
+                    const request = new Request('/submit', {
+                        method: 'POST', headers, body: 'payload', mode: 'same-origin',
+                    });
+                    const response = new Response('done', {
+                        status: 201, statusText: 'Created', headers: { 'X-Test': 'ok' },
+                        url: 'http://example.com/submit',
+                    });
+                    const cloned = request.clone();
+                    const responseText = await response.text();
+                    let cloneError = null;
+                    try { response.clone(); } catch (error) { cloneError = error.name; }
+                    let missingRequestError = null;
+                    try { new Request(); } catch (error) { missingRequestError = error.name; }
+                    const redirected = Response.redirect('/next');
+                    return {
+                        own: [Object.getOwnPropertyNames(headers), Object.getOwnPropertyNames(request),
+                            Object.getOwnPropertyNames(response)],
+                        prototypes: [Object.getOwnPropertyNames(Headers.prototype),
+                            Object.getOwnPropertyNames(Request.prototype),
+                            Object.getOwnPropertyNames(Response.prototype)],
+                        headers: [headers.get('x-test'), Array.from(headers.keys()),
+                            headers.getSetCookie()],
+                        request: [request.method, request.url, request.mode,
+                            request.headers.get('x-test'), cloned.bodyUsed, request.bodyUsed,
+                            missingRequestError],
+                        response: [response.status, response.statusText, response.ok,
+                            response.headers.get('x-test'), responseText, response.bodyUsed, cloneError],
+                        redirected: [redirected.status, redirected.type,
+                            redirected.headers.get('location')],
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "own": [[], [], []],
+                "prototypes": [
+                    ["append", "delete", "get", "getSetCookie", "has", "set", "entries",
+                        "forEach", "keys", "values", "constructor"],
+                    ["method", "url", "headers", "destination", "referrer", "referrerPolicy",
+                        "mode", "credentials", "cache", "redirect", "integrity", "keepalive",
+                        "signal", "duplex", "isHistoryNavigation", "bodyUsed", "arrayBuffer",
+                        "blob", "clone", "formData", "json", "text", "targetAddressSpace",
+                        "isReloadNavigation", "body", "bytes", "textStream", "constructor"],
+                    ["type", "url", "redirected", "status", "ok", "statusText", "headers", "body",
+                        "bodyUsed", "arrayBuffer", "blob", "clone", "formData", "json", "text",
+                        "bytes", "textStream", "constructor"],
+                ],
+                "headers": ["one, two", ["x-test"], []],
+                "request": ["POST", "http://example.com/submit", "same-origin", "one, two", false, false, "TypeError"],
+                "response": [201, "Created", true, "ok", "done", true, "TypeError"],
+                "redirected": [302, "basic", "http://example.com/next"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_and_file_use_internal_slots_and_chrome_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const seed = new Blob([
+                        'A', new Uint8Array([0, 255]), new Blob(['B']), null, undefined,
+                    ], {type: 'Text/PLAIN'});
+                    const file = new File(['x\r\ny', new Uint8Array([1, 2])], 'a/b.txt', {
+                        type: 'TEXT/PLAIN', lastModified: 123.9, endings: 'native',
+                    });
+                    const sliced = seed.slice(1, -1, 'IMAGE/PNG');
+                    const byteReader = seed.stream().getReader();
+                    const byteChunk = await byteReader.read();
+                    const byteEnd = await byteReader.read();
+                    const textReader = seed.textStream().getReader();
+                    const textChunk = await textReader.read();
+                    const textEnd = await textReader.read();
+                    const errors = [];
+                    for (const callback of [
+                        () => Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get.call({}),
+                        () => Blob.prototype.slice.call({}),
+                        () => Object.getOwnPropertyDescriptor(File.prototype, 'name').get.call({}),
+                    ]) {
+                        try { callback(); errors.push(null); }
+                        catch (error) { errors.push(error.name); }
+                    }
+                    return JSON.stringify({
+                        constructors: [Blob.length, File.length],
+                        prototypes: [
+                            Object.getOwnPropertyNames(Blob.prototype),
+                            Object.getOwnPropertyNames(File.prototype),
+                        ],
+                        own: [Object.getOwnPropertyNames(seed), Object.getOwnPropertyNames(file)],
+                        tags: [Object.prototype.toString.call(seed), Object.prototype.toString.call(file)],
+                        seed: {
+                            size: seed.size, type: seed.type, text: await seed.text(),
+                            bytes: Array.from(await seed.bytes()),
+                            arrayBuffer: Array.from(new Uint8Array(await seed.arrayBuffer())),
+                        },
+                        file: {
+                            size: file.size, type: file.type, name: file.name,
+                            lastModified: file.lastModified,
+                            date: file.lastModifiedDate.getTime(),
+                            freshDate: file.lastModifiedDate !== file.lastModifiedDate,
+                            webkitRelativePath: file.webkitRelativePath,
+                            bytes: Array.from(await file.bytes()),
+                        },
+                        sliced: {
+                            size: sliced.size, type: sliced.type,
+                            bytes: Array.from(await sliced.bytes()),
+                        },
+                        streams: {
+                            bytes: Array.from(byteChunk.value), byteDone: byteChunk.done,
+                            byteEnd: byteEnd.done, text: textChunk.value,
+                            textDone: textChunk.done, textEnd: textEnd.done,
+                        },
+                        descriptors: {
+                            sizeEnumerable: Object.getOwnPropertyDescriptor(Blob.prototype, 'size').enumerable,
+                            sliceLength: Blob.prototype.slice.length,
+                            sliceNative: Function.prototype.toString.call(Blob.prototype.slice),
+                            nameEnumerable: Object.getOwnPropertyDescriptor(File.prototype, 'name').enumerable,
+                        },
+                        types: [
+                            new Blob([], {type: 'A/B;C=D'}).type,
+                            new Blob([], {type: 'a/\u0080'}).type,
+                        ],
+                        errors,
+                    });
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(
+            result.value.unwrap().as_str().expect("JSON string result"),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "constructors": [0, 2],
+                "prototypes": [
+                    ["size", "type", "arrayBuffer", "slice", "stream", "text",
+                        "bytes", "textStream", "constructor"],
+                    ["name", "lastModified", "lastModifiedDate", "webkitRelativePath",
+                        "constructor"],
+                ],
+                "own": [[], []],
+                "tags": ["[object Blob]", "[object File]"],
+                "seed": {
+                    "size": 17, "type": "text/plain", "text": "A\u{0000}\u{fffd}Bnullundefined",
+                    "bytes": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100, 101,
+                        102, 105, 110, 101, 100],
+                    "arrayBuffer": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100,
+                        101, 102, 105, 110, 101, 100],
+                },
+                "file": {
+                    "size": 5, "type": "text/plain", "name": "a/b.txt",
+                    "lastModified": 123, "date": 123, "freshDate": true,
+                    "webkitRelativePath": "", "bytes": [120, 10, 121, 1, 2],
+                },
+                "sliced": {
+                    "size": 15, "type": "image/png",
+                    "bytes": [0, 255, 66, 110, 117, 108, 108, 117, 110, 100, 101,
+                        102, 105, 110, 101],
+                },
+                "streams": {
+                    "bytes": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100,
+                        101, 102, 105, 110, 101, 100],
+                    "byteDone": false, "byteEnd": true,
+                    "text": "A\u{0000}\u{fffd}Bnullundefined", "textDone": false,
+                    "textEnd": true,
+                },
+                "descriptors": {
+                    "sizeEnumerable": true, "sliceLength": 0,
+                    "sliceNative": "function slice() { [native code] }",
+                    "nameEnumerable": true,
+                },
+                "types": ["a/b;c=d", ""],
+                "errors": ["TypeError", "TypeError", "TypeError"],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_url_fetch_exposes_bytes_metadata_and_revoke_lifecycle() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const blob = new Blob([new Uint8Array([0, 255, 65])], {
+                        type: 'Application/octet-stream',
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const get = await fetch(url);
+                    const getBytes = Array.from(new Uint8Array(await get.arrayBuffer()));
+                    const head = await fetch(url, { method: 'HEAD' });
+                    const headBytes = Array.from(new Uint8Array(await head.arrayBuffer()));
+                    const request = await fetch(new Request(url));
+                    const requestBytes = Array.from(new Uint8Array(await request.arrayBuffer()));
+                    URL.revokeObjectURL(url);
+                    let revokeError = null;
+                    try { await fetch(url); }
+                    catch (error) { revokeError = { name: error.name, type: typeof error }; }
+                    return {
+                        urlPrefix: url.startsWith('blob:http://example.com/'),
+                        get: {
+                            type: get.type,
+                            status: get.status,
+                            statusText: get.statusText,
+                            ok: get.ok,
+                            urlMatches: get.url === url,
+                            contentType: get.headers.get('content-type'),
+                            bytes: getBytes,
+                        },
+                        head: {
+                            type: head.type,
+                            status: head.status,
+                            statusText: head.statusText,
+                            urlMatches: head.url === url,
+                            contentType: head.headers.get('content-type'),
+                            bytes: headBytes,
+                        },
+                        requestBytes,
+                        revokeError,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "urlPrefix": true,
+                "get": {
+                    "type": "basic",
+                    "status": 200,
+                    "statusText": "OK",
+                    "ok": true,
+                    "urlMatches": true,
+                    "contentType": "application/octet-stream",
+                    "bytes": [0, 255, 65],
+                },
+                "head": {
+                    "type": "basic",
+                    "status": 200,
+                    "statusText": "OK",
+                    "urlMatches": true,
+                    "contentType": "application/octet-stream",
+                    "bytes": [],
+                },
+                "requestBytes": [0, 255, 65],
+                "revokeError": { "name": "TypeError", "type": "object" },
+            }),
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -18333,6 +21494,194 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn xhr_uses_internal_slots_and_chrome_event_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body, origin, mode, credentials) => {
+                                calls.push({url, method, headers: JSON.parse(headers), body,
+                                    origin, mode, credentials});
+                                return JSON.stringify({
+                                    status: 201, statusText: 'Created', url,
+                                    headers: {
+                                        'content-length': '5',
+                                        'content-type': 'text/plain; charset=utf-8',
+                                        'x-one': 'alpha',
+                                    },
+                                    body: 'hello',
+                                });
+                            };
+                        const xhr = new XMLHttpRequest();
+                        const upload = xhr.upload;
+                        const initial = {
+                            own: Object.getOwnPropertyNames(xhr),
+                            ownSymbols: Object.getOwnPropertySymbols(xhr).length,
+                            uploadOwn: Object.getOwnPropertyNames(upload),
+                            uploadSymbols: Object.getOwnPropertySymbols(upload).length,
+                            tags: [Object.prototype.toString.call(xhr),
+                                Object.prototype.toString.call(upload)],
+                            values: [xhr.readyState, xhr.timeout, xhr.withCredentials,
+                                xhr.responseURL, xhr.status, xhr.statusText, xhr.responseType,
+                                xhr.response, xhr.responseText, xhr.responseXML],
+                            handlers: ['readystatechange','loadstart','progress','abort','error',
+                                'load','timeout','loadend'].map(name => xhr['on' + name]),
+                            uploadStable: xhr.upload === upload,
+                        };
+                        const prototypes = {
+                            xhr: Object.getOwnPropertyNames(XMLHttpRequest.prototype),
+                            eventTarget: Object.getOwnPropertyNames(XMLHttpRequestEventTarget.prototype),
+                            upload: Object.getOwnPropertyNames(XMLHttpRequestUpload.prototype),
+                            chains: [
+                                Object.getPrototypeOf(XMLHttpRequest.prototype) ===
+                                    XMLHttpRequestEventTarget.prototype,
+                                Object.getPrototypeOf(XMLHttpRequestEventTarget.prototype) ===
+                                    EventTarget.prototype,
+                                Object.getPrototypeOf(XMLHttpRequestUpload.prototype) ===
+                                    XMLHttpRequestEventTarget.prototype,
+                                xhr instanceof EventTarget, upload instanceof EventTarget,
+                            ],
+                            lengths: [XMLHttpRequest.length, XMLHttpRequestEventTarget.length,
+                                XMLHttpRequestUpload.length, XMLHttpRequest.prototype.open.length,
+                                XMLHttpRequest.prototype.send.length],
+                            native: [XMLHttpRequest, XMLHttpRequestEventTarget,
+                                XMLHttpRequestUpload, XMLHttpRequest.prototype.open]
+                                .map(fn => Function.prototype.toString.call(fn)),
+                        };
+                        const errors = [];
+                        for (const callback of [
+                            () => new XMLHttpRequestEventTarget(),
+                            () => new XMLHttpRequestUpload(),
+                            () => new XMLHttpRequest().send(),
+                            () => new XMLHttpRequest().setRequestHeader('x', 'y'),
+                            () => XMLHttpRequest.prototype.open.call({}, 'GET', '/x'),
+                            () => Object.getOwnPropertyDescriptor(
+                                XMLHttpRequest.prototype, 'readyState').get.call({}),
+                        ]) {
+                            try { callback(); errors.push(null); }
+                            catch (error) { errors.push(error.name); }
+                        }
+                        const openedEvents = [];
+                        xhr.addEventListener('readystatechange', event => openedEvents.push([
+                            event.type, xhr.readyState, event.isTrusted,
+                            Object.prototype.toString.call(event), event.target === xhr,
+                        ]));
+                        xhr.open('GET', '/xhr');
+                        const opened = [xhr.readyState, xhr.status, xhr.responseText,
+                            xhr.getAllResponseHeaders(), xhr.getResponseHeader('x-one'),
+                            openedEvents.slice()];
+                        xhr.timeout = 123; xhr.withCredentials = true; xhr.responseType = 'text';
+                        xhr.abort();
+                        const unsentAbort = [xhr.readyState, xhr.timeout, xhr.withCredentials,
+                            xhr.responseType, openedEvents.slice()];
+
+                        const net = new XMLHttpRequest();
+                        const events = [];
+                        for (const type of ['readystatechange','loadstart','progress','load','loadend']) {
+                            net.addEventListener(type, event => events.push([
+                                type, net.readyState, event.isTrusted,
+                                Object.prototype.toString.call(event),
+                                event.target === net, event.currentTarget === net,
+                                event.lengthComputable ?? null,
+                                event.loaded ?? null, event.total ?? null,
+                            ]));
+                        }
+                        net.open('GET', '/xhr');
+                        net.send();
+                        await new Promise((resolve, reject) => {
+                            net.onloadend = resolve; net.onerror = reject;
+                        });
+                        return {
+                            initial, prototypes, errors, opened, unsentAbort,
+                            completed: {
+                                values: [net.readyState, net.status, net.statusText,
+                                    net.responseURL, net.responseType, net.response,
+                                    net.responseText, net.responseXML],
+                                headers: [net.getAllResponseHeaders(),
+                                    net.getResponseHeader('X-One'),
+                                    net.getResponseHeader('missing')],
+                                events,
+                            },
+                            request: calls[0],
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "initial": {
+                    "own": [], "ownSymbols": 0, "uploadOwn": [], "uploadSymbols": 0,
+                    "tags": ["[object XMLHttpRequest]", "[object XMLHttpRequestUpload]"],
+                    "values": [0, 0, false, "", 0, "", "", "", "", null],
+                    "handlers": [null, null, null, null, null, null, null, null],
+                    "uploadStable": true,
+                },
+                "prototypes": {
+                    "xhr": ["onreadystatechange", "readyState", "timeout", "withCredentials",
+                        "upload", "responseURL", "status", "statusText", "responseType",
+                        "response", "responseText", "UNSENT", "OPENED", "HEADERS_RECEIVED",
+                        "LOADING", "DONE", "abort", "getAllResponseHeaders",
+                        "getResponseHeader", "open", "overrideMimeType", "send",
+                        "setRequestHeader", "constructor", "responseXML",
+                        "setAttributionReporting", "setPrivateToken"],
+                    "eventTarget": ["onloadstart", "onprogress", "onabort", "onerror",
+                        "onload", "ontimeout", "onloadend", "constructor"],
+                    "upload": ["constructor"],
+                    "chains": [true, true, true, true, true],
+                    "lengths": [0, 0, 0, 2, 0],
+                    "native": [
+                        "function XMLHttpRequest() { [native code] }",
+                        "function XMLHttpRequestEventTarget() { [native code] }",
+                        "function XMLHttpRequestUpload() { [native code] }",
+                        "function open() { [native code] }",
+                    ],
+                },
+                "errors": ["TypeError", "TypeError", "InvalidStateError",
+                    "InvalidStateError", "TypeError", "TypeError"],
+                "opened": [1, 0, "", "", null,
+                    [["readystatechange", 1, true, "[object Event]", true]]],
+                "unsentAbort": [1, 123, true, "text",
+                    [["readystatechange", 1, true, "[object Event]", true]]],
+                "completed": {
+                    "values": [4, 201, "Created", "http://example.com/xhr", "",
+                        "hello", "hello", null],
+                    "headers": ["content-length: 5\r\ncontent-type: text/plain; charset=utf-8\r\nx-one: alpha\r\n",
+                        "alpha", null],
+                    "events": [
+                        ["readystatechange",1,true,"[object Event]",true,true,null,null,null],
+                        ["loadstart",1,true,"[object ProgressEvent]",true,true,false,0,0],
+                        ["readystatechange",2,true,"[object Event]",true,true,null,null,null],
+                        ["readystatechange",3,true,"[object Event]",true,true,null,null,null],
+                        ["progress",3,true,"[object ProgressEvent]",true,true,true,5,5],
+                        ["readystatechange",4,true,"[object Event]",true,true,null,null,null],
+                        ["load",4,true,"[object ProgressEvent]",true,true,true,5,5],
+                        ["loadend",4,true,"[object ProgressEvent]",true,true,true,5,5],
+                    ],
+                },
+                "request": {
+                    "url": "http://example.com/xhr", "method": "GET", "headers": {},
+                    "body": "", "origin": "http://example.com", "mode": "cors",
+                    "credentials": "same-origin",
+                },
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =
             setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");
@@ -18415,6 +21764,79 @@ RequestRedirect value",
                 },
                 "detachedCssom": true,
             })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_linked_stylesheet_uses_frame_style_csp_and_creator_origin() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_content_security_policy(Some("default-src *; style-src 'none'"));
+        let blocked = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    let calls = 0;
+                    try {
+                        Deno.core.ops.op_fetch_url = () => {
+                            calls++;
+                            return JSON.stringify({status:200, headers:{}, body:'', url:''});
+                        };
+                        const link = document.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = '/blocked.css';
+                        const outcome = await new Promise(resolve => {
+                            link.onload = () => resolve('load');
+                            link.onerror = () => resolve('error');
+                            document.head.appendChild(link);
+                        });
+                        return [outcome, calls, !!document.querySelector('style[data-obscura-linked]')];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.value.unwrap(), serde_json::json!(["error", 0, false]));
+
+        rt.set_content_security_policy(Some("default-src *; style-src *"));
+        let allowed = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const origins = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headers, body, origin) => {
+                            origins.push(origin);
+                            return JSON.stringify({status:200, headers:{'content-type':'text/css'}, body:'.x{color:red}', url});
+                        };
+                        const link = document.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = 'https://cdn.example.test/theme.css';
+                        const outcome = await new Promise(resolve => {
+                            link.onload = () => resolve('load');
+                            link.onerror = () => resolve('error');
+                            document.head.appendChild(link);
+                        });
+                        return [outcome, origins, !!document.querySelector('style[data-obscura-linked]')];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.value.unwrap(),
+            serde_json::json!(["load", ["http://example.com"], true])
         );
     }
 
@@ -18675,6 +22097,48 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn optional_zero_argument_platform_methods_do_not_throw_synchronously() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const call = (owner, name) => {
+                        try {
+                            const value = owner[name]();
+                            if (value && typeof value.catch === 'function') value.catch(() => {});
+                            return value instanceof Promise ? 'promise' : typeof value;
+                        } catch (error) {
+                            return error.name + ':' + error.message;
+                        }
+                    };
+                    return {
+                        find: call(globalThis, 'find'),
+                        captureEvents: call(globalThis, 'captureEvents'),
+                        releaseEvents: call(globalThis, 'releaseEvents'),
+                        showOpenFilePicker: call(globalThis, 'showOpenFilePicker'),
+                        queryLocalFonts: call(globalThis, 'queryLocalFonts'),
+                        getScreenDetails: call(globalThis, 'getScreenDetails'),
+                        requestMIDIAccess: call(navigator, 'requestMIDIAccess'),
+                        getInstalledRelatedApps: call(navigator, 'getInstalledRelatedApps'),
+                        updateAdInterestGroups: call(navigator, 'updateAdInterestGroups'),
+                        clearAppBadge: call(navigator, 'clearAppBadge'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "find": "boolean", "captureEvents": "undefined",
+                "releaseEvents": "undefined", "showOpenFilePicker": "promise",
+                "queryLocalFonts": "promise", "getScreenDetails": "promise",
+                "requestMIDIAccess": "promise", "getInstalledRelatedApps": "promise",
+                "updateAdInterestGroups": "promise", "clearAppBadge": "promise",
+            })
+        );
+    }
+
     /// Window and Document expose different event-handler mixins. One shared
     /// list used to put both sets on both objects, which is why Document
     /// answered to `onbeforeunload`.
@@ -18892,6 +22356,7 @@ RequestRedirect value",
                 r#"(() => {
                     const audio = RTCRtpSender.getCapabilities('audio');
                     const video = RTCRtpReceiver.getCapabilities('video');
+                    const red = audio.codecs.find(c => c.mimeType === 'audio/red');
                     const name = codec => codec.mimeType
                         + (codec.sdpFmtpLine ? ';' + codec.sdpFmtpLine : '');
                     return {
@@ -18904,6 +22369,10 @@ RequestRedirect value",
                         videoCount: video.codecs.length,
                         h264Profiles: video.codecs.filter(c => c.mimeType === 'video/H264').length,
                         firstVideo: name(video.codecs[0]),
+                        redHasFmtp: 'sdpFmtpLine' in red,
+                        redFmtp: red.sdpFmtpLine ?? null,
+                        senderReceiverAgree: JSON.stringify(audio) === JSON.stringify(
+                            RTCRtpReceiver.getCapabilities('audio')),
                         headerExtensions: [audio.headerExtensions.length,
                             video.headerExtensions.length],
                         // Only the two media kinds have capabilities.
@@ -18922,6 +22391,9 @@ RequestRedirect value",
                 "videoCount": 21,
                 "h264Profiles": 8,
                 "firstVideo": "video/VP8",
+                "redHasFmtp": false,
+                "redFmtp": null,
+                "senderReceiverAgree": true,
                 "headerExtensions": [4, 11],
                 "data": null,
             })
@@ -19027,6 +22499,7 @@ RequestRedirect value",
                             .includes('ANGLE'),
                         shadingLanguage: gl.getParameter(0x1F03),
                         version2: gl2.getParameter(0x1F02),
+                        uniformBufferBindings: gl2.getParameter(0x8A2F),
                         hasDebugExtension: gl.getSupportedExtensions()
                             .includes('WEBGL_debug_renderer_info'),
                         // A context returning a handful of extensions is as
@@ -19062,6 +22535,7 @@ RequestRedirect value",
                 "unmaskedIsAdapter": true,
                 "shadingLanguage": "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
                 "version2": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+                "uniformBufferBindings": 32,
                 "hasDebugExtension": true,
                 "manyExtensions": true,
                 "precision": [127, 127, 23, 31, 30, 0],
@@ -19077,6 +22551,222 @@ RequestRedirect value",
                 "colorSpace": "srgb",
             })
         );
+    }
+
+    #[test]
+    fn webgl_standard_constants_and_parameter_defaults_match_chrome() {
+        let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl1 = document.getElementById('c').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const shape = (object, name) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(object, name);
+                        return [descriptor.value, descriptor.writable,
+                            descriptor.enumerable, descriptor.configurable];
+                    };
+                    const names = ['BYTE','UNSIGNED_BYTE','SHORT','UNSIGNED_SHORT','INT',
+                        'UNSIGNED_INT','FLOAT','DEPTH_COMPONENT','ALPHA','RGB','RGBA',
+                        'LUMINANCE','LUMINANCE_ALPHA','UNSIGNED_SHORT_4_4_4_4',
+                        'UNSIGNED_SHORT_5_5_5_1','UNSIGNED_SHORT_5_6_5',
+                        'IMPLEMENTATION_COLOR_READ_TYPE','IMPLEMENTATION_COLOR_READ_FORMAT'];
+                    return {
+                        values: names.map(name => [gl1[name], gl2[name]]),
+                        instanceOwn: [Object.hasOwn(gl1, 'RGBA'), Object.hasOwn(gl2, 'RGBA')],
+                        constantCounts: [
+                            Object.getOwnPropertyNames(WebGLRenderingContext.prototype)
+                                .filter(name => typeof WebGLRenderingContext.prototype[name]
+                                    === 'number').length,
+                            Object.getOwnPropertyNames(WebGL2RenderingContext.prototype)
+                                .filter(name => typeof WebGL2RenderingContext.prototype[name]
+                                    === 'number').length,
+                            Object.getOwnPropertyNames(WebGLRenderingContext)
+                                .filter(name => name !== 'length'
+                                    && typeof WebGLRenderingContext[name] === 'number').length,
+                            Object.getOwnPropertyNames(WebGL2RenderingContext)
+                                .filter(name => name !== 'length'
+                                    && typeof WebGL2RenderingContext[name] === 'number').length,
+                        ],
+                        gl1: [shape(WebGLRenderingContext, 'RGBA'),
+                            shape(WebGLRenderingContext.prototype, 'RGBA'),
+                            shape(WebGLRenderingContext.prototype, 'UNSIGNED_BYTE'),
+                            shape(WebGLRenderingContext.prototype, 'GENERATE_MIPMAP_HINT')],
+                        gl2: [shape(WebGL2RenderingContext, 'RGBA'),
+                            shape(WebGL2RenderingContext.prototype, 'RGBA'),
+                            shape(WebGL2RenderingContext.prototype, 'UNSIGNED_BYTE'),
+                            shape(WebGL2RenderingContext.prototype,
+                                'MAX_CLIENT_WAIT_TIMEOUT_WEBGL')],
+                        implementationRead: [
+                            gl1.getParameter(gl1.IMPLEMENTATION_COLOR_READ_FORMAT),
+                            gl1.getParameter(gl1.IMPLEMENTATION_COLOR_READ_TYPE),
+                            gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_FORMAT),
+                            gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_TYPE),
+                        ],
+                        standardRead: [
+                            gl1.getParameter(gl1.GENERATE_MIPMAP_HINT),
+                            gl1.getParameter(gl1.POLYGON_OFFSET_FILL),
+                            gl1.getParameter(gl1.STENCIL_VALUE_MASK),
+                            gl1.getParameter(gl1.STENCIL_WRITEMASK),
+                            gl2.getParameter(gl2.STENCIL_BACK_VALUE_MASK),
+                            gl2.getParameter(gl2.STENCIL_BACK_WRITEMASK),
+                        ],
+                        edgeValues: [gl1.DEPTH_BUFFER_BIT, gl1.RGBA8,
+                            gl2.READ_BUFFER, gl2.INVALID_INDEX, gl2.TIMEOUT_IGNORED,
+                            gl2.MAX_CLIENT_WAIT_TIMEOUT_WEBGL],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": [[5120,5120],[5121,5121],[5122,5122],[5123,5123],
+                    [5124,5124],[5125,5125],[5126,5126],[6402,6402],[6406,6406],
+                    [6407,6407],[6408,6408],[6409,6409],[6410,6410],[32819,32819],
+                    [32820,32820],[33635,33635],[35738,35738],[35739,35739]],
+                "instanceOwn": [false, false],
+                "constantCounts": [298,559,298,559],
+                "gl1": [[6408,false,true,false],[6408,false,true,false],
+                    [5121,false,true,false],[33170,false,true,false]],
+                "gl2": [[6408,false,true,false],[6408,false,true,false],
+                    [5121,false,true,false],[37447,false,true,false]],
+                "implementationRead": [6408,5121,6408,5121],
+                "standardRead": [4352,false,4294967295_u64,4294967295_u64,
+                    4294967295_u64,4294967295_u64],
+                "edgeValues": [256,32856,3074,4294967295_u64,-1,37447],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl1_extension_parameters_follow_enablement_and_chrome_shape() {
+        let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.getElementById('c').getContext('webgl');
+                    const read = pname => [gl.getParameter(pname), gl.getError()];
+                    const before = [read(0x8B8B), read(0x8FBB)];
+                    const derivatives = gl.getExtension('OES_standard_derivatives');
+                    const timer = gl.getExtension('EXT_disjoint_timer_query');
+                    const descriptor = (value, name) => {
+                        const entry = Object.getOwnPropertyDescriptor(
+                            Object.getPrototypeOf(value), name);
+                        return [entry.value, entry.writable,
+                            entry.enumerable, entry.configurable];
+                    };
+                    return {
+                        before,
+                        constants: [derivatives.FRAGMENT_SHADER_DERIVATIVE_HINT_OES,
+                            timer.GPU_DISJOINT_EXT],
+                        after: [read(derivatives.FRAGMENT_SHADER_DERIVATIVE_HINT_OES),
+                            read(timer.GPU_DISJOINT_EXT)],
+                        own: [Object.getOwnPropertyNames(derivatives),
+                            Object.getOwnPropertyNames(timer)],
+                        tags: [Object.prototype.toString.call(derivatives),
+                            Object.prototype.toString.call(timer)],
+                        descriptors: [descriptor(derivatives,
+                            'FRAGMENT_SHADER_DERIVATIVE_HINT_OES'),
+                            descriptor(timer, 'GPU_DISJOINT_EXT')],
+                        timerPrototype: Object.getOwnPropertyNames(
+                            Object.getPrototypeOf(timer)),
+                        same: [derivatives === gl.getExtension('OES_standard_derivatives'),
+                            timer === gl.getExtension('EXT_disjoint_timer_query')],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "before": [[null,1280],[null,1280]],
+                "constants": [35723,36795],
+                "after": [[4352,0],[false,0]],
+                "own": [[],[]],
+                "tags": ["[object OESStandardDerivatives]",
+                    "[object EXTDisjointTimerQuery]"],
+                "descriptors": [[35723,false,true,false],[36795,false,true,false]],
+                "timerPrototype": ["QUERY_COUNTER_BITS_EXT","CURRENT_QUERY_EXT",
+                    "QUERY_RESULT_EXT","QUERY_RESULT_AVAILABLE_EXT","TIME_ELAPSED_EXT",
+                    "TIMESTAMP_EXT","GPU_DISJOINT_EXT","beginQueryEXT","createQueryEXT",
+                    "deleteQueryEXT","endQueryEXT","getQueryEXT","getQueryObjectEXT",
+                    "isQueryEXT","queryCounterEXT"],
+                "same": [true,true],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl_astc_extension_matches_chrome_shape_and_profiles() {
+        let mut rt = setup_runtime("<html><body><canvas id=a></canvas><canvas id=b></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summarize = context => {
+                        const extension = context.getExtension(
+                            'WEBGL_compressed_texture_astc');
+                        const prototype = Object.getPrototypeOf(extension);
+                        const descriptor = Object.getOwnPropertyDescriptor(
+                            prototype, 'getSupportedProfiles');
+                        const first = extension.getSupportedProfiles();
+                        return {
+                            tag: Object.prototype.toString.call(extension),
+                            own: Object.getOwnPropertyNames(extension),
+                            prototype: Object.getOwnPropertyNames(prototype),
+                            bounds: [extension.COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                extension.COMPRESSED_RGBA_ASTC_12x12_KHR,
+                                extension.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,
+                                extension.COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR],
+                            profiles: first,
+                            fresh: first !== extension.getSupportedProfiles(),
+                            descriptor: [descriptor.writable, descriptor.enumerable,
+                                descriptor.configurable],
+                            native: Function.prototype.toString.call(
+                                extension.getSupportedProfiles),
+                            same: extension === context.getExtension(
+                                'WEBGL_compressed_texture_astc'),
+                        };
+                    };
+                    return {
+                        gl1: summarize(document.getElementById('a').getContext('webgl')),
+                        gl2: summarize(document.getElementById('b').getContext('webgl2')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let prototype = serde_json::json!([
+            "COMPRESSED_RGBA_ASTC_4x4_KHR","COMPRESSED_RGBA_ASTC_5x4_KHR",
+            "COMPRESSED_RGBA_ASTC_5x5_KHR","COMPRESSED_RGBA_ASTC_6x5_KHR",
+            "COMPRESSED_RGBA_ASTC_6x6_KHR","COMPRESSED_RGBA_ASTC_8x5_KHR",
+            "COMPRESSED_RGBA_ASTC_8x6_KHR","COMPRESSED_RGBA_ASTC_8x8_KHR",
+            "COMPRESSED_RGBA_ASTC_10x5_KHR","COMPRESSED_RGBA_ASTC_10x6_KHR",
+            "COMPRESSED_RGBA_ASTC_10x8_KHR","COMPRESSED_RGBA_ASTC_10x10_KHR",
+            "COMPRESSED_RGBA_ASTC_12x10_KHR","COMPRESSED_RGBA_ASTC_12x12_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR",
+            "getSupportedProfiles"
+        ]);
+        for context in ["gl1", "gl2"] {
+            assert_eq!(result[context]["tag"], "[object WebGLCompressedTextureASTC]");
+            assert_eq!(result[context]["own"], serde_json::json!([]));
+            assert_eq!(result[context]["prototype"], prototype);
+            assert_eq!(result[context]["bounds"], serde_json::json!([37808,37821,37840,37853]));
+            assert_eq!(result[context]["profiles"], serde_json::json!(["ldr","hdr"]));
+            assert_eq!(result[context]["fresh"], true);
+            assert_eq!(result[context]["descriptor"], serde_json::json!([true,true,true]));
+            assert_eq!(result[context]["native"],
+                "function getSupportedProfiles() { [native code] }");
+            assert_eq!(result[context]["same"], true);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19113,6 +22803,7 @@ RequestRedirect value",
                         allMdnsHost: candidates.slice(0, -1).every(value =>
                             / typ host /.test(value) && /\.local /.test(value)),
                         gathering: pc.iceGatheringState,
+                        redPayloadMapping: lines.includes('a=fmtp:63 111/111'),
                     };
                 }"#,
                 None,
@@ -19135,6 +22826,7 @@ RequestRedirect value",
                 "trailingNull": true,
                 "allMdnsHost": true,
                 "gathering": "complete",
+                "redPayloadMapping": true,
             })
         );
     }
@@ -19480,6 +23172,25 @@ RequestRedirect value",
             .evaluate("new TextDecoder().decode(new Uint8Array([65, 66, 67]).subarray(1, 2))")
             .unwrap();
         assert_eq!(result.as_str().unwrap(), "B");
+
+        let invalid = rt
+            .evaluate(
+                r#"[
+                    [0xff], [0xc0, 0xaf], [0xe0, 0x80, 0x80],
+                    [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80],
+                    [0xe2, 0x82], [0xe2, 0x28, 0xa1],
+                    [0xf0, 0x9f, 0x92, 0xa9], [0x61, 0x80, 0x62],
+                ].map(bytes => Array.from(
+                    new TextDecoder().decode(new Uint8Array(bytes)),
+                    value => value.codePointAt(0),
+                ))"#,
+            )
+            .unwrap();
+        assert_eq!(invalid, serde_json::json!([
+            [65533], [65533, 65533], [65533, 65533, 65533],
+            [65533, 65533, 65533], [65533, 65533, 65533, 65533],
+            [65533], [65533, 40, 65533], [128169], [97, 65533, 98],
+        ]));
     }
 
     #[test]
@@ -19621,6 +23332,67 @@ RequestRedirect value",
         assert_eq!(
             v,
             serde_json::json!("TypeError|TypeError|123:string|null|7|click|\"\"")
+        );
+    }
+
+    #[test]
+    fn mouse_and_pointer_events_match_chrome_internal_slot_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const base = new Event('x');
+                    const pointer = new PointerEvent('x');
+                    const trusted = Object.getOwnPropertyDescriptor(base, 'isTrusted');
+                    return {
+                        baseOwn: Object.getOwnPropertyNames(base),
+                        pointerOwn: Object.getOwnPropertyNames(pointer),
+                        eventPrototype: Object.getOwnPropertyNames(Event.prototype),
+                        mousePrototype: Object.getOwnPropertyNames(MouseEvent.prototype),
+                        pointerPrototype: Object.getOwnPropertyNames(PointerEvent.prototype),
+                        trusted: [trusted.enumerable, trusted.configurable,
+                            typeof trusted.get === 'function'],
+                        sourceTypes: [typeof base.sourceCapabilities,
+                            new MouseEvent('x').sourceCapabilities === null],
+                        pointerValues: [pointer.pointerId, pointer.width, pointer.height,
+                            pointer.pressure, pointer.tiltX, pointer.tiltY,
+                            pointer.azimuthAngle, pointer.altitudeAngle,
+                            pointer.tangentialPressure, pointer.twist,
+                            pointer.pointerType, pointer.isPrimary,
+                            pointer.persistentDeviceId, pointer.getPredictedEvents().length,
+                            pointer.getCoalescedEvents().length],
+                        mouseValues: [pointer.pageX, pointer.pageY, pointer.x, pointer.y,
+                            pointer.offsetX, pointer.offsetY, pointer.movementX,
+                            pointer.movementY, pointer.layerX, pointer.layerY],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "baseOwn": ["isTrusted"],
+                "pointerOwn": ["isTrusted"],
+                "eventPrototype": ["type", "target", "currentTarget", "eventPhase",
+                    "bubbles", "cancelable", "defaultPrevented", "composed", "timeStamp",
+                    "srcElement", "returnValue", "cancelBubble", "NONE", "CAPTURING_PHASE",
+                    "AT_TARGET", "BUBBLING_PHASE", "composedPath", "initEvent",
+                    "preventDefault", "stopImmediatePropagation", "stopPropagation", "constructor"],
+                "mousePrototype": ["screenX", "screenY", "clientX", "clientY", "ctrlKey",
+                    "shiftKey", "altKey", "metaKey", "button", "buttons", "relatedTarget",
+                    "pageX", "pageY", "x", "y", "offsetX", "offsetY", "movementX",
+                    "movementY", "fromElement", "toElement", "layerX", "layerY",
+                    "getModifierState", "initMouseEvent", "constructor"],
+                "pointerPrototype": ["pointerId", "width", "height", "pressure", "tiltX",
+                    "tiltY", "azimuthAngle", "altitudeAngle", "tangentialPressure", "twist",
+                    "pointerType", "isPrimary", "getPredictedEvents", "persistentDeviceId",
+                    "constructor", "getCoalescedEvents"],
+                "trusted": [true, false, true],
+                "sourceTypes": ["undefined", true],
+                "pointerValues": [0, 1, 1, 0, 0, 0, 0,
+                    std::f64::consts::FRAC_PI_2, 0, 0, "", false, 0, 0, 0],
+                "mouseValues": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }),
         );
     }
 
@@ -20635,6 +24407,78 @@ RequestRedirect value",
     }
 
     #[test]
+    fn network_information_matches_chrome_desktop_shape() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const connection = navigator.connection;
+                    const prototype = Object.getPrototypeOf(connection);
+                    const descriptorShape = name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+                        return {
+                            get: descriptor.get && [descriptor.get.name, descriptor.get.length,
+                                Function.prototype.toString.call(descriptor.get)],
+                            set: descriptor.set && [descriptor.set.name, descriptor.set.length,
+                                Function.prototype.toString.call(descriptor.set)],
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                        };
+                    };
+                    let construct;
+                    try { new NetworkInformation(); construct = null; }
+                    catch (error) { construct = [error.name, error.message]; }
+                    return {
+                        tag: Object.prototype.toString.call(connection),
+                        own: Object.getOwnPropertyNames(connection),
+                        prototype: Object.getOwnPropertyNames(prototype),
+                        typeMissing: !('type' in connection) && connection.type === undefined,
+                        eventTarget: connection instanceof EventTarget,
+                        stable: connection === navigator.connection,
+                        constructorShape: [NetworkInformation.name, NetworkInformation.length,
+                            Function.prototype.toString.call(NetworkInformation)],
+                        construct,
+                        descriptors: Object.fromEntries(
+                            ['onchange', 'effectiveType', 'rtt', 'downlink', 'saveData']
+                                .map(name => [name, descriptorShape(name)])),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let getter = |name: &str| serde_json::json!({
+            "get": [format!("get {name}"), 0, format!("function get {name}() {{ [native code] }}")],
+            "enumerable": true,
+            "configurable": true,
+        });
+        let mut descriptors = serde_json::Map::new();
+        descriptors.insert("onchange".into(), serde_json::json!({
+            "get": ["get onchange", 0, "function get onchange() { [native code] }"],
+            "set": ["set onchange", 1, "function set onchange() { [native code] }"],
+            "enumerable": true,
+            "configurable": true,
+        }));
+        for name in ["effectiveType", "rtt", "downlink", "saveData"] {
+            descriptors.insert(name.into(), getter(name));
+        }
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object NetworkInformation]",
+                "own": [],
+                "prototype": ["onchange", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
+                "typeMissing": true,
+                "eventTarget": true,
+                "stable": true,
+                "constructorShape": ["NetworkInformation", 0,
+                    "function NetworkInformation() { [native code] }"],
+                "construct": ["TypeError",
+                    "Failed to construct 'NetworkInformation': Illegal constructor"],
+                "descriptors": serde_json::Value::Object(descriptors),
+            })
+        );
+    }
+
+    #[test]
     fn text_codec_streams_expose_browser_shape() {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
@@ -21139,8 +24983,11 @@ RequestRedirect value",
                     'ClipboardEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent',
                     'CompositionEvent', 'PerformanceObserver', 'MutationObserver',
                     'Node', 'Element', 'Document', 'Headers', 'Request', 'Response',
+                    'HTMLInputElement',
                     'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
-                    'Navigator', 'Location',
+                    'Navigator', 'Location', 'XSLTProcessor', 'HTMLUserMediaElement',
+                    'InteractionContentfulPaint', 'PerformanceSoftNavigation', 'NodeRange',
+                    'OpaqueRange', 'ModelContext', 'WebMCPEvent',
                 ];
                 const bad = [];
                 for (const n of names) {
@@ -21174,7 +25021,9 @@ RequestRedirect value",
         let result = rt
             .evaluate(
                 r#"
+                (function() {
                 const e = new MessageEvent('m');
+                const input = document.createElement('input');
                 return {
                     instanceTag: Object.prototype.toString.call(e),
                     customEventTag: Object.prototype.toString.call(new CustomEvent('c')),
@@ -21192,11 +25041,19 @@ RequestRedirect value",
                     // Aliased element interfaces share one prototype, so the
                     // brand must stay on the owner rather than the last alias.
                     elementTag: Object.prototype.toString.call(document.createElement('div')),
+                    inputTag: Object.prototype.toString.call(input),
+                    inputInstance: input instanceof HTMLInputElement && input instanceof Element,
+                    inputCtorToString: HTMLInputElement.toString(),
+                    bodyTag: Object.prototype.toString.call(document.body),
+                    bodyInstance: document.body instanceof HTMLBodyElement
+                        && document.body instanceof HTMLElement,
+                    bodyCtorToString: HTMLBodyElement.toString(),
                     // ECMAScript builtins must not have been swept up.
                     dateUntouched:
                         Object.getOwnPropertyDescriptor(Date.prototype, Symbol.toStringTag) === undefined
                         && Object.getOwnPropertyDescriptor(RegExp.prototype, Symbol.toStringTag) === undefined,
                 };
+                })()
                 "#,
             )
             .unwrap();
@@ -21214,6 +25071,12 @@ RequestRedirect value",
                 "locationTag": "[object Location]",
                 "navigatorTag": "[object Navigator]",
                 "elementTag": "[object Element]",
+                "inputTag": "[object HTMLInputElement]",
+                "inputInstance": true,
+                "inputCtorToString": "function HTMLInputElement() { [native code] }",
+                "bodyTag": "[object HTMLBodyElement]",
+                "bodyInstance": true,
+                "bodyCtorToString": "function HTMLBodyElement() { [native code] }",
                 "dateUntouched": true,
             })
         );

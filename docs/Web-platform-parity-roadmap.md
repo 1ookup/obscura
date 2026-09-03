@@ -330,8 +330,8 @@ Cloudflare 质询攻关推进了 39 步(2026-08-13 至今),把 `interactiveEnd` 
 - **方向(经确认)**:能力声明对齐 Chrome,播放行为一如既往地不发生。
   - 声明侧:`canPlayType` 已知容器 → maybe、连 codecs 也已知 → probably、其余 → `""`
     (含 Chrome 同样拒绝的 `video/ogg;codecs="theora"` 与 `video/quicktime`);
-    `decodingInfo`/`encodingInfo`/`MediaSource.isTypeSupported` 全部走**同一张表**,
-    两个 API 不可能再分家。
+    后续Chrome151 oracle证明`decodingInfo`/`encodingInfo`、`MediaSource.isTypeSupported`
+    与`canPlayType`有意采用不同规则（如Ogg）；三者现按各自标准能力表实现。
   - 行为侧:`play()` 仍 reject(改用 `NotAllowedError`——拒绝是策略而非缺编解码器,也正是
     无用户手势的 headless Chrome 报的错);`readyState` 仍 HAVE_NOTHING,几何仍 0。
 - **补齐的缺失成员**:`buffered`/`played`/`seekable`(此前属性根本不存在)、

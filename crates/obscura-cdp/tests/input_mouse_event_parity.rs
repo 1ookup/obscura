@@ -52,8 +52,8 @@ async fn serve_iframe_fixture() -> String {
                     html,body { margin:0; width:100%; height:100%; }
                     #child { position:absolute; left:20px; top:30px; width:100px; height:50px; }
                     #nested { position:absolute; left:150px; top:20px; width:100px; height:80px; border:5px solid black; }
-                </style><button id=child>child</button><input id=field><iframe id=nested src=/grand></iframe>
-                <script>globalThis.childLog=[];globalThis.childWheel=[]; child.addEventListener('click',e=>{childLog.push([e.clientX,e.clientY,globalThis===window]);field.focus()});child.addEventListener('wheel',e=>{childWheel.push([e.clientX,e.clientY,e.deltaY,globalThis===window]);e.preventDefault()});</script>"#,
+                    </style><button id=child>child</button><input id=field><iframe id=nested src=/grand></iframe>
+                <script>globalThis.childLog=[];globalThis.childWheel=[]; child.addEventListener('click',e=>{childLog.push([e.clientX,e.clientY,e.screenX,e.screenY,globalThis===window]);field.focus()});child.addEventListener('wheel',e=>{childWheel.push([e.clientX,e.clientY,e.deltaY,globalThis===window]);e.preventDefault()});</script>"#,
                 "/grand" => r#"<!doctype html><style>html,body{margin:0}#grand{position:absolute;left:10px;top:10px;width:60px;height:30px}</style>
                     <button id=grand>grand</button><script>globalThis.grandLog=[];grand.addEventListener('click',e=>grandLog.push([e.clientX,e.clientY,globalThis===window]));</script>"#,
                 _ => r#"<!doctype html><style>
@@ -408,7 +408,16 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
             for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                 target.addEventListener(type, event => pLog.push({
                     type, pointerType: event.pointerType, pointerId: event.pointerId,
-                    composed: event.composed, x: event.clientX, trusted: event.isTrusted
+                    composed: event.composed, x: event.clientX, trusted: event.isTrusted,
+                    altitude: event.altitudeAngle, azimuth: event.azimuthAngle,
+                    movement: [event.movementX, event.movementY],
+                    offset: [event.offsetX, event.offsetY],
+                    layer: [event.layerX, event.layerY],
+                    expectedOffset: (() => { const r = target.getBoundingClientRect();
+                        return [event.clientX - r.left, event.clientY - r.top]; })(),
+                    predicted: event.getPredictedEvents?.().length,
+                    coalesced: event.getCoalescedEvents?.().length,
+                    own: Object.getOwnPropertyNames(event)
                 }));
             }
         })()"#,
@@ -435,7 +444,27 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
     assert_eq!(out[0]["composed"], true, "pointer events must compose across shadow boundaries");
     assert_eq!(out[0]["x"], 31.0);
     assert_eq!(out[0]["trusted"], true);
+    assert_eq!(out[0]["altitude"], std::f64::consts::FRAC_PI_2);
+    assert_eq!(out[0]["azimuth"], 0.0);
+    assert_eq!(out[0]["movement"], json!([0, 0]));
+    assert_eq!(out[0]["offset"], out[0]["expectedOffset"]);
+    assert_eq!(out[0]["layer"], out[0]["expectedOffset"]);
+    assert_eq!(out[0]["predicted"], 0);
+    assert_eq!(out[0]["coalesced"], 0);
+    assert_eq!(out[0]["own"], json!(["isTrusted"]));
     assert_eq!(out[4]["composed"], true, "click must compose across shadow boundaries");
+    assert_eq!(out[4]["pointerType"], "mouse", "CDP click is a PointerEvent in Chrome");
+    assert_eq!(out[4]["pointerId"], 1);
+    assert_eq!(out[4]["altitude"], std::f64::consts::FRAC_PI_2);
+    assert_eq!(out[4]["azimuth"], 0.0);
+    let leaked = evaluate(
+        &mut ctx,
+        4,
+        "JSON.stringify(Object.getOwnPropertyNames(globalThis).filter(name => ['__obscura_focused','__obscura_click_target','__obscura_hover_target','__obscura_mouse_down'].includes(name)))",
+        &sid,
+    )
+    .await;
+    assert_eq!(leaked["result"]["value"], "[]");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -709,7 +738,7 @@ async fn mouse_events_enter_iframe_realm_with_local_client_coordinates() {
     )
     .await;
     let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
-    assert_eq!(log, json!([[30, 40, true]]));
+    assert_eq!(log, json!([[30, 40, 140, 130, true]]));
 
     cdp(
         &mut ctx,
@@ -842,7 +871,7 @@ async fn trusted_input_events_carry_mouse_source_capabilities() {
         4,
         r#"JSON.stringify({
             scriptMouseEventIsNull: new MouseEvent('click').sourceCapabilities === null,
-            scriptEventIsNull: new Event('x').sourceCapabilities === null,
+            scriptEventIsUndefined: new Event('x').sourceCapabilities === undefined,
             scriptKeyEventIsNull: new KeyboardEvent('keydown').sourceCapabilities === null,
             ctorIsFunction: typeof InputDeviceCapabilities === 'function',
             ctorName: InputDeviceCapabilities.name,
@@ -856,7 +885,7 @@ async fn trusted_input_events_carry_mouse_source_capabilities() {
     .await;
     let intro: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(intro["scriptMouseEventIsNull"], true, "{intro}");
-    assert_eq!(intro["scriptEventIsNull"], true, "{intro}");
+    assert_eq!(intro["scriptEventIsUndefined"], true, "{intro}");
     assert_eq!(intro["scriptKeyEventIsNull"], true, "{intro}");
     assert_eq!(intro["ctorIsFunction"], true, "{intro}");
     assert_eq!(intro["ctorName"], "InputDeviceCapabilities", "{intro}");

@@ -96,6 +96,100 @@ pub(crate) struct FrameModuleMap {
     next_dynamic_helper: u64,
 }
 
+/// The subset of a frame document's CSP needed while fetching its module
+/// graph. The browser crate owns the full CSP parser; this small value object
+/// keeps the module loader independent while still applying the same
+/// script-src source-list rules to every static import.
+#[derive(Clone, Debug)]
+pub struct FrameModuleCsp {
+    header: String,
+    origin: String,
+}
+
+impl FrameModuleCsp {
+    pub fn new(header: &str, origin: &str) -> Self {
+        Self {
+            header: header.to_string(),
+            origin: origin.to_string(),
+        }
+    }
+
+    fn allows_url(&self, requested: &str) -> bool {
+        let mut script_elem = None;
+        let mut script = None;
+        let mut default = None;
+        for directive in self.header.split(';') {
+            let mut tokens = directive.split_ascii_whitespace();
+            let Some(name) = tokens.next() else { continue };
+            let values = tokens.map(str::to_string).collect::<Vec<_>>();
+            if name.eq_ignore_ascii_case("script-src-elem") && script_elem.is_none() {
+                script_elem = Some(values);
+            } else if name.eq_ignore_ascii_case("script-src") && script.is_none() {
+                script = Some(values);
+            } else if name.eq_ignore_ascii_case("default-src") && default.is_none() {
+                default = Some(values);
+            }
+        }
+        let sources = script_elem.or(script).or(default);
+        let Some(sources) = sources else { return true };
+        let Ok(target) = url::Url::parse(requested) else { return false };
+        let document = url::Url::parse(&self.origin).ok();
+        sources.iter().any(|source| {
+            let source_lower = source.to_ascii_lowercase();
+            if source_lower == "'none'" { return false; }
+            if source_lower == "*" {
+                return matches!(target.scheme(), "http" | "https" | "ws" | "wss");
+            }
+            if source_lower == "data:" { return target.scheme() == "data"; }
+            if source_lower == "blob:" { return target.scheme() == "blob"; }
+            if source_lower == "'self'" {
+                return document.as_ref().is_some_and(|document| {
+                    target.origin() == document.origin()
+                });
+            }
+            if let Some(scheme) = source_lower.strip_suffix(':') {
+                if !scheme.contains('/') { return target.scheme() == scheme; }
+            }
+            let (scheme, host_port) = source_lower
+                .split_once("://")
+                .map_or((None, source_lower.as_str()), |(scheme, rest)| {
+                    (Some(scheme), rest)
+                });
+            let host_port = host_port.split(['/', '?', '#']).next().unwrap_or("");
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .filter(|(_, value)| !value.contains(']'))
+                .map_or((host_port, None), |(host, port)| (host, Some(port)));
+            let source_scheme = scheme.or_else(|| document.as_ref().map(|value| value.scheme()));
+            if host.is_empty() || source_scheme.is_some_and(|scheme| scheme != target.scheme()) {
+                return false;
+            }
+            let host_matches = if let Some(suffix) = host.strip_prefix("*.") {
+                target
+                    .host_str()
+                    .is_some_and(|target_host| target_host.ends_with(suffix)
+                        && target_host.len() > suffix.len())
+            } else {
+                target.host_str() == Some(host)
+            };
+            if !host_matches { return false; }
+            match port {
+                Some("*") => true,
+                Some(port) => port.parse::<u16>().ok() == target.port_or_known_default(),
+                None => target.port_or_known_default() == default_port(target.scheme()),
+            }
+        })
+    }
+}
+
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    }
+}
+
 struct FrameDynamicImportHelper {
     module_map: *mut FrameModuleMap,
     referrer_url: String,
@@ -650,6 +744,7 @@ impl ObscuraJsRuntime {
         };
 
         let context = v8::Context::new(scope, v8::ContextOptions::default());
+        context.set_allow_generation_from_strings(false);
         // Same security token as the main context. Plain contexts install no
         // access-check callbacks, but equal tokens keep V8's same-origin
         // checks permissive while objects (Deno.core) are shared across
@@ -975,6 +1070,7 @@ impl ObscuraJsRuntime {
         module_url: &str,
         inline_source: Option<&str>,
         document_url: &str,
+        csp: Option<FrameModuleCsp>,
         budget_ms: u64,
     ) -> Result<(), String> {
         let context = self.frame_world_context(frame_id, generation, MAIN_WORLD)?;
@@ -991,6 +1087,7 @@ impl ObscuraJsRuntime {
                 module_url,
                 inline_source,
                 document_url,
+                csp.as_ref(),
                 budget_ms,
             )
             .await;
@@ -1006,6 +1103,7 @@ impl ObscuraJsRuntime {
         module_url: &str,
         inline_source: Option<&str>,
         document_url: &str,
+        csp: Option<&FrameModuleCsp>,
         budget_ms: u64,
     ) -> Result<(), String> {
         let deadline =
@@ -1024,6 +1122,11 @@ impl ObscuraJsRuntime {
             let (final_url, source) = match inline {
                 Some(source) => (requested_url, source),
                 None => {
+                    if csp.is_some_and(|policy| !policy.allows_url(&requested_url)) {
+                        return Err(format!(
+                            "Frame module blocked by Content-Security-Policy: {requested_url}"
+                        ));
+                    }
                     let remaining = deadline
                         .checked_duration_since(tokio::time::Instant::now())
                         .ok_or_else(|| "Frame module graph load timed out".to_string())?;
@@ -1056,6 +1159,11 @@ impl ObscuraJsRuntime {
                     .resolutions
                     .insert((identity, raw), resolved_key.clone());
                 if !module_map.modules.contains_key(&resolved_key) {
+                    if csp.is_some_and(|policy| !policy.allows_url(&resolved_key)) {
+                        return Err(format!(
+                            "Frame module import blocked by Content-Security-Policy: {resolved_key}"
+                        ));
+                    }
                     pending.push_back((
                         resolved_key.clone(),
                         resolved_key,
@@ -1068,6 +1176,11 @@ impl ObscuraJsRuntime {
                 let resolved = module_map.import_map.resolve(&raw, &referrer)?;
                 let resolved_key = resolved.to_string();
                 if !module_map.modules.contains_key(&resolved_key) {
+                    if csp.is_some_and(|policy| !policy.allows_url(&resolved_key)) {
+                        return Err(format!(
+                            "Frame dynamic module import blocked by Content-Security-Policy: {resolved_key}"
+                        ));
+                    }
                     pending.push_back((
                         resolved_key.clone(),
                         resolved_key,
@@ -1674,6 +1787,7 @@ pub(crate) fn spawn_frame_realm(
         current.get_aligned_pointer_from_embedder_data(deno_core::MODULE_MAP_SLOT_INDEX);
 
     let context = v8::Context::new(scope, v8::ContextOptions::default());
+    context.set_allow_generation_from_strings(false);
     context.set_security_token(token);
     unsafe {
         context.set_aligned_pointer_in_embedder_data(
@@ -1776,7 +1890,7 @@ fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_frame_dynamic_imports;
+    use super::{rewrite_frame_dynamic_imports, FrameModuleCsp};
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -1816,6 +1930,26 @@ mod tests {
         assert!(rewritten.contains("// import('./comment.js')"));
         assert!(rewritten.contains("/import\\(['\"]ignored/"));
         assert!(rewritten.contains("`text ${__frame_import('./nested.js').then(use)}`"));
+    }
+
+    #[test]
+    fn frame_module_csp_uses_directive_precedence_and_document_scheme() {
+        let policy = FrameModuleCsp::new(
+            "default-src 'none'; script-src https://cdn.example; script-src-elem 'self'",
+            "https://app.example/frame",
+        );
+        assert!(policy.allows_url("https://app.example/dep.js"));
+        assert!(!policy.allows_url("https://cdn.example/dep.js"));
+
+        let first_wins = FrameModuleCsp::new(
+            "script-src https://blocked.example; script-src https://allowed.example",
+            "https://app.example/frame",
+        );
+        assert!(!first_wins.allows_url("https://allowed.example/dep.js"));
+
+        let scheme_less = FrameModuleCsp::new("script-src app.example", "https://app.example/frame");
+        assert!(scheme_less.allows_url("https://app.example/dep.js"));
+        assert!(!scheme_less.allows_url("http://app.example/dep.js"));
     }
 
     #[test]
@@ -2049,11 +2183,30 @@ mod tests {
                     const native = name =>
                         /\{\s*\[native code\]\s*\}/
                             .test(Function.prototype.toString.call(win[name]));
+                    const nativeInFrame = name =>
+                        /\{\s*\[native code\]\s*\}/
+                            .test(win.Function.prototype.toString.call(win[name]));
+                    const belongsToFrame = name => win[name] instanceof win.Function;
+                    const shape = name => {
+                        const value = win[name];
+                        let constructible = true;
+                        try { Reflect.construct(value, []); } catch (_error) { constructible = false; }
+                        return [value.name, value.length, 'prototype' in value, constructible];
+                    };
                     return {
                         postMessage: native('postMessage'),
                         blur: native('blur'),
                         focus: native('focus'),
                         close: native('close'),
+                        frameFunctions: Object.fromEntries(
+                            ['postMessage', 'blur', 'focus', 'close']
+                                .map(name => [name, belongsToFrame(name)])),
+                        frameNative: Object.fromEntries(
+                            ['postMessage', 'blur', 'focus', 'close']
+                                .map(name => [name, nativeInFrame(name)])),
+                        shape: Object.fromEntries(
+                            ['postMessage', 'blur', 'focus', 'close']
+                                .map(name => [name, shape(name)])),
                     };
                 })()"#,
             )
@@ -2063,6 +2216,18 @@ mod tests {
                 "blur": true,
                 "focus": true,
                 "close": true,
+                "frameFunctions": {
+                    "postMessage": true, "blur": true, "focus": true, "close": true,
+                },
+                "frameNative": {
+                    "postMessage": true, "blur": true, "focus": true, "close": true,
+                },
+                "shape": {
+                    "postMessage": ["postMessage", 1, false, false],
+                    "blur": ["blur", 0, false, false],
+                    "focus": ["focus", 0, false, false],
+                    "close": ["close", 0, false, false],
+                },
             })
         );
     }
@@ -2081,7 +2246,12 @@ mod tests {
                         // main realm's Object off the target's prototype chain.
                         isFramesWindow: win.constructor === win.Window,
                         isNotMainObject: win.constructor !== Object,
+                        prototypeIsWindow: Object.getPrototypeOf(win) === win.Window.prototype,
                         name: win.constructor.name,
+                        own: Object.prototype.hasOwnProperty.call(win, 'constructor'),
+                        ownKeys: Object.getOwnPropertyNames(win).includes('constructor'),
+                        descriptorMissing:
+                            Object.getOwnPropertyDescriptor(win, 'constructor') === undefined,
                     };
                 })()"#,
             )
@@ -2089,7 +2259,11 @@ mod tests {
             serde_json::json!({
                 "isFramesWindow": true,
                 "isNotMainObject": true,
+                "prototypeIsWindow": true,
                 "name": "Window",
+                "own": false,
+                "ownKeys": false,
+                "descriptorMissing": true,
             })
         );
     }
@@ -2131,6 +2305,48 @@ mod tests {
                 "element": [],
                 "nidGone": true,
                 "scopeRootGone": true,
+            })
+        );
+    }
+
+    #[test]
+    fn document_location_is_own_and_lang_dir_reflect_the_root_element() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const before = Object.getOwnPropertyNames(document);
+                    document.lang = 'zh-CN';
+                    document.dir = 'rtl';
+                    const locationDescriptor = Object.getOwnPropertyDescriptor(document, 'location');
+                    const langDescriptor = Object.getOwnPropertyDescriptor(document, 'lang');
+                    const dirDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'dir');
+                    return {
+                        before,
+                        after: Object.getOwnPropertyNames(document),
+                        lang: document.lang,
+                        dir: document.dir,
+                        rootLang: document.documentElement.getAttribute('lang'),
+                        rootDir: document.documentElement.getAttribute('dir'),
+                        locationEnumerable: locationDescriptor && locationDescriptor.enumerable,
+                        locationConfigurable: locationDescriptor && locationDescriptor.configurable,
+                        langEnumerable: langDescriptor && langDescriptor.enumerable,
+                        dirEnumerable: dirDescriptor && dirDescriptor.enumerable,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "before": ["location"],
+                "after": ["location", "lang"],
+                "lang": "zh-CN",
+                "dir": "rtl",
+                "rootLang": null,
+                "rootDir": "rtl",
+                "locationEnumerable": true,
+                "locationConfigurable": false,
+                "langEnumerable": true,
+                "dirEnumerable": true,
             })
         );
     }
@@ -2181,6 +2397,185 @@ mod tests {
         assert_eq!(realm.base_url, "http://example.com/frame");
         assert_eq!(realm.scope_url.as_deref(), Some("http://example.com/frame"));
         assert_eq!(realm.scope_origin.as_deref(), Some("http://example.com"));
+    }
+
+    #[test]
+    fn frame_scoped_query_sees_incremental_fragment_insertions() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        let result = rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<fixture>",
+            r#"(() => {
+                const query = document.querySelectorAll.bind(document);
+                const container = document.createElement('null');
+                document.body.appendChild(container);
+                container.insertAdjacentHTML('beforeend',
+                    '<div id="dGSz90" class="hRkTq50"> </div>');
+                const first = query('.hRkTq50')[0];
+                first.insertAdjacentHTML('beforeend',
+                    '<span id="dGSz91" class="hRkTq56"> </span>');
+                const second = query('#dGSz91')[0];
+                second.insertAdjacentHTML('beforeend',
+                    '<div id="dGSz92" class="hRkTq58"> </div>');
+                const third = query('#dGSz92')[0];
+                return {
+                    connected: container.isConnected,
+                    tags: [first.tagName, second.tagName, third.tagName],
+                    roots: [first.ownerDocument === document,
+                        second.ownerDocument === document,
+                        third.ownerDocument === document],
+                    topHidden: document.getElementById('f') === null,
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "connected": true,
+            "tags": ["DIV", "SPAN", "DIV"],
+            "roots": [true, true, true],
+            "topHidden": true,
+        }));
+    }
+
+    #[test]
+    fn frame_document_queries_flow_through_document_prototype() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        let result = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<prototype-query>",
+                r#"(() => {
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        Document.prototype, 'querySelectorAll');
+                    const original = descriptor.value;
+                    let calls = 0;
+                    descriptor.value = function(...args) {
+                        calls++;
+                        return original.apply(this, args);
+                    };
+                    Object.defineProperty(Document.prototype, 'querySelectorAll', descriptor);
+                    const result = document.querySelectorAll('body').length;
+                    descriptor.value = original;
+                    Object.defineProperty(Document.prototype, 'querySelectorAll', descriptor);
+                    return {
+                        result,
+                        calls,
+                        own: Object.prototype.hasOwnProperty.call(
+                            Object.getPrototypeOf(document), 'querySelectorAll'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "result": 1,
+            "calls": 1,
+            "own": false,
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_permissions_follow_origin_and_iframe_delegation() {
+        async fn snapshot(origin: &str, allow: Option<&str>) -> serde_json::Value {
+            let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+            if let Some(allow) = allow {
+                rt.evaluate(&format!(
+                    "document.getElementById('f').setAttribute('allow', {allow:?})"
+                ))
+                .unwrap();
+            }
+            let root = setup_frame(&mut rt, "f", FRAME_HTML, origin, 1);
+            rt.ensure_frame_realm("frame-test", 1, root, origin).unwrap();
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<permissions>",
+                r#"globalThis.__permissionResult = null;
+                   Promise.all([
+                     navigator.permissions.query({name:'geolocation'}),
+                     navigator.permissions.query({name:'notifications'}),
+                     navigator.permissions.query({name:'camera'}),
+                     navigator.permissions.query({name:'microphone'}),
+                     navigator.permissions.query({name:'notifications'}),
+                   ]).then(values => {
+                     const status = values[1];
+                     globalThis.__permissionResult = {
+                       states: [Notification.permission, values[0].state, status.state,
+                         values[2].state, values[3].state],
+                       names: values.slice(0, 4).map(value => value.name),
+                       permissionsTag: Object.prototype.toString.call(navigator.permissions),
+                       permissionsOwn: Object.getOwnPropertyNames(navigator.permissions),
+                       permissionsProto: Object.getOwnPropertyNames(Permissions.prototype),
+                       statusTag: Object.prototype.toString.call(status),
+                       statusOwn: Object.getOwnPropertyNames(status),
+                       statusProto: Object.getOwnPropertyNames(PermissionStatus.prototype),
+                       statusConstructor: status.constructor.name,
+                       statusStable: status === values[4],
+                     };
+                   });"#,
+            )
+            .unwrap();
+            for _ in 0..10 {
+                rt.run_event_loop_bounded(25).await.unwrap();
+                let ready = rt
+                    .execute_script_in_frame_realm(
+                        "frame-test",
+                        1,
+                        "<probe>",
+                        "globalThis.__permissionResult !== null",
+                    )
+                    .unwrap();
+                if ready == serde_json::json!(true) {
+                    break;
+                }
+            }
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<result>",
+                "globalThis.__permissionResult",
+            )
+            .unwrap()
+        }
+
+        let same = snapshot("http://example.com/frame", None).await;
+        let cross = snapshot("https://frame.example/embedded", None).await;
+        let delegated = snapshot(
+            "https://frame.example/embedded",
+            Some("geolocation; camera; microphone"),
+        )
+        .await;
+
+        assert_eq!(same["states"], serde_json::json!([
+            "default", "prompt", "prompt", "prompt", "prompt"
+        ]));
+        assert_eq!(cross["states"], serde_json::json!([
+            "denied", "denied", "denied", "denied", "denied"
+        ]));
+        assert_eq!(delegated["states"], serde_json::json!([
+            "denied", "prompt", "denied", "prompt", "prompt"
+        ]));
+        for result in [&same, &cross, &delegated] {
+            assert_eq!(result["names"], serde_json::json!([
+                "geolocation", "notifications", "video_capture", "audio_capture"
+            ]));
+            assert_eq!(result["permissionsTag"], "[object Permissions]");
+            assert_eq!(result["permissionsOwn"], serde_json::json!([]));
+            assert_eq!(result["permissionsProto"], serde_json::json!(["query", "constructor"]));
+            assert_eq!(result["statusTag"], "[object PermissionStatus]");
+            assert_eq!(result["statusOwn"], serde_json::json!([]));
+            assert_eq!(result["statusProto"], serde_json::json!([
+                "name", "state", "onchange", "constructor"
+            ]));
+            assert_eq!(result["statusConstructor"], "PermissionStatus");
+            assert_eq!(result["statusStable"], false);
+        }
     }
 
     #[test]
@@ -2604,6 +2999,108 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_worker_fetch_uses_the_creator_document_csp() {
+        use base64::Engine as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_thread = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests_thread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        );
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        rt.set_url("https://top.example/index.html");
+        rt.set_content_security_policy(Some("default-src *; connect-src *"));
+        let frame_url = "https://frame.example/embedded/page.html";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        {
+            let state_handle = rt.state_handle().clone();
+            let mut state = state_handle.borrow_mut();
+            let dom = state.dom.as_mut().expect("runtime DOM");
+            let mut scope = dom
+                .document_scope(obscura_dom::NodeId::new(root))
+                .expect("frame scope");
+            scope.csp = Some(
+                "default-src *; worker-src data:; connect-src 'none'".to_string(),
+            );
+            dom.set_document_scope(obscura_dom::NodeId::new(root), scope);
+        }
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+
+        let worker_source = format!(
+            "fetch('http://{address}/probe').then(r => postMessage('status:' + r.status)).catch(e => postMessage(e.name))"
+        );
+        let worker_url = format!(
+            "data:text/javascript;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(worker_source.as_bytes())
+        );
+        let script = format!(
+            "globalThis.workerCspResult=null; const worker=new Worker({worker_url:?}); worker.onmessage=e=>workerCspResult=e.data;"
+        );
+        rt.execute_script_in_frame_realm("frame-test", 1, "<t>", &script)
+            .unwrap();
+        for _ in 0..120 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            let done = rt
+                .execute_script_in_frame_realm(
+                    "frame-test",
+                    1,
+                    "<probe>",
+                    "workerCspResult !== null",
+                )
+                .unwrap();
+            if done == serde_json::json!(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "workerCspResult",
+            )
+            .unwrap(),
+            serde_json::json!("AbortError"),
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "frame worker fetch must be blocked before network I/O",
+        );
+    }
+
     // ---- Cross-document postMessage (Phase 4) ----
 
     #[tokio::test(flavor = "current_thread")]
@@ -2995,6 +3492,28 @@ mod tests {
                parent.postMessage({ hello: true }, '*');"#,
         )
         .unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"(() => {
+                    const names = ['postMessage', 'blur', 'focus', 'close'];
+                    return Object.fromEntries(names.map(name => [name, {
+                        frameFunction: parent[name] instanceof Function,
+                        native: /\{\s*\[native code\]\s*\}/
+                            .test(Function.prototype.toString.call(parent[name])),
+                    }]));
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "postMessage": {"frameFunction": true, "native": true},
+                "blur": {"frameFunction": true, "native": true},
+                "focus": {"frameFunction": true, "native": true},
+                "close": {"frameFunction": true, "native": true},
+            }),
+        );
 
         rt.evaluate(
             r#"(() => {

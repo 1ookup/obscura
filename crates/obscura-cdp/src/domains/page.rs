@@ -1482,6 +1482,8 @@ pub fn emit_navigation_events(
     // executionContextCreated events are emitted. Issue #407: previously this
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
+    ctx.debugger_scripts
+        .retain(|(script_session, _)| script_session != &es);
     // Keep the execution-context table in lockstep with the id set. The
     // teardown above already emitted Destroyed for (and removed) every entry
     // of this page's frames; this clears any cross-page leftovers so no table

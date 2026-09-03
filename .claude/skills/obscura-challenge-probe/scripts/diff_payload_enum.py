@@ -39,6 +39,10 @@ HOSTS = {
     "so": "(screen.orientation || {})",
     "bare": "globalThis",
 }
+# Chrome deliberately reports these as `typeof === "undefined"` even though
+# `document.all` is a real HTMLAllCollection and `event` is a legacy Window
+# accessor. Do not classify those WebIDL quirks as missing APIs.
+EXPECTED_TYPEOF_UNDEFINED = {"d": {"all"}, "bare": {"event", "undefined"}}
 
 # navigator 上值得和 payload 值桶逐字对拍的关键属性。
 KEY_NAV_FIELDS = [
@@ -71,6 +75,18 @@ def collect_fy(fy, paths):
 
 def extract_paths(payload_files):
     paths = {"n": set(), "d": set(), "s": set(), "so": set(), "o": set(), "bare": set()}
+
+    def looks_like_property_bucket(value):
+        if not isinstance(value, dict):
+            return False
+        for values in value.values():
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if isinstance(item, str) and item.startswith(("n.", "d.", "s.", "so.", "o.")):
+                    return True
+        return False
+
     for fn in payload_files:
         with open(fn, encoding="utf-8") as f:
             data = json.load(f)
@@ -78,7 +94,10 @@ def extract_paths(payload_files):
         def walk(node):
             if isinstance(node, dict):
                 for k, v in node.items():
-                    if k == "fyCZH9" and isinstance(v, dict):
+                    # The obfuscated bucket name changes between challenge
+                    # revisions (for example `fyCZH9` -> `gsLi5`). Identify it
+                    # by its value shape instead of pinning a challenge key.
+                    if (k == "fyCZH9" or looks_like_property_bucket(v)) and isinstance(v, dict):
                         collect_fy(v, paths)
                     else:
                         walk(v)
@@ -136,7 +155,8 @@ async def run(endpoint, paths, targets):
                            {"expression": typeof_expr(HOSTS[key], names),
                             "returnByValue": True}, s)
             val = json.loads(r["result"]["result"]["value"])
-            missing = [p for p, t in val.items() if t == "undefined"]
+            missing = [p for p, t in val.items()
+                       if t == "undefined" and p not in EXPECTED_TYPEOF_UNDEFINED.get(key, set())]
             throwing = [p for p, t in val.items() if t == "THROW"]
             present = [p for p, t in val.items() if t not in ("undefined", "THROW")]
             print("=== %s：Chrome 读 %d 个，obscura 缺失 %d，存在 %d%s ===" % (

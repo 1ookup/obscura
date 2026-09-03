@@ -594,7 +594,7 @@ mod tests {
         ] {
             ctx.get_session_page_mut(&session)
                 .unwrap()
-                .evaluate("globalThis.__obscura_click_target = null");
+                .evaluate("globalThis[Symbol.for('obscura.inputClickTarget')] = null");
 
             handle("scrollIntoViewIfNeeded", &params, &mut ctx, &session)
                 .await
@@ -603,7 +603,7 @@ mod tests {
             let target_id = ctx
                 .get_session_page_mut(&session)
                 .unwrap()
-                .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
+                .evaluate("globalThis[Symbol.for('obscura.inputClickTarget')] && globalThis[Symbol.for('obscura.inputClickTarget')].id");
             assert_eq!(target_id, json!("target"));
         }
     }

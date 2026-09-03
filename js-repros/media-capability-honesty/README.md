@@ -40,9 +40,11 @@ Declared (now matching Chrome):
 - `canPlayType`: `maybe` for a known container, `probably` when the codecs are
   also known, `""` otherwise — including `video/ogg; codecs="theora"` and
   `video/quicktime`, which Chrome also refuses.
-- `decodingInfo` / `encodingInfo`: routed through *the same table*, so the two
-  APIs cannot disagree again. `powerEfficient` is `false`.
-- `MediaSource.isTypeSupported`: same table.
+- `decodingInfo` / `encodingInfo`: use MediaCapabilities format rules and keep
+  `powerEfficient` false because Obscura has no hardware decoder.
+- `MediaSource.isTypeSupported`: uses MediaSource's stricter container/codec
+  combinations. Chrome itself intentionally disagrees with `canPlayType` for
+  formats such as Ogg, so sharing one table would be incorrect.
 
 Unchanged (nothing is faked):
 

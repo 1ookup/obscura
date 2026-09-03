@@ -4,7 +4,528 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-08-28,step 91）：**未通过，核心指纹面已收敛**。B0-B7 全批次落地
+当前状态（2026-09-03，step 216，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+本轮继续参考 HaHaVM-General 并修复 wreq Critical-CH 重复头、跨源 iframe 初始隔离位、初始 about:blank
+兼容模式及可配置屏幕工作区指标；最新 payload 已对齐 `crossOriginIsolated=F`、`compatMode=BackCompat`、
+`screen.availTop=30`、DPR/语言/UA-CH 关键值。通过真实点击可执行
+frame proof/PAT/top proof，但 `brunhild.challenges.cloudflare.com` 经 `192.168.3.57:9000` 仍返回 `502`，
+页面换 ray，尚无目标 404。剩余分歧继续以明文 payload/事件时序对拍，不增加域名特判。
+step128存档：XHR修复与完整门通过，proof/top/new-ray链完整但仍无404。
+参考HaHaVM-General的XHR接口分层继续审计，已确认Obscura实例泄漏状态/请求/监听器字段、upload为普通
+对象且prototype层级错误；下一步以Chrome151完整shape/state oracle限定通用修复范围，不迁HaHa固定请求头。
+step130存档：参考HaHaVM-General继续核对Blob/Worker环境后，Obscura补齐Blob URL本地fetch的二进制GET/HEAD、
+Response元数据、MIME、Request输入和revoke生命周期，focused回归1/1通过，已有Blob Worker回归也通过。
+零预注入真实轮在新Reqable CA下完整走完fo/proof链但仍换ray；`tQcZu4`仍为`fetch_error`，Chrome对应为`timeout`。
+两边均未收到 `brunhild/.../i` 的response，当前差异由代理侧502/请求取消时序造成，不能据此增加站点特判。
+workspace nextest在shadow identity既有测试超过180秒中止，936通过/4失败/4 skipped/755未运行，完整门待后续清理。
+step131：修复 `Allow-CSP-From` 的通用 origin 比较。旧逻辑按原始字符串精确匹配，会误拒大小写不同、默认
+端口或尾随 `/` 的合法来源；现在解析 URL origin，拒绝凭据、路径、query、fragment和 opaque `null`，保留 `*`。
+`allow_csp_from_compares_origins_not_raw_header_strings` 与完整 embedded-CSP focused 均通过（2/2）。
+当前 Reqable CA 下零注入真实轮仍完整产生 proof/top/new-ray 后换 ray，没有 404；该修复未改变真实挑战结果，
+因为目标 Turnstile iframe 不携带 `csp`，仍不能作为当前站点阻塞根因。
+step132：参考 HaHaVM-General 的独立 HTMLIFrameElement 原型，Obscura 不再把 `HTMLIFrameElement` 别名为
+`Element`。新增专属 wrapper、Chrome 24 项 prototype 顺序/descriptor/brand、iframe 专属属性与节点映射，
+并保留 frame navigation/CSP/跨 realm 行为；shape focused、iframe navigation/CSP focused 与 obscura-js
+552 项（排除已知 shadow identity hang）均通过。真实 clean click 仍 proof/top/new-ray 后换 ray，没有 404。
+step133：Chrome/iframe 矩阵确认 `crossOriginIsolated` 是每个 Document 的状态：about:blank/srcdoc 继承父值，
+network iframe 依据自身 COOP/COEP。Obscura 将该值加入 `DocumentScope`，network frame 从响应头计算，
+blank/srcdoc 继承，frame realm 的 `document_scope_info` 改读 scope 值；隔离 focused 与 workspace 排除 hang 的
+1696/1696 全部通过。当前 Reqable CA 下真实 clean click 仍无 404，继续保留网络失败时序为未决。
+step134：在最终 release 二进制上复测 iframe 原型清理与 frame-level isolation；零预注入 clean click 仍稳定产生
+8 次 `/fo/`（含 proof/top/new-ray），页面显示 `Verification successful` 后换 ray，最终 URL 仍未真实返回404。
+这确认本轮 iframe 通用修复无回归，但也未改变当前代理/挑战失败判定。
+
+### Step 135 — Chrome 152 长尾接口面收敛（2026-09-02，完成）
+
+**假设**：当前 Chrome/Obscura 明文 payload 的 `N`/`o` 桶仍有稳定构造器差异；这些差异来自通用接口表，
+不是 `brunhild` 网络失败本身。参考 HaHaVM-General 的全局接口壳，并以当前 Chrome 152 CDP descriptor oracle
+确认具体形状。
+
+**方法与证据**：Chrome 多出 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
+`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`。其中 XSLTProcessor 可构造，其余为 illegal constructor；
+原型父级分别为 Object、HTMLElement、PerformanceEntry、PerformanceEntry、AbstractRange、AbstractRange，
+并核对了公开 accessor/method 名称、length、brand。Obscura 同时多出当前 Chrome 不公开的 `ModelContext`、
+`WebMCPEvent` 及 `navigator.modelContext`。
+
+**修复**：扩展 `_chromeInterfaceTable`，为六个接口安装 Chrome 152 的原型成员和 native descriptor；移除
+`ModelContext`/`WebMCPEvent` 及 `navigator.modelContext` 壳。实现位于 `crates/obscura-js/js/bootstrap.js`，
+未加入目标域名逻辑。
+
+**量化结果**：同轮零注入 payload 的 `N` 桶由 1167 收敛到 Chrome 的 1171，`o` 桶由 121 收敛到 120；
+六个构造器均为 `function`，两个旧壳为 `undefined`。无注入真实导航仍完整产生初始 fo、proof/top 转发并在
+`Verification successful` 后换 ray，`tQcZu4` 仍为 `fetch_error`（Chrome 为 `timeout`），目标未返回真实 404。
+
+**结论**：长尾全局接口差异已闭环且无回归，但不是当前 404 的唯一阻塞；剩余分歧继续限定在
+`brunhild/.../i` 请求的网络失败/取消时序，禁止加入站点特判。
+
+### Step 136 — 请求头/事件/worker 环境收尾与外部网络盲区（2026-09-02，调查中）
+
+**假设**：HaHaVM-General 对 worker creator origin、Window event 和脚本请求元数据的处理，仍可能与
+Obscura 在当前 Chrome 152 质询中存在通用差异；这些应先由独立回归和请求头观测确认，不能用目标域名逻辑补偿。
+
+**修复与证据**：Obscura 现在在事件 dispatch 期间暴露当前 `window.event`，空闲时恢复 `undefined`，并在
+worker `fire()` 中同样设置/恢复；blob/data worker 的环境优先继承 creator origin；stealth scripted fetch
+补齐 `Accept`、`Accept-Language`、`Sec-Fetch-Site`、`Sec-Fetch-Mode`、`Sec-Fetch-Dest`。Chrome 152
+长尾接口表同时补齐 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
+`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`，移除不公开的 `ModelContext`、`WebMCPEvent` 与
+`navigator.modelContext`。零注入 payload 结构从 `N=1167/o=121` 收敛到 `N=1171/o=120`。
+
+**回归**：`window_event_is_current_only_during_dispatch` 1/1，三个 worker origin 测试 3/3，
+`scripted_fetch_site_distinguishes_origin_and_site_boundaries` 1/1；带 trace-patched V8 的精确 release build
+和 `vendor/v8-trace.sh check` 均通过。完整 workspace nextest 排除已知会挂起的
+`shadow_root_identity_and_children_are_native_tree_backed` 后为 1697 passed / 1 flaky failure / 5 skipped；
+失败项 `test_navigate_and_snapshot` 单独以 `--retries 2` 复跑通过。
+
+**真实站复测与测量盲区**：本轮启动的最终 release serve 已确认 stealth TLS 与 Chrome 149 macOS UA，但
+`cdp_click_fast` 40 秒内没有 widget，服务端导航在 60 秒超时关闭；同一代理 `http://192.168.3.57:9000`
+对目标直接返回 Cloudflare 403 challenge，未产生可比较的 proof 请求或 `/1.txt` 404。因此本轮不能证明
+代码改变了真实判定，也不能把外部 403/Brunhild pending 归因于 Obscura。下一轮只有在代理恢复可完成挑战时，
+才继续做零注入点击和 404 验收；不增加 hostname 特判。
+
+### Step 137 — frame 文档 `script-src` 执行门（2026-09-02，完成）
+
+**假设**：frame controller 已把网络响应 CSP 写入 `DocumentScope`，但 frame 脚本调度器可能没有读取它；
+若 frame 中的 nonce/来源限制未执行，挑战 widget 的子文档会暴露与 Chrome 不同的脚本执行面。
+
+**证据与修复**：审计 `execute_frame_scripts_for` 确认 classic、module、inline 和 import map 原先均无
+`script-src` 校验，外部 frame script 即使不在响应 CSP allowlist 中也会被抓取。现在 frame 调度使用自身
+`DocumentScope.csp`：外部 classic/module 按 `script-src-elem`/`script-src`/`default-src` 检查，inline
+classic/module/import map 按 nonce/`unsafe-inline` 检查，阻断发生在网络请求和执行之前；主文档逻辑保持不变。
+
+**回归**：新增 `frame_document_csp_gates_inline_nonce_and_external_scripts`，验证无 nonce inline 被阻止、
+正确 nonce 执行、未允许的外部脚本不产生请求；该测试与既有 embedded CSP、frame module、external script
+共 4/4 通过。`obscura-browser` release+render crate 全部 111/111 通过。
+
+**结论**：这是已由独立 HTTP fixture 证明的通用 iframe CSP 缺陷，已修复且没有站点特判。当前真实 404
+仍待代理恢复后验收；本次修复本身不改变此前 `brunhild` 外部请求 pending 的结论。
+
+### Step 138 — CSP 脚本门后的真实站复测（2026-09-02，调查中）
+
+**假设**：frame `script-src` 缺口修复后，若代理恢复，挑战 widget 应至少进入可交互阶段；这次只使用
+trace-patched release、stealth、对齐 Chrome 149 UA 和零注入点击，不使用会污染 payload 的 DOM hook。
+
+**代码证据**：`execute_frame_scripts_for` 现在在 frame 自身 `DocumentScope.csp` 下 gate 外部 classic/module，
+并按 nonce/`unsafe-inline` gate inline classic/module/import map。新增 HTTP fixture 已证明禁止脚本不产生
+网络请求，允许 nonce 脚本仍执行；frame CSP/module/external focused 4/4，`obscura-browser` 111/111，
+workspace（排除已知 shadow hang）1699/1699，release/no-default/trace patch 均通过。
+
+**真实站证据**：最终 release serve 日志确认 stealth TLS 与 Chrome 149 macOS UA。对
+`https://www.thelancet.com/1.txt` 的 `cdp_click_fast --deadline 40` 连续复测仍在 40 秒内无 widget，
+页面 title/body 为空，服务端导航约 60 秒后关闭；同一代理直接响应 Cloudflare 403 challenge。没有 proof、
+`complete` 或目标 `/1.txt` 404，因此不能宣称本修复已过盾，也没有足够证据继续归因某个 Obscura iframe API。
+
+**结论**：iframe 文档 `script-src` 执行机制已闭环；当前真实 404 验收仍被代理/上游挑战状态阻断。后续
+需要代理恢复或新的可完成挑战网络条件，再按零注入流程验证，不加入站点特判。
+
+### Step 139 — 动态 frame script CSP sink（2026-09-02，完成）
+
+**假设**：即使 parser-discovered frame scripts 遵守 CSP，动态插入的 `<script>` 仍可能绕过 `script-src`；
+挑战 widget 常在运行时创建 script 元素，这会让 frame realm 的执行面与 Chrome 不一致。
+
+**修复**：`__prepareInsertedScript` 现在读取当前 frame 的 `DocumentScope.csp`，在调度 fetch/eval 前检查
+外部 classic/module 的 `script-src-elem`/`script-src`/`default-src` 来源，以及 inline classic/module/import
+map 的 nonce/`unsafe-inline`。阻断脚本仍标记为 started，避免后续连接重复执行；主文档和 worker 路径不受影响。
+
+**证据**：扩展 `frame_document_csp_gates_inline_nonce_and_external_scripts` fixture，验证动态无 nonce
+脚本不执行、动态正确 nonce 脚本执行、未授权外部动态脚本不产生请求；该测试与 frame CSP/module/external
+集合通过，workspace 排除已知 shadow hang 后 `1699/1699` 通过，no-default check 通过，release 二进制保持
+trace-patched。
+
+**结论**：动态 frame script CSP sink 已按通用规则闭环，未加入目标域名逻辑。真实 404 仍因代理当前直接
+返回 Cloudflare 403、无 widget 而无法验收。
+
+### Step 140 — frame ES module graph CSP（2026-09-02，完成）
+
+**假设**：入口 `<script type="module">` 已校验 frame `script-src`，但模块图的静态 `import` 由独立
+realm loader 抓取，可能绕过同一策略并加载未授权依赖。
+
+**修复**：新增 `FrameModuleCsp`，把 frame 的 CSP header 与 origin 传入 `prepare_module_in_frame_realm`；
+每个静态及重写的 dynamic import 在入队/抓取前按 `script-src-elem` 优先、`script-src`、`default-src`
+回退规则校验来源，处理 `self`、scheme、host wildcard、端口、`data:`/`blob:`，并遵守重复 directive
+首项规则。被阻止的依赖不会发起网络请求。
+
+**证据**：新增 frame fixture 使用 nonce 允许 module 入口、用 `https://blocked.example` 依赖验证 graph
+被 CSP 拒绝且 module body 不执行；Chrome 规则的 directive precedence、scheme-less host 与 duplicate
+directive focused 断言通过。workspace release nextest（排除已知 shadow identity hang）`1700/1700 passed`
+（1 leaky、5 skipped），no-default check、精确 release build 与 trace patch 均通过。
+
+**结论**：frame 静态 module graph 的 CSP 机制已闭环，未加入站点特判；真实 `/1.txt` 404 仍等待可完成的
+Cloudflare 上游挑战网络条件。
+
+### Step 141 — frame render warmup 的资源 CSP（2026-09-02，完成）
+
+**假设**：render 资源 warmup 在 frame realm 外扫描 CSS `url()` 并统一预取，可能绕过 frame 自身的
+`img-src`/`font-src`，在后续渲染前就发出被 CSP 禁止的请求。
+
+**修复**：`prepare_screenshot_resources` 现在保留每个 document root 的 CSP 与 origin；生成 frame 图片/字体
+候选时按 `img-src`/`font-src`（及对应 fallback）过滤，禁止候选不会进入 transport 或 renderer cache。顶层
+文档和允许资源路径保持原有行为。
+
+**证据**：新增 `frame_csp_blocks_render_warmup_resource_prefetch`，HTTP fixture 返回 frame `img-src 'none'`
+及 CSS 图片 URL，断言只收到顶层和 frame 文档请求、没有图片请求；release+render focused 通过。
+
+**结论**：frame CSP 对 speculative render warmup 已闭环，未加入站点特判；真实 404 仍取决于 Cloudflare
+挑战上游恢复。
+
+### Step 142 — frame `<img>` renderer fallback 的 CSP（2026-09-02，完成）
+
+**假设**：即使 warmup 候选过滤了 frame 图片，首次布局/绘制仍可能在 `RenderResourceCache` 的同步
+`collect_image_intrinsics` 路径直接加载图片，从而绕过 JS `op_load_image_metadata` 的 `img-src` 检查。
+
+**证据与修复**：独立 fixture 在 frame 文档声明 `img-src 'none'` 并包含真实 `<img src>`；原实现仍会
+收到图片请求。`RenderResourceCache` 现维护当前 root 的 CSP/origin（与已有 font context 同步），
+`get_or_load_image` 在调用兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入成功或失败缓存。
+候选 API 同时携带所属 root，避免同一 URL 在不同 frame policy 下错误去重。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 与
+`frame_csp_blocks_render_warmup_resource_prefetch` 均通过，后者覆盖 frame CSS URL 和真实 `<img>`；
+workspace release nextest（排除已知 shadow identity hang）`1702/1702 passed`，no-default、精确 release
+build、trace patch 和 `git diff --check` 均通过。
+
+**结论**：frame 图片在 JS、warmup、renderer fallback 三条路径都遵守 `img-src`，没有 hostname 特判。
+真实 `/1.txt` 404 仍未验收，当前 Cloudflare 响应是 403 challenge。
+
+### Step 143 — frame 图片的同步 renderer loader CSP（2026-09-02，完成）
+
+**假设**：frame `<img>` 的 JS 异步路径已经执行 `img-src`，但首次布局中的
+`collect_image_intrinsics` 可能通过 `RenderResourceCache` 同步 loader 直接取图，绕过 frame policy。
+
+**证据与修复**：加入真实 frame `<img src>` 后，warmup 关闭时仍观测到图片请求；CSS URL 过滤并未覆盖
+该路径。`RenderResourceCache` 现在与 font context 一起保存当前 document 的 CSP/origin，
+`get_or_load_image` 在兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入缓存；
+`pending_render_image_urls` 同时携带所属 root，避免跨 frame policy 去重。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 调用计数为零，
+`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 frame CSS URL 与真实 `<img>` 且仅收到文档请求。
+两项及 frame CSP focused 均通过；workspace release（排除已知 shadow identity hang）保持全通过。
+
+**结论**：frame 图片 CSP 已覆盖 JS、speculative warmup 和同步 renderer fallback 三条路径，未加入目标域名
+特判；真实 404 仍待 Cloudflare challenge 上游恢复。
+
+### Step 144 — frame `<img>` root 归属与 renderer fallback 修复（2026-09-02，完成）
+
+**假设**：warmup 过滤按 frame root 处理 CSS URL 后，普通 `<img>` 候选仍只返回 URL/profile；统一 transport
+无法知道它来自哪个 Document，可能在跨 frame policy 去重或首次布局时重新放行。
+
+**方法与证据**：把真实 `<img src>` 加入 `img-src 'none'` frame fixture，关闭自动 warmup 后仍观察到图片请求；
+`pending_render_image_urls` 返回的候选确认 root nid 为 frame content document，但原调用方丢弃了该信息。
+同步 renderer 的 `collect_image_intrinsics` 也通过共享 cache loader 直接发起请求，JS image op 的 CSP 日志不会覆盖它。
+
+**修复**：候选现在携带所属 root；page transport 在候选生成阶段按该 root 的 `img-src`/`default-src` 过滤；
+`RenderResourceCache` 与 font context 同步保存 CSP/origin，并在 `get_or_load_image` 调用兼容 loader 前 gate，
+禁止 URL 不写入成功/失败缓存，避免后续 policy 复用错误结果。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 计数为零；
+`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 CSS `url()` 与真实 `<img>`，只收到 `/` 和 frame 文档请求。
+相关 focused 全部通过，workspace release（排除已知 shadow identity hang）`1702/1702 passed`，no-default、
+精确 release build、trace patch、`git diff --check` 均通过。
+
+**结论**：frame 图片请求现在在 JS、warmup、renderer fallback 和 root 归属四个层面遵守 CSP；真实 `/1.txt`
+404 仍受当前 Cloudflare 403 challenge 网络状态阻断。
+
+### Step 145 — 真实站传输层状态复核（2026-09-02，调查中）
+
+**方法**：用最新 trace-patched release 做短超时 `fetch`，分别测试直连和
+`http://192.168.3.57:9000` 代理；不启用页面注入或 payload hook。
+
+**证据**：直连路径在 TLS handshake 因 Reqable CA 不匹配而 `CERTIFICATE_VERIFY_FAILED`；代理路径在
+20 秒 navigation deadline 内未收到响应 body，最终为 `navigation exceeded 20000ms deadline`。此前 `curl`
+直连/代理均能看到 Cloudflare 403 challenge，但当前 Obscura transport 未得到可执行页面，因此没有
+widget、proof、`complete` 或 `/1.txt` 404 可比较。
+
+**结论**：当前阻塞明确位于外部 TLS/代理/上游响应时序，不足以归因 frame CSP 或其他环境 API。待代理
+能够稳定返回挑战资源后，再按零注入流程复测真实 404；不加入站点特判。
+
+### Step 146 — frame `unsafe-eval` 与 V8 code-generation policy（2026-09-02，完成）
+
+**假设**：frame 文档的 `script-src` 即使限制了 script 来源，V8 默认仍允许 `eval()`/`new Function()`；
+这会让 CSP `script-src` 与 Chrome 不同，并可能改变挑战 widget 的反检测分支。
+
+**证据与修复**：原 V8 callback 只转换 `TrustedScript`，且 Context 默认允许 string code generation，
+所以普通字符串不会进入 callback。现在 main/frame/isolated contexts 设置
+`AllowCodeGenerationFromStrings(false)`，每个 realm 在 `__obscura_init` 根据自身 CSP 的
+`script-src`/`default-src` 写入隐藏 flag；V8 callback 读取该 flag，在没有 `'unsafe-eval'` 时拒绝字符串代码生成，
+同时保留 TrustedScript 转换和 intrinsic direct-eval 语义。flag 加入 pre-hide 列表，避免环境枚举泄漏。
+
+**回归**：top CSP 测试验证 plain `eval` 和 `new Function` 返回 `EvalError`、TrustedScript 仍执行；frame
+script fixture 同样验证 `EvalError`。focused 2/2、workspace release（排除已知 shadow identity hang）
+`1702/1702 passed`，no-default、精确 release build、trace patch 和 `git diff --check` 均通过。
+
+**真实站复测**：最新 release 经 `192.168.3.57:9000` 代理请求目标时仍在 20 秒 navigation deadline 超时，
+无 challenge body/proof/complete/404；外部传输状态继续作为未决项，不加入站点特判。
+
+### Step 147 — frame CSP 完整代码生成门验证（2026-09-02，完成）
+
+**假设**：`unsafe-eval` gate 可能只覆盖普通 frame realm，而不覆盖 V8 创建的 isolated world 或新建
+frame context；任一 realm 漏洞都会让挑战看到不一致的 string-codegen 行为。
+
+**验证与修复确认**：main context、frame main world、CDP isolated world 创建时均调用
+`AllowCodeGenerationFromStrings(false)`；V8 callback 读取各自 bootstrap 写入的 CSP flag。无明确
+`'unsafe-eval'` 时 plain `eval`/`new Function` 被拒，TrustedScript 仍按 brand 转换，未替换 intrinsic
+eval，保持 direct-eval 作用域语义。flag 已加入 pre-hide 内部字段集合。
+
+**量化回归**：top Trusted Types CSP 测试与 frame script CSP fixture 均通过（2/2）；workspace release
+nextest（排除已知 shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、
+trace patch、`git diff --check` 均通过。
+
+**结论**：CSP `unsafe-eval` 在 main/frame/isolated realm 的代码生成路径已闭环，未加入域名特判。真实
+`/1.txt` 404 仍因当前代理 navigation timeout 未验收。
+
+### Step 148 — codegen 修复后的真实站复测（2026-09-02，调查中）
+
+**方法**：使用包含 V8 `unsafe-eval` callback、frame module/image CSP 修复的最新 release，stealth、
+Chrome 149 macOS UA，经 `192.168.3.57:9000` 请求目标，timeout 20s，零注入。
+
+**证据**：请求仍在 `navigation exceeded 20000ms deadline` 失败，没有 challenge body、widget、proof、
+`complete` 或 `/1.txt` 404。该结果与代码修复前的代理时序一致，无法证明目标页面执行到了 CSP 或 frame realm。
+
+**结论**：真实验收仍被外部代理/上游响应阻断；保持未完成状态，等待可返回并执行 challenge 的网络条件，
+不添加站点特判。
+
+### Step 149 — CSP 代码生成门的最终回归（2026-09-02，完成）
+
+**假设**：CSP `unsafe-eval` gate 可能通过 V8 callback 改变正常页面的 direct-eval 作用域，或在 frame
+context 创建前后出现时序窗口；需要用现有 Trusted Types 和 frame script fixture 共同验证。
+
+**结果**：main、frame main world、CDP isolated world 创建时均禁用 Context 默认 string codegen；bootstrap
+在 `__obscura_init` 根据各自 `DocumentScope.csp` 设置 hidden allow flag，V8 callback 仅在 flag 允许时放行
+普通字符串，并继续将 TrustedScript 转换为源码。plain `eval`/`new Function` 在无 `'unsafe-eval'` 时返回
+`EvalError`，无 CSP 时的 direct-eval 行为和现有脚本保持不变；flag 纳入 pre-hide，未新增可枚举引擎字段。
+
+**验证**：Trusted Types top 测试、frame CSP（含 eval/function）测试 2/2；workspace release（排除已知
+shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、trace patch、
+`git diff --check` 均通过。
+
+**结论**：CSP 代码生成机制已在所有 Obscura Window realm 覆盖，未加入域名特判。真实 `/1.txt` 404 仍受
+代理 navigation timeout 阻断。
+
+### Step 150 — `script-src-attr` inline handler CSP（2026-09-02，完成）
+
+**假设**：CSP `script-src-attr 'none'` 只限制 event-handler content attributes；如果仍通过
+`Element._resolveInlineHandler` 的 `new Function` 编译，代码生成 flag 不足以复现 Chrome 的 handler 行为。
+
+**修复**：inline handler 解析前读取当前 realm 的 CSP，按 `script-src-attr` 优先、`script-src`、`default-src`
+回退；只有存在 `'unsafe-inline'` 才编译属性 handler，`'unsafe-hashes'`/未授权属性保持阻断。该检查与
+`unsafe-eval` callback 独立，避免把 event attribute 当作普通 eval。
+
+**证据**：新增 `script_src_attr_controls_inline_event_handlers`，验证 `script-src-attr 'none'` 下
+`onclick` 不执行、改为 `'unsafe-inline'` 后执行；frame CSP fixture 也覆盖 frame realm 的 eval/function
+gate。focused 3/3、workspace release（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped，
+release/no-default/trace patch/diff check 均通过。
+
+**结论**：inline event-handler CSP 已按 realm 生效，未加入站点特判；真实 `/1.txt` 404 仍待代理恢复。
+
+### Step 151 — `script-src-attr` 修复后的真实站复测（2026-09-02，调查中）
+
+**方法**：使用包含 frame parser/dynamic/module/image CSP、V8 `unsafe-eval` 和 `script-src-attr` 修复的
+最新 release，stealth、Chrome 149 macOS UA，经 `192.168.3.57:9000` 访问目标，timeout 20s，零注入。
+
+**证据**：仍返回 `navigation exceeded 20000ms deadline`，没有 challenge body、widget、proof、complete
+或目标 `/1.txt` 404。目标直连的 curl 同时仍为 `HTTP/2 403` + `cf-mitigated: challenge`。
+
+**结论**：外部代理/上游仍未提供可执行挑战，无法对本轮 inline handler 修复做真实过盾归因；真实 404
+验收继续保持未完成，不加入站点特判。
+
+### Step 152 — external script nonce 反射与真实挑战链恢复（2026-09-02，完成）
+
+**假设**：Cloudflare challenge 的动态 `chl_page` script 使用 `a.nonce = ...`；如果 Obscura 缺少
+`HTMLScriptElement.nonce` 反射，frame-local CSP gate 会把合法 external script 误判为未授权，页面停在
+“Enable JavaScript and cookies to continue”。
+
+**证据与修复**：实际目标 HTML 的 inline script nonce 与 CSP header 一致，并明确执行
+`a.nonce = '<nonce>'; a.src = '/cdn-cgi/.../chl_page/v1?...'; head.appendChild(a)`。新增通用 `nonce` getter/setter
+（HTML element wrapper），动态 CSP gate 对 external script 同样匹配 nonce；本地 fixture 改用 `script.nonce`
+赋值并验证 external script 请求/执行恢复。未授权外部 script 仍阻断。
+
+**真实量化结果**：最新 release 直连零注入 CDP 轮在 `t=5.3s` 点击 300x65 widget，收到 `interactiveBegin`。
+Rust 日志确认 `chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200
+（约823KB）、`/pat` 401、点击后的 proof/top 3256B；页面显示 “Verification successful”。修复前同类轮次
+在动态 `chl_page` 处即被 CSP 阻断，只有“Enable JavaScript”。
+
+**当前断点**：`brunhild.challenges.cloudflare.com/cdn-cgi/.../i` 请求在 Connect 阶段失败，随后 frame `/fo`
+仍返回 200，但站点没有发放最终响应，目标未真实返回 `/1.txt` 404。该 Connect 失败与 Chrome 同轮无 response
+一致，不能继续归因 iframe CSP；等待可访问 Brunhild 的网络条件再验收。
+
+**回归**：frame CSP focused 通过；workspace release（排除已知 shadow identity hang）`1703/1703 passed`、
+5 skipped，release/no-default/trace patch/diff check 全通过。无 hostname 特判。
+
+### Step 153 — nonce 修复后的无注入真实点击证据（2026-09-02，调查中）
+
+**方法**：使用包含 `HTMLScriptElement.nonce` 反射和 external nonce CSP gate 的最新 release，直连（不经过
+失效代理）启动 CDP，执行零注入 `cdp_click_fast --deadline 40 --settle 20`，同时开启
+`RUST_LOG=obscura_js=debug` 请求日志。
+
+**证据**：页面在 `t=5.3s` 取得 300x65 widget box 并点击，随后收到 `interactiveBegin`。请求时间线中
+`chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200（约823KB）、
+`/pat` 401、点击后 frame proof `/fo` 200、top `/fo` 3256B 均出现；页面显示
+`Verification successful. Waiting for www.thelancet.com to respond`。这证明 nonce/CSP 修复已消除此前
+“Enable JavaScript and cookies to continue”的直接阻断。
+
+**当前断点**：challenge 随后请求
+`https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/i/...`，约1.1s 后在 Connect
+阶段失败；Chrome 同网络条件也没有该请求的 response。其后 frame 转发仍返回 200，但没有站点最终响应，
+目标未真实返回 `/1.txt` 404。
+
+**结论**：iframe CSP/nonce 环境已经把执行链推进到交互后最后的 Brunhild 网络请求；剩余失败是外部 fake-DNS/
+代理/上游可达性问题，不足以继续推断 Obscura iframe API。待该 host 可达时再进行 404 验收，不加入域名特判。
+
+### Step 154 — nonce/CSP 修复后的最终代码门禁（2026-09-02，完成）
+
+**验证范围**：在 nonce 反射、external nonce 匹配、frame script/module/image CSP、`script-src-attr` 和 V8
+`unsafe-eval` 全部落地后，重新执行精确 release build、no-default feature check 与 workspace release nextest。
+
+**结果**：workspace（排除已知 `shadow_root_identity_and_children_are_native_tree_backed` hang）
+`1703/1703 passed`、5 skipped；no-default check 通过；精确二进制晚于全部相关源码；
+`vendor/v8-trace.sh check` 为 `patched`；`git diff --check` 通过。真实目标的无注入 CDP 轮仍能在 5.3s
+点击并收到 `interactiveBegin`，但 Brunhild `/i` Connect 失败，未获得站点 404。
+
+**结论**：当前代码侧 iframe/CSP 环境修复已通过完整门禁；最终 404 仍需外部 Brunhild host/fake-DNS 可达，
+不能用站点特判或测试 fixture 代替。
+
+### Step 155 — Brunhild 请求归属与最终网络断点（2026-09-02，调查中）
+
+**方法**：从最新无注入 CDP serve 的 `RUST_LOG=obscura_js=debug` 中按时序核对 Brunhild 请求、
+后续 frame/top 转发和页面状态；同时检查 DNS 与路由，不修改请求 URL 或 Host。
+
+**证据**：`brunhild.challenges.cloudflare.com` 请求由 frame challenge 触发，日志显示
+`Origin: https://challenges.cloudflare.com`、无 Referer；约 1.1 秒后 `stealth_fetch failed ... client error (Connect)`。
+同一轮之后 frame `/fo` 仍返回 200（约127KB），页面继续显示 `Verification successful`，但没有新的站点响应。
+DNS 将 Brunhild 解析到 198.18.0.157（utun fake-DNS 路由），IPv4/IPv6 直连均 TLS syscall 失败；代理
+`192.168.3.57:9000` 当前 host down。Chrome 同条件的 Brunhild 请求也没有 response。
+
+**结论**：请求 realm、Origin 和 challenge 提交链均已正确；剩余断点是外部 fake-DNS/代理可达性，不能通过
+Obscura 的 iframe CSP 或 hostname 特判修复。真实 `/1.txt` 404 仍未取得，待 Brunhild host 可达后继续验收。
+
+### Step 156 — nonce 后真实链路与代码门禁汇总（2026-09-02，调查中）
+
+**代码状态**：`HTMLScriptElement.nonce` 反射、external nonce CSP、frame parser/dynamic/module/image CSP、
+`script-src-attr` 和 V8 `unsafe-eval` 均已落地；对应 focused fixtures 与完整 workspace 均通过。
+
+**真实状态**：直连最新 release 的无注入 CDP 轮在 5.3 秒点击并收到 `interactiveBegin`，top/frame `/fo`、
+proof、`/pat` 401 和 `Verification successful` 均可观测。唯一未完成的是 Brunhild `/i` 的 Connect/TLS；
+DNS 解析到 198.18.x fake-DNS，IPv4/IPv6 均无 response，Chrome 同条件也无 response。目标 URL 仍未真实返回
+404，故不宣称过盾成功。
+
+**门禁**：workspace release nextest（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped；
+no-default check、精确 release build、trace patch 和 `git diff --check` 均通过。后续只需在 Brunhild host
+可达的网络条件下重复同一无注入点击验收，不再继续猜测已排除的 iframe CSP 根因。
+
+### Step 157 — HaHaVM-General 内存上限与 Window 常量（2026-09-02，完成）
+
+**假设**：HaHaVM-General 最新通用环境提交仍有少量可由 Chrome oracle 直接证明的公开面差异；这些差异应在
+Obscura 中按 WebIDL 语义补齐，不应与 Cloudflare 主机或质询分支绑定。
+
+**证据与修复**：本机 Chrome 152 的 `performance.memory.jsHeapSizeLimit` 和 `console.memory.jsHeapSizeLimit`
+均为 `4395630592`，Obscura 原先固定为 `4294705152`；已统一初始化、fallback 和导航重置值。Chrome 还在
+`Window` 构造器及 `Window.prototype` 上暴露不可写、可枚举、不可配置的 `TEMPORARY=0` 与 `PERSISTENT=1`，
+Obscura 原先缺失；已补齐这两组常量和 focused descriptor 回归。
+
+**验证**：`window_storage_constants_match_chrome_shape` 与
+`console_and_performance_memory_share_fresh_branded_wrappers` focused nextest 2/2 通过；精确
+trace-patched release build、no-default feature check、`vendor/v8-trace.sh check` 和 `git diff --check` 通过。
+`obscura-js` 全 crate 在既有 `shadow_root_identity_and_children_are_native_tree_backed` 挂起及宿主字体/渲染
+断言失败处中止，新增测试本身未失败。
+
+**结论**：本步完成两个通用环境差异的修复，没有改变请求或站点逻辑。代理 `192.168.3.57:9000` 当前仍
+不可达，Brunhild `/i` 无 response，目标 `/1.txt` 仍未取得真实 404。
+
+### Step 158 — frame Worker 继承 creator CSP（2026-09-02，完成）
+
+**假设**：真实 challenge 的 Brunhild `/i` 请求由 widget frame 派生的 Worker 发起；Worker 没有自己的
+Document root，若不继承创建它的 frame CSP，`op_fetch_url` 会错误地按顶层页面策略处理请求。
+
+**证据与修复**：修复前同一轮日志中 frame `/fo` 为 `root=75, csp=frame`，而 Brunhild `/i` 为
+`root=0, csp=page:none`，但 Origin 已是 `https://challenges.cloudflare.com`。新增 WorkerEnvironment 的
+creator CSP 字段和 `creator_root`/`creator_csp` op 参数；Worker 与 SharedWorker 现在将创建文档的 CSP 写入
+自身运行时，嵌套 Worker 继续沿用该策略。新增跨 frame data Worker fixture，`connect-src 'none'` 返回
+`AbortError` 且本地 HTTP 请求数为 0，证明在网络前阻断。
+
+**验证**：`frame_worker_fetch_uses_the_creator_document_csp` 及既有 frame worker 三项 focused nextest
+均通过；workspace（排除已知 shadow identity hang）`1703 passed / 2 failed`，两项失败为既有 MCP
+时序测试，单独 `--retries 2` 全部通过。精确 release build、no-default check、V8 trace patch 和 diff check
+通过。新 release 的真实轮仍稳定进入 interactiveBegin、frame/top `/fo` 和 proof/top 转发；Brunhild `/i`
+仍在 Connect/TLS 失败，目标 URL 尚未返回真实 404。
+
+**结论**：本步修复了 frame Worker CSP 传播的通用缺陷，真实请求日志中的 Worker 已从 `csp=page:none`
+迁移为有 CSP 的运行时策略；剩余 Brunhild 失败仍是外部网络可达性，未加入 hostname 特判。
+
+### Step 159 — Brunhild 真实网络路径恢复（2026-09-02，调查中）
+
+**方法**：本机 DNS 将 Brunhild 映射到 `198.18.x` fake-DNS/utun 路由，直连 TLS syscall 失败。为分离网络
+与引擎因素，使用仅作测试的本地 CONNECT 转发，将该连接送到真实 Cloudflare IP，同时保留原始 Host/SNI；
+没有修改 Obscura 请求 URL 或加入 hostname 特判。
+
+**证据**：通过该转发，Brunhild `/i` 从 Connect failure 变为真实 `204`；Obscura 仍完成 frame/top `/fo`、
+`/pat` 401 与 proof/top 转发，随后 challenge 换 ray。相同转发下 headless/headful Chrome 也停在 challenge，
+因此此前的网络失败已被独立，剩余是 challenge 判定/环境分歧。
+
+### Step 160 — 干净点击与硬件指纹 A/B（2026-09-02，调查中）
+
+**测量修正**：现有 `cdp_click_fast.py` preload 会包装 `attachShadow`，会污染函数 identity；新增固定坐标无
+preload 点击脚本，避免把探针副作用当成页面行为。动态 `Image.src` 的本地 fixture 也确认无生命周期观察时
+仍会发起 eager fetch，排除 `/ci` 缺失的 lazy-image 假设。
+
+**A/B 证据**：本机 Chrome152 同 UA 返回 `hardwareConcurrency=12`、`deviceMemory=32`，Obscura 默认 `8/8`。
+使用 `--fingerprint '{"hardwareConcurrency":12,"deviceMemory":32}'` 重跑 challenge，请求序列和结果未变：
+Brunhild `204`、`/pat` 401、proof 后换 ray，未出现真实 404。当前没有足够证据改变默认硬件策略。
+
+**结论**：iframe CSP、Worker creator CSP、图片 eager-fetch 和硬件指纹均有独立 fixture/oracle 证据；当前
+challenge 仍未返回目标真实 404，后续应继续从明文 payload/事件时序找通用差异，不添加 Cloudflare 域名分支。
+
+### Step 161 — Navigator 自有属性迁移（2026-09-02，完成）
+
+**假设**：Obscura 的 Navigator 兼容对象仍把公开 IDL 成员放在实例自身，形成 Chrome 不存在的枚举面；
+这类结构差异可能被 challenge 的全局对象探针直接读取。
+
+**证据与修复**：Chrome 152 的 `Object.getOwnPropertyNames(navigator)` 为空，`connection`、`permissions`、
+`gpu`、`geolocation`、`getBattery` 等均位于 Navigator 原型；Obscura 原先有 21 个自有成员。新增末端迁移
+层，将兼容对象的稳定值转为原型 getter、方法转为原型函数，保留对象 identity、secure-context 删除和
+`Navigator.prototype` 后续接口安装逻辑。
+
+**验证**：`navigator_has_no_own_idl_members`、fingerprint 和 StorageManager focused `3/3` 通过；workspace
+release nextest（排除已知 shadow identity hang）`1707/1707 passed`、5 skipped；精确 release build、
+no-default check、V8 trace patch 和 `git diff --check` 通过。临时真实-IP CONNECT 转发下，最新无 preload
+点击仍完成 Brunhild `204`、`/pat 401`、proof/top 转发后换 ray，目标未返回真实 404。
+
+**结论**：Navigator 枚举结构已与 Chrome 对齐，未引入站点特判；challenge 剩余分歧仍需从明文 payload 和
+事件时序继续定位。
+
+step127存档：Blob/File、UTF-8、三ray与完整门均通过，仍无真实404。
+参考HaHaVM-General的Blob分片修复继续审计公开面，Chrome151证明Obscura既有实现泄漏实例字段且把
+null/undefined分片丢弃；已迁WeakMap internal slots、补完整Blob/File接口与流读取，并修正非法UTF-8
+热路径为U+FFFD。Chrome parity focused1/1、相关6/6、obscura-js546/546与workspace1686/1686通过；
+三clean ray完整，条件点击proof/top/new-ray链完整但仍无404。step126存档：console三ray迁移与完整门均通过。
+
+Step105新增通用修复已由真实payload验证：counterclockwise arc首2x2迁移到白/191/239/48
+（Chrome白/192/244/53）；float16 context四组颜色4/4对齐；C1 Canvas文本把十宽度最大误差从
+约31px降到2.21px。49x44 Skia AA/hash、TextMetrics outline/font box、hG31项与Zok postMessage分类
+仍未决。完整门为obscura-js533/533、workspace1673/1673（4 skipped）、精确release、trace patch、
+no-default与diff check通过；deterministic 63个fixture的Obscura行为断言全过，10条checker失败
+均为Chrome151对旧参考不匹配。障碍课程未跑（本机无companion仓库）。
+
+step 104存档：**DOMParser skeleton崩溃已修，最后有效明文样本的hGgWW0有31项差异且lNCr3
+未恢复；当时迁移待测，质询仍未通过**。ZokK1最后有效payload的
+N/o/x/F/T本地分类缺口已静态覆盖，
+RTP capabilities的audio RED已从`audio/red/48000;111/111`对齐为`audio/red/48000`；
+CSSOM-only unrounded geometry已让受控inline rect从73对齐为72.9375，同时offsetWidth保持73；
+detached HTMLDocument/XMLDocument身份、owner与Document根关系已按Chrome151对齐。direct live已到
+widget proof fo 200后，但仍没有目标真实响应；
+真实payload迁移仍等待Reqable注入key刷新。ZokK1中六个已存在接口的type/native外壳已按Chrome151修复，
+本地fixture与全量门通过；真实bucket迁移待payload-2恢复。JSVMP取证已证伪frame VM和top
+secondary runProgram，并把旧ray `uA`主VM映射到新ray `nT/FX`结构；临时register probe已命中
+62/44/5 calls后删除。当前Reqable会话仍只到payload-1后600010，不能产生hG证据；按测量盲区
+应先刷新代理注入的challenge JS/key，再重复三轮payload-2。本轮已用Chrome151 oracle实现最后
+有效payload中全部34个Chrome-only N路径，并通过release CLI 34/34静态分类检查；这仍不能替代
+真实payload或过盾成功判据。后续仍按
+受控 main/frame realm oracle 拆分 parser/serializer 与其他 API。step 95 已隐藏 Error.stack 的
+Obscura/deno 内部帧；step 94 的 jdnfg5 iframe rch item 已修复（3/3）。step 95 不伪造 QqYk7，也不改变 timer 调度，
+而是在 V8 把 CallSite 交给默认或页面 formatter 前过滤内部脚本来源。thelancet 三个独立 ray
+的 payload-1 均只保留真实 `api.js`/`chl_page` URL，内部来源命中 0/3。
+`http://192.168.3.57:9000` + `https://www.thelancet.com/1.txt` 三轮均走完初始 fo、点击 proof
+和顶层 3256B 转发，随后换 ray 重开挑战，没有 `complete` 或真实 404。Chrome 149 三 payload
+按探针字段名对拍确认核心指纹面已收敛，但仍有 6 个 Chrome-only 探针、ZokK1 长尾、UA-CH
+brand、文本/canvas 与 ICE 差异；全量 V8 trace 复证 console native 绑定不可观测参数。
+B0-B7 全批次落地
 （见 step 91 与 `Challenge-fingerprint-fix-plans.md`）：UA-CH arm/26.4.0、WebGL 39 项逐项
 一致、WebGPU apple 档、SAMPLES 15 格式、N 桶 399→1137（Chrome 1164）。质询三轮提交链路
 正常（600010 回退已修）。剩余长尾：N 桶 27、o 桶 14、x/F 桶、brands 形态、sans-serif 字体
@@ -2019,6 +2540,8 @@ HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式�
 | **V8 property-lookup trace 不覆盖普通 JS 对象的属性访问**（step 90） | trace 的 MISS 仅 19 条，据此会误判「CF 没探测不存在的属性」；实际 bootstrap 的 navigator 等 JS shim 的 typeof/in 走 V8 fast path，根本不进 hook——step 89 的 42 个 navigator 缺口在 trace 里不可见 | 枚举面/缺 API 类结论只能用 `enum_realm.py`/`diff_payload_enum.py` 对拍；trace 的 MISS 只回答「window 级全局查找失败」 |
 | **`console.log` 等 native 绑定不产生 CALL 行**（postMessage 同理，step 90 复证） | 想从 trace 里读 console.log 的参数（payloadJSON），CALL/HIT 里 0 条，像「没调用过」 | payloadJSON 靠 serve 日志；trace 只见 JS→JS 与 bootstrap 实现的 API 调用 |
 | **对拍脚本不先做同侧 sanity check**（step 90） | 摊平脚本「后片覆盖前片」的 bug 把 Math 指纹 184 项**完全相同**的值误报成「144→0 缺失」，差点写进文档成为假缺口 | 任何对拍脚本先跑「自己 vs 自己」的相邻批（chrome-2 vs chrome-3、obsc-2 vs obsc-3 应≈零差）再跑跨侧对比，覆盖 bug 立刻暴露 |
+| **`diff_payload_enum.py` 只识别旧字段 `fyCZH9`**（step 92） | 当前三 payload 的枚举桶名是 `ZokK1`，脚本静默输出 `n=d=s=so=bare=0`，看起来像 CF 没读任何属性 | 先断言提取总数非零；当前 payload 直接解析数字 part 中的 `ZokK1`，按探针字段名跨 part 合并后再对拍 |
+| **Performance entry 的 Rust `recording` 日志不等于 observer 已收到**（step 93） | iframe entry 的构造日志早于 payload，容易据此误判 CF 应已采集；实际 `PerformanceObserver` 回调还在 microtask 队列里 | 同时记录 `__obscura_performance_record`、`performance.getEntries()` 和 observer 回调；区分构造、入 timeline、交付 observer 三个时刻 |
 | **按分片号（part N）对齐两边 payload**（step 90） | 同一探针在 chrome 落 part 27、obscura 落 part 20，按 part 号 diff 全是假差异；第二批提交还是**增量**的（payload-3 = payload-2 + part 40），字段集合随批增长 | 对拍一律按**探针字段名**（混淆名跨边稳定）对齐，跨 part 合并同名值；先认清「增量批」语义再解释 only-字段 |
 | **`capture_challenge.py` 的 attachShadow 注入仍在污染指纹**（step 66 证据 0 重演，step 90） | `__roots`/`__cap`/`__capHooked` 进了 ZokK1 枚举桶，包装后的 attachShadow 源码进了 payload 尾部 | 该脚本抓通信可用；凡涉及枚举面/函数源码的字段要用无注入轮次（如纯 Input domain 的导航+点击），或先给脚本去注入 |
 
@@ -4879,6 +5402,810 @@ check 均过。
 **结论**：step 90 六组缺陷全部落地，质询从「指纹大面积错配」收敛到「核心面与 149 基线
 逐项一致，剩余为记录在案的长尾」。未过盾状态不变（判定口径仍以真实 404 为准）。
 
+### Step 92 — thelancet 三 payload + console + V8 trace 复核（2026-08-28）
+
+**假设**：当前 trace-patched、render + stealth 二进制经 `http://192.168.3.57:9000`
+访问 `https://www.thelancet.com/1.txt` 时，能走完 render / 初始 fo / 点击 proof 三轮提交；
+当前未通过点应表现为提交内容的长尾差异，而不是 console、iframe、消息或请求链路中断。
+
+**方法**：
+1. 校验 `vendor/v8-trace.sh check`、stealth 启动日志、代理 CA、端口进程和 Chrome 149 macOS UA；
+2. 无 trace 启动 serve：第一轮用 `capture_challenge.py --click` 确认消息时序，后两轮用
+   纯 Target/Input domain 的固定时刻点击（零页面注入），结合 `RUST_LOG=obscura_js=debug`
+   与 `[CAP]`/`payloadJSON` 日志确认三次提交及最终响应；
+3. 用 `diff_payload_enum.py` 从 `/tmp/chrome/payload-{1,2,3}.json` 提取 CF 实际枚举面，
+   先做 Chrome 2↔3 同侧 sanity check，再按字段名与 obscura 明文 payload 对拍；
+4. 独立 trace 轮启用 property lookup trace，核对 `console.log`、DOM/XHR 调用形态和 MISS。
+
+**证据**：
+
+1. **环境基线正确**：`vendor/v8-trace.sh check` 报 `patched`；启动日志为
+   `TLS fingerprint impersonation + tracker blocking`；代理 CA 是 `CN=Reqable CA (Apr 4,
+   2026, 0D1CEBE3)`；`/json/version` 的 Browser/UA 均为 macOS Chrome 149。端口无遗留进程。
+2. **三轮断点完全一致**（字节数为 challenges CF 初始响应 / tokenB 响应 / 点击 proof 响应 /
+   顶层转发响应）：
+   | 轮次 | 探针 | 响应序列 | 最终状态 |
+   |---|---|---|---|
+   | r1 | `capture_challenge --click` | 822824 / 127224 / 5148 / 3256 B | 换 ray 重开 |
+   | r2 | 零注入 CDP 点击 | 822376 / 127224 / 5160 / 3256 B | 换 ray 重开 |
+   | r3 | 零注入 CDP 点击 | 822656 / 127216 / 5136 / 3256 B | 换 ray 重开 |
+   三轮均有 `/pat/` 401、所有 fo POST 均返回 200；均无 Cloudflare `complete` 消息或目标真实
+   404。payload 内部字符串 `"complete"` 是探针字段值，不能当作消息级成功判据。
+3. **console 明文输入完整拿到**：r2 零注入轮提取出 4.4K `chl_api_m`、105K 初始 payload、
+   109K proof payload 三个合法 JSON。Chrome 2→3 是严格增量（161→174 字段，新增 13）；
+   obscura 2→3 同样是严格增量（154→169，新增 15），同侧 sanity 通过。跨侧 stage 1 为
+   47/47 同名；stage 3 为 Chrome 174 / obscura 169、共同 168，Chrome-only 为 `Ftvr2`、
+   `GUZP4`、`cnhD4`、`eNHTJ8`、`hGgWW0`、`lNCr3`，obscura-only 为 `nCaOH3`。
+4. **核心已对齐、长尾仍明确**：ZokK1 的 N/o/x/F/T 为 Chrome `1164/121/266/13/11`，
+   obscura `1137/107/255/6/6`（差 27/14/11/7/5）；`wShvj2` 39 扩展逐项相等；WebGPU
+   adapter 均为 Apple 档且长度相等，feature 列表顺序仍不同；Math 184 项只在索引 165/167
+   有末位差。仍明显不一致的是 UA-CH 多一项 Google Chrome brand、`hGgWW0` 120 项全缺、
+   `lNCr3=true` 全缺、`qSsL2` 10/10 项不同、`nMlxj2` 11 项中 10 项不同、ICE 9→6 且缺 srflx。
+5. **V8 trace 边界复证**：短时全量 trace 239MB / 1,236,528 行（CALL 607049、RET
+   625606、HIT 3855、MISS 18）。它记录了 `XMLHttpRequest.open(POST, /cdn-cgi/.../fo/...)`、
+   header 与加密 `send(body)`；Console/log 行为 **0**，`payloadJSON` **0**。全量 trace 约 30s
+   被 watchdog 终止，只走到顶层 fo；18 个 MISS 中没有 `<page-eval>`，只含 window 级混淆名、
+   `turnstile` 等。这既不能说明 console 没调用，也不能说明 CF 没枚举缺失 API：console 参数
+   必须读无 trace serve 日志，普通 JS shim 的枚举面必须用 payload 对拍。
+
+**结论**：假设证实。iframe、消息、请求与 proof 提交链都已打通，断点在 proof 后的 Cloudflare
+最终判定；这是 payload parity 未完全对齐造成的引擎侧风险，不是页面正常等待或探针漏点。
+但现有证据不能把拒绝因果唯一归到某一个字段。下一步先定位完全无产出的 `hGgWW0` / `lNCr3`
+探针抛错点，再处理 canvas/text 指纹；其后是 ZokK1 长尾、UA-CH brand 与 ICE srflx。
+
+### Step 93 — `jdnfg5` 缺 iframe：entry 已写入，observer microtask 未及时交付（2026-08-28）
+
+**假设**：`payload-1.jdnfg5` 少 `rch/...` iframe URL，是 frame 导航没有写入父页面的
+Performance Timeline。
+
+**方法**：开启 `obscura::performance=debug`；零注入导航后直接读取主 realm
+`performance.getEntries()`；再预注入只透传返回值的 `performance.getEntries` 和
+`__obscura_performance_record` 时间钩子，对齐 entry 构造、实际入 timeline、CF 快照和 payload
+输出。另解码 chl_page 的 `btnGW2` / `MhAgV7` 表达式。
+
+**证据**：
+1. 假设证伪：主 realm 明确有 `https://challenges.cloudflare.com/.../rch/...`，类型为
+   `PerformanceResourceTiming`、`initiatorType="iframe"`。源码也在 frame 响应后调用
+   `record_performance_response(response, "resource", "iframe")`（`page.rs:5700`）。
+2. 精确时序：iframe entry 在 `15:18:04.248` 构造，`15:18:04.253` 已调用主 realm 的
+   `__obscura_performance_record`，`payload-1` 到 `15:18:05.270` 才输出。不是漏请求、漏 entry、
+   跨 realm 记错或 payload 快照过早。
+3. CF 在顶层仅于 `performance.now≈1198ms` 调一次 `getEntries()`，当时只有 navigation 与
+   orchestrate script；随后 `api.js` 和 iframe 资源靠 `PerformanceObserver` 增量收集。
+   `api.js` 进入 `jdnfg5`，iframe 没进入。
+4. `_queuePerformanceEntry` 会立即把 entry 放入 `_performanceEntries`，但 observer 的 callback
+   用 `queueMicrotask` 调度（`bootstrap.js:12362`）。Rust 的 `execute_script` 只执行 classic
+   script、不做 checkpoint（`runtime.rs:2832`）；checkpoint 只在 `run_event_loop` 边界
+   （`runtime.rs:2956`）。动态 frame 路径 flush entry 后立刻执行 frame subtree scripts
+   （`page.rs:5488-5490`），frame 的 postMessage 因而能先触发 `chl_api_m`，observer microtask
+   还没把 iframe item 加进 CF 的累计数组。
+5. `btnGW2` 与 `MhAgV7` 是同一个毫秒差值的两个别名：
+   `_cf_chl_opt.erXEv3 = Date.now(); value = erXEv3 - JCXT5`。Chrome 为 1044，obscura 多轮为
+   27-67（本轮 51），说明同一 widget 初始化/可见性流程在 obscura 提前结束；它不是尺寸字段，
+   也不是 iframe item 缺失的直接原因。
+
+**结论（被 step 94 证伪）**：本步曾把直接根因判为 PerformanceObserver 交付顺序错误。
+step 94 的 `[PO-LIST]` 证明 parent iframe resource 已在 payload 前进入 observer callback；真正
+缺失的是 child frame realm 的 navigation entry。本步的原始证据与错误假设保留，避免以后再次
+把 Rust `recording`、parent resource 和 child navigation 三种不同观测面混为一谈。
+
+### Step 94 — jdnfg5 iframe item：补 frame realm navigation timing（2026-08-28）
+
+**假设**：Chrome 的非零 rch item 来自 child frame realm 的 PerformanceNavigationTiming；在
+frame realm 创建后、任何 preload/author script 前注入该 entry，即可补齐 jdnfg5。
+
+**方法**：先用 `[PO-LIST]` 记录 CF observer callback，再以 Chrome 151 双端口跨源 fixture 同时
+读取 parent resource 与 child navigation。结果：parent iframe resource 与 Obscura 一样按 TAO
+遮蔽为 0；child navigation 报完整 timing/size，`transferSize=encodedBodySize+300`，与 Chrome
+payload 的 rch item 同形。实现将 response timing 暂存到 browsing context，在 frame main world
+创建后、preload/author script 前注入；随后跑 focused/full nextest、release build、feature
+opt-out、obstacle course 与 thelancet 三轮 payload。
+
+**证据**：待实现与实测回填。
+
+**证据（阶段性）**：
+1. Chrome 151 双端口跨源 oracle：parent `PerformanceResourceTiming(iframe)` 按 TAO 遮蔽为
+   `responseStart/transferSize/encodedBodySize=0/0/0`；child realm 的
+   `PerformanceNavigationTiming` 为完整值，`transferSize=encodedBodySize+300`。Chrome payload
+   的 rch item 与后者同形，step 93 的 observer 顺序假设证伪。
+2. 实现：BrowsingContext 按 document generation 保存网络 response 的 navigation entry；
+   frame realm 创建后、preload/author script 前调用该 realm 的
+   `__obscura_performance_record`。父 timeline 的 iframe resource/TAO 逻辑未改。
+3. 本地回归：`a_subframe_document_load_lands_in_the_parents_resource_timeline` 同时断言 parent
+   resource 与 child navigation；focused 1/1、`obscura-browser` 106/106。
+4. thelancet 修复前 3 个有效样本均只有 api.js（rch **0/3**）；修复后 3 个有效样本均为
+   两项（rch **3/3**）：`transfer/encoded` 分别为 `440041/439741`、`440020/439720`、
+   `440041/439741`，均严格差 300B；responseStart/duration 非零。另有一轮 8s 内未产 payload，
+   未混入判据。
+
+5. 全量门：最终源码的 workspace release+render nextest **1656/1656**（4 skipped）；精确
+   render+stealth release build 通过；`obscura-js` + `obscura-cli --no-default-features` check
+   通过。`obscura-benchmark` companion repo 本机不存在，obstacle course 33/33 未运行。
+6. 最终源码重建后的二进制追加 smoke 仍为两项：rch `responseStart/duration=1604/1609ms`、
+   `transfer/encoded=440020/439720B`，trace patch check 通过。
+
+**结论**：修复完成。`jdnfg5` 缺 rch 的根因是 frame realm 没有自身 navigation timing，不是
+parent iframe resource 漏记、TAO 遮蔽或 observer 顺序。实现与 Chrome 的双 timeline 语义一致：
+parent 继续看到遮蔽的 cross-origin iframe resource，child 看到完整 navigation entry；真实
+payload 从 rch 0/3 提升到 3/3。整体过盾状态未因此自动改判，剩余 payload 长尾仍按 step 92 推进。
+
+### Step 95 — 隐藏 Error.stack 的 Obscura/deno 内部帧（2026-08-29，完成）
+
+**假设**：QqYk7 末尾 `_runAtNesting (<obscura:bootstrap>)` 两帧来自 setTimeout 的 JS
+trampoline；单改 timer 调度只能把泄漏从 bootstrap 移到 deno_core event loop。正确边界是 V8
+构造 CallSite 后、交给默认或页面自定义 formatter 前，隐藏宿主内部脚本来源。
+
+**方法**：先分别试验 `queueMicrotask` 与直接 Promise reaction 调页面 callback，记录剩余
+`ext:core`/`eventLoopTick` 帧后完整回退 timer 行为。在 isolate 安装隐藏的 V8
+`PrepareStackTraceCallback`，按 CallSite source 过滤 `<obscura:`、`ext:`、`deno:`，随后完整
+委托 `deno_core::error::prepare_stack_trace_callback`。以 timeout/interval 内的
+`new Error().stack` 和页面自定义 `Error.prepareStackTrace` 两类回归锁定，再跑 timer 全组、
+crate/workspace 门和 thelancet QqYk7 三轮。
+
+**证据（阶段性）**：
+1. `queueMicrotask` 试验去掉 `_runAtNesting`，但栈底仍有 `ext:core/01_core.js`；直接 Promise
+   reaction 又留下 `eventLoopTick`。两条 timer 调度改动均已完整回退，避免改变 task/microtask
+   顺序、timer args、`this` 或 interval 清理语义。
+2. isolate callback 仅过滤内部 CallSite，再调用 deno_core formatter；没有覆盖、删除或包装
+   页面可见的 `Error.prepareStackTrace`，也没有针对 QqYk7 改字符串或 payload。
+3. `timer_callback_stacks_hide_the_browser_scheduler` 同时覆盖 timeout/interval、extra args、
+   `this === window` 与 clearInterval，页面 URL 保留且内部来源消失；
+   `custom_prepare_stack_trace_receives_filtered_callsites` 证明页面 formatter 仍运行、可返回对象，
+   且收到的是真实页面 CallSite，不含内部来源。
+4. focused：stack 1/1、timer 11/11、stack 5/5、自定义 formatter 1/1；最终源码的
+   `obscura-js` release+render 全 crate **518/518**。
+
+5. 最终 release 二进制经 `http://192.168.3.57:9000` 访问
+   `https://www.thelancet.com/1.txt`，Chrome 149 macOS UA 对齐；同一干净 serve 会话取得三个
+   独立 ray 的有效 payload-1：
+
+   | 样本 | ray | btnGW2/MhAgV7 | QqYk7 栈 | 内部来源命中 |
+   |---|---|---:|---|---:|
+   | 1 | `a324da680ab3aa69` | 49/49 | 10 帧，全部 api.js/chl_page URL | 0 |
+   | 2 | `a324da8e8b1daa69` | 52/52 | 10 帧，全部 api.js/chl_page URL | 0 |
+   | 3 | `a324dac03ae4aa69` | 50/50 | 10 帧，全部 api.js/chl_page URL | 0 |
+
+   四类判据 `<obscura:`、`_runAtNesting`、`ext:core`、`deno:` 均为 **0/3**。计时值仍自然
+   波动，证明实现没有伪造 QqYk7 或硬改 btnGW2/MhAgV7。
+6. 全量门：workspace release+render+stealth 最终 **1658/1658**（4 skipped）；精确
+   obscura-cli render+stealth release build、`obscura-js` + `obscura-cli --no-default-features`
+   check 与 `vendor/v8-trace.sh check` 均通过。第一次全量门的两个 MCP 客户端集成测试时序
+   失败，单独复跑 3/3 及随后完整复跑均通过，与栈改动无代码路径关联。
+   `obscura-benchmark` companion repo 不存在，障碍课程 33/33 未运行。
+
+**结论**：修复完成。内部 frame 在 V8 CallSite 层消失，页面脚本 URL、默认栈格式和自定义
+`Error.prepareStackTrace` 行为保留；timer 的 task/microtask、args、`this`、interval/clear
+语义未改变。真实 QqYk7 从稳定泄漏两条 `<obscura:bootstrap>` 调度帧变为三轮内部来源 0/3。
+
+### Step 96 — payload-2 缺 hGgWW0/lNCr3：DOMParser HTML document 无 body（2026-08-29，验证中）
+
+**假设**：Chrome payload-2 有 `hGgWW0` 与 `lNCr3`，Obscura 改为 `nCaOH3` error，是某个
+HTML Document 构造路径没有 body，探针读取 `body.innerHTML` 后整组中断。第一假设指向动态
+about:blank iframe 的异步 replacement commit；真实站验证未改善后，调用面收敛到
+`DOMParser.parseFromString(..., "text/html")` 的 fragment-parser 实现。
+
+**方法**：零预注入、零 Runtime.evaluate 的 CDP target 经 Chrome 149 macOS UA、Reqable 代理
+静默导航 18s，解析代理 console 的每条 JSON 后按 `has("BtIb8")` 识别 47-key payload-1 与
+92-key payload-2；数字 part 内部按混淆字段名摊平。源码侧对照同步
+`create_blank_iframe_document` 与异步 `navigate_frame_inner`，新增 event-loop/controller commit
+后的 skeleton 回归；另对 DOMParser 空输入、HTML fragment 和属性序列化建立 Chrome parity
+fixture。修复后重复三轮同侧 sanity 与真实 payload-2。
+
+**证据（修复前）**：
+1. 当前 release 零注入轮的阶段结构与 Chrome 完全一致：p1 47/47、p2 92/92，顶层 key/type
+   零差；Obscura p1/p2 序列化约 4,675B/108,760B。
+2. p2 part 按内部字段名对齐为 Chrome 168 / Obscura 167 / common 166。Chrome-only 恰为
+   `hGgWW0`（120 项成功探针数组）与 `lNCr3=true`；Obscura-only 恰为
+   `nCaOH3="TypeError: Cannot read properties of null (reading 'innerHTML')"`。
+3. 同步 iframe insertion 已 graft `<html><head></head><body></body></html>`，现有立即读取测试
+   通过；异步 `navigate_frame_inner` 新建 replacement root 后却在 `html.is_empty()` 时完全跳过
+   `parse_into_subtree`，随后删除有 skeleton 的旧 initial document。根因与 error 文案闭环。
+4. 回归扩展 `dynamic_iframe_navigation_uses_the_frame_controller`，在第三次 about:blank load 后
+   读取 active `contentDocument`。修复前 focused nextest **0/1**，表达式因
+   `d.body.innerHTML` 抛错返回 null；删除 empty-HTML parser bypass 后 **1/1**，得到
+   `[3,"HTML",true,true,""]`。
+5. `obscura-browser` release+render 全 crate **106/106**。
+6. **阶段性证伪**：精确 release build 后首个零注入真实 payload-2 仍为 167 probes，
+   `nCaOH3` error 原样、`hGgWW0/lNCr3` 仍缺。controller empty-HTML bypass 是独立真实缺陷，
+   但不是当前 CF 探针命中的完整路径；后续改从本轮 rch 源码定位具体 iframe/document 操作。
+7. 真根因：DOMParser HTML 路径用 `document.createElement("html")` + `root.innerHTML=source`
+   模拟完整文档。fragment parser 对空输入或 `<p>...</p>` 不会生成 head/body；docNode 的 body
+   getter搜索 BODY 后返回 null。hGgWW0 的 Chrome 结果内恰有 `<p>Rqaf3</p><p>XGKq7</p>` 与
+   `<div data-foo="&quot;"></div>`，与 `body.innerHTML` 探针形状一致。
+8. 新增同输入 focused 回归：空 HTML、`<p>Rqaf3</p><p>XGKq7</p>`、双引号属性序列化；
+   修复前 **0/1**，整个求值返回 null，与真实 nCaOH3 同形。
+9. 实现仅作用于 DOMParser 的 text/html 路径：fragment 解析后补 direct HEAD/BODY，head-only
+   元素在 body 内容出现前归 head，其余 loose nodes 归 body；XML 路径不变。focused 修复后
+   **1/1**，并覆盖完整 `<html><head><body>` 输入。
+10. DOMParser/XML related **4/4**；`obscura-js` release+render 全 crate **519/519**。
+11. 精确 release build 后在同一显式 Chrome 149 macOS UA、trace-patched、stealth TLS serve
+    会话里跑三次零注入 18s 导航，得到三个独立 ray。payload-2 分别为 92 keys/39 parts、
+    91/38、92/39；三轮均有 `hGgWW0` 120 项，且 `nCaOH3` 均不存在。修复前是
+    `hGgWW0/lNCr3` 缺失 + `nCaOH3=TypeError`，因此 skeleton 崩溃修复在真实质询中 **3/3 生效**。
+12. `lNCr3=true` 三轮仍缺。`hGgWW0` 与 Chrome 120 项逐索引对拍，三轮稳定有 31 项不同；
+    其中 index 85/86、103/104 的 Chrome 值为 `<p>Rqaf3</p><p>XGKq7</p>` 与
+    `<div data-foo="&quot;"></div>`，Obscura 均为空串；index 118 为
+    `UXHfN1611` vs `UXHfN1[object Object]`，另有 `-1` vs null 与一组 boolean 残差。
+    所以“字段恢复”不等于该组已对齐，也不能据此宣称质询通过。
+13. workspace 首轮 1658/1659（唯一 MCP wait selector 时序失败），失败项单独 3/3 后完整
+    重跑 **1659/1659**（4 skipped）；精确 release build、trace patch、完整 stealth TLS 与
+    no-default feature check 均通过。companion benchmark 仓库不存在，33/33 未运行。
+14. **证伪 createHTMLDocument 归因**：Chrome oracle 证明该 API 只有一套 HEAD/BODY，而
+    Obscura 在 DOMParser 已补 skeleton 后仍追加第二套；同形调用得到
+    `[HEAD,BODY,HEAD,BODY]`、`bodyIsLast=false`，能产生与 hG 完全相同的两个空串。因此删除
+    旧 workaround 并补 optional title/serialization 回归，focused 1/1。重新链接后真实 payload
+    A/B 的 31 个差异却**一个未动**，85/86/103/104 仍为空串：这是有效的通用 DOM 修复，
+    但当前 hG 的四个序列化探针不走 createHTMLDocument。下一步必须从 trace 映射调用路径，
+    不能继续仅凭输出值猜 API。
+
+**结论（更新）**：iframe controller 是独立同族缺陷，保留修复与回归；DOMParser HTML
+skeleton 是 `nCaOH3` 的直接根因，真实 payload 已 3/3 证实该错误消失。但 `hGgWW0` 仍有
+31 项内容差异且 `lNCr3` 缺失，当前修复只是消除了整组异常中断，不是该组 parity 或质询通过。
+下一步用独立 trace 轮映射 120 项的真实调用，先解释四个 HTML 序列化空串，再处理其余项。
+
+### Step 97 — 从 frame StackFrame 导出当轮 JSVMP source（2026-08-29，验证中）
+
+**假设**：CDP Debugger 已能读取 top realm source，但目标 JSVMP 在跨源 frame realm，尚未注册
+inspector。`op_dom` 是 JSVMP 已确认会经过的宿主边界；若其 V8 StackTrace 中的 `/rch/` frame
+能通过 `StackFrame::GetScriptSource` 返回完整源码，就能直接按执行中的真实脚本映射
+`hGgWW0` 120 项汇总逻辑，不再从输出形状猜 DOM API。
+
+**方法**：在 committed `vendor/v8-rusty-extras.sh` 增补 rusty_v8 缺失的
+`StackFrame::GetScriptSource` C++/Rust binding。`op_dom` 只在显式设置
+`OBSCURA_CAPTURE_FRAME_SOURCES_DIR` 时取最多 24 帧；仅当任一 frame URL 包含 `/rch/` 才导出
+长度至少 1KB 的 script source 与 URL，并在进程内一次性关闭。用 trace-patched render+stealth
+release 二进制、Chrome 149 macOS UA、Reqable 代理做 18 秒零注入导航；此诊断轮只回答能否取得
+源码，不作为 payload parity 或过盾判据。
+
+**证据**：恢复审计确认 release binary 晚于 `ops.rs` 与 vendor binding，vendor tree 中
+`exception.rs`/`binding.cc` 均含实际绑定。随后同一 18 秒零注入轮一次性导出两个 source：
+`<obscura:frame-realm-bootstrap>` 983,566B，以及 URL 精确命中当轮 `/rch/q13ya/...` 的
+`script-44.js` 431,327B。后者是此前 CDP main-realm Debugger 无法枚举的目标 JSVMP。
+
+**结论**：源码导出链已证实，frame JSVMP 不再是观测盲区。下一步在这份当轮源码中以 Chrome
+payload 的稳定字面量和 120 项数组构造点定位 `hGgWW0` 汇总，再用 Chrome oracle 对拍首个真实
+语义差异；在完成映射前不把 31 项输出形状归因到任何 DOM API。
+
+**补充证据**：首份 431,327B source 是 13,717 行的调用方，探针程序以 Base64 blob 传给
+`runProgram(blob, window)`；文件中没有 `runProgram` 定义，且 hG 字段与 Chrome 稳定输出常量
+均非明文。下一步需枚举 frame 文档全部 script，取得解释器定义后在 VM 返回边界映射 120 项。
+
+**补充证据 2**：`Runtime.enable` 在 settle 后重放出 challenges frame 的 default context；在该
+main world 中读取到 `runProgram.length=3`，其完整源码为小包装器：构造 `new Dr(blob)` 后调用
+`XB(1361)` 解出的原型方法，参数为 `(0, 94, [])`。因此解释器不是第二个 DOM/V8 script，
+而是同一 inline source 的顶层 `Dr` 绑定；下一步直接导出 `Dr` 构造器与 prototype 方法。
+
+**补充证据 3**：将 probe 移到 parser frame 的真实 `execute_in_context_at` 编译边界后成功安装。
+12 秒内 VM 方法被调用 2,222 次：首次 `(0,94,[])` 返回 `bound Dn`，后续由该绑定函数继续以
+`(pc, seed, 26项参数)` 运行同一个 instance。因而只看最终 256 寄存器会丢失探针中间值；下一步
+按每次调用的参数/返回 shape 聚合，先筛选长度 120 的值，再对候选调用做寄存器差分。
+
+**补充证据 4**：收紧后的 2,358-call 样本中，result 与最终 registers 均没有 length=120 的
+Array；第三参数栈出现 length=122 的批次 111 次。hG 数组不是 VM 方法的直接返回值。下一步按
+VM 返回的短标识符精确找 `hGgWW0` / `lNCr3`，再检查相邻调用，不能仅凭 122≈120 推断结构。
+
+**补充证据 5**：另一 ray 的 2,194-call 样本里，第三参数恰有 length=120 的调用 111 次，
+但所有 VM result short identifiers 中没有 `hGgWW0/lNCr3`。参数栈长度会随变体整体漂移，旧
+payload 混淆字段名也不能直接当 VM 返回地址。下一步必须从同一 ray 的 payload-2 反查实际
+120-array 字段，再关联该轮 VM 调用。
+
+**补充证据 6**：同一 ray 的落盘 payload-2 仍明确包含 `hGgWW0` length=120，前 66 项为 true，
+后段含 `117`、字符串化类型、`ronhq4` 与 `UXHfN1[object Object]`。所以字段名没有变化；它未
+出现在 VM result string 的含义是外层汇总映射写入。下一步搜索 118..124 参数栈内嵌套的
+120-array / plain-object data property。
+
+**补充证据 7**：候选 122/123/124 槽参数栈递归两层均没有嵌套 length=120 Array；最频繁的
+122 槽环境由三个固定 `(pc,seed)` 入口反复使用（48/54/6 次），非零槽均显示为普通 Object。
+下一步只读取最大三组 Object cell 的 own data descriptors，不触发 getter，以确定它们是 VM cell、
+闭包还是探针结果容器。
+
+**补充证据 8（frame VM 归因证伪）**：Object cell 的唯一 own data 属性为 `o`，证明第三参数是
+VM closure environment；最大直接 cell array 仅 54 项，两层内无 hG 120-array。结合 step 96
+已确认辅助 iframe 创建方为顶层 `chl_page`，且 payloadJSON 在顶层汇总，继续深挖 `/rch/` frame
+VM 已无因果依据。下一步检查 top default context 的 `runProgram` 与当轮 chl_page source。
+
+**补充证据 9（计算 realm 定位）**：top default main world 有独立 `runProgram`，源码为
+`function(j,Kg,ek){ ... new bK(j)[jj(1130)](0,190,[]) }`；frame VM 则是
+`new Dr(blob)[XB(1361)](0,94,[])`。VM 构造器、字符串解码器和 seed 均不同。hG 计算 realm
+收敛到 top `chl_page`；下一步用已打通的 Debugger.getScriptSource 导出同一导航的 orchestrate
+source，再对 top `bK` VM 做同样的只读 instance/args/result 记录。
+
+**补充证据 10**：Debugger bridge 已逐字导出当轮 top chl_page 229,485B（scriptId 29，URL 含
+同一 ray）。格式化副本定位 `bK.prototype[jy(576)]` 主循环、`U[jy(1836)]` runProgram 赋值与
+`function bK` 构造器。下一轮用独立 `OBSCURA_CAPTURE_TOP_VM_DIR` 在 main
+`execute_classic_script_at` 编译边界保存 top VM instance/args/result；frame 捕获开关不启用。
+
+**补充证据 11**：首个 top probe 因固定混淆索引未安装；新 ray 的 runProgram 入口仍是
+`new bK(j)`，但方法索引从 576 变为 1313。固定 `jy(<数字>)` 不是稳定锚点。诊断改为仅匹配当轮
+唯一的 `new bK(j)`，用 Proxy 在首次 property get 动态取得真实 method key，再替换对应
+prototype method 记录调用；不依赖混淆表索引。
+
+**补充证据 12**：下一 ray 的构造器/参数又从 `new bK(j)` 变成 `new Qo(Q)`，证明符号名也不
+稳定；但 VM 入口尾部仍是 `](0,190,[])`。诊断锚点进一步收敛为该唯一调用尾部，向前找紧邻
+method bracket 与最近 `new `，整体包装 `new <Ctor>(<blob>)`；不依赖 constructor、argument
+或 string-table symbol。
+
+**补充证据 13**：第三个 top 样本连 seed 也从 190 轮换为 124；稳定面只剩
+`new <Ctor>(<blob>)[<method>](0,<seed>,[])`。诊断改为枚举 `](0,` 候选，仅接受后接 1–3 位
+十进制 seed 与 `,[])`、且最近 `new ` 在 method bracket 前 128 字符内的项；候选必须唯一，
+否则保持原始源码不注入。
+
+**补充证据 14**：当轮源码离线复现只有一个结构候选；marker 仍不存在的根因是 top challenge
+是 target HTML 内的唯一 inline script，编译 `name` 为 target URL，Debugger/stack 的 chl_page
+URL 来自 sourceURL annotation。诊断移除 `name.contains(orchestrate)`，只保留显式 env 与唯一 VM
+结构双门控；普通脚本无候选，保持原文。
+
+**补充证据 15**：移除 name 门控后 marker 仍不存在，页面却正常产出完整 payload，证明 229KB
+chl_page VM source 不经过 classic Rust 编译入口，而由短 loader 动态生成。观测面改为导航前
+eval wrapper：只记录 source length / VM-entry 命中，再调用保存的原生 indirect eval；先证明
+动态入口，确认后再在同一边界改写。
+
+**补充证据 16**：导航前 eval wrapper 只看到 4B `this` 与 137B helper，229KB VM 不经 native
+eval。结合 bootstrap 动态 script 执行路径，probe 从主 classic 编译函数移到
+`op_run_classic_script`；诊断目录同时追加每次 op 的 source length / structural candidate count /
+URL，单轮即可区分未命中与注入后被页面移除。
+
+**补充证据 17（top VM probe 成功）**：`op_run_classic_script` 成功改写，runProgram.toString
+可见结构 probe，`__obscuraCfTopVmProbe` 已安装。12 秒内 top VM 仅 21 calls：首调用返回
+`bound nk`，后续环境栈固定 25 cells；result shape 为 17 undefined、3 Element，没有直接
+120-array。下一步完整解包 25 个 `{o:value}` cells，并查嵌套 length=120。
+
+**补充证据 18**：25-cell 环境解包后只含 RTCPeerConnection、eval toString 与 1.337MB anti-debug
+空白体，和 hG 的 DOM/API 结果形态不符；当前 runProgram 是 hG 生产者仍未证实。下一步在导航前
+包装 console 四个方法，捕获代理 `payloadJSON:` 根对象及 Error.stack，从根对象取 hG array，
+再按对象身份搜索所有 top VM args/cells/registers，直接验证生产链。
+
+**补充证据 19**：console 四方法 wrapper 捕获 0，说明代理 payloadJSON 日志不经过页面当前
+console 方法，对象身份链不可用。下一诊断在导航前包装 Array.prototype.push，仅当数组新长度
+恰为 120 且前 50 项全 true 时保存引用与 Error.stack，随后原样返回 native push；本轮只定位
+生产函数，不作为 payload parity 证据。
+
+**补充证据 20（阶段结论）**：push 诊断同样捕获 0。结合 25-cell 内容与旧定向 trace，已证伪
+两条归因：frame `Dr` VM 属于 widget；top secondary runProgram 只覆盖 RTCPeerConnection、eval
+toString 与 anti-debug blank source。hG 的剩余 31 项属于 top 主解释器/汇总路径，旧 trace 中
+高频 `uA.<computed> [as run]` 是下一目标。所有会改写 CF source 的临时 realm/op probe 已删除；
+保留通用 Debugger.getScriptSource bridge、StackFrame source binding 与 env 门控只读 dump。
+
+**补充证据 21（主VM结构映射）**：离线重读修复前保留的358MB calls trace，`uA` constructor
+在top orchestrate line1接收大Base64 program，紧接computed run以`(0,101,Array)`启动；该run整轮
+75 calls，同实例opcode helper中`B` 10269 calls。另一ray的完整top source中对应结构是`nT`：
+256-register `this.g` constructor、computed prototype run与`new nT(Q)[...](0,124,[])`入口，符号和
+seed轮换但结构一致。该source还含已排除的`bK` runProgram VM，证明上一轮“唯一候选”只在单个
+动态source内成立。下一诊断应同时包装所有同结构VM，按call count和逐call register diff识别
+75-call主VM，不再固定constructor名或seed。
+
+**补充证据 22（主VM probe命中，hG阶段受外部状态阻塞）**：临时env-gated transform按上述
+结构同时包装所有候选，并以Symbol键保存逐call 256-register浅diff；constructor/method表达式
+在probe scope外求值，避免rotating短名碰撞。当前ray命中同一`FX` VM class的三个instance，
+seed=68，14秒内calls为62/44/5且无异常，证实观测边界正确；另一轮为25/24 calls。两轮都没有
+110..130长度数组或`Rqaf3/XGKq7/UXHfN1/data-foo` marker，与当前payload-1后早期600010、无
+payload-2的外部状态一致，不能据此映射hG。该transform只作诊断，取证后删除；等Reqable注入
+脚本/key恢复payload-2时，用同一结构重跑即可直接定位31项差异的call/register。
+
+### Step 98 — UA-CH brands/fullVersionList 对齐 Chrome 149 macOS（2026-08-29，验证中）
+
+**假设**：当前 BrowserFingerprint 把 Chrome UA 自动解释为三品牌 Google Chrome + Chromium +
+grease，并把两条真实品牌 full version 都降成 UA 字符串里的 149.0.0.0；参考 Chrome 149 macOS
+在该质询中只发 Chromium + grease，Chromium full version 为 149.0.7827.0。这一稳定 JS/网络
+自洽差异是独立 bot 信号。
+
+**方法**：从 `/tmp/chrome/payload-2.json` 与当前零注入 release payload 按字段名提取
+`iqypc0`，核对 architecture/platform保持已对齐，只比较 brands/fullVersionList。随后审计
+`BrowserFingerprint::from_user_agent`、显式 overrides、JS NavigatorUAData 与 wreq/client header
+生成，建立三层回归；不按站点、ray或payload字段硬编码。
+
+**证据（修复前）**：Chrome brands=`[Chromium 149, Not)A;Brand 24]`，fullVersionList=
+`[Chromium 149.0.7827.0, Not)A;Brand 24.0.0.0]`；Obscura 多 `[Google Chrome 149]`，且 Google/
+Chromium full version均为149.0.0.0。两侧 architecture=arm、bitness=64、platform=macOS、
+platformVersion=26.4.0已经一致，差异严格收敛到品牌表。
+
+**结论**：验证中。下一步修正默认 macOS Chrome 149 profile，同时保留显式 brands与
+fullVersionList override语义，并验证JS低/高熵值和HTTP请求头使用同一表。
+
+**实现（阶段性）**：新增校准的 `DEFAULT_BROWSER_VERSION=149.0.7827.0`；仅当UA字面量等于
+仓库 `DEFAULT_USER_AGENT` 时使用 Chromium+grease两品牌与该高熵版本。其他Chrome UA仍保留
+三品牌/字面版本推导，显式brands/fullVersionList overrides仍最高优先。新增fingerprint、
+stealth实际请求头和V8 NavigatorUAData三层回归；待focused/full与真实payload验证。
+
+**真实A/B反证**：精确release、trace-patched、完整stealth、相同代理/UA下三次18秒零注入导航，
+均只产约4.7KB payload-1，紧接约862B错误对象，`qECS7=600010`，未出现payload-2/iqypc0。
+修复前同基线是payload-2 3/3且有hG。合并改动导致上游分流，不能保留。下一步做分量二分：
+保留149.0.7827.0高熵版本、恢复Google Chrome+Chromium+grease三品牌，重复三轮；若恢复payload-2，
+则两品牌与网络/TLS身份冲突，Chrome解密payload的局部形状不能直接套到当前transport profile。
+
+**分量二分（受外部状态混杂，不能归因）**：恢复Google Chrome+Chromium+grease三品牌，仅保留
+149.0.7827.0高熵版本后，再跑三次18秒零注入；仍全部payload-1后立即600010，无payload-2。
+但所有实现完整回退、重建原始reduced profile后，三次基线也同样快速600010，且每个18秒窗口
+多次换ray重试。说明CF脚本/代理/IP外部状态在顺序实验期间变化，不能把退化归因到fullVersion
+或brand数量。唯一可证结论是两个候选都未改善当前判定；所有实现和新增回归已完整回退，
+step 98关闭为不确定实验，不计作修复。
+
+### Step 99 — ZokK1已存在接口的类型/native分类修复（2026-08-29，验证中）
+
+**假设**：剩余N桶27个Chrome-only不全是缺接口。有效step97 payload显示
+`IDBKeyRange/NodeFilter`在Obscura落o桶，`blur/close/focus/postMessage`落非native f桶；Chrome
+将六者都放N桶。先修已存在值的WebIDL类型和native源码形态，可同时减少N缺口与o/f extras，
+且不需要新增站点特例或伪造行为。
+
+**方法**：用受控Chrome main world对拍六个global的typeof、own descriptor、prototype、
+constructibility与Function.prototype.toString；审计bootstrap实际实现，保留现有调用语义，只修
+WebIDL外壳/branding。随后用本地枚举fixture和真实payload验证bucket迁移。
+
+**证据（修复前）**：ZokK1 N桶Chrome/Obscura=1164/1137。Chrome-only含IDBKeyRange、
+NodeFilter、blur、close、focus、postMessage；Obscura-only o桶含IDBKeyRange/NodeFilter，f桶含
+四个Window方法，形成一一对应的类型/源码分类错误。
+
+**结论**：验证中。下一步先取Chrome oracle，再做最小通用实现。
+
+**Chrome oracle与实现（阶段性）**：Chrome151 main world确认NodeFilter是name=NodeFilter、length=0、
+无prototype、nonconstructible native function；IDBKeyRange是length=0 illegal constructor，prototype
+keys为constructor/includes/lower/lowerOpen/upper/upperOpen；blur/close/focus/postMessage均为global
+enumerable、无prototype、nonconstructible native method，postMessage.length=1。Obscura修复前两接口
+是object，四方法可构造且三个匿名/postMessage.length=2。实现保留常量、IndexedDB range语义和
+消息投递，只替换WebIDL外壳/隐藏状态/branding；focused Chrome-shape回归1/1通过。
+
+**实现后本地证据**：四个IDBKeyRange prototype getter与`includes`现在共用WeakMap receiver
+brand check；借出`lower` getter后对普通对象调用得到`TypeError: Illegal invocation`，不再返回
+undefined。release+render focused回归1/1、obscura-js全crate 522/522、精确CLI release build与
+`vendor/v8-trace.sh check`均通过。用本地HTTP加载同一fixture时，六个global的typeof/name/length、
+descriptor、constructibility、prototype keys与native toString继续匹配Chrome151 oracle。
+workspace release+render nextest为1662/1662（4 configured skips），obscura-js/CLI no-default-features
+check通过。
+真实ZokK1迁移仍等待Cloudflare恢复payload-2，不能用当前payload-1后`600010`替代该判据。
+
+### Step 100 — 当前请求链复核与下一缺口选择（2026-08-29，验证中）
+
+**假设**：Step 98/99期间的payload-1后早期`600010`可能仍是代理注入challenge JS/key失效，
+也可能外部状态已恢复。必须先用零页面注入导航取得首个`/fo/` HTTP状态与payload阶段；若仍为
+首个`/fo/` 400，则按既有测量盲区停止引擎归因并刷新代理脚本。若payload-2恢复，则立即对Step99
+六接口做三ray ZokK1迁移验证；否则转向不依赖新payload的既有Chrome oracle稳定缺口。
+
+**方法**：trace-patched render+stealth release、显式Chrome149 macOS UA、Reqable代理与其CA；
+CDP只创建target/导航/等待，不执行`addScriptToEvaluateOnNewDocument`或早期Runtime.evaluate。
+请求是否发出和完成以`RUST_LOG=obscura_js=debug`为准，失败消息来源另行读取被动CDP事件。
+
+**证据**：零注入18秒轮先后生成ray `a329e972c9974627`、`a329e99ed80d4627`。两轮页面端
+`thelancet /h/b/fo/`均为200、约113.58KB；随后widget端第一个
+`challenges.cloudflare.com /h/g/fo/`均为**400、121B**，对应代理明文错误对象均为862B且
+`qECS7="600010"`。没有payload-2；失败后`/eb/chl_api_m`也为400，并触发换ray。导航器未安装
+preload、未点击、未做Runtime.evaluate，排除探针污染。
+
+**结论**：证实当前断点是profile已记录的代理注入challenge JS加密key过期形态，不是Step99
+或当前引擎代码造成。真实bucket验证必须等代理脚本/key刷新。本轮继续使用最后一个有效
+payload-2选择可由Chrome oracle独立证明的通用接口缺口，不拿当前600010做引擎归因。
+
+**下一缺口Chrome151 oracle**：localhost安全上下文逐项检查剩余Document方法。24项全部定义在
+`Document.prototype`（当前实例向上depth=2），descriptor均writable/enumerable/configurable，
+均为nonconstructible native method且错误receiver执行WebIDL brand check。可独立闭环的首批14项：
+`captureEvents/releaseEvents/clear/exitPointerLock/webkitCancelFullScreen/webkitExitFullscreen`零参数
+返回undefined；`browsingTopics()` resolve空Array；`hasUnpartitionedCookieAccess()` resolve true；
+`ariaNotify` length1/缺参TypeError；queryCommand五个方法length1/缺参TypeError。caret、XPath、
+fullscreen/PiP Promise、storage-access请求、moveBefore和ViewTransition需要各自子系统，暂不造空壳。
+
+**首批实现**：Document class新增上述14项并统一先过`_documentPrivacyRoot` brand check；
+`hasUnpartitionedCookieAccess`复用现有per-document storage-access状态，queryCommand按idle与
+contenteditable选区区分enabled/state/value。class method保证nonconstructible，现有最终WebIDL
+pass统一设enumerable/native。focused release回归1/1通过。
+
+**EventTarget.when/Observable实现**：Chrome oracle确认四个`when`路径共享EventTarget.prototype方法，
+返回cold Observable；`subscribe`返回undefined并由Subscriber.signal取消。实现WeakMap-backed
+Observable/Subscriber，覆盖Chrome prototype的19个操作符/terminal方法、teardown、AbortSignal，
+并将共享when接入Document、window匿名prototype、Screen和ScreenOrientation。descriptor/length/
+native、事件投递、取消、map/filter/take/toArray/first/last/reduce focused回归1/1通过。
+
+**剩余接口实现**：XPathExpression/createExpression/createNSResolver复用现有XPath evaluator；
+CaretPosition与两个caret APIs复用elementFromPoint+Range；requestStorageAccess复用privacy grant并
+对未授权第三方fail-closed，requestStorageAccessFor仅同源resolve；fullscreen/PiP按Chrome失败
+闭环；moveBefore走真实DOM reparent；ViewTransition实现异步update、ready/updateCallbackDone/
+finished、types、skip/waitUntil。三组focused回归均1/1。由最后有效payload静态重算，原34个
+Chrome-only N路径已全部获得对应实现；真实bucket仍必须由刷新key后的三ray payload-2确认。
+
+**完整门与静态分类**：obscura-js release+render 527/527；workspace 1667/1667（4 configured
+skips）；精确render+stealth CLI build、trace patch check、obscura-js/CLI no-default feature check
+与`git diff --check`均通过。新release CLI逐项读取旧Chrome-only 34路径，全部满足function、native
+toString且Reflect.construct不成功，`failures=[]`。Step100本地实现完成；真实站结论保持未通过，
+唯一下一动作是刷新代理注入key后取得三ray payload-2和最终真实响应。
+
+### Step 101 — ZokK非N桶对象/状态长尾（2026-08-29，验证中）
+
+**假设**：N桶静态穷尽后，o/x/F/T仍有一组明确的通用WebIDL差异。最后有效payload集合差为
+Chrome-only o=17（`o.event`是CF自有，跳过）、x=11、F=7、T=5。它们大多不是复杂行为，
+而是Document collections、Window bar objects以及应为null/boolean的状态getter。
+
+**方法**：先用clean release对每个路径读取typeof/Array.isArray/toStringTag；HTMLCollection若因
+Array subclass落入数组桶，修真实collection identity并跑所有collection回归。随后用Chrome151
+oracle锁定Document/Window descriptor、identity与值，不按payload字段硬编码。
+
+**证据（修复前）**：15个o候选和全部x/F/T候选为undefined；`document.children`为
+`[object HTMLCollection]`但`Array.isArray(document.children)===true`，解释其不在o桶。Document
+textContent错误为空字符串而Chrome为null。
+
+**实现**：HTMLCollection从Array subclass改为WeakMap/provider-backed WebIDL object，保留数字/
+命名Proxy访问、iterator、live identity并让构造器illegal；Document补anchors/applets/embeds/plugins
+等live collections、customElementRegistry、FeaturePolicy、FragmentDirective。Window补External、
+六个BarProp、StyleMedia；Document/global/navigator补全部null/false/true状态getter。focused回归以
+与payload相同的分类优先级验证o=16、x=11、F=7、T=5，39条`bucketFailures=[]`。
+
+**crate门**：obscura-js release+render 528/528通过；forms/images/links live collection、window named
+duplicate collection、frame/worker/event/selector路径无回归。
+
+**结论**：本地实现与crate回归完成；完整workspace/release门在Step102一并通过。真实bucket迁移
+仍等待Reqable注入key刷新，质询状态保持未通过。
+
+### Step 102 — `IMOh8` audio RED codec投影（2026-08-29，验证中）
+
+**假设**：最后有效payload里`IMOh8`只有一个codec字符串不同：Chrome为
+`audio/red/48000`，Obscura为`audio/red/48000;111/111`。SDP offer中的
+`a=fmtp:63 111/111`本身与Chrome SDP一致；错误发生在从SDP生成
+`RTCRtpSender/Receiver.getCapabilities()`结果时，Obscura把RED的fmtp误暴露为
+`sdpFmtpLine`，而Chrome在capabilities视图中省略它。
+
+**方法**：保留`_rtcAudioLines`的SDP内容，只在`_rtcCapabilities`投影codec对象时按Chrome
+语义处理RED；focused回归同时断言offer仍含`a=fmtp:63 111/111`、capabilities中的
+`audio/red/48000`无`sdpFmtpLine`，并保持其余audio/video codec顺序与fmtp不变。随后运行
+obscura-js crate与完整release门。真实`IMOh8`仍需等Reqable注入key刷新后用三ray payload-2验证。
+
+**证据（阶段性）**：实现把RED与RTX的payload-type映射限定在offer SDP，不写入静态codec
+capability；其余codec的fmtp投影不变。focused release回归分别1/1通过：capabilities断言
+audio RED没有`sdpFmtpLine`且Sender/Receiver逐字一致；peer-connection offer断言仍含
+`a=fmtp:63 111/111`，原ICE与m-line断言保持通过。
+
+**完整门**：obscura-js release+render 528/528；workspace release+render 1668/1668
+（4 configured skips）；精确render+stealth CLI build成功，`vendor/v8-trace.sh check`
+为patched，no-default-features check通过。最终release CLI同形求值精确返回
+`audio/red/48000`。companion benchmark仓库不存在，obstacle course未运行。
+
+**结论**：通用codec投影修复与本地验证完成，预计消除最后有效payload的`IMOh8`唯一差异；
+Reqable注入key刷新前无法取得新payload-2，因此不能把预期当作真实迁移或过盾证据。
+
+### Step 103 — qSsL2/nMlxj2当前源码受控复现（2026-08-29，验证中）
+
+**假设**：最后有效payload中的文本与canvas差异可能部分早于B6亚像素和后续canvas修复，不能直接
+据旧值继续改实现。先从Chrome/Obscura有效payload解析两个字段的精确结构，再用本机Chrome与当前
+release对同一最小输入取值，区分“已自然修复的旧差异”和“当前仍存在的通用缺陷”。
+
+**方法**：按探针字段名从payload数字part合并qSsL2/nMlxj2，先做Chrome2↔3与Obscura同侧sanity；
+根据值结构和保留的challenge source/trace恢复输入。oracle必须使用同字体、字号、canvas尺寸、
+colorSpace/pixelFormat和DPR；无法证明输入同形时不改代码。
+
+**证据**：待解析与受控oracle回填。
+
+**证据（阶段性）**：Chrome payload-2/3同侧sanity显示两个字段逐值稳定。qSsL2是10个DOMRect
+快照，每项8字段可映射为bottom/top/left/right/height/width/x/y；nMlxj2由像素前缀、计数/耗时/hash、
+10组TextMetrics、ImageData colorSpace/pixelFormat、unorm8/float16读写和两组导出尺寸/hash组成。
+8月27日Obscura旧样本仍为白色像素、整数TextMetrics、format=null、颜色读回全零与空导出hash；
+该样本早于B6/后续canvas修复，尚不能代表当前源码。
+
+**Step97当前值复核**：8月29日有效payload中，nMlxj2的10组TextMetrics宽度已从整数变成1/64px
+亚像素，说明B6确实进入真实探针；但ImageData仍报告pixelFormat=null，display-p3请求回读srgb，
+四组unorm8/float16颜色像素仍为0,0,0,255，导出尺寸为null/0且hash为空SHA-256。该形状跨同一
+日志的多份payload稳定。qSsL2仍与8月27日旧值一致，10/10 DOMRect未改善。
+
+**源码根因候选**：当前getImageData/createImageData构造的ImageData硬编码colorSpace=srgb且不定义
+pixelFormat；OffscreenCanvas.convertToBlob固定resolve空Blob。它们与payload的display-p3回退、
+format=null和空SHA-256逐项闭环，但像素类型/转换和导出编码仍需Chrome oracle后才能实现。
+
+**Chrome151受控oracle**：同一1x1 canvas fixture确认ImageData默认srgb/rgba-unorm8，P3 settings
+保留display-p3，rgba-float16返回Float16Array；display-p3 context回报真实context attributes。
+以color(srgb 1.1 0.1 0.5)与color(display-p3 1 0.25 0.5)绘制后，四组getImageData结果分别为
+[255,28,127,255]、[255,64,127,255]、[1.0888671875,0.10845947265625,0.499267578125,1]与
+[1,0.2509765625,0.498046875,1]，与payload形状和值闭环。当前release四组均为黑色，且错误输入
+不抛；根因包含settings未实现与CSS Color 4解析缺失。
+
+**实现与回归**：ImageData改为WeakMap backing slots和Chrome形状重载/异常，补colorSpace/
+pixelFormat、Uint8ClampedArray/Float16Array；2D context保存真实attrs，CSS color()经D65矩阵在
+sRGB/Display-P3间转换，get/create/putImageData支持unorm8/float16。OffscreenCanvas改为自身
+持有真实_Canvas2D backing，convertToBlob复用PNG编码，transferToImageBitmap返回49x44快照并清空，
+createImageBitmap支持Canvas/Offscreen/ImageData/PNG Blob。ImageData focused 1/1、Offscreen
+focused 1/1、既有canvas 4/4、obscura-js 530/530。
+
+**完整门与最终产物**：workspace release+render 1670/1670（4 configured skips）；精确
+render+stealth CLI build、trace patch check、no-default-features check与git diff check通过。
+最终release binary运行同fixture，四组ImageData格式/颜色值保持对齐；Offscreen PNG为非空
+image/png，createImageBitmap与transferToImageBitmap均为49x44，transfer后backing透明。
+
+**结论**：nMlxj2的ImageData colorSpace/pixelFormat、unorm8/float16颜色与Offscreen空导出
+三组通用根因已修。本地证据预计消除该字段中对应子项，但PNG编码hash、字体TextMetrics与首段
+canvas像素仍可能不同；Reqable key刷新前不能用新payload确认实际字段变化。
+
+**qSsL2后续调查**：lookup trace把最强调用锚定到top VM的rX链，但calls trace没有对应DOM构造，
+且保存source来自另一ray，无法恢复完整输入。受控Arial fixture证明Obscura canvas advance已与
+Chrome接近/相等，而DOMRect被inline buffer与Taffy默认rounding整数化。实验性关闭全局rounding后
+focused rect从73变72.9375，但obscura-render全crate仅580/588，replaced ratio、percentage flex、
+SVG、float与ex padding共8项改变。该实验及临时测试已完整回退。正确实现需要CSSOM专用unrounded
+geometry贯穿transform/inline fragment/sticky/scroll，不能用全局reflow或改测试基线替代。
+
+**CSSOM-only实现**：DomLayout新增并行unrounded rect map，从最终Taffy unrounded_layout递归收集；
+PreparedRender仅在新cssom viewport路径读取，并复用既有transform及resolved scroll/sticky movement。
+paint、hit testing、scroll extents、client metrics与layout convergence仍使用rounded rect。auto inline
+formatting context仅在rounded宽度与ceil(shaped advance)+edges一致时，把CSSOM宽度换成1/64 advance；
+offsetWidth/Height/Top/Left在JS API边界继续取整。Chrome fixture的72.9375 rect/73 offset/72.9375
+canvas focused 1/1；先前全局rounding实验唯一残留的min-content测试恢复1/1。
+
+**完整门与render证据**：旧rounded DOMRect回归改为验证authored 66.6/142.7浮点值，client/offset
+整数断言保持；focused 1/1，obscura-js 531/531，workspace release+render 1671/1671（4 configured
+skips）。精确render+stealth release build、trace patch、no-default-features和diff check均通过。
+最终release fixture四组inline rect逐值等于canvas advance，核心组为72.9375/offset 73/72.9375。
+deterministic suite全部Obscura行为断言通过；检查器10项失败均在Chrome151侧，属于仓库旧Chrome
+参考不匹配。representative top/bottom除Porkbun两次50s导航超时与Angular bottom一次module watchdog
+后50s超时外均完成成对非空捕获或按动态capture boundary排除，产物仅在临时目录。
+
+**结论**：CSSOM-only通用实现和本地完整门已完成，未改变paint/reflow基线。真实qSsL2/nMlxj2迁移
+仍等待Reqable注入key刷新后的三ray payload-2；目标页面真实响应尚未返回，质询状态保持未通过。
+
+### Step 104 — 当前有效challenge直连链路与低开销op trace（2026-08-29，验证中）
+
+**假设**：Reqable过期rewrite只让明文payload不可用，不等于当前Cloudflare链路本身仍在首次
+`600010`。绕过代理直连现行脚本可确定真实断点；已有`--trace-op-file`比全量V8 CALL trace开销低，
+可能在payload-2边界给出hG后半组对应的宿主调用序列。
+
+**方法**：用Step103最终trace-patched render+stealth release直连
+`https://www.thelancet.com/1.txt`，35秒硬窗口，只开`obscura_js=debug`并筛选请求完成行。成功判据仍是
+目标`/1.txt`真实响应，不采用challenge文案或cookie。随后从保留Chrome payload-2和Step97同ray
+日志结构化提取hG全部逐索引差异；下一轮启用CLI native op trace并按widget首个`/fo/`时刻关联。
+
+**证据**：top orchestrate 200/230996B；top `/h/b/fo/` 200/113584B；widget首个`/h/b/fo/`
+200/823148B；`/pat/` 401/1B；widget proof `/fo/` 200/127712B。页面一度显示Verification successful，
+最终仍回到“Enable JavaScript and cookies to continue”，没有顶层完成转发或目标真实响应。当前脚本与
+key可用，断点已明确位于proof回包后的最终判定。远端Reqable CA可达，但本机没有其rewrite规则，
+因此明文payload刷新仍需要代理维护方。
+
+**保留样本复核**：hG的31项差异精确集中在index75-118：一个12/13、19个boolean、6个-1/null、
+四个HTML序列化串/空串，以及index118的`UXHfN1611`/`UXHfN1[object Object]`。此前Range与普通
+DOM method marker均为零调用，这批形状不能再直接归因到某个DOM API。
+
+**op trace证据**：`--trace-op-file`以约44.4K行完成整轮，没有全量V8 trace的预算问题。调用时序
+证明DOM conformance批次发生在widget首个大fo回包后、proof fo之前。writer原本收到
+`[cmd,arg1,arg2]`却只写前两项，本轮扩为arg3+result；因此可同时读取`set_inner_html`源、
+`inner_html`结果和`compare_order`返回值。默认未启用trace时只做OnceLock静态分支，不克隆参数。
+
+**detached Document Chrome151 oracle与实现**：Chrome的text/html与XML parser结果分别为
+`[object HTMLDocument]`/`[object XMLDocument]`，均`instanceof Document`；own key只有enumerable、
+non-configurable的`location` accessor且值null，22个安全方法直接来自Document.prototype。root/body/
+新建节点owner均指返回文档，documentElement.parentNode与getRootNode投影Document，Document↔root
+position为20/10。修复前Obscura是plain Object、55个own键、owner指live document、position=35。
+实现用WeakMap/root nid map保存内部owner，以Proxy隐藏configurable shell属性并保留真实prototype
+method identity；Node只为标记过的detached树投影parent/root/contains/position，live/frame/native
+DOM不变。focused DOMParser 4/4、obscura-js 531/531、workspace 1671/1671（4 skipped）；精确release、
+trace patch、no-default和diff check均通过。
+
+**结论**：质询仍未通过。default UA与显式macOS Chrome149 UA的direct轮都走到proof fo 200后失败，
+没有目标真实响应。detached Document修复与旧hG的boolean/position簇闭环，但Reqable明文rewrite
+未刷新，不能把预期迁移当作真实payload证据；下一步必须刷新代理challenge JS/key后量化hG剩余项，
+再恢复主VM register关联，而不是继续从加密响应体猜字段。
+
+### Step 105 — 更新代理后的条件点击与明文payload复测（2026-08-29，验证中）
+
+**假设**：代理维护方已更新缓存challenge JS/key，首个widget `/fo/`应从旧400/600010恢复为200并
+产生payload-2。当前managed挑战可能在第二次`/fo/`后进入interactive分支；必须先识别
+`interactiveBegin`和非零widget box，再点击一次，不能按固定延迟盲点。
+
+**方法**：使用trace-patched render+stealth release、远端Reqable CA/代理与显式macOS Chrome149 UA。
+首轮带closed-shadow/message探针，只用于确认第二次`/fo/`后是否出现interactive UI；同时满足
+`interactiveBegin`和iframe box才经CDP Input执行pre-move、press、release一次，并检查新proof fo、
+顶层转发与目标真实响应。该探针会污染attachShadow源码和全局枚举，所以指纹结论另取零注入三ray
+payload-2，按字段名而非part编号与Chrome/旧Obscura样本对拍。
+
+**证据 1（缓存与交互）**：零注入轮top fo 200/113584B、widget大fo 200/822304B并恢复约110KB
+明文payload-2，确认缓存更新有效。交互轮在`interactiveBegin`且iframe为300x65@(192,304)后只点
+一次；刚进入interactive就点没有proof。新ray按严格配方延迟到12.3s点击后，界面进入Verifying，
+产生widget proof fo 5240B和top转发3256B，随后换ray重开挑战，没有目标真实响应。交互链已打通，
+但最终判定仍失败。
+
+**证据 2（三ray字段迁移）**：零注入ray `a32b3b6f98b1d1db`、`a32b424b98660bbb`、
+`a32b43887a6f780d`均有120项hG，和Chrome仍差31项，lNCr3仍缺；qSsL2 10/10不同，nMlxj2
+顶层8项不同。IMOh8三轮均逐值等于Chrome。ZokK1的o/F/x/T计数已完全对齐，N为1167 vs Chrome1164。
+精确集合差中Chrome-only N仍是`blur/close/focus/postMessage`，Obscura同四项仍在f桶；而
+WindowProxy侧`o.blur/o.close/o.focus/o.postMessage`已在N桶。
+
+**下一假设**：Step99本地回归只用同realm patched Function.toString，实际Zok从另一realm读取全局
+Window方法；`_nativeFns/_nativeStr`各realm独立，导致同一类方法在WindowProxy本地副本为N、跨realm
+全局值为f。下一步把registry放到realm共享的Deno宿主对象，以真实payload四项f→N作唯一A/B判据；
+不迁移则完整回退。
+
+**证据 3（证伪跨realm registry）**：共享Deno registry后，受控frame realm读取top四方法的
+toString从源码变为native，focused 1/1；但重链后的零注入真实payload仍为N=1167/f=4，
+`blur/close/focus/postMessage`一个未迁移。按预设完整回退候选与测试扩展。CF实际获取/字符串化路径
+不是该受控oracle，不能据此修改全局native registry。
+
+**下一目标**：nMlxj2当前11个顶层子项仅3项已相等；首段canvas像素Chrome为白/灰而Obscura为
+黑/深灰，导出的49x44尺寸已对但两个hash随同一backing不同。下一步用明确标注为侵入式的canvas
+调用探针只恢复输入/状态，不使用该轮payload做指纹结论，再以相同输入建立Chrome oracle。
+
+**canvas输入与受控oracle**：侵入式轮恢复的49x44场景为0.4缩放后三个圆以multiply叠加，随后
+source-over填充双圆evenodd镂空。由此确认三处通用缺陷：path rasterizer忽略multiply、
+fill('evenodd')忽略fill rule、partial-alpha颜色对外暴露premultiplied RGB。统一straight-alpha
+source-over/multiply compositing并修evenodd后，受控Chrome151的opaque/partial/colorCount为
+1596/120/114；Obscura 8x8 coverage为1574/152/197，改为小canvas 4x4后为1598/128/136，三项
+均明显更近。为限制热路径成本，仅面积不超过65536像素使用4x4，大canvas保持2x2。focused
+canvas_multiply_evenodd_and_edge_alpha_match_browser_semantics已覆盖叠色、镂空、partial alpha
+与save/restore composite；真实字段迁移必须另取零注入ray。
+
+**零注入真实迁移**：最终4x4 release的ray a32b7c9b9983ea99生成38-part payload-2。nMlxj2的
+内部image hash从此前值迁移为d7af5a906222e9be31e545c45af826f8，证明修复进入真实探针；但
+49x44 blob/bitmap hash仍为ca886a1bb3787da9be4bb9cb92ea536d，Chrome三者均为
+d60c1bc9f33d481d1919461f625340d1。首2x2像素也从旧黑/64灰迁移为黑/48灰，仍不同于Chrome的
+白/192/244/53。结论是multiply/evenodd/straight-alpha修掉了真实通用缺陷，但canvas输入链仍有
+另一上游语义差异；下一步按侵入式日志恢复2x2准确调用序列，不从hash猜实现。
+
+**arc方向根因与修复**：2x2准确序列是黑底后以白色执行arc(0,0,2,0,1,true)并fill。当前arc
+丢弃第六个counterclockwise参数，flatten一律按顺时针短弧，正好解释像素覆盖反相；同时
+arc(0,0,r,0,2π,true)也被归一成错误方向。实现现保存方向，按整圆/方向归一化sweep，负半径
+抛IndexSizeError。小半径8段多边形把第三像素压到207，提高最小段数到16后受控2x2为
+255/191/239/48，Chrome为255/192/244/53，最大灰阶差5；focused 1/1。下一判据是重新链接后的
+零注入nMlx首像素与三个hash迁移。
+
+**arc真实payload验证**：首个release ray只到top fo，按无效外部分流丢弃。第二个ray
+a32b8ef8eb85dfca完整走top fo113584B、widget大fo845736B、PAT401和proof fo127224B，生成39-part
+payload-2。nMlx首2x2从修复前的黑/48/黑/48迁移为白/191/239/48，与Chrome白/192/244/53只剩
+1/5/5灰阶误差；真实证实counterclockwise修复。内部image hash仍d7af5a...，49x44 blob/bitmap
+仍ca886a...，所以大场景hash是独立剩余差异，不再归因短弧方向。
+
+**最终二进制条件点击复核**：第二次widget fo为822544B；探针在其后同时看到interactiveBegin与
+300x65@(192,304)，按严格start=12配方于t=12.3s只点击一次。页面进入Verifying，随后产生widget
+proof fo5160B和top转发3256B，约2秒后换ray重启挑战，没有目标/1.txt真实响应。当前arc修复没有
+破坏交互链，用户要求的“第二次fo后识别，需要时点击一次”已在最终二进制执行。
+
+**float16 backing根因与实现**：侵入式getContext参数证明四个颜色context分别是srgb/display-p3
+乘unorm8/float16；float两组attrs虽已报colorType=float16，旧实现内部仍统一Uint8Clamped，故扩展
+sRGB裁到1、P3 .25/.5量化。实现仅为显式float16 context分配Float32权威backing，renderer继续使用
+字节mirror，unorm8不增加内存。Chrome151 main-world进一步证明float Canvas使用Skia D50 gamut
+转换；unorm8保留既有D65字节路径。分离后CF同形float结果逐值为1.088867/.106018/.497314与
+1/.25/.5，ImageData和arc focused 2/2；真实payload仍待release重链。
+
+**float16真实payload验证**：release零注入ray a32bb2bb9b3062a2生成39-part payload-2，四组color
+从此前2/4相等提升到4/4逐值等于Chrome，包括扩展sRGB 1.088867/.106018/.497314和P3 1/.25/.5。
+arc首2x2迁移保持。49x44内部/导出hash仍分别d7af5a...与ca886a...，说明颜色backing缺陷已闭环，
+大场景剩余应继续从全像素边缘/叠色分布定位。
+
+**Canvas C1文本准备**：十个measureText参数的数值code point证明CF有意传UTF-8 byte binary-string，
+并非TextDecoder缺陷。Chrome151对原C1串与显式U+FFFD给相同宽度；Obscura把C1直交cosmic-text时
+宽度仅25-36。measureText/fillText/strokeText现共用C1→U+FFFD准备，focused断言宽度与像素同形。
+release ray a32bc987df5d75c0中十宽度迁移到38.66-67.89，Chrome40.34-65.68，最大误差从约31px
+降到2.21px；剩余为bundled font资源/outline metrics差异，不做比例或字符串特判。
+
+**最终门与条件点击**：obscura-js533/533、workspace1673/1673（4 skipped）、精确release、
+trace patch、no-default和diff check通过。deterministic 63个fixture均成对非空捕获，Obscura
+行为断言全过；10条checker失败均为Chrome151侧旧参考。最终条件轮第二次widget fo822608B后
+识别interactiveBegin与300x65 box，只在t=12.3s点击一次；随后proof fo5160B、top转发3256B，
+约2秒后换ray，没有真实/1.txt响应。点击要求完成，最终判定仍失败。
+
+**结论**：交互要求已按用户指示完成，点击链不是剩余断点；继续定位canvas backing差异。
+
+### Step 106 — payload恢复后的top主VM register关联（2026-08-29，证伪同步产出边界）
+
+**假设**：Step97已验证的256-register主VM在代理恢复payload-2后会把hGgWW0 120-array或31项残差
+留在run返回值、this.g或closure cells；按同ray调用序列可把差异映射到具体call。
+
+**方法**：临时env-gated改写op_run_classic_script中的rotating主VM run expression，以闭包和
+try/finally记录每次调用前后256-register浅差分、返回值、完整<=30 closure cells及110..130数组
+候选。结构由this.g=Array(256)识别，不固定符号/seed；默认不开env时source逐字不变。诊断payload
+不作指纹基线。
+
+**证据**：当前229840B top source成功安装。两轮分别103/113 calls、2 instances；top fo、widget
+大fo、PAT401、payload-2和127KB fo均正常，payload-2在seq68之后。所有register/result/closure
+扫描中110..130数组候选为0，Rqaf3/XGKq7/UXHfN1/data-foo marker也只出现在最终payloadJSON，
+未出现在VM日志。实例1主要处理selector/toString与计数，实例2主要处理token/编码。
+
+**结论**：hG不是该主run的同步返回或寄存器产物，而是它发起的异步callback/外层汇总结果。
+同步main VM register路线证伪。临时transform、brace helper和测试已完整删除；下一观测边界转向
+异步callback或Zok四函数的实际Function.toString分类路径。
+
+**Zok WindowProxy后续**：rch源码还原function分类为`instanceof callerRealm.Function`且toString
+包含native code。受控Chrome证明frame本地及cross-origin parent allowlist四方法都属于caller
+realm。Obscura的contentWindow proxy先返回main-realm target方法，导致frame方法instanceof失败。
+same-origin blur/focus/close现返回真实frame函数；postMessage由frame Function constructor创建
+realm-owned wrapper并委托原消息路由。native/realm/message focused3/3，opaque cross-origin
+回归1/1。真实三ray中blur/focus/close稳定从f迁N，对应o.*三项消失；仅postMessage与
+o.postMessage仍对调。临时toString/classifier探针均已删除；后者安装在top source而非rch，
+剩余一项需移到frame execute_in_context_at边界，不按当前0日志下结论。
+
+**最终门与点击**：obscura-js533/533；workspace前两轮分别有MCP两项和browser timer一项并发
+时序抖动，单项均复跑通过，最终完整1673/1673（4 skipped）。clean release、no-default、trace
+patch和diff check通过。最终条件轮在第二次widget fo822728B后识别300x65交互框，t=12.3s仅点击
+一次；随后proof fo5160B、top3256B，约2秒后换ray，仍无目标/1.txt真实404。三项Zok迁移没有
+改变最终判定。
+
 ### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
 
 **假设**（用户提出）：`/ci/` 是 CF 用动态 img 打的点（`sec-fetch-dest: image` + `new
@@ -4931,3 +6258,1496 @@ iframe 修复（bc0e0cf 同步 about:blank / 4ed91e1 同步 realm）导致 ifram
 1. 修动态 iframe about:blank 的 `body` 缺失（应同步建 `<html><head></head><body></body>`）。
 2. 若要进一步压 ci 波动：对比「早发轮 vs 推迟轮」的 payloadJSON 差异（错误序列 `YySko4`
    / `QqYk7`），找 CF 分流的观测点。
+### Step 107 — frame classifier真实执行边界（2026-08-30，验证中）
+
+**假设**：Step106剩余的`postMessage/o.postMessage`对调来自`/rch/` classifier实际取得的函数与
+受控WindowProxy oracle不同。此前临时探针安装在top `op_run_classic_script`，没有进入frame
+`execute_in_context_at`，所以0条分类日志不能证伪该路径。
+
+**方法**：仅在环境变量开启且frame脚本名命中`/rch/`时，在`execute_in_context_at`编译边界临时
+注入诊断。围绕真实classifier记录唯一`f`对象的函数name、是否等于`globalThis.postMessage`、
+`l === globalThis`、caller/local两侧`instanceof Function`与`Function.prototype.toString`，以及获取
+栈或邻近调用位置。默认路径必须保持source逐字不变；取得证据后完整删除探针。真实复核仍在第二次
+widget `/fo/`后同时识别`interactiveBegin`与可见box，仅需要时点击一次，成功判据为`/1.txt`真实404。
+
+**状态**：进行中。
+
+**第一轮测量修正**：探针已命中真实`/rch/`编译边界，但把caller constructor直接写成
+`l.Function`后，大量`f`分支报`Right-hand side of 'instanceof' is not an object`。真实classifier
+用的是`l[pe(o8.kH)]`，说明不能预设`l`为普通Window；该轮仅证明边界正确，不作分类结论。修订版
+改为记录精确解码key/constructor，每个字段独立try，并只在name或两侧identity指向`postMessage`
+时输出。交互侧仍在第二次fo后识别300x65 box并于t=12.3s只点一次，proof 5136B、top 3256B后
+换ray，没有真实404；由于大量诊断异常，该轮不作payload基线。
+
+**第二轮证据**：按精确解码constructor运行后0异常，但name与两侧global identity筛选仍为0；同ray
+明文payload却明确保留`f:["postMessage"]`。这说明classifier收到的`j`不是当时任一global可直接
+取回的函数，可能是枚举阶段提前缓存或再次包装后的值。条件点击仍在t=12.3s只执行一次，proof
+5224B、top 3256B后换ray，无真实404。下一版按`length===1`且无own `prototype`的方法描述符形状
+筛选，并反查local/caller own property identity key，不输出全部`f`函数。
+
+**第三轮证据与源码候选**：`length=1`且无prototype的筛选仍0条，payload仍稳定
+`f:["postMessage"]`；条件点击t=12.3s一次，proof 5160B、top 3256B后换ray。源码显示
+`_frameRealmProxyMethod`通过frame `Function`创建`function postMessage(...args)`，动态Function体内
+访问不到bootstrap词法`_markNative`，而随后外层`_markNative`只写创建代理realm的registry。因此该
+wrapper可能已满足caller `instanceof`，但caller-side `Function.prototype.toString`仍暴露源码。
+最后一轮按函数identity去重采全部`f`，只留截断源码和短stack；验证后立即删除临时注入。
+
+**测量盲区修正**：全量去重轮只得到一个`name=j,length=10,hasPrototype=true`的普通函数，且诊断里
+`pe is not defined`，stack落在当前source约5108行。通用``N : f`` marker实际命中了另一分类器，
+不是Step106还原的Zok `T(l,j)`；因此前三轮0命中均无效，也不能据此确认WindowProxy wrapper根因。
+该轮条件点击仍为t=12.3s一次、proof 5160B、top 3256B后换ray。下一步用既有frame source捕获取得
+当前已编译`/rch/`源码，再按`instanceof caller Function`、caller `Function.prototype.toString`和
+native-code includes的完整结构锁定唯一classifier。
+
+**当前源码恢复**：既有frame source捕获取得`script-47.js` 407529B。真实classifier仍是同一结构，
+但代理缓存更新后的参数已变为`l(O,Mx,...)`：`O`为caller/global，`Mx`为被分类值，Function key为
+`HX(rB.MX)`。所以marker其实命中了正确函数，失败原因是注入体沿用旧样本`l/j/pe/o8`变量名。
+source捕获轮也在第二次fo后t=12.3s点击一次，proof 5160B、top 3256B。探针现改用当前
+`O/Mx/HX/rB`，下一轮才作为有效classifier证据。
+
+**有效证据与修复**：修正变量后的首条目标记录为`name=postMessage,length=0,hasPrototype=true`，
+`O !== globalThis`、`Mx === O.postMessage`、`Mx instanceof O.Function === true`；当前realm toString
+返回native，而`O.Function.prototype.toString.call(Mx)`返回
+`function postMessage(...args){return Reflect.apply(delegate,this,args)}`。因此realm identity已经正确，
+唯一失败面是wrapper只登记进创建代理realm的native registry，caller realm看见源码。
+
+正式实现把native function与exact-string registry放进各context共享的Deno宿主WeakSet/WeakMap；
+WindowProxy wrapper同时改为realm内对象方法语法，postMessage shape变为name postMessage、length 1、
+无prototype且不可构造，delegate消息路由保持。临时classifier Rust注入已完整删除。扩展focused回归
+同时验证main/frame两侧native、frame Function identity与四方法Chrome shape，release+render 1/1通过。
+
+**真实三ray迁移**：clean release、完全零页面注入的ray `a32d373a1992b327`、
+`a32d3793da4e9bd9`、`a32d37f09c37ea17`全部得到同一结果：Zok `f`桶缺失，N桶包含裸
+`postMessage`，并且错误的`o.postMessage`不再位于N。迁移3/3稳定，证明修复命中真实classifier。
+N总数仍为1167，属于错误key到正确key的等量交换；剩余与Chrome 1164的集合差另行核算，不把
+计数不变误判为本修复未生效。
+
+**最终条件点击**：clean release的第二次widget fo为845760B，其后同时识别`interactiveBegin`和
+300x65 box，t=12.3s只点击一次。产生proof fo 5240B与top转发3256B，约2.3s后换ray重开挑战；
+网络日志没有任何目标`/1.txt`真实请求或404。Zok最后一项已闭环，但不是最终判定的唯一阻塞。
+
+**Zok剩余三项oracle与通用修复**：postMessage迁移后与Chrome N桶的精确差只剩Obscura-only
+`FontFaceSet`、`webkitAudioContext`、`constructor`。Chrome151 main world与动态同源iframe证明：
+FontFaceSet两侧都是own、non-enumerable function，必须保留；webkitAudioContext两侧均不存在；
+constructor可访问且等于各自Window，但不是own、没有own descriptor/ownKey，且Window global的原型
+就是Window.prototype。实现删除过时webkit alias，把main/frame global从own constructor hack改为继承
+Window.prototype，并让两类WindowProxy的ownKeys/descriptor不投影constructor，get/has身份保持。
+focused断言首轮仅因undefined被JSON省略失败，改显式布尔后3/3；obscura-js全crate533/533通过。
+
+**第二组真实结果**：clean release零注入ray `a32d51a79ee4aa80`的N桶从1167降到1165，
+`webkitAudioContext`和`constructor`均消失，只剩正确的`postMessage`及Chrome151明确存在的
+`FontFaceSet`。条件点击轮第二次fo后t=12.3s只点一次，proof5148B、top3256B后仍换ray，无真实
+404。Zok路线至此不再有可安全修的集合差；下一步在代理`payloadJSON`宿主边界临时抓含hG日志的
+V8 stack与源码邻域，定位同步register扫描未覆盖的异步callback/外层汇总函数。
+
+### Step 108 — hG外层汇总的异步callback边界（2026-08-30，验证中）
+
+**假设**：Step106同步top VM未找到hG，是因为120-array在`/rch/` frame的异步VM续跑中写入payload
+对象，最终由callback汇总，而非作为run返回值或register直接暴露。
+
+**证据1（payload宿主stack）**：仅在`payloadJSON`含`hGgWW0`时抓24帧，得到稳定链：frame
+`Lw(H)` line528输出JSON，直接调用者为`cb` case5 line8222；其下为`Lh -> cV.run -> c5 -> La ->
+cV.run -> c5 -> eventLoopTick`。这把生成realm从top主VM纠正为`/rch/` frame异步callback。
+
+**证据2（完整源码）**：同ray捕获script-44.js 404797B。`cb(H,O,Mx)`是XHR/VM续跑控制器；case13
+执行`runProgram(MI,D)`并调用`MG(O,cb)`，case5才`Lw(O)`序列化。下一步在cb入口、MG前后和Lw前
+只读O的数据属性图，判断hG是进入callback前已有、MG同步生成，还是异步续跑后写入。
+
+**边界结果**：第一次cb入口rootKeys=48、首次beforeLw=49、beforeMG/afterMG=49，均没有hG；第二次
+cb一进入时rootKeys=98，已存在`$.16.hGgWW0` length120。结论是hG在第一次MG返回后的异步间隙
+写入同一个O，并随第二次cb调用进入，不是MG同步返回值。下一轮仅给命中hG的entry补Error.stack，
+定位第二次cb直接调用者。
+
+**停止点与清理**：第二cb的直接调用者精确到VM `Lh` function-call opcode。对O使用递归Proxy以及
+给raw part预装hG setter仍未命中写入，说明VM在part对象进入O前已持有并完成raw构造。继续加膜会
+显著改变被测程序结构，且不能产生通用浏览器修复，因此停止。本step全部`payloadJSON/hG/RCH`
+临时Rust诊断已删除，console op恢复fast、frame execute恢复原始source；只保留上述调用链证据。
+
+**转入通用TextMetrics修复**：Chrome151独立fixture证明空串/纯空白的actual ascent/descent为0；
+空白left为0/0、center为width/2与-width/2、right为width与-width，RTL start等价right；direction
+默认inherit，且direction/textAlign/textBaseline随save/restore保存。实现这些通用Canvas语义，保留
+现有font box，未伪造字体引擎尚无的glyph outline overhang。focused release+render 1/1通过。
+
+**最终门与交互**：obscura-js533/533、workspace1673/1673（4 skipped）、精确release、no-default、
+trace patch、diff check和诊断标记清零均通过。clean条件轮widget大fo845756B后同时识别
+`interactiveBegin`与300x65 box，t=12.3s只点击一次；proof5240B、top3256B后换ray，没有真实
+`/1.txt`。当前保留代码全部是Chrome oracle/独立fixture证明的通用浏览器语义修复，CF专用
+payload/VM/frame诊断已全部删除；最终判据仍未通过。
+
+### Step 109 — HaHaVM环境参考：StorageManager与OPFS通用语义（2026-08-30，验证中）
+
+**假设**：HaHaVM-General近期通用环境补全显示`navigator.storage.getDirectory()`是其真实执行缺口；
+Obscura虽然在接口表中有`StorageManager`/FileSystem构造器，`navigator.storage`仍只是普通对象且无
+OPFS行为。这是浏览器语义缺陷，可能也被当前异步hG探针读取。
+
+**Chrome oracle与实现**：Chrome151证明storage来自安全上下文中`Navigator.prototype`的enumerable
+原生getter，返回稳定branded `StorageManager`；prototype有`estimate/persisted/getDirectory/persist`，
+OPFS root为`FileSystemDirectoryHandle {kind:"directory",name:""}`，支持目录/文件handle、resolve、
+异步遍历、File snapshot与writable。Obscura按这些接口实现realm内存对象图，不访问宿主文件系统；
+非可信HTTP来源仍由既有secure-context门控隐藏。访问器helper同步修正`.name = "get <property>"`，
+没有hostname、ray、混淆字段或CF分支。
+
+**本地门**：安全/不安全来源focused 2/2；`obscura-js` release+render 534/534；精确release重链且
+trace patch检查为patched。workspace release+render 1674/1674（4 skipped），no-default feature
+check与`git diff --check`均通过；companion benchmark仓库不存在，obstacle course无法运行。
+
+**真实三ray结果**：零页面注入三轮均走top fo 200/约113.6KB、widget大fo 200/822-846KB、PAT401、
+后续widget fo 200/约127.2KB，并各输出两条明文payload；最终均无真实`/1.txt`。Zok稳定为
+N1165/o121/x266/F13/T11，与修改前数量一致；hGgWW0与修改前最后一个clean样本120项逐项完全相同，
+三轮SHA也一致。结论：这是有效的通用浏览器语义修复，但当前CF探针没有调用新增行为，不是hG或
+最终判定的直接修复。下一轮仍严格在本次导航完成第二个`/fo/`后，同时确认`interactiveBegin`与
+可见box，最早t=12.3s仅点击一次。
+
+**条件交互结果**：本轮导航后t=6.2s已完成至少第二个`/fo/`，300x65 box位于(192,304)，但
+`interactiveBegin=false`，因此没有点击；t=9.2s消息与box同时满足，等到稳定时刻t=12.5s后在
+(213,335)执行一次mouse activation，clickCount严格为1。点击后widget proof `/fo/`返回5240B，
+顶层转发`/fo/`返回3256B，约3s后新ray重新开始top/widget链；日志没有目标`/1.txt`真实请求或
+404。交互判据与点击链均有效，最终Cloudflare判定仍未通过。
+
+### Step 110 — URL与URLSearchParams internal slots（2026-08-30，验证中）
+
+**来源与假设**：HaHaVM-General的通用URL/URLSearchParams补全提示继续审计公开对象面。Obscura
+方法行为已较完整，但用普通JS字段保存解析状态，可能让页面从实例/prototype直接枚举到宿主实现。
+
+**Chrome151 oracle**：`new URL(...)`与其`searchParams`的own property names均为空；URL prototype
+依次为origin/protocol/username/password/host/hostname/port/pathname/search/searchParams/hash/href/
+toJSON/toString/constructor，URLSearchParams prototype为size/append/delete/get/getAll/has/set/sort/
+toString/entries/forEach/keys/values/constructor。Obscura修复前实例分别泄漏`_c/_sp`和`_p/_url`，
+prototype还泄漏`_set/_refreshSP/_updateSearch/_decode/_parseString/_setFromString/_notify`。
+
+**通用修复**：四类状态迁入WeakMap，内部helper移到闭包，按Chrome顺序重建公开prototype；URL解析、
+component setter仍委托既有Rust URL ops，URL与稳定searchParams对象的双向mutation保持。无站点、ray、
+payload字段或CF分支。原相对解析与新internal-slot focused 2/2，`obscura-js`535/535，workspace
+1675/1675（4 skipped），精确release、trace patch与no-default check均通过。
+
+**真实结果**：零页面注入三ray均有效，Zok稳定N1165/o121/x266/F13/T11，hG与修改前120项逐项
+0差异；六条payload均未出现被移除的URL私有字段/helper，说明当前CF分支没有读取该面。条件轮在
+本次导航完成第二fo、`interactiveBegin`和300x65可见box同时成立后，t=12.5s于(213,335)只点击
+一次；widget proof5160B、top转发3256B后换ray，仍无真实`/1.txt`。该修复保留为通用浏览器
+语义，不归因当前最终判定。
+
+### Step 111 — MouseEvent/PointerEvent标准字段与internal slots（2026-08-30，验证中）
+
+**假设**：HaHaVM-General为交互链补了PointerEvent altitude/azimuth和MouseEvent派生坐标；Obscura
+CDP激活虽已有trusted/sourceCapabilities/pointerId，但事件类可能仍缺标准可读面。
+
+**Chrome151 oracle**：`new PointerEvent('x')` own property names仅`isTrusted`；PointerEvent prototype
+为pointerId/width/height/pressure/tiltX/tiltY/azimuthAngle/altitudeAngle/tangentialPressure/twist/
+pointerType/isPrimary/getPredictedEvents/persistentDeviceId/constructor/getCoalescedEvents，MouseEvent
+prototype为screen/client坐标、四modifier、button(s)、relatedTarget、page/x/y、offset、movement、
+from/toElement、layer、getModifierState/initMouseEvent/constructor共26项。默认altitude=PI/2、
+azimuth=0，width/height=1，其余角度/坐标/pressure为0；两个event-list方法存在且persistentDeviceId
+为number。
+
+**Obscura修复前**：PointerEvent实例暴露37个own字段，PointerEvent prototype仅constructor，
+MouseEvent仅constructor/initMouseEvent；上述角度、派生坐标和方法多数为undefined。下一步先统计
+Event传播核心对字段的写入，再选择不会破坏dispatch/retarget/cancel语义的internal-slot边界。
+
+**实现与focused结果**：Event传播写入集中在`_eventTargetDispatch/_eventInvoke`，因此Event、UIEvent、
+MouseEvent、PointerEvent分别使用WeakMap保存状态；`isTrusted`保留Chrome实例own enumerable、
+non-configurable accessor，公开只读字段迁到prototype getter。补齐page/x/y、offset/movement/layer、
+altitude/azimuth、persistentDeviceId、coalesced/predicted。接口表只给新shell连父类，故显式把已有
+Mouse/Keyboard/Focus/Input/Composition重绑UIEvent，Pointer/Wheel保持MouseEvent链。
+
+传播focused4/4、构造shape2/2、CDP pointerId/metadata/sourceCapabilities均通过。CDP首轮offset测试
+写死坐标，实际fixture checkbox位于2400px流式块后，正确结果为client-realRect（可为负）；改为断言
+该通用几何不变量。sourceCapabilities首轮undefined则精确暴露已有MouseEvent未继承UIEvent，重绑后
+恢复trusted input capability且普通Event按Chrome为undefined。
+
+**跨realm与真实结果**：受影响crate全量首轮发现main realm Event交给iframe document时，frame
+realm WeakMap不认识对象而Illegal invocation。Event/UI/Mouse/Pointer state、trusted与
+sourceCapabilities改放Deno宿主共享registry，跨realm focused4/4；obscura-js+cdp 712/712
+（3 skipped）。零注入三rayZok不变，hG仅一轮index75的既有12/13波动。条件交互首轮18s恰在
+proof发起时关闭target；32s复核轮proof5160B、top3256B后换ray，仍无真实404。
+
+### Step 112 — WorkerNavigator StorageManager与OPFS（2026-08-30，验证中）
+
+**假设与oracle**：Step111日志确认worker `navigator.storage.getDirectory()`每轮抛undefined，且该异常
+在Step108/110旧日志已存在，不是事件回归。Chrome151 localhost worker证明storage来自
+WorkerNavigator.prototype，返回branded StorageManager；prototype顺序为estimate/persisted/
+constructor/getDirectory（无Window的persist），getDirectory返回空名branded directory root。
+
+**通用实现**：安全worker prep安装稳定StorageManager singleton与worker内WeakMap OPFS root/child
+handles，支持estimate/persisted/getDirectory、directory/file handle、resolve、File snapshot；不访问
+宿主文件系统。不安全worker不安装storage getter。方法登记进共享native registry，无站点或CF分支。
+
+**结果**：focused安全/不安全2/2。release三轮有效payload中worker getDirectory异常从旧版每轮必现
+降为0/3，证明修复命中真实执行路径；Zok不变，hG三轮逐项仍等于基线。最终条件轮在第二fo、
+interactiveBegin与300x65 box满足后t=12.5s只点一次，32s内proof/top/new-ray链完整，仍无目标404。
+
+**全字段稳定差分补充**：按非数字探针字段名合并Step111/112各三轮大payload，唯一满足两侧组内
+稳定且组间变化的字段是`jeECi1`：旧版`"timeout"`，worker OPFS后`null`；Chrome payload-2与
+payload-3也均为null，完成真实parity。相邻`jqoe0`为estimate quota，Chrome样本约10.737GB而
+Obscura为5GB，但配额随设备/策略动态，不能硬编码。`uRcJs7` Chrome约10.9、Obscura null，作为
+下一条worker操作缺口定位，不按字段值猜API。
+
+### Step 113 — `uRcJs7` worker源码边界（2026-08-30，完成）
+
+**假设**：`uRcJs7`与`jeECi1/jqoe0`同属worker storage/OPFS结果，Chrome约10.9而Obscura null；需恢复
+page传入worker并由onmessage eval的源码，不能按值形状猜API。
+
+**方法**：现有`--trace-op-file`不记录`op_worker_post_message`参数，临时在该op加入仅由
+`OBSCURA_DEBUG_WORKER_MESSAGES`开启的stderr全文记录；默认路径不执行。取得源码后完整删除诊断、
+重建最终二进制，再以Chrome oracle决定通用修复。
+
+**源码结果与清理**：真实消息为`navigator.storage.getDirectory()`→`getFileHandle(name,{create:true})`
+→`createSyncAccessHandle()`→`write(Uint8Array(1),{at:0})`→计时`flush()`→`close()`，成功值即
+`uRcJs7`；任一步失败写`jeECi1`。因此剩余缺口是标准FileSystemSyncAccessHandle行为。临时
+WORKERMSG Rust日志已完整删除，正式修复不得依赖字段名或worker源码文本。
+
+**Chrome oracle与实现**：Chrome151 worker中FileSystemSyncAccessHandle为全局非法构造品牌，实例
+own keys为空；prototype顺序close/flush/getSize/read/truncate/write/mode/constructor，mode为
+`readwrite`。write/read返回字节数，flush/close为undefined，getSize与File snapshot同步。Obscura
+在安全worker内实现内存backing、游标、独占锁与上述方法，不暴露到Window，不伪造flush耗时。
+
+**真实结果**：三轮`jeECi1=null`保持，`uRcJs7`从null稳定迁为number（内存flush实测0ms）；Chrome
+约10.9ms是磁盘/机器耗时，不能固定sleep。Zok N集合前后均1165且双向差集空；额外序列化差仅顺序
+和混淆变量名。最终条件轮t=12.5s只点一次，proof/top/new-ray完整，仍无目标404。
+
+**最终门**：focused1/1、workspace1677/1677（4 skipped）、精确release、no-default、trace patch、
+diff check与诊断标记清零均通过；companion obstacle course不存在，无法运行。
+
+### Step 114 — Navigator.getGamepads四槽返回（2026-08-30，完成）
+
+**证据**：Chrome payload-2/3与当前Obscura三轮全字段稳定差中，`FYRV8`为Chrome
+`[null,null,null,null]`、Obscura`[]`。Chrome151独立oracle确认`navigator.getGamepads()`每次返回
+新的普通Array，length4且四项null；方法name/length/toString为getGamepads/0/native。
+
+**根因与通用修复**：早期Navigator已有`getGamepads(){return []}`，后续Chrome surface虽然准备了
+四槽实现，却因属性存在而跳过。将早期实现改为每次新四null Array，并扩展navigator回归；不依赖
+设备、站点、ray或payload字段。
+
+**真实三轮与交互结果**：最终release零注入三轮中`FYRV8`均稳定从`[]`迁为
+`[null,null,null,null]`，与Chrome payload-2/3一致；worker字段继续保持`jeECi1=null`、
+`uRcJs7=0`，Zok三轮均为N1165/o121/x266/F13/T11。条件轮在第二个`/fo/`已完成且300x65 box
+可见、但`interactiveBegin=false`的t=6.2s明确不点；t=9.2s两项条件同时满足，t=12.5s在
+(213,335)仅点击一次。随后widget proof 5240B、top转发3256B和新ray链完整，仍未得到目标
+`/1.txt`的真实404。结论：gamepad字段已完成通用Chrome parity，交互判据与点击路径有效，但它
+不是当前最终判定的唯一阻塞。
+
+**最终门**：focused1/1、workspace1677/1677（4 skipped）、精确render+stealth release、no-default
+feature check、trace patch、diff check、诊断标记与端口清理均通过；companion obstacle course仓库
+不存在。阶段关闭，最终404判据继续未通过。
+
+### Step 115 — 跨源frame权限状态与Permissions Policy（2026-08-30，完成）
+
+**假设**：当前稳定差`fRDEs6/nMpu4`表现为Chrome denied、Obscura default/prompt，但不能按字段名
+直接改值。更可能的通用根因是挑战widget运行在跨源iframe，Chrome把Notification与未委托的
+权限查询拒绝，而Obscura所有realm共用top级default/prompt。
+
+**Chrome151 oracle**：本地双端口fixture分别测top、同源iframe、跨源iframe和显式delegation。
+top与同源frame均为`Notification.permission=default`，geolocation/notifications/camera/microphone
+四项query均prompt；跨源无`allow`时Notification和四项query全部denied；加
+`allow="geolocation; camera; microphone"`后这三项恢复prompt，notifications仍denied。所有query
+结果均为branded `[object PermissionStatus]`。这证明差异来自通用frame origin/permissions-policy
+语义，不是CF专用值。
+
+补充shape oracle：`PermissionStatus.name`会把query输入camera/microphone分别归一化为
+video_capture/audio_capture；geolocation/notifications保持原名。真实clean样本在state修复后仍显示
+输入原名，据此补通用name映射，不能把state-only迁移算作整字段对齐。
+
+**实现边界**：frame realm初始化已能通过`frame_container_info`取得宿主iframe nid，并通过
+`iframe_scopes_same_origin`判断与父realm的同源性；将只使用这些通用DOM/origin输入和iframe
+`allow`属性计算权限状态，不读取hostname、ray、混淆字段或挑战源码。
+
+**通用实现与focused结果**：`op_dom(frame_permission_allowed)`沿完整iframe祖先链比较typed Origin；
+geolocation/camera/microphone/midi按默认`self` allowlist处理，每个跨源边界必须由宿主iframe的
+`allow`显式委托，notifications不可委托且遇到任一跨源祖先即拒绝。JS侧把普通records替换为
+WeakMap slot-backed、每次query新建的branded Permissions/PermissionStatus，并把
+`Notification.permission`改为realm-aware原生形状getter。focused覆盖同源、跨源默认、跨源
+delegation三组状态及own/prototype/tag/identity，最终1/1通过。
+
+**真实clean三ray**：最终release用纯CDP导航采样，不安装preload/hook；三轮有效payload均为
+`fRDEs6="denied"`，`nMpu4`依次为geolocation/notifications/video_capture/audio_capture且四项
+state全denied，与Chrome payload-2/3精确一致。`FYRV8=[null,null,null,null]`继续保持。第三个候选
+ray在18s只到widget大fo，未计样本；改取新的25s完整ray，不把半轮数据混入3/3。
+
+**最终条件交互**：本轮widget大`/fo/`845576B和后续`/fo/`127216B均先完成，随后收到
+`interactiveBegin`且box为300x65，才在(213,335)执行唯一一次点击。点击后widget proof 5224B、
+top转发3256B并启动新ray，仍没有目标`/1.txt`真实404。权限字段已完成通用parity，但最终判据
+仍未通过。
+
+**最终门**：focused1/1、相关focused3/3、`obscura-js`538/538、workspace1678/1678（4 skipped）、
+精确render+stealth release、no-default feature check、trace patch与diff check均通过；9223/8766端口
+清空。新增权限源码无目标域名、挑战字段或交互路径分支；companion obstacle course仓库仍不存在。
+
+### Step 116 — NetworkInformation desktop公开面与internal slots（2026-08-30，完成）
+
+**来源与Chrome oracle**：权限修复后按字段名重排稳定差，排除locale/timezone、UA-CH、GPU、quota
+等输入项；独立Chrome151 desktop fixture证明`navigator.connection.type`为undefined且`'type' in`
+为false。对象own keys为空，prototype仅onchange/effectiveType/rtt/downlink/saveData/constructor，
+继承EventTarget；构造器为length0的非法原生构造。Obscura修复前无条件type=wifi，另暴露
+`_listeners/downlinkMax/ontypechange`和own EventTarget方法。
+
+**通用实现**：NetworkInformation状态迁入WeakMap，删除desktop Chrome不存在的公开成员，五个
+accessor按Chrome顺序/descriptor/native shape安装；singleton保持稳定并把prototype接到既有
+EventTarget，不改变当前downlink/rtt等动态输入值。无站点、challenge或payload字段分支。
+
+**focused结果**：新增shape回归与既有framework EventTarget回归2/2通过，覆盖own/prototype/tag、
+type缺失、非法构造、getter/setter native descriptor、singleton和change事件监听。
+
+**真实三ray与交互**：最终release纯CDP clean三轮中稳定字段从`vqXSL3="wifi"`迁为`null`，与
+Chrome payload-2/3一致；Step115 permissions字段保持。条件轮在widget大fo845896B、后续fo127224B、
+`interactiveBegin`和300x65 box均成立后只点击一次，产生proof5240B与top3256B并换新ray，仍无
+目标真实404。该通用语义修复命中真实探针，但不是最终判定唯一阻塞。
+
+**最终门**：workspace首轮仅既有MCP `test_evaluate`空标题失败；该项独立3/3后完整重跑
+1679/1679通过（4 skipped，1 leaky），no-default feature check、精确release、trace patch、diff check、
+定向字符串扫描与9223/8766端口清理均通过。companion obstacle course仓库仍不存在。
+
+### Step 117 — CSSStyleDeclaration named/computed枚举面（2026-08-30，完成）
+
+**HaHa参考与假设**：HaHaVM-General `760c7b4`把computed style numeric属性表从456增到475，新增
+19个Chrome新长属性。当前稳定差中`DZSw4`为Chrome空数组、Obscura数百索引，可能来自CSSOM枚举
+自洽检查；不能直接复制HaHa页面样本值，只使用属性名列表作为oracle线索。
+
+**Chrome151 oracle**：空inline style为length0、745个named own properties；两项inline声明为length2、
+745 named + 2 numeric own；computed style为length475、745 named + 475 numeric own。prototype顺序精确
+为cssText/length/parentRule/cssFloat/getPropertyPriority/getPropertyValue/item/removeProperty/setProperty/
+constructor。HaHa新475 dashed列表与Chrome当前computed item逐项对应。
+
+**Obscura修复前**：named own仅309，缺anchorName/fieldSizing/全部WebKit aliases等437项且多出应在
+prototype的cssFloat；computed仅渲染snapshot约74项；prototype泄漏`_pull/_replaceFromAttribute/_push`、
+缺parentRule/cssFloat且成员顺序错误。下一步只补通用CSSOM对象/枚举语义，computed值仍取真实render
+snapshot与现有通用initial fallback，不导入HaHa的站点样本值。
+
+**通用实现与focused**：补齐Chrome151的745 named顺序与HaHa/Chrome一致的475 computed dashed顺序；
+CSSStyleDeclaration状态迁WeakMap，内部helper移出prototype，补parentRule/cssFloat并按Chrome顺序重建
+公开成员。computed values仍由renderer snapshot、inline和通用initial fallback产生。新增parity与三项
+既有style回归4/4通过。
+
+**真实三ray与结论**：最终release纯CDP三轮中`DZSw4`均保持134项，且与修复前数组逐项完全相同，
+因此“DZSw4由CSSOM枚举缺口造成”的假设被真实A/B证伪。permissions/NetworkInformation字段保持。
+CSSOM修复保留为Chrome oracle证明的通用浏览器语义，但不归因当前challenge字段。
+
+**条件交互**：widget大fo845784B、后续fo127224B完成并收到`interactiveBegin`、300x65 box可见后，
+只点击一次；widget proof5240B、top转发3256B与新ray完整，仍无目标真实404。
+
+**最终门**：`obscura-js`540/540；workspace首轮仅既有MCP `test_navigate_and_snapshot`失败，该项
+独立3/3后完整重跑1680/1680通过（4 skipped）；no-default feature check、精确release、trace patch、
+diff check、定向字符串扫描和端口清理均通过。release自检named/computed/own为745/475/1220，
+prototype与Chrome一致；companion obstacle course仓库仍不存在。
+
+### Step 118 — WebGL RGBA/UNSIGNED_BYTE标准常量（2026-08-30，完成）
+
+**证据与假设**：Step117最终clean payload的`JlnK7`与Chrome payload-2逐项比较，53项
+`getInternalformatParameter`结果和53个internalformat枚举码全部相等；唯一差异是Chrome标量
+6408/5121、Obscura null/null，恰为WebGL `RGBA`与`UNSIGNED_BYTE`。因此不采用HaHa的设备MSAA常量，
+只验证并补标准WebGL常量公开面。
+
+**Chrome oracle与实现**：Chrome151确认RGBA/UNSIGNED_BYTE同时存在于WebGL1/2构造器和prototype，
+descriptor均为不可写、可枚举、不可配置，实例不own。正式实现不只写两项，而是补齐同一WebGL1
+核心pixel type/format规范组16项，并同步安装到WebGL1/2两层；不改变设备MSAA/renderer输入。
+
+**focused**：16项WebGL1/2实例值、构造器/prototype descriptor与instance-own回归1/1通过。
+
+**首次真实A/B修正假设**：release首个有效ray中JlnK7仍为null/null，证伪“字段直接读取RGBA/
+UNSIGNED_BYTE常量”。结合payload结构，标量实际更可能来自
+`getParameter(IMPLEMENTATION_COLOR_READ_FORMAT/TYPE)`；停止剩余重复ray，转做该通用查询oracle。
+
+**最终oracle与修复**：Chrome151的IMPLEMENTATION_COLOR_READ_FORMAT/TYPE常量为35739/35738，WebGL1/2
+`getParameter`均返回6408/5121。补这两个标准常量与参数投影，并纳入同一pixel-format focused；
+不改adapter或MSAA设备输入。
+
+**真实三ray与交互**：最终release的`JlnK7`三轮均与Chrome整个四项对象逐值完全相等（不仅标量）；
+条件轮在大fo845532B、后续fo127216B、`interactiveBegin`和300x65 box成立后只点击一次，产生
+proof5240B、top3256B并换新ray，仍无目标真实404。
+
+**最终门**：focused1/1、`obscura-js`541/541；workspace首轮仅MCP `test_evaluate`失败，该项独立
+3/3后完整重跑1681/1681通过（4 skipped）。no-default feature check、trace patch、diff check、
+定向字符串扫描和端口清理均通过；companion obstacle course仓库仍不存在。结论：该字段已由
+Chrome oracle支持的通用WebGL参数语义闭环，但不是最终判定的唯一阻塞。
+
+### Step 119 — WebGL完整标准常量公开面（2026-08-30，完成）
+
+**假设与筛选**：Step118最终serve只取line55/97/139三个clean完整payload，排除click/proof/new-ray；
+同侧稳定后共有133字段、值差64。`hyPAq3`有六个Chrome非空/Obscura null项，结构与Step118相同，
+可能是参数表有答案但公开常量缺失。locale/timezone、硬件/GPU、旧Chrome目标URL与布局输入不作候选。
+
+**HaHa参考边界**：HaHa 760c7b4只新增按平台硬编码的MSAA样本数，属于设备指纹输入，不迁移。
+
+**Chrome oracle与根因**：Chrome151中WebGL1/2 prototype分别有298/559个numeric标准常量，constructor
+同步持有；descriptor均为不可写、可枚举、不可配置，实例不own。Obscura此前只有Step118的18个
+pixel常量。六个null精确映射`GENERATE_MIPMAP_HINT`、`POLYGON_OFFSET_FILL`和四个stencil mask；
+前两项参数答案已存在，四个mask默认均为4294967295。默认context的`powerPreference`是`default`，
+不因旧payload的`low-power`硬改默认。
+
+**通用实现与focused**：由Chrome公开标准enum面生成WebGL1 298项及WebGL2额外261项静态表，统一安装
+到constructor/prototype；补四个标准stencil mask查询默认值。未增加设备能力、MSAA、renderer或
+站点分支。focused覆盖数量、descriptor、instance-own、表边界及六个查询结果，1/1通过。
+
+**待验证**：精确release、三ray真实字段迁移、第二fo后的条件单击和完整门。
+
+**真实三ray修正假设**：精确release三轮均为完整38/39-part payload。`hyPAq3`后四项从null稳定
+迁为四个4294967295（3/3），与Chrome一致；前两个4352/false位置仍为null（3/3），所以“六项都
+由缺公开常量触发”被部分证伪。受控CDP直接验证HTMLCanvas WebGL2的`GENERATE_MIPMAP_HINT`、
+`FRAGMENT_SHADER_DERIVATIVE_HINT`、`RASTERIZER_DISCARD`、`POLYGON_OFFSET_FILL`及显式low-power attrs
+均正确；剩余两项属于另一个方法/入口/realm，未精确定位前不猜值。完整常量面仍由独立Chrome
+oracle证明，是应保留的通用修复。
+
+**条件交互**：第二fo后300x65 box先出现但`interactiveBegin=false`，明确不点；随后两者同时成立，
+于12.5s只点击一次。widget proof5240B、top转发3256B并进入新ray，仍无目标真实404。结论：完整
+常量面和四个mask查询完成通用语义修复及真实字段迁移，但不是最终判定的唯一阻塞；剩余两个null
+待下一步精确定位，不作字段定向修补。
+
+**最终门**：focused1/1、`obscura-js`541/541、workspace1681/1681（4 skipped）；no-default check、
+精确release、trace patch、diff check、定向字符串扫描和端口清理均通过。源码无站点、CF、ray、
+payload字段或交互流程分支；companion obstacle course仓库仍不存在。
+
+### Step 120 — WebGL1扩展启用状态参数语义（2026-08-30，完成）
+
+**调用序列取证**：native-shape CDP预注入记录183次canvas/WebGL调用，完整payload仍为38 parts。
+`hyPAq3`前两个null精确来自WebGL1 `getParameter(35723)`与`getParameter(36795)`，即
+`OES_standard_derivatives.FRAGMENT_SHADER_DERIVATIVE_HINT_OES`和
+`EXT_disjoint_timer_query.GPU_DISJOINT_EXT`。质询还先尝试OffscreenCanvas WebGL1/2并得到null，
+随后回退HTMLCanvas；但字段两项由HTMLCanvas WebGL1调用直接记录，不把Offscreen缺口混入归因。
+
+**Chrome oracle**：扩展启用前两pname均返回null并置`INVALID_ENUM(1280)`；调用对应`getExtension`
+后返回4352/false且`NO_ERROR`。扩展对象实例own keys为空，常量在prototype上readonly/enumerable/
+nonconfigurable，重复`getExtension`返回同一对象。timer prototype另有标准七常量与八方法。
+
+**实现计划**：按context扩展缓存门控两pname与error slot，并安装通用标准extension prototype；
+不无条件补参数值，不加入站点、字段或设备分支。
+
+**通用实现与focused**：context增加首错error slot；WebGL1/2按对应扩展缓存门控0x8B8B/0x8FBB；
+OES对象安装单一标准常量，timer对象安装七常量与八方法，prototype descriptor/tag/instance-own及
+重复identity对齐Chrome。focused覆盖启用前后返回值和getError、对象shape，1/1通过。
+
+**真实三ray与交互**：最终release三轮均将`hyPAq3`前两个null迁为4352/false（3/3），四个mask
+与其余位置不变。35项中34项与Chrome149旧payload一致；唯一`powerPreference=default`对比旧样本
+low-power，但Chrome151当前默认明确为default，不按旧版本/设备输入修改。条件轮box先可见而
+interactive=false时不点，12.5s两条件齐备后只点一次；proof5240B、top3256B、新ray完整，仍无404。
+
+**最终门**：focused1/1、`obscura-js`542/542、workspace1682/1682（4 skipped）；no-default check、
+精确release、trace patch、diff check、定向字符串扫描和端口清理均通过。companion obstacle course
+仓库仍不存在。结论：两项扩展状态语义和真实字段迁移闭环，但不是最终判定的唯一阻塞。
+
+### Step 121 — Apple WebGL2 uniform-buffer capability一致性（2026-08-30，完成）
+
+**证据与oracle**：Step120调用序列把`mYHfU0`唯一数值差定位为pname0x8A2F
+`MAX_UNIFORM_BUFFER_BINDINGS`：Obscura Apple profile 24、Chrome149旧payload 32。Chrome151当前
+Apple M2 Max oracle仍返回32；Obscura同profile公开renderer为Apple M2，因此24是内部能力描述不一致，
+不是任意设备值硬编码。
+
+**实现**：Apple WebGL2 capability override补0x8A2F=32，并纳入既有Apple profile focused；不改
+其他adapter、MSAA或站点行为。
+
+**真实三ray与交互**：`mYHfU0`对应位置24→32稳定3/3，`hyPAq3`前两项保持4352/false。
+首个条件点击挑战未产生proof，不计链路成功；第二个独立挑战仍按interactive+box后只点一次，产生
+proof5240B、top3256B并换ray，仍无404。
+
+**最终门**：focused1/1；并行workspace三轮仅MCP时序项波动，`test_wait_for_selector`单项累计6/6、
+`test_navigate_and_snapshot`3/3通过；`--test-threads 1`完整workspace1682/1682通过（4 skipped）。
+no-default、精确release、trace、diff/定向扫描/端口均通过；obstacle repo仍不存在。
+
+### Step 122 — WEBGL_compressed_texture_astc标准扩展对象（2026-08-30，完成）
+
+**筛选与映射**：Step121三clean payload稳定差仍63项；排除WebGL `powerPreference`版本差、设备、locale、
+目标URL和动态值。`sbfeV2`已有历史证据为混淆变量轮换，再次排除。`jimCO7`五段仅第三段为
+Chrome149 `["ldr"]`、Obscura null；HaHa与旧Obscura备份提示它是ASTC `getSupportedProfiles()`。
+
+**Chrome151 oracle**：WebGL1/2均返回branded `WebGLCompressedTextureASTC`对象，实例own keys为空；
+prototype依次有28个ASTC标准常量和`getSupportedProfiles`，方法descriptor为writable/enumerable/
+configurable，每次返回新数组`["ldr","hdr"]`，同context重复getExtension保持identity。旧Chrome149
+仅`["ldr"]`属于版本/驱动差，不为旧payload裁掉当前`hdr`。
+
+**实现计划**：用通用WebGL extension factory安装完整标准对象，两context复用语义；不添加站点或
+payload分支。
+
+**通用实现与focused**：ASTC extension prototype安装14个RGBA与14个sRGB标准常量，
+`getSupportedProfiles()`每次返回fresh `["ldr","hdr"]`，通过context extension cache保持identity；
+WebGL1/2完整shape回归1/1通过。
+
+**真实三ray与交互**：`jimCO7`第三段null→当前Chrome的`["ldr","hdr"]`稳定3/3，其余四段、
+`hyPAq3`和`mYHfU0`保持。条件轮interactive=false时不点，12.5s条件齐备后只点一次；proof5148B、
+top3256B并换ray，仍无目标404。
+
+**最终门**：focused1/1；首轮串行workspace仅MCP本地fixture连接竞态失败，该项单独3/3后完整
+串行重跑1683/1683通过（4 skipped）。no-default、精确release、trace、diff/定向扫描/端口均通过；
+obstacle repo仍不存在。结论：ASTC通用语义与真实字段迁移闭环，但不是最终判定唯一阻塞。
+
+### Step 123 — CDP输入状态移出window字符串公开面（2026-08-30，完成）
+
+**新鲜基线与筛选**：Chrome151经同一代理、UA/viewport对齐取得三轮当前`/1.txt`完整payload；
+稳定值差由旧基线62降到35。RTC Proxy探针改变上游分流而作废；offer/capabilities在Chrome当前本就
+分叉，不做局部codec拼接。`wKEE1`的dir差由页面脚本后置 mutation造成，raw响应两侧均无dir，排除。
+
+**通用缺陷证据**：同一HTTPS页面5s window own-name对拍再次发现Obscura-only
+`__obscura_click_target`；它在focus/geometry/scroll/CDP input后写入window，profile Step93已列为
+未闭环泄漏。同族`__obscura_focused`、hover_target、mouse_down也会在交互后出现。Chrome无这些字段。
+
+**实现计划**：四个输入状态迁到共享`Symbol.for`宿主槽，bootstrap与CDP桥统一读写；增加触发各路径后
+旧own string names为空的回归。不改变命中、focus或事件派发语义。
+
+**通用实现与focused**：focused/clickTarget使用bootstrap共享Symbol，hover/mouseDown由CDP注入代码
+读写同一Symbol.for宿主槽；DOM scroll与直接测试桥同步更新。bootstrap触发focus/geometry/scroll和
+CDP trusted click两项focused 2/2通过，旧四个own string names均为空。
+
+**真实三ray与交互**：最终release三轮完整38-part且既有jim/tl/WebGL字段保持；独立12秒真实页面
+own-name快照中四个旧输入字段为`[]`。条件轮interactive=false时不点，条件齐备后只点一次，产生
+proof5160B、top3256B并换ray，仍无目标404。
+
+### Step 124 — WebRTC四组能力数组的无扰动归因（2026-08-31，完成）
+
+**假设**：新鲜Chrome151三轮中仍稳定的`tlDjt8`差异来自一个或多个标准WebRTC查询，但四组数组尚未
+映射到具体API、kind、codec或属性访问。Obscura的offer SDP是旧Chrome转录，当前Chrome151的
+`createOffer()`与`RTCRtpSender.getCapabilities()`本身也使用不同codec集合，因此局部补两个H264 codec
+会制造内部不一致，禁止作为修复。
+
+**测量状态**：Step123三条clean样本精确选自最终日志第55/97/139行，均为38 parts，`jimCO7`、
+`tlDjt8`及已闭环WebGL字段保持不变，四个旧输入own names均未出现。重新启动受控Chrome151并对齐
+UA、800x600、locale和timezone后三轮均到两次`/fo/`，但当前Chrome路径取得的`chl_page`源码不再含
+代理`payloadJSON`注入，CDP也无对应console事件；这些轮次不纳入明文diff，不退回旧Chrome149基线。
+
+**下一方法**：不用会改变对象shape的Proxy预注入。先在Obscura WebRTC实现内部增加临时、被动的调用
+日志，仅记录标准API与参数，不改返回值；恢复真实调用序列后删除诊断，再用受控Chrome oracle逐项解释
+四组数组。只有完整归因后才允许通用语义修改。
+
+**无扰动归因**：宿主侧日志证明top与widget各调用一次`RTCPeerConnection → createDataChannel("") →
+createOffer({offerToReceiveAudio:true,offerToReceiveVideo:true}) → setLocalDescription`；widget随后调用
+`RTCRtpSender.getCapabilities("audio"/"video")`，再对固定8个audio和10个video配置调用
+`MediaSource.isTypeSupported`与`navigator.mediaCapabilities.decodingInfo`。临时日志轮仍生成原值
+`tlDjt8=[[1x8],[1,1,1,0,1,1,1,1,1,0],[3,0,0,3,3,3,3,3],[3,3,3,0,3,3,3,3,3,0]]`，
+说明该观测未像Proxy一样改变上游。
+
+**字段完整映射**：前两组是MediaSource对8/10配置的布尔；后两组把MediaCapabilities的
+`supported/smooth/powerEfficient`编码为1/2/4位掩码。Chrome151独立oracle的MediaSource结果精确为
+`[1,0,0,1,1,1,0,0]`与`[1,1,1,1,1,1,1,1,1,0]`，逐项解释payload前两组。Obscura的3是
+`supported|smooth`且`powerEfficient=false`；Chrome当前Apple硬件多数为7。硬件效率不是通用常量，
+不为字段改成true；Chrome challenge第四组稳定null也不按页面结果强制制造。
+
+**通用缺陷与计划**：Chrome151证明`canPlayType`、`MediaSource.isTypeSupported`、MediaCapabilities三者
+并不共享一张表；例如`audio/ogg;codecs=vorbis`分别为probably/false/supported。现有“必须同表”假设
+被证伪。另Chrome的`navigator.mediaCapabilities`是无own keys的branded singleton，方法位于
+`MediaCapabilities.prototype`，结果只有`powerEfficient/smooth/supported/keySystemAccess`；Obscura是
+普通own-method对象且多出`configuration`。正式修改仅实现这些通用API规则与shape，不包含站点、字段或
+challenge时序分支；临时`RTCDBG`全部删除后再测试。
+
+**通用实现与focused**：MIME/codec用结构化解析后分别投影canPlayType、MediaSource和
+MediaCapabilities规则；AC-3/EC-3与HEVC声明按Chrome151当前Apple oracle修正。新增branded
+`MediaCapabilities`非法构造器、prototype enumerable方法、稳定Navigator prototype getter与四字段结果；
+`powerEfficient`保持false。focused覆盖8/10矩阵、Ogg分歧、shape/order/keys，1/1通过。
+
+**真实三ray与交互**：最终release三条有效38-part ray的`tlDjt8`稳定为
+`[[1,0,0,1,1,1,0,0],[1,1,1,1,1,1,1,1,1,0],[3,0,0,3,3,3,3,3],
+[3,3,3,3,3,3,3,3,3,0]]`；前两组从Obscura旧值精确迁为Chrome值，第三组保持诚实的3，第四组
+HEVC位置0→3与独立API oracle一致。`IMOh8`仍8/21且`jimCO7`保持。条件轮t=6.2s box可见但
+interactive=false时不点，t=6.5s条件齐备后只点一次；第二widget fo此前已完成，随后proof5160B、
+top3256B并换ray，仍无真实404。
+
+**最终门**：focused2/2、串行workspace1683/1683（4 skipped）；no-default、精确release、trace、
+diff、端口和正式源码泄漏扫描均通过。obstacle repo仍不存在。结论：Step93遗留内部字段泄漏闭环，
+但不是最终判定唯一阻塞。
+
+### Step 125 — `console.memory`通用Chrome公开面（2026-08-31，完成）
+
+**HaHa参考筛选**：重点审计HaHaVM-General `760c7b4`的`core/**`，排除其checkbox轨迹、heap/MSAA
+固定样本、随机CPU/内存与canvas像素。`removeAttribute`、2D `getContextAttributes`、WebGPU canvas、
+ImageData、CSSOM和WebGL internalformat均已由Obscura更完整实现。剩余高信号候选是HaHa补出的
+`console.memory`；HaHa的固定`jsHeapSizeLimit`只作定位提示，不迁移数值。
+
+**假设与Obscura基线**：Chrome公开console上存在稳定的memory入口，而Obscura当前
+`"memory" in console=false`、无own descriptor且值undefined；它只有`performance.memory`。
+下一步用Chrome151独立oracle确认descriptor、identity、对象keys、品牌和与performance.memory的关系，
+仅在通用语义闭环后实现。
+
+**Chrome151 oracle与根因**：`console.memory`是console own enumerable/configurable accessor，匿名
+getter length0与匿名no-op setter length1均native；`performance.memory`是Performance.prototype上的
+enumerable/configurable getter。两入口每次返回不同fresh wrapper，但共享同一当前heap数值和同一
+MemoryInfo prototype。实例own keys/names为空，prototype依次是totalJSHeapSize/usedJSHeapSize/
+jsHeapSizeLimit三个enumerable/configurable getter，错误receiver抛`TypeError: Illegal invocation`，
+prototype的toStringTag为MemoryInfo且不存在全局MemoryInfo构造器。Obscura的performance.memory还错误地
+是稳定own普通对象，因此应两入口一起修，而不是只加HaHa的普通对象console getter。
+
+**实现计划**：保留Obscura现有每页动态heap数值和limit，不复制HaHa固定数字。用共享realm backing、
+WeakSet品牌与fresh MemoryInfo wrapper实现两个标准getter；console setter保持Chrome no-op。增加focused
+覆盖descriptor、identity、brand、prototype顺序和两入口数值一致性。
+
+**通用实现与focused**：现有每页`_fpRand` heap结果改存共享realm backing；Performance prototype getter
+与console own匿名get/no-op set每次创建fresh branded MemoryInfo，三getter按Chrome顺序和descriptor安装，
+错误receiver抛Illegal invocation。未暴露全局构造器、未改heap数值。focused 1/1通过。
+
+**真实三ray与交互**：三条有效38-part clean ray与Step124共有132个稳定字段逐项0差异，tlDjt8、
+IMOh8、jimCO7及WebGL字段保持；本轮payload未把console.memory单独编码为稳定字段。条件轮总体第二个
+fo（widget大提交845756B）完成后，t=6.2s box可见但interactive=false不点，t=8.0s条件齐备后只点
+一次；随后127224B提交、proof5224B、top3256B和新ray完整，仍无真实404。
+
+**最终门**：focused1/1、obscura-js544/544、workspace1684/1684（4 skipped）；no-default、精确
+release、trace patch、diff/新增定向字符串/端口检查通过。companion obstacle course仓库不存在。
+结论：HaHa提示的公开面已按更完整Chrome语义闭环，但不是最终判定唯一阻塞。
+
+### Step 126 — 完整Chrome console方法面（2026-08-31，完成）
+
+**HaHa参考与假设**：HaHa完整browserConsole提示Obscura除了刚补的memory外，还缺dirxml、profile、
+profileEnd、timeStamp、context、createTask六个Chrome方法。Obscura实测现有trace/table/group/time/count等
+方法虽存在，但Function.toString仍泄漏`() => {}`；console own-key顺序也不同。该面是通用Chrome公开
+接口，不依赖站点、设备或payload字段。
+
+**方法**：采集Chrome151全部console own names、每个方法的name/length/native/descriptor，并验证
+context facade与createTask.run语义；不改变现有“console不主动遍历对象getter”的惰性格式化规则。
+
+**Chrome151 oracle与计划**：console own顺序为debug/error/info/log/warn/dir/dirxml/table/trace/group/
+groupCollapsed/groupEnd/clear/count/countReset/assert/profile/profileEnd/time/timeLog/timeEnd/timeStamp/context/
+createTask/memory；24方法均writable/enumerable/configurable native，除context.length=1外均length0。
+console tag为`[object console]`。context返回fresh普通对象，按固定顺序有22个独立length1 native方法
+（使用dirXml），不含context/memory/createTask。createTask返回普通对象，own enumerable run为length0 native；
+合法调用以window为this、零参数执行回调并透传返回值，非函数或错误receiver抛Error。正式实现按此完整
+shape重建方法表，保留现有日志惰性格式化与宿主输出。
+
+**focused首轮修正**：5项console相关测试中4项通过，唯一差异为createTask实例不是直接继承
+Object.prototype，而是共享一个own仅constructor的中间prototype；补该标准prototype层后重跑，首轮
+不计门禁成功。
+
+**通用实现与focused**：按Chrome顺序重建24方法，全部native name/length/descriptor；补console tag、
+fresh context facade与带共享中间prototype/receiver检查的createTask.run。现有惰性对象格式化复用不变。
+首轮prototype修正后console相关focused 5/5通过。
+
+**真实三ray与交互**：三条完整38/39-part中tlDjt8、jimCO7保持；console面稳定迁移hGgWW0一处计数
+12→13及三个方法枚举/调用序列字段，符合公开面变化。条件轮第二总体fo大提交822608B完成后，t=6.2s
+box可见但interactive=false不点，t=6.5s条件齐备后只点一次；随后127216B、proof5160B、top3256B和
+新ray完整，仍无真实404。
+
+**最终门**：focused5/5、obscura-js545/545、workspace1685/1685（4 skipped）；no-default、精确
+release、trace patch、diff/新增定向字符串/端口检查通过。companion obstacle course仓库不存在。
+
+### Step 127 — Blob/File internal slots与UTF-8替换语义（2026-08-31，完成）
+
+**HaHa参考与筛选**：HaHaVM-General `ac29524`修正Blob分片拼接，提示继续审计该通用对象面；同批
+URL、elementFromPoint、Canvas/WebGPU、removeAttribute和console在Obscura已有更完整实现，不重复迁移。
+HaHa固定XHR cache headers、iframe 10ms延时与CF点击轨迹属于宿主或站点逻辑，明确排除。
+
+**假设与基线**：Obscura Blob实例自有`_bytes/size/type`，File再自有`name/lastModified`；Chrome WebIDL
+对象应以internal slots和prototype getter暴露。值层还有一处明确偏差：Obscura把null/undefined BlobPart
+当空字节，Chrome按DOMString写入`nullundefined`。
+
+**Chrome151 oracle**：Blob/File实例own names与keys均为空，prototype顺序分别为
+`size,type,arrayBuffer,slice,stream,text,bytes,textStream,constructor`和
+`name,lastModified,lastModifiedDate,webkitRelativePath,constructor`；属性/方法均为enumerable、
+configurable WebIDL成员，Blob/File构造器length为0/2，slice.length=0。File继承Blob，lastModified
+123.9截断为123，lastModifiedDate每次返回fresh Date，native endings在macOS把CRLF归一为LF。
+同一字节样本的text/bytes/arrayBuffer/stream/textStream及非法receiver均已采集。
+
+**附带根因**：样本中的0xff使Obscura TextDecoder热路径产出孤立surrogate，JSON序列化直接非法；
+Chrome对非法lead、非法continuation、过长编码、surrogate区、超U+10FFFF和截断序列按WHATWG规则产生
+U+FFFD。9组Chrome151 code-point oracle已固定到既有TextDecoder回归。
+
+**通用实现与focused**：Blob/File字节、type、name和lastModified迁到realm WeakMap；所有内部消费者
+（fetch/FormData、object URL、FileReader、OPFS）改读internal slots。补完整prototype顺序、descriptor、
+brand check、stream/textStream与File getter；null/undefined恢复字符串分片。UTF-8热路径保留纯JS性能，
+但增加完整合法范围与replacement校验。Chrome parity focused1/1，相关Blob/TextDecoder/worker/OPFS
+测试6/6、obscura-js release+render 546/546通过。
+
+**真实三ray与交互**：最终release三条clean payload均完整，分别91/38、91/38、92/39 key/parts；
+Step126与Step127共有136个稳定字段逐项0差异，说明本次修复没有扰动既有payload，但当前挑战未把
+Blob/File面单独稳定编码。条件轮6.2s box可见但interactive=false时不点，7.1s条件齐备后仅点一次；
+随后proof5240B、top3256B并换新ray，仍无目标真实404。PAT保持401。
+
+**最终门**：focused1/1、相关6/6、obscura-js546/546、workspace1686/1686（4 skipped，1 leaky）；
+no-default feature check、精确release、trace patch、diff/源码定向字符串/端口检查全部通过。companion
+`obscura-benchmark`仓库不存在，obstacle course无法运行。结论：Blob/File与UTF-8通用缺陷闭环，
+但不是最终判定唯一阻塞；下一候选为XHR公开shape/state。
+
+### Step 128 — XMLHttpRequest公开面与internal slots（2026-09-01，完成）
+
+**HaHa参考与假设**：HaHaVM-General把XHR属性/常量/方法放在`XMLHttpRequest.prototype`，事件handler
+放在`XMLHttpRequestEventTarget.prototype`，提示审计Obscura当前实现。Obscura实测源码把readyState、
+status、response、请求URL/header、aborted、listeners和全部handler写成实例own字段，upload还是只有两个
+own no-op方法的普通对象，并在XHR prototype重复EventTarget方法。Chrome应使用WebIDL prototype成员与
+internal slots；这是通用环境缺陷，不依赖站点或payload。
+
+**边界**：HaHa的固定`pragma/cache-control`、资源大小、10ms iframe延时与全局headers属于宿主/站点输入，
+不迁移。正式实现必须保留Obscura现有realm相对URL、fetch/CORS/credentials和真实响应路径；先采Chrome151
+constructor/prototype/descriptor/own keys、upload品牌、初始/open/abort状态和非法receiver，再决定范围。
+
+**Chrome152 oracle**：本机Chrome已升级到152。XHR与Upload实例own names/keys均为空，品牌分别为
+`XMLHttpRequest/XMLHttpRequestUpload`；XHR prototype按onreadystatechange、状态accessor、五常量、七方法、
+constructor、responseXML、setAttributionReporting、setPrivateToken排列，EventTarget prototype只own七个
+handler与constructor，Upload prototype只own constructor，三层prototype连接标准EventTarget。所有WebIDL
+成员enumerable/configurable，常量readonly/nonconfigurable；构造器length均0且后两者illegal constructor。
+
+**状态/事件oracle**：初始response与responseText均空串而非null；open只产生trusted Event类型的
+readystatechange并到OPENED。send前abort保持OPENED且不新增事件。成功响应顺序为readystatechange(1)、
+loadstart ProgressEvent、readystatechange(2/3)、progress ProgressEvent、readystatechange(4)、load/loadend
+ProgressEvent；5B body的progress/load/loadend均loaded=total=5。响应headers小写并以CRLF结尾。send/header
+在open前、错误receiver和非text responseText均抛标准TypeError/InvalidStateError。
+
+**请求头反证HaHa固定值**：同源Chrome GET仅有accept/referer/UA/UA-CH，无`pragma`、`cache-control`、
+`content-type`或手工`origin`，因此这些HaHa值明确不迁移。正式实现范围为WeakMap slots、WebIDL shape、
+branded upload、标准状态/事件与保留现有fetch路径。
+
+**通用实现**：XHR与Upload状态、headers、handler、request token和timeout全部迁WeakMap；新增illegal
+`XMLHttpRequestUpload`与标准三层prototype/own顺序/readonly常量/品牌。handler setter接入通用listener
+registry，内部readystatechange用trusted Event，load/progress/timeout/abort/loadend用trusted ProgressEvent；
+open/send/header/receiver增加标准状态异常。响应读取改保留原始bytes，arraybuffer/blob不再由文本重编码；
+realm相对URL、fetch CORS与credentials路径保持。EventTarget=Node架构中，通用dispatcher现在仅把带真实
+node slot的对象当DOM Node，避免XHR进入parent/shadow路径。
+
+**statusText附带修复**：focused首轮shape/event和两个既有回归均通过，仅201响应reason phrase为空；
+定位为普通与stealth `op_fetch_url`均只回数值status。两路径用标准StatusCode canonical reason加入
+`statusText`，JS Response透传，不做XHR局部硬编码。重跑focused 3/3通过。
+
+**真实三ray**：最终release三条clean均完整，为38/39/39 parts。隔夜challenge轮换了全部混淆字段名，
+Step127与Step128按字段名交集为0，故禁止把普通stable diff归因代码；改按结构身份复核。Zok三轮均
+N1165/o121/x266/F13/T11且XHR/EventTarget/Upload都在N，120项数组均true76/false22/null6，与Step127
+逐结构一致。该轮证明无链路/结构回退，但不能声称某个旧混淆字段迁移。
+
+**条件交互**：6.2s第二fo完成且box可见但interactive=false时不点，7.1s条件齐备后仅点一次；
+proof5160B、top3256B与new-ray完整，PAT401，目标仍为challenge而非真实404。serve已停止。
+
+**新增测量盲区**：challenge版本跨日轮换会让全部探针字段名变化；跨版本不能按字段名stable diff，
+必须先确认同一源码版本，或用Zok键集合、数组长度/类型/计数等结构身份对齐。否则“0 commonStable”
+只是混淆轮换，不是引擎所有能力同时变化。
+
+**最终门**：focused3/3、obscura-js547/547、workspace1687/1687（4 skipped）；no-default feature check、
+精确release、trace patch、diff/定向源码/端口检查全部通过。companion `obscura-benchmark`不存在，
+obstacle course无法运行。结论：XHR公开面、internal slots、事件和statusText通用缺陷闭环，但仍不是
+最终判定唯一阻塞；下一候选为同一fetch栈的Headers/Request/Response internal slots与公开shape。
+
+### Step 129 — iframe embedded CSP与Trusted Types继承（2026-09-01，调查中）
+
+**目标与假设**：成功判据不再是提交链完整，而是`https://www.thelancet.com/1.txt`返回真实404。当前
+frame controller已把网络响应CSP写入DocumentScope，srcdoc/about:blank复制父scope CSP，frame realm的
+fetch从自己的scope读取connect-src；但`FrameNavigationRequest`无embedded CSP字段，顶层/嵌套iframe
+属性采集也不读`csp`。若挑战iframe依赖HTMLIFrameElement CSP embedded enforcement，Obscura会运行在
+比Chrome更弱或不同的policy组合下，最终proof可提交但环境分类不同。
+
+**已确认实现边界**：top response CSP由Page保存并注入main runtime；network frame只保存自身response
+header；local frame继承parent scope；同步initial about:blank同样复制shadow-including parent scope；frame
+fetch按content root scope选择CSP，已非top-policy误用。缺口集中在`iframe[csp]`公开面、请求协商和与
+response/inherited policy的组合，不重复修已闭环的realm选择。
+
+**下一方法**：Chrome152双源fixture分别测srcdoc、about:blank、无CSP network frame、response CSP frame、
+`iframe[csp]` frame；同时观察`Sec-Required-CSP`/加载结果、connect-src fetch和require-trusted-types-for
+下plain eval。只有Chrome oracle证明后才修改请求/commit逻辑。
+
+**Chrome152 oracle**：`HTMLIFrameElement.prototype.csp`是enumerable/configurable反射accessor。父
+connect-src none会约束srcdoc/about:blank；network frame不继承父policy而使用自身response CSP。父级
+require-trusted-types-for同样在srcdoc/about:blank中阻止plain eval，network frame不继承。
+
+**embedded enforcement**：network `iframe[csp="connect-src 'none'"]`请求带
+`Sec-Required-CSP: connect-src 'none'`。无response CSP且无Allow-CSP-From时响应体不提交并变为不可访问
+错误页；response带精确/更强policy时正常提交且fetch受限。local document中，csp属性直接约束srcdoc，
+但不约束初始about:blank；后者只继承creator policy。这三条必须分开实现。
+
+**真实目标相关性**：closed-shadow属性探针确认当前Turnstile iframe只有style/src/allow/sandbox/id/
+tabindex/title，没有`csp`。因此本修复补通用浏览器机制，但现有证据不支持把它称为404根因；完成后必须
+继续点击后Chrome/Obscura第一处分歧。
+
+**通用实现与focused**：补`HTMLIFrameElement.csp`反射；ResourceRequest新增单请求headers并在普通/
+stealth transport及callbacks中一致合并；network frame发送Sec-Required-CSP。response CSP同等/更强或
+Allow-CSP-From接受才提交，否则返回专门EmbeddedEnforcement阻断；Allow接受时required policy与response
+有效source-list求交集。srcdoc与creator policy求交，about:blank忽略csp属性。策略单元、network exact/
+Allow/reject、local srcdoc/blank、公开descriptor与既有frame timing focused3/3通过。
+
+**真实404复测与探针污染**：带旧条件点击脚本的payload明确编码了attachShadow wrapper源码，该轮作废为
+指纹证据。改用零预注入、零早期evaluate，只按Rust日志第三fo+固定800x600几何点击；payload中的同一项
+恢复`function attachShadow() { [native code] }`，页面首次显示“Verification successful. Waiting for
+www.thelancet.com to respond”，但proof5160B/top3256B后仍换ray，25s未得到真实404。当前widget无csp，
+因此embedded CSP修复不是直接阻塞；转为同challenge版本完整Chrome/Obscura明文payload对拍。
+
+**新增测量盲区**：任何为找closed root而包装attachShadow的点击探针都会被当前challenge直接编码进
+payload。shadow结构轮可用它判断DOM，但不能承担payload/过盾判据。真实交互判据必须零预注入，或使用
+不修改页面realm函数identity的CDP/宿主观测。
+
+**同版本Chrome明文对拍与新根因**：零注入Obscura与Chrome152当前challenge字段名完全一致，取得
+92-key/39-part Chrome与91-key/38-part Obscura payload。Zok中Chrome N1171/o120/x266/F12/T12，
+Obscura N1165/o121/x266/F13/T11；Chrome `crossOriginIsolated`在T且有SharedArrayBuffer，Obscura在F且
+无SAB。经同代理直接响应头确认目标403明确带`Cross-Origin-Opener-Policy: same-origin`、
+`Cross-Origin-Embedder-Policy: require-corp`与CORP，原实现“永不授予隔离”的常量false与真实输入矛盾。
+
+**跨源隔离实现**：Page按安全URL + COOP same-origin + COEP require-corp/credentialless + Permissions-
+Policy未禁用推导per-document isolation并注入runtime。main/frame realm的crossOriginIsolated从同一state
+读取；isolation=true时从shared WebAssembly.Memory buffer延迟取得V8隐藏SAB constructor并以标准全局
+descriptor恢复，false时继续隐藏。header推导、main SAB descriptor/构造与frame继承focused3/3通过。
+
+**`gPOK0`明确异常映射**：Chrome同字段为`root<随机custom-element名>1/0...`，Obscura为
+`undefinedTypeError: <局部变量> is not a function`。Chrome152 oracle确认CustomElementRegistry prototype
+新增`initialize(root)`，公开顺序define/get/getName/upgrade/whenDefined/initialize/constructor，实例own空；
+scoped `attachShadow({customElementRegistry})`只升级自己的root。Obscura缺initialize且registry实例泄漏四个
+内部字段、prototype泄漏两个helper，形成完整因果链。
+
+**scoped registry实现**：registry状态迁WeakMap，内部define/upgrade helper移出prototype；补initialize、
+标准shape/tag/native descriptor与ShadowRoot.customElementRegistry，attachShadow绑定registry root，define/
+initialize只升级关联scope，global document不受scoped registry影响。新focused与既有upgrade/constructor-
+failure共3/3通过。
+
+**真实字段反证**：scoped registry精确release、零预注入复测后，`gPOK0`仍为同形TypeError，最终仍停在
+“Verification successful”后换ray。因此缺`initialize`是明确的Chrome公开面缺陷，但此前“形成完整因果链”
+的结论不成立，不能把实现通过focused等同于该字段闭环。
+
+**HaHaVM-General后续线索与oracle**：其环境还新增`Element.prototype.customElementRegistry`。Chrome152
+独立oracle确认该getter enumerable/configurable/native：普通与shadow host元素返回global registry，scoped
+shadow内子元素返回对应scoped registry。Obscura按root动态返回真实registry并加入shape/行为回归；release
+复测后`gPOK0`和404结果仍完全不变。该项同样保留为通用语义修复，后续改用零注入V8 trace和当前rch源码
+恢复TypeError实际callee，不再围绕CustomElementRegistry继续猜测。
+
+**实际probe映射（更新）**：property-only trace取得65,639条lookup、两条完整payload和同轮421,675B
+`/rch/` source。Chrome OOPIF在仅诊断轮关闭site isolation后，`gPOK0` accessor的五次赋值均暂停于VM
+store opcode `IH.B:10110`；寄存器显示四个业务对象是`#dGSz90..93`的DIV/SPAN，另有动态style、bound
+`querySelectorAll`与`contains`。各次拼接值是`root`或`VMQLo2`加匹配计数。因此该字段实际测试动态
+CSS selector/DOM查询，不是custom-element/scoped registry；下一步恢复完整style、selector和匹配集合，
+再建立最小Chrome/Obscura fixture。
+
+**`gPOK0`最终根因**：Chrome debugger恢复的调用序列是BODY.appendChild(`<null>`)后，四次交替执行
+insertAdjacentHTML(TrustedHTML)与bound document.querySelectorAll；receiver依次为NULL、dGSz90、dGSz91、
+dGSz92。Obscura append后的ownerDocument URL、connected与root identity均正确，但首次insert后bound/direct
+QSA都为0，第二次VM call因此得到字符串`insertAdjacentHTML`和undefined receiver。
+
+问题不在selector或scope，而在internal fragment parser：它把TrustedHTML先String化，再通过临时元素的
+公开innerHTML setter二次执行Trusted Types enforcement；frame default policy看到失去品牌的plain string后
+把markup改写为空。修复为insertAdjacentHTML公开sink只enforce一次，`_parseHTMLFragment`直接调用native
+set_inner_html。真实release零注入后`gPOK0`迁为Chrome同结构的五段root/VMQLo2 title串，TypeError消失。
+
+**相关live collection试验**：独立Chrome152 oracle确认getElementsByClassName/getElementsByTagName、
+Element.children和Node.childNodes在插入、class mutation与detach后实时更新，同root/query保持SameObject。
+尝试性的provider/Proxy实现触发shadow identity高频测试长时间hang，已回退，不计入本轮交付。最终点击仍
+停在Verification successful并换ray，没有真实404，下一阶段按新payload重排剩余稳定差。
+
+**验证状态**：最终源码已移除所有gPOK诊断和live childNodes试验，精确release build及patched V8 check
+通过。workspace nextest实际运行到937/1694后因试验性live childNodes路径在shadow identity测试中超时而
+中断；该试验已回退，完整门尚未在回退后的干净基线重跑。真实目标仍未取得404。
+
+### Step 162 — Navigator 收尾后的真实-IP A/B（2026-09-02，调查中）
+
+**假设**：Navigator own-key 迁移后，若环境枚举是当前 challenge 的阻塞点，真实-IP CONNECT 转发下应出现
+不同的 challenge 分支或目标响应。
+
+**方法与证据**：使用 trace-patched release、stealth、Chrome 149 macOS UA，对
+`https://www.thelancet.com/1.txt` 做无 preload 固定坐标点击；CONNECT 转发只把
+`brunhild.challenges.cloudflare.com` 映射到真实 Cloudflare IP，保留 Host/SNI。Obscura 的
+`navigator`/`window`/`document` own-key 快照无内部泄漏；Brunhild `/i` 返回 `204`，frame/top `/fo`、
+`/pat`（401）、proof 和新 ray 均完成，但页面仍回到 challenge，未收到目标真实 `404`。
+
+**结论**：Navigator 枚举修复没有改变真实判定；网络可达性与 challenge proof 链已分别证明，当前仍没有
+足够证据把剩余失败归因到新的通用环境 API，也不加入 hostname 特判。最终验收继续以真实 `404` 为准。
+
+### Step 164 — Headers/Request/Response internal slots（2026-09-02，完成）
+
+**HaHa 参考与 Chrome oracle**：HaHaVM-General 的 fetch 对象实现提示 Obscura 的 `Headers`、`Request`、
+`Response` 仍把 `_h`、请求字段和 `_bodyBytes` 放在实例 own properties；Chrome 152 三类实例 own names
+均为空，公开成员位于原型并使用 WebIDL enumerable/configurable descriptor。
+
+**修复**：三类对象的状态迁入 realm-local WeakMap；补 Headers 合并/排序与 `getSetCookie`、Request 相对 URL
+解析、clone/bodyUsed、Response bodyUsed/clone/bytes/textStream/formData，并按 Chrome 顺序重建原型成员。
+移除 Response 的 `__obscuraRequestId` own 泄漏。新增 focused shape/行为回归，既有 URL、Blob、XHR/fetch
+回归保持通过。
+
+**验证**：`obscura-js --features render` `562/562`、workspace `1711/1711`（5 skipped）、obscura-net
+`91/91`、release/no-default/trace patch 均通过；实现不包含站点特判。
+
+### Step 165 — Fetch 对象修复后的真实站复测（2026-09-02，调查中）
+
+最新 release 使用 stealth、Chrome 149 macOS UA、无 preload 固定坐标点击和真实-IP CONNECT 转发；
+Brunhild `/i` 返回 `204`，frame/top `/fo`、`/pat 401`、proof/top 与新 ray 均完成，但页面仍停在
+challenge，没有目标真实 `404`。该结果未改变此前外部 challenge 判定，继续保留未决状态。
+
+### Step 166 — Fetch redirect 边界与最终代码门禁（2026-09-02，完成）
+
+Chrome oracle 复核 `Response.redirect()` 返回 `type="default"`、绝对化 `Location`；Obscura 已修正该
+边界并加入 focused 断言。最终 workspace release nextest 为 `1711/1711 passed`（5 skipped，1 leaky 的
+既有测试环境标记），精确 release build、no-default check、`vendor/v8-trace.sh check` 和 `git diff --check`
+均通过。真实站仍以 `/1.txt` 真实 `404` 为唯一验收，当前 challenge proof 后换 ray，未宣称通过。
+
+### Step 167 — 最终 release 无注入复测（2026-09-02，调查中）
+
+包含 Headers/Request/Response 与 redirect 修复的最终 release，在真实-IP CONNECT 转发下再次完成
+Brunhild `/i 204`、frame/top `/fo`、`/pat 401`、proof/top 和新 ray；18 秒 settle 内页面仍为
+`Just a moment...`，没有真实 `/1.txt` `404`。该轮无 preload、无页面侧 hook，不把 challenge 文案或
+`Verification successful` 当成功；当前剩余问题仍是上游 challenge 判定，未获得足够证据继续添加通用 API。
+
+### Step 163 — scripted POST 的 Content-Type 保真（2026-09-02，完成）
+
+**假设与证据**：Chrome 152 本地 HTTP fixture 显示同源 `fetch`/XHR 的显式 `Content-Type` 会原样发送；
+Obscura 普通客户端此前对所有带 body 的 POST 无条件覆盖为 `application/x-www-form-urlencoded`，会破坏
+脚本请求头。该路径与 stealth transport 共用请求模型，属于通用网络语义缺陷。
+
+**修复与回归**：普通客户端现在只在导航 POST 且请求未提供 `Content-Type` 时补表单默认值；脚本 POST
+保留显式头部。新增 `scripted_post_preserves_explicit_content_type` 与
+`navigation_post_defaults_to_form_content_type`，obscura-net release nextest `91/91` 全部通过。
+该修复不含站点或 challenge 分支，真实 challenge 链仍按 Step162 的结果单独记录。
+
+### Step 168 — Fetch bodyUsed 生命周期与最终回归（2026-09-02，完成）
+
+`fetch(request)` 现在检查并更新 Request 的 internal `bodyUsed`，重复消费会按 Chrome 拒绝；Request/Response
+focused 回归保持通过。最终 workspace release nextest `1711/1711`（5 skipped），`test_wait_for_selector`
+单独重试通过；精确 release build、no-default check、V8 trace patch、diff check 均通过。真实目标仍未返回
+`404`，不将 challenge 文案当作成功。
+
+### Step 169 — Accept-CH/Critical-CH 客户端提示（2026-09-02，完成）
+
+目标响应明确返回 `Accept-CH` 与 `Critical-CH`，要求 `Sec-CH-UA-*`/`UA-*` 高熵字段；之前两条
+HTTP transport 都完全忽略。现在按 response origin 记录提示，导航遇到缺失的 Critical-CH 时只重试一次，
+并从统一 fingerprint 派生 arch、bitness、full-version、model、platform-version 与 UA 字段。普通和 stealth
+两条路径各有两跳本地 fixture，均验证重试和头部值。
+
+### Step 170 — Client Hints 修复后的真实复测（2026-09-02，调查中）
+
+最终 release 无 preload、stealth、真实-IP CONNECT 转发再次完成目标/frame `/fo`、Brunhild `/i 204`、
+PAT、proof/top 和新 ray；页面仍为 challenge，未返回真实 `/1.txt` `404`。本轮没有新的通用 API 证据，
+不加入 hostname 特判。
+
+### Step 171 — Client Hints 最终门禁（2026-09-02，完成）
+
+普通与 stealth transport 的 `Accept-CH`/`Critical-CH` 两跳 fixture 均通过；`obscura-net` release
+`93/93`、workspace release `1713/1713`（5 skipped）、精确 release build、no-default check、V8 trace
+patch 和 diff check 全部通过。真实轮仍只到 `/fo`、Brunhild `/i 204`、PAT、proof/new-ray，没有目标真实
+`404`，因此目标验收继续保持未完成。
+
+### Step 172 — Permissions-Policy 文档策略传播（2026-09-02，完成代码修复）
+
+**假设**：Chrome 152 的 challenge payload 会读取 `document.featurePolicy`；Obscura 先前忽略响应的
+`Permissions-Policy`，导致 `allowsFeature('geolocation')` 和 `getAllowlistForFeature()` 在 `feature=()` 时仍返回允许。
+
+**方法与证据**：为 `DocumentScope`、top-level `ObscuraState` 和 frame navigation 传播原始 header；bootstrap
+解析 `()`, `*`, `'self'` 与显式 origin，并据此实现 `FeaturePolicy`/`PermissionsPolicy` 的公开方法。frame 权限
+op 同时检查父文档与当前文档策略，再处理 iframe `allow`。
+
+**回归与结论**：新增 `feature_policy_reads_committed_permissions_policy_header`，验证 geolocation/camera
+拒绝、microphone self、fullscreen wildcard 和 allowlist；`obscura-browser` 113/113、`obscura-js` 排除已知
+shadow identity hang 后 562/562 通过。release build、no-default check、V8 trace check、diff check 均通过。
+真实-IP challenge 仍 proof/top/new-ray 后停在 challenge，目标 `/1.txt` 尚未返回真实 404。
+
+### Step 173 — Permissions-Policy 修复后的直接复测（2026-09-02，调查中）
+
+最新 trace-patched release 使用 stealth、无 preload 访问 `https://www.thelancet.com/1.txt`，页面先显示
+`Verification successful`，随后仍返回 Cloudflare challenge 的 `Enable JavaScript and cookies to continue`
+（Ray ID `a34bd8732f75e367`），没有真实 404。该文案不作为成功信号；当前仍缺可用代理条件下的最终验收。
+
+### Step 174 — Live Document own-key 与 HTMLDocument 反射面（2026-09-02，完成）
+
+**假设**：Chrome 152 与 Obscura 的 realm 枚举仍有通用 Document 差异，可能影响 challenge 的文档属性桶。
+
+**证据与修复**：同一代理/UA 的 CDP A/B 显示 Chrome live `document` own keys 为 `location,lang`，Obscura 为
+`lang,dir`。Obscura 补齐 live Document 的 enumerable/non-configurable own `location`，并让 `dir` 位于
+Document 原型反射根元素；保留 Chrome 中页面写入 `document.lang` 后产生的普通 own 属性语义，新增 own-key/descriptor 回归。
+
+**结论**：focused own-key 回归通过；Chrome 同代理也在 `interactiveEnd/overrunBegin` 后停留，故未把上游挑战失败
+归因于 Obscura。目标真实 404 仍未取得。
+
+### Step 175 — FeaturePolicy 默认表与 allowlist 对齐（2026-09-02，完成）
+
+**证据与修复**：Chrome 152 oracle 给出 66 项 `allowedFeatures()` 的稳定顺序及默认 allowlist（self 或 `*`）。
+Obscura 按该顺序重建默认表，补齐默认 wildcard 语义，同时保留响应 header 对显式 feature 的覆盖和跨 origin 判断。
+
+**回归与门禁**：Permissions-Policy focused、own-key focused、workspace（排除已知挂起测试）1715/1715 通过；release
+build、no-default check、V8 trace 和 diff check 通过。真实-IP CONNECT 下 Chrome 与 Obscura 均未到真实 404，验收继续未完成。
+
+### Step 176 — 最新 release 真实验收复测（2026-09-02，未通过）
+
+最新 trace-patched release 无注入访问 `https://www.thelancet.com/1.txt` 仍显示
+`Verification successful` 后回到 `Enable JavaScript and cookies to continue`（Ray ID `a34c08cb4c6f3bfd`）。
+没有真实 404；challenge 文案不作为成功判据。
+
+### Step 177 — 最终 release 复测（2026-09-02，未通过）
+
+刚重建的 trace-patched release 无注入访问目标仍返回 `Verification successful` 后的
+`Enable JavaScript and cookies to continue`（Ray ID `a34c15e86c838ace`），没有真实 404。
+
+### Step 178 — 最终 release 真实-IP CONNECT 点击链（2026-09-02，未通过）
+
+使用最终 release、Chrome 149 macOS UA 和现有真实-IP CONNECT 转发，标准 probe 点击后再次观察到 frame
+`/fo`、Brunhild `/i 204`、PAT、proof/top 提交和新 ray；页面仍停在 challenge，没有真实 404。该链路与 Chrome
+同代理的 `interactiveEnd/overrunBegin` 结果一致，未发现新的可安全归因的 iframe API 差异。
+
+### Step 179 — Chrome payload 文件格式与 enum 工具适配（2026-09-02，完成）
+
+用户提供的 `assets/payload/1.json`、`2.json`、`3.json` 是 Chrome 149 解密 payload；属性桶位于
+`1.gsLi5`，而非旧版本的 `fyCZH9`。更新 `diff_payload_enum.py` 按桶值形状识别混淆键，并将
+`document.all`/裸 `undefined`/`event` 标为 Chrome 的 `typeof undefined` 特例。
+
+### Step 180 — Chrome 149 payload 缺失集合修复（2026-09-02，完成）
+
+初次对拍的真实缺失为 `navigator.modelContext`、`ModelContext`、`WebMCPEvent` 和 `document.designMode`。
+Obscura 已补齐 secure document 下的 navigator 对象、全局构造器和 Document 原型属性；重新对拍结果为
+navigator 81/81、document 295/295、screen 15/15、orientation 9/9、window 1238/1238，无真实缺失。
+
+### Step 181 — 最新 release V8 trace（2026-09-02，完成观测）
+
+使用远程 Reqable CA（CN=Reqable CA，2026-04-04）、代理 `http://192.168.3.57:9000` 和最新 release，
+full V8 trace 产生 1,587,025 条记录。主 challenge 的 `XMLHttpRequest.open`、`cf-chl`/`cf-chl-ra`
+header、`send` body 及调用栈均可见；`console` 仅有属性读取，未观察到实际 `console.log` 方法调用。
+页面仍为 challenge，未返回真实 404；`assets/payload` 已完成类型面逐项对拍。
+
+### Step 182 — Chrome payload 类型面清零（2026-09-02，完成）
+
+`assets/payload/2.json` 与 `3.json` 的 `1.gsLi5` 桶提取出 n=81、d=295、s=15、so=9、bare=1238 个路径。
+对最终 release 的 CDP 对拍结果为 navigator 81/81、document 295/295、screen 15/15、orientation 9/9、
+window/global 1238/1238；`document.all` 与裸 `undefined/event` 按 Chrome 特殊 `typeof undefined` 处理。
+
+### Step 183 — Chrome 149 surfaces 与 link DOM 面（2026-09-02，完成）
+
+根据 payload 的真实缺失集合补齐 `navigator.modelContext`、`ModelContext`、`WebMCPEvent`、`document.designMode`；
+同时将 `<link>` 改为独立 `HTMLLinkElement` 原型，补齐 URL/媒体/跨源/优先级等反射，并隐藏 DOM wrapper 内部字段的
+own-property 反射。相关 focused 测试及最终 workspace `1717/1717` 全部通过。
+
+### Step 184 — 代理 V8 trace 与 console.log 结论（2026-09-02，完成观测）
+
+使用远程 Reqable CA（`CN=Reqable CA`，2026-04-04）和 `http://192.168.3.57:9000`，最新 release full trace
+产生 1,587,025 条记录。主 `/fo` XHR 的 `open`、`cf-chl`/`cf-chl-ra`、`send` body 和调用栈均可见；payload
+字符串仅包含裸 `console`，没有 `console.log` 路径，trace 也未观察到实际 `console.log` 调用。challenge 仍未
+返回目标真实 404，不能把错误页或 `Verification successful` 当成功。
+
+### Step 185 — 三份 Chrome payload 结构对比（2026-09-02，完成观测）
+
+`assets/payload/1.json` 是 `chl_api_m` 渲染提交（47 个顶层字段）；`2.json` 与 `3.json` 的
+`1.gsLi5` 均包含 62 个属性桶，n/d/s/so/bare 路径集合完全一致。2→3 仅有 proof 阶段的预期长度/计数变化
+（`tQdUc5` 38→39、`maNnU6` 34→37、`rPXg2` 4→5）及 token/timestamp 变化，没有新的属性集合差异。
+
+### Step 186 — 同步 nested iframe 的 sandbox 继承（2026-09-02，调查中）
+
+**假设**：HaHaVM-General 和浏览器模型都把 sandbox 限制沿嵌套 browsing context 传播；Obscura 的
+`create_blank_iframe_document` 在 iframe 插入时同步建立初始 `DocumentScope`，但只读取当前 host 的
+`sandbox` 属性，未合并 containing document 的 sandbox。父 frame 被 sandbox 后，脚本创建的 nested
+iframe 在 controller 异步提交前可能暂时拥有未沙箱化的初始文档。
+
+**方法**：在 sandboxed srcdoc frame 的真实 realm 中同步创建 nested iframe，读取其 active content root
+的 scope，随后与 Chrome 的 nested browsing-context sandbox 语义对拍。修复只使用父 scope 和
+`SandboxFlags::merged_with_parent`，不引入站点分支。
+
+**修复与证据**：`create_blank_iframe_document` 现在把 containing document 的 sandbox 与 host 自身
+属性合并后，才计算初始 opaque origin 和 scope。新增
+`synchronously_created_nested_iframe_inherits_parent_sandbox`，在 outer frame 的 author script 中
+同步 append 未声明 sandbox 的 nested iframe，断言初始 scope 仍为 active、保留 `allow-scripts`、拒绝
+`allow-same-origin` 且 origin 为 opaque；trace-patched release focused nextest 1/1 通过。
+
+**结论**：同步插入与异步 controller commit 的 sandbox 语义现在一致。该项是通用 iframe 安全修复，
+不包含目标域名逻辑；真实 `/1.txt` 404 仍需代理下的完整 challenge 结果确认。
+
+### Step 187 — 语言 fingerprint 跨 frame/worker 与请求头同步（2026-09-02，调查中）
+
+**假设**：当前同一代理、同一 Chrome 149 UA 的新 payload 中，参考 Chrome 为
+`navigator.language="zh-CN"`、`navigator.languages=["zh-CN"]`，Obscura 仍固定为
+`"en-US"`/`["en-US","en"]`。语言值同时影响 Accept-Language、frame/worker 的环境和 challenge
+明文探针；只改 JS getter 会留下跨层不一致。
+
+**方法**：把 language/languages 纳入现有 `BrowserFingerprint`/override 合同，以
+`OBSCURA_LANGUAGE` 或 `OBSCURA_FINGERPRINT_JSON` 配置，统一注入所有 realm，并由普通/stealth
+transport 和 scripted fetch 生成相同的 Accept-Language。默认值保持现有 en-US/en，不加入目标域名逻辑。
+
+**修复与证据**：`BrowserFingerprint` 新增 language/languages 与 `accept_language()`；
+`OBSCURA_LANGUAGE=zh-CN` 会同步生成 `["zh-CN"]` 和 `Accept-Language: zh-CN`，显式
+`OBSCURA_LANGUAGES`/fingerprint JSON 可覆盖多语言列表。新增 fingerprint 和 runtime focused 回归均通过。
+真实轮使用 `OBSCURA_LANGUAGE=zh-CN OBSCURA_TIMEZONE=Asia/Shanghai`，payload 的 `zIyO8` 已为
+`zh-CN`、`sKMUH1=Asia/Shanghai`、`LxEyU6=December at China Standard Time`；再用现有
+`OBSCURA_FINGERPRINT_JSON={"hardwareConcurrency":6,"deviceMemory":16}` 对拍，payload 的
+`APSY2=16`、`TpsmW1=6` 与参考值一致，但两轮都在 proof 后回到 challenge，没有真实 404。
+
+**结论**：语言/时区/硬件值已能配置并跨 realm/请求保持一致，未改变当前 Cloudflare 最终判定；真实
+失败仍不能归因到该项。
+
+### Step 188 — 响应 CSP `sandbox` directive（2026-09-02，完成代码修复）
+
+**假设**：iframe 响应头中的 `Content-Security-Policy: sandbox` 是独立于 host `sandbox` 属性的
+文档级限制；此前 Obscura 只保存该 header，未把它合并进 frame `DocumentScope`，可能错误执行
+author script 或暴露 tuple origin。
+
+**修复与证据**：`ContentSecurityPolicy::sandbox_flags()` 将 directive token 转为现有
+`SandboxFlags`，frame controller 在 network response、accepted embedded policy 和父/host sandbox
+之后按收紧规则合并；CSP sandbox 无 `allow-scripts` 时 author script 被阻止，`allow-scripts` 时仍
+保持 opaque origin。新增 `csp_sandbox_directive_maps_to_restrictions` 与
+`frame_response_csp_sandbox_gates_scripts_and_origin`，focused 2/2 通过，未加入目标域名逻辑。
+
+同一 fixture 还给 `allow-scripts` 响应附加 COOP/COEP；scope 仍报告
+`cross_origin_isolated=false`，避免 sandbox unique origin 错误暴露 SAB。
+
+**结论**：响应 CSP sandbox 已覆盖 frame 脚本执行和 origin 语义，并与嵌套 sandbox 一致；真实目标
+404 仍需完整 challenge 轮确认。
+
+### Step 189 — CSP/语言修复后的最终真实轮（2026-09-02，未通过）
+
+最终 trace-patched release 使用 `http://192.168.3.57:9000`、远程 Reqable CA、
+`OBSCURA_LANGUAGE=zh-CN`、`OBSCURA_TIMEZONE=Asia/Shanghai` 和参考硬件 fingerprint。目标页面完成
+widget 验证并显示 `Verification successful`，随后回到 `Enable JavaScript and cookies to continue`
+（Ray `a34d2c305c04b012`），没有真实 `/1.txt` `404`。本轮没有把 challenge 文案当成功，也没有发现
+新的可归因 iframe API 差异；最终 404 验收继续保持未完成。
+
+### Step 190 — 本轮代码门禁（2026-09-02，完成）
+
+新增 sandbox/语言修复后，`obscura-browser` 全 crate release nextest 为 `115/115`；workspace
+release nextest 排除已知会永久挂起的 `shadow_root_identity_and_children_are_native_tree_backed` 后为
+`1722/1722 passed`、5 skipped。未排除的全量轮在该测试处运行 829 秒后以 SIGINT 结束（958 passed、4 skipped、
+764 未运行）。精确 trace-patched release build、`cargo check -p obscura-js -p obscura-cli --no-default-features`、
+`vendor/v8-trace.sh check` 和 `git diff --check` 均通过。
+
+### Step 191 — 当前代理 Brunhild 可达性复核（2026-09-02，外部阻塞）
+
+最终 serve 使用相同代理、CA、语言/时区/硬件配置运行通信探针。日志显示 top/frame `/fo`、`/pat`、
+proof `/fo` 与顶层转发均完成；唯一的
+`https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/i/...` 请求没有收到
+完成响应。独立 `curl -x http://192.168.3.57:9000 https://brunhild.challenges.cloudflare.com/`
+在同一代理下稳定返回 `HTTP/2 502`（而 `www.thelancet.com/1.txt` 返回 Cloudflare 403 challenge）。
+
+**结论**：当前环境无法用该代理完成 Cloudflare 的 Brunhild proof 服务，因此不能取得真实 `/1.txt`
+`404`；这条证据不支持继续添加 iframe/API 特判。代理恢复或提供能转发 Brunhild 的网络条件后，才可继续
+做最终 404 验收。
+
+### Step 192 — Brunhild 真实-IP CONNECT A/B（2026-09-02，完成观测）
+
+**方法与证据**：一次性本地 CONNECT 链路将 Brunhild 的 TLS TCP 端点送至真实 Cloudflare IP，其它
+目标请求继续经 `192.168.3.57:9000`。在远程 Reqable CA 与系统 CA 合并后，Brunhild `/i` 稳定返回
+`204`；Obscura 的 frame `/fo`、`/pat 401`、proof `/fo` 和顶层 `/fo` 均完成，但页面仍回到
+`Enable JavaScript and cookies to continue`，没有真实 `/1.txt` `404`。
+
+**结论**：远程代理的 502 已与引擎判定分离；即使 proof 服务可达，当前 challenge 仍拒绝 payload，
+后续差异必须由同版本 Chrome/Obscura 明文对拍证明，不能加入 Brunhild hostname 特判。
+
+### Step 193 — navigator language 与 V8/ICU 默认 locale（2026-09-02，完成代码修复）
+
+**假设与证据**：只覆盖 `navigator.language` 会留下 Intl/Date 的跨层差异。默认 `LC_ALL=C.UTF-8`
+时 payload 时间格式是英文；显式 `LC_ALL=zh_CN.UTF-8` 后变为参考的 `十二月 中国标准时间`。
+
+**修复与验证**：CLI 在 V8 初始化前把显式 `OBSCURA_LOCALE`，或常见 `OBSCURA_LANGUAGE`/
+`OBSCURA_LANGUAGES` 映射到 `LC_ALL`；未知语言不猜测。新增 locale mapping focused 测试通过。
+在不设置外部 `LC_ALL`、仅设置 `OBSCURA_LANGUAGE=zh-CN` 的真实轮中，payload 已自动出现中文时间
+格式，但最终仍为 challenge，无真实 404。
+
+**结论**：语言、请求头、navigator、Intl/Date 现在可保持一致；该项不是当前 proof 拒绝的唯一原因。
+
+### Step 194 — 本轮最终门禁（2026-09-02，完成）
+
+CLI locale 改动后的 `obscura-cli` focused nextest 1/1、精确 trace-patched release build、
+`vendor/v8-trace.sh check` 和 `git diff --check` 通过。之前已验证的 workspace 排除已知 shadow hang
+结果保持 `1722/1722 passed`、5 skipped；未排除全量仍会在该既知测试处永久挂起。
+
+### Step 195 — locale 改动后的 workspace 复核（2026-09-02，完成门禁）
+
+带 locale 改动重新执行 workspace release nextest（保留已知 shadow identity 测试跳过）得到
+`1722 passed`、`1 leaky`、`1 flaky failure`、5 skipped；失败项为既有
+`obscura-cli::mcp_client::test_navigate_and_snapshot`，用 `--retries 2` 单独复跑通过。
+no-default check 和最终 release binary 均已在本轮通过。真实目标仍无 `404`。
+
+### Step 196 — frame 动态 stylesheet 的 CSP sink（2026-09-02，调查中）
+
+**假设**：frame realm 动态 append `<link rel="stylesheet">` 时，`_loadLinkedStylesheet` 直接调用
+`_fetchLinkedCss`，没有按该 frame 的 `style-src`/`default-src` 检查；同时它把 `origin` 参数设为
+stylesheet URL 的 origin，而不是创建请求的 document origin。跨源 frame 因此可能绕过 style CSP，或
+发送错误 Origin/CORS 元数据。
+
+**方法**：用本地 HTTP frame 返回 `style-src 'none'; connect-src 'self'`，在 frame author script
+动态添加 stylesheet，观察禁止 URL 是否发出以及请求 Origin；修复仅读取 containing frame 的
+DocumentScope，不加入目标域名分支。
+
+**修复与证据**：`_fetchLinkedCss` 现在在根 stylesheet 和每个 `@import` 前执行 frame-local
+`style-src` gate；允许请求的 origin 改为当前 document scope，而不是 stylesheet URL 的 origin。
+`dynamic_linked_stylesheet_uses_frame_style_csp_and_creator_origin` 与既有动态 stylesheet 回归
+release focused 2/2 通过：`style-src 'none'` 时网络调用为 0，允许跨源表时看到的 origin 为
+`http://example.com`。
+
+**结论**：动态 stylesheet 的 frame CSP 与请求归属已闭环，未加入目标站点逻辑；真实 404 仍未达成。
+
+### Step 197 — wreq Client-Hints 重复头（2026-09-03，代码修复完成）
+
+**假设**：导航同时经过 wreq emulation 默认头、fingerprint 显式头和 CDP
+`Network.setExtraHTTPHeaders` 时，`RequestBuilder.header` 的 append 语义会把同名
+`sec-ch-*` 发出两次；收到 `Accept-CH` 后追加的高熵 hints 也可能与自定义头重复。
+
+**方法**：本地 HTTP fixture 同时设置默认 fingerprint 和 extra `sec-ch-ua`/
+`sec-ch-ua-mobile`/`sec-ch-ua-platform`，逐行计数原始请求；再覆盖 critical client-hints
+重试路径。对真实目标使用 trace-patched release 与 clean CDP 输入，核对 `/fo` 序列。
+
+**修复与证据**：`crates/obscura-net/src/wreq_client.rs` 在注入 UA、低熵 hints、fetch
+元数据前检查 extra/request headers；accepted hints 若已有同名头则只计入已发送集合，不再 append。
+`stealth_extra_low_entropy_headers_do_not_duplicate_defaults`、
+`stealth_client_retries_critical_client_hints` 与既有 fingerprint 测试共 3/3 通过。
+真实轮的顶层/Turnstile trace 已出现 3 个 `POST /fo`（顶层 1、frame 2）；clean 点击
+命中 widget 坐标，但 Cloudflare 仍回 challenge，没有 `/1.txt` 404。头部引号由
+`BrowserFingerprint::sec_ch_*`/`client_hint_value` 统一生成：platform、full-version、
+arch、bitness 等为带双引号结构化值，mobile 为 `?0/?1`，UA 为原始字符串。
+
+**结论**：重复 `sec-ch-*` 是请求头 append 造成的引擎缺陷，已消除并有原始线级回归；
+当前目标失败点仍在 Cloudflare proof 判定/外部网络，不能用 hostname 特判替代。
+
+### Step 198 — emulation 默认头与 HTTP/2 wire 去重（2026-09-03，代码修复完成）
+
+**假设**：wreq emulation 在 middleware 层注入默认 headers，HTTP/2 序列化再叠加请求层
+headers；即使 HTTP/1 fixture 只有一条，真实代理仍可能看到重复 `sec-ch-ua`。
+
+**方法**：保留 emulation 的 TLS/HTTP2 选项但清空默认 headers，改由 Obscura 单点生成
+Accept、Accept-Language、Accept-Encoding、Priority、Sec-Fetch 和 UA-CH。通过 HTTP/2
+`https://httpbin.org/headers`，并用 CDP 注入大小写混合的 `Sec-CH-UA`，检查服务端 JSON。
+
+**证据**：服务端实际只收到一条 `Sec-Ch-Ua`、一条 `Sec-Ch-Ua-Mobile`、一条
+`Sec-Ch-Ua-Platform`；值为 `"Google Chrome";v="149", "Chromium";v="149",
+"Not)A;Brand";v="24"`、`?0`、`"macOS"`。本地 stealth 重复头回归仍为 3/3，
+release build、V8 trace check、no-default check 和 diff check 通过。
+
+**结论**：重复头已在 transport 默认层和自定义层同时消除；不是代理展示问题，也不需要
+目标域名逻辑。
+
+### Step 199 — frame 点击屏幕坐标与 proof 轮（2026-09-03，部分完成）
+
+**修复与证据**：`Input.dispatchMouseEvent` 在 frame realm 中保持 local `clientX/Y`，
+但 `screenX/Y` 使用页面坐标；iframe 回归报告 `(30,40)` 与 `(140,130)`，符合
+`screenX - clientX == screenLeft`。真实轨迹点击产生 frame proof `/fo`（846KB、随后
+127KB）和 PAT，但本轮没有顶层 proof 或真实 `/1.txt` 404，仍保持未通过。
+
+### Step 200 — Client-Hints 最终 wire 验证与 404 续测（2026-09-03，部分完成）
+
+**证据**：最终 trace-patched release 经 `http://192.168.3.57:9000` 访问
+`https://www.thelancet.com/1.txt`，使用 Chromium/Not)A;Brand、`149.0.7827.0`、
+`zh-CN,zh`、arm/64、6/16 profile；HTTP/2 请求头已按大小写归一化且 `sec-ch-ua` 只剩
+一条。多段 mouseMoved + click 仍完成 frame `/fo`、PAT 和 proof frame，但没有稳定出现
+top proof/clearance，页面保持 challenge，真实 404 尚未取得。
+
+**结论**：重复头问题已排除；当前阻塞是 Cloudflare proof 判定和 Brunhild 代理返回 502，
+继续修复必须有新的 Chrome/Obscura 明文差异证据，不能用重试或域名特判伪造 404。
+
+### Step 201 — closed-shadow widget 命中与 proof 事件链（2026-09-03，部分完成）
+
+**证据**：旧固定坐标 `(214,335)` 在不同 ray 中会落到 frame body；等待 frame 后读取当前
+300×65 容器并点击 local `(20,31)`，`Input.dispatchMouseEvent` 命中
+`frame-page-1-1` 的 node=453。修复后的跨 frame click 保持 `client=(20,31)`、页面
+`screen=(212,311)`，不再产生 Chrome 对拍中的 `[object Element]`/`-9,-20.5` body 事件。
+
+同轮请求序列稳定出现 frame `/fo` 846KB、PAT `401`、frame proof `127KB`、frame proof
+约 5.1KB 和顶层转发约 3.2KB；随后页面仍停在 challenge，未取得真实 `/1.txt` `404`。
+
+**结论**：点击目标/坐标转换已从通用 CDP 命中链修正，第三个 proof `/fo` 可触发；剩余拒绝
+发生在 Cloudflare clearance 判定或 Brunhild 网络条件，不能继续归因于 iframe CSP/点击缺失。
+
+### Step 202 — CDP click 的 PointerEvent 语义（2026-09-03，代码修复完成）
+
+**假设**：Obscura 将物理 CDP click 生成为 `MouseEvent`，而 Chrome 的 pointer-derived
+`click` 是 `PointerEvent`；Cloudflare 会读取 `pointerType`、`pointerId`、角度、压力和
+`isPrimary`，缺失会使 proof 事件桶退化。
+
+**修复与证据**：`Input.dispatchMouseEvent` 的 click 改用完整 `PointerEvent`，保留
+trusted/composed、local client 与 page screen 坐标，并填充 `pointerType=mouse`、
+`isPrimary=true`、`pointerId`、`altitudeAngle=PI/2`、`azimuthAngle=0`、tilt/twist/pressure。
+完整 `input_mouse_event_parity` release nextest `19/19 passed`。真实轮在正确命中 input 后
+产生 frame proof 与 top 转发，但仍未收到真实 `/1.txt` 404。
+
+**结论**：点击事件 shape 已与 Chrome 对齐；当前未决仍是 Cloudflare proof/clearance 判定，
+不能把 challenge 文案当成功。
+
+### Step 203 — 组合 CA、Body brand 与 Chrome click 坐标（2026-09-03，调查中）
+
+**假设**：旁路代理直连 `brunhild` 时，`SSL_CERT_FILE` 只提供 Reqable CA，覆盖了 wreq 的公网根证书；
+同时 proof payload 的相关目标仍可能把 `HTMLBodyElement` 报成通用 `Element`，或因点击点不同而分叉。
+
+**方法与证据**：对 `wreq` 的信任库先加载系统默认 roots，再追加 `SSL_CERT_FILE`/`SSL_CERT_DIR` 的 PEM/DER；
+新增独立 `HTMLBodyElement` wrapper 与 body brand 回归。使用 Chrome payload-3 对齐 frame-local `(29,28)` 点击，
+明文事件字段与 Chrome 一致：`client=(29,28)`、`offset=(20,7)`、`pointerType=mouse`、
+`altitudeAngle=PI/2`、目标 `[object HTMLInputElement]`。同一轮请求链为 frame proof `200`、
+Brunhild `/i` `204`、PAT `401`、frame proof `200`、top proof `200`；之前的
+`CERTIFICATE_VERIFY_FAILED` 已消失。
+
+**回归**：`webidl_branding_keeps_native_to_string_and_prototype_chains` 通过；HTTP/2 wire 上
+`Sec-Ch-Ua`/`Sec-Ch-Ua-Mobile`/`Sec-Ch-Ua-Platform` 各一条且结构化值保留双引号；最终 release build、
+`vendor/v8-trace.sh check`、no-default check 和 `git diff --check` 通过。
+
+**结论**：证书组合、body brand 和点击坐标均已完成通用修复，但该轮在 top proof 后仍未收到
+`https://www.thelancet.com/1.txt` 的真实 `404`，页面继续换 ray/challenge。剩余阻塞限定在 Cloudflare
+clearance 判定或其外部会话条件，不加入站点特判或 payload 硬编码。
+
+### Step 204 — closed-shadow label sibling activation（2026-09-03，调查中）
+
+**假设**：renderer 命中 `span[aria-hidden=true]` 时，closed-shadow 的 composed parent 虽为
+`label`，但 label 的 light-DOM children 为空；仅调用 `label.querySelector()` 找不到实际 checkbox，
+click 因而落到 frame `BODY`。
+
+**方法与证据**：debug hit-test 显示 node=452 的 `parent=label(450)`、`next_sibling=453`，frame root
+的普通 `input` 查询为空。新增通用 sibling labelable 控件解析，沿 `nextElementSibling/nextSibling`
+寻找 `input/button/select/textarea`，不包含站点或 challenge 字符串。最新 release 轮的 payload click
+字段为 `[object HTMLInputElement]`，`client=(29,28)`、`offset=(20,7)`，并完整发出 frame proof、
+Brunhild `/i` `204`、PAT、frame proof 和 top proof。
+
+**回归与未决**：`input_label_activation` 与 `input_mouse_event_parity` 共 `23/23` 通过；workspace
+release nextest `1725/1725 passed, 5 skipped`。proof 响应确实各携带一个 `cf_clearance` Set-Cookie，
+但最终 URL 仍未收到真实 `404`，页面继续进入新的 ray/challenge。当前剩余问题是 Cloudflare 对
+clearance 的判定/会话条件，不能继续归因于 iframe CSP 或 click target。
+
+### Step 205 — pointer activation 与真实代理 Cookie 闭环（2026-09-03，调查中）
+
+**假设**：点击前的 `mouseMoved` 预先分配 pointerId，导致后续首次 `mousePressed` 使用 ID=2；同时需要确认
+真实代理下 proof 写入的 clearance 是否会随下一次 `/1.txt` 导航发送。
+
+**修复与证据**：pointerId 状态机现在让首次 hover + press 共享 ID=1，释放后下一次按下才递增；现有
+`click_pointer_ids_increment_per_activation_and_pair_within_a_cycle` 与 click metadata 回归均通过。使用
+`http://192.168.3.57:9000`（所有主机统一走该代理）和 Reqable CA 复测，frame proof/top proof 均返回 200，
+`cf_clearance` 已存储且后续 `/1.txt` 导航明确携带 `cf_clearance` 与 `cf_chl_rc_ni`；PAT 仍为 401（与 Chrome 参考一致）。
+对齐 Chrome payload-3 的 frame-local `(29,28)` 后，click 的 `client/offset/pointerId/isPrimary` 分别为
+`(29,28)/(20,7)/1/false`，但 Cloudflare 仍上报 `fail 600010` 并换 ray，未得到真实 404。
+
+**结论**：pointerId 与 CookieJar 不是当前 404 阻塞；`isPrimary=false` 的 payload 对拍实验也未改变结果。
+临时响应体和事件探针已移除，继续禁止域名特判、payload 硬编码或伪造 404。
+
+### Step 206 — payload 事件整数化、硬件画像 A/B 与 V8 lookup trace（2026-09-03，调查中）
+
+**假设**：Chrome payload-3 中 `layerY=7`、`offsetY=8`，而 Obscura 两者均为 `7.5`；同时
+`navigator.hardwareConcurrency/deviceMemory` 的 Chrome 值为 `6/16`，可能影响 proof 判定。
+
+**修复与证据**：拆分 MouseEvent 的 layer/offset getter，layer 坐标取 floor、offset 坐标四舍五入，
+使 click payload 的 `client=(29,28)`、`layer/offset=(20,7)/(20,8)`、`pointerId=1`、`isPrimary=false`
+与 `assets/payload/3.json` 对齐。使用 `--fingerprint` 固定 Chrome payload 的两品牌、149.0.7827.0、
+arm/64、macOS 26.4.0、硬件 `6/16` 后，V8 property-lookup trace 记录到 widget 对 click 的完整
+`eventPhase/isPrimary/pointerId/pressure/geometry` 读取；没有出现缺失的事件 getter。请求仍完整经过
+frame `/fo`、Brunhild `/i`、PAT `401`、proof/top proof，随后换 ray 并上报 `fail 600010`，无真实 404。
+
+同时将导航 `Accept-Encoding` 顺序统一为 Chrome 参考的 `gzip, deflate, br, zstd`；`httpbin` 实测
+`Sec-Ch-Ua`、`Sec-Ch-Ua-Mobile`、`Sec-Ch-Ua-Platform` 各一条且引号正确。
+
+**结论**：硬件 `6/16` 和事件 layer/offset 修复均未改变 Cloudflare 最终判定；当前剩余差异限定为
+宿主屏幕/布局坐标、时间戳及服务端会话条件，继续禁止站点特判和 payload 硬编码。
+
+**对照补充**：同一代理、同一 `(29,28)` 点击流程在本机 Chrome 152 也只到 `interactiveBegin`，
+35 秒内没有 `interactiveEnd` 或真实 `/1.txt` 响应。该轮确认远端代理/Cloudflare 会话状态会独立
+阻塞成功判据，不能把 Obscura 的 `600010` 单独解释成 CSP 缺陷；后续仍以 Chrome 与 Obscura 同轮
+请求序列和明文 payload 差异为准。
+
+### Step 207 — Critical-CH 的 UA 别名补齐（2026-09-03，调查中）
+
+**假设**：目标响应的 `Accept-CH/Critical-CH` 同时列出 `UA-*` 与 `Sec-CH-*`，而请求层遗漏
+`ua-full-version-list`，使重试导航缺少完整版本列表。
+
+**修复与证据**：`client_hint_value` 现在把 `ua-full-version-list` 映射到 fingerprint 的
+`fullVersionList`，与 `sec-ch-ua-full-version-list` 共用格式和去重路径；wreq Critical-CH fixture
+新增该别名并断言重试请求包含 Chromium/Not)A;Brand 的完整版本值。真实响应列出的全部 UA 别名均可由
+同一 fingerprint 生成，`Sec-Ch-Ua*` 仍保持单条。
+
+**结论**：该请求层缺口已修复且 focused nextest 通过，但真实页面仍在 frame proof/PAT 后换 ray；
+Chrome 同代理对照同样未达成 404，当前阻塞仍不是 iframe CSP 或 Client-Hints 重复。
+
+### Step 208 — iframe 窗口几何残差复核（2026-09-03，未决）
+
+**证据**：当前 release 的 fresh `gsLi5` payload 仍将 widget realm 的
+`screenX/screenY/screenLeft/screenTop/innerWidth/innerHeight` 归入 `0` 桶，且 outer/screen 值为
+`1440/900`；Chrome payload-3 对应为窗口原点 `22/51`、outer `1200x1120`、screen `1720x1284`。
+这与 profile 早期 step 90 的差异一致，说明该面尚未完全收敛。
+
+**判断**：窗口原点和屏幕尺寸属于宿主窗口事实，会随真实 Chrome 窗口/显示器变化；当前不能把一次
+Chrome payload 的常数硬编码为默认值。下一步应从 CDP viewport/window metrics 或显式 fingerprint schema
+提供可配置的 screen/outer/origin 值，并验证 `screenX + clientX` 等不变式后再改代码。
+
+**结论**：该几何差异保留为新的通用环境候选，但尚无证据证明它单独导致 `600010`；本轮不加入站点特判。
+
+### Step 209 — 可配置 iframe/窗口 screen metrics（2026-09-03，代码完成）
+
+**修复**：扩展 `ScreenFingerprint`，增加可选 `outerWidth`、`outerHeight`、`screenX`、`screenY` 字段；
+bootstrap 在没有 CDP screen override 时使用这些值，并让 `screenLeft/screenTop` 与窗口原点保持一致。
+零值继续回退历史 maximized-window 计算，因此现有调用方和默认 fingerprint 不变。字段随 fingerprint JSON
+传播到主 realm、frame realm 和 Worker。
+
+**回归**：`fingerprint_contract_drives_navigator_ua_ch_and_screen` 固定 `outer=1200x1120`、原点 `22/51`，
+确认 JS 暴露值完整；release focused 通过。可用 `--fingerprint` 传入 Chrome payload-3 的宿主窗口 metrics，
+不再需要在代码中硬编码显示器常数。
+
+**未决**：该修复提供了宿主事实的传递通道，但当前远端 Cloudflare 会话仍在 proof 后换 ray；尚未证明它单独
+改变 `1.txt` 的最终状态码。
+
+### Step 210 — wreq Critical-CH 低熵头去重（2026-09-03，代码完成）
+
+**假设**：目标返回的 `Critical-CH` 同时包含 `Sec-CH-UA` 与 `UA` 别名；wreq 在重试时可能把已由
+fingerprint 生成的低熵 `sec-ch-ua` 再 append 一次，造成线上出现两个同名字段。
+
+**修复与证据**：wreq 的 `sent_client_hints` 现在预先记录本次请求已生成的
+`sec-ch-ua`、`sec-ch-ua-mobile`、`sec-ch-ua-platform`，重试只追加尚未发送的字段；`ua` 保持独立别名，
+不会因已有 `user-agent` 被错误抑制。回归 fixture 同时声明 `Sec-CH-UA` 和 `UA`，确认重试请求中两者各一条，
+并保留完整 `UA-Full-Version-List`。经同一代理访问 `httpbin.org/headers`，三个 `Sec-Ch-Ua*` 头各一条且双引号正确。
+
+**结论**：请求层重复头已修复。目标站当前仍返回 Cloudflare `403` challenge；点击后 proof/PAT 链可运行，
+但 `brunhild.challenges.cloudflare.com` 经 `192.168.3.57:9000` 稳定返回代理侧 `502`，因此尚未取得真实
+`https://www.thelancet.com/1.txt` `404`，不把 challenge 文案当成功。
+
+### Step 211 — 初始跨源 iframe 的隔离状态（2026-09-03，代码完成）
+
+**假设**：Chrome payload-3 的 `crossOriginIsolated` 在 widget 早期采集为 false，而 Obscura 的
+初始 `about:blank` frame 继承了顶层 true。该采集发生在网络 iframe 文档提交前，单看最终 frame scope
+会遗漏这个时序差异。
+
+**方法与证据**：本机 Chrome 最小测试确认跨源子 frame 即使响应带 COOP/COEP，运行时
+`crossOriginIsolated` 仍为 false；同源子 frame 才能在已隔离父文档中保持 true。Obscura 原实现的
+`create_blank_iframe_document` 使用全局顶层隔离位，导致嵌套 widget 的初始 realm 暂时错误为 true。
+
+**修复与回归**：初始 frame 现在读取实际父 document scope 的隔离位，并根据 iframe `src` 预判目标 origin；
+跨源、data/blob 或 opaque 目标的 transient about:blank 设为 false，实际导航提交仍由响应 COOP/COEP 和父文档
+重新计算。同源/无 src 的 about:blank 保持父文档语义。`initial_cross_origin_iframe_about_blank_is_not_isolated`
+及 `cross_origin_child_cannot_enable_cross_origin_isolation` 通过；最新 payload 已显示
+`crossOriginIsolated` 位于 `F` 桶，与 Chrome 对齐。
+
+**结论**：iframe 隔离状态的时序和跨源语义已修复，未加入站点特判。真实 `/1.txt` 仍因代理侧 Brunhild `502`
+无法取得 404，当前 challenge 结果不足以继续归因于 CSP/iframe 环境。
+
+### Step 212 — 嵌套 iframe 初始隔离位继承（2026-09-03，代码完成）
+
+**证据**：Step 211 的跨源 `src` 预判仍使用全局顶层 `gs.cross_origin_isolated`。Cloudflare widget
+先创建跨源网络 frame，再在其中创建 `about:srcdoc`；该嵌套 frame 的早期 payload 仍可能看到顶层 true，
+即使父 widget scope 已经是 false。
+
+**修复**：`create_blank_iframe_document` 现在从实际 `parent_scope.cross_origin_isolated` 取父 frame
+状态，再结合 `src` 与父 origin 判断 transient about:blank。嵌套 widget/srcdoc 不再从顶层泄漏隔离位；
+同源和无 `src` 的 about:blank 仍保留父文档语义。
+
+**回归与结果**：`initial_cross_origin_iframe_about_blank_is_not_isolated`、
+`cross_origin_child_cannot_enable_cross_origin_isolation` 及 frame CSP 测试通过；目标 payload 的
+widget `crossOriginIsolated` 已稳定落在 Chrome 一致的 `F` 桶。无预注入点击仍能执行 frame proof/PAT/top
+proof 链，但当前代理的 Brunhild 服务返回 `502`，尚未出现真实 `/1.txt` `404`。
+
+### Step 213 — screen.availTop/availLeft 宿主指标（2026-09-03，代码完成）
+
+**证据**：Chrome payload-3 将 `screen.availTop` 归入值桶 `30`，而 Obscura 原先的 Screen getter
+始终返回 `0`。该差异来自显示器工作区，不属于 iframe 或站点逻辑，但会进入 challenge 的屏幕指纹。
+
+**修复与回归**：`ScreenFingerprint` 增加可选 `availTop`/`availLeft`，Screen 实例把值保存在隐藏
+symbol slots 中，主 realm、frame realm 和 worker 均从同一 fingerprint 读取；默认值仍为零。runtime
+fingerprint contract 已用 `availTop=30` 验证 `[screen.availTop, screen.availLeft] == [30, 0]`，不会增加
+`Object.getOwnPropertyNames(screen)` 泄漏。
+
+**结论**：宿主工作区指标现在可显式对齐真实 Chrome；目标 challenge 的剩余失败仍是上游 proof 会话，
+不能把缺失屏幕常数硬编码为全局默认。
+
+### Step 214 — 初始 about:blank 的 BackCompat 时序（2026-09-03，代码完成）
+
+**证据**：Chrome payload-3 的早期 frame 桶将 `d.compatMode` 记为 `BackCompat`。Obscura 在 iframe
+插入同步阶段把 `create_blank_iframe_document` 的 scope 强制写成 `quirks=false`，因此 author/challenge
+脚本在异步导航提交前读到 `CSS1Compat`；后续文档提交才会改回正确模式。
+
+**修复与回归**：初始 `about:blank` scope 现在从插入时即标记为 quirks/`BackCompat`，后续 network/srcdoc
+导航仍以实际 HTML parser 结果覆盖。新增 `initial_about_blank_iframe_is_back_compat_synchronously`，
+并与跨源隔离、frame CSP 回归一起通过。最新目标 payload 的 `d.compatMode` 已落入 `BackCompat` 桶。
+
+**结论**：初始 iframe 文档的兼容模式时序已与 Chrome 对齐；真实 404 仍等待 Brunhild proof 服务恢复，
+不引入站点或 challenge 特判。
+
+### Step 215 — compatMode 修复后的真实点击验收（2026-09-03，外部阻塞）
+
+**方法与证据**：使用完整 Chrome 参考画像（`zh-CN`、单语言、DPR1、`availTop=30`、窗口
+`1200x1120`、原点 `22,51`）和原始代理 `http://192.168.3.57:9000`，通过 CDP 物理坐标
+`(213,335)` 点击 widget。`op_fetch_url` 日志显示 frame proof `200`、PAT 请求被发起，但
+Brunhild `/i` 只有 `called` 没有 `completed`；`Network.responseReceived` 只收到初始
+`https://www.thelancet.com/1.txt` `403`，没有第二次 `/1.txt` 导航或 `404`。
+
+**结论**：compatMode、crossOriginIsolated、screen 工作区和请求头修复均未引入新的页面断点；
+当前唯一未决是代理到 Brunhild proof 服务的连接超时/路由（该主机经代理返回 `502`，直连边缘返回
+`522`）。在该外部条件恢复前不能宣称真实 404，也不加入伪造响应或主机特判。
+
+### Step 216 — widget 嵌套 srcdoc origin 测量边界（2026-09-03，未决）
+
+**证据**：当前 CDP frame tree 中网络 widget frame 的 `origin=https://challenges.cloudflare.com`、
+`compatMode=CSS1Compat`；其 closed-shadow 内嵌 `about:srcdoc` 不能通过普通 `querySelectorAll` 枚举，
+独立 frame context 读取到 `origin=null`、`BackCompat`。payload 的 `o.origin`/`d.compatMode` 由 challenge
+在多个 realm/时刻采集，不能把单个值桶直接归属到某一层 iframe。
+
+**结论**：现有 sandbox/opaque-origin 实现保留浏览器规范语义，未发现足够证据继续修改。该测量边界不改变
+Step 214 的 `BackCompat` 修复，也不改变当前 Brunhild 代理 `502` 的真实 404 阻塞。
+
+### Step 217 — frame Fetch Metadata 与 stealth 传输（2026-09-03，代码完成）
+
+**假设**：网络 iframe 导航复用顶层 `ResourceRequest::navigation()`，会发送
+`Sec-Fetch-Site: none`、`Sec-Fetch-Dest: document` 和 `Sec-Fetch-User: ?1`，且在 stealth 页面中
+仍走 reqwest；这与 Chrome/HaHaVM-General 的 iframe 请求 profile 不一致。
+
+**修复与回归**：新增独立 frame document API，携带父文档 initiator，发送 `Sec-Fetch-Dest: iframe`，
+跳过 `Sec-Fetch-User`。stealth 模式下 GET 网络 iframe 改走 wreq，复用 TLS/HTTP2 指纹和 cookie jar；
+POST frame 保持 reqwest。reqwest 与 wreq fixture、browser frame navigation 测试均通过。
+
+**结论**：该通用环境差异已修复，顶层导航头部未改变；真实目标仍需外部 proof 服务可达才能验证后续
+`/1.txt` 404。
+
+### Step 218 — frame profile 真实站复测（2026-09-03，外部阻塞）
+
+**证据**：重新构建 trace-patched release 后，`/1.txt` 物理点击仍完成 frame/top `fo=200` 并写入
+`cf_clearance`，PAT 为 `401`；Brunhild `/i` 经 `http://192.168.3.57:9000` 没有完成响应，页面换 ray。
+
+**结论**：frame profile 和 stealth 传输修复没有引入回归，但当前代理对 Brunhild 的 `502`/无响应仍是
+真实 `404` 验收的外部阻断，不能用伪造响应替代。

@@ -1492,7 +1492,7 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
+        "Inspector.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
         "Target.setAutoAttach" => {
             Some(json!({}))

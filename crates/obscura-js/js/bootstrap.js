@@ -36,6 +36,7 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     '__obscura_viewport_w', '__obscura_viewport_h', '__obscura_screen_emulated',
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_init', '__obscura_hide_list',
+    '__obscura_csp_allows_unsafe_eval',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
@@ -82,7 +83,7 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler', 'TextMetrics',
-    'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
+    'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
@@ -188,11 +189,14 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+const _nativeRegistrySym = Symbol.for('obscura.nativeFunctionRegistry');
+const _nativeRegistry = Deno[_nativeRegistrySym] ||
+  (Deno[_nativeRegistrySym] = { fns: new WeakSet(), strings: new WeakMap() });
+const _nativeFns = _nativeRegistry.fns;
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = _nativeRegistry.strings;
 const _origToString = Function.prototype.toString;
 Function.prototype.toString = function toString() {
   if (_nativeStr.has(this)) { return _nativeStr.get(this); }
@@ -225,16 +229,46 @@ const _treeParentEpochSym = Symbol.for('obscura.treeParentEpoch');
 const _ownerDocRootSym = Symbol.for('obscura.ownerDocRoot');
 const _styleSheetListSym = Symbol.for('obscura.styleSheetList');
 const _fontsSym = Symbol.for('obscura.fonts');
+const _inputFocusedSym = Symbol.for('obscura.inputFocused');
+const _inputClickTargetSym = Symbol.for('obscura.inputClickTarget');
+const _detachedNodeOwners = new WeakMap();
+const _detachedRootOwners = new Map();
+function _detachedOwnerForNode(node) {
+  const direct = node && _detachedNodeOwners.get(node);
+  if (direct) return direct;
+  if (_detachedRootOwners.size && node && node[_nidSym] !== undefined) {
+    const rootNid = +_dom("document_root", node[_nidSym]);
+    const owner = _detachedRootOwners.get(rootNid);
+    if (owner) {
+      _detachedNodeOwners.set(node, owner);
+      return owner;
+    }
+  }
+  return null;
+}
 // Captured once so structured clone does not depend on the global binding
 // still being there. Chrome exposes no SharedArrayBuffer without cross-origin
 // isolation; matching that is tracked separately (deleting it here does work,
 // but something re-installs it after bootstrap runs).
-const _SharedArrayBufferCtor = globalThis.SharedArrayBuffer;
+let _SharedArrayBufferCtor = globalThis.SharedArrayBuffer || (() => {
+  try {
+    return new WebAssembly.Memory({initial: 1, maximum: 1, shared: true})
+      .buffer.constructor;
+  } catch (_error) { return undefined; }
+})();
 // Set by _installSecureContext at the very end of bootstrap and called from
 // __obscura_init. A closure variable rather than a global: any own property
 // name containing "obscura" leaks the engine's identity to a page that reads
 // Object.getOwnPropertyNames(window).
 let _applySecureContextGating = null;
+let _applyCrossOriginIsolation = null;
+let _crossOriginIsolatedValue = false;
+// V8's code-generation callback reads this realm-local flag to enforce the
+// document's `script-src` `unsafe-eval` requirement without replacing the
+// intrinsic eval binding (which would change direct-eval scope).
+Object.defineProperty(globalThis, '__obscura_csp_allows_unsafe_eval', {
+  value: true, writable: true, enumerable: false, configurable: true,
+});
 _nativeFns.add(Function.prototype.toString);
 // Defined above, before this set existed. A script that enumerates the global
 // and reads each value gets the function source back for anything unmarked,
@@ -275,12 +309,22 @@ _markNative(globalThis.dispatchEvent);
     // object does not, so this is a cheap, side-effect-free discriminator.
     try { return !!t && t.globalThis === t; } catch (_e) { return false; }
   }
+  function _isDomWrapper(t) {
+    try { return !!t && typeof t[_nidSym] === 'number'; }
+    catch (_e) { return false; }
+  }
   function _filter(t, names) {
-    if (!_isGlobal(t)) { return names; }
-    var set = _set();
-    if (!set) { return names; }
-    var out = [];
-    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    var out = names;
+    if (_isGlobal(t)) {
+      var set = _set();
+      if (set) out = out.filter(function(name) { return !set.has(name); });
+    }
+    // DOM wrapper implementation slots are all underscore-prefixed. They are
+    // intentionally ordinary JS fields for fast internal access, but Chrome's
+    // WebIDL objects do not expose them through own-property reflection.
+    if (_isDomWrapper(t)) {
+      out = out.filter(function(name) { return typeof name !== 'string' || name.charAt(0) !== '_'; });
+    }
     return out;
   }
   var _oGOPN = Object.getOwnPropertyNames;
@@ -298,6 +342,12 @@ _markNative(globalThis.dispatchEvent);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    }
+    if (_isDomWrapper(t)) {
+      var domKeys = _oGOPN(all);
+      for (var j = 0; j < domKeys.length; j++) {
+        if (typeof domKeys[j] === 'string' && domKeys[j].charAt(0) === '_') delete all[domKeys[j]];
+      }
     }
     return all;
   });
@@ -418,6 +468,16 @@ function _environmentDocumentRoot() {
     ? globalThis.__obscura_frame_document_nid
     : 0;
 }
+function _environmentDocumentCsp() {
+  try {
+    const root = _environmentDocumentRoot();
+    const raw = Deno.core.ops.op_dom('document_scope_info', String(root), '');
+    const info = raw && JSON.parse(raw);
+    return info && typeof info.csp === 'string' ? info.csp : '';
+  } catch (_) {
+    return '';
+  }
+}
 function _environmentReferrerContext() {
   return JSON.stringify({
     url: globalThis.location?.href || "",
@@ -425,6 +485,85 @@ function _environmentReferrerContext() {
     root: _environmentDocumentRoot(),
   });
 }
+
+// Dynamic script insertion happens after the Rust parser scheduler, so it has
+// to enforce the owning document's script policy at the DOM sink itself.
+// Keep this helper deliberately small and URL-based: the full CSP parser lives
+// in the browser crate, while this path only needs the script source-list and
+// nonce checks before scheduling a fetch/evaluation task.
+function _dynamicScriptCspAllows(script, resolvedUrl, inline) {
+  let header = '';
+  try {
+    const root = _environmentDocumentRoot();
+    const raw = Deno.core.ops.op_dom('document_scope_info', String(root), '');
+    const info = raw && JSON.parse(raw);
+    header = info && info.csp || '';
+  } catch (_) {}
+  if (!header) return true;
+  const directives = header.split(';').map(part => part.trim().split(/\s+/));
+  let sources = null;
+  for (const name of ['script-src-elem', 'script-src', 'default-src']) {
+    const found = directives.find(tokens => tokens[0]?.toLowerCase() === name);
+    if (found) { sources = found.slice(1); break; }
+  }
+  if (!sources) return true;
+  const nonce = script && script.getAttribute && script.getAttribute('nonce');
+  if (nonce && sources.some(source => {
+    const lower = source.toLowerCase();
+    return lower.startsWith("'nonce-") && lower.endsWith("'")
+      && source.slice(7, -1) === nonce;
+  })) return true;
+  if (inline) {
+    if (sources.some(source => source.toLowerCase() === "'unsafe-inline'")) return true;
+    return false;
+  }
+  let target;
+  let documentUrl;
+  try {
+    documentUrl = new URL(globalThis.location?.href || 'about:blank');
+    target = new URL(resolvedUrl, documentUrl.href);
+  } catch (_) { return false; }
+  return sources.some(source => {
+    const token = source.toLowerCase();
+    if (token === "'none'") return false;
+    if (token === '*') return ['http:', 'https:', 'ws:', 'wss:'].includes(target.protocol);
+    if (token === 'data:') return target.protocol === 'data:';
+    if (token === 'blob:') return target.protocol === 'blob:';
+    if (token.endsWith(':') && !token.includes('/')) return target.protocol === token;
+    if (token === "'self'") return target.origin === documentUrl.origin;
+    let sourceUrl;
+    try { sourceUrl = new URL(source.includes('://') ? source : documentUrl.protocol + '//' + source); }
+    catch (_) { return false; }
+    if (sourceUrl.protocol !== target.protocol || sourceUrl.port !== target.port) return false;
+    const host = sourceUrl.hostname;
+    return host.startsWith('*.')
+      ? target.hostname.endsWith(host.slice(1)) && target.hostname !== host.slice(2)
+      : target.hostname === host;
+  });
+}
+
+function _inlineEventHandlerCspAllows() {
+  let header = '';
+  try {
+    const root = _environmentDocumentRoot();
+    const raw = Deno.core.ops.op_dom('document_scope_info', String(root), '');
+    const info = raw && JSON.parse(raw);
+    header = info && info.csp || '';
+  } catch (_) {}
+  if (!header) return true;
+  let attr = null, script = null, fallback = null;
+  for (const directive of header.split(';')) {
+    const tokens = directive.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const name = tokens.shift().toLowerCase();
+    if (name === 'script-src-attr' && attr === null) attr = tokens;
+    else if (name === 'script-src' && script === null) script = tokens;
+    else if (name === 'default-src' && fallback === null) fallback = tokens;
+  }
+  const sources = attr || script || fallback;
+  return !sources || sources.some(source => source.toLowerCase() === "'unsafe-inline'");
+}
+
 async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
@@ -686,6 +825,14 @@ function _cssImportApplies(media) {
 
 async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
+  // A dynamically inserted stylesheet is governed by the creator document's
+  // style-src policy, not connect-src alone. Check every import as well as the
+  // root link so an imported sheet cannot bypass the same policy.
+  if (!_cspResourceAllows(url, 'style-src')) {
+    throw new DOMException(
+      "Refused to load the stylesheet '" + url + "' because it violates the document's Content Security Policy.",
+      'SecurityError');
+  }
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
     url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin",
@@ -705,7 +852,8 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
       const target = doubleQuoted || singleQuoted || bare || "";
       if (_cssImportApplies(media || "")) {
         try {
-          imports.push(new URL(target, url).href);
+          const importUrl = new URL(target, url).href;
+          if (_cspResourceAllows(importUrl, 'style-src')) imports.push(importUrl);
         } catch(e) {}
       }
       return "";
@@ -733,7 +881,13 @@ async function _loadLinkedStylesheet(c) {
   if (!href) return;
   const fullUrl = _resolveResourceUrl(href);
   let pageOrigin = "";
-  try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
+  try {
+    const root = _environmentDocumentRoot();
+    const scope = _domParse("document_scope_info", root) || {};
+    pageOrigin = scope.origin || new URL(globalThis.document?.URL || globalThis.location?.href || "about:blank").origin;
+  } catch(e) {
+    try { pageOrigin = new URL(globalThis.location?.href || "about:blank").origin; } catch (_) {}
+  }
   try {
     const css = await _fetchLinkedCss(fullUrl, pageOrigin);
     const previous = _linkedStylesheetNodes.get(c);
@@ -765,7 +919,7 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _fingerprint() {
   return globalThis.__obscura_fingerprint || {
-    userAgent: '', browserVersion: '', browserMajor: 0,
+    userAgent: '', language: 'en-US', languages: ['en-US', 'en'], browserVersion: '', browserMajor: 0,
     navigatorPlatform: '', uaPlatform: '', uaPlatformVersion: '',
     architecture: '', bitness: '', wow64: false, mobile: false, model: '',
     brands: [], fullVersionList: [], hardwareConcurrency: 8, deviceMemory: 8,
@@ -775,10 +929,17 @@ function _fingerprint() {
 }
 globalThis.__obscura_set_fingerprint = function(value) {
   if (!value || typeof value !== 'object') return;
+  const language = String(value.language || 'en-US');
+  const suppliedLanguages = Array.isArray(value.languages)
+    ? value.languages.map(item => String(item || '')).filter(Boolean)
+    : [];
+  const languages = Object.freeze(suppliedLanguages.length ? suppliedLanguages : [language]);
   const freezeBrands = list => Object.freeze((Array.isArray(list) ? list : []).map(item =>
     Object.freeze({brand:String(item && item.brand || ''),version:String(item && item.version || '')})
   ));
   const installed = Object.assign({}, value, {
+    language,
+    languages,
     brands: freezeBrands(value.brands),
     fullVersionList: freezeBrands(value.fullVersionList),
     screen: Object.freeze(Object.assign({}, value.screen)),
@@ -834,12 +995,12 @@ function _splitAsciiWhitespace(s) {
 // named access work on the result). `root` must expose querySelectorAll.
 function _getElementsByClassName(root, classNames) {
   const tokens = _splitAsciiWhitespace(classNames);
-  if (tokens.length === 0) return HTMLCollection._from([]);
+  if (tokens.length === 0) return _htmlCollectionFrom([]);
   // Fast path: a single CSS-identifier token goes straight to the native
   // selector engine (the common case). Only multi-token sets or exotic class
   // names (NBSP, leading digits, etc.) fall back to the O(n) JS scan below.
   if (tokens.length === 1 && /^[A-Za-z_-][\w-]*$/.test(tokens[0])) {
-    return HTMLCollection._from(root.querySelectorAll("." + tokens[0]));
+    return _htmlCollectionFrom(root.querySelectorAll("." + tokens[0]));
   }
   const all = root.querySelectorAll("*");
   const matched = [];
@@ -852,7 +1013,7 @@ function _getElementsByClassName(root, classNames) {
     }
     if (ok) matched.push(el);
   }
-  return HTMLCollection._from(matched);
+  return _htmlCollectionFrom(matched);
 }
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
@@ -885,14 +1046,82 @@ const _consoleFn = (level, args) => {
   }).join(" ")); } catch {}
 };
 
-globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
-  groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
-  timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
-  assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
-};
+const _consoleMethodNames = [
+  'debug', 'error', 'info', 'log', 'warn', 'dir', 'dirxml', 'table', 'trace',
+  'group', 'groupCollapsed', 'groupEnd', 'clear', 'count', 'countReset',
+  'assert', 'profile', 'profileEnd', 'time', 'timeLog', 'timeEnd',
+  'timeStamp', 'context', 'createTask',
+];
+function _makeConsoleMethod(name, length, implementation) {
+  const method = function() { return implementation.apply(this, arguments); };
+  Object.defineProperty(method, 'name', { value: name, configurable: true });
+  Object.defineProperty(method, 'length', { value: length, configurable: true });
+  _markNativeAs(method, `function ${name}() { [native code] }`);
+  return method;
+}
+function _consoleOutput(name, args) {
+  if (name === 'assert') {
+    if (!args[0]) _consoleFn('error', ['Assertion failed:', ...Array.from(args).slice(1)]);
+    return;
+  }
+  if (name === 'error' || name === 'warn') return _consoleFn(name, Array.from(args));
+  if (name === 'debug' || name === 'info' || name === 'log'
+      || name === 'dir' || name === 'dirxml' || name === 'table'
+      || name === 'trace') {
+    return _consoleFn('log', Array.from(args));
+  }
+}
+function _newConsoleContext() {
+  const context = {};
+  const names = [
+    'dir', 'dirXml', 'table', 'groupEnd', 'clear', 'count', 'countReset',
+    'profile', 'profileEnd', 'debug', 'error', 'info', 'log', 'warn', 'trace',
+    'group', 'groupCollapsed', 'assert', 'time', 'timeLog', 'timeEnd', 'timeStamp',
+  ];
+  for (const name of names) {
+    Object.defineProperty(context, name, {
+      value: _makeConsoleMethod(name, 1, function() {
+        return _consoleOutput(name === 'dirXml' ? 'dirxml' : name, arguments);
+      }),
+      writable: true, enumerable: true, configurable: true,
+    });
+  }
+  return context;
+}
+const _consoleTaskPrototype = Object.create(Object.prototype);
+Object.defineProperty(_consoleTaskPrototype, 'constructor', {
+  value: Object, writable: true, enumerable: false, configurable: true,
+});
+function _newConsoleTask() {
+  const task = Object.create(_consoleTaskPrototype);
+  const run = _makeConsoleMethod('run', 0, function() {
+    if (this !== task) throw new Error("'run' called with illegal receiver.");
+    const callback = arguments[0];
+    if (typeof callback !== 'function') throw new Error('First argument must be a function.');
+    return callback.call(globalThis);
+  });
+  Object.defineProperty(task, 'run', {
+    value: run, writable: true, enumerable: true, configurable: true,
+  });
+  return task;
+}
+
+globalThis.console = {};
+for (const name of _consoleMethodNames) {
+  const length = name === 'context' ? 1 : 0;
+  const implementation = name === 'context'
+    ? function() { return _newConsoleContext(); }
+    : name === 'createTask'
+      ? function() { return _newConsoleTask(); }
+      : function() { return _consoleOutput(name, arguments); };
+  Object.defineProperty(globalThis.console, name, {
+    value: _makeConsoleMethod(name, length, implementation),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
+Object.defineProperty(globalThis.console, Symbol.toStringTag, {
+  value: 'console', writable: false, enumerable: false, configurable: true,
+});
 
 // An event handler that throws does not cancel dispatch -- the remaining
 // handlers still run -- but the exception is *reported*, exactly as an uncaught
@@ -1596,6 +1825,160 @@ const _CSS_PROPERTY_NAMES = [
   "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
   "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
 ];
+const _CSS_ADDITIONAL_PROPERTY_NAMES = `
+additiveSymbols alignmentBaseline anchorName anchorScope animationComposition animationRange animationRangeEnd
+animationRangeStart animationTimeline animationTrigger appRegion ascentOverride basePalette baselineShift
+baselineSource borderEndEndRadius borderEndStartRadius borderShape borderStartEndRadius borderStartStartRadius
+boxDecorationBreak bufferedRendering caretAnimation caretShape clipRule colorInterpolation
+colorInterpolationFilters colorRendering columnHeight columnRuleBreak columnRuleInset columnRuleInsetCap
+columnRuleInsetCapEnd columnRuleInsetCapStart columnRuleInsetEnd columnRuleInsetJunction
+columnRuleInsetJunctionEnd columnRuleInsetJunctionStart columnRuleInsetStart columnRuleVisibilityItems columnWrap
+containIntrinsicBlockSize containIntrinsicHeight containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth
+contentVisibility cornerBlockEndShape cornerBlockStartShape cornerBottomLeftShape cornerBottomRightShape
+cornerBottomShape cornerEndEndShape cornerEndStartShape cornerInlineEndShape cornerInlineStartShape cornerLeftShape
+cornerRightShape cornerShape cornerStartEndShape cornerStartStartShape cornerTopLeftShape cornerTopRightShape
+cornerTopShape cx cy d descentOverride dominantBaseline dynamicRangeLimit epubCaptionSide epubTextCombine
+epubTextEmphasis epubTextEmphasisColor epubTextEmphasisStyle epubTextOrientation epubTextTransform epubWordBreak
+epubWritingMode fallback fieldSizing fill fillOpacity fillRule flexLineCount floodColor floodOpacity fontDisplay
+fontLanguageOverride fontPalette fontSynthesis fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight
+fontVariantAlternates fontVariantEastAsian fontVariantEmoji fontVariantPosition fontVariationSettings
+forcedColorAdjust hyphenateCharacter hyphenateLimitChars imageOrientation inherits initialLetter initialValue
+interactivity interestDelay interestDelayEnd interestDelayStart interpolateSize lightingColor lineGapOverride marker
+markerEnd markerMid markerStart maskClip maskComposite maskImage maskMode maskOrigin maskPosition maskRepeat maskSize
+maskType mathDepth mathShift mathStyle navigation negative objectViewBox offsetAnchor offsetDistance offsetPath
+offsetPosition offsetRotate orphans overflowBlock overflowClipMargin overflowInline overlay overrideColors pad page
+pageMarginSafety pageOrientation paintOrder positionAnchor positionArea positionTry positionTryFallbacks
+positionTryOrder positionVisibility prefix printColorAdjust r range readingFlow readingOrder result rowRule
+rowRuleBreak rowRuleColor rowRuleInset rowRuleInsetCap rowRuleInsetCapEnd rowRuleInsetCapStart rowRuleInsetEnd
+rowRuleInsetJunction rowRuleInsetJunctionEnd rowRuleInsetJunctionStart rowRuleInsetStart rowRuleStyle
+rowRuleVisibilityItems rowRuleWidth rubyAlign rubyOverhang rubyPosition rule ruleBreak ruleColor ruleInset ruleInsetCap
+ruleInsetEnd ruleInsetJunction ruleInsetStart ruleOverlap ruleStyle ruleVisibilityItems ruleWidth rx ry
+scrollInitialTarget scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom
+scrollMarginInline scrollMarginInlineEnd scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop
+scrollMarkerGroup scrollPaddingBlock scrollPaddingBlockEnd scrollPaddingBlockStart scrollPaddingBottom
+scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight
+scrollPaddingTop scrollTargetGroup scrollTimeline scrollTimelineAxis scrollTimelineName scrollbarColor scrollbarGutter
+scrollbarWidth shapeImageThreshold shapeMargin shapeOutside shapeRendering size sizeAdjust speak speakAs src stopColor
+stopOpacity stroke strokeDasharray strokeDashoffset strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity
+strokeWidth suffix symbols syntax system textAnchor textAutospace textBox textBoxEdge textBoxTrim textEmphasisColor
+textEmphasisPosition textEmphasisStyle textFit textSizeAdjust textSpacingTrim textWrap textWrapMode textWrapStyle
+timelineScope timelineTrigger timelineTriggerActivationRange timelineTriggerActivationRangeEnd
+timelineTriggerActivationRangeStart timelineTriggerActiveRange timelineTriggerActiveRangeEnd
+timelineTriggerActiveRangeStart timelineTriggerName timelineTriggerSource transitionBehavior triggerScope types
+unicodeRange vectorEffect viewTimeline viewTimelineAxis viewTimelineInset viewTimelineName viewTransitionClass
+viewTransitionGroup viewTransitionName viewTransitionScope webkitAlignContent webkitAlignItems webkitAlignSelf
+webkitAnimation webkitAnimationDelay webkitAnimationDirection webkitAnimationDuration webkitAnimationFillMode
+webkitAnimationIterationCount webkitAnimationName webkitAnimationPlayState webkitAnimationTimingFunction
+webkitAppRegion webkitAppearance webkitBackfaceVisibility webkitBackgroundClip webkitBackgroundOrigin
+webkitBackgroundSize webkitBorderAfter webkitBorderAfterColor webkitBorderAfterStyle webkitBorderAfterWidth
+webkitBorderBefore webkitBorderBeforeColor webkitBorderBeforeStyle webkitBorderBeforeWidth
+webkitBorderBottomLeftRadius webkitBorderBottomRightRadius webkitBorderEnd webkitBorderEndColor webkitBorderEndStyle
+webkitBorderEndWidth webkitBorderHorizontalSpacing webkitBorderImage webkitBorderRadius webkitBorderStart
+webkitBorderStartColor webkitBorderStartStyle webkitBorderStartWidth webkitBorderTopLeftRadius
+webkitBorderTopRightRadius webkitBorderVerticalSpacing webkitBoxAlign webkitBoxDecorationBreak webkitBoxDirection
+webkitBoxFlex webkitBoxOrdinalGroup webkitBoxOrient webkitBoxPack webkitBoxReflect webkitBoxShadow webkitBoxSizing
+webkitClipPath webkitColumnBreakAfter webkitColumnBreakBefore webkitColumnBreakInside webkitColumnCount
+webkitColumnGap webkitColumnRule webkitColumnRuleColor webkitColumnRuleStyle webkitColumnRuleWidth webkitColumnSpan
+webkitColumnWidth webkitColumns webkitFilter webkitFlex webkitFlexBasis webkitFlexDirection webkitFlexFlow
+webkitFlexGrow webkitFlexShrink webkitFlexWrap webkitFontFeatureSettings webkitFontSmoothing
+webkitHyphenateCharacter webkitJustifyContent webkitLineBreak webkitLineClamp webkitLocale webkitLogicalHeight
+webkitLogicalWidth webkitMarginAfter webkitMarginBefore webkitMarginEnd webkitMarginStart webkitMask
+webkitMaskBoxImage webkitMaskBoxImageOutset webkitMaskBoxImageRepeat webkitMaskBoxImageSlice
+webkitMaskBoxImageSource webkitMaskBoxImageWidth webkitMaskClip webkitMaskComposite webkitMaskImage webkitMaskOrigin
+webkitMaskPosition webkitMaskPositionX webkitMaskPositionY webkitMaskRepeat webkitMaskSize webkitMaxLogicalHeight
+webkitMaxLogicalWidth webkitMinLogicalHeight webkitMinLogicalWidth webkitOpacity webkitOrder webkitPaddingAfter
+webkitPaddingBefore webkitPaddingEnd webkitPaddingStart webkitPerspective webkitPerspectiveOrigin
+webkitPerspectiveOriginX webkitPerspectiveOriginY webkitPrintColorAdjust webkitRtlOrdering webkitRubyPosition
+webkitShapeImageThreshold webkitShapeMargin webkitShapeOutside webkitTapHighlightColor webkitTextCombine
+webkitTextDecorationsInEffect webkitTextEmphasis webkitTextEmphasisColor webkitTextEmphasisPosition
+webkitTextEmphasisStyle webkitTextFillColor webkitTextOrientation webkitTextSecurity webkitTextSizeAdjust
+webkitTextStroke webkitTextStrokeColor webkitTextStrokeWidth webkitTransform webkitTransformOrigin
+webkitTransformOriginX webkitTransformOriginY webkitTransformOriginZ webkitTransformStyle webkitTransition
+webkitTransitionDelay webkitTransitionDuration webkitTransitionProperty webkitTransitionTimingFunction
+webkitUserDrag webkitUserModify webkitUserSelect webkitWritingMode whiteSpaceCollapse widows x y
+`.trim().split(/\s+/);
+_CSS_PROPERTY_NAMES.splice(_CSS_PROPERTY_NAMES.indexOf('cssFloat'), 1);
+_CSS_PROPERTY_NAMES.push(..._CSS_ADDITIONAL_PROPERTY_NAMES);
+_CSS_PROPERTY_NAMES.sort();
+
+const _CSS_COMPUTED_PROPERTY_NAMES = `
+accent-color align-content align-items align-self alignment-baseline anchor-name anchor-scope animation-composition
+animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name
+animation-play-state animation-range-end animation-range-start animation-timeline animation-timing-function
+animation-trigger app-region appearance aspect-ratio backdrop-filter backface-visibility background-attachment
+background-blend-mode background-clip background-color background-image background-origin background-position
+background-repeat background-size baseline-shift baseline-source block-size border-block-end-color
+border-block-end-style border-block-end-width border-block-start-color border-block-start-style
+border-block-start-width border-bottom-color border-bottom-left-radius border-bottom-right-radius border-bottom-style
+border-bottom-width border-collapse border-end-end-radius border-end-start-radius border-image-outset
+border-image-repeat border-image-slice border-image-source border-image-width border-inline-end-color
+border-inline-end-style border-inline-end-width border-inline-start-color border-inline-start-style
+border-inline-start-width border-left-color border-left-style border-left-width border-right-color
+border-right-style border-right-width border-shape border-start-end-radius border-start-start-radius border-top-color
+border-top-left-radius border-top-right-radius border-top-style border-top-width bottom box-decoration-break
+box-shadow box-sizing break-after break-before break-inside buffered-rendering caption-side caret-animation
+caret-color caret-shape clear clip clip-path clip-rule color color-interpolation color-interpolation-filters
+color-rendering color-scheme column-count column-fill column-gap column-height column-rule-break column-rule-color
+column-rule-inset-cap-end column-rule-inset-cap-start column-rule-inset-junction-end
+column-rule-inset-junction-start column-rule-style column-rule-visibility-items column-rule-width column-span
+column-width column-wrap contain contain-intrinsic-block-size contain-intrinsic-height contain-intrinsic-inline-size
+contain-intrinsic-size contain-intrinsic-width container-name container-type content content-visibility
+corner-bottom-left-shape corner-bottom-right-shape corner-end-end-shape corner-end-start-shape
+corner-start-end-shape corner-start-start-shape corner-top-left-shape corner-top-right-shape counter-increment
+counter-reset counter-set cursor cx cy d direction display dominant-baseline dynamic-range-limit empty-cells
+field-sizing fill fill-opacity fill-rule filter flex-basis flex-direction flex-grow flex-line-count flex-shrink
+flex-wrap float flood-color flood-opacity font-family font-feature-settings font-kerning font-language-override
+font-optical-sizing font-palette font-size font-size-adjust font-stretch font-style font-synthesis-small-caps
+font-synthesis-style font-synthesis-weight font-variant font-variant-alternates font-variant-caps
+font-variant-east-asian font-variant-emoji font-variant-ligatures font-variant-numeric font-variant-position
+font-variation-settings font-weight forced-color-adjust grid-auto-columns grid-auto-flow grid-auto-rows
+grid-column-end grid-column-start grid-row-end grid-row-start grid-template-areas grid-template-columns
+grid-template-rows height hyphenate-character hyphenate-limit-chars hyphens image-orientation image-rendering
+initial-letter inline-size inset-block-end inset-block-start inset-inline-end inset-inline-start interactivity
+interest-delay-end interest-delay-start interpolate-size isolation justify-content justify-items justify-self left
+letter-spacing lighting-color line-break line-height list-style-image list-style-position list-style-type
+margin-block-end margin-block-start margin-bottom margin-inline-end margin-inline-start margin-left margin-right
+margin-top marker-end marker-mid marker-start mask-clip mask-composite mask-image mask-mode mask-origin mask-position
+mask-repeat mask-size mask-type math-depth math-shift math-style max-block-size max-height max-inline-size max-width
+min-block-size min-height min-inline-size min-width mix-blend-mode object-fit object-position object-view-box
+offset-anchor offset-distance offset-path offset-position offset-rotate opacity order orphans outline-color
+outline-offset outline-style outline-width overflow-anchor overflow-block overflow-clip-margin overflow-inline
+overflow-wrap overflow-x overflow-y overlay overscroll-behavior-block overscroll-behavior-inline
+overscroll-behavior-x overscroll-behavior-y padding-block-end padding-block-start padding-bottom padding-inline-end
+padding-inline-start padding-left padding-right padding-top paint-order perspective perspective-origin pointer-events
+position position-anchor position-area position-try-fallbacks position-try-order position-visibility
+print-color-adjust quotes r reading-flow reading-order resize right rotate row-gap row-rule-break row-rule-color
+row-rule-inset-cap-end row-rule-inset-cap-start row-rule-inset-junction-end row-rule-inset-junction-start
+row-rule-style row-rule-visibility-items row-rule-width ruby-align ruby-overhang ruby-position rule-overlap rx ry
+scale scroll-behavior scroll-initial-target scroll-margin-block-end scroll-margin-block-start scroll-margin-bottom
+scroll-margin-inline-end scroll-margin-inline-start scroll-margin-left scroll-margin-right scroll-margin-top
+scroll-marker-group scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom
+scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left scroll-padding-right scroll-padding-top
+scroll-snap-align scroll-snap-stop scroll-snap-type scroll-target-group scroll-timeline-axis scroll-timeline-name
+scrollbar-color scrollbar-gutter scrollbar-width shape-image-threshold shape-margin shape-outside shape-rendering
+speak stop-color stop-opacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin
+stroke-miterlimit stroke-opacity stroke-width tab-size table-layout text-align text-align-last text-anchor
+text-autospace text-box-edge text-box-trim text-combine-upright text-decoration text-decoration-color
+text-decoration-line text-decoration-skip-ink text-decoration-style text-decoration-thickness text-emphasis-color
+text-emphasis-position text-emphasis-style text-fit text-indent text-justify text-orientation text-overflow
+text-rendering text-shadow text-size-adjust text-spacing-trim text-transform text-underline-offset
+text-underline-position text-wrap-mode text-wrap-style timeline-scope timeline-trigger-activation-range-end
+timeline-trigger-activation-range-start timeline-trigger-active-range-end timeline-trigger-active-range-start
+timeline-trigger-name timeline-trigger-source top touch-action transform transform-box transform-origin
+transform-style transition-behavior transition-delay transition-duration transition-property
+transition-timing-function translate trigger-scope unicode-bidi user-select vector-effect vertical-align
+view-timeline-axis view-timeline-inset view-timeline-name view-transition-class view-transition-group
+view-transition-name view-transition-scope visibility white-space-collapse widows width will-change word-break
+word-spacing writing-mode x y z-index zoom -webkit-border-horizontal-spacing -webkit-border-image
+-webkit-border-vertical-spacing -webkit-box-align -webkit-box-decoration-break -webkit-box-direction
+-webkit-box-flex -webkit-box-ordinal-group -webkit-box-orient -webkit-box-pack -webkit-box-reflect
+-webkit-font-smoothing -webkit-line-break -webkit-line-clamp -webkit-locale -webkit-mask-box-image
+-webkit-mask-box-image-outset -webkit-mask-box-image-repeat -webkit-mask-box-image-slice
+-webkit-mask-box-image-source -webkit-mask-box-image-width -webkit-mask-position-x -webkit-mask-position-y
+-webkit-rtl-ordering -webkit-ruby-position -webkit-tap-highlight-color -webkit-text-combine
+-webkit-text-decorations-in-effect -webkit-text-fill-color -webkit-text-orientation -webkit-text-security
+-webkit-text-stroke-color -webkit-text-stroke-width -webkit-user-drag -webkit-user-modify -webkit-writing-mode
+`.trim().split(/\s+/);
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
 // Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
@@ -1650,68 +2033,81 @@ function _serializeCss(props) {
   return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
 }
 
-class CSSStyleDeclaration {
-  constructor(owner, onChange) {
-    // Non-enumerable so they never leak through the proxy's own-key traps.
-    Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
-    // The owner Element, if any. A live declaration reflects that element's
-    // `style` content attribute in both directions; an owner-less declaration
-    // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
-    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
-    Object.defineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
-    // Load the content attribute only when style is first observed. Keeping
-    // this as a primitive avoids allocating a separate sync object for every
-    // wrapped element.
-    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
+const _cssStyleState = new WeakMap();
+function _cssStyleFor(value) {
+  const state = _cssStyleState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _cssStylePull(value) {
+  const state = _cssStyleFor(value);
+  if (state.loaded) return state;
+  _parseCssInto(state.props, state.owner.getAttribute('style'));
+  state.loaded = true;
+  return state;
+}
+function _cssStyleReplaceFromAttribute(value, text) {
+  const state = _cssStyleFor(value);
+  _parseCssInto(state.props, text);
+  state.loaded = true;
+}
+function _cssStylePush(value) {
+  const state = _cssStyleFor(value);
+  if (state.owner) {
+    const text = _serializeCss(state.props);
+    if (text) state.owner.setAttribute('style', text);
+    else state.owner.removeAttribute('style');
+  } else if (state.onChange) {
+    state.onChange();
   }
-  // Pull the initial `style` attribute once. Later attribute mutations update
-  // the declaration directly from Element.setAttribute/removeAttribute, so
-  // repeated style reads do not cross the JS/Rust op boundary.
-  _pull() {
-    if (this._loaded) return;
-    _parseCssInto(this._props, this._owner.getAttribute("style"));
-    this._loaded = true;
-  }
-  _replaceFromAttribute(text) {
-    _parseCssInto(this._props, text);
-    this._loaded = true;
-  }
-  // Serialize `_props` back onto the owner's `style` attribute after a mutation,
-  // so el.style.x = … and cssText reflect into getAttribute('style') and
-  // serialization. No-op when owner-less.
-  _push() {
-    const o = this._owner;
-    if (o) {
-      const text = _serializeCss(this._props);
-      if (text) o.setAttribute("style", text);
-      else o.removeAttribute("style");
-    } else if (this._onChange) {
-      this._onChange();
-    }
-  }
-  // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
-  // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
-  // getPropertyValue('font-size') and el.style.fontSize stay in sync.
-  setProperty(name, value) {
-    this._pull();
-    const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
-    this._push();
-  }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
-  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
-  getPropertyPriority() { return ""; }
-  get cssText() { this._pull(); return _serializeCss(this._props); }
-  set cssText(v) {
-    _parseCssInto(this._props, v);
-    this._push();
-  }
-  get length() { this._pull(); return Object.keys(this._props).length; }
-  item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
-const _styleProxy = (decl) => new Proxy(decl, {
+class CSSStyleDeclaration {
+  constructor(owner = null, onChange = null, parentRule = null) {
+    _cssStyleState.set(this, {
+      props: {}, owner, onChange, parentRule, loaded: !owner,
+    });
+  }
+  get cssText() { return _serializeCss(_cssStylePull(this).props); }
+  set cssText(value) {
+    const state = _cssStyleFor(this);
+    _parseCssInto(state.props, value);
+    state.loaded = true;
+    _cssStylePush(this);
+  }
+  get length() { return Object.keys(_cssStylePull(this).props).length; }
+  get parentRule() { return _cssStyleFor(this).parentRule; }
+  get cssFloat() { return this.getPropertyValue('float'); }
+  set cssFloat(value) { this.setProperty('float', value); }
+  getPropertyPriority(_name) { _cssStyleFor(this); return ''; }
+  getPropertyValue(name) {
+    return _cssStylePull(this).props[_cssCamelToKebab(String(name))] || '';
+  }
+  item(index) { return Object.keys(_cssStylePull(this).props)[index] || ''; }
+  removeProperty(name) {
+    const state = _cssStylePull(this);
+    const key = _cssCamelToKebab(String(name));
+    const old = state.props[key];
+    delete state.props[key];
+    _cssStylePush(this);
+    return old || '';
+  }
+  setProperty(name, value, _priority = '') {
+    const state = _cssStylePull(this);
+    const k = _cssCamelToKebab(String(name));
+    if (value === '' || value == null) delete state.props[k];
+    else state.props[k] = String(value);
+    _cssStylePush(this);
+  }
+}
+const _cssStyleConstructor = Object.getOwnPropertyDescriptor(
+  CSSStyleDeclaration.prototype, 'constructor');
+delete CSSStyleDeclaration.prototype.constructor;
+if (_cssStyleConstructor) Object.defineProperty(
+  CSSStyleDeclaration.prototype, 'constructor', _cssStyleConstructor);
+
+const _styleProxy = (decl) => {
+  const proxy = new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
     if (/^\d+$/.test(p)) return t.item(+p);
@@ -1719,7 +2115,6 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
-    if (p === "_loaded") { t._loaded = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
     if (p in t) { Reflect.set(t, p, v); return true; }
     if (/^\d+$/.test(p)) return true;
@@ -1729,31 +2124,34 @@ const _styleProxy = (decl) => new Proxy(decl, {
   has(t, p) {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
-    t._pull();
-    if (_cssCamelToKebab(p) in t._props) return true;
+    const props = _cssStylePull(t).props;
+    if (_cssCamelToKebab(p) in props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
   ownKeys(t) {
-    t._pull();
+    const props = _cssStylePull(t).props;
     const keys = [];
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
     const names = new Set(_CSS_PROPERTY_NAMES);
-    for (const k of Object.keys(t._props)) names.add(_cssKebabToCamel(k));
+    for (const k of Object.keys(props)) names.add(_cssKebabToCamel(k));
     for (const name of names) keys.push(name);
     return keys;
   },
   getOwnPropertyDescriptor(t, p) {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
-    t._pull();
+    const props = _cssStylePull(t).props;
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
-    if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+    if (_cssCamelToKebab(p) in props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
       return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
     }
     return undefined;
   },
-});
+  });
+  _cssStyleState.set(proxy, _cssStyleFor(decl));
+  return proxy;
+};
 
 // Clone a single node (no children), used by Node.cloneNode. Elements are built
 // with createElement/createElementNS and their content attributes copied, so no
@@ -1847,7 +2245,12 @@ function _eventTargetRemove(target, type, callback, options) {
 // WebSocket, XMLHttpRequest -- so each check is guarded rather than assumed.
 function _isDomInstance(value, name) {
   const ctor = globalThis[name];
-  return typeof ctor === 'function' && value instanceof ctor;
+  if (typeof ctor !== 'function' || !(value instanceof ctor)) return false;
+  // EventTarget is currently the Node interface object in this shim. Objects
+  // such as XHR and Performance inherit its event methods but carry no DOM
+  // node slot, so they must not enter the parent/shadow retargeting path.
+  if (name === 'Node') return value[_nidSym] !== undefined;
+  return true;
 }
 function _eventParent(target, composed) {
   if (_isDomInstance(target, 'ShadowRoot')) return composed ? target.host : null;
@@ -1888,17 +2291,18 @@ function _eventRetarget(candidate, against) {
   return candidate;
 }
 function _eventInvoke(target, event, capture, atTarget, pathIndex) {
-  event.target = event._eventPath[pathIndex].adjustedTarget;
-  if (event._eventOriginalRelatedTarget !== undefined) {
-    event.relatedTarget = _eventRetarget(event._eventOriginalRelatedTarget, target);
+  const state = _eventData(event);
+  state.target = state.path[pathIndex].adjustedTarget;
+  if (state.originalRelatedTarget !== undefined) {
+    _mouseEventSetRelatedTarget(event, _eventRetarget(state.originalRelatedTarget, target));
     // Mouse/pointer boundary events do not cross a scope where target and
     // relatedTarget retarget to the same object (e.g. an internal node moving
     // to its closed-shadow host). Such a tuple is absent from the DOM path.
     if (event.relatedTarget === event.target) return;
   }
-  event.currentTarget = target;
-  event.eventPhase = atTarget ? 2 : (capture ? 1 : 3);
-  event._eventPathCurrentIndex = pathIndex;
+  state.currentTarget = target;
+  state.eventPhase = atTarget ? 2 : (capture ? 1 : 3);
+  state.pathCurrentIndex = pathIndex;
 
   // Content/IDL handlers run in the bubbling half at the target or on an
   // ancestor. Keep the existing ordering (inline before addEventListener)
@@ -1927,57 +2331,58 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
     } catch (error) {
       console.error(error);
     }
-    if (event._immediatePropagationStopped) break;
+    if (state.immediatePropagationStopped) break;
   }
 }
-function _eventTargetDispatch(target, event) {
+function _eventTargetDispatchNow(target, event) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  const state = _eventData(event);
+  if (state.dispatching) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
-  event._dispatching = true;
-  event._propagationStopped = false;
-  event._immediatePropagationStopped = false;
-  event._eventPath = _eventPathFor(target, event.composed);
-  event._eventPathCurrentIndex = -1;
-  event._eventOriginalRelatedTarget = 'relatedTarget' in event
+  state.dispatching = true;
+  state.propagationStopped = false;
+  state.immediatePropagationStopped = false;
+  state.path = _eventPathFor(target, event.composed);
+  state.pathCurrentIndex = -1;
+  state.originalRelatedTarget = 'relatedTarget' in event
     ? event.relatedTarget : undefined;
   // DOM dispatch clears endpoints after dispatch when the last reachable
   // tuple would otherwise expose a node from a shadow tree. This also covers
   // a boundary event whose target and relatedTarget collapse to one host:
   // its outer tuples are suppressed and neither internal endpoint survives.
-  const lastTuple = event._eventPath[event._eventPath.length - 1];
-  const lastRelatedTarget = event._eventOriginalRelatedTarget === undefined
-    ? null : _eventRetarget(event._eventOriginalRelatedTarget, lastTuple.invocationTarget);
+  const lastTuple = state.path[state.path.length - 1];
+  const lastRelatedTarget = state.originalRelatedTarget === undefined
+    ? null : _eventRetarget(state.originalRelatedTarget, lastTuple.invocationTarget);
   const clearTargets = _eventRootIsShadow(lastTuple.adjustedTarget)
     || _eventRootIsShadow(lastRelatedTarget)
-    || (event._eventOriginalRelatedTarget !== undefined
+    || (state.originalRelatedTarget !== undefined
         && lastTuple.adjustedTarget === lastRelatedTarget);
 
-  const path = event._eventPath;
+  const path = state.path;
   for (let i = path.length - 1; i > 0; i--) {
     _eventInvoke(path[i].invocationTarget, event, true, path[i].hostAtTarget, i);
-    if (event._propagationStopped) break;
+    if (state.propagationStopped) break;
   }
-  if (!event._propagationStopped) {
+  if (!state.propagationStopped) {
     _eventInvoke(target, event, true, true, 0);
-    if (!event._immediatePropagationStopped) {
+    if (!state.immediatePropagationStopped) {
       _eventInvoke(target, event, false, true, 0);
     }
   }
-  if (!event._propagationStopped) {
+  if (!state.propagationStopped) {
     for (let i = 1; i < path.length; i++) {
       if (path[i].hostAtTarget) {
         _eventInvoke(path[i].invocationTarget, event, false, true, i);
       } else if (event.bubbles) {
         _eventInvoke(path[i].invocationTarget, event, false, false, i);
       }
-      if (event._propagationStopped) break;
+      if (state.propagationStopped) break;
     }
   }
 
@@ -1985,23 +2390,387 @@ function _eventTargetDispatch(target, event) {
   // the target from the last invoked tuple, but clear currentTarget/path just
   // as the DOM dispatch algorithm does.
   if (clearTargets) {
-    event.target = null;
-    if (event._eventOriginalRelatedTarget !== undefined) event.relatedTarget = null;
+    state.target = null;
+    if (state.originalRelatedTarget !== undefined) _mouseEventSetRelatedTarget(event, null);
   } else {
     // Cleanup uses the outermost shadow-adjusted endpoints even when
     // propagation stopped before that tuple's listeners were invoked.
-    event.target = lastTuple.adjustedTarget;
-    if (event._eventOriginalRelatedTarget !== undefined) {
-      event.relatedTarget = lastRelatedTarget;
+    state.target = lastTuple.adjustedTarget;
+    if (state.originalRelatedTarget !== undefined) {
+      _mouseEventSetRelatedTarget(event, lastRelatedTarget);
     }
   }
-  event.currentTarget = null;
-  event.eventPhase = 0;
-  event._eventPathCurrentIndex = -1;
-  event._eventPath = null;
-  event._eventOriginalRelatedTarget = undefined;
-  event._dispatching = false;
+  state.currentTarget = null;
+  state.eventPhase = 0;
+  state.pathCurrentIndex = -1;
+  state.path = null;
+  state.originalRelatedTarget = undefined;
+  state.dispatching = false;
   return !event.defaultPrevented;
+}
+
+// Window.event is a legacy accessor: it is undefined in an idle realm, but
+// points at the event currently being dispatched while an author handler runs.
+// Keep the value per realm and restore nested dispatches on unwind.
+let _legacyWindowEvent;
+let _legacyStickyWindowEvent;
+function _legacyEventStickyEligible() {
+  return typeof globalThis.document !== 'undefined'
+    && typeof globalThis.__obscura_frame_document_nid !== 'number';
+}
+function _withLegacyWindowEvent(event, callback) {
+  const previous = _legacyWindowEvent;
+  _legacyWindowEvent = event;
+  try { return callback(); } finally { _legacyWindowEvent = previous; }
+}
+function _eventTargetDispatch(target, event) {
+  const previous = _legacyWindowEvent;
+  _legacyWindowEvent = event;
+  try {
+    return _eventTargetDispatchNow(target, event);
+  } finally {
+    if (_legacyEventStickyEligible() && !_legacyStickyWindowEvent
+        && _trustedEvents.has(event)) {
+      _legacyStickyWindowEvent = event;
+    }
+    _legacyWindowEvent = previous;
+  }
+}
+
+// Observable is the event-stream primitive behind EventTarget.when(). It is
+// cold: each subscription runs the producer independently and cancellation is
+// carried by Subscriber.signal.
+const _observableState = new WeakMap();
+const _subscriberState = new WeakMap();
+const _subscriberKey = Symbol('Subscriber');
+function _observableData(value) {
+  const state = _observableState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _subscriberData(value) {
+  const state = _subscriberState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _subscriberClose(subscriber, kind, value) {
+  const state = _subscriberData(subscriber);
+  if (!state.active) return;
+  state.active = false;
+  const callback = state.observer[kind];
+  if (typeof callback === 'function') {
+    try { callback.call(state.observer, value); }
+    catch (error) { if (typeof reportError === 'function') reportError(error); }
+  }
+  try { state.controller.abort(value); } catch (_error) {}
+  const teardowns = state.teardowns.splice(0);
+  for (const teardown of teardowns) {
+    try { teardown(); } catch (error) {
+      if (typeof reportError === 'function') reportError(error);
+    }
+  }
+}
+class Subscriber {
+  constructor(key = undefined, observer, externalSignal) {
+    if (key !== _subscriberKey) {
+      throw new TypeError("Failed to construct 'Subscriber': Illegal constructor");
+    }
+    const controller = new AbortController();
+    const state = { observer, controller, active: true, teardowns: [] };
+    _subscriberState.set(this, state);
+    if (externalSignal && typeof externalSignal.addEventListener === 'function') {
+      if (externalSignal.aborted) {
+        state.active = false;
+        try { controller.abort(externalSignal.reason); } catch (_error) {}
+      } else {
+        const abort = () => _subscriberClose(this, 'complete');
+        externalSignal.addEventListener('abort', abort, { once: true });
+        state.teardowns.push(() => externalSignal.removeEventListener('abort', abort));
+      }
+    }
+  }
+  get active() { return _subscriberData(this).active; }
+  get signal() { return _subscriberData(this).controller.signal; }
+  next(value) {
+    const state = _subscriberData(this);
+    if (!state.active) return;
+    const callback = state.observer.next;
+    if (typeof callback === 'function') {
+      try { callback.call(state.observer, value); }
+      catch (error) { this.error(error); }
+    }
+  }
+  error(error) { _subscriberClose(this, 'error', error); }
+  complete() { _subscriberClose(this, 'complete'); }
+  addTeardown(teardown) {
+    const state = _subscriberData(this);
+    if (typeof teardown !== 'function') return;
+    if (!state.active) { teardown(); return; }
+    state.teardowns.push(teardown);
+  }
+  get [Symbol.toStringTag]() { return 'Subscriber'; }
+}
+class Observable {
+  constructor(callback) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'Observable': 1 argument required, but only 0 present.");
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to construct 'Observable': parameter 1 is not a function.");
+    }
+    _observableState.set(this, callback);
+  }
+  subscribe(observer = {}, options = undefined) {
+    const callback = _observableData(this);
+    const normalized = typeof observer === 'function' ? { next: observer } : (observer || {});
+    const signal = options && typeof options === 'object' ? options.signal : null;
+    const subscriber = new Subscriber(_subscriberKey, normalized, signal);
+    if (!subscriber.active) return;
+    try {
+      const teardown = callback(subscriber);
+      if (typeof teardown === 'function') subscriber.addTeardown(teardown);
+    } catch (error) {
+      subscriber.error(error);
+    }
+  }
+  map(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => {
+      let index = 0;
+      source.subscribe({
+        next(value) { try { subscriber.next(callback(value, index++)); } catch (error) { subscriber.error(error); } },
+        error(error) { subscriber.error(error); },
+        complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  filter(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => {
+      let index = 0;
+      source.subscribe({
+        next(value) { try { if (callback(value, index++)) subscriber.next(value); } catch (error) { subscriber.error(error); } },
+        error(error) { subscriber.error(error); },
+        complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  take(count) {
+    const source = this;
+    count = Math.max(0, Math.trunc(Number(count)) || 0);
+    return new Observable(subscriber => {
+      if (count === 0) { subscriber.complete(); return; }
+      let seen = 0;
+      source.subscribe({
+        next(value) { if (++seen <= count) subscriber.next(value); if (seen >= count) subscriber.complete(); },
+        error(error) { subscriber.error(error); }, complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  drop(count) {
+    const source = this;
+    count = Math.max(0, Math.trunc(Number(count)) || 0);
+    return new Observable(subscriber => {
+      let seen = 0;
+      source.subscribe({
+        next(value) { if (seen++ >= count) subscriber.next(value); },
+        error(error) { subscriber.error(error); }, complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  inspect(observer = {}) {
+    const source = this;
+    const tap = typeof observer === 'function' ? { next: observer } : (observer || {});
+    return new Observable(subscriber => source.subscribe({
+      next(value) { try { tap.next?.(value); subscriber.next(value); } catch (error) { subscriber.error(error); } },
+      error(error) { try { tap.error?.(error); } finally { subscriber.error(error); } },
+      complete() { try { tap.complete?.(); } finally { subscriber.complete(); } },
+    }, { signal: subscriber.signal }));
+  }
+  finally(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => {
+      subscriber.addTeardown(callback);
+      source.subscribe({
+        next(value) { subscriber.next(value); }, error(error) { subscriber.error(error); },
+        complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  catch(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => source.subscribe({
+      next(value) { subscriber.next(value); },
+      error(error) {
+        let replacement;
+        try { replacement = callback(error); } catch (caught) { subscriber.error(caught); return; }
+        if (replacement instanceof Observable) {
+          replacement.subscribe(subscriber, { signal: subscriber.signal });
+        } else subscriber.complete();
+      },
+      complete() { subscriber.complete(); },
+    }, { signal: subscriber.signal }));
+  }
+  flatMap(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => {
+      let index = 0, active = 1;
+      const done = () => { if (--active === 0) subscriber.complete(); };
+      source.subscribe({
+        next(value) {
+          let inner;
+          try { inner = callback(value, index++); } catch (error) { subscriber.error(error); return; }
+          if (!(inner instanceof Observable)) { subscriber.error(new TypeError('callback must return an Observable')); return; }
+          active++;
+          inner.subscribe({ next(value) { subscriber.next(value); }, error(error) { subscriber.error(error); }, complete: done }, { signal: subscriber.signal });
+        },
+        error(error) { subscriber.error(error); }, complete: done,
+      }, { signal: subscriber.signal });
+    });
+  }
+  switchMap(callback) {
+    const source = this;
+    if (typeof callback !== 'function') throw new TypeError('callback must be callable');
+    return new Observable(subscriber => {
+      let index = 0, innerController = null, sourceDone = false, innerActive = false;
+      const maybeComplete = () => { if (sourceDone && !innerActive) subscriber.complete(); };
+      subscriber.addTeardown(() => innerController?.abort());
+      source.subscribe({
+        next(value) {
+          innerController?.abort();
+          let inner;
+          try { inner = callback(value, index++); } catch (error) { subscriber.error(error); return; }
+          if (!(inner instanceof Observable)) { subscriber.error(new TypeError('callback must return an Observable')); return; }
+          innerController = new AbortController(); innerActive = true;
+          subscriber.signal.addEventListener('abort', () => innerController.abort(), { once: true });
+          inner.subscribe({ next(value) { subscriber.next(value); }, error(error) { subscriber.error(error); },
+            complete() { innerActive = false; maybeComplete(); } }, { signal: innerController.signal });
+        },
+        error(error) { subscriber.error(error); }, complete() { sourceDone = true; maybeComplete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  takeUntil(notifier) {
+    const source = this;
+    if (!(notifier instanceof Observable)) throw new TypeError('parameter 1 is not an Observable');
+    return new Observable(subscriber => {
+      notifier.subscribe({ next() { subscriber.complete(); }, error(error) { subscriber.error(error); } }, { signal: subscriber.signal });
+      if (subscriber.active) source.subscribe({
+        next(value) { subscriber.next(value); }, error(error) { subscriber.error(error); }, complete() { subscriber.complete(); },
+      }, { signal: subscriber.signal });
+    });
+  }
+  forEach(callback) {
+    const source = this;
+    if (typeof callback !== 'function') return Promise.reject(new TypeError('callback must be callable'));
+    return new Promise((resolve, reject) => {
+      let index = 0;
+      source.subscribe({ next(value) { try { callback(value, index++); } catch (error) { reject(error); } }, error: reject, complete: resolve });
+    });
+  }
+  toArray() {
+    const source = this;
+    return new Promise((resolve, reject) => {
+      const values = [];
+      source.subscribe({ next(value) { values.push(value); }, error: reject, complete() { resolve(values); } });
+    });
+  }
+  first() {
+    const source = this;
+    return new Promise((resolve, reject) => {
+      let found = false;
+      source.subscribe({ next(value) { if (!found) { found = true; resolve(value); } }, error: reject,
+        complete() { if (!found) reject(new RangeError('No values in Observable')); } });
+    });
+  }
+  last() {
+    const source = this;
+    return new Promise((resolve, reject) => {
+      let found = false, last;
+      source.subscribe({ next(value) { found = true; last = value; }, error: reject,
+        complete() { found ? resolve(last) : reject(new RangeError('No values in Observable')); } });
+    });
+  }
+  find(callback) {
+    const source = this;
+    if (typeof callback !== 'function') return Promise.reject(new TypeError('callback must be callable'));
+    return new Promise((resolve, reject) => {
+      let index = 0, found = false;
+      source.subscribe({ next(value) { try { if (!found && callback(value, index++)) { found = true; resolve(value); } } catch (error) { reject(error); } },
+        error: reject, complete() { if (!found) resolve(undefined); } });
+    });
+  }
+  every(callback) {
+    const source = this;
+    if (typeof callback !== 'function') return Promise.reject(new TypeError('callback must be callable'));
+    return new Promise((resolve, reject) => {
+      let index = 0, result = true;
+      source.subscribe({ next(value) { try { if (!callback(value, index++)) result = false; } catch (error) { reject(error); } },
+        error: reject, complete() { resolve(result); } });
+    });
+  }
+  some(callback) {
+    const source = this;
+    if (typeof callback !== 'function') return Promise.reject(new TypeError('callback must be callable'));
+    return new Promise((resolve, reject) => {
+      let index = 0, result = false;
+      source.subscribe({ next(value) { try { if (callback(value, index++)) result = true; } catch (error) { reject(error); } },
+        error: reject, complete() { resolve(result); } });
+    });
+  }
+  reduce(callback, initialValue = undefined) {
+    const source = this;
+    if (typeof callback !== 'function') return Promise.reject(new TypeError('callback must be callable'));
+    const hasInitial = arguments.length > 1;
+    return new Promise((resolve, reject) => {
+      let index = 0, hasValue = hasInitial, accumulator = initialValue;
+      source.subscribe({
+        next(value) {
+          if (!hasValue) { accumulator = value; hasValue = true; return; }
+          try { accumulator = callback(accumulator, value, index++); } catch (error) { reject(error); }
+        },
+        error: reject,
+        complete() { hasValue ? resolve(accumulator) : reject(new TypeError('Reduce of empty Observable with no initial value')); },
+      });
+    });
+  }
+  get [Symbol.toStringTag]() { return 'Observable'; }
+}
+globalThis.Observable = Observable;
+globalThis.Subscriber = Subscriber;
+
+function _eventTargetWhen(type, options = undefined, argumentCount = 2) {
+  const target = this;
+  if (!target || typeof target.addEventListener !== 'function'
+      || typeof target.removeEventListener !== 'function'
+      || typeof target.dispatchEvent !== 'function') {
+    throw new TypeError('Illegal invocation');
+  }
+  if (argumentCount < 1) {
+    throw new TypeError(
+      "Failed to execute 'when' on 'EventTarget': 1 argument required, but only 0 present.");
+  }
+  type = String(type);
+  const listenerOptions = options && typeof options === 'object' ? options : {};
+  return new Observable(subscriber => {
+    const listener = event => subscriber.next(event);
+    const registration = {
+      capture: !!listenerOptions.capture,
+      passive: !!listenerOptions.passive,
+      signal: subscriber.signal,
+    };
+    target.addEventListener(type, listener, registration);
+    subscriber.addTeardown(() => target.removeEventListener(type, listener, registration.capture));
+    if (listenerOptions.signal && typeof listenerOptions.signal.addEventListener === 'function') {
+      if (listenerOptions.signal.aborted) subscriber.complete();
+      else listenerOptions.signal.addEventListener('abort', () => subscriber.complete(), { once: true });
+    }
+  });
 }
 
 // During custom-element upgrade, HTMLElement's constructor must return the
@@ -2018,6 +2787,10 @@ function __prepareInsertedScript(script) {
   const isImportMap = scriptType === 'importmap';
   if (isImportMap) {
     const src = script.getAttribute('src');
+    if (!_dynamicScriptCspAllows(script, '', true)) {
+      console.info('Blocked dynamic import map by Content-Security-Policy');
+      return;
+    }
     let error = '';
     if (src) {
       error = 'External import maps are not supported';
@@ -2045,6 +2818,17 @@ function __prepareInsertedScript(script) {
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
+  if (src) {
+    let resolved = src;
+    try { resolved = _resolveResourceUrl(String(src)); } catch (_) {}
+    if (!_dynamicScriptCspAllows(script, resolved, false)) {
+      console.info('Blocked dynamic script by Content-Security-Policy:', resolved);
+      return;
+    }
+  } else if (!_dynamicScriptCspAllows(script, '', true)) {
+    console.info('Blocked dynamic inline script by Content-Security-Policy');
+    return;
+  }
   const prevNid = globalThis.__currentScriptNid;
   if (src) {
     let baseHref;
@@ -2218,6 +3002,8 @@ class Node {
   get nodeType() { return +_dom("node_type", this[_nidSym]); }
   get nodeName() { return _domParse("node_name", this[_nidSym]) || ""; }
   get ownerDocument() {
+    const detachedOwner = _detachedOwnerForNode(this);
+    if (detachedOwner) return detachedOwner;
     // Owner-document scope cache (design 2.3). The stamp is the owning
     // document root nid; creation and insertion paths stamp it when they know
     // the scope, cross-document moves restamp only the moved root (a
@@ -2301,6 +3087,9 @@ class Node {
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
+    const detachedOwner = _detachedOwnerForNode(this);
+    if (detachedOwner && detachedOwner !== this
+        && detachedOwner.documentElement === this) return detachedOwner;
     if (this._treeDetachedExact) return null;
     if (this[_treeParentEpochSym] === _treeMutationEpoch) return this[_treeParentSym];
     const parent = _wrap(+_dom("parent_node", this[_nidSym]));
@@ -2456,8 +3245,18 @@ class Node {
     __prepareInsertedSubtree(n);
     return n;
   }
-  contains(o) { return o ? _dom("contains", this[_nidSym], o[_nidSym]) === "true" : false; }
-  hasChildNodes() { return _dom("has_child_nodes", this[_nidSym]) === "true"; }
+  contains(o) {
+    if (!o) return false;
+    if (o === this) return true;
+    const owner = _detachedOwnerForNode(this);
+    if (owner && owner === this && _detachedOwnerForNode(o) === owner) return true;
+    return _dom("contains", this[_nidSym], o[_nidSym]) === "true";
+  }
+  hasChildNodes() {
+    const owner = _detachedOwnerForNode(this);
+    if (owner && owner === this) return !!this.documentElement;
+    return _dom("has_child_nodes", this[_nidSym]) === "true";
+  }
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 1) {
@@ -2498,7 +3297,14 @@ class Node {
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
-    if (this[_nidSym] === other[_nidSym]) return 0;
+    if (this === other) return 0;
+    const thisOwner = _detachedOwnerForNode(this);
+    const otherOwner = _detachedOwnerForNode(other);
+    if (thisOwner && thisOwner === otherOwner) {
+      if (this === thisOwner) return 16 | 4;
+      if (other === thisOwner) return 8 | 2;
+    }
+    if (this[_nidSym] !== undefined && this[_nidSym] === other[_nidSym]) return 0;
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
     if (+_dom("node_root", this[_nidSym]) !== +_dom("node_root", other[_nidSym])) {
@@ -2511,6 +3317,8 @@ class Node {
     return (+_dom("compare_order", this[_nidSym], other[_nidSym]) < 0) ? 4 : 2;
   }
   getRootNode(options) {
+    const detachedOwner = _detachedOwnerForNode(this);
+    if (detachedOwner) return detachedOwner;
     const root = _wrap(+_dom("node_root", this[_nidSym]));
     if (options?.composed && root instanceof ShadowRoot) {
       return root.host.getRootNode(options);
@@ -2545,7 +3353,8 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this[_nidSym] === other[_nidSym]) return true;
+    if (this === other) return true;
+    if (this[_nidSym] !== undefined && this[_nidSym] === other[_nidSym]) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -2565,7 +3374,10 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this[_nidSym] === other[_nidSym]; }
+  isSameNode(other) {
+    return !!other && (other === this
+      || (this[_nidSym] !== undefined && this[_nidSym] === other[_nidSym]));
+  }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -2574,6 +3386,9 @@ class Node {
   }
   dispatchEvent(event) {
     return _eventTargetDispatch(this, event);
+  }
+  when(type, options = undefined) {
+    return _eventTargetWhen.call(this, type, options, arguments.length);
   }
 }
 class CharacterData extends Node {
@@ -2922,7 +3737,10 @@ function _parseHTMLFragment(html, context) {
   const tmp = ns && ns !== 'http://www.w3.org/1999/xhtml'
     ? document.createElementNS(ns, tag)
     : document.createElement(tag);
-  tmp.innerHTML = html;
+  // Callers already enforce the public Trusted Types sink. Going through the
+  // public innerHTML setter here would enforce a second time after the trusted
+  // wrapper was stringified, allowing a default policy to rewrite the markup.
+  _dom("set_inner_html", tmp[_nidSym], html);
   const out = [];
   let child;
   while ((child = tmp.firstChild)) out.push(tmp.removeChild(child));
@@ -3319,6 +4137,7 @@ class Element extends Node {
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
+  get customElementRegistry() { return _customElementRegistryForNode(this); }
   get localName() {
     // The native tree owns the namespace-aware QualName. Reading its local
     // component directly preserves case-sensitive SVG/MathML names such as
@@ -3331,6 +4150,12 @@ class Element extends Node {
   }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
+  // HTMLElement.nonce reflects the content attribute. Challenge scripts set
+  // this IDL property before appending a dynamically-created script; without
+  // the reflection the frame's CSP nonce gate rejects an otherwise authorized
+  // script.
+  get nonce() { return this.getAttribute("nonce") || ""; }
+  set nonce(v) { this.setAttribute("nonce", v == null ? "" : String(v)); }
   get className() {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
@@ -3427,7 +4252,7 @@ class Element extends Node {
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this[_nidSym]) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
+    return _htmlCollectionFrom(ids.map(_wrapEl).filter(Boolean));
   }
   get content() {
     // <template>.content is a DocumentFragment; <meta>.content reflects
@@ -3568,7 +4393,7 @@ class Element extends Node {
         _reconcileWindowNamedProperty(previousWindowName);
       }
     }
-    if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "style") _cssStyleReplaceFromAttribute(this._style, value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
       Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
@@ -3595,7 +4420,7 @@ class Element extends Node {
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === "" && n === "style") _cssStyleReplaceFromAttribute(this._style, value);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -3611,7 +4436,7 @@ class Element extends Node {
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
     }
-    if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "style") _cssStyleReplaceFromAttribute(this._style, "");
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
       Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
@@ -3632,7 +4457,7 @@ class Element extends Node {
     n = String(n);
     _dom("remove_attribute_ns", this[_nidSym], ns + "\0" + n);
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (ns === "" && n === "style") _cssStyleReplaceFromAttribute(this._style, "");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -3647,7 +4472,7 @@ class Element extends Node {
     const ids = _domParse("query_selector_all_scoped", this[_nidSym], s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _htmlCollectionFrom(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
     // :popover-open is a JS-observable popover state, not understood by the
@@ -3682,6 +4507,8 @@ class Element extends Node {
     // SyntaxError (both were silent no-ops before). Sibling insertions parse
     // against the parent's context, child insertions against this element, so
     // table/select fragments keep the right parsing context (_parseHTMLFragment).
+    html = globalThis.__obscura_tt_enforce(
+      'TrustedHTML', html, 'Element insertAdjacentHTML');
     const pos = String(position).toLowerCase();
     const parent = this.parentNode;
     const context = (pos === 'beforebegin' || pos === 'afterend') ? parent : this;
@@ -3765,6 +4592,7 @@ class Element extends Node {
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
     if (!src) { cache[name] = null; return null; }
+    if (!_inlineEventHandlerCspAllows()) { cache[name] = null; return null; }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -3844,8 +4672,8 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
-  blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
+  focus() { globalThis[_inputFocusedSym] = this; globalThis[_inputClickTargetSym] = this; }
+  blur() { if (globalThis[_inputFocusedSym] === this) globalThis[_inputFocusedSym] = null; }
 
   // --- Popover API (HTML "popover") ---------------------------------------
   // Read the popover content attribute case-insensitively. The HTML parser
@@ -3989,8 +4817,8 @@ class Element extends Node {
     this._dialogClose(result, true);
   }
   attachInternals() {
-    const reg = (typeof customElements !== 'undefined' && customElements._registry) ? customElements._registry : null;
-    if (!reg || !reg.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
+    const registry = _customElementRegistryForNode(this);
+    if (!registry || !registry.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
     if (this.getAttribute('is')) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
     if (this._internalsAttached) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': ElementInternals for the specified element was already attached.", "NotSupportedError");
     this._internalsAttached = true;
@@ -4297,6 +5125,10 @@ class Element extends Node {
         'TrustedHTML', v, 'HTMLIFrameElement srcdoc'));
     }
   }
+  get csp() { return this.localName === 'iframe' ? (this.getAttribute('csp') || '') : undefined; }
+  set csp(value) {
+    if (this.localName === 'iframe') this.setAttribute('csp', String(value));
+  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     const nativeRoot = +_dom("iframe_content_document_root", this[_nidSym]);
@@ -4344,7 +5176,7 @@ class Element extends Node {
   }
   get options() {
     if (this.localName !== 'select') return [];
-    return HTMLCollection._from(this.querySelectorAll('option'));
+    return _htmlCollectionFrom(this.querySelectorAll('option'));
   }
   add(item, before = null) {
     if (this.localName !== 'select') {
@@ -4481,14 +5313,14 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
-    return this.getBoundingClientRect().width;
+    return Math.round(this.getBoundingClientRect().width);
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
-    return this.getBoundingClientRect().height;
+    return Math.round(this.getBoundingClientRect().height);
   }
-  get offsetTop() { return this.getBoundingClientRect().top; }
-  get offsetLeft() { return this.getBoundingClientRect().left; }
+  get offsetTop() { return Math.round(this.getBoundingClientRect().top); }
+  get offsetLeft() { return Math.round(this.getBoundingClientRect().left); }
   // The offset parent is the ancestor those two are measured against. It was
   // absent entirely, so reading it gave `undefined` -- a value the attribute
   // never has in a browser, which returns an element or null.
@@ -4736,7 +5568,7 @@ class Element extends Node {
     }
   }
   getBoundingClientRect() {
-    globalThis.__obscura_click_target = this;
+    globalThis[_inputClickTargetSym] = this;
     // Real layout when the render feature is compiled in: ask the Rust layout
     // cache for this element's border box. The op is absent in the default
     // build, so probe with typeof and fall through to the synthetic rect below.
@@ -4820,7 +5652,7 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView(arg) {
-    globalThis.__obscura_click_target = this;
+    globalThis[_inputClickTargetSym] = this;
     const rect = this.getBoundingClientRect();
     // A viewport-fixed subtree is already expressed in the viewport's
     // coordinate space and cannot be brought closer by moving the document.
@@ -5223,6 +6055,16 @@ function _throwDocumentDomainSecurityError() {
 }
 
 const _detachedDocumentBrand = new WeakSet();
+function _stampDetachedDocumentNode(document, node) {
+  if (node && _detachedDocumentBrand.has(document)) {
+    _detachedNodeOwners.set(node, document);
+    if (node[_nidSym] !== undefined) {
+      const rootNid = +_dom("document_root", node[_nidSym]);
+      _detachedRootOwners.set(rootNid || node[_nidSym], document);
+    }
+  }
+  return node;
+}
 function _documentPrivacyRoot(value, method) {
   const branded = value instanceof Document
     || _detachedDocumentBrand.has(value)
@@ -5253,6 +6095,442 @@ function _privateStateTokenError(method, status) {
       + ": Private Token issuer origins must be both HTTP(S) and secure (\"potentially trustworthy\").");
 }
 
+const _queryCommandSupportedNames = new Set([
+  'backcolor', 'bold', 'copy', 'createlink', 'cut', 'decreasefontsize',
+  'delete', 'enableabsolutepositioneditor', 'enableinlinetableediting',
+  'enableobjectresizing', 'fontname', 'fontsize', 'forecolor', 'formatblock',
+  'forwarddelete', 'hilitecolor', 'increasefontsize', 'indent',
+  'insertbronreturn', 'inserthorizontalrule', 'inserthtml', 'insertimage',
+  'insertlinebreak', 'insertorderedlist', 'insertparagraph', 'inserttext',
+  'insertunorderedlist', 'italic', 'justifycenter', 'justifyfull',
+  'justifyleft', 'justifynone', 'justifyright', 'outdent', 'redo',
+  'removeformat', 'selectall', 'strikethrough', 'stylewithcss', 'subscript',
+  'superscript', 'underline', 'undo', 'unlink', 'usecss',
+]);
+const _queryCommandEditableNames = new Set([
+  'backcolor', 'bold', 'createlink', 'delete', 'fontname', 'fontsize',
+  'forecolor', 'formatblock', 'forwarddelete', 'hilitecolor', 'indent',
+  'inserthorizontalrule', 'inserthtml', 'insertimage', 'insertlinebreak',
+  'insertorderedlist', 'insertparagraph', 'inserttext', 'insertunorderedlist',
+  'italic', 'justifycenter', 'justifyfull', 'justifyleft', 'justifyright',
+  'outdent', 'removeformat', 'strikethrough', 'subscript', 'superscript',
+  'underline', 'unlink',
+]);
+function _queryCommandName(doc, method, command, argumentCount) {
+  _documentPrivacyRoot(doc, method);
+  if (argumentCount < 1) {
+    throw new TypeError(
+      "Failed to execute '" + method + "' on 'Document': 1 argument required, but only 0 present.");
+  }
+  return String(command).toLowerCase();
+}
+function _queryCommandEditingHost(doc) {
+  let node = doc.activeElement;
+  while (node && node !== doc) {
+    const reflected = typeof node.contentEditable === 'string'
+      ? node.contentEditable.toLowerCase() : '';
+    const attribute = typeof node.getAttribute === 'function'
+      ? node.getAttribute('contenteditable') : null;
+    if (reflected === 'true' || reflected === 'plaintext-only'
+        || (attribute !== null && String(attribute).toLowerCase() !== 'false')) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+function _queryCommandState(doc, command) {
+  const tags = {
+    bold: new Set(['B', 'STRONG']),
+    italic: new Set(['I', 'EM']),
+    underline: new Set(['U']),
+    strikethrough: new Set(['S', 'STRIKE']),
+    subscript: new Set(['SUB']),
+    superscript: new Set(['SUP']),
+  }[command];
+  if (!tags) return false;
+  const selection = doc.getSelection();
+  let node = selection && selection.anchorNode;
+  if (node && node.nodeType !== 1) node = node.parentElement;
+  while (node && node !== doc) {
+    if (tags.has(node.tagName)) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+const _xpathExpressionKey = Symbol('XPathExpression');
+const _xpathExpressionState = new WeakMap();
+class XPathExpression {
+  constructor(key = undefined, document, expression, resolver) {
+    if (key !== _xpathExpressionKey) {
+      throw new TypeError("Failed to construct 'XPathExpression': Illegal constructor");
+    }
+    _xpathExpressionState.set(this, { document, expression, resolver });
+  }
+  evaluate(contextNode, type = 0, result = null) {
+    const state = _xpathExpressionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'evaluate' on 'XPathExpression': 1 argument required, but only 0 present.");
+    }
+    return state.document.evaluate(
+      state.expression, contextNode, state.resolver, type, result);
+  }
+  get [Symbol.toStringTag]() { return 'XPathExpression'; }
+}
+globalThis.XPathExpression = XPathExpression;
+
+const _caretPositionKey = Symbol('CaretPosition');
+const _caretPositionState = new WeakMap();
+class CaretPosition {
+  constructor(key = undefined, document, node, offset) {
+    if (key !== _caretPositionKey) {
+      throw new TypeError("Failed to construct 'CaretPosition': Illegal constructor");
+    }
+    _caretPositionState.set(this, { document, node, offset });
+  }
+  get offsetNode() {
+    const state = _caretPositionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.node;
+  }
+  get offset() {
+    const state = _caretPositionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.offset;
+  }
+  getClientRect() {
+    const state = _caretPositionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    const range = new Range();
+    range.setStart(state.node, state.offset);
+    range.setEnd(state.node, state.offset);
+    return range.getBoundingClientRect();
+  }
+  get [Symbol.toStringTag]() { return 'CaretPosition'; }
+}
+globalThis.CaretPosition = CaretPosition;
+function _caretPositionAt(document, x, y) {
+  let hit = null;
+  try { hit = document.elementFromPoint(Number(x) || 0, Number(y) || 0); }
+  catch (_error) {}
+  if (!hit) hit = document.body || document.documentElement || document;
+  let text = null;
+  const stack = hit && hit.childNodes ? Array.from(hit.childNodes).reverse() : [];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node.nodeType === 3) { text = node; break; }
+    if (node.childNodes) {
+      const children = Array.from(node.childNodes);
+      for (let index = children.length - 1; index >= 0; index--) stack.push(children[index]);
+    }
+  }
+  const node = text || hit;
+  let offset = 0;
+  if (text) {
+    const length = _rngNodeLength(text);
+    const rect = hit && typeof hit.getBoundingClientRect === 'function'
+      ? hit.getBoundingClientRect() : null;
+    if (rect && rect.width > 0) {
+      offset = Math.round(((Number(x) || 0) - rect.left) / rect.width * length);
+      offset = Math.max(0, Math.min(length, offset));
+    } else {
+      offset = length;
+    }
+  }
+  return new CaretPosition(_caretPositionKey, document, node, offset);
+}
+
+const _featurePolicyKey = Symbol('FeaturePolicy');
+const _featurePolicyDocuments = new WeakMap();
+const _featurePolicyFeatures = [
+  'ch-ua-full-version-list', 'cross-origin-isolated', 'on-device-speech-recognition',
+  'translator', 'shared-storage-select-url', 'ch-ua-arch', 'bluetooth',
+  'compute-pressure', 'ch-prefers-reduced-transparency', 'deferred-fetch',
+  'ch-save-data', 'publickey-credentials-create', 'shared-storage',
+  'deferred-fetch-minimal', 'run-ad-auction', 'ch-downlink', 'ch-ua-form-factors',
+  'otp-credentials', 'ch-ua', 'ch-ua-model', 'ch-ect', 'autoplay',
+  'language-detector', 'private-state-token-issuance', 'digital-credentials-get',
+  'ch-ua-platform-version', 'idle-detection', 'language-model',
+  'private-aggregation', 'interest-cohort', 'ch-viewport-height',
+  'captured-surface-control', 'local-fonts', 'ch-ua-platform', 'midi',
+  'ch-ua-full-version', 'xr-spatial-tracking', 'gamepad', 'display-capture',
+  'keyboard-map', 'join-ad-interest-group', 'aria-notify', 'local-network',
+  'ch-ua-high-entropy-values', 'ch-width', 'ch-prefers-reduced-motion',
+  'browsing-topics', 'encrypted-media', 'local-network-access', 'ch-rtt',
+  'ch-ua-mobile', 'window-management', 'unload', 'ch-dpr',
+  'ch-prefers-color-scheme', 'ch-ua-wow64', 'fullscreen',
+  'identity-credentials-get', 'private-state-token-redemption', 'summarizer',
+  'ch-ua-bitness', 'storage-access', 'ch-device-memory', 'ch-viewport-width',
+  'picture-in-picture', 'loopback-network',
+];
+const _featurePolicyWildcardDefaults = new Set([
+  'shared-storage-select-url', 'ch-save-data', 'shared-storage',
+  'deferred-fetch-minimal', 'run-ad-auction', 'ch-ua', 'private-state-token-issuance',
+  'private-aggregation', 'interest-cohort', 'xr-spatial-tracking', 'gamepad',
+  'join-ad-interest-group', 'aria-notify', 'ch-ua-high-entropy-values',
+  'browsing-topics', 'ch-ua-platform', 'ch-ua-mobile', 'unload',
+  'private-state-token-redemption', 'storage-access', 'picture-in-picture',
+]);
+// Features can be absent from Chrome's default allowedFeatures() list yet be
+// explicitly enabled by a response header. Keep those names recognized by
+// allowsFeature()/getAllowlistForFeature() without polluting the default list.
+const _featurePolicyDeclaredFeatures = new Set([
+  ..._featurePolicyFeatures,
+  'accelerometer', 'ambient-light-sensor', 'camera', 'clipboard-read',
+  'clipboard-write', 'geolocation', 'gyroscope', 'hid', 'magnetometer',
+  'microphone', 'payment', 'publickey-credentials-get', 'screen-wake-lock',
+  'serial', 'sync-xhr', 'usb', 'speaker-selection', 'web-share',
+]);
+
+// Permissions-Policy is attached to a document, not to a JS wrapper. Keep
+// the parser here small and deterministic so FeaturePolicy and Permissions-
+// Policy expose the same result after wrapper churn and frame navigation.
+function _documentPermissionsPolicy(document) {
+  let header = '';
+  let origin = '';
+  try {
+    const root = document && typeof document[_scopeRootSym] === 'number'
+      ? document[_scopeRootSym] : 0;
+    const info = _domParse('document_scope_info', root) || {};
+    header = typeof info.permissionsPolicy === 'string' ? info.permissionsPolicy : '';
+    origin = typeof info.origin === 'string' ? info.origin : String(document.location.origin || '');
+  } catch (_error) {}
+  const directives = new Map();
+  // Header directives are comma-separated. Accept semicolons too because a
+  // few servers still emit the obsolete delimiter and Chrome tolerates it.
+  for (const part of header.split(/[,;]/)) {
+    const match = part.trim().match(/^([^=\s]+)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const name = match[1].toLowerCase();
+    const raw = match[2].trim();
+    const list = raw.startsWith('(') && raw.endsWith(')')
+      ? raw.slice(1, -1).trim().split(/\s+/).filter(Boolean)
+      : raw ? raw.split(/\s+/).filter(Boolean) : [];
+    directives.set(name, list);
+  }
+  const matchesOrigin = (token, subject = origin) => {
+    const value = String(token || '').replace(/^['"]|['"]$/g, '');
+    return value === '*' || value.toLowerCase() === 'self' && !!origin
+      && subject === origin || value === subject;
+  };
+  const allows = (feature, requestedOrigin = undefined) => {
+    const name = String(feature || '').toLowerCase();
+    if (!_featurePolicyDeclaredFeatures.has(name)) return false;
+    let subject = origin;
+    if (requestedOrigin !== undefined) {
+      try { subject = new URL(String(requestedOrigin), origin || undefined).origin; }
+      catch (_error) { subject = String(requestedOrigin); }
+    }
+    if (!directives.has(name)) {
+      return requestedOrigin === undefined || _featurePolicyWildcardDefaults.has(name)
+        || subject === origin;
+    }
+    return directives.get(name).some(token => matchesOrigin(token, subject));
+  };
+  const allowlist = feature => {
+    const name = String(feature || '').toLowerCase();
+    if (!_featurePolicyDeclaredFeatures.has(name)) return [];
+    if (!directives.has(name)) {
+      return _featurePolicyWildcardDefaults.has(name) ? ['*'] : (origin ? [origin] : []);
+    }
+    return directives.get(name).filter(token => {
+      const value = String(token).replace(/^['"]|['"]$/g, '');
+      return value !== 'none';
+    }).map(token => {
+      const value = String(token).replace(/^['"]|['"]$/g, '');
+      return value.toLowerCase() === 'self' ? origin : value;
+    }).filter(Boolean);
+  };
+  return { allows, allowlist };
+}
+
+class FeaturePolicy {
+  constructor(key = undefined, document) {
+    if (key !== _featurePolicyKey) {
+      throw new TypeError("Failed to construct 'FeaturePolicy': Illegal constructor");
+    }
+    _featurePolicyDocuments.set(this, document);
+  }
+  allowedFeatures() {
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    const policy = _documentPermissionsPolicy(_featurePolicyDocuments.get(this));
+    return _featurePolicyFeatures.filter(policy.allows);
+  }
+  allowsFeature(feature, _origin = undefined) {
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'allowsFeature' on 'FeaturePolicy': 1 argument required, but only 0 present.");
+    }
+    return _documentPermissionsPolicy(_featurePolicyDocuments.get(this)).allows(feature, _origin);
+  }
+  features() { return this.allowedFeatures(); }
+  getAllowlistForFeature(feature) {
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'getAllowlistForFeature' on 'FeaturePolicy': 1 argument required, but only 0 present.");
+    }
+    const document = _featurePolicyDocuments.get(this);
+    return _documentPermissionsPolicy(document).allowlist(feature);
+  }
+  get [Symbol.toStringTag]() { return 'FeaturePolicy'; }
+}
+globalThis.FeaturePolicy = FeaturePolicy;
+const _permissionsPolicyKey = Symbol('PermissionsPolicy');
+const _permissionsPolicyDocuments = new WeakMap();
+class PermissionsPolicy {
+  constructor(key = undefined, document) {
+    if (key !== _permissionsPolicyKey) {
+      throw new TypeError("Failed to construct 'PermissionsPolicy': Illegal constructor");
+    }
+    _permissionsPolicyDocuments.set(this, document);
+  }
+  allowedFeatures() {
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    const policy = _documentPermissionsPolicy(_permissionsPolicyDocuments.get(this));
+    return _featurePolicyFeatures.filter(policy.allows);
+  }
+  allowsFeature(feature, _origin = undefined) {
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'allowsFeature' on 'PermissionsPolicy': 1 argument required, but only 0 present.");
+    }
+    return _documentPermissionsPolicy(_permissionsPolicyDocuments.get(this)).allows(feature, _origin);
+  }
+  features() { return this.allowedFeatures(); }
+  getAllowlistForFeature(feature) {
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'getAllowlistForFeature' on 'PermissionsPolicy': 1 argument required, but only 0 present.");
+    }
+    const document = _permissionsPolicyDocuments.get(this);
+    return _documentPermissionsPolicy(document).allowlist(feature);
+  }
+  get [Symbol.toStringTag]() { return 'PermissionsPolicy'; }
+}
+const _permissionsPolicyConstructorDescriptor = Object.getOwnPropertyDescriptor(
+  PermissionsPolicy.prototype, 'constructor');
+delete PermissionsPolicy.prototype.constructor;
+Object.defineProperty(
+  PermissionsPolicy.prototype, 'constructor', _permissionsPolicyConstructorDescriptor);
+Object.defineProperty(globalThis, 'PermissionsPolicy', {
+  value: PermissionsPolicy, writable: true, enumerable: false, configurable: true,
+});
+_markNative(PermissionsPolicy);
+for (const name of Object.getOwnPropertyNames(PermissionsPolicy.prototype)) {
+  const descriptor = Object.getOwnPropertyDescriptor(PermissionsPolicy.prototype, name);
+  if (descriptor?.get) _markNative(descriptor.get);
+  if (descriptor?.set) _markNative(descriptor.set);
+  if (descriptor?.value) _markNative(descriptor.value);
+}
+class _FragmentDirective {
+  get [Symbol.toStringTag]() { return 'FragmentDirective'; }
+}
+const _documentFeaturePolicies = new WeakMap();
+const _documentFragmentDirectives = new WeakMap();
+
+const _viewTransitionTypeSetKey = Symbol('ViewTransitionTypeSet');
+class ViewTransitionTypeSet extends Set {
+  constructor(key = undefined, values = undefined) {
+    if (key !== _viewTransitionTypeSetKey) {
+      throw new TypeError("Failed to construct 'ViewTransitionTypeSet': Illegal constructor");
+    }
+    super(values);
+  }
+  get size() { return Reflect.get(Set.prototype, 'size', this); }
+  add(value) { super.add(String(value)); return this; }
+  clear() { return super.clear(); }
+  delete(value) { return super.delete(String(value)); }
+  entries() { return super.entries(); }
+  forEach(callback, thisArg = undefined) { return super.forEach(callback, thisArg); }
+  has(value) { return super.has(String(value)); }
+  keys() { return super.keys(); }
+  values() { return super.values(); }
+  get [Symbol.toStringTag]() { return 'ViewTransitionTypeSet'; }
+}
+const _viewTransitionKey = Symbol('ViewTransition');
+const _viewTransitionState = new WeakMap();
+const _activeViewTransitions = new WeakMap();
+class ViewTransition {
+  constructor(key = undefined, document, update, types) {
+    if (key !== _viewTransitionKey) {
+      throw new TypeError("Failed to construct 'ViewTransition': Illegal constructor");
+    }
+    let resolveReady, rejectReady, resolveUpdate, rejectUpdate, resolveFinished, rejectFinished;
+    const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    const updateCallbackDone = new Promise((resolve, reject) => { resolveUpdate = resolve; rejectUpdate = reject; });
+    const finished = new Promise((resolve, reject) => { resolveFinished = resolve; rejectFinished = reject; });
+    const state = {
+      document, ready, updateCallbackDone, finished,
+      resolveReady, rejectReady, resolveUpdate, rejectUpdate,
+      resolveFinished, rejectFinished, skipped: false,
+      waits: [], types: new ViewTransitionTypeSet(_viewTransitionTypeSetKey, types || []),
+    };
+    _viewTransitionState.set(this, state);
+    Promise.resolve().then(async () => {
+      try {
+        if (typeof update === 'function') await update();
+        state.resolveUpdate();
+        state.resolveReady();
+        await Promise.all(state.waits);
+        setTimeout(() => state.resolveFinished(), 0);
+      } catch (error) {
+        state.rejectUpdate(error); state.rejectReady(error); state.rejectFinished(error);
+      }
+    });
+  }
+  get finished() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.finished;
+  }
+  get ready() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.ready;
+  }
+  get updateCallbackDone() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.updateCallbackDone;
+  }
+  get types() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.types;
+  }
+  get transitionRoot() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.document.documentElement;
+  }
+  skipTransition() {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    if (state.skipped) return;
+    state.skipped = true;
+    state.resolveReady(); state.resolveFinished();
+  }
+  waitUntil(value) {
+    const state = _viewTransitionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'waitUntil' on 'ViewTransition': 1 argument required, but only 0 present.");
+    }
+    state.waits.push(Promise.resolve(value));
+  }
+  get [Symbol.toStringTag]() { return 'ViewTransition'; }
+}
+globalThis.ViewTransitionTypeSet = ViewTransitionTypeSet;
+globalThis.ViewTransition = ViewTransition;
+
 class Document extends Node {
   constructor(nid) {
     // Node's constructor stores the handle under _nidSym already, which keeps
@@ -5270,16 +6548,70 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() { return _wrapEl(+_dom("document_element")); }
+  get documentElement() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], "html"));
+    }
+    return _wrapEl(+_dom("document_element"));
+  }
   get children() {
-    const root = this.documentElement;
-    return HTMLCollection._from(root ? [root] : []);
+    return _documentCollection(this, 'children', () => {
+      const root = this.documentElement;
+      return root ? [root] : [];
+    });
   }
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
   get lastElementChild() { return this.documentElement; }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
+  get customElementRegistry() { return globalThis.customElements; }
+  get designMode() { return 'off'; }
+  set designMode(value) { String(value); }
+  // HTMLDocument exposes the root element's direction on the prototype.
+  // Chrome does not expose a Document.lang prototype member; page code that
+  // assigns document.lang consequently creates an ordinary own property.
+  get dir() {
+    const root = this.documentElement;
+    if (!root) return '';
+    const value = (root.getAttribute('dir') || '').toLowerCase();
+    return value === 'ltr' || value === 'rtl' || value === 'auto' ? value : '';
+  }
+  set dir(value) {
+    const root = this.documentElement;
+    if (root) root.setAttribute('dir', String(value));
+  }
+  get featurePolicy() {
+    if (!_documentFeaturePolicies.has(this)) {
+      _documentFeaturePolicies.set(this, new FeaturePolicy(_featurePolicyKey, this));
+    }
+    return _documentFeaturePolicies.get(this);
+  }
+  get fragmentDirective() {
+    if (!_documentFragmentDirectives.has(this)) {
+      _documentFragmentDirectives.set(this, new _FragmentDirective());
+    }
+    return _documentFragmentDirectives.get(this);
+  }
+  get activeViewTransition() { return _activeViewTransitions.get(this) || null; }
+  get fullscreenElement() { return null; }
+  get pictureInPictureElement() { return null; }
+  get pointerLockElement() { return null; }
+  get rootElement() { return null; }
+  get textContent() { return null; }
+  set textContent(_value) {}
+  get webkitCurrentFullScreenElement() { return null; }
+  get webkitFullscreenElement() { return null; }
+  get xmlEncoding() { return null; }
+  get xmlVersion() { return null; }
+  get fullscreen() { return false; }
+  get prerendering() { return false; }
+  get wasDiscarded() { return false; }
+  get webkitIsFullScreen() { return false; }
+  get xmlStandalone() { return false; }
+  get fullscreenEnabled() { return true; }
+  get pictureInPictureEnabled() { return true; }
+  get webkitFullscreenEnabled() { return true; }
   get doctype() {
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
@@ -5364,6 +6696,133 @@ class Document extends Node {
     }
     return !!result.value;
   }
+  ariaNotify(message, _options = undefined) {
+    _documentPrivacyRoot(this, 'ariaNotify');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'ariaNotify' on 'Document': 1 argument required, but only 0 present.");
+    }
+    String(message);
+  }
+  async browsingTopics(_options = undefined) {
+    _documentPrivacyRoot(this, 'browsingTopics');
+    return [];
+  }
+  async hasUnpartitionedCookieAccess() {
+    const root = _documentPrivacyRoot(this, 'hasUnpartitionedCookieAccess');
+    const result = JSON.parse(Deno.core.ops.op_has_storage_access(root));
+    if (result.status === 'invalid-state') {
+      throw new DOMException(
+        'hasUnpartitionedCookieAccess: Cannot be used unless the document is fully active.',
+        'InvalidStateError');
+    }
+    return !!result.value;
+  }
+  async requestStorageAccess() {
+    const root = _documentPrivacyRoot(this, 'requestStorageAccess');
+    const result = JSON.parse(Deno.core.ops.op_has_storage_access(root));
+    if (result.status === 'invalid-state') {
+      throw new DOMException(
+        'requestStorageAccess: Cannot be used unless the document is fully active.',
+        'InvalidStateError');
+    }
+    if (result.value) return;
+    throw new DOMException('requestStorageAccess not allowed', 'NotAllowedError');
+  }
+  async requestStorageAccessFor(requestedOrigin) {
+    _documentPrivacyRoot(this, 'requestStorageAccessFor');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'requestStorageAccessFor' on 'Document': 1 argument required, but only 0 present.");
+    }
+    let requested;
+    try { requested = new URL(String(requestedOrigin), this.URL).origin; }
+    catch (_error) { throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError'); }
+    if (requested === this.location.origin) return;
+    throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError');
+  }
+  captureEvents() { _documentPrivacyRoot(this, 'captureEvents'); }
+  releaseEvents() { _documentPrivacyRoot(this, 'releaseEvents'); }
+  clear() { _documentPrivacyRoot(this, 'clear'); }
+  exitPointerLock() { _documentPrivacyRoot(this, 'exitPointerLock'); }
+  webkitCancelFullScreen() { _documentPrivacyRoot(this, 'webkitCancelFullScreen'); }
+  webkitExitFullscreen() { _documentPrivacyRoot(this, 'webkitExitFullscreen'); }
+  async exitFullscreen() {
+    _documentPrivacyRoot(this, 'exitFullscreen');
+    throw new TypeError(
+      "Failed to execute 'exitFullscreen' on 'Document': Document not active");
+  }
+  async exitPictureInPicture() {
+    _documentPrivacyRoot(this, 'exitPictureInPicture');
+    throw new DOMException(
+      "Failed to execute 'exitPictureInPicture' on 'Document': There is no Picture-in-Picture element in this document.",
+      'InvalidStateError');
+  }
+  startViewTransition(update = undefined) {
+    _documentPrivacyRoot(this, 'startViewTransition');
+    let callback = update, types = [];
+    if (update && typeof update === 'object') {
+      callback = update.update;
+      types = Array.isArray(update.types) ? update.types : [];
+    }
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw new TypeError(
+        "Failed to execute 'startViewTransition' on 'Document': parameter 1 is not a function.");
+    }
+    const transition = new ViewTransition(_viewTransitionKey, this, callback, types);
+    _activeViewTransitions.set(this, transition);
+    transition.finished.finally(() => {
+      if (_activeViewTransitions.get(this) === transition) {
+        _activeViewTransitions.delete(this);
+      }
+    });
+    return transition;
+  }
+  moveBefore(node, child) {
+    _documentPrivacyRoot(this, 'moveBefore');
+    if (arguments.length < 2) {
+      throw new TypeError(
+        "Failed to execute 'moveBefore' on 'Document': 2 arguments required, but only "
+          + arguments.length + " present.");
+    }
+    if (!(node instanceof Node)) {
+      throw new TypeError(
+        "Failed to execute 'moveBefore' on 'Document': parameter 1 is not of type 'Node'.");
+    }
+    if (child !== null && (!(child instanceof Node) || child.parentNode !== this)) {
+      throw new DOMException(
+        "Failed to execute 'moveBefore' on 'Document': The node before which the new node is to be inserted is not a child of this node.",
+        'NotFoundError');
+    }
+    if (node === child) return;
+    this.insertBefore(node, child);
+  }
+  queryCommandEnabled(command) {
+    const name = _queryCommandName(this, 'queryCommandEnabled', command, arguments.length);
+    if (!_queryCommandSupportedNames.has(name)) return false;
+    if (name === 'selectall' || name === 'stylewithcss') return true;
+    return !!_queryCommandEditingHost(this) && _queryCommandEditableNames.has(name);
+  }
+  queryCommandIndeterm(command) {
+    _queryCommandName(this, 'queryCommandIndeterm', command, arguments.length);
+    return false;
+  }
+  queryCommandState(command) {
+    const name = _queryCommandName(this, 'queryCommandState', command, arguments.length);
+    return _queryCommandState(this, name);
+  }
+  queryCommandSupported(command) {
+    const name = _queryCommandName(this, 'queryCommandSupported', command, arguments.length);
+    return _queryCommandSupportedNames.has(name);
+  }
+  queryCommandValue(command) {
+    const name = _queryCommandName(this, 'queryCommandValue', command, arguments.length);
+    if (name === 'bold' || name === 'italic' || name === 'underline'
+        || name === 'strikethrough' || name === 'subscript' || name === 'superscript') {
+      return String(_queryCommandState(this, name));
+    }
+    return '';
+  }
   get location() { return globalThis.location; }
   set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
@@ -5380,12 +6839,18 @@ class Document extends Node {
     return "CSS1Compat";
   }
   get lastModified() {
-    // No Last-Modified header is plumbed through; Chrome falls back to the
-    // document's creation time, so the first read pins it for this document
-    // object. en-US, 24h clock, zero-padded, the format Chrome uses.
     let stamp = this[_lastModifiedSym];
     if (!stamp) {
-      stamp = new Date();
+      let header = null;
+      try {
+        const root = typeof this[_scopeRootSym] === 'number'
+          ? this[_scopeRootSym] : (this === globalThis.document ? 0 : null);
+        if (root !== null) {
+          header = _domParse('document_scope_info', root)?.lastModified || null;
+        }
+      } catch (_e) {}
+      stamp = header ? new Date(header) : new Date();
+      if (!Number.isFinite(stamp.getTime())) stamp = new Date();
       try { Object.defineProperty(this, _lastModifiedSym, { value: stamp, configurable: true }); }
       catch (_e) { this[_lastModifiedSym] = stamp; }
     }
@@ -5432,17 +6897,84 @@ class Document extends Node {
   get visibilityState() { return "visible"; }
   get webkitVisibilityState() { return this.visibilityState; }
   get webkitHidden() { return this.hidden; }
-  getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  getElementById(id) {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const sel = '[id="' + String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+      return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], sel));
+    }
+    if (_detachedDocumentBrand.has(this) && this._root) {
+      const target = String(id);
+      const stack = [this._root];
+      while (stack.length) {
+        const node = stack.pop();
+        if (node && node.nodeType === 1 && node.getAttribute
+            && node.getAttribute("id") === target) return node;
+        const children = node && node.children ? Array.from(node.children) : [];
+        for (let index = children.length - 1; index >= 0; index--) stack.push(children[index]);
+      }
+      return null;
+    }
+    return _wrapEl(+_dom("get_element_by_id", id));
+  }
+  querySelector(s) {
+    if (typeof this[_scopeRootSym] === 'number') {
+      return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], s));
+    }
+    if (_detachedDocumentBrand.has(this) && this._root) return this._root.querySelector(s);
+    return _wrapEl(+_dom("query_selector", s));
+  }
   querySelectorAll(s) {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const ids = _domParse("query_selector_all_scoped", this[_scopeRootSym], s) || [];
+      return _nodeList(ids.map(_wrapEl).filter(Boolean));
+    }
+    if (_detachedDocumentBrand.has(this) && this._root) return this._root.querySelectorAll(s);
     const ids = _domParse("query_selector_all", s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _htmlCollectionFrom(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
+  }
+  createExpression(expression, resolver = null) {
+    _documentPrivacyRoot(this, 'createExpression');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'createExpression' on 'Document': 1 argument required, but only 0 present.");
+    }
+    return new XPathExpression(
+      _xpathExpressionKey, this, String(expression), resolver);
+  }
+  createNSResolver(nodeResolver) {
+    _documentPrivacyRoot(this, 'createNSResolver');
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'createNSResolver' on 'Document': 1 argument required, but only 0 present.");
+    }
+    if (!(nodeResolver instanceof Node)) {
+      throw new TypeError(
+        "Failed to execute 'createNSResolver' on 'Document': parameter 1 is not of type 'Node'.");
+    }
+    return nodeResolver;
+  }
+  caretPositionFromPoint(x, y, _options = undefined) {
+    _documentPrivacyRoot(this, 'caretPositionFromPoint');
+    if (arguments.length < 2) {
+      throw new TypeError(
+        "Failed to execute 'caretPositionFromPoint' on 'Document': 2 arguments required, but only "
+          + arguments.length + " present.");
+    }
+    return _caretPositionAt(this, x, y);
+  }
+  caretRangeFromPoint(x = 0, y = 0) {
+    _documentPrivacyRoot(this, 'caretRangeFromPoint');
+    const position = _caretPositionAt(this, x, y);
+    const range = new Range();
+    range.setStart(position.offsetNode, position.offset);
+    range.setEnd(position.offsetNode, position.offset);
+    return range;
   }
   createElement(t) {
     const localName = String(t).toLowerCase();
@@ -5451,7 +6983,13 @@ class Document extends Node {
       "http://www.w3.org/1999/xhtml",
       localName,
     );
-    const el = new C(nid);
+    const el = C === HTMLIFrameElement
+      ? new C(nid, _iframeConstructionKey)
+      : C === HTMLLinkElement
+        ? new C(nid, _linkConstructionKey)
+        : C === HTMLInputElement
+          ? new C(nid, _inputConstructionKey)
+        : new C(nid);
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
@@ -5463,13 +7001,15 @@ class Document extends Node {
     // Creation knows its scope: stamp the owner-document root (scoped
     // documents carry _scopeRoot, the main document its own nid).
     el[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
+    _stampDetachedDocumentNode(this, el);
     _cache.set(nid, el);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
       el._templateContent._fragmentContext = 'template';
     }
-    const definition = globalThis.customElements?._registry?.get(localName);
-    if (el && definition) globalThis.customElements._upgradeElement(el, definition);
+    const registry = this.customElementRegistry || globalThis.customElements;
+    const definition = registry?.get(localName);
+    if (el && definition) _customElementUpgrade(registry, el, definition);
     return el;
   }
   createElementNS(ns, t) {
@@ -5487,7 +7027,13 @@ class Document extends Node {
     );
     const effectiveNamespace = namespace == null ? "" : namespace;
     const C = _elementClassForKnownName(effectiveNamespace, qualified);
-    const el = new C(nid);
+    const el = C === HTMLIFrameElement
+      ? new C(nid, _iframeConstructionKey)
+      : C === HTMLLinkElement
+        ? new C(nid, _linkConstructionKey)
+        : C === HTMLInputElement
+          ? new C(nid, _inputConstructionKey)
+        : new C(nid);
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
@@ -5497,6 +7043,7 @@ class Document extends Node {
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
     el[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
+    _stampDetachedDocumentNode(this, el);
     _cache.set(nid, el);
     return el;
   }
@@ -5505,6 +7052,7 @@ class Document extends Node {
     const n = new Text(nid);
     _seedDetachedTreeState(n);
     n[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
+    _stampDetachedDocumentNode(this, n);
     _cache.set(nid, n);
     return n;
   }
@@ -5513,6 +7061,7 @@ class Document extends Node {
     const n = new Comment(nid);
     _seedDetachedTreeState(n);
     n[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
+    _stampDetachedDocumentNode(this, n);
     _cache.set(nid, n);
     return n;
   }
@@ -5529,6 +7078,7 @@ class Document extends Node {
     const nid = +_dom("create_text_node", str);
     const n = new CDATASection(nid);
     _seedDetachedTreeState(n);
+    _stampDetachedDocumentNode(this, n);
     _cache.set(nid, n);
     return n;
   }
@@ -5546,6 +7096,7 @@ class Document extends Node {
     const nid = +_dom("create_text_node", str);
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
+    _stampDetachedDocumentNode(this, n);
     _cache.set(nid, n);
     return n;
   }
@@ -5554,6 +7105,7 @@ class Document extends Node {
     const frag = new DocumentFragment(nid);
     _seedDetachedTreeState(frag);
     frag[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
+    _stampDetachedDocumentNode(this, frag);
     _cache.set(nid, frag);
     return frag;
   }
@@ -5797,7 +7349,7 @@ class Document extends Node {
     };
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
-  get activeElement() { return globalThis.__obscura_focused || this.body; }
+  get activeElement() { return globalThis[_inputFocusedSym] || this.body; }
   // The element that scrolls the viewport, and where the page offset lives
   // (issue #468). Standards mode, so documentElement — quirks mode would be
   // body, but we never parse in quirks mode.
@@ -5809,21 +7361,15 @@ class Document extends Node {
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
       // the result — when we returned `globalThis.document`, the real
       // `<body>` was wiped, taking every page on the open web that ships
-      // jQuery 3.x with it. Reuse the DOMParser path to build a detached
-      // document, then optionally set the title.
+      // jQuery 3.x with it. DOMParser now builds the complete detached
+      // document skeleton, so only the optional title needs adding here.
       createHTMLDocument(title) {
-        // Build head>title and body explicitly. Parsing a full skeleton string
-        // as innerHTML of <html> collapses through the fragment parser (it
-        // dropped head/body and kept only <title>), leaving doc.body null.
         const doc = new DOMParser().parseFromString("", "text/html");
-        const root = doc.documentElement;
-        const head = document.createElement("head");
-        const titleEl = document.createElement("title");
-        if (title != null) titleEl.textContent = String(title);
-        head.appendChild(titleEl);
-        const body = document.createElement("body");
-        root.appendChild(head);
-        root.appendChild(body);
+        if (arguments.length > 0) {
+          const titleEl = document.createElement("title");
+          titleEl.textContent = String(title);
+          doc.head.appendChild(titleEl);
+        }
         return doc;
       },
       // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
@@ -5863,10 +7409,14 @@ class Document extends Node {
     if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);
     return this[_styleSheetListSym];
   }
-  get forms() { return this.querySelectorAll("form"); }
-  get images() { return this.querySelectorAll("img"); }
-  get links() { return this.querySelectorAll("a[href], area[href]"); }
-  get scripts() { return this.querySelectorAll("script"); }
+  get forms() { return _documentCollection(this, 'forms', () => this.querySelectorAll('form')); }
+  get images() { return _documentCollection(this, 'images', () => this.querySelectorAll('img')); }
+  get links() { return _documentCollection(this, 'links', () => this.querySelectorAll('a[href], area[href]')); }
+  get scripts() { return _documentCollection(this, 'scripts', () => this.querySelectorAll('script')); }
+  get anchors() { return _documentCollection(this, 'anchors', () => this.querySelectorAll('a[name]')); }
+  get applets() { return _documentCollection(this, 'applets', () => this.querySelectorAll('applet')); }
+  get embeds() { return _documentCollection(this, 'embeds', () => this.querySelectorAll('embed')); }
+  get plugins() { return this.embeds; }
   get cookie() {
     const settings = _environmentSettings();
     if (settings.origin === "null") {
@@ -5933,7 +7483,7 @@ class DocumentFragment extends Node {
   }
   get children() {
     const ids = _domParse("element_children", this[_nidSym]) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
+    return _htmlCollectionFrom(ids.map(_wrapEl).filter(Boolean));
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
@@ -6587,7 +8137,7 @@ function _performanceNowSafe() {
 // is a value no Chrome produces, and it pushes sites into their "your browser
 // cannot play video" path. Playback itself still never happens: `play()`
 // rejects, `readyState` stays HAVE_NOTHING and no frame is decoded.
-// Tables confirmed against Chrome 146 in js-repros/media-capability-honesty/.
+// The broad canPlayType table is pinned in js-repros/media-capability-honesty/.
 const _MEDIA_CONTAINERS = {
   'video/mp4': 'maybe', 'video/webm': 'maybe', 'video/ogg': 'maybe',
   'video/x-matroska': 'maybe', 'video/3gpp': 'maybe',
@@ -6599,7 +8149,59 @@ const _MEDIA_CONTAINERS = {
 };
 // Theora and the QuickTime container are absent on purpose: Chrome answers ""
 // for both, so a blanket "known container" rule would over-report.
-const _MEDIA_CODEC = /^(avc[13](\.[0-9a-f]{6})?|mp4a\.[0-9a-f]{2}(\.[0-9]+)?|vp0?[89](\.[0-9a-z.]+)?|av01(\.[0-9a-z.]+)?|vorbis|opus|flac|mp3|[12]|e?a?c-3)$/i;
+const _MEDIA_CODEC = /^(avc[13](\.[0-9a-f]{6})?|(?:hev1|hvc1)(\.[0-9a-z.]+)?|mp4a\.[0-9a-f]{2}(\.[0-9]+)?|vp0?[89](\.[0-9a-z.]+)?|av01(\.[0-9a-z.]+)?|vorbis|opus|flac|mp3|[12])$/i;
+
+function _parseMediaType(raw) {
+  const text = String(raw).trim();
+  if (!text) return null;
+  const parts = text.split(';');
+  const container = parts[0].trim().toLowerCase();
+  const match = /codecs\s*=\s*"?([^"]*)"?/i.exec(parts.slice(1).join(';'));
+  const codecs = match
+    ? match[1].split(',').map(codec => codec.trim().toLowerCase()).filter(Boolean)
+    : [];
+  return { container, codecs };
+}
+
+function _mediaSourceTypeSupported(raw) {
+  const parsed = _parseMediaType(raw);
+  if (!parsed) return false;
+  const { container, codecs } = parsed;
+  if (!codecs.length) return container === 'audio/mpeg' || container === 'audio/aac';
+  const every = pattern => codecs.every(codec => pattern.test(codec));
+  if (container === 'audio/mp4') return every(/^(?:mp4a\.|opus$)/);
+  if (container === 'audio/webm') return every(/^(?:opus|vorbis)$/);
+  if (container === 'video/mp4') {
+    return every(/^(?:avc[13]\.|hev1\.|hvc1\.|av01\.|vp09\.|mp4a\.)/);
+  }
+  if (container === 'video/webm') {
+    return every(/^(?:vp8$|vp9$|vp09\.|av01\.|opus$|vorbis$)/);
+  }
+  return false;
+}
+
+function _mediaCapabilityTypeSupported(raw) {
+  const parsed = _parseMediaType(raw);
+  if (!parsed) return false;
+  const { container, codecs } = parsed;
+  if (!codecs.length) {
+    return container === 'audio/mpeg' || container === 'audio/aac'
+      || container === 'audio/flac';
+  }
+  if (codecs.length !== 1) return false;
+  const codec = codecs[0];
+  if (container === 'audio/mp4') return /^(?:mp4a\.|opus$)/.test(codec);
+  if (container === 'audio/webm') return /^(?:opus|vorbis)$/.test(codec);
+  if (container === 'audio/ogg') return /^(?:vorbis|flac)$/.test(codec);
+  if (container === 'audio/wav') return codec === '1';
+  if (container === 'video/mp4') {
+    return /^(?:avc[13]\.|hev1\.|hvc1\.|av01\.|vp09\.)/.test(codec);
+  }
+  if (container === 'video/webm') {
+    return /^(?:vp8$|vp09\.|av01\.)/.test(codec);
+  }
+  return false;
+}
 
 function _canPlayMediaType(raw) {
   const text = String(raw).trim();
@@ -6759,6 +8361,138 @@ class HTMLTrackElement extends Element {
     return this._textTrack;
   }
 }
+// Iframes have a distinct WebIDL interface. A plain Element alias makes
+// `instanceof HTMLIFrameElement`, the prototype chain, and iframe-only
+// navigation/policy properties observably wrong.
+const _iframeConstructionKey = Symbol('HTMLIFrameElement construction');
+const _iframeFeaturePolicies = new WeakMap();
+class HTMLIFrameElement extends Element {
+  get src() {
+    const raw = this.getAttribute('src');
+    if (!raw) return '';
+    try { return new URL(raw, this.baseURI || globalThis.location?.href || 'about:blank').href; }
+    catch (_error) { return raw; }
+  }
+  set src(value) { this.setAttribute('src', value); }
+  get srcdoc() { return this.getAttribute('srcdoc') || ''; }
+  set srcdoc(value) {
+    this.setAttribute('srcdoc', globalThis.__obscura_tt_enforce(
+      'TrustedHTML', value, 'HTMLIFrameElement srcdoc'));
+  }
+  get name() { return this.getAttribute('name') || ''; }
+  set name(value) { this.setAttribute('name', value); }
+  get sandbox() {
+    if (!this._sandboxList) {
+      this._sandboxList = new DOMTokenList(this, 'sandbox', [
+        'allow-downloads', 'allow-forms', 'allow-modals', 'allow-orientation-lock',
+        'allow-pointer-lock', 'allow-popups', 'allow-popups-to-escape-sandbox',
+        'allow-presentation', 'allow-same-origin', 'allow-scripts',
+        'allow-top-navigation', 'allow-top-navigation-by-user-activation',
+        'allow-top-navigation-to-custom-protocols',
+      ]);
+    }
+    return this._sandboxList;
+  }
+  set sandbox(value) { this.setAttribute('sandbox', value); }
+  get allowFullscreen() { return this.hasAttribute('allowfullscreen'); }
+  set allowFullscreen(value) {
+    if (value) this.setAttribute('allowfullscreen', '');
+    else this.removeAttribute('allowfullscreen');
+  }
+  get width() { return this.getAttribute('width') || ''; }
+  set width(value) { this.setAttribute('width', value); }
+  get height() { return this.getAttribute('height') || ''; }
+  set height(value) { this.setAttribute('height', value); }
+  get contentDocument() {
+    const nativeRoot = +_dom('iframe_content_document_root', this[_nidSym]);
+    if (nativeRoot >= 0) {
+      if (!_frameSameOrigin(nativeRoot)) return null;
+      _materializeFrameRealm(this[_nidSym]);
+      const realmGlobal = _frameRealmGlobalFor(nativeRoot);
+      if (realmGlobal && realmGlobal.document) {
+        realmGlobal.document[_defaultViewProxySym] = _frameWindowProxyFor(this);
+        return realmGlobal.document;
+      }
+      const doc = _scopedDocumentFor(nativeRoot);
+      doc[_defaultViewProxySym] = _frameWindowProxyFor(this);
+      return doc;
+    }
+    return null;
+  }
+  get contentWindow() {
+    if (+_dom('iframe_content_document_root', this[_nidSym]) >= 0) {
+      return _frameWindowProxyFor(this);
+    }
+    return null;
+  }
+  get referrerPolicy() { return this.getAttribute('referrerpolicy') || ''; }
+  set referrerPolicy(value) { this.setAttribute('referrerpolicy', value); }
+  get csp() { return this.getAttribute('csp') || ''; }
+  set csp(value) { this.setAttribute('csp', String(value)); }
+  get allow() { return this.getAttribute('allow') || ''; }
+  set allow(value) { this.setAttribute('allow', value); }
+  get featurePolicy() {
+    let policy = _iframeFeaturePolicies.get(this);
+    if (!policy) {
+      policy = new PermissionsPolicy(_permissionsPolicyKey, this.ownerDocument || globalThis.document);
+      _iframeFeaturePolicies.set(this, policy);
+    }
+    return policy;
+  }
+  get loading() { return this.getAttribute('loading') || 'auto'; }
+  set loading(value) { this.setAttribute('loading', value); }
+  get align() { return this.getAttribute('align') || ''; }
+  set align(value) { this.setAttribute('align', value); }
+  get scrolling() { return this.getAttribute('scrolling') || ''; }
+  set scrolling(value) { this.setAttribute('scrolling', value); }
+  get frameBorder() { return this.getAttribute('frameborder') || ''; }
+  set frameBorder(value) { this.setAttribute('frameborder', value); }
+  get longDesc() { return this.getAttribute('longdesc') || ''; }
+  set longDesc(value) { this.setAttribute('longdesc', value); }
+  get marginHeight() { return this.getAttribute('marginheight') || ''; }
+  set marginHeight(value) { this.setAttribute('marginheight', value); }
+  get marginWidth() { return this.getAttribute('marginwidth') || ''; }
+  set marginWidth(value) { this.setAttribute('marginwidth', value); }
+  getSVGDocument() { return null; }
+  get credentialless() { return this.hasAttribute('credentialless'); }
+  set credentialless(value) {
+    if (value) this.setAttribute('credentialless', '');
+    else this.removeAttribute('credentialless');
+  }
+  get allowPaymentRequest() { return this.hasAttribute('allowpaymentrequest'); }
+  set allowPaymentRequest(value) {
+    if (value) this.setAttribute('allowpaymentrequest', '');
+    else this.removeAttribute('allowpaymentrequest');
+  }
+  constructor(...args) {
+    if (args.length !== 2 || args[1] !== _iframeConstructionKey) {
+      throw new TypeError('Illegal constructor');
+    }
+    super(args[0]);
+  }
+  get [Symbol.toStringTag]() { return 'HTMLIFrameElement'; }
+}
+const _iframeConstructorDescriptor = Object.getOwnPropertyDescriptor(
+  HTMLIFrameElement.prototype, 'constructor');
+delete HTMLIFrameElement.prototype.constructor;
+Object.defineProperty(HTMLIFrameElement.prototype, 'constructor', _iframeConstructorDescriptor);
+Object.defineProperty(globalThis, 'HTMLIFrameElement', {
+  value: HTMLIFrameElement, writable: true, enumerable: false, configurable: true,
+});
+_markNative(HTMLIFrameElement);
+for (const name of Object.getOwnPropertyNames(HTMLIFrameElement.prototype)) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, name);
+  if (descriptor?.get) _markNative(descriptor.get);
+  if (descriptor?.set) _markNative(descriptor.set);
+  if (descriptor?.value) _markNative(descriptor.value);
+}
+// These members belong to iframe (or object) interfaces, not Element itself.
+// Leaving them on Element.prototype leaks a non-Chrome prototype shape even
+// when the iframe wrapper has the right dedicated class.
+for (const name of ['sandbox', 'srcdoc', 'csp', 'contentDocument', 'contentWindow']) {
+  delete Element.prototype[name];
+}
+
 globalThis.HTMLMediaElement = HTMLMediaElement;
 globalThis.HTMLVideoElement = HTMLVideoElement;
 globalThis.HTMLAudioElement = HTMLAudioElement;
@@ -6782,7 +8516,11 @@ function _elementClassFor(nid) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
+  if (tag === "BODY" && globalThis.HTMLBodyElement) return globalThis.HTMLBodyElement;
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
   if (tag === "IMG") return HTMLImageElement;
+  if (tag === "LINK" && globalThis.HTMLLinkElement) return HTMLLinkElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
@@ -6802,7 +8540,11 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
+    if (tag === "BODY" && globalThis.HTMLBodyElement) return globalThis.HTMLBodyElement;
+    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "IMG") return HTMLImageElement;
+    if (tag === "LINK" && globalThis.HTMLLinkElement) return globalThis.HTMLLinkElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
@@ -6816,7 +8558,18 @@ function _wrap(nid) {
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) {
+    const C = _elementClassFor(nid);
+    n = C === HTMLIFrameElement
+      ? new C(nid, _iframeConstructionKey)
+      : C === HTMLLinkElement
+        ? new C(nid, _linkConstructionKey)
+        : C === HTMLInputElement
+          ? new C(nid, _inputConstructionKey)
+          : C === globalThis.HTMLBodyElement
+            ? new C(nid)
+        : new C(nid);
+  }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) {
@@ -6833,7 +8586,15 @@ function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
-  const n = new C(nid);
+  const n = C === HTMLIFrameElement
+    ? new C(nid, _iframeConstructionKey)
+    : C === HTMLLinkElement
+      ? new C(nid, _linkConstructionKey)
+      : C === HTMLInputElement
+        ? new C(nid, _inputConstructionKey)
+        : C === globalThis.HTMLBodyElement
+          ? new C(nid)
+      : new C(nid);
   _cache.set(nid, n);
   return n;
 }
@@ -6918,22 +8679,6 @@ class _ScopedDocument extends Document {
     this[_scopeRootSym] = rootNid;
   }
   _scopeInfo() { return _domParse("document_scope_info", this[_scopeRootSym]); }
-  get documentElement() {
-    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], "html"));
-  }
-  querySelector(s) {
-    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], s));
-  }
-  querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this[_scopeRootSym], s) || [];
-    return _nodeList(ids.map(_wrapEl).filter(Boolean));
-  }
-  getElementById(id) {
-    // CSS.escape is an identity stub in this runtime; use the same
-    // attribute-selector escape as the native get_element_by_id fallback.
-    const sel = '[id="' + String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
-    return _wrapEl(+_dom("query_selector_scoped", this[_scopeRootSym], sel));
-  }
   get title() {
     const t = _internalQuerySelector(this, "title");
     if (!t) return "";
@@ -6963,6 +8708,7 @@ class _ScopedDocument extends Document {
   get domain() {
     // The frame document's own host, not the embedder's: the base class
     // routes non-top documents through the incumbent (top) document.
+    if (typeof this[_effectiveDomainSym] === 'string') return this[_effectiveDomainSym];
     const info = this._scopeInfo();
     if (!info || !info.url) return '';
     if (info.sandboxActive && !info.allowSameOrigin) return '';
@@ -7071,6 +8817,29 @@ function _frameRealmOwnDescriptor(realmGlobal, key) {
 // carries its own identity and its own prototype, with the statics inherited
 // rather than copied.
 const _iframeRealmGlobalCache = new WeakMap();
+const _frameRealmProxyMethodCache = new WeakMap();
+
+function _frameRealmProxyMethod(realmGlobal, name, delegate) {
+  let cache = _frameRealmProxyMethodCache.get(realmGlobal);
+  if (!cache) {
+    cache = new Map();
+    _frameRealmProxyMethodCache.set(realmGlobal, cache);
+  }
+  if (cache.has(name)) return cache.get(name);
+  let wrapped = delegate;
+  try {
+    const parameters = name === 'postMessage' ? 'message' : '';
+    const factory = Reflect.construct(realmGlobal.Function, [
+      'delegate',
+      'return ({' + name + '(' + parameters
+        + '){return Reflect.apply(delegate,this,arguments)}}).' + name,
+    ]);
+    wrapped = Reflect.apply(factory, realmGlobal, [delegate]);
+  } catch (_error) {}
+  _markNative(wrapped);
+  cache.set(name, wrapped);
+  return wrapped;
+}
 
 function _iframeSourceIsConstructor(value) {
   try {
@@ -7286,6 +9055,18 @@ function _frameWindowProxyFor(hostEl) {
         const realmGlobal = _frameRealmGlobalFor(contentRoot());
         return realmGlobal ? Reflect.get(realmGlobal, "constructor", realmGlobal) : Object;
       }
+      if ((key === "postMessage" || key === "blur" || key === "focus" || key === "close")
+          && sameOrigin()) {
+        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+        if (realmGlobal) {
+          if (key === "postMessage") {
+            return _frameRealmProxyMethod(realmGlobal, key, Reflect.get(t, key));
+          }
+          const value = Reflect.get(realmGlobal, key, realmGlobal);
+          _markNative(value);
+          return value;
+        }
+      }
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
@@ -7323,6 +9104,7 @@ function _frameWindowProxyFor(hostEl) {
       const source = realmGlobal
         ? _frameRealmOwnKeys(realmGlobal) : _pristineGlobalNames;
       for (const key of source) {
+        if (key === "constructor") continue;
         if (!seen.has(key)) { seen.add(key); keys.push(key); }
       }
       if (!realmGlobal && !seen.has("globalThis")) keys.push("globalThis");
@@ -7332,6 +9114,7 @@ function _frameWindowProxyFor(hostEl) {
       const own = Reflect.getOwnPropertyDescriptor(t, key);
       if (own) return own;
       if (typeof key === "string" && !sameOrigin()) return undefined;
+      if (key === "constructor") return undefined;
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
       let descriptor;
       if (realmGlobal) {
@@ -7425,7 +9208,9 @@ async function _frameMessageRecvLoop() {
       }));
       try { globalThis.dispatchEvent(evt); } catch (e) { console.error("message dispatch error:", e); }
       if (typeof globalThis.onmessage === "function") {
-        try { globalThis.onmessage.call(globalThis, evt); } catch (e) { console.error("onmessage error:", e); }
+        try {
+          _withLegacyWindowEvent(evt, () => globalThis.onmessage.call(globalThis, evt));
+        } catch (e) { console.error("onmessage error:", e); }
       }
     }
   }
@@ -7562,6 +9347,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       if (!realmGlobal) return keys;
       const seen = new Set(keys);
       for (const key of _frameRealmOwnKeys(realmGlobal)) {
+        if (key === "constructor") continue;
         if (!seen.has(key)) keys.push(key);
       }
       return keys;
@@ -7570,6 +9356,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       const own = Reflect.getOwnPropertyDescriptor(t, key);
       if (own) return own;
       if (typeof key === "string" && !sameOrigin()) return undefined;
+      if (key === "constructor") return undefined;
       const realmGlobal = targetGlobal();
       const descriptor = realmGlobal
         ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
@@ -7598,11 +9385,18 @@ function _environmentSettings() {
   // Dedicated workers deliberately have no Document. Their environment URL
   // is the final worker script URL installed by worker_prep_script, not the
   // empty DOM state of the fresh isolate.
-  const workerUrl = typeof globalThis.document === "undefined"
-    ? globalThis.__virtualUrl : null;
+  const isWorker = typeof globalThis.document === "undefined";
+  const workerUrl = isWorker
+    ? (globalThis.__virtualUrl || globalThis.location?.href) : null;
   const url = workerUrl || _domParse("document_url") || "about:blank";
-  let origin = "null";
-  try { origin = new URL(url).origin; } catch (e) {}
+  // Blob/data workers inherit the creator's tuple origin. Parsing the script
+  // URL itself would turn those workers into opaque `null` origins and make
+  // their cross-origin fetch/CORS headers diverge from Chromium.
+  let origin = isWorker && typeof globalThis.origin === "string"
+    ? globalThis.origin : "null";
+  if (origin === "null") {
+    try { origin = new URL(url).origin; } catch (e) {}
+  }
   const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
   return { root: 0, url, baseUrl, cookieUrl: url, origin };
 }
@@ -7758,17 +9552,95 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
 });
-// A browser global is a Window object, not merely an object accepted by
-// `Window[Symbol.hasInstance]`. Framework environment gates (including Ember's)
-// also require the direct identity `self.constructor === Window`; leaving the
-// inherited Object constructor makes them enter their server-rendering path
-// and hand string selectors to DOM render operations.
-Object.defineProperty(globalThis, 'constructor', {
-  value: globalThis.Window,
-  writable: true,
-  configurable: true,
-  enumerable: false,
+// Legacy storage constants are own properties on both Window and its
+// prototype in Chrome. They are still observable through interface-shape
+// probes even though the synchronous Web Storage API no longer uses them.
+Object.defineProperties(globalThis.Window, {
+  TEMPORARY: { value: 0, writable: false, enumerable: true, configurable: false },
+  PERSISTENT: { value: 1, writable: false, enumerable: true, configurable: false },
 });
+Object.defineProperties(globalThis.Window.prototype, {
+  TEMPORARY: { value: 0, writable: false, enumerable: true, configurable: false },
+  PERSISTENT: { value: 1, writable: false, enumerable: true, configurable: false },
+});
+// A browser global inherits from Window.prototype. This gives frameworks the
+// required `self.constructor === Window` identity without exposing constructor
+// as an own Window key (Chrome does not).
+Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
+const _barPropKey = Symbol('BarProp');
+class BarProp {
+  constructor(key = undefined) {
+    if (key !== _barPropKey) {
+      throw new TypeError("Failed to construct 'BarProp': Illegal constructor");
+    }
+  }
+  get visible() { return true; }
+  get [Symbol.toStringTag]() { return 'BarProp'; }
+}
+const _externalKey = Symbol('External');
+class External {
+  constructor(key = undefined) {
+    if (key !== _externalKey) {
+      throw new TypeError("Failed to construct 'External': Illegal constructor");
+    }
+  }
+  AddSearchProvider() {}
+  IsSearchProviderInstalled() { return 0; }
+  get [Symbol.toStringTag]() { return 'External'; }
+}
+globalThis.BarProp = BarProp;
+globalThis.External = External;
+Object.defineProperty(globalThis, 'external', {
+  value: new External(_externalKey), writable: true, enumerable: true, configurable: true,
+});
+for (const name of ['locationbar', 'menubar', 'personalbar',
+                    'scrollbars', 'statusbar', 'toolbar']) {
+  Object.defineProperty(globalThis, name, {
+    value: new BarProp(_barPropKey), writable: true, enumerable: true, configurable: true,
+  });
+}
+const _styleMediaPrototype = {};
+Object.defineProperties(_styleMediaPrototype, {
+  type: {
+    get: _markNativeAs(function () { return 'screen'; },
+      'function get type() { [native code] }'),
+    enumerable: true, configurable: true,
+  },
+  matchMedium: {
+    value: _markNative(function matchMedium(query) { return matchMedia(String(query)).matches; }),
+    writable: true, enumerable: true, configurable: true,
+  },
+  [Symbol.toStringTag]: { value: 'StyleMedia', configurable: true },
+});
+Object.defineProperty(globalThis, 'styleMedia', {
+  value: Object.create(_styleMediaPrototype),
+  writable: true, enumerable: true, configurable: true,
+});
+for (const [name, value] of [
+  ['fence', null], ['credentialless', false], ['offscreenBuffering', true],
+  ['originAgentCluster', true],
+]) {
+  Object.defineProperty(globalThis, name, {
+    value, writable: true, enumerable: true, configurable: true,
+  });
+}
+if (!Object.getOwnPropertyDescriptor(Navigator.prototype,
+    'deprecatedRunAdAuctionEnforcesKAnonymity')) {
+  Object.defineProperty(Navigator.prototype,
+    'deprecatedRunAdAuctionEnforcesKAnonymity', {
+      value: false, writable: true, enumerable: true, configurable: true,
+    });
+}
+const _windowEventPrototype = Object.getPrototypeOf(globalThis);
+if (_windowEventPrototype && !Object.getOwnPropertyDescriptor(_windowEventPrototype, 'when')) {
+  const when = ({ when(type, options = undefined) {
+    return _eventTargetWhen.call(this, type, options, arguments.length);
+  } }).when;
+  _markNative(when);
+  Object.defineProperty(_windowEventPrototype, 'when', {
+    value: when, writable: true, enumerable: true, configurable: true,
+  });
+}
 
 
 // The child browsing contexts, exposed as `window.length` and `window[i]`.
@@ -7889,44 +9761,73 @@ _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
+const _networkInformationKey = {};
+const _networkInformationState = new WeakMap();
+const _networkInformation = value => {
+  const state = _networkInformationState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+};
 class NetworkInformation {
-  constructor() { this._listeners = Object.create(null); }
-  get downlink() { return 10; }
-  get downlinkMax() { return Infinity; }
-  get effectiveType() { return '4g'; }
-  get rtt() { return 50; }
-  get saveData() { return false; }
-  get type() { return 'wifi'; }
-  get onchange() { return this._onchange || null; }
-  set onchange(v) { this._onchange = typeof v === "function" ? v : null; }
-  get ontypechange() { return this._ontypechange || null; }
-  set ontypechange(v) { this._ontypechange = typeof v === "function" ? v : null; }
-  addEventListener(type, listener) {
-    if (typeof listener !== "function") return;
-    (this._listeners[type] || (this._listeners[type] = [])).push(listener);
-  }
-  removeEventListener(type, listener) {
-    const listeners = this._listeners[type];
-    if (listeners) this._listeners[type] = listeners.filter((item) => item !== listener);
-  }
-  dispatchEvent(event) {
-    if (!event || !event.type) return true;
-    for (const listener of this._listeners[event.type] || []) {
-      try { listener.call(this, event); } catch (error) { console.error(error); }
+  constructor(key = undefined) {
+    if (key !== _networkInformationKey) {
+      throw new TypeError("Failed to construct 'NetworkInformation': Illegal constructor");
     }
-    const handler = this["on" + event.type];
-    if (typeof handler === "function") {
-      try { handler.call(this, event); } catch (error) { console.error(error); }
-    }
-    return !event.defaultPrevented;
+    _networkInformationState.set(this, { onchange: null });
   }
+  get onchange() { return _networkInformation(this).onchange; }
+  set onchange(value) {
+    _networkInformation(this).onchange = typeof value === 'function' ? value : null;
+  }
+  get effectiveType() { _networkInformation(this); return '4g'; }
+  get rtt() { _networkInformation(this); return 50; }
+  get downlink() { _networkInformation(this); return 10; }
+  get saveData() { _networkInformation(this); return false; }
 }
+const _networkInformationConstructor = Object.getOwnPropertyDescriptor(
+  NetworkInformation.prototype, 'constructor');
+delete NetworkInformation.prototype.constructor;
+if (_networkInformationConstructor) Object.defineProperty(
+  NetworkInformation.prototype, 'constructor', _networkInformationConstructor);
+Object.defineProperty(NetworkInformation.prototype, Symbol.toStringTag,
+  { value: 'NetworkInformation', configurable: true });
 _markNative(NetworkInformation);
+for (const name of ['onchange', 'effectiveType', 'rtt', 'downlink', 'saveData']) {
+  const descriptor = Object.getOwnPropertyDescriptor(NetworkInformation.prototype, name);
+  if (descriptor.get) _markNative(descriptor.get);
+  if (descriptor.set) _markNative(descriptor.set);
+}
 globalThis.NetworkInformation = NetworkInformation;
 
 
 function _uaBrands() {
   return (_fingerprint().brands || []).map(item => ({brand:item.brand,version:item.version}));
+}
+
+function _permissionPolicyAllows(name) {
+  const root = globalThis.__obscura_frame_document_nid;
+  if (typeof root !== 'number' || root <= 0) return true;
+  try { return _dom('frame_permission_allowed', root, String(name)) === 'true'; }
+  catch (_error) { return false; }
+}
+
+function _permissionState(name) {
+  name = String(name || '');
+  if (!_permissionPolicyAllows(name)) return 'denied';
+  if (name === 'notifications') {
+    const permission = globalThis.Notification && Notification.permission;
+    return permission === 'granted' || permission === 'denied' ? permission : 'prompt';
+  }
+  if (name === 'geolocation' || name === 'camera' || name === 'microphone'
+      || name === 'midi') return 'prompt';
+  return 'granted';
+}
+
+function _permissionStatusName(name) {
+  name = String(name || '');
+  if (name === 'camera') return 'video_capture';
+  if (name === 'microphone') return 'audio_capture';
+  return name;
 }
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
@@ -7940,7 +9841,7 @@ globalThis.navigator = {
   appName: "Netscape", appCodeName: "Mozilla", vendorSub: "",
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
-  connection: new NetworkInformation(),
+  connection: new NetworkInformation(_networkInformationKey),
   pdfViewerEnabled: true,
   userAgentData: {
     get mobile() { return !!_fingerprint().mobile; },
@@ -7987,14 +9888,10 @@ globalThis.navigator = {
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
     var n = params && params.name;
-    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
-    // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
+    return Promise.resolve({state: _permissionState(n), onchange: null});
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
-  getGamepads() { return []; },
+  getGamepads() { return [null, null, null, null]; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
   geolocation: {
@@ -8058,8 +9955,13 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return _fingerprint().navigatorPlatform || '';
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() { return _fingerprint().language || "en-US"; });
+  defGetter('languages', function() {
+    const values = _fingerprint().languages;
+    return Array.isArray(values) && values.length
+      ? values
+      : [_fingerprint().language || "en-US"];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
@@ -8209,6 +10111,8 @@ const _WEBGL1_PARAMETERS = {
   0x8CA7: null,    // RENDERBUFFER_BINDING
   0x8B8D: null,    // CURRENT_PROGRAM
   0x84E0: 0x84C0,  // ACTIVE_TEXTURE -> TEXTURE0
+  0x8B9A: 0x1401,  // IMPLEMENTATION_COLOR_READ_TYPE -> UNSIGNED_BYTE
+  0x8B9B: 0x1908,  // IMPLEMENTATION_COLOR_READ_FORMAT -> RGBA
 };
 // Values that are arrays have to be fresh each call: a caller that mutates the
 // returned Int32Array must not change what the next caller sees.
@@ -8271,7 +10175,11 @@ Object.assign(_WEBGL1_PARAMETERS, {
   0xB45: 1029,  // CULL_FACE_MODE
   0xB46: 2305,  // FRONT_FACE
   0xB97: 0,  // STENCIL_REF
+  0xB93: 0xFFFFFFFF,  // STENCIL_VALUE_MASK
+  0xB98: 0xFFFFFFFF,  // STENCIL_WRITEMASK
   0x8CA3: 0,  // STENCIL_BACK_REF
+  0x8CA4: 0xFFFFFFFF,  // STENCIL_BACK_VALUE_MASK
+  0x8CA5: 0xFFFFFFFF,  // STENCIL_BACK_WRITEMASK
   0xD53: 8,  // GREEN_BITS
   0xD54: 8,  // BLUE_BITS
   0xD55: 8,  // ALPHA_BITS
@@ -8369,6 +10277,7 @@ const _WEBGL_APPLE = {
     0x8A2B: 16,  // MAX_VERTEX_UNIFORM_BLOCKS
     0x8A2D: 16,  // MAX_FRAGMENT_UNIFORM_BLOCKS
     0x8A2E: 32,  // MAX_COMBINED_UNIFORM_BLOCKS
+    0x8A2F: 32,  // MAX_UNIFORM_BUFFER_BINDINGS
     0x8A30: 16384,  // MAX_UNIFORM_BLOCK_SIZE
     0x8A31: 69632,  // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
     0x8A33: 69632,  // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
@@ -8401,10 +10310,94 @@ function _webglProfile() {
 const _WEBGL_PRECISION_FLOAT = { rangeMin: 127, rangeMax: 127, precision: 23 };
 const _WEBGL_PRECISION_INT = { rangeMin: 31, rangeMax: 30, precision: 0 };
 
+function _webglExtensionObject(tag, constants, methods = {}) {
+  const prototype = {};
+  for (const [name, value] of Object.entries(constants)) {
+    Object.defineProperty(prototype, name, {
+      value, writable: false, enumerable: true, configurable: false,
+    });
+  }
+  for (const [name, method] of Object.entries(methods)) {
+    Object.defineProperty(prototype, name, {
+      value: _markNative(method), writable: true, enumerable: true, configurable: true,
+    });
+  }
+  Object.defineProperty(prototype, Symbol.toStringTag, {
+    value: tag, configurable: true,
+  });
+  return Object.create(prototype);
+}
+
+function _oesStandardDerivatives() {
+  return _webglExtensionObject('OESStandardDerivatives', {
+    FRAGMENT_SHADER_DERIVATIVE_HINT_OES: 0x8B8B,
+  });
+}
+
+function _extDisjointTimerQuery() {
+  return _webglExtensionObject('EXTDisjointTimerQuery', {
+    QUERY_COUNTER_BITS_EXT: 0x8864,
+    CURRENT_QUERY_EXT: 0x8865,
+    QUERY_RESULT_EXT: 0x8866,
+    QUERY_RESULT_AVAILABLE_EXT: 0x8867,
+    TIME_ELAPSED_EXT: 0x88BF,
+    TIMESTAMP_EXT: 0x8E28,
+    GPU_DISJOINT_EXT: 0x8FBB,
+  }, {
+    beginQueryEXT() {},
+    createQueryEXT() { return {}; },
+    deleteQueryEXT() {},
+    endQueryEXT() {},
+    getQueryEXT() { return null; },
+    getQueryObjectEXT(_query, pname) {
+      if (+pname === 0x8867) return false;
+      if (+pname === 0x8866) return 0;
+      return null;
+    },
+    isQueryEXT() { return false; },
+    queryCounterEXT() {},
+  });
+}
+
+function _webglCompressedTextureAstc() {
+  return _webglExtensionObject('WebGLCompressedTextureASTC', {
+    COMPRESSED_RGBA_ASTC_4x4_KHR: 0x93B0,
+    COMPRESSED_RGBA_ASTC_5x4_KHR: 0x93B1,
+    COMPRESSED_RGBA_ASTC_5x5_KHR: 0x93B2,
+    COMPRESSED_RGBA_ASTC_6x5_KHR: 0x93B3,
+    COMPRESSED_RGBA_ASTC_6x6_KHR: 0x93B4,
+    COMPRESSED_RGBA_ASTC_8x5_KHR: 0x93B5,
+    COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6,
+    COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
+    COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8,
+    COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
+    COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA,
+    COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
+    COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC,
+    COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR: 0x93D0,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR: 0x93D1,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR: 0x93D2,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR: 0x93D3,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR: 0x93D4,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR: 0x93D5,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR: 0x93D6,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR: 0x93D7,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR: 0x93D8,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR: 0x93D9,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR: 0x93DA,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR: 0x93DB,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR: 0x93DC,
+    COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR: 0x93DD,
+  }, {
+    getSupportedProfiles() { return ['ldr', 'hdr']; },
+  });
+}
+
 class _WebGLContext {
   constructor(canvas, isWebGL2, attrs) {
     this.canvas = canvas; this._isWebGL2 = !!isWebGL2; this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
-    this._lost = false; this._extensions = new Map();
+    this._lost = false; this._extensions = new Map(); this._error = 0;
     // Chrome echoes back the attributes the caller passed, filling defaults.
     this._attrs = (attrs && typeof attrs === 'object') ? attrs : {};
   }
@@ -8428,6 +10421,18 @@ class _WebGLContext {
   }
   getParameter(name) {
     const key = +name;
+    if (key === 0x8B8B && !this._isWebGL2) {
+      if (this._extensions.has('OES_standard_derivatives')) return 0x1100;
+      if (!this._error) this._error = 0x0500;
+      return null;
+    }
+    if (key === 0x8FBB) {
+      const extension = this._isWebGL2
+        ? 'EXT_disjoint_timer_query_webgl2' : 'EXT_disjoint_timer_query';
+      if (this._extensions.has(extension)) return false;
+      if (!this._error) this._error = 0x0500;
+      return null;
+    }
     // The adapter strings sit behind WEBGL_debug_renderer_info, never here.
     if (key === 0x9245 || key === 0x9246) {
       const gpu = _fingerprint().gpu || {};
@@ -8467,6 +10472,13 @@ class _WebGLContext {
       value = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
     } else if (key === 'EXT_texture_filter_anisotropic') {
       value = { TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF };
+    } else if (key === 'OES_standard_derivatives') {
+      value = _oesStandardDerivatives();
+    } else if (key === 'EXT_disjoint_timer_query'
+        || key === 'EXT_disjoint_timer_query_webgl2') {
+      value = _extDisjointTimerQuery();
+    } else if (key === 'WEBGL_compressed_texture_astc') {
+      value = _webglCompressedTextureAstc();
     } else if (key === 'WEBGL_lose_context') {
       const context = this;
       value = {
@@ -8526,7 +10538,11 @@ class _WebGLContext {
   // missing, so a probe that called them got a TypeError instead of a value
   // -- and a thrown exception is a louder signal than any number they could
   // have returned.
-  getError() { return 0; }
+  getError() {
+    const error = this._error;
+    this._error = 0;
+    return error;
+  }
   isEnabled(capability) { return +capability === 0x0BD0; }  // DITHER is on by default
   checkFramebufferStatus() { return 0x8CD5; }               // FRAMEBUFFER_COMPLETE
   getInternalformatParameter(_target, internalformat, pname) {
@@ -8584,6 +10600,163 @@ globalThis.WebGLShaderPrecisionFormat = class WebGLShaderPrecisionFormat {
 };
 globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {};
+const _WEBGL1_CONSTANTS = {
+  DEPTH_BUFFER_BIT: 0x100, STENCIL_BUFFER_BIT: 0x400, COLOR_BUFFER_BIT: 0x4000, POINTS: 0x0,
+  LINES: 0x1, LINE_LOOP: 0x2, LINE_STRIP: 0x3, TRIANGLES: 0x4,
+  TRIANGLE_STRIP: 0x5, TRIANGLE_FAN: 0x6, ZERO: 0x0, ONE: 0x1,
+  SRC_COLOR: 0x300, ONE_MINUS_SRC_COLOR: 0x301, SRC_ALPHA: 0x302, ONE_MINUS_SRC_ALPHA: 0x303,
+  DST_ALPHA: 0x304, ONE_MINUS_DST_ALPHA: 0x305, DST_COLOR: 0x306, ONE_MINUS_DST_COLOR: 0x307,
+  SRC_ALPHA_SATURATE: 0x308, FUNC_ADD: 0x8006, BLEND_EQUATION: 0x8009, BLEND_EQUATION_RGB: 0x8009,
+  BLEND_EQUATION_ALPHA: 0x883D, FUNC_SUBTRACT: 0x800A, FUNC_REVERSE_SUBTRACT: 0x800B, BLEND_DST_RGB: 0x80C8,
+  BLEND_SRC_RGB: 0x80C9, BLEND_DST_ALPHA: 0x80CA, BLEND_SRC_ALPHA: 0x80CB, CONSTANT_COLOR: 0x8001,
+  ONE_MINUS_CONSTANT_COLOR: 0x8002, CONSTANT_ALPHA: 0x8003, ONE_MINUS_CONSTANT_ALPHA: 0x8004, BLEND_COLOR: 0x8005,
+  ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, ARRAY_BUFFER_BINDING: 0x8894, ELEMENT_ARRAY_BUFFER_BINDING: 0x8895,
+  STREAM_DRAW: 0x88E0, STATIC_DRAW: 0x88E4, DYNAMIC_DRAW: 0x88E8, BUFFER_SIZE: 0x8764,
+  BUFFER_USAGE: 0x8765, CURRENT_VERTEX_ATTRIB: 0x8626, FRONT: 0x404, BACK: 0x405,
+  FRONT_AND_BACK: 0x408, TEXTURE_2D: 0xDE1, CULL_FACE: 0xB44, BLEND: 0xBE2,
+  DITHER: 0xBD0, STENCIL_TEST: 0xB90, DEPTH_TEST: 0xB71, SCISSOR_TEST: 0xC11,
+  POLYGON_OFFSET_FILL: 0x8037, SAMPLE_ALPHA_TO_COVERAGE: 0x809E, SAMPLE_COVERAGE: 0x80A0, NO_ERROR: 0x0,
+  INVALID_ENUM: 0x500, INVALID_VALUE: 0x501, INVALID_OPERATION: 0x502, OUT_OF_MEMORY: 0x505,
+  CW: 0x900, CCW: 0x901, LINE_WIDTH: 0xB21, ALIASED_POINT_SIZE_RANGE: 0x846D,
+  ALIASED_LINE_WIDTH_RANGE: 0x846E, CULL_FACE_MODE: 0xB45, FRONT_FACE: 0xB46, DEPTH_RANGE: 0xB70,
+  DEPTH_WRITEMASK: 0xB72, DEPTH_CLEAR_VALUE: 0xB73, DEPTH_FUNC: 0xB74, STENCIL_CLEAR_VALUE: 0xB91,
+  STENCIL_FUNC: 0xB92, STENCIL_FAIL: 0xB94, STENCIL_PASS_DEPTH_FAIL: 0xB95, STENCIL_PASS_DEPTH_PASS: 0xB96,
+  STENCIL_REF: 0xB97, STENCIL_VALUE_MASK: 0xB93, STENCIL_WRITEMASK: 0xB98, STENCIL_BACK_FUNC: 0x8800,
+  STENCIL_BACK_FAIL: 0x8801, STENCIL_BACK_PASS_DEPTH_FAIL: 0x8802, STENCIL_BACK_PASS_DEPTH_PASS: 0x8803, STENCIL_BACK_REF: 0x8CA3,
+  STENCIL_BACK_VALUE_MASK: 0x8CA4, STENCIL_BACK_WRITEMASK: 0x8CA5, VIEWPORT: 0xBA2, SCISSOR_BOX: 0xC10,
+  COLOR_CLEAR_VALUE: 0xC22, COLOR_WRITEMASK: 0xC23, UNPACK_ALIGNMENT: 0xCF5, PACK_ALIGNMENT: 0xD05,
+  MAX_TEXTURE_SIZE: 0xD33, MAX_VIEWPORT_DIMS: 0xD3A, SUBPIXEL_BITS: 0xD50, RED_BITS: 0xD52,
+  GREEN_BITS: 0xD53, BLUE_BITS: 0xD54, ALPHA_BITS: 0xD55, DEPTH_BITS: 0xD56,
+  STENCIL_BITS: 0xD57, POLYGON_OFFSET_UNITS: 0x2A00, POLYGON_OFFSET_FACTOR: 0x8038, TEXTURE_BINDING_2D: 0x8069,
+  SAMPLE_BUFFERS: 0x80A8, SAMPLES: 0x80A9, SAMPLE_COVERAGE_VALUE: 0x80AA, SAMPLE_COVERAGE_INVERT: 0x80AB,
+  COMPRESSED_TEXTURE_FORMATS: 0x86A3, DONT_CARE: 0x1100, FASTEST: 0x1101, NICEST: 0x1102,
+  GENERATE_MIPMAP_HINT: 0x8192, BYTE: 0x1400, UNSIGNED_BYTE: 0x1401, SHORT: 0x1402,
+  UNSIGNED_SHORT: 0x1403, INT: 0x1404, UNSIGNED_INT: 0x1405, FLOAT: 0x1406,
+  DEPTH_COMPONENT: 0x1902, ALPHA: 0x1906, RGB: 0x1907, RGBA: 0x1908,
+  LUMINANCE: 0x1909, LUMINANCE_ALPHA: 0x190A, UNSIGNED_SHORT_4_4_4_4: 0x8033, UNSIGNED_SHORT_5_5_5_1: 0x8034,
+  UNSIGNED_SHORT_5_6_5: 0x8363, FRAGMENT_SHADER: 0x8B30, VERTEX_SHADER: 0x8B31, MAX_VERTEX_ATTRIBS: 0x8869,
+  MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB, MAX_VARYING_VECTORS: 0x8DFC, MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D, MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4C,
+  MAX_TEXTURE_IMAGE_UNITS: 0x8872, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD, SHADER_TYPE: 0x8B4F, DELETE_STATUS: 0x8B80,
+  LINK_STATUS: 0x8B82, VALIDATE_STATUS: 0x8B83, ATTACHED_SHADERS: 0x8B85, ACTIVE_UNIFORMS: 0x8B86,
+  ACTIVE_ATTRIBUTES: 0x8B89, SHADING_LANGUAGE_VERSION: 0x8B8C, CURRENT_PROGRAM: 0x8B8D, NEVER: 0x200,
+  LESS: 0x201, EQUAL: 0x202, LEQUAL: 0x203, GREATER: 0x204,
+  NOTEQUAL: 0x205, GEQUAL: 0x206, ALWAYS: 0x207, KEEP: 0x1E00,
+  REPLACE: 0x1E01, INCR: 0x1E02, DECR: 0x1E03, INVERT: 0x150A,
+  INCR_WRAP: 0x8507, DECR_WRAP: 0x8508, VENDOR: 0x1F00, RENDERER: 0x1F01,
+  VERSION: 0x1F02, NEAREST: 0x2600, LINEAR: 0x2601, NEAREST_MIPMAP_NEAREST: 0x2700,
+  LINEAR_MIPMAP_NEAREST: 0x2701, NEAREST_MIPMAP_LINEAR: 0x2702, LINEAR_MIPMAP_LINEAR: 0x2703, TEXTURE_MAG_FILTER: 0x2800,
+  TEXTURE_MIN_FILTER: 0x2801, TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803, TEXTURE: 0x1702,
+  TEXTURE_CUBE_MAP: 0x8513, TEXTURE_BINDING_CUBE_MAP: 0x8514, TEXTURE_CUBE_MAP_POSITIVE_X: 0x8515, TEXTURE_CUBE_MAP_NEGATIVE_X: 0x8516,
+  TEXTURE_CUBE_MAP_POSITIVE_Y: 0x8517, TEXTURE_CUBE_MAP_NEGATIVE_Y: 0x8518, TEXTURE_CUBE_MAP_POSITIVE_Z: 0x8519, TEXTURE_CUBE_MAP_NEGATIVE_Z: 0x851A,
+  MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C, TEXTURE0: 0x84C0, TEXTURE1: 0x84C1, TEXTURE2: 0x84C2,
+  TEXTURE3: 0x84C3, TEXTURE4: 0x84C4, TEXTURE5: 0x84C5, TEXTURE6: 0x84C6,
+  TEXTURE7: 0x84C7, TEXTURE8: 0x84C8, TEXTURE9: 0x84C9, TEXTURE10: 0x84CA,
+  TEXTURE11: 0x84CB, TEXTURE12: 0x84CC, TEXTURE13: 0x84CD, TEXTURE14: 0x84CE,
+  TEXTURE15: 0x84CF, TEXTURE16: 0x84D0, TEXTURE17: 0x84D1, TEXTURE18: 0x84D2,
+  TEXTURE19: 0x84D3, TEXTURE20: 0x84D4, TEXTURE21: 0x84D5, TEXTURE22: 0x84D6,
+  TEXTURE23: 0x84D7, TEXTURE24: 0x84D8, TEXTURE25: 0x84D9, TEXTURE26: 0x84DA,
+  TEXTURE27: 0x84DB, TEXTURE28: 0x84DC, TEXTURE29: 0x84DD, TEXTURE30: 0x84DE,
+  TEXTURE31: 0x84DF, ACTIVE_TEXTURE: 0x84E0, REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812F,
+  MIRRORED_REPEAT: 0x8370, FLOAT_VEC2: 0x8B50, FLOAT_VEC3: 0x8B51, FLOAT_VEC4: 0x8B52,
+  INT_VEC2: 0x8B53, INT_VEC3: 0x8B54, INT_VEC4: 0x8B55, BOOL: 0x8B56,
+  BOOL_VEC2: 0x8B57, BOOL_VEC3: 0x8B58, BOOL_VEC4: 0x8B59, FLOAT_MAT2: 0x8B5A,
+  FLOAT_MAT3: 0x8B5B, FLOAT_MAT4: 0x8B5C, SAMPLER_2D: 0x8B5E, SAMPLER_CUBE: 0x8B60,
+  VERTEX_ATTRIB_ARRAY_ENABLED: 0x8622, VERTEX_ATTRIB_ARRAY_SIZE: 0x8623, VERTEX_ATTRIB_ARRAY_STRIDE: 0x8624, VERTEX_ATTRIB_ARRAY_TYPE: 0x8625,
+  VERTEX_ATTRIB_ARRAY_NORMALIZED: 0x886A, VERTEX_ATTRIB_ARRAY_POINTER: 0x8645, VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: 0x889F, IMPLEMENTATION_COLOR_READ_TYPE: 0x8B9A,
+  IMPLEMENTATION_COLOR_READ_FORMAT: 0x8B9B, COMPILE_STATUS: 0x8B81, LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1,
+  HIGH_FLOAT: 0x8DF2, LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
+  FRAMEBUFFER: 0x8D40, RENDERBUFFER: 0x8D41, RGBA4: 0x8056, RGB5_A1: 0x8057,
+  RGB565: 0x8D62, DEPTH_COMPONENT16: 0x81A5, STENCIL_INDEX8: 0x8D48, DEPTH_STENCIL: 0x84F9,
+  RENDERBUFFER_WIDTH: 0x8D42, RENDERBUFFER_HEIGHT: 0x8D43, RENDERBUFFER_INTERNAL_FORMAT: 0x8D44, RENDERBUFFER_RED_SIZE: 0x8D50,
+  RENDERBUFFER_GREEN_SIZE: 0x8D51, RENDERBUFFER_BLUE_SIZE: 0x8D52, RENDERBUFFER_ALPHA_SIZE: 0x8D53, RENDERBUFFER_DEPTH_SIZE: 0x8D54,
+  RENDERBUFFER_STENCIL_SIZE: 0x8D55, FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: 0x8CD0, FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: 0x8CD1, FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: 0x8CD2,
+  FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: 0x8CD3, COLOR_ATTACHMENT0: 0x8CE0, DEPTH_ATTACHMENT: 0x8D00, STENCIL_ATTACHMENT: 0x8D20,
+  DEPTH_STENCIL_ATTACHMENT: 0x821A, NONE: 0x0, FRAMEBUFFER_COMPLETE: 0x8CD5, FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 0x8CD6,
+  FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: 0x8CD7, FRAMEBUFFER_INCOMPLETE_DIMENSIONS: 0x8CD9, FRAMEBUFFER_UNSUPPORTED: 0x8CDD, FRAMEBUFFER_BINDING: 0x8CA6,
+  RENDERBUFFER_BINDING: 0x8CA7, MAX_RENDERBUFFER_SIZE: 0x84E8, INVALID_FRAMEBUFFER_OPERATION: 0x506, UNPACK_FLIP_Y_WEBGL: 0x9240,
+  UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241, CONTEXT_LOST_WEBGL: 0x9242, UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, BROWSER_DEFAULT_WEBGL: 0x9244,
+  RGB8: 0x8051, RGBA8: 0x8058,
+};
+const _WEBGL2_EXTRA_CONSTANTS = {
+  READ_BUFFER: 0xC02, UNPACK_ROW_LENGTH: 0xCF2, UNPACK_SKIP_ROWS: 0xCF3, UNPACK_SKIP_PIXELS: 0xCF4,
+  PACK_ROW_LENGTH: 0xD02, PACK_SKIP_ROWS: 0xD03, PACK_SKIP_PIXELS: 0xD04, COLOR: 0x1800,
+  DEPTH: 0x1801, STENCIL: 0x1802, RED: 0x1903, RGB10_A2: 0x8059,
+  TEXTURE_BINDING_3D: 0x806A, UNPACK_SKIP_IMAGES: 0x806D, UNPACK_IMAGE_HEIGHT: 0x806E, TEXTURE_3D: 0x806F,
+  TEXTURE_WRAP_R: 0x8072, MAX_3D_TEXTURE_SIZE: 0x8073, UNSIGNED_INT_2_10_10_10_REV: 0x8368, MAX_ELEMENTS_VERTICES: 0x80E8,
+  MAX_ELEMENTS_INDICES: 0x80E9, TEXTURE_MIN_LOD: 0x813A, TEXTURE_MAX_LOD: 0x813B, TEXTURE_BASE_LEVEL: 0x813C,
+  TEXTURE_MAX_LEVEL: 0x813D, MIN: 0x8007, MAX: 0x8008, DEPTH_COMPONENT24: 0x81A6,
+  MAX_TEXTURE_LOD_BIAS: 0x84FD, TEXTURE_COMPARE_MODE: 0x884C, TEXTURE_COMPARE_FUNC: 0x884D, CURRENT_QUERY: 0x8865,
+  QUERY_RESULT: 0x8866, QUERY_RESULT_AVAILABLE: 0x8867, STREAM_READ: 0x88E1, STREAM_COPY: 0x88E2,
+  STATIC_READ: 0x88E5, STATIC_COPY: 0x88E6, DYNAMIC_READ: 0x88E9, DYNAMIC_COPY: 0x88EA,
+  MAX_DRAW_BUFFERS: 0x8824, DRAW_BUFFER0: 0x8825, DRAW_BUFFER1: 0x8826, DRAW_BUFFER2: 0x8827,
+  DRAW_BUFFER3: 0x8828, DRAW_BUFFER4: 0x8829, DRAW_BUFFER5: 0x882A, DRAW_BUFFER6: 0x882B,
+  DRAW_BUFFER7: 0x882C, DRAW_BUFFER8: 0x882D, DRAW_BUFFER9: 0x882E, DRAW_BUFFER10: 0x882F,
+  DRAW_BUFFER11: 0x8830, DRAW_BUFFER12: 0x8831, DRAW_BUFFER13: 0x8832, DRAW_BUFFER14: 0x8833,
+  DRAW_BUFFER15: 0x8834, MAX_FRAGMENT_UNIFORM_COMPONENTS: 0x8B49, MAX_VERTEX_UNIFORM_COMPONENTS: 0x8B4A, SAMPLER_3D: 0x8B5F,
+  SAMPLER_2D_SHADOW: 0x8B62, FRAGMENT_SHADER_DERIVATIVE_HINT: 0x8B8B, PIXEL_PACK_BUFFER: 0x88EB, PIXEL_UNPACK_BUFFER: 0x88EC,
+  PIXEL_PACK_BUFFER_BINDING: 0x88ED, PIXEL_UNPACK_BUFFER_BINDING: 0x88EF, FLOAT_MAT2x3: 0x8B65, FLOAT_MAT2x4: 0x8B66,
+  FLOAT_MAT3x2: 0x8B67, FLOAT_MAT3x4: 0x8B68, FLOAT_MAT4x2: 0x8B69, FLOAT_MAT4x3: 0x8B6A,
+  SRGB: 0x8C40, SRGB8: 0x8C41, SRGB8_ALPHA8: 0x8C43, COMPARE_REF_TO_TEXTURE: 0x884E,
+  RGBA32F: 0x8814, RGB32F: 0x8815, RGBA16F: 0x881A, RGB16F: 0x881B,
+  VERTEX_ATTRIB_ARRAY_INTEGER: 0x88FD, MAX_ARRAY_TEXTURE_LAYERS: 0x88FF, MIN_PROGRAM_TEXEL_OFFSET: 0x8904, MAX_PROGRAM_TEXEL_OFFSET: 0x8905,
+  MAX_VARYING_COMPONENTS: 0x8B4B, TEXTURE_2D_ARRAY: 0x8C1A, TEXTURE_BINDING_2D_ARRAY: 0x8C1D, R11F_G11F_B10F: 0x8C3A,
+  UNSIGNED_INT_10F_11F_11F_REV: 0x8C3B, RGB9_E5: 0x8C3D, UNSIGNED_INT_5_9_9_9_REV: 0x8C3E, TRANSFORM_FEEDBACK_BUFFER_MODE: 0x8C7F,
+  MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS: 0x8C80, TRANSFORM_FEEDBACK_VARYINGS: 0x8C83, TRANSFORM_FEEDBACK_BUFFER_START: 0x8C84, TRANSFORM_FEEDBACK_BUFFER_SIZE: 0x8C85,
+  TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN: 0x8C88, RASTERIZER_DISCARD: 0x8C89, MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS: 0x8C8A, MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS: 0x8C8B,
+  INTERLEAVED_ATTRIBS: 0x8C8C, SEPARATE_ATTRIBS: 0x8C8D, TRANSFORM_FEEDBACK_BUFFER: 0x8C8E, TRANSFORM_FEEDBACK_BUFFER_BINDING: 0x8C8F,
+  RGBA32UI: 0x8D70, RGB32UI: 0x8D71, RGBA16UI: 0x8D76, RGB16UI: 0x8D77,
+  RGBA8UI: 0x8D7C, RGB8UI: 0x8D7D, RGBA32I: 0x8D82, RGB32I: 0x8D83,
+  RGBA16I: 0x8D88, RGB16I: 0x8D89, RGBA8I: 0x8D8E, RGB8I: 0x8D8F,
+  RED_INTEGER: 0x8D94, RGB_INTEGER: 0x8D98, RGBA_INTEGER: 0x8D99, SAMPLER_2D_ARRAY: 0x8DC1,
+  SAMPLER_2D_ARRAY_SHADOW: 0x8DC4, SAMPLER_CUBE_SHADOW: 0x8DC5, UNSIGNED_INT_VEC2: 0x8DC6, UNSIGNED_INT_VEC3: 0x8DC7,
+  UNSIGNED_INT_VEC4: 0x8DC8, INT_SAMPLER_2D: 0x8DCA, INT_SAMPLER_3D: 0x8DCB, INT_SAMPLER_CUBE: 0x8DCC,
+  INT_SAMPLER_2D_ARRAY: 0x8DCF, UNSIGNED_INT_SAMPLER_2D: 0x8DD2, UNSIGNED_INT_SAMPLER_3D: 0x8DD3, UNSIGNED_INT_SAMPLER_CUBE: 0x8DD4,
+  UNSIGNED_INT_SAMPLER_2D_ARRAY: 0x8DD7, DEPTH_COMPONENT32F: 0x8CAC, DEPTH32F_STENCIL8: 0x8CAD, FLOAT_32_UNSIGNED_INT_24_8_REV: 0x8DAD,
+  FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING: 0x8210, FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE: 0x8211, FRAMEBUFFER_ATTACHMENT_RED_SIZE: 0x8212, FRAMEBUFFER_ATTACHMENT_GREEN_SIZE: 0x8213,
+  FRAMEBUFFER_ATTACHMENT_BLUE_SIZE: 0x8214, FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE: 0x8215, FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE: 0x8216, FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE: 0x8217,
+  FRAMEBUFFER_DEFAULT: 0x8218, UNSIGNED_INT_24_8: 0x84FA, DEPTH24_STENCIL8: 0x88F0, UNSIGNED_NORMALIZED: 0x8C17,
+  DRAW_FRAMEBUFFER_BINDING: 0x8CA6, READ_FRAMEBUFFER: 0x8CA8, DRAW_FRAMEBUFFER: 0x8CA9, READ_FRAMEBUFFER_BINDING: 0x8CAA,
+  RENDERBUFFER_SAMPLES: 0x8CAB, FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: 0x8CD4, MAX_COLOR_ATTACHMENTS: 0x8CDF, COLOR_ATTACHMENT1: 0x8CE1,
+  COLOR_ATTACHMENT2: 0x8CE2, COLOR_ATTACHMENT3: 0x8CE3, COLOR_ATTACHMENT4: 0x8CE4, COLOR_ATTACHMENT5: 0x8CE5,
+  COLOR_ATTACHMENT6: 0x8CE6, COLOR_ATTACHMENT7: 0x8CE7, COLOR_ATTACHMENT8: 0x8CE8, COLOR_ATTACHMENT9: 0x8CE9,
+  COLOR_ATTACHMENT10: 0x8CEA, COLOR_ATTACHMENT11: 0x8CEB, COLOR_ATTACHMENT12: 0x8CEC, COLOR_ATTACHMENT13: 0x8CED,
+  COLOR_ATTACHMENT14: 0x8CEE, COLOR_ATTACHMENT15: 0x8CEF, FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: 0x8D56, MAX_SAMPLES: 0x8D57,
+  HALF_FLOAT: 0x140B, RG: 0x8227, RG_INTEGER: 0x8228, R8: 0x8229,
+  RG8: 0x822B, R16F: 0x822D, R32F: 0x822E, RG16F: 0x822F,
+  RG32F: 0x8230, R8I: 0x8231, R8UI: 0x8232, R16I: 0x8233,
+  R16UI: 0x8234, R32I: 0x8235, R32UI: 0x8236, RG8I: 0x8237,
+  RG8UI: 0x8238, RG16I: 0x8239, RG16UI: 0x823A, RG32I: 0x823B,
+  RG32UI: 0x823C, VERTEX_ARRAY_BINDING: 0x85B5, R8_SNORM: 0x8F94, RG8_SNORM: 0x8F95,
+  RGB8_SNORM: 0x8F96, RGBA8_SNORM: 0x8F97, SIGNED_NORMALIZED: 0x8F9C, COPY_READ_BUFFER: 0x8F36,
+  COPY_WRITE_BUFFER: 0x8F37, COPY_READ_BUFFER_BINDING: 0x8F36, COPY_WRITE_BUFFER_BINDING: 0x8F37, UNIFORM_BUFFER: 0x8A11,
+  UNIFORM_BUFFER_BINDING: 0x8A28, UNIFORM_BUFFER_START: 0x8A29, UNIFORM_BUFFER_SIZE: 0x8A2A, MAX_VERTEX_UNIFORM_BLOCKS: 0x8A2B,
+  MAX_FRAGMENT_UNIFORM_BLOCKS: 0x8A2D, MAX_COMBINED_UNIFORM_BLOCKS: 0x8A2E, MAX_UNIFORM_BUFFER_BINDINGS: 0x8A2F, MAX_UNIFORM_BLOCK_SIZE: 0x8A30,
+  MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS: 0x8A31, MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS: 0x8A33, UNIFORM_BUFFER_OFFSET_ALIGNMENT: 0x8A34, ACTIVE_UNIFORM_BLOCKS: 0x8A36,
+  UNIFORM_TYPE: 0x8A37, UNIFORM_SIZE: 0x8A38, UNIFORM_BLOCK_INDEX: 0x8A3A, UNIFORM_OFFSET: 0x8A3B,
+  UNIFORM_ARRAY_STRIDE: 0x8A3C, UNIFORM_MATRIX_STRIDE: 0x8A3D, UNIFORM_IS_ROW_MAJOR: 0x8A3E, UNIFORM_BLOCK_BINDING: 0x8A3F,
+  UNIFORM_BLOCK_DATA_SIZE: 0x8A40, UNIFORM_BLOCK_ACTIVE_UNIFORMS: 0x8A42, UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES: 0x8A43, UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER: 0x8A44,
+  UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: 0x8A46, INVALID_INDEX: 0xFFFFFFFF, MAX_VERTEX_OUTPUT_COMPONENTS: 0x9122, MAX_FRAGMENT_INPUT_COMPONENTS: 0x9125,
+  MAX_SERVER_WAIT_TIMEOUT: 0x9111, OBJECT_TYPE: 0x9112, SYNC_CONDITION: 0x9113, SYNC_STATUS: 0x9114,
+  SYNC_FLAGS: 0x9115, SYNC_FENCE: 0x9116, SYNC_GPU_COMMANDS_COMPLETE: 0x9117, UNSIGNALED: 0x9118,
+  SIGNALED: 0x9119, ALREADY_SIGNALED: 0x911A, TIMEOUT_EXPIRED: 0x911B, CONDITION_SATISFIED: 0x911C,
+  WAIT_FAILED: 0x911D, SYNC_FLUSH_COMMANDS_BIT: 0x1, VERTEX_ATTRIB_ARRAY_DIVISOR: 0x88FE, ANY_SAMPLES_PASSED: 0x8C2F,
+  ANY_SAMPLES_PASSED_CONSERVATIVE: 0x8D6A, SAMPLER_BINDING: 0x8919, RGB10_A2UI: 0x906F, INT_2_10_10_10_REV: 0x8D9F,
+  TRANSFORM_FEEDBACK: 0x8E22, TRANSFORM_FEEDBACK_PAUSED: 0x8E23, TRANSFORM_FEEDBACK_ACTIVE: 0x8E24, TRANSFORM_FEEDBACK_BINDING: 0x8E25,
+  TEXTURE_IMMUTABLE_FORMAT: 0x912F, MAX_ELEMENT_INDEX: 0x8D6B, TEXTURE_IMMUTABLE_LEVELS: 0x82DF, TIMEOUT_IGNORED: -1,
+  MAX_CLIENT_WAIT_TIMEOUT_WEBGL: 0x9247,
+};
+function _installWebGLConstants(constructor, tables) {
+  for (const table of tables) {
+    for (const [name, value] of Object.entries(table)) {
+      const descriptor = { value, writable: false, enumerable: true, configurable: false };
+      Object.defineProperty(constructor, name, descriptor);
+      Object.defineProperty(constructor.prototype, name, descriptor);
+    }
+  }
+}
+_installWebGLConstants(globalThis.WebGLRenderingContext, [_WEBGL1_CONSTANTS]);
+_installWebGLConstants(globalThis.WebGL2RenderingContext,
+  [_WEBGL1_CONSTANTS, _WEBGL2_EXTRA_CONSTANTS]);
 
 // `screen.orientation` used to be an object literal with three no-op methods.
 // A probe that walks it saw 5 members where Chrome has 9, and `lock` -- which
@@ -8610,6 +10783,9 @@ class ScreenOrientation {
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  when(type, options = undefined) {
+    return _eventTargetWhen.call(this, type, options, arguments.length);
+  }
   get [Symbol.toStringTag]() { return 'ScreenOrientation'; }
 }
 globalThis.ScreenOrientation = _markNative(ScreenOrientation);
@@ -8620,7 +10796,7 @@ globalThis.ScreenOrientation = _markNative(ScreenOrientation);
 // screen object has no own string-keyed properties at all.
 const _screenSlots = Symbol('Screen slots');
 class Screen {
-  constructor(w, h, availW, availH) {
+  constructor(w, h, availW, availH, availTop, availLeft) {
     // Every observable value lives behind this one symbol. `colorDepth` and
     // friends used to be own data properties, which put them in
     // `Object.getOwnPropertyNames(screen)` -- a list that is empty in a
@@ -8629,6 +10805,8 @@ class Screen {
       w, h,
       availW: availW === undefined ? w : availW,
       availH: availH === undefined ? h - 40 : availH,
+      availTop: availTop === undefined ? 0 : availTop,
+      availLeft: availLeft === undefined ? 0 : availLeft,
       orientation: new ScreenOrientation(_screenOrientationKey),
       onchange: null,
     };
@@ -8637,8 +10815,8 @@ class Screen {
   get height() { return this[_screenSlots].h; }
   get availWidth() { return this[_screenSlots].availW; }
   get availHeight() { return this[_screenSlots].availH; }
-  get availTop() { return 0; }
-  get availLeft() { return 0; }
+  get availTop() { return this[_screenSlots].availTop; }
+  get availLeft() { return this[_screenSlots].availLeft; }
   get colorDepth() { return 24; }
   get pixelDepth() { return 24; }
   get orientation() { return this[_screenSlots].orientation; }
@@ -8650,6 +10828,9 @@ class Screen {
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  when(type, options = undefined) {
+    return _eventTargetWhen.call(this, type, options, arguments.length);
+  }
   get [Symbol.toStringTag]() { return 'Screen'; }
 }
 ['width','height','availWidth','availHeight','availTop','availLeft','colorDepth',
@@ -8663,7 +10844,7 @@ class Screen {
 });
 globalThis.Screen = Screen;
 globalThis.screen = new Screen(1920, 1080);
-function _applyScreenSize(w, h, emulated, availW, availH) {
+function _applyScreenSize(w, h, emulated, availW, availH, availTop, availLeft) {
   const resolvedAvailW = Number.isFinite(availW) ? availW : w;
   const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
   if (globalThis.screen instanceof Screen) {
@@ -8672,8 +10853,10 @@ function _applyScreenSize(w, h, emulated, availW, availH) {
     slots.h = h;
     slots.availW = resolvedAvailW;
     slots.availH = resolvedAvailH;
+    slots.availTop = Number.isFinite(availTop) ? availTop : 0;
+    slots.availLeft = Number.isFinite(availLeft) ? availLeft : 0;
   } else {
-    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH);
+    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH, availTop, availLeft);
   }
 }
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
@@ -8693,6 +10876,8 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
     !!emulated,
     Number(fallback.availWidth),
     Number(fallback.availHeight),
+    Number(fallback.availTop),
+    Number(fallback.availLeft),
   );
 };
 globalThis.__obscura_apply_fingerprint = function() {
@@ -8705,6 +10890,8 @@ globalThis.__obscura_apply_fingerprint = function() {
       !!globalThis.__obscura_screen_emulated,
       Number(fallback.availWidth),
       Number(fallback.availHeight),
+      Number(fallback.availTop),
+      Number(fallback.availLeft),
     );
   }
   const scale = Number(fallback.deviceScaleFactor);
@@ -8759,8 +10946,8 @@ function _bodyToUint8Array(body) {
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-  // obscura's Blob materializes its data into _bytes in the constructor.
-  if (body._bytes instanceof Uint8Array) return body._bytes;
+  const blobBytes = _blobBytes(body);
+  if (blobBytes) return blobBytes;
   return new TextEncoder().encode(String(body));
 }
 
@@ -8801,10 +10988,11 @@ function _formDataToMultipart(fd) {
   for (let i = 0; i < entries.length; i++) {
     const k = entries[i][0], v = entries[i][1];
     out += '--' + bnd + '\r\n';
-    if (v != null && typeof v === 'object' && v._bytes != null) {
+    const blobBytes = _blobBytes(v);
+    if (blobBytes) {
       out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
       out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
-      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
+      try { out += new TextDecoder().decode(blobBytes); } catch (e) {}
       out += '\r\n';
     } else {
       out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
@@ -8854,10 +11042,11 @@ function _serializeBody(initBody, headers) {
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const inputRequest = input instanceof Request ? _requestData(input) : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (inputRequest
+      ? inputRequest.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
@@ -8865,20 +11054,49 @@ globalThis.fetch = async (input, init = {}) => {
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
-  const body = _serializeBody(init.body, _h);
+  const method = init.method || (inputRequest ? inputRequest.method : "GET");
+  if (url.startsWith('blob:')) {
+    const upperMethod = String(method).toUpperCase();
+    if (upperMethod !== 'GET' && upperMethod !== 'HEAD') {
+      throw new TypeError("Failed to fetch");
+    }
+    const storedBytes = globalThis.__blobBytesStore?.[url];
+    const storedText = globalThis.__blobStore?.[url];
+    if (storedBytes === undefined && storedText === undefined) {
+      throw new TypeError("Failed to fetch");
+    }
+    const body = upperMethod === 'HEAD'
+      ? null
+      : (storedBytes !== undefined ? storedBytes : storedText);
+    return new Response(body, {
+      status: 200,
+      statusText: 'OK',
+      headers: { 'Content-Type': globalThis.__blobTypeStore?.[url] || '' },
+      type: 'basic',
+      url,
+      redirected: false,
+    });
+  }
+  let _h = inputRequest ? Object.fromEntries(inputRequest.headers.entries()) : {};
+  if (init.headers instanceof Headers) _h = Object.fromEntries(init.headers.entries());
+  else if (init.headers !== undefined) _h = init.headers || {};
+  const initBody = init.body !== undefined ? init.body : inputRequest?.body;
+  if (inputRequest && init.body === undefined) {
+    if (inputRequest.bodyUsed) throw new TypeError('Body is unusable');
+    if (inputRequest.body !== null && inputRequest.body !== undefined) inputRequest.bodyUsed = true;
+  }
+  const body = _serializeBody(initBody, _h);
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (inputRequest ? inputRequest.mode : "cors");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (inputRequest ? inputRequest.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const fetchRedirect = init.redirect !== undefined
     ? String(init.redirect)
-    : (input instanceof Request ? input.redirect : "follow");
+    : (inputRequest ? inputRequest.redirect : "follow");
   if (!_FETCH_REDIRECT_MODES.has(fetchRedirect)) {
     throw new TypeError("Failed to execute 'fetch': '" + fetchRedirect + "' is not a valid RequestRedirect value");
   }
@@ -8925,7 +11143,7 @@ globalThis.fetch = async (input, init = {}) => {
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
   const response = new Response(responseBody, {
     status: parsed.status,
-    statusText: "",
+    statusText: parsed.statusText || "",
     headers: parsed.headers || {},
     type: respType,
     url: parsed.url || url,
@@ -8937,290 +11155,421 @@ globalThis.fetch = async (input, init = {}) => {
     _recordFetchResourceTiming(
       { ...parsed, url: parsed.url || url }, 'fetch', performanceStart, pageOrigin, bodySize);
   }
-  if (parsed.requestId) {
-    Object.defineProperty(response, "__obscuraRequestId", {
-      value: parsed.requestId,
-      configurable: true,
-    });
-  }
   return response;
 };
 
-if (typeof Headers === "undefined") {
-  globalThis.Headers = class Headers {
-    constructor(init={}) { this._h={}; if(init) { if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); } else if(typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); } } }
-    get(n) { return this._h[n.toLowerCase()]??null; } set(n,v) { this._h[n.toLowerCase()]=String(v); }
-    has(n) { return n.toLowerCase() in this._h; } delete(n) { delete this._h[n.toLowerCase()]; }
-    append(n,v) { this._h[n.toLowerCase()]=String(v); }
-    forEach(cb) { for(const[k,v] of Object.entries(this._h)) cb(v,k,this); }
-    entries() { return Object.entries(this._h)[Symbol.iterator](); }
-    keys() { return Object.keys(this._h)[Symbol.iterator](); }
-    values() { return Object.values(this._h)[Symbol.iterator](); }
-    [Symbol.iterator]() { return this.entries(); }
-  };
+// Fetch Headers use internal slots. Keeping the backing map on the instance
+// makes `Object.getOwnPropertyNames(new Headers())` expose an engine-only
+// `_h` field and also lets a page mutate the map without WebIDL validation.
+const _headersState = new WeakMap();
+function _headersData(value) {
+  const state = _headersState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _headerName(value) {
+  const name = String(value).toLowerCase();
+  if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name)) {
+    throw new TypeError("Headers.append: invalid header name");
+  }
+  return name;
+}
+function _headerValue(value) {
+  const result = String(value).trim();
+  if (/[^\t\x20-\x7e\x80-\xff]/.test(result)) {
+    throw new TypeError("Headers.append: invalid header value");
+  }
+  return result;
+}
+function _headersInitEntries(init) {
+  if (init == null) return [];
+  if (init instanceof Headers) return Array.from(_headersData(init).map.entries());
+  if (typeof init[Symbol.iterator] === 'function' && typeof init !== 'string') {
+    const entries = [];
+    for (const pair of init) {
+      if (!pair || typeof pair[Symbol.iterator] !== 'function') {
+        throw new TypeError('Headers constructor: each item must be a sequence');
+      }
+      const values = Array.from(pair);
+      if (values.length < 2) throw new TypeError('Headers constructor: sequence item has fewer than 2 elements');
+      entries.push([values[0], values[1]]);
+    }
+    return entries;
+  }
+  if (typeof init === 'object') return Object.entries(init);
+  throw new TypeError('Headers constructor: init is not an object');
+}
+function _headersEntries(value) {
+  return Array.from(_headersData(value).map.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]));
+}
+function _reorderWebIDLPrototype(prototype, names) {
+  const descriptors = new Map();
+  for (const name of names) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+    if (descriptor) {
+      descriptor.enumerable = name !== 'constructor';
+      descriptors.set(name, descriptor);
+      try { delete prototype[name]; } catch (_error) {}
+    }
+  }
+  for (const name of names) {
+    const descriptor = descriptors.get(name);
+    if (descriptor) {
+      try { Object.defineProperty(prototype, name, descriptor); } catch (_error) {}
+    }
+  }
+}
+const _Headers = class Headers {
+  constructor(init = undefined) {
+    const state = { map: new Map() };
+    _headersState.set(this, state);
+    for (const [name, value] of _headersInitEntries(init)) {
+      const key = _headerName(name);
+      const next = _headerValue(value);
+      state.map.set(key, state.map.has(key) ? state.map.get(key) + ', ' + next : next);
+    }
+  }
+  get(name) { return _headersData(this).map.get(_headerName(name)) ?? null; }
+  set(name, value) { _headersData(this).map.set(_headerName(name), _headerValue(value)); }
+  has(name) { return _headersData(this).map.has(_headerName(name)); }
+  delete(name) { _headersData(this).map.delete(_headerName(name)); }
+  append(name, value) {
+    const state = _headersData(this), key = _headerName(name), next = _headerValue(value);
+    state.map.set(key, state.map.has(key) ? state.map.get(key) + ', ' + next : next);
+  }
+  forEach(callback, thisArg = undefined) {
+    if (typeof callback !== 'function') throw new TypeError('Headers.forEach callback is not a function');
+    for (const [name, value] of _headersEntries(this)) callback.call(thisArg, value, name, this);
+  }
+  entries() { return _headersEntries(this)[Symbol.iterator](); }
+  keys() { return _headersEntries(this).map(entry => entry[0])[Symbol.iterator](); }
+  values() { return _headersEntries(this).map(entry => entry[1])[Symbol.iterator](); }
+  getSetCookie() { _headersData(this); return []; }
+  [Symbol.iterator]() { return this.entries(); }
+};
+globalThis.Headers = _Headers;
+_markNative(Headers);
+for (const name of ['get', 'set', 'has', 'delete', 'append', 'forEach', 'entries', 'keys', 'values', 'getSetCookie']) {
+  _markNative(Headers.prototype[name]);
+}
+Object.defineProperty(Headers.prototype, Symbol.toStringTag, { value: 'Headers', configurable: true });
+_reorderWebIDLPrototype(Headers.prototype,
+  ['append', 'delete', 'get', 'getSetCookie', 'has', 'set', 'entries', 'forEach', 'keys', 'values', 'constructor']);
+
+const _xhrState = new WeakMap();
+const _xhrUploadState = new WeakMap();
+const _xhrEventTargetKey = {};
+function _xhrData(value) {
+  const state = _xhrState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _xhrTargetData(value) {
+  const state = _xhrState.get(value) || _xhrUploadState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _xhrHandlerStore(target) {
+  const state = _xhrTargetData(target);
+  return _xhrState.has(target) ? state.handlers : state.uploadHandlers;
+}
+function _xhrGetHandler(target, type) {
+  return _xhrHandlerStore(target).get(type)?.value || null;
+}
+function _xhrSetHandler(target, type, value) {
+  const store = _xhrHandlerStore(target);
+  let entry = store.get(type);
+  const callable = typeof value === 'function' ? value : null;
+  if (!entry && callable) {
+    entry = { value: callable, wrapper: null };
+    entry.wrapper = event => {
+      const current = store.get(type)?.value;
+      if (typeof current === 'function') current.call(target, event);
+    };
+    store.set(type, entry);
+    _eventTargetAdd(target, type, entry.wrapper);
+  } else if (entry) {
+    entry.value = callable;
+    if (!callable) {
+      _eventTargetRemove(target, type, entry.wrapper);
+      store.delete(type);
+    }
+  }
+}
+function _xhrResetResponse(state) {
+  state.status = 0; state.statusText = ''; state.responseURL = '';
+  state.responseText = ''; state.responseXML = null;
+  state.response = state.responseType === '' || state.responseType === 'text' ? '' : null;
+  state.responseHeaders = Object.create(null);
+}
+function _xhrFire(target, type, progress = null) {
+  const event = progress ? new ProgressEvent(type, progress) : new Event(type);
+  return target.dispatchEvent(__obscura_markTrusted(event));
+}
+function _xhrReady(target, state, readyState) {
+  state.readyState = readyState;
+  _xhrFire(target, 'readystatechange');
+}
+function _xhrBodySize(body) {
+  if (body == null) return 0;
+  if (typeof body === 'string') return new TextEncoder().encode(body).length;
+  const bytes = _bodyToUint8Array(body);
+  return bytes ? bytes.length : 0;
 }
 
-// XMLHttpRequestEventTarget — spec-required ancestor for XHR EventTarget methods.
-// zone.js prefers to walk XMLHttpRequestEventTarget.prototype for addEventListener/
-// removeEventListener/dispatchEvent descriptors before falling back to XHR.prototype.
-class XMLHttpRequestEventTarget {
-  addEventListener(type, handler) {
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(handler);
-  }
-  removeEventListener(type, handler) {
-    if (this._listeners && this._listeners[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
-    }
-  }
-  dispatchEvent(event) {
-    if (!event || !event.type) return false;
-    const ev = (typeof event === 'object') ? event : { type: event };
-    ev.target = ev.target || this;
-    ev.currentTarget = ev.currentTarget || this;
-    const type = ev.type;
-    const handlers = (this._listeners && this._listeners[type]) || [];
-    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
-    const prop = 'on' + type;
-    if (typeof this[prop] === 'function') {
-      try { this[prop](ev); } catch (e) {}
-    }
-    return true;
-  }
-}
-globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
-_markNative(XMLHttpRequestEventTarget);
-_markNative(XMLHttpRequestEventTarget.prototype.addEventListener);
-_markNative(XMLHttpRequestEventTarget.prototype.removeEventListener);
-_markNative(XMLHttpRequestEventTarget.prototype.dispatchEvent);
-
-globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
-  static UNSENT = 0;
-  static OPENED = 1;
-  static HEADERS_RECEIVED = 2;
-  static LOADING = 3;
-  static DONE = 4;
-  UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
-
-  constructor() {
-    super();
-    this.readyState = 0;
-    this.status = 0;
-    this.statusText = "";
-    this.responseText = "";
-    this.responseXML = null;
-    this.responseURL = "";
-    this.responseType = "";
-    this.response = null;
-    this.timeout = 0;
-    this.withCredentials = false;
-    this.upload = { addEventListener(){}, removeEventListener(){} };
-    this._method = "GET";
-    this._url = "";
-    this._headers = {};
-    this._responseHeaders = {};
-    this._aborted = false;
-    this._listeners = {};
-    this.onreadystatechange = null;
-    this.onload = null;
-    this.onerror = null;
-    this.onabort = null;
-    this.onprogress = null;
-    this.ontimeout = null;
-    this.onloadstart = null;
-    this.onloadend = null;
-  }
-
-  open(method, url, async_) {
-    this._method = method;
-    this._url = url;
-    this._headers = {};
-    this._responseHeaders = {};
-    this._aborted = false;
-    this.status = 0;
-    this.statusText = "";
-    this.responseText = "";
-    this.response = null;
-    this._setReadyState(1);
-  }
-
-  setRequestHeader(name, value) {
-    this._headers[name] = value;
-  }
-
-  getResponseHeader(name) {
-    const lower = name.toLowerCase();
-    for (const [k, v] of Object.entries(this._responseHeaders)) {
-      if (k.toLowerCase() === lower) return v;
-    }
-    return null;
-  }
-
-  getAllResponseHeaders() {
-    return Object.entries(this._responseHeaders)
-      .map(([k, v]) => k + ': ' + v)
-      .join('\r\n');
-  }
-
-  overrideMimeType(mime) { this._overrideMime = mime; }
-
-  send(body) {
-    if (this.readyState !== 1) return;
-    if (this._aborted) return;
-
-    const xhr = this;
-    this._fireEvent('loadstart');
-
-    let url = this._url;
-    if (url && !url.includes('://')) {
-      try {
-        // This realm's own document, not the top-level one. `document_url` is
-        // the Rust side's page URL, so a request made from inside a frame
-        // resolved against the embedder: a challenge widget POSTing to
-        // `/cdn-cgi/...` from an iframe reached the embedding site instead of
-        // its own origin, which answered 400. `fetch` was already correct
-        // because it bases on `location`, and every frame realm has its own.
-        const base = globalThis.location?.href
-          || _domParse("document_url")
-          || "about:blank";
-        url = new URL(url, base).href;
-      } catch(e) {}
-    }
-
-    fetch(url, {
-      method: this._method,
-      headers: this._headers,
-      body: body || undefined,
-      mode: 'cors',
-      credentials: this.withCredentials ? 'include' : 'same-origin',
-    }).then(async (resp) => {
-      if (xhr._aborted) return;
-
-      xhr.status = resp.status;
-      xhr.statusText = resp.statusText || '';
-      xhr.responseURL = resp.url || url;
-
-      if (resp.headers) {
-        resp.headers.forEach((v, k) => { xhr._responseHeaders[k] = v; });
-      }
-
-      xhr._setReadyState(2); // HEADERS_RECEIVED
-
-      const text = await resp.text();
-      if (xhr._aborted) return;
-
-      xhr.responseText = text;
-      xhr._setReadyState(3); // LOADING
-
-      switch (xhr.responseType) {
-        case 'json':
-          try { xhr.response = JSON.parse(text); } catch(e) { xhr.response = null; }
-          break;
-        case 'text':
-        case '':
-          xhr.response = text;
-          break;
-        case 'arraybuffer':
-          xhr.response = new TextEncoder().encode(text).buffer;
-          break;
-        case 'blob':
-          xhr.response = new Blob([text]);
-          break;
-        case 'document':
-          xhr.response = text; // simplified
-          break;
-        default:
-          xhr.response = text;
-      }
-
-      xhr._setReadyState(4); // DONE
-      xhr._fireEvent('load');
-      xhr._fireEvent('loadend');
-    }).catch((err) => {
-      if (xhr._aborted) return;
-      xhr.status = 0;
-      xhr.readyState = 4;
-      xhr._fireEvent('readystatechange');
-      if (err && err.__aborted) {
-        xhr._aborted = true;
-        xhr._fireEvent('abort');
-        xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
-      } else {
-        xhr._fireEvent('error');
-        xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
-      }
-    });
-  }
-
-  abort() {
-    this._aborted = true;
-    if (this.readyState > 0 && this.readyState < 4) {
-      this._setReadyState(4);
-      this._fireEvent('abort');
-      this._fireEvent('loadend');
-    }
-    this.readyState = 0;
-  }
-
-  addEventListener(type, handler) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(handler);
-  }
-
-  removeEventListener(type, handler) {
-    if (this._listeners[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
-    }
-  }
-
-  // Per WHATWG DOM spec — required by zone.js which patches XHR via
-  // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
-  dispatchEvent(event) {
-    if (!event || !event.type) return false;
-    const ev = (typeof event === 'object') ? event : { type: event };
-    ev.target = ev.target || this;
-    ev.currentTarget = ev.currentTarget || this;
-    const type = ev.type;
-    const handlers = (this._listeners && this._listeners[type]) || [];
-    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
-    const prop = 'on' + type;
-    if (typeof this[prop] === 'function') {
-      try { this[prop](ev); } catch (e) {}
-    }
-    return true;
-  }
-
-  _setReadyState(state) {
-    this.readyState = state;
-    this._fireEvent('readystatechange');
-    if (this.onreadystatechange) {
-      try { this.onreadystatechange(); } catch(e) { __XHRDBG(this, 'onreadystatechange', e); }
-    }
-  }
-
-  _fireEvent(type) {
-    const event = { type, target: this, currentTarget: this, bubbles: false };
-    const handlers = this._listeners[type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { __XHRDBG(this, type + ' listener', e); } }
-    const prop = 'on' + type;
-    if (type !== 'readystatechange' && typeof this[prop] === 'function') {
-      try { this[prop](event); } catch(e) { __XHRDBG(this, prop, e); }
-    }
+const XMLHttpRequestEventTarget = function XMLHttpRequestEventTarget(key) {
+  if (key !== _xhrEventTargetKey) {
+    throw new TypeError("Failed to construct 'XMLHttpRequestEventTarget': Illegal constructor");
   }
 };
-_markNative(XMLHttpRequest);
-_markNative(XMLHttpRequest.prototype.open);
-_markNative(XMLHttpRequest.prototype.send);
-_markNative(XMLHttpRequest.prototype.abort);
-_markNative(XMLHttpRequest.prototype.setRequestHeader);
-_markNative(XMLHttpRequest.prototype.addEventListener);
-_markNative(XMLHttpRequest.prototype.removeEventListener);
-_markNative(XMLHttpRequest.prototype.dispatchEvent);
-_markNative(XMLHttpRequest.prototype.getResponseHeader);
-_markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
+Object.setPrototypeOf(XMLHttpRequestEventTarget.prototype, Node.prototype);
+const XMLHttpRequestUpload = function XMLHttpRequestUpload(key, state) {
+  if (key !== _xhrEventTargetKey) {
+    throw new TypeError("Failed to construct 'XMLHttpRequestUpload': Illegal constructor");
+  }
+  _xhrUploadState.set(this, state);
+};
+Object.setPrototypeOf(XMLHttpRequestUpload.prototype, XMLHttpRequestEventTarget.prototype);
+
+globalThis.XMLHttpRequest = class XMLHttpRequest {
+  constructor() {
+    const state = {
+      readyState: 0, timeout: 0, withCredentials: false,
+      responseURL: '', status: 0, statusText: '', responseType: '',
+      response: '', responseText: '', responseXML: null,
+      method: 'GET', url: '', async: true,
+      headers: Object.create(null), responseHeaders: Object.create(null),
+      overrideMimeType: '', sent: false, aborted: false, requestId: 0,
+      timeoutId: null, handlers: new Map(), uploadHandlers: new Map(),
+      attributionReporting: null, privateToken: null,
+    };
+    state.upload = new XMLHttpRequestUpload(_xhrEventTargetKey, state);
+    _xhrState.set(this, state);
+  }
+  get onreadystatechange() { return _xhrGetHandler(this, 'readystatechange'); }
+  set onreadystatechange(value) { _xhrSetHandler(this, 'readystatechange', value); }
+  get readyState() { return _xhrData(this).readyState; }
+  get timeout() { return _xhrData(this).timeout; }
+  set timeout(value) {
+    const number = Number(value);
+    _xhrData(this).timeout = Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+  }
+  get withCredentials() { return _xhrData(this).withCredentials; }
+  set withCredentials(value) {
+    const state = _xhrData(this);
+    if (state.readyState > 1 || state.sent) throw new DOMException('The object is in an invalid state.', 'InvalidStateError');
+    state.withCredentials = !!value;
+  }
+  get upload() { return _xhrData(this).upload; }
+  get responseURL() { return _xhrData(this).responseURL; }
+  get status() { return _xhrData(this).status; }
+  get statusText() { return _xhrData(this).statusText; }
+  get responseType() { return _xhrData(this).responseType; }
+  set responseType(value) {
+    const state = _xhrData(this);
+    value = String(value);
+    if (!['', 'arraybuffer', 'blob', 'document', 'json', 'text'].includes(value)) value = '';
+    if (state.readyState === 3 || state.readyState === 4) {
+      throw new DOMException('The object is in an invalid state.', 'InvalidStateError');
+    }
+    state.responseType = value;
+    state.response = value === '' || value === 'text' ? state.responseText : null;
+  }
+  get response() { return _xhrData(this).response; }
+  get responseText() {
+    const state = _xhrData(this);
+    if (state.responseType !== '' && state.responseType !== 'text') {
+      throw new DOMException(
+        "Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was '" + state.responseType + "').",
+        'InvalidStateError');
+    }
+    return state.responseText;
+  }
+  get responseXML() { return _xhrData(this).responseXML; }
+  abort() {
+    const state = _xhrData(this);
+    if (state.readyState === 0 || state.readyState === 4 || (state.readyState === 1 && !state.sent)) return;
+    state.requestId++; state.aborted = true; state.sent = false;
+    if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
+    _xhrResetResponse(state); _xhrReady(this, state, 4);
+    _xhrFire(this, 'abort', {lengthComputable: false, loaded: 0, total: 0});
+    _xhrFire(this, 'loadend', {lengthComputable: false, loaded: 0, total: 0});
+    state.readyState = 0;
+  }
+  getAllResponseHeaders() {
+    const state = _xhrData(this);
+    if (state.readyState < 2) return '';
+    return Object.keys(state.responseHeaders).sort()
+      .map(name => name + ': ' + state.responseHeaders[name] + '\r\n').join('');
+  }
+  getResponseHeader(name) {
+    const state = _xhrData(this);
+    if (state.readyState < 2) return null;
+    const value = state.responseHeaders[String(name).toLowerCase()];
+    return value === undefined ? null : value;
+  }
+  open(method, url, async = true, _user = undefined, _password = undefined) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'open' on 'XMLHttpRequest': 2 arguments required, but only " + arguments.length + ' present.');
+    }
+    const state = _xhrData(this);
+    method = String(method).toUpperCase();
+    let resolved;
+    try {
+      const base = globalThis.location?.href || _domParse('document_url') || 'about:blank';
+      resolved = new URL(String(url), base).href;
+    } catch (_error) {
+      throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", 'SyntaxError');
+    }
+    state.requestId++;
+    if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
+    state.method = method; state.url = resolved; state.async = async !== false;
+    state.headers = Object.create(null); state.sent = false; state.aborted = false;
+    _xhrResetResponse(state); _xhrReady(this, state, 1);
+  }
+  overrideMimeType(mime) {
+    const state = _xhrData(this);
+    if (state.readyState === 3 || state.readyState === 4) {
+      throw new DOMException('The object is in an invalid state.', 'InvalidStateError');
+    }
+    state.overrideMimeType = String(mime);
+  }
+  send(body = null) {
+    const state = _xhrData(this);
+    if (state.readyState !== 1 || state.sent) {
+      throw new DOMException(
+        "Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.",
+        'InvalidStateError');
+    }
+    if (state.method === 'GET' || state.method === 'HEAD') body = null;
+    state.sent = true; state.aborted = false;
+    const requestId = ++state.requestId;
+    const uploadSize = _xhrBodySize(body);
+    _xhrFire(this, 'loadstart', {lengthComputable: false, loaded: 0, total: 0});
+    if (body !== null) _xhrFire(state.upload, 'loadstart', {lengthComputable: false, loaded: 0, total: 0});
+    if (state.timeout > 0) {
+      state.timeoutId = setTimeout(() => {
+        if (!state.sent || state.requestId !== requestId) return;
+        state.requestId++; state.sent = false; state.timeoutId = null;
+        _xhrResetResponse(state); _xhrReady(this, state, 4);
+        _xhrFire(this, 'timeout', {lengthComputable: false, loaded: 0, total: 0});
+        _xhrFire(this, 'loadend', {lengthComputable: false, loaded: 0, total: 0});
+      }, state.timeout);
+    }
+    fetch(state.url, {
+      method: state.method, headers: state.headers,
+      body: body === null ? undefined : body, mode: 'cors',
+      credentials: state.withCredentials ? 'include' : 'same-origin',
+    }).then(async resp => {
+      if (!state.sent || state.requestId !== requestId) return;
+      state.status = resp.status; state.statusText = resp.statusText || '';
+      state.responseURL = resp.url || state.url;
+      state.responseHeaders = Object.create(null);
+      if (resp.headers) resp.headers.forEach((value, name) => {
+        state.responseHeaders[String(name).toLowerCase()] = String(value);
+      });
+      _xhrReady(this, state, 2);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      if (!state.sent || state.requestId !== requestId) return;
+      const text = _decodeBodyWithCharset(bytes, resp.headers);
+      state.responseText = text; _xhrReady(this, state, 3);
+      const declared = Number(state.responseHeaders['content-length']);
+      const lengthComputable = Number.isFinite(declared) && declared >= 0;
+      const total = lengthComputable ? declared : 0;
+      _xhrFire(this, 'progress', {lengthComputable, loaded: bytes.length, total});
+      switch (state.responseType) {
+        case 'json': try { state.response = JSON.parse(text); } catch (_error) { state.response = null; } break;
+        case 'arraybuffer': state.response = _arrayBufferFromBytes(bytes); break;
+        case 'blob': state.response = new Blob([bytes], {type: state.responseHeaders['content-type'] || ''}); break;
+        case 'document': state.response = text; break;
+        default: state.response = text;
+      }
+      state.sent = false;
+      if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
+      if (body !== null) {
+        const uploadProgress = {lengthComputable: true, loaded: uploadSize, total: uploadSize};
+        _xhrFire(state.upload, 'progress', uploadProgress);
+        _xhrFire(state.upload, 'load', uploadProgress);
+        _xhrFire(state.upload, 'loadend', uploadProgress);
+      }
+      _xhrReady(this, state, 4);
+      const progress = {lengthComputable, loaded: bytes.length, total};
+      _xhrFire(this, 'load', progress); _xhrFire(this, 'loadend', progress);
+    }).catch(error => {
+      if (!state.sent || state.requestId !== requestId) return;
+      state.sent = false;
+      if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
+      _xhrResetResponse(state); _xhrReady(this, state, 4);
+      const type = error && error.__aborted ? 'abort' : 'error';
+      _xhrFire(this, type, {lengthComputable: false, loaded: 0, total: 0});
+      _xhrFire(this, 'loadend', {lengthComputable: false, loaded: 0, total: 0});
+    });
+  }
+  setRequestHeader(name, value) {
+    const state = _xhrData(this);
+    if (state.readyState !== 1 || state.sent) {
+      throw new DOMException(
+        "Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.",
+        'InvalidStateError');
+    }
+    name = String(name).toLowerCase(); value = String(value).trim();
+    state.headers[name] = state.headers[name] === undefined ? value : state.headers[name] + ', ' + value;
+  }
+  setAttributionReporting(options) { _xhrData(this).attributionReporting = options; }
+  setPrivateToken(options) { _xhrData(this).privateToken = options; }
+};
+Object.setPrototypeOf(XMLHttpRequest.prototype, XMLHttpRequestEventTarget.prototype);
+globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+globalThis.XMLHttpRequestUpload = XMLHttpRequestUpload;
+
+function _xhrInstallHandler(prototype, name) {
+  const getter = function() { return _xhrGetHandler(this, name.slice(2)); };
+  const setter = function(value) { _xhrSetHandler(this, name.slice(2), value); };
+  Object.defineProperty(getter, 'name', {value: 'get ' + name, configurable: true});
+  Object.defineProperty(setter, 'name', {value: 'set ' + name, configurable: true});
+  _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
+  _markNativeAs(setter, 'function set ' + name + '() { [native code] }');
+  Object.defineProperty(prototype, name, {get: getter, set: setter, enumerable: true, configurable: true});
+}
+const _xhrEventTargetConstructor = Object.getOwnPropertyDescriptor(
+  XMLHttpRequestEventTarget.prototype, 'constructor');
+delete XMLHttpRequestEventTarget.prototype.constructor;
+for (const name of ['onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {
+  _xhrInstallHandler(XMLHttpRequestEventTarget.prototype, name);
+}
+Object.defineProperty(XMLHttpRequestEventTarget.prototype, 'constructor', _xhrEventTargetConstructor);
+const _xhrProto = XMLHttpRequest.prototype;
+const _xhrDescriptors = Object.getOwnPropertyDescriptors(_xhrProto);
+for (const name of Object.getOwnPropertyNames(_xhrProto)) delete _xhrProto[name];
+for (const name of ['onreadystatechange','readyState','timeout','withCredentials','upload','responseURL',
+  'status','statusText','responseType','response','responseText']) {
+  const descriptor = _xhrDescriptors[name]; descriptor.enumerable = true;
+  Object.defineProperty(_xhrProto, name, descriptor);
+}
+for (const [name, value] of [['UNSENT',0],['OPENED',1],['HEADERS_RECEIVED',2],['LOADING',3],['DONE',4]]) {
+  Object.defineProperty(XMLHttpRequest, name, {value, writable: false, enumerable: true, configurable: false});
+  Object.defineProperty(_xhrProto, name, {value, writable: false, enumerable: true, configurable: false});
+}
+for (const name of ['abort','getAllResponseHeaders','getResponseHeader','open','overrideMimeType','send','setRequestHeader']) {
+  const descriptor = _xhrDescriptors[name]; descriptor.enumerable = true;
+  Object.defineProperty(_xhrProto, name, descriptor);
+}
+Object.defineProperty(_xhrProto, 'constructor', _xhrDescriptors.constructor);
+for (const name of ['responseXML','setAttributionReporting','setPrivateToken']) {
+  const descriptor = _xhrDescriptors[name]; descriptor.enumerable = true;
+  Object.defineProperty(_xhrProto, name, descriptor);
+}
+Object.defineProperty(XMLHttpRequestEventTarget.prototype, Symbol.toStringTag, {
+  value: 'XMLHttpRequestEventTarget', configurable: true,
+});
+Object.defineProperty(XMLHttpRequestUpload.prototype, Symbol.toStringTag, {
+  value: 'XMLHttpRequestUpload', configurable: true,
+});
+Object.defineProperty(_xhrProto, Symbol.toStringTag, {value: 'XMLHttpRequest', configurable: true});
+Object.defineProperty(XMLHttpRequestEventTarget, 'length', {value: 0, configurable: true});
+Object.defineProperty(XMLHttpRequestUpload, 'length', {value: 0, configurable: true});
+for (const ctor of [XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload]) _markNative(ctor);
 
 // WHATWG URL parsing/serialization is delegated to the Rust `url` crate via
 // op_url_parse / op_url_set. The op returns the full component set as JSON; the
@@ -9249,53 +11598,86 @@ function _urlResolveOp(href, base) {
     return r ? r : null;
   } catch (e) { return null; }
 }
-if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
+const _urlState = new WeakMap();
+let _urlSearchParamsBind = null;
+let _urlSearchParamsSetFromString = null;
+function _urlData(value) {
+  const state = _urlState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _urlSetPart(value, part, nextValue) {
+  const state = _urlData(value);
+  const parsed = _urlSetOp(state.c.href, part, nextValue);
+  if (parsed) state.c = parsed;
+}
+function _urlRefreshSearchParams(value) {
+  const state = _urlData(value);
+  if (state.sp && _urlSearchParamsSetFromString) {
+    _urlSearchParamsSetFromString(state.sp, state.c.search);
+  }
+}
+function _urlUpdateSearch(value, query) {
+  _urlSetPart(value, 'search', query ? ('?' + query) : '');
+}
+{
   const _URL = class URL {
     constructor(url, base) {
       const c = _urlParseOp(url, base);
       if (!c) throw new TypeError("Failed to construct 'URL': Invalid URL");
-      this._c = c;
-      this._sp = null;
+      _urlState.set(this, { c, sp: null });
     }
-    get href() { return this._c.href; }
-    set href(v) { const c = _urlParseOp(v, undefined); if (!c) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); this._c = c; this._refreshSP(); }
-    get protocol() { return this._c.protocol; }
-    set protocol(v) { this._set('protocol', v); }
-    get username() { return this._c.username; }
-    set username(v) { this._set('username', v); }
-    get password() { return this._c.password; }
-    set password(v) { this._set('password', v); }
-    get host() { return this._c.host; }
-    set host(v) { this._set('host', v); }
-    get hostname() { return this._c.hostname; }
-    set hostname(v) { this._set('hostname', v); }
-    get port() { return this._c.port; }
-    set port(v) { this._set('port', v); }
-    get pathname() { return this._c.pathname; }
-    set pathname(v) { this._set('pathname', v); }
-    get search() { return this._c.search; }
-    set search(v) { this._set('search', v); this._refreshSP(); }
-    get hash() { return this._c.hash; }
-    set hash(v) { this._set('hash', v); }
-    get origin() { return this._c.origin; }
+    get origin() { return _urlData(this).c.origin; }
+    get protocol() { return _urlData(this).c.protocol; }
+    set protocol(v) { _urlSetPart(this, 'protocol', v); }
+    get username() { return _urlData(this).c.username; }
+    set username(v) { _urlSetPart(this, 'username', v); }
+    get password() { return _urlData(this).c.password; }
+    set password(v) { _urlSetPart(this, 'password', v); }
+    get host() { return _urlData(this).c.host; }
+    set host(v) { _urlSetPart(this, 'host', v); }
+    get hostname() { return _urlData(this).c.hostname; }
+    set hostname(v) { _urlSetPart(this, 'hostname', v); }
+    get port() { return _urlData(this).c.port; }
+    set port(v) { _urlSetPart(this, 'port', v); }
+    get pathname() { return _urlData(this).c.pathname; }
+    set pathname(v) { _urlSetPart(this, 'pathname', v); }
+    get search() { return _urlData(this).c.search; }
+    set search(v) { _urlSetPart(this, 'search', v); _urlRefreshSearchParams(this); }
     get searchParams() {
-      if (!this._sp) { this._sp = new URLSearchParams(this._c.search); this._sp._url = this; }
-      return this._sp;
+      const state = _urlData(this);
+      if (!state.sp) {
+        state.sp = new URLSearchParams(state.c.search);
+        if (_urlSearchParamsBind) _urlSearchParamsBind(state.sp, this);
+      }
+      return state.sp;
     }
-    _set(part, value) { const c = _urlSetOp(this._c.href, part, value); if (c) this._c = c; }
-    // search changed on the URL side: refresh the bound searchParams contents.
-    _refreshSP() { if (this._sp && this._sp._setFromString) this._sp._setFromString(this._c.search); }
-    // searchParams mutated: write the serialized query back without re-refreshing.
-    _updateSearch(qs) { this._set('search', qs ? ('?' + qs) : ''); }
-    toString() { return this._c.href; }
-    toJSON() { return this._c.href; }
+    get hash() { return _urlData(this).c.hash; }
+    set hash(v) { _urlSetPart(this, 'hash', v); }
+    get href() { return _urlData(this).c.href; }
+    set href(v) {
+      const parsed = _urlParseOp(v, undefined);
+      if (!parsed) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
+      _urlData(this).c = parsed;
+      _urlRefreshSearchParams(this);
+    }
+    toJSON() { return _urlData(this).c.href; }
+    toString() { return _urlData(this).c.href; }
     static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
     static revokeObjectURL() {}
     // WHATWG URL.parse: like the constructor but returns null instead of throwing.
-    static parse(url, base) { const c = _urlParseOp(url, base); if (!c) return null; const u = Object.create(_URL.prototype); u._c = c; u._sp = null; return u; }
+    static parse(url, base) {
+      const c = _urlParseOp(url, base);
+      if (!c) return null;
+      const parsed = Object.create(_URL.prototype);
+      _urlState.set(parsed, { c, sp: null });
+      return parsed;
+    }
     static canParse(url, base) { return _urlParseOp(url, base) !== null; }
   };
-  _URL.__obscura = true;
+  const constructorDescriptor = Object.getOwnPropertyDescriptor(_URL.prototype, 'constructor');
+  delete _URL.prototype.constructor;
+  Object.defineProperty(_URL.prototype, 'constructor', constructorDescriptor);
   globalThis.URL = _URL;
 }
 
@@ -9312,54 +11694,130 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function cancel
 _markNative(globalThis.requestIdleCallback);
 _markNative(globalThis.cancelIdleCallback);
 
-if (typeof Request === 'undefined') {
-  globalThis.Request = class Request {
-    constructor(input, init = {}) {
-      const inputRequest = input instanceof Request ? input : null;
-      if (typeof input === 'string') { this.url = input; }
-      else if (inputRequest) { this.url = inputRequest.url; init = { ...inputRequest, ...init }; }
-      else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
-      else { this.url = input?.url || input?.href || String(input); }
-      this.method = (init.method || 'GET').toUpperCase();
-      this.headers = new Headers(init.headers);
-      this.body = init.body || null;
-      this.mode = init.mode || 'cors';
-      this.credentials = init.credentials !== undefined
-        ? String(init.credentials)
-        : (inputRequest ? inputRequest.credentials : 'same-origin');
-      if (this.credentials !== 'omit' && this.credentials !== 'same-origin' && this.credentials !== 'include') {
-        throw new TypeError("Failed to construct 'Request': '" + this.credentials + "' is not a valid RequestCredentials value");
-      }
-      this.redirect = init.redirect !== undefined ? String(init.redirect) : 'follow';
-      if (!_FETCH_REDIRECT_MODES.has(this.redirect)) {
-        throw new TypeError("Failed to construct 'Request': '" + this.redirect + "' is not a valid RequestRedirect value");
-      }
-      this.referrer = init.referrer || '';
-      this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
-      this.cache = init.cache || 'default';
-    }
-    clone() {
-      return new Request(this.url, {
-        method: this.method,
-        headers: this.headers,
-        body: this.body,
-        mode: this.mode,
-        credentials: this.credentials,
-        redirect: this.redirect,
-        referrer: this.referrer,
-        signal: this.signal,
-        cache: this.cache,
-      });
-    }
-    async text() { return this.body ? String(this.body) : ''; }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
-    async blob() {
-      const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
-      return new Blob(this.body != null ? [this.body] : [], { type: ct });
-    }
-  };
+const _requestState = new WeakMap();
+function _requestData(value) {
+  const state = _requestState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
 }
+function _requestBodyBytes(body) {
+  if (body == null) return new Uint8Array(0);
+  if (body instanceof Uint8Array) return new Uint8Array(body);
+  if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(body)) {
+    return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+  }
+  if (typeof Blob !== 'undefined' && body instanceof Blob) return _bodyToUint8Array(body);
+  return new TextEncoder().encode(typeof body === 'string' ? body : String(body));
+}
+const _Request = class Request {
+  constructor(input, init = {}) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'Request': 1 argument required, but only 0 present.");
+    }
+    const source = input instanceof Request ? _requestData(input) : null;
+    init = init || {};
+    let url;
+    if (source) url = source.url;
+    else if (typeof URL === 'function' && input instanceof URL) url = input.href;
+    else if (input && typeof input === 'object') url = input.url || input.href || String(input);
+    else url = String(input);
+    try { url = new URL(String(url), globalThis.location?.href || 'about:blank').href; }
+    catch (_error) { throw new TypeError("Failed to construct 'Request': Invalid URL"); }
+    const state = {
+      url: String(url),
+      method: String(init.method !== undefined ? init.method : source?.method || 'GET').toUpperCase(),
+      headers: new Headers(init.headers !== undefined ? init.headers : source?.headers),
+      body: init.body !== undefined ? init.body : source?.body,
+      mode: String(init.mode !== undefined ? init.mode : source?.mode || 'cors'),
+      credentials: String(init.credentials !== undefined ? init.credentials : source?.credentials || 'same-origin'),
+      redirect: String(init.redirect !== undefined ? init.redirect : source?.redirect || 'follow'),
+      referrer: String(init.referrer !== undefined ? init.referrer : source?.referrer || ''),
+      referrerPolicy: String(init.referrerPolicy !== undefined ? init.referrerPolicy : source?.referrerPolicy || ''),
+      signal: init.signal !== undefined ? init.signal : source?.signal || new AbortController().signal,
+      cache: String(init.cache !== undefined ? init.cache : source?.cache || 'default'),
+      integrity: String(init.integrity !== undefined ? init.integrity : source?.integrity || ''),
+      keepalive: !!(init.keepalive !== undefined ? init.keepalive : source?.keepalive),
+      bodyUsed: false,
+    };
+    if (!['omit', 'same-origin', 'include'].includes(state.credentials)) {
+      throw new TypeError("Failed to construct 'Request': '" + state.credentials + "' is not a valid RequestCredentials value");
+    }
+    if (!_FETCH_REDIRECT_MODES.has(state.redirect)) {
+      throw new TypeError("Failed to construct 'Request': '" + state.redirect + "' is not a valid RequestRedirect value");
+    }
+    _requestState.set(this, state);
+  }
+  get url() { return _requestData(this).url; }
+  get method() { return _requestData(this).method; }
+  get headers() { return _requestData(this).headers; }
+  get destination() { _requestData(this); return ''; }
+  get referrer() { return _requestData(this).referrer; }
+  get referrerPolicy() { return _requestData(this).referrerPolicy; }
+  get mode() { return _requestData(this).mode; }
+  get credentials() { return _requestData(this).credentials; }
+  get cache() { return _requestData(this).cache; }
+  get redirect() { return _requestData(this).redirect; }
+  get integrity() { return _requestData(this).integrity; }
+  get keepalive() { return _requestData(this).keepalive; }
+  get duplex() { _requestData(this); return 'half'; }
+  get isReloadNavigation() { _requestData(this); return false; }
+  get isHistoryNavigation() { _requestData(this); return false; }
+  get targetAddressSpace() { _requestData(this); return 'unknown'; }
+  get signal() { return _requestData(this).signal; }
+  get body() { _requestData(this); return null; }
+  get bodyUsed() { return _requestData(this).bodyUsed; }
+  clone() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
+    return new Request(this);
+  }
+  async text() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return new TextDecoder().decode(_requestBodyBytes(state.body));
+  }
+  async json() { return JSON.parse(await this.text()); }
+  async arrayBuffer() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return _requestBodyBytes(state.body).buffer;
+  }
+  async blob() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    const ct = state.headers.get('content-type') || '';
+    return new Blob([_requestBodyBytes(state.body)], { type: ct });
+  }
+  async formData() { throw new TypeError('Could not parse the body as FormData.'); }
+  async bytes() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return _requestBodyBytes(state.body);
+  }
+  textStream() {
+    const state = _requestData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    const text = new TextDecoder().decode(_requestBodyBytes(state.body));
+    return new ReadableStream({ start(controller) { controller.enqueue(text); controller.close(); } });
+  }
+};
+globalThis.Request = _Request;
+_markNative(Request);
+for (const name of ['arrayBuffer', 'blob', 'clone', 'formData', 'json', 'text', 'bytes', 'textStream']) {
+  _markNative(Request.prototype[name]);
+}
+_reorderWebIDLPrototype(Request.prototype,
+  ['method', 'url', 'headers', 'destination', 'referrer', 'referrerPolicy', 'mode',
+    'credentials', 'cache', 'redirect', 'integrity', 'keepalive', 'signal', 'duplex',
+    'isHistoryNavigation', 'bodyUsed', 'arrayBuffer', 'blob', 'clone', 'formData',
+    'json', 'text', 'targetAddressSpace', 'isReloadNavigation', 'body', 'bytes',
+    'textStream', 'constructor']);
 
 // Decode a response body honoring the Content-Type charset, so fetch()/XHR
 // over non-UTF-8 resources (GBK, Shift_JIS, ISO-8859-x, ...) return correctly
@@ -9378,29 +11836,102 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
-if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body);
-      // `|| 200` would turn the one status that carries meaning into the one
-      // that does not: an opaque or opaque-redirect response is status 0, and
-      // reporting 200 for it claims a success that never happened.
-      this.status = init.status === undefined || init.status === null ? 200 : Number(init.status);
-      this.statusText = init.statusText || '';
-      this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
-    }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
-  };
+const _responseState = new WeakMap();
+function _responseData(value) {
+  const state = _responseState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
 }
+const _Response = class Response {
+  constructor(body = null, init = {}) {
+    const status = init.status === undefined || init.status === null ? 200 : Number(init.status);
+    const state = {
+      bodyBytes: _bodyToUint8Array(body),
+      status,
+      statusText: init.statusText === undefined ? '' : String(init.statusText),
+      headers: new Headers(init.headers),
+      type: init.type || 'basic',
+      url: init.url || '',
+      redirected: !!init.redirected,
+      bodyUsed: false,
+    };
+    state.ok = status >= 200 && status < 300;
+    _responseState.set(this, state);
+  }
+  get type() { return _responseData(this).type; }
+  get url() { return _responseData(this).url; }
+  get redirected() { return _responseData(this).redirected; }
+  get status() { return _responseData(this).status; }
+  get ok() { return _responseData(this).ok; }
+  get statusText() { return _responseData(this).statusText; }
+  get headers() { return _responseData(this).headers; }
+  get body() { _responseData(this); return null; }
+  get bodyUsed() { return _responseData(this).bodyUsed; }
+  async text() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return _decodeBodyWithCharset(state.bodyBytes, state.headers);
+  }
+  async json() { return JSON.parse(await this.text()); }
+  async arrayBuffer() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return _arrayBufferFromBytes(state.bodyBytes);
+  }
+  async blob() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return new Blob([state.bodyBytes], { type: state.headers.get('content-type') || '' });
+  }
+  async formData() { throw new TypeError('Could not parse the body as FormData.'); }
+  async bytes() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    return new Uint8Array(state.bodyBytes);
+  }
+  textStream() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError('Body is unusable');
+    state.bodyUsed = true;
+    const text = _decodeBodyWithCharset(state.bodyBytes, state.headers);
+    return new ReadableStream({ start(controller) { controller.enqueue(text); controller.close(); } });
+  }
+  clone() {
+    const state = _responseData(this);
+    if (state.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+    return new Response(state.bodyBytes, {
+      status: state.status, statusText: state.statusText, headers: state.headers,
+      type: state.type, url: state.url, redirected: state.redirected,
+    });
+  }
+  static error() { return new Response(null, { status: 0, type: 'error' }); }
+  static redirect(url, status = 302) {
+    if (![301, 302, 303, 307, 308].includes(Number(status))) {
+      throw new RangeError('Invalid status code');
+    }
+    let location;
+    try { location = new URL(String(url), globalThis.location?.href || 'about:blank').href; }
+    catch (_error) { throw new TypeError('Failed to parse URL from Response.redirect'); }
+    return new Response(null, { status: Number(status), headers: { Location: location } });
+  }
+  static json(data, init = {}) {
+    const headers = new Headers(init.headers);
+    if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+    return new Response(JSON.stringify(data), { ...init, headers });
+  }
+};
+globalThis.Response = _Response;
+_markNative(Response);
+for (const name of ['arrayBuffer', 'blob', 'clone', 'formData', 'json', 'text', 'bytes', 'textStream']) {
+  _markNative(Response.prototype[name]);
+}
+_reorderWebIDLPrototype(Response.prototype,
+  ['type', 'url', 'redirected', 'status', 'ok', 'statusText', 'headers', 'body', 'bodyUsed',
+    'arrayBuffer', 'blob', 'clone', 'formData', 'json', 'text', 'bytes', 'textStream', 'constructor']);
 
 if (!Element.prototype.replaceWith) {
   // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
@@ -9797,11 +12328,42 @@ function _utf8DecodeBytes(bytes, start) {
   let str = '', i = start | 0;
   const n = bytes.length;
   while (i < n) {
-    let c = bytes[i++];
-    if (c < 0x80) str += String.fromCharCode(c);
-    else if (c < 0xE0) str += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
-    else if (c < 0xF0) { const b1 = bytes[i++], b2 = bytes[i++]; str += String.fromCharCode(((c & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)); }
-    else { const b1 = bytes[i++], b2 = bytes[i++], b3 = bytes[i++]; const cp = ((c & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); if (cp > 0xFFFF) { const s = cp - 0x10000; str += String.fromCharCode(0xD800 + (s >> 10), 0xDC00 + (s & 0x3FF)); } else str += String.fromCharCode(cp); }
+    const c = bytes[i++];
+    if (c < 0x80) { str += String.fromCharCode(c); continue; }
+    let needed = 0, cp = 0, min = 0, firstMin = 0x80, firstMax = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) {
+      needed = 1; cp = c & 0x1F; min = 0x80;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      needed = 2; cp = c & 0x0F; min = 0x800;
+      if (c === 0xE0) firstMin = 0xA0;
+      if (c === 0xED) firstMax = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      needed = 3; cp = c & 0x07; min = 0x10000;
+      if (c === 0xF0) firstMin = 0x90;
+      if (c === 0xF4) firstMax = 0x8F;
+    } else {
+      str += '\uFFFD';
+      continue;
+    }
+    let consumed = 0, valid = true;
+    while (consumed < needed) {
+      if (i >= n) { valid = false; break; }
+      const b = bytes[i];
+      const low = consumed === 0 ? firstMin : 0x80;
+      const high = consumed === 0 ? firstMax : 0xBF;
+      if (b < low || b > high) { valid = false; break; }
+      cp = (cp << 6) | (b & 0x3F);
+      i++; consumed++;
+    }
+    if (!valid || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      str += '\uFFFD';
+      continue;
+    }
+    if (cp <= 0xFFFF) str += String.fromCharCode(cp);
+    else {
+      const scalar = cp - 0x10000;
+      str += String.fromCharCode(0xD800 + (scalar >> 10), 0xDC00 + (scalar & 0x3FF));
+    }
   }
   return str;
 }
@@ -10055,7 +12617,7 @@ globalThis.getComputedStyle = (el) => {
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
   let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [] };
+    snapshot = { rendered: null, epoch: -1, names: _CSS_COMPUTED_PROPERTY_NAMES };
     if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
   const refreshRendered = () => {
@@ -10070,7 +12632,11 @@ globalThis.getComputedStyle = (el) => {
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
-    snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];
+    const customNames = snapshot.rendered
+      ? Object.keys(snapshot.rendered).filter(name => name.startsWith('--')) : [];
+    snapshot.names = customNames.length
+      ? _CSS_COMPUTED_PROPERTY_NAMES.concat(customNames)
+      : _CSS_COMPUTED_PROPERTY_NAMES;
   };
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
@@ -10157,7 +12723,8 @@ globalThis.getComputedStyle = (el) => {
   const target = style;
   return new Proxy(style, {
     get(_, prop) {
-      if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
+      if (prop === Symbol.toPrimitive) return undefined;
+      if (prop === Symbol.toStringTag) return 'CSSStyleDeclaration';
       if (prop === 'getPropertyValue') return (name) => lookup(name);
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => {
@@ -10182,6 +12749,24 @@ globalThis.getComputedStyle = (el) => {
       }
       if (prop in target) return target[prop];
       if (typeof prop === 'string') return lookup(prop);
+      return undefined;
+    },
+    ownKeys() {
+      refreshRendered();
+      const keys = [];
+      for (let index = 0; index < snapshot.names.length; index++) keys.push(String(index));
+      keys.push(..._CSS_PROPERTY_NAMES);
+      return keys;
+    },
+    getOwnPropertyDescriptor(_, prop) {
+      if (typeof prop !== 'string') return undefined;
+      refreshRendered();
+      if (/^\d+$/.test(prop) && +prop < snapshot.names.length) {
+        return { value: snapshot.names[+prop], writable: false, enumerable: true, configurable: true };
+      }
+      if (_CSS_PROP_SET.has(prop)) {
+        return { value: lookup(prop), writable: true, enumerable: true, configurable: true };
+      }
       return undefined;
     },
   });
@@ -10235,9 +12820,10 @@ class CSSStyleRule extends CSSRule {
   constructor(selectorText, declarations) {
     super("", CSSRule.STYLE_RULE);
     this._selectorText = String(selectorText || "").trim();
-    const declaration = new CSSStyleDeclaration(null, () => this._changed());
-    _parseCssInto(declaration._props, declarations);
-    declaration._loaded = true;
+    const declaration = new CSSStyleDeclaration(null, () => this._changed(), this);
+    const state = _cssStyleFor(declaration);
+    _parseCssInto(state.props, declarations);
+    state.loaded = true;
     this._style = _styleProxy(declaration);
   }
   get selectorText() { return this._selectorText; }
@@ -10794,6 +13380,7 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   }
 };
 
+const _shadowCustomElementRegistries = new WeakMap();
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   constructor(nid, host, options) {
     super(nid);
@@ -10803,6 +13390,11 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
     this._slotAssignment = options.slotAssignment === 'manual' ? 'manual' : 'named';
     this._clonable = !!options.clonable;
     this._serializable = !!options.serializable;
+    const registry = options.customElementRegistry;
+    _shadowCustomElementRegistries.set(
+      this,
+      registry instanceof CustomElementRegistry ? registry : globalThis.customElements,
+    );
   }
   get host() { return this._host; }
   get mode() { return this._mode; }
@@ -10810,6 +13402,7 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   get slotAssignment() { return this._slotAssignment; }
   get clonable() { return this._clonable; }
   get serializable() { return this._serializable; }
+  get customElementRegistry() { return _shadowCustomElementRegistries.get(this) || null; }
   _assertInsertable(node, operation) {
     const createsComposedCycle = node instanceof ShadowRoot
       || node === this._host
@@ -10890,86 +13483,136 @@ function _isValidCustomElementName(name) {
   // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
   return /^[a-z][a-z0-9._·À-￿-]*-[a-z0-9._·À-￿-]*$/.test(name);
 }
+const _customElementRegistryState = new WeakMap();
+function _customElementRegistryData(value) {
+  const state = _customElementRegistryState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _customElementUpgrade(registry, el, cls) {
+  if (el.__customUpgraded) return;
+  el.__customUpgraded = true;
+  try {
+    const constructionEntry = { element: el, constructor: cls, constructed: false };
+    _customElementConstructionStack.push(constructionEntry);
+    let constructed;
+    try {
+      constructed = Reflect.construct(cls, []);
+    } finally {
+      const pending = _customElementConstructionStack.lastIndexOf(constructionEntry);
+      if (pending !== -1) _customElementConstructionStack.splice(pending, 1);
+    }
+    if (constructed !== el) {
+      throw new TypeError('Custom element constructor did not produce the element being upgraded');
+    }
+    if (typeof el.connectedCallback === 'function' && el.isConnected) {
+      try { el.connectedCallback(); } catch (_error) {}
+    }
+  } catch (_error) {
+    el.__customUpgradeFailed = true;
+  }
+}
+function _customElementUpgradeRoot(registry, root) {
+  const state = _customElementRegistryData(registry);
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  for (const [name, cls] of state.registry.entries()) {
+    if (root.localName === name) _customElementUpgrade(registry, root, cls);
+    for (const el of root.querySelectorAll(name)) _customElementUpgrade(registry, el, cls);
+  }
+}
+function _customElementRegistryForNode(node) {
+  try {
+    const root = node?.getRootNode?.();
+    if (root?.customElementRegistry instanceof CustomElementRegistry) {
+      return root.customElementRegistry;
+    }
+    const doc = node?.ownerDocument || (node?.nodeType === 9 ? node : null);
+    if (doc?.customElementRegistry instanceof CustomElementRegistry) {
+      return doc.customElementRegistry;
+    }
+  } catch (_error) {}
+  return globalThis.customElements;
+}
+
 class CustomElementRegistry {
-  constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
+  constructor() {
+    _customElementRegistryState.set(this, {
+      registry: new Map(), byCtor: new Map(), resolvers: new Map(),
+      defining: false, roots: new Set(),
+    });
+  }
   define(name, cls, opts) {
+    const state = _customElementRegistryData(this);
     if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not a constructor.");
     if (!_isValidCustomElementName(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError");
-    if (this._defining) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': operation is not supported while a definition is in progress", "NotSupportedError");
-    if (this._registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
-    if (this._byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
-    this._defining = true;
-    try { this._byCtor.set(cls, name); this._defineInner(name, cls, opts); } finally { this._defining = false; }
-  }
-  _defineInner(name, cls, opts) {
-    this._registry.set(name, cls);
-    // Upgrade existing matching elements: instantiate the class on each,
-    // fire connectedCallback if the element is in the document. Without
-    // this, lit / MusicKit / Polymer components never wire up their
-    // shadow DOM or render, leaving heavy chunks of YouTube,
-    // music.apple.com, and any web-component site as empty shells.
+    if (state.defining) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': operation is not supported while a definition is in progress", "NotSupportedError");
+    if (state.registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
+    if (state.byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
+    state.defining = true;
     try {
-      const matches = globalThis.document?.querySelectorAll(name) || [];
-      for (const el of matches) this._upgradeElement(el, cls);
-    } catch (e) {}
-    const resolvers = this._whenDefinedResolvers.get(name);
+      state.byCtor.set(cls, name);
+      state.registry.set(name, cls);
+      for (const root of state.roots) _customElementUpgradeRoot(this, root);
+    } finally {
+      state.defining = false;
+    }
+    const resolvers = state.resolvers.get(name);
     if (resolvers) {
       for (const r of resolvers) r(cls);
-      this._whenDefinedResolvers.delete(name);
+      state.resolvers.delete(name);
     }
   }
-  _upgradeElement(el, cls) {
-    if (el.__customUpgraded) return;
-    el.__customUpgraded = true;
-    try {
-      // Upgrade preserves object identity but installs the definition's
-      // prototype before running its class constructor. HTMLElement's
-      // constructor consumes this entry and returns `el`, so derived class
-      // fields and constructor-side state initialize on the real DOM wrapper.
-      const constructionEntry = { element: el, constructor: cls, constructed: false };
-      _customElementConstructionStack.push(constructionEntry);
-      let constructed;
-      try {
-        constructed = Reflect.construct(cls, []);
-      } finally {
-        const pending = _customElementConstructionStack.lastIndexOf(constructionEntry);
-        if (pending !== -1) _customElementConstructionStack.splice(pending, 1);
-      }
-      if (constructed !== el) {
-        throw new TypeError("Custom element constructor did not produce the element being upgraded");
-      }
-      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
-        try { el.connectedCallback(); } catch (e) {}
-      }
-    } catch (e) {
-      el.__customUpgradeFailed = true;
-    }
-  }
-  get(name) { return this._registry.get(name); }
+  get(name) { return _customElementRegistryData(this).registry.get(name); }
   getName(cls) {
+    const state = _customElementRegistryData(this);
     if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'getName' on 'CustomElementRegistry': parameter 1 is not a constructor.");
-    return this._byCtor.has(cls) ? this._byCtor.get(cls) : null;
+    return state.byCtor.has(cls) ? state.byCtor.get(cls) : null;
   }
   whenDefined(name) {
+    const state = _customElementRegistryData(this);
     if (!_isValidCustomElementName(name)) return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError"));
-    const cls = this._registry.get(name);
+    const cls = state.registry.get(name);
     if (cls) return Promise.resolve(cls);
     return new Promise((resolve) => {
-      const list = this._whenDefinedResolvers.get(name) || [];
+      const list = state.resolvers.get(name) || [];
       list.push(resolve);
-      this._whenDefinedResolvers.set(name, list);
+      state.resolvers.set(name, list);
     });
   }
   upgrade(root) {
-    if (!root || !root.querySelectorAll) return;
-    for (const [name, cls] of this._registry.entries()) {
-      const matches = root.querySelectorAll(name);
-      for (const el of matches) this._upgradeElement(el, cls);
+    _customElementRegistryData(this);
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'upgrade' on 'CustomElementRegistry': 1 argument required, but only 0 present.");
+    }
+    _customElementUpgradeRoot(this, root);
+  }
+  initialize(root) {
+    const state = _customElementRegistryData(this);
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'initialize' on 'CustomElementRegistry': 1 argument required, but only 0 present.");
+    }
+    if (root?.customElementRegistry === this) {
+      state.roots.add(root);
+      _customElementUpgradeRoot(this, root);
     }
   }
 }
 globalThis.CustomElementRegistry = CustomElementRegistry;
 globalThis.customElements = new CustomElementRegistry();
+_customElementRegistryData(globalThis.customElements).roots.add(globalThis.document);
+{
+  const prototype = CustomElementRegistry.prototype;
+  const descriptors = Object.getOwnPropertyDescriptors(prototype);
+  for (const name of Object.getOwnPropertyNames(prototype)) delete prototype[name];
+  for (const name of ['define','get','getName','upgrade','whenDefined','initialize']) {
+    const descriptor = descriptors[name]; descriptor.enumerable = true;
+    Object.defineProperty(prototype, name, descriptor);
+  }
+  Object.defineProperty(prototype, 'constructor', descriptors.constructor);
+  Object.defineProperty(prototype, Symbol.toStringTag, {
+    value: 'CustomElementRegistry', configurable: true,
+  });
+}
 globalThis.HTMLUnknownElement = Element;
 // ElementInternals: form-associated custom element internals. Validity/state
 // are JS-observable; ARIA reflection that needs the accessibility tree is not.
@@ -10999,7 +13642,8 @@ globalThis.ElementInternals = class ElementInternals {
 // FILTER_ACCEPT/REJECT/SKIP and most SHOW_* values, so the canonical
 // `acceptNode() { return NodeFilter.FILTER_ACCEPT; }` filter idiom returned
 // undefined and TreeWalker/NodeIterator rejected every node.
-globalThis.NodeFilter = {
+const NodeFilter = ({ NodeFilter() {} }).NodeFilter;
+Object.assign(NodeFilter, {
   SHOW_ALL: 0xFFFFFFFF,
   SHOW_ELEMENT: 0x1,
   SHOW_ATTRIBUTE: 0x2,
@@ -11016,7 +13660,11 @@ globalThis.NodeFilter = {
   FILTER_ACCEPT: 1,
   FILTER_REJECT: 2,
   FILTER_SKIP: 3,
-};
+});
+_markNative(NodeFilter);
+Object.defineProperty(globalThis, 'NodeFilter', {
+  value: NodeFilter, writable: true, enumerable: false, configurable: true,
+});
 // ResizeObserver is defined earlier with real per-target firing; the stub
 // that previously lived here was a no-op that clobbered the real class.
 //
@@ -11426,12 +14074,19 @@ globalThis.DOMException = (function () {
 // a closure-private WeakSet so page JS can neither read nor forge the flag.
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
-const _trustedEvents = new WeakSet();
+const _eventInternalStateRegistrySym = Symbol.for('obscura.eventStateRegistry');
+const _eventInternalStateRegistry = Deno[_eventInternalStateRegistrySym]
+  || (Deno[_eventInternalStateRegistrySym] = {
+  trusted: new WeakSet(), sourceCapabilities: new WeakMap(),
+  events: new WeakMap(), uiEvents: new WeakMap(),
+  mouseEvents: new WeakMap(), pointerEvents: new WeakMap(),
+});
+const _trustedEvents = _eventInternalStateRegistry.trusted;
 // Device input (mouse, keyboard) additionally reports the capabilities of the
 // device it came from through Event.sourceCapabilities; script-built events
 // report null. Same WeakMap discipline as isTrusted: page JS can neither read
 // nor forge the association.
-const _eventSourceCapabilities = new WeakMap();
+const _eventSourceCapabilities = _eventInternalStateRegistry.sourceCapabilities;
 let _mouseInputCaps = null;
 globalThis.__obscura_markTrusted = function(ev) {
   try {
@@ -11453,9 +14108,22 @@ globalThis.__obscura_markTrusted = function(ev) {
 // event is a fingerprint. `acquire` starts a new activation sequence; without
 // it the current id is reused, and the very first call mints id 1.
 let _pointerIdSeq = 0;
+let _pointerNeedsNewActivation = true;
+let _pointerEverPressed = false;
 globalThis.__obscura_pointer_id = function(acquire) {
-  if (acquire || _pointerIdSeq === 0) _pointerIdSeq++;
+  if (_pointerIdSeq === 0) _pointerIdSeq = 1;
+  // A hover can mint the first id before the corresponding press arrives.
+  // Keep that id for the first activation; after a release, the next press
+  // gets a fresh id as Chrome does.
+  if (acquire) {
+    if (_pointerNeedsNewActivation && _pointerEverPressed) _pointerIdSeq++;
+    _pointerNeedsNewActivation = false;
+    _pointerEverPressed = true;
+  }
   return _pointerIdSeq;
+};
+globalThis.__obscura_pointer_release = function() {
+  _pointerNeedsNewActivation = true;
 };
 
 // Write value/checked through the element's *prototype* accessor, skipping any
@@ -11528,15 +14196,64 @@ function _eventTimeStamp() {
   } catch (e) {}
   return 0;
 }
+const _eventState = _eventInternalStateRegistry.events;
+const _uiEventState = _eventInternalStateRegistry.uiEvents;
+const _mouseEventState = _eventInternalStateRegistry.mouseEvents;
+const _pointerEventState = _eventInternalStateRegistry.pointerEvents;
+function _eventData(value) {
+  const state = _eventState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _eventInit(value, type, bubbles, cancelable, composed = false) {
+  const state = _eventData(value);
+  state.type = String(type); state.bubbles = !!bubbles;
+  state.cancelable = !!cancelable; state.composed = !!composed;
+  state.defaultPrevented = false; state.propagationStopped = false;
+  state.immediatePropagationStopped = false;
+}
+function _eventSetEndpoints(value, target, currentTarget) {
+  const state = _eventData(value);
+  state.target = target; state.currentTarget = currentTarget;
+}
+const _eventIsTrusted = function isTrusted() {
+  return _trustedEvents.has(this);
+};
+Object.defineProperty(_eventIsTrusted, 'name', { value:'get isTrusted', configurable:true });
+_markNativeAs(_eventIsTrusted, 'function get isTrusted() { [native code] }');
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=_eventTimeStamp();this._propagationStopped=false;this._immediatePropagationStopped=false;this._dispatching=false;this._eventPath=null;this._eventPathCurrentIndex=-1; }
-  get isTrusted() { return _trustedEvents.has(this); }
-  get sourceCapabilities() { return _eventSourceCapabilities.has(this) ? _eventSourceCapabilities.get(this) : null; }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present.");
+    _eventState.set(this, { type:String(t), bubbles:!!o.bubbles,
+      cancelable:!!o.cancelable, composed:!!o.composed, defaultPrevented:false,
+      target:null, currentTarget:null, eventPhase:0, timeStamp:_eventTimeStamp(),
+      propagationStopped:false, immediatePropagationStopped:false,
+      dispatching:false, path:null, pathCurrentIndex:-1,
+      originalRelatedTarget:undefined });
+    Object.defineProperty(this, 'isTrusted', { get:_eventIsTrusted, enumerable:true });
+  }
+  get type() { return _eventData(this).type; }
+  get target() { return _eventData(this).target; }
+  get currentTarget() { return _eventData(this).currentTarget; }
+  get eventPhase() { return _eventData(this).eventPhase; }
+  get bubbles() { return _eventData(this).bubbles; }
+  get cancelable() { return _eventData(this).cancelable; }
+  get defaultPrevented() { return _eventData(this).defaultPrevented; }
+  get composed() { return _eventData(this).composed; }
+  get timeStamp() { return _eventData(this).timeStamp; }
+  get srcElement() { return _eventData(this).target; }
+  get returnValue() { return !_eventData(this).defaultPrevented; }
+  set returnValue(value) { if (!value) this.preventDefault(); }
+  get cancelBubble() { return _eventData(this).propagationStopped; }
+  set cancelBubble(value) { if (value) _eventData(this).propagationStopped = true; }
+  get NONE() { return 0; }
+  get CAPTURING_PHASE() { return 1; }
+  get AT_TARGET() { return 2; }
+  get BUBBLING_PHASE() { return 3; }
   composedPath() {
-    const tuples = this._eventPath;
-    const currentIndex = this._eventPathCurrentIndex;
+    const state = _eventData(this);
+    const tuples = state.path;
+    const currentIndex = state.pathCurrentIndex;
     if (!tuples || currentIndex < 0) return [];
     return tuples.filter((tuple, index) => {
       for (let i = index; i < tuples.length; i++) {
@@ -11548,7 +14265,19 @@ globalThis.Event = class Event {
       return true;
     }).map(tuple => tuple.invocationTarget);
   }
+  initEvent(type,bubbles,cancelable) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present.");
+    _eventInit(this, type, bubbles, cancelable, false);
+  }
+  preventDefault() { const state=_eventData(this); if(state.cancelable) state.defaultPrevented=true; }
+  stopImmediatePropagation() { const state=_eventData(this); state.propagationStopped=true; state.immediatePropagationStopped=true; }
+  stopPropagation() { _eventData(this).propagationStopped=true; }
 };
+{
+  const descriptor = Object.getOwnPropertyDescriptor(Event.prototype, 'constructor');
+  delete Event.prototype.constructor;
+  Object.defineProperty(Event.prototype, 'constructor', descriptor);
+}
 _markNative(Event);
 // Chrome surfaces the physical device behind trusted input events through
 // Event.sourceCapabilities. The class itself is a window global there, so its
@@ -11566,39 +14295,104 @@ globalThis.CustomEvent = class CustomEvent extends Event {
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
   initCustomEvent(type,bubbles,cancelable,detail) {
-    this.type = type;
-    this.bubbles = !!bubbles;
-    this.cancelable = !!cancelable;
+    _eventInit(this,type,bubbles,cancelable,false);
     this.detail = detail;
   }
 };
+function _mouseEventData(value) {
+  const state = _mouseEventState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _mouseEventSetRelatedTarget(value, relatedTarget) {
+  const state = _mouseEventState.get(value);
+  if (state) state.relatedTarget = relatedTarget;
+  else { try { value.relatedTarget = relatedTarget; } catch (_error) {} }
+}
+function _mouseEventOffset(value) {
+  const state = _mouseEventData(value);
+  const target = _eventData(value).target;
+  if (!target || typeof target.getBoundingClientRect !== 'function') return [0, 0];
+  try {
+    const rect = target.getBoundingClientRect();
+    // Chromium exposes offset coordinates as integer CSS pixels (rounding
+    // fractional layout positions), while layer coordinates retain the
+    // lower pixel boundary. Keep the raw relation available to the layer
+    // getter below so the two standard views do not collapse to 7.5/7.5.
+    return [Math.round(state.clientX - rect.left), Math.round(state.clientY - rect.top)];
+  } catch (_error) { return [0, 0]; }
+}
+function _mouseEventLayer(value) {
+  const state = _mouseEventData(value);
+  const target = _eventData(value).target;
+  if (!target || typeof target.getBoundingClientRect !== 'function') return [0, 0];
+  try {
+    const rect = target.getBoundingClientRect();
+    return [Math.floor(state.clientX - rect.left), Math.floor(state.clientY - rect.top)];
+  } catch (_error) { return [0, 0]; }
+}
 globalThis.MouseEvent = class MouseEvent extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
+  constructor(t,o={}) {
+    super(t,o);
+    _uiEventState.set(this, { view:o.view||null, detail:Number(o.detail)||0 });
+    _mouseEventState.set(this, { screenX:Number(o.screenX)||0,
+      screenY:Number(o.screenY)||0, clientX:Number(o.clientX)||0,
+      clientY:Number(o.clientY)||0, ctrlKey:!!o.ctrlKey,
+      shiftKey:!!o.shiftKey, altKey:!!o.altKey, metaKey:!!o.metaKey,
+      button:Number(o.button)||0, buttons:Number(o.buttons)||0,
+      relatedTarget:o.relatedTarget||null, movementX:Number(o.movementX)||0,
+      movementY:Number(o.movementY)||0 });
+  }
+  get screenX() { return _mouseEventData(this).screenX; }
+  get screenY() { return _mouseEventData(this).screenY; }
+  get clientX() { return _mouseEventData(this).clientX; }
+  get clientY() { return _mouseEventData(this).clientY; }
+  get ctrlKey() { return _mouseEventData(this).ctrlKey; }
+  get shiftKey() { return _mouseEventData(this).shiftKey; }
+  get altKey() { return _mouseEventData(this).altKey; }
+  get metaKey() { return _mouseEventData(this).metaKey; }
+  get button() { return _mouseEventData(this).button; }
+  get buttons() { return _mouseEventData(this).buttons; }
+  get relatedTarget() { return _mouseEventData(this).relatedTarget; }
+  get pageX() { return this.clientX + (Number(globalThis.scrollX)||0); }
+  get pageY() { return this.clientY + (Number(globalThis.scrollY)||0); }
+  get x() { return this.clientX; }
+  get y() { return this.clientY; }
+  get offsetX() { return _mouseEventOffset(this)[0]; }
+  get offsetY() { return _mouseEventOffset(this)[1]; }
+  get movementX() { return _mouseEventData(this).movementX; }
+  get movementY() { return _mouseEventData(this).movementY; }
+  get fromElement() { return this.type==='mouseover' ? this.relatedTarget : this.target; }
+  get toElement() { return this.type==='mouseout' ? this.relatedTarget : this.target; }
+  get layerX() { return _mouseEventLayer(this)[0]; }
+  get layerY() { return _mouseEventLayer(this)[1]; }
+  getModifierState(key) { return !!({Alt:this.altKey,AltGraph:false,
+    Control:this.ctrlKey,Meta:this.metaKey,Shift:this.shiftKey}[String(key)]); }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
-    this.detail=detail||0;
-    this.screenX=screenX||0;
-    this.screenY=screenY||0;
-    this.clientX=clientX||0;
-    this.clientY=clientY||0;
-    this.ctrlKey=!!ctrlKey;
-    this.altKey=!!altKey;
-    this.shiftKey=!!shiftKey;
-    this.metaKey=!!metaKey;
-    this.button=button||0;
-    this.relatedTarget=relatedTarget===undefined?null:relatedTarget;
+    _eventInit(this,type,canBubble,cancelable,false);
+    _uiEventState.set(this,{view:view===undefined?null:view,detail:detail||0});
+    _mouseEventState.set(this,{screenX:screenX||0,screenY:screenY||0,
+      clientX:clientX||0,clientY:clientY||0,ctrlKey:!!ctrlKey,
+      shiftKey:!!shiftKey,altKey:!!altKey,metaKey:!!metaKey,
+      button:button||0,buttons:0,
+      relatedTarget:relatedTarget===undefined?null:relatedTarget,
+      movementX:0,movementY:0});
   }
 };
+{
+  const descriptor=Object.getOwnPropertyDescriptor(MouseEvent.prototype,'constructor');
+  delete MouseEvent.prototype.constructor;
+  Object.defineProperty(MouseEvent.prototype,'constructor',descriptor);
+}
 globalThis.KeyboardEvent = class KeyboardEvent extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
   // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
   initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
+    _eventInit(this,type,canBubble,cancelable,false);
+    _uiEventState.set(this,{view:view===undefined?null:view,detail:0});
     this.key=key===undefined?"":String(key);
     this.location=location||0;
     this.ctrlKey=!!ctrlKey;
@@ -11607,24 +14401,68 @@ globalThis.KeyboardEvent = class KeyboardEvent extends Event {
     this.metaKey=!!metaKey;
   }
 };
-globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
-globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
+globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.relatedTarget=o.relatedTarget||null; } };
+globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class ErrorEvent extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
-  constructor(t,o={}) { super(t,o); this.pointerId=o.pointerId||0; this.width=o.width||1; this.height=o.height||1; this.pressure=o.pressure||0; this.pointerType=o.pointerType === undefined ? '' : String(o.pointerType); this.isPrimary=!!o.isPrimary; this.tiltX=o.tiltX||0; this.tiltY=o.tiltY||0; this.tangentialPressure=o.tangentialPressure||0; this.twist=o.twist||0; }
+  constructor(t,o={}) {
+    super(t,o);
+    _pointerEventState.set(this,{pointerId:Number(o.pointerId)||0,
+      width:Number(o.width)||1,height:Number(o.height)||1,
+      pressure:Number(o.pressure)||0,tiltX:Number(o.tiltX)||0,
+      tiltY:Number(o.tiltY)||0,
+      azimuthAngle:o.azimuthAngle===undefined?0:Number(o.azimuthAngle),
+      altitudeAngle:o.altitudeAngle===undefined?Math.PI/2:Number(o.altitudeAngle),
+      tangentialPressure:Number(o.tangentialPressure)||0,
+      twist:Number(o.twist)||0,
+      pointerType:o.pointerType===undefined?'':String(o.pointerType),
+      isPrimary:!!o.isPrimary,persistentDeviceId:Number(o.persistentDeviceId)||0});
+  }
+  get pointerId(){return _pointerEventState.get(this)?.pointerId??0;}
+  get width(){return _pointerEventState.get(this)?.width??1;}
+  get height(){return _pointerEventState.get(this)?.height??1;}
+  get pressure(){return _pointerEventState.get(this)?.pressure??0;}
+  get tiltX(){return _pointerEventState.get(this)?.tiltX??0;}
+  get tiltY(){return _pointerEventState.get(this)?.tiltY??0;}
+  get azimuthAngle(){return _pointerEventState.get(this)?.azimuthAngle??0;}
+  get altitudeAngle(){return _pointerEventState.get(this)?.altitudeAngle??Math.PI/2;}
+  get tangentialPressure(){return _pointerEventState.get(this)?.tangentialPressure??0;}
+  get twist(){return _pointerEventState.get(this)?.twist??0;}
+  get pointerType(){return _pointerEventState.get(this)?.pointerType??'';}
+  get isPrimary(){return _pointerEventState.get(this)?.isPrimary??false;}
+  getPredictedEvents(){return [];}
+  get persistentDeviceId(){return _pointerEventState.get(this)?.persistentDeviceId??0;}
+  getCoalescedEvents(){return [];}
 };
+{
+  const ctor=Object.getOwnPropertyDescriptor(PointerEvent.prototype,'constructor');
+  const coalesced=Object.getOwnPropertyDescriptor(PointerEvent.prototype,'getCoalescedEvents');
+  delete PointerEvent.prototype.constructor;
+  delete PointerEvent.prototype.getCoalescedEvents;
+  Object.defineProperty(PointerEvent.prototype,'constructor',ctor);
+  Object.defineProperty(PointerEvent.prototype,'getCoalescedEvents',coalesced);
+}
 globalThis.AnimationEvent = class AnimationEvent extends Event {};
 globalThis.TransitionEvent = class TransitionEvent extends Event {};
 globalThis.UIEvent = class UIEvent extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0; }
+  constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0}); }
+  get view(){return _uiEventState.get(this)?.view??null;}
+  get detail(){return _uiEventState.get(this)?.detail??0;}
+  get sourceCapabilities(){return _eventSourceCapabilities.has(this)?_eventSourceCapabilities.get(this):null;}
+  get which(){return 0;}
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initUIEvent(type,canBubble,cancelable,view,detail) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
-    this.detail=detail||0;
+    _eventInit(this,type,canBubble,cancelable,false);
+    _uiEventState.set(this,{view:view===undefined?null:view,detail:detail||0});
   }
 };
+for (const ctor of [MouseEvent, KeyboardEvent, FocusEvent, InputEvent]) {
+  try {
+    Object.setPrototypeOf(ctor.prototype, UIEvent.prototype);
+    Object.setPrototypeOf(ctor, UIEvent);
+  } catch (_error) {}
+}
 // WheelEvent inherits all MouseEvent coordinates and modifier state. CDP
 // Input.dispatchMouseEvent supplies those fields and automation libraries use
 // them to distinguish wheel gestures over nested panes.
@@ -11633,15 +14471,19 @@ globalThis.WheelEvent = class WheelEvent extends MouseEvent {
 };
 
 globalThis.CompositionEvent = class CompositionEvent extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.data=o.data||""; }
+  constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.data=o.data||""; }
   // Legacy DOM Level 3 initializer. Positional signature per UI Events spec.
   initCompositionEvent(type,canBubble,cancelable,view,data) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initCompositionEvent' on 'CompositionEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
+    _eventInit(this,type,canBubble,cancelable,false);
+    _uiEventState.set(this,{view:view===undefined?null:view,detail:0});
     this.data=data===undefined?"":String(data);
   }
 };
+try {
+  Object.setPrototypeOf(CompositionEvent.prototype, UIEvent.prototype);
+  Object.setPrototypeOf(CompositionEvent, UIEvent);
+} catch (_error) {}
 globalThis.PopStateEvent = class PopStateEvent extends Event {
   constructor(type, init) {
     super(type, init || {});
@@ -11747,7 +14589,7 @@ _markNative(globalThis.StorageEvent);
       ? reason
       : new DOMException("signal is aborted without reason", "AbortError");
     const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
-    try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
+    try { if (evt instanceof Event) _eventSetEndpoints(evt, signal, signal); } catch (_) {}
     emit(signal, evt);
   }
   globalThis.AbortSignal = class AbortSignal {
@@ -11809,11 +14651,30 @@ _markNative(globalThis.StorageEvent);
   _markNative(globalThis.AbortSignal);
   _markNative(globalThis.AbortController);
 })();
+const _blobState = new WeakMap();
+const _fileState = new WeakMap();
+const _blobData = value => {
+  const state = _blobState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+};
+const _fileData = value => {
+  const state = _fileState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+};
+const _blobBytes = value => {
+  const state = value != null && (typeof value === 'object' || typeof value === 'function')
+    ? _blobState.get(value)
+    : null;
+  return state ? state.bytes : null;
+};
+
 // Normalize one Blob part to bytes. `native` newline normalization applies to
 // string parts when the Blob/File `endings` option is "native".
 function _blobPartToBytes(p, native) {
-  if (p == null) return new Uint8Array(0);
-  if (typeof Blob === "function" && p instanceof Blob) return p._bytes || new Uint8Array(0);
+  const blobBytes = _blobBytes(p);
+  if (blobBytes) return blobBytes;
   if (p instanceof ArrayBuffer) return new Uint8Array(p.slice(0));
   if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer.slice(p.byteOffset, p.byteOffset + p.byteLength));
   let s = String(p);
@@ -11834,36 +14695,94 @@ if (typeof Blob === "undefined") globalThis.Blob = class Blob {
     }
     const data = new Uint8Array(total); let off = 0;
     for (const c of chunks) { data.set(c, off); off += c.length; }
-    this._bytes = data;
-    this.size = total;
     const t = opts.type != null ? String(opts.type) : "";
-    this.type = /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "";
+    _blobState.set(this, {
+      bytes: data,
+      type: /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "",
+    });
   }
-  get [Symbol.toStringTag]() { return "Blob"; }
+  get size() { return _blobData(this).bytes.length; }
+  get type() { return _blobData(this).type; }
+  arrayBuffer() { return Promise.resolve(_arrayBufferFromBytes(_blobData(this).bytes)); }
   slice(start, end, contentType) {
-    const len = this.size;
+    const state = _blobData(this);
+    const len = state.bytes.length;
     const s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
     let e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
     if (e < s) e = s;
-    const out = new Blob([], contentType != null ? { type: contentType } : {});
-    out._bytes = this._bytes.slice(s, e);
-    out.size = out._bytes.length;
-    return out;
+    return new Blob([state.bytes.slice(s, e)], contentType != null ? { type: contentType } : {});
   }
-  text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
-  arrayBuffer() { return Promise.resolve(_arrayBufferFromBytes(this._bytes)); }
-  bytes() { return Promise.resolve(this._bytes.slice()); }
+  stream() {
+    const bytes = _blobData(this).bytes.slice();
+    return new ReadableStream({
+      start(controller) { controller.enqueue(bytes); controller.close(); },
+    });
+  }
+  text() { return Promise.resolve(new TextDecoder().decode(_blobData(this).bytes)); }
+  bytes() { return Promise.resolve(_blobData(this).bytes.slice()); }
+  textStream() {
+    const text = new TextDecoder().decode(_blobData(this).bytes);
+    return new ReadableStream({
+      start(controller) { controller.enqueue(text); controller.close(); },
+    });
+  }
 };
 if (typeof File === "undefined") globalThis.File = class File extends Blob {
   constructor(parts, name, opts) {
     if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
     opts = opts || {};
     super(parts, opts);
-    this.name = String(name);
-    this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
+    const modified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
+    _fileState.set(this, {
+      name: String(name),
+      lastModified: Number.isFinite(modified) ? Math.trunc(modified) : 0,
+    });
   }
-  get [Symbol.toStringTag]() { return "File"; }
+  get name() { return _fileData(this).name; }
+  get lastModified() { return _fileData(this).lastModified; }
+  get lastModifiedDate() { return new Date(_fileData(this).lastModified); }
+  get webkitRelativePath() { _fileData(this); return ''; }
 };
+
+// Web IDL attributes and operations are enumerable prototype members. Re-add
+// them in Chrome's interface order after class syntax creates `constructor`
+// first and non-enumerable methods.
+const _blobPrototype = globalThis.Blob.prototype;
+const _filePrototype = globalThis.File.prototype;
+const _blobDescriptors = Object.getOwnPropertyDescriptors(_blobPrototype);
+const _fileDescriptors = Object.getOwnPropertyDescriptors(_filePrototype);
+Object.defineProperty(_blobDescriptors.slice.value, 'length', {value: 0, configurable: true});
+for (const name of Object.getOwnPropertyNames(_blobPrototype)) delete _blobPrototype[name];
+for (const name of Object.getOwnPropertyNames(_filePrototype)) delete _filePrototype[name];
+for (const name of ['size', 'type', 'arrayBuffer', 'slice', 'stream', 'text', 'bytes', 'textStream']) {
+  const descriptor = _blobDescriptors[name];
+  descriptor.enumerable = true;
+  Object.defineProperty(_blobPrototype, name, descriptor);
+}
+Object.defineProperty(_blobPrototype, 'constructor', _blobDescriptors.constructor);
+for (const name of ['name', 'lastModified', 'lastModifiedDate', 'webkitRelativePath']) {
+  const descriptor = _fileDescriptors[name];
+  descriptor.enumerable = true;
+  Object.defineProperty(_filePrototype, name, descriptor);
+}
+Object.defineProperty(_filePrototype, 'constructor', _fileDescriptors.constructor);
+Object.defineProperty(_blobPrototype, Symbol.toStringTag, {
+  value: 'Blob', writable: false, enumerable: false, configurable: true,
+});
+Object.defineProperty(_filePrototype, Symbol.toStringTag, {
+  value: 'File', writable: false, enumerable: false, configurable: true,
+});
+Object.defineProperty(globalThis.Blob, 'length', {value: 0, configurable: true});
+Object.defineProperty(globalThis.File, 'length', {value: 2, configurable: true});
+_markNative(globalThis.Blob);
+_markNative(globalThis.File);
+for (const name of ['size', 'type']) _markNative(_blobDescriptors[name].get);
+for (const name of ['arrayBuffer', 'slice', 'stream', 'text', 'bytes', 'textStream']) {
+  _markNative(_blobDescriptors[name].value);
+}
+for (const name of ['name', 'lastModified', 'lastModifiedDate', 'webkitRelativePath']) {
+  _markNative(_fileDescriptors[name].get);
+}
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
@@ -11872,29 +14791,15 @@ function _formEncode(s){
   return encodeURIComponent(String(s)).replace(/%20/g,'+').replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 }
 function _hexv(c){ if(c>=48&&c<=57)return c-48; if(c>=65&&c<=70)return c-55; if(c>=97&&c<=102)return c-87; return -1; }
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class URLSearchParams {
-  constructor(init=""){
-    this._p=[];
-    this._url=null; // set by URL.searchParams so mutations write back to the URL
-    if (typeof URLSearchParams === 'function' && init instanceof URLSearchParams) {
-      this._p = init._p.map(pair => [pair[0], pair[1]]);
-    } else if(typeof init==="string"){
-      this._parseString(init);
-    } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) {
-        const a = Array.from(pair);
-        if (a.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Each query pair must be an iterable [name, value] tuple");
-        this._p.push([String(a[0]), String(a[1])]);
-      }
-    } else if (init && typeof init === 'object') {
-      Object.keys(init).forEach(k => this._p.push([String(k), String(init[k])]));
-    }
-  }
-  _decode(s){
-    // application/x-www-form-urlencoded percent-decoding: decode each valid %XX
-    // byte, leave invalid escapes literal (decodeURIComponent throws on the whole
-    // string instead), '+' -> space, then UTF-8 decode the resulting bytes.
-    s = String(s);
+if (typeof URLSearchParams === "undefined") {
+  const state = new WeakMap();
+  const data = value => {
+    const stored = state.get(value);
+    if (!stored) throw new TypeError('Illegal invocation');
+    return stored;
+  };
+  const decode = value => {
+    const s = String(value);
     const out = [];
     for (let i = 0; i < s.length; i++) {
       const c = s.charCodeAt(i);
@@ -11906,35 +14811,66 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
       else { const e = new TextEncoder().encode(s[i]); for (let j = 0; j < e.length; j++) out.push(e[j]); }
     }
     try { return new TextDecoder().decode(new Uint8Array(out)); } catch (e) { return s; }
-  }
-  _parseString(s){
-    s = String(s).replace(/^\?/, "");
-    if (s === "") return;
+  };
+  const parseString = value => {
+    const pairs = [];
+    const s = String(value).replace(/^\?/, "");
+    if (s === "") return pairs;
     for (const pair of s.split("&")) {
       if (pair === "") continue;
       const i = pair.indexOf("=");
       const k = i === -1 ? pair : pair.slice(0, i);
       const v = i === -1 ? "" : pair.slice(i + 1);
-      this._p.push([this._decode(k), this._decode(v)]);
+      pairs.push([decode(k), decode(v)]);
     }
-  }
-  _setFromString(s){ this._p = []; this._parseString(s); }
-  _notify(){ if (this._url) this._url._updateSearch(this.toString()); }
-  append(k,v){ this._p.push([String(k),String(v)]); this._notify(); }
-  get(k){k=String(k); const p=this._p.find(([key])=>key===k); return p?p[1]:null;}
-  getAll(k){k=String(k); return this._p.filter(([key])=>key===k).map(pair=>pair[1]);}
-  set(k,v){k=String(k); v=String(v); let done=false; const out=[]; for (const pair of this._p){ if(pair[0]===k){ if(!done){ out.push([k,v]); done=true; } } else out.push(pair); } if(!done) out.push([k,v]); this._p=out; this._notify(); }
-  delete(k,v){k=String(k); const hv=(v!==undefined); v=String(v); this._p=this._p.filter(([key,val])=> hv ? !(key===k&&val===v) : key!==k); this._notify();}
-  has(k,v){k=String(k); const hv=(v!==undefined); v=String(v); return this._p.some(([key,val])=> hv ? (key===k&&val===v) : key===k);}
-  sort(){ this._p.sort((a,b)=> a[0]<b[0]?-1:(a[0]>b[0]?1:0)); this._notify(); }
-  get size(){ return this._p.length; }
-  toString(){return this._p.map(pair=>_formEncode(pair[0])+"="+_formEncode(pair[1])).join("&");}
-  forEach(cb,thisArg){this._p.slice().forEach(pair=>cb.call(thisArg,pair[1],pair[0],this));}
-  *entries(){ for (const pair of this._p) yield [pair[0],pair[1]]; }
-  *keys(){ for (const pair of this._p) yield pair[0]; }
-  *values(){ for (const pair of this._p) yield pair[1]; }
-  [Symbol.iterator](){ return this.entries(); }
-};
+    return pairs;
+  };
+  const serialize = pairs => pairs.map(pair =>
+    _formEncode(pair[0]) + "=" + _formEncode(pair[1])).join("&");
+  const notify = value => {
+    const stored = data(value);
+    if (stored.url) _urlUpdateSearch(stored.url, serialize(stored.pairs));
+  };
+  const URLSearchParamsImpl = class URLSearchParams {
+    constructor(init=""){
+      let pairs = [];
+      if (typeof URLSearchParams === 'function' && init instanceof URLSearchParams) {
+        pairs = data(init).pairs.map(pair => [pair[0], pair[1]]);
+      } else if(typeof init==="string"){
+        pairs = parseString(init);
+      } else if (init && typeof init[Symbol.iterator] === 'function') {
+        for (const pair of init) {
+          const a = Array.from(pair);
+          if (a.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Each query pair must be an iterable [name, value] tuple");
+          pairs.push([String(a[0]), String(a[1])]);
+        }
+      } else if (init && typeof init === 'object') {
+        Object.keys(init).forEach(k => pairs.push([String(k), String(init[k])]));
+      }
+      state.set(this, { pairs, url: null });
+    }
+    get size(){ return data(this).pairs.length; }
+    append(k,v){ data(this).pairs.push([String(k),String(v)]); notify(this); }
+    delete(k,v){ const stored=data(this); k=String(k); const hv=(v!==undefined); v=String(v); stored.pairs=stored.pairs.filter(([key,val])=> hv ? !(key===k&&val===v) : key!==k); notify(this);}
+    get(k){k=String(k); const p=data(this).pairs.find(([key])=>key===k); return p?p[1]:null;}
+    getAll(k){k=String(k); return data(this).pairs.filter(([key])=>key===k).map(pair=>pair[1]);}
+    has(k,v){k=String(k); const hv=(v!==undefined); v=String(v); return data(this).pairs.some(([key,val])=> hv ? (key===k&&val===v) : key===k);}
+    set(k,v){const stored=data(this); k=String(k); v=String(v); let done=false; const out=[]; for (const pair of stored.pairs){ if(pair[0]===k){ if(!done){ out.push([k,v]); done=true; } } else out.push(pair); } if(!done) out.push([k,v]); stored.pairs=out; notify(this); }
+    sort(){ const stored=data(this); stored.pairs.sort((a,b)=> a[0]<b[0]?-1:(a[0]>b[0]?1:0)); notify(this); }
+    toString(){return serialize(data(this).pairs);}
+    *entries(){ for (const pair of data(this).pairs) yield [pair[0],pair[1]]; }
+    forEach(cb,thisArg){data(this).pairs.slice().forEach(pair=>cb.call(thisArg,pair[1],pair[0],this));}
+    *keys(){ for (const pair of data(this).pairs) yield pair[0]; }
+    *values(){ for (const pair of data(this).pairs) yield pair[1]; }
+    [Symbol.iterator](){ return this.entries(); }
+  };
+  const constructorDescriptor = Object.getOwnPropertyDescriptor(URLSearchParamsImpl.prototype, 'constructor');
+  delete URLSearchParamsImpl.prototype.constructor;
+  Object.defineProperty(URLSearchParamsImpl.prototype, 'constructor', constructorDescriptor);
+  globalThis.URLSearchParams = URLSearchParamsImpl;
+  _urlSearchParamsBind = (params, url) => { data(params).url = url; };
+  _urlSearchParamsSetFromString = (params, value) => { data(params).pairs = parseString(value); };
+}
 
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
@@ -11993,6 +14929,17 @@ function _xmlWellFormed(src) {
   return stack.length === 0 && rootsClosed === 1;
 }
 
+const _detachedDocumentPrototypeMethods = new Set([
+  "createTreeWalker", "createNodeIterator", "querySelector", "querySelectorAll",
+  "getElementById", "getElementsByTagName", "getElementsByClassName",
+  "getElementsByName", "createElement", "createElementNS", "createTextNode",
+  "createComment", "createDocumentFragment", "createRange", "createEvent",
+  "createCDATASection", "createProcessingInstruction", "adoptNode", "importNode",
+  "addEventListener", "removeEventListener", "dispatchEvent",
+  "contains", "hasChildNodes", "compareDocumentPosition", "getRootNode",
+  "isEqualNode", "isSameNode",
+]);
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -12027,6 +14974,50 @@ globalThis.DOMParser = class DOMParser {
 
     const findByTagName = (name) => walk(root, n => n.tagName === name);
 
+    // `innerHTML` above is a fragment parse, while DOMParser's text/html mode
+    // parses a complete document. Normalize the fragment result into the
+    // document skeleton the full parser always creates, and place loose nodes
+    // where the HTML tree builder would put them.
+    if (!isXml) {
+      const directChild = (name) => {
+        const children = root.children || [];
+        for (let i = 0; i < children.length; i++) {
+          if (children[i].tagName === name) return children[i];
+        }
+        return null;
+      };
+      const looseNodes = Array.from(root.childNodes || []);
+      let head = directChild("HEAD");
+      let body = directChild("BODY");
+      if (!head) {
+        head = document.createElement("head");
+        root.insertBefore(head, body || root.firstChild);
+      }
+      if (!body) {
+        body = document.createElement("body");
+        root.appendChild(body);
+      }
+      const headNames = new Set([
+        "BASE", "BASEFONT", "BGSOUND", "LINK", "META", "NOFRAMES",
+        "SCRIPT", "STYLE", "TEMPLATE", "TITLE",
+      ]);
+      let bodyStarted = (body.childNodes || []).length > 0;
+      for (const node of looseNodes) {
+        if (node === head || node === body) continue;
+        const headNode = !bodyStarted && node.nodeType === 1
+          && headNames.has(node.tagName);
+        if (headNode) {
+          head.appendChild(node);
+          continue;
+        }
+        if (node.nodeType !== 3 || /\S/.test(node.textContent || "")) {
+          bodyStarted = true;
+        }
+        body.appendChild(node);
+      }
+    }
+
+    let exposedDocument = null;
     const docNode = {
       _root: root,
       nodeName: "#document",
@@ -12088,24 +15079,26 @@ globalThis.DOMParser = class DOMParser {
       getElementsByName(n) {
         return root.querySelectorAll(`[name="${n}"]`);
       },
-      createElement: (t) => document.createElement(t),
-      createElementNS: (ns, t) => document.createElement(t),
-      createTextNode: (t) => document.createTextNode(t),
-      createComment: (t) => document.createComment(t),
-      createDocumentFragment: () => document.createDocumentFragment(),
+      createElement: (t) => _stampDetachedDocumentNode(exposedDocument, document.createElement(t)),
+      createElementNS: (ns, t) => _stampDetachedDocumentNode(exposedDocument, document.createElementNS(ns, t)),
+      createTextNode: (t) => _stampDetachedDocumentNode(exposedDocument, document.createTextNode(t)),
+      createComment: (t) => _stampDetachedDocumentNode(exposedDocument, document.createComment(t)),
+      createDocumentFragment: () => _stampDetachedDocumentNode(exposedDocument, document.createDocumentFragment()),
       createRange: () => new Range(),
       createEvent: (type) => document.createEvent(type),
       createCDATASection: (data) => {
         if (mimeType === "text/html") throw new DOMException("createCDATASection is not supported in HTML documents", "NotSupportedError");
         const s = String(data);
         if (s.indexOf("]]>") !== -1) throw new DOMException("CDATA section data must not contain ']]>'", "InvalidCharacterError");
-        return new CDATASection(+_dom("create_text_node", s));
+        return _stampDetachedDocumentNode(
+          exposedDocument, new CDATASection(+_dom("create_text_node", s)));
       },
       createProcessingInstruction: (target, data) => {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        return _stampDetachedDocumentNode(
+          exposedDocument, new ProcessingInstruction(+_dom("create_text_node", s), t));
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
@@ -12124,7 +15117,38 @@ globalThis.DOMParser = class DOMParser {
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
     _detachedDocumentBrand.add(docNode);
-    return docNode;
+    const prototype = isXml
+      ? globalThis.XMLDocument?.prototype
+      : globalThis.HTMLDocument?.prototype;
+    if (prototype) Object.setPrototypeOf(docNode, prototype);
+    Object.defineProperty(docNode, "location", {
+      get() { return null; },
+      set(_value) {},
+      enumerable: true,
+      configurable: false,
+    });
+    exposedDocument = new Proxy(docNode, {
+      get(target, key, receiver) {
+        if (_detachedDocumentPrototypeMethods.has(key)) {
+          return Reflect.get(Document.prototype, key, receiver);
+        }
+        return Reflect.get(target, key, receiver);
+      },
+      ownKeys(target) {
+        return ["location", ...Reflect.ownKeys(target).filter(key => typeof key === "symbol")];
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "location" || typeof key === "symbol") {
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        }
+        return undefined;
+      },
+    });
+    _detachedDocumentBrand.add(exposedDocument);
+    _detachedNodeOwners.set(exposedDocument, exposedDocument);
+    _detachedNodeOwners.set(root, exposedDocument);
+    _detachedRootOwners.set(root[_nidSym], exposedDocument);
+    return exposedDocument;
   }
 };
 globalThis.XMLSerializer = class XMLSerializer {
@@ -12196,7 +15220,7 @@ globalThis.performance = globalThis.performance || {
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
   navigation: { type: 0, redirectCount: 0 },
   memory: {
-    jsHeapSizeLimit: 4294705152,
+    jsHeapSizeLimit: 4395630592,
     totalJSHeapSize: 19321856,
     usedJSHeapSize: 16781520,
   },
@@ -12233,6 +15257,59 @@ class Performance {
 Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: 'Performance' });
 Object.setPrototypeOf(globalThis.performance, Performance.prototype);
 globalThis.Performance = Performance;
+
+const _initialMemoryInfo = globalThis.performance.memory || {};
+const _memoryInfoBacking = {
+  jsHeapSizeLimit: Number(_initialMemoryInfo.jsHeapSizeLimit) || 4395630592,
+  totalJSHeapSize: Number(_initialMemoryInfo.totalJSHeapSize) || 19321856,
+  usedJSHeapSize: Number(_initialMemoryInfo.usedJSHeapSize) || 16781520,
+};
+const _memoryInfoInstances = new WeakSet();
+const _memoryInfoPrototype = {};
+function _memoryInfoValue(receiver, name) {
+  if (!_memoryInfoInstances.has(receiver)) throw new TypeError('Illegal invocation');
+  return _memoryInfoBacking[name];
+}
+const _memoryInfoGetterHolders = {
+  totalJSHeapSize: { get totalJSHeapSize() { return _memoryInfoValue(this, 'totalJSHeapSize'); } },
+  usedJSHeapSize: { get usedJSHeapSize() { return _memoryInfoValue(this, 'usedJSHeapSize'); } },
+  jsHeapSizeLimit: { get jsHeapSizeLimit() { return _memoryInfoValue(this, 'jsHeapSizeLimit'); } },
+};
+for (const name of ['totalJSHeapSize', 'usedJSHeapSize', 'jsHeapSizeLimit']) {
+  const getter = Object.getOwnPropertyDescriptor(_memoryInfoGetterHolders[name], name).get;
+  _markNative(getter);
+  Object.defineProperty(_memoryInfoPrototype, name, {
+    get: getter, set: undefined, enumerable: true, configurable: true,
+  });
+}
+Object.defineProperty(_memoryInfoPrototype, Symbol.toStringTag, {
+  value: 'MemoryInfo', writable: false, enumerable: false, configurable: true,
+});
+function _newMemoryInfo() {
+  const info = Object.create(_memoryInfoPrototype);
+  _memoryInfoInstances.add(info);
+  return info;
+}
+
+delete globalThis.performance.memory;
+const _performanceMemoryGetter = Object.getOwnPropertyDescriptor({
+  get memory() { return _newMemoryInfo(); },
+}, 'memory').get;
+_markNative(_performanceMemoryGetter);
+Object.defineProperty(Performance.prototype, 'memory', {
+  get: _performanceMemoryGetter, set: undefined, enumerable: true, configurable: true,
+});
+
+const _consoleMemoryGetter = function() { return _newMemoryInfo(); };
+const _consoleMemorySetter = function(_value) {};
+Object.defineProperty(_consoleMemoryGetter, 'name', { value: '', configurable: true });
+Object.defineProperty(_consoleMemorySetter, 'name', { value: '', configurable: true });
+_markNativeAs(_consoleMemoryGetter, 'function () { [native code] }');
+_markNativeAs(_consoleMemorySetter, 'function () { [native code] }');
+Object.defineProperty(globalThis.console, 'memory', {
+  get: _consoleMemoryGetter, set: _consoleMemorySetter,
+  enumerable: true, configurable: true,
+});
 
 // W3C Performance Timeline / User Timing / Resource Timing. Entries are fed
 // by real transport and lifecycle milestones through the two internal hooks;
@@ -12481,7 +15558,7 @@ function _documentAllNamed(elements, key) {
   if (!named.length) return undefined;
   // One match answers with the element; several answer with a collection, as
   // named access does everywhere else.
-  return named.length === 1 ? named[0] : HTMLCollection._from(named);
+  return named.length === 1 ? named[0] : _htmlCollectionFrom(named);
 }
 globalThis.__obscura_document_all_resolve = function (kind, key) {
   try {
@@ -13583,10 +16660,132 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = Element;
+const _linkConstructionKey = Symbol('HTMLLinkElement construction');
+class HTMLLinkElement extends Element {
+  constructor(...args) {
+    if (args.length !== 2 || args[1] !== _linkConstructionKey) {
+      throw new TypeError("Failed to construct 'HTMLLinkElement': Illegal constructor");
+    }
+    super(args[0]);
+  }
+  get disabled() { return this.hasAttribute('disabled'); }
+  set disabled(value) {
+    if (value) this.setAttribute('disabled', '');
+    else this.removeAttribute('disabled');
+  }
+  get href() {
+    const raw = this.getAttribute('href');
+    if (raw === null) return '';
+    const resolved = _urlResolveOp(raw, _anchorBase());
+    return resolved === null ? raw : resolved;
+  }
+  set href(value) { this.setAttribute('href', value); }
+  get crossOrigin() { return this.getAttribute('crossorigin'); }
+  set crossOrigin(value) {
+    if (value === null || value === undefined) this.removeAttribute('crossorigin');
+    else this.setAttribute('crossorigin', String(value));
+  }
+  get rel() { return this.getAttribute('rel') || ''; }
+  set rel(value) { this.setAttribute('rel', String(value)); }
+  get relList() {
+    return Object.getOwnPropertyDescriptor(Element.prototype, 'relList').get.call(this);
+  }
+  get media() { return this.getAttribute('media') || ''; }
+  set media(value) { this.setAttribute('media', String(value)); }
+  get as() { return this.getAttribute('as') || ''; }
+  set as(value) { this.setAttribute('as', String(value)); }
+  get type() { return this.getAttribute('type') || ''; }
+  set type(value) { this.setAttribute('type', String(value)); }
+  get hreflang() { return this.getAttribute('hreflang') || ''; }
+  set hreflang(value) { this.setAttribute('hreflang', String(value)); }
+  get referrerPolicy() { return this.getAttribute('referrerpolicy') || ''; }
+  set referrerPolicy(value) { this.setAttribute('referrerpolicy', String(value)); }
+  get fetchPriority() { return this.getAttribute('fetchpriority') || 'auto'; }
+  set fetchPriority(value) { this.setAttribute('fetchpriority', String(value)); }
+  get sizes() {
+    return Object.getOwnPropertyDescriptor(Element.prototype, 'sizes').get.call(this);
+  }
+  get target() { return this.getAttribute('target') || ''; }
+  set target(value) { this.setAttribute('target', String(value)); }
+  get sheet() {
+    return Object.getOwnPropertyDescriptor(Element.prototype, 'sheet').get.call(this);
+  }
+  get integrity() { return this.getAttribute('integrity') || ''; }
+  set integrity(value) { this.setAttribute('integrity', String(value)); }
+  get blocking() { return this.getAttribute('blocking') || ''; }
+  set blocking(value) { this.setAttribute('blocking', String(value)); }
+  get imageSrcset() { return this.getAttribute('imagesrcset') || ''; }
+  set imageSrcset(value) { this.setAttribute('imagesrcset', String(value)); }
+  get imageSizes() { return this.getAttribute('imagesizes') || ''; }
+  set imageSizes(value) { this.setAttribute('imagesizes', String(value)); }
+  get charset() { return this.getAttribute('charset') || ''; }
+  set charset(value) { this.setAttribute('charset', String(value)); }
+  get rev() { return this.getAttribute('rev') || ''; }
+  set rev(value) { this.setAttribute('rev', String(value)); }
+  get [Symbol.toStringTag]() { return 'HTMLLinkElement'; }
+}
+_markNative(HTMLLinkElement);
+for (const name of Object.getOwnPropertyNames(HTMLLinkElement.prototype)) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, name);
+  if (descriptor?.get) _markNative(descriptor.get);
+  if (descriptor?.set) _markNative(descriptor.set);
+  if (descriptor?.value) _markNative(descriptor.value);
+}
+// HTMLInputElement has its own WebIDL prototype in Chromium. Most input
+// behavior is implemented on Element for the shared DOM fast path, but the
+// dedicated wrapper is required for instanceof and Object#toString branding.
+const _inputConstructionKey = Symbol('HTMLInputElement construction');
+class HTMLInputElement extends Element {
+  constructor(nid, key) {
+    if (key !== _inputConstructionKey) {
+      throw new TypeError("Failed to construct 'HTMLInputElement': Illegal constructor");
+    }
+    super(nid);
+  }
+  get [Symbol.toStringTag]() { return 'HTMLInputElement'; }
+}
+globalThis.HTMLInputElement = HTMLInputElement;
+Object.defineProperty(HTMLInputElement, 'length', { value: 0, configurable: true });
+_markNative(HTMLInputElement);
+_markNative(Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, Symbol.toStringTag).get);
+// Keep the existing shared implementations, but expose input IDL members on
+// the dedicated prototype where WebIDL places them in Chrome.
+for (const name of [
+  'accept', 'alt', 'autocomplete', 'defaultChecked', 'checked', 'dirName',
+  'disabled', 'form', 'files', 'formAction', 'formEnctype', 'formMethod',
+  'formNoValidate', 'formTarget', 'height', 'indeterminate', 'list', 'max',
+  'maxLength', 'min', 'minLength', 'multiple', 'name', 'pattern',
+  'placeholder', 'readOnly', 'required', 'size', 'src', 'step', 'type',
+  'defaultValue', 'value', 'valueAsDate', 'valueAsNumber', 'width',
+  'willValidate', 'validity', 'validationMessage', 'labels', 'selectionStart',
+  'selectionEnd', 'selectionDirection', 'align', 'useMap', 'webkitdirectory',
+  'incremental', 'checkValidity', 'reportValidity', 'select', 'setCustomValidity',
+  'setRangeText', 'setSelectionRange', 'showPicker', 'stepDown', 'stepUp',
+  'webkitEntries',
+]) {
+  const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, name);
+  if (descriptor) Object.defineProperty(HTMLInputElement.prototype, name, descriptor);
+}
+
+class HTMLBodyElement extends HTMLElement {
+  constructor(nid, key) {
+    // Internal wrappers pass the node id as the sole argument. Script-level
+    // construction remains illegal, matching the native interface.
+    if (arguments.length !== 1 || nid === undefined) {
+      throw new TypeError("Failed to construct 'HTMLBodyElement': Illegal constructor");
+    }
+    super(nid);
+  }
+  get [Symbol.toStringTag]() { return 'HTMLBodyElement'; }
+}
+globalThis.HTMLBodyElement = HTMLBodyElement;
+Object.defineProperty(HTMLBodyElement, 'length', { value: 0, configurable: true });
+_markNative(HTMLBodyElement);
+_markNative(Object.getOwnPropertyDescriptor(HTMLBodyElement.prototype, Symbol.toStringTag).get);
+
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
+  get elements() { return _htmlCollectionFrom(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
@@ -13596,15 +16795,14 @@ globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = Element;
 globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
+// HTMLIFrameElement is defined with its dedicated prototype above.
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
-globalThis.HTMLLinkElement = Element;
+globalThis.HTMLLinkElement = HTMLLinkElement;
 globalThis.HTMLMetaElement = Element;
 globalThis.HTMLHeadElement = Element;
-globalThis.HTMLBodyElement = Element;
 globalThis.HTMLHtmlElement = Element;
 globalThis.HTMLBRElement = Element;
 globalThis.HTMLHRElement = Element;
@@ -13721,6 +16919,9 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
 globalThis.EventTarget = Node;
+if (typeof NetworkInformation === 'function') {
+  try { Object.setPrototypeOf(NetworkInformation.prototype, EventTarget.prototype); } catch (_error) {}
+}
 // Performance is not a DOM Node, but its Web IDL interface inherits
 // EventTarget. Link the prototype after EventTarget is installed so
 // `performance instanceof EventTarget` matches browsers while its listener
@@ -14091,16 +17292,35 @@ if (typeof Performance === 'function') {
   });
 })();
 
-globalThis.HTMLCollection = class HTMLCollection extends Array {
+const _htmlCollectionKey = Symbol('HTMLCollection');
+const _htmlCollectionValues = new WeakMap();
+function _htmlCollectionData(value) {
+  const held = _htmlCollectionValues.get(value);
+  if (!held) throw new TypeError('Illegal invocation');
+  const values = typeof held === 'function' ? held() : held;
+  return Array.from(values || []).filter(Boolean);
+}
+class HTMLCollection {
+  constructor(key = undefined, values = undefined) {
+    if (key !== _htmlCollectionKey) {
+      throw new TypeError("Failed to construct 'HTMLCollection': Illegal constructor");
+    }
+    _htmlCollectionValues.set(this, values || []);
+  }
+  get length() {
+    return _htmlCollectionData(this).length;
+  }
   item(i) {
     i = i >>> 0;
-    return this[i] != null ? this[i] : null;
+    const values = _htmlCollectionData(this);
+    return values[i] != null ? values[i] : null;
   }
   namedItem(name) {
+    const values = _htmlCollectionData(this);
     if (name === undefined || name === null || name === "") return null;
     name = String(name);
-    for (let i = 0; i < this.length; i++) {
-      const el = this[i];
+    for (let i = 0; i < values.length; i++) {
+      const el = values[i];
       if (!el) continue;
       // id always contributes; name only for HTML elements in HTML documents.
       if (el.id === name) return el;
@@ -14108,17 +17328,22 @@ globalThis.HTMLCollection = class HTMLCollection extends Array {
     }
     return null;
   }
-  // Factory: build an HTMLCollection from an array of elements. Named access
-  // (collection[name]) is served lazily by a Proxy so there is NO per-element
-  // work at build time (eager defineProperty per id was an O(n) build cost that
-  // made querySelectorAll on large result sets ~26x slower). The Proxy only
-  // resolves a name when an unknown string key is actually read.
-  static _from(arr) {
-    const c = new HTMLCollection();
-    if (arr) for (let i = 0; i < arr.length; i++) { if (arr[i]) c[c.length] = arr[i]; }
-    return new Proxy(c, _htmlCollectionProxy);
+  *[Symbol.iterator]() {
+    const values = _htmlCollectionData(this);
+    yield* values;
   }
-};
+  get [Symbol.toStringTag]() { return 'HTMLCollection'; }
+}
+globalThis.HTMLCollection = HTMLCollection;
+function _htmlCollectionFrom(source) {
+  const values = typeof source === 'function'
+    ? source
+    : Array.from(source || []).filter(Boolean);
+  const target = new HTMLCollection(_htmlCollectionKey, values);
+  const collection = new Proxy(target, _htmlCollectionProxy);
+  _htmlCollectionValues.set(collection, values);
+  return collection;
+}
 _markNative(HTMLCollection.prototype.item);
 _markNative(HTMLCollection.prototype.namedItem);
 // Shared (allocated once) Proxy traps for HTMLCollection named access. Indices,
@@ -14127,15 +17352,57 @@ _markNative(HTMLCollection.prototype.namedItem);
 // Array methods are never shadowed and id="namedItem" cannot recurse.
 const _htmlCollectionProxy = {
   get(t, k, r) {
+    if (typeof k === 'string' && /^(?:0|[1-9]\d*)$/.test(k)) {
+      return _htmlCollectionData(r)[Number(k)];
+    }
     const v = Reflect.get(t, k, r);
     if (v !== undefined || typeof k !== "string") return v;
     return t.namedItem ? (t.namedItem(k) || undefined) : undefined;
   },
   has(t, k) {
     if (Reflect.has(t, k)) return true;
+    if (typeof k === 'string' && /^(?:0|[1-9]\d*)$/.test(k)) {
+      return Number(k) < _htmlCollectionData(t).length;
+    }
     return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
   },
+  ownKeys(t) {
+    const values = _htmlCollectionData(t);
+    const keys = values.map((_value, index) => String(index));
+    const seen = new Set(keys);
+    for (const element of values) {
+      if (!element) continue;
+      const names = [element.id];
+      if (_isHTMLEl(element) && typeof element.getAttribute === 'function') {
+        names.push(element.getAttribute('name'));
+      }
+      for (const name of names) {
+        if (name && !seen.has(name)) { seen.add(name); keys.push(name); }
+      }
+    }
+    return keys;
+  },
+  getOwnPropertyDescriptor(t, k) {
+    if (typeof k !== 'string') return Reflect.getOwnPropertyDescriptor(t, k);
+    const values = _htmlCollectionData(t);
+    if (/^(?:0|[1-9]\d*)$/.test(k) && Number(k) < values.length) {
+      return { value: values[Number(k)], writable: false, enumerable: true, configurable: true };
+    }
+    const named = t.namedItem(k);
+    if (named) return { value: named, writable: false, enumerable: false, configurable: true };
+    return Reflect.getOwnPropertyDescriptor(t, k);
+  },
 };
+const _documentCollectionState = new WeakMap();
+function _documentCollection(document, name, provider) {
+  let collections = _documentCollectionState.get(document);
+  if (!collections) {
+    collections = new Map();
+    _documentCollectionState.set(document, collections);
+  }
+  if (!collections.has(name)) collections.set(name, _htmlCollectionFrom(provider));
+  return collections.get(name);
+}
 // True for elements in the HTML namespace (the only ones whose name attribute
 // contributes to an HTMLCollection's supported property names).
 function _isHTMLEl(el) {
@@ -14148,7 +17415,7 @@ function _nodeList(els) {
   for (let i = 0; i < els.length; i++) nl[i] = els[i];
   nl.length = els.length;
   return nl;
-}
+  }
 
 // Window named access. HTML exposes every element id, plus the name of a
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
@@ -14230,7 +17497,7 @@ function _windowNamedCandidates(name) {
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
-  if (matches.length > 1) return HTMLCollection._from(matches);
+  if (matches.length > 1) return _htmlCollectionFrom(matches);
   const element = matches[0];
   return element.localName === "iframe" && element.contentWindow
     ? element.contentWindow
@@ -14773,9 +18040,149 @@ function _makeTextMetrics(values) {
   return metrics;
 }
 
+const _imageDataState = new WeakMap();
+const _IMAGE_DATA_COLOR_SPACES = new Set(['srgb', 'display-p3']);
+const _IMAGE_DATA_PIXEL_FORMATS = new Set(['rgba-unorm8', 'rgba-float16']);
+function _imageDataEnum(value, fallback, allowed, member) {
+  if (value === undefined) return fallback;
+  const normalized = String(value);
+  if (!allowed.has(normalized)) {
+    throw new TypeError("Failed to read the '" + member
+      + "' property from 'ImageDataSettings': The provided value '"
+      + normalized + "' is not a valid enum value.");
+  }
+  return normalized;
+}
+function _imageDataSettings(settings, defaultColorSpace = 'srgb') {
+  settings = settings == null ? {} : Object(settings);
+  return {
+    colorSpace: _imageDataEnum(settings.colorSpace, defaultColorSpace,
+      _IMAGE_DATA_COLOR_SPACES, 'colorSpace'),
+    pixelFormat: _imageDataEnum(settings.pixelFormat, 'rgba-unorm8',
+      _IMAGE_DATA_PIXEL_FORMATS, 'pixelFormat'),
+  };
+}
+function _imageDataDimensions(width, height, prefix = "Failed to construct 'ImageData'") {
+  width = Math.trunc(Number(width));
+  height = Math.trunc(Number(height));
+  if (!Number.isFinite(width) || width <= 0) {
+    throw new DOMException(prefix + ': The source width is zero or not a number.', 'IndexSizeError');
+  }
+  if (!Number.isFinite(height) || height <= 0) {
+    throw new DOMException(prefix + ': The source height is zero or not a number.', 'IndexSizeError');
+  }
+  if (width > _MAX_CANVAS_DIMENSION || height > _MAX_CANVAS_DIMENSION
+      || width * height > _MAX_CANVAS_PIXELS) {
+    throw new DOMException(prefix + ': The requested image data is too large.', 'IndexSizeError');
+  }
+  return [width, height];
+}
+function _installImageData(target, data, width, height, colorSpace, pixelFormat) {
+  _imageDataState.set(target, { data, width, height, colorSpace, pixelFormat });
+  // Blink exposes the Uint8ClampedArray as an own property for the legacy
+  // rgba-unorm8 shape. Float16 data stays behind the prototype getter.
+  if (pixelFormat === 'rgba-unorm8') {
+    Object.defineProperty(target, 'data', {
+      value: data, enumerable: true, writable: false, configurable: true,
+    });
+  }
+  return target;
+}
+function _makeImageData(data, width, height, colorSpace, pixelFormat) {
+  return _installImageData(Object.create(globalThis.ImageData.prototype),
+    data, width, height, colorSpace, pixelFormat);
+}
+function _imageData(value) {
+  const state = _imageDataState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+
+// Chromium canvas converts its named sRGB and Display-P3 spaces through
+// Skia's D50 gamut matrices. These combined linear-light transforms preserve
+// extended components and avoid a lossy XYZ round trip.
+const _P3_TO_SRGB = [
+  1.2248163647793426, -0.22511484254967298, 0.000004016024995612266,
+  -0.04203825737967747, 1.0421472265146752, 0.000011317757177765203,
+  -0.01962348117620927, -0.07863566035626239, 1.098419217632786,
+];
+const _SRGB_TO_P3 = [
+  0.822547142507788, 0.1776785326630192, -0.000004838127636017949,
+  0.03317981798185353, 0.9667237517446563, -0.00001008212117997691,
+  0.01707030882567679, 0.07238186538013885, 0.9103984127298359,
+];
+const _SRGB_TO_XYZ = [
+  506752 / 1228815, 87881 / 245763, 12673 / 70218,
+  87098 / 409605, 175762 / 245763, 12673 / 175545,
+  7918 / 409605, 87881 / 737289, 1001167 / 1053270,
+];
+const _XYZ_TO_SRGB = [
+  12831 / 3959, -329 / 214, -1974 / 3959,
+  -851781 / 878810, 1648619 / 878810, 36519 / 878810,
+  705 / 12673, -2585 / 12673, 705 / 667,
+];
+const _P3_TO_XYZ = [
+  608311 / 1250200, 189793 / 714400, 198249 / 1000160,
+  35783 / 156275, 247089 / 357200, 198249 / 2500400,
+  0, 32229 / 714400, 5220557 / 5000800,
+];
+const _XYZ_TO_P3 = [
+  446124 / 178915, -333277 / 357830, -72051 / 178915,
+  -14852 / 17905, 63121 / 35810, 423 / 17905,
+  11844 / 330415, -50337 / 660830, 316169 / 330415,
+];
+function _colorTransferToLinear(value) {
+  const sign = value < 0 ? -1 : 1;
+  const magnitude = Math.abs(value);
+  return sign * (magnitude <= 0.04045
+    ? magnitude / 12.92 : Math.pow((magnitude + 0.055) / 1.055, 2.4));
+}
+function _colorTransferFromLinear(value) {
+  const sign = value < 0 ? -1 : 1;
+  const magnitude = Math.abs(value);
+  return sign * (magnitude <= 0.0031308
+    ? magnitude * 12.92 : 1.055 * Math.pow(magnitude, 1 / 2.4) - 0.055);
+}
+function _colorMatrix(matrix, rgb) {
+  return [
+    matrix[0] * rgb[0] + matrix[1] * rgb[1] + matrix[2] * rgb[2],
+    matrix[3] * rgb[0] + matrix[4] * rgb[1] + matrix[5] * rgb[2],
+    matrix[6] * rgb[0] + matrix[7] * rgb[1] + matrix[8] * rgb[2],
+  ];
+}
+function _convertCanvasColor(rgb, source, destination) {
+  const linear = rgb.map(_colorTransferToLinear);
+  const xyz = _colorMatrix(source === 'display-p3' ? _P3_TO_XYZ : _SRGB_TO_XYZ, linear);
+  return _colorMatrix(destination === 'display-p3' ? _XYZ_TO_P3 : _XYZ_TO_SRGB, xyz)
+    .map(_colorTransferFromLinear);
+}
+function _convertCanvasFloatColor(rgb, source, destination) {
+  if (source === destination) return rgb.slice();
+  const linear = rgb.map(_colorTransferToLinear);
+  return _colorMatrix(source === 'display-p3' ? _P3_TO_SRGB : _SRGB_TO_P3, linear)
+    .map(_colorTransferFromLinear);
+}
+function _canvasColorComponent(token) {
+  token = String(token).trim();
+  return token.endsWith('%') ? Number(token.slice(0, -1)) / 100 : Number(token);
+}
+const _CANVAS_AA_2X2 = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]];
+const _CANVAS_AA_4X4 = Array.from({length: 16}, (_, index) =>
+  [(index % 4 + 0.5) / 4, (Math.floor(index / 4) + 0.5) / 4]);
+function _prepareCanvasText(value) {
+  return String(value).replace(/[\x80-\x9f]/g, '\uFFFD');
+}
+
 class _Canvas2D {
-  constructor(canvas) {
+  constructor(canvas, attrs = undefined) {
     this.canvas = canvas;
+    attrs = attrs == null ? {} : Object(attrs);
+    this._colorSpace = _imageDataEnum(attrs.colorSpace, 'srgb',
+      _IMAGE_DATA_COLOR_SPACES, 'colorSpace');
+    this._colorType = attrs.colorType === 'float16' ? 'float16' : 'unorm8';
+    this._alpha = attrs.alpha !== false;
+    this._desynchronized = !!attrs.desynchronized;
+    this._willReadFrequently = !!attrs.willReadFrequently;
     this._damageQueued = false;
     this._resizeFromCanvas();
   }
@@ -14792,10 +18199,12 @@ class _Canvas2D {
     this.font = '10px sans-serif';
     this.textAlign = 'start';
     this.textBaseline = 'alphabetic';
+    this.direction = 'inherit';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
     this._transform = [1, 0, 0, 1, 0, 0];
+    this._path = [];
   }
   _resizeFromCanvas() {
     const requestedWidth = this._canvasDimension('width', 300);
@@ -14806,9 +18215,13 @@ class _Canvas2D {
     this._w = valid ? requestedWidth : 0;
     this._h = valid ? requestedHeight : 0;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    this._floatBuf = this._colorType === 'float16'
+      ? new Float32Array(this._buf.length) : null;
+    this._colorBuf = this._colorSpace === 'srgb' && !this._floatBuf
+      ? this._buf : new Uint8ClampedArray(this._buf.length);
     this._resetDrawingState();
     const register = Deno.core.ops.op_canvas_register_surface;
-    if (typeof register === 'function') {
+    if (typeof register === 'function' && this.canvas[_nidSym] != null) {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
       const bytes = new Uint8Array(
@@ -14822,6 +18235,7 @@ class _Canvas2D {
     }
   }
   _markPaintDamage() {
+    if (this.canvas[_nidSym] == null) return;
     if (this._damageQueued) return;
     this._damageQueued = true;
     queueMicrotask(() => {
@@ -14832,6 +18246,29 @@ class _Canvas2D {
   }
   _parseColor(css) {
     if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
+    const functional = /^color\(\s*(srgb|display-p3)\s+([^\s/]+)\s+([^\s/]+)\s+([^\s/)]+)(?:\s*\/\s*([^\s)]+))?\s*\)$/i.exec(css);
+    if (functional) {
+      const source = functional[1].toLowerCase();
+      const rgb = [_canvasColorComponent(functional[2]),
+        _canvasColorComponent(functional[3]), _canvasColorComponent(functional[4])];
+      if (rgb.every(Number.isFinite)) {
+        const converted = (this._floatBuf
+          ? _convertCanvasFloatColor : _convertCanvasColor)(rgb, source, this._colorSpace);
+        const alpha = functional[5] === undefined ? 1 : _canvasColorComponent(functional[5]);
+        if (this._floatBuf) {
+          return [converted[0] * 255, converted[1] * 255, converted[2] * 255,
+            Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 1)) * 255];
+        }
+        const p3TieBias = source === 'display-p3' && this._colorSpace === 'display-p3'
+          ? Number.EPSILON * 255 : 0;
+        return [
+          Math.round(Math.max(0, Math.min(1, converted[0])) * 255 - p3TieBias),
+          Math.round(Math.max(0, Math.min(1, converted[1])) * 255 - p3TieBias),
+          Math.round(Math.max(0, Math.min(1, converted[2])) * 255 - p3TieBias),
+          Math.round(Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 1)) * 255),
+        ];
+      }
+    }
     if (css.startsWith('#')) {
       const hex = css.slice(1);
       if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
@@ -14841,33 +18278,56 @@ class _Canvas2D {
     const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
     if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
     const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
+    const value = named[css] || [0,0,0,255];
+    if (this._colorSpace === 'srgb') return value;
+    const converted = (this._floatBuf
+      ? _convertCanvasFloatColor : _convertCanvasColor)(value.slice(0, 3).map(v => v / 255),
+      'srgb', this._colorSpace);
+    return converted.map(v => Math.round(Math.max(0, Math.min(1, v)) * 255))
+      .concat(value[3]);
   }
-  _setPixel(x, y, r, g, b, a) {
+  _syncRendererPixel(idx) {
+    if (this._colorBuf === this._buf && !this._floatBuf) return;
+    const source = this._floatBuf
+      ? [this._floatBuf[idx], this._floatBuf[idx + 1], this._floatBuf[idx + 2]]
+      : [this._colorBuf[idx] / 255, this._colorBuf[idx + 1] / 255,
+        this._colorBuf[idx + 2] / 255];
+    const converted = (this._floatBuf
+      ? _convertCanvasFloatColor : _convertCanvasColor)(source,
+      this._colorSpace, 'srgb');
+    this._buf[idx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+    this._buf[idx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+    this._buf[idx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+    this._buf[idx + 3] = this._floatBuf
+      ? Math.round(Math.max(0, Math.min(1, this._floatBuf[idx + 3])) * 255)
+      : this._colorBuf[idx + 3];
+  }
+  _setPixel(x, y, r, g, b, a, sourceSpace = this._colorSpace) {
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    const idx = (y * this._w + x) * 4;
-    const alpha = (a / 255) * this.globalAlpha;
-    if (this.globalCompositeOperation === 'multiply') {
-      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
-      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
-      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
-      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
-    } else {
-      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    if (sourceSpace !== this._colorSpace) {
+      const converted = (this._floatBuf
+        ? _convertCanvasFloatColor : _convertCanvasColor)([r / 255, g / 255, b / 255],
+        sourceSpace, this._colorSpace);
+      r = converted[0] * 255;
+      g = converted[1] * 255;
+      b = converted[2] * 255;
     }
+    this._blendPixel(x, y, r, g, b, a, 1);
   }
   fillRect(x, y, w, h) {
     const t = this._transform;
     const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
     if (!identity || (this.fillStyle && this.fillStyle._stops)) {
-      this.beginPath();
-      this.rect(x, y, w, h);
-      this.fill();
+      const currentPath = this._path;
+      try {
+        this._path = [];
+        this.rect(x, y, w, h);
+        this.fill();
+      } finally {
+        this._path = currentPath;
+      }
       return;
     }
     const [r,g,b,a] = this._parseColor(this.fillStyle);
@@ -14884,7 +18344,13 @@ class _Canvas2D {
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
         const idx = (py * this._w + px) * 4;
-        this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
+        this._colorBuf[idx] = this._colorBuf[idx+1] = this._colorBuf[idx+2] = 0;
+        this._colorBuf[idx+3] = this._alpha ? 0 : 255;
+        if (this._floatBuf) {
+          this._floatBuf[idx] = this._floatBuf[idx + 1] = this._floatBuf[idx + 2] = 0;
+          this._floatBuf[idx + 3] = this._alpha ? 0 : 1;
+        }
+        if (this._colorBuf !== this._buf || this._floatBuf) this._syncRendererPixel(idx);
       }
     }
     this._markPaintDamage();
@@ -14908,7 +18374,7 @@ class _Canvas2D {
       ? fill._stops[0][1] : this._parseColor(fill);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    const str = String(text);
+    const str = _prepareCanvasText(text);
     const [tx, ty] = this._applyTransform(+x || 0, +y || 0);
     let cx = Math.round(tx);
     for (let i = 0; i < str.length; i++) {
@@ -14940,19 +18406,34 @@ class _Canvas2D {
     // element widths the same engine produced next door. The ascent/descent
     // were worse: constants derived from the size alone, so they did not move
     // when the family did.
-    const box = _measureTextBox(String(t), this.font);
+    const text = _prepareCanvasText(t);
+    const box = _measureTextBox(text, this.font);
+    const hasInk = !/^\s*$/u.test(text);
+    let direction = this.direction;
+    if (direction !== 'ltr' && direction !== 'rtl') {
+      direction = 'ltr';
+      for (let node = this.canvas; node; node = node.parentElement) {
+        const authored = node.getAttribute && node.getAttribute('dir');
+        if (authored === 'ltr' || authored === 'rtl') { direction = authored; break; }
+      }
+    }
+    let align = this.textAlign;
+    if (align === 'start') align = direction === 'rtl' ? 'right' : 'left';
+    if (align === 'end') align = direction === 'rtl' ? 'left' : 'right';
+    const alignmentOffset = align === 'center' ? box.width / 2
+      : align === 'right' ? box.width : 0;
     return _makeTextMetrics({
       width: box.width,
       // No per-glyph outlines are available here, so the ink extents fall back
       // to the font box and the advance. That is a superset of the real ink
       // rather than an invented number, and it stays consistent with the
       // font box reported beside it.
-      actualBoundingBoxLeft: 0,
-      actualBoundingBoxRight: box.width,
+      actualBoundingBoxLeft: alignmentOffset,
+      actualBoundingBoxRight: (hasInk ? box.width : 0) - alignmentOffset,
       fontBoundingBoxAscent: box.ascent,
       fontBoundingBoxDescent: box.descent,
-      actualBoundingBoxAscent: box.ascent,
-      actualBoundingBoxDescent: box.descent,
+      actualBoundingBoxAscent: hasInk ? box.ascent : 0,
+      actualBoundingBoxDescent: hasInk ? box.descent : 0,
       // Chrome puts the hanging baseline at 80% of the font ascent, the
       // alphabetic one at the origin, and the ideographic one at the font
       // descent. Checked against Chrome 146 for sans-serif, Arial, Times New
@@ -14963,60 +18444,92 @@ class _Canvas2D {
       ideographicBaseline: -box.descent,
     });
   }
-  getImageData(x, y, w, h) {
+  getImageData(x, y, w, h, settings = undefined) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    const data = new Uint8ClampedArray(w * h * 4);
+    [w, h] = _imageDataDimensions(w, h, "Failed to execute 'getImageData' on 'CanvasRenderingContext2D'");
+    const output = _imageDataSettings(settings, this._colorSpace);
+    const data = output.pixelFormat === 'rgba-float16'
+      ? new Float16Array(w * h * 4) : new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const srcX = x + px, srcY = y + py;
         const dstIdx = (py * w + px) * 4;
         if (srcX >= 0 && srcX < this._w && srcY >= 0 && srcY < this._h) {
           const srcIdx = (srcY * this._w + srcX) * 4;
-          data[dstIdx] = this._buf[srcIdx];
-          data[dstIdx+1] = this._buf[srcIdx+1];
-          data[dstIdx+2] = this._buf[srcIdx+2];
-          data[dstIdx+3] = this._buf[srcIdx+3];
+          const sourceColor = this._floatBuf
+            ? [this._floatBuf[srcIdx], this._floatBuf[srcIdx + 1],
+              this._floatBuf[srcIdx + 2]]
+            : [this._colorBuf[srcIdx] / 255, this._colorBuf[srcIdx + 1] / 255,
+              this._colorBuf[srcIdx + 2] / 255];
+          const sourceAlpha = this._floatBuf
+            ? this._floatBuf[srcIdx + 3] : this._colorBuf[srcIdx + 3] / 255;
+          const converted = (this._floatBuf
+            ? _convertCanvasFloatColor : _convertCanvasColor)(sourceColor,
+            this._colorSpace, output.colorSpace);
+          if (output.pixelFormat === 'rgba-float16') {
+            data[dstIdx] = converted[0]; data[dstIdx + 1] = converted[1];
+            data[dstIdx + 2] = converted[2]; data[dstIdx + 3] = sourceAlpha;
+          } else {
+            data[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+            data[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+            data[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+            data[dstIdx + 3] = Math.round(Math.max(0, Math.min(1, sourceAlpha)) * 255);
+          }
         }
       }
     }
-    // Chrome hands back a branded ImageData, not a plain object.
-    const image = Object.create(globalThis.ImageData.prototype);
-    Object.defineProperties(image, {
-      data: { value: data, enumerable: true, writable: false, configurable: true },
-      width: { value: w, enumerable: true, writable: false, configurable: true },
-      height: { value: h, enumerable: true, writable: false, configurable: true },
-      colorSpace: { value: 'srgb', enumerable: true, writable: false, configurable: true },
-    });
-    return image;
+    return _makeImageData(data, w, h, output.colorSpace, output.pixelFormat);
   }
   putImageData(imageData, dx, dy) {
     dx=Math.round(dx); dy=Math.round(dy);
-    const {data, width: w, height: h} = imageData;
+    const source = _imageData(imageData);
+    const {data, width: w, height: h} = source;
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const srcIdx = (py * w + px) * 4;
         const x = dx + px, y = dy + py;
         if (x >= 0 && x < this._w && y >= 0 && y < this._h) {
           const dstIdx = (y * this._w + x) * 4;
-          this._buf[dstIdx] = data[srcIdx];
-          this._buf[dstIdx+1] = data[srcIdx+1];
-          this._buf[dstIdx+2] = data[srcIdx+2];
-          this._buf[dstIdx+3] = data[srcIdx+3];
+          const scale = source.pixelFormat === 'rgba-float16' ? 1 : 1 / 255;
+          const converted = (this._floatBuf
+            ? _convertCanvasFloatColor : _convertCanvasColor)([data[srcIdx] * scale,
+            data[srcIdx + 1] * scale, data[srcIdx + 2] * scale],
+            source.colorSpace, this._colorSpace);
+          const alpha = Math.max(0, Math.min(1, data[srcIdx + 3] * scale));
+          if (this._floatBuf) {
+            this._floatBuf[dstIdx] = converted[0];
+            this._floatBuf[dstIdx + 1] = converted[1];
+            this._floatBuf[dstIdx + 2] = converted[2];
+            this._floatBuf[dstIdx + 3] = alpha;
+          }
+          this._colorBuf[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+          this._colorBuf[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+          this._colorBuf[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+          this._colorBuf[dstIdx + 3] = Math.round(alpha * 255);
+          this._syncRendererPixel(dstIdx);
         }
       }
     }
     this._markPaintDamage();
   }
-  createImageData(w, h) {
-    const data = new Uint8ClampedArray(w*h*4);
-    const image = Object.create(globalThis.ImageData.prototype);
-    Object.defineProperties(image, {
-      data: { value: data, enumerable: true, configurable: true },
-      width: { value: w, enumerable: true, configurable: true },
-      height: { value: h, enumerable: true, configurable: true },
-      colorSpace: { value: 'srgb', enumerable: true, configurable: true },
-    });
-    return image;
+  createImageData(widthOrImage, height, settings = undefined) {
+    if (_imageDataState.has(widthOrImage)) {
+      const source = _imageData(widthOrImage);
+      const output = _imageDataSettings(height, source.colorSpace);
+      const data = output.pixelFormat === 'rgba-float16'
+        ? new Float16Array(source.width * source.height * 4)
+        : new Uint8ClampedArray(source.width * source.height * 4);
+      return _makeImageData(data, source.width, source.height,
+        output.colorSpace, output.pixelFormat);
+    }
+    const dimensions = _imageDataDimensions(widthOrImage, height,
+      "Failed to execute 'createImageData' on 'CanvasRenderingContext2D'");
+    const output = _imageDataSettings(settings, this._colorSpace);
+    const data = output.pixelFormat === 'rgba-float16'
+      ? new Float16Array(dimensions[0] * dimensions[1] * 4)
+      : new Uint8ClampedArray(dimensions[0] * dimensions[1] * 4);
+    return _makeImageData(data, dimensions[0], dimensions[1],
+      output.colorSpace, output.pixelFormat);
   }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
     if (img && img._ctx && img._ctx._buf) {
@@ -15028,7 +18541,11 @@ class _Canvas2D {
           const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
           if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
             const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
+            const sourceBuffer = src._floatBuf || src._colorBuf || src._buf;
+            const scale = src._floatBuf ? 255 : 1;
+            this._setPixel(dx+px, dy+py, sourceBuffer[srcIdx] * scale,
+              sourceBuffer[srcIdx+1] * scale, sourceBuffer[srcIdx+2] * scale,
+              sourceBuffer[srcIdx+3] * scale, src._colorSpace || 'srgb');
           }
         }
       }
@@ -15037,54 +18554,81 @@ class _Canvas2D {
   }
   beginPath() { this._path = []; }
   closePath() { if (this._path) this._path.push({t:'Z'}); }
-  moveTo(x, y) { if (this._path) this._path.push({t:'M', x:+x, y:+y}); }
-  lineTo(x, y) { if (this._path) this._path.push({t:'L', x:+x, y:+y}); }
+  moveTo(x, y) {
+    if (this._path) {
+      const point = this._applyTransform(+x, +y);
+      this._path.push({t:'M', x:point[0], y:point[1]});
+    }
+  }
+  lineTo(x, y) {
+    if (this._path) {
+      const point = this._applyTransform(+x, +y);
+      this._path.push({t:'L', x:point[0], y:point[1]});
+    }
+  }
   bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
-    if (!this._path || !this._path.length) this._path.push({t:'M', x:cp1x, y:cp1y});
+    if (!this._path.length) this.moveTo(cp1x, cp1y);
     const last = this._path[this._path.length - 1];
-    this._path.push({t:'C', x0:last.x, y0:last.y, x1:+cp1x, y1:+cp1y,
-      x2:+cp2x, y2:+cp2y, x:+x, y:+y});
+    const p1 = this._applyTransform(+cp1x, +cp1y);
+    const p2 = this._applyTransform(+cp2x, +cp2y);
+    const end = this._applyTransform(+x, +y);
+    this._path.push({t:'C', x0:last.x, y0:last.y, x1:p1[0], y1:p1[1],
+      x2:p2[0], y2:p2[1], x:end[0], y:end[1]});
   }
   quadraticCurveTo(cpx, cpy, x, y) {
-    if (!this._path || !this._path.length) this._path.push({t:'M', x:cpx, y:cpy});
+    if (!this._path.length) this.moveTo(cpx, cpy);
     const last = this._path[this._path.length - 1];
-    this._path.push({t:'Q', x0:last.x, y0:last.y, x1:+cpx, y1:+cpy, x:+x, y:+y});
+    const control = this._applyTransform(+cpx, +cpy);
+    const end = this._applyTransform(+x, +y);
+    this._path.push({t:'Q', x0:last.x, y0:last.y,
+      x1:control[0], y1:control[1], x:end[0], y:end[1]});
   }
-  arc(x, y, r, startAngle, endAngle) {
-    if (this._path) this._path.push({t:'A', x:+x, y:+y, r:+r,
-      s:+(startAngle || 0), e:+(endAngle === undefined ? Math.PI * 2 : endAngle)});
+  arc(x, y, r, startAngle, endAngle, counterclockwise = false) {
+    r = +r;
+    if (r < 0) throw new DOMException('The radius provided is negative.', 'IndexSizeError');
+    if (this._path) this._path.push({t:'A', x:+x, y:+y, r,
+      s:+(startAngle || 0), e:+(endAngle === undefined ? Math.PI * 2 : endAngle),
+      ccw:!!counterclockwise, m:this._transform.slice()});
   }
   arcTo() {}
   rect(x, y, w, h) {
     if (!this._path) return;
     const x0 = +x, y0 = +y, ww = +w, hh = +h;
-    this._path.push({t:'M', x:x0, y:y0}, {t:'L', x:x0 + ww, y:y0},
-      {t:'L', x:x0 + ww, y:y0 + hh}, {t:'L', x:x0, y:y0 + hh}, {t:'Z'});
+    this.moveTo(x0, y0); this.lineTo(x0 + ww, y0);
+    this.lineTo(x0 + ww, y0 + hh); this.lineTo(x0, y0 + hh); this.closePath();
   }
   ellipse(x, y, rx, ry) {
-    if (this._path) this._path.push({t:'E', x:+x, y:+y, rx:+rx, ry:+ry === 0 ? +rx : +ry});
+    if (this._path) this._path.push({t:'E', x:+x, y:+y, rx:+rx,
+      ry:+ry === 0 ? +rx : +ry, m:this._transform.slice()});
   }
   roundRect(x, y, w, h) { this.rect(x, y, w, h); }
-  // Path commands are recorded in user space and mapped through the current
-  // transform, so the rasterizer only ever sees device pixels.
+  // Path commands capture the current transform when they are appended, so
+  // later CTM changes cannot move geometry already present in the path.
   _applyTransform(x, y) {
     const [a, b, c, d, e, f] = this._transform;
     return [a * x + c * y + e, b * x + d * y + f];
   }
-  _flattenPath() {
+  _flattenPath(minPoints) {
     const subpaths = [];
     let current = null;
-    const finish = () => { if (current && current.length >= 3) subpaths.push(current); current = null; };
-    const push = (x, y) => {
-      const [px, py] = this._applyTransform(x, y);
-      if (!current) current = [[px, py]];
-      else current.push([px, py]);
+    const finish = close => {
+      if (close && current && current.length > 1) current.push(current[0].slice());
+      if (current && current.length >= minPoints) subpaths.push(current);
+      current = null;
     };
-    const arcSteps = r => Math.max(8, Math.min(64, Math.ceil(r * 2)));
+    const push = (x, y) => {
+      if (!current) current = [[x, y]];
+      else current.push([x, y]);
+    };
+    const mappedPush = (matrix, x, y) => {
+      const [a, b, c, d, e, f] = matrix;
+      push(a * x + c * y + e, b * x + d * y + f);
+    };
+    const arcSteps = r => Math.max(16, Math.min(64, Math.ceil(r * 2)));
     for (const seg of this._path || []) {
-      if (seg.t === 'M') { finish(); push(seg.x, seg.y); }
+      if (seg.t === 'M') { finish(false); push(seg.x, seg.y); }
       else if (seg.t === 'L') push(seg.x, seg.y);
-      else if (seg.t === 'Z') { finish(); }
+      else if (seg.t === 'Z') { finish(true); }
       else if (seg.t === 'C' || seg.t === 'Q') {
         const cubic = seg.t === 'C'
           ? [seg.x0, seg.y0, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y]
@@ -15101,35 +18645,39 @@ class _Canvas2D {
         }
       } else if (seg.t === 'A') {
         let sweep = seg.e - seg.s;
-        if (sweep < 0) sweep += Math.PI * 2;
+        const fullTurn = Math.PI * 2;
+        if (Math.abs(sweep) >= fullTurn) sweep = seg.ccw ? -fullTurn : fullTurn;
+        else if (seg.ccw) { while (sweep > 0) sweep -= fullTurn; }
+        else { while (sweep < 0) sweep += fullTurn; }
         const steps = arcSteps(seg.r);
         for (let step = 0; step <= steps; step++) {
           const angle = seg.s + sweep * step / steps;
-          push(seg.x + seg.r * Math.cos(angle), seg.y + seg.r * Math.sin(angle));
+          mappedPush(seg.m, seg.x + seg.r * Math.cos(angle), seg.y + seg.r * Math.sin(angle));
         }
       } else if (seg.t === 'E') {
         const steps = arcSteps(Math.max(seg.rx, seg.ry));
         for (let step = 0; step <= steps; step++) {
           const angle = Math.PI * 2 * step / steps;
-          push(seg.x + seg.rx * Math.cos(angle), seg.y + seg.ry * Math.sin(angle));
+          mappedPush(seg.m, seg.x + seg.rx * Math.cos(angle), seg.y + seg.ry * Math.sin(angle));
         }
       }
     }
-    finish();
+    finish(false);
     return subpaths;
   }
   // Nonzero winding number at a device-space point.
-  _windingAt(subpaths, x, y) {
-    let winding = 0;
+  _windingAt(subpaths, x, y, evenOdd = false) {
+    let winding = 0, crossings = 0;
     for (const poly of subpaths) {
       for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
         const [xi, yi] = poly[i], [xj, yj] = poly[j];
         if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+          crossings++;
           winding += yj > yi ? 1 : -1;
         }
       }
     }
-    return winding;
+    return evenOdd ? crossings & 1 : winding;
   }
   // Paint source at a device-space pixel: either a flat color or a gradient
   // evaluated in its own user space (device point unmapped through the
@@ -15137,7 +18685,7 @@ class _Canvas2D {
   _paintAt(px, py) {
     const fill = this.fillStyle;
     if (fill && fill._stops && fill._stops.length) {
-      const inv = this._transformInverse();
+      const inv = this._transformInverse(fill._transform);
       const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
       return this._gradientColorAt(fill, ux, uy);
     }
@@ -15145,8 +18693,11 @@ class _Canvas2D {
     color.gradient = false;
     return color;
   }
-  _transformInverse() {
-    const [a, b, c, d, e, f] = this._transform;
+  _coverageSamples() {
+    return this._w * this._h <= 65536 ? _CANVAS_AA_4X4 : _CANVAS_AA_2X2;
+  }
+  _transformInverse(matrix) {
+    const [a, b, c, d, e, f] = matrix || this._transform;
     const det = a * d - b * c;
     if (!det) return [1, 0, 0, 1, 0, 0];
     return [d / det, -b / det, -c / det, a / det,
@@ -15180,10 +18731,10 @@ class _Canvas2D {
     }
     return lastStop[1].slice();
   }
-  fill() {
+  fill(fillRule = 'nonzero') {
     if (!this._path) return;
-    const subpaths = this._flattenPath();
-    this._path = [];
+    const evenOdd = String(fillRule).toLowerCase() === 'evenodd';
+    const subpaths = this._flattenPath(3);
     if (!subpaths.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const poly of subpaths) for (const [x, y] of poly) {
@@ -15192,25 +18743,23 @@ class _Canvas2D {
     }
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
     const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
-    // 2x2 supersampling gives the antialiased edge coverage a real canvas
-    // shows; a hard edge is itself a fingerprint.
+    const samples = this._coverageSamples();
     for (let py = y0; py <= y1; py++) {
       for (let px = x0; px <= x1; px++) {
         let coverage = 0;
-        for (const [ox, oy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
-          if (this._windingAt(subpaths, px + ox, py + oy) !== 0) coverage++;
+        for (const [ox, oy] of samples) {
+          if (this._windingAt(subpaths, px + ox, py + oy, evenOdd) !== 0) coverage++;
         }
         if (!coverage) continue;
         const [r, g, b, a] = this._paintAt(px + 0.5, py + 0.5);
-        this._blendPixel(px, py, r, g, b, a, coverage / 4);
+        this._blendPixel(px, py, r, g, b, a, coverage / samples.length);
       }
     }
     this._markPaintDamage();
   }
   stroke() {
     if (!this._path) return;
-    const subpaths = this._flattenPath();
-    this._path = [];
+    const subpaths = this._flattenPath(2);
     if (!subpaths.length) return;
     const half = Math.max(0.5, +this.lineWidth / 2 || 0.5);
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -15220,10 +18769,11 @@ class _Canvas2D {
     }
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
     const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
+    const samples = this._coverageSamples();
     for (let py = y0; py <= y1; py++) {
       for (let px = x0; px <= x1; px++) {
         let inside = 0;
-        for (const [ox, oy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
+        for (const [ox, oy] of samples) {
           const sx = px + ox, sy = py + oy;
           for (const poly of subpaths) {
             for (let i = 1; i < poly.length; i++) {
@@ -15233,7 +18783,7 @@ class _Canvas2D {
         }
         if (!inside) continue;
         const [r, g, b, a] = this._paintStrokeAt(px + 0.5, py + 0.5);
-        this._blendPixel(px, py, r, g, b, a, inside / 4);
+        this._blendPixel(px, py, r, g, b, a, inside / samples.length);
       }
     }
     this._markPaintDamage();
@@ -15241,7 +18791,7 @@ class _Canvas2D {
   _paintStrokeAt(px, py) {
     const stroke = this.strokeStyle;
     if (stroke && stroke._stops && stroke._stops.length) {
-      const inv = this._transformInverse();
+      const inv = this._transformInverse(stroke._transform);
       const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
       return this._gradientColorAt(stroke, ux, uy);
     }
@@ -15254,19 +18804,38 @@ class _Canvas2D {
     return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
   }
   _blendPixel(x, y, r, g, b, a, coverage) {
-    const alpha = (a / 255) * coverage * this.globalAlpha;
-    if (alpha <= 0) return;
+    const sourceAlpha = (a / 255) * coverage * this.globalAlpha;
+    if (sourceAlpha <= 0) return;
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
     const idx = (y * this._w + x) * 4;
-    this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-    this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-    this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-    this._buf[idx+3] = Math.min(255, Math.round(255 * alpha + this._buf[idx+3] * (1 - alpha)));
+    const destinationAlpha = this._floatBuf
+      ? this._floatBuf[idx + 3] : this._colorBuf[idx + 3] / 255;
+    const outputAlpha = sourceAlpha + destinationAlpha * (1 - sourceAlpha);
+    const source = [r / 255, g / 255, b / 255];
+    const destination = this._floatBuf
+      ? [this._floatBuf[idx], this._floatBuf[idx + 1], this._floatBuf[idx + 2]]
+      : [this._colorBuf[idx] / 255, this._colorBuf[idx + 1] / 255,
+        this._colorBuf[idx + 2] / 255];
+    for (let channel = 0; channel < 3; channel++) {
+      const blended = this.globalCompositeOperation === 'multiply'
+        ? source[channel] * destination[channel] : source[channel];
+      const premultiplied = source[channel] * sourceAlpha * (1 - destinationAlpha)
+        + destination[channel] * destinationAlpha * (1 - sourceAlpha)
+        + blended * sourceAlpha * destinationAlpha;
+      const value = outputAlpha > 0 ? premultiplied / outputAlpha : 0;
+      if (this._floatBuf) this._floatBuf[idx + channel] = value;
+      this._colorBuf[idx + channel] = Math.round(Math.max(0, Math.min(1, value)) * 255);
+    }
+    if (this._floatBuf) this._floatBuf[idx + 3] = outputAlpha;
+    this._colorBuf[idx + 3] = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
+    this._syncRendererPixel(idx);
   }
   clip() {}
   save() {
     this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle,
       globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth,
+      textAlign: this.textAlign, textBaseline: this.textBaseline, direction: this.direction,
+      globalCompositeOperation: this.globalCompositeOperation,
       _transform: this._transform.slice()});
   }
   restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); this._transform = t; } }
@@ -15289,9 +18858,10 @@ class _Canvas2D {
   transform(a, b, c, d, e, f) {
     const [a0, b0, c0, d0, e0, f0] = this._transform;
     this._transform = [
-      +a * a0 + +c * b0, +b * a0 + +d * b0,
-      +a * c0 + +c * d0, +b * c0 + +d * d0,
-      +a * e0 + +c * f0 + (+e || 0), +b * e0 + +d * f0 + (+f || 0)];
+      a0 * +a + c0 * +b, b0 * +a + d0 * +b,
+      a0 * +c + c0 * +d, b0 * +c + d0 * +d,
+      a0 * (+e || 0) + c0 * (+f || 0) + e0,
+      b0 * (+e || 0) + d0 * (+f || 0) + f0];
   }
   createLinearGradient(x0, y0, x1, y1) {
     return this._makeGradient('linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
@@ -15315,6 +18885,7 @@ class _Canvas2D {
         this._stops.sort((a, b) => a[0] - b[0]);
       },
       get [Symbol.toStringTag]() { return 'CanvasGradient'; },
+      _transform: this._transform.slice(),
     }, params);
     return grad;
   }
@@ -15326,7 +18897,11 @@ class _Canvas2D {
   // "is not a function" from a timer each tick, spamming errors (#258).
   setLineDash() {}
   getLineDash() { return []; }
-  getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
+  getContextAttributes() {
+    return { alpha: this._alpha, colorSpace: this._colorSpace, colorType: this._colorType,
+      desynchronized: this._desynchronized, toneMapping: { mode: 'standard' },
+      willReadFrequently: this._willReadFrequently };
+  }
 }
 
 class HTMLCanvasElement extends Element {
@@ -15391,14 +18966,20 @@ HTMLCanvasElement.prototype.toDataURL = function(type) {
   }
   return 'data:,';
 };
-HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
-  const url = this.toDataURL(type, q);
+function _canvasPngBlob(ctx) {
+  if (!ctx || !ctx._buf || ctx._w === 0 || ctx._h === 0) return null;
+  const url = _encodePNG(ctx._w, ctx._h, ctx._buf);
   const comma = url.indexOf(',');
-  if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
   const binary = atob(url.slice(comma + 1));
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  cb(new Blob([bytes], {type: String(type || 'image/png')}));
+  return new Blob([bytes], {type: 'image/png'});
+}
+HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+  const blob = _canvasPngBlob(this._ctx || this.getContext('2d'));
+  if (blob && type && String(type).toLowerCase() === 'image/png')
+    Object.defineProperty(blob, 'type', {value: 'image/png', configurable: true});
+  cb(blob);
 };
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
@@ -15433,6 +19014,12 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   shadow._treeConnected = this.isConnected;
   shadow._treeConnectedEpoch = _treeMutationEpoch;
   _cache.set(rootNid, shadow);
+  try {
+    const registry = shadow.customElementRegistry;
+    const state = _customElementRegistryData(registry);
+    state.roots.add(shadow);
+    _customElementUpgradeRoot(registry, shadow);
+  } catch (_error) {}
   return shadow;
 };
 
@@ -15558,8 +19145,6 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     return p;
   }
 };
-globalThis.webkitAudioContext = globalThis.AudioContext;
-
 globalThis.speechSynthesis = {
   speaking: false, pending: false, paused: false,
   getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
@@ -16050,8 +19635,8 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 // interfaces were absent, so the call threw.
 //
 // The answer is derived from the same SDP sections the offer is built from,
-// so the two can never disagree: a codec that appears in one appears in the
-// other, with the same clock rate and the same format parameters.
+// so codec ordering and clock rates stay aligned. Per-offer payload mappings
+// for RTX and RED remain in SDP rather than the static capability view.
 function _rtcCapabilities(kind) {
   if (kind !== 'audio' && kind !== 'video') return null;
   const section = _RTC_SDP_SECTIONS[kind];
@@ -16066,11 +19651,12 @@ function _rtcCapabilities(kind) {
     const match = /^a=rtpmap:(\d+) ([^/]+)\/(\d+)(?:\/(\d+))?$/.exec(line);
     if (!match) continue;
     const name = match[2];
-    // Retransmission has one entry whatever the payload types; its fmtp only
-    // names the codec it repairs, which is per-connection rather than a
-    // capability.
-    const isRetransmission = name.toLowerCase() === 'rtx';
-    const parameters = isRetransmission ? undefined : formats.get(match[1]);
+    // RTX and RED format parameters name the payload types they repair or
+    // encapsulate. Chrome keeps those mappings in the offer SDP, but omits
+    // them from the static codec capability.
+    const lowerName = name.toLowerCase();
+    const hasPayloadMapping = lowerName === 'rtx' || lowerName === 'red';
+    const parameters = hasPayloadMapping ? undefined : formats.get(match[1]);
     // The clock rate is part of a codec's identity: telephone-event is
     // offered at both 48000 and 8000, and keying on the name alone collapsed
     // them into one.
@@ -16296,12 +19882,59 @@ globalThis.indexedDB = {
   databases() { return Promise.resolve([...__obscura_idb.keys()].map(name => ({ name, version: _idbState(name).version }))); },
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
-globalThis.IDBKeyRange = {
-  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
-  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
-  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
-  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
-};
+const _idbKeyRangeState = new WeakMap();
+function IDBKeyRange() {
+  throw new TypeError("Failed to construct 'IDBKeyRange': Illegal constructor");
+}
+function _idbKeyRange(lower, upper, lowerOpen, upperOpen) {
+  const range = Object.create(IDBKeyRange.prototype);
+  _idbKeyRangeState.set(range, { lower, upper, lowerOpen, upperOpen });
+  return range;
+}
+function _idbKeyRangeData(value) {
+  const state = _idbKeyRangeState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+Object.defineProperties(IDBKeyRange.prototype, {
+  lower: { get: _markNativeAs(function () {
+    return _idbKeyRangeData(this).lower;
+  }, 'function get lower() { [native code] }'), enumerable: true, configurable: true },
+  upper: { get: _markNativeAs(function () {
+    return _idbKeyRangeData(this).upper;
+  }, 'function get upper() { [native code] }'), enumerable: true, configurable: true },
+  lowerOpen: { get: _markNativeAs(function () {
+    return _idbKeyRangeData(this).lowerOpen;
+  }, 'function get lowerOpen() { [native code] }'), enumerable: true, configurable: true },
+  upperOpen: { get: _markNativeAs(function () {
+    return _idbKeyRangeData(this).upperOpen;
+  }, 'function get upperOpen() { [native code] }'), enumerable: true, configurable: true },
+  includes: { value: _markNative(function includes(value) {
+    const state = _idbKeyRangeData(this);
+    const above = state.lower === null || (state.lowerOpen ? value > state.lower : value >= state.lower);
+    const below = state.upper === null || (state.upperOpen ? value < state.upper : value <= state.upper);
+    return above && below;
+  }), writable: true, enumerable: true, configurable: true },
+  [Symbol.toStringTag]: { value: 'IDBKeyRange', configurable: true },
+});
+Object.defineProperties(IDBKeyRange, {
+  only: { value: _markNative(function only(value) {
+    return _idbKeyRange(value, value, false, false);
+  }), writable: true, enumerable: true, configurable: true },
+  lowerBound: { value: _markNative(function lowerBound(value, open = false) {
+    return _idbKeyRange(value, null, !!open, false);
+  }), writable: true, enumerable: true, configurable: true },
+  upperBound: { value: _markNative(function upperBound(value, open = false) {
+    return _idbKeyRange(null, value, false, !!open);
+  }), writable: true, enumerable: true, configurable: true },
+  bound: { value: _markNative(function bound(lower, upper, lowerOpen = false, upperOpen = false) {
+    return _idbKeyRange(lower, upper, !!lowerOpen, !!upperOpen);
+  }), writable: true, enumerable: true, configurable: true },
+});
+_markNative(IDBKeyRange);
+Object.defineProperty(globalThis, 'IDBKeyRange', {
+  value: IDBKeyRange, writable: true, enumerable: false, configurable: true,
+});
 
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
@@ -16332,31 +19965,67 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
-// `powerEfficient` is false, not true: Chrome reports false for software
-// decoding, which is what a headless run without GPU acceleration does. The
-// previous `true` claimed hardware-accelerated decoding from an engine that
-// decodes nothing at all -- and contradicted canPlayType's answer next door.
-navigator.mediaCapabilities = {
-  decodingInfo(cfg) {
-    const supported = _mediaConfigurationSupported(cfg);
-    return Promise.resolve({
-      supported, smooth: supported, powerEfficient: false,
-      keySystemAccess: null, configuration: cfg,
-    });
-  },
-  encodingInfo(cfg) {
-    const supported = _mediaConfigurationSupported(cfg);
-    return Promise.resolve({
-      supported, smooth: supported, powerEfficient: false, configuration: cfg,
-    });
-  },
+const _mediaCapabilitiesInstances = new WeakSet();
+const _mediaCapabilitiesToken = {};
+globalThis.MediaCapabilities = class MediaCapabilities {
+  constructor(token) {
+    if (token !== _mediaCapabilitiesToken) {
+      throw new TypeError("Failed to construct 'MediaCapabilities': Illegal constructor");
+    }
+    _mediaCapabilitiesInstances.add(this);
+  }
+  async decodingInfo(configuration) {
+    if (!_mediaCapabilitiesInstances.has(this)) {
+      throw new TypeError("Failed to execute 'decodingInfo' on 'MediaCapabilities': Illegal invocation");
+    }
+    const supported = _mediaConfigurationSupported(configuration);
+    return { powerEfficient: false, smooth: supported, supported, keySystemAccess: null };
+  }
+  async encodingInfo(configuration) {
+    if (!_mediaCapabilitiesInstances.has(this)) {
+      throw new TypeError("Failed to execute 'encodingInfo' on 'MediaCapabilities': Illegal invocation");
+    }
+    const supported = _mediaConfigurationSupported(configuration);
+    return { powerEfficient: false, smooth: supported, supported, keySystemAccess: null };
+  }
+  get [Symbol.toStringTag]() { return 'MediaCapabilities'; }
 };
-// Routed through the same table as canPlayType so the two cannot disagree.
+const _mediaCapabilitiesConstructor = Object.getOwnPropertyDescriptor(
+  MediaCapabilities.prototype, 'constructor');
+const _mediaCapabilitiesMethods = new Map([
+  ['decodingInfo', MediaCapabilities.prototype.decodingInfo],
+  ['encodingInfo', MediaCapabilities.prototype.encodingInfo],
+]);
+delete MediaCapabilities.prototype.constructor;
+delete MediaCapabilities.prototype.decodingInfo;
+delete MediaCapabilities.prototype.encodingInfo;
+for (const name of ['decodingInfo', 'encodingInfo']) {
+  const method = _mediaCapabilitiesMethods.get(name);
+  _markNative(method);
+  Object.defineProperty(MediaCapabilities.prototype, name, {
+    value: method, writable: true, enumerable: true, configurable: true,
+  });
+}
+Object.defineProperty(
+  MediaCapabilities.prototype, 'constructor', _mediaCapabilitiesConstructor);
+_markNative(MediaCapabilities);
+const _mediaCapabilities = new MediaCapabilities(_mediaCapabilitiesToken);
+delete globalThis.navigator.mediaCapabilities;
+const _mediaCapabilitiesGetterHolder = {
+  get mediaCapabilities() { return _mediaCapabilities; },
+};
+const _mediaCapabilitiesGetter = Object.getOwnPropertyDescriptor(
+  _mediaCapabilitiesGetterHolder, 'mediaCapabilities').get;
+_markNative(_mediaCapabilitiesGetter);
+Object.defineProperty(Object.getPrototypeOf(globalThis.navigator), 'mediaCapabilities', {
+  get: _mediaCapabilitiesGetter, set: undefined, enumerable: true, configurable: true,
+});
+
 function _mediaConfigurationSupported(configuration) {
   const media = configuration && (configuration.video || configuration.audio);
   const contentType = media && media.contentType;
   if (!contentType) return false;
-  return _canPlayMediaType(contentType) !== '';
+  return _mediaCapabilityTypeSupported(contentType);
 }
 navigator.locks = {
   request(name, opts, cb) {
@@ -16920,6 +20589,9 @@ globalThis.Worker = class Worker {
         String(this._name || ''),
         creatorUrl,
         JSON.stringify(_fingerprint()),
+        String(_environmentDocumentRoot()),
+        _environmentDocumentCsp(),
+        false,
       );
     }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
@@ -17017,6 +20689,8 @@ globalThis.Worker = class Worker {
 };
 
 globalThis.__blobStore = globalThis.__blobStore || {};
+globalThis.__blobBytesStore = globalThis.__blobBytesStore || {};
+globalThis.__blobTypeStore = globalThis.__blobTypeStore || {};
 // `blob:<serialized origin>/<uuid v4>`, per the File API's "generate a new blob
 // URL". The format is load-bearing beyond cosmetics: a blob-URL Worker takes
 // this string as its script URL, so it is what `location.href` reports inside
@@ -17051,12 +20725,13 @@ URL.createObjectURL = function(blob) {
     // real browsers; the previous async blob.text().then() store raced the
     // Worker constructor, so new Worker(blobURL) fell through to fetch() and
     // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
-    // The obscura Blob materializes _bytes in its constructor; fall back to
-    // the async text() store only for foreign Blob shims without _bytes.
-    if (blob._bytes) {
+    const bytes = _blobBytes(blob);
+    if (bytes) {
       let text = '';
-      try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
+      try { text = new TextDecoder().decode(bytes); } catch (e) {}
       globalThis.__blobStore[id] = text;
+      globalThis.__blobBytesStore[id] = bytes.slice();
+      globalThis.__blobTypeStore[id] = blob.type || '';
     } else if (typeof blob.text === 'function') {
       blob.text().then(text => { globalThis.__blobStore[id] = text; });
     } else {
@@ -17068,6 +20743,8 @@ URL.createObjectURL = function(blob) {
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  delete globalThis.__blobBytesStore[url];
+  delete globalThis.__blobTypeStore[url];
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional
@@ -17133,14 +20810,14 @@ for (const [name, offset] of [
     get() { const root = _scrollRoot(); return root ? (root[offset] || 0) : 0; },
   });
 }
-globalThis.focus = function() {}; _markNative(globalThis.focus);
-globalThis.blur = function() {}; _markNative(globalThis.blur);
+globalThis.focus = ({ focus() {} }).focus; _markNative(globalThis.focus);
+globalThis.blur = ({ blur() {} }).blur; _markNative(globalThis.blur);
 globalThis.print = function() {}; _markNative(globalThis.print);
 globalThis.alert = function() {}; _markNative(globalThis.alert);
 globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
 globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
-globalThis.close = function() {}; _markNative(globalThis.close);
+globalThis.close = ({ close() {} }).close; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Window.postMessage aimed at one's own window. HTML treats it as an ordinary
 // cross-document message that happens to have the same source and destination:
@@ -17150,7 +20827,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // the iframes -- and the previous no-op stub swallowed those posts, so the
 // listener never ran and the script sat waiting on a reply it had sent itself.
 // The frame-to-frame directions already work; only self-delivery was missing.
-globalThis.postMessage = function postMessage(message, targetOrigin) {
+globalThis.postMessage = ({ postMessage(message, targetOrigin) {
   const to = _normalizeTargetOrigin(targetOrigin);
   const selfOrigin = (globalThis.location && globalThis.location.origin) || "";
   if (to !== "*" && to !== "/") {
@@ -17173,10 +20850,12 @@ globalThis.postMessage = function postMessage(message, targetOrigin) {
     // `onmessage` is not routed through dispatchEvent for the Window, so the
     // handler slot is invoked here the same way the frame receive loop does.
     if (typeof globalThis.onmessage === "function") {
-      try { globalThis.onmessage.call(globalThis, evt); } catch (e) {}
+      try { _withLegacyWindowEvent(evt, () => globalThis.onmessage.call(globalThis, evt)); } catch (e) {}
     }
   });
-}; _markNative(globalThis.postMessage);
+} }).postMessage;
+Object.defineProperty(globalThis.postMessage, 'length', { value: 1, configurable: true });
+_markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -17793,7 +21472,7 @@ if (typeof FileReader === 'undefined') {
       const self = this;
       Promise.resolve().then(function () {
         if (self.readyState !== 1) return; // aborted before completion
-        const bytes = (blob && blob._bytes) ? blob._bytes : new Uint8Array(0);
+        const bytes = _blobBytes(blob) || new Uint8Array(0);
         try {
           if (kind === "text") self.result = new TextDecoder(encoding || "utf-8").decode(bytes);
           else if (kind === "binary") self.result = _bytesToBinaryString(bytes);
@@ -18092,24 +21771,192 @@ if (typeof MediaQueryList === 'undefined') {
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
-    constructor(w, h) {
-      if (w instanceof Uint8ClampedArray) { this.data = w; this.width = h; this.height = w.length / (4 * h); }
-      else { this.width = w; this.height = h; this.data = new Uint8ClampedArray(w * h * 4); }
+    constructor(dataOrWidth, widthOrHeight, heightOrSettings = undefined, settings = undefined) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'ImageData': 2 arguments required, but only "
+          + arguments.length + ' present.');
+      }
+      const isBytes = dataOrWidth instanceof Uint8ClampedArray;
+      const isFloat = typeof Float16Array !== 'undefined'
+        && dataOrWidth instanceof Float16Array;
+      if (!isBytes && !isFloat && ArrayBuffer.isView(dataOrWidth)) {
+        throw new TypeError("Failed to construct 'ImageData': The provided ArrayBufferView is not a supported type.");
+      }
+      if (isBytes || isFloat) {
+        let height = heightOrSettings;
+        let resolvedSettings = settings;
+        if (heightOrSettings !== undefined && typeof heightOrSettings === 'object') {
+          resolvedSettings = heightOrSettings;
+          height = undefined;
+        }
+        const output = _imageDataSettings(resolvedSettings);
+        if (isBytes && output.pixelFormat !== 'rgba-unorm8') {
+          throw new DOMException("Failed to construct 'ImageData': Uint8ClampedArray must use rgba-unorm8 pixelFormat.",
+            'InvalidStateError');
+        }
+        if (isFloat && output.pixelFormat !== 'rgba-float16') {
+          throw new DOMException("Failed to construct 'ImageData': Float16Array must use rgba-float16 pixelFormat.",
+            'InvalidStateError');
+        }
+        const width = Math.trunc(Number(widthOrHeight));
+        if (!Number.isFinite(width) || width <= 0) {
+          throw new DOMException("Failed to construct 'ImageData': The source width is zero or not a number.",
+            'IndexSizeError');
+        }
+        if (height === undefined) {
+          height = dataOrWidth.length / (4 * width);
+        }
+        const dimensions = _imageDataDimensions(width, height);
+        if (dataOrWidth.length !== dimensions[0] * dimensions[1] * 4) {
+          throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of (4 * width).",
+            'IndexSizeError');
+        }
+        _installImageData(this, dataOrWidth, dimensions[0], dimensions[1],
+          output.colorSpace, output.pixelFormat);
+        return;
+      }
+      const dimensions = _imageDataDimensions(dataOrWidth, widthOrHeight);
+      const output = _imageDataSettings(heightOrSettings);
+      const data = output.pixelFormat === 'rgba-float16'
+        ? new Float16Array(dimensions[0] * dimensions[1] * 4)
+        : new Uint8ClampedArray(dimensions[0] * dimensions[1] * 4);
+      _installImageData(this, data, dimensions[0], dimensions[1],
+        output.colorSpace, output.pixelFormat);
     }
+    get data() { return _imageData(this).data; }
+    get width() { return _imageData(this).width; }
+    get height() { return _imageData(this).height; }
+    get colorSpace() { return _imageData(this).colorSpace; }
+    get pixelFormat() { return _imageData(this).pixelFormat; }
+    get [Symbol.toStringTag]() { return 'ImageData'; }
   };
 }
 
 if (typeof CanvasRenderingContext2D === 'undefined') {
   globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
 }
+Object.setPrototypeOf(_Canvas2D.prototype, globalThis.CanvasRenderingContext2D.prototype);
+Object.defineProperty(_Canvas2D.prototype, Symbol.toStringTag, {
+  value: 'CanvasRenderingContext2D', configurable: true,
+});
 
 if (typeof OffscreenCanvas === 'undefined') {
-  globalThis.OffscreenCanvas = class OffscreenCanvas {
-    constructor(w, h) { this.width = w; this.height = h; }
-    getContext(type) { return globalThis.document?.createElement('canvas')?.getContext(type) || null; }
-    convertToBlob() { return Promise.resolve(new Blob([''])); }
-    transferToImageBitmap() { return {}; }
+  const _offscreenCanvasState = new WeakMap();
+  const _imageBitmapState = new WeakMap();
+  const _bitmapKey = Symbol('ImageBitmap');
+
+  globalThis.OffscreenCanvasRenderingContext2D = class OffscreenCanvasRenderingContext2D {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get [Symbol.toStringTag]() { return 'OffscreenCanvasRenderingContext2D'; }
   };
+  Object.setPrototypeOf(globalThis.OffscreenCanvasRenderingContext2D.prototype,
+    _Canvas2D.prototype);
+
+  globalThis.ImageBitmap = class ImageBitmap {
+    constructor(key, width, height, pixels = undefined) {
+      if (key !== _bitmapKey) throw new TypeError('Illegal constructor');
+      _imageBitmapState.set(this, {width, height, pixels, closed: false});
+    }
+    get width() { const state = _imageBitmapState.get(this); return state.closed ? 0 : state.width; }
+    get height() { const state = _imageBitmapState.get(this); return state.closed ? 0 : state.height; }
+    close() { const state = _imageBitmapState.get(this); state.closed = true; state.pixels = undefined; }
+    get [Symbol.toStringTag]() { return 'ImageBitmap'; }
+  };
+
+  globalThis.OffscreenCanvas = class OffscreenCanvas {
+    constructor(width, height) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'OffscreenCanvas': 2 arguments required, but only "
+          + arguments.length + ' present.');
+      }
+      width = Math.max(0, Math.trunc(Number(width)) || 0);
+      height = Math.max(0, Math.trunc(Number(height)) || 0);
+      _offscreenCanvasState.set(this, {width, height, context: null, contextType: null});
+    }
+    get width() { return _offscreenCanvasState.get(this).width; }
+    set width(value) {
+      const state = _offscreenCanvasState.get(this);
+      state.width = Math.max(0, Math.trunc(Number(value)) || 0);
+      if (state.context) state.context._resizeFromCanvas();
+    }
+    get height() { return _offscreenCanvasState.get(this).height; }
+    set height(value) {
+      const state = _offscreenCanvasState.get(this);
+      state.height = Math.max(0, Math.trunc(Number(value)) || 0);
+      if (state.context) state.context._resizeFromCanvas();
+    }
+    getAttribute(name) {
+      if (name === 'width') return String(this.width);
+      if (name === 'height') return String(this.height);
+      return null;
+    }
+    getContext(type, attrs = undefined) {
+      const state = _offscreenCanvasState.get(this);
+      type = String(type).toLowerCase();
+      if (state.contextType !== null && state.contextType !== type) return null;
+      if (type !== '2d') return null;
+      if (!state.context) {
+        state.context = new _Canvas2D(this, attrs);
+        Object.setPrototypeOf(state.context,
+          globalThis.OffscreenCanvasRenderingContext2D.prototype);
+        state.contextType = type;
+      }
+      return state.context;
+    }
+    convertToBlob() {
+      const state = _offscreenCanvasState.get(this);
+      if (!state.context) {
+        return Promise.reject(new DOMException(
+          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': 'OffscreenCanvas' has no rendering context.",
+          'InvalidStateError'));
+      }
+      if (state.width === 0 || state.height === 0) {
+        return Promise.reject(new DOMException(
+          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The canvas has no pixels.",
+          'IndexSizeError'));
+      }
+      return Promise.resolve(_canvasPngBlob(state.context));
+    }
+    transferToImageBitmap() {
+      const state = _offscreenCanvasState.get(this);
+      const context = state.context || this.getContext('2d');
+      const bitmap = new globalThis.ImageBitmap(_bitmapKey, state.width, state.height,
+        context._buf.slice());
+      context._resizeFromCanvas();
+      return bitmap;
+    }
+    get [Symbol.toStringTag]() { return 'OffscreenCanvas'; }
+  };
+
+  globalThis.createImageBitmap = _markNative(async function createImageBitmap(source, ...crop) {
+    let width = 0, height = 0, pixels;
+    const offscreen = _offscreenCanvasState.get(source);
+    if (offscreen) {
+      const context = offscreen.context || source.getContext('2d');
+      width = offscreen.width; height = offscreen.height; pixels = context._buf.slice();
+    } else if (source && source._ctx instanceof _Canvas2D) {
+      width = source._ctx._w; height = source._ctx._h; pixels = source._ctx._buf.slice();
+    } else if (_imageDataState.has(source)) {
+      const image = _imageData(source);
+      width = image.width; height = image.height;
+    } else if (source instanceof Blob) {
+      const bytes = new Uint8Array(await source.arrayBuffer());
+      if (bytes.length >= 24 && bytes[0] === 0x89 && bytes[1] === 0x50
+          && bytes[2] === 0x4e && bytes[3] === 0x47) {
+        width = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0;
+        height = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0;
+      } else {
+        throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+      }
+    } else {
+      throw new TypeError("Failed to execute 'createImageBitmap': The provided value is not an image source.");
+    }
+    if (crop.length >= 4) {
+      width = Math.abs(Math.trunc(Number(crop[2])));
+      height = Math.abs(Math.trunc(Number(crop[3])));
+    }
+    return new globalThis.ImageBitmap(_bitmapKey, width, height, pixels);
+  });
 }
 
 if (typeof Path2D === 'undefined') {
@@ -18572,7 +22419,8 @@ function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
   try {
     id = Deno.core.ops.op_shared_worker_connect(
       String(source), String(finalUrl), String(workerType), String(entry.name),
-      creatorUrl, JSON.stringify(_fingerprint()), true,
+      creatorUrl, JSON.stringify(_fingerprint()),
+      String(_environmentDocumentRoot()), _environmentDocumentCsp(), true,
     );
   } catch (e) { _sharedWorkerError(entry, e && e.message ? e.message : String(e)); return; }
   entry.id = id;
@@ -18726,9 +22574,9 @@ _markNative(globalThis.SharedWorker);
 try {
   Object.setPrototypeOf(globalThis.SharedWorker.prototype, EventTarget.prototype);
 } catch (e) {}
-// MediaSource: absent entirely before, which no Chrome build is. It answers
-// the same capability table as canPlayType, and an instance sits in "closed"
-// forever because nothing ever attaches it to a media element that plays.
+// MediaSource: absent entirely before, which no Chrome build is. Its stricter
+// container/codec rules intentionally differ from canPlayType, as in Chrome.
+// An instance stays "closed" because nothing attaches it to a playing element.
 if (typeof globalThis.MediaSource === 'undefined') {
   const MediaSource = class MediaSource extends EventTarget {
     constructor() {
@@ -18763,7 +22611,7 @@ if (typeof globalThis.MediaSource === 'undefined') {
     }
     setLiveSeekableRange() {}
     clearLiveSeekableRange() {}
-    static isTypeSupported(type) { return _canPlayMediaType(type) !== ''; }
+    static isTypeSupported(type) { return _mediaSourceTypeSupported(type); }
     get [Symbol.toStringTag]() { return 'MediaSource'; }
   };
   _markNative(MediaSource);
@@ -19142,7 +22990,9 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+  Document.prototype.importNode = function(node, deep) {
+    return _stampDetachedDocumentNode(this, node?.cloneNode(!!deep) || null);
+  };
 }
 
 // Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
@@ -19156,7 +23006,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
     if (node && node[_nidSym] !== undefined) {
       node[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     }
-    return node || null;
+    return _stampDetachedDocumentNode(this, node || null);
   };
 }
 
@@ -19334,6 +23184,48 @@ globalThis.__obscura_init = function() {
     // the same Document object exposed as globalThis.document.
     _cache.set(documentNid, globalThis.document);
   }
+  // `location` is [LegacyUnforgeable] on a live Document: Chrome exposes it
+  // as an enumerable, non-configurable own accessor. Install it after the
+  // realm chooses its document so the closure points at that realm's Window,
+  // including frame documents created by the shared-isolate host.
+  try {
+    if (!Object.prototype.hasOwnProperty.call(globalThis.document, 'location')) {
+      Object.defineProperty(globalThis.document, 'location', {
+        get() { return globalThis.location; },
+        set(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); },
+        enumerable: true,
+        configurable: false,
+      });
+    }
+  } catch (_error) {}
+  try {
+    const registryState = _customElementRegistryData(globalThis.customElements);
+    registryState.roots.clear();
+    registryState.roots.add(globalThis.document);
+  } catch (_e) {}
+  try { _applyCrossOriginIsolation?.(frameRootNid || 0); } catch (_e) {}
+  // Keep string-code generation enabled unless this document explicitly has
+  // a script-src/default-src without 'unsafe-eval'. The flag is consumed by
+  // V8's isolate callback, so the intrinsic eval binding retains direct-eval
+  // semantics in every frame realm.
+  try {
+    const scopeInfo = _domParse('document_scope_info', frameRootNid || 0) || {};
+    const header = String(scopeInfo.csp || '');
+    let scriptSources = null;
+    let defaultSources = null;
+    for (const directive of header.split(';')) {
+      const tokens = directive.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) continue;
+      const name = tokens.shift().toLowerCase();
+      if (name === 'script-src' && scriptSources === null) scriptSources = tokens;
+      if (name === 'default-src' && defaultSources === null) defaultSources = tokens;
+    }
+    const sources = scriptSources || defaultSources;
+    globalThis.__obscura_csp_allows_unsafe_eval =
+      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+  } catch (_e) {
+    globalThis.__obscura_csp_allows_unsafe_eval = true;
+  }
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(globalThis.document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
@@ -19359,6 +23251,8 @@ globalThis.__obscura_init = function() {
     !!globalThis.__obscura_screen_emulated,
     hasScreenOverride ? undefined : Number(fingerprintScreen.availWidth),
     hasScreenOverride ? undefined : Number(fingerprintScreen.availHeight),
+    hasScreenOverride ? undefined : Number(fingerprintScreen.availTop),
+    hasScreenOverride ? undefined : Number(fingerprintScreen.availLeft),
   );
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
@@ -19465,9 +23359,21 @@ globalThis.__obscura_init = function() {
     : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
       ? Number(fingerprintScreen.availHeight) : sh);
   const windowTop = Math.max(0, sh - availH);
-  globalThis.outerWidth = availW; globalThis.outerHeight = availH;
-  globalThis.screenX = 0; globalThis.screenY = windowTop;
-  globalThis.screenLeft = 0; globalThis.screenTop = windowTop;
+  // A host can provide real window metrics through ScreenFingerprint. Zero
+  // keeps the historical maximized-window fallback used by embedders that do
+  // not expose native window placement.
+  const configuredOuterW = Number(fingerprintScreen.outerWidth);
+  const configuredOuterH = Number(fingerprintScreen.outerHeight);
+  const configuredScreenX = Number(fingerprintScreen.screenX);
+  const configuredScreenY = Number(fingerprintScreen.screenY);
+  globalThis.outerWidth = !hasScreenOverride && configuredOuterW > 0 ? configuredOuterW : availW;
+  globalThis.outerHeight = !hasScreenOverride && configuredOuterH > 0 ? configuredOuterH : availH;
+  globalThis.screenX = !hasScreenOverride && Number.isFinite(configuredScreenX)
+    ? configuredScreenX : 0;
+  globalThis.screenY = !hasScreenOverride && Number.isFinite(configuredScreenY)
+    ? configuredScreenY : windowTop;
+  globalThis.screenLeft = globalThis.screenX;
+  globalThis.screenTop = globalThis.screenY;
 
   // The time origin is when navigation started, so it is always in the past.
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,
@@ -19480,13 +23386,10 @@ globalThis.__obscura_init = function() {
   globalThis.__obscura_rebasePerformanceOrigin?.(t0);
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
-  globalThis.performance.memory = {
-    jsHeapSizeLimit: 4294705152,
-    totalJSHeapSize: _totalHeap,
-    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
-  };
-  globalThis.Notification.permission = "default";
-
+  _memoryInfoBacking.jsHeapSizeLimit = 4395630592;
+  _memoryInfoBacking.totalJSHeapSize = _totalHeap;
+  _memoryInfoBacking.usedJSHeapSize = Math.floor(
+    _totalHeap * (0.3 + _fpRand(621) * 0.5));
   // Navigator, UA-CH, screen and request headers share the Rust-derived
   // fingerprint contract installed before page initialization.
 
@@ -20066,7 +23969,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     'CustomElementRegistry', 'ElementInternals', 'DOMException',
     // HTML element interfaces that own their prototype. The rest are aliases
     // of Element and are filtered out by the constructor check below.
-    'HTMLFormElement', 'HTMLImageElement', 'HTMLMediaElement',
+    'HTMLFormElement', 'HTMLInputElement', 'HTMLImageElement', 'HTMLMediaElement',
     'HTMLVideoElement', 'HTMLAudioElement', 'HTMLObjectElement', 'HTMLTrackElement',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement', 'SVGAnimatedString',
@@ -20085,7 +23988,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     'ResizeObserverSize', 'Animation', 'KeyframeEffect', 'DocumentTimeline',
     // Fetch, XHR and streams
     'Headers', 'Request', 'Response', 'FormData', 'AbortController',
-    'AbortSignal', 'XMLHttpRequest', 'XMLHttpRequestEventTarget',
+    'AbortSignal', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload',
     'ReadableStream', 'WritableStream', 'TransformStream',
     'TextEncoder', 'TextDecoder', 'TextEncoderStream', 'TextDecoderStream',
     'URL', 'URLSearchParams', 'URLPattern', 'WebSocket',
@@ -20219,23 +24122,62 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     configurable: true,
   });
 
-  // `crossOriginIsolated` is a WindowOrWorkerGlobalScope attribute Chrome
-  // always exposes; on a document without COOP+COEP it reads `false`, never
-  // `undefined`. Answering `undefined` while `SharedArrayBuffer` is withheld
-  // is self-contradictory: the two travel together, and the pair is one line
-  // to check. Isolation is never granted here because no COOP/COEP header is
-  // parsed anywhere in the engine, so this is a constant rather than a lookup.
+  // The navigation layer derives this from COOP+COEP and Permissions-Policy.
+  // Drive this getter and the SAB global from one per-document value.
   Object.defineProperty(globalThis, 'crossOriginIsolated', {
-    get: _markNativeAs(function crossOriginIsolated() { return false; },
+    get: _markNativeAs(function crossOriginIsolated() { return _crossOriginIsolatedValue; },
       'function get crossOriginIsolated() { [native code] }'),
     set: undefined,
     enumerable: true,
     configurable: true,
   });
 
+  _applyCrossOriginIsolation = function (documentRoot) {
+    let isolated = false;
+    try {
+      const info = _domParse('document_scope_info', documentRoot || 0) || {};
+      isolated = _secureNow() && info.crossOriginIsolated === true;
+    } catch (_error) {}
+    _crossOriginIsolatedValue = isolated;
+    if (isolated && typeof _SharedArrayBufferCtor !== 'function') {
+      try {
+        _SharedArrayBufferCtor = new WebAssembly.Memory(
+          {initial: 1, maximum: 1, shared: true}).buffer.constructor;
+      } catch (_error) {}
+    }
+    if (isolated && typeof _SharedArrayBufferCtor === 'function') {
+      Object.defineProperty(globalThis, 'SharedArrayBuffer', {
+        value: _SharedArrayBufferCtor,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    } else {
+      try { delete globalThis.SharedArrayBuffer; } catch (_error) {}
+    }
+  };
+
+  // Legacy Window accessors that remain observable even when their value is
+  // absent. `event` reads undefined outside dispatch, while `origin` reads the
+  // serialized location origin; both keep a native no-op setter in Chrome.
+  if (!('event' in globalThis)) {
+    Object.defineProperty(globalThis, 'event', {
+      get: _markNativeAs(function event() {
+        return _legacyWindowEvent || (_legacyEventStickyEligible() ? _legacyStickyWindowEvent : undefined);
+      },
+        'function get event() { [native code] }'),
+      set: _markNativeAs(function event(value) { _legacyWindowEvent = value; },
+        'function set event() { [native code] }'),
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
   // `origin` is a WindowOrWorkerGlobalScope attribute that Chrome exposes on
-  // every global; it was missing here entirely. An opaque origin reads "null".
+  // every global. An opaque origin reads "null".
   if (!('origin' in globalThis)) {
+    const originSetter = _markNativeAs(function origin(value) {},
+      'function set origin() { [native code] }');
     Object.defineProperty(globalThis, 'origin', {
       get: _markNativeAs(function origin() {
         try {
@@ -20243,7 +24185,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
           return value === undefined || value === '' ? 'null' : value;
         } catch (_error) { return 'null'; }
       }, 'function get origin() { [native code] }'),
-      set: undefined,
+      set: originSetter,
       enumerable: true,
       configurable: true,
     });
@@ -20735,6 +24677,7 @@ const _chromeInterfaceTable = [
   ["HTMLTimeElement",0,0,"HTMLElement","",0],
   ["HTMLTitleElement",0,0,"HTMLElement","",0],
   ["HTMLTrackElement",0,0,"HTMLElement","",0],
+  ["HTMLUserMediaElement",0,0,"HTMLElement","HTMLUserMediaElement",0],
   ["HTMLUListElement",0,0,"HTMLElement","",0],
   ["HTMLUnknownElement",0,0,"HTMLElement","",0],
   ["HTMLVideoElement",0,0,"HTMLMediaElement","",0],
@@ -20773,6 +24716,7 @@ const _chromeInterfaceTable = [
   ["InputDeviceCapabilities",0,1,"Object","InputDeviceCapabilities",0],
   ["InputDeviceInfo",0,0,"MediaDeviceInfo","",0],
   ["InputEvent",0,2,"UIEvent","",1],
+  ["InteractionContentfulPaint",0,0,"PerformanceEntry","InteractionContentfulPaint",0],
   ["Int16Array",0,1,"TypedArray","Int16Array",3],
   ["Int32Array",0,1,"TypedArray","Int32Array",3],
   ["Int8Array",0,1,"TypedArray","Int8Array",3],
@@ -20828,6 +24772,7 @@ const _chromeInterfaceTable = [
   ["MediaSession",0,0,"Object","",0],
   ["MediaSource",0,1,"EventTarget","MediaSource",0],
   ["MediaSourceHandle",0,0,"Object","",0],
+  ["ModelContext",0,0,"Object","",0],
   ["MediaStream",0,1,"EventTarget","MediaStream",0],
   ["MediaStreamAudioDestinationNode",0,2,"AudioNode","",1],
   ["MediaStreamAudioSourceNode",0,3,"AudioNode","",2],
@@ -20843,7 +24788,6 @@ const _chromeInterfaceTable = [
   ["MessagePort",0,0,"EventTarget","",0],
   ["MimeType",0,0,"Object","",0],
   ["MimeTypeArray",0,0,"Object","",0],
-  ["ModelContext",0,0,"Object","",0],
   ["MouseEvent",0,2,"UIEvent","",1],
   ["MutationObserver",0,2,"Object","",1],
   ["MutationRecord",0,0,"Object","",0],
@@ -20866,6 +24810,7 @@ const _chromeInterfaceTable = [
   ["NodeFilter",0,4,"no-proto","",0],
   ["NodeIterator",0,0,"Object","",0],
   ["NodeList",0,0,"Object","",0],
+  ["NodeRange",0,0,"AbstractRange","NodeRange",0],
   ["NotRestoredReasonDetails",0,0,"Object","",0],
   ["NotRestoredReasons",0,0,"Object","",0],
   ["Notification",0,2,"EventTarget","",1],
@@ -20876,6 +24821,7 @@ const _chromeInterfaceTable = [
   ["OfflineAudioCompletionEvent",0,3,"Event","",2],
   ["OfflineAudioContext",0,2,"BaseAudioContext","",1],
   ["OffscreenCanvas",0,3,"EventTarget","",2],
+  ["OpaqueRange",0,0,"AbstractRange","OpaqueRange",0],
   ["OffscreenCanvasRenderingContext2D",0,0,"Object","",0],
   ["Option",0,1,"HTMLElement","HTMLOptionElement",0],
   ["OrientationSensor",0,0,"Sensor","",0],
@@ -20908,6 +24854,7 @@ const _chromeInterfaceTable = [
   ["PerformanceObserverEntryList",0,0,"Object","",0],
   ["PerformancePaintTiming",0,0,"PerformanceEntry","",0],
   ["PerformanceResourceTiming",0,0,"PerformanceEntry","",0],
+  ["PerformanceSoftNavigation",0,0,"PerformanceEntry","PerformanceSoftNavigation",0],
   ["PerformanceScriptTiming",0,0,"PerformanceEntry","",0],
   ["PerformanceServerTiming",0,0,"Object","",0],
   ["PerformanceTiming",0,0,"Object","",0],
@@ -21253,7 +25200,6 @@ const _chromeInterfaceTable = [
   ["WebGLVertexArrayObject",0,0,"WebGLObject","",0],
   ["WebKitCSSMatrix",0,1,"DOMMatrixReadOnly","DOMMatrix",0],
   ["WebKitMutationObserver",0,2,"Object","",1],
-  ["WebMCPEvent",0,0,"Object","",0],
   ["WebSocket",0,2,"EventTarget","",1],
   ["WebSocketError",0,1,"DOMException","WebSocketError",0],
   ["WebSocketStream",0,2,"Object","",1],
@@ -21262,6 +25208,7 @@ const _chromeInterfaceTable = [
   ["WebTransportDatagramDuplexStream",0,0,"Object","",0],
   ["WebTransportError",0,1,"DOMException","WebTransportError",0],
   ["WheelEvent",0,2,"MouseEvent","",1],
+  ["WebMCPEvent",0,0,"Event","",0],
   ["Window",0,0,"EventTarget","",0],
   ["WindowControlsOverlay",0,0,"EventTarget","",0],
   ["WindowControlsOverlayGeometryChangeEvent",0,4,"Event","",2],
@@ -21275,6 +25222,7 @@ const _chromeInterfaceTable = [
   ["XMLHttpRequestEventTarget",0,0,"EventTarget","",0],
   ["XMLHttpRequestUpload",0,0,"XMLHttpRequestEventTarget","",0],
   ["XMLSerializer",0,1,"Object","XMLSerializer",0],
+  ["XSLTProcessor",0,1,"Object","XSLTProcessor",0],
   ["XPathEvaluator",0,1,"Object","XPathEvaluator",0],
   ["XPathExpression",0,0,"Object","",0],
   ["XPathResult",0,0,"Object","",0],
@@ -21512,8 +25460,8 @@ const _chromeNavigatorTable = [
   ["mediaCapabilities", 1],
   ["mediaDevices", 1],
   ["mediaSession", 1],
-  ["mimeTypes", 1],
   ["modelContext", 1],
+  ["mimeTypes", 1],
   ["permissions", 1],
   ["plugins", 1],
   ["presentation", 1],
@@ -21591,9 +25539,20 @@ const _chromeNavigatorTable = [
         if (typeof globalThis[name] !== 'undefined') continue;
         let ctor;
         if (protoParent === 'no-proto') {
-          // A window method, not a constructor: no .prototype, and `new`
-          // throws "is not a constructor" exactly like Chrome's methods.
-          ctor = () => { throw new TypeError(argMessage(name, 1)); };
+          // Arrow functions keep window methods non-constructible. Methods
+          // with optional arguments must still accept a normal zero-argument
+          // call after feature detection succeeds.
+          if (name === 'find') {
+            ctor = () => false;
+          } else if (name === 'captureEvents' || name === 'releaseEvents') {
+            ctor = () => undefined;
+          } else if (name === 'showDirectoryPicker' || name === 'showOpenFilePicker'
+              || name === 'showSaveFilePicker' || name === 'queryLocalFonts'
+              || name === 'getScreenDetails') {
+            ctor = () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+          } else {
+            ctor = () => { throw new TypeError(argMessage(name, 1)); };
+          }
         } else if (ctorMode === 0) {
           ctor = function() {
             throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
@@ -21648,6 +25607,369 @@ const _chromeNavigatorTable = [
   }
 })();
 
+// A handful of Chrome 152 interfaces are exposed even though their concrete
+// implementations are internal-only. Keep their public prototype shape so
+// feature probes see the same constructors and WebIDL members.
+(function installLongTailInterfaceMembers() {
+  const method = (proto, name, length, fn) => {
+    const value = _markNative(fn || function() {});
+    try { Object.defineProperty(value, 'length', { value: length, configurable: true }); } catch (_e) {}
+    Object.defineProperty(proto, name, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  };
+  const getter = (proto, name) => {
+    const get = _markNativeAs(
+      function() { throw new TypeError('Illegal invocation'); },
+      'function get ' + name + '() { [native code] }',
+    );
+    Object.defineProperty(proto, name, {
+      get, set: undefined, enumerable: true, configurable: true,
+    });
+  };
+  if (typeof XSLTProcessor === 'function') {
+    const proto = XSLTProcessor.prototype;
+    method(proto, 'clearParameters', 0, function clearParameters() {});
+    method(proto, 'getParameter', 2, function getParameter() {});
+    method(proto, 'importStylesheet', 1, function importStylesheet() {});
+    method(proto, 'removeParameter', 2, function removeParameter() {});
+    method(proto, 'reset', 0, function reset() {});
+    method(proto, 'setParameter', 3, function setParameter() {});
+    method(proto, 'transformToDocument', 1, function transformToDocument() {});
+    method(proto, 'transformToFragment', 2, function transformToFragment() {});
+  }
+  if (typeof HTMLUserMediaElement === 'function') {
+    const proto = HTMLUserMediaElement.prototype;
+    for (const name of ['error', 'onstream', 'oncancel', 'onerror', 'stream']) getter(proto, name);
+    method(proto, 'setConstraints', 0, function setConstraints() {});
+  }
+  if (typeof InteractionContentfulPaint === 'function') {
+    const proto = InteractionContentfulPaint.prototype;
+    getter(proto, 'largestContentfulPaint');
+    getter(proto, 'interactionId');
+    method(proto, 'toJSON', 0, function toJSON() { return {}; });
+    getter(proto, 'paintTime');
+    getter(proto, 'presentationTime');
+  }
+  if (typeof PerformanceSoftNavigation === 'function') {
+    const proto = PerformanceSoftNavigation.prototype;
+    getter(proto, 'navigationType');
+    getter(proto, 'interactionId');
+    method(proto, 'getLargestInteractionContentfulPaint', 0,
+      function getLargestInteractionContentfulPaint() {});
+    getter(proto, 'paintTime');
+    getter(proto, 'presentationTime');
+  }
+  if (typeof NodeRange === 'function') {
+    const proto = NodeRange.prototype;
+    getter(proto, 'startContainer');
+    getter(proto, 'endContainer');
+  }
+  if (typeof OpaqueRange === 'function') {
+    const proto = OpaqueRange.prototype;
+    method(proto, 'disconnect', 0, function disconnect() {});
+    method(proto, 'getBoundingClientRect', 0, function getBoundingClientRect() {});
+    method(proto, 'getClientRects', 0, function getClientRects() {});
+  }
+})();
+
+// Permissions are realm-sensitive: a cross-origin iframe does not inherit
+// the top document's prompt state unless every boundary delegates the feature.
+// Keep the public objects branded and slot-backed like Chromium rather than
+// returning plain records from query().
+(function installPermissions() {
+  if (typeof Permissions !== 'function' || typeof PermissionStatus !== 'function') return;
+  const statusState = new WeakMap();
+  const permissions = globalThis.navigator.permissions;
+  if (!permissions) return;
+
+  const status = value => {
+    const state = statusState.get(value);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const nameGetter = _markNative(function name() { return status(this).name; });
+  const stateGetter = _markNative(function state() { return status(this).state; });
+  const onchangeGetter = _markNative(function onchange() { return status(this).onchange; });
+  const onchangeSetter = _markNative(function onchange(value) {
+    status(this).onchange = typeof value === 'function' ? value : null;
+  });
+  const statusConstructor = Object.getOwnPropertyDescriptor(
+    PermissionStatus.prototype, 'constructor');
+  delete PermissionStatus.prototype.constructor;
+  Object.defineProperties(PermissionStatus.prototype, {
+    name: { get: nameGetter, set: undefined, enumerable: true, configurable: true },
+    state: { get: stateGetter, set: undefined, enumerable: true, configurable: true },
+    onchange: { get: onchangeGetter, set: onchangeSetter, enumerable: true, configurable: true },
+  });
+  if (statusConstructor) Object.defineProperty(
+    PermissionStatus.prototype, 'constructor', statusConstructor);
+
+  const query = _markNative(function query(descriptor) {
+    if (arguments.length === 0) {
+      return Promise.reject(new TypeError(
+        "Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
+    }
+    const name = descriptor && descriptor.name;
+    const result = Object.create(PermissionStatus.prototype);
+    statusState.set(result, {
+      name: _permissionStatusName(name), state: _permissionState(name), onchange: null,
+    });
+    return Promise.resolve(result);
+  });
+  const permissionsConstructor = Object.getOwnPropertyDescriptor(
+    Permissions.prototype, 'constructor');
+  delete Permissions.prototype.constructor;
+  Object.defineProperty(Permissions.prototype, 'query',
+    { value: query, writable: true, enumerable: true, configurable: true });
+  if (permissionsConstructor) Object.defineProperty(
+    Permissions.prototype, 'constructor', permissionsConstructor);
+  delete permissions.query;
+  Object.setPrototypeOf(permissions, Permissions.prototype);
+
+  Object.defineProperty(Notification, 'permission', {
+    get: _markNative(function permission() {
+      return _permissionPolicyAllows('notifications') ? 'default' : 'denied';
+    }),
+    set: undefined,
+    enumerable: true,
+    configurable: true,
+  });
+})();
+
+// StorageManager and the origin-private file system. The backing graph is
+// page/realm-local and never touches the host filesystem; it exists to provide
+// the durable browser object model and API semantics pages observe.
+(function installOriginPrivateFileSystem() {
+  if (typeof StorageManager !== 'function'
+      || typeof FileSystemHandle !== 'function'
+      || typeof FileSystemDirectoryHandle !== 'function'
+      || typeof FileSystemFileHandle !== 'function') return;
+
+  const storageState = new WeakSet();
+  const handleState = new WeakMap();
+  const writableState = new WeakMap();
+  const rootNode = { kind: 'directory', name: '', parent: null, children: new Map() };
+  const manager = Object.create(StorageManager.prototype);
+  storageState.add(manager);
+
+  const requireStorage = value => {
+    if (!storageState.has(value)) throw new TypeError('Illegal invocation');
+  };
+  const requireHandle = value => {
+    const state = handleState.get(value);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const requireDirectory = value => {
+    const state = requireHandle(value);
+    if (state.node.kind !== 'directory') throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const validName = value => {
+    const name = String(value);
+    if (!name || name === '.' || name === '..' || name.includes('/')) {
+      throw new TypeError('Name is not allowed.');
+    }
+    return name;
+  };
+  const method = (prototype, name, fn, length = fn.length) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: length, configurable: true });
+    _markNative(fn);
+    Object.defineProperty(prototype, name, {
+      value: fn, writable: true, enumerable: true, configurable: true,
+    });
+  };
+  const getter = (prototype, name, fn) => {
+    Object.defineProperty(fn, 'name', { value: 'get ' + name, configurable: true });
+    Object.defineProperty(prototype, name, {
+      get: _markNativeAs(fn, 'function get ' + name + '() { [native code] }'),
+      set: undefined, enumerable: true, configurable: true,
+    });
+  };
+  const makeHandle = node => {
+    const prototype = node.kind === 'directory'
+      ? FileSystemDirectoryHandle.prototype : FileSystemFileHandle.prototype;
+    const handle = Object.create(prototype);
+    handleState.set(handle, { node });
+    return handle;
+  };
+  const rootHandle = makeHandle(rootNode);
+
+  method(StorageManager.prototype, 'estimate', async function estimate() {
+    requireStorage(this);
+    return { quota: 5000000000, usage: 0, usageDetails: {} };
+  }, 0);
+  method(StorageManager.prototype, 'persisted', async function persisted() {
+    requireStorage(this); return false;
+  }, 0);
+  method(StorageManager.prototype, 'getDirectory', async function getDirectory() {
+    requireStorage(this); return rootHandle;
+  }, 0);
+  method(StorageManager.prototype, 'persist', async function persist() {
+    requireStorage(this); return false;
+  }, 0);
+
+  getter(FileSystemHandle.prototype, 'kind', function kind() {
+    return requireHandle(this).node.kind;
+  });
+  getter(FileSystemHandle.prototype, 'name', function name() {
+    return requireHandle(this).node.name;
+  });
+  method(FileSystemHandle.prototype, 'isSameEntry', async function isSameEntry(other) {
+    const left = requireHandle(this).node;
+    const right = requireHandle(other).node;
+    return left === right;
+  }, 1);
+  method(FileSystemHandle.prototype, 'queryPermission', async function queryPermission() {
+    requireHandle(this); return 'granted';
+  }, 0);
+  method(FileSystemHandle.prototype, 'requestPermission', async function requestPermission() {
+    requireHandle(this); return 'granted';
+  }, 0);
+  method(FileSystemHandle.prototype, 'remove', async function remove(options = undefined) {
+    const node = requireHandle(this).node;
+    if (!node.parent) throw new DOMException('The root directory cannot be removed.', 'InvalidModificationError');
+    if (node.kind === 'directory' && node.children.size
+        && !(options && options.recursive === true)) {
+      throw new DOMException('The directory is not empty.', 'InvalidModificationError');
+    }
+    node.parent.children.delete(node.name);
+  }, 0);
+
+  const child = (directory, name, kind, options) => {
+    name = validName(name);
+    const state = requireDirectory(directory);
+    let node = state.node.children.get(name);
+    if (node && node.kind !== kind) {
+      throw new DOMException('A handle of a different kind exists.', 'TypeMismatchError');
+    }
+    if (!node) {
+      if (!(options && options.create === true)) {
+        throw new DOMException('A requested file or directory could not be found.', 'NotFoundError');
+      }
+      node = kind === 'directory'
+        ? { kind, name, parent: state.node, children: new Map() }
+        : { kind, name, parent: state.node, bytes: new Uint8Array(0), lastModified: Date.now() };
+      state.node.children.set(name, node);
+    }
+    return makeHandle(node);
+  };
+  method(FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', async function getDirectoryHandle(name, options = undefined) {
+    return child(this, name, 'directory', options);
+  }, 1);
+  method(FileSystemDirectoryHandle.prototype, 'getFileHandle', async function getFileHandle(name, options = undefined) {
+    return child(this, name, 'file', options);
+  }, 1);
+  method(FileSystemDirectoryHandle.prototype, 'removeEntry', async function removeEntry(name, options = undefined) {
+    name = validName(name);
+    const directory = requireDirectory(this).node;
+    const node = directory.children.get(name);
+    if (!node) throw new DOMException('A requested file or directory could not be found.', 'NotFoundError');
+    if (node.kind === 'directory' && node.children.size
+        && !(options && options.recursive === true)) {
+      throw new DOMException('The directory is not empty.', 'InvalidModificationError');
+    }
+    directory.children.delete(name);
+  }, 1);
+  method(FileSystemDirectoryHandle.prototype, 'resolve', async function resolve(possibleDescendant) {
+    const directory = requireDirectory(this).node;
+    let node = requireHandle(possibleDescendant).node;
+    const path = [];
+    while (node && node !== directory) { path.unshift(node.name); node = node.parent; }
+    return node === directory ? path : null;
+  }, 1);
+  const directoryIterator = (directory, mode) => {
+    const entries = Array.from(requireDirectory(directory).node.children.entries());
+    let index = 0;
+    return {
+      [Symbol.asyncIterator]() { return this; },
+      next() {
+        if (index >= entries.length) return Promise.resolve({ value: undefined, done: true });
+        const [name, node] = entries[index++];
+        const handle = makeHandle(node);
+        return Promise.resolve({
+          value: mode === 'keys' ? name : mode === 'values' ? handle : [name, handle],
+          done: false,
+        });
+      },
+    };
+  };
+  method(FileSystemDirectoryHandle.prototype, 'entries', function entries() {
+    return directoryIterator(this, 'entries');
+  }, 0);
+  method(FileSystemDirectoryHandle.prototype, 'keys', function keys() {
+    return directoryIterator(this, 'keys');
+  }, 0);
+  method(FileSystemDirectoryHandle.prototype, 'values', function values() {
+    return directoryIterator(this, 'values');
+  }, 0);
+  Object.defineProperty(FileSystemDirectoryHandle.prototype, Symbol.asyncIterator, {
+    value: FileSystemDirectoryHandle.prototype.entries,
+    writable: true, enumerable: false, configurable: true,
+  });
+
+  method(FileSystemFileHandle.prototype, 'getFile', async function getFile() {
+    const node = requireHandle(this).node;
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    return new File([node.bytes], node.name, {
+      type: node.name.toLowerCase().endsWith('.txt') ? 'text/plain' : '',
+      lastModified: node.lastModified,
+    });
+  }, 0);
+  method(FileSystemFileHandle.prototype, 'createWritable', async function createWritable() {
+    const node = requireHandle(this).node;
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    const stream = Object.create(FileSystemWritableFileStream.prototype);
+    writableState.set(stream, { node, position: 0, closed: false });
+    return stream;
+  }, 0);
+  method(FileSystemFileHandle.prototype, 'move', async function move(name) {
+    const node = requireHandle(this).node;
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    name = validName(name);
+    if (node.parent) { node.parent.children.delete(node.name); node.name = name; node.parent.children.set(name, node); }
+  }, 1);
+
+  if (typeof FileSystemWritableFileStream === 'function') {
+    const writable = value => {
+      const state = writableState.get(value);
+      if (!state || state.closed) throw new TypeError('Illegal invocation');
+      return state;
+    };
+    method(FileSystemWritableFileStream.prototype, 'write', async function write(data) {
+      const state = writable(this);
+      if (data && typeof data === 'object' && typeof data.type === 'string') {
+        if (data.type === 'seek') { state.position = Math.max(0, Number(data.position) || 0); return; }
+        if (data.type === 'truncate') {
+          const size = Math.max(0, Number(data.size) || 0);
+          const next = new Uint8Array(size); next.set(state.node.bytes.subarray(0, size));
+          state.node.bytes = next; return;
+        }
+        if (data.type === 'write') { state.position = Math.max(0, Number(data.position) || 0); data = data.data; }
+      }
+      const bytes = _blobPartToBytes(data, false);
+      const size = Math.max(state.node.bytes.length, state.position + bytes.length);
+      const next = new Uint8Array(size); next.set(state.node.bytes); next.set(bytes, state.position);
+      state.node.bytes = next; state.position += bytes.length; state.node.lastModified = Date.now();
+    }, 1);
+    method(FileSystemWritableFileStream.prototype, 'seek', async function seek(position) {
+      writable(this).position = Math.max(0, Number(position) || 0);
+    }, 1);
+    method(FileSystemWritableFileStream.prototype, 'truncate', async function truncate(size) {
+      const state = writable(this); size = Math.max(0, Number(size) || 0);
+      const next = new Uint8Array(size); next.set(state.node.bytes.subarray(0, size)); state.node.bytes = next;
+    }, 1);
+    method(FileSystemWritableFileStream.prototype, 'close', async function close() {
+      const state = writable(this); state.closed = true;
+    }, 0);
+  }
+
+  delete globalThis.navigator.storage;
+  getter(Navigator.prototype, 'storage', function storage() { return manager; });
+})();
+
 // Navigator members the same capture proves a real Chrome carries. Object
 // members return a cached singleton whose prototype is the matching interface
 // from the table above when one exists; method members throw Chrome's
@@ -21687,6 +26009,15 @@ const _chromeNavigatorTable = [
           impl = function getGamepads() { return [null, null, null, null]; };
         } else if (name === 'javaEnabled') {
           impl = function javaEnabled() { return false; };
+        } else if (name === 'getInstalledRelatedApps') {
+          impl = function getInstalledRelatedApps() { return Promise.resolve([]); };
+        } else if (name === 'clearAppBadge' || name === 'setAppBadge'
+            || name === 'updateAdInterestGroups') {
+          impl = function() { return Promise.resolve(); };
+        } else if (name === 'requestMIDIAccess') {
+          impl = function requestMIDIAccess() {
+            return Promise.reject(new DOMException('MIDI is not supported', 'NotSupportedError'));
+          };
         } else {
           impl = function() {
             throw new TypeError("Failed to execute '" + name
@@ -21698,6 +26029,93 @@ const _chromeNavigatorTable = [
           { value: impl, writable: true, enumerable: true, configurable: true });
       }
     } catch (_e) {}
+  }
+})();
+
+// Navigator is a WebIDL interface object: Chrome keeps its exposed members on
+// the prototype and has no own string-keyed properties on the instance. The
+// initial compatibility object above is convenient for constructing stable
+// backing values, but leaving those fields own makes `getOwnPropertyNames`
+// expose an engine-specific shape. Move the backing values to the existing
+// navigator prototype as native accessors/methods after all late surface
+// installers (credentials, keyboard and gpu) have run.
+(function moveNavigatorOwnPropertiesToPrototype() {
+  const navigatorObject = globalThis.navigator;
+  const prototype = Object.getPrototypeOf(navigatorObject);
+  for (const name of Object.getOwnPropertyNames(navigatorObject)) {
+    const descriptor = Object.getOwnPropertyDescriptor(navigatorObject, name);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+    const value = descriptor.value;
+    if (!delete navigatorObject[name]) continue;
+    if (Object.prototype.hasOwnProperty.call(prototype, name)) continue;
+    if (typeof value === 'function') {
+      _markNative(value);
+      Object.defineProperty(prototype, name, {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+      continue;
+    }
+    const getter = _markNativeAs(
+      function() { return value; },
+      'function get ' + name + '() { [native code] }',
+    );
+    Object.defineProperty(getter, 'name', { value: 'get ' + name, configurable: true });
+    Object.defineProperty(prototype, name, {
+      get: getter, set: undefined, enumerable: true, configurable: true,
+    });
+  }
+})();
+
+// Legacy Window attributes are own accessors on a browsing-context global in
+// Chrome. Keep their state per realm and connect Window.prototype to the
+// EventTarget chain so `window instanceof EventTarget` and own-key reflection
+// agree with the browser surface.
+(function installWindowLegacySurface() {
+  let windowName = '';
+  let windowStatus = '';
+  const accessor = (name, getter, setter) => {
+    const get = _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
+    Object.defineProperty(get, 'name', { value: 'get ' + name, configurable: true });
+    const descriptor = {
+      get, enumerable: true, configurable: true,
+    };
+    if (setter) {
+      const set = _markNativeAs(setter, 'function set ' + name + '() { [native code] }');
+      Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true });
+      descriptor.set = set;
+    } else {
+      descriptor.set = undefined;
+    }
+    Object.defineProperty(globalThis, name, descriptor);
+  };
+  accessor('name', function() { return windowName; }, function(value) {
+    windowName = String(value);
+  });
+  accessor('status', function() { return windowStatus; }, function(value) {
+    windowStatus = String(value);
+  });
+  accessor('closed', function() { return false; }, null);
+  try {
+    if (globalThis.EventTarget?.prototype) {
+      Object.setPrototypeOf(globalThis.Window.prototype, globalThis.EventTarget.prototype);
+    }
+  } catch (_) {}
+  for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (!descriptor || typeof descriptor.value !== 'function') continue;
+    try { delete globalThis[name]; } catch (_) { continue; }
+    // A bare call in a strict page script can arrive with an undefined
+    // receiver. The Window methods therefore target this realm explicitly,
+    // while DOM EventTargets continue using Node.prototype's receiver-aware
+    // implementations.
+    const method = name === 'addEventListener'
+      ? function addEventListener(type, fn) { return _eventTargetAdd(globalThis, type, fn, arguments[2]); }
+      : name === 'removeEventListener'
+        ? function removeEventListener(type, fn) { return _eventTargetRemove(globalThis, type, fn, arguments[2]); }
+        : function dispatchEvent(event) { return _eventTargetDispatch(globalThis, event); };
+    Object.defineProperty(globalThis.Window.prototype, name, {
+      value: _markNative(method), writable: true, enumerable: true, configurable: true,
+    });
   }
 })();
 

@@ -281,6 +281,12 @@ pub struct Page {
     /// Content-Security-Policy of the committed top-level response. Child
     /// frame requests consult its frame-src/child-src/default-src chain.
     document_csp: Option<String>,
+    /// Raw Permissions-Policy of the committed top-level response.
+    document_permissions_policy: Option<String>,
+    /// COOP+COEP isolation capability of the committed top-level document.
+    cross_origin_isolated: bool,
+    /// Raw Last-Modified header of the committed top-level response.
+    document_last_modified: Option<String>,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
     pub js: Option<ObscuraJsRuntime>,
@@ -361,6 +367,7 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<PreloadScript>,
+    debugger_enabled: bool,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -599,6 +606,7 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
 /// Extract network-backed `url(...)` assets while respecting CSS comments and
 /// strings. Linked sheets have already been rebased before materialization;
 /// inline declarations are resolved against the document base here.
+#[cfg(any(feature = "render", test))]
 fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
     let mut urls = Vec::new();
     let mut index = 0usize;
@@ -701,6 +709,7 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
 /// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
 /// parentheses do not end the rule. A malformed import is left to the normal
 /// scanner so this helper cannot swallow following declarations.
+#[cfg(any(feature = "render", test))]
 fn css_import_rule_len(css: &str) -> Option<usize> {
     let prefix = css.get(..7)?;
     if !prefix.eq_ignore_ascii_case("@import") {
@@ -752,6 +761,7 @@ fn css_import_rule_len(css: &str) -> Option<usize> {
     None
 }
 
+#[cfg(any(feature = "render", test))]
 fn render_resource_type(url: &url::Url) -> ResourceType {
     let path = url.path().to_ascii_lowercase();
     if [".woff", ".woff2", ".ttf", ".otf", ".eot"]
@@ -1004,6 +1014,9 @@ impl Page {
             frame_id,
             document_origin: None,
             document_csp: None,
+            document_permissions_policy: None,
+            cross_origin_isolated: false,
+            document_last_modified: None,
             url: None,
             dom: None,
             js: None,
@@ -1046,6 +1059,7 @@ impl Page {
                 .map(InputStrategy::selector),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            debugger_enabled: false,
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             frame_stylesheet_cache: std::collections::HashMap::new(),
@@ -1286,6 +1300,7 @@ impl Page {
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
         rt.set_referrer_policy(self.referrer_policy.as_str());
+        rt.set_last_modified(self.document_last_modified.as_deref());
         rt.set_performance_time_origin(self.performance_time_origin_ms);
 
         #[cfg(feature = "stealth")]
@@ -1336,11 +1351,16 @@ impl Page {
         // scripted fetch unchecked while script-src and style-src still work,
         // because those are evaluated on the browser side.
         rt.set_content_security_policy(self.document_csp.as_deref());
+        rt.set_permissions_policy(self.document_permissions_policy.as_deref());
+        rt.set_cross_origin_isolated(self.cross_origin_isolated);
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
         }
 
+        if self.debugger_enabled {
+            rt.enable_debugger();
+        }
         rt.run_page_init();
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -1445,6 +1465,48 @@ impl Page {
             "recording Performance Timeline entry",
         );
         self.record_performance_entry(entry);
+    }
+
+    /// Build the navigation entry visible inside a committed frame document.
+    /// Unlike the embedding page's cross-origin iframe resource entry, this
+    /// entry belongs to the response's own realm and therefore exposes its
+    /// timing and body sizes without a Timing-Allow-Origin grant.
+    fn frame_navigation_performance_entry(
+        response: &obscura_net::Response,
+    ) -> serde_json::Value {
+        let response_start = response.timing.response_start.as_secs_f64() * 1_000.0;
+        let response_end = response.timing.response_end.as_secs_f64() * 1_000.0;
+        let redirect_end = if response.redirected_from.is_empty() {
+            0.0
+        } else {
+            response.timing.redirect_end.as_secs_f64() * 1_000.0
+        };
+        let body_size = response.body.len();
+        const RESOURCE_HEADER_BYTES: usize = 300;
+        serde_json::json!({
+            "name": response.url.as_str(),
+            "entryType": "navigation",
+            "initiatorType": "navigation",
+            "startTime": 0.0,
+            "duration": response_end,
+            "redirectStart": 0.0,
+            "redirectEnd": redirect_end,
+            "fetchStart": 0.0,
+            "domainLookupStart": 0.0,
+            "domainLookupEnd": 0.0,
+            "connectStart": 0.0,
+            "connectEnd": 0.0,
+            "requestStart": 0.0,
+            "responseStart": response_start,
+            "responseEnd": response_end,
+            "nextHopProtocol": if response.url.scheme() == "https" { "h2" } else { "http/1.1" },
+            "transferSize": body_size + RESOURCE_HEADER_BYTES,
+            "encodedBodySize": body_size,
+            "decodedBodySize": body_size,
+            "responseStatus": response.status,
+            "redirectCount": response.redirected_from.len(),
+            "type": "navigate",
+        })
     }
 
     /// File one built Performance Timeline entry, or hold it until a runtime
@@ -2683,6 +2745,7 @@ impl Page {
             return;
         };
         let generation = frame.document_generation;
+        let navigation_timing = frame.navigation_timing.clone();
 
         let Some(scope) = self
             .js
@@ -2706,6 +2769,16 @@ impl Page {
         {
             tracing::warn!("frame realm creation failed ({frame_id}): {error}");
             return;
+        }
+        if let Some(entry) = navigation_timing {
+            if let Err(error) = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-navigation-timing>",
+                &format!("globalThis.__obscura_performance_record({entry});"),
+            ) {
+                tracing::warn!("frame navigation timing install failed ({frame_id}): {error}");
+            }
         }
         let _ = js.execute_script_in_frame_realm(
             frame_id,
@@ -2776,6 +2849,7 @@ impl Page {
         }
         struct FrameScript {
             src: Option<String>,
+            nonce: Option<String>,
             inline: String,
             nid: u32,
             base_url: String,
@@ -2844,6 +2918,7 @@ impl Page {
                             _ => continue,
                         };
                         let src = node.get_attribute("src").map(str::to_string);
+                        let nonce = node.get_attribute("nonce").map(str::to_string);
                         let inline = if src.is_none() {
                             dom.text_content(sid)
                         } else {
@@ -2852,6 +2927,7 @@ impl Page {
                         if src.is_some() || !inline.trim().is_empty() {
                             scripts.push(FrameScript {
                                 src,
+                                nonce,
                                 inline,
                                 nid: sid.raw(),
                                 source_line: dom.source_line(sid).unwrap_or(1),
@@ -2876,6 +2952,10 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return;
         };
+        let frame_script_policy = scope
+            .csp
+            .as_deref()
+            .map(crate::frame_policy::ContentSecurityPolicy::parse);
         // Already-started marks are frame-document-local: set them in the
         // frame's realm so frame code moving these nodes cannot re-run them.
         let ids = scripts
@@ -2911,6 +2991,16 @@ impl Page {
                     .map(|url| url.to_string())
                     .unwrap_or_else(|| src.clone())
             };
+            if frame_script_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.script_src_allows(&full_url, &scope.origin))
+            {
+                tracing::info!(
+                    "Blocked frame script by Content-Security-Policy: {}",
+                    full_url
+                );
+                continue;
+            }
             if !subresource_allowed(Url::parse(&frame_base).ok().as_ref(), &full_url) {
                 tracing::warn!(
                     "blocking cross-scheme frame <script src>: frame={} src={}",
@@ -3080,6 +3170,15 @@ impl Page {
             match script.kind {
                 FrameScriptKind::ImportMap => {
                     if script.src.is_none() {
+                        if frame_script_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.inline_script_allows(script.nonce.as_deref()))
+                        {
+                            tracing::info!(
+                                "Blocked frame import map by Content-Security-Policy"
+                            );
+                            continue;
+                        }
                         if let Some(js) = self.js.as_mut() {
                             if let Err(error) = js.add_frame_import_map(
                                 frame_id,
@@ -3093,6 +3192,14 @@ impl Page {
                     }
                 }
                 FrameScriptKind::Classic => {
+                    if script.src.is_none()
+                        && frame_script_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.inline_script_allows(script.nonce.as_deref()))
+                    {
+                        tracing::info!("Blocked inline frame script by Content-Security-Policy");
+                        continue;
+                    }
                     if script.is_defer && !script.is_async && script.src.is_some() {
                         post_parse.push(PostParseScript::Classic(index));
                     } else {
@@ -3100,6 +3207,14 @@ impl Page {
                     }
                 }
                 FrameScriptKind::Module => {
+                    if script.src.is_none()
+                        && frame_script_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.inline_script_allows(script.nonce.as_deref()))
+                    {
+                        tracing::info!("Blocked inline frame module by Content-Security-Policy");
+                        continue;
+                    }
                     let module_url = match &script.src {
                         Some(src) => Url::parse(&script.base_url)
                             .ok()
@@ -3110,6 +3225,17 @@ impl Page {
                     let Some(module_url) = module_url else {
                         continue;
                     };
+                    if script.src.is_some()
+                        && frame_script_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.script_src_allows(&module_url, &scope.origin))
+                    {
+                        tracing::info!(
+                            "Blocked frame module by Content-Security-Policy: {}",
+                            module_url
+                        );
+                        continue;
+                    }
                     if script.src.is_some()
                         && !subresource_allowed(
                             Url::parse(&script.base_url).ok().as_ref(),
@@ -3128,6 +3254,12 @@ impl Page {
                         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
                         .unwrap_or(0);
                     let inline = script.src.is_none().then_some(script.inline.as_str());
+                    let module_csp = scope.csp.as_deref().map(|header| {
+                        obscura_js::realm::FrameModuleCsp::new(
+                            header,
+                            &scope.origin.serialize(),
+                        )
+                    });
                     let prepared = match self.js.as_mut() {
                         Some(js) => {
                             js.prepare_module_in_frame_realm(
@@ -3137,6 +3269,7 @@ impl Page {
                                 &module_url,
                                 inline,
                                 initiator.as_str(),
+                                module_csp,
                                 remaining_ms,
                             )
                             .await
@@ -3266,6 +3399,7 @@ impl Page {
         if max_ms == 0 {
             return;
         }
+        #[cfg(feature = "render")]
         let settle_started = std::time::Instant::now();
         if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
             self.settle_for_duration(max_ms).await;
@@ -3497,6 +3631,9 @@ impl Page {
         self.referrer_policy = obscura_net::ReferrerPolicy::default();
         self.document_origin = Some(obscura_dom::Origin::from_url(url.as_str()));
         self.document_csp = None;
+        self.document_permissions_policy = None;
+        self.cross_origin_isolated = false;
+        self.document_last_modified = None;
         self.url = Some(url.clone());
         self.network_events.clear();
 
@@ -3584,8 +3721,14 @@ impl Page {
         self.document_csp = response
             .header("content-security-policy")
             .map(str::to_string);
+        self.document_permissions_policy = response
+            .header("permissions-policy")
+            .map(str::to_string);
+        self.cross_origin_isolated = response_grants_cross_origin_isolation(&response);
+        self.document_last_modified = response.header("last-modified").map(str::to_string);
         if let Some(js) = &self.js {
             js.set_content_security_policy(self.document_csp.as_deref());
+            js.set_permissions_policy(self.document_permissions_policy.as_deref());
         }
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
@@ -3925,8 +4068,26 @@ impl Page {
         let mut candidates = std::collections::BTreeMap::new();
 
         if let Some(js) = &self.js {
-            for (raw, profile) in js.pending_render_image_urls() {
+            for (raw, profile, root) in js.pending_render_image_urls() {
                 if let Ok(mut url) = url::Url::parse(&raw) {
+                    if let Some(scope) = js
+                        .with_dom(|dom| dom.document_scope(root))
+                        .flatten()
+                    {
+                        let policy = scope
+                            .csp
+                            .as_deref()
+                            .map(crate::frame_policy::ContentSecurityPolicy::parse);
+                        if policy.as_ref().is_some_and(|policy| {
+                            !policy.resource_src_allows("img-src", url.as_str(), &scope.origin)
+                        }) {
+                            tracing::info!(
+                                "Blocked speculative frame image by Content-Security-Policy: {}",
+                                url
+                            );
+                            continue;
+                        }
+                    }
                     url.set_fragment(None);
                     candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
                 }
@@ -3953,6 +4114,10 @@ impl Page {
                     }
                     let mut sources = Vec::new();
                     for (root, root_base) in roots {
+                        let (root_csp, root_origin) = dom
+                            .document_scope(root)
+                            .map(|scope| (scope.csp.clone(), scope.origin.clone()))
+                            .unwrap_or((None, obscura_dom::Origin::from_url(&document_url.to_string())));
                         for id in dom.descendants(root) {
                             let Some(node) = dom.get_node(id) else {
                                 continue;
@@ -3961,10 +4126,20 @@ impl Page {
                                 .as_element()
                                 .is_some_and(|element| element.local.as_ref() == "style")
                             {
-                                sources.push((dom.text_content(id), root_base.clone()));
+                                sources.push((
+                                    dom.text_content(id),
+                                    root_base.clone(),
+                                    root_csp.clone(),
+                                    root_origin.clone(),
+                                ));
                             }
                             if let Some(style) = node.get_attribute("style") {
-                                sources.push((style.to_string(), root_base.clone()));
+                                sources.push((
+                                    style.to_string(),
+                                    root_base.clone(),
+                                    root_csp.clone(),
+                                    root_origin.clone(),
+                                ));
                             }
                             if node
                                 .as_element()
@@ -3974,7 +4149,12 @@ impl Page {
                                     .get_attribute("href")
                                     .or_else(|| node.get_attribute("xlink:href"))
                                 {
-                                    sources.push((format!("url({href})"), root_base.clone()));
+                                    sources.push((
+                                        format!("url({href})"),
+                                        root_base.clone(),
+                                        root_csp.clone(),
+                                        root_origin.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -3982,7 +4162,7 @@ impl Page {
                     sources
                 })
                 .unwrap_or_default();
-            for (css, root_base) in css_sources {
+            for (css, root_base, root_csp, root_origin) in css_sources {
                 let scan_base = root_base
                     .as_deref()
                     .and_then(|raw| url::Url::parse(raw).ok())
@@ -3990,6 +4170,25 @@ impl Page {
                 for raw in css_resource_urls(&css, &scan_base) {
                     if let Ok(mut url) = url::Url::parse(&raw) {
                         let kind = render_resource_type(&url);
+                        if let Some(header) = root_csp.as_deref() {
+                            let directive = match kind {
+                                ResourceType::Font => "font-src",
+                                ResourceType::Image => "img-src",
+                                _ => "media-src",
+                            };
+                            let policy = crate::frame_policy::ContentSecurityPolicy::parse(header);
+                            if !policy.resource_src_allows(
+                                directive,
+                                url.as_str(),
+                                &root_origin,
+                            ) {
+                                tracing::info!(
+                                    "Blocked speculative frame resource by Content-Security-Policy: {}",
+                                    url
+                                );
+                                continue;
+                            }
+                        }
                         url.set_fragment(None);
                         candidates.insert((url.to_string(), None), kind);
                     }
@@ -5006,6 +5205,33 @@ impl Page {
         self.preload_scripts = scripts;
     }
 
+    pub fn set_debugger_enabled(&mut self, enabled: bool) {
+        self.debugger_enabled = enabled;
+        if enabled {
+            if let Some(js) = self.js.as_mut() {
+                js.enable_debugger();
+            }
+        }
+    }
+
+    pub async fn debugger_scripts(
+        &mut self,
+    ) -> Result<Vec<obscura_js::runtime::DebuggerScript>, String> {
+        self.js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime unavailable".to_string())?
+            .debugger_scripts()
+            .await
+    }
+
+    pub async fn debugger_script_source(&mut self, script_id: &str) -> Result<String, String> {
+        self.js
+            .as_mut()
+            .ok_or_else(|| "JavaScript runtime unavailable".to_string())?
+            .debugger_script_source(script_id)
+            .await
+    }
+
     fn inject_main_document_preloads(&mut self) {
         let scripts = self.preload_scripts.clone();
         if scripts.is_empty() {
@@ -5307,6 +5533,10 @@ pub struct FrameNavigationRequest {
     pub referrer: Option<String>,
     /// Optional `iframe[referrerpolicy]` override for this navigation.
     pub referrer_policy: Option<String>,
+    /// Required policy from the host iframe's `csp` attribute. Network
+    /// navigations negotiate it with Sec-Required-CSP; srcdoc applies it
+    /// directly, while initial about:blank ignores it.
+    pub required_csp: Option<String>,
     /// Parsed `sandbox` attribute of the host element. Propagation from the
     /// parent scope happens inside the controller.
     pub sandbox: obscura_dom::SandboxFlags,
@@ -5338,6 +5568,52 @@ impl std::fmt::Display for FrameNavigateError {
             Self::Dom(message) => write!(f, "frame dom commit failed: {message}"),
         }
     }
+}
+
+fn nonempty_required_csp(value: Option<String>) -> Option<String> {
+    value.filter(|policy| !policy.trim().is_empty())
+}
+
+fn combine_required_csp(base: Option<String>, required: Option<&str>) -> Option<String> {
+    let Some(required) = required.filter(|policy| !policy.trim().is_empty()) else {
+        return base;
+    };
+    let required = crate::frame_policy::ContentSecurityPolicy::parse(required);
+    Some(match base {
+        Some(base) if !base.trim().is_empty() => {
+            crate::frame_policy::ContentSecurityPolicy::parse(&base)
+                .combined_with_required(&required)
+        }
+        _ => required.serialized(),
+    })
+}
+
+fn allow_csp_from_accepts(value: Option<&str>, embedder: &obscura_dom::Origin) -> bool {
+    value.is_some_and(|value| {
+        value
+            .split(|character: char| character == ',' || character.is_ascii_whitespace())
+            .filter(|token| !token.is_empty())
+            .any(|token| {
+                if token == "*" {
+                    return true;
+                }
+                // Allow-CSP-From carries origins, not arbitrary URL strings.
+                // Parse before comparing so scheme/host casing, default ports,
+                // and an optional trailing slash follow URL-origin rules.
+                let Ok(url) = Url::parse(token) else {
+                    return false;
+                };
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || (url.path() != "" && url.path() != "/")
+                {
+                    return false;
+                }
+                obscura_dom::Origin::from_url(url.as_str()) == *embedder
+            })
+    })
 }
 
 impl Page {
@@ -5379,7 +5655,7 @@ impl Page {
     }
 
     /// The parent document's scope pieces needed for inheritance: (base URL,
-    /// origin, sandbox, csp, referrer policy).
+    /// origin, sandbox, csp, permissions policy, referrer policy).
     fn frame_parent_inheritance(
         &self,
         frame_id: &str,
@@ -5388,7 +5664,9 @@ impl Page {
         obscura_dom::Origin,
         obscura_dom::SandboxFlags,
         Option<String>,
+        Option<String>,
         String,
+        bool,
     ) {
         let parent = self
             .frames
@@ -5406,7 +5684,9 @@ impl Page {
                         scope.origin.clone(),
                         scope.sandbox,
                         scope.csp.clone(),
+                        scope.permissions_policy.clone(),
                         scope.referrer_policy.clone(),
+                        scope.cross_origin_isolated,
                     );
                 }
             }
@@ -5428,7 +5708,9 @@ impl Page {
             origin,
             obscura_dom::SandboxFlags::default(),
             self.document_csp.clone(),
+            self.document_permissions_policy.clone(),
             self.referrer_policy.as_str().to_string(),
+            self.cross_origin_isolated,
         )
     }
 
@@ -5539,6 +5821,12 @@ impl Page {
             .ok_or(FrameNavigateError::UnknownFrame)?
             .host_nid
             .ok_or(FrameNavigateError::UnknownFrame)?;
+        let required_csp = nonempty_required_csp(request.required_csp.clone().or_else(|| {
+            self.dom
+                .as_ref()
+                .and_then(|dom| dom.get_node(host_nid))
+                .and_then(|node| node.get_attribute("csp").map(str::to_string))
+        }));
         let navigation_generation = self
             .frames
             .begin_navigation(frame_id)
@@ -5547,7 +5835,15 @@ impl Page {
             return Err(FrameNavigateError::DepthExceeded);
         }
 
-        let (parent_base, parent_origin, parent_sandbox, parent_csp, parent_policy) =
+        let (
+            parent_base,
+            parent_origin,
+            parent_sandbox,
+            parent_csp,
+            parent_permissions_policy,
+            parent_policy,
+            parent_cross_origin_isolated,
+        ) =
             self.frame_parent_inheritance(frame_id);
         let frame_policy = request
             .referrer_policy
@@ -5559,16 +5855,24 @@ impl Page {
                 .first()
                 .map(|(url, _)| url.clone())
         });
-        let sandbox = request.sandbox.merged_with_parent(parent_sandbox);
-        let sandbox_forces_opaque =
-            sandbox.active && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN);
+        let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
         let ancestors = self.frame_ancestor_chain(frame_id);
 
         // Resolve the document: URL, origin, and HTML body.
         let resolved_document = if let Some(srcdoc) = request.srcdoc {
+            // An embedded CSP policy applies directly to srcdoc documents.
+            // Unlike the initial about:blank special case below, this is a
+            // real replacement document and must honor a CSP sandbox token.
+            if let Some(required_flags) = required_csp.as_deref().and_then(|header| {
+                crate::frame_policy::ContentSecurityPolicy::parse(header).sandbox_flags()
+            }) {
+                sandbox = sandbox.merged_with_parent(required_flags);
+            }
             // srcdoc inherits the creator origin unless sandbox forces opaque;
             // its base URL is the creator's.
-            let origin = if sandbox_forces_opaque {
+            let origin = if sandbox.active
+                && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+            {
                 obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
             } else {
                 parent_origin.clone()
@@ -5582,12 +5886,18 @@ impl Page {
                 parent_base.clone(),
                 origin,
                 srcdoc,
-                parent_csp.clone(),
+                combine_required_csp(parent_csp.clone(), required_csp.as_deref()),
+                parent_permissions_policy.clone(),
+                None,
+                None,
+                parent_cross_origin_isolated,
             )
         } else {
             let raw_url = request.url.as_deref().unwrap_or("about:blank");
             if raw_url == "about:blank" || raw_url.is_empty() {
-                let origin = if sandbox_forces_opaque {
+                let origin = if sandbox.active
+                    && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+                {
                     obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
                 } else {
                     parent_origin.clone()
@@ -5598,6 +5908,10 @@ impl Page {
                     origin,
                     String::new(),
                     parent_csp.clone(),
+                    parent_permissions_policy.clone(),
+                    None,
+                    None,
+                    parent_cross_origin_isolated,
                 )
             } else {
                 // A relative URL resolves against the parent document's base.
@@ -5627,29 +5941,92 @@ impl Page {
 
                 if resolved.scheme() == "data" {
                     let body = decode_data_uri(&resolved_str).unwrap_or_default();
+                    if let Some(required_flags) = required_csp.as_deref().and_then(|header| {
+                        crate::frame_policy::ContentSecurityPolicy::parse(header).sandbox_flags()
+                    }) {
+                        sandbox = sandbox.merged_with_parent(required_flags);
+                    }
                     // data: documents always get a fresh opaque origin.
                     (
                         resolved_str.clone(),
                         resolved_str,
                         obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new()),
                         String::from_utf8_lossy(&body).into_owned(),
+                        combine_required_csp(None, required_csp.as_deref()),
+                        parent_permissions_policy.clone(),
                         None,
+                        None,
+                        false,
                     )
                 } else {
                     let method = match request.method.as_deref() {
                         Some("POST") | Some("post") => Method::POST,
                         _ => Method::GET,
                     };
+                    let mut navigation_headers = std::collections::HashMap::new();
+                    if let Some(required_csp) = required_csp.as_deref() {
+                        navigation_headers.insert(
+                            "Sec-Required-CSP".to_string(),
+                            required_csp.to_string(),
+                        );
+                    }
+                    let frame_initiator = Url::parse(&parent_base).ok();
+                    let frame_referrer = inherited_referrer
+                        .as_deref()
+                        .and_then(|value| Url::parse(value).ok());
+                    #[cfg(feature = "stealth")]
+                    let response = if method == Method::GET {
+                        if let Some(stealth) = &self.stealth_client {
+                            stealth
+                                .fetch_frame_document_with_referrer_headers(
+                                    &resolved,
+                                    frame_referrer.clone(),
+                                    frame_initiator.clone(),
+                                    frame_policy,
+                                    navigation_headers.clone(),
+                                    Some(&self.callbacks),
+                                )
+                                .await
+                        } else {
+                            self.http_client
+                                .fetch_frame_document_with_method_referrer_headers(
+                                    method,
+                                    &resolved,
+                                    request.body.clone(),
+                                    frame_referrer.clone(),
+                                    frame_initiator.clone(),
+                                    frame_policy,
+                                    navigation_headers.clone(),
+                                    Some(&self.callbacks),
+                                )
+                                .await
+                        }
+                    } else {
+                        self.http_client
+                            .fetch_frame_document_with_method_referrer_headers(
+                                method,
+                                &resolved,
+                                request.body.clone(),
+                                frame_referrer,
+                                frame_initiator,
+                                frame_policy,
+                                navigation_headers,
+                                Some(&self.callbacks),
+                            )
+                            .await
+                    }
+                    .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
+                    #[cfg(not(feature = "stealth"))]
                     let response = self
                         .http_client
-                        .fetch_document_with_method_referrer(
+                        .fetch_frame_document_with_method_referrer_headers(
                             method,
                             &resolved,
                             request.body.clone(),
-                            inherited_referrer
-                                .as_deref()
-                                .and_then(|value| Url::parse(value).ok()),
+                            frame_referrer,
+                            frame_initiator,
                             frame_policy,
+                            navigation_headers,
                             Some(&self.callbacks),
                         )
                         .await
@@ -5689,22 +6066,111 @@ impl Page {
                     // the element's local name. Skipping it left a page that
                     // counts its own resources one entry short of a browser.
                     self.record_performance_response(&response, "resource", "iframe");
+                    let navigation_timing =
+                        Some(Self::frame_navigation_performance_entry(&response));
 
                     let final_url = response.url.to_string();
-                    let document_csp = response
+                    let response_csp = response
                         .header("content-security-policy")
                         .map(str::to_string);
-                    let origin = if sandbox_forces_opaque {
+                    let response_permissions_policy = response
+                        .header("permissions-policy")
+                        .map(str::to_string);
+                    let document_csp = if let Some(required_value) = required_csp.as_deref() {
+                        let required =
+                            crate::frame_policy::ContentSecurityPolicy::parse(required_value);
+                        let response_policy = response_csp
+                            .as_deref()
+                            .map(crate::frame_policy::ContentSecurityPolicy::parse);
+                        let policy_accepts = response_policy
+                            .as_ref()
+                            .is_some_and(|policy| policy.subsumes_required(&required));
+                        let header_accepts = allow_csp_from_accepts(
+                            response.header("allow-csp-from"),
+                            &parent_origin,
+                        );
+                        if !policy_accepts && !header_accepts {
+                            return Err(FrameNavigateError::Blocked(
+                                crate::frame_policy::FrameBlockedReason::CspEmbeddedEnforcement,
+                            ));
+                        }
+                        if policy_accepts {
+                            response_csp
+                        } else {
+                            combine_required_csp(response_csp, Some(required_value))
+                        }
+                    } else {
+                        response_csp
+                    };
+                    // CSP's response-level sandbox is an independent
+                    // restriction and composes with both the embedding
+                    // iframe attribute and any accepted embedded policy.
+                    if let Some(response_flags) = policies
+                        .iter()
+                        .filter_map(|policy| policy.sandbox_flags())
+                        .next()
+                    {
+                        sandbox = sandbox.merged_with_parent(response_flags);
+                    }
+                    if let Some(required_flags) = required_csp.as_deref().and_then(|header| {
+                        crate::frame_policy::ContentSecurityPolicy::parse(header).sandbox_flags()
+                    }) {
+                        sandbox = sandbox.merged_with_parent(required_flags);
+                    }
+                    // A sandboxed unique-origin document is not eligible for
+                    // cross-origin isolation, even when its response carries
+                    // COOP/COEP. `allow-same-origin` keeps the tuple origin
+                    // and may therefore retain isolation.
+                    // COOP is a top-level browsing-context boundary. A
+                    // cross-origin child cannot become isolated from its own
+                    // response headers, even when it advertises COOP+COEP;
+                    // Chrome exposes `crossOriginIsolated === false` for
+                    // Cloudflare's cross-origin widget frame. Same-origin
+                    // children inherit the parent's isolated context and may
+                    // retain it when their own response also grants it.
+                    let document_cross_origin_isolated =
+                        frame_response_grants_cross_origin_isolation(
+                            &response,
+                            &response_origin,
+                            &parent_origin,
+                            parent_cross_origin_isolated,
+                        )
+                            && (!sandbox.active
+                                || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+                    let last_modified = response.header("last-modified").map(str::to_string);
+                    let origin = if sandbox.active
+                        && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+                    {
                         obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
                     } else {
                         response_origin
                     };
                     let html = response.text();
-                    (final_url.clone(), final_url, origin, html, document_csp)
+                    (
+                        final_url.clone(),
+                        final_url,
+                        origin,
+                        html,
+                        document_csp,
+                        response_permissions_policy,
+                        last_modified,
+                        navigation_timing,
+                        document_cross_origin_isolated,
+                    )
                 }
             }
         };
-        let (document_url, base_url, origin, html, document_csp) = resolved_document;
+        let (
+            document_url,
+            base_url,
+            origin,
+            html,
+            document_csp,
+            document_permissions_policy,
+            last_modified,
+            navigation_timing,
+            document_cross_origin_isolated,
+        ) = resolved_document;
 
         if !self
             .frames
@@ -5721,11 +6187,10 @@ impl Page {
         let (content_root, _replaced) = dom
             .create_iframe_content_document(host_nid)
             .map_err(|error| FrameNavigateError::Dom(error.to_string()))?;
-        let quirks = if html.is_empty() {
-            false
-        } else {
-            obscura_dom::parse_into_subtree(dom, content_root, &html)
-        };
+        // Even an empty HTML response is a complete Document with an html,
+        // head and body. Skipping the parser left about:blank and empty
+        // srcdoc documents as bare Document nodes after the async commit.
+        let quirks = obscura_dom::parse_into_subtree(dom, content_root, &html);
         let frame_referrer_policy = document_referrer_policy_from_root(
             dom,
             content_root,
@@ -5749,20 +6214,26 @@ impl Page {
                 crate::frames::CommitError::UnknownFrame => FrameNavigateError::UnknownFrame,
                 crate::frames::CommitError::Superseded => FrameNavigateError::Superseded,
             })?;
+        if let Some(frame) = self.frames.get_mut(frame_id) {
+            frame.navigation_timing = navigation_timing;
+        }
         let dom = self.dom.as_ref().expect("checked above");
         dom.set_document_scope(
             content_root,
             obscura_dom::DocumentScope {
-                url: document_url,
+                url: document_url.to_string(),
                 origin,
                 base_url: base_url.clone(),
+                last_modified,
                 sandbox,
                 csp: document_csp,
+                permissions_policy: document_permissions_policy,
                 referrer_policy: frame_referrer_policy.as_str().to_string(),
                 referrer: frame_referrer,
                 frame_id: frame_id.to_string(),
                 document_generation: committed.document_generation,
                 quirks,
+                cross_origin_isolated: document_cross_origin_isolated,
             },
         );
         // The superseded document is detached by the registry swap inside
@@ -6165,7 +6636,8 @@ mod tests {
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
         materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
         document_referrer_policy, parse_import_url, rebase_css_urls, script_response_is_executable,
-        split_css_imports,
+        split_css_imports, response_grants_cross_origin_isolation,
+        frame_response_grants_cross_origin_isolation,
         truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
     };
     #[cfg(feature = "render")]
@@ -6321,8 +6793,14 @@ mod tests {
             .unwrap();
         assert_eq!(scope.url, "about:blank");
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("dynamicLoads").unwrap(),
-            serde_json::json!(3.0),
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => { const d = document.getElementById('dynamic').contentDocument; return [dynamicLoads, d.documentElement.tagName, !!d.head, !!d.body, d.body.innerHTML]; })()",
+                )
+                .unwrap(),
+            serde_json::json!([3, "HTML", true, true, ""]),
         );
     }
 
@@ -7049,6 +7527,53 @@ mod tests {
             serde_json::json!(["iframe", "http/1.1", 300]),
             "a subframe's document is a resource of the embedding document",
         );
+
+        let child_id = page
+            .frames
+            .get(page.frames.main_frame_id())
+            .unwrap()
+            .children[0]
+            .clone();
+        let generation = page.frames.get(&child_id).unwrap().document_generation;
+        let child_timing = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &child_id,
+                generation,
+                "<frame-navigation-timing-probe>",
+                r#"(() => {
+                    const entry = performance.getEntriesByType('navigation')[0];
+                    return entry ? [
+                        entry.name.endsWith('/frame'),
+                        entry.entryType,
+                        entry.initiatorType,
+                        entry.responseStart > 0,
+                        entry.responseEnd >= entry.responseStart,
+                        entry.transferSize - entry.encodedBodySize,
+                        entry.encodedBodySize,
+                        entry.responseStatus,
+                        entry instanceof PerformanceNavigationTiming,
+                    ] : null;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            child_timing,
+            serde_json::json!([
+                true,
+                "navigation",
+                "navigation",
+                true,
+                true,
+                300,
+                frame_body.len(),
+                200,
+                true,
+            ]),
+            "a frame document exposes its own complete navigation timing",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7139,6 +7664,291 @@ mod tests {
             requested,
             vec!["/main-blocked", "/main-nested", "/child.html"]
         );
+    }
+
+    #[test]
+    fn allow_csp_from_compares_origins_not_raw_header_strings() {
+        let embedder = obscura_dom::Origin::from_url("https://Parent.Example/");
+        assert!(super::allow_csp_from_accepts(
+            Some("HTTPS://parent.example:443/"),
+            &embedder,
+        ));
+        assert!(super::allow_csp_from_accepts(
+            Some("https://other.example, https://parent.example"),
+            &embedder,
+        ));
+        assert!(!super::allow_csp_from_accepts(
+            Some("https://parent.example:8443"),
+            &embedder,
+        ));
+        assert!(!super::allow_csp_from_accepts(
+            Some("https://parent.example/path"),
+            &embedder,
+        ));
+
+        let opaque = obscura_dom::Origin::from_url("data:text/html,opaque");
+        assert!(super::allow_csp_from_accepts(Some("*"), &opaque));
+        assert!(!super::allow_csp_from_accepts(Some("null"), &opaque));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_embedded_csp_negotiates_network_and_applies_only_to_srcdoc_locals() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut seen = 0;
+            while seen < 3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                if length == 0 {
+                    continue;
+                }
+                seen += 1;
+                let head = String::from_utf8_lossy(&request[..length]).to_string();
+                request_tx.send(head.clone()).unwrap();
+                let request_line = head.lines().next().unwrap_or("");
+                let exact = request_line.contains("/exact");
+                let allow = request_line.contains("/allow");
+                let body = if exact {
+                    "<p id=accepted>accepted</p>"
+                } else if allow {
+                    "<p id=allowed>allowed</p>"
+                } else {
+                    "not accepted"
+                };
+                let csp = if exact {
+                    "Content-Security-Policy: connect-src 'none'\r\n"
+                } else if allow {
+                    "Allow-CSP-From: *\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{csp}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let html = format!(
+            "<!doctype html><iframe id=exact csp=\"connect-src 'none'\" src=\"{origin}/exact\"></iframe>\
+             <iframe id=allow csp=\"connect-src 'none'\" src=\"{origin}/allow\"></iframe>\
+             <iframe id=reject csp=\"connect-src 'none'\" src=\"{origin}/reject\"></iframe>",
+        );
+        let mut page = frame_test_page(&html);
+        let main_id = page.frames.main_frame_id().to_string();
+        for (id, path, expected) in [
+            ("exact", "exact", Ok(())),
+            ("allow", "allow", Ok(())),
+            (
+                "reject",
+                "reject",
+                Err(super::FrameNavigateError::Blocked(
+                    crate::frame_policy::FrameBlockedReason::CspEmbeddedEnforcement,
+                )),
+            ),
+        ] {
+            let host = page
+                .with_dom(|dom| dom.query_selector(&format!("#{id}")).unwrap().unwrap())
+                .unwrap();
+            let frame_id = page.frames.attach_child(&main_id, host).unwrap();
+            let result = page
+                .navigate_frame(
+                    &frame_id,
+                    super::FrameNavigationRequest {
+                        url: Some(format!("{origin}/{path}")),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(result, expected, "{id}");
+        }
+        let (accepted, allowed, rejected, exact_csp, allowed_csp) = page
+            .with_dom(|dom| {
+                let exact = dom.query_selector("#exact").unwrap().unwrap();
+                let allow = dom.query_selector("#allow").unwrap().unwrap();
+                let reject = dom.query_selector("#reject").unwrap().unwrap();
+                let exact_root = dom.iframe_content_document(exact).unwrap();
+                let allow_root = dom.iframe_content_document(allow).unwrap();
+                (
+                    dom.query_selector_from(exact_root, "#accepted").unwrap().is_some(),
+                    dom.query_selector_from(allow_root, "#allowed").unwrap().is_some(),
+                    dom.iframe_content_document(reject).is_none(),
+                    dom.document_scope(exact_root).unwrap().csp,
+                    dom.document_scope(allow_root).unwrap().csp,
+                )
+            })
+            .unwrap();
+        assert!(accepted);
+        assert!(allowed);
+        assert!(rejected);
+        assert_eq!(exact_csp.as_deref(), Some("connect-src 'none'"));
+        assert_eq!(allowed_csp.as_deref(), Some("connect-src 'none'"));
+        let requests: Vec<String> = (0..3)
+            .map(|_| request_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap())
+            .collect();
+        for request in requests {
+            assert!(
+                request.to_ascii_lowercase().contains("sec-required-csp: connect-src 'none'"),
+                "{request}"
+            );
+        }
+
+        let mut local = frame_test_page(
+            "<!doctype html>\
+             <iframe id=srcdoc csp=\"connect-src 'none'\" srcdoc='<p>srcdoc</p>'></iframe>\
+             <iframe id=blank csp=\"connect-src 'none'\"></iframe>",
+        );
+        local.document_csp = Some("connect-src *".to_string());
+        assert_eq!(local.load_child_frames().await, 2);
+        let (srcdoc_csp, blank_csp) = local
+            .with_dom(|dom| {
+                let srcdoc = dom.query_selector("#srcdoc").unwrap().unwrap();
+                let blank = dom.query_selector("#blank").unwrap().unwrap();
+                let srcdoc_root = dom.iframe_content_document(srcdoc).unwrap();
+                let blank_root = dom.iframe_content_document(blank).unwrap();
+                (
+                    dom.document_scope(srcdoc_root).unwrap().csp,
+                    dom.document_scope(blank_root).unwrap().csp,
+                )
+            })
+            .unwrap();
+        assert_eq!(srcdoc_csp.as_deref(), Some("connect-src 'none'"));
+        assert_eq!(blank_csp.as_deref(), Some("connect-src *"));
+
+        local.init_js();
+        let shape = local
+            .evaluate(
+                r#"(() => {
+                    const frame = document.getElementById('srcdoc');
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        HTMLIFrameElement.prototype, 'csp');
+                    frame.csp = "connect-src 'self'";
+                    return [frame.csp, frame.getAttribute('csp'), descriptor.enumerable,
+                        descriptor.configurable, descriptor.get.name, descriptor.set.name,
+                        Function.prototype.toString.call(descriptor.get),
+                        Function.prototype.toString.call(descriptor.set)];
+                })()"#,
+            );
+        assert_eq!(shape, serde_json::json!([
+            "connect-src 'self'", "connect-src 'self'", true, true,
+            "get csp", "set csp", "function get csp() { [native code] }",
+            "function set csp() { [native code] }",
+        ]));
+    }
+
+    #[test]
+    fn coop_coep_and_permissions_policy_derive_cross_origin_isolation() {
+        let response = |headers: &[(&str, &str)]| obscura_net::Response {
+            url: url::Url::parse("https://isolated.example/page").unwrap(),
+            status: 200,
+            headers: headers.iter().map(|(name, value)| {
+                ((*name).to_string(), (*value).to_string())
+            }).collect(),
+            body: Vec::new(),
+            redirected_from: Vec::new(),
+            timing: obscura_net::ResponseTiming::default(),
+        };
+        assert!(response_grants_cross_origin_isolation(&response(&[
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-embedder-policy", "require-corp"),
+        ])));
+        assert!(response_grants_cross_origin_isolation(&response(&[
+            ("cross-origin-opener-policy", "same-origin; report-to=coop"),
+            ("cross-origin-embedder-policy", "credentialless"),
+        ])));
+        assert!(!response_grants_cross_origin_isolation(&response(&[
+            ("cross-origin-opener-policy", "same-origin-allow-popups"),
+            ("cross-origin-embedder-policy", "require-corp"),
+        ])));
+        assert!(!response_grants_cross_origin_isolation(&response(&[
+            ("cross-origin-opener-policy", "same-origin"),
+        ])));
+        assert!(!response_grants_cross_origin_isolation(&response(&[
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-embedder-policy", "require-corp"),
+            ("permissions-policy", "camera=(), cross-origin-isolated = ()"),
+        ])));
+    }
+
+    #[test]
+    fn cross_origin_child_cannot_enable_cross_origin_isolation() {
+        let response = obscura_net::Response {
+            url: url::Url::parse("https://widget.example/frame").unwrap(),
+            status: 200,
+            headers: [
+                ("cross-origin-opener-policy".to_string(), "same-origin".to_string()),
+                ("cross-origin-embedder-policy".to_string(), "require-corp".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            body: Vec::new(),
+            redirected_from: Vec::new(),
+            timing: obscura_net::ResponseTiming::default(),
+        };
+        let widget = obscura_dom::Origin::from_url("https://widget.example/frame");
+        let page = obscura_dom::Origin::from_url("https://page.example/");
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response, &widget, &page, true,
+        ));
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response, &widget, &widget, false,
+        ));
+        assert!(frame_response_grants_cross_origin_isolation(
+            &response, &widget, &widget, true,
+        ));
+    }
+
+    #[test]
+    fn feature_policy_reads_committed_permissions_policy_header() {
+        let mut page = frame_test_page("<!doctype html><html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url("https://top.example/app/"));
+        page.document_permissions_policy = Some(
+            "geolocation=(), camera=(), microphone=(self), fullscreen=*".to_string(),
+        );
+        page.init_js();
+        let result = page
+            .evaluate(
+                "(() => { const p = document.featurePolicy; return {\
+                    geo: p.allowsFeature('geolocation'),\
+                    camera: p.allowsFeature('camera'),\
+                    mic: p.allowsFeature('microphone'),\
+                    micOther: p.allowsFeature('microphone', 'https://other.example'),\
+                    fullscreen: p.allowsFeature('fullscreen'),\
+                    pictureOther: p.allowsFeature('picture-in-picture', 'https://other.example'),\
+                    features: p.allowedFeatures().slice(0, 5),\
+                    geoList: p.getAllowlistForFeature('geolocation'),\
+                    micList: p.getAllowlistForFeature('microphone'),\
+                    unknown: p.getAllowlistForFeature('not-a-feature'),\
+                }; })()",
+            );
+        assert_eq!(result["geo"], false);
+        assert_eq!(result["camera"], false);
+        assert_eq!(result["mic"], true);
+        assert_eq!(result["micOther"], false);
+        assert_eq!(result["fullscreen"], true);
+        assert_eq!(result["pictureOther"], true);
+        assert_eq!(
+            result["features"],
+            serde_json::json!([
+                "ch-ua-full-version-list",
+                "cross-origin-isolated",
+                "on-device-speech-recognition",
+                "translator",
+                "shared-storage-select-url",
+            ])
+        );
+        assert_eq!(result["geoList"], serde_json::json!([]));
+        assert_eq!(
+            result["micList"],
+            serde_json::json!(["https://top.example"])
+        );
+        assert_eq!(result["unknown"], serde_json::json!([]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7316,6 +8126,48 @@ mod tests {
             .unwrap()
             .frame_realm(&frame_id, generation)
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronously_created_nested_iframe_inherits_parent_sandbox() {
+        // The nested iframe is created from the outer frame's author script,
+        // so its initial about:blank scope is observed before the controller
+        // can replace it with an asynchronous navigation commit.
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body><iframe sandbox=\"allow-scripts\" srcdoc=\"\
+             <script>\
+               const nested = document.createElement('iframe');\
+               nested.id = 'nested';\
+               document.body.appendChild(nested);\
+             </script>\
+             \"></iframe></body></html>",
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+
+        let nested_scope = page
+            .with_dom(|dom| {
+                let outer = dom.query_selector("iframe").unwrap().unwrap();
+                let outer_root = dom.iframe_content_document(outer).unwrap();
+                let nested = dom
+                    .query_selector_from(outer_root, "#nested")
+                    .unwrap()
+                    .unwrap();
+                let nested_root = dom.iframe_content_document(nested).unwrap();
+                dom.document_scope(nested_root)
+            })
+            .flatten()
+            .expect("nested initial about:blank scope");
+
+        assert!(nested_scope.sandbox.active);
+        assert!(nested_scope
+            .sandbox
+            .allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(!nested_scope
+            .sandbox
+            .allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+        assert!(nested_scope.origin.is_opaque());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7704,6 +8556,239 @@ mod tests {
                 .unwrap(),
             serde_json::json!("undefined")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_document_csp_gates_inline_nonce_and_external_scripts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let _ = request_tx.send(path.clone());
+                let (csp, content_type, body): (&str, &str, &[u8]) = match path.as_str() {
+                    "/" => (
+                        "",
+                        "text/html",
+                        b"<!doctype html><iframe src='/frame.html'></iframe>",
+                    ),
+                    "/frame.html" => (
+                        "script-src 'nonce-good'",
+                        "text/html",
+                        b"<!doctype html><script>globalThis.blocked=1</script>\
+                           <script nonce='good'>globalThis.allowed=2;\
+                             globalThis.evalState='allowed';\
+                             try { eval('2 + 2'); } catch (error) { globalThis.evalState=error.name; }\
+                             globalThis.functionState='allowed';\
+                             try { new Function('return 1'); } catch (error) { globalThis.functionState=error.name; }\
+                             const denied=document.createElement('script');\
+                             denied.textContent='globalThis.dynamicDenied=4';\
+                             document.body.appendChild(denied);\
+                             const allowed=document.createElement('script');\
+                             allowed.nonce='good';\
+                             allowed.textContent='globalThis.dynamicAllowed=5';\
+                             document.body.appendChild(allowed);\
+                             const external=document.createElement('script');\
+                             external.nonce='good';\
+                             external.src='/allowed.js';\
+                             document.body.appendChild(external);\
+                           </script>\
+                           <script nonce='good' type='module'>\
+                             import 'https://blocked.example/dep.js';\
+                             globalThis.moduleMarker=1;\
+                           </script>\
+                           <script src='/frame.js'></script>",
+                    ),
+                    "/frame.js" => (
+                        "",
+                        "application/javascript",
+                        b"globalThis.cspExternalMarker=3",
+                    ),
+                    "/allowed.js" => (
+                        "",
+                        "application/javascript",
+                        b"globalThis.dynamicExternalAllowed=6",
+                    ),
+                    _ => ("", "text/plain", b"missing"),
+                };
+                let csp_header = if csp.is_empty() {
+                    String::new()
+                } else {
+                    format!("Content-Security-Policy: {csp}\r\n")
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{csp_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-script-csp".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-script-csp".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+        page.settle_for_duration(100).await;
+
+        let values = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(() => { const w = document.querySelector('iframe').contentWindow; return [w.blocked, w.allowed, w.__obscura_csp_allows_unsafe_eval, w.evalState, w.functionState, w.cspExternalMarker, w.dynamicDenied, w.dynamicAllowed, w.dynamicExternalAllowed, w.moduleMarker]; })()",
+            )
+            .unwrap();
+        assert_eq!(values, serde_json::json!([null, 2, false, "EvalError", "EvalError", null, null, 5, 6, null]));
+
+        let requested: Vec<String> = request_rx.try_iter().collect();
+        assert_eq!(requested, vec!["/", "/frame.html", "/allowed.js"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_response_csp_sandbox_gates_scripts_and_origin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (csp, body) = match path.as_str() {
+                    "/" => (
+                        "",
+                        "<!doctype html><iframe id=strict src='/strict.html'></iframe><iframe id=relaxed src='/relaxed.html'></iframe>",
+                    ),
+                    "/strict.html" => (
+                        "sandbox",
+                        "<!doctype html><script>globalThis.strictRan=1</script>",
+                    ),
+                    "/relaxed.html" => (
+                        "sandbox allow-scripts",
+                        "<!doctype html><script>globalThis.relaxedRan=1</script>",
+                    ),
+                    _ => ("", "missing"),
+                };
+                let csp_header = if csp.is_empty() {
+                    String::new()
+                } else {
+                    format!("Content-Security-Policy: {csp}\r\n")
+                };
+                let isolation_headers = if path == "/relaxed.html" {
+                    "Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\n"
+                } else {
+                    ""
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{csp_header}{isolation_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-response-csp-sandbox".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-response-csp-sandbox".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        let (strict, relaxed) = page
+            .with_dom(|dom| {
+                let strict_host = dom.query_selector("#strict").unwrap().unwrap();
+                let relaxed_host = dom.query_selector("#relaxed").unwrap().unwrap();
+                let strict_root = dom.iframe_content_document(strict_host).unwrap();
+                let relaxed_root = dom.iframe_content_document(relaxed_host).unwrap();
+                (
+                    dom.document_scope(strict_root).unwrap(),
+                    dom.document_scope(relaxed_root).unwrap(),
+                )
+            })
+            .unwrap();
+        assert!(strict.sandbox.active);
+        assert!(!strict.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(strict.origin.is_opaque());
+        assert!(relaxed.sandbox.active);
+        assert!(relaxed.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(relaxed.origin.is_opaque());
+        assert!(!relaxed.cross_origin_isolated);
+
+        let (strict_host, relaxed_host) = page
+            .with_dom(|dom| {
+                (
+                    dom.query_selector("#strict").unwrap().unwrap(),
+                    dom.query_selector("#relaxed").unwrap().unwrap(),
+                )
+            })
+            .unwrap();
+        let strict_frame = page.frames.by_host(strict_host).unwrap();
+        let relaxed_frame = page.frames.by_host(relaxed_host).unwrap();
+        let (strict_id, strict_generation, relaxed_id, relaxed_generation) = (
+            strict_frame.frame_id.clone(),
+            strict_frame.document_generation,
+            relaxed_frame.frame_id.clone(),
+            relaxed_frame.document_generation,
+        );
+        let strict_ran = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &strict_id,
+                strict_generation,
+                "<csp-sandbox-probe>",
+                "typeof strictRan",
+            )
+            .unwrap();
+        let relaxed_ran = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &relaxed_id,
+                relaxed_generation,
+                "<csp-sandbox-probe>",
+                "relaxedRan",
+            )
+            .unwrap();
+        assert_eq!(strict_ran, serde_json::json!("undefined"));
+        assert_eq!(relaxed_ran, serde_json::json!(1.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8158,6 +9243,69 @@ mod tests {
         assert_eq!(
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_and_frame_documents_expose_their_last_modified_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request_text = String::from_utf8_lossy(&request[..length]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (body, modified) = if path == "/frame" {
+                    ("<!doctype html><p>frame</p>", "Tue, 15 Nov 1994 12:45:26 GMT")
+                } else {
+                    ("<!doctype html><iframe src='/frame'></iframe>", "Wed, 21 Oct 2015 07:28:00 GMT")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nLast-Modified: {modified}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "last-modified".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("last-modified".to_string(), context);
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const frame = document.querySelector('iframe').contentDocument;
+                    return [
+                        Date.parse(document.lastModified),
+                        Date.parse(frame.lastModified),
+                        Date.parse((new Document()).lastModified)
+                            !== Date.parse(document.lastModified),
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!([1_445_412_480_000u64, 784_903_526_000u64, true])
         );
     }
 
@@ -9906,6 +11054,105 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn frame_csp_blocks_render_warmup_resource_prefetch() {
+        use std::io::{Read, Write};
+
+        // Disable navigation's two automatic warmup passes so this test can
+        // isolate the explicit frame-aware warmup below.
+        std::env::set_var("OBSCURA_RENDER_RESOURCE_WARMUP_MS", "0");
+        std::env::set_var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS", "0");
+        std::env::set_var("OBSCURA_RENDER_RESOURCE_SETTLE_WARMUP_MS", "0");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let _ = seen_tx.send(path.clone());
+                let (content_type, csp, body): (&str, &str, &[u8]) = match path.as_str() {
+                    "/" => (
+                        "text/html",
+                        "",
+                        b"<!doctype html><iframe src='/frame.html'></iframe>",
+                    ),
+                    "/frame.html" => (
+                        "text/html",
+                        "img-src 'none'",
+                        b"<!doctype html><style>.blocked{background:url('/blocked.svg')}</style><div class=blocked></div><img src='/blocked.svg'>",
+                    ),
+                    "/blocked.svg" => (
+                        "image/svg+xml",
+                        "",
+                        br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#,
+                    ),
+                    _ => ("text/plain", "", b"missing"),
+                };
+                let csp_header = if csp.is_empty() {
+                    String::new()
+                } else {
+                    format!("Content-Security-Policy: {csp}\r\n")
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{csp_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-render-csp".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-render-csp".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+        let frame_csp = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                let root = dom.iframe_content_document(host).unwrap();
+                dom.document_scope(root).unwrap().csp
+            })
+            .unwrap();
+        assert_eq!(frame_csp.as_deref(), Some("img-src 'none'"));
+        let mut before_warmup = Vec::new();
+        while let Ok(path) = seen_rx.try_recv() {
+            before_warmup.push(path);
+        }
+        assert!(
+            !before_warmup.iter().any(|path| path == "/blocked.svg"),
+            "warmup/navigation already fetched blocked image: {before_warmup:?}"
+        );
+        let _ = page.prepare_screenshot_resources(500).await;
+
+        let mut paths = before_warmup;
+        while let Ok(path) = seen_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            paths.push(path);
+        }
+        assert!(paths.iter().any(|path| path == "/"));
+        assert!(paths.iter().any(|path| path == "/frame.html"));
+        assert!(!paths.iter().any(|path| path == "/blocked.svg"), "saw {paths:?}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn render_resource_deadline_does_not_negative_cache_cancelled_requests() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -10626,6 +11873,53 @@ impl From<ObscuraNetError> for PageError {
 /// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
 /// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
 /// be base64-encoded so Network.getResponseBody returns intact bytes.
+fn response_grants_cross_origin_isolation(response: &obscura_net::Response) -> bool {
+    let trustworthy = response.url.scheme() == "https"
+        || response.url.scheme() == "wss"
+        || response.url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.ends_with(".localhost")
+                || host == "::1"
+                || host.starts_with("127.")
+        });
+    if !trustworthy {
+        return false;
+    }
+    let token = |name: &str| {
+        response
+            .header(name)
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+    };
+    if token("cross-origin-opener-policy").as_deref() != Some("same-origin") {
+        return false;
+    }
+    if !matches!(
+        token("cross-origin-embedder-policy").as_deref(),
+        Some("require-corp" | "credentialless")
+    ) {
+        return false;
+    }
+    !response
+        .header("permissions-policy")
+        .map(|value| value.to_ascii_lowercase().replace(' ', ""))
+        .is_some_and(|value| value.split(',').any(|entry| {
+            entry == "cross-origin-isolated=()"
+        }))
+}
+
+fn frame_response_grants_cross_origin_isolation(
+    response: &obscura_net::Response,
+    response_origin: &obscura_dom::Origin,
+    parent_origin: &obscura_dom::Origin,
+    parent_cross_origin_isolated: bool,
+) -> bool {
+    parent_cross_origin_isolated
+        && response_origin == parent_origin
+        && response_grants_cross_origin_isolation(response)
+}
+
 fn is_text_like_content_type(content_type: Option<&str>) -> bool {
     let ct = match content_type {
         Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),

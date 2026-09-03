@@ -170,7 +170,7 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
         &mut ctx,
         2,
         "Runtime.evaluate",
-        json!({"expression": "globalThis.__obscura_click_target = document.getElementById('b')"}),
+        json!({"expression": "globalThis[Symbol.for('obscura.inputClickTarget')] = document.getElementById('b')"}),
         session_id,
     )
     .await;

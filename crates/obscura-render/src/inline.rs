@@ -1223,7 +1223,7 @@ impl TextEngine {
     /// width quantized to 1/64 px, the resolution Chrome's 26.6 fixed-point
     /// pipeline reports. The layout path keeps its ceiled line width; only
     /// the canvas measurement channel carries the fraction.
-    fn measure_canvas_width(&mut self, idx: usize) -> f32 {
+    pub(crate) fn measure_canvas_width(&mut self, idx: usize) -> f32 {
         let TextEngine {
             font_system, items, ..
         } = self;

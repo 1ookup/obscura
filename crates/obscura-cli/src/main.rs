@@ -337,6 +337,48 @@ fn resolve_v8_flags(user: Option<&str>, inherited: Option<&str>) -> String {
         .unwrap_or_else(|| effective_v8_flags(None))
 }
 
+/// Return a libc/ICU locale for the small set of language tags commonly used
+/// by browser profiles. An explicit `OBSCURA_LOCALE` always wins; unknown
+/// language tags are left untouched so a missing host locale cannot make the
+/// process fail before V8 starts.
+fn locale_for_browser_language(language: &str) -> Option<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "zh-cn" | "zh-hans" => Some("zh_CN.UTF-8"),
+        "zh-tw" | "zh-hant" => Some("zh_TW.UTF-8"),
+        "en-us" => Some("en_US.UTF-8"),
+        "en-gb" => Some("en_GB.UTF-8"),
+        "de-de" => Some("de_DE.UTF-8"),
+        "fr-fr" => Some("fr_FR.UTF-8"),
+        "ja-jp" => Some("ja_JP.UTF-8"),
+        "ko-kr" => Some("ko_KR.UTF-8"),
+        "es-es" => Some("es_ES.UTF-8"),
+        "it-it" => Some("it_IT.UTF-8"),
+        _ => None,
+    }
+}
+
+fn configure_browser_locale() {
+    let explicit = std::env::var("OBSCURA_LOCALE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let inferred = std::env::var("OBSCURA_LANGUAGE")
+        .ok()
+        .and_then(|language| locale_for_browser_language(&language).map(str::to_string))
+        .or_else(|| {
+            std::env::var("OBSCURA_LANGUAGES")
+                .ok()
+                .and_then(|languages| languages.split(',').next().map(str::to_string))
+                .and_then(|language| locale_for_browser_language(&language).map(str::to_string))
+        });
+    let Some(locale) = explicit.or(inferred) else {
+        return;
+    };
+    // SAFETY: main() invokes this before any V8 isolate or worker thread is
+    // created, so the process locale is initialized deterministically.
+    unsafe { std::env::set_var("LC_ALL", locale); }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -361,6 +403,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var("TZ", "Europe/Berlin");
         }
     }
+    configure_browser_locale();
 
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
@@ -909,7 +952,7 @@ async fn run_fetch(
     // pages stay fast.
     settle_page(&mut page, wait_secs, wait_is_fixed).await;
 
-    let mut deferred_eval_output = None;
+    let mut _deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
         controlled_scroll_request.as_ref().map(|(x, requested_y)| {
             page.evaluate(&format!(
@@ -954,7 +997,7 @@ async fn run_fetch(
                 return Ok(());
             }
             if screenshot.is_some() {
-                deferred_eval_output = Some(result);
+                _deferred_eval_output = Some(result);
             }
 
             // --eval combined with --selector, --dump, and/or --screenshot
@@ -1059,11 +1102,11 @@ async fn run_fetch(
                 });
             if eval_at_capture_boundary {
                 if let Some(ref expr) = eval {
-                    deferred_eval_output =
+                    _deferred_eval_output =
                         Some(page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs)));
                 }
             }
-            let capture_state = deferred_eval_output.as_ref().map(|_| {
+            let capture_state = _deferred_eval_output.as_ref().map(|_| {
                 page.evaluate(
                     "(()=>({\
                      scrollX:window.scrollX,scrollY:window.scrollY,\
@@ -1081,7 +1124,7 @@ async fn run_fetch(
             // completely. Emit both its value and a standard state sampled
             // after the post-eval settle so automation can record the exact
             // live viewport that was painted.
-            if let Some(result) = deferred_eval_output {
+            if let Some(result) = _deferred_eval_output {
                 let mut controlled_scroll_report = controlled_scroll;
                 if let (Some(report), Some(initial)) = (
                     controlled_scroll_report.as_mut(),
@@ -1958,12 +2001,21 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, resolve_v8_flags,
+        locale_for_browser_language, merge_proxy, normalize_v8_flags, read_urls_from_file,
+        resolve_asset_url, resolve_v8_flags,
         select_log_filter,
         write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn browser_language_maps_to_an_icu_locale_without_guessing_unknown_tags() {
+        assert_eq!(locale_for_browser_language("zh-CN"), Some("zh_CN.UTF-8"));
+        assert_eq!(locale_for_browser_language("en-US"), Some("en_US.UTF-8"));
+        assert_eq!(locale_for_browser_language("de-DE"), Some("de_DE.UTF-8"));
+        assert_eq!(locale_for_browser_language("xx-YY"), None);
+    }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.

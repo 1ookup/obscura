@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -259,6 +259,9 @@ pub struct ResourceRequest {
     pub referrer_policy: ReferrerPolicy,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
+    /// Headers owned by this one request. These are merged after the client's
+    /// global extra headers and participate in interception/callback metadata.
+    pub headers: HashMap<String, String>,
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
@@ -273,6 +276,7 @@ impl ResourceRequest {
             referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
+            headers: HashMap::new(),
             max_response_bytes: 64 * 1024 * 1024,
         }
     }
@@ -303,6 +307,7 @@ impl ResourceRequest {
             referrer_policy: ReferrerPolicy::default(),
             mode,
             credentials,
+            headers: HashMap::new(),
             max_response_bytes: match resource_type {
                 ResourceType::Stylesheet | ResourceType::Font => 16 * 1024 * 1024,
                 ResourceType::Script | ResourceType::Other => 32 * 1024 * 1024,
@@ -326,6 +331,7 @@ impl ResourceRequest {
             referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
+            headers: HashMap::new(),
             max_response_bytes: 32 * 1024 * 1024,
         }
     }
@@ -371,6 +377,59 @@ impl ResourceRequest {
                 .as_ref()
                 .is_some_and(|initiator| initiator.origin() == target.origin()),
         }
+    }
+}
+
+pub(crate) fn client_hint_origin(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+pub(crate) fn parse_client_hint_list(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect()
+}
+
+pub(crate) fn client_hint_value(name: &str, fingerprint: &crate::fingerprint::BrowserFingerprint) -> Option<String> {
+    let full_version_list = fingerprint
+        .full_version_list
+        .iter()
+        .map(|brand| format!("\"{}\";v=\"{}\"", brand.brand, brand.version))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value = match name {
+        "sec-ch-ua" => fingerprint.sec_ch_ua(),
+        "sec-ch-ua-mobile" => fingerprint.sec_ch_ua_mobile().to_string(),
+        "sec-ch-ua-platform" => fingerprint.sec_ch_ua_platform(),
+        "sec-ch-ua-arch" | "ua-arch" => format!("\"{}\"", fingerprint.architecture),
+        "sec-ch-ua-bitness" | "ua-bitness" => format!("\"{}\"", fingerprint.bitness),
+        "sec-ch-ua-full-version" | "ua-full-version" => format!("\"{}\"", fingerprint.browser_version),
+        "sec-ch-ua-full-version-list" | "ua-full-version-list" => full_version_list,
+        "sec-ch-ua-model" | "ua-model" => format!("\"{}\"", fingerprint.model),
+        "sec-ch-ua-platform-version" | "ua-platform-version" => {
+            format!("\"{}\"", fingerprint.ua_platform_version)
+        }
+        "ua-mobile" => fingerprint.sec_ch_ua_mobile().to_string(),
+        "ua-platform" => fingerprint.sec_ch_ua_platform(),
+        "ua" => fingerprint.user_agent.clone(),
+        _ => return None,
+    };
+    Some(value)
+}
+
+pub(crate) fn apply_client_hints(
+    headers: &mut HeaderMap,
+    accepted: &HashSet<String>,
+    fingerprint: &crate::fingerprint::BrowserFingerprint,
+) {
+    for name in accepted {
+        let Some(value) = client_hint_value(name, fingerprint) else { continue };
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else { continue };
+        let Ok(header_value) = HeaderValue::from_str(&value) else { continue };
+        headers.insert(header_name, header_value);
     }
 }
 
@@ -966,6 +1025,11 @@ pub struct ObscuraHttpClient {
     /// Callers replace it atomically so requests cannot observe a mixed pair.
     pub fingerprint: RwLock<crate::fingerprint::BrowserFingerprint>,
     pub extra_headers: RwLock<HashMap<String, String>>,
+    /// Client-Hints accepted by each response origin. Chromium learns these
+    /// from Accept-CH and retries a navigation carrying the requested
+    /// high-entropy UA fields; keeping the policy origin-scoped avoids leaking
+    /// one site's hints to another.
+    accepted_client_hints: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -1151,6 +1215,7 @@ impl ObscuraHttpClient {
             cookie_jar,
             fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(HashMap::new()),
+            accepted_client_hints: Arc::new(RwLock::new(HashMap::new())),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
@@ -1176,6 +1241,7 @@ impl ObscuraHttpClient {
             cookie_jar: self.cookie_jar.clone(),
             fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(extra_headers),
+            accepted_client_hints: self.accepted_client_hints.clone(),
             // The browser Page interception channel is page-owned separately;
             // a boxed custom interceptor cannot be shared without changing its
             // ownership contract.
@@ -1313,9 +1379,57 @@ impl ObscuraHttpClient {
         policy: ReferrerPolicy,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_document_with_method_referrer_headers(
+            method,
+            url,
+            body,
+            referrer,
+            policy,
+            HashMap::new(),
+            callbacks,
+        )
+        .await
+    }
+
+    pub async fn fetch_document_with_method_referrer_headers(
+        &self,
+        method: Method,
+        url: &Url,
+        body: Option<Vec<u8>>,
+        referrer: Option<Url>,
+        policy: ReferrerPolicy,
+        headers: HashMap<String, String>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
         let mut request = ResourceRequest::navigation();
         request.referrer = referrer;
         request.referrer_policy = policy;
+        request.headers = headers;
+        self.fetch_with_profile(method, url, body, callbacks, request)
+            .await
+    }
+
+    /// Fetch a network iframe document. Frame navigations are still
+    /// `navigate` requests, but their initiator and Fetch Metadata differ
+    /// from a top-level navigation. Keeping this separate prevents the
+    /// top-level `Sec-Fetch-Site: none` profile from leaking into child frames.
+    pub async fn fetch_frame_document_with_method_referrer_headers(
+        &self,
+        method: Method,
+        url: &Url,
+        body: Option<Vec<u8>>,
+        referrer: Option<Url>,
+        initiator: Option<Url>,
+        policy: ReferrerPolicy,
+        mut headers: HashMap<String, String>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        headers.insert("Sec-Fetch-Dest".to_string(), "iframe".to_string());
+        let mut request = ResourceRequest::navigation();
+        request.initiator = initiator;
+        request.referrer = referrer;
+        request.referrer_policy = policy;
+        request.headers = headers;
         self.fetch_with_profile(method, url, body, callbacks, request)
             .await
     }
@@ -1356,6 +1470,12 @@ impl ObscuraHttpClient {
             .iter()
             .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
             .collect::<Vec<_>>();
+        extra_headers.extend(
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.clone())),
+        );
         extra_headers.sort();
         if extra_headers.iter().any(|(name, value)| {
             name == "authorization"
@@ -1516,10 +1636,12 @@ impl ObscuraHttpClient {
         let Some(callbacks) = callbacks else {
             return;
         };
+        let mut callback_headers = self.extra_headers.read().await.clone();
+        callback_headers.extend(request.headers.clone());
         let request_info = RequestInfo {
             url: url.clone(),
             method: Method::GET.to_string(),
-            headers: self.extra_headers.read().await.clone(),
+            headers: callback_headers,
             resource_type: request.resource_type,
         };
         callbacks.fire_request(&request_info).await;
@@ -1566,13 +1688,16 @@ impl ObscuraHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
         let mut redirect_end = Duration::ZERO;
+        let mut client_hint_retry = false;
 
         for _redirect_count in 0..max_redirects {
             validate_request_mode(&request, &current_url)?;
+            let mut callback_headers = self.extra_headers.read().await.clone();
+            callback_headers.extend(request.headers.clone());
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: callback_headers,
                 resource_type: request.resource_type.clone(),
             };
 
@@ -1601,6 +1726,13 @@ impl ObscuraHttpClient {
 
             let fingerprint = self.fingerprint.read().await.clone();
             let ua = &fingerprint.user_agent;
+            let is_frame_navigation = request
+                .headers
+                .iter()
+                .any(|(name, value)| {
+                    name.eq_ignore_ascii_case("sec-fetch-dest")
+                        && value.eq_ignore_ascii_case("iframe")
+                });
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
             // accept-encoding/host after these, so accept-encoding lands after
@@ -1635,7 +1767,7 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-mode"),
                 HeaderValue::from_static(request.mode.header_value()),
             );
-            if request.mode == RequestMode::Navigate {
+            if request.mode == RequestMode::Navigate && !is_frame_navigation {
                 headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
             }
             headers.insert(
@@ -1650,7 +1782,9 @@ impl ObscuraHttpClient {
             let request_origin = serialized_request_origin(&request, redirect_tainted);
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
+                HeaderValue::from_str(&fingerprint.accept_language()).unwrap_or_else(|_| {
+                    HeaderValue::from_static("en-US,en;q=0.9")
+                }),
             );
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
@@ -1696,6 +1830,14 @@ impl ObscuraHttpClient {
                     headers.insert(name, val);
                 }
             }
+            for (k, v) in &request.headers {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    headers.insert(name, val);
+                }
+            }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
             if cors_required(&request, &current_url) {
@@ -1706,11 +1848,27 @@ impl ObscuraHttpClient {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
+            let hint_origin = client_hint_origin(&current_url);
+            if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
+                apply_client_hints(&mut headers, accepted, &fingerprint);
+            }
+
+            let form_content_type = method == Method::POST
+                && request.mode == RequestMode::Navigate
+                && !headers.contains_key(reqwest::header::CONTENT_TYPE);
+            let sent_client_hints: HashSet<String> = headers
+                .keys()
+                .map(|name| name.as_str().to_ascii_lowercase())
+                .collect();
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
-                if method == Method::POST {
+                // Navigation form submissions have a form-urlencoded default.
+                // Scripted fetch/XHR requests own their Content-Type (and a
+                // plain string body otherwise has no implicit form encoding);
+                // never overwrite an explicit request header here.
+                if form_content_type {
                     req_builder = req_builder.header(
                         reqwest::header::CONTENT_TYPE,
                         "application/x-www-form-urlencoded",
@@ -1732,6 +1890,35 @@ impl ObscuraHttpClient {
                 &request_origin,
                 resp.headers(),
             )?;
+
+            let accepted_hints = resp
+                .headers()
+                .get(HeaderName::from_static("accept-ch"))
+                .and_then(|value| value.to_str().ok())
+                .map(parse_client_hint_list);
+            let critical_hints = resp
+                .headers()
+                .get("critical-ch")
+                .and_then(|value| value.to_str().ok())
+                .map(parse_client_hint_list)
+                .unwrap_or_default();
+            if let Some(hints) = accepted_hints {
+                self.accepted_client_hints
+                    .write()
+                    .await
+                    .entry(client_hint_origin(&current_url))
+                    .or_default()
+                    .extend(hints);
+            }
+            if !client_hint_retry && !critical_hints.is_empty()
+                && critical_hints
+                    .iter()
+                    .any(|hint| !sent_client_hints.contains(hint))
+            {
+                client_hint_retry = true;
+                drop(resp);
+                continue;
+            }
 
             if request.sends_credentials_to(&current_url) {
                 for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
@@ -1865,6 +2052,7 @@ mod ssrf_tests {
         validate_resolved_addresses, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
         ReferrerPolicy, RequestCredentials, RequestMode, ResourceRequest, ResourceType,
     };
+    use reqwest::Method;
     use crate::cookies::CookieJar;
     use std::collections::HashMap;
     use std::net::{IpAddr, SocketAddr};
@@ -2115,6 +2303,113 @@ mod ssrf_tests {
         assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
         assert!(request.contains("\r\nsec-ch-ua-platform: \"macos\"\r\n"), "{request}");
         assert_eq!(client.browser_fingerprint().await, fingerprint);
+    }
+
+    #[tokio::test]
+    async fn scripted_post_preserves_explicit_content_type() {
+        let (url, mut requests) = http_fixture(vec![ok_response("", "ok")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let mut request = ResourceRequest::subresource(ResourceType::Fetch, &url);
+        request.mode = RequestMode::SameOrigin;
+        request.headers.insert(
+            "Content-Type".to_string(),
+            "application/json".to_string(),
+        );
+        let response = client
+            .fetch_with_profile(
+                Method::POST,
+                &url,
+                Some(br#"{}"#.to_vec()),
+                None,
+                request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let raw = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(raw.contains("\r\ncontent-type: application/json\r\n"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn navigation_post_defaults_to_form_content_type() {
+        let (url, mut requests) = http_fixture(vec![ok_response("", "ok")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let response = client
+            .fetch_with_profile(
+                Method::POST,
+                &url,
+                Some(b"a=1".to_vec()),
+                None,
+                ResourceRequest::navigation(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let raw = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(
+            raw.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_client_hints_retry_navigation_with_high_entropy_ua_fields() {
+        let first = ok_response(
+            "Accept-CH: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\n\
+             Critical-CH: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\n",
+            "first",
+        );
+        let (url, mut requests) = http_fixture(vec![first, ok_response("", "second")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let response = client.fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+        let initial = requests.recv().await.unwrap().to_ascii_lowercase();
+        let retry = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(!initial.contains("sec-ch-ua-arch:"), "{initial}");
+        assert!(retry.contains("\r\nsec-ch-ua-arch: \"arm\"\r\n"), "{retry}");
+        assert!(retry.contains("\r\nsec-ch-ua-bitness: \"64\"\r\n"), "{retry}");
+    }
+
+    #[tokio::test]
+    async fn frame_navigation_uses_iframe_fetch_metadata() {
+        let (target, mut requests) = http_fixture(vec![ok_response("", "frame")]).await;
+        let initiator = Url::parse("https://www.example.test/page").unwrap();
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+
+        let response = client
+            .fetch_frame_document_with_method_referrer_headers(
+                Method::GET,
+                &target,
+                None,
+                Some(initiator.clone()),
+                Some(initiator),
+                ReferrerPolicy::default(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"frame");
+        let request = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("\r\nsec-fetch-dest: iframe\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-fetch-site: cross-site\r\n"), "{request}");
+        assert!(!request.contains("\r\nsec-fetch-user:"), "{request}");
     }
 
     #[tokio::test]

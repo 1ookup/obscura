@@ -148,6 +148,7 @@ pub struct RenderResourceCache {
     sync_loading_enabled: bool,
     loader: Box<dyn RenderResourceLoader>,
     font_csp: Option<(String, String)>,
+    image_csp: Option<(String, String)>,
 }
 
 impl Default for RenderResourceCache {
@@ -188,6 +189,7 @@ impl RenderResourceCache {
             sync_loading_enabled: true,
             loader: Box::new(loader),
             font_csp: None,
+            image_csp: None,
         }
     }
 
@@ -199,11 +201,38 @@ impl RenderResourceCache {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
     }
 
-    /// Set the enforced CSP context used by synchronous @font-face loading.
+    /// Set the enforced CSP context used by synchronous font and image loading.
     /// The cache is shared by nested documents, so embedders refresh this
     /// before preparing each document root.
     pub fn set_font_csp(&mut self, header: Option<&str>, self_origin: &str) {
         self.font_csp = header.map(|value| (value.to_string(), self_origin.to_string()));
+        self.image_csp = header.map(|value| (value.to_string(), self_origin.to_string()));
+    }
+
+    fn image_src_allows(&self, request_url: &str) -> bool {
+        let Some((header, self_origin)) = self.image_csp.as_ref() else { return true };
+        let mut image = None;
+        let mut default = None;
+        for part in header.split(';') {
+            let mut tokens = part.split_ascii_whitespace();
+            let Some(name) = tokens.next() else { continue };
+            let values = tokens.collect::<Vec<_>>();
+            if name.eq_ignore_ascii_case("img-src") && image.is_none() {
+                image = Some(values);
+            } else if name.eq_ignore_ascii_case("default-src") && default.is_none() {
+                default = Some(values);
+            }
+        }
+        let Some(sources) = image.or(default) else { return true };
+        let Ok(target) = url::Url::parse(request_url) else { return false };
+        let target_origin = target.origin().ascii_serialization();
+        sources.into_iter().any(|source| match source.to_ascii_lowercase().as_str() {
+            "'none'" => false,
+            "'self'" => target_origin.eq_ignore_ascii_case(self_origin),
+            "*" => matches!(target.scheme(), "http" | "https"),
+            value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+            value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+        })
     }
 
     fn font_src_allows(&self, request_url: &str) -> bool {
@@ -476,6 +505,9 @@ impl RenderResourceCache {
         url: &str,
         profile: ImageRequestProfile,
     ) -> Option<Arc<[u8]>> {
+        if !self.image_src_allows(&network_resource_url(url)) {
+            return None;
+        }
         let key = image_resource_key(url, profile);
         if let Some(entry) = self.entries.get(&key) {
             match entry {
@@ -1326,6 +1358,23 @@ impl PreparedRender {
         )
     }
 
+    fn cssom_document_rect(&self, id: obscura_dom::tree::NodeId) -> Option<crate::Rect> {
+        let rect = self
+            .layout
+            .cssom_rects
+            .get(&id)
+            .or_else(|| self.layout.rects.get(&id))
+            .copied()?;
+        Some(
+            self.layout
+                .transforms
+                .get(&id)
+                .copied()
+                .map(|transform| transform.map_rect(rect))
+                .unwrap_or(rect),
+        )
+    }
+
     /// Unscaled padding-box size used by CSSOM View's `clientWidth` and
     /// `clientHeight`. Layout rects are border boxes, so remove the resolved
     /// borders but retain padding. This deliberately ignores visual
@@ -1814,6 +1863,20 @@ impl PreparedRender {
         scroll: &ResolvedScrollState,
     ) -> Option<crate::Rect> {
         let mut rect = self.document_rect(id)?;
+        let movement = scroll.movement_for(id);
+        rect.x += movement.0;
+        rect.y += movement.1;
+        Some(rect)
+    }
+
+    /// CSSOM border box with subpixel Taffy geometry and the same resolved
+    /// scroll/sticky movement as the painted rounded layout.
+    pub fn cssom_viewport_rect_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<crate::Rect> {
+        let mut rect = self.cssom_document_rect(id)?;
         let movement = scroll.movement_for(id);
         rect.x += movement.0;
         rect.y += movement.1;
@@ -11659,6 +11722,25 @@ mod tests {
 
         resources.set_font_csp(Some("default-src 'none'"), "https://app.example");
         assert!(!resources.font_src_allows("https://app.example/font.woff2"));
+    }
+
+    #[test]
+    fn image_resource_cache_enforces_img_src_before_loader() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loads_for_loader = Arc::clone(&loads);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            loads_for_loader.fetch_add(1, Ordering::Relaxed);
+            let _ = url;
+            Some(vec![1, 2, 3])
+        });
+        resources.set_font_csp(
+            Some("default-src 'none'; img-src 'self' https://img.example"),
+            "https://app.example",
+        );
+        assert!(resources.get_or_load_image("https://img.example/a.svg", ImageRequestProfile::NoCorsInclude).is_some());
+        assert!(resources.get_or_load_image("https://evil.example/a.svg", ImageRequestProfile::NoCorsInclude).is_none());
+        assert_eq!(loads.load(Ordering::Relaxed), 1, "CSP-blocked images must not reach the loader");
     }
 
     struct StubFrameSurfaces {

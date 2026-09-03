@@ -50,6 +50,38 @@ fn emit_script_parsed(ctx: &mut CdpContext, session_id: &Option<String>, page_id
     });
 }
 
+fn emit_v8_script_parsed(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    script: obscura_js::runtime::DebuggerScript,
+) {
+    if !ctx
+        .debugger_scripts
+        .insert((session_id.clone(), script.script_id.clone()))
+    {
+        return;
+    }
+    ctx.pending_events.push(crate::types::CdpEvent {
+        method: "Debugger.scriptParsed".into(),
+        params: json!({
+            "scriptId": script.script_id,
+            "url": script.url,
+            "startLine": script.start_line,
+            "startColumn": script.start_column,
+            "endLine": script.end_line,
+            "endColumn": script.end_column,
+            "executionContextId": 2,
+            "hash": script.hash,
+            "isLiveEdit": false,
+            "sourceMapURL": "",
+            "hasSourceURL": false,
+            "isModule": false,
+            "length": script.length,
+        }),
+        session_id: session_id.clone(),
+    });
+}
+
 pub(crate) fn emit_navigation_script(ctx: &mut CdpContext, session_id: &Option<String>, page_id: &str, url: &str) {
     if ctx.debugger_enabled.contains(session_id) {
         emit_script_parsed(ctx, session_id, page_id, url);
@@ -65,15 +97,31 @@ pub async fn handle(
     match method {
         "enable" => {
             ctx.debugger_enabled.insert(session_id.clone());
-            if let Some(page) = ctx.get_session_page(session_id) {
-                let id = page.id.clone();
-                let url = page.url_string();
-                emit_script_parsed(ctx, session_id, &id, &url);
+            let fallback = ctx
+                .get_session_page(session_id)
+                .map(|page| (page.id.clone(), page.url_string()));
+            let scripts = if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_debugger_enabled(true);
+                page.debugger_scripts().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if scripts.is_empty() {
+                if let Some((id, url)) = fallback {
+                    emit_script_parsed(ctx, session_id, &id, &url);
+                }
+            } else {
+                for script in scripts {
+                    emit_v8_script_parsed(ctx, session_id, script);
+                }
             }
             Ok(json!({}))
         }
         "disable" => {
             ctx.debugger_enabled.remove(session_id);
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_debugger_enabled(false);
+            }
             Ok(json!({}))
         }
         "setBreakpointByUrl" => {
@@ -98,7 +146,17 @@ pub async fn handle(
             ctx.debugger_pause_next.insert(session_id.clone());
             Ok(json!({}))
         }
-        "getScriptSource" => Ok(json!({"scriptSource": ""})),
+        "getScriptSource" => {
+            let script_id = params
+                .get("scriptId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Debugger.getScriptSource requires scriptId".to_string())?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or_else(|| "No page attached to debugger session".to_string())?;
+            let source = page.debugger_script_source(script_id).await?;
+            Ok(json!({"scriptSource": source}))
+        }
         "setInstrumentationBreakpoint" => {
             let name = params.get("instrumentation").and_then(Value::as_str).unwrap_or("");
             Ok(json!({"breakpointId": format!("instrumentation:{name}")}))

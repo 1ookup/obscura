@@ -180,6 +180,9 @@ pub struct ObscuraState {
     pub(crate) webgl_enabled: bool,
     pub url: String,
     pub document_csp: Option<String>,
+    pub document_permissions_policy: Option<String>,
+    pub cross_origin_isolated: bool,
+    pub document_last_modified: Option<String>,
     /// Typed origin of the top-level document, derived exactly once per
     /// committed document. Same-origin checks against frame scopes must use
     /// this instance: re-deriving from `url` would mint a fresh opaque id on
@@ -393,6 +396,9 @@ impl ObscuraState {
             webgl_enabled: false,
             url: "about:blank".to_string(),
             document_csp: None,
+            document_permissions_policy: None,
+            cross_origin_isolated: false,
+            document_last_modified: None,
             top_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
@@ -592,13 +598,19 @@ pub(crate) struct WebSocketState {
 
 /// Opt-in host-operation trace. Native deno ops do not always have a V8
 /// function frame, so this stream complements the V8 property trace.
+fn host_op_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_TRACE_OP_FILE").is_some())
+}
+
 pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
+    if !host_op_trace_enabled() { return }
     static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
     let sink = TRACE.get_or_init(|| {
         let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
-        let _ = writeln!(file, "timestamp_us\toperation\targ1\targ2");
+        let _ = writeln!(file, "timestamp_us\toperation\targ1\targ2\targ3\tresult");
         Some(std::sync::Mutex::new(file))
     });
     let Some(file) = sink else { return };
@@ -606,8 +618,14 @@ pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
     let clean = |value: &str| value.replace(['\t', '\r', '\n'], " ").chars().take(2048).collect::<String>();
     let arg1 = args.first().map_or_else(String::new, |value| clean(value));
     let arg2 = args.get(1).map_or_else(String::new, |value| clean(value));
+    let arg3 = args.get(2).map_or_else(String::new, |value| clean(value));
+    let result = args.get(3).map_or_else(String::new, |value| clean(value));
     if let Ok(mut file) = file.lock() {
-        let _ = writeln!(file, "{timestamp}\t{}\t{arg1}\t{arg2}", clean(name));
+        let _ = writeln!(
+            file,
+            "{timestamp}\t{}\t{arg1}\t{arg2}\t{arg3}\t{result}",
+            clean(name),
+        );
         let _ = file.flush();
     }
 }
@@ -1176,20 +1194,24 @@ fn op_dom(
     #[string] arg1: String,
     #[string] arg2: String,
 ) -> String {
-    trace_host_op("dom", &[&cmd, &arg1, &arg2]);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
     // inconsistent tree node degrades to a null result for that single call.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let trace_args = host_op_trace_enabled().then(|| (cmd.clone(), arg1.clone(), arg2.clone()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         op_dom_inner(state, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
         "null".to_string()
-    })
+    });
+    if let Some((trace_cmd, trace_arg1, trace_arg2)) = trace_args {
+        trace_host_op("dom", &[&trace_cmd, &trace_arg1, &trace_arg2, &result]);
+    }
+    result
 }
 
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
@@ -1606,7 +1628,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             }
             // A sandboxed frame without allow-same-origin gets a fresh opaque
             // origin, so it must not read as same-origin with its embedder.
-            let sandbox = dom
+            let own_sandbox = dom
                 .get_node(host)
                 .map(|node| obscura_dom::SandboxFlags::parse(node.get_attribute("sandbox")))
                 .unwrap_or_default();
@@ -1619,13 +1641,25 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let parent_scope = dom
                 .containing_document_root_shadow_including(host)
                 .and_then(|root| dom.document_scope(root));
-            let (parent_origin, base_url, csp, referrer, referrer_policy) = match parent_scope {
+            let (
+                parent_origin,
+                base_url,
+                csp,
+                permissions_policy,
+                referrer,
+                referrer_policy,
+                parent_sandbox,
+                parent_cross_origin_isolated,
+            ) = match parent_scope {
                 Some(scope) => (
                     scope.origin,
                     scope.base_url,
                     scope.csp,
+                    scope.permissions_policy,
                     scope.referrer,
                     scope.referrer_policy,
+                    scope.sandbox,
+                    scope.cross_origin_isolated,
                 ),
                 None => (
                     gs.top_origin
@@ -1633,19 +1667,43 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                         .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url)),
                     gs.url.clone(),
                     gs.document_csp.clone(),
+                    gs.document_permissions_policy.clone(),
                     gs.referrer.clone(),
                     // The top document's policy is not on the shared state;
                     // the loader's commit records the real one moments later.
                     String::new(),
+                    obscura_dom::SandboxFlags::default(),
+                    gs.cross_origin_isolated,
                 ),
             };
+            // Sandboxing is inherited through every nested browsing context.
+            // The controller repeats this merge at navigation commit, but the
+            // initial about:blank document is exposed synchronously from the
+            // insertion algorithm and must already have the same restrictions.
+            let sandbox = own_sandbox.merged_with_parent(parent_sandbox);
             let origin = if sandbox.active
                 && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
             {
                 obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
             } else {
-                parent_origin
+                parent_origin.clone()
             };
+            // The initial about:blank used by an iframe that is about to
+            // navigate cross-origin is not an isolated document in Chrome.
+            // It can run briefly before the network response commits and is
+            // observable by early fingerprint probes. Do not leak the
+            // parent's isolation bit into that transient cross-origin
+            // browsing context; the committed navigation computes it again
+            // from the response and the real parent scope.
+            let iframe_src = dom
+                .get_node(host)
+                .and_then(|node| node.get_attribute("src").map(str::to_string));
+            let initial_cross_origin_isolated = initial_iframe_cross_origin_isolated(
+                &parent_origin,
+                parent_cross_origin_isolated,
+                &base_url,
+                iframe_src.as_deref(),
+            );
             let Ok((root, _previous)) = dom.create_iframe_content_document(host) else {
                 return "-1".into();
             };
@@ -1662,8 +1720,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     url: "about:blank".to_string(),
                     origin,
                     base_url,
+                    last_modified: None,
                     sandbox,
                     csp,
+                    permissions_policy,
                     referrer_policy,
                     referrer,
                     // The frame registry names the browsing context when the
@@ -1672,7 +1732,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     // every reader of the scope.
                     frame_id: String::new(),
                     document_generation: 0,
-                    quirks: false,
+                    // about:blank has no doctype and is therefore in
+                    // BackCompat from the moment the iframe is inserted;
+                    // author code can read this before the async navigation
+                    // controller replaces the document.
+                    quirks: true,
+                    cross_origin_isolated: initial_cross_origin_isolated,
                 },
             );
             root.index().to_string()
@@ -1782,6 +1847,122 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 None => serde_json::json!({ "host": -1, "parentRoot": -1 }).to_string(),
             }
         }
+        // Permissions Policy's iframe inheritance for the permission-backed
+        // features exposed by navigator.permissions. Most have a default
+        // allowlist of `self`: each cross-origin boundary must explicitly
+        // delegate the feature through the host iframe's `allow` attribute.
+        // Notifications are not delegable and stay denied below any
+        // cross-origin ancestor.
+        "frame_permission_allowed" => {
+            let feature = arg2.trim().to_ascii_lowercase();
+            let mut child_root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let top_origin = gs
+                .top_origin
+                .clone()
+                .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url));
+            // A document's Permissions-Policy header constrains both that
+            // document and every descendant. Evaluate it at each boundary
+            // before applying the iframe's `allow` delegation.
+            let policy_allows = |header: Option<&str>, subject: &obscura_dom::Origin,
+                                 owner: &obscura_dom::Origin| {
+                let Some(header) = header else { return true };
+                let mut found = None;
+                for part in header.split([',', ';']) {
+                    let Some((name, value)) = part.split_once('=') else { continue };
+                    if name.trim().eq_ignore_ascii_case(&feature) {
+                        found = Some(value.trim());
+                        break;
+                    }
+                }
+                let Some(value) = found else { return true };
+                let value = value.trim();
+                if value == "()" { return false; }
+                let value = value.trim_start_matches('(').trim_end_matches(')');
+                value.split_ascii_whitespace().any(|token| {
+                    let token = token.trim_matches(['\'', '"']);
+                    token == "*"
+                        || token.eq_ignore_ascii_case("self") && subject.same_origin(owner)
+                        || token == subject.serialize()
+                })
+            };
+            let mut allowed = true;
+            for _ in 0..=dom.len() {
+                let Some(host) = dom.iframe_host(child_root) else {
+                    break;
+                };
+                let parent_root = dom.containing_iframe_content_document(host);
+                let Some(child_origin) = dom
+                    .document_scope(child_root)
+                    .map(|scope| scope.origin)
+                else {
+                    allowed = false;
+                    break;
+                };
+                let parent_origin = parent_root
+                    .and_then(|root| dom.document_scope(root).map(|scope| scope.origin))
+                    .unwrap_or_else(|| top_origin.clone());
+                let same_origin = child_origin.same_origin(&parent_origin);
+
+                let child_policy = dom
+                    .document_scope(child_root)
+                    .and_then(|scope| scope.permissions_policy.as_deref().map(str::to_owned));
+                if !policy_allows(child_policy.as_deref(), &child_origin, &child_origin) {
+                    allowed = false;
+                    break;
+                }
+                let parent_policy = parent_root
+                    .and_then(|root| dom.document_scope(root))
+                    .and_then(|scope| scope.permissions_policy)
+                    .or_else(|| gs.document_permissions_policy.clone());
+                if !policy_allows(parent_policy.as_deref(), &child_origin, &parent_origin) {
+                    allowed = false;
+                    break;
+                }
+
+                if feature == "notifications" {
+                    if !same_origin {
+                        allowed = false;
+                        break;
+                    }
+                } else {
+                    let directive = dom
+                        .get_node(host)
+                        .and_then(|node| node.get_attribute("allow").map(str::to_owned))
+                        .and_then(|raw| {
+                            raw.split(';').find_map(|part| {
+                                let mut tokens = part.split_ascii_whitespace();
+                                let name = tokens.next()?;
+                                name.eq_ignore_ascii_case(&feature)
+                                    .then(|| tokens.map(str::to_owned).collect::<Vec<_>>())
+                            })
+                        });
+                    let boundary_allowed = match directive {
+                        None => same_origin,
+                        Some(tokens) if tokens.is_empty() => true,
+                        Some(tokens) => {
+                            let child = child_origin.serialize();
+                            tokens.into_iter().any(|token| {
+                                let token = token.trim_matches(['\'', '"']);
+                                token == "*"
+                                    || token.eq_ignore_ascii_case("src")
+                                    || token.eq_ignore_ascii_case("self") && same_origin
+                                    || token == child
+                            })
+                        }
+                    };
+                    if !boundary_allowed {
+                        allowed = false;
+                        break;
+                    }
+                }
+
+                let Some(parent_root) = parent_root else {
+                    break;
+                };
+                child_root = parent_root;
+            }
+            allowed.to_string()
+        }
         "document_scope_info" => {
             let root = arg1.parse::<u32>().unwrap_or(0);
             if root == 0 {
@@ -1789,6 +1970,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "url": gs.url,
                     "origin": gs.top_origin.as_ref().map(|origin| origin.serialize()),
                     "csp": gs.document_csp,
+                    "permissionsPolicy": gs.document_permissions_policy,
+                    "crossOriginIsolated": gs.cross_origin_isolated,
+                    "lastModified": gs.document_last_modified,
                     // The top document's parse mode: doctypeless and
                     // about:blank documents are BackCompat in Chrome.
                     "quirks": dom.is_quirks(),
@@ -1800,6 +1984,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "url": scope.url,
                     "origin": scope.origin.serialize(),
                     "baseUrl": scope.base_url,
+                    "lastModified": scope.last_modified,
                     "referrer": scope.referrer,
                     "referrerPolicy": scope.referrer_policy,
                     "sandboxActive": scope.sandbox.active,
@@ -1811,6 +1996,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "documentGeneration": scope.document_generation,
                     "quirks": scope.quirks,
                     "csp": scope.csp,
+                    "permissionsPolicy": scope.permissions_policy,
+                    "crossOriginIsolated": scope.cross_origin_isolated,
                 })
                 .to_string(),
                 None => "null".into(),
@@ -1884,10 +2071,21 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let existing = dom.document_scope(root);
             let quirks = existing.as_ref().map(|scope| scope.quirks).unwrap_or(false);
             let csp = existing.as_ref().and_then(|scope| scope.csp.clone());
+            let existing_permissions_policy = existing
+                .as_ref()
+                .and_then(|scope| scope.permissions_policy.clone());
+            let permissions_policy = spec
+                .get("permissionsPolicy")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_permissions_policy);
             let existing_referrer_policy = existing
                 .as_ref()
                 .map(|scope| scope.referrer_policy.clone());
             let existing_referrer = existing.as_ref().map(|scope| scope.referrer.clone());
+            let existing_last_modified = existing
+                .as_ref()
+                .and_then(|scope| scope.last_modified.clone());
             let referrer_policy = spec
                 .get("referrerPolicy")
                 .and_then(|value| value.as_str())
@@ -1900,19 +2098,30 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(str::to_string)
                 .or(existing_referrer)
                 .unwrap_or_default();
+            let last_modified = spec
+                .get("lastModified")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_last_modified);
             dom.set_document_scope(
                 root,
                 obscura_dom::DocumentScope {
                     url,
                     origin,
                     base_url,
+                    last_modified,
                     sandbox,
                     csp,
+                    permissions_policy,
                     referrer_policy,
                     referrer,
                     frame_id,
                     document_generation,
                     quirks,
+                    cross_origin_isolated: spec
+                        .get("crossOriginIsolated")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(gs.cross_origin_isolated),
                 },
             );
             "true".into()
@@ -2805,6 +3014,31 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Return the isolation bit visible from an iframe's initial about:blank
+/// document. A network `src` with a different origin will replace that
+/// document asynchronously, so Chrome keeps the transient realm
+/// non-isolated even when its parent is isolated.
+fn initial_iframe_cross_origin_isolated(
+    parent_origin: &obscura_dom::Origin,
+    parent_cross_origin_isolated: bool,
+    parent_base_url: &str,
+    src: Option<&str>,
+) -> bool {
+    if !parent_cross_origin_isolated {
+        return false;
+    }
+    let Some(raw) = src.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return true;
+    };
+    let Some(target) = url::Url::parse(parent_base_url)
+        .ok()
+        .and_then(|base| base.join(raw).ok())
+    else {
+        return true;
+    };
+    obscura_dom::Origin::from_url(target.as_str()) == *parent_origin
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2834,6 +3068,7 @@ fn csp_sources(header: &str, directive: &str) -> Option<Vec<String>> {
 }
 
 /// Fetch directives fall back to `default-src`; document directives do not.
+#[cfg(any(feature = "render", test))]
 fn csp_falls_back_to_default(directive: &str) -> bool {
     !matches!(directive, "base-uri" | "form-action" | "frame-ancestors")
 }
@@ -2854,6 +3089,7 @@ fn csp_connect_allows(header: Option<&str>, request_url: &str, page_origin: &str
     })
 }
 
+#[cfg(any(feature = "render", test))]
 fn csp_resource_allows(
     header: Option<&str>,
     directive: &str,
@@ -2926,7 +3162,7 @@ async fn op_fetch_url(
         // it a subframe request is indistinguishable from a top-document one,
         // and the two are checked against different policies.
         tracing::debug!(
-            "op_fetch_url called: {} {} (root={}, csp={}, intercept check pending)",
+            "op_fetch_url called: {} {} (root={}, csp={}, origin={}, mode={}, credentials={}, intercept check pending)",
             method,
             url,
             request_root.raw(),
@@ -2935,7 +3171,10 @@ async fn op_fetch_url(
                 (0, false) => "page:none",
                 (_, true) => "frame",
                 (_, false) => "frame:none",
-            }
+            },
+            origin,
+            mode,
+            credentials,
         );
         if !csp_connect_allows(request_csp.as_deref(), &url, &origin) {
             // A blocked request otherwise leaves no trace at all: it has an
@@ -3479,6 +3718,11 @@ async fn op_fetch_url(
     };
 
     let status = response.status().as_u16();
+    let status_text = response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_string();
 
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
@@ -3595,6 +3839,7 @@ async fn op_fetch_url(
 
     Ok(serde_json::json!({
         "status": status,
+        "statusText": status_text,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
@@ -3741,6 +3986,28 @@ fn fetch_response(
 /// handling lives inside StealthHttpClient::send_single, which shares the
 /// context jar. Response bodies are not mirrored into the CDP
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+#[cfg(any(feature = "stealth", test))]
+fn scripted_fetch_site(page_origin: &str, target: &url::Url) -> &'static str {
+    let Ok(initiator) = url::Url::parse(page_origin) else {
+        return "cross-site";
+    };
+    if initiator.origin() == target.origin() {
+        return "same-origin";
+    }
+    let registrable = |url: &url::Url| {
+        let labels: Vec<&str> = url.host_str().unwrap_or_default().split('.').collect();
+        labels
+            .get(labels.len().saturating_sub(2)..)
+            .map(|parts| parts.join("."))
+            .unwrap_or_default()
+    };
+    if registrable(&initiator) == registrable(target) {
+        "same-site"
+    } else {
+        "cross-site"
+    }
+}
+
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
@@ -3792,12 +4059,38 @@ async fn stealth_fetch_all(
         {
             req_headers.insert("referer".to_string(), value);
         }
+        req_headers.entry("accept".to_string()).or_insert_with(|| "*/*".to_string());
+        let accept_language = stealth.browser_fingerprint().await.accept_language();
+        req_headers
+            .entry("accept-language".to_string())
+            .or_insert(accept_language);
+        req_headers
+            .entry("sec-fetch-site".to_string())
+            .or_insert_with(|| scripted_fetch_site(&page_origin, &parsed_current).to_string());
+        req_headers
+            .entry("sec-fetch-mode".to_string())
+            .or_insert_with(|| match mode.as_str() {
+                "no-cors" => "no-cors".to_string(),
+                "same-origin" => "same-origin".to_string(),
+                _ => "cors".to_string(),
+            });
+        req_headers
+            .entry("sec-fetch-dest".to_string())
+            .or_insert_with(|| "empty".to_string());
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
+        tracing::debug!(
+            "stealth_fetch request: {} {} origin={:?} referer={:?}",
+            current_method,
+            current_url,
+            req_headers.get("origin"),
+            req_headers.get("referer"),
+        );
+
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
-        let r = stealth
+        let r = match stealth
             .send_single(
                 &current_method,
                 &parsed_current,
@@ -3807,7 +4100,19 @@ async fn stealth_fetch_all(
                 credentials_allowed,
             )
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    "stealth_fetch failed: {} {} after {:?}: {}",
+                    current_method,
+                    current_url,
+                    performance_started.elapsed(),
+                    error,
+                );
+                return Err(deno_error::JsErrorBox::generic(error.to_string()));
+            }
+        };
         let current_response_start = performance_started.elapsed();
 
         if !(300..400).contains(&r.status) {
@@ -3909,6 +4214,10 @@ async fn stealth_fetch_all(
     }
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let status_text = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .map(|code| code.canonical_reason().unwrap_or("").to_string())
+        .unwrap_or_default();
     let response_end = performance_started.elapsed();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -3934,6 +4243,7 @@ async fn stealth_fetch_all(
 
     Ok(serde_json::json!({
         "status": status,
+        "statusText": status_text,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "url": current_url,
@@ -3979,7 +4289,8 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         cors_response_allows, csp_connect_allows, csp_resource_allows, glob_match,
-        is_potentially_trustworthy, validate_fetch_url, FetchCredentials,
+        initial_iframe_cross_origin_isolated, is_potentially_trustworthy, scripted_fetch_site,
+        validate_fetch_url, FetchCredentials,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
@@ -4068,6 +4379,60 @@ mod tests {
 
         assert!(FetchCredentials::Include.allows(page_origin, same_origin_url));
         assert!(FetchCredentials::Include.allows(page_origin, cross_origin_url));
+    }
+
+    #[test]
+    fn scripted_fetch_site_distinguishes_origin_and_site_boundaries() {
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://challenges.cloudflare.com/cdn-cgi").unwrap(),
+            ),
+            "same-origin"
+        );
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://brunhild.challenges.cloudflare.com/cdn-cgi").unwrap(),
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://example.test/cdn-cgi").unwrap(),
+            ),
+            "cross-site"
+        );
+    }
+
+    #[test]
+    fn initial_cross_origin_iframe_about_blank_is_not_isolated() {
+        let parent = obscura_dom::Origin::from_url("https://page.example/");
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            Some("https://widget.example/frame"),
+        ));
+        assert!(initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            Some("/same-origin-frame"),
+        ));
+        assert!(initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            None,
+        ));
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            false,
+            "https://page.example/",
+            Some("/same-origin-frame"),
+        ));
     }
 
     #[test]
@@ -4232,6 +4597,7 @@ mod tests {
                 "url": "https://frame.example/page",
                 "origin": "https://frame.example",
                 "baseUrl": "https://frame.example/",
+                "lastModified": null,
                 "referrer": "",
                 "referrerPolicy": "strict-origin-when-cross-origin",
                 "sandboxActive": true,
@@ -4241,6 +4607,8 @@ mod tests {
                 "documentGeneration": 3,
                 "quirks": false,
                 "csp": null,
+                "permissionsPolicy": null,
+                "crossOriginIsolated": false,
             }),
         );
         // A doctype-less document parses in quirks mode; the parse writes the
@@ -5845,6 +6213,8 @@ fn worker_environment(
     shared: &SharedState,
     name: String,
     creator_url: &str,
+    creator_root: u32,
+    creator_csp: Option<String>,
     fingerprint_json: &str,
     shared_worker: bool,
 ) -> crate::worker::WorkerEnvironment {
@@ -5883,6 +6253,15 @@ fn worker_environment(
         shared: shared_worker,
         origin,
         secure_context,
+        document_csp: if creator_root > 0 {
+            gs.dom
+                .as_ref()
+                .and_then(|dom| dom.document_scope(obscura_dom::NodeId::new(creator_root)))
+                .and_then(|scope| scope.csp.clone())
+                .or(creator_csp)
+        } else {
+            creator_csp.or_else(|| gs.document_csp.clone())
+        },
         fingerprint: serde_json::from_str(fingerprint_json).unwrap_or_default(),
         #[cfg(feature = "stealth")]
         stealth_client: gs.stealth_client.clone(),
@@ -5898,10 +6277,22 @@ fn op_worker_spawn(
     #[string] name: String,
     #[string] creator_url: String,
     #[string] fingerprint_json: String,
+    #[string] creator_root: String,
+    #[string] creator_csp: String,
     shared_worker: bool,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
-    let environment = worker_environment(&shared, name.clone(), &creator_url, &fingerprint_json, shared_worker);
+    let creator_root = creator_root.parse::<u32>().unwrap_or(0);
+    let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    let environment = worker_environment(
+        &shared,
+        name.clone(),
+        &creator_url,
+        creator_root,
+        creator_csp,
+        &fingerprint_json,
+        shared_worker,
+    );
     let mut gs = shared.borrow_mut();
     if shared_worker {
         return Err(deno_error::JsErrorBox::generic("shared workers use op_shared_worker_connect"));
@@ -5996,9 +6387,21 @@ fn op_shared_worker_connect(
     #[string] name: String,
     #[string] creator_url: String,
     #[string] fingerprint_json: String,
+    #[string] creator_root: String,
+    #[string] creator_csp: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
-    let environment = worker_environment(&shared, name.clone(), &creator_url, &fingerprint_json, true);
+    let creator_root = creator_root.parse::<u32>().unwrap_or(0);
+    let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    let environment = worker_environment(
+        &shared,
+        name.clone(),
+        &creator_url,
+        creator_root,
+        creator_csp,
+        &fingerprint_json,
+        true,
+    );
     let key = format!("{}\n{}\n{}\n{}", environment.origin, name, url, kind);
     let connection = {
         let registry = { shared.borrow().shared_worker_registry.clone() };
@@ -6321,7 +6724,7 @@ async fn op_frame_message_recv(state: Rc<RefCell<OpState>>) -> String {
 }
 
 pub fn build_extension() -> Extension {
-    let mut ops = vec![
+    let ops = vec![
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
@@ -6384,6 +6787,8 @@ pub fn build_extension() -> Extension {
         op_post_to_parent(),
         op_frame_message_recv(),
     ];
+    #[cfg(feature = "render")]
+    let mut ops = ops;
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
@@ -7536,7 +7941,7 @@ fn frame_geometry_json(
     nid: NodeId,
     scroll: &obscura_render::ResolvedScrollState,
 ) -> String {
-    let Some(rect) = prepared.viewport_rect_with_scroll(nid, scroll) else {
+    let Some(rect) = prepared.cssom_viewport_rect_with_scroll(nid, scroll) else {
         return String::new();
     };
     let Some((client_width, client_height)) = prepared.client_size(nid) else {
