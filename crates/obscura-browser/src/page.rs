@@ -2062,11 +2062,18 @@ impl Page {
             .document_csp
             .as_deref()
             .map(crate::frame_policy::ContentSecurityPolicy::parse);
+        let sandbox_allows_scripts = script_policy
+            .as_ref()
+            .and_then(|policy| policy.sandbox_flags())
+            .is_none_or(|sandbox| sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
         let script_self_origin = self
             .document_origin
             .clone()
             .unwrap_or_else(|| obscura_dom::Origin::from_url(&self.url_string()));
         let script_allowed = |script: &ScriptInfo| {
+            if !sandbox_allows_scripts {
+                return false;
+            }
             let Some(policy) = &script_policy else {
                 return true;
             };
@@ -3827,6 +3834,18 @@ impl Page {
         self.encoding = encoding_name.to_string();
         let dom = parse_html(&body_text);
         self.document_csp = effective_document_csp(&dom, dom.document(), response_csp);
+        if let Some(sandbox) = self.document_csp.as_deref().and_then(|header| {
+            crate::frame_policy::ContentSecurityPolicy::parse(header).sandbox_flags()
+        }) {
+            if sandbox.active
+                && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+            {
+                self.document_origin = Some(obscura_dom::Origin::Opaque(
+                    obscura_dom::OpaqueOriginId::new(),
+                ));
+                self.cross_origin_isolated = false;
+            }
+        }
         self.referrer_policy = document_referrer_policy(
             &dom,
             response.header("referrer-policy"),
@@ -7985,6 +8004,35 @@ mod tests {
         assert!(page
             .get_response_body(&event.request_id)
             .is_some_and(|body| body.body.contains("404 body")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_csp_sandbox_blocks_parser_scripts_and_reports_scope_flags() {
+        let mut page = frame_test_page(
+            "<html><body><script>globalThis.topCspRan = true;</script></body></html>",
+        );
+        page.document_csp = Some("sandbox".to_string());
+        page.init_js();
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("typeof globalThis.topCspRan")
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => { const info = JSON.parse(Deno.core.ops.op_dom('document_scope_info', '0', '')); return [info.sandboxActive, info.allowScripts, info.allowSameOrigin]; })()",
+                )
+                .unwrap(),
+            serde_json::json!([true, false, false])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

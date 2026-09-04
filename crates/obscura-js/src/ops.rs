@@ -36,6 +36,23 @@ use serde_json::json;
 use crate::import_map::ImportMap;
 use crate::privacy::{normalize_private_token_issuer, PrivateTokenQueryState, PrivacyPolicy};
 
+/// Extract the enforced CSP `sandbox` directive for the top-level document.
+/// The browser crate owns the full CSP parser, but `document_scope_info` is
+/// served by this crate and only needs the sandbox capability bits. Keep the
+/// first-directive-wins rule aligned with CSP parsing and let the shared DOM
+/// parser handle known and unknown sandbox tokens.
+fn csp_sandbox_flags(header: &str) -> Option<obscura_dom::SandboxFlags> {
+    for chunk in header.split(';') {
+        let mut tokens = chunk.split_ascii_whitespace();
+        let Some(name) = tokens.next() else { continue };
+        if name.eq_ignore_ascii_case("sandbox") {
+            let value = tokens.collect::<Vec<_>>().join(" ");
+            return Some(obscura_dom::SandboxFlags::parse(Some(&value)));
+        }
+    }
+    None
+}
+
 pub type InterceptCallback = Arc<
     Mutex<
         Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>,
@@ -1966,10 +1983,21 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "document_scope_info" => {
             let root = arg1.parse::<u32>().unwrap_or(0);
             if root == 0 {
+                let sandbox = gs
+                    .document_csp
+                    .as_deref()
+                    .and_then(csp_sandbox_flags);
                 return serde_json::json!({
                     "url": gs.url,
                     "origin": gs.top_origin.as_ref().map(|origin| origin.serialize()),
                     "csp": gs.document_csp,
+                    "sandboxActive": sandbox.is_some_and(|flags| flags.active),
+                    "allowScripts": sandbox
+                        .as_ref()
+                        .is_none_or(|flags| flags.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS)),
+                    "allowSameOrigin": sandbox
+                        .as_ref()
+                        .is_none_or(|flags| flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)),
                     "permissionsPolicy": gs.document_permissions_policy,
                     "crossOriginIsolated": gs.cross_origin_isolated,
                     "lastModified": gs.document_last_modified,

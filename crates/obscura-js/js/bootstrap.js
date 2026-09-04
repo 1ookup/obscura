@@ -20522,6 +20522,7 @@ globalThis.opener = null;
 // TODO(phase 3.11 follow-up): full structured clone, transfer lists,
 // and http(s) importScripts.
 function _workerCspAllows(url) {
+  if (!_environmentAllowsScripts()) return false;
   const root = _callingFrameRoot();
   const info = _domParse("document_scope_info", root) || {};
   const header = info.csp;
