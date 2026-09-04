@@ -2562,6 +2562,52 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn frame_network_events_keep_child_frame_identity() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+        let main_frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+        let event = obscura_browser::NetworkEvent {
+            request_id: "page.2".into(),
+            url: "https://child.example/missing".into(),
+            method: "GET".into(),
+            resource_type: "Document".into(),
+            frame_id: Some("frame-child".into()),
+            status: 404,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
+                "content-type".into(),
+                "text/html".into(),
+            )])),
+            body_size: 12,
+            timestamp: 42.0,
+        };
+
+        emit_navigation_events(
+            &mut ctx,
+            &session_id,
+            &main_frame_id,
+            "loader-main",
+            "about:blank",
+            &page_id,
+            &[event],
+            WaitUntil::DomContentLoaded,
+            false,
+        );
+
+        let response = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Network.responseReceived")
+            .expect("child response event");
+        assert_eq!(response.params["frameId"], "frame-child");
+        assert_eq!(response.params["response"]["status"], 404);
+        assert_eq!(response.params["loaderId"], "loader-main");
+    }
+
     #[tokio::test]
     async fn get_layout_metrics_returns_chrome_default_viewport() {
         let mut ctx = CdpContext::new();
