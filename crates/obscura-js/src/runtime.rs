@@ -34,47 +34,20 @@ use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
 
-fn callsite_source_name<'s>(
-    scope: &mut deno_core::v8::HandleScope<'s>,
-    callsite: deno_core::v8::Local<'s, deno_core::v8::Object>,
-) -> Option<String> {
-    for method_name in ["getScriptNameOrSourceURL", "getFileName"] {
-        let key = deno_core::v8::String::new(scope, method_name)?;
-        let method = callsite
-            .get(scope, key.into())
-            .and_then(|value| deno_core::v8::Local::<deno_core::v8::Function>::try_from(value).ok());
-        let Some(method) = method else { continue };
-        let value = method.call(scope, callsite.into(), &[])?;
-        if !value.is_null_or_undefined() {
-            return Some(value.to_rust_string_lossy(scope));
-        }
-    }
-    None
-}
-
 fn obscura_prepare_stack_trace_callback<'s>(
     scope: &mut deno_core::v8::HandleScope<'s>,
     error: deno_core::v8::Local<'s, deno_core::v8::Value>,
     callsites: deno_core::v8::Local<'s, deno_core::v8::Array>,
 ) -> deno_core::v8::Local<'s, deno_core::v8::Value> {
-    let mut visible = Vec::with_capacity(callsites.length() as usize);
-    for index in 0..callsites.length() {
-        let Some(callsite) = callsites
-            .get_index(scope, index)
-            .and_then(|value| deno_core::v8::Local::<deno_core::v8::Object>::try_from(value).ok())
-        else {
-            continue;
-        };
-        let internal = callsite_source_name(scope, callsite).is_some_and(|source| {
-            source.starts_with("<obscura:")
-                || source.starts_with("ext:")
-                || source.starts_with("deno:")
-        });
-        if !internal {
-            visible.push(callsite.into());
+    let global = scope.get_current_context().global(scope);
+    let helper = deno_core::v8::String::new(scope, "__obscura_filter_prepare_stack_trace")
+        .and_then(|key| global.get(scope, key.into()))
+        .and_then(|value| deno_core::v8::Local::<deno_core::v8::Function>::try_from(value).ok());
+    if let Some(helper) = helper {
+        if let Some(value) = helper.call(scope, global.into(), &[error, callsites.into()]) {
+            return value;
         }
     }
-    let callsites = deno_core::v8::Array::new_with_elements(scope, &visible);
     deno_core::error::prepare_stack_trace_callback(scope, error, callsites)
 }
 

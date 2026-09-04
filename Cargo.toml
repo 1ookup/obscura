@@ -64,6 +64,10 @@ anyhow = "1"
 base64 = "0.22"
 
 [patch.crates-io]
+# Keep deno_core's error conversion re-entrant. Its source-map RefCell is
+# optional presentation state and must not panic when V8 formats an exception
+# while another frame is being inspected.
+deno_core = { path = "vendor/deno_core" }
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and

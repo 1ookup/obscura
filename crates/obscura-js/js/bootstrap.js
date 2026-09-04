@@ -26308,4 +26308,48 @@ const _chromeNavigatorTable = [
 // interface above is installed and after the enumerability pass.
 _pristineGlobalNames = new Set(Object.getOwnPropertyNames(globalThis));
 
+// V8 invokes the embedder prepare-stack callback instead of calling
+// Error.prepareStackTrace directly. Keep CallSite inspection in JavaScript,
+// where V8 owns the stack handles, and let the native callback only dispatch
+// to this helper. This avoids re-entering Rust source-map state while V8 is
+// materializing an Error.stack value.
+Object.defineProperty(globalThis, '__obscura_filter_prepare_stack_trace', {
+  configurable: true,
+  enumerable: false,
+  value: function(error, callsites) {
+    const visible = [];
+    for (let i = 0; i < callsites.length; i++) {
+      const site = callsites[i];
+      let source = null;
+      try {
+        if (site && typeof site.getScriptNameOrSourceURL === 'function') {
+          source = site.getScriptNameOrSourceURL();
+        }
+        if ((source === null || source === undefined)
+            && site && typeof site.getFileName === 'function') {
+          source = site.getFileName();
+        }
+      } catch (_) {}
+      if (!(typeof source === 'string'
+            && (source.startsWith('<obscura:')
+                || source.startsWith('ext:')
+                || source.startsWith('deno:')))) {
+        visible.push(site);
+      }
+    }
+    const prepare = Error.prepareStackTrace;
+    if (typeof prepare === 'function') {
+      return prepare(error, visible);
+    }
+    let result = error && error.name ? String(error.name) : 'Error';
+    if (error && error.message) result += ': ' + String(error.message);
+    for (let i = 0; i < visible.length; i++) {
+      let frame = 'native';
+      try { frame = String(visible[i]); } catch (_) {}
+      result += '\n    at ' + frame;
+    }
+    return result;
+  },
+});
+
 })();
