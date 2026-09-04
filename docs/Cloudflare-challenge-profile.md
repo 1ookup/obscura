@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-03，step 216，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-05，step 219，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 本轮继续参考 HaHaVM-General 并修复 wreq Critical-CH 重复头、跨源 iframe 初始隔离位、初始 about:blank
 兼容模式及可配置屏幕工作区指标；最新 payload 已对齐 `crossOriginIsolated=F`、`compatMode=BackCompat`、
 `screen.availTop=30`、DPR/语言/UA-CH 关键值。通过真实点击可执行
@@ -7751,3 +7751,21 @@ POST frame 保持 reqwest。reqwest 与 wreq fixture、browser frame navigation 
 
 **结论**：frame profile 和 stealth 传输修复没有引入回归，但当前代理对 Brunhild 的 `502`/无响应仍是
 真实 `404` 验收的外部阻断，不能用伪造响应替代。
+
+### Step 219 — 当前 release 早期求值与 Brunhild DNS 复核（2026-09-05，外部阻塞）
+
+**方法**：使用当前 trace-patched release serve，在不修改页面对象的前提下运行
+`cdp_filmstrip.py --start 1 --every 1`，并用 `RUST_LOG=obscura_js=debug` 的通信探针记录请求状态；随后
+通过 DNS-over-HTTPS 和直连 TLS 独立检查 `brunhild.challenges.cloudflare.com`，避免把旧探针盲区当作引擎
+缺陷。
+
+**证据**：早期首个 `Runtime.evaluate` 在 1 秒落地后，页面仍保持 `Just a moment...`、widget frame
+`300x65@192,304`，后续截图和 frame 元数据均非空；该现象不再复现旧记录中的“永久空文档”。真实点击仍完整
+产生顶层/frame `/fo`、PAT `401`、proof `/fo` 和 `fail 600010`，但 `brunhild/.../i` 在约 1.1 秒于 Connect
+阶段失败。系统 DNS 和 `https://1.1.1.1/dns-query` 均显示该主机没有 A 记录；直连 TLS 返回
+`SSL_ERROR_SYSCALL`。`challenges.cloudflare.com` 与 `hagen.challenges.cloudflare.com` 可解析，说明失败
+集中在 Brunhild 上游路由而非 iframe CSP 或 frame realm 请求归属。
+
+**结论**：早期求值清空文档应从当前未决缺陷列表移除（现有导航并发路径已覆盖）；真实 `/1.txt` 404 仍需
+能解析并转发 Brunhild 的外部网络条件。禁止在 Obscura 中加入 Brunhild hostname 特判、伪造 DNS 或伪造
+clearance 作为验收替代。
