@@ -1768,6 +1768,88 @@ pub(crate) fn emit_runtime_network_events(
     }
 }
 
+/// Emit the network portion of a direct child-frame navigation. This path does
+/// not use the top-level `emit_navigation_events` batch, but clients still
+/// expect the request/response/body events for the frame's loader.
+fn emit_frame_network_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    document_url: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+) {
+    for network_event in network_events {
+        let request_id = &network_event.request_id;
+        if ctx.fetch_intercept.enabled {
+            ctx.pending_events.push(CdpEvent {
+                method: "Fetch.requestPaused".into(),
+                params: json!({
+                    "requestId": request_id,
+                    "request": {
+                        "url": network_event.url,
+                        "method": network_event.method,
+                        "headers": network_event.headers,
+                    },
+                    "frameId": frame_id,
+                    "resourceType": network_event.resource_type,
+                    "networkId": request_id,
+                }),
+                session_id: session_id.clone(),
+            });
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "documentURL": document_url,
+                "request": {
+                    "url": network_event.url,
+                    "method": network_event.method,
+                    "headers": network_event.headers,
+                },
+                "timestamp": network_event.timestamp,
+                "wallTime": network_event.timestamp,
+                "initiator": {"type": "other"},
+                "type": network_event.resource_type,
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.responseReceived".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "timestamp": network_event.timestamp,
+                "type": network_event.resource_type,
+                "response": {
+                    "url": network_event.url,
+                    "status": network_event.status,
+                    "statusText": "",
+                    "headers": &*network_event.response_headers,
+                    "mimeType": network_event.response_headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.loadingFinished".into(),
+            params: json!({
+                "requestId": request_id,
+                "timestamp": network_event.timestamp,
+                "encodedDataLength": network_event.body_size,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
 /// `Page.navigate`.
 pub fn parse_wait_until(params: &Value) -> WaitUntil {
@@ -1856,21 +1938,43 @@ async fn navigate_child_frame(
         sandbox,
         ..Default::default()
     };
-    let loader_id = {
+    let (loader_id, document_url, network_events) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         page.navigate_frame_for_cdp(frame_id, request)
             .await
             .map_err(|error| error.to_string())?;
-        page.frames
+        let loader_id = page
+            .frames
             .get(frame_id)
             .map(|frame| frame.loader_id.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let document_url = page
+            .frames
+            .get(frame_id)
+            .and_then(|frame| frame.active_document_root)
+            .and_then(|root| page.with_dom(|dom| dom.document_scope(root)).flatten())
+            .map(|scope| scope.url)
+            .unwrap_or_else(|| url.to_string());
+        let all_events = std::mem::take(&mut page.network_events);
+        let (frame_events, other_events): (Vec<_>, Vec<_>) = all_events
+            .into_iter()
+            .partition(|event| event.frame_id.as_deref() == Some(frame_id));
+        page.network_events = other_events;
+        (loader_id, document_url, frame_events)
     };
     // Old-document contexts (and any removed descendant frames) go first,
     // then the navigated subtree's lifecycle and fresh realm contexts.
     emit_frame_teardown_events(ctx, session_id, &page_id);
+    emit_frame_network_events(
+        ctx,
+        session_id,
+        frame_id,
+        &loader_id,
+        &document_url,
+        &network_events,
+    );
     emit_frame_rollout_events(ctx, session_id, &page_id);
     Ok(json!({
         "frameId": frame_id,
