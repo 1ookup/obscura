@@ -13629,7 +13629,13 @@ function _customElementUpgradeRoot(registry, root) {
 function _customElementRegistryForNode(node) {
   try {
     const root = node?.getRootNode?.();
-    if (root?.customElementRegistry instanceof CustomElementRegistry) {
+    // A detached element's native root is the element itself. Reading
+    // `root.customElementRegistry` in that case re-enters this resolver
+    // through Element#customElementRegistry forever. Detached elements still
+    // resolve through ownerDocument below; only inspect a distinct document or
+    // shadow root here.
+    if (root && root !== node
+        && root?.customElementRegistry instanceof CustomElementRegistry) {
       return root.customElementRegistry;
     }
     const doc = node?.ownerDocument || (node?.nodeType === 9 ? node : null);
