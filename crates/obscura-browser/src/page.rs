@@ -3143,8 +3143,15 @@ impl Page {
                 continue;
             };
             if !script_response_is_executable(resp.status) {
-                self.record_network_event_with_body(
-                    &url, "GET", "Script", resp.status, &resp.headers, &resp.body, false,
+                self.record_network_event_with_body_for_frame(
+                    frame_id,
+                    &url,
+                    "GET",
+                    "Script",
+                    resp.status,
+                    &resp.headers,
+                    &resp.body,
+                    false,
                 );
                 tracing::warn!("Refusing to execute frame script {} after HTTP {}", url, resp.status);
                 continue;
@@ -3158,7 +3165,8 @@ impl Page {
                 let script = &scripts[$index];
                 let executable = if script.src.is_some() {
                     fetched.remove(&$index).map(|(url, code, resp)| {
-                        self.record_network_event_with_body(
+                        self.record_network_event_with_body_for_frame(
+                            frame_id,
                             &url,
                             "GET",
                             "Script",
@@ -6551,6 +6559,7 @@ impl Page {
             }
             let Some(css) = self
                 .materialize_frame_stylesheet(
+                    frame_id,
                     key,
                     resolved,
                     &base,
@@ -6624,6 +6633,7 @@ impl Page {
     /// transport, like frame navigation itself.
     async fn materialize_frame_stylesheet(
         &mut self,
+        frame_id: &str,
         root_key: String,
         root_url: Url,
         base: &Url,
@@ -6668,7 +6678,8 @@ impl Page {
                     }
                 };
                 let response_url = response.url.clone();
-                self.record_network_event_with_body(
+                self.record_network_event_with_body_for_frame(
+                    frame_id,
                     response_url.as_str(),
                     "GET",
                     "Stylesheet",
@@ -8862,6 +8873,18 @@ mod tests {
             requested.iter().any(|path| path == "/sub/js/app.js"),
             "expected the frame-relative script fetch, saw {requested:?}",
         );
+        let frame_id = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                page.frames.by_host(host).unwrap().frame_id.clone()
+            })
+            .unwrap();
+        let script_event = page
+            .network_events
+            .iter()
+            .find(|event| event.url.ends_with("/sub/js/app.js"))
+            .expect("frame script network event");
+        assert_eq!(script_event.frame_id.as_deref(), Some(frame_id.as_str()));
 
         // The external frame script's top-level var stayed in its realm.
         assert_eq!(
@@ -9292,6 +9315,18 @@ mod tests {
                 .count(),
             1
         );
+        let frame_id = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("iframe").unwrap().unwrap();
+                page.frames.by_host(host).unwrap().frame_id.clone()
+            })
+            .unwrap();
+        let stylesheet_event = page
+            .network_events
+            .iter()
+            .find(|event| event.url.ends_with("/sub/css/frame.css"))
+            .expect("frame stylesheet network event");
+        assert_eq!(stylesheet_event.frame_id.as_deref(), Some(frame_id.as_str()));
 
         // Frame <img> resources are discovered and warmed through the page
         // transport into the shared render cache.
