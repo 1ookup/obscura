@@ -23403,6 +23403,71 @@ RequestRedirect value",
     }
 
     #[test]
+    fn security_policy_violation_event_matches_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const event = new SecurityPolicyViolationEvent(
+                        'securitypolicyviolation', {
+                            blockedURI: 'https://cdn.example/app.js',
+                            effectiveDirective: 'script-src',
+                            violatedDirective: 'script-src',
+                            documentURI: 'https://app.example/',
+                            originalPolicy: "script-src 'self'",
+                            sourceFile: 'https://app.example/index.js',
+                            sample: 'alert(1)', lineNumber: 4, columnNumber: 5,
+                            statusCode: 403, disposition: 'enforce',
+                        });
+                    const names = Object.getOwnPropertyNames(
+                        SecurityPolicyViolationEvent.prototype);
+                    return {
+                        instance: event instanceof Event,
+                        tag: Object.prototype.toString.call(event),
+                        own: Object.getOwnPropertyNames(event),
+                        names,
+                        values: [event.blockedURI, event.effectiveDirective,
+                            event.violatedDirective, event.documentURI,
+                            event.originalPolicy, event.sourceFile, event.sample,
+                            event.lineNumber, event.columnNumber, event.statusCode,
+                            event.disposition, event.referrer],
+                        defaults: (() => {
+                            const empty = new SecurityPolicyViolationEvent('x');
+                            return [empty.disposition, empty.blockedURI,
+                                empty.lineNumber, empty.statusCode];
+                        })(),
+                        missingArgThrows: (() => {
+                            try { new SecurityPolicyViolationEvent(); return false; }
+                            catch (error) { return error instanceof TypeError; }
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "tag": "[object SecurityPolicyViolationEvent]",
+                "own": ["isTrusted"],
+                "names": [
+                    "documentURI", "referrer", "blockedURI", "violatedDirective",
+                    "effectiveDirective", "originalPolicy", "disposition", "sourceFile",
+                    "statusCode", "lineNumber", "columnNumber", "sample", "constructor"
+                ],
+                "values": [
+                    "https://cdn.example/app.js", "script-src", "script-src",
+                    "https://app.example/", "script-src 'self'",
+                    "https://app.example/index.js", "alert(1)", 4, 5, 403,
+                    "enforce", ""
+                ],
+                "defaults": ["enforce", "", 0, 0],
+                "missingArgThrows": true,
+            })
+        );
+    }
+
+    #[test]
     fn mouse_and_pointer_events_match_chrome_internal_slot_shape() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
