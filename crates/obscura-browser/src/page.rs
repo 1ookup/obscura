@@ -194,6 +194,61 @@ fn document_referrer_policy_from_root(
     obscura_net::ReferrerPolicy::default()
 }
 
+/// Extract enforced CSP policies declared by document metadata. A meta policy
+/// is applied after the response policy, so when both exist their source lists
+/// are intersected instead of allowing the later declaration to weaken the
+/// response header. The parser intentionally leaves report-only metadata out
+/// of this path because only the `http-equiv` CSP policy is enforced here.
+fn meta_content_security_policy(
+    dom: &DomTree,
+    root: obscura_dom::NodeId,
+) -> Option<String> {
+    let mut effective: Option<crate::frame_policy::ContentSecurityPolicy> = None;
+    for id in dom.query_selector_all_from(root, "meta").unwrap_or_default() {
+        let Some(node) = dom.get_node(id) else { continue };
+        let is_csp = node
+            .get_attribute("http-equiv")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("content-security-policy"));
+        if !is_csp {
+            continue;
+        }
+        let Some(content) = node
+            .get_attribute("content")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let policy = crate::frame_policy::ContentSecurityPolicy::parse(content);
+        effective = Some(match effective {
+            Some(existing) => {
+                let combined = existing.combined_with_required(&policy);
+                crate::frame_policy::ContentSecurityPolicy::parse(&combined)
+            }
+            None => policy,
+        });
+    }
+    effective.map(|policy| policy.serialized())
+}
+
+fn effective_document_csp(
+    dom: &DomTree,
+    root: obscura_dom::NodeId,
+    response_csp: Option<String>,
+) -> Option<String> {
+    let Some(meta_csp) = meta_content_security_policy(dom, root) else {
+        return response_csp;
+    };
+    let meta = crate::frame_policy::ContentSecurityPolicy::parse(&meta_csp);
+    Some(match response_csp {
+        Some(response) => {
+            crate::frame_policy::ContentSecurityPolicy::parse(&response)
+                .combined_with_required(&meta)
+        }
+        None => meta.serialized(),
+    })
+}
+
 /// Escape a value for safe inclusion inside a JavaScript template
 /// literal. The previous implementation only escaped `\`, `` ` `` and
 /// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
@@ -225,6 +280,10 @@ pub struct NetworkEvent {
     pub url: String,
     pub method: String,
     pub resource_type: String,
+    /// Browsing context that owns this request. `None` keeps the historical
+    /// top-level/scripted event shape; frame navigations set this explicitly so
+    /// CDP does not attribute a child response to the main frame.
+    pub frame_id: Option<String>,
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
@@ -3718,9 +3777,10 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
-        self.document_csp = response
+        let response_csp = response
             .header("content-security-policy")
             .map(str::to_string);
+        self.document_csp = response_csp.clone();
         self.document_permissions_policy = response
             .header("permissions-policy")
             .map(str::to_string);
@@ -3758,6 +3818,7 @@ impl Page {
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
         let dom = parse_html(&body_text);
+        self.document_csp = effective_document_csp(&dom, dom.document(), response_csp);
         self.referrer_policy = document_referrer_policy(
             &dom,
             response.header("referrer-policy"),
@@ -4518,6 +4579,7 @@ impl Page {
                 url: ev.url,
                 method: ev.method,
                 resource_type: "Fetch".to_string(),
+                frame_id: None,
                 status: ev.status,
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
@@ -4849,6 +4911,36 @@ impl Page {
         self.store_response_body(request_id, body, base64_encoded);
     }
 
+    fn record_network_event_with_body_for_frame(
+        &mut self,
+        frame_id: &str,
+        url: &str,
+        method: &str,
+        resource_type: &str,
+        status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+        base64_encoded: bool,
+    ) {
+        let request_id = self.record_network_event_inner(
+            url,
+            method,
+            resource_type,
+            status,
+            response_headers,
+            body.len(),
+        );
+        if let Some(event) = self
+            .network_events
+            .iter_mut()
+            .rev()
+            .find(|event| event.request_id == request_id)
+        {
+            event.frame_id = Some(frame_id.to_string());
+        }
+        self.store_response_body(request_id, body, base64_encoded);
+    }
+
     fn record_network_event_inner(
         &mut self,
         url: &str,
@@ -4869,6 +4961,7 @@ impl Page {
             url: url.to_string(),
             method: method.to_string(),
             resource_type: resource_type.to_string(),
+            frame_id: None,
             status,
             headers: std::collections::HashMap::new(),
             response_headers: Arc::new(response_headers.clone()),
@@ -5963,6 +6056,7 @@ impl Page {
                         Some("POST") | Some("post") => Method::POST,
                         _ => Method::GET,
                     };
+                    let request_method = method.to_string();
                     let mut navigation_headers = std::collections::HashMap::new();
                     if let Some(required_csp) = required_csp.as_deref() {
                         navigation_headers.insert(
@@ -6038,6 +6132,24 @@ impl Page {
                     {
                         return Err(FrameNavigateError::Superseded);
                     }
+
+                    // A frame document is a real network resource even when
+                    // its status is 404 or an embedding policy later blocks
+                    // it. Keep the response body available to CDP so callers
+                    // can distinguish a genuine error document from an empty
+                    // about:blank fallback.
+                    let frame_is_binary =
+                        !is_text_like_content_type(response.content_type());
+                    self.record_network_event_with_body_for_frame(
+                        frame_id,
+                        response.url.as_str(),
+                        &request_method,
+                        "Document",
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                        frame_is_binary,
+                    );
 
                     // Response gates: X-Frame-Options / frame-ancestors,
                     // evaluated against the complete ancestor origin chain.
@@ -6165,7 +6277,7 @@ impl Page {
             base_url,
             origin,
             html,
-            document_csp,
+            mut document_csp,
             document_permissions_policy,
             last_modified,
             navigation_timing,
@@ -6191,6 +6303,7 @@ impl Page {
         // head and body. Skipping the parser left about:blank and empty
         // srcdoc documents as bare Document nodes after the async commit.
         let quirks = obscura_dom::parse_into_subtree(dom, content_root, &html);
+        document_csp = effective_document_csp(dom, content_root, document_csp);
         let frame_referrer_policy = document_referrer_policy_from_root(
             dom,
             content_root,
@@ -7689,6 +7802,209 @@ mod tests {
         let opaque = obscura_dom::Origin::from_url("data:text/html,opaque");
         assert!(super::allow_csp_from_accepts(Some("*"), &opaque));
         assert!(!super::allow_csp_from_accepts(Some("null"), &opaque));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_404_response_commits_real_document_and_network_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let frame_origin = origin.clone();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                request_tx.send(path.clone()).unwrap();
+                let (status, csp, body) = if path == "/missing" {
+                    (
+                        "404 Not Found",
+                        "Content-Security-Policy: script-src 'none'\r\n".to_string(),
+                        "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"img-src 'none'\"><title>Not Found</title></head><body><h1 id=missing>404</h1></body></html>".to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        String::new(),
+                        format!(
+                            "<!doctype html><html><body><iframe id=missing-frame src=\"{frame_origin}/missing\"></iframe></body></html>"
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n{csp}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "iframe-404".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("iframe-404".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        let (frame_id, root) = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("#missing-frame").unwrap().unwrap();
+                let frame = page.frames.by_host(host).expect("iframe browsing context");
+                (frame.frame_id.clone(), frame.active_document_root.unwrap())
+            })
+            .unwrap();
+        let scope = page
+            .with_dom(|dom| dom.document_scope(root))
+            .flatten()
+            .unwrap();
+        assert_eq!(scope.url, format!("{origin}/missing"));
+        assert_eq!(
+            scope.csp.as_deref(),
+            Some("script-src 'none'; img-src 'none'")
+        );
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => { const d = document.getElementById('missing-frame').contentDocument; return [d.URL, d.title, d.body.innerHTML]; })()",
+                )
+                .unwrap(),
+            serde_json::json!([
+                format!("{origin}/missing"),
+                "Not Found",
+                "<h1 id=\"missing\">404</h1>"
+            ]),
+        );
+
+        let event = page
+            .network_events
+            .iter()
+            .find(|event| event.frame_id.as_deref() == Some(frame_id.as_str()))
+            .expect("iframe network event");
+        assert_eq!(event.status, 404);
+        assert_eq!(event.resource_type, "Document");
+        assert!(event.body_size > 0);
+        let stored = page.get_response_body(&event.request_id).unwrap();
+        assert!(!stored.base64_encoded);
+        assert!(
+            stored.body.contains("404"),
+            "unexpected stored iframe body: {}",
+            stored.body
+        );
+        assert_eq!(
+            request_rx.try_iter().collect::<Vec<_>>(),
+            vec!["/".to_string(), "/missing".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_level_404_response_commits_real_document() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = "<!doctype html><html><head><title>Missing</title></head><body><p>404 body</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "top-404".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("top-404".to_string(), context);
+        page.navigate(&format!("{origin}/missing")).await.unwrap();
+        assert_eq!(page.url_string(), format!("{origin}/missing"));
+        assert_eq!(page.title, "Missing");
+        assert_eq!(
+            page.with_dom(|dom| {
+                let body = dom.query_selector("body").unwrap().unwrap();
+                dom.text_content(body)
+            })
+            .unwrap(),
+            "404 body"
+        );
+        let event = page
+            .network_events
+            .iter()
+            .find(|event| event.resource_type == "Document")
+            .expect("top-level network event");
+        assert_eq!(event.status, 404);
+        assert!(page
+            .get_response_body(&event.request_id)
+            .is_some_and(|body| body.body.contains("404 body")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_meta_csp_blocks_inline_script_before_frame_realm_runs() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    frame.id = 'meta-csp-frame';
+                    frame.srcdoc = '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'"><script>globalThis.metaCspRan = true;</script><p>body</p>';
+                    document.body.appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+
+        let (frame_id, root) = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("#meta-csp-frame").unwrap().unwrap();
+                let frame = page.frames.by_host(host).expect("meta CSP frame");
+                (frame.frame_id.clone(), frame.active_document_root.unwrap())
+            })
+            .unwrap();
+        let scope = page
+            .with_dom(|dom| dom.document_scope(root))
+            .flatten()
+            .unwrap();
+        assert_eq!(scope.csp.as_deref(), Some("script-src 'none'"));
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => { const frame = document.getElementById('meta-csp-frame'); return [frame.contentDocument.body.textContent, frame.contentWindow.metaCspRan ?? null]; })()",
+                )
+                .unwrap(),
+            serde_json::json!(["body", null]),
+        );
+        assert_eq!(
+            page.frames.get(&frame_id).unwrap().active_document_root,
+            Some(root)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

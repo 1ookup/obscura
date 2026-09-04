@@ -1425,6 +1425,18 @@ pub fn emit_navigation_events(
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
     // via `requestId === loaderId && type === "Document"` (issue #189).
+    // Frame navigations are collected alongside the top-level response. Keep
+    // their owning frame and loader available while emitting the combined
+    // event stream, so an iframe 404 is not projected onto the main frame.
+    let frame_metadata: std::collections::HashMap<String, (String, String)> = ctx
+        .get_page(page_id)
+        .map(|page| {
+            collect_child_frames(page)
+                .into_iter()
+                .map(|frame| (frame.frame_id, (frame.loader_id, frame.url)))
+                .collect()
+        })
+        .unwrap_or_default();
     let nav_request_ids: Vec<String> = {
         let mut nav_seen = false;
         network_events
@@ -1576,6 +1588,7 @@ pub fn emit_navigation_events(
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
             let rid = &nav_request_ids[i];
+            let event_frame_id = net_event.frame_id.as_deref().unwrap_or(frame_id);
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -1585,7 +1598,7 @@ pub fn emit_navigation_events(
                         "method": net_event.method,
                         "headers": net_event.headers,
                     },
-                    "frameId": frame_id,
+                    "frameId": event_frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
                 }),
@@ -1596,16 +1609,25 @@ pub fn emit_navigation_events(
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
+        let event_frame_id = net_event.frame_id.as_deref().unwrap_or(frame_id);
+        let event_loader_id = frame_metadata
+            .get(event_frame_id)
+            .map(|(loader_id, _)| loader_id.as_str())
+            .unwrap_or(loader_id);
+        let event_document_url = frame_metadata
+            .get(event_frame_id)
+            .map(|(_, url)| url.as_str())
+            .unwrap_or(page_url);
         if Some(i) != nav_idx {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": event_loader_id, "documentURL": event_document_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": event_frame_id}),
                 session_id: es.clone(),
             });
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": event_loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": event_frame_id}),
             session_id: es.clone(),
         });
         ctx.pending_events.push(CdpEvent {
@@ -2508,6 +2530,7 @@ mod tests {
             resource_type: "Fetch".into(),
             status: 200,
             headers: std::collections::HashMap::new(),
+            frame_id: None,
             response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
                 "content-type".into(),
                 "application/json".into(),
