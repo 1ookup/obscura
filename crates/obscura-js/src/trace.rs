@@ -533,7 +533,7 @@ impl NativeTraceState {
         if state.is_null() {
             return None;
         }
-        // SAFETY: slot 0 is set to the Box-owned state for this isolate and
+        // SAFETY: the trace slot is set to the Box-owned state for this isolate and
         // the object can only be created while that isolate is entered.
         if unsafe { !(*state).enabled() } {
             return None;
