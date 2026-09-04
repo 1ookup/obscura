@@ -109,12 +109,14 @@ python3 tests/test_all.py
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
 because the engine owns a single V8 isolate per process.
 
-## Building against a patched V8
+## Building against the vendored V8 source
 
-Only needed when working on the property tracer. `vendor/v8-source.toml` carries
-both the `[patch.crates-io]` entry pointing at `vendor/rusty_v8` and
-`V8_FROM_SOURCE=1`; passing one without the other fails on a missing
-`gen/src_binding_release_<target>.rs`, so they live in one file:
+The native iv8 API monitor does not require a V8 source patch. A source build is
+still useful when the page needs the `document.all` bindings supplied by
+`vendor/v8-rusty-extras.sh`. `vendor/v8-source.toml` carries both the
+`[patch.crates-io]` entry pointing at `vendor/rusty_v8` and `V8_FROM_SOURCE=1`;
+passing one without the other selects the wrong rusty_v8 build path, so they
+live in one file:
 
 ```bash
 cargo build --release -p obscura-cli --bins --features render \

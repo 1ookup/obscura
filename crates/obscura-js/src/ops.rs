@@ -6723,6 +6723,20 @@ async fn op_frame_message_recv(state: Rc<RefCell<OpState>>) -> String {
     }
 }
 
+/// Create a V8 ObjectTemplate instance carrying iv8-style native named
+/// property interceptors. The trace state is isolate-local and the operation
+/// returns `undefined` in normal runs, so the production object path remains
+/// unchanged.
+#[op2(reentrant)]
+fn op_trace_object<'a>(
+    scope: &mut v8::HandleScope<'a>,
+    #[string] path: &str,
+) -> v8::Local<'a, v8::Value> {
+    crate::trace::NativeTraceState::new_native_object(scope, path)
+        .map(Into::into)
+        .unwrap_or_else(|| v8::undefined(scope).into())
+}
+
 pub fn build_extension() -> Extension {
     let ops = vec![
         op_dom(),
@@ -6786,6 +6800,7 @@ pub fn build_extension() -> Extension {
         op_post_to_frame(),
         op_post_to_parent(),
         op_frame_message_recv(),
+        op_trace_object(),
     ];
     #[cfg(feature = "render")]
     let mut ops = ops;
@@ -6818,6 +6833,7 @@ pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
+        global_template_middleware: Some(crate::trace::NativeTraceState::global_template_middleware),
         ..Default::default()
     }
 }

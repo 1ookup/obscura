@@ -7,6 +7,7 @@ pub mod ops;
 mod privacy;
 pub mod realm;
 pub mod runtime;
+mod trace;
 pub mod v8_flags;
 pub mod worker;
 

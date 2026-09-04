@@ -68,6 +68,26 @@ struct Args {
     /// from V8's property trace so both diagnostics can run in one process.
     #[arg(long, global = true, value_name = "FILE")]
     trace_op_file: Option<std::path::PathBuf>,
+
+    /// Write native iv8-compatible browser API access records to a file.
+    /// Uses the Rust/V8 ObjectTemplate interceptor path and needs no V8 trace
+    /// flag or JavaScript Proxy instrumentation.
+    #[arg(long, global = true, value_name = "FILE")]
+    trace_api_file: Option<std::path::PathBuf>,
+
+    /// Comma-separated exact iv8 API paths omitted from the native trace.
+    #[arg(long, global = true, value_name = "PATHS")]
+    trace_api_ignore: Option<String>,
+
+    /// Comma-separated exact iv8 API paths that trigger a native debugger
+    /// statement before the access record is written.
+    #[arg(long, global = true, value_name = "PATHS")]
+    trace_api_watch: Option<String>,
+
+    /// Arm `--trace-api-watch` for attached DevTools sessions. iv8 keeps the
+    /// watch list and the debugger gate separate, so a list alone is inert.
+    #[arg(long, global = true)]
+    trace_api_devtools: bool,
 }
 
 #[derive(Subcommand)]
@@ -423,6 +443,22 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: configured before any V8 isolate or worker starts.
         unsafe { std::env::set_var("OBSCURA_TRACE_OP_FILE", path); }
     }
+    if let Some(path) = args.trace_api_file.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_FILE", path); }
+    }
+    if let Some(paths) = args.trace_api_ignore.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_IGNORE", paths); }
+    }
+    if let Some(paths) = args.trace_api_watch.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_WATCH", paths); }
+    }
+    if args.trace_api_devtools {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_DEVTOOLS", "1"); }
+    }
 
     // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
     // directly for its SSRF gate. Mirror the CLI flag into the env var so
@@ -680,6 +716,18 @@ async fn run_multi_worker_serve(
         cmd.env("OBSCURA_V8_FLAGS", &v8_flags);
         if let Some(path) = std::env::var_os("OBSCURA_TRACE_OP_FILE") {
             cmd.env("OBSCURA_TRACE_OP_FILE", path);
+        }
+        if let Some(path) = std::env::var_os("OBSCURA_TRACE_API_FILE") {
+            cmd.env("OBSCURA_TRACE_API_FILE", path);
+        }
+        if let Some(paths) = std::env::var_os("OBSCURA_TRACE_API_IGNORE") {
+            cmd.env("OBSCURA_TRACE_API_IGNORE", paths);
+        }
+        if let Some(paths) = std::env::var_os("OBSCURA_TRACE_API_WATCH") {
+            cmd.env("OBSCURA_TRACE_API_WATCH", paths);
+        }
+        if std::env::var_os("OBSCURA_TRACE_API_DEVTOOLS").is_some() {
+            cmd.env("OBSCURA_TRACE_API_DEVTOOLS", "1");
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -2254,6 +2302,47 @@ mod tests {
         let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
             .expect("clap should accept fetch without --v8-flags");
         assert!(args.v8_flags.is_none());
+    }
+
+    #[test]
+    fn parsed_native_iv8_trace_option_is_global() {
+        let args = Args::try_parse_from([
+            "obscura", "--trace-api-file", "/tmp/iv8-native.log", "serve",
+        ])
+        .expect("clap should accept native iv8 trace option");
+        assert_eq!(
+            args.trace_api_file.as_deref(),
+            Some(std::path::Path::new("/tmp/iv8-native.log"))
+        );
+    }
+
+    #[test]
+    fn parsed_native_iv8_trace_ignore_is_global() {
+        let args = Args::try_parse_from([
+            "obscura", "--trace-api-ignore", "navigator.userAgent,window.document", "serve",
+        ])
+        .expect("clap should accept native iv8 trace ignore");
+        assert_eq!(
+            args.trace_api_ignore.as_deref(),
+            Some("navigator.userAgent,window.document")
+        );
+    }
+
+    #[test]
+    fn parsed_native_iv8_trace_watch_and_devtools_are_global() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--trace-api-watch",
+            "navigator.userAgent,document.querySelector",
+            "--trace-api-devtools",
+            "serve",
+        ])
+        .expect("clap should accept native iv8 watch controls");
+        assert_eq!(
+            args.trace_api_watch.as_deref(),
+            Some("navigator.userAgent,document.querySelector")
+        );
+        assert!(args.trace_api_devtools);
     }
 
     #[test]

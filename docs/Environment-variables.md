@@ -142,3 +142,12 @@ Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-s
 ## HTTP proxy environment
 
 Obscura does not honor `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. Use `--proxy` or `OBSCURA_PROXY`.
+
+`OBSCURA_TRACE_API_FILE` enables the native iv8-compatible browser API access
+trace. The CLI equivalent is `--trace-api-file`. The monitor is installed by
+the Rust/V8 `ObjectTemplate` callback layer and does not use JavaScript Proxy
+wrappers or private V8 trace flags. `OBSCURA_TRACE_API_IGNORE` accepts comma-separated exact paths;
+the CLI equivalent is `--trace-api-ignore`. `OBSCURA_TRACE_API_WATCH` and
+`OBSCURA_TRACE_API_DEVTOOLS=1` implement iv8's separate watch-list and debugger
+gate; the CLI equivalents are `--trace-api-watch` and
+`--trace-api-devtools`.

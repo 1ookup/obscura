@@ -12,31 +12,25 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Build
 
-**Every build and test must use the trace-patched V8.** Always add
-`--config vendor/v8-source.toml` to every `cargo build` and `cargo nextest`
-invocation. That file carries both the `[patch.crates-io]` entry and
-`V8_FROM_SOURCE=1`, which have to travel together: the patch alone sends
-rusty_v8 down the prebuilt path and fails on a missing
-`gen/src_binding_release_<target>.rs`, an error that says nothing about the
-actual cause.
+The native iv8 monitor is implemented in the Rust/V8 `ObjectTemplate` and
+callback layer; it does not depend on a trace-patched V8 or on V8's historical
+`--trace` flags. The repository's source-build/test commands still carry
+`--config vendor/v8-source.toml` so they exercise the pinned vendored V8 and
+the `document.all` rusty_v8 bindings. A normal prebuilt-V8 binary can run the
+native monitor too, but it does not provide the source-only `document.all`
+extras.
 
-A build without the override relinks against the prebuilt V8 and **silently
-drops the trace patch**: the binary still works, but
-`--trace-property-lookup-file` stops being recognized and every trace run
-produces an empty file that reads like "the page did nothing". It also rewrites
-Cargo.lock's `v8` source and checksum lines, whose absence is intentional.
-Verify the binary with `vendor/v8-trace.sh check` before any trace run. First
-compile with the vendor V8 takes ~30 minutes; incremental builds are seconds.
+Verify a trace-capable binary with `vendor/v8-trace.sh check` before a run.
+The first source build takes ~30 minutes; incremental builds are seconds.
 
 The aliases in `.cargo/config.toml` wrap the common shapes: `cargo v8-build`,
 `cargo v8-build-lean`, `cargo v8-check`, `cargo v8-test`.
 
-Two committed scripts patch the gitignored vendor tree, and `vendor/v8-trace.sh
-build` runs both: `vendor/v8-property-trace.sh` (the trace patch, in V8 itself)
-and `vendor/v8-rusty-extras.sh` (two `ObjectTemplate` bindings rusty_v8 leaves
-unbound, which `document.all` needs). Both are idempotent. The extras are
-absent from a prebuilt-V8 build, and `document.all` is then simply undefined --
-the behaviour those builds have today, not a regression.
+`vendor/v8-trace.sh build` optionally builds from the vendored source and runs
+`vendor/v8-rusty-extras.sh` (two `ObjectTemplate` bindings rusty_v8 leaves
+unbound, which `document.all` needs). The extras are absent from a prebuilt-V8
+build, and `document.all` is then simply undefined -- the behaviour those builds
+have today, not a regression.
 
 ```bash
 # Rendering and stealth. `stealth` is in the default feature set, so --features
@@ -64,9 +58,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   Incremental builds are seconds.
 - **Iterating on one crate? Scope it:** `cargo build -p obscura-cli --config
   vendor/v8-source.toml`. A bare `cargo build` can re-link the whole workspace;
-  the V8 compile is the cost, so avoid touching it when you don't need to. Never
-  run a plain `cargo build` or `cargo nextest` without the `--config` override:
-  it relinks the prebuilt V8 and drops the trace patch from every later build.
+  the V8 compile is the cost, so avoid touching it when you don't need to.
 - **Stealth:** on by default. It adds the wreq/BoringSSL transport, fingerprint
   protections, and tracker blocklist on top of whatever rendering surface the
   build has. BoringSSL builds through CMake, so `cmake`, `clang` and
@@ -80,9 +72,8 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 
 ## Test
 
-Run tests with **`cargo nextest`, not `cargo test`**, and always with the
-trace-patched V8 (`--config vendor/v8-source.toml`) so a test run never replaces
-the patched binary:
+Run tests with **`cargo nextest`, not `cargo test`**, and use the source override
+(`--config vendor/v8-source.toml`) for the supported source-build test shape:
 
 ```bash
 cargo nextest run --release --features render -p <crate> \

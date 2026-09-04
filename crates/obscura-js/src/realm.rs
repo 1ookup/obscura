@@ -743,7 +743,21 @@ impl ObscuraJsRuntime {
             )
         };
 
-        let context = v8::Context::new(scope, v8::ContextOptions::default());
+        let context = if std::env::var_os("OBSCURA_TRACE_API_FILE").is_some() {
+            let object_template = v8::ObjectTemplate::new(scope);
+            let template = crate::trace::NativeTraceState::global_template_middleware(
+                scope, object_template,
+            );
+            v8::Context::new(
+                scope,
+                v8::ContextOptions {
+                    global_template: Some(template),
+                    ..Default::default()
+                },
+            )
+        } else {
+            v8::Context::new(scope, v8::ContextOptions::default())
+        };
         context.set_allow_generation_from_strings(false);
         // Same security token as the main context. Plain contexts install no
         // access-check callbacks, but equal tokens keep V8's same-origin
@@ -916,6 +930,7 @@ impl ObscuraJsRuntime {
             "<obscura:frame-realm-page-init>",
             "globalThis.__obscura_init();",
         )?;
+        self.install_native_trace_in_context(&context);
 
         // Snapshot the content root's scope for later diagnostics/routing;
         // the scope may legitimately not exist yet (about:blank pre-commit).
@@ -1655,6 +1670,9 @@ impl ObscuraJsRuntime {
         source: &str,
         line: u64,
     ) -> Result<serde_json::Value, String> {
+        let _trace_guard = self.trace_suppression_guard(
+            name.starts_with('<') && name != "<eval>",
+        );
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let context = v8::Local::new(scope, context);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -1786,7 +1804,21 @@ pub(crate) fn spawn_frame_realm(
     let module_map =
         current.get_aligned_pointer_from_embedder_data(deno_core::MODULE_MAP_SLOT_INDEX);
 
-    let context = v8::Context::new(scope, v8::ContextOptions::default());
+    let context = if std::env::var_os("OBSCURA_TRACE_API_FILE").is_some() {
+        let object_template = v8::ObjectTemplate::new(scope);
+        let template = crate::trace::NativeTraceState::global_template_middleware(
+            scope, object_template,
+        );
+        v8::Context::new(
+            scope,
+            v8::ContextOptions {
+                global_template: Some(template),
+                ..Default::default()
+            },
+        )
+    } else {
+        v8::Context::new(scope, v8::ContextOptions::default())
+    };
     context.set_allow_generation_from_strings(false);
     context.set_security_token(token);
     unsafe {

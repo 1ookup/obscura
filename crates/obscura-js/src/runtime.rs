@@ -349,6 +349,10 @@ fn input_hit_in_document(
 }
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
+// Trace-enabled runtimes intentionally skip the startup snapshot so
+// deno_core can apply the global-template middleware that installs the native
+// Window interceptor. The same source is still snapshotted for normal runs.
+static BOOTSTRAP_SRC: &str = include_str!("../js/bootstrap.js");
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
@@ -421,6 +425,13 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Per-isolate native iv8 trace suppression bit shared by ObjectTemplate
+    /// callbacks while context/bootstrap setup runs; the page never sees it.
+    trace_suppressed: Box<u8>,
+    /// Native iv8 call trampolines and their retained original functions.
+    /// Entries are process-local and only populated when --trace-api-file is
+    /// configured, so normal page construction remains unchanged.
+    trace_state: Box<crate::trace::NativeTraceState>,
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
     /// pages without iframes; the main-context path never touches it. Boxed so
     /// a raw pointer to it can be shared into `ObscuraState` and used from ops
@@ -435,6 +446,30 @@ pub struct ObscuraJsRuntime {
     /// op, which requires a live tokio context, so the pump paths start it
     /// lazily once a MainRealm-targeted message exists.
     frame_message_pump_started: bool,
+}
+
+pub(crate) struct TraceSuppressionGuard {
+    slot: *mut u8,
+    previous: u8,
+}
+
+impl TraceSuppressionGuard {
+    fn new(slot: &mut Box<u8>, enabled: bool) -> Self {
+        let slot_ptr = (&mut **slot) as *mut u8;
+        let previous = unsafe { *slot_ptr };
+        if enabled {
+            unsafe { *slot_ptr = 1; }
+        }
+        Self { slot: slot_ptr, previous }
+    }
+}
+
+impl Drop for TraceSuppressionGuard {
+    fn drop(&mut self) {
+        // The slot points into ObscuraJsRuntime and the guard never outlives
+        // the method that borrowed that runtime.
+        unsafe { *self.slot = self.previous; }
+    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -565,6 +600,17 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 const FRAME_MESSAGE_DRAIN_ROUNDS: usize = 64;
 
 impl ObscuraJsRuntime {
+    pub(crate) fn set_trace_suppressed(&mut self, suppressed: bool) {
+        *self.trace_suppressed = u8::from(suppressed);
+    }
+
+    pub(crate) fn trace_suppression_guard(
+        &mut self,
+        enabled: bool,
+    ) -> TraceSuppressionGuard {
+        TraceSuppressionGuard::new(&mut self.trace_suppressed, enabled)
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -600,7 +646,7 @@ impl ObscuraJsRuntime {
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
-        let (runtime, isolate_handle) = {
+        let (runtime, isolate_handle, trace_suppressed, trace_state) = {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -610,12 +656,30 @@ impl ObscuraJsRuntime {
             // race an isolate being built on another connection thread.
             crate::v8_flags::apply_baseline_v8_flags();
 
+            let trace_requested = std::env::var_os("OBSCURA_TRACE_API_FILE").is_some();
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
-                startup_snapshot: Some(SNAPSHOT),
+                startup_snapshot: (!trace_requested).then_some(SNAPSHOT),
                 ..Default::default()
             });
+            // A trace-enabled runtime executes bootstrap after context
+            // creation (the startup snapshot is intentionally skipped), so
+            // its early DOM ops need the same op-state registration that the
+            // snapshot path already has by the time page init runs.
+            runtime.op_state().borrow_mut().put(state_clone);
+            if trace_requested {
+                runtime
+                    .execute_script("<obscura:bootstrap>", BOOTSTRAP_SRC.to_string())
+                    .expect("bootstrap.js should not fail in native trace mode");
+            }
+            let mut trace_suppressed = Box::new(1u8);
+            let trace_state = Box::new(crate::trace::NativeTraceState::from_environment(
+                (&mut *trace_suppressed) as *mut u8,
+            ));
+            let trace_state_ptr = (&*trace_state) as *const crate::trace::NativeTraceState
+                as *mut std::ffi::c_void;
+            runtime.v8_isolate().set_data(0, trace_state_ptr);
 
             runtime
                 .v8_isolate()
@@ -631,8 +695,6 @@ impl ObscuraJsRuntime {
                 .v8_isolate()
                 .set_prepare_stack_trace_callback(obscura_prepare_stack_trace_callback);
 
-            runtime.op_state().borrow_mut().put(state_clone);
-
             runtime
                 .execute_script(
                     "<obscura:init>",
@@ -641,7 +703,7 @@ impl ObscuraJsRuntime {
                 .expect("init should not fail");
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-            (runtime, isolate_handle)
+            (runtime, isolate_handle, trace_suppressed, trace_state)
         };
 
         let mut runtime = ObscuraJsRuntime {
@@ -655,6 +717,8 @@ impl ObscuraJsRuntime {
             import_map,
             module_load_activity,
             isolate_handle,
+            trace_suppressed,
+            trace_state,
             frame_realms: Box::new(crate::realm::FrameRealmHost::default()),
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
@@ -1567,6 +1631,7 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        self.set_trace_suppressed(true);
         // Before __obscura_init, which is where the bootstrap picks the
         // collection up and hangs it off Document.prototype.
         self.install_document_all();
@@ -1574,6 +1639,33 @@ impl ObscuraJsRuntime {
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+        self.set_trace_suppressed(false);
+        self.install_native_trace_current_context();
+    }
+
+    /// Install native iv8 call trampolines on the current (main) context. The
+    /// operation is a no-op unless `OBSCURA_TRACE_API_FILE` is configured.
+    pub(crate) fn install_native_trace_current_context(&mut self) {
+        let context = self.runtime.main_context();
+        self.install_native_trace_in_context(&context);
+    }
+
+    /// Install native iv8 call trampolines on an explicitly retained realm.
+    /// Frame and isolated-world contexts share the isolate's trace state but
+    /// have their own bootstrap prototypes and browser globals.
+    pub(crate) fn install_native_trace_in_context(
+        &mut self,
+        context: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        if !self.trace_state.enabled() {
+            return;
+        }
+        let previous = *self.trace_suppressed;
+        *self.trace_suppressed = 1;
+        let scope = &mut self.runtime.handle_scope();
+        let context = deno_core::v8::Local::new(scope, context);
+        self.trace_state.install(scope, context);
+        *self.trace_suppressed = previous;
     }
 
     /// Put `document.all`'s backing object on the main realm's global. It has

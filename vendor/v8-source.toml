@@ -1,4 +1,4 @@
-# The trace-patched V8, in one place.
+# The pinned vendored V8 source, in one place.
 #
 # Load it with `cargo --config vendor/v8-source.toml ...`, or via the aliases in
 # .cargo/config.toml (`cargo v8-build`, `cargo v8-test`, ...).
@@ -22,7 +22,7 @@
 [patch.crates-io]
 # Pinned to v137.3.0: deno_core 0.350 requires v8 ^137.1.0, and cargo's [patch]
 # must satisfy the original semver range, so rusty_v8's default branch (v152.x)
-# is rejected outright. See docs/Trace-page-script.md.
+# is rejected outright. See docs/Build-from-source.md.
 v8 = { path = "vendor/rusty_v8" }
 
 [env]

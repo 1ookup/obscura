@@ -17,8 +17,8 @@
 # rusty_v8 release binds the name/id methods and omits only the source method.
 #
 # vendor/rusty_v8 is gitignored (several GB of upstream source), so the change
-# lives here as a script rather than as a diff, exactly like
-# vendor/v8-property-trace.sh. Re-running is a no-op on an already-patched tree.
+# lives here as a script rather than as a diff because the upstream checkout is
+# gitignored. Re-running is a no-op on an already-patched tree.
 #
 # Usage:
 #   vendor/v8-rusty-extras.sh [vendor/rusty_v8]

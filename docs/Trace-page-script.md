@@ -1,293 +1,126 @@
 # V8 Trace — 页面脚本调用监控系统
 
-Records what page script asks the browser for: which object, which method, the
-arguments, what came back, and whether a property existed at all.
+## Native iv8 API trace
+
+Obscura also supports a native iv8-style access monitor. It is implemented in
+the Rust/V8 `ObjectTemplate` and callback layer and does not install JavaScript
+Proxy wrappers or instrument page bytecode:
+
+```bash
+obscura --trace-api-file /tmp/iv8-api.log fetch https://example.com --dump text
+```
+
+Use `--trace-api-ignore navigator.userAgent,window.document` for iv8-style
+exact path filtering. The equivalent environment variables are
+`OBSCURA_TRACE_API_FILE` and `OBSCURA_TRACE_API_IGNORE`.
+
+The output is line-oriented and follows iv8's monitor format:
+
+```text
+实例访问 - navigator.userAgent -> getter -> string:"..."
+实例访问 - navigator.__missing__ -> getter -> undefined
+实例访问 - navigator.userAgent -> setter -> setter(string:"...") -> undefined
+实例访问 - document.querySelector -> call -> (string:"#app") -> [object Element]
+```
+
+The monitor is independent of the historical V8 `--trace`/property-trace
+patches. It works with the normal V8 binding; a source build is only needed for
+the separate `document.all` rusty_v8 extras. `vendor/v8-trace.sh build` is a
+convenience source-build wrapper, not a runtime prerequisite.
+Browser method calls are emitted by native callback trampolines with
+their arguments and return value. `--trace-api-watch` plus
+`--trace-api-devtools` follows iv8's two-step watch/breakpoint gate.
+
+When native tracing is enabled, Obscura creates the main and frame contexts
+with a native global `Window` template and executes the same bootstrap source
+instead of loading the startup snapshot. This is what makes missing
+`window.*` names observable without a JavaScript `Proxy`; normal runs retain
+the snapshot fast path. Worker contexts use the same global template hook.
+
+Records the browser properties that page script reads or writes, including the
+receiver, property name, resolved value, and whether a lookup existed.
 
 ## 架构
 
-**完全是 V8 层面的补丁，不涉及 Obscura 自身代码的修改。** Obscura 的 Rust/JS 源码
-（`crates/`）未被触碰——没有 `bootstrap.js` wrapper、没有 ops、没有 CLI flags。Trace
-通过 Obscura 已有的 `--v8-flags` 透传机制启用。
+**核心监控在 native 对象层实现。** Obscura 的 CLI 只负责设置 trace 文件
+路径；runtime 在每个 realm 创建带 named getter/setter/query handler 的真实
+`ObjectTemplate` 对象，并用 native callback trampoline 记录方法调用。页面
+没有收到 Proxy 或字节码注入。
 
-这样做是设计意图而非便利。JS 层的 instrumentation 与被观测的代码处于同一层，需要做
-反检测并证明其不可见性；V8 内部的 hook 对页面脚本无可发现之物。同时消除了 JS wrapper
-改变引擎观测值的问题——两套系统并存时，wrapper 会把 `Document.getElementById("a")`
-报告成 `Document.m`，参数全部丢失。
+这样做是设计意图而非便利。拦截器安装在真实 V8 `ObjectTemplate` carrier 上，观察的是
+页面最终使用的对象，而不是改写页面字节码；native trampoline 保留原 receiver、参数和
+返回值。安装只在显式 trace 文件启用时发生，普通运行路径不创建 carrier。
 
 ### 涉及文件
 
 | 文件 | 作用 |
 |------|------|
-| `vendor/v8-property-trace.sh` | **核心。** 以锚点插入方式直接修改 V8 源码（3 个 hook 点 + 2 个 flag） |
 | `vendor/v8-trace.sh` | 便利 wrapper，封装 build / run / check 三步，防止 flag 配错或静默降级 |
 | `vendor/v8-source.toml` | `--config` 加载的 override 文件，同时携带 `[patch.crates-io]` 的 v8 路径与 `V8_FROM_SOURCE=1` |
 | `.cargo/config.toml` | `cargo v8-build` / `v8-build-lean` / `v8-check` / `v8-test` 四个别名，封装上面的 `--config` |
 | `.gitignore` | 忽略 `vendor/rusty_v8/`（数 GB 上游源码，仅通过 `--config` override 使用） |
 | `docs/Trace-page-script.md` | 本文档 |
 
-## 从零重建
+## 构建与运行
 
-### 1. 获取 V8 源码
-
-```bash
-git clone --recurse-submodules https://github.com/denoland/rusty_v8 vendor/rusty_v8
-cd vendor/rusty_v8 && git checkout v137.3.0 && git submodule update --init --recursive
-```
-
-约 800 MB 源码。必须锁定 v137.3.0：项目的 `deno_core 0.350.0` 要求 `v8 = "^137.1.0"`，
-而 `cargo [patch]` 必须满足原 semver 约束。默认分支（目前 v152.x）落在范围外，
-Cargo 拒绝解析 patch；同时补丁锚点在 v152 上有两处失配。
-
-验证版本：此补丁在 V8 rev `f68bbb6cda689a14d019a6a60cc93963724e7c35`
-（`rusty_v8` v137.3.0 所引用的版本）上编译运行通过。
-
-### 2. 打补丁
+`vendor/rusty_v8/` 是被忽略的上游源码。只有需要 source-only bindings（例如
+`document.all`）时才执行：
 
 ```bash
-vendor/v8-property-trace.sh vendor/rusty_v8/v8
+vendor/v8-trace.sh build
 ```
 
-脚本用 **锚点字符串匹配** 而非行号来定位插入位置。这是故意的——不同 V8 修订版之间
-行号漂移，`git apply` 会因行号对不上而拒绝；锚点在漂移后要么依然命中，要么报告清晰的
-失败信息（anchor missing）。每个文件幂等：重复运行直接输出 `already patched`。
+该命令会运行 `vendor/v8-rusty-extras.sh`，并使用
+`--config vendor/v8-source.toml` 从源码编译 V8。普通 native trace 运行不需要
+重新 patch 或重新编译。
 
-修改的三个位置：
-
-#### a) `src/ic/ic.cc`
-
-**插入 reporter 函数**（~300 行 C++）在 `IC::TraceIC` 定义之前。核心函数：
-
-- `TracePropertyLookup(isolate, receiver, name, found)` — 将一次属性查找格式化为 TSV 行：
-  receiver 的 JavaScript 可见构造函数名（通过 `JSReceiver::GetConstructorName`），属性名，
-  HIT 或 MISS，源码位置，调用链
-- `TraceCallEnter(isolate)` / `TraceCallExit(isolate, value)` — 记录函数调用和返回
-- `TraceCallOrigin(isolate, ...)` — 遍历 JavaScript 栈帧，跳过引擎帧，构造调用链
-- `TraceDescribeFrame(isolate, frame, ...)` — 描述单个帧：脚本名、行、列、函数名
-- `TraceAppendValue(isolate, value, out)` — 无副作用的值渲染（不调用 toString/valueOf/accessor）
-- `TracePropertyLookupFile()` — 惰性打开输出文件，进程退出时自动关闭
-
-**插入调用点**在 `LoadIC::Load` 中，`LookupForRead` 之后、`use_ic` 分支之前：
-
-```cpp
-if (V8_UNLIKELY(v8_flags.trace_property_lookup)) {
-  TracePropertyLookup(isolate(), receiver, name, it.IsFound());
-}
-```
-
-放在 `use_ic` 之前使得它不依赖 cache-update 路径——V8 的 IC log 只在 cache-update 时
-触发，因此无法记录 MISS 也无法覆盖所有 HIT。`it.IsFound()` 是 V8 完成查找后的内部答案，
-从外部无法获取。
-
-#### b) `src/runtime/runtime-test.cc`
-
-替换 `Runtime_TraceEnter` 和 `Runtime_TraceExit` 的默认实现。V8 在 `--trace` 下本就
-会调用这两个函数；默认实现打印原始 dump 到 stdout。补丁版本在配置了输出文件时写入
-结构化 TSV，否则退回到原始行为。
-
-入口和出口通过**嵌套深度**配对而非函数标识——读者将 RET 匹配到其上方的 CALL，与 V8
-自身输出中缩进传达的信息相同。
-
-#### c) `src/flags/flag-definitions.h`
-
-添加两个新 flag：
-
-```
-DEFINE_BOOL(trace_property_lookup, false,
-            "trace property lookups with receiver and resolution")
-DEFINE_STRING(trace_property_lookup_file, nullptr,
-              "file to write property lookup records to")
-```
-
-### 3. 编译
+运行与检查：
 
 ```bash
-cargo build --release -p obscura-cli --bins \
-  --features render \
-  --config vendor/v8-source.toml
-```
-
-`stealth` 是默认 feature，所以 `--features render` 得到的是 render + stealth；
-要去掉 stealth 用 `--no-default-features --features render`。`.cargo/config.toml`
-里的 `cargo v8-build` 和 `cargo v8-build-lean` 分别是这两条的别名。
-
-**patch 与 `V8_FROM_SOURCE=1` 必须成对出现。** 只给 patch 而不设环境变量，rusty_v8
-会走预编译路径并报 `couldn't read .../gen/src_binding_release_<target>.rs`——一个
-和真实原因毫无关系的错误。`vendor/v8-source.toml` 把两者装进同一个文件正是为了
-消灭这个陷阱，因此用 `--config vendor/v8-source.toml`，不要再手写
-`--config 'patch.crates-io.v8.path=...'`。
-
-`vendor/v8-trace.sh build` 走同一条路径：`OBSCURA_NO_DEFAULT=1` 切到
-no-default-features（无 stealth、无 BoringSSL）。注意 `OBSCURA_FEATURES` 是**叠加**
-在 default 之上的，所以 `OBSCURA_FEATURES=render` 现在意味着 render **和** stealth，
-不再是「只有 render」。
-
-首次编译约 30 分钟。`--config` 是临时的：`Cargo.toml` 不变，普通构建继续使用预编译 V8。
-
-**这是最容易踩的坑：** 任何不带 `--config` 的 `cargo build` 或 `cargo nextest` 会
-重新链接预编译 V8，**静默丢弃补丁**。此时 `obscura fetch` 仍然成功，trace 输出文件
-为空——读起来像"页面什么都没做"，而不是"二进制已降级"。它同时会把 `Cargo.lock` 里
-`v8` 条目的 `source` 和 `checksum` 两行写回去——那两行的缺失是有意的（patch 生效时
-v8 来自本地路径），不要提交这种改动。
-
-### 4. 验证二进制
-
-```bash
-# 方法一：wrapper 脚本
 vendor/v8-trace.sh check
-
-# 方法二：手动
-./target/release/obscura --v8-flags "--trace-property-lookup" fetch "about:blank" \
-  --dump text >/dev/null 2>.v8trace-probe
-grep -q "unrecognized flag" .v8trace-probe && echo "NOT PATCHED" || echo "PATCHED"
-```
-
-建议在每次 trace 运行**之前**验证而非之后——未打补丁的二进制静默生成空文件，读起来像
-页面什么都没做。
-
-### 5. 运行
-
-```bash
-# 方法一：wrapper 脚本（自动验证二进制 + 组合正确的 flags）
-vendor/v8-trace.sh run /tmp/trace.tsv -- fetch https://example.com --dump text
-
-# 方法二：手动（完整 flags）
-obscura --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation \
-  --trace-property-lookup-file=/tmp/trace.tsv" \
-  fetch https://example.com --dump text -o page.txt
-```
-
-输出写入 `--trace-property-lookup-file` 指定的文件（不在 stdout，因为 stdout 属于
-`--dump`）。页面内容用 `--dump text -o` 分流。
-
-## Flag 参考
-
-| Flag | 控制范围 | 缺失后果 |
-|------|---------|---------|
-| `--trace` | CALL + RET | 丢失所有函数调用和返回记录 |
-| `--trace-property-lookup` | HIT + MISS | 丢失所有属性查找记录。trace 输出为空 |
-| `--no-lazy-feedback-allocation` | HIT + MISS 的完整性 | CALL/RET 不受影响；属性命中从 5 降到 3，MISS 从 1 降到 0——缺失属性检测完全消失 |
-| `--trace-property-lookup-file` | 输出目标 | 记录写入 `/dev/null`，trace 静默为空 |
-
-### 不要加的 flag
-
-**`--no-use-ic`** — 读起来像是补全 trace 的 flag，实际上做相反的事：禁用 inline cache
-把所有属性加载推上 bypass 路径，完全抑制 `LoadIC::Load`。实测：30 个属性中 0 个被记录。
-
-### `OBSCURA_TRACE_MODE=lookups`
-
-当页面自身时序敏感时（例如等待网络往返的 challenge 页面），设置此环境变量只启
-用属性查找 hook，去掉 `--trace`（call/return hook）。`--trace` 几乎占了全部性能开销——
-它把每次函数进入和退出都路由到运行时。在一个 Cloudflare challenge 页面上，`--trace`
-开启时页面在 deadline 前只发了 3 个请求，关闭后发了 7 个。
-
-```bash
-OBSCURA_TRACE_MODE=lookups vendor/v8-trace.sh run /tmp/trace.tsv -- \
+vendor/v8-trace.sh run /tmp/iv8-api.log -- \
   fetch https://example.com --dump text
 ```
 
-等效于手动去掉 `--trace`：
+也可以直接使用 CLI：
 
 ```bash
-obscura --v8-flags "--trace-property-lookup --no-lazy-feedback-allocation \
-  --trace-property-lookup-file=/tmp/trace.tsv" \
+obscura --trace-api-file /tmp/iv8-api.log \
   fetch https://example.com --dump text
 ```
 
-## 输出格式
+`--trace-api-file` 和 `OBSCURA_TRACE_API_FILE` 只打开 native monitor；不修改
+V8 flags，也不关闭 inline cache。ObjectTemplate interceptor 在 cache 命中和
+缺失路径上都可观察到访问。
 
-Tab 分隔，每行一条记录：
+## 输出
 
-| 列 | 内容 |
-|----|------|
-| 1 | `CALL` / `RET` / `HIT` / `MISS` |
-| 2 | receiver 的构造函数名（RET 上为空） |
-| 3 | 属性或方法名（RET 上为空） |
-| 4 | 脚本名，或 `<page-eval>`（页面通过 eval 执行的代码） |
-| 5 | 行号 |
-| 6 | 列号 |
-| 7 | CALL 上为参数，RET 上为返回值，HIT/MISS 上为空 |
-| 8 | 调用链 `func:line:col <- func:line:col`（RET 上无此列，只有 7 列） |
+每行一条有序记录：
 
-```
-CALL  Document  getElementById  a.html  3  21  string:"a"     inner:3:21 <- outer:9:26
-RET                             a.html  3  21  object:Element
-MISS  Element   __missing_x__   a.html  5  14                 inner:5:14 <- outer:9:26
+```text
+实例访问 - navigator.userAgent -> getter -> string:"..."
+实例访问 - navigator.missingApi -> getter -> undefined
+实例访问 - navigator.userAgent -> query -> exists
+实例访问 - navigator.__traceValue -> setter -> setter(number:1) -> undefined
+实例访问 - document.querySelector -> call -> (string:"#app") -> [object Element]
 ```
 
-### 过滤页面记录
+记录来源于 native ObjectTemplate interceptor 和 callback trampoline。调用期间的参数、
+返回值和异常都会记录；`--trace-api-ignore` 支持逗号分隔的精确路径过滤。
 
-`HIT` 和 `MISS` 不过滤，数据量反映了这一点——一个 4 行的页面产生了 198 条引擎记录
-对 46 条页面记录。因为属性 hook 没有 caller 可供筛选（call hook 通过 caller 帧判断是否
-来自页面代码），bootstrap 会替页面执行大量属性查找。用第 4 列过滤：
+## 设计边界
 
-```bash
-awk -F'\t' '$4 !~ /obscura|^ext:/' trace.tsv
-```
+- 不修改页面对象身份，不注入 JavaScript `Proxy` 作为 trace 机制。
+- 安装期和引擎内部 helper 调用会被 per-isolate suppression 排除。
+- `then` 探测和 ECMAScript 标准对象不会混入 browser API trace。
+- native trace 不依赖 V8 source patch；`--config vendor/v8-source.toml` 只决定
+  是否使用 source V8 和 `document.all` extras。
 
-### `<page-eval>` 的含义
+## 调试工作流：Stealth + Native Trace + 网络代理 + 截图
 
-动态插入的脚本（challenge 和 fingerprinting payload 的传递方式）通过 eval 运行，不带
-脚本名。在一个 Cloudflare 页面上 4448 条记录中有 2610 条来自 `<page-eval>`。如果
-消费者将无脚本名的帧视为引擎内部帧而丢弃，恰好丢掉了最有价值的记录。
-
-## 三个 hook 的设计理由
-
-### 为什么必须在 V8 内部做
-
-不存在的属性没有 accessor 可包装，所以任何 JS 层的 instrumentation 都无法看到对它的
-读取。V8 的 inline-cache log 也不行：`map-details` 记录只有约 58% 携带 descriptor
-array，内置原型（如 `Array.prototype`）属于不携带的那部分——`Array.prototype` 的 map
-里根本没有 `map` 这个描述符。事后重构时，"描述符里没列出"和"日志从未描述那个 map"
-是无法区分的。
-
-在 `LoadIC::Load` 内部，`receiver` 和 `it.IsFound()` 是普通的局部变量。前者是真实对象，
-后者是 V8 完成查找后的内部答案。
-
-### 为什么用 `Runtime_TraceEnter/Exit` 而非自己加
-
-V8 在 `--trace` 下已经对每次函数进入和退出调用这两个 runtime 函数，并传入整个帧
-（receiver、callee、实际参数）。接管其函数体是把已有机制变成 trace 的数据源，而非
-添加一个平行机制。
-
-### 为什么按 caller 而非 callee 筛选
-
-`getElementById` 和 `setAttribute` 定义在 `bootstrap.js` 中，所以页面调用它们时 callee
-是引擎代码。如果按 callee 的脚本来筛选，几乎所有有价值的 DOM 调用都会被丢弃。
-Caller 的帧才能判断"是不是页面发起的调用"。入口和出口共用同一个筛选谓词——只筛选
-一个会导致 RET 与 CALL 无法配对。
-
-## 性能代价
-
-`--trace` 把每次函数进入和退出路由到运行时，`--no-lazy-feedback-allocation` 强制每个
-函数分配 feedback vector。在 20k 元素 DOM 负载上实测：1312 ms（无 trace）vs 3207 ms
-（完整 trace）。**这是诊断构建，不是生产配置。**
-
-使用 `OBSCURA_TRACE_MODE=lookups` 去掉 `--trace` 可以大幅降低开销，代价是丢失
-CALL/RET 记录。
-
-## 限制
-
-- **重复访问不计数** — 同一属性对同一对象形状（hidden class）的后续查找走 IC 快速路径，
-  不经过 `LoadIC::Load`
-- **属性读取没有值** — 值来自函数返回（RET）。一个属性被读取但从不变为调用，trace
-  中没有其值
-- **完全不接触属性或调用函数的页面不可见**
-- **源码位置依赖 lazily-built source position tables** — 必须调用
-  `EnsureSourcePositionsAvailable`，且位置来自 `frame->position()` 而非 code offset。
-  两者缺一都不是 0 就是 1:1
-
-## 故障排查
-
-| 现象 | 原因 | 排查 |
-|------|------|------|
-| `unrecognized flag: --trace-property-lookup` | 二进制链接了预编译 V8，不是打过补丁的 | `vendor/v8-trace.sh check`，重新 `build` |
-| trace 文件为空 | 同上；或忘了 `--trace-property-lookup-file` | 先验证二进制，再检查 flag |
-| 有 CALL/RET 但没有 HIT/MISS | 漏了 `--no-lazy-feedback-allocation` | 加上该 flag |
-| HIT/MISS 全都没有 | 加了 `--no-use-ic` | 去掉该 flag |
-| 所有记录 line:col 都是 1:1 | 漏了 `EnsureSourcePositionsAvailable` 或用了 code offset 而非 `frame->position()` | 检查补丁是否正确应用 |
-| 页面行为与无 trace 时不同 | `--trace` 开销改变了页面时序 | 使用 `OBSCURA_TRACE_MODE=lookups` |
-
-## 调试工作流：Stealth + Trace + Proxy + 截图
+本节保留历史诊断记录；当前 trace 入口统一使用上面的 native iv8
+`--trace-api-file`/`vendor/v8-trace.sh run`，不再使用旧的
+`--trace-property-lookup` 或 `--trace` flags。
 
 完整的反检测页面诊断管线，组合 TLS 指纹伪装、V8 层调用追踪、代理出口、定时截图。
 
@@ -311,8 +144,7 @@ REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/req
 ```bash
 SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
   obscura \
-  --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation \
-    --trace-property-lookup-file=/tmp/trace.tsv" \
+  --trace-api-file /tmp/trace.log \
   fetch https://example.com \
   --dump text \
   --proxy http://127.0.0.1:9000 \
@@ -323,7 +155,7 @@ SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
 ```
 
 关键参数：
-- `--v8-flags` 必须在 `fetch` 子命令**之前**（全局选项）
+- 全局参数（包括 `--trace-api-file`、`--v8-flags`）放在子命令之前最清晰；CLI 也接受已声明为 global 的参数放在子命令后
 - `SSL_CERT_FILE` 指向代理的 CA 证书，解决 TLS 验证
 - `OBSCURA_ALLOW_PRIVATE_NETWORK=1` 允许连接 `127.0.0.1` 代理
 - `--stealth` 启用浏览器指纹伪装和 TLS 指纹匹配
@@ -375,40 +207,22 @@ async def capture_timeline(url, out_dir, count=30, interval=1.0):
                 await asyncio.sleep(interval)
 ```
 
-注：`serve` 命令不支持 `--v8-flags`。如需同时 trace 和 CDP 截图，用 `fetch --screenshot`+ `--v8-flags`（单张），或用定时截图后分析单次 trace。
+注：`--v8-flags` 是全局参数，启动 CDP 时使用
+`obscura --v8-flags "..." serve ...`。`serve` 的每个页面会继承同一组启动 flags；多 worker
+场景也应通过全局参数或 `OBSCURA_V8_FLAGS` 传递。
 
 ### Trace 错误分析
 
-从 trace 中提取反检测页面的错误信号：
+native trace 是一行一条的文本，不再是旧 `--trace` 的 TSV。可以这样提取常用信号：
 
 ```bash
-T=/tmp/trace.tsv
+T=/tmp/trace.log
 
-# 1. 错误关键字
-grep "RET" "$T" | awk -F'\t' '$4=="<page-eval>"' \
-  | grep -iE "error|turnstile|fail|unsupported" \
-  | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn
-
-# 2. 不存在属性（环境探测）
-awk -F'\t' '$1=="MISS" && $4=="<page-eval>"' "$T" \
-  | while IFS=$'\t' read type rcv prop script ln col val stack; do
-      echo "recv=$rcv  prop=$prop  line=$ln:$col  stack=$stack"
-    done
-
-# 3. 资源加载记录
-grep "set src" "$T" | awk -F'\t' '$1=="CALL"' \
-  | awk -F'\t' '$4 !~ /obscura|^ext:/' | awk -F'\t' '{print $7}'
-
-# 4. 网络请求（XHR/fetch）
-grep -E "XMLHttpRequest|open.*POST|send" "$T" \
-  | awk -F'\t' '$4=="<page-eval>" && $1=="CALL"'
-
-# 5. Turnstile/Cloudflare 挑战状态码
-grep "cf_chl" "$T" | awk -F'\t' '$1=="RET"' \
-  | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn
-
-# 6. 统计脚本来源
-cut -f4 "$T" | sort | uniq -c | sort -rn | head -15
+# 命中、缺失、查询、写入和方法调用
+grep -E -- ' -> (getter|query|setter|call) -> ' "$T"
+grep -E -- ' -> getter -> undefined$' "$T"                    # 缺失 API
+grep -E -- ' -> call -> ' "$T" | grep -Ei 'xhr|fetch|send|post' # 相关方法调用
+grep -E -- '^(实例访问|原型访问) - ' "$T" | head -100
 ```
 
 ### 诊断信号对照表
@@ -432,8 +246,7 @@ cut -f4 "$T" | sort | uniq -c | sort -rn | head -15
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
   obscura \
-  --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation \
-    --trace-property-lookup-file=/tmp/zencare-trace.tsv" \
+  --trace-api-file /tmp/zencare-trace.log \
   fetch https://zencare.co/1.txt \
   --dump text \
   --proxy http://127.0.0.1:9000 \
@@ -460,7 +273,10 @@ SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
 1. **TLS 层** — `--stealth` 可以解决
 2. **JS 环境层** — 即使 TLS 和 API 调用都正确，Turnstile 内部的环境检测仍可能拒绝非标准浏览器
 
-## 2026-08-15 升级：引擎脚本过滤 + 异步写队列
+## 历史记录：旧 V8 `--trace` writer（不适用于 native iv8 trace）
+
+以下内容只记录旧版本的实验结果。当前实现不再安装这些 `--trace`/TSV writer hook，
+请使用本文前面的 `--trace-api-file` 和逐行 native iv8 输出。
 
 补丁 v2（`TraceEnqueueLine` 特征）：两个改动，兼容旧树（升级重打就地拼接，见脚本内
 "Pre-queue patch present" 分支）。
@@ -498,4 +314,4 @@ writer 落后时主线程条件变量等待（背压，内存有界）；`atexit
   trace 仍用 lookups 模式。
 - **trace 文件可能含非法 UTF-8 字节**（JSVMP 的二进制字符串参数经 `TraceAppendValue`
   原样写入）。`awk`/`cut` 会报 `Illegal byte sequence`，用 `LC_ALL=C` 或 `grep -a`。
-- 队列在 `--trace-property-lookup-file` 未配置时不启动 writer（gate 不变）。
+- 当前 native trace 不使用旧的 `--trace-property-lookup-file` writer。

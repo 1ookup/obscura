@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Build and run the property tracer.
+# Build and run the native iv8 API tracer.
 #
-# The build needs `V8_FROM_SOURCE=1` and a `--config` override, and the run needs
-# three V8 flags in the right combination. Typing either by hand is how the two
-# failures this exists to prevent happen:
+# Native tracing lives in the Rust/ObjectTemplate bridge. The source build is
+# still useful for document.all's rusty_v8 extras, but no V8 trace flag or V8
+# source patch is required at runtime.
 #
-#   * a plain `cargo build` or `cargo nextest` relinks against the prebuilt V8 and
-#     silently drops the patch, so tracing stops with no explanation beyond
-#     "unrecognized flag";
-#   * `--no-use-ic` reads like the flag that would make the trace complete and
-#     does the opposite, and `--no-lazy-feedback-allocation` -- which is the one
-#     that matters -- is easy to leave off, taking missing-property detection with
-#     it and nothing else, so the trace still looks fine.
+#   * a fresh source checkout still needs the rusty_v8 extras if document.all is
+#     part of the page contract;
+#   * trace is enabled by `OBSCURA_TRACE_API_FILE`, independent of V8 flags.
 #
 # Usage:
-#   vendor/v8-trace.sh build                     patch V8 and build against it
-#   vendor/v8-trace.sh run OUT.tsv -- <args...>  run obscura, trace to OUT.tsv
+#   vendor/v8-trace.sh build                     build against vendored V8
+#   vendor/v8-trace.sh run OUT.log -- <args...>  run obscura, trace to OUT.log
 #
-# OBSCURA_TRACE_MODE=lookups drops the call/return hooks, which are most of the
-# slowdown, and keeps property lookups. Use it when the page's own timing
-# matters -- anything gated on network round trips.
-#   vendor/v8-trace.sh check                     is the current binary patched?
+# The native iv8 monitor records lookup/query/setter and callback calls directly;
+# it does not enable V8's historical `--trace` CALL/RET stream.
+#   vendor/v8-trace.sh check                     is the current binary trace-capable?
 #
 # OBSCURA_NO_DEFAULT=1 builds without the default features -- no stealth, hence
 # no BoringSSL. Only useful when the traced page does not care about the
@@ -37,32 +32,11 @@ BIN="$ROOT/target/release/obscura"
 # backs the cargo aliases and .githooks/pre-push, so the override is defined once.
 PATCH_CONFIG="vendor/v8-source.toml"
 
-# The flag combination, in one place. --trace drives the call and return hooks;
-# --no-lazy-feedback-allocation drives the property ones, because V8 withholds a
-# feedback vector from a function until it has run several times and loads
-# without one bypass the inline caches entirely -- which is most of page script.
-#
-# --trace is also nearly all of the cost: it routes every function entry and
-# exit through the runtime. On a page whose work is gated on network round
-# trips that is enough to change what the page does before the deadline -- the
-# Cloudflare challenge reached three requests under it and seven without. Pass
-# `lookups` as the mode to drop the call hooks and keep the property ones; the
-# same page then behaves as it does untraced.
-trace_flags() {
-  if [[ "${OBSCURA_TRACE_MODE:-full}" == "lookups" ]]; then
-    printf -- '--trace-property-lookup --no-lazy-feedback-allocation --trace-property-lookup-file=%s' "$1"
-  else
-    printf -- '--trace --trace-property-lookup --no-lazy-feedback-allocation --trace-property-lookup-file=%s' "$1"
-  fi
-}
-
 die() { echo "$*" >&2; exit 1; }
 
-binary_is_patched() {
+binary_is_trace_capable() {
   [[ -x "$BIN" ]] || return 1
-  "$BIN" --v8-flags "--trace-property-lookup" fetch "about:blank" --dump text \
-    >/dev/null 2>"$ROOT/.v8trace-probe" || true
-  ! grep -q "unrecognized flag" "$ROOT/.v8trace-probe" 2>/dev/null
+  "$BIN" --help 2>/dev/null | grep -q -- '--trace-api-file'
 }
 
 cmd_build() {
@@ -71,11 +45,10 @@ cmd_build() {
 
   git clone --recurse-submodules https://github.com/denoland/rusty_v8 $V8_DIR"
 
-  "$ROOT/vendor/v8-property-trace.sh" "$V8_DIR/v8" >/dev/null
-  # Independent of the trace patch: these are ObjectTemplate bindings the engine
+  # Independent of API tracing: these are ObjectTemplate bindings the engine
   # needs (document.all), and they live in rusty_v8 rather than in V8.
   "$RUSTY_EXTRAS" "$V8_DIR" >/dev/null
-  echo "patched; building (first time takes ~30 minutes)"
+  echo "building native-interceptor binary (first time takes ~30 minutes)"
   cd "$ROOT"
 
   # --features adds to the default set rather than replacing it, and `default`
@@ -95,28 +68,27 @@ cmd_build() {
 }
 
 cmd_check() {
-  if binary_is_patched; then
-    echo "patched: $BIN"
+  if binary_is_trace_capable; then
+    echo "trace-capable: $BIN"
   else
-    die "not patched: $BIN
-A cargo build or nextest run without --config relinks against the prebuilt V8.
-Rebuild with: vendor/v8-trace.sh build"
+    die "trace API unavailable: $BIN
+Rebuild with: cargo build --release -p obscura-cli --config vendor/v8-source.toml"
   fi
 }
 
 cmd_run() {
   local out="${1:-}"
-  [[ -n "$out" ]] || die "usage: $0 run OUT.tsv -- <obscura args...>"
+  [[ -n "$out" ]] || die "usage: $0 run OUT.log -- <obscura args...>"
   shift
   [[ "${1:-}" == "--" ]] && shift
 
   # Checked before the run rather than after: a silently unpatched binary
   # otherwise produces a successful fetch and an empty file, which reads as "the
   # page did nothing".
-  binary_is_patched || die "not patched: $BIN
+  binary_is_trace_capable || die "trace API unavailable: $BIN
 Rebuild with: vendor/v8-trace.sh build"
 
-  "$BIN" --v8-flags "$(trace_flags "$out")" "$@"
+  OBSCURA_TRACE_API_FILE="$out" "$BIN" "$@"
   echo "trace: $out ($(wc -l < "$out" | tr -d ' ') records)" >&2
 }
 
@@ -126,4 +98,3 @@ case "${1:-}" in
   run)   shift; cmd_run "$@" ;;
   *) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
-
