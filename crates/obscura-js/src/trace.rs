@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use deno_core::v8;
 
+// deno_core owns embedder data slot 0 for JsRuntimeState. Keep the trace
+// monitor in a separate slot so native module/worker callbacks see the real
+// runtime state instead of the trace state pointer.
+pub(crate) const NATIVE_TRACE_DATA_SLOT: u32 = 1;
+
 /// A process-wide append sink lets page and worker isolates write one trace
 /// stream without truncating each other's records.  Each write is one line
 /// under the mutex, so records from concurrent workers cannot interleave.
@@ -523,7 +528,7 @@ impl NativeTraceState {
         scope: &mut v8::HandleScope<'s>,
         path: &str,
     ) -> Option<v8::Local<'s, v8::Object>> {
-        let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+        let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
             as *mut NativeTraceState;
         if state.is_null() {
             return None;
@@ -1545,7 +1550,7 @@ fn native_instance_get<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<v8::Value>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1562,7 +1567,7 @@ fn native_instance_set<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<()>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1577,7 +1582,7 @@ fn native_instance_query<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<v8::Integer>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1592,7 +1597,7 @@ fn native_global_get<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<v8::Value>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1608,7 +1613,7 @@ fn native_global_set<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<()>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1623,7 +1628,7 @@ fn native_global_query<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<v8::Integer>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;
@@ -1639,7 +1644,7 @@ fn native_instance_define<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     rv: v8::ReturnValue<()>,
 ) -> v8::Intercepted {
-    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(0)
+    let state = AsRef::<v8::Isolate>::as_ref(scope).get_data(NATIVE_TRACE_DATA_SLOT)
         as *mut NativeTraceState;
     if state.is_null() {
         return v8::Intercepted::No;

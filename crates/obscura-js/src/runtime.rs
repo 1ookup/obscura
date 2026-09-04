@@ -652,7 +652,9 @@ impl ObscuraJsRuntime {
             ));
             let trace_state_ptr = (&*trace_state) as *const crate::trace::NativeTraceState
                 as *mut std::ffi::c_void;
-            runtime.v8_isolate().set_data(0, trace_state_ptr);
+            runtime
+                .v8_isolate()
+                .set_data(crate::trace::NATIVE_TRACE_DATA_SLOT, trace_state_ptr);
 
             runtime
                 .v8_isolate()
