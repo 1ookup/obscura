@@ -6283,13 +6283,13 @@ impl Page {
         let (
             document_url,
             base_url,
-            origin,
+            mut origin,
             html,
             mut document_csp,
             document_permissions_policy,
             last_modified,
             navigation_timing,
-            document_cross_origin_isolated,
+            mut document_cross_origin_isolated,
         ) = resolved_document;
 
         if !self
@@ -6312,6 +6312,21 @@ impl Page {
         // srcdoc documents as bare Document nodes after the async commit.
         let quirks = obscura_dom::parse_into_subtree(dom, content_root, &html);
         document_csp = effective_document_csp(dom, content_root, document_csp);
+        // A CSP sandbox declared in metadata takes effect once the parser has
+        // seen the meta element. It must update the security context as well
+        // as the stored policy: without this step a sandboxed meta-only frame
+        // incorrectly retains its tuple origin and isolation bit.
+        if let Some(meta_sandbox) = document_csp.as_deref().and_then(|header| {
+            crate::frame_policy::ContentSecurityPolicy::parse(header).sandbox_flags()
+        }) {
+            sandbox = sandbox.merged_with_parent(meta_sandbox);
+            if sandbox.active
+                && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+            {
+                origin = obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new());
+                document_cross_origin_isolated = false;
+            }
+        }
         let frame_referrer_policy = document_referrer_policy_from_root(
             dom,
             content_root,
@@ -8016,6 +8031,41 @@ mod tests {
             page.frames.get(&frame_id).unwrap().active_document_root,
             Some(root)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_meta_csp_sandbox_creates_opaque_origin() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    frame.id = 'meta-sandbox-frame';
+                    frame.srcdoc = '<meta http-equiv="Content-Security-Policy" content="sandbox"><p>opaque</p>';
+                    document.body.appendChild(frame);
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+
+        let root = page
+            .with_dom(|dom| {
+                let host = dom.query_selector("#meta-sandbox-frame").unwrap().unwrap();
+                dom.iframe_content_document(host).unwrap()
+            })
+            .unwrap();
+        let scope = page
+            .with_dom(|dom| dom.document_scope(root))
+            .flatten()
+            .unwrap();
+        assert_eq!(scope.csp.as_deref(), Some("sandbox"));
+        assert!(scope.sandbox.active);
+        assert!(!scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+        assert!(scope.origin.is_opaque());
+        assert!(!scope.cross_origin_isolated);
     }
 
     #[tokio::test(flavor = "current_thread")]
