@@ -566,6 +566,16 @@ function _environmentDocumentCsp() {
     return '';
   }
 }
+function _environmentAllowsScripts() {
+  try {
+    const root = _environmentDocumentRoot();
+    const raw = Deno.core.ops.op_dom('document_scope_info', String(root), '');
+    const info = raw && JSON.parse(raw);
+    return !(info && info.sandboxActive === true && info.allowScripts === false);
+  } catch (_) {
+    return true;
+  }
+}
 function _environmentReferrerContext() {
   return JSON.stringify({
     url: globalThis.location?.href || "",
@@ -580,6 +590,7 @@ function _environmentReferrerContext() {
 // in the browser crate, while this path only needs the script source-list and
 // nonce checks before scheduling a fetch/evaluation task.
 function _dynamicScriptCspAllows(script, resolvedUrl, inline) {
+  if (!_environmentAllowsScripts()) return false;
   let header = '';
   try {
     const root = _environmentDocumentRoot();
@@ -631,6 +642,7 @@ function _dynamicScriptCspAllows(script, resolvedUrl, inline) {
 }
 
 function _inlineEventHandlerCspAllows() {
+  if (!_environmentAllowsScripts()) return false;
   let header = '';
   try {
     const root = _environmentDocumentRoot();

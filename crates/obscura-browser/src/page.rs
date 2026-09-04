@@ -8036,6 +8036,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frame_meta_csp_sandbox_creates_opaque_origin() {
         let mut page = frame_test_page("<html><body></body></html>");
+        page.set_preload_scripts(vec![super::PreloadScript::main_world(
+            "if (document.URL === 'about:srcdoc') { const script = document.createElement('script'); script.textContent = 'globalThis.metaSandboxDynamic = true'; document.body.appendChild(script); }",
+        )]);
         page.init_js();
         page.js
             .as_mut()
@@ -8051,10 +8054,12 @@ mod tests {
             .unwrap();
         assert_eq!(page.process_pending_frame_navigations().await, 1);
 
-        let root = page
+        let (frame_id, generation, root) = page
             .with_dom(|dom| {
                 let host = dom.query_selector("#meta-sandbox-frame").unwrap().unwrap();
-                dom.iframe_content_document(host).unwrap()
+                let root = dom.iframe_content_document(host).unwrap();
+                let frame = page.frames.by_host(host).unwrap();
+                (frame.frame_id.clone(), frame.document_generation, root)
             })
             .unwrap();
         let scope = page
@@ -8066,6 +8071,19 @@ mod tests {
         assert!(!scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
         assert!(scope.origin.is_opaque());
         assert!(!scope.cross_origin_isolated);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_realm(
+                    &frame_id,
+                    generation,
+                    "<meta-sandbox-probe>",
+                    "typeof globalThis.metaSandboxDynamic",
+                )
+                .unwrap(),
+            serde_json::json!("undefined")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
