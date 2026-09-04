@@ -7769,3 +7769,16 @@ POST frame 保持 reqwest。reqwest 与 wreq fixture、browser frame navigation 
 **结论**：早期求值清空文档应从当前未决缺陷列表移除（现有导航并发路径已覆盖）；真实 `/1.txt` 404 仍需
 能解析并转发 Brunhild 的外部网络条件。禁止在 Obscura 中加入 Brunhild hostname 特判、伪造 DNS 或伪造
 clearance 作为验收替代。
+
+### Step 220 — Brunhild edge-IP A/B（2026-09-05，外部阻塞）
+
+**方法**：不改变 Obscura 代码或请求 URL，仅使用 `curl --resolve` 将
+`brunhild.challenges.cloudflare.com` 的 TLS 连接临时送到 Cloudflare edge IP，并对比
+`challenges.cloudflare.com` 的已知可用 edge。
+
+**证据**：`104.18.8.208`、`104.18.9.208`、`104.18.94.41`、`104.18.95.41` 均返回 Cloudflare
+`HTTP/2 522`；Brunhild 的 DoH 查询仍没有 A 记录。该结果与 Obscura 日志中的 Connect failure
+一致，且不涉及 CSP、frame origin 或请求头生成。
+
+**结论**：即使绕过本机 fake-DNS，Brunhild 仍没有可用的上游响应；当前真实 `/1.txt` 404 验收需要
+外部提供可工作的 Brunhild proof 路由，不能由引擎内加入域名映射或伪造响应解决。
