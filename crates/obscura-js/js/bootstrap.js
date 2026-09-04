@@ -35,7 +35,7 @@ const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
     '__obscura_performance_time_origin_ms',
     '__obscura_viewport_w', '__obscura_viewport_h', '__obscura_screen_emulated',
     // runtime-set by Rust (runtime.rs / page.rs)
-    '__obscura_init', '__obscura_hide_list',
+    '__obscura_init', '__obscura_hide_list', '__obscura_filter_prepare_stack_trace',
     '__obscura_csp_allows_unsafe_eval',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
@@ -26314,7 +26314,7 @@ _pristineGlobalNames = new Set(Object.getOwnPropertyNames(globalThis));
 // to this helper. This avoids re-entering Rust source-map state while V8 is
 // materializing an Error.stack value.
 Object.defineProperty(globalThis, '__obscura_filter_prepare_stack_trace', {
-  configurable: true,
+  configurable: false,
   enumerable: false,
   value: function(error, callsites) {
     const visible = [];
