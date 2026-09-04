@@ -7782,3 +7782,18 @@ clearance 作为验收替代。
 
 **结论**：即使绕过本机 fake-DNS，Brunhild 仍没有可用的上游响应；当前真实 `/1.txt` 404 验收需要
 外部提供可工作的 Brunhild proof 路由，不能由引擎内加入域名映射或伪造响应解决。
+
+### Step 221 — SecurityPolicyViolationEvent WebIDL 对齐（2026-09-05，代码完成）
+
+**假设**：HaHaVM-General 暴露 `SecurityPolicyViolationEvent` 及 `onsecuritypolicyviolation`，而 Obscura
+只有接口 shell；CSP 相关代码或页面探针构造该事件时会看到错误的 constructor、brand、prototype 或实例
+own-key 形状。
+
+**修复与证据**：新增 WeakMap-backed `SecurityPolicyViolationEvent`，覆盖 Chrome 的 12 个 enumerable
+原型 getter、默认值、`[object SecurityPolicyViolationEvent]` brand 和缺少 type 参数时的 `TypeError`。
+实例仍只有 Event 的 `isTrusted` own slot。Chrome CDP oracle 与 `security_policy_violation_event_matches_chrome_shape`
+focused 回归均通过；该实现不改变资源阻断、frame 导航或 challenge 请求路径。
+
+**真实复测**：最新 release 仍完成 frame/top `/fo`、PAT `401` 和 proof `/fo`，随后因 Brunhild Connect
+失败上报 `600010`，没有目标 `/1.txt` 真实 `404`。该结果确认 CSP WebIDL 修复无回归，但最终验收仍受
+外部 proof 路由阻断。
