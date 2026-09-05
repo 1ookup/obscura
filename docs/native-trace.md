@@ -17,6 +17,14 @@ is masked; in that case enabling API trace may change early page execution. Use
 host-op/console tracing for payload capture until transparent V8 IC
 instrumentation replaces this path.
 
+The lower-level property/call hooks are fixed directly in the pinned vendored
+V8 source, rather than applied by a build-time shell patch. The implementation
+is in `vendor/rusty_v8/v8/src/ic/ic.cc`,
+`vendor/rusty_v8/v8/src/runtime/runtime-test.cc`, and
+`vendor/rusty_v8/v8/src/flags/flag-definitions.h`. The source override in
+`vendor/v8-source.toml` selects this checkout, so a source build uses the same
+instrumentation every time.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
