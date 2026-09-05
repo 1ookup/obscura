@@ -25,6 +25,11 @@ is in `vendor/rusty_v8/v8/src/ic/ic.cc`,
 `vendor/v8-source.toml` selects this checkout, so a source build uses the same
 instrumentation every time.
 
+The pinned V8 checkout currently carries commit `e296b664`
+(`add native property and call trace hooks`). Because the vendored checkout is
+a nested repository, this commit is made in `vendor/rusty_v8/v8`, not in the
+outer Obscura repository.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
