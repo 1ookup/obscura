@@ -46,6 +46,19 @@ Default proxy URL used by `obscura-worker` for the parallel `scrape` command whe
 OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 ```
 
+### `OBSCURA_INSECURE_TLS`
+
+Opt out of TLS certificate verification for both the standard and stealth HTTP
+clients. This is intended only for local MITM debugging when installing the
+proxy CA is not possible; it accepts forged, expired, or otherwise invalid
+certificates for every host. The default is secure verification.
+
+Truthy values: `1`, `true`, `yes`, `on`.
+
+```bash
+OBSCURA_INSECURE_TLS=1 obscura --proxy http://127.0.0.1:8080 --stealth serve
+```
+
 ## Stealth and identity
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.

@@ -78,6 +78,21 @@ pub(crate) fn custom_cert_store_requested(
     cert_file.is_some_and(|v| !v.is_empty()) || cert_dir.is_some_and(|v| !v.is_empty())
 }
 
+/// Whether the caller explicitly opted out of TLS certificate verification.
+/// This is intentionally environment-only and opt-in: normal browser traffic
+/// must continue to reject untrusted certificates. Both HTTP transports read
+/// the same switch so stealth and non-stealth sessions cannot disagree.
+pub(crate) fn insecure_tls_requested() -> bool {
+    std::env::var_os("OBSCURA_INSECURE_TLS")
+        .as_deref()
+        .is_some_and(|value| {
+            matches!(
+                value.to_str().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            )
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
@@ -1259,7 +1274,7 @@ impl ObscuraHttpClient {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
+                .danger_accept_invalid_certs(insecure_tls_requested())
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
@@ -3112,17 +3127,35 @@ mod ssrf_tests {
     async fn private_ca_is_still_rejected_without_ssl_cert_file() {
         // The same fixture that the SSL_CERT_FILE test trusts must fail here. The
         // listener is reachable (same setup), so an Err can only be TLS.
+        std::env::remove_var("OBSCURA_INSECURE_TLS");
         let (port, _ca_pem) = https_fixture_with_private_ca().await;
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
         assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
     }
+
+    #[tokio::test]
+    async fn insecure_tls_env_accepts_a_private_ca_without_a_trust_store() {
+        std::env::set_var("OBSCURA_INSECURE_TLS", "1");
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
+        let (port, _ca_pem) = https_fixture_with_private_ca().await;
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let response = client
+            .fetch(&url)
+            .await
+            .expect("OBSCURA_INSECURE_TLS must bypass certificate validation");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.text(), "private ca ok");
+    }
 }
 
 #[cfg(test)]
 mod cert_env_tests {
-    use super::custom_cert_store_requested;
+    use super::{custom_cert_store_requested, insecure_tls_requested};
     use std::ffi::OsStr;
 
     #[test]
@@ -3147,5 +3180,19 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+
+    #[test]
+    fn insecure_tls_flag_accepts_only_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("OBSCURA_INSECURE_TLS", value);
+            assert!(insecure_tls_requested(), "{value} should enable the opt-in");
+        }
+        for value in ["", "0", "false", "no", "random"] {
+            std::env::set_var("OBSCURA_INSECURE_TLS", value);
+            assert!(!insecure_tls_requested(), "{value} should leave verification enabled");
+        }
+        std::env::remove_var("OBSCURA_INSECURE_TLS");
+        assert!(!insecure_tls_requested());
     }
 }

@@ -226,7 +226,11 @@ impl StealthHttpClient {
             // can never be serialized twice by the transport layer.
             .default_headers(wreq::header::HeaderMap::new())
             .timeout(Duration::from_secs(30))
-            .redirect(wreq::redirect::Policy::none());
+            .redirect(wreq::redirect::Policy::none())
+            // Keep certificate verification enabled by default. The explicit
+            // opt-out is for local MITM/debugging only and does not alter the
+            // emulated TLS handshake profile.
+            .tls_cert_verification(!crate::client::insecure_tls_requested());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //
