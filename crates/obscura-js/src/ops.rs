@@ -647,6 +647,23 @@ pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
     }
 }
 
+fn trace_console_message(level: &str, message: &str) {
+    if !host_op_trace_enabled() { return; }
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = TRACE.get_or_init(|| {
+        let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(file))
+    });
+    let Some(file) = sink else { return };
+    let timestamp = TRACE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{timestamp}\tconsole.{level}\t{message}");
+        let _ = file.flush();
+    }
+}
+
 static TRACE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2926,6 +2943,7 @@ fn op_monotonic_ms() -> f64 {
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
+    trace_console_message(level, msg);
     match level {
         "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
