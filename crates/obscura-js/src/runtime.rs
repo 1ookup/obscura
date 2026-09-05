@@ -45,6 +45,17 @@ fn obscura_prepare_stack_trace_callback<'s>(
         .and_then(|value| deno_core::v8::Local::<deno_core::v8::Function>::try_from(value).ok());
     if let Some(helper) = helper {
         if let Some(value) = helper.call(scope, global.into(), &[error, callsites.into()]) {
+            if value.is_string() {
+                let rendered = value.to_rust_string_lossy(scope);
+                let filtered = rendered
+                    .lines()
+                    .filter(|line| !line.contains("<cdp-"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(value) = deno_core::v8::String::new(scope, &filtered) {
+                    return value.into();
+                }
+            }
             return value;
         }
     }
