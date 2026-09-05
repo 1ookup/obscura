@@ -31,6 +31,11 @@ Because the vendored checkout is
 a nested repository, this commit is made in `vendor/rusty_v8/v8`, not in the
 outer Obscura repository.
 
+Runtime miss probes were added in V8 commit `dc297593`, with a compile fix in
+`008aae52`. These cover runtime fallback functions, while generated
+`AccessorAssembler` fast/generic paths can bypass them; full named/keyed hit
+coverage remains a follow-up.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
