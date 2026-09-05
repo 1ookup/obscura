@@ -25,8 +25,9 @@ is in `vendor/rusty_v8/v8/src/ic/ic.cc`,
 `vendor/v8-source.toml` selects this checkout, so a source build uses the same
 instrumentation every time.
 
-The pinned V8 checkout currently carries commit `e296b664`
-(`add native property and call trace hooks`). Because the vendored checkout is
+The pinned V8 checkout currently carries commits `e296b664` and `f0f833f5`
+(`add native property and call trace hooks`, plus internal-script filtering).
+Because the vendored checkout is
 a nested repository, this commit is made in `vendor/rusty_v8/v8`, not in the
 outer Obscura repository.
 
