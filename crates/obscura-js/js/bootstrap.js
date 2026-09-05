@@ -26405,6 +26405,7 @@ Object.defineProperty(globalThis, '__obscura_filter_prepare_stack_trace', {
       } catch (_) {}
       if (!(typeof source === 'string'
             && (source.startsWith('<obscura:')
+                || source.startsWith('<cdp-')
                 || source.startsWith('ext:')
                 || source.startsWith('deno:')))) {
         visible.push(site);

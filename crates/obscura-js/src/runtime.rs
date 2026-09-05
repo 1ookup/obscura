@@ -8924,6 +8924,15 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn cdp_injected_script_names_are_hidden_from_error_stacks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("<cdp-input>", "globalThis.__cdpStack = new Error('click').stack;")
+            .unwrap();
+        let stack = rt.evaluate("__cdpStack").unwrap().as_str().unwrap_or_default().to_string();
+        assert!(!stack.contains("<cdp-input>"), "{stack}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn zero_delay_timer_runs_as_a_task_after_microtasks() {
         let mut rt = setup_runtime("<html><body></body></html>");
