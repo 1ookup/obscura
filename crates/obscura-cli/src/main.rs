@@ -456,19 +456,6 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: configured before any V8 isolate or worker starts.
         unsafe { std::env::set_var("OBSCURA_TRACE_OP_FILE", path); }
     }
-    if let Some(paths) = args.trace_api_ignore.as_ref() {
-        // SAFETY: configured before any V8 isolate or worker starts.
-        unsafe { std::env::set_var("OBSCURA_TRACE_API_IGNORE", paths); }
-    }
-    if let Some(paths) = args.trace_api_watch.as_ref() {
-        // SAFETY: configured before any V8 isolate or worker starts.
-        unsafe { std::env::set_var("OBSCURA_TRACE_API_WATCH", paths); }
-    }
-    if args.trace_api_devtools {
-        // SAFETY: configured before any V8 isolate or worker starts.
-        unsafe { std::env::set_var("OBSCURA_TRACE_API_DEVTOOLS", "1"); }
-    }
-
     // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
     // directly for its SSRF gate. Mirror the CLI flag into the env var so
     // iframe loads and JS fetch() see the same policy the http_client layer
@@ -728,15 +715,6 @@ async fn run_multi_worker_serve(
         }
         if let Some(path) = std::env::var_os("OBSCURA_TRACE_API_FILE") {
             cmd.env("OBSCURA_TRACE_API_FILE", path);
-        }
-        if let Some(paths) = std::env::var_os("OBSCURA_TRACE_API_IGNORE") {
-            cmd.env("OBSCURA_TRACE_API_IGNORE", paths);
-        }
-        if let Some(paths) = std::env::var_os("OBSCURA_TRACE_API_WATCH") {
-            cmd.env("OBSCURA_TRACE_API_WATCH", paths);
-        }
-        if std::env::var_os("OBSCURA_TRACE_API_DEVTOOLS").is_some() {
-            cmd.env("OBSCURA_TRACE_API_DEVTOOLS", "1");
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
