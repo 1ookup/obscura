@@ -12,12 +12,13 @@ Top-level flags apply to every subcommand.
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
-    --trace-api-file <FILE>  Write native iv8-compatible API access trace
+    --trace-api-file <FILE>  Write pinned V8 property trace (source build required)
+    --trace-op-file <FILE>   Write host operations and complete console strings
     --trace-api-ignore <PATHS>
-                             Comma-separated exact paths omitted from API trace
+                             Retired descriptor-monitor option (returns an error)
     --trace-api-watch <PATHS>
-                             Comma-separated paths that trigger a debugger pause
-    --trace-api-devtools       Arm API watch pauses for an attached DevTools session
+                             Retired descriptor-monitor option (returns an error)
+    --trace-api-devtools       Retired descriptor-monitor option (returns an error)
 -h, --help                   Help
 -V, --version                Version
 ```

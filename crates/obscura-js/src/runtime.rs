@@ -24810,6 +24810,36 @@ RequestRedirect value",
         assert_eq!(result, serde_json::json!(["menu", "true"]));
     }
 
+    #[test]
+    fn event_target_is_not_node_and_window_has_no_node_members() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            const target = new EventTarget();
+            const element = document.querySelector('div');
+            const xhr = new XMLHttpRequest();
+            return {
+                distinct: EventTarget !== Node,
+                nodeParent: Object.getPrototypeOf(Node.prototype) === EventTarget.prototype,
+                instance: target instanceof EventTarget && !(target instanceof Node),
+                element: element instanceof Node && element instanceof EventTarget,
+                window: window instanceof EventTarget && !(window instanceof Node),
+                clean: ['nodeType', 'appendChild', 'childNodes', 'ELEMENT_NODE'].every(
+                    name => !(name in window) && !(name in target) && !(name in xhr)),
+                xhrParent: Object.getPrototypeOf(XMLHttpRequestEventTarget.prototype)
+                    === EventTarget.prototype,
+                ownNames: Object.getOwnPropertyNames(target),
+                brand: Object.prototype.toString.call(target),
+                inherited: !Object.hasOwn(Node.prototype, 'addEventListener')
+                    && Node.prototype.addEventListener === EventTarget.prototype.addEventListener,
+            };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "distinct": true, "nodeParent": true, "instance": true,
+            "element": true, "window": true, "clean": true, "xhrParent": true,
+            "ownNames": [], "brand": "[object EventTarget]", "inherited": true,
+        }));
+    }
+
     /// Framework schedulers commonly subclass EventTarget for their own
     /// lifecycle events. These targets have no backing DOM node, but must
     /// still deliver callbacks (including object, once, and signal listeners).

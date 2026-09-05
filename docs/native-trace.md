@@ -1,101 +1,150 @@
 # Native Trace
 
-Obscura has two opt-in diagnostic streams. They are disabled unless explicitly
-requested and do not change normal page behavior.
+## Architecture
 
-## API trace
+`--trace-api-file FILE` selects the property instrumentation in the pinned
+vendored V8. The CLI enables `--trace-property-lookup` before isolate creation
+and supplies the filename separately through `OBSCURA_TRACE_API_FILE`, including
+filenames containing spaces. This requires a source-built binary.
 
-`--trace-api-file <path>` enables the native browser API monitor. It records
-getter, setter, query, missing-property and callback events for instrumented
-BOM/DOM/WebIDL objects across the main realm and frame realms. Prototype misses
-are reported separately so a missing method can be distinguished from an
-ordinary undefined value.
+The active path does not install ObjectTemplate descriptor trampolines or JS
+Proxy wrappers. It does not replace page-visible methods or descriptors. The
+old Rust descriptor-monitor code remains dormant; its install calls have been
+removed. Its ignore/watch/devtools CLI options now fail explicitly instead of
+silently doing nothing. Their environment equivalents are not implemented by
+the V8 monitor either.
 
-The descriptor-trampoline implementation is a diagnostic plane. Anti-tamper
-pages can observe replaced function identity even when `Function.prototype.toString`
-is masked; in that case enabling API trace may change early page execution. Use
-host-op/console tracing for payload capture until transparent V8 IC
-instrumentation replaces this path.
+The implementation is edited directly in `vendor/rusty_v8/v8`, a nested Git
+repository. There is no build-time V8 trace patch script:
+The bytecode migration is committed in that checkout as `59ee73ae`.
 
-The lower-level property/call hooks are fixed directly in the pinned vendored
-V8 source, rather than applied by a build-time shell patch. The implementation
-is in `vendor/rusty_v8/v8/src/ic/ic.cc`,
-`vendor/rusty_v8/v8/src/runtime/runtime-test.cc`, and
-`vendor/rusty_v8/v8/src/flags/flag-definitions.h`. The source override in
-`vendor/v8-source.toml` selects this checkout, so a source build uses the same
-instrumentation every time.
+| V8 source | Responsibility |
+| --- | --- |
+| `src/interpreter/bytecode-array-builder.cc` | One GET/SET/HAS runtime probe per supported property bytecode |
+| `src/ic/ic.cc` | Side-effect-free resolution, filtering, formatting, async writer; cold global fallback |
+| `src/runtime/runtime.h` | Diagnostic runtime intrinsic |
+| `src/runtime/runtime-test.cc` | Optional historical JS CALL/RET hooks |
+| `src/flags/flag-definitions.h` | Compile-time opt-in flag |
 
-The pinned V8 checkout currently carries commits `e296b664` and `f0f833f5`
-(`add native property and call trace hooks`, plus internal-script filtering).
-Because the vendored checkout is
-a nested repository, this commit is made in `vendor/rusty_v8/v8`, not in the
-outer Obscura repository.
+Probe bytecodes are emitted only when the property flag is enabled. Normal
+compilation emits none. Overlapping AccessorAssembler and IC-miss probes were
+removed. Traced runs compile bootstrap instead of loading Obscura's untraced
+startup snapshot. Configure trace before creating any isolate.
 
-Runtime miss probes were added in V8 commit `dc297593`, with a compile fix in
-`008aae52`. These cover runtime fallback functions, while generated
-`AccessorAssembler` fast/generic paths can bypass them; full named/keyed hit
-coverage remains a follow-up.
+## Coverage
 
-The subsequent `a9022ec5` commit adds probes to the no-feedback and keyed-has
-runtime fallbacks. A smoke page still showed no records for ordinary object
-loads, confirming that this V8 revision uses generated fast paths for that case;
-the next implementation target is the corresponding AccessorAssembler
-load/store/has branches.
+Supported operations include ordinary Object and Array named/computed reads,
+numeric indices, array holes, typed-array bounds, symbols, named/computed
+assignments, `in`, and enumerated keyed reads. BOM/DOM shims are ordinary JS
+objects, so explicit property accesses use the same mechanism. The probe is
+emitted with bytecode, independently of the selected IC fallback. It preserves
+the accumulator and does not evaluate getters, Proxy traps or object-key
+coercions for logging.
 
-The generated named-load experiment is in V8 commits `d8142db6`, `dd607575`,
-`af0ac565`, and `9fce662c`. Source build and release build succeed, but the
-ordinary-object smoke still produces zero records, so this path is not yet the
-active execution path for the tested scripts. It remains diagnostic work, not
-completed coverage.
+Property records have eight tab-separated fields:
+Property record fields escape backslashes, tabs and line breaks. V8 diagnostic
+string conversion normalizes embedded NUL to a space; this is not a lossless
+serialization of arbitrary JS strings.
 
-The monitor is installed through V8 `ObjectTemplate` handlers and native
-callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
-flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
-`--trace-api-devtools` arms an optional debugger pause before recording.
-
-## Host-op trace
-
-`--trace-op-file <path>` records native operations that may not have a visible
-JavaScript function frame:
-
-- `fetch`/XHR and redirects
-- DOM operations
-- WebSocket operations
-- IndexedDB operations
-- console operations
-
-`console.log` is a bootstrap JavaScript wrapper that ends at `op_console_msg`.
-The host-op stream records its complete string argument, including
-`payloadJSON`/`fo` challenge payloads. This is the supported way to compare
-payloads in `assets/payload`; API trace alone does not contain console arguments.
-
-## Builtin JavaScript calls
-
-The native monitor also wraps selected ECMAScript builtin entry points. Current
-coverage includes `Object`, `Reflect`, `JSON`, `RegExp`, `String`, `Function`,
-and common `Array.prototype` methods. These calls use the same native callback
-envelope and preserve receiver, arguments, return values and exceptions.
-
-## Deliberate boundary
-
-Arbitrary ordinary-object and array element accesses are not currently traced:
-
-```js
-obj.field;
-obj.missing;
-arr[0];
-arr.missing;
+```text
+resolution  receiver  property  script  line  column  operation  stack
+HIT         Object    present   page.js 1     12      GET        ...
+MISS        Object    absent    page.js 1     24      GET        ...
+UNKNOWN     Object    proxied   page.js 1     36      GET        ...
 ```
 
-Those objects are created directly by V8 and do not pass through browser
-`ObjectTemplate` handlers. Complete tracing would require a separate opt-in V8
-property-access instrumentation layer for named loads, indexed loads, stores,
-`HasProperty` and enumeration. It must remain separate from the API monitor to
-avoid tracing V8 internals and imposing a production cost.
+- `HIT`: a data property or accessor exists, including present-but-undefined.
+- `MISS`: lookup reached absence or a typed-array invalid index.
+- `UNKNOWN`: resolving would require a Proxy, interceptor, access check, object
+  key coercion, or an invalid receiver. Do not treat it as a missing API.
+- `GET`, `SET`, `HAS`: attempted operation. SET resolution is measured before
+  the write; it does not say the write succeeded.
+- `GLOBAL`: legacy cold global lookup evidence, not complete global coverage.
 
-## Reading a trace
+A missing method invocation first produces a missing property GET, then JS may
+throw. A MISS alone does not prove a bug: feature detection intentionally probes
+absent properties too. Numeric keys are rendered as names; symbols currently
+share the `<symbol>` label. Object keys use `<unresolved-key>` rather than
+running ToPropertyKey twice.
 
-Use API trace for browser surface parity, host-op trace for network/console
-causality, and payload JSON for field-level comparison. A missing API trace line
-does not prove that a JavaScript function did not execute: direct host ops and
-unresolved ordinary-object accesses use different instrumentation paths.
+Engine `ext:`, `deno:` and internal `<...>` scripts are filtered. User evaluation
+labels such as `<eval>` and `<eval-remote>` are explicitly allowed. Anonymous
+page eval is labelled `<page-eval>`. Script labels are not reliable realm IDs.
+
+## Calls And Console
+
+A `GET Array.map` proves the method was read, not that it was called. Optional
+`--v8-flags "--trace"` adds historical JS function CALL/RET records, including
+bootstrap functions called directly by page JS. It is not universal native
+builtin/callback invocation tracing, and it can substantially change timing.
+Call arguments/returns use compact previews, not full object serialization.
+
+`--trace-op-file FILE` is the separate host-operation stream: DOM ops, requests,
+WebSocket, IndexedDB and console. `console.log` reaches `op_console_msg`, which
+records complete strings, including long `payloadJSON` output. This works in
+`fetch` as well as `serve`. Objects still undergo normal console formatting;
+serialize deliberately when a structured payload is needed.
+
+Neither stream is zero-cost when enabled. Property records are queued in 1 MiB
+chunks and drained by a background thread; normal process exit flushes the
+tail. Abrupt termination can lose buffered records. Separate timing-sensitive
+payload collection from full trace, and retain a trace-off comparison.
+
+## Usage And Verification
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins \
+  --features render --config vendor/v8-source.toml
+vendor/v8-trace.sh check
+./target/release/obscura --trace-api-file /tmp/properties.tsv \
+  --trace-op-file /tmp/operations.log fetch https://example.com --wait 0
+cargo nextest run --release --features render -p obscura-cli \
+  --test native_trace --config vendor/v8-source.toml
+```
+
+`check` executes a real author-script HIT/MISS smoke. The presence of a CLI
+option alone is not evidence that the linked V8 contains the instrumentation.
+The integration fixture checks exact hot/cold counts, forced TurboFan optimization, IC-disabled and interpreter
+execution, array indices, getter/setter and Proxy side effects, key coercion,
+CLI evaluation visibility, filenames containing spaces, and console strings.
+
+Current unimplemented boundaries: universal native builtin CALL/RET, exception
+events, full global loads, `super`/private access, reflection builtin internals,
+delete/define/enumeration events, stable symbol/realm IDs, and watch/ignore gates.
+Do not describe this as full iv8-equivalent coverage yet.
+
+## Migration Evidence (2026-09-06)
+
+Focused CLI verification passed all four tests, including 165 reads before
+and after forced TurboFan optimization and 4,000 reads in each IC/interpreter
+mode, plus current-realm Window MISS. EventTarget/XHR/Window/event focused
+coverage passed 67 tests. The workspace gate is still being verified.
+The pre-migration author-script smoke recorded
+ordinary-object HIT/MISS twice per cold read. Earlier zero-record `<eval>`
+experiments were hidden by name filtering, not proof that IC hooks never ran.
+
+A pre-rebuild proxy run captured complete console payloads (47 and 91 top-level
+keys). `gsLi5` comparison, excluding `o.*` and merging path-to-bucket sets without
+overwriting, found 77 differences: 55 live-only paths, 3 reference-only paths,
+19 changed buckets. Reference payloads 2 and 3 had zero differences under the
+same comparison. Device, locale, viewport, dynamic URLs and document state were
+not aligned, so these are not 77 proven engine defects. Equal top-level key
+counts do not establish environment parity or explain the final challenge result.
+
+Chrome oracle identified one independent defect: EventTarget and Node must be
+distinct, with Node inheriting EventTarget. Obscura aliased them and consequently
+exposed Node members on Window. The correction changes the shared inheritance
+rather than hiding individual properties from enumeration. Event dispatch and
+subclass behavior are covered by runtime regression tests.
+
+Three post-fix live payloads each removed exactly 47 extra global Node paths.
+The same comparison dropped from 77 differences to 30 (1,690 live paths to
+1,643, versus 1,638 reference paths), in all three runs. The page still returned
+a challenge.
+
+The full-property proxy run recorded 500,850 events: 478,381 HIT, 22,439 MISS,
+and 30 UNKNOWN; 464,576 GET, 35,364 SET, 33 HAS and 877 GLOBAL. It produced zero
+malformed TSV rows and zero engine-internal script rows. It also triggered the
+synchronous V8 watchdog before any payloadJSON output. This trace is a partial
+execution record, not payload-parity evidence. The watchdog was not weakened;
+the three complete payload samples used console-op tracing alone.

@@ -69,23 +69,20 @@ struct Args {
     #[arg(long, global = true, value_name = "FILE")]
     trace_op_file: Option<std::path::PathBuf>,
 
-    /// Write native iv8-compatible browser API access records to a file.
-    /// Uses the Rust/V8 ObjectTemplate interceptor path and needs no V8 trace
-    /// flag or JavaScript Proxy instrumentation.
+    /// Write native property access records to a file (requires pinned V8).
+    /// Does not replace page-visible functions or property descriptors.
     #[arg(long, global = true, value_name = "FILE")]
     trace_api_file: Option<std::path::PathBuf>,
 
-    /// Comma-separated exact iv8 API paths omitted from the native trace.
+    /// Legacy descriptor-monitor option (not supported by pinned V8 tracing).
     #[arg(long, global = true, value_name = "PATHS")]
     trace_api_ignore: Option<String>,
 
-    /// Comma-separated exact iv8 API paths that trigger a native debugger
-    /// statement before the access record is written.
+    /// Legacy descriptor-monitor option (not supported by pinned V8 tracing).
     #[arg(long, global = true, value_name = "PATHS")]
     trace_api_watch: Option<String>,
 
-    /// Arm `--trace-api-watch` for attached DevTools sessions. iv8 keeps the
-    /// watch list and the debugger gate separate, so a list alone is inert.
+    /// Legacy descriptor-monitor option (not supported by pinned V8 tracing).
     #[arg(long, global = true)]
     trace_api_devtools: bool,
 }
@@ -402,6 +399,11 @@ fn configure_browser_locale() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.trace_api_ignore.is_some() || args.trace_api_watch.is_some()
+        || args.trace_api_devtools
+    {
+        anyhow::bail!("trace ignore/watch/devtools options belong to the retired descriptor monitor and are not implemented by the pinned V8 trace; use --trace-api-file alone");
+    }
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
     // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
@@ -438,21 +440,21 @@ async fn main() -> anyhow::Result<()> {
     let inherited_v8_flags = std::env::var("OBSCURA_V8_FLAGS").ok();
     let mut v8_flags = resolve_v8_flags(args.v8_flags.as_deref(), inherited_v8_flags.as_deref());
     if let Some(path) = args.trace_api_file.as_ref() {
+        // Configure the path separately from whitespace-delimited V8 flags.
+        // SAFETY: no V8 isolate or worker has been started yet.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_FILE", path); }
+    }
+    if std::env::var_os("OBSCURA_TRACE_API_FILE").is_some() {
         // Enable the pinned V8 IC/runtime monitor before the first isolate.
         // Unlike descriptor trampolines, this does not replace page-visible
         // functions or mutate browser objects.
-        v8_flags.push_str(" --trace-property-lookup --no-lazy-feedback-allocation --trace-property-lookup-file=");
-        v8_flags.push_str(&path.to_string_lossy());
+        v8_flags.push_str(" --trace-property-lookup");
     }
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
     if let Some(path) = args.trace_op_file.as_ref() {
         // SAFETY: configured before any V8 isolate or worker starts.
         unsafe { std::env::set_var("OBSCURA_TRACE_OP_FILE", path); }
-    }
-    if let Some(path) = args.trace_api_file.as_ref() {
-        // SAFETY: configured before any V8 isolate or worker starts.
-        unsafe { std::env::set_var("OBSCURA_TRACE_API_FILE", path); }
     }
     if let Some(paths) = args.trace_api_ignore.as_ref() {
         // SAFETY: configured before any V8 isolate or worker starts.

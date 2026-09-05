@@ -12,13 +12,12 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Build
 
-The native iv8 monitor is implemented in the Rust/V8 `ObjectTemplate` and
-callback layer; it does not depend on a trace-patched V8 or on V8's historical
-`--trace` flags. The repository's source-build/test commands still carry
-`--config vendor/v8-source.toml` so they exercise the pinned vendored V8 and
-the `document.all` rusty_v8 bindings. A normal prebuilt-V8 binary can run the
-native monitor too, but it does not provide the source-only `document.all`
-extras.
+Native property tracing is implemented directly in the pinned vendored V8
+bytecode builder/runtime. The previous Rust/V8 descriptor-trampoline monitor
+is no longer installed. `--trace-api-file` requires the source build selected
+by `--config vendor/v8-source.toml`; a stock prebuilt V8 cannot provide these
+probes. Host-op and console tracing (`--trace-op-file`) is independent. See
+`docs/native-trace.md` for exact coverage and remaining call-trace limitations.
 
 Verify a trace-capable binary with `vendor/v8-trace.sh check` before a run.
 The first source build takes ~30 minutes; incremental builds are seconds.

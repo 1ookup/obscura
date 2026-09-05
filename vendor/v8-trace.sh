@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# Build and run the native iv8 API tracer.
+# Build and run the pinned V8 property tracer.
 #
-# Native tracing lives in the Rust/ObjectTemplate bridge. The source build is
-# still useful for document.all's rusty_v8 extras, but no V8 trace flag or V8
-# source patch is required at runtime.
+# Native tracing is implemented directly in the vendored V8 source. This script
+# only builds and verifies it; it does not patch V8 source.
 #
 #   * a fresh source checkout still needs the rusty_v8 extras if document.all is
 #     part of the page contract;
-#   * trace is enabled by `OBSCURA_TRACE_API_FILE`, independent of V8 flags.
+#   * the CLI enables the V8 property flag for `OBSCURA_TRACE_API_FILE`.
 #
 # Usage:
 #   vendor/v8-trace.sh build                     build against vendored V8
 #   vendor/v8-trace.sh run OUT.log -- <args...>  run obscura, trace to OUT.log
 #
-# The native iv8 monitor records lookup/query/setter and callback calls directly;
-# it does not enable V8's historical `--trace` CALL/RET stream.
+# Property tracing does not enable V8's optional `--trace` CALL/RET stream.
 #   vendor/v8-trace.sh check                     is the current binary trace-capable?
 #
 # OBSCURA_NO_DEFAULT=1 builds without the default features -- no stealth, hence
@@ -36,7 +34,18 @@ die() { echo "$*" >&2; exit 1; }
 
 binary_is_trace_capable() {
   [[ -x "$BIN" ]] || return 1
-  "$BIN" --help 2>/dev/null | grep -q -- '--trace-api-file'
+  local probe
+  probe="$(mktemp "${TMPDIR:-/tmp}/obscura-trace-check.XXXXXX")" || return 1
+  local status=1
+  if "$BIN" --trace-api-file "$probe" fetch \
+      'data:text/html,<script>(()=>{const o={traceCheck:1};o.traceCheck;o.traceAbsent;})();</script>' \
+      --wait 0 --timeout 5 --quiet >/dev/null 2>&1 &&
+      grep -q $'^HIT\tObject\ttraceCheck\t' "$probe" &&
+      grep -q $'^MISS\tObject\ttraceAbsent\t' "$probe"; then
+    status=0
+  fi
+  rm -f -- "$probe"
+  return "$status"
 }
 
 cmd_build() {
@@ -48,7 +57,7 @@ cmd_build() {
   # Independent of API tracing: these are ObjectTemplate bindings the engine
   # needs (document.all), and they live in rusty_v8 rather than in V8.
   "$RUSTY_EXTRAS" "$V8_DIR" >/dev/null
-  echo "building native-interceptor binary (first time takes ~30 minutes)"
+  echo "building pinned V8 trace binary (first time takes ~30 minutes)"
   cd "$ROOT"
 
   # --features adds to the default set rather than replacing it, and `default`

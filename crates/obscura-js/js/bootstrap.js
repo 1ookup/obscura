@@ -2346,9 +2346,8 @@ function _eventTargetRemove(target, type, callback, options) {
 function _isDomInstance(value, name) {
   const ctor = globalThis[name];
   if (typeof ctor !== 'function' || !(value instanceof ctor)) return false;
-  // EventTarget is currently the Node interface object in this shim. Objects
-  // such as XHR and Performance inherit its event methods but carry no DOM
-  // node slot, so they must not enter the parent/shadow retargeting path.
+  // Only backed DOM nodes participate in parent/shadow retargeting. A Node
+  // prototype or a page-created object inheriting it has no tree position.
   if (name === 'Node') return value[_nidSym] !== undefined;
   return true;
 }
@@ -3078,7 +3077,22 @@ function _seedUnchangedConnection(node, connected) {
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
 
-class Node {
+class EventTarget {
+  addEventListener(type, callback, options = undefined) {
+    _eventTargetAdd(this, type, callback, options);
+  }
+  dispatchEvent(event) {
+    return _eventTargetDispatch(this, event);
+  }
+  removeEventListener(type, callback, options = undefined) {
+    _eventTargetRemove(this, type, callback, options);
+  }
+  when(type, options = undefined) {
+    return _eventTargetWhen.call(this, type, options, arguments.length);
+  }
+}
+
+class Node extends EventTarget {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
@@ -3099,6 +3113,7 @@ class Node {
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
   constructor(nid) {
+    super();
     // In native iv8 trace mode Node instances are minted by a real V8
     // ObjectTemplate carrying observe-then-passthrough named interceptors.
     // The template object adopts this class's prototype, so all existing JS
@@ -3495,18 +3510,6 @@ class Node {
   isSameNode(other) {
     return !!other && (other === this
       || (this[_nidSym] !== undefined && this[_nidSym] === other[_nidSym]));
-  }
-  addEventListener(type, callback, options) {
-    _eventTargetAdd(this, type, callback, options);
-  }
-  removeEventListener(type, callback, options) {
-    _eventTargetRemove(this, type, callback, options);
-  }
-  dispatchEvent(event) {
-    return _eventTargetDispatch(this, event);
-  }
-  when(type, options = undefined) {
-    return _eventTargetWhen.call(this, type, options, arguments.length);
   }
 }
 class CharacterData extends Node {
@@ -11441,7 +11444,7 @@ const XMLHttpRequestEventTarget = function XMLHttpRequestEventTarget(key) {
     throw new TypeError("Failed to construct 'XMLHttpRequestEventTarget': Illegal constructor");
   }
 };
-Object.setPrototypeOf(XMLHttpRequestEventTarget.prototype, Node.prototype);
+Object.setPrototypeOf(XMLHttpRequestEventTarget.prototype, EventTarget.prototype);
 const XMLHttpRequestUpload = function XMLHttpRequestUpload(key, state) {
   if (key !== _xhrEventTargetKey) {
     throw new TypeError("Failed to construct 'XMLHttpRequestUpload': Illegal constructor");
@@ -17095,7 +17098,7 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.prepend = Element.prototype.prepend;
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
-globalThis.EventTarget = Node;
+globalThis.EventTarget = EventTarget;
 if (typeof NetworkInformation === 'function') {
   try { Object.setPrototypeOf(NetworkInformation.prototype, EventTarget.prototype); } catch (_error) {}
 }
@@ -17302,9 +17305,8 @@ if (typeof Performance === 'function') {
         throw new TypeError(
           "Failed to construct 'ServiceWorkerContainer': Illegal constructor");
       }
-      // Listener storage is private to the container: its prototype is linked
-      // to EventTarget.prototype below for `instanceof`, but EventTarget is
-      // Node here and the DOM listener path expects a node id.
+      // Preserve the container's private listener storage when linking its
+      // prototype to EventTarget below.
       this._listeners = Object.create(null);
       this._handlers = Object.create(null);
       // The spec's [[ready promise]] resolves only once an active
@@ -17449,8 +17451,7 @@ if (typeof Performance === 'function') {
   Object.defineProperty(ServiceWorkerContainer.prototype, Symbol.toStringTag, {
     value: 'ServiceWorkerContainer', configurable: true,
   });
-  // `instanceof EventTarget` without inheriting Node's listener plumbing,
-  // the same trick Performance uses above.
+  // Preserve the container's own event implementation and EventTarget brand.
   try {
     Object.setPrototypeOf(ServiceWorkerContainer.prototype, EventTarget.prototype);
   } catch (_error) {}
@@ -21935,8 +21936,7 @@ if (typeof BroadcastChannel === 'undefined') {
     }
     get [Symbol.toStringTag]() { return 'BroadcastChannel'; }
   };
-  // EventTarget is currently Node-backed in this runtime; link the prototype
-  // without invoking Node's DOM-node constructor or exposing a fake `_nid`.
+  // Keep the channel's event implementation while sharing the EventTarget chain.
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
 }
 
@@ -22748,7 +22748,7 @@ globalThis.SharedWorker = class SharedWorker {
   get [Symbol.toStringTag]() { return 'SharedWorker'; }
 };
 _markNative(globalThis.SharedWorker);
-// `instanceof EventTarget` without inheriting Node's listener plumbing.
+// Preserve the worker's event implementation while sharing the EventTarget chain.
 try {
   Object.setPrototypeOf(globalThis.SharedWorker.prototype, EventTarget.prototype);
 } catch (e) {}
@@ -24207,11 +24207,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     'SubmitEvent', 'ToggleEvent', 'PromiseRejectionEvent', 'StorageEvent',
     'SecurityPolicyViolationEvent',
     'EventSource',
-    // Core DOM. `Node` must precede `EventTarget`: the two are the same
-    // function here (`globalThis.EventTarget = Node`), and whichever name is
-    // seen first wins the brand. Real nodes vastly outnumber bare
-    // `new EventTarget()` instances, so Node is the better answer for the
-    // prototype they share.
+    // Core DOM interfaces own distinct prototypes.
     'Node', 'EventTarget', 'Element', 'Document', 'XMLDocument', 'DocumentFragment',
     'DocumentType', 'CharacterData', 'Text', 'Comment', 'CDATASection',
     'ProcessingInstruction', 'Attr', 'NamedNodeMap', 'NodeList',
@@ -24278,9 +24274,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     // stamp the wrong identifier on Element.prototype, so only the
     // constructor that owns the prototype may name it. Order-independent.
     if (ctor.prototype.constructor !== ctor) { continue; }
-    // Shape 2: one constructor published under two names, as in
-    // `globalThis.EventTarget = Node`. Here the ownership test passes for both
-    // names, so the first name in the list wins and the second is dropped --
+    // Shape 2: one constructor published under two names. Here the ownership
+    // test passes for both names, so the first name wins and the second is dropped --
     // otherwise the later name would also rewrite `.name` on the shared
     // constructor and undo the earlier brand.
     if (branded.has(ctor.prototype)) { continue; }
@@ -26357,7 +26352,7 @@ const _chromeNavigatorTable = [
     try { delete globalThis[name]; } catch (_) { continue; }
     // A bare call in a strict page script can arrive with an undefined
     // receiver. The Window methods therefore target this realm explicitly,
-    // while DOM EventTargets continue using Node.prototype's receiver-aware
+    // while DOM EventTargets continue using EventTarget.prototype's receiver-aware
     // implementations.
     const method = name === 'addEventListener'
       ? function addEventListener(type, fn) { return _eventTargetAdd(globalThis, type, fn, arguments[2]); }
