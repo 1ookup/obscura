@@ -42,6 +42,12 @@ loads, confirming that this V8 revision uses generated fast paths for that case;
 the next implementation target is the corresponding AccessorAssembler
 load/store/has branches.
 
+The generated named-load experiment is in V8 commits `d8142db6`, `dd607575`,
+`af0ac565`, and `9fce662c`. Source build and release build succeed, but the
+ordinary-object smoke still produces zero records, so this path is not yet the
+active execution path for the tested scripts. It remains diagnostic work, not
+completed coverage.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
