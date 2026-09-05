@@ -536,11 +536,6 @@ fn worker_thread_main(
                 let _ = out_tx.send(error_entry(&format!("worker global setup failed: {e}")));
                 return;
             }
-            // Worker runtimes do not call ObscuraJsRuntime::run_page_init, so
-            // their suppression byte remains at the construction-time value
-            // until prep finishes. Author worker code must be observable by
-            // the native monitor just like page/frame scripts.
-            rt.set_trace_suppressed(false);
             // HTML "run a worker": the worker source executes exactly once.
             // Later messages only dispatch events (worker_event_loop below).
             let source_result = if kind == "module" {
@@ -898,13 +893,6 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // depend on a document or a viewport. `navigator.plugins` resolving inside
   // a worker cannot happen in a browser.
   // ---------------------------------------------------------------------
-  try {
-    if (typeof G.__obscura_enable_native_trace === 'function') {
-      G.__obscura_enable_native_trace();
-    } else {
-      _obscuraTraceRuntimeReady = true;
-    }
-  } catch (e) {}
   var WorkerNavigator = illegalConstructor('WorkerNavigator');
   defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
     value: 'WorkerNavigator', configurable: true,
@@ -1128,24 +1116,6 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         });
       nativeGetter(WorkerNavigator.prototype, 'storage', function () { return storageManager; });
     }
-    try {
-      // Use the op directly here. A worker prep script is a separate global
-      // script and some V8 revisions do not resolve bootstrap lexical helper
-      // bindings through that boundary, even though the op table is shared.
-      var traceObjectOp = Deno && Deno.core && Deno.core.ops
-        ? Deno.core.ops.op_trace_object : null;
-      var nativeWorkerNav = typeof traceObjectOp === 'function'
-        ? traceObjectOp('navigator') : null;
-      if (nativeWorkerNav && typeof nativeWorkerNav === 'object') {
-        Object.setPrototypeOf(nativeWorkerNav, Object.getPrototypeOf(workerNav));
-        var navKeys = Reflect.ownKeys(workerNav);
-        for (var nk = 0; nk < navKeys.length; nk++) {
-          var navDescriptor = Object.getOwnPropertyDescriptor(workerNav, navKeys[nk]);
-          if (navDescriptor) Object.defineProperty(nativeWorkerNav, navKeys[nk], navDescriptor);
-        }
-        workerNav = nativeWorkerNav;
-      }
-    } catch (e) {}
     defineProperty(G, 'navigator', {
       get: function () { return workerNav; },
       enumerable: true, configurable: true,

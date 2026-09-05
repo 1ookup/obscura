@@ -189,93 +189,10 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-// Native iv8 trace mode can ask Rust for an ObjectTemplate-backed object. The
-// fallback is deliberately lazy so snapshot creation and production runs keep
-// the original object allocation path.
-const _obscuraTraceNativeObjects = new WeakSet();
-let _obscuraTraceRuntimeReady = false;
-function _obscuraTraceObject(path, fallback) {
-  if (!_obscuraTraceRuntimeReady) return fallback();
-  try {
-    const op = Deno && Deno.core && Deno.core.ops && Deno.core.ops.op_trace_object;
-    if (typeof op === 'function') {
-      const object = op(path);
-      if (object && typeof object === 'object') {
-        _obscuraTraceNativeObjects.add(object);
-        return object;
-      }
-    }
-  } catch (_error) {}
-  return fallback();
-}
-
-function _obscuraAdoptTraceObject(path, source) {
-  if (!source || typeof source !== 'object') return source;
-  if (_obscuraTraceNativeObjects.has(source)) return source;
-  const native = _obscuraTraceObject(path, () => null);
-  if (!native || native === source) return source;
-  try { Object.setPrototypeOf(native, Object.getPrototypeOf(source)); } catch (_error) {}
-  try {
-    for (const key of Reflect.ownKeys(source)) {
-      const descriptor = Object.getOwnPropertyDescriptor(source, key);
-      if (descriptor) Object.defineProperty(native, key, descriptor);
-    }
-  } catch (_error) {}
-  return native;
-}
-
-function _obscuraAdoptTracePrototypes() {
-  const names = [
-    'EventTarget', 'Node', 'Element', 'HTMLElement', 'Document',
-    'DocumentFragment', 'Text', 'Comment', 'Screen', 'NetworkInformation',
-    'Location', 'Performance', 'Navigator',
-  ];
-  for (const name of Object.getOwnPropertyNames(globalThis)) {
-    if (_ecmaScriptGlobals.has(name) || name.startsWith('_')
-        || name.startsWith('__') || names.includes(name)) continue;
-    try {
-      if (typeof globalThis[name] === 'function'
-          && globalThis[name].prototype
-          && typeof globalThis[name].prototype === 'object') {
-        names.push(name);
-      }
-    } catch (_error) {}
-  }
-  const replacements = new Map();
-  const sources = new Map();
-  for (const name of names) {
-    const ctor = globalThis[name];
-    const source = ctor && ctor.prototype;
-    if (!source || typeof source !== 'object') continue;
-    sources.set(name, source);
-    const replacement = _obscuraAdoptTraceObject(name + '.prototype', source);
-    if (replacement !== source) {
-      try { ctor.prototype = replacement; } catch (_error) { continue; }
-      replacements.set(name, replacement);
-    }
-  }
-  // Reconnect the copied prototypes to copied parents after every constructor
-  // has been replaced. This preserves the WebIDL chain while adding a native
-  // prototype interceptor at each layer.
-  for (const [name, replacement] of replacements) {
-    const source = sources.get(name);
-    const parent = source && Object.getPrototypeOf(source);
-    for (const [parentName, parentSource] of sources) {
-      if (parent === parentSource && replacements.has(parentName)) {
-        try { Object.setPrototypeOf(replacement, replacements.get(parentName)); } catch (_error) {}
-        break;
-      }
-    }
-  }
-}
-
-// Worker prep runs as a separate script in the snapshot realm and cannot
-// reliably assign this lexical binding across script boundaries on every V8
-// revision. Keep one internal bridge for that prep phase; it is hidden with
-// the rest of __obscura_* internals before author page code runs.
-globalThis.__obscura_enable_native_trace = function() {
-  _obscuraTraceRuntimeReady = true;
-};
+// Browser objects are ordinary JS shims. Property tracing is implemented below
+// the page-visible object layer by the pinned V8 bytecode/runtime monitor.
+function _bootstrapObject(_label, fallback) { return fallback(); }
+function _identityObject(_label, source) { return source; }
 
 const _nativeRegistrySym = Symbol.for('obscura.nativeFunctionRegistry');
 const _nativeRegistry = Deno[_nativeRegistrySym] ||
@@ -1206,7 +1123,7 @@ function _newConsoleTask() {
   return task;
 }
 
-globalThis.console = _obscuraTraceObject('console', () => ({}));
+globalThis.console = _bootstrapObject('console', () => ({}));
 for (const name of _consoleMethodNames) {
   const length = name === 'context' ? 1 : 0;
   const implementation = name === 'context'
@@ -3114,22 +3031,6 @@ class Node extends EventTarget {
 
   constructor(nid) {
     super();
-    // In native iv8 trace mode Node instances are minted by a real V8
-    // ObjectTemplate carrying observe-then-passthrough named interceptors.
-    // The template object adopts this class's prototype, so all existing JS
-    // fields and WebIDL methods keep their ordinary semantics. Normal runs do
-    // not expose the op and stay on the original allocation path.
-    const native = _obscuraTraceRuntimeReady
-      && typeof Deno.core.ops.op_trace_object === 'function'
-      ? Deno.core.ops.op_trace_object('node') : undefined;
-    if (native && typeof native === 'object') {
-      // The base constructor's `this` already carries the derived class
-      // prototype. Reading it avoids relying on new.target propagation through
-      // the native op boundary on older V8 revisions.
-      try { Object.setPrototypeOf(native, Object.getPrototypeOf(this)); } catch (_error) {}
-      native[_nidSym] = nid;
-      return native;
-    }
     this[_nidSym] = nid;
   }
   get nodeType() { return +_dom("node_type", this[_nidSym]); }
@@ -9544,7 +9445,7 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _environmentSettings().url;
 }
-globalThis.location = _obscuraTraceObject('location', () => ({
+globalThis.location = _bootstrapObject('location', () => ({
   get href() { return __currentUrl(); },
   set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
@@ -9953,7 +9854,7 @@ function _permissionStatusName(name) {
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
-globalThis.navigator = _obscuraTraceObject('navigator', () => ({
+globalThis.navigator = _bootstrapObject('navigator', () => ({
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   // Legacy Navigator attributes every browser still reports verbatim. Their
@@ -9964,7 +9865,7 @@ globalThis.navigator = _obscuraTraceObject('navigator', () => ({
   doNotTrack: null,
   connection: new NetworkInformation(_networkInformationKey),
   pdfViewerEnabled: true,
-  userAgentData: _obscuraTraceObject('navigator.userAgentData', () => ({
+  userAgentData: _bootstrapObject('navigator.userAgentData', () => ({
     get mobile() { return !!_fingerprint().mobile; },
     get brands() { return _uaBrands(); },
     get platform() { return _fingerprint().uaPlatform || ""; },
@@ -9993,7 +9894,7 @@ globalThis.navigator = _obscuraTraceObject('navigator', () => ({
   })),
   // serviceWorker is an accessor on Navigator.prototype (see
   // _installServiceWorkerInterfaces); Chrome has no own property here.
-  mediaDevices: _obscuraTraceObject('navigator.mediaDevices', () => ({
+  mediaDevices: _bootstrapObject('navigator.mediaDevices', () => ({
     enumerateDevices() {
       return Promise.resolve([
         {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
@@ -10006,8 +9907,8 @@ globalThis.navigator = _obscuraTraceObject('navigator', () => ({
     getDisplayMedia() { return Promise.reject(new DOMException("Permission denied", "NotAllowedError")); },
     addEventListener(){}, removeEventListener(){},
   })),
-  clipboard: _obscuraTraceObject('navigator.clipboard', () => ({ writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} })),
-  permissions: _obscuraTraceObject('navigator.permissions', () => ({ query(params){
+  clipboard: _bootstrapObject('navigator.clipboard', () => ({ writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} })),
+  permissions: _bootstrapObject('navigator.permissions', () => ({ query(params){
     var n = params && params.name;
     return Promise.resolve({state: _permissionState(n), onchange: null});
   } })),
@@ -10015,7 +9916,7 @@ globalThis.navigator = _obscuraTraceObject('navigator', () => ({
   getGamepads() { return [null, null, null, null]; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
-  geolocation: _obscuraTraceObject('navigator.geolocation', () => ({
+  geolocation: _bootstrapObject('navigator.geolocation', () => ({
     getCurrentPosition(success, error) {
       const coords = {
         latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
@@ -10046,7 +9947,7 @@ globalThis.navigator = _obscuraTraceObject('navigator', () => ({
     },
     clearWatch() {},
   })),
-  storage: _obscuraTraceObject('navigator.storage', () => ({
+  storage: _bootstrapObject('navigator.storage', () => ({
     estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
@@ -11018,7 +10919,7 @@ globalThis.__obscura_apply_fingerprint = function() {
   const scale = Number(fallback.deviceScaleFactor);
   if (Number.isFinite(scale) && scale > 0) globalThis.devicePixelRatio = scale;
 };
-globalThis.visualViewport = _obscuraTraceObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
+globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
 globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
@@ -23320,10 +23221,7 @@ globalThis.__obscura_init = function() {
   _installWasmStreamingFallback();
   _installDocumentAll();
   // Browser objects stay on the ordinary shim path. Native property tracing is
-  // provided by the pinned V8 IC/runtime hooks; allocating ObjectTemplate
-  // carriers here would replace page-visible objects and make tracing
-  // observable to anti-tamper scripts.
-  _obscuraTraceRuntimeReady = false;
+  // provided by the pinned V8 IC/runtime hooks.
 
   // Frame wrappers belong to the replaced document; the Rust loader creates
   // fresh content roots for the new page.
@@ -23437,7 +23335,7 @@ globalThis.__obscura_init = function() {
     hasScreenOverride ? undefined : Number(fingerprintScreen.availTop),
     hasScreenOverride ? undefined : Number(fingerprintScreen.availLeft),
   );
-  globalThis.visualViewport = _obscuraTraceObject('visualViewport', () => ({ width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
+  globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -23568,10 +23466,10 @@ globalThis.__obscura_init = function() {
   globalThis.performance.timeOrigin = t0;
   globalThis.__obscura_rebasePerformanceOrigin?.(t0);
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
-  globalThis.performance.timing = _obscuraAdoptTraceObject(
+  globalThis.performance.timing = _identityObject(
     'performance.timing', globalThis.performance.timing);
   if (globalThis.performance.navigation) {
-    globalThis.performance.navigation = _obscuraAdoptTraceObject(
+    globalThis.performance.navigation = _identityObject(
       'performance.navigation', globalThis.performance.navigation);
   }
   // The startup snapshot was created before runtime ops existed, so its
@@ -23587,7 +23485,7 @@ globalThis.__obscura_init = function() {
     ]) {
       if (nav && nav[childName] && typeof nav[childName] === 'object') {
         const source = nav[childName];
-        const adopted = _obscuraAdoptTraceObject(
+        const adopted = _identityObject(
           'navigator.' + childName, source);
         if (adopted !== source) {
           const holder = navProto && Object.getOwnPropertyDescriptor(navProto, childName)
@@ -23611,9 +23509,9 @@ globalThis.__obscura_init = function() {
         }
       }
     }
-    globalThis.navigator = _obscuraAdoptTraceObject('navigator', nav);
-    globalThis.console = _obscuraAdoptTraceObject('console', globalThis.console);
-    globalThis.visualViewport = _obscuraAdoptTraceObject(
+    globalThis.navigator = _identityObject('navigator', nav);
+    globalThis.console = _identityObject('console', globalThis.console);
+    globalThis.visualViewport = _identityObject(
       'visualViewport', globalThis.visualViewport);
     // The remaining BOM surfaces are initialized by the startup snapshot
     // before runtime ops exist, so adopt them after page state is available.
@@ -23621,14 +23519,14 @@ globalThis.__obscura_init = function() {
     // writable global property; update that binding to preserve
     // `window.location` identity and navigation setters.
     const locationSource = globalThis.location;
-    const locationNative = _obscuraAdoptTraceObject('location', locationSource);
+    const locationNative = _identityObject('location', locationSource);
     if (locationNative && locationNative !== locationSource) _locationObj = locationNative;
     for (const name of [
       'screen', 'history', 'performance', 'crypto',
       'localStorage', 'sessionStorage', 'caches',
     ]) {
       const source = globalThis[name];
-      const adopted = _obscuraAdoptTraceObject(name, source);
+      const adopted = _identityObject(name, source);
       if (adopted && adopted !== source) {
         try { globalThis[name] = adopted; } catch (_error) {}
       }
@@ -23663,7 +23561,6 @@ globalThis.__obscura_init = function() {
   // only place the initial window[i] set gets built. It runs last: the
   // document nid this realm binds to is set further up in this function.
   try { _syncWindowFrameIndices(); } catch(e) {}
-  _obscuraTraceRuntimeReady = false;
   delete globalThis.__obscura_init;
 };
 

@@ -1655,9 +1655,6 @@ impl ObscuraJsRuntime {
         source: &str,
         line: u64,
     ) -> Result<serde_json::Value, String> {
-        let _trace_guard = self.trace_suppression_guard(
-            name.starts_with('<') && name != "<eval>",
-        );
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let context = v8::Local::new(scope, context);
         let scope = &mut v8::ContextScope::new(scope, context);

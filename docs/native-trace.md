@@ -9,14 +9,14 @@ filenames containing spaces. This requires a source-built binary.
 
 The active path does not install ObjectTemplate descriptor trampolines or JS
 Proxy wrappers. It does not replace page-visible methods or descriptors. The
-old Rust descriptor-monitor code remains dormant; its install calls have been
-removed. Its ignore/watch/devtools CLI options now fail explicitly instead of
-silently doing nothing. Their environment equivalents are not implemented by
-the V8 monitor either.
+old Rust descriptor-monitor implementation has been deleted. Its
+ignore/watch/devtools CLI options now fail explicitly instead of silently doing
+nothing. Their environment equivalents are not implemented by the V8 monitor.
 
 The implementation is edited directly in `vendor/rusty_v8/v8`, a nested Git
 repository. There is no build-time V8 trace patch script:
-The bytecode migration is committed in that checkout as `59ee73ae`.
+The bytecode migration is committed in that checkout as `59ee73ae`. The outer
+cleanup is committed as `336a7b8`.
 
 | V8 source | Responsibility |
 | --- | --- |

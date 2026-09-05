@@ -14,7 +14,7 @@ capabilities. It targets web scraping and AI-agent automation.
 
 Native property tracing is implemented directly in the pinned vendored V8
 bytecode builder/runtime. The previous Rust/V8 descriptor-trampoline monitor
-is no longer installed. `--trace-api-file` requires the source build selected
+has been removed. `--trace-api-file` requires the source build selected
 by `--config vendor/v8-source.toml`; a stock prebuilt V8 cannot provide these
 probes. Host-op and console tracing (`--trace-op-file`) is independent. See
 `docs/native-trace.md` for exact coverage and remaining call-trace limitations.
