@@ -6881,7 +6881,7 @@ pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
-        global_template_middleware: Some(crate::trace::NativeTraceState::global_template_middleware),
+        global_template_middleware: None,
         ..Default::default()
     }
 }

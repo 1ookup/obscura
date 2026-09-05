@@ -23319,15 +23319,11 @@ globalThis.__obscura_init = function() {
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
   _installDocumentAll();
-  // Enable native carrier allocation before the document wrapper is minted.
-  // In normal builds op_trace_object returns undefined, so this flag is a
-  // no-op; traced realms need the document itself (not only its methods) to
-  // observe missing DOM properties.
-  _obscuraTraceRuntimeReady = true;
-  // Prototype carriers are kept ordinary for now: replacing a class prototype
-  // changes private-brand checks in the existing JS WebIDL shim. Instance
-  // carriers still provide all named interception; their miss path emits the
-  // equivalent interface prototype records without changing class identity.
+  // Browser objects stay on the ordinary shim path. Native property tracing is
+  // provided by the pinned V8 IC/runtime hooks; allocating ObjectTemplate
+  // carriers here would replace page-visible objects and make tracing
+  // observable to anti-tamper scripts.
+  _obscuraTraceRuntimeReady = false;
 
   // Frame wrappers belong to the replaced document; the Rust loader creates
   // fresh content roots for the new page.
@@ -23667,7 +23663,7 @@ globalThis.__obscura_init = function() {
   // only place the initial window[i] set gets built. It runs last: the
   // document nid this realm binds to is set further up in this function.
   try { _syncWindowFrameIndices(); } catch(e) {}
-  _obscuraTraceRuntimeReady = true;
+  _obscuraTraceRuntimeReady = false;
   delete globalThis.__obscura_init;
 };
 

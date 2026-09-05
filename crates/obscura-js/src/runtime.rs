@@ -1626,7 +1626,6 @@ impl ObscuraJsRuntime {
             "globalThis.__obscura_init();".to_string(),
         );
         self.set_trace_suppressed(false);
-        self.install_native_trace_current_context();
     }
 
     /// Install native iv8 call trampolines on the current (main) context. The

@@ -541,7 +541,6 @@ fn worker_thread_main(
             // until prep finishes. Author worker code must be observable by
             // the native monitor just like page/frame scripts.
             rt.set_trace_suppressed(false);
-            rt.install_native_trace_current_context();
             // HTML "run a worker": the worker source executes exactly once.
             // Later messages only dispatch events (worker_event_loop below).
             let source_result = if kind == "module" {
