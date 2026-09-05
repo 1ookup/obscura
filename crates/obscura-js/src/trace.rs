@@ -1058,7 +1058,13 @@ impl NativeTraceState {
         if let Some(proto) = global.get_prototype(scope).and_then(|value| value.to_object(scope)) {
             self.visit_prototype(scope, proto, "Window");
         }
-        self.install_reflection(scope, global);
+        // Replacing ECMAScript builtins (Object/Reflect/JSON) is observable by
+        // anti-tamper scripts and can change the challenge's early bootstrap
+        // path. Keep browser API tracing side-effect free by making reflection
+        // wrapping an explicit diagnostic opt-in.
+        if std::env::var_os("OBSCURA_TRACE_REFLECTION").is_some() {
+            self.install_reflection(scope, global);
+        }
     }
 
     fn install_reflection<'s>(
