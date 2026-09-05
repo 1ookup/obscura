@@ -11,6 +11,12 @@ BOM/DOM/WebIDL objects across the main realm and frame realms. Prototype misses
 are reported separately so a missing method can be distinguished from an
 ordinary undefined value.
 
+The descriptor-trampoline implementation is a diagnostic plane. Anti-tamper
+pages can observe replaced function identity even when `Function.prototype.toString`
+is masked; in that case enabling API trace may change early page execution. Use
+host-op/console tracing for payload capture until transparent V8 IC
+instrumentation replaces this path.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
