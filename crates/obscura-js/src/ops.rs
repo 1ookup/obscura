@@ -2875,17 +2875,6 @@ fn op_run_classic_script<'a>(
     let thrown = {
         let context_scope = &mut v8::ContextScope::new(scope, context);
         let tc = &mut v8::TryCatch::new(context_scope);
-        // Deno is an embedder implementation detail.  Author and challenge
-        // scripts execute through this boundary, so expose the browser view
-        // of the global while they run, then restore the binding for the
-        // engine's own bootstrap/op plumbing.
-        let deno_key = v8::String::new(tc, "Deno");
-        let deno_value = deno_key.and_then(|key| tc.get_current_context().global(tc).get(tc, key.into()));
-        if let Some(key) = deno_key {
-            let undefined = v8::undefined(tc);
-            let global = tc.get_current_context().global(tc);
-            let _ = global.set(tc, key.into(), undefined.into());
-        }
         let compiled = v8::String::new(tc, source)
             .zip(v8::String::new(tc, url))
             .and_then(|(body, name)| {
@@ -2908,9 +2897,6 @@ fn op_run_classic_script<'a>(
             script.run(tc);
         }
         let caught = tc.exception().map(|thrown| v8::Global::new(tc, thrown));
-        if let (Some(key), Some(value)) = (deno_key, deno_value) {
-            let _ = tc.get_current_context().global(tc).set(tc, key.into(), value);
-        }
         // Leaving the TryCatch armed would rethrow on scope exit and bypass the
         // JS-side reporting.
         tc.reset();
