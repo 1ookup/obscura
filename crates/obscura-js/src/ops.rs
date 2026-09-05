@@ -4110,11 +4110,13 @@ async fn stealth_fetch_all(
         }
 
         tracing::debug!(
-            "stealth_fetch request: {} {} origin={:?} referer={:?}",
+            "stealth_fetch request: {} {} origin={:?} referer={:?} referrer_source={:?} policy={}",
             current_method,
             current_url,
             req_headers.get("origin"),
             req_headers.get("referer"),
+            if referrer_url.is_empty() { None } else { Some(referrer_url.as_str()) },
+            referrer_policy.as_str(),
         );
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
