@@ -592,9 +592,24 @@ pub fn referrer_value(
     target: &Url,
     policy: ReferrerPolicy,
 ) -> Option<String> {
-    if !matches!(source.scheme(), "http" | "https")
-        || !matches!(target.scheme(), "http" | "https")
-    {
+    if !matches!(target.scheme(), "http" | "https") {
+        return None;
+    }
+    // Blob documents inherit the origin of their creator. Fetch uses that
+    // creator URL for referrer policy calculations rather than treating the
+    // opaque `blob:` URL as a non-network source.
+    let blob_source;
+    let source = if source.scheme() == "blob" {
+        let creator = source
+            .as_str()
+            .strip_prefix("blob:")
+            .or_else(|| Some(source.path()))?;
+        blob_source = Url::parse(creator).ok()?;
+        &blob_source
+    } else {
+        source
+    };
+    if !matches!(source.scheme(), "http" | "https") {
         return None;
     }
     let same_origin = source.origin() == target.origin();
@@ -2244,6 +2259,17 @@ mod ssrf_tests {
         assert_eq!(
             referrer_value(&source, &cross, ReferrerPolicy::UnsafeUrl).as_deref(),
             Some(expected_full)
+        );
+    }
+
+    #[test]
+    fn blob_referrer_uses_creator_origin() {
+        let blob = Url::parse("blob:https://challenges.cloudflare.com/uuid").unwrap();
+        let target = Url::parse("https://brunhild.challenges.cloudflare.com/cdn-cgi/i").unwrap();
+        assert_eq!(
+            referrer_value(&blob, &target, ReferrerPolicy::StrictOriginWhenCrossOrigin)
+                .as_deref(),
+            Some("https://challenges.cloudflare.com/")
         );
     }
 
