@@ -1075,11 +1075,6 @@ impl NativeTraceState {
         let Some(json) = global_value_object(scope, global, "JSON") else {
             return;
         };
-        let array_proto = global_value_object(scope, global, "Array")
-            .and_then(|constructor| {
-                let key = v8::String::new(scope, "prototype")?;
-                constructor.get(scope, key.into())?.to_object(scope)
-            });
         let object_proto = v8::String::new(scope, "prototype")
             .and_then(|key| object_ctor.get(scope, key.into()))
             .and_then(|value| value.to_object(scope));
@@ -1189,28 +1184,6 @@ impl NativeTraceState {
                 "String.prototype.search".to_string(),
                 ReflectionKind::StringSearch,
             );
-        }
-        if let Some(array_proto) = array_proto {
-            for name in [
-                "at", "concat", "copyWithin", "entries", "every", "fill", "filter",
-                "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
-                "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf", "map",
-                "pop", "push", "reduce", "reduceRight", "reverse", "shift", "slice",
-                "some", "sort", "splice", "toReversed", "toSorted", "toSpliced", "unshift",
-                "values",
-            ] {
-                let Some(key) = v8::String::new(scope, name) else { continue };
-                let Some(value) = array_proto.get(scope, key.into()) else { continue };
-                if value.is_function() {
-                    self.wrap_data_function(
-                        scope,
-                        array_proto,
-                        name,
-                        value,
-                        format!("Array.prototype.{name}"),
-                    );
-                }
-            }
         }
         if let Some(function_proto) = function_proto {
             self.wrap_reflection_method(
