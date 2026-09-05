@@ -2929,7 +2929,6 @@ impl ObscuraJsRuntime {
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let hide_deno = !name.starts_with('<');
         let scope = &mut self.runtime.handle_scope();
         let source = deno_core::v8::String::new(scope, source)
             .ok_or_else(|| "JS error: source allocation failed".to_string())?;
@@ -2949,55 +2948,34 @@ impl ObscuraJsRuntime {
             None,
         );
         let scope = &mut deno_core::v8::TryCatch::new(scope);
-        let deno_key = deno_core::v8::String::new(scope, "Deno");
-        let deno_value = deno_key
-            .and_then(|key| scope.get_current_context().global(scope).get(scope, key.into()));
-        if hide_deno {
-            if let Some(key) = deno_key {
-                let undefined = deno_core::v8::undefined(scope);
-                let global = scope.get_current_context().global(scope);
-                let _ = global.set(scope, key.into(), undefined.into());
-            }
-        }
         let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
-        let result = if let Some(script) = script {
-            if script.run(scope).is_none() {
-                if scope.is_execution_terminating() {
-                    scope.cancel_terminate_execution();
-                    Err("JS error: Uncaught Error: execution terminated".to_string())
-                } else {
-                    match scope.exception() {
-                        Some(exception) => {
-                            let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                            Err(format!("JS error: {error}"))
-                        }
-                        None => Err("JS error: script execution failed without an exception".to_string()),
-                    }
-                }
-            } else {
-                Ok(())
-            }
-        } else {
+        let Some(script) = script else {
             if scope.is_execution_terminating() {
                 scope.cancel_terminate_execution();
-                Err("JS error: Uncaught Error: execution terminated".to_string())
-            } else {
-                match scope.exception() {
-                    Some(exception) => {
-                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
-                    }
-                    None => Err("JS error: script compilation failed without an exception".to_string()),
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            return match scope.exception() {
+                Some(exception) => {
+                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                    Err(format!("JS error: {error}"))
                 }
-            }
+                None => Err("JS error: script compilation failed without an exception".to_string()),
+            };
         };
-        if hide_deno {
-            if let (Some(key), Some(value)) = (deno_key, deno_value) {
-                let global = scope.get_current_context().global(scope);
-                let _ = global.set(scope, key.into(), value);
+        if script.run(scope).is_none() {
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
             }
+            return match scope.exception() {
+                Some(exception) => {
+                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                    Err(format!("JS error: {error}"))
+                }
+                None => Err("JS error: script execution failed without an exception".to_string()),
+            };
         }
-        result
+        Ok(())
     }
 
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
