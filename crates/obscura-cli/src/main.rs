@@ -436,7 +436,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let inherited_v8_flags = std::env::var("OBSCURA_V8_FLAGS").ok();
-    let v8_flags = resolve_v8_flags(args.v8_flags.as_deref(), inherited_v8_flags.as_deref());
+    let mut v8_flags = resolve_v8_flags(args.v8_flags.as_deref(), inherited_v8_flags.as_deref());
+    if let Some(path) = args.trace_api_file.as_ref() {
+        // Enable the pinned V8 IC/runtime monitor before the first isolate.
+        // Unlike descriptor trampolines, this does not replace page-visible
+        // functions or mutate browser objects.
+        v8_flags.push_str(" --trace-property-lookup --no-lazy-feedback-allocation --trace-property-lookup-file=");
+        v8_flags.push_str(&path.to_string_lossy());
+    }
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
     if let Some(path) = args.trace_op_file.as_ref() {
