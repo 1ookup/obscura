@@ -1154,7 +1154,8 @@ async fn process_with_interception(
         }
     };
 
-    tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
+    let nav_url = req.params.get("url").and_then(|value| value.as_str()).unwrap_or("");
+    tracing::info!("INTERCEPTION navigate: {} (id={}, url={})", req.method, req.id, nav_url);
 
     let session_id = &req.session_id;
     let page_id = session_id
