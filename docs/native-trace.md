@@ -36,6 +36,12 @@ Runtime miss probes were added in V8 commit `dc297593`, with a compile fix in
 `AccessorAssembler` fast/generic paths can bypass them; full named/keyed hit
 coverage remains a follow-up.
 
+The subsequent `a9022ec5` commit adds probes to the no-feedback and keyed-has
+runtime fallbacks. A smoke page still showed no records for ordinary object
+loads, confirming that this V8 revision uses generated fast paths for that case;
+the next implementation target is the corresponding AccessorAssembler
+load/store/has branches.
+
 The monitor is installed through V8 `ObjectTemplate` handlers and native
 callback trampolines. It does not use JavaScript `Proxy` or historical V8 trace
 flags. `--trace-api-ignore` filters exact paths. `--trace-api-watch` plus
