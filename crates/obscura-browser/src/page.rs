@@ -5985,10 +5985,6 @@ impl Page {
                 .map(|(url, _)| url.clone())
         });
         let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
-        let allow_cross_origin_isolated = request
-            .allow
-            .as_deref()
-            .is_some_and(iframe_allows_cross_origin_isolated);
         let ancestors = self.frame_ancestor_chain(frame_id);
 
         // Resolve the document: URL, origin, and HTML body.
@@ -6283,7 +6279,14 @@ impl Page {
                         &response_origin,
                         &parent_origin,
                         parent_cross_origin_isolated,
-                        allow_cross_origin_isolated,
+                        request.allow.as_deref().is_some_and(|allow| {
+                            iframe_allow_applies_to_origin(
+                                allow,
+                                &response_origin,
+                                &parent_origin,
+                                parent_permissions_policy.as_deref(),
+                            )
+                        }),
                         sandbox,
                     );
                     let last_modified = response.header("last-modified").map(str::to_string);
@@ -8357,17 +8360,28 @@ mod tests {
         assert!(frame_response_grants_cross_origin_isolation(
             &response, &widget, &widget, true,
         ));
-        assert!(super::iframe_allows_cross_origin_isolated(
-            "cross-origin-isolated; fullscreen; autoplay"
-        ));
         assert!(super::frame_document_isolation(
             &response, &widget, &page, true, true, obscura_dom::SandboxFlags::default(),
         ));
         assert!(!super::frame_document_isolation(
             &response, &widget, &page, true, false, obscura_dom::SandboxFlags::default(),
         ));
-        assert!(!super::iframe_allows_cross_origin_isolated("fullscreen; autoplay"));
-        assert!(!super::iframe_allows_cross_origin_isolated("cross-origin-isolated-extra"));
+        assert!(super::iframe_allow_applies_to_origin(
+            "cross-origin-isolated https://widget.example",
+            &widget, &page, None,
+        ));
+        assert!(!super::iframe_allow_applies_to_origin(
+            "cross-origin-isolated https://other.example",
+            &widget, &page, None,
+        ));
+        assert!(!super::iframe_allow_applies_to_origin(
+            "cross-origin-isolated 'self'",
+            &widget, &page, None,
+        ));
+        assert!(!super::iframe_allow_applies_to_origin(
+            "cross-origin-isolated",
+            &widget, &page, Some("cross-origin-isolated=()"),
+        ));
     }
 
     #[test]
@@ -12410,12 +12424,45 @@ fn frame_response_grants_cross_origin_isolation(
         && response_grants_cross_origin_isolation(response)
 }
 
-fn iframe_allows_cross_origin_isolated(value: &str) -> bool {
+fn iframe_allow_applies_to_origin(
+    value: &str,
+    child_origin: &obscura_dom::Origin,
+    parent_origin: &obscura_dom::Origin,
+    parent_permissions_policy: Option<&str>,
+) -> bool {
+    if parent_permissions_policy.is_some_and(|policy| {
+        policy.split(',').any(|entry| {
+            let mut parts = entry.splitn(2, '=');
+            parts.next().map(str::trim).is_some_and(|name| {
+                name.eq_ignore_ascii_case("cross-origin-isolated")
+                    && parts.next().is_some_and(|value| value.trim() == "()")
+            })
+        })
+    }) {
+        return false;
+    }
     value.split(';').any(|directive| {
-        directive
-            .split_whitespace()
+        let mut tokens = directive.split_whitespace();
+        if !tokens
             .next()
             .is_some_and(|feature| feature.eq_ignore_ascii_case("cross-origin-isolated"))
+        {
+            return false;
+        }
+        let origins = tokens.collect::<Vec<_>>();
+        if origins.is_empty() {
+            // A bare iframe allow directive delegates to the frame's src origin.
+            return true;
+        }
+        origins.iter().any(|token| match token.to_ascii_lowercase().as_str() {
+            "*" | "'src'" => true,
+            "'self'" => child_origin == parent_origin,
+            "'none'" => false,
+            value => url::Url::parse(value)
+                .ok()
+                .map(|url| obscura_dom::Origin::from_url(url.as_str()) == *child_origin)
+                .unwrap_or(false),
+        })
     })
 }
 

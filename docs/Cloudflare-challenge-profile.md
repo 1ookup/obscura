@@ -7950,7 +7950,7 @@ UA 和 UA-CH；Obscura 代码均有对应生成逻辑。可控 Chrome 仍报告�
 **结论**：本轮没有新的通用 header 修复，也没有修改 V8 trace；direct op 的请求是否完成仍以
 Rust host-op 日志为准，页面 payload 仅作为结果证据。
 
-### Step 233 - iframe allow="cross-origin-isolated"（2026-09-06，修复中）
+### Step 233 - iframe allow="cross-origin-isolated"（2026-09-06，代码完成）
 
 **假设**：Chrome Turnstile iframe 宿主声明 `allow="cross-origin-isolated; ..."`，Obscura 未保存
 `iframe[allow]`，导致 child 即使自身 COOP/COEP/CORP 完整也读作 `crossOriginIsolated=false`。
@@ -7964,3 +7964,13 @@ Rust host-op 日志为准，页面 payload 仅作为结果证据。
 release 和 `vendor/v8-trace.sh check` 通过。指定代理真实点击轮中，frame payload 的
 `crossOriginIsolated`/`SharedArrayBuffer` 差异消失，枚举路径由 1646 增至 1647；proof `/fo`
 返回 200，页面保持等待 Brunhild。目标仍未返回 404，修复提交为 `31f82fc`。
+
+### Step 234 - iframe allow origin-list 解析（2026-09-06，代码完成）
+
+`iframe[allow]` 不应只按 feature 名称判断；现在支持裸 token（src origin）、`*`、`'src'`、
+`'self'`、显式 URL origin，并在父 Permissions-Policy 明确为 `cross-origin-isolated=()` 时拒绝。
+无 allow 的跨源 frame 仍不能启用 isolation。focused、完整 workspace `1755/1755`、release 和
+trace check 通过；真实 payload 保持 isolation 对齐，目标仍 403 challenge。
+
+最终 obstacle course 仍为 `31/33`，失败项是既有 fixture 的 IntersectionObserver `io:50` 期望和
+Win32 平台固定期望，两项在旧二进制和 Chrome oracle 中同样失败。
