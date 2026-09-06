@@ -708,8 +708,7 @@ async function __processDynScriptQueue() {
 function _resolveResourceUrl(src) {
   let baseHref = null;
   try {
-    const baseEl = globalThis.document?.querySelector('base[href]');
-    baseHref = baseEl ? baseEl.getAttribute('href') : null;
+    baseHref = _internalBaseHref(globalThis.document);
   } catch(e) { baseHref = null; }
   const docUrl = globalThis.location?.href || 'http://localhost/';
   let baseUrl;
@@ -2848,8 +2847,7 @@ function __prepareInsertedScript(script) {
   if (src) {
     let baseHref;
     try {
-      const baseEl = globalThis.document?.querySelector('base[href]');
-      baseHref = baseEl ? baseEl.getAttribute('href') : null;
+      baseHref = _internalBaseHref(globalThis.document);
     } catch(e) { baseHref = null; }
     const docUrl = globalThis.location?.href || 'http://localhost/';
     let baseUrl;
@@ -3071,9 +3069,8 @@ class Node extends EventTarget {
       // iframe content documents.
       const doc = (_iframeContentDocsSeen && this.ownerDocument) || globalThis.document;
       const docUrl = (doc && doc.URL) || "";
-      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
-      if (baseEl) {
-        const href = baseEl.getAttribute("href");
+      const href = _internalBaseHref(doc);
+      if (href) {
         if (href) {
           const resolved = docUrl ? new URL(href, docUrl).href : href;
           if (_cspBaseUriAllows(resolved)) return resolved;
@@ -9440,6 +9437,18 @@ function _environmentSettings() {
   const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
   return { root: 0, url, baseUrl, cookieUrl: url, origin };
 }
+// Internal base lookup used by the engine's own URL resolution. Calling the
+// author-facing querySelector here leaks an implementation detail into the
+// challenge's selector telemetry (Chrome resolves this natively).
+function _internalBaseHref(doc) {
+  try {
+    if (!doc || !doc[_nidSym]) return null;
+    const nid = Number(_dom("query_selector_scoped", doc[_nidSym], "base[href]"));
+    if (!Number.isFinite(nid) || nid < 0) return null;
+    return _dom("get_attribute", nid, "href") || null;
+  } catch (_) { return null; }
+}
+
 function _resolveUrl(url) {
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
