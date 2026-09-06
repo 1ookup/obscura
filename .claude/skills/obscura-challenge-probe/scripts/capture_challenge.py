@@ -33,7 +33,9 @@ except ImportError:
 PRELOAD = r"""
 (function () {
   if (globalThis.__capHooked) return;
-  globalThis.__capHooked = 1;
+  Object.defineProperty(globalThis, '__capHooked', {
+    value: 1, writable: true, configurable: true, enumerable: false,
+  });
   var cap = [];
   window.__cap = cap;
   var t0 = Date.now();
