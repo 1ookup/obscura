@@ -15877,7 +15877,10 @@ globalThis.Crypto = class Crypto {
     return s;
   }
 };
-globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
+function registerCryptoSurface() {
+  globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
+}
+registerCryptoSurface();
 // Real structured clone (not JSON). JSON.parse(JSON.stringify) silently drops
 // ArrayBuffer/TypedArray (they serialize to {}), so browser verification
 // orchestrate loses every byte it tries to round-trip through postMessage and
