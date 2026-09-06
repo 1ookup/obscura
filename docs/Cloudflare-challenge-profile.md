@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-06，step 223，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-06，step 229，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
@@ -7839,7 +7839,7 @@ focused 13/13；首次 workspace 1751/1752（MCP selector 等待超时），该�
 失败为observer-intersection（期望io:50，实际空）和fingerprint（硬编码Win32，实际MacIntel）；两项均
 在保留的修复前二进制复现，属于已有门禁缺口，本轮不报告33/33。
 
-**下一步**：Chrome本地oracle确认Document.prototype.adoptedStyleSheets的enumerable/configurable均为
+**下一步**：继续对拍 direct op 的请求头、取消时序和 frame isolation；Chrome本地oracle确认Document.prototype.adoptedStyleSheets的enumerable/configurable均为
 true，Obscura均为false，可解释直接读取成功但payload枚举缺失。该独立修复尚未实施。
 
 ### Step 223 - Document.adoptedStyleSheets枚举描述符（2026-09-06，代码完成）
@@ -7898,6 +7898,12 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 **网络 A/B**：同代理直接请求本轮 Brunhild URL 返回 `HTTP/2 502`（mitmproxy）；存档的 Chrome
 headful click HAR 曾对 Brunhild 请求收到 `204`。这解释了当前 Chrome/Obscura 都无法完成 proof
 路由的外部差异，不能通过 Obscura hostname 特判、伪造响应或修改 clearance 判据解决。
+
+**Frame isolation 复核**：真实 Chrome Turnstile frame 自身带 COOP/COEP/CORP，读取为
+`crossOriginIsolated=true`、`SharedArrayBuffer=function`；Obscura frame 为 `false/undefined`。
+本地 HTTPS 跨站 fixture 中 top/child 同样带 COOP/COEP/CORP，Chrome child 仍为
+`false/undefined`，因此目前证据矛盾，不能放宽 `frame_response_grants_cross_origin_isolation` 的
+同源条件。该差异留待更完整的跨站响应策略 oracle。
 
 **frame isolation oracle**：真实 Chrome Turnstile frame（自身 COOP/COEP/CORP）读取为
 `crossOriginIsolated=true`、`SharedArrayBuffer=function`，Obscura frame 为 `false/undefined`。
