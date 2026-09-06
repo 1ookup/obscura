@@ -7959,3 +7959,8 @@ Rust host-op 日志为准，页面 payload 仅作为结果证据。
 授予 COOP/COEP、allow 属性明确委托且 sandbox 允许同源时启用 child isolation；没有 allow 的
 跨源 frame 保持原规则。新增 helper/回归覆盖 allow token 与非匹配 token，focused 通过。
 代码待完整门禁和真实 payload 验证。
+
+**验证**：browser focused helper/分支通过；完整 workspace `1755/1755 passed, 4 skipped`，
+release 和 `vendor/v8-trace.sh check` 通过。指定代理真实点击轮中，frame payload 的
+`crossOriginIsolated`/`SharedArrayBuffer` 差异消失，枚举路径由 1646 增至 1647；proof `/fo`
+返回 200，页面保持等待 Brunhild。目标仍未返回 404，修复提交为 `31f82fc`。
