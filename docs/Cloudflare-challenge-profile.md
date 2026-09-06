@@ -7899,6 +7899,13 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 headful click HAR 曾对 Brunhild 请求收到 `204`。这解释了当前 Chrome/Obscura 都无法完成 proof
 路由的外部差异，不能通过 Obscura hostname 特判、伪造响应或修改 clearance 判据解决。
 
+**frame isolation oracle**：真实 Chrome Turnstile frame（自身 COOP/COEP/CORP）读取为
+`crossOriginIsolated=true`、`SharedArrayBuffer=function`，Obscura frame 为 `false/undefined`。
+但本地 HTTPS 双端口 fixture 中 top/child 均带 COOP+COEP（child 另带 CORP）时 Chrome child 仍为
+`false/undefined`；因此不能仅凭 Cloudflare frame 的单一结果放宽现有
+`frame_response_grants_cross_origin_isolation` 同源条件。需下一轮用跨站 HTTPS fixture/完整响应策略
+继续归因，当前不改 isolation 规则。
+
 **后续 oracle**：固定本地延迟响应服务器配合 `AbortController` 证明 Obscura 原先完全忽略 fetch
 的 `signal`，请求在 30ms abort 后仍等到响应；Chrome 在相同输入立即拒绝 `AbortError`。
 现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
