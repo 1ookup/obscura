@@ -9066,10 +9066,6 @@ function _frameWindowProxyFor(hostEl) {
       return frameLocation;
     },
     set location(v) { navigate(v); },
-    get frameElement() {
-      if (!sameOrigin()) throw securityError();
-      return hostEl;
-    },
     get name() {
       if (!sameOrigin()) throw securityError();
       return hostEl.getAttribute("name") || "";
@@ -9077,8 +9073,6 @@ function _frameWindowProxyFor(hostEl) {
     // Single-realm: the top and (for frames embedded by the top document)
     // parent window are the main global. The full ancestor WindowProxy chain
     // for nested frames arrives with per-frame realms (Phase 3.7).
-    get top() { return globalThis; },
-    get parent() { return globalThis; },
     get length() {
       const root = contentRoot();
       if (root < 0) return 0;
@@ -9105,7 +9099,12 @@ function _frameWindowProxyFor(hostEl) {
   _markNative(target.blur);
   _markNative(target.focus);
   _markNative(target.close);
-  Object.defineProperty(target, "frames", { get: () => proxy, configurable: true });
+  Object.defineProperties(target, {
+    frames: { get: () => proxy, configurable: true },
+    top: { get: () => globalThis, configurable: true },
+    parent: { get: () => globalThis, configurable: true },
+    frameElement: { get: () => { if (!sameOrigin()) throw securityError(); return hostEl; }, configurable: true },
+  });
   Object.defineProperty(target, "globalThis", { get: () => proxy, configurable: true });
 
   const proxy = new Proxy(target, {
