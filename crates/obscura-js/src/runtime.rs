@@ -7569,6 +7569,25 @@ a timer firing *early* is as wrong as one firing late",
             serde_json::json!(["AbortError", "DOMException", "This operation was aborted"]));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_timeout_aborts_its_underlying_fetch() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        rt.execute_script(
+            "xhr-timeout-abort",
+            r#"(() => {
+                const xhr = new XMLHttpRequest();
+                xhr.timeout = 30;
+                xhr.ontimeout = () => { globalThis.__xhrTimeout = [xhr.readyState, xhr.status]; };
+                xhr.open('GET', '/hydrate');
+                xhr.send();
+            })()"#,
+        ).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        accepted.recv_timeout(std::time::Duration::from_millis(100))
+            .expect("fixture XHR was not issued");
+        assert_eq!(rt.evaluate("__xhrTimeout").unwrap(), serde_json::json!([4, 0]));
+    }
+
     /// Fetching the worker script needs no worker, so every check that depends
     /// on the *response* -- status, redirect, MIME type, scope cap -- is
     /// reachable, and the refusal has to sit behind all of them. Refusing in

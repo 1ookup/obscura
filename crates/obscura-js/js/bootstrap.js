@@ -11389,7 +11389,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       method: 'GET', url: '', async: true,
       headers: Object.create(null), responseHeaders: Object.create(null),
       overrideMimeType: '', sent: false, aborted: false, requestId: 0,
-      timeoutId: null, handlers: new Map(), uploadHandlers: new Map(),
+      timeoutId: null, controller: null, handlers: new Map(), uploadHandlers: new Map(),
       attributionReporting: null, privateToken: null,
     };
     state.upload = new XMLHttpRequestUpload(_xhrEventTargetKey, state);
@@ -11439,6 +11439,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     const state = _xhrData(this);
     if (state.readyState === 0 || state.readyState === 4 || (state.readyState === 1 && !state.sent)) return;
     state.requestId++; state.aborted = true; state.sent = false;
+    if (state.controller) { state.controller.abort(); state.controller = null; }
     if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
     _xhrResetResponse(state); _xhrReady(this, state, 4);
     _xhrFire(this, 'abort', {lengthComputable: false, loaded: 0, total: 0});
@@ -11492,6 +11493,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     }
     if (state.method === 'GET' || state.method === 'HEAD') body = null;
     state.sent = true; state.aborted = false;
+    const controller = new AbortController();
+    state.controller = controller;
     const requestId = ++state.requestId;
     const uploadSize = _xhrBodySize(body);
     _xhrFire(this, 'loadstart', {lengthComputable: false, loaded: 0, total: 0});
@@ -11499,6 +11502,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     if (state.timeout > 0) {
       state.timeoutId = setTimeout(() => {
         if (!state.sent || state.requestId !== requestId) return;
+        controller.abort();
+        state.controller = null;
         state.requestId++; state.sent = false; state.timeoutId = null;
         _xhrResetResponse(state); _xhrReady(this, state, 4);
         _xhrFire(this, 'timeout', {lengthComputable: false, loaded: 0, total: 0});
@@ -11509,6 +11514,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       method: state.method, headers: state.headers,
       body: body === null ? undefined : body, mode: 'cors',
       credentials: state.withCredentials ? 'include' : 'same-origin',
+      signal: controller.signal,
     }).then(async resp => {
       if (!state.sent || state.requestId !== requestId) return;
       state.status = resp.status; state.statusText = resp.statusText || '';
@@ -11534,6 +11540,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
         default: state.response = text;
       }
       state.sent = false;
+      state.controller = null;
       if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
       if (body !== null) {
         const uploadProgress = {lengthComputable: true, loaded: uploadSize, total: uploadSize};
@@ -11547,6 +11554,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     }).catch(error => {
       if (!state.sent || state.requestId !== requestId) return;
       state.sent = false;
+      state.controller = null;
       if (state.timeoutId !== null) { clearTimeout(state.timeoutId); state.timeoutId = null; }
       _xhrResetResponse(state); _xhrReady(this, state, 4);
       const type = error && error.__aborted ? 'abort' : 'error';

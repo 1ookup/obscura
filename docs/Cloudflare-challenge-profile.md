@@ -7889,3 +7889,12 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
 `This operation was aborted`。transport failure 和 abort focused 各 1/1 通过，提交为 `c24378a`。
 其workspace、release、trace check与代理复测已完成；tQcZu4仍未迁移。
+
+### Step 226 - XHR timeout取消底层请求（2026-09-06，修复中）
+
+**假设**：XHR timeout 只派发了 `timeout/loadend`，没有取消内部 fetch；这会让 Brunhild 请求继续
+pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
+
+**修复与证据**：每个 XHR send 创建 AbortController，timeout 和 abort() 调用 controller.abort()，
+成功、错误和超时路径清理 controller。延迟 HTTP fixture 的 readyState/status/ontimeout 回归通过；
+与 fetch AbortSignal 回归合计 3/3。代码待提交，需完整门禁和真实代理复测。
