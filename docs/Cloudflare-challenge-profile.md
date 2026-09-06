@@ -7936,3 +7936,16 @@ pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
 最新 release 指定代理无注入轮取得两个 console payload；Brunhild GET 仍无 completion，PAT 401 和
 `/fo` 200 正常。`tQcZu4` 仍为 `fetch_error`，目标 `/1.txt` 仍 403。与 Step 227/228 的 direct-op
 证据一致，当前没有新的可安全修改的 fetch/XHR 或 V8 trace 缺陷。
+
+### Step 232 - Brunhild 请求头 CDP 对拍（2026-09-06，证据完成）
+
+**方法**：在本地 HTTPS 页面中用 Chrome CDP 直接 `fetch` 历史 Brunhild URL，捕获
+`Network.requestWillBeSentExtraInfo`，与 Obscura `stealth_fetch_all` 的请求构造逐项对照。
+
+**证据**：Chrome 实际发送 `Origin`、`Referer`、`Sec-Fetch-Site/Mode/Dest`、Accept-Encoding、
+UA 和 UA-CH；Obscura 代码均有对应生成逻辑。可控 Chrome 仍报告自身 152 brands，而本轮页面
+显式 UA 是 Chrome 149；Obscura fingerprint 也按 149 生成 brands。该 UA/UA-CH 版本混用属于
+测试基线差异，不是单个请求头缺失。历史 Brunhild 204 与当前代理 502 的外部差异仍未改变。
+
+**结论**：本轮没有新的通用 header 修复，也没有修改 V8 trace；direct op 的请求是否完成仍以
+Rust host-op 日志为准，页面 payload 仅作为结果证据。
