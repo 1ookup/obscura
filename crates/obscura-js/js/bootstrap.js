@@ -16161,7 +16161,7 @@ registerHistorySurface();
 // Navigation API. New framework routers increasingly prefer `navigation`
 // over popstate/history. Keep it backed by the functional History API above
 // so both surfaces agree about the current URL and state.
-(() => {
+function registerNavigationSurface() {
   const listeners = Object.create(null);
   const nav = {
     addEventListener(type, callback) {
@@ -16254,7 +16254,9 @@ registerHistorySurface();
     return { committed: done, finished: done };
   };
   globalThis.navigation = nav;
-})();
+}
+
+registerNavigationSurface();
 
 // Canonical Window geometry surface. Keep definitions in Chrome's stable
 // insertion order so every realm and WindowProxy observes the same sequence.
