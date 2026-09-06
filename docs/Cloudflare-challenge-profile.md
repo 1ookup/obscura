@@ -7930,3 +7930,9 @@ pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
 **验证**：完整 workspace `1755/1755 passed, 4 skipped`，精确 release 和 trace check 通过。
 指定代理无注入新轮仍为 `tQcZu4=fetch_error`；Brunhild GET 没有 completion，页面超时先结束，
 因此该修复没有把外部 pending 连接伪造成 `timeout`，目标仍未返回真实 404。
+
+### Step 231 - 最新 release 代理复测（2026-09-06，调查中）
+
+最新 release 指定代理无注入轮取得两个 console payload；Brunhild GET 仍无 completion，PAT 401 和
+`/fo` 200 正常。`tQcZu4` 仍为 `fetch_error`，目标 `/1.txt` 仍 403。与 Step 227/228 的 direct-op
+证据一致，当前没有新的可安全修改的 fetch/XHR 或 V8 trace 缺陷。
