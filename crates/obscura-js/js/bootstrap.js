@@ -129,6 +129,14 @@ globalThis.removeEventListener = function removeEventListener(type, fn) {
 globalThis.dispatchEvent = function dispatchEvent(event) {
   return _eventTargetDispatch(globalThis, event);
 };
+// Legacy Window.event exists in Chrome even when no event is being handled.
+// Cloudflare probes its presence through the window surface; keep the
+// browser-compatible null value outside dispatch callbacks.
+Object.defineProperty(globalThis, 'event', {
+  configurable: true,
+  enumerable: true,
+  get() { return null; },
+});
 
 // A cross-context V8 GlobalProxy exposes built-in bindings but can miss
 // properties created later on the owning global object. Keep one realm-owned
