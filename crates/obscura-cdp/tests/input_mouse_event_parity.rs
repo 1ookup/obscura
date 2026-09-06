@@ -327,7 +327,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
             const target = document.getElementById('check');
             document.elementFromPoint = () => target;
             globalThis.mouseLog = [];
-            for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
+            for (const type of ['mousedown', 'focus', 'mouseup', 'click', 'input', 'change']) {
                 target.addEventListener(type, event => mouseLog.push({
                     type, checked: target.checked, x: event.clientX,
                     ctrl: event.ctrlKey, shift: event.shiftKey, trusted: event.isTrusted
@@ -359,7 +359,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
     let pressed: Value = serde_json::from_str(pressed["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(pressed["checked"], false, "checkbox activation must wait for release");
     assert_eq!(pressed["log"][0]["type"], "mousedown");
-    assert_eq!(pressed["log"].as_array().unwrap().len(), 1, "press must not synthesize click");
+    assert_eq!(pressed["log"].as_array().unwrap().len(), 2, "press must not synthesize click");
 
     cdp(
         &mut ctx,
@@ -386,13 +386,13 @@ async fn press_release_orders_events_and_defers_click_activation() {
         .iter()
         .map(|entry| entry["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["mousedown", "mouseup", "click", "input", "change"]);
+    assert_eq!(types, ["mousedown", "focus", "mouseup", "click", "input", "change"]);
     assert_eq!(released["checked"], true);
-    assert_eq!(released["log"][2]["checked"], true, "click sees checkbox pre-activation");
-    assert_eq!(released["log"][2]["x"], 31.0);
-    assert_eq!(released["log"][2]["ctrl"], true);
-    assert_eq!(released["log"][2]["shift"], true);
-    assert_eq!(released["log"][2]["trusted"], true);
+    assert_eq!(released["log"][3]["checked"], true, "click sees checkbox pre-activation");
+    assert_eq!(released["log"][3]["x"], 31.0);
+    assert_eq!(released["log"][3]["ctrl"], true);
+    assert_eq!(released["log"][3]["shift"], true);
+    assert_eq!(released["log"][3]["trusted"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
