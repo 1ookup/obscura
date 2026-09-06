@@ -7519,6 +7519,36 @@ a timer firing *early* is as wrong as one firing late",
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_fetch_transport_failure_is_a_type_error() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.execute_script(
+                "fetch-transport-error",
+                r#"fetch("http://127.0.0.1:1/").catch(error => ({
+                    name: error.name,
+                    constructor: error.constructor.name,
+                    message: error.message,
+                })).then(value => { globalThis.__fetchError = value; })"#,
+            )
+            .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__fetchError").unwrap(),
+            serde_json::json!({
+                "name": "TypeError",
+                "constructor": "TypeError",
+                "message": "Failed to fetch",
+            })
+        );
+    }
+
     /// Fetching the worker script needs no worker, so every check that depends
     /// on the *response* -- status, redirect, MIME type, scope cap -- is
     /// reachable, and the refusal has to sit behind all of them. Refusing in

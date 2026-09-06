@@ -11124,15 +11124,23 @@ globalThis.fetch = async (input, init = {}) => {
   }
   const pageOrigin = _environmentSettings().origin;
   const performanceStart = performance.now();
-  const raw = await Deno.core.ops.op_fetch_url(
-    url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
-    JSON.stringify({
-      url: _environmentSettings().url || globalThis.location?.href || "",
-      policy: _environmentReferrerPolicy(),
-      redirect: fetchRedirect,
-      root: _environmentDocumentRoot(),
-    })
-  );
+  let raw;
+  try {
+    raw = await Deno.core.ops.op_fetch_url(
+      url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
+      JSON.stringify({
+        url: _environmentSettings().url || globalThis.location?.href || "",
+        policy: _environmentReferrerPolicy(),
+        redirect: fetchRedirect,
+        root: _environmentDocumentRoot(),
+      })
+    );
+  } catch (_error) {
+    // Fetch exposes transport failures as a TypeError in browsers. Let the
+    // op retain detailed Rust diagnostics in the host log without leaking its
+    // implementation-specific Error class into page-visible code.
+    throw new TypeError('Failed to fetch');
+  }
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');

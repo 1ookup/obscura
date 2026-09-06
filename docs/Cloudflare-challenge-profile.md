@@ -7867,3 +7867,15 @@ lastModified及8个额外接口；本机Chrome152也具备这8个接口，因此
 Document响应仍为403→403，最终title仍是挑战页。真实404尚未取得。
 精确release构建及最终trace check通过；最终原始obstacle harness仍为31/33，失败项与Step222及Chrome
 oracle一致。该门禁缺口保留在记录中，不以成功的单元测试替代33/33要求。
+
+### Step 224 - fetch传输错误类型（2026-09-06，代码完成）
+
+**假设**：Chrome将网络/DNS失败暴露为 `TypeError: Failed to fetch`，而Obscura的wreq op错误直接
+穿透为普通 `Error`；challenge的 `tQcZu4=fetch_error` 与Chrome的 `timeout` 可能受到该类型差异影响。
+
+**证据与修复**：固定允许私网的拒绝端口回归在修复前得到 `Error/Error/error sending request`，
+修复后得到 `TypeError/TypeError/Failed to fetch`。bootstrap只捕获transport op异常并归一化；已解析的
+Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `待提交`，focused test通过。
+
+**限制**：Brunhild请求在当前代理上仍是未完成连接，不能仅凭其最终 `fetch_error` 证明类型修复
+会让Cloudflare发放clearance；需以重建后的真实payload和目标Document状态复核。
