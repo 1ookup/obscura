@@ -11122,11 +11122,17 @@ globalThis.fetch = async (input, init = {}) => {
   if (!_FETCH_REDIRECT_MODES.has(fetchRedirect)) {
     throw new TypeError("Failed to execute 'fetch': '" + fetchRedirect + "' is not a valid RequestRedirect value");
   }
+  const fetchSignal = init.signal !== undefined ? init.signal : inputRequest?.signal;
+  if (fetchSignal !== undefined && !(fetchSignal instanceof AbortSignal)) {
+    throw new TypeError("Failed to execute 'fetch': 'signal' is not an AbortSignal");
+  }
+  if (fetchSignal?.aborted) throw fetchSignal.reason;
   const pageOrigin = _environmentSettings().origin;
   const performanceStart = performance.now();
   let raw;
+  let abortHandler;
   try {
-    raw = await Deno.core.ops.op_fetch_url(
+    const operation = Deno.core.ops.op_fetch_url(
       url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
       JSON.stringify({
         url: _environmentSettings().url || globalThis.location?.href || "",
@@ -11135,11 +11141,23 @@ globalThis.fetch = async (input, init = {}) => {
         root: _environmentDocumentRoot(),
       })
     );
+    if (fetchSignal) {
+      const aborted = new Promise((_, reject) => {
+        abortHandler = () => reject(fetchSignal.reason);
+        fetchSignal.addEventListener('abort', abortHandler, { once: true });
+      });
+      raw = await Promise.race([operation, aborted]);
+    } else {
+      raw = await operation;
+    }
   } catch (_error) {
     // Fetch exposes transport failures as a TypeError in browsers. Let the
     // op retain detailed Rust diagnostics in the host log without leaking its
     // implementation-specific Error class into page-visible code.
+    if (fetchSignal?.aborted) throw fetchSignal.reason;
     throw new TypeError('Failed to fetch');
+  } finally {
+    if (fetchSignal && abortHandler) fetchSignal.removeEventListener('abort', abortHandler);
   }
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
@@ -14678,7 +14696,7 @@ _markNative(globalThis.SecurityPolicyViolationEvent);
     signal._aborted = true;
     signal._reason = reason !== undefined
       ? reason
-      : new DOMException("signal is aborted without reason", "AbortError");
+      : new DOMException("This operation was aborted", "AbortError");
     const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
     try { if (evt instanceof Event) _eventSetEndpoints(evt, signal, signal); } catch (_) {}
     emit(signal, evt);
@@ -14713,7 +14731,7 @@ _markNative(globalThis.SecurityPolicyViolationEvent);
       s._aborted = true;
       s._reason = reason !== undefined
         ? reason
-        : new DOMException("signal is aborted without reason", "AbortError");
+        : new DOMException("This operation was aborted", "AbortError");
       return s;
     }
     static timeout(ms) {

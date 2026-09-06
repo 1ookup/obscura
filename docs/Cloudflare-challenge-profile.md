@@ -7879,3 +7879,12 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 
 **限制**：Brunhild请求在当前代理上仍是未完成连接，不能仅凭其最终 `fetch_error` 证明类型修复
 会让Cloudflare发放clearance；需以重建后的真实payload和目标Document状态复核。
+
+**真实复测**：重建 release 后指定代理无注入轮仍为 `tQcZu4=fetch_error`，日志显示 Brunhild GET
+持续 pending，payload 的页面超时分支先完成，未进入 transport rejection。因此没有把 `fetch_error`
+强行映射成 `timeout`，也没有修改网络超时或加入域名特判。
+
+**后续 oracle**：固定本地延迟响应服务器配合 `AbortController` 证明 Obscura 原先完全忽略 fetch
+的 `signal`，请求在 30ms abort 后仍等到响应；Chrome 在相同输入立即拒绝 `AbortError`。
+现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
+`This operation was aborted`。transport failure 和 abort focused 各 1/1 通过，待提交和真实复测。
