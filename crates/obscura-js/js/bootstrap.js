@@ -16069,7 +16069,7 @@ globalThis.atob = globalThis.atob || ((s) => {
 // replace mutate the stack and set globalThis.__virtualUrl so location.href
 // reads the new URL. Real Chrome doesn't fire popstate on push/replace,
 // only on user-driven back/forward — we match that exactly.
-(() => {
+function registerHistorySurface() {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const historyToken = Symbol("History");
@@ -16154,7 +16154,9 @@ globalThis.atob = globalThis.atob || ((s) => {
   Object.defineProperty(globalThis, "history", {
     value: new History(historyToken), writable: true, configurable: true,
   });
-})();
+}
+
+registerHistorySurface();
 
 // Navigation API. New framework routers increasingly prefer `navigation`
 // over popstate/history. Keep it backed by the functional History API above
