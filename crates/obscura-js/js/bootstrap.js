@@ -10982,10 +10982,6 @@ globalThis.__obscura_apply_fingerprint = function() {
   const scale = Number(fallback.deviceScaleFactor);
   if (Number.isFinite(scale) && scale > 0) globalThis.devicePixelRatio = scale;
 };
-globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
-globalThis.devicePixelRatio = 1;
-globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
-globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
 globalThis.__fetchInterceptEnabled = false;
 globalThis.__fetchInterceptCallback = null; // Set by CDP to handle paused requests
 
@@ -16259,6 +16255,12 @@ globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
 // Canonical Window geometry surface. Keep definitions in Chrome's stable
 // insertion order so every realm and WindowProxy observes the same sequence.
+globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1920;
+globalThis.innerHeight = 1000;
+globalThis.outerWidth = 1920;
+globalThis.outerHeight = 1080;
 globalThis.scrollX = 0;
 globalThis.pageXOffset = 0;
 globalThis.scrollY = 0;
