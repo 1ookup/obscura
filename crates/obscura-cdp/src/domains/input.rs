@@ -333,6 +333,7 @@ pub async fn handle(
                             if (!suppressMouse) {{\
                                 var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
+                                if (!disabledControl && target.focus) target.focus();\
                             }}\
                         }})()",
                         x = target.x,
@@ -427,8 +428,8 @@ pub async fn handle(
                                 return;\
                             }}\
                             if (checkable && clickTarget.checked !== oldChecked) {{\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
+                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true,composed:true}}))); }} catch(e) {{}}\
+                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true,composed:true}}))); }} catch(e) {{}}\
                                 return;\
                             }}\
                             {label_activation}\

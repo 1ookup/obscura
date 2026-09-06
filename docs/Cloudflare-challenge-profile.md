@@ -7994,6 +7994,19 @@ prototype getter，`typeof` 为 `number`，payload 桶值为 4；top realm 没�
 最新 release 指定代理无注入轮取得两个 payload，`tQcZu4=fetch_error`。Brunhild `/i` 仍只有
 direct `op_fetch_url`/pending 日志，PAT 401、`/fo` 200 和新 ray 链正常；目标 `/1.txt` 没有真实 404。
 
+### Step 238 - 第三个 payload 点击事件对拍（2026-09-06，修复中）
+
+**方法**：对 Obscura 和 Chrome 使用相同 frame-local 坐标 `(21,31)`，通过 CDP 发送
+`mouseMoved -> mouseMoved -> mousePressed -> mouseReleased`，并对比第三 payload 和事件 trace。
+
+**证据**：Obscura 第二→第三 payload 无新增属性路径，但 `gIBpo1` 中两项计数比 Chrome 少 1；
+Chrome widget 事件链包含 `focus`、`input`、`blur`，Obscura 只看到 pointer/mouse 与 click。
+根因是 `HTMLElement.focus/blur` 不派发事件，checkable input/change 未设置 `composed`，闭合 shadow
+root 外的 widget 收不到它们。
+
+**修复**：focus/blur 派发 trusted composed FocusEvent；CDP checkable input/change 设为 composed。
+现有 CDP input parity focused 8/8 通过，待全量门禁及新 binary 第三 payload 复测。
+
 ### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
 
 最终 release 通过指定代理无注入访问并开启 CDP 条件点击。Turnstile frame owner 的

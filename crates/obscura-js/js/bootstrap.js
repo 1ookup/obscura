@@ -4694,8 +4694,27 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis[_inputFocusedSym] = this; globalThis[_inputClickTargetSym] = this; }
-  blur() { if (globalThis[_inputFocusedSym] === this) globalThis[_inputFocusedSym] = null; }
+  focus() {
+    if (globalThis[_inputFocusedSym] === this) return;
+    const previous = globalThis[_inputFocusedSym];
+    if (previous && previous !== this && typeof previous.blur === 'function') previous.blur();
+    globalThis[_inputFocusedSym] = this;
+    globalThis[_inputClickTargetSym] = this;
+    try {
+      this.dispatchEvent(__obscura_markTrusted(new FocusEvent('focus', {
+        bubbles: false, cancelable: false, composed: true, view: globalThis,
+      })));
+    } catch (_error) {}
+  }
+  blur() {
+    if (globalThis[_inputFocusedSym] !== this) return;
+    globalThis[_inputFocusedSym] = null;
+    try {
+      this.dispatchEvent(__obscura_markTrusted(new FocusEvent('blur', {
+        bubbles: false, cancelable: false, composed: true, view: globalThis,
+      })));
+    } catch (_error) {}
+  }
 
   // --- Popover API (HTML "popover") ---------------------------------------
   // Read the popover content attribute case-insensitively. The HTML parser
