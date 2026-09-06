@@ -9067,6 +9067,9 @@ function _frameWindowProxyFor(hostEl) {
     },
     get closed() { return false; },
     get opener() { return null; },
+    // WindowProxy exposes the legacy event slot as well as the realm global.
+    // Without this target-level member, proxy reads bypass the realm getter.
+    get event() { return null; },
     // Cross-document messaging (Phase 4): enqueue through the realm-aware
     // Rust queue. Works from the main realm and from a frame realm holding a
     // nested frame's proxy; the sender identifies its own realm.
