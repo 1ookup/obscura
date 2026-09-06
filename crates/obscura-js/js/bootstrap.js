@@ -9529,13 +9529,16 @@ Object.setPrototypeOf(_locationObj, Location.prototype);
 
 registerLocationSurface();
 
-globalThis.window = globalThis;
-globalThis.self = globalThis;
-globalThis.top = globalThis;
-globalThis.parent = globalThis;
-globalThis.frames = globalThis;
-globalThis.frameElement = null;
-globalThis.length = 0;
+function registerWindowAliasesSurface() {
+  globalThis.window = globalThis;
+  globalThis.self = globalThis;
+  globalThis.top = globalThis;
+  globalThis.parent = globalThis;
+  globalThis.frames = globalThis;
+  globalThis.frameElement = null;
+  globalThis.length = 0;
+}
+registerWindowAliasesSurface();
 
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
