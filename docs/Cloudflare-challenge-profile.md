@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-06，step 232，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-06，step 235，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
@@ -7974,3 +7974,11 @@ trace check 通过；真实 payload 保持 isolation 对齐，目标仍 403 chal
 
 最终 obstacle course 仍为 `31/33`，失败项是既有 fixture 的 IntersectionObserver `io:50` 期望和
 Win32 平台固定期望，两项在旧二进制和 Chrome oracle 中同样失败。
+
+### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
+
+最终 release 通过指定代理无注入访问并开启 CDP 条件点击。Turnstile frame owner 的
+`allow="cross-origin-isolated; fullscreen; autoplay; keyboard-map; gamepad; xr-spatial-tracking"`
+被正确传播后，frame payload 的 `crossOriginIsolated`/`SharedArrayBuffer` 差异归零，路径集合为 1647。
+点击在 `interactiveBegin` 后触发 proof `/fo` 200 和顶层新 ray；目标仍未收到真实 `/1.txt` 404。
+Brunhild `/i` 只记录 direct `op_fetch_url` 请求且无 completion，当前代理路由仍是外部阻断。
