@@ -9033,6 +9033,11 @@ function _frameWindowProxyFor(hostEl) {
   }
 
   const target = {
+    // WindowProxy's own surface starts with these aliases in Chromium.
+    // Defining them first keeps iframe enumeration order stable without a
+    // post-hoc reorder in the proxy trap.
+    get window() { return proxy; },
+    get self() { return proxy; },
     get document() {
       const root = contentRoot();
       if (root < 0) return null;
@@ -9094,8 +9099,6 @@ function _frameWindowProxyFor(hostEl) {
   _markNative(target.blur);
   _markNative(target.focus);
   _markNative(target.close);
-  Object.defineProperty(target, "self", { get: () => proxy, configurable: true });
-  Object.defineProperty(target, "window", { get: () => proxy, configurable: true });
   Object.defineProperty(target, "frames", { get: () => proxy, configurable: true });
   Object.defineProperty(target, "globalThis", { get: () => proxy, configurable: true });
 
