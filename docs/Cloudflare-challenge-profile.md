@@ -7949,3 +7949,13 @@ UA 和 UA-CH；Obscura 代码均有对应生成逻辑。可控 Chrome 仍报告�
 
 **结论**：本轮没有新的通用 header 修复，也没有修改 V8 trace；direct op 的请求是否完成仍以
 Rust host-op 日志为准，页面 payload 仅作为结果证据。
+
+### Step 233 - iframe allow="cross-origin-isolated"（2026-09-06，修复中）
+
+**假设**：Chrome Turnstile iframe 宿主声明 `allow="cross-origin-isolated; ..."`，Obscura 未保存
+`iframe[allow]`，导致 child 即使自身 COOP/COEP/CORP 完整也读作 `crossOriginIsolated=false`。
+
+**修复**：`FrameNavigationRequest` 保存 `allow`，frame loader 仅在父文档已 isolation、响应自身
+授予 COOP/COEP、allow 属性明确委托且 sandbox 允许同源时启用 child isolation；没有 allow 的
+跨源 frame 保持原规则。新增 helper/回归覆盖 allow token 与非匹配 token，focused 通过。
+代码待完整门禁和真实 payload 验证。

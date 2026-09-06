@@ -5241,6 +5241,7 @@ impl Page {
                         sandbox: obscura_dom::SandboxFlags::parse(
                             node.get_attribute("sandbox"),
                         ),
+                        allow: node.get_attribute("allow").map(str::to_string),
                         ..FrameNavigationRequest::default()
                     })
                     .unwrap_or_default();
@@ -5263,12 +5264,16 @@ impl Page {
                 .get_node(host)
                 .map(|node| obscura_dom::SandboxFlags::parse(node.get_attribute("sandbox")))
                 .unwrap_or_default();
+            let allow = dom
+                .get_node(host)
+                .and_then(|node| node.get_attribute("allow").map(str::to_string));
             let request = if let Some(url) = pending.url {
                 FrameNavigationRequest {
                     url: Some(url),
                     method: Some(pending.method),
                     body: (!pending.body.is_empty()).then_some(pending.body.into_bytes()),
                     sandbox,
+                    allow: allow.clone(),
                     ..FrameNavigationRequest::default()
                 }
             } else {
@@ -5280,6 +5285,7 @@ impl Page {
                             .get_attribute("referrerpolicy")
                             .map(str::to_string),
                         sandbox,
+                        allow,
                         ..FrameNavigationRequest::default()
                     })
                     .unwrap_or_default()
@@ -5660,6 +5666,9 @@ pub struct FrameNavigationRequest {
     /// Parsed `sandbox` attribute of the host element. Propagation from the
     /// parent scope happens inside the controller.
     pub sandbox: obscura_dom::SandboxFlags,
+    /// Permissions Policy declaration from the embedding iframe's `allow`
+    /// attribute.
+    pub allow: Option<String>,
     pub user_activated: bool,
 }
 
@@ -5976,6 +5985,10 @@ impl Page {
                 .map(|(url, _)| url.clone())
         });
         let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
+        let allow_cross_origin_isolated = request
+            .allow
+            .as_deref()
+            .is_some_and(iframe_allows_cross_origin_isolated);
         let ancestors = self.frame_ancestor_chain(frame_id);
 
         // Resolve the document: URL, origin, and HTML body.
@@ -6261,21 +6274,18 @@ impl Page {
                     // COOP/COEP. `allow-same-origin` keeps the tuple origin
                     // and may therefore retain isolation.
                     // COOP is a top-level browsing-context boundary. A
-                    // cross-origin child cannot become isolated from its own
-                    // response headers, even when it advertises COOP+COEP;
-                    // Chrome exposes `crossOriginIsolated === false` for
-                    // Cloudflare's cross-origin widget frame. Same-origin
-                    // children inherit the parent's isolated context and may
-                    // retain it when their own response also grants it.
-                    let document_cross_origin_isolated =
-                        frame_response_grants_cross_origin_isolation(
-                            &response,
-                            &response_origin,
-                            &parent_origin,
-                            parent_cross_origin_isolated,
-                        )
-                            && (!sandbox.active
-                                || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+                    // cross-origin child may retain isolation when the
+                    // embedding iframe explicitly delegates the feature via
+                    // `allow="cross-origin-isolated"` and its own response
+                    // grants COOP+COEP.
+                    let document_cross_origin_isolated = frame_document_isolation(
+                        &response,
+                        &response_origin,
+                        &parent_origin,
+                        parent_cross_origin_isolated,
+                        allow_cross_origin_isolated,
+                        sandbox,
+                    );
                     let last_modified = response.header("last-modified").map(str::to_string);
                     let origin = if sandbox.active
                         && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
@@ -6456,6 +6466,7 @@ impl Page {
                             sandbox: obscura_dom::SandboxFlags::parse(
                                 attr("sandbox").as_deref(),
                             ),
+                            allow: attr("allow"),
                             ..FrameNavigationRequest::default()
                         },
                     )
@@ -6505,6 +6516,7 @@ impl Page {
                         srcdoc: attr("srcdoc"),
                         referrer_policy: attr("referrerpolicy"),
                         sandbox: obscura_dom::SandboxFlags::parse(attr("sandbox").as_deref()),
+                        allow: attr("allow"),
                         ..FrameNavigationRequest::default()
                     },
                 )
@@ -8345,6 +8357,17 @@ mod tests {
         assert!(frame_response_grants_cross_origin_isolation(
             &response, &widget, &widget, true,
         ));
+        assert!(super::iframe_allows_cross_origin_isolated(
+            "cross-origin-isolated; fullscreen; autoplay"
+        ));
+        assert!(super::frame_document_isolation(
+            &response, &widget, &page, true, true, obscura_dom::SandboxFlags::default(),
+        ));
+        assert!(!super::frame_document_isolation(
+            &response, &widget, &page, true, false, obscura_dom::SandboxFlags::default(),
+        ));
+        assert!(!super::iframe_allows_cross_origin_isolated("fullscreen; autoplay"));
+        assert!(!super::iframe_allows_cross_origin_isolated("cross-origin-isolated-extra"));
     }
 
     #[test]
@@ -12385,6 +12408,37 @@ fn frame_response_grants_cross_origin_isolation(
     parent_cross_origin_isolated
         && response_origin == parent_origin
         && response_grants_cross_origin_isolation(response)
+}
+
+fn iframe_allows_cross_origin_isolated(value: &str) -> bool {
+    value.split(';').any(|directive| {
+        directive
+            .split_whitespace()
+            .next()
+            .is_some_and(|feature| feature.eq_ignore_ascii_case("cross-origin-isolated"))
+    })
+}
+
+fn frame_document_isolation(
+    response: &obscura_net::Response,
+    response_origin: &obscura_dom::Origin,
+    parent_origin: &obscura_dom::Origin,
+    parent_cross_origin_isolated: bool,
+    allow_cross_origin_isolated: bool,
+    sandbox: obscura_dom::SandboxFlags,
+) -> bool {
+    let own_isolation = frame_response_grants_cross_origin_isolation(
+        response,
+        response_origin,
+        parent_origin,
+        parent_cross_origin_isolated,
+    );
+    let delegated_isolation = allow_cross_origin_isolated
+        && parent_cross_origin_isolated
+        && response_grants_cross_origin_isolation(response);
+    (own_isolation || delegated_isolation)
+        && (!sandbox.active
+            || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))
 }
 
 fn is_text_like_content_type(content_type: Option<&str>) -> bool {
