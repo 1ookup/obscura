@@ -9163,17 +9163,19 @@ function _frameWindowProxyFor(hostEl) {
       return key === "globalThis" || _blankFrameSurfaceHas(key);
     },
     ownKeys(t) {
-      const keys = Reflect.ownKeys(t);
-      if (!sameOrigin()) return keys;
-      const seen = new Set(keys);
+      if (!sameOrigin()) return Reflect.ownKeys(t);
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
       const source = realmGlobal
         ? _frameRealmOwnKeys(realmGlobal) : _pristineGlobalNames;
+      const keys = [];
+      const seen = new Set();
       for (const key of source) {
         if (key === "constructor") continue;
         if (!seen.has(key)) { seen.add(key); keys.push(key); }
       }
-      if (!realmGlobal && !seen.has("globalThis")) keys.push("globalThis");
+      for (const key of Reflect.ownKeys(t)) {
+        if (!seen.has(key)) { seen.add(key); keys.push(key); }
+      }
       return keys;
     },
     getOwnPropertyDescriptor(t, key) {
