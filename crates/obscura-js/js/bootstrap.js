@@ -9426,6 +9426,9 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
   return ref;
 }
 
+// Register the two primary Window aliases before document/location so the
+// global property order matches Chromium.
+globalThis.window = globalThis;
 globalThis.self = globalThis;
 
 globalThis.document = null;
@@ -9533,15 +9536,12 @@ Object.setPrototypeOf(_locationObj, Location.prototype);
 registerLocationSurface();
 
 function registerWindowAliasesSurface() {
-  globalThis.window = globalThis;
-  globalThis.self = globalThis;
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.frames = globalThis;
   globalThis.frameElement = null;
   globalThis.length = 0;
 }
-registerWindowAliasesSurface();
 
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
@@ -9676,6 +9676,7 @@ for (const name of ['locationbar', 'menubar', 'personalbar',
     value: new BarProp(_barPropKey), writable: true, enumerable: true, configurable: true,
   });
 }
+registerWindowAliasesSurface();
 const _styleMediaPrototype = {};
 Object.defineProperties(_styleMediaPrototype, {
   type: {
