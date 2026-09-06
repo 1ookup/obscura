@@ -10928,7 +10928,6 @@ class Screen {
   _markNative(Screen.prototype[k]);
 });
 globalThis.Screen = Screen;
-globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated, availW, availH, availTop, availLeft) {
   const resolvedAvailW = Number.isFinite(availW) ? availW : w;
   const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
@@ -16250,11 +16249,13 @@ globalThis.atob = globalThis.atob || ((s) => {
   globalThis.navigation = nav;
 })();
 
-globalThis.screenX = 0; globalThis.screenY = 0;
-globalThis.screenLeft = 0; globalThis.screenTop = 0;
-globalThis.screenLeft = 0; globalThis.screenTop = 0;
 // Canonical Window geometry surface. Keep definitions in Chrome's stable
 // insertion order so every realm and WindowProxy observes the same sequence.
+globalThis.screen = new Screen(1920, 1080);
+globalThis.screenX = 0;
+globalThis.screenY = 0;
+globalThis.screenLeft = 0;
+globalThis.screenTop = 0;
 globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920;
