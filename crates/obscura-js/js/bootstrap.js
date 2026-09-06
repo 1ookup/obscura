@@ -9933,7 +9933,26 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
   } })),
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return [null, null, null, null]; },
-  sendBeacon() { return true; },
+  sendBeacon(url, data) {
+    // Beacon queues a credentials-including POST and returns before the
+    // response arrives. Reuse the realm fetch path so CSP, proxy, cookies,
+    // and request interception stay identical to other page requests.
+    try {
+      if (arguments.length < 1) return false;
+      const target = new URL(String(url), location.href).href;
+      let body = data;
+      if (data instanceof Blob && data.type) {
+        // fetch preserves Blob MIME metadata in the request body.
+        body = data;
+      }
+      Promise.resolve(fetch(target, {
+        method: 'POST', body, keepalive: true, credentials: 'include',
+      })).catch(() => {});
+      return true;
+    } catch (_) {
+      return false;
+    }
+  },
   javaEnabled() { return false; },
   geolocation: _bootstrapObject('navigator.geolocation', () => ({
     getCurrentPosition(success, error) {
