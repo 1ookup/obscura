@@ -9489,6 +9489,8 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _environmentSettings().url;
 }
+let _locationObj;
+function registerLocationSurface() {
 globalThis.location = _bootstrapObject('location', () => ({
   get href() { return __currentUrl(); },
   set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
@@ -9505,7 +9507,7 @@ globalThis.location = _bootstrapObject('location', () => ({
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
 }));
-let _locationObj = globalThis.location;
+_locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
   set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
@@ -9523,6 +9525,9 @@ Object.defineProperty(globalThis, 'Location', {
 });
 _markNative(Location);
 Object.setPrototypeOf(_locationObj, Location.prototype);
+}
+
+registerLocationSurface();
 
 globalThis.window = globalThis;
 globalThis.self = globalThis;
