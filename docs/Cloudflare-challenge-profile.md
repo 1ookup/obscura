@@ -7975,7 +7975,7 @@ trace check 通过；真实 payload 保持 isolation 对齐，目标仍 403 chal
 最终 obstacle course 仍为 `31/33`，失败项是既有 fixture 的 IntersectionObserver `io:50` 期望和
 Win32 平台固定期望，两项在旧二进制和 Chrome oracle 中同样失败。
 
-### Step 236 - isolated frame cpuPerformance（2026-09-06，修复中）
+### Step 236 - isolated frame cpuPerformance（2026-09-06，代码完成）
 
 **证据**：同 UA Chrome 152 的真实 Turnstile frame 中，`navigator.cpuPerformance` 为 enumerable
 prototype getter，`typeof` 为 `number`，payload 桶值为 4；top realm 没有该属性。Obscura frame
@@ -7983,7 +7983,16 @@ prototype getter，`typeof` 为 `number`，payload 桶值为 4；top realm 没�
 
 **修复**：当 frame 自身已通过 COOP/COEP 和 `allow="cross-origin-isolated"` 获得 isolation 后，
 安装 native-shaped `Navigator.prototype.cpuPerformance` getter；值按 fingerprint hardwareConcurrency
-映射到 1..4，top realm 和非-isolated frame 不安装。focused frame realm 回归通过，待完整门禁与真实 payload。
+映射到 1..4，top realm 和非-isolated frame 不安装。focused frame realm 回归通过，修复提交为 `fb217c0`。
+
+**验证**：完整 workspace `1756/1756 passed, 4 skipped`，release 和 trace check 通过。以 Chrome 152
+同 UA/viewport/hardware fingerprint 重新采集 payload 后，`n.cpuPerformance` 差异消失，路径集合
+`1647 -> 1648`；剩余为动态文档 URL/时间和三个版本相关接口。真实目标仍为 403 challenge。
+
+### Step 237 - cpuPerformance 后真实 challenge 复测（2026-09-06，未通过）
+
+最新 release 指定代理无注入轮取得两个 payload，`tQcZu4=fetch_error`。Brunhild `/i` 仍只有
+direct `op_fetch_url`/pending 日志，PAT 401、`/fo` 200 和新 ray 链正常；目标 `/1.txt` 没有真实 404。
 
 ### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
 
