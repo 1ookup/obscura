@@ -1121,7 +1121,10 @@ function _newConsoleTask() {
   return task;
 }
 
-globalThis.console = _bootstrapObject('console', () => ({}));
+function registerConsoleSurface() {
+  globalThis.console = _bootstrapObject('console', () => ({}));
+}
+registerConsoleSurface();
 for (const name of _consoleMethodNames) {
   const length = name === 'context' ? 1 : 0;
   const implementation = name === 'context'
