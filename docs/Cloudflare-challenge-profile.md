@@ -7884,6 +7884,17 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 持续 pending，payload 的页面超时分支先完成，未进入 transport rejection。因此没有把 `fetch_error`
 强行映射成 `timeout`，也没有修改网络超时或加入域名特判。
 
+### Step 227 - Brunhild 通信归属与 timeout 分支（2026-09-06，调查中）
+
+**方法与证据**：当前 release 的全 realm `cdp_comm_probe.py` 记录 widget XHR/fetch 在 t=0.75s
+和 t=5.86s 由其 `px` handler 构造，`interactiveBegin` 在 t=8.87s；点击后 proof `/fo` 返回
+200 并触发新的顶层 ray。Brunhild `/i` 只出现在 Rust `op_fetch_url`/`stealth_fetch request`，
+没有 JS hook completion 或 caller。
+
+**结论**：`tQcZu4=fetch_error` 来自 Brunhild 外部连接 pending 时页面自己的超时/失败汇总，不能归因
+于 XHR timeout。当前 V8 trace 能记录属性 GET/SET/HAS 和 host-op 请求，但不能捕获 direct
+`op_fetch_url` 的 JS caller 或 postMessage payload；这是已记录的能力边界，不伪造 trace 事件。
+
 **后续 oracle**：固定本地延迟响应服务器配合 `AbortController` 证明 Obscura 原先完全忽略 fetch
 的 `signal`，请求在 30ms abort 后仍等到响应；Chrome 在相同输入立即拒绝 `AbortError`。
 现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
