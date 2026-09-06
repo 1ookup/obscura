@@ -8836,9 +8836,26 @@ function _materializeFrameRealm(hostNid) {
     globals[String(root)] = bridge;
   }
 }
+const _chromeWindowKeyOrder = [
+  'window', 'self', 'document', 'location', 'customElements', 'history',
+  'navigation', 'locationbar', 'menubar', 'personalbar', 'scrollbars',
+  'statusbar', 'toolbar', 'frames', 'top', 'parent', 'frameElement',
+  'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
+  'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
+  'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
+  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
+  'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',
+  'Intl', 'Atomics', 'Reflect', 'console', 'CSS', 'Temporal', 'WebAssembly',
+];
 function _frameRealmOwnKeys(realmGlobal) {
-  try { return realmGlobal.Reflect.ownKeys(realmGlobal); }
-  catch (e) { return Reflect.ownKeys(realmGlobal); }
+  let keys;
+  try { keys = realmGlobal.Reflect.ownKeys(realmGlobal); }
+  catch (e) { keys = Reflect.ownKeys(realmGlobal); }
+  const rank = new Map(_chromeWindowKeyOrder.map((key, index) => [key, index]));
+  const strings = keys.filter(key => typeof key === 'string');
+  const symbols = keys.filter(key => typeof key !== 'string');
+  strings.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
+  return strings.concat(symbols);
 }
 function _frameRealmOwnDescriptor(realmGlobal, key) {
   try { return realmGlobal.Object.getOwnPropertyDescriptor(realmGlobal, key); }
