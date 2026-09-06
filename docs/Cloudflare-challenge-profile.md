@@ -7897,4 +7897,8 @@ pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
 
 **修复与证据**：每个 XHR send 创建 AbortController，timeout 和 abort() 调用 controller.abort()，
 成功、错误和超时路径清理 controller。延迟 HTTP fixture 的 readyState/status/ontimeout 回归通过；
-与 fetch AbortSignal 回归合计 3/3。代码待提交，需完整门禁和真实代理复测。
+与 fetch AbortSignal 回归合计 3/3。代码提交为 `14cdec8`。
+
+**验证**：完整 workspace `1755/1755 passed, 4 skipped`，精确 release 和 trace check 通过。
+指定代理无注入新轮仍为 `tQcZu4=fetch_error`；Brunhild GET 没有 completion，页面超时先结束，
+因此该修复没有把外部 pending 连接伪造成 `timeout`，目标仍未返回真实 404。
