@@ -7895,6 +7895,10 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 于 XHR timeout。当前 V8 trace 能记录属性 GET/SET/HAS 和 host-op 请求，但不能捕获 direct
 `op_fetch_url` 的 JS caller 或 postMessage payload；这是已记录的能力边界，不伪造 trace 事件。
 
+**网络 A/B**：同代理直接请求本轮 Brunhild URL 返回 `HTTP/2 502`（mitmproxy）；存档的 Chrome
+headful click HAR 曾对 Brunhild 请求收到 `204`。这解释了当前 Chrome/Obscura 都无法完成 proof
+路由的外部差异，不能通过 Obscura hostname 特判、伪造响应或修改 clearance 判据解决。
+
 **后续 oracle**：固定本地延迟响应服务器配合 `AbortController` 证明 Obscura 原先完全忽略 fetch
 的 `signal`，请求在 30ms abort 后仍等到响应；Chrome 在相同输入立即拒绝 `AbortError`。
 现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
