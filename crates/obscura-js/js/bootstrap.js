@@ -8850,6 +8850,12 @@ const _chromeWindowKeyOrder = [
   'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',
   'Intl', 'Atomics', 'Reflect', 'console', 'CSS', 'Temporal', 'WebAssembly',
 ];
+function _orderedWindowNames(names) {
+  const rank = new Map(_chromeWindowKeyOrder.map((key, index) => [key, index]));
+  const values = Array.from(names);
+  values.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
+  return values;
+}
 function _frameRealmOwnKeys(realmGlobal) {
   let keys;
   try { keys = realmGlobal.Reflect.ownKeys(realmGlobal); }
@@ -23705,8 +23711,8 @@ globalThis.__obscura_init = function() {
   // explicit-resource-management set), which then read as page additions.
   // Indices are excluded on purpose: they are this window's child frames, and
   // a fresh frame has none.
-  _pristineGlobalNames = new Set(
-    Object.getOwnPropertyNames(globalThis).filter(name => !/^\d+$/.test(name)));
+  _pristineGlobalNames = new Set(_orderedWindowNames(
+    Object.getOwnPropertyNames(globalThis).filter(name => !/^\d+$/.test(name))));
   // Iframes the parser produced never run the insertion steps, so this is the
   // only place the initial window[i] set gets built. It runs last: the
   // document nid this realm binds to is set further up in this function.
@@ -26421,7 +26427,7 @@ const _chromeNavigatorTable = [
 // the WindowProxy answers from it while the frame is still on its initial
 // about:blank and has no realm of its own. Captured last, after every
 // interface above is installed and after the enumerability pass.
-_pristineGlobalNames = new Set(Object.getOwnPropertyNames(globalThis));
+_pristineGlobalNames = new Set(_orderedWindowNames(Object.getOwnPropertyNames(globalThis)));
 
 // V8 invokes the embedder prepare-stack callback instead of calling
 // Error.prepareStackTrace directly. Keep CallSite inspection in JavaScript,
