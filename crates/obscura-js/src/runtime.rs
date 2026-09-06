@@ -17593,6 +17593,14 @@ RequestRedirect value",
                     const firstAdopted = first.adoptedStyleSheets;
                     const secondAdopted = second.adoptedStyleSheets;
                     const documentAdopted = document.adoptedStyleSheets;
+                    const adoptionDescriptors = [Document.prototype, ShadowRoot.prototype].map(proto => {
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'adoptedStyleSheets');
+                        return [descriptor.enumerable, descriptor.configurable];
+                    });
+                    const adoptionEnumerated = [document, first].map(root => {
+                        for (const key in root) if (key === 'adoptedStyleSheets') return true;
+                        return false;
+                    });
 
                     const shared = new CSSStyleSheet();
                     first.adoptedStyleSheets = [shared];
@@ -17642,7 +17650,8 @@ RequestRedirect value",
                         firstList.length,
                         inlineSheet.ownerNode,
                     ];
-                    return { initial, synchronized, afterRemoval, inlineRemoval };
+                    return { initial, synchronized, afterRemoval, inlineRemoval,
+                        adoptionDescriptors, adoptionEnumerated };
                 })()
                 "#,
             )
@@ -17659,6 +17668,8 @@ RequestRedirect value",
                 "synchronized": [true, true, true],
                 "afterRemoval": [true, 0, null, 0, true, true, true],
                 "inlineRemoval": [true, 0, null],
+                "adoptionDescriptors": [[true, true], [true, true]],
+                "adoptionEnumerated": [true, true],
             })
         );
     }

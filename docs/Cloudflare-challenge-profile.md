@@ -4,10 +4,11 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-06，step 222，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
-指定代理当前可达，console-op trace 恢复 47/91 键 payload；参考枚举面的剩余差异为 30 项。
+当前状态（2026-09-06，step 223，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
-对齐语言和屏幕后，CDP 实际点击触发目标二次导航，仍为 HTTP403 challenge；下一项已证实差异是 adoptedStyleSheets 描述符。
+Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
+CDP实际点击触发目标二次导航，仍为HTTP403 challenge，后续需继续对拍完整payload行为差异。
 本轮继续参考 HaHaVM-General 并修复 wreq Critical-CH 重复头、跨源 iframe 初始隔离位、初始 about:blank
 兼容模式及可配置屏幕工作区指标；最新 payload 已对齐 `crossOriginIsolated=F`、`compatMode=BackCompat`、
 `screen.availTop=30`、DPR/语言/UA-CH 关键值。通过真实点击可执行
@@ -7840,3 +7841,29 @@ focused 13/13；首次 workspace 1751/1752（MCP selector 等待超时），该�
 
 **下一步**：Chrome本地oracle确认Document.prototype.adoptedStyleSheets的enumerable/configurable均为
 true，Obscura均为false，可解释直接读取成功但payload枚举缺失。该独立修复尚未实施。
+
+### Step 223 - Document.adoptedStyleSheets枚举描述符（2026-09-06，代码完成）
+
+**假设与证据**：实时payload唯一已证实的缺失文档路径为d.adoptedStyleSheets。Chrome同输入本地oracle
+确认Document/ShadowRoot两个prototype的descriptor均为enumerable=true、configurable=true。
+Obscura只有Document两项为false；ShadowRoot最终描述符已由bootstrap后续归一处理成正确值。
+Document最初defineProperty未设置标志，使该访问器不可配置，后续归一也无法修正。
+
+**修复范围**：只补Document访问器的两个WebIDL标志。现有stylesheet adoption回归增加for-in可见性和
+描述符检查，并继续验证数组identity、跨root更新及真实cascade。暂不调整ShadowRoot或样式算法。
+
+**门禁复核补充**：companion的observer-intersection fixture在真实Chrome152中3秒后也为marker空、
+cards=10，无法达到其io:50断言。fixture只observe同一个sentinel一次，却期待持续交付相同相交状态；
+该预期不符合IntersectionObserver的阈值通知机制。另一失败固定Win32，与本机Chrome的MacIntel亦不符。
+原始harness结果仍如实记录31/33，未更改fixture或引擎行为来制造通过。
+
+**验证**：adoption focused3/3，完整workspace1752/1752、4 skipped。原生trace本地fixture中getter
+仍为GET HIT，直接读取与for-in枚举均正确；三个真实aligned payload都新增d.adoptedStyleSheets，
+落入与Chrome相同的空字符串桶，路径1645→1646，对旧参考差12→11。剩余为动态referrer/baseURI/
+lastModified及8个额外接口；本机Chrome152也具备这8个接口，因此不能据旧Chrome149样本直接判定
+这些接口为引擎缺陷或删除它们。枚举面不是全部payload行为对齐的充分条件。
+
+**实际点击**：无preload、用已验证截图坐标(213,313)发送CDP输入，触发proof及顶层重新导航；目标
+Document响应仍为403→403，最终title仍是挑战页。真实404尚未取得。
+精确release构建及最终trace check通过；最终原始obstacle harness仍为31/33，失败项与Step222及Chrome
+oracle一致。该门禁缺口保留在记录中，不以成功的单元测试替代33/33要求。

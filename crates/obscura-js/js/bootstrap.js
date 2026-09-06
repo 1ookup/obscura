@@ -13313,6 +13313,8 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
   set(sheets) {
     _replaceAdoptedStyleSheets(this, sheets);
   },
+  enumerable: true,
+  configurable: true,
 });
 
 globalThis.__mutationObservers = [];
