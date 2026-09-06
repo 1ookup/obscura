@@ -8470,6 +8470,24 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_frame_exposes_cpu_performance_projection() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "https://widget.example/frame", null, true);
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            "[typeof navigator.cpuPerformance, navigator.cpuPerformance, 'cpuPerformance' in navigator, typeof SharedArrayBuffer]",
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!(["number", 3, true, "function"]));
+    }
+
     #[test]
     fn scoped_document_domain_persists_the_relaxed_value() {
         let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");

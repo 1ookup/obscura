@@ -23321,6 +23321,19 @@ globalThis.__obscura_init = function() {
     registryState.roots.add(globalThis.document);
   } catch (_e) {}
   try { _applyCrossOriginIsolation?.(frameRootNid || 0); } catch (_e) {}
+  if (frameRootNid > 0 && _crossOriginIsolatedValue
+      && !Object.getOwnPropertyDescriptor(Navigator.prototype, 'cpuPerformance')) {
+    const getter = _markNativeAs(function cpuPerformance() {
+      const cores = Number(_fingerprint().hardwareConcurrency) || 8;
+      return Math.max(1, Math.min(4, Math.round(cores / 3)));
+    }, 'function get cpuPerformance() { [native code] }');
+    try { Object.defineProperty(getter, 'name', { value: 'get cpuPerformance', configurable: true }); } catch (_e) {}
+    Object.defineProperty(Navigator.prototype, 'cpuPerformance', {
+      get: getter,
+      enumerable: true,
+      configurable: true,
+    });
+  }
   // Keep string-code generation enabled unless this document explicitly has
   // a script-src/default-src without 'unsafe-eval'. The flag is consumed by
   // V8's isolate callback, so the intrinsic eval binding retains direct-eval

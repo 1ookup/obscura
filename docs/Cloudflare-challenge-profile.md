@@ -7975,6 +7975,16 @@ trace check 通过；真实 payload 保持 isolation 对齐，目标仍 403 chal
 最终 obstacle course 仍为 `31/33`，失败项是既有 fixture 的 IntersectionObserver `io:50` 期望和
 Win32 平台固定期望，两项在旧二进制和 Chrome oracle 中同样失败。
 
+### Step 236 - isolated frame cpuPerformance（2026-09-06，修复中）
+
+**证据**：同 UA Chrome 152 的真实 Turnstile frame 中，`navigator.cpuPerformance` 为 enumerable
+prototype getter，`typeof` 为 `number`，payload 桶值为 4；top realm 没有该属性。Obscura frame
+此前完全缺失该属性，导致 path 差异。
+
+**修复**：当 frame 自身已通过 COOP/COEP 和 `allow="cross-origin-isolated"` 获得 isolation 后，
+安装 native-shaped `Navigator.prototype.cpuPerformance` getter；值按 fingerprint hardwareConcurrency
+映射到 1..4，top realm 和非-isolated frame 不安装。focused frame realm 回归通过，待完整门禁与真实 payload。
+
 ### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
 
 最终 release 通过指定代理无注入访问并开启 CDP 条件点击。Turnstile frame owner 的
