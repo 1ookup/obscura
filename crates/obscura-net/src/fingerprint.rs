@@ -118,15 +118,36 @@ fn default_languages() -> Vec<String> {
 /// argument through each entry point. Malformed JSON yields empty overrides
 /// with the parse error on stderr rather than aborting a running pipeline.
 pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
-    let mut overrides = match std::env::var("OBSCURA_FINGERPRINT_JSON") {
-        Ok(raw) => match serde_json::from_str(&raw) {
-            Ok(overrides) => overrides,
-            Err(err) => {
-                eprintln!("obscura: ignoring invalid OBSCURA_FINGERPRINT_JSON: {err}");
-                FingerprintOverrides::default()
-            }
-        },
-        Err(_) => FingerprintOverrides::default(),
+    let profile = std::env::var_os("OBSCURA_PROFILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let path = std::path::PathBuf::from("profile.json");
+            path.is_file().then_some(path)
+        });
+    let mut merged = serde_json::Map::new();
+    if let Some(path) = profile {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Object(values)) => merged.extend(values),
+                Ok(_) => eprintln!("obscura: ignoring non-object profile {}", path.display()),
+                Err(err) => eprintln!("obscura: ignoring invalid profile {}: {err}", path.display()),
+            },
+            Err(err) => eprintln!("obscura: ignoring unreadable profile {}: {err}", path.display()),
+        }
+    }
+    if let Ok(raw) = std::env::var("OBSCURA_FINGERPRINT_JSON") {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Object(values)) => merged.extend(values),
+            Err(err) => eprintln!("obscura: ignoring invalid OBSCURA_FINGERPRINT_JSON: {err}"),
+            Ok(_) => eprintln!("obscura: ignoring non-object OBSCURA_FINGERPRINT_JSON"),
+        }
+    }
+    let mut overrides = match serde_json::from_value(serde_json::Value::Object(merged)) {
+        Ok(overrides) => overrides,
+        Err(err) => {
+            eprintln!("obscura: ignoring invalid fingerprint profile values: {err}");
+            FingerprintOverrides::default()
+        }
     };
     // Language is deliberately a separate, small override because it is a
     // common per-session setting and must stay synchronized across JS realms,
