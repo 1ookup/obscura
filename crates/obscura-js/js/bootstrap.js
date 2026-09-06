@@ -8730,7 +8730,7 @@ class _ScopedDocument extends Document {
   get baseURI() {
     const info = this._scopeInfo();
     const docUrl = (info && (info.baseUrl || info.url)) || "about:blank";
-    const base = this.querySelector("base[href]");
+    const base = _internalQuerySelector(this, "base[href]");
     if (base) {
       const href = base.getAttribute("href");
       if (href) {
@@ -9442,7 +9442,7 @@ function _environmentSettings() {
 // challenge's selector telemetry (Chrome resolves this natively).
 function _internalBaseHref(doc) {
   try {
-    if (!doc || !doc[_nidSym]) return null;
+    if (!doc || typeof doc[_nidSym] !== 'number') return null;
     const nid = Number(_dom("query_selector_scoped", doc[_nidSym], "base[href]"));
     if (!Number.isFinite(nid) || nid < 0) return null;
     return _dom("get_attribute", nid, "href") || null;
