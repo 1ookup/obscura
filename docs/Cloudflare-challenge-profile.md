@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-06，step 229，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-06，step 232，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
@@ -7918,7 +7918,7 @@ headful click HAR 曾对 Brunhild 请求收到 `204`。这解释了当前 Chrome
 `This operation was aborted`。transport failure 和 abort focused 各 1/1 通过，提交为 `c24378a`。
 其workspace、release、trace check与代理复测已完成；tQcZu4仍未迁移。
 
-### Step 226 - XHR timeout取消底层请求（2026-09-06，修复中）
+### Step 226 - XHR timeout取消底层请求（2026-09-06，代码完成）
 
 **假设**：XHR timeout 只派发了 `timeout/loadend`，没有取消内部 fetch；这会让 Brunhild 请求继续
 pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
