@@ -1,0 +1,19 @@
+{
+  "language": "zh-CN",
+  "languages": ["zh-CN"],
+  "hardwareConcurrency": 6,
+  "deviceMemory": 16,
+  "screen": {
+    "width": 1720,
+    "height": 1284,
+    "availWidth": 1720,
+    "availHeight": 1164,
+    "availTop": 30,
+    "availLeft": 0,
+    "outerWidth": 1200,
+    "outerHeight": 1120,
+    "screenX": 315,
+    "screenY": 33,
+    "deviceScaleFactor": 1
+  }
+}
