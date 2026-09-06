@@ -10986,9 +10986,6 @@ globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:19
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
 globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
-globalThis.scrollX = 0; globalThis.pageXOffset = 0;
-globalThis.scrollY = 0; globalThis.pageYOffset = 0;
-
 globalThis.__fetchInterceptEnabled = false;
 globalThis.__fetchInterceptCallback = null; // Set by CDP to handle paused requests
 
@@ -16260,8 +16257,12 @@ globalThis.atob = globalThis.atob || ((s) => {
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
-globalThis.scrollX = 0; globalThis.pageXOffset = 0;
-globalThis.scrollY = 0; globalThis.pageYOffset = 0;
+// Canonical Window geometry surface. Keep definitions in Chrome's stable
+// insertion order so every realm and WindowProxy observes the same sequence.
+globalThis.scrollX = 0;
+globalThis.pageXOffset = 0;
+globalThis.scrollY = 0;
+globalThis.pageYOffset = 0;
 
 // Keep the JavaScript capability surface aligned with the declarations the
 // renderer actually implements. Reporting an unknown declaration as supported
