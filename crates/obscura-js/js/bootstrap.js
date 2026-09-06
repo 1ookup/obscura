@@ -8735,7 +8735,7 @@ class _ScopedDocument extends Document {
     if (!info || !info.url) return '';
     if (info.sandboxActive && !info.allowSameOrigin) return '';
     try {
-      const host = new URL(info.url).hostname;
+      const host = new URL(info.origin || info.url).hostname;
       return host || '';
     } catch (_e) { return ''; }
   }
@@ -24302,7 +24302,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 
   // Legacy Window accessors that remain observable even when their value is
   // absent. `event` reads undefined outside dispatch, while `origin` reads the
-  // serialized location origin; both keep a native no-op setter in Chrome.
+  // serialized environment origin; both keep a native no-op setter in Chrome.
   if (!('event' in globalThis)) {
     Object.defineProperty(globalThis, 'event', {
       get: _markNativeAs(function event() {
@@ -24324,6 +24324,10 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     Object.defineProperty(globalThis, 'origin', {
       get: _markNativeAs(function origin() {
         try {
+          // about:blank/srcdoc inherit their creator's origin, while their
+          // location.origin remains "null". Sandboxed scopes stay opaque.
+          const info = _domParse('document_scope_info', _callingFrameRoot());
+          if (info && typeof info.origin === 'string') return info.origin;
           const value = globalThis.location?.origin;
           return value === undefined || value === '' ? 'null' : value;
         } catch (_error) { return 'null'; }

@@ -4,7 +4,10 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-05，step 219，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-06，step 222，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+指定代理当前可达，console-op trace 恢复 47/91 键 payload；参考枚举面的剩余差异为 30 项。
+初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
+对齐语言和屏幕后，CDP 实际点击触发目标二次导航，仍为 HTTP403 challenge；下一项已证实差异是 adoptedStyleSheets 描述符。
 本轮继续参考 HaHaVM-General 并修复 wreq Critical-CH 重复头、跨源 iframe 初始隔离位、初始 about:blank
 兼容模式及可配置屏幕工作区指标；最新 payload 已对齐 `crossOriginIsolated=F`、`compatMode=BackCompat`、
 `screen.availTop=30`、DPR/语言/UA-CH 关键值。通过真实点击可执行
@@ -7797,3 +7800,43 @@ focused 回归均通过；该实现不改变资源阻断、frame 导航或 chall
 **真实复测**：最新 release 仍完成 frame/top `/fo`、PAT `401` 和 proof `/fo`，随后因 Brunhild Connect
 失败上报 `600010`，没有目标 `/1.txt` 真实 `404`。该结果确认 CSP WebIDL 修复无回归，但最终验收仍受
 外部 proof 路由阻断。
+
+### Step 222 - 初始空白文档的 origin、domain 与 referrer（2026-09-06，代码完成）
+
+**假设**：实时枚举中的 `origin=null` 及缺失的 `d.domain`、`d.referrer` 来自初始空白 iframe
+没有正确投影创建者文档的环境，而不是应当保留的 sandbox 不透明 origin。
+
+**方法与证据**：指定代理下 source release 实测恢复 47/91 键 console payload。按桶形状识别枚举面、
+合并 path-to-bucket 集合并排除 `o.*` 后，参考 2/3 自比零差；当前 1643 路径对参考 1638 路径共 30 差。
+本地同一 HTTP fixture 同步创建空白 iframe 和下一层 iframe。Chrome 的 Window origin 两层均为
+父 HTTP origin，document.domain 均为父 host；第一层 referrer 是父文档 URL，第二层为 `about:blank`。
+Obscura 两层均为 origin `null`、domain/referrer 空字符串。两侧 location.origin 均为 `null`，
+adoptedStyleSheets 均为空列表，故后者没有被此 fixture 证实为缺陷。
+
+**根因与边界**：Window origin getter 错读 location.origin；ScopedDocument.domain 错读空白 URL 的 host；
+初始文档创建时 referrer 错复制父文档自己的 referrer。应使用已有 scope origin 和创建者 URL，并保持
+sandbox 不透明 origin、URL origin 与窗口 origin 的区别。原生 trace 自检通过；完整 console 字符串
+已由 host-op trace 捕获，本轮不需要新 trace hook。
+
+**修复与验证**：Window origin 读取已有 document scope 的 origin；ScopedDocument.domain 从该 origin
+取 host；初始文档 referrer 使用创建者 URL。新增两层同步 iframe 回归，修复前失败、修复后通过；
+独立 sandbox 回归确认 Window/location origin 仍为 `null`、domain 为空、父文档访问被拒。
+focused 13/13；首次 workspace 1751/1752（MCP selector 等待超时），该用例单独通过后以两个并发槽完整
+复跑 1752/1752、4 skipped。精确 release 构建与 `vendor/v8-trace.sh check` 通过。
+
+本地原生属性 trace 捕获 Document domain/referrer/adoptedStyleSheets 的 GET HIT；WindowProxy origin
+读取为 UNKNOWN，不能由该记录推断缺失或实际值，后者由完整 console payload 证明。无额外 getter 执行。
+同一离线8-frame fixture交错运行新旧各6轮：旧版 wall 0.48-0.50s、中位0.49s，新版0.49-0.50s、
+中位0.495s；RSS分别110854144-115589120与108003328-117440512字节，无超出10%噪声区间的变化。
+
+**真实结果**：指定代理三轮分别得到47/91、47/92、47/91键payload；每轮origin/domain均为challenge
+源，referrer均为当轮widget URL，枚举路径1643→1645，原始参考差30→28。使用已有fingerprint选项对齐
+16项设备/语言/屏幕差异后剩12项，包括3项动态URL/时间、8项额外接口和adoptedStyleSheets。
+无preload CDP轮通过截图定位复选框并点击，顶层Document响应序列403→403，仍未取得真实404。
+
+**Obstacle course**：从README指向的公开companion仓库取得6ebac829版33阶段fixture，实际运行31/33。
+失败为observer-intersection（期望io:50，实际空）和fingerprint（硬编码Win32，实际MacIntel）；两项均
+在保留的修复前二进制复现，属于已有门禁缺口，本轮不报告33/33。
+
+**下一步**：Chrome本地oracle确认Document.prototype.adoptedStyleSheets的enumerable/configurable均为
+true，Obscura均为false，可解释直接读取成功但payload枚举缺失。该独立修复尚未实施。

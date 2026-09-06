@@ -15863,6 +15863,41 @@ RequestRedirect value",
     }
 
     #[test]
+    fn initial_about_blank_inherits_creator_origin_domain_and_referrer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example:8443/parent/path");
+        let result = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            const read = frame => ({
+                url: frame.contentDocument.URL,
+                locationOrigin: frame.contentWindow.location.origin,
+                origin: frame.contentWindow.origin,
+                domain: frame.contentDocument.domain,
+                referrer: frame.contentDocument.referrer,
+                base: frame.contentDocument.baseURI,
+            });
+            const child = read(frame);
+            const nested = frame.contentDocument.createElement('iframe');
+            frame.contentDocument.body.append(nested);
+            return {child, nested: read(nested)};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "child": {
+                "url": "about:blank", "locationOrigin": "null",
+                "origin": "https://creator.example:8443", "domain": "creator.example",
+                "referrer": "https://creator.example:8443/parent/path",
+                "base": "https://creator.example:8443/parent/path",
+            },
+            "nested": {
+                "url": "about:blank", "locationOrigin": "null",
+                "origin": "https://creator.example:8443", "domain": "creator.example",
+                "referrer": "about:blank", "base": "https://creator.example:8443/parent/path",
+            },
+        }));
+    }
+
+    #[test]
     fn initial_about_blank_iframe_is_back_compat_synchronously() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -15875,6 +15910,28 @@ RequestRedirect value",
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["BackCompat", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_initial_about_blank_keeps_opaque_origin_and_domain() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            frame.sandbox = 'allow-scripts';
+            document.body.append(frame);
+            if (frame.contentDocument !== null) throw new Error('sandbox access');
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("opaque-initial", 1, root, "about:blank").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "opaque-initial", 1, crate::realm::MAIN_WORLD,
+            "[origin, location.origin, document.domain, document.referrer]",
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!([
+            "null", "null", "", "http://example.com/test",
+        ]));
     }
 
     #[cfg(feature = "render")]

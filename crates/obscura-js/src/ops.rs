@@ -1690,7 +1690,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     scope.base_url,
                     scope.csp,
                     scope.permissions_policy,
-                    scope.referrer,
+                    scope.url,
                     scope.referrer_policy,
                     scope.sandbox,
                     scope.cross_origin_isolated,
@@ -1702,7 +1702,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     gs.url.clone(),
                     gs.document_csp.clone(),
                     gs.document_permissions_policy.clone(),
-                    gs.referrer.clone(),
+                    gs.url.clone(),
                     // The top document's policy is not on the shared state;
                     // the loader's commit records the real one moments later.
                     String::new(),
