@@ -9906,6 +9906,7 @@ function _permissionStatusName(name) {
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
+function registerNavigatorSurface() {
 globalThis.navigator = _bootstrapObject('navigator', () => ({
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
@@ -10024,6 +10025,8 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     persisted() { return Promise.resolve(false); },
   })),
 }));
+}
+registerNavigatorSurface();
 
 // Put spoofed navigator props on a thin prototype above Navigator.prototype
 // so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
