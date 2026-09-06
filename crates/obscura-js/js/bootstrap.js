@@ -16039,8 +16039,11 @@ const _mkStore = (kind) => {
     },
   });
 };
-globalThis.localStorage = _mkStore('local');
-globalThis.sessionStorage = _mkStore('session');
+function registerStorageSurface() {
+  globalThis.localStorage = _mkStore('local');
+  globalThis.sessionStorage = _mkStore('session');
+}
+registerStorageSurface();
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
