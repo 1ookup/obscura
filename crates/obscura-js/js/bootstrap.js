@@ -20058,6 +20058,7 @@ function _idbDatabase(name, version) {
   };
 }
 
+function registerIndexedDbSurface() {
 globalThis.indexedDB = {
   open(name, version) {
     const dbName = String(name);
@@ -20085,6 +20086,8 @@ globalThis.indexedDB = {
   databases() { return Promise.resolve([...__obscura_idb.keys()].map(name => ({ name, version: _idbState(name).version }))); },
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
+}
+registerIndexedDbSurface();
 const _idbKeyRangeState = new WeakMap();
 function IDBKeyRange() {
   throw new TypeError("Failed to construct 'IDBKeyRange': Illegal constructor");
@@ -20139,6 +20142,7 @@ Object.defineProperty(globalThis, 'IDBKeyRange', {
   value: IDBKeyRange, writable: true, enumerable: false, configurable: true,
 });
 
+function registerCacheSurface() {
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
   match() { return Promise.resolve(undefined); },
@@ -20146,6 +20150,8 @@ globalThis.caches = {
   delete() { return Promise.resolve(false); },
   keys() { return Promise.resolve([]); },
 };
+}
+registerCacheSurface();
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
