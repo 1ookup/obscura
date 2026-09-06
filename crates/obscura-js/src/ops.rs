@@ -3073,8 +3073,10 @@ fn initial_iframe_cross_origin_isolated(
     if !parent_cross_origin_isolated {
         return false;
     }
+    // The initial about:blank document has a transient, non-isolated realm.
+    // Isolation is recalculated only after a committed response grants it.
     let Some(raw) = src.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return true;
+        return false;
     };
     let Some(target) = url::Url::parse(parent_base_url)
         .ok()
@@ -4469,7 +4471,7 @@ mod tests {
             "https://page.example/",
             Some("/same-origin-frame"),
         ));
-        assert!(initial_iframe_cross_origin_isolated(
+        assert!(!initial_iframe_cross_origin_isolated(
             &parent,
             true,
             "https://page.example/",
