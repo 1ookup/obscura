@@ -9,7 +9,7 @@ Preloads a passive hook in every frame realm that records:
 
 Every record also goes out through console.warn, which obscura funnels from
 all realms into the serve log (one grep sees widget + top). After settle it
-also dumps the TOP realm's window.__cap for easy reading.
+also dumps the TOP realm's captured state for easy reading.
 
 Chrome's full challenge is THREE submissions: the render (chl_api_m) + an
 initial /fo/ + a post-click proof /fo/. A passive run only sees the pre-click
@@ -32,11 +32,13 @@ except ImportError:
 
 PRELOAD = r"""
 (function () {
-  var hookKey = Symbol.for('obscura.capture.hooked');
-  if (globalThis[hookKey]) return;
-  globalThis[hookKey] = 1;
-  var cap = [];
-  window.__cap = cap;
+  var stateKey = Symbol.for('obscura.capture.state');
+  if (globalThis[stateKey]) return;
+  var state = { cap: [], roots: [] };
+  Object.defineProperty(globalThis, stateKey, {
+    value: state, writable: false, configurable: true, enumerable: false,
+  });
+  var cap = state.cap;
   var t0 = Date.now();
   function rec(kind, detail) {
     var o = { t: Date.now() - t0, kind: kind, d: detail };
@@ -44,11 +46,10 @@ PRELOAD = r"""
   }
   // shadow-root capture, so the click probe can see the widget iframe inside
   // Turnstile's closed shadow root.
-  window.__roots = [];
   var _ash = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function (i) {
     var r = _ash.apply(this, arguments);
-    try { window.__roots.push(r); } catch (e) {}
+    try { state.roots.push(r); } catch (e) {}
     return r;
   };
   // passive postMessage listener (does NOT wrap postMessage/contentWindow)
@@ -85,16 +86,16 @@ PRELOAD = r"""
 })();
 """
 
-DUMP = "JSON.stringify({url: String(location.href), cap: window.__cap || []})"
+DUMP = "JSON.stringify({url: String(location.href), cap: (globalThis[Symbol.for('obscura.capture.state')] || {cap:[]}).cap || []})"
 
 # Finds the widget iframe box (through shadow roots) and whether interactiveBegin
 # has fired (from the recorded postMessages). Single-line IIFE -- obscura's
 # Runtime.evaluate silently drops some multi-line forms.
-PROBE = ("(function(){var b=null;var it=false;"
-         "try{(window.__cap||[]).forEach(function(o){if(o.kind==='PM'&&o.d&&o.d.data&&"
+PROBE = ("(function(){var b=null;var it=false;var st=globalThis[Symbol.for('obscura.capture.state')]||{cap:[],roots:[]};"
+         "try{(st.cap||[]).forEach(function(o){if(o.kind==='PM'&&o.d&&o.d.data&&"
          "o.d.data.indexOf('interactiveBegin')>=0)it=true;});}catch(e){}"
          "var fr=[];"
-         "try{(window.__roots||[]).forEach(function(r){var f=r.querySelectorAll('iframe');"
+         "try{(st.roots||[]).forEach(function(r){var f=r.querySelectorAll('iframe');"
          "for(var i=0;i<f.length;i++)fr.push(f[i]);});}catch(e){}"
          "try{var t=document.querySelectorAll('iframe');for(var j=0;j<t.length;j++)fr.push(t[j]);}catch(e){}"
          "for(var k=0;k<fr.length;k++){var q=fr[k].getBoundingClientRect();"
