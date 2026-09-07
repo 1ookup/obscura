@@ -10811,6 +10811,33 @@ RequestRedirect value",
     }
 
     #[test]
+    fn window_webidl_constructors_are_not_enumerable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const enumerableConstructors = Object.keys(window)
+                        .filter(name => /^[A-Z]/.test(name));
+                    const samples = ['Image', 'XMLSerializer', 'Element', 'FontFaceSet']
+                        .map(name => {
+                            const descriptor = Object.getOwnPropertyDescriptor(window, name);
+                            return [name, descriptor && descriptor.enumerable];
+                        });
+                    return [enumerableConstructors, samples];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [],
+                [["Image", false], ["XMLSerializer", false],
+                 ["Element", false], ["FontFaceSet", false]],
+            ])
+        );
+    }
+
+    #[test]
     fn window_named_access_exposes_ids_and_eligible_names() {
         let mut rt = setup_runtime(
             r#"<html><body>
@@ -10826,6 +10853,8 @@ RequestRedirect value",
                 return [
                     window.payload === document.getElementById("payload"),
                     window.payload.text,
+                    !Object.getOwnPropertyNames(window).includes("payload"),
+                    !Object.keys(window).includes("payload"),
                     window.duplicate instanceof HTMLCollection,
                     window.duplicate.length,
                     window.login === document.querySelector("form"),
@@ -10840,6 +10869,8 @@ RequestRedirect value",
             serde_json::json!([
                 true,
                 "{\"ready\":true}",
+                true,
+                true,
                 true,
                 2,
                 true,
@@ -11162,6 +11193,23 @@ RequestRedirect value",
             )
             .unwrap(),
             serde_json::json!([1024, 768, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn screen_orientation_methods_follow_chrome_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "Object.keys(ScreenOrientation.prototype).filter(name => name !== 'constructor')",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "type", "angle", "onchange", "lock", "unlock",
+                "addEventListener", "dispatchEvent", "removeEventListener", "when",
+            ])
         );
     }
 

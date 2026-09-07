@@ -8014,3 +8014,45 @@ root 外的 widget 收不到它们。
 被正确传播后，frame payload 的 `crossOriginIsolated`/`SharedArrayBuffer` 差异归零，路径集合为 1647。
 点击在 `interactiveBegin` 后触发 proof `/fo` 200 和顶层新 ray；目标仍未收到真实 `/1.txt` 404。
 Brunhild `/i` 只记录 direct `op_fetch_url` 请求且无 completion，当前代理路由仍是外部阻断。
+
+### Step 239 - `gsLi5.o` Window/Navigator/Document 顺序与 named property（2026-09-07，代码完成）
+
+**证据**：新构建的 payload 以 `assets/payload/2-2.json` 的 `1.gsLi5` 为基线，Window、Navigator、
+Document、screen 四段顺序逐项一致。此前 Window 的 `history`/`frames`/`top`/`parent`/`frameElement`
+因默认 non-enumerable 被推迟，Navigator 的 overlay prototype 把 `modelContext`/`serviceWorker` 等
+推到错误位置，`_ScopedDocument.defaultView` 也遮蔽了基类顺序。
+
+**修复**：bootstrap 收尾统一 Window WebIDL namespace 的 enumerable descriptor，补全 GPU 常量顺序，
+把 Navigator overlay descriptor 展平到 `Navigator.prototype` 后按 Chrome 表重排，并让 scoped Document
+复用基类 `defaultView`。Worker 初始化不再复制页面的 `storage` getter，避免覆盖 Worker 自己的
+origin-private storage。Window named access 改为 `Window.prototype` 上的不可枚举 getter；Chrome 只支持
+`window[id]`/`id in window`，不会把 `<style id=...>` 列入 Window own keys，因此清除了 payload 中的
+`o.UwwC7`。`o.__capHooked`、`o.__cap`、`o.__roots` 也未再出现。
+
+**验证**：`window_named_access_exposes_ids_and_eligible_names`、动态 ID、Navigator own-property 回归
+均通过；最新点击轮最后一个 `gsLi5` 的 `o` 数组为 121 项，与 Chrome 参考完全相同。前两个早期提交
+没有 `o.event`，属于事件时序差异，不改变已对齐的顺序。目标站仍受 Brunhild 外部路由影响，未将
+challenge 文案或伪造 404 当作成功。
+
+### Step 240 - 最新 Chrome 149 `gsLi5` 全量顺序复核（2026-09-08，代码完成）
+
+**证据**：使用最新 release、stealth、macOS Chrome 149 UA、语言/屏幕画像（DPR=1）重新捕获
+`/tmp/obscura-payload-2.json`，按结构定位 `gsLi5`，与 `assets/payload/2-2.json` 逐桶比较。两侧
+均为 62 个桶，全部嵌套数组的 multiset 完全一致；关键数组的长度和集合为 `o=121`、`N=1164`、
+`T=11`、`F=13`、`x=266`。最新一轮 `N` 只出现两个 challenge 自有 `o.*` 名称
+(`runProgram`/`dwHkH1`) 的相邻交换，另一次有效轮次顺序相同，未涉及浏览器 surface。此前的 `N` 差异由
+大写 WebIDL 构造器错误 enumerable 导致，`screen.orientation`
+的 `dispatchEvent/removeEventListener` 也有顺序交换；`T` 的多余 `o.crossOriginIsolated` 与
+`o.SharedArrayBuffer` 来自跨源 frame 错误继承隔离状态。
+
+**修复**：全局 WebIDL 构造器统一为 non-enumerable，并为 `ScreenOrientation.prototype` 使用 Chrome
+顺序。跨源 frame 即使带 `allow="cross-origin-isolated"` 仍按 Chrome 保持非隔离，只有同源 COOP/COEP
+frame 获得隔离；非隔离跨源 frame 的反射面隐藏 8 个实验接口，直接访问仍保留。`Document.head/body`
+及 forms/images/links/scripts 等原生 getter 改用内部 selector，避免公开 `querySelector(All)` hook
+记录引擎自身的 `body/head/img/form/a[href]` 查询。
+
+**验证**：WebIDL/Window/frame/Document collection focused nextest 全部通过；最新 payload-2 的
+`gsLi5` 62/62 桶数组内容 exact，浏览器 surface 数组顺序 exact；仅保留上述 challenge 自有 `o.*`
+异步注册交换。`maNnU6` 中由引擎 getter 自发产生的 `body/head/img/form` 等 selector
+不再出现，剩余为 challenge 自身的动态 selector。真实站最终响应仍受外部
+Brunhild 路由影响，不以 challenge 页面文案代替 404 判据。

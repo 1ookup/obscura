@@ -6270,10 +6270,12 @@ impl Page {
                     // COOP/COEP. `allow-same-origin` keeps the tuple origin
                     // and may therefore retain isolation.
                     // COOP is a top-level browsing-context boundary. A
-                    // cross-origin child may retain isolation when the
-                    // embedding iframe explicitly delegates the feature via
-                    // `allow="cross-origin-isolated"` and its own response
-                    // grants COOP+COEP.
+                    // A cross-origin child remains in the non-isolated agent
+                    // cluster in Chrome even when the embedding element has
+                    // an `allow="cross-origin-isolated"` token. The token is
+                    // still retained for Permissions Policy reflection, but
+                    // it must not turn a cross-origin frame's own COOP/COEP
+                    // response into an isolated realm.
                     let document_cross_origin_isolated = frame_document_isolation(
                         &response,
                         &response_origin,
@@ -8360,7 +8362,7 @@ mod tests {
         assert!(frame_response_grants_cross_origin_isolation(
             &response, &widget, &widget, true,
         ));
-        assert!(super::frame_document_isolation(
+        assert!(!super::frame_document_isolation(
             &response, &widget, &page, true, true, obscura_dom::SandboxFlags::default(),
         ));
         assert!(!super::frame_document_isolation(
@@ -12471,7 +12473,7 @@ fn frame_document_isolation(
     response_origin: &obscura_dom::Origin,
     parent_origin: &obscura_dom::Origin,
     parent_cross_origin_isolated: bool,
-    allow_cross_origin_isolated: bool,
+    _allow_cross_origin_isolated: bool,
     sandbox: obscura_dom::SandboxFlags,
 ) -> bool {
     let own_isolation = frame_response_grants_cross_origin_isolation(
@@ -12480,10 +12482,7 @@ fn frame_document_isolation(
         parent_origin,
         parent_cross_origin_isolated,
     );
-    let delegated_isolation = allow_cross_origin_isolated
-        && parent_cross_origin_isolated
-        && response_grants_cross_origin_isolation(response);
-    (own_isolation || delegated_isolation)
+    own_isolation
         && (!sandbox.active
             || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))
 }

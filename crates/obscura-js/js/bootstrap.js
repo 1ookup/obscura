@@ -267,6 +267,14 @@ let _SharedArrayBufferCtor = globalThis.SharedArrayBuffer || (() => {
 let _applySecureContextGating = null;
 let _applyCrossOriginIsolation = null;
 let _crossOriginIsolatedValue = false;
+// Chrome's non-isolated child Window surface omits these experimental
+// constructors from own-key reflection. The values remain available through
+// direct property access in realms that implement them; only the reflected
+// surface is gated, and isolated frames keep the complete set.
+const _nonIsolatedFrameHiddenNames = new Set([
+  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint', 'NodeRange',
+  'OpaqueRange', 'PerformanceSoftNavigation', 'PermissionsPolicy', 'XSLTProcessor',
+]);
 // V8's code-generation callback reads this realm-local flag to enforce the
 // document's `script-src` `unsafe-eval` requirement without replacing the
 // intrinsic eval binding (which would change direct-eval scope).
@@ -313,6 +321,21 @@ _markNative(globalThis.dispatchEvent);
     // object does not, so this is a cheap, side-effect-free discriminator.
     try { return !!t && t.globalThis === t; } catch (_e) { return false; }
   }
+  function _isNonIsolatedFrameGlobal(t) {
+    let root = 0;
+    try { root = Number(t && t.__obscura_frame_document_nid) || 0; } catch (_e) {}
+    if (root <= 0) return false;
+    try {
+      const info = _domParse('document_scope_info', root) || {};
+      if (info.crossOriginIsolated === true) return false;
+      // Same-origin about:blank frames share the normal platform surface.
+      // The reduced own-key view is specific to a cross-origin child, which
+      // is the WindowProxy shape used by the challenge widget.
+      const container = _domParse('frame_container_info', root) || {};
+      const parentRoot = Number(container.parentRoot) || 0;
+      return _dom('iframe_scopes_same_origin', root, parentRoot) !== 'true';
+    } catch (_e) { return false; }
+  }
   function _isDomWrapper(t) {
     try { return !!t && typeof t[_nidSym] === 'number'; }
     catch (_e) { return false; }
@@ -322,6 +345,11 @@ _markNative(globalThis.dispatchEvent);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) out = out.filter(function(name) { return !set.has(name); });
+      if (_isNonIsolatedFrameGlobal(t)) {
+        out = out.filter(function(name) {
+          return typeof name !== 'string' || !_nonIsolatedFrameHiddenNames.has(name);
+        });
+      }
     }
     // DOM wrapper implementation slots are all underscore-prefixed. They are
     // intentionally ordinary JS fields for fast internal access, but Chrome's
@@ -346,6 +374,12 @@ _markNative(globalThis.dispatchEvent);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+      if (_isNonIsolatedFrameGlobal(t)) {
+        var frameKeys = _oGOPN(all);
+        for (var fi = 0; fi < frameKeys.length; fi++) {
+          if (_nonIsolatedFrameHiddenNames.has(frameKeys[fi])) delete all[frameKeys[fi]];
+        }
+      }
     }
     if (_isDomWrapper(t)) {
       var domKeys = _oGOPN(all);
@@ -1011,13 +1045,16 @@ function _splitAsciiWhitespace(s) {
 function _getElementsByClassName(root, classNames) {
   const tokens = _splitAsciiWhitespace(classNames);
   if (tokens.length === 0) return _htmlCollectionFrom([]);
+  const queryAll = root && typeof root[_nidSym] === 'number'
+    ? selector => _internalQuerySelectorAll(root, selector)
+    : selector => root.querySelectorAll(selector);
   // Fast path: a single CSS-identifier token goes straight to the native
   // selector engine (the common case). Only multi-token sets or exotic class
   // names (NBSP, leading digits, etc.) fall back to the O(n) JS scan below.
   if (tokens.length === 1 && /^[A-Za-z_-][\w-]*$/.test(tokens[0])) {
-    return _htmlCollectionFrom(root.querySelectorAll("." + tokens[0]));
+    return _htmlCollectionFrom(queryAll("." + tokens[0]));
   }
-  const all = root.querySelectorAll("*");
+  const all = queryAll("*");
   const matched = [];
   for (let i = 0; i < all.length; i++) {
     const el = all[i];
@@ -2432,8 +2469,11 @@ function _eventTargetDispatchNow(target, event) {
 let _legacyWindowEvent;
 let _legacyStickyWindowEvent;
 function _legacyEventStickyEligible() {
-  return typeof globalThis.document !== 'undefined'
-    && typeof globalThis.__obscura_frame_document_nid !== 'number';
+  // Window.event is exposed by every browsing-context global. Keep the first
+  // trusted browser-dispatched event available to the asynchronous challenge
+  // sampler in both the top and iframe realms; author-created events remain
+  // transient and never populate this slot.
+  return typeof globalThis.document !== 'undefined';
 }
 function _withLegacyWindowEvent(event, callback) {
   const previous = _legacyWindowEvent;
@@ -3036,6 +3076,7 @@ class Node extends EventTarget {
   get nodeType() { return +_dom("node_type", this[_nidSym]); }
   get nodeName() { return _domParse("node_name", this[_nidSym]) || ""; }
   get ownerDocument() {
+    if (typeof Document === 'function' && this instanceof Document) return null;
     const detachedOwner = _detachedOwnerForNode(this);
     if (detachedOwner) return detachedOwner;
     // Owner-document scope cache (design 2.3). The stamp is the owning
@@ -3067,6 +3108,16 @@ class Node extends EventTarget {
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
     try {
+      if (typeof this[_scopeRootSym] === 'number') {
+        const info = _domParse('document_scope_info', this[_scopeRootSym]) || {};
+        const docUrl = info.baseUrl || info.url || 'about:blank';
+        const href = _internalBaseHref(this);
+        if (href) {
+          const resolved = new URL(href, docUrl).href;
+          if (_cspBaseUriAllows(resolved)) return resolved;
+        }
+        return docUrl;
+      }
       // Frame content nodes resolve against their own document's base; the
       // ownerDocument lookup is cached and skipped entirely on pages without
       // iframe content documents.
@@ -3084,7 +3135,10 @@ class Node extends EventTarget {
       return "";
     }
   }
-  get textContent() { return _domParse("text_content", this[_nidSym]) ?? ""; }
+  get textContent() {
+    if (typeof Document === 'function' && this instanceof Document) return null;
+    return _domParse("text_content", this[_nidSym]) ?? "";
+  }
   set textContent(v) {
     if (this.localName === 'script') {
       v = globalThis.__obscura_tt_enforce(
@@ -4493,7 +4547,7 @@ class Element extends Node {
     const ids = _domParse("query_selector_all_scoped", this[_nidSym], s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return _htmlCollectionFrom(this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _htmlCollectionFrom(_internalQuerySelectorAll(this, t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
     // :popover-open is a JS-observable popover state, not understood by the
@@ -6603,8 +6657,11 @@ class Document extends Node {
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
   get lastElementChild() { return this.documentElement; }
-  get head() { return this.querySelector("head"); }
-  get body() { return this.querySelector("body"); }
+  // Native Document getters query the tree internally. Calling the public
+  // querySelector method here lets a page's monkey-patch observe engine
+  // bookkeeping (and pollutes the challenge's selector trace).
+  get head() { return _internalQuerySelector(this, "head"); }
+  get body() { return _internalQuerySelector(this, "body"); }
   get customElementRegistry() { return globalThis.customElements; }
   get designMode() { return 'off'; }
   set designMode(value) { String(value); }
@@ -6653,6 +6710,13 @@ class Document extends Node {
   get pictureInPictureEnabled() { return true; }
   get webkitFullscreenEnabled() { return true; }
   get doctype() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const ids = _domParse("child_nodes", this[_scopeRootSym]) || [];
+      for (const cid of ids) {
+        if (+_dom("node_type", cid) === 10) return _wrap(+cid);
+      }
+      return null;
+    }
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
@@ -6662,7 +6726,13 @@ class Document extends Node {
     }
     return this._doctype;
   }
-  get title() { return _domParse("document_title") ?? ""; }
+  get title() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const title = _internalQuerySelector(this, "title");
+      return title ? (title.textContent || '').split(/[\t\n\f\r ]+/).filter(Boolean).join(' ') : '';
+    }
+    return _domParse("document_title") ?? "";
+  }
   set title(v) {
     const value = String(v);
     let title = _internalQuerySelector(this, "title");
@@ -6679,9 +6749,21 @@ class Document extends Node {
     }
     title.textContent = value;
   }
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const info = _domParse('document_scope_info', this[_scopeRootSym]);
+      return (info && info.url) || 'about:blank';
+    }
+    return _domParse("document_url") ?? "";
+  }
   get documentURI() { return this.URL; }
   get domain() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      if (typeof this[_effectiveDomainSym] === 'string') return this[_effectiveDomainSym];
+      const info = _domParse('document_scope_info', this[_scopeRootSym]);
+      if (!info || !info.url || (info.sandboxActive && !info.allowSameOrigin)) return '';
+      try { return new URL(info.origin || info.url).hostname || ''; } catch (_e) { return ''; }
+    }
     return this === globalThis.document
       ? (typeof this._effectiveDomain === "string" ? this._effectiveDomain : _documentUrlHost())
       : _incumbentDocumentDomain();
@@ -6703,7 +6785,13 @@ class Document extends Node {
     // grant cross-document access.
     this._effectiveDomain = candidate;
   }
-  get referrer() { return _domParse("document_referrer") ?? ""; }
+  get referrer() {
+    if (typeof this[_scopeRootSym] === 'number') {
+      const info = _domParse('document_scope_info', this[_scopeRootSym]);
+      return (info && info.referrer) || '';
+    }
+    return _domParse("document_referrer") ?? "";
+  }
   async hasPrivateToken(issuer) {
     const root = _documentPrivacyRoot(this, "hasPrivateToken");
     if (arguments.length < 1) {
@@ -6865,7 +6953,10 @@ class Document extends Node {
   }
   get location() { return globalThis.location; }
   set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
-  get defaultView() { return globalThis; }
+  // Scoped frame documents use the same Document prototype as the top-level
+  // document. Resolve their WindowProxy through the internal slot so the
+  // inherited member keeps Chrome's prototype enumeration position.
+  get defaultView() { return this[_defaultViewProxySym] || globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -6972,9 +7063,12 @@ class Document extends Node {
     const ids = _domParse("query_selector_all", s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return _htmlCollectionFrom(this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _htmlCollectionFrom(_internalQuerySelectorAll(this, t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
-  getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
+  getElementsByName(name) {
+    return _internalQuerySelectorAll(
+      this, '[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+  }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
@@ -7449,13 +7543,13 @@ class Document extends Node {
     if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);
     return this[_styleSheetListSym];
   }
-  get forms() { return _documentCollection(this, 'forms', () => this.querySelectorAll('form')); }
-  get images() { return _documentCollection(this, 'images', () => this.querySelectorAll('img')); }
-  get links() { return _documentCollection(this, 'links', () => this.querySelectorAll('a[href], area[href]')); }
-  get scripts() { return _documentCollection(this, 'scripts', () => this.querySelectorAll('script')); }
-  get anchors() { return _documentCollection(this, 'anchors', () => this.querySelectorAll('a[name]')); }
-  get applets() { return _documentCollection(this, 'applets', () => this.querySelectorAll('applet')); }
-  get embeds() { return _documentCollection(this, 'embeds', () => this.querySelectorAll('embed')); }
+  get forms() { return _documentCollection(this, 'forms', () => _internalQuerySelectorAll(this, 'form')); }
+  get images() { return _documentCollection(this, 'images', () => _internalQuerySelectorAll(this, 'img')); }
+  get links() { return _documentCollection(this, 'links', () => _internalQuerySelectorAll(this, 'a[href], area[href]')); }
+  get scripts() { return _documentCollection(this, 'scripts', () => _internalQuerySelectorAll(this, 'script')); }
+  get anchors() { return _documentCollection(this, 'anchors', () => _internalQuerySelectorAll(this, 'a[name]')); }
+  get applets() { return _documentCollection(this, 'applets', () => _internalQuerySelectorAll(this, 'applet')); }
+  get embeds() { return _documentCollection(this, 'embeds', () => _internalQuerySelectorAll(this, 'embed')); }
   get plugins() { return this.embeds; }
   get cookie() {
     const settings = _environmentSettings();
@@ -7497,6 +7591,16 @@ class Document extends Node {
   }
   hasFocus() { return true; }
   execCommand() { return false; }
+}
+
+// Node supplies these members for Document as well. Keep the document
+// interface prototype free of duplicate Node entries so frame `for..in`
+// follows the native Document -> Node ordering.
+for (const _documentNodeName of [
+  'textContent', 'nodeType', 'nodeName', 'ownerDocument',
+  'addEventListener', 'removeEventListener', 'dispatchEvent',
+]) {
+  try { delete Document.prototype[_documentNodeName]; } catch (_e) {}
 }
 
 class DocumentFragment extends Node {
@@ -8782,7 +8886,6 @@ class _ScopedDocument extends Document {
   }
   // Wired by the contentDocument/contentWindow getters; null for a document
   // no longer presented in a frame.
-  get defaultView() { return this[_defaultViewProxySym] || null; }
   get location() { return this[_defaultViewProxySym] ? this[_defaultViewProxySym].location : null; }
   set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
   get doctype() {
@@ -8792,6 +8895,15 @@ class _ScopedDocument extends Document {
     }
     return null;
   }
+}
+// Scoped documents share Document's public prototype in Chromium. Their
+// getters dispatch on _scopeRootSym above; keeping a second enumerable layer
+// would put title/doctype/defaultView before the browser's canonical members.
+for (const _scopedPublicName of [
+  'title', 'URL', 'baseURI', 'compatMode', 'designMode', 'referrer',
+  'location', 'doctype',
+]) {
+  try { delete _ScopedDocument.prototype[_scopedPublicName]; } catch (_e) {}
 }
 // _ScopedDocument's own class members shadow Document.prototype; without
 // the native marker their toString exposes the source and the challenge
@@ -8840,6 +8952,10 @@ function _materializeFrameRealm(hostNid) {
   }
 }
 const _chromeWindowKeyOrder = [
+  // WindowProxy exposes opener before the event-handler block. The boolean
+  // and secure-context globals follow the same native registration order.
+  'opener', 'closed', 'crossOriginIsolated', 'credentialless',
+  'isSecureContext', 'originAgentCluster', 'offscreenBuffering',
   'window', 'self', 'document', 'location', 'customElements', 'history',
   'navigation', 'locationbar', 'menubar', 'personalbar', 'scrollbars',
   'statusbar', 'toolbar', 'frames', 'top', 'parent', 'frameElement',
@@ -8849,6 +8965,37 @@ const _chromeWindowKeyOrder = [
   'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
   'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',
   'Intl', 'Atomics', 'Reflect', 'console', 'CSS', 'Temporal', 'WebAssembly',
+  'GPUBufferUsage', 'GPUColorWrite', 'GPUMapMode', 'GPUShaderStage',
+  'GPUTextureUsage',
+  'onsearch', 'onappinstalled', 'onbeforeinstallprompt', 'onabort',
+  'onbeforeinput', 'onbeforematch', 'onbeforetoggle', 'onblur', 'oncancel',
+  'oncanplay', 'oncanplaythrough', 'onchange', 'onclick', 'onclose',
+  'oncommand', 'oncontentvisibilityautostatechange', 'oncontextlost',
+  'oncontextmenu', 'oncontextrestored', 'oncuechange', 'ondblclick', 'ondrag',
+  'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart',
+  'ondrop', 'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus',
+  'onformdata', 'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup',
+  'onload', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onmousedown',
+  'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover',
+  'onmouseup', 'onmousewheel', 'onpause', 'onplay', 'onplaying', 'onprogress',
+  'onratechange', 'onreset', 'onresize', 'onscroll', 'onscrollend',
+  'onsecuritypolicyviolation', 'onseeked', 'onseeking', 'onselect',
+  'onslotchange', 'onstalled', 'onsubmit', 'onsuspend', 'ontimeupdate',
+  'ontoggle', 'onvolumechange', 'onwaiting', 'onwebkitanimationend',
+  'onwebkitanimationiteration', 'onwebkitanimationstart', 'onwebkittransitionend',
+  'onwheel', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture',
+  'onpointerdown', 'onpointermove', 'onpointerup', 'onpointercancel',
+  'onpointerover', 'onpointerout', 'onpointerenter', 'onpointerleave',
+  'onselectstart', 'onselectionchange', 'onanimationcancel', 'onanimationend',
+  'onanimationiteration', 'onanimationstart', 'ontransitionrun',
+  'ontransitionstart', 'ontransitionend', 'ontransitioncancel', 'onbeforexrselect',
+  'onafterprint', 'onbeforeprint', 'onbeforeunload', 'onhashchange',
+  'onlanguagechange', 'onmessage', 'onmessageerror', 'onoffline', 'ononline',
+  'onpagehide', 'onpageshow', 'onpopstate', 'onrejectionhandled', 'onstorage',
+  'onunhandledrejection', 'onunload', 'ondevicemotion', 'ondeviceorientation',
+  'ondeviceorientationabsolute', 'onpointerrawupdate', 'onpageswap',
+  'onpagereveal', 'fence', 'onscrollsnapchange', 'onscrollsnapchanging',
+  'ongamepadconnected', 'ongamepaddisconnected',
 ];
 function _orderedWindowNames(names) {
   const rank = new Map(_chromeWindowKeyOrder.map((key, index) => [key, index]));
@@ -9110,10 +9257,14 @@ function _frameWindowProxyFor(hostEl) {
   _markNative(target.focus);
   _markNative(target.close);
   Object.defineProperties(target, {
-    frames: { get: () => proxy, configurable: true },
-    top: { get: () => globalThis, configurable: true },
-    parent: { get: () => globalThis, configurable: true },
-    frameElement: { get: () => { if (!sameOrigin()) throw securityError(); return hostEl; }, configurable: true },
+    frames: { get: () => proxy, enumerable: true, configurable: true },
+    top: { get: () => globalThis, enumerable: true, configurable: true },
+    parent: { get: () => globalThis, enumerable: true, configurable: true },
+    frameElement: {
+      get: () => { if (!sameOrigin()) throw securityError(); return hostEl; },
+      enumerable: true,
+      configurable: true,
+    },
   });
   _alignPropertiesOrder(target, _chromeWindowKeyOrder);
 
@@ -9121,6 +9272,10 @@ function _frameWindowProxyFor(hostEl) {
     // Access checks run per property operation, not only on contentDocument:
     // cross-origin callers get the HTML allowlist; anything else throws.
     get(t, key) {
+      if (key === "globalThis") {
+        if (!sameOrigin()) throw securityError();
+        return proxy;
+      }
       // `constructor` is inherited off the target's Object.prototype, which
       // would answer the *main* realm's Object. A browser answers the frame's
       // own Window, so route it through the frame realm like every other
@@ -9160,6 +9315,7 @@ function _frameWindowProxyFor(hostEl) {
         : Reflect.set(t, key, value);
     },
     has(t, key) {
+      if (key === "globalThis") return sameOrigin();
       if (key === "constructor") {
         if (!sameOrigin()) return false;
         const realmGlobal = _frameRealmGlobalFor(contentRoot());
@@ -9185,13 +9341,16 @@ function _frameWindowProxyFor(hostEl) {
       for (const key of Reflect.ownKeys(t)) {
         if (!seen.has(key)) { seen.add(key); keys.push(key); }
       }
-      return keys;
+      return _orderedWindowNames(keys);
     },
     getOwnPropertyDescriptor(t, key) {
       const own = Reflect.getOwnPropertyDescriptor(t, key);
       if (own) return own;
       if (typeof key === "string" && !sameOrigin()) return undefined;
       if (key === "constructor") return undefined;
+      if (key === "globalThis") {
+        return { value: proxy, writable: true, enumerable: false, configurable: true };
+      }
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
       let descriptor;
       if (realmGlobal) {
@@ -9381,12 +9540,16 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
   _markNative(target.blur);
   _markNative(target.focus);
   _markNative(target.close);
-  Object.defineProperty(target, "self", { get: () => ref, configurable: true });
-  Object.defineProperty(target, "window", { get: () => ref, configurable: true });
-  Object.defineProperty(target, "frames", { get: () => ref, configurable: true });
+  Object.defineProperty(target, "self", { get: () => ref, enumerable: true, configurable: true });
+  Object.defineProperty(target, "window", { get: () => ref, enumerable: true, configurable: true });
+  Object.defineProperty(target, "frames", { get: () => ref, enumerable: true, configurable: true });
   _alignPropertiesOrder(target, _chromeWindowKeyOrder);
   const ref = new Proxy(target, {
     get(t, key) {
+      if (key === "globalThis") {
+        if (!sameOrigin()) throw securityError();
+        return ref;
+      }
       if (key === "constructor") {
         if (!sameOrigin()) throw securityError();
         const realmGlobal = targetGlobal();
@@ -9408,6 +9571,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
         : Reflect.set(t, key, value);
     },
     has(t, key) {
+      if (key === "globalThis") return sameOrigin();
       if (key === "constructor") {
         if (!sameOrigin()) return false;
         const realmGlobal = targetGlobal();
@@ -9428,13 +9592,16 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
         if (key === "constructor") continue;
         if (!seen.has(key)) keys.push(key);
       }
-      return keys;
+      return _orderedWindowNames(keys);
     },
     getOwnPropertyDescriptor(t, key) {
       const own = Reflect.getOwnPropertyDescriptor(t, key);
       if (own) return own;
       if (typeof key === "string" && !sameOrigin()) return undefined;
       if (key === "constructor") return undefined;
+      if (key === "globalThis") {
+        return { value: ref, writable: true, enumerable: false, configurable: true };
+      }
       const realmGlobal = targetGlobal();
       const descriptor = realmGlobal
         ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
@@ -17648,7 +17815,8 @@ function _nodeList(els) {
 // Window named access. HTML exposes every element id, plus the name of a
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
 // global object cannot be replaced with a WindowProxy after snapshot startup,
-// so install lazy accessors for the supported names present in this document.
+// so install lazy accessors on Window.prototype for the supported names present
+// in this document. This keeps the global's own-property reflection browser-like.
 // The accessor resolves against the live tree: one match returns that element
 // (or an iframe's Window), while duplicates return a live-shaped
 // HTMLCollection in tree order.
@@ -17737,11 +17905,18 @@ function _ensureWindowNamedProperty(name) {
   if (!name || _windowNamedPropertyNames.has(name)) return;
   // Existing own Window properties win over named elements.
   if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
+  const holder = globalThis.Window?.prototype || Object.getPrototypeOf(globalThis);
+  if (!holder || Object.prototype.hasOwnProperty.call(holder, name)) return;
   try {
-    Object.defineProperty(globalThis, name, {
+    // Named properties are an exotic WindowProxy feature in browsers. They
+    // participate in `name in window` and `window[name]`, but are absent from
+    // the WindowProxy's own-property reflection and from `for..in`. Defining
+    // the live accessor on Window.prototype preserves those semantics while
+    // keeping the V8 global's own key list stable.
+    Object.defineProperty(holder, name, {
       get() { return _windowNamedValue(name); },
       configurable: true,
-      enumerable: true,
+      enumerable: false,
     });
     _windowNamedPropertyNames.add(name);
   } catch (_error) {}
@@ -17750,7 +17925,8 @@ function _ensureWindowNamedProperty(name) {
 function _reconcileWindowNamedProperty(name) {
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
-  try { delete globalThis[name]; } catch (_error) {}
+  const holder = globalThis.Window?.prototype || Object.getPrototypeOf(globalThis);
+  try { if (holder) delete holder[name]; } catch (_error) {}
   _windowNamedPropertyNames.delete(name);
 }
 
@@ -17796,8 +17972,7 @@ function _reconcileWindowNamedProperties(names) {
   }
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
-      try { delete globalThis[name]; } catch (_error) {}
-      _windowNamedPropertyNames.delete(name);
+      _reconcileWindowNamedProperty(name);
     }
   }
 }
@@ -23723,12 +23898,39 @@ globalThis.__obscura_init = function() {
   // explicit-resource-management set), which then read as page additions.
   // Indices are excluded on purpose: they are this window's child frames, and
   // a fresh frame has none.
+  try {
+    _extendChromeWindowFunctionOrder();
+    _normalizeWindowObjectEnumerability(globalThis);
+    _flattenNavigatorPrototypeSurface();
+    if (globalThis.navigator) {
+      _alignPropertiesOrder(Object.getPrototypeOf(globalThis.navigator), _chromeNavigatorKeyOrder);
+    }
+    if (globalThis.Document?.prototype) {
+      _alignPropertiesOrder(globalThis.Document.prototype, _chromeDocumentKeyOrder);
+    }
+    if (globalThis.Screen?.prototype) {
+      _alignPropertiesOrder(globalThis.Screen.prototype, _chromeScreenKeyOrder);
+    }
+    if (globalThis.ScreenOrientation?.prototype) {
+      _alignPropertiesOrder(
+        globalThis.ScreenOrientation.prototype,
+        _chromeScreenOrientationKeyOrder,
+      );
+    }
+    if (globalThis.Node?.prototype) {
+      _alignPropertiesOrder(globalThis.Node.prototype, _chromeNodeKeyOrder);
+    }
+  } catch (e) {}
   _pristineGlobalNames = new Set(_orderedWindowNames(
     Object.getOwnPropertyNames(globalThis).filter(name => !/^\d+$/.test(name))));
   // Iframes the parser produced never run the insertion steps, so this is the
   // only place the initial window[i] set gets built. It runs last: the
   // document nid this realm binds to is set further up in this function.
   try { _syncWindowFrameIndices(); } catch(e) {}
+  // Each iframe realm is initialized after the snapshot has been restored.
+  // Reapply the canonical Window order here so its real global object (the
+  // object challenge code enumerates) matches the snapshot and WindowProxy.
+  try { _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder); } catch(e) {}
   delete globalThis.__obscura_init;
 };
 
@@ -26440,7 +26642,8 @@ const _chromeNavigatorKeyOrder = [
   'webkitPersistentStorage', 'windowControlsOverlay', 'hardwareConcurrency',
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
-  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'getGamepads',
+  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'modelContext',
+  'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
   'clipboard', 'credentials', 'keyboard', 'managed', 'mediaDevices',
@@ -26520,33 +26723,319 @@ const _chromeDocumentKeyOrder = [
   'customElementRegistry', 'ariaNotify'
 ];
 
-function _alignPropertiesOrder(target, keyOrder) {
-  if (!target) return;
-  for (const key of keyOrder) {
-    const desc = Object.getOwnPropertyDescriptor(target, key);
-    if (desc && desc.configurable) {
-      delete target[key];
-      Object.defineProperty(target, key, desc);
-    }
+const _chromeScreenKeyOrder = [
+  'availWidth', 'availHeight', 'width', 'height', 'colorDepth', 'pixelDepth',
+  'availLeft', 'availTop', 'orientation', 'isExtended', 'onchange',
+  'addEventListener', 'dispatchEvent', 'removeEventListener', 'when',
+  'constructor',
+];
+const _chromeScreenOrientationKeyOrder = [
+  'type', 'angle', 'onchange', 'lock', 'unlock',
+  'addEventListener', 'dispatchEvent', 'removeEventListener', 'when',
+  'constructor',
+];
+const _chromeNodeKeyOrder = [
+  'nodeType', 'nodeName', 'baseURI', 'isConnected', 'ownerDocument',
+  'parentNode', 'parentElement', 'childNodes', 'firstChild', 'lastChild',
+  'previousSibling', 'nextSibling', 'nodeValue', 'textContent',
+  'ELEMENT_NODE', 'ATTRIBUTE_NODE', 'TEXT_NODE', 'CDATA_SECTION_NODE',
+  'ENTITY_REFERENCE_NODE', 'ENTITY_NODE', 'PROCESSING_INSTRUCTION_NODE',
+  'COMMENT_NODE', 'DOCUMENT_NODE', 'DOCUMENT_TYPE_NODE', 'DOCUMENT_FRAGMENT_NODE',
+  'NOTATION_NODE', 'DOCUMENT_POSITION_DISCONNECTED', 'DOCUMENT_POSITION_PRECEDING',
+  'DOCUMENT_POSITION_FOLLOWING', 'DOCUMENT_POSITION_CONTAINS',
+  'DOCUMENT_POSITION_CONTAINED_BY', 'DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC',
+  'appendChild', 'cloneNode', 'compareDocumentPosition', 'contains', 'getRootNode',
+  'hasChildNodes', 'insertBefore', 'isDefaultNamespace', 'isEqualNode', 'isSameNode',
+  'lookupNamespaceURI', 'lookupPrefix', 'normalize', 'removeChild', 'replaceChild',
+  'addEventListener', 'dispatchEvent', 'removeEventListener', 'when', 'constructor',
+];
+// Chrome installs the callable Window surface in two stable groups: the
+// Window/ECMAScript functions first, then the generated interface constructors
+// in the reference payload order. Keep this generated table in bootstrap so
+// realm enumeration follows the same registration sequence.
+const _chromeWindowVersionExtras = new Set([
+  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint', 'NodeRange',
+  'OpaqueRange', 'PerformanceSoftNavigation', 'PermissionsPolicy', 'XSLTProcessor',
+]);
+const _chromePayloadBareFunctionOrder = [
+ 'alert', 'atob', 'blur', 'btoa', 'cancelAnimationFrame', 'cancelIdleCallback', 'captureEvents', 'clearInterval',
+ 'clearTimeout', 'close', 'confirm', 'createImageBitmap', 'fetch', 'find', 'focus', 'getComputedStyle',
+ 'getSelection', 'matchMedia', 'moveBy', 'moveTo', 'open', 'postMessage', 'print', 'prompt',
+ 'queueMicrotask', 'releaseEvents', 'reportError', 'requestAnimationFrame', 'requestIdleCallback', 'resizeBy', 'resizeTo', 'scroll',
+ 'scrollBy', 'scrollTo', 'setInterval', 'setTimeout', 'stop', 'structuredClone', 'webkitCancelAnimationFrame', 'webkitRequestAnimationFrame',
+ 'fetchLater', 'getScreenDetails', 'queryLocalFonts', 'showDirectoryPicker', 'showOpenFilePicker', 'showSaveFilePicker', 'webkitRequestFileSystem', 'webkitResolveLocalFileSystemURL',
+ 'addEventListener', 'dispatchEvent', 'removeEventListener', 'when', 'Object', 'Function', 'Number', 'parseFloat',
+ 'parseInt', 'Boolean', 'String', 'Symbol', 'Date', 'Promise', 'RegExp', 'Error',
+ 'AggregateError', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'ArrayBuffer',
+ 'Uint8Array', 'Int8Array', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'BigUint64Array', 'BigInt64Array',
+ 'Uint8ClampedArray', 'Float32Array', 'Float64Array', 'DataView', 'Map', 'BigInt', 'Set', 'Iterator',
+ 'WeakMap', 'WeakSet', 'Proxy', 'FinalizationRegistry', 'WeakRef', 'decodeURI', 'decodeURIComponent', 'encodeURI',
+ 'encodeURIComponent', 'escape', 'unescape', 'eval', 'isFinite', 'isNaN', 'Option', 'Image',
+ 'Audio', 'webkitURL', 'webkitRTCPeerConnection', 'webkitMediaStream', 'WebKitMutationObserver', 'WebKitCSSMatrix', 'XPathResult', 'XPathExpression',
+ 'XPathEvaluator', 'XMLSerializer', 'XMLHttpRequestUpload', 'XMLHttpRequestEventTarget', 'XMLHttpRequest', 'XMLDocument', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController',
+ 'WritableStream', 'Worker', 'WindowControlsOverlayGeometryChangeEvent', 'WindowControlsOverlay', 'Window', 'WheelEvent', 'WebSocket', 'WebGLVertexArrayObject',
+ 'WebGLUniformLocation', 'WebGLTransformFeedback', 'WebGLTexture', 'WebGLSync', 'WebGLShaderPrecisionFormat', 'WebGLShader', 'WebGLSampler', 'WebGLRenderingContext',
+ 'WebGLRenderbuffer', 'WebGLQuery', 'WebGLProgram', 'WebGLObject', 'WebGLFramebuffer', 'WebGLContextEvent', 'WebGLBuffer', 'WebGLActiveInfo',
+ 'WebGL2RenderingContext', 'WaveShaperNode', 'VisualViewport', 'VisibilityStateEntry', 'VirtualKeyboardGeometryChangeEvent', 'ViewTransitionTypeSet', 'ViewTransition', 'ViewTimeline',
+ 'VideoPlaybackQuality', 'VideoFrame', 'VideoColorSpace', 'ValidityState', 'VTTCue', 'UserActivation', 'URLSearchParams', 'URLPattern',
+ 'URL', 'UIEvent', 'TrustedTypePolicyFactory', 'TrustedTypePolicy', 'TrustedScriptURL', 'TrustedScript', 'TrustedHTML', 'TreeWalker',
+ 'TransitionEvent', 'TransformStreamDefaultController', 'TransformStream', 'TrackEvent', 'TouchList', 'TouchEvent', 'Touch', 'ToggleEvent',
+ 'TimeRanges', 'TextUpdateEvent', 'TextTrackList', 'TextTrackCueList', 'TextTrackCue', 'TextTrack', 'TextMetrics', 'TextFormatUpdateEvent',
+ 'TextFormat', 'TextEvent', 'TextEncoderStream', 'TextEncoder', 'TextDecoderStream', 'TextDecoder', 'Text', 'TaskSignal',
+ 'TaskPriorityChangeEvent', 'TaskController', 'TaskAttributionTiming', 'SyncManager', 'Subscriber', 'SubmitEvent', 'StyleSheetList', 'StyleSheet',
+ 'StylePropertyMapReadOnly', 'StylePropertyMap', 'StorageEvent', 'Storage', 'StereoPannerNode', 'StaticRange', 'SourceBufferList', 'SourceBuffer',
+ 'ShadowRoot', 'Selection', 'SecurityPolicyViolationEvent', 'ScrollTimeline', 'ScriptProcessorNode', 'ScreenOrientation', 'Screen', 'Scheduling',
+ 'Scheduler', 'SVGViewElement', 'SVGUseElement', 'SVGUnitTypes', 'SVGTransformList', 'SVGTransform', 'SVGTitleElement', 'SVGTextPositioningElement',
+ 'SVGTextPathElement', 'SVGTextElement', 'SVGTextContentElement', 'SVGTSpanElement', 'SVGSymbolElement', 'SVGSwitchElement', 'SVGStyleElement', 'SVGStringList',
+ 'SVGStopElement', 'SVGSetElement', 'SVGScriptElement', 'SVGSVGElement', 'SVGRectElement', 'SVGRect', 'SVGRadialGradientElement', 'SVGPreserveAspectRatio',
+ 'SVGPolylineElement', 'SVGPolygonElement', 'SVGPointList', 'SVGPoint', 'SVGPatternElement', 'SVGPathElement', 'SVGNumberList', 'SVGNumber',
+ 'SVGMetadataElement', 'SVGMatrix', 'SVGMaskElement', 'SVGMarkerElement', 'SVGMPathElement', 'SVGLinearGradientElement', 'SVGLineElement', 'SVGLengthList',
+ 'SVGLength', 'SVGImageElement', 'SVGGraphicsElement', 'SVGGradientElement', 'SVGGeometryElement', 'SVGGElement', 'SVGForeignObjectElement', 'SVGFilterElement',
+ 'SVGFETurbulenceElement', 'SVGFETileElement', 'SVGFESpotLightElement', 'SVGFESpecularLightingElement', 'SVGFEPointLightElement', 'SVGFEOffsetElement', 'SVGFEMorphologyElement', 'SVGFEMergeNodeElement',
+ 'SVGFEMergeElement', 'SVGFEImageElement', 'SVGFEGaussianBlurElement', 'SVGFEFuncRElement', 'SVGFEFuncGElement', 'SVGFEFuncBElement', 'SVGFEFuncAElement', 'SVGFEFloodElement',
+ 'SVGFEDropShadowElement', 'SVGFEDistantLightElement', 'SVGFEDisplacementMapElement', 'SVGFEDiffuseLightingElement', 'SVGFEConvolveMatrixElement', 'SVGFECompositeElement', 'SVGFEComponentTransferElement', 'SVGFEColorMatrixElement',
+ 'SVGFEBlendElement', 'SVGEllipseElement', 'SVGElement', 'SVGDescElement', 'SVGDefsElement', 'SVGComponentTransferFunctionElement', 'SVGClipPathElement', 'SVGCircleElement',
+ 'SVGAnimationElement', 'SVGAnimatedTransformList', 'SVGAnimatedString', 'SVGAnimatedRect', 'SVGAnimatedPreserveAspectRatio', 'SVGAnimatedNumberList', 'SVGAnimatedNumber', 'SVGAnimatedLengthList',
+ 'SVGAnimatedLength', 'SVGAnimatedInteger', 'SVGAnimatedEnumeration', 'SVGAnimatedBoolean', 'SVGAnimatedAngle', 'SVGAnimateTransformElement', 'SVGAnimateMotionElement', 'SVGAnimateElement',
+ 'SVGAngle', 'SVGAElement', 'Response', 'ResizeObserverSize', 'ResizeObserverEntry', 'ResizeObserver', 'Request', 'ReportingObserver',
+ 'ReportBody', 'ReadableStreamDefaultReader', 'ReadableStreamDefaultController', 'ReadableStreamBYOBRequest', 'ReadableStreamBYOBReader', 'ReadableStream', 'ReadableByteStreamController', 'Range',
+ 'RadioNodeList', 'RTCTrackEvent', 'RTCStatsReport', 'RTCSessionDescription', 'RTCSctpTransport', 'RTCRtpTransceiver', 'RTCRtpSender', 'RTCRtpReceiver',
+ 'RTCPeerConnectionIceEvent', 'RTCPeerConnectionIceErrorEvent', 'RTCPeerConnection', 'RTCIceTransport', 'RTCIceCandidate', 'RTCErrorEvent', 'RTCError', 'RTCEncodedVideoFrame',
+ 'RTCEncodedAudioFrame', 'RTCDtlsTransport', 'RTCDataChannelEvent', 'RTCDTMFToneChangeEvent', 'RTCDTMFSender', 'RTCCertificate', 'PromiseRejectionEvent', 'ProgressEvent',
+ 'ProcessingInstruction', 'PopStateEvent', 'PointerEvent', 'PluginArray', 'Plugin', 'PictureInPictureWindow', 'PictureInPictureEvent', 'Permissions',
+ 'PermissionStatus', 'PeriodicWave', 'PerformanceTiming', 'PerformanceServerTiming', 'PerformanceScriptTiming', 'PerformanceResourceTiming', 'PerformancePaintTiming', 'PerformanceObserverEntryList',
+ 'PerformanceObserver', 'PerformanceNavigationTiming', 'PerformanceNavigation', 'PerformanceMeasure', 'PerformanceMark', 'PerformanceLongTaskTiming', 'PerformanceLongAnimationFrameTiming', 'PerformanceEventTiming',
+ 'PerformanceEntry', 'PerformanceElementTiming', 'Performance', 'Path2D', 'PannerNode', 'PageTransitionEvent', 'OverconstrainedError', 'OscillatorNode',
+ 'OffscreenCanvasRenderingContext2D', 'OffscreenCanvas', 'OfflineAudioContext', 'OfflineAudioCompletionEvent', 'Observable', 'NodeList', 'NodeIterator', 'NodeFilter',
+ 'Node', 'NetworkInformation', 'NavigatorUAData', 'Navigator', 'NavigationTransition', 'NavigationPrecommitController', 'NavigationHistoryEntry', 'NavigationDestination',
+ 'NavigationCurrentEntryChangeEvent', 'NavigationActivation', 'Navigation', 'NavigateEvent', 'NamedNodeMap', 'MutationRecord', 'MutationObserver', 'MouseEvent',
+ 'MimeTypeArray', 'MimeType', 'MessagePort', 'MessageEvent', 'MessageChannel', 'MediaStreamTrackVideoStats', 'MediaStreamTrackProcessor', 'MediaStreamTrackGenerator',
+ 'MediaStreamTrackEvent', 'MediaStreamTrackAudioStats', 'MediaStreamTrack', 'MediaStreamEvent', 'MediaStreamAudioSourceNode', 'MediaStreamAudioDestinationNode', 'MediaStream', 'MediaSourceHandle',
+ 'MediaSource', 'MediaRecorder', 'MediaQueryListEvent', 'MediaQueryList', 'MediaList', 'MediaError', 'MediaEncryptedEvent', 'MediaElementAudioSourceNode',
+ 'MediaCapabilities', 'MathMLElement', 'Location', 'LayoutShiftAttribution', 'LayoutShift', 'LargestContentfulPaint', 'KeyframeEffect', 'KeyboardEvent',
+ 'IntersectionObserverEntry', 'IntersectionObserver', 'InterestEvent', 'InputEvent', 'InputDeviceInfo', 'InputDeviceCapabilities', 'Ink', 'ImageData',
+ 'ImageBitmapRenderingContext', 'ImageBitmap', 'IdleDeadline', 'IIRFilterNode', 'IDBVersionChangeEvent', 'IDBTransaction', 'IDBRequest', 'IDBRecord',
+ 'IDBOpenDBRequest', 'IDBObjectStore', 'IDBKeyRange', 'IDBIndex', 'IDBFactory', 'IDBDatabase', 'IDBCursorWithValue', 'IDBCursor',
+ 'History', 'HighlightRegistry', 'Highlight', 'Headers', 'HashChangeEvent', 'HTMLVideoElement', 'HTMLUnknownElement', 'HTMLUListElement',
+ 'HTMLTrackElement', 'HTMLTitleElement', 'HTMLTimeElement', 'HTMLTextAreaElement', 'HTMLTemplateElement', 'HTMLTableSectionElement', 'HTMLTableRowElement', 'HTMLTableElement',
+ 'HTMLTableColElement', 'HTMLTableCellElement', 'HTMLTableCaptionElement', 'HTMLStyleElement', 'HTMLSpanElement', 'HTMLSourceElement', 'HTMLSlotElement', 'HTMLSelectedContentElement',
+ 'HTMLSelectElement', 'HTMLScriptElement', 'HTMLQuoteElement', 'HTMLProgressElement', 'HTMLPreElement', 'HTMLPictureElement', 'HTMLParamElement', 'HTMLParagraphElement',
+ 'HTMLOutputElement', 'HTMLOptionsCollection', 'HTMLOptionElement', 'HTMLOptGroupElement', 'HTMLObjectElement', 'HTMLOListElement', 'HTMLModElement', 'HTMLMeterElement',
+ 'HTMLMetaElement', 'HTMLMenuElement', 'HTMLMediaElement', 'HTMLMarqueeElement', 'HTMLMapElement', 'HTMLLinkElement', 'HTMLLegendElement', 'HTMLLabelElement',
+ 'HTMLLIElement', 'HTMLInputElement', 'HTMLImageElement', 'HTMLIFrameElement', 'HTMLHtmlElement', 'HTMLHeadingElement', 'HTMLHeadElement', 'HTMLHRElement',
+ 'HTMLFrameSetElement', 'HTMLFrameElement', 'HTMLFormElement', 'HTMLFormControlsCollection', 'HTMLFontElement', 'HTMLFieldSetElement', 'HTMLEmbedElement', 'HTMLElement',
+ 'HTMLDocument', 'HTMLDivElement', 'HTMLDirectoryElement', 'HTMLDialogElement', 'HTMLDetailsElement', 'HTMLDataListElement', 'HTMLDataElement', 'HTMLDListElement',
+ 'HTMLCollection', 'HTMLCanvasElement', 'HTMLButtonElement', 'HTMLBodyElement', 'HTMLBaseElement', 'HTMLBRElement', 'HTMLAudioElement', 'HTMLAreaElement',
+ 'HTMLAnchorElement', 'HTMLAllCollection', 'GeolocationPositionError', 'GeolocationPosition', 'GeolocationCoordinates', 'Geolocation', 'GamepadHapticActuator', 'GamepadEvent',
+ 'GamepadButton', 'Gamepad', 'GainNode', 'FormDataEvent', 'FormData', 'FontFaceSetLoadEvent', 'FontFace', 'FocusEvent',
+ 'FileReader', 'FileList', 'File', 'FeaturePolicy', 'External', 'EventTarget', 'EventSource', 'EventCounts',
+ 'Event', 'ErrorEvent', 'EncodedVideoChunk', 'EncodedAudioChunk', 'ElementInternals', 'Element', 'EditContext', 'DynamicsCompressorNode',
+ 'DragEvent', 'DocumentType', 'DocumentTimeline', 'DocumentFragment', 'Document', 'DelegatedInkTrailPresenter', 'DelayNode', 'DecompressionStream',
+ 'DataTransferItemList', 'DataTransferItem', 'DataTransfer', 'DOMTokenList', 'DOMStringMap', 'DOMStringList', 'DOMRectReadOnly', 'DOMRectList',
+ 'DOMRect', 'DOMQuad', 'DOMPointReadOnly', 'DOMPoint', 'DOMParser', 'DOMMatrixReadOnly', 'DOMMatrix', 'DOMImplementation',
+ 'DOMException', 'DOMError', 'CustomStateSet', 'CustomEvent', 'CustomElementRegistry', 'Crypto', 'CountQueuingStrategy', 'ConvolverNode',
+ 'ContentVisibilityAutoStateChangeEvent', 'ConstantSourceNode', 'CompressionStream', 'CompositionEvent', 'Comment', 'CommandEvent', 'CloseWatcher', 'CloseEvent',
+ 'ClipboardEvent', 'CharacterData', 'CharacterBoundsUpdateEvent', 'ChannelSplitterNode', 'ChannelMergerNode', 'CaretPosition', 'CanvasRenderingContext2D', 'CanvasPattern',
+ 'CanvasGradient', 'CanvasCaptureMediaStreamTrack', 'CSSViewTransitionRule', 'CSSVariableReferenceValue', 'CSSUnparsedValue', 'CSSUnitValue', 'CSSTranslate', 'CSSTransition',
+ 'CSSTransformValue', 'CSSTransformComponent', 'CSSSupportsRule', 'CSSStyleValue', 'CSSStyleSheet', 'CSSStyleRule', 'CSSStyleDeclaration', 'CSSStartingStyleRule',
+ 'CSSSkewY', 'CSSSkewX', 'CSSSkew', 'CSSScopeRule', 'CSSScale', 'CSSRuleList', 'CSSRule', 'CSSRotate',
+ 'CSSPropertyRule', 'CSSPositionValue', 'CSSPositionTryRule', 'CSSPositionTryDescriptors', 'CSSPerspective', 'CSSPageRule', 'CSSNumericValue', 'CSSNumericArray',
+ 'CSSNestedDeclarations', 'CSSNamespaceRule', 'CSSMediaRule', 'CSSMatrixComponent', 'CSSMathValue', 'CSSMathSum', 'CSSMathProduct', 'CSSMathNegate',
+ 'CSSMathMin', 'CSSMathMax', 'CSSMathInvert', 'CSSMathClamp', 'CSSMarginRule', 'CSSLayerStatementRule', 'CSSLayerBlockRule', 'CSSKeywordValue',
+ 'CSSKeyframesRule', 'CSSKeyframeRule', 'CSSImportRule', 'CSSImageValue', 'CSSGroupingRule', 'CSSFontPaletteValuesRule', 'CSSFontFaceRule', 'CSSCounterStyleRule',
+ 'CSSContainerRule', 'CSSConditionRule', 'CSSAnimation', 'CSPViolationReportBody', 'CDATASection', 'ByteLengthQueuingStrategy', 'BrowserCaptureMediaStreamTrack', 'BroadcastChannel',
+ 'BlobEvent', 'Blob', 'BiquadFilterNode', 'BeforeUnloadEvent', 'BeforeInstallPromptEvent', 'BaseAudioContext', 'BarProp', 'AudioWorkletNode',
+ 'AudioSinkInfo', 'AudioScheduledSourceNode', 'AudioProcessingEvent', 'AudioParamMap', 'AudioParam', 'AudioNode', 'AudioListener', 'AudioDestinationNode',
+ 'AudioData', 'AudioContext', 'AudioBufferSourceNode', 'AudioBuffer', 'Attr', 'AnimationTimeline', 'AnimationPlaybackEvent', 'AnimationEvent',
+ 'AnimationEffect', 'Animation', 'AnalyserNode', 'AbstractRange', 'AbortSignal', 'AbortController', 'SuppressedError', 'DisposableStack',
+ 'AsyncDisposableStack', 'Float16Array', 'AbsoluteOrientationSensor', 'Accelerometer', 'AudioDecoder', 'AudioEncoder', 'AudioWorklet', 'BatteryManager',
+ 'Cache', 'CacheStorage', 'Clipboard', 'ClipboardChangeEvent', 'ClipboardItem', 'CookieChangeEvent', 'CookieStore', 'CookieStoreManager',
+ 'CreateMonitor', 'Credential', 'CredentialsContainer', 'CryptoKey', 'DeviceMotionEvent', 'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate', 'DeviceOrientationEvent',
+ 'FederatedCredential', 'GPU', 'GPUAdapter', 'GPUAdapterInfo', 'GPUBindGroup', 'GPUBindGroupLayout', 'GPUBuffer', 'GPUCanvasContext',
+ 'GPUCommandBuffer', 'GPUCommandEncoder', 'GPUCompilationInfo', 'GPUCompilationMessage', 'GPUComputePassEncoder', 'GPUComputePipeline', 'GPUDevice', 'GPUDeviceLostInfo',
+ 'GPUError', 'GPUExternalTexture', 'GPUInternalError', 'GPUOutOfMemoryError', 'GPUPipelineError', 'GPUPipelineLayout', 'GPUQuerySet', 'GPUQueue',
+ 'GPURenderBundle', 'GPURenderBundleEncoder', 'GPURenderPassEncoder', 'GPURenderPipeline', 'GPUSampler', 'GPUShaderModule', 'GPUSupportedFeatures', 'GPUSupportedLimits',
+ 'GPUTexture', 'GPUTextureView', 'GPUUncapturedErrorEvent', 'GPUValidationError', 'GravitySensor', 'Gyroscope', 'IdleDetector', 'ImageCapture',
+ 'ImageDecoder', 'ImageTrack', 'ImageTrackList', 'Keyboard', 'KeyboardLayoutMap', 'LinearAccelerationSensor', 'MIDIAccess', 'MIDIConnectionEvent',
+ 'MIDIInput', 'MIDIInputMap', 'MIDIMessageEvent', 'MIDIOutput', 'MIDIOutputMap', 'MIDIPort', 'MediaDeviceInfo', 'MediaDevices',
+ 'MediaKeyMessageEvent', 'MediaKeySession', 'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys', 'NavigationPreloadManager', 'NavigatorManagedData', 'OrientationSensor',
+ 'PasswordCredential', 'ProtectedAudience', 'RelativeOrientationSensor', 'ScreenDetailed', 'ScreenDetails', 'Sensor', 'SensorErrorEvent', 'ServiceWorkerRegistration',
+ 'StorageManager', 'SubtleCrypto', 'VideoDecoder', 'VideoEncoder', 'VirtualKeyboard', 'WGSLLanguageFeatures', 'WebTransport', 'WebTransportBidirectionalStream',
+ 'WebTransportDatagramDuplexStream', 'WebTransportError', 'Worklet', 'XRDOMOverlayState', 'XRLayer', 'XRWebGLBinding', 'AudioPlaybackStats', 'AuthenticatorAssertionResponse',
+ 'AuthenticatorAttestationResponse', 'AuthenticatorResponse', 'PublicKeyCredential', 'BarcodeDetector', 'Bluetooth', 'BluetoothCharacteristicProperties', 'BluetoothDevice', 'BluetoothRemoteGATTCharacteristic',
+ 'BluetoothRemoteGATTDescriptor', 'BluetoothRemoteGATTServer', 'BluetoothRemoteGATTService', 'CaptureController', 'CrashReportContext', 'DevicePosture', 'DigitalCredential', 'DocumentPictureInPicture',
+ 'EyeDropper', 'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle', 'FileSystemWritableFileStream', 'FileSystemObserver', 'FontData',
+ 'FragmentDirective', 'HID', 'HIDConnectionEvent', 'HIDDevice', 'HIDInputReportEvent', 'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider',
+ 'NavigatorLogin', 'LanguageDetector', 'LanguageModel', 'Lock', 'LockManager', 'ServiceWorker', 'ServiceWorkerContainer', 'ModelContext',
+ 'NotRestoredReasonDetails', 'NotRestoredReasons', 'OTPCredential', 'PaymentAddress', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse', 'PaymentManager',
+ 'PaymentMethodChangeEvent', 'Presentation', 'PresentationAvailability', 'PresentationConnection', 'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent', 'PresentationConnectionList', 'PresentationReceiver',
+ 'PresentationRequest', 'PressureObserver', 'PressureRecord', 'Serial', 'SerialPort', 'SpeechRecognitionPhrase', 'StorageBucket', 'StorageBucketManager',
+ 'Summarizer', 'Translator', 'USB', 'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice', 'USBEndpoint',
+ 'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket', 'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'WakeLock',
+ 'WakeLockSentinel', 'WebMCPEvent', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
+ 'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource', 'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
+ 'XRJointPose', 'XRJointSpace', 'XRLightEstimate', 'XRLightProbe', 'XRPose', 'XRRay', 'XRReferenceSpace', 'XRReferenceSpaceEvent',
+ 'XRRenderState', 'XRRigidTransform', 'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSystem', 'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource',
+ 'XRView', 'XRViewerPose', 'XRViewport', 'XRWebGLDepthInformation', 'XRWebGLLayer', 'XRCompositionLayer', 'XRProjectionLayer', 'XRCubeLayer',
+ 'XRCylinderLayer', 'XREquirectLayer', 'XRLayerEvent', 'XRQuadLayer', 'XRSubImage', 'XRWebGLSubImage', 'XRPlane', 'XRPlaneSet',
+ 'XRVisibilityMaskChangeEvent', 'AnimationTrigger', 'BackgroundFetchManager', 'BackgroundFetchRecord', 'BackgroundFetchRegistration', 'BluetoothUUID', 'CSSFontFeatureValuesRule', 'CSSFunctionDeclarations',
+ 'CSSFunctionDescriptors', 'CSSFunctionRule', 'CSSPseudoElement', 'ChapterInformation', 'CropTarget', 'DocumentPictureInPictureEvent', 'Fence', 'FencedFrameConfig',
+ 'HTMLFencedFrameElement', 'HTMLGeolocationElement', 'IntegrityViolationReportBody', 'LaunchParams', 'LaunchQueue', 'MediaMetadata', 'MediaSession', 'Notification',
+ 'Origin', 'PageRevealEvent', 'PageSwapEvent', 'PerformanceTimingConfidence', 'PeriodicSyncManager', 'Profiler', 'PushManager', 'PushSubscription',
+ 'PushSubscriptionOptions', 'QuotaExceededError', 'RTCDataChannel', 'RTCRtpScriptTransform', 'RemotePlayback', 'RestrictionTarget', 'Sanitizer', 'SharedStorage',
+ 'SharedStorageWorklet', 'SharedStorageAppendMethod', 'SharedStorageClearMethod', 'SharedStorageDeleteMethod', 'SharedStorageModifierMethod', 'SharedStorageSetMethod', 'SharedWorker', 'SnapEvent',
+ 'SpeechGrammar', 'SpeechGrammarList', 'SpeechRecognition', 'SpeechRecognitionErrorEvent', 'SpeechRecognitionEvent', 'SpeechSynthesis', 'SpeechSynthesisErrorEvent', 'SpeechSynthesisEvent',
+ 'SpeechSynthesisUtterance', 'SpeechSynthesisVoice', 'TimelineTrigger', 'TimelineTriggerRange', 'TimelineTriggerRangeList', 'Viewport', 'WebSocketError', 'WebSocketStream',
+ 'webkitSpeechGrammar', 'webkitSpeechGrammarList', 'webkitSpeechRecognition', 'webkitSpeechRecognitionError', 'webkitSpeechRecognitionEvent'
+];
+function _extendChromeWindowFunctionOrder() {
+  const ordered = _chromePayloadBareFunctionOrder;
+  const seen = new Set(_chromeWindowKeyOrder);
+  for (const name of ordered) {
+    if (!seen.has(name)) { seen.add(name); _chromeWindowKeyOrder.push(name); }
+  }
+  for (const name of _chromeWindowVersionExtras) {
+    if (!seen.has(name)) { seen.add(name); _chromeWindowKeyOrder.push(name); }
   }
 }
 
-// Re-align globalThis own keys and prototype properties to standard Chrome WebIDL order
+function _alignPropertiesOrder(target, keyOrder) {
+  if (!target) return;
+  for (const key of keyOrder) {
+    if (target === globalThis && _ecmaScriptGlobals.has(key)) continue;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(target, key);
+      if (desc && desc.configurable) {
+        delete target[key];
+        Object.defineProperty(target, key, desc);
+      }
+    } catch (_error) {}
+  }
+}
+
+// Window's WebIDL namespace objects are enumerable own properties in Chrome.
+// The ECMAScript namespace objects that follow them (globalThis, JSON, Math,
+// CSS and the GPU constant objects) are not. Keep this descriptor contract in
+// one place because secure-context gating and frame initialization can replace
+// these properties after the initial bootstrap pass.
+const _chromeEnumerableWindowObjects = [
+  'window', 'self', 'document', 'location', 'customElements', 'history',
+  'navigation', 'locationbar', 'menubar', 'personalbar', 'scrollbars',
+  'statusbar', 'toolbar', 'frames', 'top', 'parent', 'frameElement',
+  'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
+  'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
+  'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
+  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
+  'viewport', 'launchQueue', 'speechSynthesis',
+];
+const _chromeEnumerableWindowFunctions = [
+  'alert', 'atob', 'blur', 'btoa', 'cancelAnimationFrame', 'cancelIdleCallback',
+  'captureEvents', 'clearInterval', 'clearTimeout', 'close', 'confirm',
+  'createImageBitmap', 'fetch', 'find', 'focus', 'getComputedStyle',
+  'getSelection', 'matchMedia', 'moveBy', 'moveTo', 'open', 'postMessage',
+  'print', 'prompt', 'queueMicrotask', 'releaseEvents', 'reportError',
+  'requestAnimationFrame', 'requestIdleCallback', 'resizeBy', 'resizeTo',
+  'scroll', 'scrollBy', 'scrollTo', 'setInterval', 'setTimeout', 'stop',
+  'structuredClone', 'webkitCancelAnimationFrame', 'webkitRequestAnimationFrame',
+  'fetchLater', 'getScreenDetails', 'queryLocalFonts', 'showDirectoryPicker',
+  'showOpenFilePicker', 'showSaveFilePicker', 'webkitRequestFileSystem',
+  'webkitResolveLocalFileSystemURL', 'addEventListener', 'dispatchEvent',
+  'removeEventListener', 'when',
+];
+const _chromeNonEnumerableWindowObjects = [
+  'globalThis', 'JSON', 'Math', 'Intl', 'Atomics', 'Reflect', 'console',
+  'CSS', 'Temporal', 'WebAssembly', 'GPUBufferUsage', 'GPUColorWrite',
+  'GPUMapMode', 'GPUShaderStage', 'GPUTextureUsage',
+];
+function _normalizeWindowObjectEnumerability(target) {
+  if (!target) return;
+  const isFrameRealm = typeof target.__obscura_frame_document_nid === 'number'
+    && target.__obscura_frame_document_nid > 0;
+  const setEnumerable = (name, enumerable) => {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(target, name);
+      if (!descriptor || descriptor.enumerable === enumerable || !descriptor.configurable) return;
+      Object.defineProperty(target, name, { ...descriptor, enumerable });
+    } catch (_error) {}
+  };
+  for (const name of _chromeEnumerableWindowObjects) setEnumerable(name, true);
+  for (const name of _chromeEnumerableWindowFunctions) {
+    if (isFrameRealm && !Object.prototype.hasOwnProperty.call(target, name)
+        && target.Window?.prototype && typeof target.Window.prototype[name] === 'function') {
+      try {
+        Object.defineProperty(target, name, {
+          value: target.Window.prototype[name], writable: true,
+          enumerable: true, configurable: true,
+        });
+      } catch (_error) {}
+    }
+    setEnumerable(name, true);
+  }
+  // Window interface constructors are own properties of the global object,
+  // but WebIDL exposes those bindings as non-enumerable. Several legacy
+  // shims were installed with `globalThis.X = ...` before the interface table
+  // pass and consequently retained enumerable:true. That makes an enumerable
+  // walk put Image/Element/etc. before ECMAScript globals, unlike Chrome.
+  // Keep the rule derived from the descriptor shape rather than maintaining a
+  // second list of constructor names that would drift with the interface table.
+  for (const name of Object.getOwnPropertyNames(target)) {
+    if (!/^[A-Z]/.test(name) || _ecmaScriptGlobals.has(name)) continue;
+    try {
+      const value = target[name];
+      if (typeof value === 'function') setEnumerable(name, false);
+    } catch (_error) {}
+  }
+  for (const name of _chromeNonEnumerableWindowObjects) setEnumerable(name, false);
+}
+
+// The initial navigator shim used a thin overlay prototype for per-page
+// getters. Copy its descriptors into Navigator.prototype once every installer
+// has run so one ordered WebIDL surface is observed by for-in.
+function _flattenNavigatorPrototypeSurface() {
+  const navigatorObject = globalThis.navigator;
+  const prototype = globalThis.Navigator?.prototype;
+  const overlay = navigatorObject && Object.getPrototypeOf(navigatorObject);
+  if (!navigatorObject || !prototype || !overlay || overlay === prototype) return;
+  for (const name of Object.getOwnPropertyNames(overlay)) {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(overlay, name);
+      if (!descriptor || name === 'constructor') continue;
+      Object.defineProperty(prototype, name, descriptor);
+    } catch (_error) {}
+  }
+  try { Object.setPrototypeOf(navigatorObject, prototype); } catch (_error) {}
+}
+
+// Re-align globalThis own keys and interface prototypes to standard Chrome order.
 try {
+  _normalizeWindowObjectEnumerability(globalThis);
+  _flattenNavigatorPrototypeSurface();
   _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
+  if (globalThis.navigator) {
+    _alignPropertiesOrder(Object.getPrototypeOf(globalThis.navigator), _chromeNavigatorKeyOrder);
+  }
   if (globalThis.Navigator?.prototype) {
     _alignPropertiesOrder(globalThis.Navigator.prototype, _chromeNavigatorKeyOrder);
   }
   if (globalThis.Document?.prototype) {
     _alignPropertiesOrder(globalThis.Document.prototype, _chromeDocumentKeyOrder);
   }
+  if (globalThis.Screen?.prototype) {
+    _alignPropertiesOrder(globalThis.Screen.prototype, _chromeScreenKeyOrder);
+  }
+  if (globalThis.ScreenOrientation?.prototype) {
+    _alignPropertiesOrder(
+      globalThis.ScreenOrientation.prototype,
+      _chromeScreenOrientationKeyOrder,
+    );
+  }
+  if (globalThis.Node?.prototype) {
+    _alignPropertiesOrder(globalThis.Node.prototype, _chromeNodeKeyOrder);
+  }
 } catch (_) {}
 
 // The global's own property names as the engine leaves them, before any page
-// script runs. This is the surface a fresh same-origin frame's window has, so
-// the WindowProxy answers from it while the frame is still on its initial
-// about:blank and has no realm of its own. Captured last, after every
-// interface above is installed and after the enumerability pass.
+// script runs. This is the surface a fresh same-origin frame's window has.
 _pristineGlobalNames = new Set(_orderedWindowNames(Object.getOwnPropertyNames(globalThis)));
 
 // V8 invokes the embedder prepare-stack callback instead of calling

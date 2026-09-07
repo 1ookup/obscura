@@ -911,7 +911,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       'productSub', 'userAgent', 'vendor', 'vendorSub',
       'language', 'languages', 'onLine',
       'hardwareConcurrency', 'deviceMemory',
-      'userAgentData', 'connection', 'storage', 'locks', 'permissions',
+      'userAgentData', 'connection', 'locks', 'permissions',
       'mediaCapabilities', 'serviceWorker', 'sendBeacon',
     ];
     for (var n = 0; n < NAV_ALLOW.length; n++) {
