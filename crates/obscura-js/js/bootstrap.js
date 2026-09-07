@@ -9105,7 +9105,7 @@ function _frameWindowProxyFor(hostEl) {
     parent: { get: () => globalThis, configurable: true },
     frameElement: { get: () => { if (!sameOrigin()) throw securityError(); return hostEl; }, configurable: true },
   });
-  Object.defineProperty(target, "globalThis", { get: () => proxy, configurable: true });
+  _alignPropertiesOrder(target, _chromeWindowKeyOrder);
 
   const proxy = new Proxy(target, {
     // Access checks run per property operation, not only on contentDocument:
@@ -9374,6 +9374,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
   Object.defineProperty(target, "self", { get: () => ref, configurable: true });
   Object.defineProperty(target, "window", { get: () => ref, configurable: true });
   Object.defineProperty(target, "frames", { get: () => ref, configurable: true });
+  _alignPropertiesOrder(target, _chromeWindowKeyOrder);
   const ref = new Proxy(target, {
     get(t, key) {
       if (key === "constructor") {
@@ -26422,6 +26423,114 @@ const _chromeNavigatorTable = [
     });
   }
 })();
+
+const _chromeNavigatorKeyOrder = [
+  'vendorSub', 'productSub', 'vendor', 'maxTouchPoints', 'scheduling',
+  'userActivation', 'geolocation', 'doNotTrack', 'webkitTemporaryStorage',
+  'webkitPersistentStorage', 'windowControlsOverlay', 'hardwareConcurrency',
+  'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
+  'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
+  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'getGamepads',
+  'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
+  'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
+  'clipboard', 'credentials', 'keyboard', 'managed', 'mediaDevices',
+  'serviceWorker', 'virtualKeyboard', 'wakeLock', 'deviceMemory', 'userAgentData',
+  'locks', 'storage', 'gpu', 'login', 'ink', 'mediaCapabilities', 'permissions',
+  'devicePosture', 'hid', 'mediaSession', 'presentation', 'serial', 'usb', 'xr',
+  'storageBuckets', 'adAuctionComponents', 'runAdAuction',
+  'canLoadAdAuctionFencedFrame', 'canShare', 'share', 'clearAppBadge',
+  'getBattery', 'getUserMedia', 'requestMIDIAccess', 'requestMediaKeySystemAccess',
+  'setAppBadge', 'webkitGetUserMedia', 'clearOriginJoinedAdInterestGroups',
+  'createAuctionNonce', 'joinAdInterestGroup', 'leaveAdInterestGroup',
+  'updateAdInterestGroups', 'deprecatedReplaceInURN', 'deprecatedURNToURL',
+  'getInstalledRelatedApps', 'getInterestGroupAdAuctionData',
+  'registerProtocolHandler', 'unregisterProtocolHandler'
+];
+
+const _chromeDocumentKeyOrder = [
+  'implementation', 'URL', 'documentURI', 'compatMode', 'characterSet',
+  'charset', 'inputEncoding', 'contentType', 'doctype', 'documentElement',
+  'xmlEncoding', 'xmlVersion', 'xmlStandalone', 'domain', 'referrer', 'cookie',
+  'lastModified', 'readyState', 'title', 'dir', 'body', 'head', 'images',
+  'embeds', 'plugins', 'links', 'forms', 'scripts', 'currentScript',
+  'defaultView', 'designMode', 'onreadystatechange', 'anchors', 'applets',
+  'fgColor', 'linkColor', 'vlinkColor', 'alinkColor', 'bgColor', 'all',
+  'scrollingElement', 'onpointerlockchange', 'onpointerlockerror', 'hidden',
+  'visibilityState', 'wasDiscarded', 'prerendering', 'featurePolicy',
+  'webkitVisibilityState', 'webkitHidden', 'onbeforecopy', 'onbeforecut',
+  'onbeforepaste', 'onfreeze', 'onprerenderingchange', 'onresume', 'onsearch',
+  'onvisibilitychange', 'timeline', 'fullscreenEnabled', 'fullscreen',
+  'onfullscreenchange', 'onfullscreenerror', 'webkitIsFullScreen',
+  'webkitCurrentFullScreenElement', 'webkitFullscreenEnabled',
+  'webkitFullscreenElement', 'onwebkitfullscreenchange', 'onwebkitfullscreenerror',
+  'rootElement', 'pictureInPictureEnabled', 'onabort', 'onbeforeinput',
+  'onbeforematch', 'onbeforetoggle', 'onblur', 'oncancel', 'oncanplay',
+  'oncanplaythrough', 'onchange', 'onclick', 'onclose', 'oncommand',
+  'oncontentvisibilityautostatechange', 'oncontextlost', 'oncontextmenu',
+  'oncontextrestored', 'oncuechange', 'ondblclick', 'ondrag', 'ondragend',
+  'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop',
+  'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus', 'onformdata',
+  'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload',
+  'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onmousedown',
+  'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover',
+  'onmouseup', 'onmousewheel', 'onpause', 'onplay', 'onplaying', 'onprogress',
+  'onratechange', 'onreset', 'onresize', 'onscroll', 'onscrollend',
+  'onsecuritypolicyviolation', 'onseeked', 'onseeking', 'onselect',
+  'onslotchange', 'onstalled', 'onsubmit', 'onsuspend', 'ontimeupdate',
+  'ontoggle', 'onvolumechange', 'onwaiting', 'onwebkitanimationend',
+  'onwebkitanimationiteration', 'onwebkitanimationstart', 'onwebkittransitionend',
+  'onwheel', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture',
+  'onpointerdown', 'onpointermove', 'onpointerup', 'onpointercancel',
+  'onpointerover', 'onpointerout', 'onpointerenter', 'onpointerleave',
+  'onselectstart', 'onselectionchange', 'onanimationcancel', 'onanimationend',
+  'onanimationiteration', 'onanimationstart', 'ontransitionrun',
+  'ontransitionstart', 'ontransitionend', 'ontransitioncancel', 'onbeforexrselect',
+  'oncopy', 'oncut', 'onpaste', 'children', 'firstElementChild',
+  'lastElementChild', 'childElementCount', 'activeElement', 'styleSheets',
+  'pointerLockElement', 'fullscreenElement', 'adoptedStyleSheets',
+  'pictureInPictureElement', 'fonts', 'adoptNode', 'append', 'captureEvents',
+  'caretPositionFromPoint', 'caretRangeFromPoint', 'clear', 'close',
+  'createAttribute', 'createAttributeNS', 'createCDATASection', 'createComment',
+  'createDocumentFragment', 'createElement', 'createElementNS', 'createEvent',
+  'createExpression', 'createNSResolver', 'createNodeIterator',
+  'createProcessingInstruction', 'createRange', 'createTextNode',
+  'createTreeWalker', 'elementFromPoint', 'elementsFromPoint', 'evaluate',
+  'execCommand', 'exitFullscreen', 'exitPictureInPicture', 'exitPointerLock',
+  'getAnimations', 'getElementById', 'getElementsByClassName',
+  'getElementsByName', 'getElementsByTagName', 'getElementsByTagNameNS',
+  'getSelection', 'hasFocus', 'hasStorageAccess', 'hasUnpartitionedCookieAccess',
+  'importNode', 'moveBefore', 'open', 'prepend', 'queryCommandEnabled',
+  'queryCommandIndeterm', 'queryCommandState', 'queryCommandSupported',
+  'queryCommandValue', 'querySelector', 'querySelectorAll', 'releaseEvents',
+  'replaceChildren', 'requestStorageAccess', 'requestStorageAccessFor',
+  'startViewTransition', 'webkitCancelFullScreen', 'webkitExitFullscreen',
+  'write', 'writeln', 'constructor', 'fragmentDirective', 'onpointerrawupdate',
+  'browsingTopics', 'hasPrivateToken', 'hasRedemptionRecord',
+  'activeViewTransition', 'onscrollsnapchange', 'onscrollsnapchanging',
+  'customElementRegistry', 'ariaNotify'
+];
+
+function _alignPropertiesOrder(target, keyOrder) {
+  if (!target) return;
+  for (const key of keyOrder) {
+    const desc = Object.getOwnPropertyDescriptor(target, key);
+    if (desc && desc.configurable) {
+      delete target[key];
+      Object.defineProperty(target, key, desc);
+    }
+  }
+}
+
+// Re-align globalThis own keys and prototype properties to standard Chrome WebIDL order
+try {
+  _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
+  if (globalThis.Navigator?.prototype) {
+    _alignPropertiesOrder(globalThis.Navigator.prototype, _chromeNavigatorKeyOrder);
+  }
+  if (globalThis.Document?.prototype) {
+    _alignPropertiesOrder(globalThis.Document.prototype, _chromeDocumentKeyOrder);
+  }
+} catch (_) {}
 
 // The global's own property names as the engine leaves them, before any page
 // script runs. This is the surface a fresh same-origin frame's window has, so
