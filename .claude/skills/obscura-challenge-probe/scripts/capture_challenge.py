@@ -32,10 +32,9 @@ except ImportError:
 
 PRELOAD = r"""
 (function () {
-  if (globalThis.__capHooked) return;
-  Object.defineProperty(globalThis, '__capHooked', {
-    value: 1, writable: true, configurable: true, enumerable: false,
-  });
+  var hookKey = Symbol.for('obscura.capture.hooked');
+  if (globalThis[hookKey]) return;
+  globalThis[hookKey] = 1;
   var cap = [];
   window.__cap = cap;
   var t0 = Date.now();
