@@ -8853,18 +8853,28 @@ const _chromeWindowKeyOrder = [
 function _orderedWindowNames(names) {
   const rank = new Map(_chromeWindowKeyOrder.map((key, index) => [key, index]));
   const values = Array.from(names);
-  values.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
-  return values;
+  const indices = values.filter(key => _isWindowIndexKey(key))
+    .sort((a, b) => Number(a) - Number(b));
+  const named = values.filter(key => !_isWindowIndexKey(key));
+  named.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
+  return indices.concat(named);
+}
+function _isWindowIndexKey(key) {
+  if (typeof key !== 'string' || !/^(?:0|[1-9]\d*)$/.test(key)) return false;
+  const value = Number(key);
+  return Number.isSafeInteger(value) && value >= 0 && value < 0xFFFFFFFF;
 }
 function _frameRealmOwnKeys(realmGlobal) {
   let keys;
   try { keys = realmGlobal.Reflect.ownKeys(realmGlobal); }
   catch (e) { keys = Reflect.ownKeys(realmGlobal); }
   const rank = new Map(_chromeWindowKeyOrder.map((key, index) => [key, index]));
-  const strings = keys.filter(key => typeof key === 'string');
+  const indices = keys.filter(key => _isWindowIndexKey(key))
+    .sort((a, b) => Number(a) - Number(b));
+  const strings = keys.filter(key => typeof key === 'string' && !_isWindowIndexKey(key));
   const symbols = keys.filter(key => typeof key !== 'string');
   strings.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
-  return strings.concat(symbols);
+  return indices.concat(strings, symbols);
 }
 function _frameRealmOwnDescriptor(realmGlobal, key) {
   try { return realmGlobal.Object.getOwnPropertyDescriptor(realmGlobal, key); }

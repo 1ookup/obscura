@@ -3600,17 +3600,20 @@ mod tests {
             rt.evaluate(
                 r#"(() => {
                     const w = document.getElementById('f').contentWindow;
+                    const names = Object.getOwnPropertyNames(window);
+                    const numeric = names.filter(name => /^(?:0|[1-9][0-9]*)$/.test(name));
                     return [
                         window.length,
                         window[0] === w,
                         window.frames[0] === w,
                         window.frames === window,
                         typeof w.postMessage === 'function',
+                        names.slice(0, numeric.length),
                     ];
                 })()"#,
             )
             .unwrap(),
-            serde_json::json!([1, true, true, true, true])
+            serde_json::json!([1, true, true, true, true, ["0"]])
         );
     }
 
