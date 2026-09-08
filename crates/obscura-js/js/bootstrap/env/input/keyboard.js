@@ -17,33 +17,3 @@ const _KEYBOARD_LAYOUT_US = [
 ];
 // KeyboardLayoutMap is maplike and read-only: it answers `get`/`has`/`size`
 // and iterates, but has no `set`. A plain Map would answer `set` too.
-globalThis.KeyboardLayoutMap = class KeyboardLayoutMap {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get size() { return this._entries.size; }
-  get(key) { return this._entries.get(String(key)); }
-  has(key) { return this._entries.has(String(key)); }
-  keys() { return this._entries.keys(); }
-  values() { return this._entries.values(); }
-  entries() { return this._entries.entries(); }
-  forEach(callback, thisArg) { this._entries.forEach(callback, thisArg); }
-  [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
-  get [Symbol.toStringTag]() { return 'KeyboardLayoutMap'; }
-};
-globalThis.Keyboard = class Keyboard {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  getLayoutMap() {
-    const map = Object.create(globalThis.KeyboardLayoutMap.prototype);
-    Object.defineProperty(map, '_entries', {
-      value: new Map(_KEYBOARD_LAYOUT_US), configurable: true,
-    });
-    return Promise.resolve(map);
-  }
-  lock() { return Promise.resolve(); }
-  unlock() {}
-  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
-  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
-  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
-  get [Symbol.toStringTag]() { return 'Keyboard'; }
-};
-navigator.keyboard = Object.create(globalThis.Keyboard.prototype);
-

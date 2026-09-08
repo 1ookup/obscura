@@ -162,87 +162,6 @@ function _gpuSupportedFeatures(names) {
   return features;
 }
 
-globalThis.GPUSupportedLimits = class GPUSupportedLimits {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get [Symbol.toStringTag]() { return 'GPUSupportedLimits'; }
-};
-// Reflect the limit names on the prototype so a probe that enumerates them
-// sees the same list a browser does, whatever the instance carries.
-for (const name of Object.keys(_GPU_LIMITS)) {
-  Object.defineProperty(globalThis.GPUSupportedLimits.prototype, name, {
-    get() { return undefined; }, enumerable: true, configurable: true,
-  });
-}
-globalThis.GPUSupportedFeatures = class GPUSupportedFeatures {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get size() { return this._set.size; }
-  has(value) { return this._set.has(String(value)); }
-  keys() { return this._set.keys(); }
-  values() { return this._set.values(); }
-  entries() { return this._set.entries(); }
-  forEach(callback, thisArg) { this._set.forEach(callback, thisArg); }
-  [Symbol.iterator]() { return this._set[Symbol.iterator](); }
-  get [Symbol.toStringTag]() { return 'GPUSupportedFeatures'; }
-};
-globalThis.GPUAdapterInfo = class GPUAdapterInfo {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get vendor() { return _webglProfile() === 'apple' ? 'apple' : 'intel'; }
-  get architecture() { return _webglProfile() === 'apple' ? '' : 'gen-9'; }
-  get device() { return ''; }
-  get description() { return ''; }
-  // Apple GPUs do not expose subgroups through the adapter info.
-  get subgroupMinSize() { return _webglProfile() === 'apple' ? null : 8; }
-  get subgroupMaxSize() { return _webglProfile() === 'apple' ? null : 32; }
-  get isFallbackAdapter() { return false; }
-  get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
-};
-globalThis.GPUDevice = class GPUDevice {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get features() { return _gpuSupportedFeatures(['core-features-and-limits']); }
-  get limits() {
-    const base = _gpuSupportedLimits(_GPU_DEFAULT_LIMITS);
-    if (_webglProfile() === 'apple') {
-      Object.defineProperty(base, 'minSubgroupSize', { value: null, enumerable: false, configurable: true });
-      Object.defineProperty(base, 'maxSubgroupSize', { value: null, enumerable: false, configurable: true });
-    }
-    return base;
-  }
-  get adapterInfo() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
-  get label() { return ''; }
-  get lost() { return new Promise(() => {}); }
-  get queue() { return { label: '', submit() {}, onSubmittedWorkDone() { return Promise.resolve(); } }; }
-  destroy() {}
-  get [Symbol.toStringTag]() { return 'GPUDevice'; }
-};
-globalThis.GPUAdapter = class GPUAdapter {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  get features() { return _gpuSupportedFeatures(_gpuAdapterProfile().features); }
-  get limits() { return _gpuSupportedLimits(_gpuAdapterProfile().limits); }
-  get info() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
-  get isFallbackAdapter() { return false; }
-  requestAdapterInfo() { return Promise.resolve(this.info); }
-  requestDevice() {
-    return Promise.resolve(Object.create(globalThis.GPUDevice.prototype));
-  }
-  get [Symbol.toStringTag]() { return 'GPUAdapter'; }
-};
-globalThis.GPU = class GPU {
-  constructor() { throw new TypeError('Illegal constructor'); }
-  requestAdapter(options) {
-    // Without the consistency profile there is no adapter to describe, which
-    // is also what Chrome answers when the GPU is unavailable. A fallback
-    // request resolves null as well: there is no SwiftShader behind the
-    // hardware profile.
-    if (!globalThis.__obscura_webgl_enabled) return Promise.resolve(null);
-    if (options && options.forceFallbackAdapter) return Promise.resolve(null);
-    return Promise.resolve(Object.create(globalThis.GPUAdapter.prototype));
-  }
-  getPreferredCanvasFormat() { return 'bgra8unorm'; }
-  get wgslLanguageFeatures() { return _gpuSupportedFeatures(_GPU_WGSL_FEATURES); }
-  get [Symbol.toStringTag]() { return 'GPU'; }
-};
-navigator.gpu = Object.create(globalThis.GPU.prototype);
-
 // The WebGPU usage/stage constants Chrome hangs off the global. Spec values,
 // identical across implementations.
 globalThis.GPUBufferUsage = { MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008, INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080, INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200 };
@@ -250,4 +169,3 @@ globalThis.GPUColorWrite = { RED: 0x1, GREEN: 0x2, BLUE: 0x4, ALPHA: 0x8, ALL: 0
 globalThis.GPUMapMode = { READ: 0x1, WRITE: 0x2 };
 globalThis.GPUShaderStage = { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
 globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
-

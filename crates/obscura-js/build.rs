@@ -14,7 +14,11 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
         .parent()
         .expect("bootstrap manifest directory")
         .join("bootstrap");
-    let mut source = String::new();
+    // Keep the generated bootstrap as one classic lexical scope. The wrapper
+    // belongs to the assembler rather than any module, so every source file is
+    // independently parseable while shared private bindings remain shared in
+    // the snapshot and in secondary realms.
+    let mut source = String::from("(function () {\n");
     let mut module_count = 0;
 
     for line in manifest.lines() {
@@ -36,6 +40,7 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
     }
 
     assert!(module_count > 0, "bootstrap manifest has no modules");
+    source.push_str("\n})();\n");
     source
 }
 

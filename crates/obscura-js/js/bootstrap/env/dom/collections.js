@@ -6,41 +6,6 @@ function _htmlCollectionData(value) {
   const values = typeof held === 'function' ? held() : held;
   return Array.from(values || []).filter(Boolean);
 }
-class HTMLCollection {
-  constructor(key = undefined, values = undefined) {
-    if (key !== _htmlCollectionKey) {
-      throw new TypeError("Failed to construct 'HTMLCollection': Illegal constructor");
-    }
-    _htmlCollectionValues.set(this, values || []);
-  }
-  get length() {
-    return _htmlCollectionData(this).length;
-  }
-  item(i) {
-    i = i >>> 0;
-    const values = _htmlCollectionData(this);
-    return values[i] != null ? values[i] : null;
-  }
-  namedItem(name) {
-    const values = _htmlCollectionData(this);
-    if (name === undefined || name === null || name === "") return null;
-    name = String(name);
-    for (let i = 0; i < values.length; i++) {
-      const el = values[i];
-      if (!el) continue;
-      // id always contributes; name only for HTML elements in HTML documents.
-      if (el.id === name) return el;
-      if (_isHTMLEl(el) && typeof el.getAttribute === "function" && el.getAttribute("name") === name) return el;
-    }
-    return null;
-  }
-  *[Symbol.iterator]() {
-    const values = _htmlCollectionData(this);
-    yield* values;
-  }
-  get [Symbol.toStringTag]() { return 'HTMLCollection'; }
-}
-globalThis.HTMLCollection = HTMLCollection;
 function _htmlCollectionFrom(source) {
   const values = typeof source === 'function'
     ? source
@@ -50,8 +15,6 @@ function _htmlCollectionFrom(source) {
   _htmlCollectionValues.set(collection, values);
   return collection;
 }
-_markNative(HTMLCollection.prototype.item);
-_markNative(HTMLCollection.prototype.namedItem);
 // Shared (allocated once) Proxy traps for HTMLCollection named access. Indices,
 // length, and inherited methods resolve normally via Reflect; only an unknown
 // non-numeric string key falls back to namedItem(), so item/namedItem and the
@@ -295,21 +258,6 @@ globalThis.DOMTokenList = DOMTokenList;
 // It keeps the array-like surface scripts actually use: indexed access, length,
 // item(), forEach(), entries/keys/values, and iteration (so spread and for..of
 // work).
-globalThis.NodeList = class NodeList {
-  constructor() { this.length = 0; }
-  item(i) { i = i >>> 0; return this[i] != null ? this[i] : null; }
-  forEach(cb, thisArg) {
-    for (let i = 0; i < this.length; i++) cb.call(thisArg, this[i], i, this);
-  }
-  *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this[i]; }
-  *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; }
-  *keys() { for (let i = 0; i < this.length; i++) yield i; }
-  *values() { for (let i = 0; i < this.length; i++) yield this[i]; }
-  get [Symbol.toStringTag]() { return 'NodeList'; }
-};
-_markNative(NodeList);
-_markNative(NodeList.prototype.item);
-_markNative(NodeList.prototype.forEach);
 // Live Range over the real DOM tree. dom/ranges/* tests are pure boundary-point
 // algorithms (no layout, no editing engine), so a property-storing Range with
 // correct tree-order comparison passes them. Mutating ops (extract/delete/

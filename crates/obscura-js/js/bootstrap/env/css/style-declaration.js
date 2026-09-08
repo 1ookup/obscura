@@ -1,3 +1,6 @@
+const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
 // Standard CSS property names (camelCase). Real CSSStyleDeclaration exposes every
 // property as an enumerable accessor, so feature-detection code (`'gap' in
 // el.style`) and enumeration (`Object.keys(el.style)`) see the whole set, not
@@ -382,4 +385,3 @@ const _styleProxy = (decl) => {
   _cssStyleState.set(proxy, _cssStyleFor(decl));
   return proxy;
 };
-

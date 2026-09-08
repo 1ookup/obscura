@@ -1,5 +1,4 @@
 "use strict";
-(function () {
 
 // Everything the JavaScript engine put on the global before this file runs.
 // Their prototypes follow ECMAScript rules (members non-enumerable) and must

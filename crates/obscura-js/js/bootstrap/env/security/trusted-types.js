@@ -1,5 +1,3 @@
-})();
-
 // Trusted Types (W3C). Chrome ships the entire surface; `window.trustedTypes`
 // being undefined is a Firefox/Safari answer and contradicts every other
 // Chrome signal this build sends, which is why the roadmap lists it (§3.2-#12).
@@ -286,4 +284,3 @@
     value: _enforceSink, writable: false, enumerable: false, configurable: false,
   });
 })();
-

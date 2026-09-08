@@ -1,0 +1,1 @@
+class HTMLAudioElement extends HTMLMediaElement {}

@@ -118,3 +118,4 @@ if (typeof globalThis.MediaSource === 'undefined') {
       enumerable: true, configurable: true,
     });
   }
+})();

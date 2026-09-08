@@ -1,26 +1,12 @@
 // CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
 // Extends Text so data/length/textContent/childNodes reuse the working text
 // node machinery; only the type-identifying getters differ.
-class CDATASection extends Text {
-  get nodeName() { return "#cdata-section"; }
-  get nodeType() { return 4; }
-  get nodeValue() { return this.data; }
-  set nodeValue(v) { this.data = v; }
-  cloneNode() { return new CDATASection(+_dom("create_text_node", this.data)); }
-}
+
 
 // ProcessingInstruction: nodeType 7, nodeName === target. Extends CharacterData
 // and carries a separate target. Backed by a text node so data/nodeValue/
 // textContent/length work without native PI support.
-class ProcessingInstruction extends CharacterData {
-  constructor(nid, target) { super(nid); this._target = target; }
-  get target() { return this._target; }
-  get nodeName() { return this._target; }
-  get nodeType() { return 7; }
-  get nodeValue() { return this.data; }
-  set nodeValue(v) { this.data = v; }
-  cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
-}
+
 
 // Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
 // Cached per runtime: the encoding is fixed for a document's lifetime and this
@@ -86,4 +72,3 @@ function _setElemHrefPart(el, part, value) {
   const c = _urlSetOp(u.href, part, value);
   if (c) el.setAttribute('href', c.href);
 }
-

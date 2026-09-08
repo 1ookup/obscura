@@ -1,5 +1,3 @@
-})();
-
 (function _markBuiltinsNative() {
   var seen = new Set();
   function walk(ctor) {
@@ -2504,5 +2502,3 @@ Object.defineProperty(globalThis, '__obscura_filter_prepare_stack_trace', {
     return result;
   },
 });
-
-})();

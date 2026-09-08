@@ -1,0 +1,1 @@
+globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.relatedTarget=o.relatedTarget||null; } };
