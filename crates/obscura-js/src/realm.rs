@@ -33,9 +33,10 @@ use crate::runtime::ObscuraJsRuntime;
 /// with `auxData.isDefault = true`. Isolated worlds use ids above this.
 pub const MAIN_WORLD: u64 = 0;
 
-/// bootstrap.js source. The snapshot (build.rs) contains its executed result
-/// in the default context only; a secondary context runs the source again.
-const BOOTSTRAP_SRC: &str = include_str!("../js/bootstrap.js");
+/// Build-generated bootstrap source assembled from the `js/bootstrap.js`
+/// manifest. The snapshot (build.rs) contains its executed result in the
+/// default context only; a secondary context runs the source again.
+const BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 
 /// Mirror of the `<obscura:init>` script the runtime constructor executes in
 /// the default context (runtime.rs).

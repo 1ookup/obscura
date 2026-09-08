@@ -1,0 +1,253 @@
+// WebGPU, like WebGL above, is a consistency surface rather than an
+// implementation: `requestAdapter()` resolved with `null`, so any page that
+// walked the adapter got a TypeError instead of a machine description. The
+// adapter described here is the same Intel part the WebGL renderer string
+// claims, on D3D12 -- reporting an Apple adapter under a Windows user agent
+// would trade one mismatch for a worse one. It follows the same
+// `--stealth`-driven flag, so an engine with no GPU profile still answers
+// `null` truthfully.
+const _GPU_LIMITS = {
+  maxTextureDimension1D: 16384,
+  maxTextureDimension2D: 16384,
+  maxTextureDimension3D: 2048,
+  maxTextureArrayLayers: 2048,
+  maxBindGroups: 4,
+  maxBindGroupsPlusVertexBuffers: 24,
+  maxBindingsPerBindGroup: 1000,
+  maxDynamicUniformBuffersPerPipelineLayout: 8,
+  maxDynamicStorageBuffersPerPipelineLayout: 8,
+  maxSampledTexturesPerShaderStage: 16,
+  maxSamplersPerShaderStage: 16,
+  maxStorageBuffersPerShaderStage: 10,
+  maxStorageTexturesPerShaderStage: 8,
+  maxUniformBuffersPerShaderStage: 12,
+  maxUniformBufferBindingSize: 65536,
+  maxStorageBufferBindingSize: 2147483644,
+  minUniformBufferOffsetAlignment: 256,
+  minStorageBufferOffsetAlignment: 256,
+  maxVertexBuffers: 8,
+  maxBufferSize: 2147483648,
+  maxVertexAttributes: 16,
+  maxVertexBufferArrayStride: 2048,
+  maxInterStageShaderVariables: 28,
+  maxColorAttachments: 8,
+  maxColorAttachmentBytesPerSample: 64,
+  maxComputeWorkgroupStorageSize: 32768,
+  maxComputeInvocationsPerWorkgroup: 1024,
+  maxComputeWorkgroupSizeX: 1024,
+  maxComputeWorkgroupSizeY: 1024,
+  maxComputeWorkgroupSizeZ: 64,
+  maxComputeWorkgroupsPerDimension: 65535,
+  minSubgroupSize: 8,
+  maxSubgroupSize: 32,
+  maxStorageBuffersInFragmentStage: 10,
+  maxStorageTexturesInFragmentStage: 8,
+  maxStorageBuffersInVertexStage: 10,
+  maxStorageTexturesInVertexStage: 8,
+};
+// The limits a device gets when it asks for none: the spec defaults, which
+// are the same on every adapter.
+const _GPU_DEFAULT_LIMITS = {
+  maxTextureDimension1D: 8192, maxTextureDimension2D: 8192,
+  maxTextureDimension3D: 2048, maxTextureArrayLayers: 256,
+  maxBindGroups: 4, maxBindGroupsPlusVertexBuffers: 24,
+  maxBindingsPerBindGroup: 1000,
+  maxDynamicUniformBuffersPerPipelineLayout: 8,
+  maxDynamicStorageBuffersPerPipelineLayout: 4,
+  maxSampledTexturesPerShaderStage: 16, maxSamplersPerShaderStage: 16,
+  maxStorageBuffersPerShaderStage: 8, maxStorageTexturesPerShaderStage: 4,
+  maxUniformBuffersPerShaderStage: 12, maxUniformBufferBindingSize: 65536,
+  maxStorageBufferBindingSize: 134217728, minUniformBufferOffsetAlignment: 256,
+  minStorageBufferOffsetAlignment: 256, maxVertexBuffers: 8,
+  maxBufferSize: 268435456, maxVertexAttributes: 16,
+  maxVertexBufferArrayStride: 2048, maxInterStageShaderVariables: 16,
+  maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32,
+  maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256,
+  maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256,
+  maxComputeWorkgroupSizeZ: 64, maxComputeWorkgroupsPerDimension: 65535,
+  minSubgroupSize: 8, maxSubgroupSize: 32,
+  maxStorageBuffersInFragmentStage: 8, maxStorageTexturesInFragmentStage: 4,
+  maxStorageBuffersInVertexStage: 8, maxStorageTexturesInVertexStage: 4,
+};
+// An Intel part on D3D12: BC compression, no ASTC or ETC2, which are the
+// mobile and Apple formats.
+const _GPU_ADAPTER_FEATURES = [
+  'depth32float-stencil8', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
+  'texture-formats-tier1', 'texture-compression-bc', 'dual-source-blending',
+  'core-features-and-limits', 'float32-filterable', 'indirect-first-instance',
+  'float32-blendable', 'depth-clip-control', 'texture-compression-bc-sliced-3d',
+  'texture-formats-tier2', 'shader-f16', 'clip-distances',
+  'texture-component-swizzle', 'subgroups',
+];
+// The Apple/Metal adapter a macOS fingerprint claims. Feature order is the
+// captured order; subgroup limits are absent (null) on Apple GPUs.
+const _GPU_APPLE = {
+  limits: {
+    maxTextureDimension1D: 16384,
+    maxTextureDimension2D: 16384,
+    maxTextureDimension3D: 2048,
+    maxTextureArrayLayers: 2048,
+    maxBindGroups: 4,
+    maxBindGroupsPlusVertexBuffers: 24,
+    maxBindingsPerBindGroup: 1000,
+    maxDynamicUniformBuffersPerPipelineLayout: 10,
+    maxDynamicStorageBuffersPerPipelineLayout: 8,
+    maxSampledTexturesPerShaderStage: 48,
+    maxSamplersPerShaderStage: 16,
+    maxStorageBuffersPerShaderStage: 10,
+    maxStorageTexturesPerShaderStage: 8,
+    maxUniformBuffersPerShaderStage: 12,
+    maxUniformBufferBindingSize: 65536,
+    maxStorageBufferBindingSize: 4294967292,
+    minUniformBufferOffsetAlignment: 256,
+    minStorageBufferOffsetAlignment: 256,
+    maxVertexBuffers: 8,
+    maxBufferSize: 4294967292,
+    maxVertexAttributes: 30,
+    maxVertexBufferArrayStride: 2048,
+    maxInterStageShaderVariables: 28,
+    maxColorAttachments: 8,
+    maxColorAttachmentBytesPerSample: 128,
+    maxComputeWorkgroupStorageSize: 32768,
+    maxComputeInvocationsPerWorkgroup: 1024,
+    maxComputeWorkgroupSizeX: 1024,
+    maxComputeWorkgroupSizeY: 1024,
+    maxComputeWorkgroupSizeZ: 64,
+    maxComputeWorkgroupsPerDimension: 65535,
+    minSubgroupSize: null,
+    maxSubgroupSize: null,
+    maxStorageBuffersInFragmentStage: 10,
+    maxStorageTexturesInFragmentStage: 8,
+    maxStorageBuffersInVertexStage: 10,
+    maxStorageTexturesInVertexStage: 8,
+  },
+  features: [
+    'core-features-and-limits', 'depth-clip-control', 'indirect-first-instance',
+    'shader-f16', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
+    'float32-filterable', 'float32-blendable', 'clip-distances', 'dual-source-blending',
+    'texture-compression-bc', 'texture-compression-bc-sliced-3d',
+    'texture-compression-astc', 'texture-compression-astc-sliced-3d',
+    'texture-compression-etc2', 'texture-formats-tier1', 'texture-formats-tier2',
+    'texture-component-swizzle', 'depth32float-stencil8', 'subgroups',
+  ],
+};
+function _gpuAdapterProfile() {
+  return _webglProfile() === 'apple' ? _GPU_APPLE : {
+    limits: _GPU_LIMITS, features: _GPU_ADAPTER_FEATURES,
+  };
+}
+// A property of the Chrome build, not of the adapter.
+const _GPU_WGSL_FEATURES = [
+  'packed_4x8_integer_dot_product', 'subgroup_uniformity', 'subgroup_id',
+  'linear_indexing', 'readonly_and_readwrite_storage_textures',
+  'unrestricted_pointer_parameters', 'texture_and_sampler_let',
+  'pointer_composite_access', 'uniform_buffer_standard_layout',
+];
+
+function _gpuSupportedLimits(values) {
+  const limits = Object.create(globalThis.GPUSupportedLimits.prototype);
+  for (const name of Object.keys(values)) {
+    Object.defineProperty(limits, name, {
+      value: values[name], enumerable: false, configurable: true,
+    });
+  }
+  return limits;
+}
+// GPUSupportedFeatures is a setlike, so it answers `has`, iterates, and
+// reports `size` -- a plain Array would fail every one of those checks.
+function _gpuSupportedFeatures(names) {
+  const features = Object.create(globalThis.GPUSupportedFeatures.prototype);
+  const backing = new Set(names);
+  Object.defineProperty(features, '_set', { value: backing, configurable: true });
+  return features;
+}
+
+globalThis.GPUSupportedLimits = class GPUSupportedLimits {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'GPUSupportedLimits'; }
+};
+// Reflect the limit names on the prototype so a probe that enumerates them
+// sees the same list a browser does, whatever the instance carries.
+for (const name of Object.keys(_GPU_LIMITS)) {
+  Object.defineProperty(globalThis.GPUSupportedLimits.prototype, name, {
+    get() { return undefined; }, enumerable: true, configurable: true,
+  });
+}
+globalThis.GPUSupportedFeatures = class GPUSupportedFeatures {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get size() { return this._set.size; }
+  has(value) { return this._set.has(String(value)); }
+  keys() { return this._set.keys(); }
+  values() { return this._set.values(); }
+  entries() { return this._set.entries(); }
+  forEach(callback, thisArg) { this._set.forEach(callback, thisArg); }
+  [Symbol.iterator]() { return this._set[Symbol.iterator](); }
+  get [Symbol.toStringTag]() { return 'GPUSupportedFeatures'; }
+};
+globalThis.GPUAdapterInfo = class GPUAdapterInfo {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get vendor() { return _webglProfile() === 'apple' ? 'apple' : 'intel'; }
+  get architecture() { return _webglProfile() === 'apple' ? '' : 'gen-9'; }
+  get device() { return ''; }
+  get description() { return ''; }
+  // Apple GPUs do not expose subgroups through the adapter info.
+  get subgroupMinSize() { return _webglProfile() === 'apple' ? null : 8; }
+  get subgroupMaxSize() { return _webglProfile() === 'apple' ? null : 32; }
+  get isFallbackAdapter() { return false; }
+  get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
+};
+globalThis.GPUDevice = class GPUDevice {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get features() { return _gpuSupportedFeatures(['core-features-and-limits']); }
+  get limits() {
+    const base = _gpuSupportedLimits(_GPU_DEFAULT_LIMITS);
+    if (_webglProfile() === 'apple') {
+      Object.defineProperty(base, 'minSubgroupSize', { value: null, enumerable: false, configurable: true });
+      Object.defineProperty(base, 'maxSubgroupSize', { value: null, enumerable: false, configurable: true });
+    }
+    return base;
+  }
+  get adapterInfo() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
+  get label() { return ''; }
+  get lost() { return new Promise(() => {}); }
+  get queue() { return { label: '', submit() {}, onSubmittedWorkDone() { return Promise.resolve(); } }; }
+  destroy() {}
+  get [Symbol.toStringTag]() { return 'GPUDevice'; }
+};
+globalThis.GPUAdapter = class GPUAdapter {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get features() { return _gpuSupportedFeatures(_gpuAdapterProfile().features); }
+  get limits() { return _gpuSupportedLimits(_gpuAdapterProfile().limits); }
+  get info() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
+  get isFallbackAdapter() { return false; }
+  requestAdapterInfo() { return Promise.resolve(this.info); }
+  requestDevice() {
+    return Promise.resolve(Object.create(globalThis.GPUDevice.prototype));
+  }
+  get [Symbol.toStringTag]() { return 'GPUAdapter'; }
+};
+globalThis.GPU = class GPU {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  requestAdapter(options) {
+    // Without the consistency profile there is no adapter to describe, which
+    // is also what Chrome answers when the GPU is unavailable. A fallback
+    // request resolves null as well: there is no SwiftShader behind the
+    // hardware profile.
+    if (!globalThis.__obscura_webgl_enabled) return Promise.resolve(null);
+    if (options && options.forceFallbackAdapter) return Promise.resolve(null);
+    return Promise.resolve(Object.create(globalThis.GPUAdapter.prototype));
+  }
+  getPreferredCanvasFormat() { return 'bgra8unorm'; }
+  get wgslLanguageFeatures() { return _gpuSupportedFeatures(_GPU_WGSL_FEATURES); }
+  get [Symbol.toStringTag]() { return 'GPU'; }
+};
+navigator.gpu = Object.create(globalThis.GPU.prototype);
+
+// The WebGPU usage/stage constants Chrome hangs off the global. Spec values,
+// identical across implementations.
+globalThis.GPUBufferUsage = { MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008, INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080, INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200 };
+globalThis.GPUColorWrite = { RED: 0x1, GREEN: 0x2, BLUE: 0x4, ALPHA: 0x8, ALL: 0xF };
+globalThis.GPUMapMode = { READ: 0x1, WRITE: 0x2 };
+globalThis.GPUShaderStage = { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
+globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
+

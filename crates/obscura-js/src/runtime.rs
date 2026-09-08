@@ -335,8 +335,9 @@ fn input_hit_in_document(
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 // Trace-enabled runtimes intentionally skip the startup snapshot so
 // deno_core can apply the global-template middleware that installs the native
-// Window interceptor. The same source is still snapshotted for normal runs.
-static BOOTSTRAP_SRC: &str = include_str!("../js/bootstrap.js");
+// Window interceptor. The generated source is still snapshotted for normal
+// runs.
+static BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main

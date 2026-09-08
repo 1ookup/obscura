@@ -1,4 +1,43 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const BOOTSTRAP_MARKER: &str = "// @obscura-module ";
+
+fn load_bootstrap_source(manifest_path: &Path) -> String {
+    let manifest = fs::read_to_string(manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bootstrap manifest {}: {error}",
+            manifest_path.display()
+        )
+    });
+    let source_root = manifest_path
+        .parent()
+        .expect("bootstrap manifest directory")
+        .join("bootstrap");
+    let mut source = String::new();
+    let mut module_count = 0;
+
+    for line in manifest.lines() {
+        let Some(relative_path) = line.strip_prefix(BOOTSTRAP_MARKER) else {
+            continue;
+        };
+        let relative_path = relative_path.trim();
+        assert!(!relative_path.is_empty(), "empty bootstrap module path");
+        let module_path = source_root.join(relative_path);
+        println!("cargo:rerun-if-changed={}", module_path.display());
+        let module = fs::read_to_string(&module_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read bootstrap module {}: {error}",
+                module_path.display()
+            )
+        });
+        source.push_str(&module);
+        module_count += 1;
+    }
+
+    assert!(module_count > 0, "bootstrap manifest has no modules");
+    source
+}
 
 fn main() {
     // Keep the generated snapshot coupled to bootstrap/op contract changes.
@@ -7,8 +46,19 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let snapshot_path = out_dir.join("OBSCURA_SNAPSHOT.bin");
+    let bootstrap_path = out_dir.join("bootstrap.js");
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    let bootstrap_js = load_bootstrap_source(Path::new("js/bootstrap.js"));
+    fs::write(&bootstrap_path, &bootstrap_js).unwrap_or_else(|error| {
+        panic!(
+            "failed to write generated bootstrap {}: {error}",
+            bootstrap_path.display()
+        )
+    });
+    println!(
+        "cargo:rustc-env=OBSCURA_BOOTSTRAP_PATH={}",
+        bootstrap_path.display()
+    );
 
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
