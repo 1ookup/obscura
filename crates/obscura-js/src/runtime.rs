@@ -420,8 +420,9 @@ pub struct ObscuraJsRuntime {
     pub(crate) frame_module_maps: HashMap<(String, u64), Box<crate::realm::FrameModuleMap>>,
     /// Whether the main realm's cross-document message recv loop (bootstrap
     /// `_frameMessageRecvLoop`, Phase 4) has been started. It spawns an async
-    /// op, which requires a live tokio context, so the pump paths start it
-    /// lazily once a MainRealm-targeted message exists.
+    /// op, which requires a live tokio context, so the pump paths start it on
+    /// their first event-loop turn once an active frame realm exists and leave
+    /// it parked on the queue notify.
     frame_message_pump_started: bool,
 }
 
@@ -3140,23 +3141,21 @@ impl ObscuraJsRuntime {
         result
     }
 
-    /// Start the main realm's cross-document message recv loop the first
-    /// time a MainRealm-targeted entry is queued (Phase 4). Must only be
-    /// called from an async pump path: the loop's `op_frame_message_recv`
-    /// can only be spawned inside a live tokio context. Messages queue in
-    /// Rust until the loop's first scan, so nothing is lost by the lazy
-    /// start; pages that never receive frame messages pay one bool check.
+    /// Start the main realm's cross-document message recv loop on the first
+    /// event-loop turn (Phase 4). Must only be called from an async pump path:
+    /// the loop's `op_frame_message_recv` can only be spawned inside a live
+    /// tokio context. Starting it before a message exists is required because
+    /// a frame can post while the event loop is already parked on network or
+    /// timer work; a queue-only check here would miss that first notification.
     fn ensure_frame_message_pump(&mut self) {
         if self.frame_message_pump_started {
             return;
         }
-        let has_main_entry = self
-            .state
-            .borrow()
-            .frame_messages
-            .iter()
-            .any(|msg| matches!(msg.target, crate::ops::FrameMessageTarget::Main));
-        if !has_main_entry {
+        // Pages without frames should retain the ordinary event-loop shape and
+        // pay no async-op cost. Frame realms are registered before their
+        // scripts can call parent/top.postMessage, so this remains safe for
+        // messages that arrive later while the loop is already parked.
+        if self.frame_realms.active_count() == 0 {
             return;
         }
         self.frame_message_pump_started = true;

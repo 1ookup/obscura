@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-06，step 235，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-08，step 245，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
@@ -8056,3 +8056,164 @@ frame 获得隔离；非隔离跨源 frame 的反射面隐藏 8 个实验接口�
 异步注册交换。`maNnU6` 中由引擎 getter 自发产生的 `body/head/img/form` 等 selector
 不再出现，剩余为 challenge 自身的动态 selector。真实站最终响应仍受外部
 Brunhild 路由影响，不以 challenge 页面文案代替 404 判据。
+
+### Step 241 - 事件循环运行期间的 frame->main `postMessage`（2026-09-08，代码完成）
+
+**假设**：第二次/第三次 `/cdn-cgi/challenge-platform/h/g/fo/` 完成后，iframe 已调用
+`parent.postMessage`，但主文档没有继续执行，是因为主 realm 的异步接收循环尚未启动。现有
+`ensure_frame_message_pump` 只在 Rust 队列已经有 `Main` 消息时启动；若页面先进入持续的网络/定时器
+事件循环，之后才由 iframe 入队，`Notify` 没有等待者，消息会留在队列中。
+
+**方法**：审计 `op_post_to_parent` 的入队与通知、`_frameMessageRecvLoop` 的 `op_frame_message_recv`
+等待关系，并新增一个离线 fixture：先让事件循环开始运行，再由 frame 定时调用
+`parent.postMessage`。修复前消息队列有残留、主文档监听器不触发；该场景与现有“入队后再启动事件循环”
+的回归不同。
+
+**修复**：首次进入事件循环路径且已有活动 frame realm 时启动主 realm 接收循环，让它先等待 `Notify`；frame 的
+`parent/top.postMessage` 在成功入队后安排一个无延迟、ref'd 的 browser tick，确保 unref 接收 op
+在事件循环已 idle 时仍会被轮询。frame-targeted `postMessage` 复用同一唤醒路径；target origin、
+generation 和 source 校验保持不变。无 iframe 页面不创建该接收 op，避免改变普通页面的事件循环形状。改动位于 `crates/obscura-js/src/runtime.rs` 与
+`crates/obscura-js/js/bootstrap.js`，回归位于 `crates/obscura-js/src/realm.rs`。
+
+**量化验证**：修复前新增 fixture 的 frame timer 已执行，但主文档监听器保持 `null`；修复后同一
+fixture 收到 `{value:42, origin:"http://example.com", sourceIsFrame:true}`。`obscura-js` 消息/计时器
+focused nextest 5/5、`obscura-browser` frame message focused nextest 4/4 通过，`git diff --check`
+通过。最终 release 经指定代理真实运行后，`/fo/` 后页面继续显示 `Verification successful. Waiting
+for www.thelancet.com to respond`，不再在消息处提前卡死；代理/上游仍未返回目标内容，尚未以 404
+判据验收。
+
+### Step 242 - `chrome-2-fo.har` 与失败消息内容对拍（2026-09-08，调查中）
+
+**HAR 基线**：`assets/har/chrome-2-fo.har` 共 12 条请求，Chrome 顺序为
+`top fo(200, 2348B) -> Turnstile frame(200) -> frame fo(200, 4674B/845852B)`，随后
+`brunhild /i(502)`、`PAT(401)`、`ci(200 image)`、`frame fo(200, 89911B/7164B)`、
+`top fo(200, 8898B/3660B)`，最后 `POST /1.txt(404, 2670B/23B)`。HAR 的 frame/top proof
+请求均带正确的 frame/top `Origin` 与 `Referer`，最终 top `fo` 响应包含 `cf-chl-out`、
+`cf-chl-out-s` 和 `cf_clearance`。
+
+**Obscura 请求证据**：同一 release、stealth、指定代理的 CDP 真点击已完成
+`frame fo(845-846KB) -> PAT(401) + brunhild /i -> frame fo(127KB) -> frame fo(约5KB)
+-> top fo(约3.2KB)`，proof 响应的 `cf_clearance` 已进入 cookie jar，后续导航也携带。
+但导航重新回到新的 `chl_page`，没有 HAR 中的最终 `/1.txt(404)`；这表明消息已推动主文档，
+当前阻塞在 Cloudflare 对 proof 的判定，而不是请求完全缺失。
+
+**postMessage 抓包**：不包装 `postMessage/contentWindow`，仅用 CDP 预注入 message listener
+并在 TOP/WIDGET realm 记录完整 `origin/data`。本轮 Obscura 消息序列最后为：
+
+```text
+TOP <= https://challenges.cloudflare.com
+{"source":"cloudflare-challenge","widgetId":"...","event":"interactiveEnd"}
+TOP <= https://challenges.cloudflare.com
+{"source":"cloudflare-challenge","widgetId":"...","event":"fail",
+ "code":"600010","rcV":"...","cfChlOut":"...","cfChlOutS":"..."}
+```
+
+没有收到 `event:"complete"` 或 token 字段；`fail` 后主页面仍会转发 top `fo`。该结果与
+Chrome 成功判据 `interactiveEnd -> complete + token -> /1.txt(404)` 的差异已明确，下一步继续
+对比 proof 事件/请求体和服务端会话条件，禁止伪造 token、clearance 或最终 404。
+
+### Step 243 - `/ci/` 当前请求统计与底层边界（2026-09-08，证据完成）
+
+**问题**：单轮日志中看不到 `/ci/`，是否说明 Obscura 的图像请求没有发送，从而必然导致质询失败。
+
+**方法**：同一 release、stealth、代理和 `https://www.thelancet.com/1.txt`，使用不修改
+`Image`、`fetch` 或 `postMessage` 的 CDP 观测，检查 Rust 图像传输 timing；另用 V8 属性 trace
+确认未发轮次是否执行 widget 的 `HTMLImageElement.src`。`/ci/` 不经过 `op_fetch_url`，所以不能用
+普通 fetch 日志作判据。
+
+**证据**：
+
+1. `assets/har/chrome-2-fo.har` 的第 9 条请求是
+   `GET challenges.cloudflare.com/.../h/g/ci/...`，`200 image/png`；它是 Chrome 该轮的
+   动态 `new Image().src` 请求。
+2. 当前无注入观测的四轮中，两个轮次出现
+   `image transport timing handed to the element's realm`，URL 明确包含
+   `/cdn-cgi/challenge-platform/h/g/ci/`，响应体分别为 1,730 和 4,372 字节；另外两个轮次
+   没有该 timing，也没有 widget 图像 op。相同二进制、代理和入口下行为交替出现，不能归因于
+   图像管线固定丢包。
+3. 发出 CI 的轮次和未发出的轮次都先完成约 822-846KB 的 widget `/fo`，并出现 PAT `401` 与
+   Brunhild `/i`。未发 CI 的点击轮仍继续完成 127KB frame `/fo`、约 5KB frame proof 和
+   约 3.2KB top proof；所以 `/ci/` 缺席不会阻止 proof 请求被构造。
+4. 图像实现本身在 Rust `op_load_image_metadata` 中按 frame 文档 base/origin 建立
+   `ResourceType::Image` 请求，成功响应写入 render cache 并交回 frame realm；已有的
+   200 响应、PNG 解码和 `naturalWidth/naturalHeight` 证据覆盖构造、传输和解码三环。
+5. 此前独立的无 CI V8 trace 没有 widget `HTMLImageElement.src` 命中，只有顶层 challenge
+   文档的 favicon/API 资源（本轮全量 trace 因写盘放大了 API.js 延迟，不作为该四轮样本的计数）。
+   这说明根因边界在 Cloudflare JSVMP 的分支选择：该类轮次根本没有执行 `new Image().src`，
+   不是 Obscura 在 `op_load_image_metadata` 或 HTTP 层把已构造的请求吞掉。`/ci/` 的发送时机
+   受服务端下发 payload/异步分支影响，约有轮间波动；单轮没有 CI 不能证明引擎回归。
+
+**终态对照**：失败轮 TOP realm 最后收到的是
+`interactiveBegin -> interactiveEnd -> fail(code:"600010", cfChlOut, cfChlOutS)`，没有
+`event:"complete"` 或 token。发出 CI 的轮次同样可能停在 proof 判定，故当前可行动断点仍是
+Cloudflare 对 proof 输入/会话的验证，不应伪造 CI、token、clearance 或最终 404 来掩盖该差异。
+
+**剩余风险**：历史调查发现动态辅助 iframe 的 `about:blank`/DOM parity 曾使 challenge 的
+JSVMP 分支抛异常；当前同步和 DOMParser skeleton 已有回归，但若后续轮次再次出现
+`body === null`，仍需把该异常与 CI 分支做同轮关联。现有证据不足以把它认定为本轮 CI 缺席的确定原因。
+
+### Step 244 - `/fo` 同源 POST 的 Origin 与最终导航 initiator（2026-09-08，代码完成）
+
+**假设**：HAR 中 top/frame 的同源 proof `POST /h/g/fo/` 以及最终 `POST /1.txt` 都带
+`Origin`。Obscura 原先只在跨源 CORS 请求上添加 Origin，导致 proof 请求的 wire headers
+与 Chrome 不同；顶层表单导航还没有 submitter initiator，因此 `Sec-Fetch-Site` 会落成
+`none`。
+
+**修复**：新增统一 `origin_header_required` 规则：所有非 GET/HEAD 请求带 Origin，跨源
+CORS GET/HEAD 也带；应用于 reqwest、wreq navigation 和 stealth scripted fetch/XHR。新增
+`fetch_document_with_method_referrer_and_initiator`，页面表单 POST 传入上一文档 URL，生成
+正确的 Origin 与 `Sec-Fetch-Site: same-origin`。GET、PAT 和 no-cors CI 图片保持原有头部。
+
+**证据**：
+
+1. 修复前日志中同源 top/frame `/fo` 的 `stealth_fetch request` 是 `origin=None`；修复后分别
+   为 `Some("https://www.thelancet.com")` 和 `Some("https://challenges.cloudflare.com")`，
+   与 HAR 条目 3、5、9、10 一致。
+2. 新增 reqwest focused 回归：同源 CORS POST、同源导航 POST 的 Origin、Fetch Metadata
+   和表单 Content-Type 均通过；`obscura-net` focused **2/2**。
+3. 新 release 真实轮仍完成 `frame /fo(822KB) -> CI -> frame /fo(127KB) -> frame proof
+   5160B -> top proof 3240B -> 新 ray`。Origin 差异已消除，但 Cloudflare 仍没有发出
+   `complete + token`，所以没有进入 HAR 的最终 `/1.txt` 404；该结果将剩余断点限定在
+   proof 内容/服务端会话判定，不把已修复的 header 与 CI 混为同一问题。
+
+### Step 245 - 指定 `/1.txt` 的 clean payload、postMessage 和 V8 trace 复核（2026-09-08，调查中）
+
+**假设**：当前失败可能仍是 `/ci/` 图片未发送、主窗口漏收 widget 消息，或 profile 的语言/时区
+只写入 navigator 而没有进入 ICU。需要用指定代理和 URL 做零预注入 payload 轮，再用独立通信和
+property trace 轮分离这些问题。
+
+**方法**：使用最新 release、stealth、远程 Reqable CA、代理 `http://192.168.3.57:9000`，访问
+`https://www.thelancet.com/1.txt`；指纹为 `profiles/chrome-152.json`，时区为
+`OBSCURA_TIMEZONE=Asia/Shanghai`。payload 轮只通过 CDP `Target`/`Input` 导航和固定坐标点击，
+不加 preload、不执行 `Runtime.evaluate`；通信轮使用被动 `message` listener、XHR/fetch/img 调用栈；
+trace 轮单独启用 `--trace-api-file` 和 `--trace-op-file`，不以其时序或 payload 作判据。
+
+**证据**：
+
+1. clean payload 的初始提交为 47 keys，第二提交为 92 keys、39 parts、160 个探针字段，和
+   `assets/payload-2fo/2.json` 的 39 parts/160 字段结构一致。`zIyO8` 为 `MacIntel`、`zh-CN`、6 核、
+   16GB；Intl 字段为 `十二月 中国标准时间`、`世界语（乌克兰）`、`21,000万亿`，时区为
+   `Asia/Shanghai`。这证明语言/时区没有再形成跨层矛盾。
+2. 同一轮 `rPXg2` 明确包含 `/cdn-cgi/challenge-platform/h/g/ci/` 图片 URL，响应成功并记录
+   `EazF1/dtkfB9/gtlhH0` timing。此前无 CI 的轮次没有 `HTMLImageElement.src` 命中，说明 CI 是
+   Cloudflare JSVMP 的条件分支选择，不是 Obscura 图片 transport 丢请求；不能预先伪造 CI URL。
+3. 全 realm 通信轮收到 `interactiveBegin -> interactiveEnd -> fail`，失败消息为
+   `code: "600010"` 并带 `cfChlOut/cfChlOutS`。没有 `event: "complete"`、token 或主窗口成功回调。
+   Rust debug 同时确认 frame proof `/fo` 和 top proof `/fo` 均返回 200，随后换 ray；因此断点是
+   Cloudflare 对 proof 输入/会话的判定，不是 postMessage 接收循环或请求完全缺失。
+4. property trace 约 1.8M 行、346MB，在 trace 放大下被 autonomous task budget 终止，未产生可用
+   payload。trace 仍记录了 `Document.body/createElement/querySelector/Element.innerHTML/appendChild`
+   等正常 DOM 调用，仅 3 个稳定的 Window 随机名 MISS；没有新的、可归因于 Obscura 的 BOM/DOM
+   缺失证据。`--trace-api-file` 不能替代无 trace payload 轮。
+
+**修复**：发现 CLI 先调用 `configure_browser_locale()`，后才把 `--fingerprint @file` 写入
+`OBSCURA_FINGERPRINT_JSON`，所以 profile 的 `language` 不会影响 V8/ICU。现在 fingerprint 解析
+在 locale 初始化前完成，locale 推导顺序为 `OBSCURA_LOCALE`、`OBSCURA_LANGUAGE`、
+`OBSCURA_LANGUAGES`、fingerprint profile language/languages；新增
+`fingerprint_profile_language_is_used_for_icu_locale` 回归测试。实现位于
+`crates/obscura-cli/src/main.rs`。
+
+**验证与结论**：CLI focused nextest 该回归 **1/1**，data URL sanity 显示 `zh-CN`、中文 Intl 和
+`Asia/Shanghai`。指定 URL 的 clean 轮仍未得到目标真实 `POST /1.txt -> 404`，所以不能宣称过盾；
+当前剩余差异是 proof payload 的动态资源/DOM/字体/渲染字段与 Cloudflare 服务端判定。`/ci/`、
+postMessage 接收和 Origin header 均已有正向证据，不再作为当前根因继续修改。

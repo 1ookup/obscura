@@ -24,7 +24,7 @@ use crate::client::{
     ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
     request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
     client_hint_origin, client_hint_value, parse_client_hint_list,
-    validate_cors_response, validate_request_mode, validate_url,
+    validate_cors_response, validate_request_mode, validate_url, origin_header_required,
 };
 
 // The default stealth identity is the same macOS Chrome 149 the fingerprint
@@ -488,7 +488,7 @@ impl StealthHttpClient {
                 }
                 req = req.header(k.as_str(), v.as_str());
             }
-            if cors_required(&request, &current_url) {
+            if origin_header_required(&request, &current_url, "GET") {
                 req = req.header("origin", &request_origin);
             }
 

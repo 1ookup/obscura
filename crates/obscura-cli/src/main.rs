@@ -374,21 +374,41 @@ fn locale_for_browser_language(language: &str) -> Option<&'static str> {
     }
 }
 
-fn configure_browser_locale() {
-    let explicit = std::env::var("OBSCURA_LOCALE")
-        .ok()
+fn configured_browser_locale(
+    explicit: Option<String>,
+    language: Option<String>,
+    languages: Option<String>,
+    profile: &obscura_net::FingerprintOverrides,
+) -> Option<String> {
+    if let Some(locale) = explicit
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let inferred = std::env::var("OBSCURA_LANGUAGE")
-        .ok()
-        .and_then(|language| locale_for_browser_language(&language).map(str::to_string))
-        .or_else(|| {
-            std::env::var("OBSCURA_LANGUAGES")
-                .ok()
-                .and_then(|languages| languages.split(',').next().map(str::to_string))
-                .and_then(|language| locale_for_browser_language(&language).map(str::to_string))
-        });
-    let Some(locale) = explicit.or(inferred) else {
+        .filter(|value| !value.is_empty())
+    {
+        return Some(locale);
+    }
+    let profile_languages = profile.languages.as_deref().and_then(|values| values.first());
+    [
+        language.as_deref(),
+        languages
+            .as_deref()
+            .and_then(|value| value.split(',').next()),
+        profile.language.as_deref(),
+        profile_languages.map(String::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| locale_for_browser_language(value).map(str::to_string))
+}
+
+fn configure_browser_locale() {
+    let profile = obscura_net::fingerprint_overrides_from_env();
+    let locale = configured_browser_locale(
+        std::env::var("OBSCURA_LOCALE").ok(),
+        std::env::var("OBSCURA_LANGUAGE").ok(),
+        std::env::var("OBSCURA_LANGUAGES").ok(),
+        &profile,
+    );
+    let Some(locale) = locale else {
         return;
     };
     // SAFETY: main() invokes this before any V8 isolate or worker thread is
@@ -403,6 +423,31 @@ async fn main() -> anyhow::Result<()> {
         || args.trace_api_devtools
     {
         anyhow::bail!("trace ignore/watch/devtools options belong to the retired descriptor monitor and are not implemented by the pinned V8 trace; use --trace-api-file alone");
+    }
+
+    // `--fingerprint` only sets an env var; every from_user_agent() site picks
+    // it up, including worker processes spawned by multi-worker serve. Set it
+    // before locale initialization so a profile's language also configures
+    // V8/ICU rather than leaving navigator and Intl on different locales.
+    if let Some(ref spec) = args.fingerprint {
+        let raw = match spec.strip_prefix('@') {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(err) => {
+                    eprintln!("obscura: --fingerprint: cannot read {path}: {err}");
+                    std::process::exit(2);
+                }
+            },
+            None => spec.clone(),
+        };
+        if let Err(err) = serde_json::from_str::<obscura_net::FingerprintOverrides>(&raw) {
+            eprintln!("obscura: --fingerprint: invalid JSON: {err}");
+            std::process::exit(2);
+        }
+        // SAFETY: set_var runs before any spawned worker exists.
+        unsafe {
+            std::env::set_var("OBSCURA_FINGERPRINT_JSON", raw);
+        }
     }
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -474,30 +519,6 @@ async fn main() -> anyhow::Result<()> {
     // field is absent (`obscura --storage-dir DIR fetch ...`).
     let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
-
-    // `--fingerprint` only sets an env var; every from_user_agent() site picks
-    // it up, including worker processes spawned by multi-worker serve.
-    if let Some(ref spec) = args.fingerprint {
-        let raw = match spec.strip_prefix('@') {
-            Some(path) => match std::fs::read_to_string(path) {
-                Ok(text) => text,
-                Err(err) => {
-                    eprintln!("obscura: --fingerprint: cannot read {path}: {err}");
-                    std::process::exit(2);
-                }
-            },
-            None => spec.clone(),
-        };
-        if let Err(err) = serde_json::from_str::<obscura_net::FingerprintOverrides>(&raw) {
-            eprintln!("obscura: --fingerprint: invalid JSON: {err}");
-            std::process::exit(2);
-        }
-        // SAFETY: set_var is unsafe in newer rustc; this runs before any
-        // spawned worker exists, so nothing races on the environment.
-        unsafe {
-            std::env::set_var("OBSCURA_FINGERPRINT_JSON", raw);
-        }
-    }
 
     match args.command {
         Some(Command::Serve {
@@ -2036,7 +2057,8 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        locale_for_browser_language, merge_proxy, normalize_v8_flags, read_urls_from_file,
+        configured_browser_locale, locale_for_browser_language, merge_proxy, normalize_v8_flags,
+        read_urls_from_file,
         resolve_asset_url, resolve_v8_flags,
         select_log_filter,
         write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
@@ -2050,6 +2072,36 @@ mod tests {
         assert_eq!(locale_for_browser_language("en-US"), Some("en_US.UTF-8"));
         assert_eq!(locale_for_browser_language("de-DE"), Some("de_DE.UTF-8"));
         assert_eq!(locale_for_browser_language("xx-YY"), None);
+    }
+
+    #[test]
+    fn fingerprint_profile_language_is_used_for_icu_locale() {
+        let profile = obscura_net::FingerprintOverrides {
+            language: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_browser_locale(None, None, None, &profile),
+            Some("zh_CN.UTF-8".to_string())
+        );
+        assert_eq!(
+            configured_browser_locale(
+                None,
+                Some("en-US".to_string()),
+                None,
+                &profile,
+            ),
+            Some("en_US.UTF-8".to_string())
+        );
+        assert_eq!(
+            configured_browser_locale(
+                Some(" C.UTF-8 ".to_string()),
+                Some("zh-CN".to_string()),
+                None,
+                &profile,
+            ),
+            Some("C.UTF-8".to_string())
+        );
     }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and

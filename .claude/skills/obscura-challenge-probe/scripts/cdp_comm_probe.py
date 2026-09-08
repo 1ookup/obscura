@@ -58,7 +58,7 @@ var _b=navigator.sendBeacon;
 if(typeof _b==='function'){navigator.sendBeacon=function(u){rec('BEACON',String(u).slice(-55)+' :: '+stk());return _b.apply(this,arguments);};}
 try{var _img=Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,'src');
 if(_img&&_img.set){Object.defineProperty(HTMLImageElement.prototype,'src',{
-  set:function(v){rec('IMG',String(v).slice(-55));_img.set.call(this,v);},get:_img.get});}}catch(e){}
+  set:function(v){var s=String(v);rec('IMG',s+' (len='+s.length+')');_img.set.call(this,v);},get:_img.get});}}catch(e){}
 rec('READY','');
 }catch(e){try{console.warn('[comm] init-error '+e);}catch(x){}}})();"""
 

@@ -526,12 +526,17 @@ function _environmentAllowsScripts() {
     return true;
   }
 }
-function _environmentReferrerContext() {
-  return JSON.stringify({
+function _environmentReferrerContext(destination = "") {
+  const context = {
     url: globalThis.location?.href || "",
     policy: _environmentReferrerPolicy(),
     root: _environmentDocumentRoot(),
-  });
+  };
+  // The op argument list is already at deno_core's limit, so keep the
+  // browser-owned destination in this internal context rather than exposing
+  // a page-settable Sec-Fetch-* header.
+  if (destination) context.destination = destination;
+  return JSON.stringify(context);
 }
 
 // Dynamic script insertion happens after the Rust parser scheduler, so it has
@@ -623,8 +628,9 @@ async function __fetchDynClassicScript(task) {
     // Resource Timing entry, so only this branch files one.
     const fetchStart = performance.now();
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin",
-      _environmentReferrerContext()
+      task.url, "GET", "{}", "", task.pageOrigin,
+      task.requestMode || "no-cors", task.requestCredentials || "include",
+      _environmentReferrerContext("script")
     );
     const parsed = JSON.parse(raw);
     // A browser records the response before deciding whether it is executable,
@@ -885,7 +891,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
     url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin",
-    _environmentReferrerContext()
+    _environmentReferrerContext("style")
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -2905,13 +2911,31 @@ function __prepareInsertedScript(script) {
       console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
       fullUrl = src;
     }
-    const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
+    // Fetch metadata and Origin belong to the document's environment, not to
+    // a cross-origin <base href> used only to resolve this script URL.
+    const pageOrigin = _environmentSettings().origin
+      || (function() { try { return new URL(docUrl).origin; } catch(e) { return ""; } })();
+    const crossOrigin = script.getAttribute('crossorigin');
+    let requestMode = 'no-cors';
+    let requestCredentials = 'include';
+    if (crossOrigin !== null) {
+      const value = String(crossOrigin).trim().toLowerCase();
+      if (value === '' || value === 'anonymous') {
+        requestMode = 'cors';
+        requestCredentials = 'same-origin';
+      } else if (value === 'use-credentials') {
+        requestMode = 'cors';
+        requestCredentials = 'include';
+      }
+    }
     const task = {
       url: fullUrl,
       isModule,
       nid: script[_nidSym],
       prevNid,
       pageOrigin,
+      requestMode,
+      requestCredentials,
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
     };
     // Non-parser-inserted external scripts are async by default, but scripts
@@ -8792,6 +8816,17 @@ function _normalizeTargetOrigin(targetOrigin) {
   return t;
 }
 
+// The main frame-message receive op is intentionally unref'd so an idle page
+// can settle. A late cross-document post therefore also needs one ref'd event
+// loop wake to poll that op after it is notified.
+function _wakeFrameMessageDelivery() {
+  try {
+    if (Deno.core.ops.op_async_runtime_available()) {
+      Deno.core.ops.op_posted_task().catch(() => {});
+    }
+  } catch (e) {}
+}
+
 // The calling realm's own content root, 0 in the main Window realm. Frame
 // realms get the flag injected by the Rust realm host before bootstrap runs.
 // In this shared-isolate model the flag is the realm's identity claim toward
@@ -9243,7 +9278,11 @@ function _frameWindowProxyFor(hostEl) {
     postMessage(message, targetOrigin) {
       const to = _normalizeTargetOrigin(targetOrigin);
       const payload = _workerSerializeMessage(message);
-      try { Deno.core.ops.op_post_to_frame(hostNid, payload, to, _callingFrameRoot()); } catch (e) {}
+      try {
+        if (Deno.core.ops.op_post_to_frame(hostNid, payload, to, _callingFrameRoot()) === "ok") {
+          _wakeFrameMessageDelivery();
+        }
+      } catch (e) {}
     },
     blur() {},
     focus() {},
@@ -9499,7 +9538,14 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     postMessage(message, targetOrigin) {
       const to = _normalizeTargetOrigin(targetOrigin);
       const payload = _workerSerializeMessage(message);
-      try { Deno.core.ops.op_post_to_parent(_callingFrameRoot() || selfRoot, payload, to, !!toTop); } catch (e) {}
+      try {
+        if (Deno.core.ops.op_post_to_parent(_callingFrameRoot() || selfRoot, payload, to, !!toTop) === "ok") {
+          // A frame can post after the main event loop has gone idle. The
+          // receive pump is intentionally unref'd, so wake one ref'd browser
+          // tick as well; it will poll the pending message op and dispatch it.
+          _wakeFrameMessageDelivery();
+        }
+      } catch (e) {}
     },
     get document() {
       if (!sameOrigin()) throw securityError();

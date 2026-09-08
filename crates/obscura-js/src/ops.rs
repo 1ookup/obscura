@@ -3186,6 +3186,12 @@ async fn op_fetch_url(
     // referrer context; resolve the policy before borrowing shared state for
     // the rest of the request.
     let referrer_context = serde_json::from_str::<serde_json::Value>(&referrer_context).ok();
+    let request_destination = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("destination"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
     let request_root = referrer_context
         .as_ref()
         .and_then(|value| value.get("root"))
@@ -3560,6 +3566,7 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 request_csp.clone(),
+                request_destination.clone(),
             )
             .await;
         }
@@ -3584,6 +3591,11 @@ async fn op_fetch_url(
             .unwrap_or(false);
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
+        }
+        if !request_destination.is_empty() {
+            req = req
+                .header("Sec-Fetch-Mode", &mode)
+                .header("Sec-Fetch-Dest", &request_destination);
         }
         if let (Ok(source), Ok(target)) = (
             url::Url::parse(&referrer_url),
@@ -4072,6 +4084,7 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     request_csp: Option<String>,
+    request_destination: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
@@ -4098,7 +4111,14 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
-        if current_is_cross_origin {
+        // Origin is present on every non-GET/HEAD request, including a
+        // same-origin form POST, and on cross-origin CORS GET/HEAD requests.
+        // The former is what the challenge's proof POSTs use; checking only
+        // target origin drops a browser-visible header.
+        let origin_required = (!current_method.eq_ignore_ascii_case("GET")
+            && !current_method.eq_ignore_ascii_case("HEAD"))
+            || (mode == "cors" && current_is_cross_origin);
+        if origin_required {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         if let Some(value) = url::Url::parse(&referrer_url)
@@ -4124,7 +4144,13 @@ async fn stealth_fetch_all(
             });
         req_headers
             .entry("sec-fetch-dest".to_string())
-            .or_insert_with(|| "empty".to_string());
+            .or_insert_with(|| {
+                if request_destination.is_empty() {
+                    "empty".to_string()
+                } else {
+                    request_destination.clone()
+                }
+            });
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }

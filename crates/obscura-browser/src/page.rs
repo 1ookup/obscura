@@ -1958,6 +1958,7 @@ impl Page {
         struct ScriptInfo {
             src: Option<String>,
             nonce: Option<String>,
+            cross_origin: Option<String>,
             inline: String,
             is_defer: bool,
             is_async: bool,
@@ -2008,6 +2009,9 @@ impl Page {
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
                             let nonce = node.get_attribute("nonce").map(|s| s.to_string());
+                            let cross_origin = node
+                                .get_attribute("crossorigin")
+                                .map(|s| s.to_string());
                             let script_type = node
                                 .get_attribute("type")
                                 .unwrap_or("")
@@ -2037,6 +2041,7 @@ impl Page {
                                 scripts.push(ScriptInfo {
                                     src,
                                     nonce,
+                                    cross_origin,
                                     inline: inline_code,
                                     is_defer,
                                     is_async,
@@ -2165,6 +2170,7 @@ impl Page {
                 let initiator = script_initiator.clone();
                 let url = url.clone();
                 let idx = *idx;
+                let cross_origin = all_scripts[idx].cross_origin.clone();
                 let referrer_policy = referrer_policy;
                 async move {
                     let parsed =
@@ -2194,7 +2200,10 @@ impl Page {
                         };
                         return Some((idx, url, resp));
                     }
-                    let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::classic_script(
+                        &initiator,
+                        cross_origin.as_deref(),
+                    );
                     request.referrer_policy = referrer_policy;
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
@@ -2916,6 +2925,7 @@ impl Page {
         struct FrameScript {
             src: Option<String>,
             nonce: Option<String>,
+            cross_origin: Option<String>,
             inline: String,
             nid: u32,
             base_url: String,
@@ -2985,6 +2995,9 @@ impl Page {
                         };
                         let src = node.get_attribute("src").map(str::to_string);
                         let nonce = node.get_attribute("nonce").map(str::to_string);
+                        let cross_origin = node
+                            .get_attribute("crossorigin")
+                            .map(str::to_string);
                         let inline = if src.is_none() {
                             dom.text_content(sid)
                         } else {
@@ -2994,6 +3007,7 @@ impl Page {
                             scripts.push(FrameScript {
                                 src,
                                 nonce,
+                                cross_origin,
                                 inline,
                                 nid: sid.raw(),
                                 source_line: dom.source_line(sid).unwrap_or(1),
@@ -3091,6 +3105,7 @@ impl Page {
                 let client = client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
+                let cross_origin = scripts[index].cross_origin.clone();
                 let referrer_policy = referrer_policy;
                 async move {
                     let parsed =
@@ -3117,8 +3132,10 @@ impl Page {
                         };
                         return Some((index, url, resp));
                     }
-                    let mut request =
-                        ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::classic_script(
+                        &initiator,
+                        cross_origin.as_deref(),
+                    );
                     request.referrer_policy = referrer_policy;
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
@@ -3776,10 +3793,11 @@ impl Page {
             })
         } else if method == "POST" {
             self.http_client
-                .fetch_document_with_method_referrer(
+                .fetch_document_with_method_referrer_and_initiator(
                     Method::POST,
                     &url,
                     Some(body.as_bytes().to_vec()),
+                    Url::parse(referrer).ok(),
                     Url::parse(referrer).ok(),
                     self.referrer_policy,
                     Some(&self.callbacks),

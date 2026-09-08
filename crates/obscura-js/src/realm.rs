@@ -3179,6 +3179,55 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_postmessage_after_event_loop_start_reaches_main_window() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+
+        rt.evaluate(
+            r#"(() => {
+                globalThis.__lateMessage = null;
+                window.addEventListener('message', event => {
+                    globalThis.__lateMessage = {
+                        value: event.data.value,
+                        origin: event.origin,
+                        sourceIsFrame: event.source === document.getElementById('f').contentWindow,
+                    };
+                });
+            })()"#,
+        )
+        .unwrap();
+
+        // Start the frame's timer only after the main event loop has had a
+        // chance to park. The message therefore arrives after the recv pump
+        // setup point, matching a challenge iframe's post-/fo callback.
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            "globalThis.__lateTimerRan = false; setTimeout(() => { __lateTimerRan = true; parent.postMessage({ value: 42 }, '*'); }, 10);",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "__lateTimerRan")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+
+        assert_eq!(
+            rt.evaluate("globalThis.__lateMessage").unwrap(),
+            serde_json::json!({
+                "value": 42,
+                "origin": "http://example.com",
+                "sourceIsFrame": true,
+            })
+        );
+    }
+
     /// A window may address a message at itself, and HTML delivers it like any
     /// other cross-document message. Scripts use this as a same-realm mailbox
     /// -- post work to yourself, collect it in the one `message` listener that

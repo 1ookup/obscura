@@ -334,6 +334,30 @@ impl ResourceRequest {
         }
     }
 
+    /// Fetch profile for a classic script element. Without a `crossorigin`
+    /// attribute, classic scripts use no-CORS with credentials; `anonymous`
+    /// (including the empty attribute) switches to CORS with same-origin
+    /// credentials, while `use-credentials` keeps credentials cross-origin.
+    /// Invalid enumerated values use the missing-value default.
+    pub fn classic_script(initiator: &Url, crossorigin: Option<&str>) -> Self {
+        let mut request = Self::subresource(ResourceType::Script, initiator);
+        let Some(value) = crossorigin else {
+            return request;
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "anonymous" => {
+                request.mode = RequestMode::Cors;
+                request.credentials = RequestCredentials::SameOrigin;
+            }
+            "use-credentials" => {
+                request.mode = RequestMode::Cors;
+                request.credentials = RequestCredentials::Include;
+            }
+            _ => {}
+        }
+        request
+    }
+
     /// Fetch profile for JavaScript modules. Unlike classic scripts, module
     /// scripts are CORS-enabled and use `same-origin` credentials by default.
     /// Keep this separate from `subresource(Script, ..)`, whose no-CORS,
@@ -476,6 +500,21 @@ pub(crate) fn same_origin(request: &ResourceRequest, target: &Url) -> bool {
 
 pub(crate) fn cors_required(request: &ResourceRequest, target: &Url) -> bool {
     request.mode == RequestMode::Cors && !same_origin(request, target)
+}
+
+/// Whether the wire request carries an Origin header. CORS response
+/// validation only applies to cross-origin targets, but the request header is
+/// broader: browsers send it for every non-GET/HEAD request (including a
+/// same-origin form navigation) and for cross-origin CORS GET/HEAD requests.
+/// The distinction matters for both challenge proof XHRs and the final form
+/// POST after a successful challenge.
+pub(crate) fn origin_header_required(
+    request: &ResourceRequest,
+    target: &Url,
+    method: &str,
+) -> bool {
+    (!method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD"))
+        || (request.mode == RequestMode::Cors && !same_origin(request, target))
 }
 
 /// Serialize the request origin used by both the Origin request header and the
@@ -1409,11 +1448,38 @@ impl ObscuraHttpClient {
         policy: ReferrerPolicy,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_document_with_method_referrer_headers(
+        self.fetch_document_with_method_referrer_and_initiator(
             method,
             url,
             body,
             referrer,
+            None,
+            policy,
+            callbacks,
+        )
+        .await
+    }
+
+    /// Fetch a top-level document navigation while retaining the previous
+    /// document as the initiator. A form POST is a navigation request, but
+    /// Chrome still sends its Origin and same-origin Fetch Metadata derived
+    /// from the submitting document.
+    pub async fn fetch_document_with_method_referrer_and_initiator(
+        &self,
+        method: Method,
+        url: &Url,
+        body: Option<Vec<u8>>,
+        referrer: Option<Url>,
+        initiator: Option<Url>,
+        policy: ReferrerPolicy,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_document_with_method_referrer_headers_and_initiator(
+            method,
+            url,
+            body,
+            referrer,
+            initiator,
             policy,
             HashMap::new(),
             callbacks,
@@ -1431,7 +1497,32 @@ impl ObscuraHttpClient {
         headers: HashMap<String, String>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_document_with_method_referrer_headers_and_initiator(
+            method,
+            url,
+            body,
+            referrer,
+            None,
+            policy,
+            headers,
+            callbacks,
+        )
+        .await
+    }
+
+    pub async fn fetch_document_with_method_referrer_headers_and_initiator(
+        &self,
+        method: Method,
+        url: &Url,
+        body: Option<Vec<u8>>,
+        referrer: Option<Url>,
+        initiator: Option<Url>,
+        policy: ReferrerPolicy,
+        headers: HashMap<String, String>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
         let mut request = ResourceRequest::navigation();
+        request.initiator = initiator;
         request.referrer = referrer;
         request.referrer_policy = policy;
         request.headers = headers;
@@ -1870,7 +1961,7 @@ impl ObscuraHttpClient {
             }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
-            if cors_required(&request, &current_url) {
+            if origin_header_required(&request, &current_url, method.as_str()) {
                 if let Ok(value) = HeaderValue::from_str(&request_origin) {
                     headers.insert(reqwest::header::ORIGIN, value);
                 }
@@ -2078,7 +2169,7 @@ pub enum ObscuraNetError {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, referrer_value, request_fetch_site, request_referrer, validate_url,
+        is_forbidden_ip, origin_header_required, referrer_value, request_fetch_site, request_referrer, validate_url,
         validate_resolved_addresses, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
         ReferrerPolicy, RequestCredentials, RequestMode, ResourceRequest, ResourceType,
     };
@@ -2163,6 +2254,24 @@ mod ssrf_tests {
         assert_eq!(stylesheet.destination(), "style");
         assert_eq!(stylesheet.accept(), "text/css,*/*;q=0.1");
 
+        let classic = ResourceRequest::classic_script(&document, None);
+        assert_eq!(classic.mode, RequestMode::NoCors);
+        assert_eq!(classic.credentials, RequestCredentials::Include);
+        assert_eq!(classic.destination(), "script");
+
+        let anonymous = ResourceRequest::classic_script(&document, Some("anonymous"));
+        assert_eq!(anonymous.mode, RequestMode::Cors);
+        assert_eq!(anonymous.credentials, RequestCredentials::SameOrigin);
+
+        let use_credentials =
+            ResourceRequest::classic_script(&document, Some("use-credentials"));
+        assert_eq!(use_credentials.mode, RequestMode::Cors);
+        assert_eq!(use_credentials.credentials, RequestCredentials::Include);
+
+        let invalid = ResourceRequest::classic_script(&document, Some("invalid"));
+        assert_eq!(invalid.mode, RequestMode::NoCors);
+        assert_eq!(invalid.credentials, RequestCredentials::Include);
+
         let font = ResourceRequest::subresource(ResourceType::Font, &document);
         assert_eq!(font.mode, RequestMode::Cors);
         assert_eq!(font.credentials, RequestCredentials::SameOrigin);
@@ -2212,6 +2321,21 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    #[test]
+    fn same_origin_cors_post_still_sends_origin_header() {
+        let target = Url::parse("https://app.example/api").unwrap();
+        let request = ResourceRequest::subresource(
+            ResourceType::Fetch,
+            &Url::parse("https://app.example/page").unwrap(),
+        );
+        assert!(origin_header_required(&request, &target, "POST"));
+        assert!(!origin_header_required(&request, &target, "GET"));
+        assert!(!origin_header_required(&request, &target, "HEAD"));
+        let mut navigation = ResourceRequest::navigation();
+        navigation.initiator = Some(Url::parse("https://app.example/page").unwrap());
+        assert!(origin_header_required(&navigation, &target, "POST"));
     }
 
     #[test]
@@ -2399,6 +2523,35 @@ mod ssrf_tests {
             raw.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"),
             "{raw}"
         );
+    }
+
+    #[tokio::test]
+    async fn navigation_post_uses_submitter_origin_and_fetch_site() {
+        let (target, mut requests) = http_fixture(vec![ok_response("", "ok")]).await;
+        let initiator = target.join("/1.txt").unwrap();
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client
+            .fetch_document_with_method_referrer_and_initiator(
+                Method::POST,
+                &target,
+                Some(b"cf=proof".to_vec()),
+                Some(initiator.clone()),
+                Some(initiator),
+                ReferrerPolicy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let raw = requests.recv().await.unwrap().to_ascii_lowercase();
+        assert!(raw.contains("\r\norigin: "), "{raw}");
+        assert!(raw.contains("\r\nsec-fetch-site: same-origin\r\n"), "{raw}");
+        assert!(raw.contains("\r\nsec-fetch-mode: navigate\r\n"), "{raw}");
+        assert!(raw.contains("\r\nsec-fetch-dest: document\r\n"), "{raw}");
+        assert!(raw.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"), "{raw}");
     }
 
     #[tokio::test]
