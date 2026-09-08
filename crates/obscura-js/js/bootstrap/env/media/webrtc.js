@@ -266,29 +266,6 @@ function _rtcMdnsHosts() {
   return _rtcMdnsHosts._cache;
 }
 
-const _rtcState = new WeakMap();
-function _rtcSlots(connection) {
-  let slots = _rtcState.get(connection);
-  if (!slots) {
-    slots = {
-      sessionId: _rtcRandomUint(19),
-      ufrag: _rtcRandomBase64(4),
-      pwd: _rtcRandomBase64(24),
-      fingerprint: _rtcRandomHex(32).join(':'),
-      transceivers: [],
-      dataChannel: false,
-      localDescription: null,
-      remoteDescription: null,
-      iceGatheringState: 'new',
-      listeners: Object.create(null),
-      onicecandidate: null,
-      onicegatheringstatechange: null,
-      closed: false,
-    };
-    _rtcState.set(connection, slots);
-  }
-  return slots;
-}
 function _rtcBuildOffer(slots) {
   const kinds = slots.transceivers.map(item => item.kind);
   if (slots.dataChannel) kinds.push('application');
@@ -424,4 +401,3 @@ function _rtcCapabilities(kind) {
     .map(match => ({ uri: match[1] }));
   return { codecs, headerExtensions };
 }
-

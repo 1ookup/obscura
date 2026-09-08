@@ -1,17 +1,13 @@
 // A probe that walks it saw 5 members where Chrome has 9, and `lock` -- which
 // pages call and which Chrome rejects outside fullscreen -- was simply absent.
-const _screenOrientationKey = Symbol('ScreenOrientation');
-const _screenOrientationHandlers = new WeakMap();
 class ScreenOrientation {
   constructor(key) {
-    if (key !== _screenOrientationKey) throw new TypeError('Illegal constructor');
+    _screenOrientationInitialize(this, key);
   }
   get type() { return 'landscape-primary'; }
   get angle() { return 0; }
-  get onchange() { return _screenOrientationHandlers.get(this) || null; }
-  set onchange(value) {
-    _screenOrientationHandlers.set(this, typeof value === 'function' ? value : null);
-  }
+  get onchange() { return _screenOrientationOnChange(this); }
+  set onchange(value) { _screenOrientationSetOnChange(this, value); }
   // Chrome rejects with NotSupportedError unless the document is fullscreen,
   // which is the state a headless page is always in.
   lock() {
@@ -33,37 +29,28 @@ globalThis.ScreenOrientation = _markNative(ScreenOrientation);
 // running `for..in`, so a non-enumerable `_w` is still one
 // `Object.getOwnPropertyNames(screen)` away from being visible. A browser's
 // screen object has no own string-keyed properties at all.
-const _screenSlots = Symbol('Screen slots');
 class Screen {
   constructor(w, h, availW, availH, availTop, availLeft) {
     // Every observable value lives behind this one symbol. `colorDepth` and
     // friends used to be own data properties, which put them in
     // `Object.getOwnPropertyNames(screen)` -- a list that is empty in a
     // browser, where all of Screen is prototype accessors.
-    this[_screenSlots] = {
-      w, h,
-      availW: availW === undefined ? w : availW,
-      availH: availH === undefined ? h - 40 : availH,
-      availTop: availTop === undefined ? 0 : availTop,
-      availLeft: availLeft === undefined ? 0 : availLeft,
-      orientation: new ScreenOrientation(_screenOrientationKey),
-      onchange: null,
-    };
+    _screenInitialize(this, w, h, availW, availH, availTop, availLeft);
   }
-  get width() { return this[_screenSlots].w; }
-  get height() { return this[_screenSlots].h; }
-  get availWidth() { return this[_screenSlots].availW; }
-  get availHeight() { return this[_screenSlots].availH; }
-  get availTop() { return this[_screenSlots].availTop; }
-  get availLeft() { return this[_screenSlots].availLeft; }
+  get width() { return _screenSlot(this, 'w'); }
+  get height() { return _screenSlot(this, 'h'); }
+  get availWidth() { return _screenSlot(this, 'availW'); }
+  get availHeight() { return _screenSlot(this, 'availH'); }
+  get availTop() { return _screenSlot(this, 'availTop'); }
+  get availLeft() { return _screenSlot(this, 'availLeft'); }
   get colorDepth() { return 24; }
   get pixelDepth() { return 24; }
-  get orientation() { return this[_screenSlots].orientation; }
+  get orientation() { return _screenOrientationFor(this); }
   // Chrome reports false unless the window spans several displays, which a
   // headless engine never does.
   get isExtended() { return false; }
-  get onchange() { return this[_screenSlots].onchange; }
-  set onchange(value) { this[_screenSlots].onchange = typeof value === 'function' ? value : null; }
+  get onchange() { return _screenSlot(this, 'onchange'); }
+  set onchange(value) { _screenSetSlot(this, 'onchange', typeof value === 'function' ? value : null); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
@@ -82,33 +69,18 @@ class Screen {
   _markNative(Screen.prototype[k]);
 });
 globalThis.Screen = Screen;
-function _applyScreenSize(w, h, emulated, availW, availH, availTop, availLeft) {
-  const resolvedAvailW = Number.isFinite(availW) ? availW : w;
-  const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
-  if (globalThis.screen instanceof Screen) {
-    const slots = globalThis.screen[_screenSlots];
-    slots.w = w;
-    slots.h = h;
-    slots.availW = resolvedAvailW;
-    slots.availH = resolvedAvailH;
-    slots.availTop = Number.isFinite(availTop) ? availTop : 0;
-    slots.availLeft = Number.isFinite(availLeft) ? availLeft : 0;
-  } else {
-    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH, availTop, availLeft);
-  }
-}
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   globalThis.__obscura_screen_emulated = !!emulated;
   if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
     globalThis.__obscura_screen_w = w;
     globalThis.__obscura_screen_h = h;
-    _applyScreenSize(w, h, !!emulated);
+    _screenApplySize(w, h, !!emulated);
     return;
   }
   delete globalThis.__obscura_screen_w;
   delete globalThis.__obscura_screen_h;
   const fallback = _fingerprint().screen || {};
-  _applyScreenSize(
+  _screenApplySize(
     Number(fallback.width) || 1920,
     Number(fallback.height) || 1080,
     !!emulated,
@@ -122,7 +94,7 @@ globalThis.__obscura_apply_fingerprint = function() {
   const fingerprint = _fingerprint();
   const fallback = fingerprint.screen || {};
   if (!(Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0)) {
-    _applyScreenSize(
+    _screenApplySize(
       Number(fallback.width) || 1920,
       Number(fallback.height) || 1080,
       !!globalThis.__obscura_screen_emulated,

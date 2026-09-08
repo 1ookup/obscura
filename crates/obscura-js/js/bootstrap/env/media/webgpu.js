@@ -145,6 +145,10 @@ const _GPU_WGSL_FEATURES = [
 ];
 
 function _gpuSupportedLimits(values) {
+  if (typeof _webgpuMakeSupportedLimits === 'function') {
+    return _webgpuMakeSupportedLimits(values);
+  }
+  // Compatibility for snapshots using the pre-split manifest.
   const limits = Object.create(globalThis.GPUSupportedLimits.prototype);
   for (const name of Object.keys(values)) {
     Object.defineProperty(limits, name, {
@@ -156,6 +160,10 @@ function _gpuSupportedLimits(values) {
 // GPUSupportedFeatures is a setlike, so it answers `has`, iterates, and
 // reports `size` -- a plain Array would fail every one of those checks.
 function _gpuSupportedFeatures(names) {
+  if (typeof _webgpuMakeSupportedFeatures === 'function') {
+    return _webgpuMakeSupportedFeatures(names);
+  }
+  // Compatibility for snapshots using the pre-split manifest.
   const features = Object.create(globalThis.GPUSupportedFeatures.prototype);
   const backing = new Set(names);
   Object.defineProperty(features, '_set', { value: backing, configurable: true });
@@ -164,8 +172,21 @@ function _gpuSupportedFeatures(names) {
 
 // The WebGPU usage/stage constants Chrome hangs off the global. Spec values,
 // identical across implementations.
-globalThis.GPUBufferUsage = { MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008, INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080, INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200 };
-globalThis.GPUColorWrite = { RED: 0x1, GREEN: 0x2, BLUE: 0x4, ALPHA: 0x8, ALL: 0xF };
-globalThis.GPUMapMode = { READ: 0x1, WRITE: 0x2 };
-globalThis.GPUShaderStage = { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
-globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
+// Legacy fallback dictionaries.  gpu-constants.js installs these as shape
+// data in the split manifest; the guards preserve snapshots built before that
+// module was introduced.
+if (typeof globalThis.GPUBufferUsage === 'undefined') {
+  globalThis.GPUBufferUsage = { MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008, INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080, INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200 };
+}
+if (typeof globalThis.GPUColorWrite === 'undefined') {
+  globalThis.GPUColorWrite = { RED: 0x1, GREEN: 0x2, BLUE: 0x4, ALPHA: 0x8, ALL: 0xF };
+}
+if (typeof globalThis.GPUMapMode === 'undefined') {
+  globalThis.GPUMapMode = { READ: 0x1, WRITE: 0x2 };
+}
+if (typeof globalThis.GPUShaderStage === 'undefined') {
+  globalThis.GPUShaderStage = { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 };
+}
+if (typeof globalThis.GPUTextureUsage === 'undefined') {
+  globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
+}

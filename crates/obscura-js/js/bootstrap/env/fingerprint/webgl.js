@@ -268,15 +268,6 @@ const _WEBGL_APPLE = {
   samplesFormats: new Set([0x8229, 0x822B, 0x8051, 0x8058, 0x8C43, 0x8059, 0x81A5, 0x81A6, 0x8CAC, 0x8D48, 0x88F0, 0x8CAD, 0x8056, 0x8057, 0x8D62]),
 };
 
-// Which canned capability shape the WebGL/WebGPU surface serves. The GPU
-// fingerprint tags it explicitly; otherwise it follows the UA platform.
-function _webglProfile() {
-  const fingerprint = _fingerprint() || {};
-  const tag = (fingerprint.gpu && fingerprint.gpu.webgpuProfile) || '';
-  if (tag === 'apple' || tag === 'intel') return tag;
-  return (fingerprint.uaPlatform || '') === 'macOS' ? 'apple' : 'intel';
-}
-
 // getShaderPrecisionFormat on any desktop GL: IEEE single precision for the
 // float formats and 32-bit two's complement for the integer ones, regardless
 // of the requested precision qualifier.

@@ -13,29 +13,10 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
-const _mediaCapabilitiesInstances = new WeakSet();
-const _mediaCapabilitiesToken = {};
 globalThis.MediaCapabilities = class MediaCapabilities {
-  constructor(token) {
-    if (token !== _mediaCapabilitiesToken) {
-      throw new TypeError("Failed to construct 'MediaCapabilities': Illegal constructor");
-    }
-    _mediaCapabilitiesInstances.add(this);
-  }
-  async decodingInfo(configuration) {
-    if (!_mediaCapabilitiesInstances.has(this)) {
-      throw new TypeError("Failed to execute 'decodingInfo' on 'MediaCapabilities': Illegal invocation");
-    }
-    const supported = _mediaConfigurationSupported(configuration);
-    return { powerEfficient: false, smooth: supported, supported, keySystemAccess: null };
-  }
-  async encodingInfo(configuration) {
-    if (!_mediaCapabilitiesInstances.has(this)) {
-      throw new TypeError("Failed to execute 'encodingInfo' on 'MediaCapabilities': Illegal invocation");
-    }
-    const supported = _mediaConfigurationSupported(configuration);
-    return { powerEfficient: false, smooth: supported, supported, keySystemAccess: null };
-  }
+  constructor(token) { _mediaCapabilitiesInitialize(this, token); }
+  async decodingInfo(configuration) { return _mediaCapabilitiesInfo(this, configuration, 'decodingInfo'); }
+  async encodingInfo(configuration) { return _mediaCapabilitiesInfo(this, configuration, 'encodingInfo'); }
   get [Symbol.toStringTag]() { return 'MediaCapabilities'; }
 };
 const _mediaCapabilitiesConstructor = Object.getOwnPropertyDescriptor(
@@ -69,12 +50,6 @@ Object.defineProperty(Object.getPrototypeOf(globalThis.navigator), 'mediaCapabil
   get: _mediaCapabilitiesGetter, set: undefined, enumerable: true, configurable: true,
 });
 
-function _mediaConfigurationSupported(configuration) {
-  const media = configuration && (configuration.video || configuration.audio);
-  const contentType = media && media.contentType;
-  if (!contentType) return false;
-  return _mediaCapabilityTypeSupported(contentType);
-}
 navigator.locks = {
   request(name, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }

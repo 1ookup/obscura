@@ -1,62 +1,4 @@
-// EventTarget listener state belongs to the JS wrapper rather than the backing
-// DOM node.  This is also what makes `new EventTarget()` and subclasses used by
-// framework schedulers work: those targets deliberately have no native node id.
-const _eventTargetListeners = new WeakMap();
-function _eventCapture(options) {
-  return typeof options === "boolean" ? options : !!(options && options.capture);
-}
-function _eventTargetAdd(target, type, callback, options) {
-  if (callback == null) return;
-  const isFunction = typeof callback === "function";
-  if (!isFunction && typeof callback.handleEvent !== "function") return;
-  type = String(type);
-  const capture = _eventCapture(options);
-  const signal = options && typeof options === "object" ? options.signal : null;
-  if (signal && signal.aborted) return;
-  let byType = _eventTargetListeners.get(target);
-  if (!byType) {
-    byType = new Map();
-    _eventTargetListeners.set(target, byType);
-  }
-  let listeners = byType.get(type);
-  if (!listeners) {
-    listeners = [];
-    byType.set(type, listeners);
-  }
-  if (listeners.some((entry) => entry.callback === callback && entry.capture === capture)) return;
-  const entry = {
-    callback,
-    capture,
-    once: !!(options && typeof options === "object" && options.once),
-    passive: !!(options && typeof options === "object" && options.passive),
-    signal,
-    abortHandler: null,
-  };
-  listeners.push(entry);
-  if (signal && typeof signal.addEventListener === "function") {
-    entry.abortHandler = () => _eventTargetRemove(target, type, callback, capture);
-    signal.addEventListener("abort", entry.abortHandler, { once: true });
-  }
-}
-function _eventTargetRemove(target, type, callback, options) {
-  const byType = _eventTargetListeners.get(target);
-  if (!byType) return;
-  type = String(type);
-  const listeners = byType.get(type);
-  if (!listeners) return;
-  const capture = _eventCapture(options);
-  for (let i = 0; i < listeners.length; i++) {
-    const entry = listeners[i];
-    if (entry.callback !== callback || entry.capture !== capture) continue;
-    listeners.splice(i, 1);
-    if (entry.signal && entry.abortHandler && typeof entry.signal.removeEventListener === "function") {
-      entry.signal.removeEventListener("abort", entry.abortHandler);
-    }
-    break;
-  }
-  if (listeners.length === 0) byType.delete(type);
-  if (byType.size === 0) _eventTargetListeners.delete(target);
-}
+// Listener registry and add/remove behavior live in support/listeners.js.
 // Worker scopes strip the whole Window-only DOM surface, so these interfaces
 // are unresolvable bindings there rather than merely unmatched. Dispatch runs
 // in a worker for every EventTarget that does exist in one -- MessagePort,
@@ -256,4 +198,3 @@ function _eventTargetDispatch(target, event) {
     _legacyWindowEvent = previous;
   }
 }
-
