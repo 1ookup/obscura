@@ -44,3 +44,6 @@ function _screenApplySize(w, h, emulated, availW, availH, availTop, availLeft) {
     globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH, availTop, availLeft);
   }
 }
+// page-init and older realm snippets use the original bridge name. Keep the
+// alias while the Screen shape owns the new support-prefixed implementation.
+function _applyScreenSize(...args) { return _screenApplySize(...args); }

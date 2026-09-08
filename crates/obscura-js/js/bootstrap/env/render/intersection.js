@@ -356,4 +356,3 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   if (globalThis.document) wireUp();
   else Promise.resolve().then(wireUp);
 })();
-globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
