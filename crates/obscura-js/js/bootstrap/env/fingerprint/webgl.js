@@ -563,7 +563,9 @@ globalThis.WebGLShaderPrecisionFormat = class WebGLShaderPrecisionFormat {
   constructor() { throw new TypeError('Illegal constructor'); }
 };
 globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLContext {};
-globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {};
+globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {
+  get drawingBufferFormat() { return 0x8058; }
+};
 const _WEBGL1_CONSTANTS = {
   DEPTH_BUFFER_BIT: 0x100, STENCIL_BUFFER_BIT: 0x400, COLOR_BUFFER_BIT: 0x4000, POINTS: 0x0,
   LINES: 0x1, LINE_LOOP: 0x2, LINE_STRIP: 0x3, TRIANGLES: 0x4,

@@ -11344,6 +11344,58 @@ RequestRedirect value",
     }
 
     #[test]
+    fn match_media_returns_a_branded_event_target() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const list = matchMedia('(min-width: 1px)');
+                    let construct;
+                    try { new MediaQueryList(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    let dispatched = 0;
+                    list.addListener(() => dispatched++);
+                    list.dispatchEvent(new Event('change'));
+                    return {
+                        construct,
+                        constructorLength: MediaQueryList.length,
+                        instance: list instanceof MediaQueryList,
+                        eventTarget: list instanceof EventTarget,
+                        parent: Object.getPrototypeOf(MediaQueryList.prototype).constructor.name,
+                        tag: Object.prototype.toString.call(list),
+                        own: Object.getOwnPropertyNames(list),
+                        prototype: Object.getOwnPropertyNames(MediaQueryList.prototype),
+                        media: list.media,
+                        matches: list.matches,
+                        onchange: list.onchange,
+                        methods: [typeof list.addListener, typeof list.removeListener,
+                            typeof list.addEventListener, typeof list.removeEventListener],
+                        dispatched,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'MediaQueryList': Illegal constructor",
+                "constructorLength": 0,
+                "instance": true,
+                "eventTarget": true,
+                "parent": "EventTarget",
+                "tag": "[object MediaQueryList]",
+                "own": [],
+                "prototype": ["constructor", "media", "matches", "onchange", "addListener", "removeListener"],
+                "media": "(min-width: 1px)",
+                "matches": true,
+                "onchange": null,
+                "methods": ["function", "function", "function", "function"],
+                "dispatched": 1,
+            })
+        );
+    }
+
+    #[test]
     fn computed_style_access_does_not_get_shadowed_by_inline_style_proxy() {
         let mut rt = setup_runtime(
             r#"<html><body><div id="box" style="opacity:.5;width:40px"></div></body></html>"#,
@@ -11419,6 +11471,35 @@ RequestRedirect value",
                 ],
                 "de-DE",
                 "origin"
+            ])
+        );
+    }
+
+    #[test]
+    fn draggable_and_spellcheck_use_chrome_boolean_reflection_defaults() {
+        let mut rt = setup_runtime(r#"<div id="probe"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const probe = document.getElementById('probe');
+                const initial = [probe.draggable, probe.spellcheck,
+                    probe.hasAttribute('draggable'), probe.hasAttribute('spellcheck')];
+                probe.draggable = true;
+                probe.spellcheck = false;
+                const assigned = [probe.draggable, probe.spellcheck,
+                    probe.getAttribute('draggable'), probe.getAttribute('spellcheck')];
+                probe.setAttribute('draggable', 'invalid');
+                probe.setAttribute('spellcheck', 'invalid');
+                return [initial, assigned, [probe.draggable, probe.spellcheck]];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [false, true, false, false],
+                [true, false, "true", "false"],
+                [false, true]
             ])
         );
     }
@@ -13153,6 +13234,43 @@ RequestRedirect value",
                 "undefined",
                 ["DIV", false]
             ])
+        );
+    }
+
+    #[test]
+    fn traversal_factories_return_branded_interface_objects() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                const iterator = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                let walkerError = null;
+                let iteratorError = null;
+                try { new TreeWalker(); } catch (error) { walkerError = error.name; }
+                try { new NodeIterator(); } catch (error) { iteratorError = error.name; }
+                return {
+                    walker: [walker instanceof TreeWalker,
+                        Object.getPrototypeOf(walker) === TreeWalker.prototype,
+                        Object.keys(walker), walker.root === root,
+                        typeof walker.nextNode, Object.prototype.toString.call(walker),
+                        walkerError],
+                    iterator: [iterator instanceof NodeIterator,
+                        Object.getPrototypeOf(iterator) === NodeIterator.prototype,
+                        Object.keys(iterator), iterator.root === root,
+                        typeof iterator.nextNode, Object.prototype.toString.call(iterator),
+                        iteratorError],
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "walker": [true, true, [], true, "function", "[object TreeWalker]", "TypeError"],
+                "iterator": [true, true, [], true, "function", "[object NodeIterator]", "TypeError"],
+            })
         );
     }
 
@@ -17603,6 +17721,41 @@ RequestRedirect value",
                 "innerHTMLDetached": true,
                 "textContentDetached": true,
             })
+        );
+    }
+
+    #[test]
+    fn css_style_sheet_inherits_the_style_sheet_interface() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style id="sheet">.a { color: red }</style></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const sheet = document.getElementById('sheet').sheet;
+                let constructorError = null;
+                try { new StyleSheet(); } catch (error) { constructorError = error.name; }
+                const before = sheet.disabled;
+                sheet.disabled = true;
+                return [
+                    sheet instanceof CSSStyleSheet,
+                    sheet instanceof StyleSheet,
+                    Object.getPrototypeOf(CSSStyleSheet.prototype) === StyleSheet.prototype,
+                    sheet.type,
+                    before,
+                    sheet.disabled,
+                    Object.prototype.toString.call(sheet),
+                    constructorError,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, "text/css", false, true,
+                "[object CSSStyleSheet]", "TypeError"
+            ])
         );
     }
 
@@ -22816,6 +22969,14 @@ RequestRedirect value",
                             gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_FORMAT),
                             gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_TYPE),
                         ],
+                        drawingBufferFormat: [
+                            typeof gl1.drawingBufferFormat,
+                            gl2.drawingBufferFormat,
+                            Object.hasOwn(gl2, 'drawingBufferFormat'),
+                            Object.getOwnPropertyDescriptor(
+                                WebGL2RenderingContext.prototype,
+                                'drawingBufferFormat').enumerable,
+                        ],
                         standardRead: [
                             gl1.getParameter(gl1.GENERATE_MIPMAP_HINT),
                             gl1.getParameter(gl1.POLYGON_OFFSET_FILL),
@@ -22839,12 +23000,13 @@ RequestRedirect value",
                     [6407,6407],[6408,6408],[6409,6409],[6410,6410],[32819,32819],
                     [32820,32820],[33635,33635],[35738,35738],[35739,35739]],
                 "instanceOwn": [false, false],
-                "constantCounts": [298,559,298,559],
+                "constantCounts": [298,560,298,559],
                 "gl1": [[6408,false,true,false],[6408,false,true,false],
                     [5121,false,true,false],[33170,false,true,false]],
                 "gl2": [[6408,false,true,false],[6408,false,true,false],
                     [5121,false,true,false],[37447,false,true,false]],
                 "implementationRead": [6408,5121,6408,5121],
+                "drawingBufferFormat": ["undefined",32856,false,true],
                 "standardRead": [4352,false,4294967295_u64,4294967295_u64,
                     4294967295_u64,4294967295_u64],
                 "edgeValues": [256,32856,3074,4294967295_u64,-1,37447],
@@ -24763,6 +24925,10 @@ RequestRedirect value",
                 r#"
                 const encoder = new TextEncoderStream();
                 const decoder = new TextDecoderStream();
+                const readable = new ReadableStream();
+                const reader = readable.getReader();
+                const lockedWhileOwned = readable.locked;
+                reader.releaseLock();
                 return {
                     encoder: encoder.encoding,
                     encoderReadable: typeof encoder.readable.getReader,
@@ -24770,6 +24936,13 @@ RequestRedirect value",
                     decoder: decoder.encoding,
                     decoderReadable: typeof decoder.readable.getReader,
                     decoderWritable: typeof decoder.writable.getWriter,
+                    readableOwn: Object.getOwnPropertyNames(readable),
+                    readableValues: typeof readable.values,
+                    iteratorAlias:
+                        ReadableStream.prototype[Symbol.asyncIterator]
+                            === ReadableStream.prototype.values,
+                    lockedWhileOwned,
+                    lockedAfterRelease: readable.locked,
                 };
                 "#,
             )
@@ -24783,6 +24956,11 @@ RequestRedirect value",
                 "decoder": "utf-8",
                 "decoderReadable": "function",
                 "decoderWritable": "function",
+                "readableOwn": [],
+                "readableValues": "function",
+                "iteratorAlias": true,
+                "lockedWhileOwned": true,
+                "lockedAfterRelease": false,
             })
         );
     }
@@ -25385,6 +25563,203 @@ RequestRedirect value",
                 "bodyInstance": true,
                 "bodyCtorToString": "function HTMLBodyElement() { [native code] }",
                 "dateUntouched": true,
+            })
+        );
+    }
+
+    #[test]
+    fn canvas_2d_context_uses_the_public_illegal_constructor_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const context = document.createElement('canvas').getContext('2d');
+                    let construct;
+                    try { new CanvasRenderingContext2D(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    return {
+                        construct,
+                        samePrototype:
+                            Object.getPrototypeOf(context) === CanvasRenderingContext2D.prototype,
+                        parentIsObject:
+                            Object.getPrototypeOf(CanvasRenderingContext2D.prototype) === Object.prototype,
+                        constructorName: context.constructor.name,
+                        instance: context instanceof CanvasRenderingContext2D,
+                        tag: Object.prototype.toString.call(context),
+                        methods: [typeof context.fillRect, typeof context.measureText],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'CanvasRenderingContext2D': Illegal constructor",
+                "samePrototype": true,
+                "parentIsObject": true,
+                "constructorName": "CanvasRenderingContext2D",
+                "instance": true,
+                "tag": "[object CanvasRenderingContext2D]",
+                "methods": ["function", "function"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_devices_is_branded_and_fails_closed_without_fake_hardware() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const devices = navigator.mediaDevices;
+                    let construct;
+                    try { new MediaDevices(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    const capture = async method => {
+                        try { await devices[method]({audio: true}); return 'fulfilled'; }
+                        catch (error) { return error.name; }
+                    };
+                    return {
+                        construct,
+                        instance: devices instanceof MediaDevices,
+                        eventTarget: devices instanceof EventTarget,
+                        constructorLength: MediaDevices.length,
+                        parent: Object.getPrototypeOf(MediaDevices.prototype).constructor.name,
+                        tag: Object.prototype.toString.call(devices),
+                        own: Object.getOwnPropertyNames(devices),
+                        stable: devices === navigator.mediaDevices,
+                        methods: [
+                            typeof devices.enumerateDevices,
+                            typeof devices.getSupportedConstraints,
+                            typeof devices.getUserMedia,
+                            typeof devices.getDisplayMedia,
+                            typeof devices.setCaptureHandleConfig,
+                        ],
+                        enumerated: await devices.enumerateDevices(),
+                        constraints: devices.getSupportedConstraints(),
+                        userMedia: await capture('getUserMedia'),
+                        displayMedia: await capture('getDisplayMedia'),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'MediaDevices': Illegal constructor",
+                "instance": true,
+                        "eventTarget": true,
+                        "constructorLength": 0,
+                "parent": "EventTarget",
+                "tag": "[object MediaDevices]",
+                "own": [],
+                "stable": true,
+                "methods": ["function", "function", "function", "function", "function"],
+                "enumerated": [],
+                "constraints": {},
+                "userMedia": "NotAllowedError",
+                "displayMedia": "NotAllowedError",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigator_battery_returns_a_stable_branded_manager() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const first = await navigator.getBattery();
+                    const second = await navigator.getBattery();
+                    let construct;
+                    try { new BatteryManager(); construct = 'constructed'; }
+                    catch (error) { construct = error.name; }
+                    const descriptor = name => {
+                        const value = Object.getOwnPropertyDescriptor(BatteryManager.prototype, name);
+                        return [!!value, !!value?.get, !!value?.set, value?.enumerable];
+                    };
+                    return {
+                        stable: first === second,
+                        instance: first instanceof BatteryManager,
+                        eventTarget: first instanceof EventTarget,
+                        tag: Object.prototype.toString.call(first),
+                        own: Object.getOwnPropertyNames(first),
+                        construct,
+                        values: [typeof first.charging, typeof first.chargingTime,
+                            typeof first.dischargingTime, typeof first.level],
+                        events: [descriptor('onchargingchange'), descriptor('onchargingtimechange'),
+                            descriptor('ondischargingtimechange'), descriptor('onlevelchange')],
+                        handler: (() => {
+                            const before = first.onlevelchange;
+                            first.onlevelchange = () => {};
+                            return [before, typeof first.onlevelchange];
+                        })(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "stable": true,
+                "instance": true,
+                "eventTarget": true,
+                "tag": "[object BatteryManager]",
+                "own": [],
+                "construct": "TypeError",
+                "values": ["boolean", "number", "number", "number"],
+                "events": [
+                    [true, true, true, true], [true, true, true, true],
+                    [true, true, true, true], [true, true, true, true],
+                ],
+                "handler": [null, "function"],
+            })
+        );
+    }
+
+    #[test]
+    fn performance_surface_members_live_on_the_interface_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = [
+                        'now', 'timeOrigin', 'timing', 'navigation', 'memory',
+                        'mark', 'measure', 'clearMarks', 'clearMeasures',
+                        'clearResourceTimings', 'getEntries', 'getEntriesByName',
+                        'getEntriesByType', 'setResourceTimingBufferSize',
+                        'onresourcetimingbufferfull',
+                    ];
+                    return {
+                        own: Object.getOwnPropertyNames(performance),
+                        prototypeMembers: names.map(name =>
+                            Object.prototype.hasOwnProperty.call(Performance.prototype, name)),
+                        stable: [performance.timing === performance.timing,
+                            performance.navigation === performance.navigation],
+                        values: [typeof performance.now, typeof performance.mark,
+                            typeof performance.getEntries, performance.timeOrigin > 0],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "own": [],
+                "prototypeMembers": [true, true, true, true, true,
+                    true, true, true, true, true, true, true, true, true, true],
+                "stable": [true, true],
+                "values": ["function", "function", "function", true],
             })
         );
     }

@@ -42,6 +42,9 @@
 // @obscura-module env/security/permissions-policy-support.js
 // @obscura-module env/security/permissions-policy-objects.js
 // @obscura-module env/security/view-transition.js
+// @obscura-module env/dom/support/traversal.js
+// @obscura-module env/dom/tree-walker.js
+// @obscura-module env/dom/node-iterator.js
 // @obscura-module env/dom/document.js
 // @obscura-module env/dom/document-fragments.js
 // @obscura-module env/dom/document-fragment.js
@@ -69,6 +72,8 @@
 // @obscura-module env/window/location.js
 // @obscura-module env/window/plugins.js
 // @obscura-module env/fingerprint/navigator.js
+// @obscura-module env/media/support/media-devices-behavior.js
+// @obscura-module env/media/media-devices.js
 // @obscura-module env/fingerprint/support/webgl-profile.js
 // @obscura-module env/fingerprint/webgl.js
 // @obscura-module env/fingerprint/support/screen-state.js
@@ -89,6 +94,7 @@
 // @obscura-module env/css/css-rule.js
 // @obscura-module env/css/css-style-rule.js
 // @obscura-module env/css/css-rule-list.js
+// @obscura-module env/css/style-sheet.js
 // @obscura-module env/css/css-style-sheet.js
 // @obscura-module env/css/style-sheet-list.js
 // @obscura-module env/css/mutation-observer.js
@@ -176,6 +182,7 @@
 // @obscura-module env/media/support/text-metrics-state.js
 // @obscura-module env/media/text-metrics.js
 // @obscura-module env/media/canvas.js
+// @obscura-module env/media/canvas-rendering-context-2d.js
 // @obscura-module env/media/canvas-element.js
 // @obscura-module env/media/support/audio-context-behavior.js
 // @obscura-module env/media/audio-buffer.js

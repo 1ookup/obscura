@@ -68,7 +68,9 @@ if (typeof ImageData === 'undefined') {
 if (typeof CanvasRenderingContext2D === 'undefined') {
   globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
 }
-Object.setPrototypeOf(_Canvas2D.prototype, globalThis.CanvasRenderingContext2D.prototype);
+if (_Canvas2D.prototype !== globalThis.CanvasRenderingContext2D.prototype) {
+  Object.setPrototypeOf(_Canvas2D.prototype, globalThis.CanvasRenderingContext2D.prototype);
+}
 Object.defineProperty(_Canvas2D.prototype, Symbol.toStringTag, {
   value: 'CanvasRenderingContext2D', configurable: true,
 });

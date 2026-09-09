@@ -129,6 +129,19 @@ function _convertNodes(nodes) {
   const reflectNullable = (name, attr) => def(name,
     function () { return this.getAttribute(attr); },
     function (v) { if (v === null || v === undefined) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); });
+  // Boolean enumerated reflectors. Unlike a presence boolean, draggable and
+  // spellcheck serialize the assigned value and have distinct missing/invalid
+  // defaults in Chrome (false and true respectively).
+  const reflectBooleanKeyword = (name, attr, missingDefault, invalidDefault) => def(name,
+    function () {
+      const value = this.getAttribute(attr);
+      if (value === null) return missingDefault;
+      const keyword = String(value).trim().toLowerCase();
+      if (keyword === 'true') return true;
+      if (keyword === 'false') return false;
+      return invalidDefault;
+    },
+    function (value) { this.setAttribute(attr, value ? 'true' : 'false'); });
 
   // Global content attributes reflected on every element (HTML "global attributes").
   reflectStr("title", "title");
@@ -138,6 +151,8 @@ function _convertNodes(nodes) {
   reflectEnum("dir", "dir", ["ltr", "rtl", "auto"], "", "");
   reflectBool("autofocus", "autofocus");
   reflectBool("hidden", "hidden");
+  reflectBooleanKeyword('draggable', 'draggable', false, false);
+  reflectBooleanKeyword('spellcheck', 'spellcheck', true, true);
   // tabIndex default is element-dependent (0 for natively-focusable, else -1);
   // reflection.js does not assert it, but match the common case anyway.
   reflectLong("tabIndex", "tabindex", function () {

@@ -1,21 +1,18 @@
-class CSSStyleSheet {
+class CSSStyleSheet extends StyleSheet {
   constructor(_options) {
+    super(_styleSheetConstructionKey);
     this.ownerRule = null;
-    this.disabled = false;
+    this._disabled = false;
     this._ownerNode = null;
     this._sourceNode = null;
     this._sourceText = "";
     this._href = null;
+    this._media = null;
     this._originClean = true;
     this._rules = [];
     this._cssRules = new CSSRuleList(this);
     this._adopters = new Set();
   }
-  get type() { return "text/css"; }
-  get ownerNode() { return this._ownerNode; }
-  get parentStyleSheet() { return null; }
-  get href() { return this._href; }
-  get title() { return this._ownerNode?.getAttribute?.("title") || ""; }
   get cssRules() {
     this._assertOriginClean();
     this._refreshFromOwner();

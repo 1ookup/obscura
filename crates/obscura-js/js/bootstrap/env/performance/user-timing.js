@@ -57,6 +57,23 @@ Object.assign(globalThis.performance, {
   },
 });
 
+// User Timing methods are WebIDL prototype members, not enumerable own
+// properties of the singleton. Move the implementations after installing
+// them so their function identity and behavior remain unchanged.
+for (const name of [
+  'mark', 'measure', 'clearMarks', 'clearMeasures', 'clearResourceTimings',
+  'getEntries', 'getEntriesByName', 'getEntriesByType', 'setResourceTimingBufferSize',
+]) {
+  const method = globalThis.performance[name];
+  delete globalThis.performance[name];
+  Object.defineProperty(Performance.prototype, name, {
+    value: method,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 globalThis.PerformanceEntry = PerformanceEntry;
 globalThis.PerformanceMark = PerformanceMark;
 globalThis.PerformanceMeasure = PerformanceMeasure;

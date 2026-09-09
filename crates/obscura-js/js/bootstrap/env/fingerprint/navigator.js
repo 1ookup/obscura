@@ -1,5 +1,55 @@
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
+// BatteryManager is an EventTarget-backed interface. Keep the existing
+// fingerprint-derived values, but expose one stable branded object with the
+// standard change-handler attributes instead of returning a fresh plain record.
+if (typeof BatteryManager === 'undefined') {
+  globalThis.BatteryManager = class BatteryManager extends EventTarget {
+    constructor() { throw new TypeError("Failed to construct 'BatteryManager': Illegal constructor"); }
+    get charging() { _batteryManagerAssert(this); return !!_fp('batteryCharging'); }
+    get chargingTime() { _batteryManagerAssert(this); return this.charging ? 0 : Infinity; }
+    get dischargingTime() {
+      _batteryManagerAssert(this);
+      return this.charging ? Infinity : Math.floor(3600 + _fpRand(250) * 7200);
+    }
+    get level() { _batteryManagerAssert(this); return _fp('batteryLevel'); }
+  };
+}
+const _batteryManagerInstances = new WeakSet();
+const _batteryManagerAssert = instance => {
+  if (!_batteryManagerInstances.has(instance)) throw new TypeError('Illegal invocation');
+};
+_markNative(BatteryManager);
+for (const _batteryGetter of ['charging', 'chargingTime', 'dischargingTime', 'level']) {
+  const _descriptor = Object.getOwnPropertyDescriptor(BatteryManager.prototype, _batteryGetter);
+  if (_descriptor?.get) _markNative(_descriptor.get);
+}
+const _batteryEventHandlers = new WeakMap();
+for (const _batteryEvent of [
+  'chargingchange', 'chargingtimechange', 'dischargingtimechange', 'levelchange',
+]) {
+  const _slot = 'on' + _batteryEvent;
+  Object.defineProperty(BatteryManager.prototype, _slot, {
+    get() { _batteryManagerAssert(this); return _batteryEventHandlers.get(this)?.[_slot] || null; },
+    set(value) {
+      _batteryManagerAssert(this);
+      const handlers = _batteryEventHandlers.get(this);
+      handlers[_slot] = typeof value === 'function' ? value : null;
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  const _handlerDescriptor = Object.getOwnPropertyDescriptor(BatteryManager.prototype, _slot);
+  _markNative(_handlerDescriptor.get);
+  _markNative(_handlerDescriptor.set);
+}
+Object.defineProperty(BatteryManager.prototype, Symbol.toStringTag, {
+  value: 'BatteryManager', configurable: true,
+});
+const _batteryManagerInstance = Object.create(BatteryManager.prototype);
+_batteryManagerInstances.add(_batteryManagerInstance);
+_batteryEventHandlers.set(_batteryManagerInstance, Object.create(null));
+
 function registerNavigatorSurface() {
 globalThis.navigator = _bootstrapObject('navigator', () => ({
   onLine: true, cookieEnabled: true,
@@ -41,25 +91,15 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
   })),
   // serviceWorker is an accessor on Navigator.prototype (see
   // _installServiceWorkerInterfaces); Chrome has no own property here.
-  mediaDevices: _bootstrapObject('navigator.mediaDevices', () => ({
-    enumerateDevices() {
-      return Promise.resolve([
-        {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
-        {deviceId:"comms",kind:"audioinput",label:"",groupId:"comms"},
-        {deviceId:"default",kind:"audiooutput",label:"",groupId:"default"},
-        {deviceId:"",kind:"videoinput",label:"",groupId:""},
-      ]);
-    },
-    getUserMedia() { return Promise.reject(new DOMException("Permission denied", "NotAllowedError")); },
-    getDisplayMedia() { return Promise.reject(new DOMException("Permission denied", "NotAllowedError")); },
-    addEventListener(){}, removeEventListener(){},
-  })),
+  // The dedicated MediaDevices shape module replaces this slot without
+  // changing Navigator's observable property insertion order.
+  mediaDevices: undefined,
   clipboard: _bootstrapObject('navigator.clipboard', () => ({ writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} })),
   permissions: _bootstrapObject('navigator.permissions', () => ({ query(params){
     var n = params && params.name;
     return Promise.resolve({state: _permissionState(n), onchange: null});
   } })),
-  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
+  getBattery() { return Promise.resolve(_batteryManagerInstance); },
   getGamepads() { return [null, null, null, null]; },
   sendBeacon(url, data) {
     // Beacon queues a credentials-including POST and returns before the
@@ -213,5 +253,3 @@ globalThis.Notification = class Notification {
   static requestPermission() { return Promise.resolve(Notification.permission); }
   constructor() {}
 };
-
-
