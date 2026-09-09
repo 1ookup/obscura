@@ -40,7 +40,7 @@ function _internalBaseHref(doc) {
     if (!doc || typeof doc[_nidSym] !== 'number') return null;
     const nid = Number(_dom("query_selector_scoped", doc[_nidSym], "base[href]"));
     if (!Number.isFinite(nid) || nid < 0) return null;
-    return _dom("get_attribute", nid, "href") || null;
+    return _domParse("get_attribute", nid, "href") || null;
   } catch (_) { return null; }
 }
 

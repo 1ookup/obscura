@@ -3,6 +3,7 @@
 > 状态:评审稿 · 日期:2026-08-14 · 分支:`feat/web-platform-parity`
 > 相关文档:[Cloudflare challenge 诊断记录](Cloudflare-challenge-profile.md)、[Trace 页面脚本](Trace-page-script.md)、[Anti-detection: real engine vs. JS patching](Anti-detection-vs-js-environment-patching.md)、[Iframe 设计](Iframe-support-design.md)
 > 外部参考:[HaHaVM-General](https://github.com/1ookup/HaHaVM-General)(通用补环境框架,含 `examples/cloudflare/` 外置模式)
+> 全量对照台账:[HaHaVM environment parity ledger](HaHaVM-environment-parity.md)
 
 ## 1. 背景与动机
 

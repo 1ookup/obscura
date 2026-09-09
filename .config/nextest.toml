@@ -26,6 +26,15 @@
 [test-groups.timing-sensitive]
 max-threads = 1
 
+# Each MCP stdio integration test starts a complete `obscura mcp` process,
+# including a V8 isolate and renderer, and serves a private TCP fixture. Running
+# the sixteen tests together can starve the fixture/client startup path and
+# turn a successful navigation into an empty-page evaluation. Keep this group
+# isolated so a workspace run exercises the same deterministic process shape as
+# the focused MCP regression.
+[test-groups.mcp-processes]
+max-threads = 1
+
 [[profile.default.overrides]]
 filter = '''
   test(autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll)
@@ -35,4 +44,9 @@ filter = '''
   or test(timer_ordering_and_lateness_match_the_chrome_capture)
 '''
 test-group = 'timing-sensitive'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+filter = 'package(obscura-cli) and test(mcp_client)'
+test-group = 'mcp-processes'
 threads-required = 'num-test-threads'
