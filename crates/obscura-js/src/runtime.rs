@@ -25763,4 +25763,84 @@ RequestRedirect value",
             })
         );
     }
+
+    #[test]
+    fn performance_timing_uses_the_legacy_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const timing = performance.timing;
+                    return {
+                        instance: timing instanceof PerformanceTiming,
+                        tag: Object.prototype.toString.call(timing),
+                        own: Object.getOwnPropertyNames(timing),
+                        prototype: Object.getOwnPropertyNames(PerformanceTiming.prototype),
+                        values: [typeof timing.navigationStart, typeof timing.loadEventEnd,
+                            typeof timing.toJSON, timing === performance.timing],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "tag": "[object PerformanceTiming]",
+                "own": [],
+                "prototype": [
+                    "navigationStart", "unloadEventStart", "unloadEventEnd",
+                    "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart",
+                    "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart",
+                    "requestStart", "responseStart", "responseEnd", "domLoading",
+                    "domInteractive", "domContentLoadedEventStart", "domContentLoadedEventEnd",
+                    "domComplete", "loadEventStart", "loadEventEnd", "toJSON", "constructor",
+                ],
+                "values": ["number", "number", "function", true],
+            })
+        );
+    }
+
+    #[test]
+    fn navigator_virtual_keyboard_uses_the_interface_shape_without_fake_geometry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const keyboard = navigator.virtualKeyboard;
+                    let construct;
+                    try { new VirtualKeyboard(); construct = 'constructed'; }
+                    catch (error) { construct = error.name; }
+                    keyboard.ongeometrychange = () => {};
+                    return {
+                        instance: keyboard instanceof VirtualKeyboard,
+                        eventTarget: keyboard instanceof EventTarget,
+                        tag: Object.prototype.toString.call(keyboard),
+                        own: Object.getOwnPropertyNames(keyboard),
+                        prototype: Object.getOwnPropertyNames(VirtualKeyboard.prototype),
+                        construct,
+                        overlays: keyboard.overlaysContent,
+                        rect: [keyboard.boundingRect.x, keyboard.boundingRect.y,
+                            keyboard.boundingRect.width, keyboard.boundingRect.height],
+                        handler: typeof keyboard.ongeometrychange,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "eventTarget": true,
+                "tag": "[object VirtualKeyboard]",
+                "own": [],
+                "prototype": ["constructor", "boundingRect", "overlaysContent",
+                    "ongeometrychange", "hide", "show"],
+                "construct": "TypeError",
+                "overlays": false,
+                "rect": [0, 0, 0, 0],
+                "handler": "function",
+            })
+        );
+    }
 }

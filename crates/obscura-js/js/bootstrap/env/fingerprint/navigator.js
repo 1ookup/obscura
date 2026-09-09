@@ -50,6 +50,50 @@ const _batteryManagerInstance = Object.create(BatteryManager.prototype);
 _batteryManagerInstances.add(_batteryManagerInstance);
 _batteryEventHandlers.set(_batteryManagerInstance, Object.create(null));
 
+// VirtualKeyboard is exposed even when no software keyboard backend exists.
+// Provide the interface shape and inert state without inventing geometry or
+// dispatching synthetic keyboard events.
+if (typeof VirtualKeyboard === 'undefined') {
+  globalThis.VirtualKeyboard = class VirtualKeyboard extends EventTarget {
+    constructor() { throw new TypeError("Failed to construct 'VirtualKeyboard': Illegal constructor"); }
+    get boundingRect() {
+      _virtualKeyboardData(this);
+      return typeof DOMRect === 'function' ? new DOMRect(0, 0, 0, 0) : null;
+    }
+    get overlaysContent() { return _virtualKeyboardData(this).overlaysContent; }
+    set overlaysContent(value) {
+      _virtualKeyboardData(this).overlaysContent = Boolean(value);
+    }
+    get ongeometrychange() { return _virtualKeyboardData(this).ongeometrychange; }
+    set ongeometrychange(value) {
+      _virtualKeyboardData(this).ongeometrychange = typeof value === 'function' ? value : null;
+    }
+    hide() {}
+    show() {}
+  };
+}
+const _virtualKeyboardState = new WeakMap();
+function _virtualKeyboardData(instance) {
+  let state = _virtualKeyboardState.get(instance);
+  if (!state) {
+    if (!(instance instanceof VirtualKeyboard)) throw new TypeError('Illegal invocation');
+    state = { overlaysContent: false, ongeometrychange: null };
+    _virtualKeyboardState.set(instance, state);
+  }
+  return state;
+}
+_markNative(VirtualKeyboard);
+for (const _virtualKeyboardMethod of ['hide', 'show']) {
+  _markNative(VirtualKeyboard.prototype[_virtualKeyboardMethod]);
+}
+for (const _virtualKeyboardProperty of ['boundingRect', 'overlaysContent', 'ongeometrychange']) {
+  const _descriptor = Object.getOwnPropertyDescriptor(VirtualKeyboard.prototype, _virtualKeyboardProperty);
+  if (_descriptor?.get) _markNative(_descriptor.get);
+  if (_descriptor?.set) _markNative(_descriptor.set);
+}
+Object.defineProperty(VirtualKeyboard.prototype, Symbol.toStringTag, {
+  value: 'VirtualKeyboard', configurable: true,
+});
 function registerNavigatorSurface() {
 globalThis.navigator = _bootstrapObject('navigator', () => ({
   onLine: true, cookieEnabled: true,
