@@ -862,10 +862,89 @@ class _Canvas2D {
   }
 }
 
-Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getComputedTextLength = function() { return 0; };
-Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getSubStringLength = function(ch, len) { return 0; };
+// SVG geometry. These used to be constants -- an empty box and a length of 0 --
+// which is not a value any browser returns. A page that measures text through
+// SVG therefore got the same answer for every family and every string, and the
+// digest CF's challenge takes of that answer was the digest of "0". The
+// challenge measures through `getComputedTextLength`, so the constant made its
+// font probe read as an emulated environment. Ask the same text engine
+// `canvas.measureText` and element layout already use, with the element's own
+// computed font.
+function _svgMeasurementFont(element) {
+  let style = null;
+  try {
+    if (typeof globalThis.getComputedStyle === 'function') {
+      style = globalThis.getComputedStyle(element);
+    }
+  } catch (_error) { style = null; }
+  const size = (style && style.fontSize) || '10px';
+  const family = (style && style.fontFamily) || 'sans-serif';
+  const weight = (style && style.fontWeight) || 'normal';
+  const fontStyle = (style && style.fontStyle) || 'normal';
+  return fontStyle + ' ' + weight + ' ' + size + ' ' + family;
+}
+
+function _svgTextContent(element) {
+  const text = element.textContent;
+  return text == null ? '' : String(text);
+}
+
+Element.prototype.getBBox = function() {
+  const box = _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this));
+  return { x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent };
+};
+
+Element.prototype.getComputedTextLength = function() {
+  return _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this)).width;
+};
+
+Element.prototype.getExtentOfChar = function(ch) {
+  const text = _svgTextContent(this);
+  const font = _svgMeasurementFont(this);
+  // The extent is the tight box of one glyph, placed at the advance accumulated
+  // over the run's prefix. Reporting a zero origin for every character (the
+  // previous behaviour) makes a per-character position list collapse onto one
+  // point, and a zero width reports a glyph no font can produce.
+  const index = _svgCharacterIndex(this, ch);
+  const box = _measureTextBox(text.charAt(index), font);
+  return {
+    x: _svgAdvanceTo(this, index),
+    y: -box.ascent,
+    width: box.width,
+    height: box.ascent + box.descent,
+  };
+};
+
+Element.prototype.getSubStringLength = function(ch, len) {
+  const text = _svgTextContent(this);
+  const start = Math.max(0, Math.trunc(Number(ch)) || 0);
+  const count = len === undefined ? text.length - start : Math.max(0, Math.trunc(Number(len)) || 0);
+  return _measureTextBox(text.slice(start, start + count), _svgMeasurementFont(this)).width;
+};
+
+// The character-position half of the same interface. Chrome exposes these on
+// SVGTextContentElement and Obscura had none of them, so a probe that walks a
+// text run one character at a time -- which is how the challenge builds its
+// ascending per-character position list -- collected nothing at all. Advances
+// come from the same engine, accumulated over the prefix of the run.
+function _svgCharacterIndex(element, index) {
+  const text = _svgTextContent(element);
+  const i = Math.trunc(Number(index));
+  if (!Number.isFinite(i) || i < 0 || i >= text.length) {
+    throw new DOMException(
+      'The index provided (' + index + ') is greater than the number of characters available.',
+      'IndexSizeError',
+    );
+  }
+  return i;
+}
+
+function _svgAdvanceTo(element, count) {
+  return _measureTextBox(_svgTextContent(element).slice(0, count), _svgMeasurementFont(element)).width;
+}
+
+// The interface itself is installed by the last manifest module, so the
+// methods above are attached from there (config/webidl-branding.js).
 
 Element.prototype.attachShadow = function attachShadow(opts) {
   var _mode = opts == null ? undefined : opts.mode;

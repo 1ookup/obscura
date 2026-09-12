@@ -39,7 +39,14 @@ const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
-    if (a instanceof Error) {
+    // `instanceof` misses an Error that came from another realm -- a frame
+    // realm or the challenge's own vm -- and those then fell through to the
+    // `[object Object]` branch below, which is a brand test the comment there
+    // already relies on. The internal Error slot is what
+    // Object.prototype.toString reports, and a plain object can only imitate
+    // it by setting Symbol.toStringTag, which the devtools probe this guards
+    // against does not do (it would have tripped the same check).
+    if (a instanceof Error || Object.prototype.toString.call(a) === '[object Error]') {
       const _pst = Error.prepareStackTrace;
       if (_pst !== undefined) Error.prepareStackTrace = undefined;
       const _s = a.stack || a.message || String(a);

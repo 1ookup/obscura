@@ -39,6 +39,9 @@
       const url = new URL(String(href));
       if (url.protocol === 'https:' || url.protocol === 'wss:'
         || url.protocol === 'file:') return true;
+      // data: carries an opaque origin, and so does a sandboxed document.
+      // Neither is a secure context in Chrome either.
+      if (url.origin === 'null') return false;
       const host = url.hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
       if (host === 'localhost' || host.endsWith('.localhost')) return true;
       if (host === '::1' || /^0*:0*:0*:0*:0*:0*:0*:0*1$/.test(host)) return true;
@@ -49,6 +52,36 @@
     }
   }
 
+  // The origin the engine resolved for a document root.
+  function _scopeOrigin(root) {
+    try {
+      const info = _domParse('document_scope_info', Number(root) || 0);
+      if (info && typeof info.origin === 'string') return info.origin;
+    } catch (_error) {}
+    return null;
+  }
+
+  // The origin of the document that created this one. about:blank and
+  // about:srcdoc inherit the creator's origin, and Chrome keeps that
+  // inheritance even when sandboxing forces the frame's own origin opaque: a
+  // sandboxed srcdoc child of a loopback page is still a secure context, and
+  // of an http LAN page is not. `frame_container_info` maps a frame's content
+  // root to the document holding its <iframe>; parentRoot 0 is the top
+  // document, which `document_scope_info` answers for as well.
+  function _inheritedDocumentOrigin() {
+    let root = 0;
+    try { root = Number(_callingFrameRoot()) || 0; } catch (_error) { return null; }
+    if (root <= 0) return null;
+    try {
+      const container = _domParse('frame_container_info', root);
+      if (!container) return null;
+      const parentRoot = Number(container.parentRoot);
+      if (!Number.isFinite(parentRoot) || parentRoot < 0) return null;
+      return _scopeOrigin(parentRoot);
+    } catch (_error) {}
+    return null;
+  }
+
   // Evaluated on every read rather than captured once: bootstrap runs while the
   // document URL is still about:blank, and the real one arrives later.
   function _secureNow() {
@@ -56,7 +89,25 @@
     try { href = globalThis.location?.href || ''; } catch (_error) { href = ''; }
     // No URL yet is the engine's own bootstrapping, not a page an insecure
     // origin can observe.
-    return href === '' || href === 'about:blank' || _isPotentiallyTrustworthy(href);
+    if (href === '') return true;
+    // A document with no origin of its own -- about:blank, about:srcdoc, a
+    // blob: URL -- is exactly as trustworthy as the origin behind it and never
+    // more: Chrome reports an about:blank or blob child of an insecure page as
+    // an insecure context too, which `href === 'about:blank'` used to answer as
+    // secure. The origin comes from the engine's document scope, not from the
+    // URL text: a blob: URL carries whatever `location.origin` said when it was
+    // minted, and `history.pushState` can rewrite that without a same-origin
+    // check. A sandboxed document's own origin is opaque, so the creator's is
+    // used instead -- which is the trust Chrome grants it.
+    if (href === 'about:blank' || href === 'about:srcdoc' || href.startsWith('blob:')) {
+      const own = _scopeOrigin(_callingFrameRoot());
+      const origin = own !== null && own !== 'null' ? own : _inheritedDocumentOrigin();
+      // A top-level about:blank has no creator to inherit from; that keeps the
+      // previous answer, which is also Chrome's for a fresh tab.
+      if (origin === null) return true;
+      return origin !== 'null' && _isPotentiallyTrustworthy(origin);
+    }
+    return _isPotentiallyTrustworthy(href);
   }
 
   Object.defineProperty(globalThis, 'isSecureContext', {
@@ -1919,6 +1970,54 @@ const _chromeNavigatorTable = [
   getter(Navigator.prototype, 'storage', function storage() { return manager; });
 })();
 
+// Navigator member -> interface name, for members whose interface name cannot
+// be derived from the member name by capitalizing its first letter. That rule
+// holds for what a URL and a device list are called and fails for almost
+// everything else the capture's navigator carries: acronyms (USB, HID), an XR
+// member whose interface is XRSystem, a plural that is not the interface's
+// (credentials -> CredentialsContainer, locks -> LockManager, login ->
+// NavigatorLogin, managed -> NavigatorManagedData, storageBuckets ->
+// StorageBucketManager), and one that shares no prefix at all (userAgentData ->
+// NavigatorUAData). Deriving it anyway named an interface that does not exist,
+// so the member kept a @@toStringTag invented from its own name --
+// `[object Usb]`, `[object Xr]`, `[object WebkitTemporaryStorage]` -- or fell
+// all the way back to `[object Object]`. Listing every member here also makes
+// this object the one place that names the set the brand pass owns.
+// DeprecatedStorageQuota is [LegacyNoInterfaceObject]: neither engine exposes a
+// constructor for it, so its prototype is built on demand below.
+const _navigatorInterfaceNames = {
+  clipboard: 'Clipboard',
+  credentials: 'CredentialsContainer',
+  geolocation: 'Geolocation',
+  hid: 'HID',
+  locks: 'LockManager',
+  login: 'NavigatorLogin',
+  managed: 'NavigatorManagedData',
+  storageBuckets: 'StorageBucketManager',
+  usb: 'USB',
+  userAgentData: 'NavigatorUAData',
+  wakeLock: 'WakeLock',
+  webkitPersistentStorage: 'DeprecatedStorageQuota',
+  webkitTemporaryStorage: 'DeprecatedStorageQuota',
+  xr: 'XRSystem',
+};
+function _navigatorInterfaceName(member) {
+  return _navigatorInterfaceNames[member]
+    || member.charAt(0).toUpperCase() + member.slice(1);
+}
+
+// The capture's declared arity for the members the capability modules
+// implemented with a longer parameter list than the IDL has
+// (`geolocation.getCurrentPosition` takes an error callback the shim never
+// calls; `locks.request` spells out the optional callback). A function's length
+// is part of the prototype surface a probe reads, so pin the ones that differ.
+const _navigatorMemberLengths = {
+  credentials: { store: 1 },
+  geolocation: { getCurrentPosition: 1, watchPosition: 1, clearWatch: 1 },
+  clipboard: { writeText: 1 },
+  locks: { request: 2 },
+};
+
 // Navigator members the same capture proves a real Chrome carries. Object
 // members return a cached singleton whose prototype is the matching interface
 // from the table above when one exists; method members throw Chrome's
@@ -1928,7 +2027,7 @@ const _chromeNavigatorTable = [
   const prototype = Object.getPrototypeOf(globalThis.navigator);
   const instances = new Map();
   function interfaceFor(name) {
-    const candidate = globalThis[name.charAt(0).toUpperCase() + name.slice(1)];
+    const candidate = globalThis[_navigatorInterfaceName(name)];
     return candidate && candidate.prototype ? candidate.prototype : null;
   }
   for (const row of _chromeNavigatorTable) {
@@ -1943,7 +2042,7 @@ const _chromeNavigatorTable = [
               const proto = interfaceFor(name);
               const object = proto ? Object.create(proto) : {};
               if (!proto) Object.defineProperty(object, Symbol.toStringTag,
-                { value: name.charAt(0).toUpperCase() + name.slice(1), configurable: true });
+                { value: _navigatorInterfaceName(name), configurable: true });
               instances.set(name, object);
             }
             return instances.get(name);
@@ -2012,6 +2111,254 @@ const _chromeNavigatorTable = [
     Object.defineProperty(prototype, name, {
       get: getter, set: undefined, enumerable: true, configurable: true,
     });
+  }
+})();
+
+// A navigator object member is a WebIDL interface instance, not a plain object.
+// Its prototype is the interface prototype, the IDL operations are that
+// prototype's own members, and both `constructor.name` and
+// `Object.prototype.toString.call` read the interface identifier off it. The
+// capability modules that own each member's behavior built several of them as
+// object literals, so `navigator.credentials.constructor.name` answered
+// "Object" and `Object.prototype.toString.call(navigator.credentials)`
+// answered "[object Object]" where the captured Chrome answers
+// "CredentialsContainer" and "[object CredentialsContainer]". That is a
+// two-line brand check no shim should fail. Move each backing implementation
+// onto its interface prototype and re-point the instance, so the member keeps
+// its behavior and gains the Chrome surface around it.
+(function installNavigatorInterfaceBrands() {
+  const method = (proto, name, length, fn) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: length, configurable: true });
+    _markNative(fn);
+    Object.defineProperty(proto, name, {
+      value: fn, writable: true, enumerable: true, configurable: true,
+    });
+  };
+  // Event-handler attributes are nullable per-instance slots, like the
+  // BatteryManager accessors above: the value starts at null and only a
+  // function assignment is retained.
+  const handlerSlots = new WeakMap();
+  const handler = (proto, slot) => {
+    const get = _markNativeAs(function() {
+      const state = handlerSlots.get(this);
+      return state && state[slot] ? state[slot] : null;
+    }, 'function get ' + slot + '() { [native code] }');
+    const set = _markNativeAs(function(value) {
+      let state = handlerSlots.get(this);
+      if (!state) { state = Object.create(null); handlerSlots.set(this, state); }
+      state[slot] = typeof value === 'function' ? value : null;
+    }, 'function set ' + slot + '(value) { [native code] }');
+    Object.defineProperty(get, 'name', { value: 'get ' + slot, configurable: true });
+    Object.defineProperty(set, 'name', { value: 'set ' + slot, configurable: true });
+    Object.defineProperty(proto, slot, { get, set, enumerable: true, configurable: true });
+  };
+  const prototypeFor = name => {
+    const ctor = globalThis[name];
+    return ctor && ctor.prototype ? ctor.prototype : null;
+  };
+
+  // Clipboard: the engine implements readText and writeText; the capture shows
+  // read, write and the onclipboardchange handler attribute beside them. The
+  // document this engine runs has no clipboard access, and Chrome in that state
+  // rejects the promise with "Document is not focused." -- the same answer the
+  // capture recorded for the sibling writeText. The binding-level argument
+  // check runs first, as it did in the capture.
+  const clipboardProto = prototypeFor('Clipboard');
+  if (clipboardProto) {
+    method(clipboardProto, 'read', 0, function read() {
+      return Promise.reject(new DOMException(
+        "Failed to execute 'read' on 'Clipboard': Document is not focused.",
+        'NotAllowedError'));
+    });
+    method(clipboardProto, 'write', 1, function write(data) {
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'write' on 'Clipboard': 1 argument required,"
+          + ' but only 0 present.'));
+      }
+      return Promise.reject(new DOMException(
+        "Failed to execute 'write' on 'Clipboard': Document is not focused.",
+        'NotAllowedError'));
+    });
+    handler(clipboardProto, 'onclipboardchange');
+  }
+
+  // USB and HID have no device backend here. The capture shows getDevices
+  // resolving with an empty sequence and requestDevice refusing for want of a
+  // user gesture.
+  for (const deviceInterface of ['USB', 'HID']) {
+    const proto = prototypeFor(deviceInterface);
+    if (!proto) continue;
+    method(proto, 'getDevices', 0, function getDevices() { return Promise.resolve([]); });
+    method(proto, 'requestDevice', 1, function requestDevice(options) {
+      return Promise.reject(new DOMException(
+        "Failed to execute 'requestDevice' on '" + deviceInterface
+        + "': Must be handling a user gesture to show a permission request.",
+        'SecurityError'));
+    });
+    handler(proto, 'onconnect');
+    handler(proto, 'ondisconnect');
+  }
+
+  // XRSystem: no device is ever present, so the session query answers false and
+  // the session request refuses exactly the way the capture did.
+  const xrProto = prototypeFor('XRSystem');
+  if (xrProto) {
+    method(xrProto, 'isSessionSupported', 1, function isSessionSupported(mode) {
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'isSessionSupported' on 'XRSystem': 1 argument"
+          + ' required, but only 0 present.'));
+      }
+      return Promise.resolve(false);
+    });
+    method(xrProto, 'requestSession', 1, function requestSession(mode) {
+      return Promise.reject(new DOMException(
+        "Failed to execute 'requestSession' on 'XRSystem': The requested"
+        + ' session requires user activation.',
+        'SecurityError'));
+    });
+    handler(xrProto, 'ondevicechange');
+  }
+
+  // NavigatorLogin and NavigatorManagedData back enterprise-managed browser
+  // state Obscura has none of; both answer the captured values.
+  const loginProto = prototypeFor('NavigatorLogin');
+  if (loginProto) {
+    method(loginProto, 'setStatus', 1, function setStatus(status) {
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'setStatus' on 'NavigatorLogin': 1 argument"
+          + ' required, but only 0 present.'));
+      }
+      return Promise.resolve();
+    });
+  }
+  const managedProto = prototypeFor('NavigatorManagedData');
+  if (managedProto) {
+    method(managedProto, 'getManagedConfiguration', 1,
+      function getManagedConfiguration(keys) {
+        if (arguments.length === 0) {
+          return Promise.reject(new TypeError(
+            "Failed to execute 'getManagedConfiguration' on"
+            + " 'NavigatorManagedData': 1 argument required, but only 0"
+            + ' present.'));
+        }
+        return Promise.reject(new DOMException(
+          'Managed configuration is empty. This API is available only for'
+          + ' managed apps.',
+          'NotAllowedError'));
+      });
+    handler(managedProto, 'onmanagedconfigurationchange');
+  }
+
+  // StorageBucketManager: the bucket store is empty, so keys() resolves with no
+  // names and delete() resolves without a value. `open` is deliberately left
+  // out -- the captured Chrome never settled it on any origin, so neither a
+  // resolved nor a rejected behavior could be pinned for it.
+  const bucketProto = prototypeFor('StorageBucketManager');
+  if (bucketProto) {
+    method(bucketProto, 'keys', 0, function keys() { return Promise.resolve([]); });
+    method(bucketProto, 'delete', 1, function deleteBucket(name) {
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'delete' on 'StorageBucketManager': 1 argument"
+          + ' required, but only 0 present.'));
+      }
+      return Promise.resolve();
+    });
+  }
+
+  // DeprecatedStorageQuota is [LegacyNoInterfaceObject]: both engines expose it
+  // only through the legacy navigator members, and Chrome shares one prototype
+  // between the two. Build that prototype so both report
+  // "[object DeprecatedStorageQuota]" rather than a name invented from the
+  // member name.
+  const quotaProto = Object.create(Object.prototype);
+  Object.defineProperty(quotaProto, Symbol.toStringTag,
+    { value: 'DeprecatedStorageQuota', configurable: true });
+  const quotaArgCount = (name, count) =>
+    "Failed to execute '" + name + "' on 'DeprecatedStorageQuota': " + count
+    + ' argument' + (count > 1 ? 's' : '') + ' required, but only 0 present.';
+  method(quotaProto, 'queryUsageAndQuota', 1, function queryUsageAndQuota(successCallback) {
+    if (arguments.length === 0) throw new TypeError(quotaArgCount('queryUsageAndQuota', 1));
+    // The captured quota is the shared origin quota the capture reported;
+    // usage is the same 0 the StorageManager estimate reports.
+    if (typeof successCallback === 'function') successCallback(0, 10737418240);
+  });
+  method(quotaProto, 'requestQuota', 1, function requestQuota(quota) {
+    if (arguments.length === 0) throw new TypeError(quotaArgCount('requestQuota', 1));
+    return undefined;
+  });
+
+  // Chrome reports each interface's own members in IDL declaration order.
+  // Property enumeration order is specified, so it is part of what a probe that
+  // joins `Object.getOwnPropertyNames` into one string reads back, and the
+  // engine's own insertion order is not the capture's. `open` is missing from
+  // the StorageBucketManager row for the reason above; a name the order pass
+  // cannot find is simply left out, which is what the capture's own list is.
+  const memberOrder = {
+    Clipboard: ['onclipboardchange', 'read', 'readText', 'write', 'writeText'],
+    CredentialsContainer: ['create', 'get', 'preventSilentAccess', 'store'],
+    Geolocation: ['clearWatch', 'getCurrentPosition', 'watchPosition'],
+    HID: ['onconnect', 'ondisconnect', 'getDevices', 'requestDevice'],
+    LockManager: ['query', 'request'],
+    NavigatorLogin: ['setStatus'],
+    NavigatorManagedData: ['onmanagedconfigurationchange', 'getManagedConfiguration'],
+    NavigatorUAData: ['brands', 'mobile', 'platform', 'getHighEntropyValues', 'toJSON'],
+    StorageBucketManager: ['delete', 'keys', 'open'],
+    USB: ['onconnect', 'ondisconnect', 'getDevices', 'requestDevice'],
+    WakeLock: ['request'],
+    XRSystem: ['ondevicechange', 'isSessionSupported', 'requestSession'],
+    DeprecatedStorageQuota: ['queryUsageAndQuota', 'requestQuota'],
+  };
+
+  const syntheticPrototypes = new Map([['DeprecatedStorageQuota', quotaProto]]);
+  for (const member of Object.keys(_navigatorInterfaceNames)) {
+    let instance;
+    try { instance = globalThis.navigator[member]; } catch (_error) { continue; }
+    if (!instance || typeof instance !== 'object') continue;
+    const interfaceName = _navigatorInterfaceName(member);
+    const proto = prototypeFor(interfaceName) || syntheticPrototypes.get(interfaceName);
+    if (!proto) continue;
+    // The literal's own string-keyed members are the IDL operations. Move each
+    // onto the prototype; a WebIDL interface member is not an own property of
+    // the instance, and the capture reports an empty
+    // `Object.getOwnPropertyNames(navigator.credentials)`.
+    for (const key of Object.getOwnPropertyNames(instance)) {
+      const descriptor = Object.getOwnPropertyDescriptor(instance, key);
+      try { delete instance[key]; } catch (_error) { continue; }
+      if (Object.prototype.hasOwnProperty.call(proto, key)) continue;
+      if (descriptor.get || descriptor.set) {
+        Object.defineProperty(proto, key, {
+          get: descriptor.get, set: descriptor.set,
+          enumerable: true, configurable: true,
+        });
+        continue;
+      }
+      const value = typeof descriptor.value === 'function'
+        ? _markNative(descriptor.value) : descriptor.value;
+      const length = (_navigatorMemberLengths[member] || {})[key];
+      if (typeof value === 'function' && Number.isFinite(length)) {
+        Object.defineProperty(value, 'length', { value: length, configurable: true });
+      }
+      Object.defineProperty(proto, key, {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    Object.setPrototypeOf(instance, proto);
+    // A retro-fitted @@toStringTag on the instance would shadow the
+    // prototype's and keep the wrong brand alive; the prototype owns it.
+    if (Object.prototype.hasOwnProperty.call(instance, Symbol.toStringTag)) {
+      delete instance[Symbol.toStringTag];
+    }
+  }
+
+  // Runs last: it reorders members that are already on the prototype.
+  for (const interfaceName of Object.keys(memberOrder)) {
+    const proto = prototypeFor(interfaceName) || syntheticPrototypes.get(interfaceName);
+    if (proto) _alignPropertiesOrder(proto, memberOrder[interfaceName]);
   }
 })();
 

@@ -868,6 +868,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    /// Whether script has queued a navigation that has not been committed yet.
+    /// Peeking lets a settling page decide to commit one without consuming the
+    /// queue when it does not.
+    pub fn has_pending_navigation(&self) -> bool {
+        self.state.borrow().pending_navigation.is_some()
+    }
+
     pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_frame_navigations)
     }
@@ -10970,6 +10977,38 @@ RequestRedirect value",
     }
 
     #[test]
+    fn viewport_override_preserves_fingerprinted_window_placement() {
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 3440,
+                    height: 1440,
+                    avail_width: 3440,
+                    avail_height: 1326,
+                    avail_top: 25,
+                    avail_left: 0,
+                    device_scale_factor: 2.0,
+                    outer_width: 2309,
+                    outer_height: 1326,
+                    screen_x: 674,
+                    screen_y: 25,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_viewport(1024.0, 768.0);
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate("[innerWidth,innerHeight,outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]")
+                .unwrap(),
+            serde_json::json!([1024, 768, 2309, 1326, 674, 25, 674, 25])
+        );
+    }
+
+    #[test]
     fn navigator_has_no_own_idl_members() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -14071,8 +14110,13 @@ RequestRedirect value",
         assert_eq!(initial["tracker"], serde_json::json!([320, 200, 320, 200]));
         assert_eq!(initial["box"][0], serde_json::json!(116));
         assert_eq!(initial["box"][1], serde_json::json!(62));
-        assert!((initial["box"][2].as_f64().unwrap() - 123.0).abs() < 0.05);
-        assert!((initial["box"][3].as_f64().unwrap() - 66.6).abs() < 0.05);
+        // Chrome 153 (headless, 1x) on this exact box: border box
+        // 122.765625 x 66.59375. Blink floors each used length onto its 1/64
+        // LayoutUnit grid and composes the border box from the snapped pieces,
+        // so the authored 123.0 is never reported verbatim. Previously pinned
+        // to 123.0 / 66.6, which was this engine's unsnapped value.
+        assert_eq!(initial["box"][2], serde_json::json!(122.765625));
+        assert_eq!(initial["box"][3], serde_json::json!(66.59375));
 
         // Attribute-backed inline-style changes invalidate the retained
         // render. Borders do not change the padding box; padding does.
@@ -14094,7 +14138,9 @@ RequestRedirect value",
             .unwrap();
         assert_eq!(mutated[0], serde_json::json!(100));
         assert_eq!(mutated[1], serde_json::json!(126));
-        assert!((mutated[2].as_f64().unwrap() - 142.7).abs() < 0.05);
+        // Chrome 153 on the same mutation (border-left 13px, padding-left 17px):
+        // 142.578125, not the unsnapped 142.7.
+        assert_eq!(mutated[2], serde_json::json!(142.578125));
 
         // A later CDP/emulation viewport update invalidates the layout too;
         // both the root special case and an ordinary 100vh box are live.
@@ -17559,6 +17605,144 @@ RequestRedirect value",
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true, 1, 1]));
+    }
+
+    /// `btoa`/`atob` are byte-oriented: one code unit is one byte, and the
+    /// decoded string is Latin-1. Encoding through TextEncoder keeps
+    /// `atob(btoa(s)) === s` true while inflating every unit above 0x7F to two
+    /// bytes, which corrupts every binary round trip -- a FileReader data URL, a
+    /// JWK byte field, an exported ECDSA key. The expected values are Chrome
+    /// 152's, measured on the same bytes.
+    #[test]
+    fn atob_and_btoa_are_byte_oriented() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const bytes = new Uint8Array([0x41, 0x80, 0xA1, 0xFF, 0x42]);
+                    let binary = "";
+                    for (const byte of bytes) binary += String.fromCharCode(byte);
+                    const encoded = btoa(binary);
+                    const decoded = atob(encoded);
+                    const codes = [];
+                    for (let i = 0; i < decoded.length; i++) codes.push(decoded.charCodeAt(i));
+                    let over255 = "none";
+                    try { btoa("\u0100"); } catch (e) { over255 = e.name; }
+                    return [encoded, decoded.length, codes, atob("QQ").length, over255];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["QYCh/0I=", 5, [65, 128, 161, 255, 66], 1, "InvalidCharacterError"])
+        );
+    }
+
+    /// The public-key half of `crypto.subtle` runs in Rust (`op_subtle_asym`),
+    /// which is synchronous, so the round trips below are asserted directly.
+    /// The shim's own parameter and usage rules sit on top of this and are
+    /// covered by the values pinned here.
+    #[test]
+    fn asymmetric_webcrypto_round_trips() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (command, request) =>
+                        JSON.parse(Deno.core.ops.op_subtle_asym(command, JSON.stringify(request)));
+                    const encode = (bytes) => btoa(String.fromCharCode(...bytes));
+                    const decode = (text) => {
+                        const binary = atob(text);
+                        const out = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+                        return out;
+                    };
+                    const out = {};
+
+                    // ECDSA: sign, verify, tamper, and the canonical encodings.
+                    const ecdsa = op("generate", { kind: "ECDSA", curve: "P-256" });
+                    const scalar = decode(ecdsa.private), point = decode(ecdsa.public);
+                    out.privateLength = scalar.length;
+                    out.publicLength = point.length;
+                    const message = new TextEncoder().encode("obscura");
+                    const signed = op("ec_sign", {
+                        curve: "P-256", hash: "SHA-256",
+                        key: encode(scalar), data: encode(message),
+                    });
+                    const signature = decode(signed.sig);
+                    out.signatureLength = signature.length;
+                    const verify = (candidate) => op("ec_verify", {
+                        curve: "P-256", hash: "SHA-256", key: encode(point),
+                        signature: encode(candidate), data: encode(message),
+                    }).ok;
+                    out.verifies = verify(signature);
+                    const tampered = new Uint8Array(signature);
+                    tampered[0] ^= 1;
+                    out.rejectsTampered = !verify(tampered);
+                    out.rejectsTruncated = !verify(signature.slice(2));
+
+                    // SPKI and PKCS#8 are the round-trip forms used on the wire.
+                    const spki = decode(op("ec_export", {
+                        curve: "P-256", format: "spki", type: "public", key: encode(point),
+                    }).data);
+                    const pkcs8 = decode(op("ec_export", {
+                        curve: "P-256", format: "pkcs8", type: "private", key: encode(scalar),
+                    }).data);
+                    out.spkiLength = spki.length;
+                    out.pkcs8Length = pkcs8.length;
+                    const fromSpki = op("ec_import", {
+                        curve: "P-256", format: "spki", type: "public", data: encode(spki),
+                    });
+                    out.spkiRoundTrip = fromSpki.key === ecdsa.public;
+                    const fromPkcs8 = op("ec_import", {
+                        curve: "P-256", format: "pkcs8", type: "private", data: encode(pkcs8),
+                    });
+                    out.pkcs8RoundTrip = fromPkcs8.key === ecdsa.private;
+
+                    // ECDH agrees in both directions and honours the length cap.
+                    const peer = op("generate", { kind: "ECDH", curve: "P-256" });
+                    const derive = (mine, theirs) => op("ec_derive", {
+                        curve: "P-256", private: mine, public: theirs, length: 256,
+                    }).bits;
+                    out.ecdhAgrees = derive(ecdsa.private, peer.public) ===
+                        derive(peer.private, ecdsa.public);
+                    let tooLong = "none";
+                    try {
+                        op("ec_derive", {
+                            curve: "P-256", private: ecdsa.private, public: peer.public, length: 264,
+                        });
+                    } catch (error) { tooLong = String(error.message).split(":")[0]; }
+                    out.ecdhTooLong = tooLong;
+
+                    // RSA-OAEP, plus the algorithm mismatch Chrome reports.
+                    const rsa = op("generate", {
+                        kind: "RSA-OAEP", modulusLength: 2048, publicExponent: encode([1, 0, 1]),
+                        hash: "SHA-256",
+                    });
+                    const encrypted = op("rsa_encrypt", {
+                        hash: "SHA-256", key: rsa.public, data: encode(message),
+                    });
+                    const cipher = decode(encrypted.data);
+                    out.rsaCipherLength = cipher.length;
+                    const decrypted = op("rsa_decrypt", {
+                        hash: "SHA-256", key: rsa.private, data: encode(cipher),
+                    });
+                    out.rsaPlain = new TextDecoder().decode(decode(decrypted.data));
+                    let mismatch = "none";
+                    try {
+                        op("ec_sign", {
+                            curve: "P-256", hash: "SHA-256", key: rsa.private, data: encode(message),
+                        });
+                    } catch (error) { mismatch = String(error.message).split(":")[0]; }
+                    out.ecKeyMismatch = mismatch;
+                    return JSON.stringify(out);
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"privateLength":32,"publicLength":65,"signatureLength":64,"verifies":true,"rejectsTampered":true,"rejectsTruncated":true,"spkiLength":91,"pkcs8Length":138,"spkiRoundTrip":true,"pkcs8RoundTrip":true,"ecdhAgrees":true,"ecdhTooLong":"OperationError","rsaCipherLength":256,"rsaPlain":"obscura","ecKeyMismatch":"DataError"}"#)
+        );
     }
 
     #[test]
@@ -25565,6 +25749,243 @@ RequestRedirect value",
                 "dateUntouched": true,
             })
         );
+    }
+
+    /// A navigator object member is a WebIDL interface instance, so the two
+    /// lines a brand check runs -- `navigator.x.constructor.name` and
+    /// `Object.prototype.toString.call(navigator.x)` -- both have to name the
+    /// interface, and the instance must carry no own string-keyed members.
+    /// Every one of these answered "Object" / "[object Object]" (or a name
+    /// invented from the member name, as in "[object Usb]") because the
+    /// capability module that owns the behavior built it as an object literal.
+    /// Values pinned against headless Chrome 152; see
+    /// `navigator_interface_prototypes_carry_the_captured_members` for the
+    /// prototype surface around them.
+    #[test]
+    fn navigator_object_members_report_their_interface_brand() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const table = [
+                        ['credentials', 'CredentialsContainer'],
+                        ['geolocation', 'Geolocation'],
+                        ['clipboard', 'Clipboard'],
+                        ['locks', 'LockManager'],
+                        ['wakeLock', 'WakeLock'],
+                        ['usb', 'USB'],
+                        ['hid', 'HID'],
+                        ['xr', 'XRSystem'],
+                        ['login', 'NavigatorLogin'],
+                        ['managed', 'NavigatorManagedData'],
+                        ['storageBuckets', 'StorageBucketManager'],
+                        ['userAgentData', 'NavigatorUAData'],
+                        ['webkitPersistentStorage', 'DeprecatedStorageQuota'],
+                        ['webkitTemporaryStorage', 'DeprecatedStorageQuota'],
+                    ];
+                    const bad = [];
+                    for (const [member, interfaceName] of table) {
+                        const value = navigator[member];
+                        if (!value || typeof value !== 'object') {
+                            bad.push(member + ':missing');
+                            continue;
+                        }
+                        const tag = Object.prototype.toString.call(value);
+                        if (tag !== '[object ' + interfaceName + ']') {
+                            bad.push(member + ':tag=' + tag);
+                        }
+                        // DeprecatedStorageQuota is [LegacyNoInterfaceObject].
+                        // Neither engine exposes a constructor for it, so its
+                        // instances inherit Object's -- exactly as Chrome does.
+                        const ctor = globalThis[interfaceName];
+                        const expectedCtor = ctor ? interfaceName : 'Object';
+                        const name = value.constructor && value.constructor.name;
+                        if (name !== expectedCtor) {
+                            bad.push(member + ':ctor=' + name);
+                        }
+                        // Chrome keeps every IDL member on the prototype: the
+                        // instance itself has no own string-keyed property.
+                        const own = Object.getOwnPropertyNames(value);
+                        if (own.length) bad.push(member + ':own=' + own.join('|'));
+                        if (Object.prototype.hasOwnProperty.call(value, Symbol.toStringTag)) {
+                            bad.push(member + ':ownToStringTag');
+                        }
+                        if (ctor) {
+                            if (Object.getPrototypeOf(value) !== ctor.prototype) {
+                                bad.push(member + ':prototype');
+                            }
+                            if (!(value instanceof ctor)) bad.push(member + ':instanceof');
+                        }
+                    }
+                    return bad;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
+    /// The prototype surface around those brands: the own members the capture
+    /// recorded, their arity, their descriptor shape, and the nullable
+    /// event-handler attributes. Together with the brand test above this is the
+    /// whole two-object shape a challenge script reads off `navigator`.
+    #[test]
+    fn navigator_interface_prototypes_carry_the_captured_members() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    // The capture's list for StorageBucketManager also carries
+                    // `open`, left out on purpose: the captured Chrome never
+                    // settled that promise on any origin, so neither a resolved
+                    // nor a rejected answer could be pinned for it.
+                    // In the capture's own order: Chrome lists an interface's
+                    // members in IDL declaration order, and property
+                    // enumeration order is specified, so the joined names are
+                    // compared as a sequence rather than as a set.
+                    const expected = {
+                        CredentialsContainer: 'create,get,preventSilentAccess,store',
+                        Geolocation: 'clearWatch,getCurrentPosition,watchPosition',
+                        Clipboard: 'onclipboardchange,read,readText,write,writeText',
+                        LockManager: 'query,request',
+                        WakeLock: 'request',
+                        USB: 'onconnect,ondisconnect,getDevices,requestDevice',
+                        HID: 'onconnect,ondisconnect,getDevices,requestDevice',
+                        XRSystem: 'ondevicechange,isSessionSupported,requestSession',
+                        NavigatorLogin: 'setStatus',
+                        NavigatorManagedData:
+                            'onmanagedconfigurationchange,getManagedConfiguration',
+                        StorageBucketManager: 'delete,keys',
+                        NavigatorUAData: 'brands,mobile,platform,getHighEntropyValues,toJSON',
+                        DeprecatedStorageQuota: 'queryUsageAndQuota,requestQuota',
+                    };
+                    // Declared arity, as the capture reported it. Several of
+                    // these disagree with the shim's own parameter list, which
+                    // the prototype pass pins to Chrome's.
+                    const lengths = {
+                        'CredentialsContainer.get': 0,
+                        'CredentialsContainer.create': 0,
+                        'CredentialsContainer.store': 1,
+                        'CredentialsContainer.preventSilentAccess': 0,
+                        'Geolocation.getCurrentPosition': 1,
+                        'Geolocation.watchPosition': 1,
+                        'Geolocation.clearWatch': 1,
+                        'Clipboard.read': 0,
+                        'Clipboard.readText': 0,
+                        'Clipboard.write': 1,
+                        'Clipboard.writeText': 1,
+                        'LockManager.request': 2,
+                        'LockManager.query': 0,
+                        'WakeLock.request': 0,
+                        'USB.getDevices': 0,
+                        'USB.requestDevice': 1,
+                        'HID.getDevices': 0,
+                        'HID.requestDevice': 1,
+                        'XRSystem.isSessionSupported': 1,
+                        'XRSystem.requestSession': 1,
+                        'NavigatorLogin.setStatus': 1,
+                        'NavigatorManagedData.getManagedConfiguration': 1,
+                        'StorageBucketManager.delete': 1,
+                        'StorageBucketManager.keys': 0,
+                        'NavigatorUAData.getHighEntropyValues': 1,
+                        'NavigatorUAData.toJSON': 0,
+                        'DeprecatedStorageQuota.queryUsageAndQuota': 1,
+                        'DeprecatedStorageQuota.requestQuota': 1,
+                    };
+                    // The legacy quota interface has no interface object, so
+                    // its prototype is reached through a member.
+                    const quotaPrototype =
+                        Object.getPrototypeOf(navigator.webkitTemporaryStorage);
+                    const prototypeFor = interfaceName => {
+                        const ctor = globalThis[interfaceName];
+                        return ctor ? ctor.prototype : quotaPrototype;
+                    };
+                    const bad = [];
+                    for (const interfaceName of Object.keys(expected)) {
+                        const proto = prototypeFor(interfaceName);
+                        const names = Object.getOwnPropertyNames(proto)
+                            .filter(name => name !== 'constructor').join(',');
+                        if (names !== expected[interfaceName]) {
+                            bad.push(interfaceName + '=' + names);
+                        }
+                        for (const name of expected[interfaceName].split(',')) {
+                            const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+                            if (!descriptor) {
+                                bad.push(interfaceName + '.' + name + ':missing');
+                                continue;
+                            }
+                            if (!descriptor.enumerable || !descriptor.configurable) {
+                                bad.push(interfaceName + '.' + name + ':descriptor');
+                            }
+                        }
+                    }
+                    for (const key of Object.keys(lengths)) {
+                        const dot = key.indexOf('.');
+                        const proto = prototypeFor(key.slice(0, dot));
+                        const descriptor =
+                            Object.getOwnPropertyDescriptor(proto, key.slice(dot + 1));
+                        if (!descriptor || typeof descriptor.value !== 'function') {
+                            bad.push(key + ':notMethod');
+                            continue;
+                        }
+                        if (descriptor.value.length !== lengths[key]) {
+                            bad.push(key + ':length=' + descriptor.value.length);
+                        }
+                    }
+                    // Chrome keeps these five interfaces on the EventTarget
+                    // chain and the rest directly on Object.
+                    for (const interfaceName of
+                        ['Clipboard', 'USB', 'HID', 'XRSystem', 'NavigatorManagedData']) {
+                        if (Object.getPrototypeOf(prototypeFor(interfaceName))
+                            !== EventTarget.prototype) {
+                            bad.push(interfaceName + ':parent');
+                        }
+                    }
+                    for (const interfaceName of
+                        ['CredentialsContainer', 'Geolocation', 'LockManager', 'WakeLock',
+                         'NavigatorLogin', 'StorageBucketManager', 'NavigatorUAData']) {
+                        if (Object.getPrototypeOf(prototypeFor(interfaceName))
+                            !== Object.prototype) {
+                            bad.push(interfaceName + ':parent');
+                        }
+                    }
+                    // One shared DeprecatedStorageQuota prototype for the two
+                    // legacy members, and no own constructor on it -- which is
+                    // why both report `constructor.name === 'Object'`.
+                    if (Object.getPrototypeOf(navigator.webkitPersistentStorage)
+                        !== quotaPrototype) {
+                        bad.push('DeprecatedStorageQuota:sharedPrototype');
+                    }
+                    if (Object.getPrototypeOf(quotaPrototype) !== Object.prototype) {
+                        bad.push('DeprecatedStorageQuota:parent');
+                    }
+                    // Event-handler attributes: null until assigned, function
+                    // only, and stored per instance rather than on the
+                    // prototype.
+                    for (const [target, slot] of [
+                        [navigator.usb, 'onconnect'],
+                        [navigator.usb, 'ondisconnect'],
+                        [navigator.hid, 'onconnect'],
+                        [navigator.hid, 'ondisconnect'],
+                        [navigator.clipboard, 'onclipboardchange'],
+                        [navigator.xr, 'ondevicechange'],
+                        [navigator.managed, 'onmanagedconfigurationchange'],
+                    ]) {
+                        if (target[slot] !== null) {
+                            bad.push(slot + ':default=' + String(target[slot]));
+                        }
+                        const listener = function () {};
+                        target[slot] = listener;
+                        if (target[slot] !== listener) bad.push(slot + ':assign');
+                        target[slot] = 'not a function';
+                        if (target[slot] !== null) bad.push(slot + ':coerce');
+                    }
+                    if (navigator.usb.onconnect !== null) bad.push('onconnect:leaked');
+                    if (navigator.hid.onconnect !== null) bad.push('onconnect:leaked');
+                    return bad;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
     }
 
     #[test]

@@ -61,6 +61,20 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
     })
 }
 
+/// Chrome's `priority` header for a request shape: navigations are `u=0`,
+/// scripted fetch/XHR are `u=1`, and images are `i`. Chrome sends it on every
+/// request it makes, so its absence is itself a signal that the client is not
+/// Chrome; the Cloudflare challenge reads it on its `/fo/` POSTs.
+pub(crate) fn request_priority(mode: RequestMode, destination: &str) -> &'static str {
+    if destination.eq_ignore_ascii_case("image") {
+        "i"
+    } else if mode == RequestMode::Navigate {
+        "u=0, i"
+    } else {
+        "u=1, i"
+    }
+}
+
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
 /// variable that is set but empty (e.g. `SSL_CERT_FILE=""`, a common shell
 /// accident) is treated as unset, matching the `!is_empty()` filter in
@@ -439,21 +453,27 @@ pub(crate) fn client_hint_value(name: &str, fingerprint: &crate::fingerprint::Br
         .map(|brand| format!("\"{}\";v=\"{}\"", brand.brand, brand.version))
         .collect::<Vec<_>>()
         .join(", ");
+    // Only the `Sec-CH-UA*` names are answered. `Accept-CH` may also list the
+    // spellings from before the `Sec-CH-` rename (`UA`, `UA-Arch`,
+    // `UA-Full-Version`, ...); Chrome no longer implements those and ignores
+    // the tokens, so honouring them would put headers on the wire that no real
+    // Chrome sends. Cloudflare's challenge answers `Accept-CH`/`Critical-CH`
+    // with both spellings at once, which is where the difference shows up: a
+    // Chrome that sees that response sends the `Sec-CH-UA*` set and nothing
+    // else, while mapping the legacy names too would add eight headers
+    // (`ua`, `ua-arch`, `ua-bitness`, `ua-full-version`,
+    // `ua-full-version-list`, `ua-model`, `ua-platform`,
+    // `ua-platform-version`) that are absent from every real Chrome.
     let value = match name {
         "sec-ch-ua" => fingerprint.sec_ch_ua(),
         "sec-ch-ua-mobile" => fingerprint.sec_ch_ua_mobile().to_string(),
         "sec-ch-ua-platform" => fingerprint.sec_ch_ua_platform(),
-        "sec-ch-ua-arch" | "ua-arch" => format!("\"{}\"", fingerprint.architecture),
-        "sec-ch-ua-bitness" | "ua-bitness" => format!("\"{}\"", fingerprint.bitness),
-        "sec-ch-ua-full-version" | "ua-full-version" => format!("\"{}\"", fingerprint.browser_version),
-        "sec-ch-ua-full-version-list" | "ua-full-version-list" => full_version_list,
-        "sec-ch-ua-model" | "ua-model" => format!("\"{}\"", fingerprint.model),
-        "sec-ch-ua-platform-version" | "ua-platform-version" => {
-            format!("\"{}\"", fingerprint.ua_platform_version)
-        }
-        "ua-mobile" => fingerprint.sec_ch_ua_mobile().to_string(),
-        "ua-platform" => fingerprint.sec_ch_ua_platform(),
-        "ua" => fingerprint.user_agent.clone(),
+        "sec-ch-ua-arch" => format!("\"{}\"", fingerprint.architecture),
+        "sec-ch-ua-bitness" => format!("\"{}\"", fingerprint.bitness),
+        "sec-ch-ua-full-version" => format!("\"{}\"", fingerprint.browser_version),
+        "sec-ch-ua-full-version-list" => full_version_list,
+        "sec-ch-ua-model" => format!("\"{}\"", fingerprint.model),
+        "sec-ch-ua-platform-version" => format!("\"{}\"", fingerprint.ua_platform_version),
         _ => return None,
     };
     Some(value)
@@ -1895,6 +1915,12 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-dest"),
                 HeaderValue::from_static(request.destination()),
             );
+            if !headers.contains_key(HeaderName::from_static("priority")) {
+                headers.insert(
+                    HeaderName::from_static("priority"),
+                    HeaderValue::from_static(request_priority(request.mode, request.destination())),
+                );
+            }
             if let Some(referer) = request_referrer(&request, &current_url) {
                 if let Ok(value) = HeaderValue::from_str(&referer) {
                     headers.insert(reqwest::header::REFERER, value);

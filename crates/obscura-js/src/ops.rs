@@ -104,6 +104,11 @@ pub struct PendingIframeNavigation {
     pub url: Option<String>,
     pub method: String,
     pub body: String,
+    /// Document text for a script-created `blob:` navigation, already
+    /// resolved from the page's blob URL store by the bootstrap. Those bytes
+    /// never exist on the network, so the frame loader must commit them
+    /// directly instead of issuing a request for `url`.
+    pub inline_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5460,6 +5465,7 @@ fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
             url: None,
             method: "GET".to_string(),
             body: String::new(),
+            inline_body: None,
         });
     }
 }
@@ -5480,6 +5486,30 @@ fn op_navigate_iframe(
             url: Some(url.to_string()),
             method: method.to_string(),
             body: body.to_string(),
+            inline_body: None,
+        });
+}
+
+/// Queue a `blob:` document navigation for an iframe.
+///
+/// A blob URL's bytes live in the page's blob URL store, so there is nothing
+/// for the loader to request: the bootstrap resolves the text (the same store
+/// `fetch()`/`XHR` read) and hands it over with the URL that the frame's
+/// `location.href` and `document.URL` must report. Sending the URL alone to
+/// `op_queue_iframe_navigation` made the loader ask the network client for it,
+/// which rejects every non-http(s) scheme, so the frame silently stayed at
+/// about:blank.
+#[op2(fast)]
+fn op_navigate_iframe_blob(state: &OpState, host_nid: u32, #[string] url: &str, #[string] body: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    gs.borrow_mut()
+        .pending_iframe_navigations
+        .push(PendingIframeNavigation {
+            host_nid,
+            url: Some(url.to_string()),
+            method: "GET".to_string(),
+            body: String::new(),
+            inline_body: Some(body.to_string()),
         });
 }
 
@@ -6829,6 +6859,7 @@ pub fn build_extension() -> Extension {
         op_navigate_frame(),
         op_queue_iframe_navigation(),
         op_navigate_iframe(),
+        op_navigate_iframe_blob(),
         op_async_runtime_available(),
         op_browser_timer_schedule(),
         op_browser_timer_complete(),
@@ -6841,6 +6872,7 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_ctr(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
+        crate::subtle_asym::op_subtle_asym(),
         op_random_bytes(),
         op_url_parse(),
         op_url_set(),

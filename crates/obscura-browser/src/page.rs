@@ -3517,6 +3517,18 @@ impl Page {
                         150,
                     )
                     .await;
+                // A page can navigate itself: `location.href = ...`,
+                // `form.submit()`, `location.reload()`. Both CDP paths drain
+                // that after an evaluate or an input event, but a settling
+                // page has no such boundary. Without this the navigation the
+                // script asked for stays queued and is then dropped, so the
+                // caller keeps looking at the document the page was leaving.
+                if self.has_pending_navigation() {
+                    if self.process_pending_navigation().await.is_ok() {
+                        continue;
+                    }
+                    break;
+                }
                 // Timers and fetch completions can insert iframes after the
                 // navigation-time fixed-point drain. Hand those requests to
                 // the Rust frame controller, then give successfully committed
@@ -3572,6 +3584,15 @@ impl Page {
                 break;
             }
             Self::settle_runtime_for_duration(js, slice_ms).await;
+            // Same reason as `settle`: a scripted navigation has to be
+            // committed, or a fixed-delay wait would hold the caller on the
+            // document the page already left.
+            if self.has_pending_navigation() {
+                if self.process_pending_navigation().await.is_ok() {
+                    continue;
+                }
+                break;
+            }
             self.process_pending_frame_navigations().await;
         }
     }
@@ -5159,6 +5180,13 @@ impl Page {
         }
     }
 
+    /// Whether script has queued a navigation that has not been committed yet.
+    pub fn has_pending_navigation(&self) -> bool {
+        self.js
+            .as_ref()
+            .is_some_and(|js| js.has_pending_navigation())
+    }
+
     /// Commit iframe navigations requested by script through the Rust frame
     /// controller. This also discovers newly-connected iframe elements, whose
     /// initial about:blank/src/srcdoc browsing context cannot be created while
@@ -5288,6 +5316,7 @@ impl Page {
             let request = if let Some(url) = pending.url {
                 FrameNavigationRequest {
                     url: Some(url),
+                    inline_body: pending.inline_body,
                     method: Some(pending.method),
                     body: (!pending.body.is_empty()).then_some(pending.body.into_bytes()),
                     sandbox,
@@ -5672,6 +5701,12 @@ pub struct FrameNavigationRequest {
     /// initial about:blank document.
     pub url: Option<String>,
     pub srcdoc: Option<String>,
+    /// Document text the embedder already holds, committed without a request.
+    /// Script-created `blob:` documents are the only producer: their bytes
+    /// live in the page's blob URL store, and `url` carries the blob URL the
+    /// frame must report. Takes precedence over a network navigation like
+    /// `srcdoc`, but keeps `url` as the document's own URL.
+    pub inline_body: Option<String>,
     pub method: Option<String>,
     pub body: Option<Vec<u8>>,
     pub referrer: Option<String>,
@@ -6005,9 +6040,24 @@ impl Page {
         let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
         let ancestors = self.frame_ancestor_chain(frame_id);
 
+        // A document whose bytes are already in hand: `srcdoc`, or a
+        // script-created `blob:` document the embedder resolved from its blob
+        // URL store. Both are replacement documents with no response of their
+        // own, so they differ only in the URL and base URL they report: the
+        // blob URL for a blob, which is what the frame's `location.href` and
+        // `document.URL` must return.
+        let inline_document = if let Some(srcdoc) = request.srcdoc.clone() {
+            Some(("about:srcdoc".to_string(), parent_base.clone(), srcdoc))
+        } else {
+            request.inline_body.clone().map(|body| {
+                let url = request.url.clone().unwrap_or_default();
+                (url.clone(), url, body)
+            })
+        };
+
         // Resolve the document: URL, origin, and HTML body.
-        let resolved_document = if let Some(srcdoc) = request.srcdoc {
-            // An embedded CSP policy applies directly to srcdoc documents.
+        let resolved_document = if let Some((document_url, base_url, body)) = inline_document {
+            // An embedded CSP policy applies directly to an inline document.
             // Unlike the initial about:blank special case below, this is a
             // real replacement document and must honor a CSP sandbox token.
             if let Some(required_flags) = required_csp.as_deref().and_then(|header| {
@@ -6015,8 +6065,9 @@ impl Page {
             }) {
                 sandbox = sandbox.merged_with_parent(required_flags);
             }
-            // srcdoc inherits the creator origin unless sandbox forces opaque;
-            // its base URL is the creator's.
+            // An inline document inherits the creator origin unless sandbox
+            // forces opaque. A blob URL's origin is its creator's, so the
+            // parent origin is also the origin the URL itself names.
             let origin = if sandbox.active
                 && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
             {
@@ -6029,10 +6080,10 @@ impl Page {
             // subframe a strictly weaker policy than the document that made it,
             // which is the opposite of what CSP is for.
             (
-                "about:srcdoc".to_string(),
-                parent_base.clone(),
+                document_url,
+                base_url,
                 origin,
-                srcdoc,
+                body,
                 combine_required_csp(parent_csp.clone(), required_csp.as_deref()),
                 parent_permissions_policy.clone(),
                 None,
@@ -7410,6 +7461,275 @@ mod tests {
                 .evaluate("failedFrameLoads")
                 .unwrap(),
             serde_json::json!(1.0),
+        );
+    }
+
+    /// A script-created `blob:` document is committed from the page's blob URL
+    /// store, not from a request: the loader has nothing to fetch, and letting
+    /// the URL reach the network client made it reject the scheme and leave
+    /// the frame silently at about:blank.
+    ///
+    /// The expectations are Chrome 140's, captured with the same probe served
+    /// over http://127.0.0.1 (a file:// origin serializes to `null` and blocks
+    /// the blob URL, so it cannot be used):
+    ///
+    /// ```text
+    /// iframe.src = URL.createObjectURL(new Blob([html], {type:'text/html'}))
+    ///   contentWindow.location.href      -> the blob URL
+    ///   contentWindow.location.protocol  -> "blob:"
+    ///   contentWindow.origin             -> the creating origin
+    ///   contentDocument.URL              -> the blob URL
+    ///   contentDocument.body.innerHTML   -> "inner-ok"
+    /// ```
+    ///
+    /// Chrome does not sniff a blob frame: with an `application/octet-stream`
+    /// type the frame never leaves about:blank, which is what the second half
+    /// of this test pins down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_url_iframe_navigation_commits_the_stored_document() {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    globalThis.blobProbeUrl = URL.createObjectURL(new Blob(
+                        ['<!DOCTYPE html><html><body>inner-ok</body></html>'],
+                        { type: 'text/html' }));
+                    const frame = document.createElement('iframe');
+                    frame.id = 'blobbed';
+                    frame.src = globalThis.blobProbeUrl;
+                    document.body.appendChild(frame);
+
+                    const opaque = document.createElement('iframe');
+                    opaque.id = 'opaque-blob';
+                    opaque.src = URL.createObjectURL(new Blob(
+                        ['<!DOCTYPE html><html><body>inner-ok</body></html>'],
+                        { type: 'application/octet-stream' }));
+                    document.body.appendChild(opaque);
+                })()"#,
+            )
+            .unwrap();
+
+        // The blob frame commits; the octet-stream one is not a renderable
+        // document and keeps its initial about:blank, so only one navigation
+        // is committed.
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+
+        let blob_url = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("globalThis.blobProbeUrl")
+            .unwrap();
+        let blob_url = blob_url.as_str().expect("blob URL is a string").to_string();
+        assert!(
+            blob_url.starts_with("blob:https://top.example/"),
+            "blob URL should name the creating origin: {blob_url}"
+        );
+
+        let host = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| dom.query_selector("#blobbed").unwrap().unwrap())
+            .unwrap();
+        let frame = page.frames.by_host(host).unwrap();
+        let scope = page
+            .js
+            .as_ref()
+            .unwrap()
+            .with_dom(|dom| dom.document_scope(frame.active_document_root.unwrap()))
+            .flatten()
+            .unwrap();
+        assert_eq!(scope.url, blob_url, "frame document URL is the blob URL");
+        assert_eq!(
+            scope.origin.serialize(),
+            "https://top.example",
+            "a blob document keeps its creator's origin"
+        );
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"(() => {
+                        const frame = document.getElementById('blobbed');
+                        const opaque = document.getElementById('opaque-blob');
+                        return [
+                            frame.contentWindow.location.protocol,
+                            frame.contentWindow.location.href === globalThis.blobProbeUrl,
+                            frame.contentDocument.URL === globalThis.blobProbeUrl,
+                            String(frame.contentWindow.origin),
+                            frame.contentDocument.body.innerHTML,
+                            opaque.contentWindow.location.href,
+                            String(opaque.contentDocument.body.innerHTML),
+                        ];
+                    })()"#
+                )
+                .unwrap(),
+            serde_json::json!([
+                "blob:",
+                true,
+                true,
+                "https://top.example",
+                "inner-ok",
+                "about:blank",
+                "",
+            ]),
+        );
+    }
+
+    /// A page whose top-level document is at `url`, for the frame
+    /// secure-context tests.
+    fn secure_frame_page(url: &str) -> super::Page {
+        let mut page = frame_test_page("<html><body></body></html>");
+        page.url = Some(url::Url::parse(url).unwrap());
+        page.document_origin = Some(obscura_dom::Origin::from_url(url));
+        page.init_js();
+        page
+    }
+
+    /// The secure-context surface read inside a frame realm. It stays source
+    /// text because the sandboxed frame has to evaluate it for itself.
+    ///
+    /// The member list is the half of the decision `isSecureContext` cannot
+    /// show: `_applySecureContextGating` removes `crypto.subtle` and the gated
+    /// `navigator.*` members by asking the same `_secureNow()` the
+    /// `isSecureContext` getter asks, so a fix that moved one and not the
+    /// other would read as a correct flag with the APIs still missing.
+    const SURFACE_PROBE: &str = concat!(
+        r#"[isSecureContext, typeof crypto.subtle, typeof navigator.credentials,"#,
+        r#" typeof navigator.serviceWorker, typeof navigator.storage,"#,
+        r#" typeof navigator.mediaDevices, typeof navigator.clipboard,"#,
+        r#" typeof navigator.wakeLock, typeof navigator.locks,"#,
+        r#" ("caches" in globalThis)]"#,
+    );
+
+    /// Creates three child frames in the page under test: `a` srcdoc, `b` a
+    /// script-created blob document, `c` a sandboxed srcdoc. The sandboxed one
+    /// reports itself, because a parent may not evaluate into an opaque-origin
+    /// frame -- Chrome throws SecurityError there and so does this engine.
+    fn create_frame_surface() -> String {
+        format!(
+            r#"(() => {{
+                const probe = '{probe}';
+                globalThis.__frameSurface = {{}};
+                addEventListener('message', (event) => {{
+                    try {{ globalThis.__frameSurface.sandbox = JSON.parse(event.data); }}
+                    catch (_) {{}}
+                }});
+                const mk = (id, opts) => {{
+                    const frame = document.createElement('iframe');
+                    frame.id = id;
+                    if (opts.sandboxed) frame.sandbox = 'allow-scripts';
+                    if (opts.report) {{
+                        frame.srcdoc = '<script>parent.postMessage(JSON.stringify(' + probe + '), "*")<\/script>';
+                    }} else if (opts.blob) {{
+                        frame.src = URL.createObjectURL(new Blob(['<body>x</body>'], {{type: 'text/html'}}));
+                    }} else {{
+                        frame.srcdoc = '<body>x</body>';
+                    }}
+                    document.body.appendChild(frame);
+                }};
+                mk('a', {{}});
+                mk('b', {{blob: true}});
+                mk('c', {{sandboxed: true, report: true}});
+            }})()"#,
+            probe = SURFACE_PROBE,
+        )
+    }
+
+    /// Reads each frame's own secure-context surface. Each frame realm
+    /// evaluates it for itself, so these are that realm's values and not the
+    /// embedder's.
+    async fn frame_secure_surface(page: &mut super::Page) -> serde_json::Value {
+        let source = format!(
+            r#"(() => {{
+                const probe = '{probe}';
+                const read = (id) => {{
+                    const frame = document.getElementById(id);
+                    if (!frame) return 'missing';
+                    try {{ return frame.contentWindow.eval(probe); }}
+                    catch (error) {{ return 'eval-threw:' + error.name; }}
+                }};
+                const reported = globalThis.__frameSurface && globalThis.__frameSurface.sandbox;
+                return [read('a'), read('b'), reported || 'missing'];
+            }})()"#,
+            probe = SURFACE_PROBE,
+        );
+        page.js.as_mut().unwrap().evaluate(&source).unwrap()
+    }
+
+    /// A frame document has no origin of its own, so it is exactly as
+    /// trustworthy as the document that created it -- and that is what decides
+    /// both `isSecureContext` and which members survive.
+    ///
+    /// Chrome 140, one probe over two origins:
+    ///   parent `http://127.0.0.1:<port>` (loopback is potentially
+    ///     trustworthy): the srcdoc, blob and sandboxed-srcdoc children are all
+    ///     secure contexts with `crypto.subtle` and every gated navigator
+    ///     member present.
+    ///   parent `http://<lan-ip>:<port>`: every one of those children is
+    ///     insecure and every one of those members is gone. That is the nail
+    ///     against reading this as "local schemes are always trustworthy".
+    ///   `sandbox="allow-scripts"` does not change it, even though the sandbox
+    ///     makes the frame's own origin opaque: an opaque frame falls back to
+    ///     the creator's origin, which is the trust Chrome grants it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_secure_context_follows_the_creating_document() {
+        // Loopback is trustworthy even over plain HTTP, so https here stands
+        // in for any trustworthy creator.
+        let mut secure = secure_frame_page("https://top.example/app/");
+        secure
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(&create_frame_surface())
+            .unwrap();
+        assert_eq!(secure.process_pending_frame_navigations().await, 3);
+        secure
+            .js
+            .as_mut()
+            .unwrap()
+            .deliver_pending_frame_messages()
+            .await;
+        let live = serde_json::json!([
+            true, "object", "object", "object", "object", "object", "object", "object",
+            "object", true
+        ]);
+        assert_eq!(
+            frame_secure_surface(&mut secure).await,
+            serde_json::json!([live.clone(), live.clone(), live]),
+        );
+
+        // A non-loopback http origin: the same frames must lose all of it.
+        let mut insecure = secure_frame_page("http://192.168.1.5/app/");
+        insecure
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(&create_frame_surface())
+            .unwrap();
+        assert_eq!(insecure.process_pending_frame_navigations().await, 3);
+        insecure
+            .js
+            .as_mut()
+            .unwrap()
+            .deliver_pending_frame_messages()
+            .await;
+        let gone = serde_json::json!([
+            false, "undefined", "undefined", "undefined", "undefined", "undefined",
+            "undefined", "undefined", "undefined", false
+        ]);
+        assert_eq!(
+            frame_secure_surface(&mut insecure).await,
+            serde_json::json!([gone.clone(), gone.clone(), gone]),
         );
     }
 

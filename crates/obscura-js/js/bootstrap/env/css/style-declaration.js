@@ -216,6 +216,18 @@ const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
 // Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
 // dashed-key store, replacing its contents in place.
+// A declaration's priority is stored inline with its value so the serialized
+// form round-trips through the `style` attribute, and split off again for
+// `getPropertyValue` / `getPropertyPriority`.
+const _CSS_PRIORITY_RE = /!\s*important\s*$/i;
+function _cssHasPriority(value) {
+  return typeof value === 'string' && _CSS_PRIORITY_RE.test(value);
+}
+function _cssStripPriority(value) {
+  if (!_cssHasPriority(value)) return value;
+  return value.replace(_CSS_PRIORITY_RE, '').trim();
+}
+
 function _parseCssInto(props, text) {
   for (const k in props) delete props[k];
   if (text) _splitCssDeclarations(text).forEach((p) => {
@@ -312,9 +324,16 @@ class CSSStyleDeclaration {
   get parentRule() { return _cssStyleFor(this).parentRule; }
   get cssFloat() { return this.getPropertyValue('float'); }
   set cssFloat(value) { this.setProperty('float', value); }
-  getPropertyPriority(_name) { _cssStyleFor(this); return ''; }
+  getPropertyPriority(name) {
+    const value = _cssStylePull(this).props[_cssCamelToKebab(String(name))];
+    return _cssHasPriority(value) ? 'important' : '';
+  }
   getPropertyValue(name) {
-    return _cssStylePull(this).props[_cssCamelToKebab(String(name))] || '';
+    const value = _cssStylePull(this).props[_cssCamelToKebab(String(name))];
+    if (!value) return '';
+    // The declaration's priority is reported through getPropertyPriority, not
+    // through the value, so a stored "150px !important" reads back as "150px".
+    return _cssStripPriority(value);
   }
   item(index) { return Object.keys(_cssStylePull(this).props)[index] || ''; }
   removeProperty(name) {
@@ -325,11 +344,19 @@ class CSSStyleDeclaration {
     _cssStylePush(this);
     return old || '';
   }
-  setProperty(name, value, _priority = '') {
+  setProperty(name, value, priority = '') {
     const state = _cssStylePull(this);
     const k = _cssCamelToKebab(String(name));
-    if (value === '' || value == null) delete state.props[k];
-    else state.props[k] = String(value);
+    if (value === '' || value == null) { delete state.props[k]; _cssStylePush(this); return; }
+    const text = String(value);
+    // `!important` is not part of a declaration value: it belongs to the
+    // separate priority argument. Chrome drops the whole declaration when it
+    // appears in the value, which is what an IDL assignment such as
+    // `el.style.fontSize = "150px !important"` goes through.
+    if (_cssHasPriority(text)) { _cssStylePush(this); return; }
+    const flag = String(priority == null ? '' : priority).trim().toLowerCase();
+    if (flag !== '' && flag !== 'important') { _cssStylePush(this); return; }
+    state.props[k] = flag === 'important' ? `${text} !important` : text;
     _cssStylePush(this);
   }
 }

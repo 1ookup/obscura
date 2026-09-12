@@ -57,6 +57,20 @@
     'WebGL2RenderingContext', 'OffscreenCanvas', 'Path2D', 'ImageData',
     'ImageBitmap', 'DOMMatrix', 'DOMPoint', 'DOMRect', 'DOMRectReadOnly',
     'DOMRectList',
+    // Performance timeline. These are real JS classes rather than host
+    // interfaces, so nothing else stamps them; without the tag every entry
+    // stringifies as `[object Object]` while `constructor.name` is correct,
+    // a pair no browser produces. The chrome interface table in
+    // surface-finalize.js already declares the tag each one should carry.
+    'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure',
+    'PerformanceResourceTiming', 'PerformanceNavigationTiming',
+    'PerformancePaintTiming', 'PerformanceLongTaskTiming',
+    'PerformanceLongAnimationFrameTiming', 'PerformanceElementTiming',
+    'PerformanceEventTiming', 'PerformanceServerTiming',
+    'PerformanceObserverEntryList', 'PerformanceObserver',
+    'PerformanceTiming', 'PerformanceNavigation',
+    'LargestContentfulPaint', 'LayoutShift', 'LayoutShiftAttribution',
+    'TaskAttributionTiming',
     // Media, storage and the long tail of stubs
     'MediaStream', 'MediaStreamTrack', 'AudioBuffer', 'AudioContext',
     'OfflineAudioContext', 'SpeechSynthesisUtterance', 'Notification',
@@ -98,4 +112,86 @@
       });
     } catch (e) {}
   }
+})();
+
+// SVGTextContentElement's character-position API. Chrome exposes it on the
+// interface; Obscura had none of it, so a probe that walks a text run one
+// character at a time -- which is how the challenge builds its ascending
+// per-character position list -- collected an empty list instead of the
+// advances a browser reports. This runs here rather than next to the
+// measurement methods in env/media/canvas.js because the SVG interfaces are
+// installed by this, the last, manifest module.
+(function _installSvgTextContentGeometry() {
+  if (typeof _measureTextBox !== 'function') return;
+  const geometry = {
+    getNumberOfChars() { return _svgTextContent(this).length; },
+    getStartPositionOfChar(index) {
+      return { x: _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 };
+    },
+    getEndPositionOfChar(index) {
+      const i = _svgCharacterIndex(this, index);
+      const char = _svgTextContent(this).charAt(i);
+      return { x: _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 };
+    },
+    getRotationOfChar(index) {
+      _svgCharacterIndex(this, index);
+      return 0;
+    },
+    getCharNumAtPosition(point) {
+      const x = point && Number(point.x);
+      if (!Number.isFinite(x)) return -1;
+      const text = _svgTextContent(this);
+      for (let i = 0; i < text.length; i++) {
+        if (x < _svgAdvanceTo(this, i + 1)) return i;
+      }
+      return -1;
+    },
+  };
+  // Where they belong. `SVGTextElement` and its siblings are still published
+  // as aliases of SVGElement here, so a <text> node does not inherit from this
+  // prototype yet -- the install below Element.prototype is what makes them
+  // reachable on the element the challenge actually measures.
+  const owner = globalThis.SVGTextContentElement && globalThis.SVGTextContentElement.prototype;
+  if (owner) {
+    for (const name of Object.keys(geometry)) {
+      Object.defineProperty(owner, name, {
+        value: geometry[name], writable: true, enumerable: false, configurable: true,
+      });
+    }
+  }
+  for (const name of Object.keys(geometry)) {
+    Object.defineProperty(Element.prototype, name, {
+      value: geometry[name], writable: true, enumerable: false, configurable: true,
+    });
+  }
+})();
+
+// Geometry producers hand back plain records, so `Object.prototype.toString`
+// on a rect reads `[object Object]` where a browser reads `[object DOMRect]`,
+// and `rect instanceof DOMRect` is false. The tag alone does not help: the
+// value has to actually be an instance. Re-wrap the producer instead of
+// rewriting the layout path.
+(function _brandGeometryResults() {
+  if (typeof DOMRect !== 'function' || typeof _markNative !== 'function') return;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    Element.prototype, 'getBoundingClientRect');
+  if (!descriptor || typeof descriptor.value !== 'function') return;
+  const call = descriptor.value;
+  try {
+    Object.defineProperty(Element.prototype, 'getBoundingClientRect', {
+      value: _markNative(function () {
+        const result = call.apply(this, arguments);
+        if (result == null || typeof result.x !== 'number'
+            || typeof result.width !== 'number') return result;
+        if (result instanceof DOMRect) return result;
+        const branded = new DOMRect(result.x, result.y, result.width, result.height);
+        // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
+        // and skips the scroll for it. The branded value has to carry that
+        // marker, or a fixed subtree starts moving the document.
+        if (result.__obscuraViewportFixed) branded.__obscuraViewportFixed = true;
+        return branded;
+      }),
+      writable: true, enumerable: false, configurable: true,
+    });
+  } catch (e) {}
 })();

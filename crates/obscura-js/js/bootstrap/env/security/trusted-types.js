@@ -201,6 +201,16 @@
         throw new TypeError('Policy "' + name + '" already exists.');
       }
     }
+    // A document can register at most one default policy. Unlike the plain
+    // duplicate-name rule below, this one applies whether or not a
+    // `trusted-types` directive is present: a second `createPolicy("default")`
+    // throws in Chrome, and a page that guards the call with try/catch can tell
+    // the difference.
+    if (name === 'default' && _defaultPolicy !== null) {
+      throw new TypeError(
+        "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': " +
+        'Policy with name "default" already exists.');
+    }
     const policy = Object.create(TrustedTypePolicy.prototype);
     // The options are a WebIDL dictionary of callbacks: read once here, so a
     // later mutation of the caller's object cannot change the policy.

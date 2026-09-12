@@ -420,7 +420,10 @@ impl StealthHttpClient {
                 req = req.header("accept-encoding", "gzip, deflate, br, zstd");
             }
             if !has_header("priority") {
-                req = req.header("priority", "u=0, i");
+                req = req.header(
+                    "priority",
+                    crate::client::request_priority(request.mode, request.destination()),
+                );
             }
             if !has_header("sec-fetch-site") {
                 req = req.header("sec-fetch-site", request_fetch_site(&request, &current_url));
@@ -688,6 +691,11 @@ impl StealthHttpClient {
         }
         if !has_header("accept-encoding") {
             req = req.header("accept-encoding", "gzip, deflate, br, zstd");
+        }
+        if !has_header("priority") {
+            // Scripted fetch/XHR: Chrome sends `u=1, i` here (its navigation and
+            // subresource paths use `u=0, i` / `i`, set in fetch_with_profile).
+            req = req.header("priority", "u=1, i");
         }
         if !fingerprint.brands.is_empty() {
             if !has_header("sec-ch-ua") {
@@ -964,7 +972,7 @@ mod tests {
         tokio::spawn(async move {
             let mut captured = Vec::new();
             for response in [
-                "HTTP/1.1 200 OK\r\ncontent-length: 5\r\naccept-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, UA, UA-Full-Version-List\r\ncritical-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, UA, UA-Full-Version-List\r\nconnection: close\r\n\r\nfirst",
+                "HTTP/1.1 200 OK\r\ncontent-length: 5\r\naccept-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, UA, UA-Arch, UA-Bitness, UA-Full-Version-List\r\ncritical-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, UA, UA-Arch, UA-Bitness, UA-Full-Version-List\r\nconnection: close\r\n\r\nfirst",
                 "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecond",
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -999,11 +1007,15 @@ mod tests {
         assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-arch: \"arm\"\r\n"), "{captured:?}");
         assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-bitness: \"64\"\r\n"), "{captured:?}");
         let retry_lower = captured[1].to_ascii_lowercase();
-        assert!(retry_lower.contains("\r\nua-full-version-list: "), "{captured:?}");
+        assert!(retry_lower.contains("\r\nsec-ch-ua-full-version-list: "), "{captured:?}");
         assert!(retry_lower.contains("\"chromium\";v=\"149.0.0.0\""), "{captured:?}");
         assert!(retry_lower.contains("\"not)a;brand\";v=\"24.0.0.0\""), "{captured:?}");
         assert_eq!(retry_lower.matches("\r\nsec-ch-ua:").count(), 1, "{captured:?}");
-        assert_eq!(retry_lower.matches("\r\nua:").count(), 1, "{captured:?}");
+        // The legacy spellings in Accept-CH (`UA`, `UA-Full-Version-List`) are
+        // ignored the way Chrome ignores them, so neither the bare `ua` header
+        // nor any `ua-*` header is sent.
+        assert!(!retry_lower.contains("\r\nua:"), "{captured:?}");
+        assert!(!retry_lower.contains("\r\nua-full-version-list:"), "{captured:?}");
     }
 
     #[tokio::test]

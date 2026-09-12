@@ -154,11 +154,16 @@ impl BorderModel {
 }
 
 fn used_width(specified: f32, style: BorderStyle) -> f32 {
-    if style.is_visible() {
-        specified.max(0.0)
-    } else {
-        0.0
+    if !style.is_visible() || specified <= 0.0 {
+        return 0.0;
     }
+    // Blink keeps used border widths as whole pixels: a non-zero specified
+    // width is truncated, and a sub-pixel width is clamped up to 1 px so an
+    // authored border cannot vanish. Measured on Chrome 153 (border-left, solid,
+    // 100px content box, border box width x64): 0px -> 0, 0.04px -> 1,
+    // 0.4px -> 1, 0.9px -> 1, 1px -> 1, 1.6px -> 1, 2.5px -> 2, 3.9px -> 3,
+    // 10.9px -> 10, and style `none`/`hidden` -> 0.
+    specified.trunc().max(1.0)
 }
 
 /// Uniform outline state. Outlines paint outside the border edge and never

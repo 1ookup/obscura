@@ -44,12 +44,197 @@ class Element extends Node {
   }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
-  // HTMLElement.nonce reflects the content attribute. Challenge scripts set
-  // this IDL property before appending a dynamically-created script; without
-  // the reflection the frame's CSP nonce gate rejects an otherwise authorized
-  // script.
-  get nonce() { return this.getAttribute("nonce") || ""; }
-  set nonce(v) { this.setAttribute("nonce", v == null ? "" : String(v)); }
+  // `HTMLElement.nonce`. Assigning through the IDL attribute stores the value
+  // in an internal slot, which is what Chrome does: the content attribute is
+  // neither created nor updated, so `getAttribute("nonce")` stays null and the
+  // attribute never appears in `attributes`. The challenge orchestration
+  // reports its own DOM outline by walking `attributes`, and a visible nonce
+  // there is a value a real browser does not produce. The content attribute is
+  // still mirrored because the native CSP nonce gate reads it; that gate is the
+  // only consumer that needs the value to be on the node.
+  get nonce() {
+    const held = _idlNonce.get(this);
+    return held !== undefined ? held : (this.getAttribute("nonce") || "");
+  }
+  set nonce(v) {
+    const value = v == null ? "" : String(v);
+    _idlNonce.set(this, value);
+    this.setAttribute("nonce", value);
+  }
+  // `HTMLScriptElement.async` / `.defer` are boolean content attributes. The
+  // challenge orchestration assigns both to the api.js script before inserting
+  // it and then reports the element's attribute list back to the server, so a
+  // missing reflection is directly observable. `async` also drives script
+  // ordering: assigning false opts a dynamically inserted classic script out
+  // of force-async execution, and that opt-out has to survive the reflection.
+  _reflectBooleanAttr(name, v) {
+    if (Boolean(v)) this.setAttribute(name, "");
+    else this.removeAttribute(name);
+  }
+  get async() {
+    if (this.localName !== "script") return undefined;
+    return this.hasAttribute("async");
+  }
+  set async(v) {
+    if (this.localName !== "script") {
+      Object.defineProperty(this, "async", {
+        value: v, writable: true, enumerable: true, configurable: true,
+      });
+      return;
+    }
+    this._reflectBooleanAttr("async", v);
+    if (v) _scriptAsyncOptOut.delete(this);
+    else _scriptAsyncOptOut.add(this);
+  }
+  get defer() {
+    if (this.localName !== "script") return undefined;
+    return this.hasAttribute("defer");
+  }
+  set defer(v) {
+    if (this.localName !== "script") {
+      Object.defineProperty(this, "defer", {
+        value: v, writable: true, enumerable: true, configurable: true,
+      });
+      return;
+    }
+    this._reflectBooleanAttr("defer", v);
+  }
+  // The remaining `HTMLScriptElement` reflections. `in`-checks against the
+  // script element are a common environment probe, so an absent property is
+  // itself the signal; each returns the attribute's value or the IDL default.
+  get integrity() {
+    if (this.localName !== "script") return undefined;
+    return this.getAttribute("integrity") || "";
+  }
+  set integrity(v) {
+    if (this.localName === "script") this.setAttribute("integrity", String(v));
+  }
+  get crossOrigin() {
+    if (this.localName !== "script") return undefined;
+    return this.getAttribute("crossorigin");
+  }
+  set crossOrigin(v) {
+    if (this.localName !== "script") return;
+    if (v == null) this.removeAttribute("crossorigin");
+    else this.setAttribute("crossorigin", String(v));
+  }
+  get noModule() {
+    if (this.localName !== "script") return undefined;
+    return this.hasAttribute("nomodule");
+  }
+  set noModule(v) {
+    if (this.localName === "script") this._reflectBooleanAttr("nomodule", v);
+  }
+  get fetchPriority() {
+    if (this.localName !== "script") return undefined;
+    return this.getAttribute("fetchpriority") || "auto";
+  }
+  set fetchPriority(v) {
+    if (this.localName === "script") this.setAttribute("fetchpriority", String(v));
+  }
+  get charset() {
+    if (this.localName !== "script") return undefined;
+    return this.getAttribute("charset") || "";
+  }
+  set charset(v) {
+    if (this.localName === "script") this.setAttribute("charset", String(v));
+  }
+  // `HTMLInputElement` / `HTMLTextAreaElement` `.maxLength`: a limited IDL
+  // attribute that reads as -1 when the content attribute is absent, not as an
+  // absent property. An `in`-check against the element is an environment probe,
+  // so the default matters as much as the reflection.
+  get maxLength() {
+    if (this.localName !== "input" && this.localName !== "textarea") return undefined;
+    const raw = this.getAttribute("maxlength");
+    if (raw === null) return -1;
+    const value = parseInt(raw, 10);
+    if (!isFinite(value)) return -1;
+    if (value < 0) return -1;
+    return value > 2147483647 ? 2147483647 : value;
+  }
+  set maxLength(v) {
+    if (this.localName !== "input" && this.localName !== "textarea") return;
+    const value = Number(v);
+    // The setter clamps into the limited-to-only-non-negative range; -1 and
+    // anything below it remove the attribute again.
+    if (!isFinite(value) || value < 0) this.removeAttribute("maxlength");
+    else this.setAttribute("maxlength", String(Math.min(Math.floor(value), 2147483647)));
+  }
+  // `HTMLOptionElement` `.index` / `.label` / `.defaultSelected`.
+  get index() {
+    if (this.localName !== "option") return undefined;
+    // The index is counted over the owning select's whole option list, so an
+    // option inside an optgroup still reports its position in the select.
+    let select = this.parentElement;
+    if (select && select.localName === "optgroup") select = select.parentElement;
+    if (!select || select.localName !== "select") return 0;
+    const options = select.options;
+    if (!options || typeof options.length !== "number") return 0;
+    for (let i = 0; i < options.length; i++) {
+      if (options[i] === this) return i;
+    }
+    return 0;
+  }
+  get label() {
+    if (this.localName !== "option") return undefined;
+    const raw = this.getAttribute("label");
+    if (raw !== null) return raw;
+    return (this.textContent || "").trim();
+  }
+  set label(v) {
+    if (this.localName === "option") this.setAttribute("label", String(v));
+  }
+  get defaultSelected() {
+    if (this.localName !== "option") return undefined;
+    return this.hasAttribute("selected");
+  }
+  set defaultSelected(v) {
+    if (this.localName === "option") this._reflectBooleanAttr("selected", v);
+  }
+  // `HTMLElement.translate` / `.inert` / `.contentEditable`. These live on the
+  // shared HTML element interface in a real browser, so they are guarded on the
+  // element being an HTML element rather than on one tag.
+  get translate() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    // Only the exact "no" state turns translation off; every other value
+    // (including a missing attribute) reads as true.
+    const raw = this.getAttribute("translate");
+    return raw === null || raw.toLowerCase() !== "no";
+  }
+  set translate(v) {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
+    this.setAttribute("translate", v ? "yes" : "no");
+  }
+  get inert() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    return this.hasAttribute("inert");
+  }
+  set inert(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml") {
+      this._reflectBooleanAttr("inert", v);
+    }
+  }
+  get contentEditable() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    const raw = this.getAttribute("contenteditable");
+    if (raw === null) return "inherit";
+    const value = raw.toLowerCase();
+    // The empty string and "true" are both the true state; anything that is not
+    // one of the four known states also reads as true.
+    if (value === "false") return "false";
+    if (value === "plaintext-only") return "plaintext-only";
+    return "true";
+  }
+  set contentEditable(v) {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
+    const value = String(v);
+    // The IDL setter maps the three keyword-ish inputs onto themselves and
+    // anything else onto "true", which is what the spec's reflecting setter
+    // does for this attribute.
+    const normalized = /^(true|false|inherit|plaintext-only)$/i.test(value)
+      ? value.toLowerCase() : "true";
+    this.setAttribute("contenteditable", normalized);
+  }
   get className() {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
@@ -290,7 +475,7 @@ class Element extends Node {
     if (n === "style") _cssStyleReplaceFromAttribute(this._style, value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
-      Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
+      _queueIframeNavigation(this[_nidSym]);
     }
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this[_nidSym], [], [], n);
     if (this.localName === "source"
@@ -333,7 +518,7 @@ class Element extends Node {
     if (n === "style") _cssStyleReplaceFromAttribute(this._style, "");
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
-      Deno.core.ops.op_queue_iframe_navigation(this[_nidSym]);
+      _queueIframeNavigation(this[_nidSym]);
     }
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {

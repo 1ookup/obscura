@@ -63,13 +63,59 @@ function registerStorageSurface() {
 }
 registerStorageSurface();
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => {
+// `btoa`/`atob` are byte-oriented: every code unit of the string is one byte,
+// and the decoded string is Latin-1. Encoding through TextEncoder instead
+// makes the pair look self-consistent (`atob(btoa(s)) === s` still holds) while
+// silently inflating every code unit above 0x7F to two bytes, so any binary
+// round trip through them -- a FileReader data URL, a JWK byte field, an
+// ECDSA/RSA key exported to Rust and back, a challenge payload decoded with
+// `Uint8Array.from(atob(x), c=>c.charCodeAt(0))` -- comes back the wrong
+// length and the wrong bytes.
+//
+// Measured against Chrome 152 on the bytes [0x41,0x80,0xA1,0xFF,0x42]:
+//   Chrome  btoa -> "QYCh/0I="        atob -> 5 bytes [65,128,161,255,66]
+//   before  btoa -> "QcKAwqHDv0I="    atob -> 8 bytes [65,194,128,...]
+// and `btoa('Ā')` throws InvalidCharacterError in Chrome, which a UTF-8
+// encoder cannot do because it never sees a code unit above 0xFF.
+globalThis.btoa = globalThis.btoa || ((data) => {
+  const s = String(data);
   const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let r="";
+  for(let i=0;i<s.length;i+=3){
+    const a=s.charCodeAt(i);
+    const hasB=i+1<s.length, hasC=i+2<s.length;
+    const b=hasB?s.charCodeAt(i+1):0, cc=hasC?s.charCodeAt(i+2):0;
+    if(a>0xff||b>0xff||cc>0xff){
+      throw new DOMException(
+        "Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",
+        "InvalidCharacterError");
+    }
+    r+=c[a>>2]+c[((a&3)<<4)|(b>>4)]+(hasB?c[((b&15)<<2)|(cc>>6)]:"=")+(hasC?c[cc&63]:"=");
+  }
+  return r;
+});
+globalThis.atob = globalThis.atob || ((data) => {
+  const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let s=String(data).replace(/[\t\n\f\r ]/g,"");
+  // `forgiving-base64 decode`: the padding is optional and is dropped before
+  // the length check, so "QQ" and "QQ==" both decode and "Q" does not.
+  if(s.length%4===0){
+    if(s.endsWith("=="))s=s.slice(0,-2);
+    else if(s.endsWith("="))s=s.slice(0,-1);
+  }
+  if(s.length%4===1){
+    throw new DOMException(
+      "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",
+      "InvalidCharacterError");
+  }
   const r=[];
-  s=String(s).replace(/[\t\n\f\r ]/g,"");
   for(let i=0;i<s.length;i+=4){
     const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]);
+    if(a<0||b<0||(i+2<s.length&&cc<0)||(i+3<s.length&&d<0)){
+      throw new DOMException(
+        "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",
+        "InvalidCharacterError");
+    }
     r.push((a<<2)|(b>>4));
     if(cc>=0)r.push(((b&15)<<4)|(cc>>2));
     if(d>=0)r.push(((cc&3)<<6)|d);

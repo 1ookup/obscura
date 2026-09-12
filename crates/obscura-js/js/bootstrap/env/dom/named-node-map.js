@@ -31,7 +31,14 @@ class NamedNodeMap {
     });
   }
   _names() {
-    return _domParse("attribute_names", this._element[_nidSym]) || [];
+    const names = _domParse("attribute_names", this._element[_nidSym]) || [];
+    // A nonce assigned through the IDL attribute lives in an internal slot in a
+    // real browser, so it is not part of the element's attribute list even
+    // though the native CSP nonce gate still reads the mirrored content
+    // attribute.
+    return _idlNonce.has(this._element)
+      ? names.filter((name) => name !== 'nonce')
+      : names;
   }
   _attr(name) {
     const value = this._element.getAttribute(name);

@@ -208,6 +208,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       body: body === null ? undefined : body, mode: 'cors',
       credentials: state.withCredentials ? 'include' : 'same-origin',
       signal: controller.signal,
+      // XHR rides the fetch entry point internally, but the resource it
+      // produces is not a fetch: PerformanceResourceTiming reports the API the
+      // page actually used, and CF reads back the initiatorType of its own
+      // submissions.
+      __obscuraInitiator: 'xmlhttprequest',
     }).then(async resp => {
       if (!state.sent || state.requestId !== requestId) return;
       state.status = resp.status; state.statusText = resp.statusText || '';

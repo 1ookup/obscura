@@ -35,8 +35,23 @@ globalThis.getComputedStyle = (el) => {
   // `'static'` for position, which made every list render 0 items. Pulling
   // width/height from the synthesized bounding rect makes those libraries
   // actually render content.
+  // Chrome answers `auto` for the offset properties of a static box. The
+  // synthesized rect only stands in for them once the box is positioned,
+  // otherwise every static element reported an offset resolved from its own
+  // border box, which no browser does and which a layout probe reads as a
+  // value the renderer invented.
+  const computedPosition = () => {
+    if (snapshot.rendered && typeof snapshot.rendered.position === 'string') {
+      return snapshot.rendered.position;
+    }
+    const authored = target.getPropertyValue ? target.getPropertyValue('position') : '';
+    return authored || 'static';
+  };
   const dimensionFor = (name) => {
     try {
+      const positioned = name !== 'left' && name !== 'top'
+        && name !== 'right' && name !== 'bottom';
+      if (!positioned && computedPosition() === 'static') return null;
       const r = el.getBoundingClientRect && el.getBoundingClientRect();
       if (!r) return null;
       switch (name) {
@@ -57,10 +72,17 @@ globalThis.getComputedStyle = (el) => {
     return null;
   };
 
+  // Longhands Chrome always resolves. Anything absent here fell through to
+  // `''`, which in CSSOM means "no such property", so a probe that read a
+  // supported property such as `font-style` or `word-spacing` was told the
+  // declaration does not exist. Only entries whose computed value is
+  // well known are listed; the renderer snapshot still wins when it has one.
   const defaultsKebab = {
     display: 'block', visibility: 'visible', opacity: '1',
     position: 'static', overflow: 'visible',
+    'overflow-x': 'visible', 'overflow-y': 'visible',
     transform: 'none', 'transform-origin': '0px 0px',
+    translate: 'none', rotate: 'none', scale: 'none',
     transition: 'none', animation: 'none',
     float: 'none', clear: 'none',
     margin: '0px', padding: '0px',
@@ -69,17 +91,49 @@ globalThis.getComputedStyle = (el) => {
     'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
     'letter-spacing': 'normal',
     'font-family': 'Times',
+    'font-style': 'normal', 'font-variant': 'normal', 'font-stretch': '100%',
+    'font-kerning': 'auto', 'font-feature-settings': 'normal',
+    'font-variation-settings': 'normal', 'font-optical-sizing': 'auto',
+    'font-size-adjust': 'none', 'font-synthesis': 'weight style small-caps',
     color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+    'background-image': 'none', 'background-repeat': 'repeat',
+    'background-position': '0% 0%', 'background-size': 'auto',
     'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
     'border-top-width': '0px', 'border-right-width': '0px',
     'border-bottom-width': '0px', 'border-left-width': '0px',
     'border-radius': '0px',
+    'border-collapse': 'separate', 'border-spacing': '0px',
     'z-index': 'auto', 'pointer-events': 'auto',
     'box-sizing': 'content-box', cursor: 'auto',
-    'white-space': 'normal', 'text-align': 'start',
+    'white-space': 'normal', 'text-align': 'start', 'text-align-last': 'auto',
+    'text-indent': '0px', 'text-transform': 'none', 'text-shadow': 'none',
+    'text-overflow': 'clip', 'text-rendering': 'auto',
+    'text-decoration-line': 'none', 'text-decoration-style': 'solid',
+    'text-decoration-color': 'rgb(0, 0, 0)', 'text-underline-offset': 'auto',
+    'text-underline-position': 'auto',
+    'word-spacing': '0px', 'word-break': 'normal', 'overflow-wrap': 'normal',
+    'line-break': 'auto', 'hyphens': 'manual', 'tab-size': '8',
+    'direction': 'ltr', 'unicode-bidi': 'normal', 'writing-mode': 'horizontal-tb',
+    'vertical-align': 'baseline',
+    'list-style-type': 'disc', 'list-style-position': 'outside', 'list-style-image': 'none',
+    'caption-side': 'top', 'empty-cells': 'show', 'table-layout': 'auto',
+    'left': 'auto', 'top': 'auto', 'right': 'auto', 'bottom': 'auto',
+    'min-width': 'auto', 'min-height': 'auto', 'max-width': 'none', 'max-height': 'none',
     'flex-flow': 'row nowrap', 'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
-    'justify-content': 'normal', gap: 'normal',
+    'align-self': 'auto', 'flex-grow': '0', 'flex-shrink': '1', 'flex-basis': 'auto',
+    'justify-content': 'normal', 'justify-items': 'legacy', 'justify-self': 'auto',
+    'order': '0', gap: 'normal', 'row-gap': 'normal', 'column-gap': 'normal',
     'grid-template-columns': 'none', 'grid-template-rows': 'none',
+    'aspect-ratio': 'auto', 'object-fit': 'fill', 'object-position': '50% 50%',
+    'image-rendering': 'auto', 'mix-blend-mode': 'normal', 'isolation': 'auto',
+    'box-shadow': 'none', 'filter': 'none', 'clip': 'auto', content: 'normal',
+    quotes: 'auto', resize: 'none', 'caret-color': 'auto', 'accent-color': 'auto',
+    'user-select': 'auto', 'touch-action': 'auto', 'scroll-behavior': 'auto',
+    'overscroll-behavior': 'auto', 'color-scheme': 'normal',
+    'content-visibility': 'visible', zoom: '1',
+    'outline-color': 'rgb(0, 0, 0)', 'outline-style': 'none', 'outline-width': '0px',
+    'fill': 'rgb(0, 0, 0)', stroke: 'none', 'stroke-width': '1px',
+    'vector-effect': 'none', d: 'none',
     'will-change': 'auto', 'backface-visibility': 'visible',
   };
 

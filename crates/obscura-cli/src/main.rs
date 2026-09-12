@@ -74,6 +74,31 @@ struct Args {
     #[arg(long, global = true, value_name = "FILE")]
     trace_api_file: Option<std::path::PathBuf>,
 
+    /// Shape of `--trace-api-file` records: `tsv` (default, one property
+    /// resolution per line) or `jsonl` (one `{t,src,name,args,result}` record
+    /// per API access, reads probed after the load so they carry their value).
+    #[arg(long, global = true, value_name = "FORMAT")]
+    trace_api_format: Option<String>,
+
+    /// Restrict `--trace-api-file` to matching names. Comma-separated
+    /// substrings of `Interface.member`; `+x` or a bare `x` includes, `-x`
+    /// excludes. Statically named accesses outside the include set emit no
+    /// probe at all, which is what keeps a traced challenge run affordable.
+    #[arg(long, global = true, value_name = "SPEC")]
+    trace_api_filter: Option<String>,
+
+    /// Add one JSON record per traced API call, carrying its arguments and
+    /// return value. Emitted at exit, so a call is one record rather than an
+    /// entry/return pair.
+    #[arg(long, global = true)]
+    trace_api_calls: bool,
+
+    /// Emit records for keyed (computed) property reads and writes, which can
+    /// only be filtered at runtime. On by default; `--trace-api-keyed off`
+    /// drops them, and with them the bulk of a page-internal trace.
+    #[arg(long, global = true, value_name = "on|off")]
+    trace_api_keyed: Option<String>,
+
     /// Legacy descriptor-monitor option (not supported by pinned V8 tracing).
     #[arg(long, global = true, value_name = "PATHS")]
     trace_api_ignore: Option<String>,
@@ -292,6 +317,14 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+/// Same precedence rule as [`merge_proxy`] for `--user-agent`. Without this the
+/// top-level spelling is parsed and then dropped, so `obscura --user-agent UA
+/// fetch URL` would silently present the default identity on both the wire and
+/// in `navigator.userAgent` while `obscura fetch URL --user-agent UA` honours it.
+fn merge_user_agent(global: Option<String>, command: Option<String>) -> Option<String> {
+    command.or(global)
+}
+
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
 /// Returns `None` when the user didn't pass the flag, passed an empty string,
 /// or passed only whitespace; in those cases V8 is left untouched.
@@ -400,6 +433,25 @@ fn configured_browser_locale(
     .find_map(|value| locale_for_browser_language(value).map(str::to_string))
 }
 
+/// The host's IANA timezone name, read from the `/etc/localtime` symlink.
+///
+/// `TZ` is normally unset on macOS and under launchd/CI, but the system zone is
+/// still on disk: `/etc/localtime` points into a `zoneinfo` tree whose relative
+/// path is the zone name (`/var/db/timezone/zoneinfo/Asia/Shanghai` on macOS,
+/// `/usr/share/zoneinfo/...` on Linux). Returning the host's own zone keeps the
+/// reported zone consistent with the platform and locale the process advertises.
+fn host_timezone() -> Option<String> {
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let text = target.to_string_lossy();
+    let zone = text
+        .find("zoneinfo/")
+        .map(|index| &text[index + "zoneinfo/".len()..])?;
+    if zone.is_empty() {
+        return None;
+    }
+    Some(zone.to_string())
+}
+
 fn configure_browser_locale() {
     let profile = obscura_net::fingerprint_overrides_from_env();
     let locale = configured_browser_locale(
@@ -453,9 +505,9 @@ async fn main() -> anyhow::Result<()> {
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
     // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
     // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
+    // zone, a cross-surface mismatch fingerprinting scripts flag. An existing TZ from
+    // the host is respected, then OBSCURA_TIMEZONE (set it to match the exit IP's
+    // region when the traffic egresses elsewhere), then the host's own zone.
     // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
     // effectively single threaded here.
     if let Some(tz) = std::env::var("OBSCURA_TIMEZONE")
@@ -467,7 +519,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else if std::env::var_os("TZ").is_none() {
         unsafe {
-            std::env::set_var("TZ", "Europe/Berlin");
+            std::env::set_var("TZ", host_timezone().unwrap_or_else(|| "UTC".to_string()));
         }
     }
     configure_browser_locale();
@@ -495,6 +547,51 @@ async fn main() -> anyhow::Result<()> {
         // functions or mutate browser objects.
         v8_flags.push_str(" --trace-property-lookup");
     }
+    // The trace's shape is configured through the environment rather than
+    // through V8 flags: the filter and record format are read where the probe
+    // runs, and every worker process inherits them.
+    if let Some(format) = args.trace_api_format.as_ref() {
+        let normalized = format.trim().to_ascii_lowercase();
+        if normalized != "tsv" && normalized != "json" && normalized != "jsonl" {
+            anyhow::bail!("--trace-api-format expects tsv or jsonl, got {format}");
+        }
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_FORMAT", normalized); }
+    }
+    if let Some(spec) = args.trace_api_filter.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_FILTER", spec); }
+    }
+    // `--eval` compiles the expression inside a fixed one-line wrapper, so a
+    // source position the trace reads from that script would be one line below
+    // the expression the caller wrote. Only that path needs the correction;
+    // every other entry point (page scripts, CDP evaluate) compiles the code
+    // as written and is left alone.
+    let eval_uses_wrapper = args
+        .command
+        .as_ref()
+        .is_some_and(|command| command_has_eval(command));
+    if std::env::var_os("OBSCURA_TRACE_API_FILE").is_some() && eval_uses_wrapper {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_EVAL_LINE_BIAS", "1"); }
+    }
+    if args.trace_api_calls {
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe { std::env::set_var("OBSCURA_TRACE_API_CALLS", "1"); }
+    }
+    if let Some(keyed) = args.trace_api_keyed.as_ref() {
+        let normalized = keyed.trim().to_ascii_lowercase();
+        if normalized != "on" && normalized != "off" {
+            anyhow::bail!("--trace-api-keyed expects on or off, got {keyed}");
+        }
+        // SAFETY: configured before any V8 isolate or worker starts.
+        unsafe {
+            std::env::set_var(
+                "OBSCURA_TRACE_API_KEYED",
+                if normalized == "on" { "1" } else { "0" },
+            );
+        }
+    }
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
     if let Some(path) = args.trace_op_file.as_ref() {
@@ -518,6 +615,7 @@ async fn main() -> anyhow::Result<()> {
     // Keep the top-level spelling usable when the command-local optional
     // field is absent (`obscura --storage-dir DIR fetch ...`).
     let global_storage_dir = args.storage_dir.clone();
+    let global_user_agent = args.user_agent.clone();
     let stealth = args.stealth;
 
     match args.command {
@@ -541,6 +639,7 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
             });
             let storage_dir = storage_dir.or_else(|| global_storage_dir.clone());
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -594,6 +693,7 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             screenshot,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -677,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
             user_agent,
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
             } else {
@@ -736,6 +837,22 @@ async fn run_multi_worker_serve(
         }
         if let Some(path) = std::env::var_os("OBSCURA_TRACE_API_FILE") {
             cmd.env("OBSCURA_TRACE_API_FILE", path);
+        }
+        // The record shape and filters travel with the file they apply to;
+        // without them a worker would write default-shaped records into the
+        // same trace.
+        for name in [
+            "OBSCURA_TRACE_API_FORMAT",
+            "OBSCURA_TRACE_API_FILTER",
+            "OBSCURA_TRACE_API_CALLS",
+            "OBSCURA_TRACE_API_KEYED",
+            "OBSCURA_TRACE_API_ENGINE_CALLS",
+            "OBSCURA_TRACE_LIMIT",
+            "OBSCURA_TRACE_EVAL_LINE_BIAS",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -1651,6 +1768,15 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
     result
 }
 
+/// Whether this run evaluates caller-supplied JS through the CLI's expression
+/// wrapper (`--eval`). See the trace line bias in `main`.
+fn command_has_eval(command: &Command) -> bool {
+    match command {
+        Command::Fetch { eval, .. } | Command::Scrape { eval, .. } => eval.is_some(),
+        _ => false,
+    }
+}
+
 async fn run_parallel_scrape(
     urls: Vec<String>,
     eval: Option<String>,
@@ -2057,7 +2183,8 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        configured_browser_locale, locale_for_browser_language, merge_proxy, normalize_v8_flags,
+        configured_browser_locale, locale_for_browser_language, merge_proxy, merge_user_agent,
+        normalize_v8_flags,
         read_urls_from_file,
         resolve_asset_url, resolve_v8_flags,
         select_log_filter,
@@ -2691,6 +2818,40 @@ mod tests {
         let proxy = merge_proxy(Some("http://global.example:8080".to_string()), None);
 
         assert_eq!(proxy.as_deref(), Some("http://global.example:8080"));
+    }
+
+    #[test]
+    fn command_user_agent_overrides_global_user_agent() {
+        let user_agent = merge_user_agent(
+            Some("GlobalUA/1.0".to_string()),
+            Some("CommandUA/2.0".to_string()),
+        );
+
+        assert_eq!(user_agent.as_deref(), Some("CommandUA/2.0"));
+    }
+
+    #[test]
+    fn global_user_agent_is_used_when_command_user_agent_is_absent() {
+        let user_agent = merge_user_agent(Some("GlobalUA/1.0".to_string()), None);
+
+        assert_eq!(user_agent.as_deref(), Some("GlobalUA/1.0"));
+    }
+
+    #[test]
+    fn global_user_agent_reaches_fetch_from_the_top_level_spelling() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--user-agent",
+            "GlobalUA/1.0",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept the top-level --user-agent");
+
+        assert_eq!(
+            merge_user_agent(args.user_agent.clone(), None).as_deref(),
+            Some("GlobalUA/1.0")
+        );
     }
 
     #[test]

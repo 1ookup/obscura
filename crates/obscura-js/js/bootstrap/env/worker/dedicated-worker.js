@@ -118,9 +118,24 @@ function _workerSerializeMessage(data) {
 }
 
 globalThis.Worker = class Worker {
+  // IDL event-handler attributes live on the prototype, like Chrome's
+  // Worker.prototype. An own data property per instance would show up in
+  // Object.keys(worker) and in the own-property descriptor, which a Worker
+  // created by a challenge script is exactly the sort of place gets read.
+  get onmessage() { return this._handlers.message; }
+  set onmessage(fn) {
+    this._handlers.message = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+  }
+  get onmessageerror() { return this._handlers.messageerror; }
+  set onmessageerror(fn) {
+    this._handlers.messageerror = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+  }
+  get onerror() { return this._handlers.error; }
+  set onerror(fn) {
+    this._handlers.error = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+  }
   constructor(url, options) {
-    this.onmessage = null;
-    this.onerror = null;
+    this._handlers = { message: null, messageerror: null, error: null };
     this._listeners = {};
     this._terminated = false;
     this._id = null;
@@ -356,4 +371,54 @@ URL.revokeObjectURL = function(url) {
   delete globalThis.__blobBytesStore[url];
   delete globalThis.__blobTypeStore[url];
 };
+
+// The text of a script-created blob document, or null when this realm's blob
+// URL store has no entry for the URL. This is the same store fetch() and XHR
+// read, so a frame navigation and a fetch of one URL agree on the bytes.
+function _blobDocumentText(url) {
+  const store = globalThis.__blobStore;
+  if (!store) return null;
+  const text = store[url];
+  if (typeof text === 'string') return text;
+  const bytes = globalThis.__blobBytesStore && globalThis.__blobBytesStore[url];
+  if (bytes) { try { return new TextDecoder().decode(bytes); } catch (e) {} }
+  return null;
+}
+
+// Chrome serves a blob URL with the type the Blob was created with and does
+// not sniff a frame document: `text/html` renders, an empty or `text/plain`
+// type lands in the plain-text viewer, and any other type is treated as a
+// download with the frame left at about:blank. The engine has one
+// frame-document parser (HTML), so only the HTML type is resolved here and
+// every other type keeps the previous behaviour, which is also Chrome's for
+// a non-renderable type.
+function _blobDocumentIsHtml(url) {
+  const type = (globalThis.__blobTypeStore && globalThis.__blobTypeStore[url]) || '';
+  return type.split(';')[0].trim().toLowerCase() === 'text/html';
+}
+
+// Hand a `blob:` frame navigation to the loader as an inline document.
+// Returns false when the URL is not an HTML blob document of this realm, in
+// which case the caller falls through to the ordinary navigation path. The
+// lookup is realm-local on purpose: a frame's blob documents come from that
+// frame's own store, which is what keeps a cross-origin embed from reaching
+// the embedder's.
+function _queueBlobIframeDocument(hostNid, url) {
+  if (typeof url !== "string" || !url.startsWith("blob:")) return false;
+  if (!_blobDocumentIsHtml(url)) return false;
+  const text = _blobDocumentText(url);
+  if (text === null) return false;
+  Deno.core.ops.op_navigate_iframe_blob(hostNid, url, text);
+  return true;
+}
+
+// Queue an iframe's src/srcdoc navigation. Every entry point that sees an
+// iframe src change, or a newly connected iframe, goes through here so a blob
+// document is resolved in one place.
+function _queueIframeNavigation(hostNid) {
+  let src = null;
+  try { src = _domParse("get_attribute", hostNid, "src"); } catch (e) {}
+  if (_queueBlobIframeDocument(hostNid, src)) return;
+  Deno.core.ops.op_queue_iframe_navigation(hostNid);
+}
 

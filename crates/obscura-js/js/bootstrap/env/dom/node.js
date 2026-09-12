@@ -5,6 +5,20 @@
 // browser custom-element implementations.
 const _customElementConstructionStack = [];
 
+// Elements whose `nonce` was assigned through the IDL attribute. Chrome keeps
+// that value in an internal slot: the content attribute is never created or
+// updated, so `getAttribute("nonce")` stays null and the attribute is absent
+// from `attributes`. The native CSP nonce gate still reads the content
+// attribute, so the setter mirrors the value there and this map is what tells
+// the JS-visible attribute surface to hide it.
+const _idlNonce = new WeakMap();
+
+// Scripts whose `async` was explicitly assigned `false`. A non-parser-inserted
+// classic script is force-async unless the page opted out this way, and once
+// `async` reflects the content attribute the opt-out can no longer be read
+// back from the element.
+const _scriptAsyncOptOut = new WeakSet();
+
 function __prepareInsertedScript(script) {
   if (!Deno.core.ops.op_script_try_start(script[_nidSym])) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
@@ -110,9 +124,7 @@ function __prepareInsertedScript(script) {
     // explicitly assigned `.async = false`. Keep that opt-out in insertion
     // order; default/async=true scripts fetch concurrently and execute as soon
     // as each response is ready.
-    const explicitlyInOrder = !isModule
-      && Object.prototype.hasOwnProperty.call(script, 'async')
-      && script.async === false;
+    const explicitlyInOrder = !isModule && _scriptAsyncOptOut.has(script);
     if (!isModule) {
       // Fetch all dynamically inserted classics immediately. `async=false`
       // changes only execution order: browsers still overlap their network
@@ -159,7 +171,7 @@ function __prepareInsertedSubtree(root) {
   if (!root || !root.isConnected) return;
   if (root.nodeType === 1 && root.localName === 'iframe') {
     _dom("create_blank_iframe_document", root[_nidSym]);
-    Deno.core.ops.op_queue_iframe_navigation(root[_nidSym]);
+    _queueIframeNavigation(root[_nidSym]);
   }
   // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
   // so an iframe inside a shadow root -- how widget embeds are built, Turnstile
@@ -169,7 +181,7 @@ function __prepareInsertedSubtree(root) {
   const iframeIds = _domParse("iframe_hosts_including_shadow", root[_nidSym], "") || [];
   for (const nid of iframeIds) {
     _dom("create_blank_iframe_document", +nid);
-    Deno.core.ops.op_queue_iframe_navigation(+nid);
+    _queueIframeNavigation(+nid);
   }
   _syncWindowFrameIndices();
   const scripts = [];

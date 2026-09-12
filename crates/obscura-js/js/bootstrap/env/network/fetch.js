@@ -33,7 +33,7 @@ const _FETCH_REDIRECT_MODES = new Set(['follow', 'error', 'manual']);
 // Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
 function _serializeBody(initBody, headers) {
-  if (initBody == null || initBody === '') return '';
+  if (initBody == null) return '';
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
     headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
@@ -61,7 +61,20 @@ function _serializeBody(initBody, headers) {
     let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return s;
   }
-  return typeof initBody === 'string' ? initBody : String(initBody);
+  if (typeof initBody === 'string') {
+    // Fetch's "extract a body" gives a USVString body the type
+    // `text/plain;charset=UTF-8` when the caller set no Content-Type of its
+    // own; XMLHttpRequest's send() specifies the same default for a string.
+    // Without it the request goes out with no Content-Type at all, which is
+    // not what a browser sends and which endpoints that key off the header
+    // (Cloudflare's challenge /fo/ POST among them) read as a different
+    // request than the one the page meant to make.
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'text/plain;charset=UTF-8';
+    }
+    return initBody;
+  }
+  return String(initBody);
 }
 
 globalThis.fetch = async (input, init = {}) => {
@@ -203,7 +216,12 @@ globalThis.fetch = async (input, init = {}) => {
     const bodySize = responseBody && Number.isFinite(responseBody.byteLength)
       ? responseBody.byteLength : String(parsed.body || '').length;
     _recordFetchResourceTiming(
-      { ...parsed, url: parsed.url || url }, 'fetch', performanceStart, pageOrigin, bodySize);
+      { ...parsed, url: parsed.url || url },
+      // `init` is the page's own dictionary plus the internal marker XMLHttpRequest
+      // sets, so the entry names the API the page used rather than the entry point
+      // both of them share.
+      init.__obscuraInitiator === 'xmlhttprequest' ? 'xmlhttprequest' : 'fetch',
+      performanceStart, pageOrigin, bodySize);
   }
   return response;
 };

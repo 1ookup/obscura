@@ -8217,3 +8217,335 @@ trace 轮单独启用 `--trace-api-file` 和 `--trace-op-file`，不以其时序
 `Asia/Shanghai`。指定 URL 的 clean 轮仍未得到目标真实 `POST /1.txt -> 404`，所以不能宣称过盾；
 当前剩余差异是 proof payload 的动态资源/DOM/字体/渲染字段与 Cloudflare 服务端判定。`/ci/`、
 postMessage 接收和 Origin header 均已有正向证据，不再作为当前根因继续修改。
+
+### Step 246 - HaHaVM-General 直连 `/123.txt` 对拍（2026-09-10，完成）
+
+**假设**：HaHaVM-General 的通用 dispatch trace、挑战编排和 Cookie 复用是否能在不使用上游代理的情况下完成一次可验证的源站访问，需要用同一测试 URL 做独立对拍。
+
+**方法与证据**：在 `/Volumes/ZHITAI/projects/HaHaVM-General` 使用 Chrome-emulation TLS 客户端的 direct 模式访问 `https://www.thelancet.com/123.txt`，代理参数为 `direct`，无外部代理。挑战执行产生目标站 `cf_clearance`，随后带 Cookie 重新 GET 同一 URL。运行目录为 `/tmp/hahavm-thelancet-wreq-direct-20260910-013407`；stderr 记录完整请求序列，最终复访 `状态码 : 404`，响应体为 `Missing resource /123.txt`。
+
+**trace 校验**：`trace.jsonl` 共 **33,811** 条记录，JSONL 无损坏行，覆盖 **828** 个 API 名称，其中 **6,002** 条来源栈来自 `www.thelancet.com/123.txt`。日志同时记录目标站 clearance 捕获与最终 404；未发现复访挑战页。
+
+**结论**：HaHaVM-General 本轮满足直连、取得 CK、携带 CK 得到真实源站 404、trace 可读完整的对拍判据。该结果证明 HaHaVM-General 的路径，不改变 Obscura 当前 `/1.txt` 仍未得到 404 的状态；两者不能互相替代。
+
+### Step 247 - HaHaVM 窗口指标对拍与 Obscura 修复（2026-09-10，部分完成）
+
+**假设**：HaHaVM-General 成功 trace 读取 `window.screenX=674`、`screenY=25`；Obscura 在加载 fingerprint profile 后仍可能因 viewport override 将宿主窗口位置回退为零，造成 proof 环境差异。
+
+**修复**：`page-init.js` 现在独立应用 fingerprint 的 `outerWidth/outerHeight/screenX/screenY`，viewport override 只控制 CSS viewport 和 screen 尺寸。新增 `viewport_override_preserves_fingerprinted_window_placement` 回归，验证 `1024x768` viewport 下仍暴露 `2309x1326`、`674,25` 窗口指标。
+
+**证据与限制**：focused nextest 通过，修复后二进制加载 profile 后确实返回 `screenX=674/screenY=25`。使用该 profile 直连真实 `/123.txt` 仍完成 top proof 并换 ray，没有真实 404；因此窗口指标缺陷已闭环，但不是当前唯一的 Cloudflare proof 判定差异。
+
+### Step 248 - HaHaVM TextEncoder CSS map A/B（2026-09-10，证据完成）
+
+**假设**：HaHaVM-General 的 CF 外置补丁将 `TextEncoder.encode("{}")` 替换为 1,150 项 CSS property map；该值级差异可能导致 Obscura 的 proof 被拒绝。
+
+**方法与证据**：只通过 `Page.addScriptToEvaluateOnNewDocument` 临时注入从 HaHaVM-General 提取的 exact CSS map，关闭 shadow/message 探针，使用直连、HaHaVM 窗口画像和固定点击。Obscura 仍完成 widget `/fo`、PAT、frame proof 和 top proof；top proof 为 3240B、返回 200 并写入 clearance，随后页面换 ray，未出现真实 `/123.txt` 404。
+
+**结论**：单独迁移 TextEncoder CSS map 不能使 Obscura 通过 Cloudflare；该补丁不进入通用引擎，剩余差异继续限定在动态 DOM、字体、渲染和整体 proof payload。
+
+### Step 249 - 正确 timezone 与完整 UA-CH 画像复测（2026-09-10，证据完成）
+
+**假设**：旧 Obscura payload 中 `Europe/Berlin`、英文 Intl、`Chrome/149.0.0.0 + Not A Brand/99` 与 Chrome 参考的 `Asia/Shanghai`、中文 Intl、`Chromium/149.0.7827.0 + Not)A;Brand/24` 差异，可能是 proof 被拒绝的直接原因。
+
+**方法与证据**：使用完整 fingerprint overrides（语言、UA-CH、版本、arm/64、硬件 6/16、DPR1、screen/outer/window metrics）和 `OBSCURA_TIMEZONE=Asia/Shanghai` 直连 `/123.txt`。Obscura 的 initial/widget/proof 请求均完成，top proof 返回 200 并写入 clearance；随后仍回到新的 `chl_page`，没有真实 404。
+
+**结论**：timezone、Intl、UA-CH 和窗口画像已与参考 profile 对齐，但未改变 Cloudflare 最终判定；这些差异已排除为唯一阻断。
+
+### Step 250 - HaHaVM Chrome148 TLS platform A/B（2026-09-10，证据完成）
+
+**假设**：HaHaVM-General 的 `wreq::Emulation::Chrome148` 使用默认 Windows platform，而 Obscura stealth client 明确使用 MacOS platform；TLS/HTTP2 指纹差异可能解释 HaHaVM 成功而 Obscura proof 被拒绝。
+
+**方法与证据**：临时将 Obscura stealth emulation platform 改为 Windows，保持 Chrome149 macOS UA、完整 UA-CH/profile、Asia/Shanghai timezone 和直连请求。真实 challenge 仍完成 proof 链并回到 challenge，没有 `/123.txt` 404。
+
+**结论**：TLS platform 不是当前唯一阻断；临时改动已恢复，Obscura 保持 MacOS platform 与显式 UA 一致。
+
+### Step 251 - HaHaVM 无点击成功轮 + payload 语义对拍 + 请求序列定点（2026-09-11，证据完成）
+
+**假设**：HaHaVM-General 能过，Obscura 不能过。此前对拍的观测契约不对称（HaHaVM 有 dispatch 级
+方法 trace，Obscura 只有 property/host-op），无法逐字段比。本轮先用同一代理把 HaHaVM 跑成**可复现
+的参考基线**，再把两边**提交前的明文 payload** 归一化后逐桶对比，最后用 `RUST_LOG=obscura_js=debug`
+拿到 Obscura 完整的请求/响应序列。
+
+**方法与证据**
+
+1. **HaHaVM 参考基线可复现**：`TLS_SERVER=http://127.0.0.1:3001/forward node examples/cloudflare/index.js
+   'https://www.thelancet.com/1.txt' 'http://192.168.3.57:9000' 'http://127.0.0.1:3001/forward'`，
+   连跑 3 次均在 11–13s 内捕获 `cf_clearance`（`token 到手`），首次直连复访 `状态码: 404`、
+   响应体 `Missing resource /1.txt`。落盘 `/tmp/cf-run/haha-trace.jsonl`（33,531 条 dispatch 记录）、
+   `/tmp/cf-run/haha-console.jsonl`（812 条，含 3 条 `payloadJSON:` 明文）。
+2. **Obscura 基线**：同一代理、同 URL，`--stealth`。拿到 CK 前的请求序列与 payload 结构与 HaHaVM 同构，
+   但最终停在挑战页，无 404。
+3. **payload 逐桶对拍**（`/tmp/cf-run/payload-semantic-diff.md`、`payload-semantic-map.json`）：
+   两边 payload 的 **91 个随机键名完全一致**（同一 challenge variant），可逐键对比。关键方法学结论：
+   **数字桶索引 1..38 不是标识**，只有 `1/2/3` 保持下标，`6..38` 是置换、`4`/`5` 整体互换；
+   必须按**桶内字段名集合**对齐，否则会产生约 120 条幻影"缺失"差异（旧的 `payload-diff.txt` 即踩此坑）。
+   语义来源三条：CF 自带的 `2.gsLi5` 反查索引（值 → 环境表达式）、对 HaHaVM trace 全部字符串做哈希求原像、
+   以及 trace 值连接。已确认 7 个框架字段含义，其中 `hCfV6` = 采集器耗时 ms（`TPpkV4 − Vtvy6 == hCfV6` 全量成立）。
+4. **结构性差异只有两类**：`4/5` 桶缺 `vqXep1: True`、缺 `neil9`（attestation 返回的 token），
+   以及 `tQcZu4` 取值 `timeout`(H) / `fetch_error`(O)。值差异 300+ 条，绝大多数是身份（平台/UA/语言/
+   GPU/屏幕）与每次挑战不同的签名 token、epoch 时间戳、采集器耗时。
+5. **身份差异被排除**：用 HaHaVM 的完全一致身份复跑 Obscura（`--user-agent` Windows Chrome 148 +
+   `OBSCURA_LANGUAGE=en-US` + `OBSCURA_TIMEZONE=UTC`），payload 的 `zIyO8` 变成
+   `{platform: Win32, languages: [en-US], hw: 8, mem: 8, UA: Chrome/148}`，与 HaHaVM 一致；
+   结果**仍停在挑战页**。同理，用 Chrome HAR 参考的 macOS Chrome 149 + zh-CN 身份也失败。
+6. **`/pat/ 401` 与 brunhild 失败均被证伪为阻塞点**：Chrome HAR 第 8 条 `/g/pat/` 是 **401**、
+   第 7 条 brunhild `/g/i/` 是 **502**，Chrome 仍然在第 11 条拿到 `cf_clearance` 并在第 12 条得到
+   `POST /1.txt → 404`。所以这两项不是判据。
+7. **请求序列定点（决定性）**：`RUST_LOG=obscura_js=debug` 下 Obscura 完整发生 7 次 JS fetch/XHR，
+   与 Chrome 12 条序列逐条对齐后，**少的正好是最后三跳**：
+
+   | Chrome # | 步骤 | Obscura |
+   |---|---|---|
+   | 1–8 | 403 → chl_page → api.js → **顶层 fo** → rch iframe → **widget fo** → brunhild 502 → pat 401 | 均已发出，顺序一致 |
+   | 9 | `ci` 图片 | **未观察到** |
+   | 10 | widget `fo` 第 2 次 | 已发出（t≈12.0s，响应 200） |
+   | 11 | **顶层 `fo` 第 2 次** | **缺失** |
+   | 12 | `POST /1.txt → 404` | **缺失** |
+
+   关键：**`cf_clearance` 只在第 11 条（第二次顶层 `fo`）的 `set-cookie` 里下发**（Chrome HAR 12 条里
+   仅第 11 条带 `cf_clearance`）。Obscura 从不发第 11 条，因此永远拿不到 clearance，也不会出现第 12 条。
+   `Network.getAllCookies` 在该轮返回 **0 个 cookie**，与此自洽。
+8. **响应体量对比（第二次 widget `fo`）**：Chrome 第 9 条响应（`cf-chl-out` / `cf-chl-out-s`，成功态）
+   解码后 **7,164 B**；Obscura 对应请求响应 **127,240 B**（即又被塞回一份挑战产物）。两侧第一次
+   widget `fo` 的响应体量是接近的（Chrome 845,852 B / Obscura 823,080 B），说明只有**proof 这一跳**
+   被判失败。
+9. **观测盲区（必须记住）**：Obscura 的 CDP `Network` 域对 JS fetch/XHR **完全不报**（只报 doc 级），
+   且 `page.rs` 两处 `NetworkEvent` 构造点写死 `headers: HashMap::new()`，因此经 CDP 拿不到任何请求头；
+   `getResponseBody` 对 `fetch-N` 也失败。任何"Obscura 没发某个请求"的结论都必须改用
+   `RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` / `stealth_fetch request|completed` 行来证伪。
+
+**结论**：HaHaVM 参考基线可复现；两边 payload 结构同构（唯一结构差异是 HaHaVM 的 attestation 成功
+产物 `neil9`/`vqXep1`，而 Chrome 在 `/pat/ 401` 下也能过，故非判据）；身份差异已用 A/B 排除。
+当前**唯一可量化的分叉**是：CF 对 Obscura 的 **widget proof 请求**返回 127KB 的再挑战产物（Chrome 为
+7KB 成功产物），导致顶层第二次 `fo` 与最终 `POST /1.txt` 双双不发生。下一步应把该 proof 请求的
+**出站请求头与请求体**与 Chrome HAR 第 9 条逐字段对比，而不是继续在环境值上做无证据的改动。
+
+### Step 252 - 反机器人探测面暴露的常量桩与通用修复（2026-09-11，代码完成 / 真实 404 未达成）
+
+**假设**：既然 CF 对 HaHaVM 的假环境照收，环境**取值**本身不构成判据；能构成判据的是
+「真实浏览器绝不会产生的值」，其中最典型的一类是把测量结果写成常量的桩。逐字段对拍
+（`/tmp/cf-run/payload-semantic-diff.md`）里 `12.kRQwh3`/`oSIr8`/`RKUE0` 三个摘要都是
+`sha256('0')`，而在 HaHaVM 的 trace 里对同一批数字求原像得到 `sha256('888')`、
+`sha256('0.00888')`、`sha256('5271.15673828125')` —— 说明 Obscura 侧三个测量全部返回 0。
+
+**证据（定位）**：在 `haha-trace.jsonl` 中反查 `888` 的产出者，命中
+`{"t":10386,"name":"SVGSVGElement.getComputedTextLength","result":"888"}`。而 Obscura 的实现在
+`crates/obscura-js/js/bootstrap/env/media/canvas.js` 把整组 SVG 测量写死：
+
+```js
+Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
+Element.prototype.getComputedTextLength = function() { return 0; };
+Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
+Element.prototype.getSubStringLength = function(ch, len) { return 0; };
+```
+
+CF 的字体/文本探针正是走 `SVGSVGElement.getComputedTextLength()`，恒返回 0 等于告诉对方
+「这个环境不渲染文本」。
+
+**修复（通用，无站点特判）**：改为走同一个文本引擎（`_measureTextBox` → `op_canvas_text_metrics`，
+与 `canvas.measureText`、元素布局同源），并按元素自身的计算字体（`getComputedStyle` 的
+style/weight/size/family）测量；`getBBox` 返回文本框，`getSubStringLength` 按子串，
+`getExtentOfChar` 按单字符。
+
+**量化结果**：修复后同一轮 payload 的三个摘要里 `kRQwh3`/`oSIr8` 已从 `sha256('0')`
+变为真实测量摘要（`b080ab48…`、`f9c1b64e…`），`RKUE0` 仍为 `sha256('0')`（第三个探针仍未定位）。
+独立测量页确认 API 恢复真实值：`svg.getComputedTextLength()=574.4375`、
+`text.getBBox()=[0,-14,574.4375,17]`、`getSubStringLength(0,10)=101.34375`、
+`canvas.measureText()=574.4375`、隐藏容器内 `574.4375`、`display:none` 的 SVG `277.34375`。
+
+**同轮一并落地的其它通用修复**（均由 Chrome HAR / HaHaVM 双向证据支撑）：
+
+1. **字符串 body 缺 `Content-Type`**：`_serializeBody` 对 USVString body 不设 Content-Type，
+   而 Fetch 规范要求 `text/plain;charset=UTF-8`，Chrome 四个 `/fo/` 全带，HaHaVM 的
+   `XMLHttpRequest_send` 也显式写死该值。修复后 MITM 抓包确认三个 `/fo/` POST 均已带上。
+2. **旧版 Client Hints 头**：CF 的 `Accept-CH`/`Critical-CH` 同时列出 `Sec-CH-UA-*` 与改名前的
+   `UA-*`；真实 Chrome 149（HAR 实证）只发 `Sec-CH-UA-*` 并忽略旧名，而 Obscura 两个都发，
+   凭空多出 8 个真 Chrome 永不发送的头（`ua`、`ua-arch`、`ua-bitness`、`ua-full-version`、
+   `ua-full-version-list`、`ua-model`、`ua-platform`、`ua-platform-version`）。已改为只应答
+   `Sec-CH-UA*` 名，`client_hint_value` 不再映射旧别名；`obscura-net` 102/102 通过。
+3. **`fetch` 路径丢弃页面发起的导航**：`op_navigate` 只入队，消费点只有 CDP 的两处
+   （`Runtime.evaluate` 之后、CDP 点击之后）。`obscura fetch` 在 settle 期间由脚本触发的
+   `location.href=`/`form.submit()` 因此永远不提交。已在 `Page::settle` 与 `settle_for_duration`
+   的循环里排空 `pending_navigation`（新增 `has_pending_navigation` 窥视接口，不消费队列）。
+   受控验证：本地表单页 `fetch --eval 'form.submit()'` 修复前只有 `GET /t.html`，修复后有
+   `POST /t.html len=23 body=b'probe_field=probe_value'`。这是拿到最终 404 的必经一步。
+4. **跨 realm Error 的 console 呈现**：`tools/dom-query.js` 用 `a instanceof Error` 判定，
+   跨 realm（iframe / 挑战自己的 realm）的 Error 落空并降级成 `[object Error]`，丢掉
+   `.message`/`.stack`。改为品牌判定 `Object.prototype.toString.call(a) === '[object Error]'`
+   ——与旁边那段「只读 Symbol.toStringTag，不触发探测 getter」的既有安全推理一致。
+
+**门禁**：`obscura-net` 102/102、`obscura-browser` 124/124、`obscura-js` 597/597 通过；
+release render build 通过。workspace 全量与 trace check 见下一步。
+
+**结论**：本轮把反机器人探测面上「常量即指纹」的一类缺陷（SVG 文本测量）、请求头保真
+（Content-Type、旧版 CH）、以及最终导航通路（fetch 路径排空）修掉，并全部有双向证据。
+但**真实 `/1.txt` 404 仍未取得**：widget proof 请求的响应依然是 `cf-chl-gen`（再挑战，
+127,232 B），而 Chrome 同一跳是 `cf-chl-out`（成功，7,164 B）。已确证 CF 看到的是代理
+转发后的 HTTP 层（代理本身是 MITM），因此判据只能来自请求头或请求体；请求头现已与
+Chrome 仅剩 `priority: u=1, i`、`sec-fetch-storage-access: active` 两项差距。
+
+### Step 253 - 反机器人探测面第二批通用修复（2026-09-11，代码完成 / 真实 404 仍未达成）
+
+**方法**：对 JS 环境层做「本该返回真实值却写死成常量/空值」的系统审计（静态扫描 + 本地最小页面
+逐接口 A/B），修掉其中能成为「真实浏览器绝不会产生的值」的那一类。
+
+**修复（均为通用，无站点特判）**
+
+1. **`getComputedStyle` 对约 128 个标准属性返回 `''`**（`env/css/computed-style.js` 的
+   `defaultsKebab` 只有约 50 项，未命中即 `return ''`）。`''` 在 CSSOM 里表示「没有这个属性」，
+   于是一个读 `font-style`/`word-spacing`/`text-indent`/`vertical-align`/`text-transform`/
+   `list-style-type`/`flex-grow`/`aspect-ratio` 等字体与文本布局属性的探针会被告知该属性不存在。
+   已把表补到 Chrome 的计算初始值（`word-spacing: 0px`、`text-indent: 0px`、`vertical-align: baseline`、
+   `font-style: normal`、`font-stretch: 100%`、`list-style-type: disc` 等），并加入
+   `overflow-x/y`、`min/max-width/height`、`flex-*`、`object-fit`、`touch-action`、`color-scheme`、
+   `content-visibility`、`text-shadow`、`outline-*`、`fill/stroke` 等一批。
+2. **`position: static` 元素的 `top/left/right/bottom`** 被解析成 `rect` 偏移（Chrome 返回 `auto`）。
+   现在只在非 static 时用 rect，否则回落到 `defaultsKebab` 的 `auto`。
+3. **性能条目缺 `Symbol.toStringTag`**：`PerformanceEntry`/`Mark`/`Measure`/`ResourceTiming`/
+   `NavigationTiming`/`PaintTiming`/`Observer` 等是真实 JS class，不在宿主品牌步骤里，
+   于是 `String(entry)` 是 `[object Object]` 而 `constructor.name` 正确 —— 这一对组合任何浏览器都不产生。
+   已加入 `config/webidl-branding.js` 名单（仓库自己的 Chrome 表 `surface-finalize.js` 早已声明应有 tag）。
+4. **`SVGTextContentElement` 的逐字符位置 API 全部缺失**：`getNumberOfChars`、
+   `getStartPositionOfChar`、`getEndPositionOfChar`、`getRotationOfChar`、`getCharNumAtPosition`
+   在 Obscura 是 `undefined`，一个按字符遍历文本的探针（挑战正是这样构造它的递增位置列表）
+   会收到空列表。已用同一文本引擎（`_measureTextBox` → `op_canvas_text_metrics`）按前缀
+   advance 累加实现，并随 `canvas.js` 里已有的四个测量方法一起暴露；接口本身由最后一个
+   manifest 模块安装，所以安装点放在 `config/webidl-branding.js`。
+   验证：`getStartPositionOfChar(0..3)` = `[[0,0],[10.67,0],[21.34,0],[32.9,0]]`，`getNumberOfChars()=8`。
+
+**同轮证伪（保留，避免重走）**
+
+- **`document.referrer` 不是缺陷**：Obscura 的 frame realm 正确返回嵌入文档 URL
+  （实测 `FRAMERef = 父页 URL`，srcdoc 帧亦然，顶层直连为 `''`）。payload 里 top 为 `''` 是正确值。
+- **`document.compatMode` 不是缺陷**：CF 的 403 挑战页首行是 `<!DOCTYPE html>`，标准模式，
+  Obscura 的 `CSS1Compat` 正确，HaHaVM 的 `BackCompat` 才是伪造值。
+- **字体集与平台不一致不是判据**：HaHaVM 用 Windows UA + 纯 macOS 字体列表照样通过，
+  该类别的不一致 CF 并不拒绝。
+- **`/ci/` 与顶层 `fo` 次数不是判据**：`/ci/` 6 轮中随机出现 2 轮，有无 `/ci/` 的轮次同样失败；
+  第二次顶层 `fo` 是 proof 通过后的结果而非原因。
+- **`cf-chl` 复用正确**：同一 URL 的两次 POST 逐字节相同，且等于 URL 末段与 brunhild 路径段。
+
+**门禁**：`obscura-net` 102/102、`obscura-browser` 124/124、`obscura-js` 597/597、workspace
+`1784/1784`（4 skipped）通过；release render build 通过。
+
+**仍未闭环**：真实 `/1.txt` 仍无 404。CF 对 widget proof 的响应始终是 `cf-chl-gen`
+（再挑战，127,232 B），Chrome 同一跳是 `cf-chl-out`（成功，7,164 B）。请求头现已与 Chrome
+逐项一致（含 `content-type`、`priority: u=1, i`，且已移除真 Chrome 不会发的 8 个旧版 `UA-*` 头），
+因此**判据落在请求体（加密后的 proof payload）**。用 CF 自带的 `2.gsLi5` 反查索引与 HaHaVM
+逐桶对拍后，仍为「参考非空而 Obscura 为空/零」的只剩三处：`10.bLvQ6`（递增整数序列，
+Obscura 为 `[]`）、`12.RKUE0`（`sha256('0')`，另两个同类摘要已在本轮修复中变成真实值）、
+以及 `26.aJofP9`/`urTy2`（bucket 26 = 「digest pair + 两个布尔标志（完整性 / CSP 探针）」，
+两边取值相反）。后者是最可疑的一处：一个完整性/CSP 探针给出相反结论，正是「脚本被判定为
+被篡改」的形态。下一步应从这三处入手，而不是继续改环境取值。
+
+### Step 254 - widget 的 `reloadApiJsRequest` 被拒：卡点从"proof 被拒"上移到"widget 从未完成"（2026-09-11，证据完成）
+
+**背景**：在此之前所有轮次的观测都指向"顶层 proof 被 CF 拒绝"。本轮用跨 realm 通信探针
+（`.claude/skills/obscura-challenge-probe/scripts/cdp_comm_probe.py`，`--no-click`）把 widget 与顶层的
+消息时间线与 HaHaVM 的成功轮逐条对比，把卡点上移了一步。
+
+**方法**：`obscura serve --port 9555 --stealth --proxy <代理>`，`RUST_LOG=info`（**必须**：只设
+`RUST_LOG=obscura_js=debug` 会把 `obscura::console` 过滤掉，serve 日志里就看不到 `[comm]` 行，
+这是本技能文档里记过的观测盲区）。探针 `--start 5 --deadline 60 --settle 45 --no-click`。
+
+**证据（消息时间线对比）**
+
+| 时序 | HaHaVM（通过） | Obscura（失败） |
+|---|---|---|
+| 1 | `init` (mode: managed) | `init` (mode: managed) |
+| 2 | `requestExtraParams` | `requestExtraParams` |
+| 3 | `translationInit` | **`reloadApiJsRequest` → `reloadApiJsRejected`** |
+| 4 | `execute` | `translationInit` |
+| 5 | `meow`/`food` 心跳 seq 2..11 | 两次 widget `XHR POST /fo/` + 一次 `IMG /ci/` |
+| 6 | `interactiveBegin` | `interactiveBegin`（t≈9.5s） |
+| 7 | `interactiveEnd` | **没有** |
+| 8 | **`complete` + token** | **没有** |
+
+即：Obscura 的 widget 在 `interactiveBegin` 之后不再前进，既没有 `interactiveEnd` 也没有
+`complete`+token；顶层因此永远不发自己的 proof，`cf_clearance` 也就无从下发。
+
+**根因定位（CF 代码级）**：在 turnstile api.js（`assets/har/chrome-2-fo.har` entry 2）里找到该消息的
+处理分支：
+
+```js
+case "reloadApiJsRequest":
+  if (We("reload", o)) { kt(i.widgetId); break; }      // 该 widget 被 kill 了 reload
+  if (cr !== void 0)   { kt(i.widgetId); break; }      // 已有一次 reload 在途
+  if (yo())            { kt(i.widgetId); break; }      // 退避窗口内 (Y() < apiJsReloadNextAllowedTsMs)
+  ri() ? (g.apiJsMismatchReloadAttempts++, bo(), _o(i.widgetId)) : kt(i.widgetId);
+```
+
+`kt()` 发出的正是 `reloadApiJsRejected`。`ri()` 定义为
+
+```js
+function ri(){ if (ln(), Qa()) return !1;
+               var e = La(window.turnstile, g);
+               return e ? !0 : (dn(), !1) }
+```
+
+`La(e,t)` 会**用新 URL 替换 api.js 的 `<script>`**（`api.js?_upgrade=true&_cb=<now>`），前置条件是
+`xt()` 能找到该 script 元素且它有 `parentNode`，并且 `Oa(window.turnstile)` 是非 null 对象。
+本地逐条核实这些前置条件在 Obscura 里**都成立**：解析器建出的 `<script src=...>` 是
+`HTMLScriptElement` 实例（`instanceof` 通过）、有 `parentNode`、`async`/`nonce` 可写、
+`parentNode.replaceChild` 抛不出异常；`typeof window.turnstile === "object"` 且有
+`render/execute/reset/ready/getResponse/remove/isExpired/_private`。因此拒绝来自 `Qa()`
+（任一 widget 的 `chlPageData` 非空）或 `cr`/`yo()` 状态，而不是这些前置条件；真正的
+**触发点**在 widget 侧——它为什么会认为 api.js 需要 reload（mismatch），尚未定位。
+
+**同轮证伪**
+
+- `apiJsResourceTiming` 里 `transferSize/encodedBodySize/decodedBodySize/responseStatus/nextHopProtocol`
+  为 0 或空**不是缺陷**：CF 的 api.js 响应只有 `access-control-allow-origin: *`，没有
+  `Timing-Allow-Origin`，跨源资源本来就该被归零；同源资源的同一组字段在 Obscura 里全部真实
+  （实测 `nhp="http/1.1"`、`ts=431`、`ebs=dbs=131`、`domainLookup/connect/request/response` 均非零、`ss=200`）。
+- 通信探针里 `cs:[[0,129,"Error\n at ki (...) at ke (...) at Object.I [as render]"]]` **不是异常**：
+  `ki` 的源码是 `function ki(e,t){try{var r=new Error().stack;return [e,Math.max(0,Math.floor(Y()-t)),r,Ci]}catch(n){}}`，
+  即它是一个用 `new Error().stack` 采集调用栈的**计时上报**辅助函数，`cs` 是 widget 发给顶层的时序记录。
+
+**附带修复（本轮落地）**
+
+- `env/html/interface-aliases.js` 把 27 个 `HTML*Element` 整体别名为 `Element`，导致这些接口的**专有 IDL
+  属性整批不存在**（本地 oracle 实测 18 项 `in` 恒为 false：`script.integrity/async/defer/crossOrigin/noModule/fetchPriority/blocking`、
+  `select.multiple/size`、`textarea.rows/cols/wrap`、`ol.start/reversed`、`option.index` 等）。
+  真浏览器里 IDL 属性恒存在，这正是"真实浏览器绝不会产生的值"。已为 script/select/textarea/option/ol/li/label/meta/style/details/dialog/slot/progress/fieldset
+  建立真实子类与属性反射，并在 `_elementClassFor` / `_elementClassForKnownName` 注册这些 tag。
+  修后 `script.integrity/async/defer/crossOrigin` 等 `in` 全部为 true，且 `async` 正确反射为内容属性。
+
+**结论**：卡点从"顶层 proof 被服务端拒绝"上移到**"widget 在 `interactiveBegin` 后不再前进"**，
+其直接表现是 widget 请求重载 turnstile api.js 而被顶层拒绝。下一步应定位 widget 判定
+`apiJsMismatch` 的依据（widget 帧代码在 `chrome-2-fo.har` entry 4，429 KB 混淆脚本），
+而不是继续调整环境取值。
+
+**撤回记录（同轮）**：为 `HTML*Element` 建立真实子类的改动**已回退**。它确实补齐了缺失的 IDL 属性，
+但 `HTMLScriptElement.prototype` 上的 `src`/`text`/`async` 会**遮蔽** `Element.prototype` 上既有的、
+有测试覆盖的实现（TrustedScript 强制、`dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order`、
+Trusted Types sink 名、表单原生 setter），导致 workspace 出现 5 个失败
+（`obscura-cdp::dynamic_script_onload_fires::dynamic_classic_fetch_concurrency_matches_force_async_state`、
+`obscura-js::assigning_script_text_runs_the_default_policy_once`、
+`obscura-js::dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order`、
+`obscura-js::sinks_hand_the_default_policy_the_expected_type_and_the_sink_name`、
+`obscura-mcp::fill_form_check_and_select_use_native_setter_and_trusted_events`）。
+该缺口是真实的（18 项 `in` 检测恒 false），但正确做法是在既有 `Element.prototype` 反射之上**扩展**而不是覆盖，
+且它没有被证据表明是本次 CF 判定的原因。回退后 5 项全部通过，workspace 恢复全绿。
+
+**补充证据（同轮，带点击轮）**：把探针的消息截断上限从 500 提到 4000 后拿到 widget 收到的完整
+`extraParams` 消息，并做了一次带点击（探针默认会点 widget 复选框，实测 `clicked t=19.3s at (213,335)`）：
+
+- **带点击后 widget 能走完 `interactiveBegin → interactiveEnd`**（实测 17701ms → 18593ms），
+  但**仍然没有 `complete`**；3.3s 后页面换了一个新的 widgetId 重来（`egwwp` → `8jjf2` → `pdz3o`），
+  说明 `interactiveEnd` 之后的那一步判定为失败。
+- **每一个 widget 都会发 `reloadApiJsRequest` 并被顶层的 api.js 拒绝**，与是否点击无关；
+  两个通过参照（HaHaVM、Chrome）的通信时间线里都**没有**这条消息。
+- 完整的 `extraParams` 消息里 `chlPageData` 非空、`au` 是 api.js 的 URL、
+  `apiJsResourceTiming` 的跨源归零字段与 Chrome 行为一致（见上一节证伪）。
+  按 api.js 的源码，`reloadApiJsRequest` 分支的四个拒绝条件中，`We("reload")`（widget 被 kill）
+  与 `cr`（reload 在途）在本轮都不成立，剩余候选是 `yo()`（退避窗口）与 `ri()`；
+  而 `ri()` 的前置条件（`xt()` 找得到 api.js script 且有 parentNode、`Oa(window.turnstile)` 非 null 对象）
+  已在本地逐条实测成立。真正的**触发点**在 widget 侧：它为什么认为 api.js 需要 reload，
+  仍要在 widget 帧代码（HAR entry 4，429 KB 混淆脚本）里定位。
+
+**当前进度**：卡点已从"顶层 proof 被服务端拒绝"精确到
+**"widget 在 `interactiveBegin`/`interactiveEnd` 之后拿不到 `complete` + token"**，
+且有一个每个 widget 都会发生、而参照侧从不发生的可见异常（`reloadApiJsRequest` 被拒）。
+真实 `/1.txt` 404 仍未取得。

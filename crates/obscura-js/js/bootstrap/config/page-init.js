@@ -250,12 +250,14 @@ globalThis.__obscura_init = function() {
   const configuredOuterH = Number(fingerprintScreen.outerHeight);
   const configuredScreenX = Number(fingerprintScreen.screenX);
   const configuredScreenY = Number(fingerprintScreen.screenY);
-  globalThis.outerWidth = !hasScreenOverride && configuredOuterW > 0 ? configuredOuterW : availW;
-  globalThis.outerHeight = !hasScreenOverride && configuredOuterH > 0 ? configuredOuterH : availH;
-  globalThis.screenX = !hasScreenOverride && Number.isFinite(configuredScreenX)
-    ? configuredScreenX : 0;
-  globalThis.screenY = !hasScreenOverride && Number.isFinite(configuredScreenY)
-    ? configuredScreenY : windowTop;
+  // Viewport emulation changes the CSS/screen size, but it does not erase the
+  // host window placement supplied by the fingerprint. Keep location and outer
+  // bounds independent so CDP viewport overrides do not turn a real window
+  // into the historical all-zero geometry.
+  globalThis.outerWidth = configuredOuterW > 0 ? configuredOuterW : availW;
+  globalThis.outerHeight = configuredOuterH > 0 ? configuredOuterH : availH;
+  globalThis.screenX = Number.isFinite(configuredScreenX) ? configuredScreenX : 0;
+  globalThis.screenY = Number.isFinite(configuredScreenY) ? configuredScreenY : windowTop;
   globalThis.screenLeft = globalThis.screenX;
   globalThis.screenTop = globalThis.screenY;
 

@@ -7432,6 +7432,11 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
 }
 
 fn set_margin_px(margin: &mut Edges, idx: usize, px: f32) {
+    // Used margins live on Blink's LayoutUnit grid like every other length; a
+    // box that ends flush against a snapped container edge derives its size from
+    // the snapped margins, so `margin-left:12.12px` in an 800px container reports
+    // width 800 - 12.109375 = 787.890625 rather than floor(787.88) = 787.875.
+    let px = crate::dom::snap_to_layout_unit(px);
     match idx {
         0 => margin.top = px,
         1 => margin.right = px,
@@ -7483,6 +7488,8 @@ fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
 }
 
 fn set_padding_px(padding: &mut Edges, idx: usize, px: f32) {
+    // Used padding lives on Blink's LayoutUnit grid like every other length.
+    let px = crate::dom::snap_padding_px(px);
     match idx {
         0 => padding.top = px,
         1 => padding.right = px,

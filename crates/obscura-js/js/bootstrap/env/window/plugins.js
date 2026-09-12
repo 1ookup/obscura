@@ -96,6 +96,22 @@ function _permissionPolicyAllows(name) {
   catch (_error) { return false; }
 }
 
+// Chrome's defaults, measured on a fresh profile. The split is not arbitrary:
+// the names it reports as `granted` are the ones it auto-grants to a page that
+// has not been asked, while the rest stay `prompt` until the user answers.
+// Neither list may fall back to `granted` -- a page that never prompted for the
+// camera still reads `prompt`, so a blanket `granted` is a value Chrome does
+// not produce for any of these.
+const _PERMISSION_DEFAULT_PROMPT = new Set([
+  'geolocation', 'notifications', 'camera', 'microphone', 'midi',
+  'clipboard-read', 'persistent-storage', 'idle-detection', 'local-fonts',
+  'window-management',
+]);
+const _PERMISSION_DEFAULT_GRANTED = new Set([
+  'clipboard-write', 'background-sync', 'storage-access', 'accelerometer',
+  'gyroscope', 'magnetometer', 'payment-handler', 'screen-wake-lock',
+]);
+
 function _permissionState(name) {
   name = String(name || '');
   if (!_permissionPolicyAllows(name)) return 'denied';
@@ -103,9 +119,9 @@ function _permissionState(name) {
     const permission = globalThis.Notification && Notification.permission;
     return permission === 'granted' || permission === 'denied' ? permission : 'prompt';
   }
-  if (name === 'geolocation' || name === 'camera' || name === 'microphone'
-      || name === 'midi') return 'prompt';
-  return 'granted';
+  if (_PERMISSION_DEFAULT_GRANTED.has(name)) return 'granted';
+  if (_PERMISSION_DEFAULT_PROMPT.has(name)) return 'prompt';
+  return 'prompt';
 }
 
 function _permissionStatusName(name) {

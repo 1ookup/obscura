@@ -423,6 +423,7 @@ function _frameWindowProxyFor(hostEl) {
     "SecurityError");
   const navigate = (value) => {
     const url = _resolveUrl(String(value));
+    if (_queueBlobIframeDocument(hostNid, url)) return;
     Deno.core.ops.op_navigate_iframe(hostNid, url, "GET", "");
   };
 

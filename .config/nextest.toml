@@ -47,6 +47,6 @@ test-group = 'timing-sensitive'
 threads-required = 'num-test-threads'
 
 [[profile.default.overrides]]
-filter = 'package(obscura-cli) and test(mcp_client)'
+filter = 'binary(mcp_client)'
 test-group = 'mcp-processes'
 threads-required = 'num-test-threads'

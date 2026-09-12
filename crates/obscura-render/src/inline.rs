@@ -348,16 +348,36 @@ fn used_line_height_for_font(style: &LayoutStyle, font: &ResolvedFont) -> f32 {
     used_line_height_with_metrics(style, font.metrics)
 }
 
+/// Blink quantises the used line box onto its 1/64 LayoutUnit grid, and the
+/// direction depends on how the line height was specified: a length or a
+/// percentage is rounded to nearest, a unitless ratio is floored. The two forms
+/// are observably different even at identical computed values. Measured on
+/// Chrome 153 (Arial 16px, block rect height x64, one line per row):
+/// `18.4px` -> 1178 (round of 1177.6) but `1.15` (computed 18.4px) -> 1177
+/// (floor); `107%` -> 1096 but `1.07` -> 1095; `18.45px` -> 1181;
+/// `1.1525` -> 1180; `0.5px` -> 32. A block's height is the sum of the
+/// already-snapped per-line boxes, not a snap of the summed height
+/// (`18.4px` over 3 lines -> 3534 = 3 x 1178; `1.15` -> 3531 = 3 x 1177).
+#[inline]
+fn snap_line_height_round(px: f32) -> f32 {
+    (px * 64.0).round() / 64.0
+}
+
+#[inline]
+fn snap_line_height_floor(px: f32) -> f32 {
+    (px * 64.0).floor() / 64.0
+}
+
 fn used_line_height_with_metrics(style: &LayoutStyle, metrics: FaceMetrics) -> f32 {
     let font_size = style.font_size.unwrap_or(16.0);
     match style.line_height {
-        Some(crate::LineHeight::Px(px)) => px,
-        Some(crate::LineHeight::Ratio(ratio)) => font_size * ratio,
+        Some(crate::LineHeight::Px(px)) => snap_line_height_round(px),
+        Some(crate::LineHeight::Ratio(ratio)) => snap_line_height_floor(font_size * ratio),
         Some(crate::LineHeight::Relative(relative)) => match relative {
-            crate::Dimension::Percent(percent) => font_size * percent,
+            crate::Dimension::Percent(percent) => snap_line_height_round(font_size * percent),
             dimension => match dimension.resolve(font_size, 16.0, 0.0, 0.0) {
-                crate::Dimension::Px(px) => px,
-                _ => font_size,
+                crate::Dimension::Px(px) => snap_line_height_round(px),
+                _ => snap_line_height_floor(font_size),
             },
         },
         None | Some(crate::LineHeight::Normal) => normal_line_height(font_size, metrics),

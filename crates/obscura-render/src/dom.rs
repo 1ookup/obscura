@@ -1936,16 +1936,16 @@ fn sync_resolved_percentage_padding(
 
     fn sync(style: &mut crate::LayoutStyle, containing_block_width: f32) {
         if let Some(percent) = style.padding_percent[0] {
-            style.padding.top = percent * containing_block_width;
+            style.padding.top = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[1] {
-            style.padding.right = percent * containing_block_width;
+            style.padding.right = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[2] {
-            style.padding.bottom = percent * containing_block_width;
+            style.padding.bottom = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[3] {
-            style.padding.left = percent * containing_block_width;
+            style.padding.left = snap_padding_px(percent * containing_block_width);
         }
     }
 
@@ -2139,7 +2139,7 @@ fn sync_positioned_pseudo_percentage_padding(
         }
         for (index, percent) in pseudo.padding_percent.into_iter().enumerate() {
             let Some(percent) = percent else { continue };
-            let value = percent * containing_block_width;
+            let value = snap_padding_px(percent * containing_block_width);
             match index {
                 0 => pseudo.padding.top = value,
                 1 => pseudo.padding.right = value,
@@ -5475,10 +5475,10 @@ fn layout_dom_once(
                             expression, em_px, root_fs, vw, vh, cb_w,
                         ) {
                             match i {
-                                0 => style.padding.top = px.max(0.0),
-                                1 => style.padding.right = px.max(0.0),
-                                2 => style.padding.bottom = px.max(0.0),
-                                _ => style.padding.left = px.max(0.0),
+                                0 => style.padding.top = snap_padding_px(px),
+                                1 => style.padding.right = snap_padding_px(px),
+                                2 => style.padding.bottom = snap_padding_px(px),
+                                _ => style.padding.left = snap_padding_px(px),
                             }
                         }
                     }
@@ -5487,40 +5487,40 @@ fn layout_dom_once(
                             expression, em_px, root_fs, vw, vh, cb_w,
                         ) {
                             match i {
-                                0 => style.margin.top = px,
-                                1 => style.margin.right = px,
-                                2 => style.margin.bottom = px,
-                                _ => style.margin.left = px,
+                                0 => style.margin.top = snap_to_layout_unit(px),
+                                1 => style.margin.right = snap_to_layout_unit(px),
+                                2 => style.margin.bottom = snap_to_layout_unit(px),
+                                _ => style.margin.left = snap_to_layout_unit(px),
                             }
                         }
                     }
                     if let Some(relative) = style.padding_relative[i] {
                         if let crate::Dimension::Px(px) = relative.resolve(em_px, root_fs, vw, vh) {
                             match i {
-                                0 => style.padding.top = px.max(0.0),
-                                1 => style.padding.right = px.max(0.0),
-                                2 => style.padding.bottom = px.max(0.0),
-                                _ => style.padding.left = px.max(0.0),
+                                0 => style.padding.top = snap_padding_px(px),
+                                1 => style.padding.right = snap_padding_px(px),
+                                2 => style.padding.bottom = snap_padding_px(px),
+                                _ => style.padding.left = snap_padding_px(px),
                             }
                         }
                     }
                     if let Some(relative) = style.margin_relative[i] {
                         if let crate::Dimension::Px(px) = relative.resolve(em_px, root_fs, vw, vh) {
                             match i {
-                                0 => style.margin.top = px,
-                                1 => style.margin.right = px,
-                                2 => style.margin.bottom = px,
-                                _ => style.margin.left = px,
+                                0 => style.margin.top = snap_to_layout_unit(px),
+                                1 => style.margin.right = snap_to_layout_unit(px),
+                                2 => style.margin.bottom = snap_to_layout_unit(px),
+                                _ => style.margin.left = snap_to_layout_unit(px),
                             }
                         }
                     }
                     if let Some(frac) = style.margin_percent[i] {
                         let px = frac * cb_w;
                         match i {
-                            0 => style.margin.top = px,
-                            1 => style.margin.right = px,
-                            2 => style.margin.bottom = px,
-                            _ => style.margin.left = px,
+                            0 => style.margin.top = snap_to_layout_unit(px),
+                            1 => style.margin.right = snap_to_layout_unit(px),
+                            2 => style.margin.bottom = snap_to_layout_unit(px),
+                            _ => style.margin.left = snap_to_layout_unit(px),
                         }
                     }
                 }
@@ -5692,10 +5692,10 @@ fn layout_dom_once(
                                 relative.resolve(pseudo_em, root_fs, vw, vh)
                             {
                                 match index {
-                                    0 => pseudo.padding.top = px.max(0.0),
-                                    1 => pseudo.padding.right = px.max(0.0),
-                                    2 => pseudo.padding.bottom = px.max(0.0),
-                                    _ => pseudo.padding.left = px.max(0.0),
+                                    0 => pseudo.padding.top = snap_padding_px(px),
+                                    1 => pseudo.padding.right = snap_padding_px(px),
+                                    2 => pseudo.padding.bottom = snap_padding_px(px),
+                                    _ => pseudo.padding.left = snap_padding_px(px),
                                 }
                             }
                         }
@@ -5704,20 +5704,20 @@ fn layout_dom_once(
                                 relative.resolve(pseudo_em, root_fs, vw, vh)
                             {
                                 match index {
-                                    0 => pseudo.margin.top = px,
-                                    1 => pseudo.margin.right = px,
-                                    2 => pseudo.margin.bottom = px,
-                                    _ => pseudo.margin.left = px,
+                                    0 => pseudo.margin.top = snap_to_layout_unit(px),
+                                    1 => pseudo.margin.right = snap_to_layout_unit(px),
+                                    2 => pseudo.margin.bottom = snap_to_layout_unit(px),
+                                    _ => pseudo.margin.left = snap_to_layout_unit(px),
                                 }
                             }
                         }
                         if let Some(percent) = pseudo.margin_percent[index] {
                             let px = percent * cb_w;
                             match index {
-                                0 => pseudo.margin.top = px,
-                                1 => pseudo.margin.right = px,
-                                2 => pseudo.margin.bottom = px,
-                                _ => pseudo.margin.left = px,
+                                0 => pseudo.margin.top = snap_to_layout_unit(px),
+                                1 => pseudo.margin.right = snap_to_layout_unit(px),
+                                2 => pseudo.margin.bottom = snap_to_layout_unit(px),
+                                _ => pseudo.margin.left = snap_to_layout_unit(px),
                             }
                         }
                         if let Some(inset) = pseudo.inset[index] {
@@ -8236,6 +8236,29 @@ fn resolve_named_placement(
     }
 }
 
+/// Blink keeps every layout length in a LayoutUnit, i.e. a 1/64 px grid, so
+/// CSSOM View can only ever report multiples of 1/64. Measured on Chrome 153
+/// (headless, 1x): a `width:123.4px` box reports 123.390625 = 7897/64 and
+/// `width:12.12px` reports 12.109375 = 775/64, i.e. the authored length is
+/// floored onto the grid rather than rounded to nearest. Taffy stores f32, so
+/// the raw unrounded layout has to be floored onto the same grid before it is
+/// exposed: otherwise the exposed value is off-grid and differs from Chrome in
+/// the low bits (12.119999885559082 where Chrome reports 12.109375).
+#[inline]
+pub(crate) fn snap_to_layout_unit(value: f32) -> f32 {
+    (value * 64.0).floor() / 64.0
+}
+
+/// Used padding is resolved onto the same LayoutUnit grid, at every place a
+/// padding length becomes pixels (fixed lengths at parse time, `em`/`rem`/`vw`
+/// contextual lengths and percentages at layout time). Measured on Chrome 153:
+/// `padding-left:8.2px` contributes 524/64 and `padding-left:7.5%` of a 333px
+/// containing block contributes 1598/64, i.e. floor, matching `width`/`height`.
+#[inline]
+pub(crate) fn snap_padding_px(px: f32) -> f32 {
+    snap_to_layout_unit(px.max(0.0))
+}
+
 fn compute_absolute_unrounded_rects(
     taffy_tree: &TaffyTree<usize>,
     taffy_id: taffy::NodeId,
@@ -8245,16 +8268,28 @@ fn compute_absolute_unrounded_rects(
     rects: &mut HashMap<NodeId, Rect>,
 ) {
     let layout = taffy_tree.unrounded_layout(taffy_id);
-    let x = abs_x + layout.location.x;
-    let y = abs_y + layout.location.y;
+    // Children accumulate on the snapped parent edge, the same way a LayoutUnit
+    // child offset is added to the parent's LayoutUnit origin in Blink.
+    let left = abs_x + layout.location.x;
+    let top = abs_y + layout.location.y;
+    let x = snap_to_layout_unit(left);
+    let y = snap_to_layout_unit(top);
+    // Blink snaps each edge independently and derives the size from the two
+    // snapped edges, so a box that ends on a snapped edge keeps that edge
+    // exactly: `margin-left:12.12px` in an 800px container reports
+    // x=12.109375 (775/64) and width=800-12.109375=787.890625 (50425/64).
+    // Snapping the taffy size instead loses one 1/64 step whenever the
+    // unrounded origin is not already on the grid.
+    let right = snap_to_layout_unit(left + layout.size.width);
+    let bottom = snap_to_layout_unit(top + layout.size.height);
     if let Some(dom_id) = id_map.get(&taffy_id) {
         rects.insert(
             *dom_id,
             Rect {
                 x,
                 y,
-                width: layout.size.width,
-                height: layout.size.height,
+                width: right - x,
+                height: bottom - y,
             },
         );
     }

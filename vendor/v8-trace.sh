@@ -76,12 +76,40 @@ cmd_build() {
   echo "built $BIN"
 }
 
+# The JSONL contract is the one a HaHaVM comparison needs: one record per API
+# access with t/src/name/args/result, reads carrying the value they returned.
+# Checked separately from the TSV smoke because the two modes are emitted from
+# different probe sites and a binary can have one without the other.
+json_trace_is_capable() {
+  [[ -x "$BIN" ]] || return 1
+  local probe
+  probe="$(mktemp "${TMPDIR:-/tmp}/obscura-trace-json.XXXXXX")" || return 1
+  local status=1
+  if "$BIN" --trace-api-file "$probe" --trace-api-format jsonl \
+      --trace-api-filter 'userAgent,setAttribute,title' --trace-api-calls \
+      fetch 'data:text/html,<script>document.title="t";document.body.setAttribute("x","1");void navigator.userAgent;</script>' \
+      --wait 0 --timeout 5 --quiet >/dev/null 2>&1 &&
+      grep -q '"name":"[A-Za-z]*\.userAgent"' "$probe" &&
+      grep -q '"src":"set ' "$probe" &&
+      grep -q '"name":"[A-Za-z]*\.setAttribute"' "$probe"; then
+    status=0
+  fi
+  rm -f -- "$probe"
+  return "$status"
+}
+
 cmd_check() {
   if binary_is_trace_capable; then
     echo "trace-capable: $BIN"
   else
     die "trace API unavailable: $BIN
 Rebuild with: cargo build --release -p obscura-cli --config vendor/v8-source.toml"
+  fi
+  if json_trace_is_capable; then
+    echo "trace-capable (jsonl): $BIN"
+  else
+    echo "jsonl records unavailable: rebuild with vendor/v8-trace.sh build" >&2
+    exit 1
   fi
 }
 
