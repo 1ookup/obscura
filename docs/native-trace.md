@@ -15,8 +15,19 @@ nothing. Their environment equivalents are not implemented by the V8 monitor.
 
 The implementation is edited directly in `vendor/rusty_v8/v8`, a nested Git
 repository. There is no build-time V8 trace patch script:
-The bytecode migration is committed in that checkout as `59ee73ae`. The outer
-cleanup is committed as `9ea95aa`.
+The bytecode migration is committed in that checkout as `59ee73ae`, and the
+API-call layer on top of it as `4632570d`, which is the tip of the local
+`obscura-trace` branch. That checkout sits on a detached HEAD, so keep the
+branch: without it those commits are reachable only from HEAD and a checkout
+of another ref would leave them to be collected. The outer cleanup is committed
+as `9ea95aa`.
+
+Two build notes. Nothing watches the V8 source tree: `vendor/rusty_v8/build.rs`
+re-runs on `.gn`, `BUILD.gn` and `src/binding.cc`, so an edit under
+`vendor/rusty_v8/v8/src` is picked up only after one of those is touched, or
+ninja will report the object files up to date and the binary will silently
+keep the old trace. And a V8 rebuild is incremental once the build script
+does re-run; only the first source build is the long one.
 
 | V8 source | Responsibility |
 | --- | --- |
