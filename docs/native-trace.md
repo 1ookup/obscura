@@ -189,16 +189,31 @@ python3 .claude/skills/obscura-challenge-probe/scripts/trace_compare.py \
   reference.jsonl /tmp/api.jsonl --json /tmp/trace-compare.json
 ```
 
-Known boundaries: a call that throws leaves no record, a keyed or iterator
-access has no pre-load resolution record, and a function whose name is only
-inferred at runtime (an anonymous function expression assigned to a property)
-gets no call record, since the call hook is selected by the statically known
-name. On the reference side a construct produces no record at all: HaHaVM
+Known boundaries: a call that throws leaves no record, and a keyed or iterator
+access has no pre-load resolution record. On the reference side a construct
+produces no record at all: HaHaVM
 exposes each interface constructor as a plain function, and the only place to
 hook them centrally would be to replace the global binding, which would make
 `x.constructor === Interface` false. Trace only what the page did, not what
 the harness had to change to see it; drop `new` records with
 `--trace-api-filter -constructor` when comparing against that side.
+
+A call whose callee carries an inferred name (an anonymous function expression
+stored under a computed key, which V8 spells as a path such as
+`s.<computed>`) is now named by the member the read probe remembers it under,
+falling back to the old owner-prefixed spelling when nothing was remembered.
+That is what lets a dispatch that reaches an interface member through a
+computed key line up with the member it invoked; previously every such call
+was either named under an inferred path no comparison can match or dropped.
+
+The bound on that fix is worth stating: it only recovers a name for a callee
+that was itself read through a traced property access. A page that reads the
+environment once and then drives everything off its own state objects shows
+its dispatch as reads of those objects, under whatever member names it chose,
+and no trace setting turns those into the environment reads that produced
+them. The challenge widget is exactly this shape, which is why a traced widget
+frame reports far fewer environment members than the reference does even when
+both run the same script.
 
 **A traced live challenge that does not finish is expected, not a crash.**
 Traced runs compile bootstrap instead of loading the startup snapshot and pay
