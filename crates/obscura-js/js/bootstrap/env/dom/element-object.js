@@ -143,22 +143,29 @@ class Element extends Node {
   // attribute that reads as -1 when the content attribute is absent, not as an
   // absent property. An `in`-check against the element is an environment probe,
   // so the default matters as much as the reflection.
+  // `maxLength`, `minLength` and `size` are all limited-to-only-non-negative
+  // IDL attributes: the reader falls back to -1 (or the supplied default) for
+  // an absent, unparsable or negative attribute, and the writer removes the
+  // attribute again for a negative value.
+  _limitedLength(attribute, absent) {
+    const raw = this.getAttribute(attribute);
+    if (raw === null) return absent === undefined ? -1 : absent;
+    const value = parseInt(raw, 10);
+    if (!isFinite(value) || value < 0) return absent === undefined ? -1 : absent;
+    return value > 2147483647 ? 2147483647 : value;
+  }
+  _setLimitedLength(attribute, v) {
+    const value = Number(v);
+    if (!isFinite(value) || value < 0) this.removeAttribute(attribute);
+    else this.setAttribute(attribute, String(Math.min(Math.floor(value), 2147483647)));
+  }
   get maxLength() {
     if (this.localName !== "input" && this.localName !== "textarea") return undefined;
-    const raw = this.getAttribute("maxlength");
-    if (raw === null) return -1;
-    const value = parseInt(raw, 10);
-    if (!isFinite(value)) return -1;
-    if (value < 0) return -1;
-    return value > 2147483647 ? 2147483647 : value;
+    return this._limitedLength("maxlength");
   }
   set maxLength(v) {
     if (this.localName !== "input" && this.localName !== "textarea") return;
-    const value = Number(v);
-    // The setter clamps into the limited-to-only-non-negative range; -1 and
-    // anything below it remove the attribute again.
-    if (!isFinite(value) || value < 0) this.removeAttribute("maxlength");
-    else this.setAttribute("maxlength", String(Math.min(Math.floor(value), 2147483647)));
+    this._setLimitedLength("maxlength", v);
   }
   // `HTMLOptionElement` `.index` / `.label` / `.defaultSelected`.
   get index() {
@@ -234,6 +241,139 @@ class Element extends Node {
     const normalized = /^(true|false|inherit|plaintext-only)$/i.test(value)
       ? value.toLowerCase() : "true";
     this.setAttribute("contenteditable", normalized);
+  }
+  get isContentEditable() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    const state = this.contentEditable;
+    return state === "true" || state === "plaintext-only";
+  }
+  // The enumerated reflections below all share one shape: a lowercase keyword
+  // list, an invalid value reading as the empty string, and a separate IDL
+  // default for the one that has one. Existence probes read these as much as
+  // value probes do, so the property has to exist on every HTML element.
+  _reflectKeyword(attribute, keywords) {
+    const raw = this.getAttribute(attribute);
+    if (raw === null) return "";
+    const value = String(raw).toLowerCase();
+    return keywords.includes(value) ? value : "";
+  }
+  _setKeyword(attribute, keywords, v) {
+    const value = String(v == null ? "" : v).toLowerCase();
+    if (keywords.includes(value)) this.setAttribute(attribute, value);
+    else this.removeAttribute(attribute);
+  }
+  get autocapitalize() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    return this._reflectKeyword("autocapitalize",
+      ["none", "off", "on", "sentences", "words", "characters"]);
+  }
+  set autocapitalize(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml") {
+      this._setKeyword("autocapitalize",
+        ["none", "off", "on", "sentences", "words", "characters"], v);
+    }
+  }
+  get enterKeyHint() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    return this._reflectKeyword("enterkeyhint",
+      ["enter", "done", "go", "next", "previous", "search", "send"]);
+  }
+  set enterKeyHint(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml") {
+      this._setKeyword("enterkeyhint",
+        ["enter", "done", "go", "next", "previous", "search", "send"], v);
+    }
+  }
+  get inputMode() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    return this._reflectKeyword("inputmode",
+      ["none", "text", "tel", "url", "email", "numeric", "decimal", "search"]);
+  }
+  set inputMode(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml") {
+      this._setKeyword("inputmode",
+        ["none", "text", "tel", "url", "email", "numeric", "decimal", "search"], v);
+    }
+  }
+  get virtualKeyboardPolicy() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    return this._reflectKeyword("virtualkeyboardpolicy", ["auto", "manual"]);
+  }
+  set virtualKeyboardPolicy(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml") {
+      this._setKeyword("virtualkeyboardpolicy", ["auto", "manual"], v);
+    }
+  }
+  get writingSuggestions() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    const raw = this.getAttribute("writingsuggestions");
+    if (raw === null) return "true";
+    return String(raw).toLowerCase() === "false" ? "false" : "true";
+  }
+  set writingSuggestions(v) {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
+    const value = String(v == null ? "" : v).toLowerCase();
+    if (value === "true" || value === "false") this.setAttribute("writingsuggestions", value);
+    else this.removeAttribute("writingsuggestions");
+  }
+  get currentCSSZoom() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    const zoom = Number.parseFloat(this._effectiveZoom());
+    return Number.isFinite(zoom) ? zoom : 1;
+  }
+  get part() {
+    if (!this._partList) this._partList = new DOMTokenList(this, "part");
+    return this._partList;
+  }
+  get prefix() { return null; }
+  // `clientTop`/`clientLeft` are the border edges of the client area, so they
+  // come from the rendered border box rather than from a constant. An element
+  // with no layout box reports zero, as it does in a browser.
+  get clientTop() { return this._clientBorderWidth("borderTopWidth"); }
+  get clientLeft() { return this._clientBorderWidth("borderLeftWidth"); }
+  _clientBorderWidth(property) {
+    if (!this._renderClientMetrics()) return 0;
+    try {
+      const style = globalThis.getComputedStyle && globalThis.getComputedStyle(this);
+      const value = Number.parseFloat(style && style[property]);
+      return Number.isFinite(value) ? value : 0;
+    } catch (_error) { return 0; }
+  }
+  _effectiveZoom() {
+    try {
+      const style = globalThis.getComputedStyle && globalThis.getComputedStyle(this);
+      return style ? style.zoom : "";
+    } catch (_error) { return ""; }
+  }
+  get minLength() {
+    if (this.localName !== "input" && this.localName !== "textarea") return undefined;
+    return this._limitedLength("minlength");
+  }
+  set minLength(v) {
+    if (this.localName === "input" || this.localName === "textarea") {
+      this._setLimitedLength("minlength", v);
+    }
+  }
+  get dirName() {
+    if (this.localName !== "input" && this.localName !== "textarea") return undefined;
+    return this.getAttribute("dirname") || "";
+  }
+  set dirName(v) {
+    if (this.localName === "input" || this.localName === "textarea") {
+      this.setAttribute("dirname", String(v));
+    }
+  }
+  get size() {
+    if (this.localName === "input") return this._limitedLength("size", 20);
+    if (this.localName !== "select") return undefined;
+    const raw = this.getAttribute("size");
+    const value = raw === null ? 0 : Number.parseInt(raw, 10);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+  set size(v) {
+    if (this.localName === "input" || this.localName === "select") {
+      this._setLimitedLength("size", v);
+    }
   }
   get className() {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
