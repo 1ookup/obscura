@@ -6655,10 +6655,17 @@ fn op_post_to_frame(
             return "no-frame".into();
         };
         let host = NodeId::new(host_nid);
+        let __dbg = std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some();
         let Some(target_root) = dom.iframe_content_document(host) else {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> no-frame payload={}", host_nid, &payload.chars().take(120).collect::<String>());
+            }
             return "no-frame".into();
         };
         let Some(target_scope) = dom.document_scope(target_root) else {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> no-scope payload={}", host_nid, &payload.chars().take(120).collect::<String>());
+            }
             return "no-frame".into();
         };
         let sender_origin = if sender_root > 0 {
@@ -6673,7 +6680,16 @@ fn op_post_to_frame(
                 .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url))
         };
         if !post_message_target_allows(target_origin, &sender_origin, &target_scope.origin) {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> dropped(origin) target={} payload={}",
+                    host_nid, target_origin,
+                    &payload.chars().take(120).collect::<String>());
+            }
             return "dropped".into();
+        }
+        if __dbg {
+            eprintln!("[pmsg] post_to_frame host={} -> queued payload={}",
+                host_nid, &payload.chars().take(120).collect::<String>());
         }
         // MessageEvent.source, reconstructed in the target realm: `parent`
         // when the sender document directly contains the host, `top` when the

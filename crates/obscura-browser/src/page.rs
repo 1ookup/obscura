@@ -1327,6 +1327,9 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+            eprintln!("[treedetach] init_js runtime re-init");
+        }
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
@@ -3897,6 +3900,9 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
+        if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+            eprintln!("[treedetach] top document replaced (navigate), frames detached below");
+        }
         self.dom = Some(dom);
         // Phase 2b: the Rust frame loader replaces the JS iframe pre-scan; it
         // covers src, srcdoc, data:, nesting, sandbox propagation and the

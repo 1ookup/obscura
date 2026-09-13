@@ -3,6 +3,35 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+// Debug-only detach tracing (OBSCURA_DEBUG_TREE_DETACH=1): every detach of a
+// connected element is logged with its identity and, when the subtree hosts
+// an iframe, a captured backtrace. Used to locate engine-side subtree
+// replacements that orphan a live frame's ancestors.
+fn tree_detach_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some())
+}
+
+fn describe_node_for_detach(inner: &DomTreeInner, id: NodeId) -> String {
+    match inner.nodes.get(id.index()).and_then(|n| n.as_ref()) {
+        Some(node) => {
+            let kind = match &node.data {
+                NodeData::Element { name, .. } => {
+                    let id_attr = node.get_attribute("id").unwrap_or_default();
+                    let class = node.get_attribute("class").unwrap_or_default();
+                    format!("{}#{}.{}", name.local, id_attr, class)
+                }
+                NodeData::Text { .. } => "text".to_string(),
+                NodeData::Document => "document".to_string(),
+                _ => "other".to_string(),
+            };
+            format!("{}:{}(conn={})", id.index(), kind, node.connected)
+        }
+        None => format!("{}:missing", id.index()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
 
@@ -1244,6 +1273,59 @@ impl DomTree {
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
+        if tree_detach_debug_enabled() {
+            let is_element = inner
+                .nodes
+                .get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .is_some_and(|n| matches!(n.data, NodeData::Element { .. }));
+            let was_connected = inner
+                .nodes
+                .get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .is_some_and(|n| n.connected);
+            if is_element && was_connected {
+                let parent_desc = inner
+                    .nodes
+                    .get(node_id.index())
+                    .and_then(|n| n.as_ref())
+                    .and_then(|n| n.parent)
+                    .map(|p| describe_node_for_detach(&inner, p))
+                    .unwrap_or_else(|| "none".to_string());
+                let subtree_hosts_iframe = {
+                    let mut hosts = false;
+                    let mut stack = vec![node_id];
+                    while let Some(cur) = stack.pop() {
+                        if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                            if let NodeData::Element { name, .. } = &node.data {
+                                if name.local.as_ref() == "iframe" {
+                                    hosts = true;
+                                    break;
+                                }
+                            }
+                            let mut child = node.first_child;
+                            while let Some(c) = child {
+                                stack.push(c);
+                                child = inner.nodes.get(c.index())
+                                    .and_then(|n| n.as_ref())
+                                    .and_then(|n| n.next_sibling);
+                            }
+                        }
+                    }
+                    hosts
+                };
+                eprintln!(
+                    "[treedetach] node={} parent={} hosts_iframe={}",
+                    describe_node_for_detach(&inner, node_id),
+                    parent_desc,
+                    subtree_hosts_iframe
+                );
+                if subtree_hosts_iframe {
+                    eprintln!("[treedetach] backtrace:\n{}",
+                        std::backtrace::Backtrace::force_capture());
+                }
+            }
+        }
 
         // The document, registered ShadowRoots and iframe content documents
         // have no ordinary parent and cannot be detached through light-tree
