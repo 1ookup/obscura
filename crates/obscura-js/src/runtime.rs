@@ -4320,6 +4320,114 @@ mod tests {
         rt
     }
 
+    /// SVG fragments have to participate in the geometry interfaces the way
+    /// Chrome does (verified against headless Chrome on the same fixture):
+    /// getCTM composes the element's own transform, ancestor transforms and
+    /// the viewBox map; getScreenCTM adds the root svg's viewport origin plus
+    /// the window origin; getBoundingClientRect maps the fragment bbox corners
+    /// through the viewport CTM (rotate swaps width/height); getBBox of a
+    /// container unions its children; geometry elements answer path lengths.
+    /// Before env/html/svg-geometry.js every SVG child answered gBCR with an
+    /// all-zero rect and getCTM/getScreenCTM/getTotalLength did not exist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn svg_fragment_geometry_matches_chrome_mapping() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+<svg id="s1" width="300" height="100" style="position:absolute;left:40px;top:30px">
+  <g id="g1" transform="translate(10,20) scale(2)"><text id="t1" font-size="12">MMMM</text></g>
+  <g id="gr" transform="rotate(90 10 10)"><text id="t4" font-size="12">MMMM</text></g>
+  <g id="gg"><text id="a1" x="0" y="0" font-size="12">AAAA</text><text id="a2" x="0" y="30" font-size="12">BBBB</text></g>
+</svg>
+<svg id="s2" width="200" height="100" viewBox="50 25 100 50" style="position:absolute;left:0;top:200px"><rect id="r2" x="0" y="0" width="40" height="20"/></svg>
+<svg id="s3" width="120" height="60" style="position:absolute;left:0;top:320px"><circle id="c1" cx="50" cy="30" r="20"/><rect id="r3" x="10" y="10" width="30" height="15"/><path id="p1" d="M0 0 L100 0"/></svg>
+</body></html>"#,
+        );
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const $ = id => document.getElementById(id);
+                    const root = $("s1");
+                    const rootRect = root.getBoundingClientRect();
+                    const ctm = $("t1").getCTM();
+                    const sctm = $("t1").getScreenCTM();
+                    const bbox = $("t1").getBBox();
+                    const rect = $("t1").getBoundingClientRect();
+                    const rotated = $("t4").getBoundingClientRect();
+                    const rotatedBox = $("t4").getBBox();
+                    const union = $("gg").getBBox();
+                    const one = $("a1").getBBox();
+                    const vb = $("r2").getCTM();
+                    const circleLen = $("c1").getTotalLength();
+                    const p = $("p1").getPointAtLength(50);
+                    const list = $("t1").getClientRects();
+                    const div = document.createElement("div");
+                    return {
+                        // The root keeps its real layout box; children map
+                        // through it. (The unit environment sizes the root
+                        // through its default intrinsic box without render
+                        // warmup; the exact 300x100 attribute sizing is
+                        // covered by the fixture runs against the binary.)
+                        rootBoxFromLayout: rootRect.width > 0 && rootRect.height > 0
+                            && rootRect.width === root.getBoundingClientRect().width,
+                        ctmScaled: [ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f]
+                            .every((v, i) => Math.abs(v - [2, 0, 0, 2, 10, 20][i]) < 1e-9),
+                        screenCtmAddsOrigins:
+                            Math.abs(sctm.e - (window.screenX + rootRect.x + 10)) < 1e-6
+                            && Math.abs(sctm.f - (window.screenY + rootRect.y + 20)) < 1e-6,
+                        gBCRScaledBox:
+                            Math.abs(rect.x - (rootRect.x + 10)) < 1e-6
+                            && Math.abs(rect.y - (rootRect.y + 20 + bbox.y * 2)) < 1e-6
+                            && Math.abs(rect.width - bbox.width * 2) < 1e-6
+                            && Math.abs(rect.height - bbox.height * 2) < 1e-6,
+                        gBCRRotateSwaps:
+                            Math.abs(rotated.width - rotatedBox.height) < 1e-6
+                            && Math.abs(rotated.height - rotatedBox.width) < 1e-6,
+                        viewBoxCtm: [vb.a, vb.b, vb.c, vb.d, vb.e, vb.f]
+                            .every((v, i) => Math.abs(v - [2, 0, 0, 2, -100, -50][i]) < 1e-9),
+                        containerUnionGapsByBaseline:
+                            Math.abs((union.height - one.height) - 30) < 1e-6
+                            && Math.abs(union.y - one.y) < 1e-6,
+                        circleLengthNearCircumference:
+                            Math.abs(circleLen - 2 * Math.PI * 20) < 0.5,
+                        rectPerimeter: $("r3").getTotalLength() === 90,
+                        pointAtLengthExact: p.x === 50 && p.y === 0,
+                        clientRectsSingleFragment: list.length === 1
+                            && Math.abs(list.item(0).x - rect.x) < 1e-6,
+                        htmlOutsideSvgHasNoCtm: div.getCTM() === null && div.getScreenCTM() === null,
+                        textIsNotGeometry: typeof $("t1").getTotalLength === "undefined",
+                        circleIsGeometry: $("c1") instanceof SVGGeometryElement,
+                        rectShapeIsGeometry: $("r3") instanceof SVGGeometryElement,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "rootBoxFromLayout": true,
+                "ctmScaled": true,
+                "screenCtmAddsOrigins": true,
+                "gBCRScaledBox": true,
+                "gBCRRotateSwaps": true,
+                "viewBoxCtm": true,
+                "containerUnionGapsByBaseline": true,
+                "circleLengthNearCircumference": true,
+                "rectPerimeter": true,
+                "pointAtLengthExact": true,
+                "clientRectsSingleFragment": true,
+                "htmlOutsideSvgHasNoCtm": true,
+                "textIsNotGeometry": true,
+                "circleIsGeometry": true,
+                "rectShapeIsGeometry": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn document_privacy_apis_match_chrome_shape_defaults_and_failures() {
         let mut rt = setup_privacy_runtime();

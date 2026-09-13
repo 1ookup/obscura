@@ -832,7 +832,9 @@ class _Canvas2D {
   }
   _makeGradient(type, params) {
     const ctx = this;
-    const grad = Object.assign({
+    // Chrome hands back a CanvasGradient instance; binding the interface
+    // prototype keeps `instanceof CanvasGradient` true for gradient probes.
+    const grad = Object.setPrototypeOf(Object.assign({
       _type: type, _stops: [],
       addColorStop(offset, color) {
         offset = +offset;
@@ -844,7 +846,7 @@ class _Canvas2D {
       },
       get [Symbol.toStringTag]() { return 'CanvasGradient'; },
       _transform: this._transform.slice(),
-    }, params);
+    }, params), (typeof CanvasGradient === 'function' ? CanvasGradient.prototype : null));
     return grad;
   }
   createPattern() { return {}; }

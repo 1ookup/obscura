@@ -1609,8 +1609,8 @@ class Element extends Node {
         // subpixel precision for getBoundingClientRect(); client metrics round
         // to whole CSS pixels like Chromium.
         return {
-          width: Math.round(Math.max(0, geometry.clientWidth)),
-          height: Math.round(Math.max(0, geometry.clientHeight)),
+          width: Math.min(33554430, Math.round(Math.max(0, geometry.clientWidth))),
+          height: Math.min(33554430, Math.round(Math.max(0, geometry.clientHeight))),
         };
       }
     } catch (_error) {}

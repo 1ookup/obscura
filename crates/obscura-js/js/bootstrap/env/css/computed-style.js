@@ -46,6 +46,39 @@ globalThis.getComputedStyle = (el) => {
   // otherwise every static element reported an offset resolved from its own
   // border box, which no browser does and which a layout probe reads as a
   // value the renderer invented.
+  // Chrome clamps every resolved layout length at LayoutUnit's maximum
+  // (2^31 / 64 = 33554431.98 -> the observable clamp value is 33554430): an
+  // authored `width: 8e37px`, `-8e37px`, `8e37%` or an overflowing em/vw unit
+  // all answer `3.35544e+07px`, and the box measures ~33554430 CSS px.
+  // Chrome also serializes computed lengths >= 1e6 in CSSOM scientific form.
+  // Answering the raw magnitude (or `infpx`) is a value no browser produces.
+  const _LAYOUT_UNIT_MAX = 33554430;
+  const _sciPx = (v) => {
+    const [mant, exp] = v.toExponential(5).split('e');
+    const e = parseInt(exp, 10);
+    return `${mant}e${e < 0 ? '-' : '+'}${String(Math.abs(e)).padStart(2, '0')}px`;
+  };
+  const chromeLengthPx = (v) => {
+    if (!Number.isFinite(v)) return _sciPx(_LAYOUT_UNIT_MAX);
+    const clamped = Math.abs(v) > _LAYOUT_UNIT_MAX ? _LAYOUT_UNIT_MAX : v;
+    return Math.abs(clamped) >= 1e6 ? _sciPx(clamped) : `${clamped}px`;
+  };
+  const _DIMENSION_PROPS = new Set(['width', 'height', 'inline-size', 'block-size',
+    'min-width', 'min-height', 'max-width', 'max-height', 'max-inline-size', 'max-block-size',
+    'left', 'top', 'right', 'bottom', 'client-width', 'client-height',
+    'offset-width', 'offset-height']);
+  // Authored dimension values that overflow Chrome's layout range answer the
+  // clamp instead of echoing the authored magnitude.
+  const clampAuthoredDimension = (kebab, value) => {
+    if (!_DIMENSION_PROPS.has(kebab) || typeof value !== 'string') return value;
+    const t = value.trim();
+    if (/^[-+]?(inf(inity)?|nan)(px|%)?$/i.test(t)) return chromeLengthPx(Infinity);
+    const m = t.match(/^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(px|em|rem|ex|ch|vw|vh|%|cm|mm|in|pt|pc|q|vmin|vmax)?$/);
+    if (!m) return value;
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && Math.abs(n) <= _LAYOUT_UNIT_MAX) return value;
+    return chromeLengthPx(n);
+  };
   const computedPosition = () => {
     if (snapshot.rendered && typeof snapshot.rendered.position === 'string') {
       return snapshot.rendered.position;
@@ -62,17 +95,17 @@ globalThis.getComputedStyle = (el) => {
       if (!r) return null;
       switch (name) {
         case 'width': case 'inline-size':
-          return r.width != null ? `${r.width}px` : null;
+          return r.width != null ? chromeLengthPx(r.width) : null;
         case 'height': case 'block-size':
-          return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
+          return r.height != null ? chromeLengthPx(r.height) : null;
+        case 'left': return r.left != null ? chromeLengthPx(r.left) : null;
+        case 'top': return r.top != null ? chromeLengthPx(r.top) : null;
+        case 'right': return r.right != null ? chromeLengthPx(r.right) : null;
+        case 'bottom': return r.bottom != null ? chromeLengthPx(r.bottom) : null;
         case 'client-width': case 'offset-width':
-          return r.width != null ? `${r.width}px` : null;
+          return r.width != null ? chromeLengthPx(r.width) : null;
         case 'client-height': case 'offset-height':
-          return r.height != null ? `${r.height}px` : null;
+          return r.height != null ? chromeLengthPx(r.height) : null;
       }
     } catch (e) {}
     return null;
@@ -143,7 +176,7 @@ globalThis.getComputedStyle = (el) => {
     'will-change': 'auto', 'backface-visibility': 'visible',
   };
 
-  const lookup = (rawProp) => {
+  const lookupValue = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
     refreshRendered();
     let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
@@ -162,7 +195,7 @@ globalThis.getComputedStyle = (el) => {
         const value = Number(inlineVal);
         if (Number.isFinite(value)) return String(Math.min(1, Math.max(0, value)));
       }
-      return inlineVal;
+      return clampAuthoredDimension(kebab, inlineVal);
     }
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;
@@ -179,6 +212,15 @@ globalThis.getComputedStyle = (el) => {
   };
 
   const target = style;
+  // Every answer for a box-dimension property passes the layout-range clamp,
+  // whichever source produced it (renderer snapshot, inline echo, or the
+  // synthesized rect): Chrome reports the clamp for any overflowing value.
+  const lookup = (rawProp) => {
+    const value = lookupValue(rawProp);
+    if (typeof rawProp !== 'string') return value;
+    const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    return clampAuthoredDimension(kebab, value);
+  };
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive) return undefined;

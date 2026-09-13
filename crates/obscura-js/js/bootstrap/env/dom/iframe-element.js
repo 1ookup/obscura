@@ -150,6 +150,13 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
     if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
     if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    // Basic shapes answer getTotalLength/getPointAtLength in Chrome; the
+    // geometry prototype (an SVGElement subclass) keeps every Element-level
+    // API while adding the geometry one.
+    if (globalThis.SVGGeometryElement && (
+      tag === "circle" || tag === "ellipse" || tag === "line"
+      || tag === "polygon" || tag === "polyline" || tag === "rect"
+    )) return globalThis.SVGGeometryElement;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
@@ -172,6 +179,13 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/2000/svg") {
     if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
     if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    // Basic shapes answer getTotalLength/getPointAtLength in Chrome; giving
+    // them the geometry prototype (a subclass of SVGElement) keeps every
+    // Element-level API while adding the geometry one.
+    if (globalThis.SVGGeometryElement && (
+      localName === "circle" || localName === "ellipse" || localName === "line"
+      || localName === "polygon" || localName === "polyline" || localName === "rect"
+    )) return globalThis.SVGGeometryElement;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {

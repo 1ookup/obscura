@@ -284,7 +284,12 @@
         if (result == null || typeof result.x !== 'number'
             || typeof result.width !== 'number') return result;
         if (result instanceof DOMRect) return result;
-        const branded = new DOMRect(result.x, result.y, result.width, result.height);
+        // Chrome's layout engine clamps every box at LayoutUnit's maximum;
+        // a magnitude no browser can produce (an overflowing authored width
+        // that reached layout) is a renderer fingerprint.
+        const clampBox = (v) => (!Number.isFinite(v) || Math.abs(v) > 33554430) ? 33554430 : v;
+        const branded = new DOMRect(
+          clampBox(result.x), clampBox(result.y), clampBox(result.width), clampBox(result.height));
         // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
         // and skips the scroll for it. The branded value has to carry that
         // marker, or a fixed subtree starts moving the document.
@@ -294,6 +299,67 @@
       writable: true, enumerable: false, configurable: true,
     });
   } catch (e) {}
+})();
+
+// Late interface bindings. The media modules build their objects before the
+// interface shells above exist, so instanceof bindings that belong to page
+// time land here: the audio context class chain, and the speechSynthesis
+// singleton's interface prototype.
+(function _bindLateInterfaces() {
+  try {
+    if (typeof globalThis.BaseAudioContext === 'function') {
+      for (const name of ['AudioContext', 'OfflineAudioContext']) {
+        const ctor = globalThis[name];
+        if (typeof ctor === 'function'
+            && Object.getPrototypeOf(ctor.prototype) !== globalThis.BaseAudioContext.prototype) {
+          Object.setPrototypeOf(ctor.prototype, globalThis.BaseAudioContext.prototype);
+        }
+      }
+    }
+  } catch (_e) {}
+  try {
+    if (globalThis.speechSynthesis && typeof globalThis.SpeechSynthesis === 'function'
+        && !(globalThis.speechSynthesis instanceof globalThis.SpeechSynthesis)) {
+      Object.setPrototypeOf(globalThis.speechSynthesis, globalThis.SpeechSynthesis.prototype);
+    }
+  } catch (_e) {}
+})();
+
+// Chrome's built-in-AI interfaces expose static availability()/create() even
+// when no model is downloaded. The auto-generated interface shells have the
+// constructor but neither static, so a feature probe reading
+// `Summarizer.availability` got undefined -- a value no Chrome produces --
+// and calling it threw. Stock Chrome resolves availability to "unavailable"
+// when the model is absent (verified against the passing-side reference).
+(function _installAiStatics() {
+  if (typeof _markNative !== 'function') return;
+  const statics = ['Summarizer', 'LanguageDetector', 'Translator', 'Writer',
+    'Proofreader', 'Prompt'];
+  for (const name of statics) {
+    const ctor = globalThis[name];
+    if (typeof ctor !== 'function') continue;
+    if (typeof ctor.availability !== 'function') {
+      try {
+        Object.defineProperty(ctor, 'availability', {
+          value: _markNative(function availability() {
+            return Promise.resolve('unavailable');
+          }),
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (_e) {}
+    }
+    if (typeof ctor.create !== 'function') {
+      try {
+        Object.defineProperty(ctor, 'create', {
+          value: _markNative(function create() {
+            return Promise.reject(new DOMException(
+              'Not supported', 'NotSupportedError'));
+          }),
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (_e) {}
+    }
+  }
 })();
 
 // Final native-presentation sweep. _markBuiltinsNative (surface-finalize)
