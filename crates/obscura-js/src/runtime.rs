@@ -6353,6 +6353,49 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_svg_elements_expose_geometry_methods_after_namespace_creation() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://top.example/index.html");
+        rt.run_page_init();
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("f", "<svg xmlns='http://www.w3.org/2000/svg'><text id='t'>MMMM</text></svg>", "https://widget.example/frame", "");
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("svg-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        let result = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "svg-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"(() => {
+                    const ns = "http://www.w3.org/2000/svg";
+                    const svg = document.createElementNS(ns, "svg");
+                    const text = document.createElementNS(ns, "text");
+                    text.textContent = "MMMM";
+                    svg.appendChild(text);
+                    return [typeof svg.getBBox, typeof text.getComputedTextLength,
+                        svg.getBBox().width > 0, text.getComputedTextLength() > 0];
+                })()"#,
+                true,
+                true,
+                5_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["function", "function", true, true]));
+    }
+
     #[test]
     fn media_src_csp_marks_blocked_media_as_no_source() {
         let mut rt = setup_runtime("<html><body><video id='v' src='https://cdn.example/movie.mp4'></video></body></html>");

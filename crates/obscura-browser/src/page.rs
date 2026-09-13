@@ -1115,7 +1115,17 @@ impl Page {
             input_strategy: std::env::var("OBSCURA_AUTO_CLICK_SELECTOR")
                 .ok()
                 .filter(|selector| !selector.trim().is_empty())
-                .map(InputStrategy::selector),
+                .map(|selector| {
+                    let delay_ms = std::env::var("OBSCURA_AUTO_CLICK_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    let key_delay_ms = std::env::var("OBSCURA_AUTO_CLICK_KEY_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(25);
+                    InputStrategy { selector, delay_ms, key_delay_ms }
+                }),
             intercept_tx: None,
             preload_scripts: Vec::new(),
             debugger_enabled: false,
@@ -2783,10 +2793,37 @@ impl Page {
                 break;
             }
             self.execute_frame_scripts_for(&frame_id, deadline).await;
+            // A frame's widget may append its interactive control only after
+            // its author scripts and asynchronous bootstrap have run. Re-arm
+            // the embedder's opt-in selector policy after the frame script
+            // phase so the frame helper gets a final immediate lookup in
+            // addition to its bounded observer/retry window.
+            self.rearm_frame_input_strategy(&frame_id);
         }
         if let Some(token) = watchdog {
             if let Some(js) = self.js.as_mut() {
                 js.disarm_watchdog(token);
+            }
+        }
+    }
+
+    fn rearm_frame_input_strategy(&mut self, frame_id: &str) {
+        let Some(strategy) = self.input_strategy.as_ref() else { return; };
+        let Some(frame) = self.frames.get(frame_id) else { return; };
+        let generation = frame.document_generation;
+        let Ok(selector) = serde_json::to_string(&strategy.selector) else { return; };
+        let source = format!(
+            "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
+            strategy.delay_ms, strategy.key_delay_ms,
+        );
+        if let Some(js) = self.js.as_mut() {
+            if let Err(error) = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-input-strategy-rearm>",
+                &source,
+            ) {
+                tracing::debug!("frame input strategy rearm failed ({frame_id}): {error}");
             }
         }
     }
