@@ -670,6 +670,17 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
   var getOwnPropertyNames = Object.getOwnPropertyNames;
+  // A worker's performance clock counts from the worker's own creation, like
+  // Chrome's worker time origin. The startup snapshot otherwise leaves the
+  // monotonic base at process start, so worker `performance.now()` reports
+  // process uptime -- a proof-of-work shard then claims milliseconds-since-
+  // boot as its compute duration, which no real browser produces.
+  try {
+    if (typeof G.__obscura_rebasePerformanceOrigin === 'function') {
+      G.__obscura_rebasePerformanceOrigin(Date.now());
+      G.performance.timeOrigin = Date.now();
+    }
+  } catch (e) {}
   // A shared worker's scope is branded SharedWorkerGlobalScope, reaches its
   // pages over connection ports rather than a scope-level `postMessage`, and
   // exposes `onconnect` where a dedicated scope exposes `onmessage`.

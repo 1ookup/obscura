@@ -473,17 +473,22 @@ impl BrowserFingerprint {
 
 fn desktop_screen(device_scale_factor: f64) -> ScreenFingerprint {
     ScreenFingerprint {
-        width: 1920,
-        height: 1080,
-        avail_width: 1920,
-        avail_height: 1080,
-        avail_top: 0,
+        // A real cascaded desktop session: 3440x1440 monitor with the taskbar
+        // at the top (availTop 25), a 2309x1326 window at (674, 25). A
+        // maximized 1920x1080 window at the monitor origin is the headless
+        // shape; every measured human session had a smaller-than-screen
+        // window off the origin.
+        width: 3440,
+        height: 1440,
+        avail_width: 3440,
+        avail_height: 1326,
+        avail_top: 25,
         avail_left: 0,
         device_scale_factor,
-        outer_width: 0,
-        outer_height: 0,
-        screen_x: 0,
-        screen_y: 0,
+        outer_width: 2309,
+        outer_height: 1326,
+        screen_x: 674,
+        screen_y: 25,
     }
 }
 

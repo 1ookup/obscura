@@ -210,13 +210,26 @@ impl StealthHttpClient {
         allow_private_network: bool,
         fingerprint: crate::fingerprint::BrowserFingerprint,
     ) -> Self {
-        // Chrome148 is the closest profile wreq-util ships to 149; the macOS
-        // platform matches the default fingerprint identity. Requests carry an
+        // Chrome148 is the closest profile wreq-util ships to 149. The
+        // platform must agree with the fingerprint identity the page reports
+        // (Win32/D3D11 etc.): a macOS-marked transport under a Windows
+        // identity is a cross-layer mismatch. Requests still carry an
         // explicit UA and sec-ch-ua from the fingerprint, so the emulation
         // mostly contributes TLS and HTTP/2 framing.
+        let platform = if fingerprint.user_agent.contains("Windows") {
+            wreq_util::Platform::Windows
+        } else if fingerprint.user_agent.contains("Macintosh") {
+            wreq_util::Platform::MacOS
+        } else if fingerprint.user_agent.contains("Android") {
+            wreq_util::Platform::Android
+        } else if fingerprint.user_agent.contains("iPhone") || fingerprint.user_agent.contains("iPad") {
+            wreq_util::Platform::IOS
+        } else {
+            wreq_util::Platform::Linux
+        };
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome148)
-            .platform(wreq_util::Platform::MacOS)
+            .platform(platform)
             .build();
 
         let mut builder = wreq::Client::builder()
@@ -226,7 +239,16 @@ impl StealthHttpClient {
             // can never be serialized twice by the transport layer.
             .default_headers(wreq::header::HeaderMap::new())
             .timeout(Duration::from_secs(30))
-            .redirect(wreq::redirect::Policy::none())
+            .redirect(wreq::redirect::Policy::none());
+        if proxy_url.is_some() {
+            // Some intercepting proxies mishandle large HTTP/2 uploads (their
+            // inbound flow-control accounting kills the connection on ~90KB
+            // POST bodies, measured against mitmproxy 12). HTTP/1.1 has no
+            // stream flow control and the same proxy accepts it, so proxied
+            // sessions pin h1. Direct connections keep the h2 fingerprint.
+            builder = builder.http1_only();
+        }
+        let mut builder = builder
             // Keep certificate verification enabled by default. The explicit
             // opt-out is for local MITM/debugging only and does not alter the
             // emulated TLS handshake profile.

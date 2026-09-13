@@ -921,6 +921,19 @@ impl ObscuraJsRuntime {
 
     pub fn set_fingerprint(&mut self, fingerprint: &obscura_net::BrowserFingerprint) {
         self.fingerprint = fingerprint.clone();
+        // Image subresources ride the renderer's own loader; keep its proxy and
+        // User-Agent identical to the page transport so a CDN never sees the
+        // same session arrive from two clients.
+        #[cfg(feature = "render")]
+        {
+            let proxy = self
+                .state
+                .borrow()
+                .http_client
+                .as_ref()
+                .and_then(|client| client.proxy_url().map(str::to_string));
+            obscura_render::set_image_transport(proxy, fingerprint.user_agent.clone());
+        }
         let Ok(json) = serde_json::to_string(fingerprint) else {
             return;
         };
@@ -8495,6 +8508,38 @@ RequestRedirect value",
         assert_eq!(result, serde_json::json!(["number", 3, true, "function"]));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_subtle_generate_key_material_is_realm_local() {
+        // generateKey stores op_random_bytes output as key material; without a
+        // realm-local copy the frame's `instanceof Uint8Array` check in
+        // keyBytes rejects every generated key with "Argument is not a valid
+        // CryptoKey", so encrypt/decrypt/sign become unusable in frames.
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "https://widget.example/frame", null, true);
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(async () => {
+                const subtle = crypto.subtle;
+                const aes = await subtle.generateKey({name: "AES-GCM", length: 128}, true, ["encrypt", "decrypt"]);
+                const iv = crypto.getRandomValues(new Uint8Array(12));
+                const data = new TextEncoder().encode("frame-key");
+                const ct = await subtle.encrypt({name: "AES-GCM", iv}, aes, data);
+                const pt = new TextDecoder().decode(await subtle.decrypt({name: "AES-GCM", iv}, aes, ct));
+                const mac = await subtle.generateKey({name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+                const sig = await subtle.sign("HMAC", mac, data);
+                return [pt, ct.byteLength > data.length, sig.byteLength];
+            })()"#,
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!(["frame-key", true, 32]));
+    }
+
     #[test]
     fn scoped_document_domain_persists_the_relaxed_value() {
         let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
@@ -9597,7 +9642,7 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!({
-                "entryTypes": ["mark", "measure", "mark", "resource"],
+                "entryTypes": ["visibility-state", "mark", "measure", "mark", "resource"],
                 "measure": [4, 6, true],
                 "resource": ["script", 13, 16, 20, 7, 200, true],
                 "bufferedRecords": 1,
@@ -11098,6 +11143,11 @@ RequestRedirect value",
 
     #[test]
     fn chrome149_payload_interfaces_are_present_on_secure_documents() {
+        // ModelContext/WebMCPEvent existed only behind a Chrome 153+ origin
+        // trial (the earlier capture ran a headful trial build). The UA this
+        // engine presents is stable Chrome 148, which does not expose them,
+        // and the passing baseline enumerates neither. Keep the surface free
+        // of both so the payload cannot contradict its own user agent.
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -11114,10 +11164,10 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!({
-                "modelContext": "object",
-                "modelContextTag": "[object ModelContext]",
-                "modelContextCtor": "function",
-                "webMcpEvent": "function",
+                "modelContext": "undefined",
+                "modelContextTag": "[object Undefined]",
+                "modelContextCtor": "undefined",
+                "webMcpEvent": "undefined",
                 "designMode": "off",
                 "navigatorOwn": [],
             })
@@ -19003,8 +19053,8 @@ RequestRedirect value",
                     "ownCount": 748, "numericCount": 3, "namedCount": 745, "ownHas": true,
                 },
                 "computed": {
-                    "tag": "[object CSSStyleDeclaration]", "length": 475,
-                    "ownCount": 1220, "numericCount": 475, "namedCount": 745, "ownHas": true,
+                    "tag": "[object CSSStyleDeclaration]", "length": 456,
+                    "ownCount": 1150, "numericCount": 456, "namedCount": 694, "ownHas": true,
                 },
                 "prototype": ["cssText", "length", "parentRule", "cssFloat",
                     "getPropertyPriority", "getPropertyValue", "item", "removeProperty",
@@ -22598,7 +22648,7 @@ RequestRedirect value",
             serde_json::json!({
                 "beforeInsert": null,
                 "url": "about:blank",
-                "brand": "[object Document]",
+                "brand": "[object HTMLDocument]",
                 "skeleton": ["HTML", true, true],
                 "missingFromFrame": [],
                 "defaultView": true,
@@ -25088,8 +25138,8 @@ RequestRedirect value",
             serde_json::json!({
                 "tag": "[object NetworkInformation]",
                 "own": [],
-                "prototype": ["onchange", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
-                "typeMissing": true,
+                "prototype": ["onchange", "type", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
+                "typeMissing": false,
                 "eventTarget": true,
                 "stable": true,
                 "constructorShape": ["NetworkInformation", 0,
@@ -25651,12 +25701,15 @@ RequestRedirect value",
                     'WheelEvent', 'ProgressEvent', 'PopStateEvent', 'HashChangeEvent',
                     'ClipboardEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent',
                     'CompositionEvent', 'PerformanceObserver', 'MutationObserver',
-                    'Node', 'Element', 'Document', 'Headers', 'Request', 'Response',
+                    // Element and Document carry per-instance tag getters
+                    // ([object HTMLDivElement], [object HTMLDocument]); their
+                    // prototype tags are intentionally not the interface name.
+                    'Node', 'Headers', 'Request', 'Response',
                     'HTMLInputElement',
                     'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
                     'Navigator', 'Location', 'XSLTProcessor', 'HTMLUserMediaElement',
                     'InteractionContentfulPaint', 'PerformanceSoftNavigation', 'NodeRange',
-                    'OpaqueRange', 'ModelContext', 'WebMCPEvent',
+                    'OpaqueRange',
                 ];
                 const bad = [];
                 for (const n of names) {
@@ -25739,7 +25792,7 @@ RequestRedirect value",
                 "navigatorIsNavigator": true,
                 "locationTag": "[object Location]",
                 "navigatorTag": "[object Navigator]",
-                "elementTag": "[object Element]",
+                "elementTag": "[object HTMLDivElement]",
                 "inputTag": "[object HTMLInputElement]",
                 "inputInstance": true,
                 "inputCtorToString": "function HTMLInputElement() { [native code] }",

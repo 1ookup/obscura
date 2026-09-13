@@ -7684,19 +7684,72 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
 /// old per-call `ureq::get`) reads as a burst and gets 429'd, whereas reusing
 /// one pooled connection to the same host (as a browser does) both avoids most
 /// throttling and is much faster on an image-heavy page.
-fn image_agent() -> &'static ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
+///
+/// The agent is rebuilt when the host changes the page's transport identity:
+/// subresource images must leave from the same proxy and carry the same
+/// User-Agent as the document, or an origin that spans both (any CDN that
+/// binds a session to IP + UA) sees one page as two clients.
+fn image_agent() -> std::sync::Arc<ureq::Agent> {
+    static STATE: std::sync::OnceLock<std::sync::RwLock<ImageTransportState>> =
+        std::sync::OnceLock::new();
+    let state = STATE.get_or_init(Default::default);
+    let guard = state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(agent) = guard.agent.as_ref() {
+        return std::sync::Arc::clone(agent);
+    }
+    drop(guard);
+    let mut guard = state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(agent) = guard.agent.as_ref() {
+        return std::sync::Arc::clone(agent);
+    }
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(&guard.user_agent);
+    if let Some(proxy) = guard.proxy.as_ref() {
+        if let Ok(proxy) = ureq::Proxy::new(proxy) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let agent = std::sync::Arc::new(builder.build());
+    guard.agent = Some(std::sync::Arc::clone(&agent));
+    agent
+}
+
+struct ImageTransportState {
+    proxy: Option<String>,
+    user_agent: String,
+    agent: Option<std::sync::Arc<ureq::Agent>>,
+}
+
+impl Default for ImageTransportState {
+    fn default() -> Self {
+        Self {
+            proxy: None,
             // Present the same normal browser identity the engine uses for the
             // document. A bot-identifying UA got image requests filtered by CDNs
             // that gate on User-Agent (Akamai/Cloudflare image endpoints on
             // cnbc, techcrunch, arstechnica), so the images Chrome loads came
             // back blank; a real browser UA loads the same bytes Chrome does.
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            .build()
-    })
+            user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+            agent: None,
+        }
+    }
+}
+
+/// Point the renderer's image subresource transport at the page's proxy and
+/// User-Agent. Called whenever the embedder configures the page identity;
+/// images fetched before the first call use the built-in default agent.
+pub fn set_image_transport(proxy: Option<String>, user_agent: String) {
+    static STATE: std::sync::OnceLock<std::sync::RwLock<ImageTransportState>> =
+        std::sync::OnceLock::new();
+    let state = STATE.get_or_init(Default::default);
+    let mut guard = state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.proxy == proxy && guard.user_agent == user_agent {
+        return;
+    }
+    guard.proxy = proxy;
+    guard.user_agent = user_agent;
+    guard.agent = None;
 }
 
 /// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that

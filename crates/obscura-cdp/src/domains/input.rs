@@ -131,7 +131,7 @@ fn mouse_hover_exit_js(x: f64, y: f64, sx: f64, sy: f64) -> String {
                 }}\
                 return result;\
             }}\
-            var pointer = {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:-1,buttons:0,relatedTarget:null,pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+            var pointer = {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:-1,buttons:0,relatedTarget:null,pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
             var leavePointer = Object.assign({{}}, pointer, {{bubbles:false,cancelable:false,composed:false}});\
             old.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerout', pointer)));\
             for (var p of path(old)) p.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerleave', leavePointer)));\
@@ -157,7 +157,7 @@ fn mouse_hover_move_js(target_js: &str, x: f64, y: f64, sx: f64, sy: f64) -> Str
                 }}\
                 return result;\
             }}\
-            var pointer = {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:-1,buttons:0,relatedTarget:null,pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
+            var pointer = {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:-1,buttons:0,relatedTarget:null,pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}};\
             var enterPointer = Object.assign({{}}, pointer, {{bubbles:false,cancelable:false,composed:false}});\
             if (old !== target) {{\
                 var oldPath = path(old), newPath = path(target);\
@@ -325,13 +325,13 @@ pub async fn handle(
                             if (!target) return;\
                             globalThis[Symbol.for('obscura.inputClickTarget')] = target;\
                             globalThis[Symbol.for('obscura.inputMouseDown')] = {{target:target,nodeId:{down_node},button:{button_code},clickCount:{click_count}}};\
-                            var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(true),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
+                            var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(true),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
                             var disabledControl = target.matches && target.matches(':disabled');\
                             var pointerAllowed = target.dispatchEvent(pevt);\
                             var suppressMouse = disabledControl || !pointerAllowed;\
                             globalThis[Symbol.for('obscura.inputMouseDown')].suppressMouse = suppressMouse;\
                             if (!suppressMouse) {{\
-                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                                 if (!disabledControl && target.focus) target.focus();\
                             }}\
@@ -378,11 +378,11 @@ pub async fn handle(
                             if (!target) return;\
                             var down = globalThis[Symbol.for('obscura.inputMouseDown')];\
                             globalThis[Symbol.for('obscura.inputMouseDown')] = null;\
-                            var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:0,detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
+                            var pevt = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:{button_code},buttons:0,detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0}}));\
                             target.dispatchEvent(pevt);\
                             if (globalThis.__obscura_pointer_release) globalThis.__obscura_pointer_release();\
                             if (!down || !down.suppressMouse) {{\
-                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                             }}\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
@@ -419,7 +419,7 @@ pub async fn handle(
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
                             }}\
-                            var click = globalThis.__obscura_markTrusted(new PointerEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx},screenY:{sy},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:false,width:1,height:1,pressure:0,tiltX:0,tiltY:0,twist:0,altitudeAngle:1.5707963267948966,azimuthAngle:0,tangentialPressure:0}}));\
+                            var click = globalThis.__obscura_markTrusted(new PointerEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},screenX:{sx}+globalThis.__obscura_window_origin_x(),screenY:{sy}+globalThis.__obscura_window_origin_y(),button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},pointerId:__obscura_pointer_id(false),pointerType:'mouse',isPrimary:false,width:1,height:1,pressure:0,tiltX:0,tiltY:0,twist:0,altitudeAngle:1.5707963267948966,azimuthAngle:0,tangentialPressure:0}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\

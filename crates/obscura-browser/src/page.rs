@@ -6440,11 +6440,32 @@ impl Page {
             Url::parse(&document_url),
         ) {
             (Some(source), Ok(target)) if matches!(target.scheme(), "http" | "https") => {
-                obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default()
+                let policy_value =
+                    obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default();
+                if policy_value.is_empty()
+                    && matches!(source.scheme(), "http" | "https")
+                    && frame_policy == obscura_net::ReferrerPolicy::SameOrigin
+                {
+                    // Chrome keeps an origin floor for a frame document's
+                    // referrer: measured on a page whose response sets
+                    // `Referrer-Policy: same-origin`, a cross-origin iframe
+                    // still reports the embedder's origin as
+                    // document.referrer (the header strips the wire Referer
+                    // header only). An empty scope referrer here makes the
+                    // frame read as if it had no embedder at all.
+                    obscura_net::referrer_value(
+                        &source,
+                        &target,
+                        obscura_net::ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                    )
+                    .unwrap_or_default()
+                } else {
+                    policy_value
+                }
             }
             // about:blank/srcdoc and other non-network documents inherit the
             // creator's source URL as their environment referrer.
-            _ => inherited_referrer.unwrap_or_default(),
+            _ => inherited_referrer.clone().unwrap_or_default(),
         };
         let committed = self
             .frames

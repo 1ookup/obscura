@@ -450,7 +450,9 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
     assert_eq!(out[0]["offset"], out[0]["expectedOffset"]);
     assert_eq!(out[0]["layer"], out[0]["expectedOffset"]);
     assert_eq!(out[0]["predicted"], 0);
-    assert_eq!(out[0]["coalesced"], 0);
+    // CDP input rides the real input pipeline, so Chrome's coalesced list
+    // holds at least the event itself; a synthetic dispatch stays empty.
+    assert_eq!(out[0]["coalesced"], 1);
     assert_eq!(out[0]["own"], json!(["isTrusted"]));
     assert_eq!(out[4]["composed"], true, "click must compose across shadow boundaries");
     assert_eq!(out[4]["pointerType"], "mouse", "CDP click is a PointerEvent in Chrome");
