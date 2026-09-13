@@ -19,7 +19,7 @@ fn directory() -> std::path::PathBuf {
     path
 }
 
-fn run(script: &str, trace: &Path, filter: &str, calls: bool) -> Output {
+fn run(script: &str, trace: &Path, filter: &str, calls: bool, exact: bool) -> Output {
     // Keep the URL on one line so it is also a usable source field.
     let source: String = script.lines().map(str::trim).collect();
     let url = format!("data:text/html,<script>{source}</script>");
@@ -34,6 +34,9 @@ fn run(script: &str, trace: &Path, filter: &str, calls: bool) -> Output {
     command.arg("--trace-api-file").arg(trace);
     command.arg("--trace-api-format").arg("jsonl");
     command.arg("--trace-api-filter").arg(filter);
+    if exact {
+        command.env("OBSCURA_TRACE_API_FILTER_EXACT", "1");
+    }
     if calls {
         command.arg("--trace-api-calls");
     }
@@ -75,7 +78,7 @@ fn json_records_carry_time_source_name_arguments_and_result() {
         globalThis.traceResult=navigator.userAgent.length;
       })();
     "#;
-    let output = run(script, &path, "userAgent,setAttribute,title", true);
+    let output = run(script, &path, "userAgent,setAttribute,title", true, false);
     assert!(
         output.status.success(),
         "{}",
@@ -145,7 +148,7 @@ fn json_filter_excludes_non_matching_members_and_keeps_the_rest() {
         void navigator.userAgent;
       })();
     "#;
-    let output = run(script, &path, "userAgent", false);
+    let output = run(script, &path, "userAgent", false, false);
     assert!(
         output.status.success(),
         "{}",
@@ -158,4 +161,21 @@ fn json_filter_excludes_non_matching_members_and_keeps_the_rest() {
         let name = record["name"].as_str().unwrap();
         assert!(name.contains("userAgent"), "leaked record: {record}");
     }
+}
+
+#[test]
+fn exact_filter_does_not_match_unrelated_objects_with_the_same_member() {
+    let directory = directory();
+    let path = directory.join("exact.jsonl");
+    let output = run(
+        "(()=>{ const probe={userAgent:'x'}; void probe.userAgent; void navigator.userAgent; })();",
+        &path,
+        "Navigator.userAgent",
+        false,
+        true,
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let records = records(&std::fs::read_to_string(&path).expect("exact trace file"));
+    assert!(!records.is_empty(), "exact trace is empty");
+    assert!(records.iter().all(|record| record["name"] == "Navigator.userAgent"));
 }

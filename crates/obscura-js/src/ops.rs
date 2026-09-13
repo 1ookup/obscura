@@ -6658,13 +6658,13 @@ fn op_post_to_frame(
         let __dbg = std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some();
         let Some(target_root) = dom.iframe_content_document(host) else {
             if __dbg {
-                eprintln!("[pmsg] post_to_frame host={} -> no-frame payload={}", host_nid, &payload.chars().take(120).collect::<String>());
+                eprintln!("[pmsg] post_to_frame host={} -> no-frame payload_bytes={} payload={}", host_nid, payload.len(), payload);
             }
             return "no-frame".into();
         };
         let Some(target_scope) = dom.document_scope(target_root) else {
             if __dbg {
-                eprintln!("[pmsg] post_to_frame host={} -> no-scope payload={}", host_nid, &payload.chars().take(120).collect::<String>());
+                eprintln!("[pmsg] post_to_frame host={} -> no-scope payload_bytes={} payload={}", host_nid, payload.len(), payload);
             }
             return "no-frame".into();
         };
@@ -6681,15 +6681,14 @@ fn op_post_to_frame(
         };
         if !post_message_target_allows(target_origin, &sender_origin, &target_scope.origin) {
             if __dbg {
-                eprintln!("[pmsg] post_to_frame host={} -> dropped(origin) target={} payload={}",
-                    host_nid, target_origin,
-                    &payload.chars().take(120).collect::<String>());
+                eprintln!("[pmsg] post_to_frame host={} -> dropped(origin) target={} payload_bytes={} payload={}",
+                    host_nid, target_origin, payload.len(), payload);
             }
             return "dropped".into();
         }
         if __dbg {
-            eprintln!("[pmsg] post_to_frame host={} -> queued payload={}",
-                host_nid, &payload.chars().take(120).collect::<String>());
+            eprintln!("[pmsg] post_to_frame host={} -> queued payload_bytes={} payload={}",
+                host_nid, payload.len(), payload);
         }
         // MessageEvent.source, reconstructed in the target realm: `parent`
         // when the sender document directly contains the host, `top` when the

@@ -3231,15 +3231,13 @@ impl ObscuraJsRuntime {
                 // Target generation destroyed (navigation/detach): drop.
                 if !self.frame_realms.contains(&frame_id, generation) {
                     if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+                        let payload = serde_json::to_string(&msg.payload).unwrap_or_default();
                         eprintln!(
-                            "[pmsg] DROPPED to frame {} gen {} (realm gone) payload_head={:?}",
+                            "[pmsg] DROPPED to frame {} gen {} (realm gone) payload_bytes={} payload={}",
                             frame_id,
                             generation,
-                            serde_json::to_string(&msg.payload)
-                                .unwrap_or_default()
-                                .chars()
-                                .take(120)
-                                .collect::<String>()
+                            payload.len(),
+                            payload
                         );
                     }
                     continue;

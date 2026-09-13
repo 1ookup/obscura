@@ -167,6 +167,13 @@ trace did not. Keyed and iterator accesses have no static name and are only
 filtered at runtime; `--trace-api-keyed off` drops them, which is the bulk of a
 page-internal trace.
 
+For a trace derived from full `Interface.member` names, set
+`OBSCURA_TRACE_API_FILTER_EXACT=1`. Include and exclude clauses then compare
+the complete dotted name rather than a substring. This opt-in diagnostic mode
+prevents a member such as `value` from retaining unrelated `Object.value` and
+`Array.value` records when a reference trace contains `Attr.value`; the default
+substring contract remains unchanged.
+
 Turning a reference trace into a filter is what makes the two comparable:
 derive the include list from the reference's own names so both sides record the
 same API surface.
@@ -306,6 +313,13 @@ hundred thousand. This is a measurement dilemma, not a tuning knob: the probe
 that would explain the branch is the probe that changes it.
 
 ## Calls And Console
+
+`OBSCURA_DEBUG_TREE_DETACH=1` also enables `[pmsg]` stderr diagnostics for
+frame message queueing and drops. These include the complete serialized payload
+and its UTF-8 byte count (`payload_bytes`). A truncated prefix cannot establish
+that an event was absent: structured-clone keys can place `event` after large
+resource-timing or stack fields. This diagnostic remains opt-in and does not
+alter message delivery.
 
 A `GET Array.map` proves the method was read, not that it was called. Optional
 `--v8-flags "--trace"` adds historical JS function CALL/RET records, including
