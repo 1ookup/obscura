@@ -165,6 +165,11 @@ function _eventTargetDispatchNow(target, event) {
   state.path = null;
   state.originalRelatedTarget = undefined;
   state.dispatching = false;
+  // Event Timing: discrete trusted input feeds the performance timeline as
+  // Chrome does, so an observer of type 'event' sees interactions.
+  if (typeof globalThis.__obscura_queue_event_timing === 'function') {
+    try { globalThis.__obscura_queue_event_timing(event); } catch (_timingError) {}
+  }
   return !event.defaultPrevented;
 }
 

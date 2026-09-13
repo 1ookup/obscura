@@ -223,7 +223,7 @@
       // too, and gpu stays for engine continuity (its shell predates this
       // table and callers rely on it in tests).
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
-      'protectedAudience', 'modelContext', 'storageBuckets',
+      'protectedAudience', 'storageBuckets',
     ]) _remove(globalThis.navigator, name);
     for (const name of ['sharedStorage', 'documentPictureInPicture', 'launchQueue']) {
       _remove(globalThis, name);
@@ -772,7 +772,6 @@ const _chromeInterfaceTable = [
   ["MediaSession",0,0,"Object","",0],
   ["MediaSource",0,1,"EventTarget","MediaSource",0],
   ["MediaSourceHandle",0,0,"Object","",0],
-  ["ModelContext",0,0,"Object","",0],
   ["MediaStream",0,1,"EventTarget","MediaStream",0],
   ["MediaStreamAudioDestinationNode",0,2,"AudioNode","",1],
   ["MediaStreamAudioSourceNode",0,3,"AudioNode","",2],
@@ -1208,7 +1207,6 @@ const _chromeInterfaceTable = [
   ["WebTransportDatagramDuplexStream",0,0,"Object","",0],
   ["WebTransportError",0,1,"DOMException","WebTransportError",0],
   ["WheelEvent",0,2,"MouseEvent","",1],
-  ["WebMCPEvent",0,0,"Event","",0],
   ["Window",0,0,"EventTarget","",0],
   ["WindowControlsOverlay",0,0,"EventTarget","",0],
   ["WindowControlsOverlayGeometryChangeEvent",0,4,"Event","",2],
@@ -1460,7 +1458,6 @@ const _chromeNavigatorTable = [
   ["mediaCapabilities", 1],
   ["mediaDevices", 1],
   ["mediaSession", 1],
-  ["modelContext", 1],
   ["mimeTypes", 1],
   ["permissions", 1],
   ["plugins", 1],
@@ -2421,7 +2418,7 @@ const _chromeNavigatorKeyOrder = [
   'webkitPersistentStorage', 'windowControlsOverlay', 'hardwareConcurrency',
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
-  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'modelContext',
+  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection',
   'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
@@ -2645,13 +2642,13 @@ const _chromePayloadBareFunctionOrder = [
  'BluetoothRemoteGATTDescriptor', 'BluetoothRemoteGATTServer', 'BluetoothRemoteGATTService', 'CaptureController', 'CrashReportContext', 'DevicePosture', 'DigitalCredential', 'DocumentPictureInPicture',
  'EyeDropper', 'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle', 'FileSystemWritableFileStream', 'FileSystemObserver', 'FontData',
  'FragmentDirective', 'HID', 'HIDConnectionEvent', 'HIDDevice', 'HIDInputReportEvent', 'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider',
- 'NavigatorLogin', 'LanguageDetector', 'LanguageModel', 'Lock', 'LockManager', 'ServiceWorker', 'ServiceWorkerContainer', 'ModelContext',
+ 'NavigatorLogin', 'LanguageDetector', 'LanguageModel', 'Lock', 'LockManager', 'ServiceWorker', 'ServiceWorkerContainer',
  'NotRestoredReasonDetails', 'NotRestoredReasons', 'OTPCredential', 'PaymentAddress', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse', 'PaymentManager',
  'PaymentMethodChangeEvent', 'Presentation', 'PresentationAvailability', 'PresentationConnection', 'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent', 'PresentationConnectionList', 'PresentationReceiver',
  'PresentationRequest', 'PressureObserver', 'PressureRecord', 'Serial', 'SerialPort', 'SpeechRecognitionPhrase', 'StorageBucket', 'StorageBucketManager',
  'Summarizer', 'Translator', 'USB', 'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice', 'USBEndpoint',
  'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket', 'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'WakeLock',
- 'WakeLockSentinel', 'WebMCPEvent', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
+ 'WakeLockSentinel', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
  'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource', 'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
  'XRJointPose', 'XRJointSpace', 'XRLightEstimate', 'XRLightProbe', 'XRPose', 'XRRay', 'XRReferenceSpace', 'XRReferenceSpaceEvent',
  'XRRenderState', 'XRRigidTransform', 'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSystem', 'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource',

@@ -185,6 +185,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
         'InvalidStateError');
     }
     if (state.method === 'GET' || state.method === 'HEAD') body = null;
+    // XHR spec: a body sent as a string is typed text/plain;charset=UTF-8
+    // unless the author set a Content-Type. Chrome sends exactly this on the
+    // challenge's own proof POSTs, so an untyped body is both non-conforming
+    // and observable at the origin.
+    if (typeof body === 'string' && !Object.keys(state.headers)
+        .some(k => k.toLowerCase() === 'content-type')) {
+      state.headers['Content-Type'] = 'text/plain;charset=UTF-8';
+    }
     state.sent = true; state.aborted = false;
     const controller = new AbortController();
     state.controller = controller;

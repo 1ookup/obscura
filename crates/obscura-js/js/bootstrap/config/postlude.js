@@ -138,8 +138,15 @@ function _installDocumentAll() {
   try { Object.setPrototypeOf(collection, globalThis.HTMLAllCollection.prototype); }
   catch (_error) {}
   if (Object.getOwnPropertyDescriptor(Document.prototype, 'all')) return;
+  // Runs again on every navigation (see the document-replacement hook), which
+  // is after the native-presentation sweeps, so the getter carries its own
+  // mark instead of relying on a later pass.
+  const allGetter = function () { return collection; };
+  try {
+    Object.defineProperty(allGetter, 'name', { value: 'get all', configurable: true });
+  } catch (_error) {}
   Object.defineProperty(Document.prototype, 'all', {
-    get() { return collection; },
+    get: _markNative(allGetter),
     enumerable: true, configurable: true,
   });
 }

@@ -4,6 +4,7 @@
 function registerNavigationSurface() {
   const listeners = Object.create(null);
   const nav = {
+    [Symbol.toStringTag]: 'Navigation',
     addEventListener(type, callback) {
       if (typeof callback !== "function") return;
       (listeners[String(type)] ||= []).push(callback);

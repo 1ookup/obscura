@@ -40,9 +40,25 @@ function _clampNestedDelay(delay) {
 function _runAtNesting(level, f, args) {
   const previous = _timerNesting;
   _timerNesting = level;
-  try { f(...args); }
-  catch (e) { console.error("Timer error:", e); }
-  finally { _timerNesting = previous; }
+  // Long task timings feed the LoAF timeline (see
+  // env/performance/long-animation-frame.js); without the wrapper the
+  // duration of a blocking callback is invisible to PerformanceObserver.
+  const run = () => {
+    try { f(...args); }
+    catch (e) {
+      // A timer callback that throws is an uncaught exception: report it to the
+      // window (error event + onerror) before logging, or page-side collectors
+      // never observe the failure.
+      const handled = typeof globalThis.__obscura_report_uncaught === 'function'
+        && globalThis.__obscura_report_uncaught(e);
+      if (!handled) console.error("Timer error:", e);
+    }
+    finally { _timerNesting = previous; }
+  };
+  if (typeof globalThis.__obscura_measure_task === 'function') {
+    return globalThis.__obscura_measure_task('TimerHandler', run);
+  }
+  return run();
 }
 
 _defineWindowValue('setTimeout', (fn, delay = 0, ...args) => {
@@ -171,19 +187,30 @@ function _runAnimationFrameBatch() {
   _rafCurrentBatch = batch;
   _rafRunningFrame = true;
   const timestamp = performance.now();
-  try {
-    for (const [id, callback] of batch) {
-      // cancelAnimationFrame() may remove a later callback while an earlier
-      // callback in the same frame is running.
-      if (!batch.has(id)) continue;
-      batch.delete(id);
-      try { callback(timestamp); }
-      catch (e) { console.error("Animation frame error:", e); }
+  const runFrame = () => {
+    try {
+      for (const [id, callback] of batch) {
+        // cancelAnimationFrame() may remove a later callback while an earlier
+        // callback in the same frame is running.
+        if (!batch.has(id)) continue;
+        batch.delete(id);
+        try { callback(timestamp); }
+        catch (e) {
+          const handled = typeof globalThis.__obscura_report_uncaught === 'function'
+            && globalThis.__obscura_report_uncaught(e);
+          if (!handled) console.error("Animation frame error:", e);
+        }
+      }
+    } finally {
+      _rafRunningFrame = false;
+      _rafCurrentBatch = null;
+      _scheduleAnimationFrame();
     }
-  } finally {
-    _rafRunningFrame = false;
-    _rafCurrentBatch = null;
-    _scheduleAnimationFrame();
+  };
+  if (typeof globalThis.__obscura_measure_task === 'function') {
+    globalThis.__obscura_measure_task('FrameRequestCallback', runFrame);
+  } else {
+    runFrame();
   }
 }
 

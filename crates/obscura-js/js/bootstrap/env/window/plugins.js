@@ -64,6 +64,7 @@ class NetworkInformation {
   set onchange(value) {
     _networkInformation(this).onchange = typeof value === 'function' ? value : null;
   }
+  get type() { _networkInformation(this); return 'wifi'; }
   get effectiveType() { _networkInformation(this); return '4g'; }
   get rtt() { _networkInformation(this); return 50; }
   get downlink() { _networkInformation(this); return 10; }
@@ -77,7 +78,7 @@ if (_networkInformationConstructor) Object.defineProperty(
 Object.defineProperty(NetworkInformation.prototype, Symbol.toStringTag,
   { value: 'NetworkInformation', configurable: true });
 _markNative(NetworkInformation);
-for (const name of ['onchange', 'effectiveType', 'rtt', 'downlink', 'saveData']) {
+for (const name of ['onchange', 'type', 'effectiveType', 'rtt', 'downlink', 'saveData']) {
   const descriptor = Object.getOwnPropertyDescriptor(NetworkInformation.prototype, name);
   if (descriptor.get) _markNative(descriptor.get);
   if (descriptor.set) _markNative(descriptor.set);

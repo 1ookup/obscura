@@ -149,6 +149,8 @@
 // @obscura-module env/performance/performance-observer-entry-list.js
 // @obscura-module env/performance/observer.js
 // @obscura-module env/performance/user-timing.js
+// @obscura-module env/performance/event-timing.js
+// @obscura-module env/performance/long-animation-frame.js
 // @obscura-module env/performance/lifecycle-hooks.js
 // @obscura-module env/dom/document-all.js
 // @obscura-module tools/fonts.js

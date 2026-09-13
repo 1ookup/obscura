@@ -198,7 +198,9 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     clearWatch() {},
   })),
   storage: _bootstrapObject('navigator.storage', () => ({
-    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
+    // Chrome grants ~60% of free disk space; a stable per-install value in the
+    // 200-300GB band matches a real drive without the flat 5GB tell.
+    estimate() { return Promise.resolve({ quota: 200000000000 + Math.floor(_fpRand(650) * 100000000000), usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   })),
@@ -238,16 +240,29 @@ registerNavigatorSurface();
   });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
-  var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
+  // Every PDF plugin carries both PDF mimetypes, and each navigator-level
+  // MimeType resolves enabledPlugin to the first plugin, exactly as Chrome
+  // links them. Empty plugin mime lists are the headless shape.
+  var _makePluginMimes = function(plugin) {
+    return [
+      Object.assign(new MimeType("application/pdf", "Portable Document Format", "pdf", null), { enabledPlugin: plugin }),
+      Object.assign(new MimeType("text/pdf", "Portable Document Format", "pdf", null), { enabledPlugin: plugin }),
+    ];
+  };
+  var _pdfPluginNames = ["PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer", "Microsoft Edge PDF Viewer", "WebKit built-in PDF"];
+  var _plugins = new PluginArray(_pdfPluginNames.map(function(name) {
+    return new Plugin(name, "internal-pdf-viewer", "Portable Document Format", []);
+  }));
+  for (var _pi = 0; _pi < _plugins.length; _pi++) {
+    var _mimes = _makePluginMimes(_plugins[_pi]);
+    for (var _mi = 0; _mi < _mimes.length; _mi++) {
+      try { _plugins[_pi][_mi] = _mimes[_mi]; } catch (_e) {}
+    }
+    try { _plugins[_pi].length = _mimes.length; } catch (_e2) {}
+  }
   var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+    new MimeType("application/pdf", "Portable Document Format", "pdf", _plugins[0]),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", _plugins[0]),
   ]);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });

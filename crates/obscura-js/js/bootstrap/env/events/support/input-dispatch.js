@@ -4,6 +4,17 @@
 // invoke them by name after bootstrap has been evaluated.
 let _mouseInputCaps = null;
 
+// Real browsers keep event screen coordinates in the desktop frame:
+// screenX - clientX === window.screenLeft for every event. The window
+// position is fingerprinted (non-zero on purpose), so every synthesized
+// event has to add it or the pair becomes a tell.
+globalThis.__obscura_window_origin_x = function () {
+  return Number(globalThis.screenX) || 0;
+};
+globalThis.__obscura_window_origin_y = function () {
+  return Number(globalThis.screenY) || 0;
+};
+
 globalThis.__obscura_markTrusted = function(ev) {
   try {
     if (ev) {
@@ -16,10 +27,45 @@ globalThis.__obscura_markTrusted = function(ev) {
         }
         _eventSourceCapabilities.set(ev, _mouseInputCaps);
       }
+      // Sticky/transient user activation: a trusted activation event makes
+      // navigator.userActivation report hasBeenActive forever and isActive
+      // for the transient window, the observable a real input pipeline
+      // produces. Only this internal helper can set it; the global stays
+      // hidden from page code.
+      var activationType = String(ev.type);
+      if (activationType === 'keydown' || activationType === 'mousedown'
+          || activationType === 'pointerdown' || activationType === 'touchend'
+          || activationType === 'click') {
+        _userActivationEver = true;
+        _userActivationAt = performance.now();
+      }
     }
   } catch (_error) {}
   return ev;
 };
+
+// User-activation state fed by the trusted-input pipeline above.
+let _userActivationEver = false;
+let _userActivationAt = -Infinity;
+const USER_ACTIVATION_TRANSIENT_MS = 5000;
+
+class UserActivation {
+  get hasBeenActive() { return _userActivationEver; }
+  get isActive() {
+    return _userActivationEver
+      && Number.isFinite(_userActivationAt)
+      && performance.now() - _userActivationAt < USER_ACTIVATION_TRANSIENT_MS;
+  }
+}
+Object.defineProperty(UserActivation.prototype, Symbol.toStringTag, {
+  value: 'UserActivation', configurable: true,
+});
+if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+  Object.defineProperty(Navigator.prototype, 'userActivation', {
+    configurable: true, enumerable: true,
+    get() { return new UserActivation(); },
+  });
+}
 
 let _pointerIdSeq = 0;
 let _pointerNeedsNewActivation = true;

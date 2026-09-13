@@ -138,7 +138,7 @@ globalThis.__obscura_init = function() {
     hasScreenOverride ? undefined : Number(fingerprintScreen.availTop),
     hasScreenOverride ? undefined : Number(fingerprintScreen.availLeft),
   );
-  globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
+  globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, [Symbol.toStringTag]: 'VisualViewport', addEventListener(){}, removeEventListener(){} }));
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -318,6 +318,7 @@ globalThis.__obscura_init = function() {
     globalThis.console = _identityObject('console', globalThis.console);
     globalThis.visualViewport = _identityObject(
       'visualViewport', globalThis.visualViewport);
+    globalThis.__obscura_seed_visibility_entry?.();
     // The remaining BOM surfaces are initialized by the startup snapshot
     // before runtime ops exist, so adopt them after page state is available.
     // `location` is backed by the private _locationObj binding rather than a

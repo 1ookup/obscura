@@ -77,9 +77,9 @@ function _audioContextCreateOscillator(context) {
 function _audioContextCreateDynamicsCompressor(context) {
   return {
     context,
-    threshold: _audioParam(_fp('compThreshold'), -100, 0),
-    knee: _audioParam(_fp('compKnee'), 0, 40),
-    ratio: _audioParam(_fp('compRatio'), 1, 20),
+    threshold: _audioParam(-24, -100, 0),
+    knee: _audioParam(30, 0, 40),
+    ratio: _audioParam(12, 1, 20),
     attack: _audioParam(0.003, 0, 1),
     release: _audioParam(0.25, 0, 1),
     reduction: 0,

@@ -73,7 +73,13 @@ function _splitTopLevelCssRules(value) {
 function _cssRuleFromText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
-  if (trimmed[0] === "@") return new CSSRule(trimmed, 0);
+  if (trimmed[0] === "@") {
+    // `@keyframes name { ... }` gets a real CSSKeyframesRule so `.name`,
+    // `.cssRules` and the child key blocks answer like every browser.
+    const keyframes = /^@(-webkit-)?keyframes\s+([\w-]+)\s*\{([\s\S]*)\}$/.exec(trimmed);
+    if (keyframes) return new CSSKeyframesRule(keyframes[2], keyframes[3]);
+    return new CSSRule(trimmed, 0);
+  }
   const open = trimmed.indexOf("{");
   if (open <= 0 || !trimmed.endsWith("}")) return null;
   const selector = trimmed.slice(0, open).trim();

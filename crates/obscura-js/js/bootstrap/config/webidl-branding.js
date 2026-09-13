@@ -114,6 +114,106 @@
   }
 })();
 
+// Per-element [object XXX] tags. Every DOM element here is an instance of the
+// single Element class, so the interface-table brand would answer the generic
+// "Element" for a <div>. Chrome answers the concrete interface name, computed
+// from the tag; a prototype getter reproduces that without stamping an own
+// symbol on every instance (Chrome has none).
+(function _installPerElementToStringTags() {
+  const HTML_TAGS = {
+    a: 'HTMLAnchorElement', abbr: 'HTMLElement', acronym: 'HTMLElement',
+    address: 'HTMLElement', applet: 'HTMLAppletElement', area: 'HTMLAreaElement',
+    article: 'HTMLElement', aside: 'HTMLElement', audio: 'HTMLAudioElement',
+    b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLBaseFontElement',
+    bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLBGSoundElement',
+    big: 'HTMLElement', blink: 'HTMLElement', blockquote: 'HTMLQuoteElement',
+    body: 'HTMLBodyElement', br: 'HTMLBRElement', button: 'HTMLButtonElement',
+    canvas: 'HTMLCanvasElement', caption: 'HTMLTableCaptionElement',
+    center: 'HTMLElement', cite: 'HTMLElement', code: 'HTMLElement',
+    col: 'HTMLTableColElement', colgroup: 'HTMLTableColElement',
+    data: 'HTMLDataElement', datalist: 'HTMLDataListElement',
+    dd: 'HTMLElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
+    dfn: 'HTMLElement', dialog: 'HTMLDialogElement', dir: 'HTMLDirectoryElement',
+    div: 'HTMLDivElement', dl: 'HTMLDListElement', dt: 'HTMLElement',
+    em: 'HTMLElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
+    figcaption: 'HTMLElement', figure: 'HTMLElement', font: 'HTMLFontElement',
+    footer: 'HTMLElement', form: 'HTMLFormElement', frame: 'HTMLFrameElement',
+    frameset: 'HTMLFrameSetElement', h1: 'HTMLHeadingElement',
+    h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement',
+    h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement', head: 'HTMLHeadElement',
+    header: 'HTMLElement', hgroup: 'HTMLElement', hr: 'HTMLHRElement',
+    html: 'HTMLHtmlElement', i: 'HTMLElement', iframe: 'HTMLIFrameElement',
+    img: 'HTMLImageElement', input: 'HTMLInputElement', ins: 'HTMLModElement',
+    kbd: 'HTMLElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
+    li: 'HTMLLIElement', link: 'HTMLLinkElement', main: 'HTMLElement',
+    map: 'HTMLMapElement', mark: 'HTMLElement', marquee: 'HTMLMarqueeElement',
+    menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
+    nav: 'HTMLElement', nobr: 'HTMLElement', noembed: 'HTMLElement',
+    noframes: 'HTMLElement', noscript: 'HTMLElement', object: 'HTMLObjectElement',
+    ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
+    option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
+    param: 'HTMLParamElement', picture: 'HTMLPictureElement',
+    plaintext: 'HTMLElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
+    q: 'HTMLQuoteElement', rp: 'HTMLElement', rt: 'HTMLElement',
+    ruby: 'HTMLElement', s: 'HTMLElement', samp: 'HTMLElement',
+    script: 'HTMLScriptElement', search: 'HTMLElement', section: 'HTMLElement',
+    select: 'HTMLSelectElement', slot: 'HTMLSlotElement', small: 'HTMLElement',
+    source: 'HTMLSourceElement', span: 'HTMLSpanElement', strike: 'HTMLElement',
+    strong: 'HTMLElement', style: 'HTMLStyleElement', sub: 'HTMLElement',
+    summary: 'HTMLElement', sup: 'HTMLElement', table: 'HTMLTableElement',
+    tbody: 'HTMLTableSectionElement', td: 'HTMLTableCellElement',
+    template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
+    tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement',
+    thead: 'HTMLTableSectionElement', time: 'HTMLTimeElement',
+    title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
+    tt: 'HTMLElement', u: 'HTMLElement', ul: 'HTMLUListElement',
+    var: 'HTMLElement', video: 'HTMLVideoElement', wbr: 'HTMLElement',
+    xmp: 'HTMLElement',
+  };
+  const SVG_TAGS = {
+    svg: 'SVGSVGElement', path: 'SVGPathElement', text: 'SVGTextElement',
+    g: 'SVGGElement', circle: 'SVGCircleElement', rect: 'SVGRectElement',
+    line: 'SVGLineElement', polyline: 'SVGPolylineElement',
+    polygon: 'SVGPolygonElement', ellipse: 'SVGEllipseElement',
+    image: 'SVGImageElement', use: 'SVGUseElement', tspan: 'SVGTSpanElement',
+    title: 'SVGTitleElement', desc: 'SVGDescElement', defs: 'SVGDefsElement',
+    symbol: 'SVGSymbolElement', marker: 'SVGMarkerElement', clipPath: 'SVGClipPathElement',
+    mask: 'SVGMaskElement', pattern: 'SVGPatternElement', linearGradient: 'SVGLinearGradientElement',
+    radialGradient: 'SVGRadialGradientElement', stop: 'SVGStopElement',
+  };
+  const namespaceOf = (el) => {
+    try { return el.namespaceURI || el[_nsSym] || 'http://www.w3.org/1999/xhtml'; }
+    catch (e) { return 'http://www.w3.org/1999/xhtml'; }
+  };
+  try {
+    Object.defineProperty(Element.prototype, Symbol.toStringTag, {
+      get() {
+        try {
+          const name = this.localName;
+          if (!name) return 'Element';
+          if (namespaceOf(this) === 'http://www.w3.org/2000/svg') {
+            return SVG_TAGS[name] || 'SVGElement';
+          }
+          return HTML_TAGS[name] || 'HTMLElement';
+        } catch (e) { return 'Element'; }
+      },
+      configurable: true,
+    });
+  } catch (e) {}
+  // Documents: an HTML document answers [object HTMLDocument].
+  try {
+    Object.defineProperty(Document.prototype, Symbol.toStringTag, {
+      get() {
+        try {
+          const root = this.documentElement;
+          return root && root.localName === 'html' ? 'HTMLDocument' : 'Document';
+        } catch (e) { return 'Document'; }
+      },
+      configurable: true,
+    });
+  } catch (e) {}
+})();
+
 // SVGTextContentElement's character-position API. Chrome exposes it on the
 // interface; Obscura had none of it, so a probe that walks a text run one
 // character at a time -- which is how the challenge builds its ascending
@@ -194,4 +294,66 @@
       writable: true, enumerable: false, configurable: true,
     });
   } catch (e) {}
+})();
+
+// Final native-presentation sweep. _markBuiltinsNative (surface-finalize)
+// walks constructors and prototypes, but not constructor statics, window
+// accessors, or anything installed after it -- and this module's SVG
+// geometry installs land exactly there. Every function left unmarked answers
+// Function.prototype.toString with its bootstrap source, which is what an
+// anti-tamper probe compares against a fresh realm's reference. Re-walking
+// is idempotent: the registries behind _markNative are a WeakSet/WeakMap.
+(function _markRemainingBuiltinsNative() {
+  if (typeof _markNative !== 'function') return;
+  const seen = new Set();
+  const nameOf = (fn, name) => {
+    try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_e) {}
+  };
+  function markMembers(owner) {
+    let keys;
+    try { keys = Object.getOwnPropertyNames(owner); } catch (_e) { return; }
+    for (const key of keys) {
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(owner, key); } catch (_e) { continue; }
+      if (!d) continue;
+      if (typeof d.value === 'function') {
+        // An anonymous function installed under a slot (URL.createObjectURL's
+        // plain assignment drops the name) must carry the slot's name.
+        if (d.value.name === '') nameOf(d.value, key);
+        _markNative(d.value);
+      }
+      if (typeof d.get === 'function') {
+        // 'get'/'set' are shorthand-definition artifacts (`get() {}`), never
+        // the accessor's real name; Chrome reports "get <key>".
+        if (d.get.name === '' || d.get.name === 'get') nameOf(d.get, 'get ' + key);
+        if (!_nativeStr.has(d.get)) _markNativeAs(d.get, 'function get ' + key + '() { [native code] }');
+      }
+      if (typeof d.set === 'function') {
+        if (d.set.name === '' || d.set.name === 'set') nameOf(d.set, 'set ' + key);
+        if (!_nativeStr.has(d.set)) _markNativeAs(d.set, 'function set ' + key + '() { [native code] }');
+      }
+    }
+  }
+  function walkConstructor(ctor) {
+    if (typeof ctor !== 'function') return;
+    _markNative(ctor);
+    // Static interface members (URL.createObjectURL, URL.parse) are as
+    // page-visible as prototype members.
+    markMembers(ctor);
+    const proto = ctor.prototype;
+    if (!proto || seen.has(proto)) return;
+    seen.add(proto);
+    markMembers(proto);
+  }
+  const names = Object.getOwnPropertyNames(globalThis);
+  for (const name of names) {
+    if (!/^[A-Z]/.test(name)) continue;
+    let val;
+    try { val = globalThis[name]; } catch (_e) { continue; }
+    walkConstructor(val);
+  }
+  // Window's own slots follow the same rules: nameless shims take the slot's
+  // name (Chrome reports setTimeout.name === "setTimeout") and its accessors
+  // answer with the `get <key>` shape every other accessor uses.
+  markMembers(globalThis);
 })();

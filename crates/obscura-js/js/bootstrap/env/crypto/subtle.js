@@ -498,17 +498,22 @@ if (!globalThis.crypto.subtle) {
         );
         return { privateKey, publicKey };
       }
+      // Key material crosses from the op bridge as a Uint8Array of the realm
+      // the op ran in, so an `instanceof Uint8Array` check in a frame realm
+      // would reject it. Copy into this realm's Uint8Array like every other
+      // op consumer here (bufferOf/toBytes) already does.
+      const randomKeyBytes = (n) => new Uint8Array(Deno.core.ops.op_random_bytes(n));
       if (alg.name === "HMAC") {
         const hash = normalizeHash(alg.hash);
         const len = alg.length ? Math.ceil(alg.length / 8) : hashBlockSize(hash);
-        const bytes = Deno.core.ops.op_random_bytes(len);
+        const bytes = randomKeyBytes(len);
         return makeKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: len * 8 }, keyUsages, bytes);
       }
       if (alg.name === "AES-CTR" || alg.name === "AES-CBC" || alg.name === "AES-GCM" || alg.name === "AES-KW") {
         if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256) {
           throw new DOMException("AES key length must be 128, 192, or 256 bits", "OperationError");
         }
-        const bytes = Deno.core.ops.op_random_bytes(alg.length / 8);
+        const bytes = randomKeyBytes(alg.length / 8);
         return makeKey("secret", extractable, { name: alg.name, length: alg.length }, keyUsages, bytes);
       }
       throw new DOMException("generateKey does not support " + alg.name, "NotSupportedError");

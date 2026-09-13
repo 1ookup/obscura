@@ -26,7 +26,12 @@ globalThis.PointerEvent = class PointerEvent extends MouseEvent {
   get isPrimary(){return _pointerEventState.get(this)?.isPrimary??false;}
   getPredictedEvents(){return [];}
   get persistentDeviceId(){return _pointerEventState.get(this)?.persistentDeviceId??0;}
-  getCoalescedEvents(){return [];}
+  // Per spec the coalesced list contains the event itself when the input
+  // pipeline reports no coalescing. Chrome only produces that list for real
+  // trusted-pipeline input; a synthetic dispatchEvent returns an empty list.
+  // Consumers read [0]'s pointer surface, so the trusted gate decides whether
+  // they see the event or undefined.
+  getCoalescedEvents(){return _trustedEvents.has(this) ? [this] : [];}
 };
 {
   const ctor=Object.getOwnPropertyDescriptor(PointerEvent.prototype,'constructor');

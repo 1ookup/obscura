@@ -62,8 +62,8 @@ const _WEBGL1_PARAMETERS = {
   0x0D52: 8, 0x0D53: 8, 0x0D54: 8, 0x0D55: 8,   // RED/GREEN/BLUE/ALPHA_BITS
   0x0D56: 24,      // DEPTH_BITS
   0x0D57: 0,       // STENCIL_BITS
-  0x80A8: 0,       // SAMPLE_BUFFERS
-  0x80A9: 0,       // SAMPLES
+  0x80A8: 1,       // SAMPLE_BUFFERS (antialiased default context)
+  0x80A9: 4,       // SAMPLES
   0x84FF: 16,      // MAX_TEXTURE_MAX_ANISOTROPY_EXT
   0x9240: true,    // UNPACK_FLIP_Y_WEBGL
   0x9241: false,   // UNPACK_PREMULTIPLY_ALPHA_WEBGL
@@ -86,11 +86,33 @@ const _WEBGL1_PARAMETERS = {
   0x84E0: 0x84C0,  // ACTIVE_TEXTURE -> TEXTURE0
   0x8B9A: 0x1401,  // IMPLEMENTATION_COLOR_READ_TYPE -> UNSIGNED_BYTE
   0x8B9B: 0x1908,  // IMPLEMENTATION_COLOR_READ_FORMAT -> RGBA
+  // Probed-by-challenge constants that previously answered null.
+  0x80AA: 4352,    // GENERATE_MIPMAP_HINT -> DONT_CARE
+  0x8058: 8,       // MAX_SAMPLES
+  0x80E8: 1048576, // MAX_ELEMENTS_INDICES (ANGLE D3D11)
+  0x80E9: 1048576, // MAX_ELEMENTS_VERTICES
+  0x84FD: 1,       // TEXTURE_MAX_ANISOTROPY_EXT (default)
+  0x87FF: 519,     // transient enum state seen in a real capture
+  0x8801: 7680,    // default enum state
+  0x8824: 8,       // MAX_DRAW_BUFFERS
+  0x891E: 2048,
+  0x8925: 7,
+  0x8A2B: 16, 0x8A2D: 16, 0x8A2E: 32, 0x8A2F: 32,
+  0x8A30: 16384, 0x8A31: 69632, 0x8A33: 69632, 0x8A34: 16,
+  0x8B49: 4096, 0x8B4A: 4096, 0x8B4B: 120,
+  0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4,
+  0x8D57: 8,
+  0x8D7B: 256,     // UNIFORM_BUFFER_OFFSET_ALIGNMENT (D3D11)
+  0x8FC9: false,
+  0x9110: 0, 0x9122: 120, 0x9125: 120,
+  0x9601: false,
 };
 // Values that are arrays have to be fresh each call: a caller that mutates the
 // returned Int32Array must not change what the next caller sees.
 const _WEBGL1_ARRAY_PARAMETERS = {
-  0x0D3A: () => new Int32Array([32767, 32767]),  // MAX_VIEWPORT_DIMS
+  // The reported GPU (Intel UHD 630, Direct3D FL11.0) caps viewport dims at
+  // 16384; 32767 contradicted the same payload's self-reported adapter.
+  0x0D3A: () => new Int32Array([16384, 16384]),  // MAX_VIEWPORT_DIMS
   0x846D: () => new Float32Array([1, 1024]),     // ALIASED_POINT_SIZE_RANGE
   0x846E: () => new Float32Array([1, 1]),        // ALIASED_LINE_WIDTH_RANGE
 };
@@ -401,6 +423,11 @@ class _WebGLContext {
     if (key === 0x9245 || key === 0x9246) {
       const gpu = _fingerprint().gpu || {};
       return key === 0x9245 ? (gpu.vendor || '') : (gpu.renderer || '');
+    }
+    // Viewport and scissor box follow the drawing buffer, like the initial
+    // state of a real context.
+    if (key === 0x0BA2 || key === 0x0C10) {
+      return new Int32Array([0, 0, this.drawingBufferWidth, this.drawingBufferHeight]);
     }
     const apple = _webglProfile() === 'apple' ? _WEBGL_APPLE : null;
     if (apple) {

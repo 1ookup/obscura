@@ -135,6 +135,7 @@ function _idbDatabase(name, version) {
 
 function registerIndexedDbSurface() {
 globalThis.indexedDB = {
+  [Symbol.toStringTag]: 'IDBFactory',
   open(name, version) {
     const dbName = String(name);
     const requested = version === undefined ? 1 : Number(version);

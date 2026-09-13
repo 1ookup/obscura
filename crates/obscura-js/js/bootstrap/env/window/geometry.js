@@ -5,7 +5,7 @@ globalThis.screenX = 0;
 globalThis.screenY = 0;
 globalThis.screenLeft = 0;
 globalThis.screenTop = 0;
-globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} }));
+globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, [Symbol.toStringTag]: 'VisualViewport', addEventListener(){}, removeEventListener(){} }));
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920;
 globalThis.innerHeight = 1000;
