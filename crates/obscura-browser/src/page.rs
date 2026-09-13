@@ -2848,6 +2848,28 @@ impl Page {
             tracing::warn!("frame realm creation failed ({frame_id}): {error}");
             return;
         }
+        // An embedder supplied interaction policy belongs to every browsing
+        // context. In particular, a selector may only exist inside a
+        // cross-origin iframe (for example a widget hosted in a closed shadow
+        // root). Installing it only on the top realm silently makes the policy
+        // ineffective there. The helper is inert until its selector appears
+        // and remains opt-in through Page::set_input_strategy or the CLI env.
+        if let Some(strategy) = &self.input_strategy {
+            if let Ok(selector) = serde_json::to_string(&strategy.selector) {
+                let source = format!(
+                    "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
+                    strategy.delay_ms, strategy.key_delay_ms,
+                );
+                if let Err(error) = js.execute_script_in_frame_realm(
+                    frame_id,
+                    generation,
+                    "<frame-input-strategy>",
+                    &source,
+                ) {
+                    tracing::warn!("frame input strategy install failed ({frame_id}): {error}");
+                }
+            }
+        }
         if let Some(entry) = navigation_timing {
             if let Err(error) = js.execute_script_in_frame_realm(
                 frame_id,
