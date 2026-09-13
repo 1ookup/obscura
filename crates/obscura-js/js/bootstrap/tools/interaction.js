@@ -87,6 +87,24 @@ globalThis.__obscura_schedule_input_strategy = function() {
     document.addEventListener('DOMContentLoaded', run, { once: true });
     setTimeout(run, 0);
   }
+  // Widget controls are often appended by an asynchronous script after both
+  // bootstrap and DOMContentLoaded. Keep the opt-in policy alive until the
+  // selector appears, then disconnect promptly so ordinary pages pay no
+  // observer cost after the requested interaction has fired.
+  if (!present && typeof MutationObserver === 'function') {
+    const observer = new MutationObserver(() => {
+      try {
+        if (document.querySelector(policy.selector)) {
+          observer.disconnect();
+          run();
+        }
+      } catch (e) { observer.disconnect(); }
+    });
+    try {
+      observer.observe(document, { childList: true, subtree: true });
+      setTimeout(() => observer.disconnect(), 10000);
+    } catch (e) { observer.disconnect(); }
+  }
 };
 globalThis.__obscura_natural_type = function(target, text, keyDelayMs) {
   target = target || document.activeElement;
