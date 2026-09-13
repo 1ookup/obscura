@@ -133,7 +133,7 @@ pub use paint::{
     screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces,
     validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
     CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
-    ResolvedScrollState, SelectedImage,
+    ResolvedScrollState, SelectedImage, set_image_transport,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
@@ -272,6 +272,7 @@ pub mod inline {
             _parent: NodeId,
             _run: &[NodeId],
             _styles: &HashMap<NodeId, crate::LayoutStyle>,
+            _flattened_owner_chains: &HashMap<NodeId, Vec<NodeId>>,
         ) -> Option<usize> {
             None
         }

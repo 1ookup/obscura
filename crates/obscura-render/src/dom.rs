@@ -2171,6 +2171,11 @@ fn sync_positioned_pseudo_percentage_padding(
 #[derive(Default)]
 struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
+    /// For each node surfaced by `flatten_boxless_inline_children`, the
+    /// chain of flattened boxless-inline ancestors that were removed above
+    /// it (outermost first). Run collection re-opens each as an inline
+    /// owner so the element keeps a getBoundingClientRect box.
+    flattened_owner_chains: HashMap<NodeId, Vec<NodeId>>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
     generated: Vec<GeneratedBoxBuild>,
@@ -9704,7 +9709,9 @@ fn build_flex_grid_children(
             run.push(node);
             index += 1;
         }
-        if let Some(item) = engine.try_build_run(tree, parent, &run, styles) {
+        if let Some(item) =
+            engine.try_build_run(tree, parent, &run, styles, &ifc_items.flattened_owner_chains)
+        {
             let style = taffy::Style {
                 display: taffy::style::Display::Block,
                 ..Default::default()
@@ -12518,7 +12525,16 @@ fn build(
     // containing block formatting context.
     if style.display == crate::Display::Block || style.internal_flex_container {
         let mut flattened = Vec::new();
-        flatten_boxless_inline_children(tree, &dom_children, styles, &mut flattened);
+        let mut chains = std::mem::take(&mut ifc_items.flattened_owner_chains);
+        flatten_boxless_inline_chained(
+            tree,
+            &dom_children,
+            styles,
+            &mut flattened,
+            &[],
+            &mut chains,
+        );
+        ifc_items.flattened_owner_chains = chains;
         dom_children = flattened;
     }
     let internal_mixed_block_flow = style.internal_flex_container
@@ -13087,7 +13103,11 @@ fn build_mixed_block(
                 // Fast path: the whole run folds to one shaped leaf, unless
                 // pseudo-content word leaves must share its lines.
                 if !join_before && !join_after {
-                    if let Some(item) = engine.try_build_run(tree, id, run, styles) {
+                    let chains = std::mem::take(&mut ifc_items.flattened_owner_chains);
+                    let folded =
+                        engine.try_build_run(tree, id, run, styles, &chains);
+                    ifc_items.flattened_owner_chains = chains;
+                    if let Some(item) = folded {
                         let leaf = taffy_tree
                             .new_leaf_with_context(run_leaf_style(), item)
                             .ok()?;
@@ -13364,18 +13384,43 @@ fn flatten_boxless_inline_children(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     out: &mut Vec<NodeId>,
 ) {
+    flatten_boxless_inline_chained(tree, children, styles, out, &[], &mut HashMap::new());
+}
+
+fn flatten_boxless_inline_chained(
+    tree: &DomTree,
+    children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    out: &mut Vec<NodeId>,
+    chain: &[NodeId],
+    owner_chains: &mut HashMap<NodeId, Vec<NodeId>>,
+) {
     for &cid in children {
         let display_contents = styles
             .get(&cid)
             .map(|style| style.display_contents && style.display != crate::Display::None)
             .unwrap_or(false);
         if display_contents
-            || is_flattenable_inline(tree, cid, styles)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
+            // Structural transparency: nothing above it changes except that
+            // display:contents and block-wrapping inlines contribute no box of
+            // their own in any engine.
             let kids = rendered_children(tree, cid);
-            flatten_boxless_inline_children(tree, &kids, styles, out);
+            flatten_boxless_inline_chained(tree, &kids, styles, out, chain, owner_chains);
+        } else if is_flattenable_inline(tree, cid, styles) {
+            // A plain boxless inline is transparent to the box tree, but it is
+            // still an element with a getBoundingClientRect box in every real
+            // browser. Record it on the chain so run collection can reopen it
+            // as an inline owner; the flattened descendants inherit it.
+            let mut nested = chain.to_vec();
+            nested.push(cid);
+            let kids = rendered_children(tree, cid);
+            flatten_boxless_inline_chained(tree, &kids, styles, out, &nested, owner_chains);
         } else {
+            if !chain.is_empty() {
+                owner_chains.insert(cid, chain.to_vec());
+            }
             out.push(cid);
         }
     }

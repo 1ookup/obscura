@@ -93,19 +93,23 @@ fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     let family = match token.as_str() {
         "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => SYSTEM_FAMILY,
 
-        "monospace" | "ui-monospace" | "courier" | "courier new" | "consolas"
-        | "lucida console" | "menlo" | "monaco" | "cascadia mono" | "cascadia code"
-        | "dejavu sans mono" | "liberation mono" | "andale mono" => MONO_FAMILY,
+        "monospace" | "ui-monospace" | "courier new" | "consolas"
+        | "lucida console" | "cascadia mono" | "cascadia code" => MONO_FAMILY,
 
-        "serif" | "ui-serif" | "times" | "times new roman" | "georgia" | "cambria"
-        | "garamond" | "book antiqua" | "palatino" | "palatino linotype"
-        | "baskerville" | "dejavu serif" | "liberation serif" | "noto serif" => SERIF_FAMILY,
+        "serif" | "ui-serif" | "times new roman" | "georgia" | "cambria"
+        | "book antiqua" | "palatino linotype" | "constantia" | "sylfaen"
+        | "sitka" | "sitka text" | "sitka heading" => SERIF_FAMILY,
 
-        "sans-serif" | "arial" | "arial black" | "arial narrow" | "helvetica"
-        | "helvetica neue" | "roboto" | "segoe ui" | "segoe ui variable"
-        | "inter" | "verdana" | "tahoma" | "trebuchet ms" | "calibri" | "candara"
-        | "microsoft sans serif" | "dejavu sans" | "liberation sans" | "noto sans"
-        | "gill sans" | "futura" | "lucida grande" => FAMILY,
+        // Sans faces split across the two bundled sans faces so probes see
+        // distinct metrics between families, like distinct real fonts would.
+        "sans-serif" | "arial" | "arial narrow" | "calibri" | "candara"
+        | "comic sans ms" | "microsoft sans serif" | "trebuchet ms" => FAMILY,
+        "segoe ui" | "segoe ui variable" | "verdana" | "tahoma" | "impact"
+        | "arial black" | "lucida sans unicode" | "franklin gothic medium"
+        | "segoe ui emoji" | "segoe ui historic" | "segoe ui symbol"
+        | "segoe print" | "segoe script" | "ebrima" | "javanese text"
+        | "malgun gothic" | "mv boli" | "nirmala ui" | "yu gothic"
+        | "webdings" | "wingdings" => SYSTEM_FAMILY,
 
         _ => return None,
     };
@@ -115,6 +119,9 @@ fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
 #[derive(Clone)]
 struct LoadedFamily {
     faces: Vec<LoadedFace>,
+    /// True only for families the page registered as webfonts; bundled faces
+    /// are internal and must not answer font-presence probes by name.
+    is_webfont: bool,
 }
 
 #[derive(Clone)]
@@ -160,10 +167,13 @@ fn resolve_loaded_font(
     if let Some(stack) = fam {
         for token in stack.split(',') {
             let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            let family = loaded.get(&name.to_ascii_lowercase()).or_else(|| {
-                bundled_family_for_css_token(name)
-                    .and_then(|family| loaded.get(&family.to_ascii_lowercase()))
-            });
+            let family = loaded
+                .get(&name.to_ascii_lowercase())
+                .filter(|entry| entry.is_webfont)
+                .or_else(|| {
+                    bundled_family_for_css_token(name)
+                        .and_then(|family| loaded.get(&family.to_ascii_lowercase()))
+                });
             if let Some(resolved) = family
                 .and_then(|family| select_loaded_face(family, requested_weight, requested_italic))
             {
@@ -994,13 +1004,35 @@ impl TextEngine {
             let italic = declared_italic
                 .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
             let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-            let declared_names: Vec<String> = declared_family
-                .map(|name| vec![name])
-                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+            let (declared_names, webfont) = match declared_family.as_ref() {
+                Some(name) => (vec![name.clone()], true),
+                None => {
+                    // Bundled faces register only under the canonical family
+                    // names the platform table routes to; any other real
+                    // names stay unlisted so probes cannot discover them.
+                    let canonical = names
+                        .iter()
+                        .map(|(name, _)| name.to_ascii_lowercase())
+                        .find(|name| {
+                            matches!(
+                                name.as_str(),
+                                "liberation sans"
+                                    | "liberation serif"
+                                    | "liberation mono"
+                                    | "dejavu sans"
+                            )
+                        })
+                        .unwrap_or_else(|| FAMILY.to_string());
+                    (vec![canonical], false)
+                }
+            };
             for name in declared_names {
                 let family = loaded_families
                     .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+                    .or_insert_with(|| LoadedFamily {
+                        faces: Vec::new(),
+                        is_webfont: webfont,
+                    });
                 family.faces.push(LoadedFace {
                     name: Arc::clone(&internal_name),
                     font_id: Some(id),
@@ -1130,6 +1162,7 @@ impl TextEngine {
         parent: NodeId,
         run: &[NodeId],
         styles: &std::collections::HashMap<NodeId, LayoutStyle>,
+        flattened_owner_chains: &std::collections::HashMap<NodeId, Vec<NodeId>>,
     ) -> Option<usize> {
         let mut has_text = false;
         for &cid in run {
@@ -1152,6 +1185,21 @@ impl TextEngine {
         let line_height = ctx.line_height;
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
         for &cid in run {
+            // A flattened boxless inline above this child is still an element
+            // with a box in every real browser: reopen each ancestor of the
+            // chain as an inline owner so shaping provenance attributes this
+            // text to it and CSSOM gets a fragment box.
+            let chain = flattened_owner_chains.get(&cid);
+            let opened = chain.map(|chain| {
+                let mut opened = 0usize;
+                for &owner in chain {
+                    if let Some(owner_style) = styles.get(&owner) {
+                        collector.begin_owner(owner, owner_style);
+                        opened += 1;
+                    }
+                }
+                opened
+            });
             collect_node_spans(
                 tree,
                 cid,
@@ -1161,6 +1209,13 @@ impl TextEngine {
                 &mut collector,
                 &self.loaded_families,
             );
+            if let Some(opened) = opened {
+                if let Some(chain) = chain {
+                    for &owner in chain.iter().take(opened).rev() {
+                        collector.end_owner(owner);
+                    }
+                }
+            }
         }
         self.push_shaped_item(
             base,
@@ -3956,6 +4011,7 @@ mod tests {
     #[test]
     fn declared_family_selects_a_face_with_a_different_internal_name() {
         let family = LoadedFamily {
+            is_webfont: true,
             faces: vec![
                 LoadedFace {
                     name: Arc::from("Poppins"),
@@ -4016,6 +4072,7 @@ mod tests {
         engine.loaded_families.insert(
             "test variable".to_string(),
             LoadedFamily {
+                is_webfont: true,
                 faces: vec![LoadedFace {
                     name: Arc::from(FAMILY),
                     font_id: Some(regular_id),
@@ -4118,6 +4175,7 @@ mod tests {
         let loaded = HashMap::from([(
             "inter".to_string(),
             LoadedFamily {
+                is_webfont: true,
                 faces: vec![LoadedFace {
                     name: Arc::from("Inter"),
                     font_id: None,
