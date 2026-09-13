@@ -13,13 +13,65 @@ globalThis.__obscura_schedule_input_strategy = function() {
     const activate = () => {
       const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
       if (rect && rect.width > 0 && rect.height > 0) {
-        const opts = { bubbles: true, cancelable: true, composed: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1, pointerId: __obscura_pointer_id(true), pointerType: 'mouse', isPrimary: true };
-        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', opts)));
-        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', opts)));
-        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', Object.assign({}, opts, { buttons: 0 }))));
-        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseup', Object.assign({}, opts, { buttons: 0 }))));
+        const clientX = rect.left + rect.width / 2;
+        const clientY = rect.top + rect.height / 2;
+        const pointerId = __obscura_pointer_id(true);
+        const eventOptions = (x, y, buttons) => ({
+          bubbles: true, cancelable: true, composed: true,
+          view: globalThis, clientX: x, clientY: y,
+          screenX: (Number(globalThis.screenX) || 0) + x,
+          screenY: (Number(globalThis.screenY) || 0) + y,
+          button: buttons ? 0 : 0, buttons, detail: 0,
+          pointerId, pointerType: 'mouse', isPrimary: true,
+          width: 1, height: 1, pressure: buttons ? 0.5 : 0,
+          tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0,
+          altitudeAngle: Math.PI / 2, azimuthAngle: 0,
+        });
+        const opts = eventOptions(clientX, clientY, 1);
+        // Turnstile records the approach, not just the final activation. Keep
+        // this path deterministic and bounded while preserving the normal
+        // trusted event constructors used by CDP Input.
+        const path = [[-40, -18], [-28, -14], [-18, -10], [-10, -6],
+          [-5, -3], [-2, -1], [0, 0]];
+        const startX = clientX - 4, startY = clientY - 3;
+        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerover', eventOptions(startX, startY, 0))));
+        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseover', eventOptions(startX, startY, 0))));
+        path.forEach((point, index) => {
+          const move = () => {
+            const x = clientX + point[0], y = clientY + point[1];
+            const moveOpts = eventOptions(x, y, 0);
+            target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointermove', moveOpts)));
+            target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousemove', moveOpts)));
+          };
+          if (index === 0) move();
+          else setTimeout(move, index * 12);
+        });
+        const press = () => {
+          target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', opts)));
+          target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', opts)));
+        };
+        setTimeout(press, path.length * 12 + 20);
+        const release = () => {
+          const up = eventOptions(clientX, clientY, 0);
+          target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', up)));
+          target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseup', up)));
+          const type = String(target.getAttribute && target.getAttribute('type') || '').toLowerCase();
+          const checkable = target.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
+          if (checkable) {
+            const oldChecked = !!target.checked;
+            target.checked = type === 'radio' ? true : !oldChecked;
+            target.dispatchEvent(__obscura_markTrusted(new PointerEvent('click', Object.assign({}, up, { detail: 1 }))));
+            if (target.checked !== oldChecked) {
+              target.dispatchEvent(__obscura_markTrusted(new Event('input', { bubbles: true, composed: true })));
+              target.dispatchEvent(__obscura_markTrusted(new Event('change', { bubbles: true, composed: true })));
+            }
+          } else {
+            target.click();
+          }
+          __obscura_pointer_release();
+        };
+        setTimeout(release, path.length * 12 + 130);
       }
-      target.click();
     };
     const delay = Math.max(0, Number(policy.delayMs) || 0);
     if (delay) setTimeout(activate, delay); else activate();
