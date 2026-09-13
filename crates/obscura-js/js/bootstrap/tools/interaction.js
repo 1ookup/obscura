@@ -4,15 +4,18 @@
 // as CDP Input and the natural type helper emits one input event per code unit.
 globalThis.__obscura_schedule_input_strategy = function() {
   const policy = globalThis.__obscura_input_strategy;
-  if (!policy || !policy.selector || globalThis.__obscura_input_strategy_done) return;
+  if (!policy || !policy.selector || globalThis.__obscura_input_strategy_done
+      || globalThis.__obscura_input_strategy_pending) return;
   const run = () => {
     let target;
     try { target = document.querySelector(policy.selector); } catch (e) { return; }
     if (!target || (target.matches && target.matches(':disabled'))) return;
-    globalThis.__obscura_input_strategy_done = true;
+    globalThis.__obscura_input_strategy_pending = true;
     const activate = () => {
+      globalThis.__obscura_input_strategy_pending = false;
       const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
       if (rect && rect.width > 0 && rect.height > 0) {
+        globalThis.__obscura_input_strategy_done = true;
         const clientX = rect.left + rect.width / 2;
         const clientY = rect.top + rect.height / 2;
         const pointerId = __obscura_pointer_id(true);
@@ -104,6 +107,19 @@ globalThis.__obscura_schedule_input_strategy = function() {
       observer.observe(document, { childList: true, subtree: true });
       setTimeout(() => observer.disconnect(), 10000);
     } catch (e) { observer.disconnect(); }
+  }
+  // A late style/layout pass can give an already inserted control its box
+  // without another child-list mutation. Poll only during the same bounded
+  // window as the mutation observer, and stop as soon as activation succeeds.
+  if (typeof setInterval === 'function') {
+    const retry = setInterval(() => {
+      if (globalThis.__obscura_input_strategy_done) {
+        clearInterval(retry);
+        return;
+      }
+      run();
+    }, 100);
+    setTimeout(() => clearInterval(retry), 10000);
   }
 };
 globalThis.__obscura_natural_type = function(target, text, keyDelayMs) {
