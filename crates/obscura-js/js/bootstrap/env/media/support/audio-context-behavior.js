@@ -180,6 +180,16 @@ function _audioContextCreateAnalyser(context) {
         array[index] = -100 + _fpRand(700 + index) * 5;
       }
     },
+    // An analyser with no live source reads back silence. Chrome fills the
+    // time-domain views with exactly that: zeros for the float form and the
+    // 128 midpoint for the byte form. Omitting the two methods entirely made
+    // a probe that analyses a rendered buffer throw on the first call.
+    getFloatTimeDomainData(array) {
+      for (let index = 0; index < array.length; index++) array[index] = 0;
+    },
+    getByteTimeDomainData(array) {
+      for (let index = 0; index < array.length; index++) array[index] = 128;
+    },
   }, 'AnalyserNode');
 }
 function _audioContextCreateGain(context) {

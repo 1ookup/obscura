@@ -6045,6 +6045,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn analyser_node_exposes_all_four_readback_views() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const context = new OfflineAudioContext(1, 4096, 44100);
+                    const analyser = context.createAnalyser();
+                    const oscillator = context.createOscillator();
+                    oscillator.connect(analyser);
+                    await context.startRendering();
+                    const frequency = new Float32Array(analyser.frequencyBinCount);
+                    const byteFrequency = new Uint8Array(analyser.frequencyBinCount);
+                    const time = new Float32Array(analyser.fftSize);
+                    const byteTime = new Uint8Array(analyser.fftSize);
+                    analyser.getFloatFrequencyData(frequency);
+                    analyser.getByteFrequencyData(byteFrequency);
+                    analyser.getFloatTimeDomainData(time);
+                    analyser.getByteTimeDomainData(byteTime);
+                    return {
+                        sizes: [analyser.fftSize, analyser.frequencyBinCount],
+                        frequencyFilled: frequency.every(value => Number.isFinite(value)),
+                        timeSilent: time.every(value => value === 0),
+                        byteTimeMidpoint: byteTime.every(value => value === 128),
+                        tags: [Object.prototype.toString.call(analyser),
+                            Object.prototype.toString.call(frequency)],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sizes": [2048, 1024],
+                "frequencyFilled": true,
+                "timeSilent": true,
+                "byteTimeMidpoint": true,
+                "tags": ["[object AnalyserNode]", "[object Float32Array]"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
