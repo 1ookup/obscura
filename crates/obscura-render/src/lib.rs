@@ -307,6 +307,13 @@ pub mod inline {
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
         }
+
+        /// Whole-IFC items never exist in layout-only builds (`try_build`
+        /// declines), so the CSSOM subpixel replacement loop never reaches
+        /// this.
+        pub(crate) fn measure_canvas_width(&mut self, _idx: usize) -> f32 {
+            0.0
+        }
     }
 
     pub(crate) fn used_line_height(style: &crate::LayoutStyle) -> f32 {
