@@ -6044,6 +6044,78 @@ mod tests {
         assert_eq!(requested, vec!["/audio.js", "/paint.js"]);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    const texture = device.createTexture(
+                        {size: [16, 16], format: 'rgba8unorm', usage: 17});
+                    const module = device.createShaderModule({code:
+                        '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{'
+                        + 'var p=array<vec2f,3>(vec2f(0,.5),vec2f(-.5,-.5),vec2f(.5,-.5));'
+                        + 'return vec4f(p[i],0,1);}'
+                        + '@fragment fn fs()->@location(0) vec4f{return vec4f(0,1,0,1);}'});
+                    const pipeline = device.createRenderPipeline({layout: 'auto',
+                        vertex: {module, entryPoint: 'vs'},
+                        fragment: {module, entryPoint: 'fs', targets: [{format: 'rgba8unorm'}]}});
+                    const encoder = device.createCommandEncoder();
+                    const pass = encoder.beginRenderPass({colorAttachments: [{
+                        view: texture.createView(), loadOp: 'clear',
+                        clearValue: {r: 0, g: 0, b: 0, a: 1}, storeOp: 'store'}]});
+                    pass.setPipeline(pipeline);
+                    pass.draw(3);
+                    pass.end();
+                    const buffer = device.createBuffer({size: 4096, usage: 9});
+                    encoder.copyTextureToBuffer(
+                        {texture}, {buffer, bytesPerRow: 256}, [16, 16]);
+                    device.queue.submit([encoder.finish()]);
+                    await buffer.mapAsync(1);
+                    const pixels = new Uint8Array(buffer.getMappedRange());
+                    const inside = Array.from(pixels.slice(8 * 256 + 8 * 4, 8 * 256 + 8 * 4 + 4));
+                    const outside = Array.from(pixels.slice(8 * 4, 8 * 4 + 4));
+                    let unmapError = null;
+                    buffer.unmap();
+                    try { buffer.getMappedRange(); } catch (error) { unmapError = error.name; }
+                    const compilation = await module.getCompilationInfo();
+                    return {
+                        extents: [texture.width, texture.height, texture.format],
+                        inside, outside,
+                        pitch: pixels.length,
+                        messages: compilation.messages.length,
+                        unmapError,
+                        mapState: buffer.mapState,
+                        tags: [Object.prototype.toString.call(texture),
+                            Object.prototype.toString.call(buffer),
+                            Object.prototype.toString.call(device.queue)],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "extents": [16, 16, "rgba8unorm"],
+                "inside": [0, 255, 0, 255],
+                "outside": [0, 0, 0, 255],
+                "pitch": 4096,
+                "messages": 0,
+                "unmapError": "TypeError",
+                "mapState": "unmapped",
+                "tags": ["[object GPUTexture]", "[object GPUBuffer]", "[object GPUQueue]"],
+            })
+        );
+    }
+
     #[test]
     fn offscreen_canvas_runs_webgl_families_with_cached_contexts() {
         let mut rt = setup_runtime("<html><body></body></html>");

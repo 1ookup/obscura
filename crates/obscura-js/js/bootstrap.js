@@ -215,6 +215,7 @@
 // @obscura-module env/media/gpu-supported-limits.js
 // @obscura-module env/media/gpu-supported-features.js
 // @obscura-module env/media/gpu-adapter-info.js
+// @obscura-module env/media/gpu-command.js
 // @obscura-module env/media/gpu-device.js
 // @obscura-module env/media/gpu-adapter.js
 // @obscura-module env/media/gpu.js
