@@ -6791,6 +6791,19 @@ fn op_post_to_parent(
     if to_main {
         gs.frame_message_notify.notify_one();
     }
+    // The frame-to-embedder direction carries the challenge verdict: the
+    // widget announces `complete` with a token or a failure code. Logging it
+    // under the same opt-in switch as the reverse direction makes the
+    // decision visible without changing what the page observes.
+    if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+        eprintln!(
+            "[pmsg] post_to_parent sender_root={} to_top={} -> queued payload_bytes={} payload={}",
+            sender_root,
+            to_top,
+            payload.len(),
+            payload
+        );
+    }
     "ok".into()
 }
 
