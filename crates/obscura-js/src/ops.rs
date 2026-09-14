@@ -1578,6 +1578,29 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        // Same as "query_selector_scoped", but the walk also enters hosted
+        // (including closed) shadow trees. A page query cannot cross that
+        // boundary, yet the engine may need to reach a widget control rendered
+        // into a closed shadow root -- for example to answer the click listener
+        // the widget registered for it.
+        "query_selector_all_shadow_including" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            let ids: Vec<i32> = dom
+                .query_selector_all_shadow_including(NodeId::new(root_nid), &arg2)
+                .unwrap_or_default()
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
+        "query_selector_shadow_including" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.query_selector_shadow_including(NodeId::new(root_nid), &arg2)
+                .ok()
+                .flatten()
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom

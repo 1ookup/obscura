@@ -2,10 +2,203 @@
 // embedder installs `__obscura_input_strategy`; the core never matches page
 // text or hostnames. The click path uses the same trusted activation behavior
 // as CDP Input and the natural type helper emits one input event per code unit.
+
+// Recorded approach trajectories. A widget that guards against automation
+// measures the approach, not just the activation, so the delivery below
+// replays a human-shaped path: a run of decreasing pointer steps with
+// non-uniform inter-event delays, a short dwell, and a small settle after the
+// press. Two recorded shapes (a long glide and a short correction) plus jitter
+// keep repeated activations from being byte-identical.
+const _obscuraApproachTemplates = [
+  [[-46, -21], [-33, -16], [-24, -12], [-17, -9], [-12, -6], [-8, -4], [-5, -3], [-3, -2], [-2, -1], [-1, 0], [0, 0]],
+  [[-28, -14], [-19, -10], [-12, -7], [-8, -5], [-6, -4], [-4, -3], [-2, -2], [-1, -1], [-1, 0], [0, 0]],
+];
+
+function _obscuraJitteredApproach() {
+  const template = _obscuraApproachTemplates[
+    Math.floor(Math.random() * _obscuraApproachTemplates.length)];
+  const jitterX = (Math.random() - 0.5) * 1.6;
+  const jitterY = (Math.random() - 0.5) * 1.6;
+  const points = [];
+  for (let index = 0; index < template.length; index++) {
+    const drift = index / (template.length - 1 || 1);
+    points.push([
+      Math.round((template[index][0] + jitterX * (1 - drift)) * 100) / 100,
+      Math.round((template[index][1] + jitterY * (1 - drift)) * 100) / 100,
+    ]);
+  }
+  return points;
+}
+
+// Deliver one activation on `target` through a recorded approach. Shared by the
+// selector strategy and the listener strategy so both produce the same event
+// family, ordering and timing.
+function __obscura_deliver_activation(target) {
+  if (!target || typeof target.dispatchEvent !== 'function') return false;
+  const rect = typeof target.getBoundingClientRect === 'function'
+    ? target.getBoundingClientRect() : null;
+  if (!rect || !(rect.width > 0) || !(rect.height > 0)) return false;
+  const clientX = rect.left + rect.width / 2;
+  const clientY = rect.top + rect.height / 2;
+  const pointerId = __obscura_pointer_id(true);
+  const eventOptions = (x, y, buttons) => ({
+    bubbles: true, cancelable: true, composed: true,
+    view: globalThis, clientX: x, clientY: y,
+    screenX: (Number(globalThis.screenX) || 0) + x,
+    screenY: (Number(globalThis.screenY) || 0) + y,
+    button: 0, buttons, detail: 0,
+    pointerId, pointerType: 'mouse', isPrimary: true,
+    width: 1, height: 1, pressure: buttons ? 0.5 : 0,
+    tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0,
+    altitudeAngle: Math.PI / 2, azimuthAngle: 0,
+  });
+  const approach = _obscuraJitteredApproach();
+  const entry = approach[0];
+  target.dispatchEvent(__obscura_markTrusted(new PointerEvent(
+    'pointerover', eventOptions(clientX + entry[0], clientY + entry[1], 0))));
+  target.dispatchEvent(__obscura_markTrusted(new MouseEvent(
+    'mouseover', eventOptions(clientX + entry[0], clientY + entry[1], 0))));
+  let elapsed = 0;
+  for (let index = 1; index < approach.length; index++) {
+    const step = approach[index];
+    // 7-19ms between samples, matching a mouse reporting interval.
+    elapsed += 7 + Math.round(Math.random() * 12);
+    const move = () => {
+      const options = eventOptions(clientX + step[0], clientY + step[1], 0);
+      target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointermove', options)));
+      target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousemove', options)));
+    };
+    setTimeout(move, elapsed);
+  }
+  // Dwell before the press: a real pointer pauses on the target first.
+  elapsed += 30 + Math.round(Math.random() * 60);
+  const pressed = eventOptions(clientX, clientY, 1);
+  setTimeout(() => {
+    target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', pressed)));
+    target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', pressed)));
+  }, elapsed);
+  // Hold for 60-140ms, then release and activate.
+  setTimeout(() => {
+    const up = eventOptions(clientX, clientY, 0);
+    target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', up)));
+    target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseup', up)));
+    const type = String((target.getAttribute && target.getAttribute('type')) || '').toLowerCase();
+    const checkable = target.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
+    if (checkable) {
+      const oldChecked = !!target.checked;
+      target.checked = type === 'radio' ? true : !oldChecked;
+      target.dispatchEvent(__obscura_markTrusted(new PointerEvent(
+        'click', Object.assign({}, up, { detail: 1 }))));
+      if (target.checked !== oldChecked) {
+        target.dispatchEvent(__obscura_markTrusted(new Event(
+          'input', { bubbles: true, composed: true })));
+        target.dispatchEvent(__obscura_markTrusted(new Event(
+          'change', { bubbles: true, composed: true })));
+      }
+    } else {
+      target.click();
+    }
+    __obscura_pointer_release();
+  }, elapsed + 60 + Math.round(Math.random() * 80));
+  return true;
+}
+
+// Listener strategy: the challenge announces the control it is waiting on by
+// registering a click handler. Answering that registration with one recorded
+// activation mirrors the environment-driven interaction a simulated browser
+// performs, and it needs no external timer or blind coordinate. The page may
+// register the handler on the control itself or delegate to its document, so
+// the registration only decides *when* to act; the policy selector still
+// decides *where*, keeping the target choice with the embedder.
+function __obscura_install_click_listener_strategy(policy) {
+  if (globalThis.__obscura_click_listener_hooked) return;
+  globalThis.__obscura_click_listener_hooked = true;
+  const proto = globalThis.EventTarget && globalThis.EventTarget.prototype;
+  if (!proto || typeof proto.addEventListener !== 'function') return;
+  const original = proto.addEventListener;
+  const directMatch = (node) => {
+    if (!node || node.nodeType !== 1) return false;
+    if (policy.selector) {
+      try { return !!node.matches(policy.selector); } catch (e) { return false; }
+    }
+    if (node.tagName !== 'INPUT') return false;
+    const type = String(node.getAttribute('type') || '').toLowerCase();
+    return type === 'checkbox' || type === 'radio';
+  };
+  const resolveTarget = (node) => {
+    if (directMatch(node)) return node;
+    if (!policy.selector) return null;
+    try {
+      const direct = document.querySelector(policy.selector);
+      if (direct) return direct;
+    } catch (e) {}
+    // The widget may render its control into a closed shadow root, which no
+    // page query can cross. The engine's own tree still holds it, so ask the
+    // native side for the shadow-including match and wrap the resulting node.
+    // A frame realm queries its own content root, not the top document.
+    try {
+      const root = typeof globalThis.__obscura_frame_document_nid === 'number'
+        ? globalThis.__obscura_frame_document_nid : Number(_dom('document_root'));
+      const nid = Number(_dom('query_selector_shadow_including', root, policy.selector));
+      if (Number.isFinite(nid) && nid >= 0) {
+        return typeof _wrap === 'function' ? _wrap(nid) : null;
+      }
+    } catch (e) {}
+    return null;
+  };
+  const schedule = (target) => {
+    // One trajectory per document: further handlers are invoked by the single
+    // activation, exactly as a real click would.
+    globalThis.__obscura_trajectory_fired = true;
+    const delay = Math.max(0, Number(policy.delayMs) || 0);
+    globalThis.__obscura_input_strategy_pending = true;
+    setTimeout(() => {
+      globalThis.__obscura_input_strategy_pending = false;
+      if (__obscura_deliver_activation(target)) {
+        globalThis.__obscura_input_strategy_done = true;
+      } else {
+        globalThis.__obscura_trajectory_fired = false;
+      }
+    }, delay);
+  };
+  proto.addEventListener = function(type, listener, options) {
+    const result = original.call(this, type, listener, options);
+    try {
+      if (String(type) === 'click' && !globalThis.__obscura_trajectory_fired) {
+        globalThis.__obscura_click_listener_seen = true;
+        const target = resolveTarget(this);
+        if (target) schedule(target);
+      }
+    } catch (e) {}
+    return result;
+  };
+  // A delegated handler is registered before the control it guards is
+  // necessarily in the tree, so retry briefly once the registration is seen.
+  const retry = setInterval(() => {
+    if (globalThis.__obscura_trajectory_fired || globalThis.__obscura_input_strategy_done) {
+      clearInterval(retry);
+      return;
+    }
+    if (!globalThis.__obscura_click_listener_seen) return;
+    const target = resolveTarget(null);
+    if (target) {
+      clearInterval(retry);
+      schedule(target);
+    }
+  }, 250);
+  setTimeout(() => clearInterval(retry), 15000);
+}
+
 globalThis.__obscura_schedule_input_strategy = function() {
   const policy = globalThis.__obscura_input_strategy;
-  if (!policy || !policy.selector || globalThis.__obscura_input_strategy_done
-      || globalThis.__obscura_input_strategy_pending) return;
+  if (!policy || globalThis.__obscura_input_strategy_done) return;
+  if (policy.listener) {
+    // The control is discovered from the page's own registration, so nothing
+    // is polled and no coordinate is guessed.
+    __obscura_install_click_listener_strategy(policy);
+    return;
+  }
+  if (!policy.selector || globalThis.__obscura_input_strategy_pending) return;
   const run = () => {
     let target;
     try { target = document.querySelector(policy.selector); } catch (e) { return; }
@@ -13,67 +206,11 @@ globalThis.__obscura_schedule_input_strategy = function() {
     globalThis.__obscura_input_strategy_pending = true;
     const activate = () => {
       globalThis.__obscura_input_strategy_pending = false;
-      const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
-      if (rect && rect.width > 0 && rect.height > 0) {
+      // The recorded approach is shared with the listener strategy, so the
+      // event family, ordering and timing are identical however the control
+      // was discovered.
+      if (__obscura_deliver_activation(target)) {
         globalThis.__obscura_input_strategy_done = true;
-        const clientX = rect.left + rect.width / 2;
-        const clientY = rect.top + rect.height / 2;
-        const pointerId = __obscura_pointer_id(true);
-        const eventOptions = (x, y, buttons) => ({
-          bubbles: true, cancelable: true, composed: true,
-          view: globalThis, clientX: x, clientY: y,
-          screenX: (Number(globalThis.screenX) || 0) + x,
-          screenY: (Number(globalThis.screenY) || 0) + y,
-          button: buttons ? 0 : 0, buttons, detail: 0,
-          pointerId, pointerType: 'mouse', isPrimary: true,
-          width: 1, height: 1, pressure: buttons ? 0.5 : 0,
-          tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0,
-          altitudeAngle: Math.PI / 2, azimuthAngle: 0,
-        });
-        const opts = eventOptions(clientX, clientY, 1);
-        // Turnstile records the approach, not just the final activation. Keep
-        // this path deterministic and bounded while preserving the normal
-        // trusted event constructors used by CDP Input.
-        const path = [[-40, -18], [-28, -14], [-18, -10], [-10, -6],
-          [-5, -3], [-2, -1], [0, 0]];
-        const startX = clientX - 4, startY = clientY - 3;
-        target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerover', eventOptions(startX, startY, 0))));
-        target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseover', eventOptions(startX, startY, 0))));
-        path.forEach((point, index) => {
-          const move = () => {
-            const x = clientX + point[0], y = clientY + point[1];
-            const moveOpts = eventOptions(x, y, 0);
-            target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointermove', moveOpts)));
-            target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousemove', moveOpts)));
-          };
-          if (index === 0) move();
-          else setTimeout(move, index * 12);
-        });
-        const press = () => {
-          target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerdown', opts)));
-          target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mousedown', opts)));
-        };
-        setTimeout(press, path.length * 12 + 20);
-        const release = () => {
-          const up = eventOptions(clientX, clientY, 0);
-          target.dispatchEvent(__obscura_markTrusted(new PointerEvent('pointerup', up)));
-          target.dispatchEvent(__obscura_markTrusted(new MouseEvent('mouseup', up)));
-          const type = String(target.getAttribute && target.getAttribute('type') || '').toLowerCase();
-          const checkable = target.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
-          if (checkable) {
-            const oldChecked = !!target.checked;
-            target.checked = type === 'radio' ? true : !oldChecked;
-            target.dispatchEvent(__obscura_markTrusted(new PointerEvent('click', Object.assign({}, up, { detail: 1 }))));
-            if (target.checked !== oldChecked) {
-              target.dispatchEvent(__obscura_markTrusted(new Event('input', { bubbles: true, composed: true })));
-              target.dispatchEvent(__obscura_markTrusted(new Event('change', { bubbles: true, composed: true })));
-            }
-          } else {
-            target.click();
-          }
-          __obscura_pointer_release();
-        };
-        setTimeout(release, path.length * 12 + 130);
       }
     };
     const delay = Math.max(0, Number(policy.delayMs) || 0);

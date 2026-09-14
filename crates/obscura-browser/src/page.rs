@@ -457,11 +457,15 @@ pub struct InputStrategy {
     pub selector: String,
     pub delay_ms: u64,
     pub key_delay_ms: u64,
+    /// Discover the control from the page's own click-listener registration
+    /// and answer it with one recorded approach, instead of polling a selector
+    /// and clicking blind. Off unless the embedder asks for it.
+    pub listener: bool,
 }
 
 impl InputStrategy {
     pub fn selector(selector: impl Into<String>) -> Self {
-        Self { selector: selector.into(), delay_ms: 0, key_delay_ms: 25 }
+        Self { selector: selector.into(), delay_ms: 0, key_delay_ms: 25, listener: false }
     }
 }
 
@@ -1124,7 +1128,10 @@ impl Page {
                         .ok()
                         .and_then(|value| value.parse().ok())
                         .unwrap_or(25);
-                    InputStrategy { selector, delay_ms, key_delay_ms }
+                    let listener = std::env::var("OBSCURA_AUTO_CLICK_MODE")
+                        .map(|mode| mode.eq_ignore_ascii_case("listener"))
+                        .unwrap_or(false);
+                    InputStrategy { selector, delay_ms, key_delay_ms, listener }
                 }),
             intercept_tx: None,
             preload_scripts: Vec::new(),
@@ -2813,8 +2820,8 @@ impl Page {
         let generation = frame.document_generation;
         let Ok(selector) = serde_json::to_string(&strategy.selector) else { return; };
         let source = format!(
-            "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
-            strategy.delay_ms, strategy.key_delay_ms,
+            "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{},listener:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
+            strategy.delay_ms, strategy.key_delay_ms, strategy.listener,
         );
         if let Some(js) = self.js.as_mut() {
             if let Err(error) = js.execute_script_in_frame_realm(
@@ -2895,8 +2902,8 @@ impl Page {
         if let Some(strategy) = &self.input_strategy {
             if let Ok(selector) = serde_json::to_string(&strategy.selector) {
                 let source = format!(
-                    "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
-                    strategy.delay_ms, strategy.key_delay_ms,
+                    "globalThis.__obscura_input_strategy={{selector:{selector},delayMs:{},keyDelayMs:{},listener:{}}}; globalThis.__obscura_schedule_input_strategy?.();",
+                    strategy.delay_ms, strategy.key_delay_ms, strategy.listener,
                 );
                 if let Err(error) = js.execute_script_in_frame_realm(
                     frame_id,
