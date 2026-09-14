@@ -240,12 +240,14 @@ impl StealthHttpClient {
             .default_headers(wreq::header::HeaderMap::new())
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none());
-        if proxy_url.is_some() {
+        if proxy_url.is_some() && std::env::var("OBSCURA_PROXY_H1_ONLY").is_ok() {
             // Some intercepting proxies mishandle large HTTP/2 uploads (their
             // inbound flow-control accounting kills the connection on ~90KB
             // POST bodies, measured against mitmproxy 12). HTTP/1.1 has no
-            // stream flow control and the same proxy accepts it, so proxied
-            // sessions pin h1. Direct connections keep the h2 fingerprint.
+            // stream flow control and the same proxy accepts it. Opt in via
+            // OBSCURA_PROXY_H1_ONLY; the default follows Chrome, which
+            // negotiates h2 inside the CONNECT tunnel and multiplexes the
+            // challenge's parallel requests over it.
             builder = builder.http1_only();
         }
         let mut builder = builder

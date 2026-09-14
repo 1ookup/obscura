@@ -1582,6 +1582,27 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    /// True when an element-driven image load for this exact URL and CORS
+    /// profile is still in flight. A speculative warmup must not race it:
+    /// single-use challenge assets answer the second request with 4xx even
+    /// though the element's own request would have succeeded.
+    #[cfg(feature = "render")]
+    pub fn render_image_in_flight(
+        &self,
+        url: &str,
+        profile: crate::ops::ImageRequestProfile,
+    ) -> bool {
+        let state = self.state.borrow();
+        state
+            .render_image_in_flight
+            .keys()
+            .any(|(generation, in_flight_url, in_flight_profile)| {
+                *generation == state.document_generation
+                    && in_flight_url == url
+                    && *in_flight_profile == profile
+            })
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
@@ -6024,6 +6045,68 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_canvas_runs_webgl_families_with_cached_contexts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(8, 8);
+                    const gl1 = canvas.getContext('webgl2', {powerPreference: 'low-power'});
+                    const gl2 = canvas.getContext('webgl2');
+                    const wrongFamily = canvas.getContext('webgl');
+                    const attrs = gl2.getContextAttributes();
+                    let invalidEnum = null;
+                    try { new OffscreenCanvas(4, 4).getContext('webgl', {powerPreference: 'banana'}); }
+                    catch (error) { invalidEnum = error.name; }
+                    const aliased = new OffscreenCanvas(4, 4);
+                    const webgl = aliased.getContext('experimental-webgl', {powerPreference: 'low-power'});
+                    const aliasedAgain = aliased.getContext('webgl');
+                    return [
+                        gl1 instanceof WebGL2RenderingContext,
+                        gl1 === gl2,
+                        wrongFamily === null,
+                        attrs.powerPreference,
+                        invalidEnum,
+                        webgl instanceof WebGLRenderingContext,
+                        webgl === aliasedAgain,
+                        aliasedAgain.getContextAttributes().powerPreference,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, "low-power", "TypeError", true, true, "low-power"
+            ])
+        );
+    }
+
+    #[test]
+    fn offline_audio_context_inherits_base_audio_factories() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const context = new OfflineAudioContext(1, 16, 44100);
+                    const oscillator = context.createOscillator();
+                    return [
+                        typeof context.createOscillator,
+                        typeof context.createDynamicsCompressor,
+                        oscillator instanceof OscillatorNode,
+                        Object.getPrototypeOf(OfflineAudioContext.prototype) === BaseAudioContext.prototype,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["function", "function", true, true])
+        );
+    }
+
+    #[test]
     fn shared_worker_sync_failure_does_not_poison_the_registry() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -6383,7 +6466,9 @@ mod tests {
                     text.textContent = "MMMM";
                     svg.appendChild(text);
                     return [typeof svg.getBBox, typeof text.getComputedTextLength,
-                        svg.getBBox().width > 0, text.getComputedTextLength() > 0];
+                        svg.getBBox().width > 0, text.getComputedTextLength() > 0,
+                        Object.prototype.hasOwnProperty.call(SVGGraphicsElement.prototype, "getBBox"),
+                        Object.prototype.hasOwnProperty.call(SVGSVGElement.prototype, "getComputedTextLength")];
                 })()"#,
                 true,
                 true,
@@ -6393,7 +6478,10 @@ mod tests {
             .unwrap()
             .value
             .unwrap();
-        assert_eq!(result, serde_json::json!(["function", "function", true, true]));
+        assert_eq!(
+            result,
+            serde_json::json!(["function", "function", true, true, true, true])
+        );
     }
 
     #[test]
@@ -9765,6 +9853,51 @@ RequestRedirect value",
         );
         // Counting from the origin, not from the epoch.
         assert!(now >= 0.0 && now < 60_000.0, "performance.now() was {now}");
+    }
+
+    #[test]
+    fn navigation_entry_recorded_after_bootstrap_still_leads_the_timeline() {
+        // The host records a frame's navigation entry after the realm's
+        // bootstrap ran, so other startTime==0 entries (visibility-state)
+        // are already buffered. Chrome creates the navigation entry first
+        // (it is the earliest event on the document's timeline), so a stable
+        // startTime sort alone would keep the bootstrap entries ahead of it.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    performance.mark('before-navigation', { startTime: 0 });
+                    __obscura_performance_record({
+                        name: 'https://example.test/frame.html', entryType: 'navigation',
+                        type: 'navigate', startTime: 0, duration: 3,
+                    });
+                    const types = performance.getEntries().map(entry => entry.entryType);
+                    const first = performance.getEntries()[0];
+                    const navByType = performance.getEntriesByType('navigation');
+                    return {
+                        types,
+                        firstName: first.name,
+                        firstType: first.entryType,
+                        navCount: navByType.length,
+                        observerOrder: (() => {
+                            const observer = new PerformanceObserver(() => {});
+                            observer.observe({ type: 'navigation', buffered: true });
+                            return observer.takeRecords().map(entry => entry.entryType);
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "types": ["navigation", "visibility-state", "mark"],
+                "firstName": "https://example.test/frame.html",
+                "firstType": "navigation",
+                "navCount": 1,
+                "observerOrder": ["navigation"],
+            }),
+        );
     }
 
     #[test]
@@ -23538,6 +23671,263 @@ RequestRedirect value",
         }
     }
 
+    #[test]
+    fn webgl_context_is_cached_per_canvas_and_echoes_power_preference() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = document.createElement('canvas');
+                    const first = canvas.getContext('webgl2', {powerPreference: 'low-power'});
+                    // A re-fetch without attributes returns the same context,
+                    // so getContextAttributes still echoes the request.
+                    const refetch = canvas.getContext('webgl2');
+                    const alias = document.createElement('canvas');
+                    const webgl1 = alias.getContext('webgl', {powerPreference: 'high-performance'});
+                    let threw = null;
+                    try { canvas.getContext('webgl2', {powerPreference: 'banana'}); }
+                    catch (error) { threw = error.name; }
+                    const resized = document.createElement('canvas');
+                    const resizedContext = resized.getContext('webgl');
+                    resized.setAttribute('width', '17');
+                    const webglFirst = document.createElement('canvas');
+                    webglFirst.getContext('webgl');
+                    const twoDFirst = document.createElement('canvas');
+                    twoDFirst.getContext('2d');
+                    return {
+                        sameObject: refetch === first,
+                        echoed: refetch.getContextAttributes().powerPreference,
+                        aliasSame: alias.getContext('experimental-webgl') === webgl1,
+                        aliasEcho: webgl1.getContextAttributes().powerPreference,
+                        familiesExclusive: canvas.getContext('webgl') === null,
+                        webglThenTwoD: webglFirst.getContext('2d') === null,
+                        twoDThenWebgl: twoDFirst.getContext('webgl2') === null,
+                        invalidEnumThrows: threw,
+                        freshDefaults: document.createElement('canvas')
+                            .getContext('webgl2').getContextAttributes().powerPreference,
+                        drawingBufferFollowsResize: [
+                            resizedContext.drawingBufferWidth,
+                            resizedContext.drawingBufferHeight,
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sameObject": true,
+                "echoed": "low-power",
+                "aliasSame": true,
+                "aliasEcho": "high-performance",
+                "familiesExclusive": true,
+                "webglThenTwoD": true,
+                "twoDThenWebgl": true,
+                "invalidEnumThrows": "TypeError",
+                "freshDefaults": "default",
+                "drawingBufferFollowsResize": [17, 150],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl_internalformat_samples_follow_chrome_format_classes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        // The default macOS identity selects the Apple profile: the fifteen
+        // core renderable formats at 4x/2x, everything else -- integer, float,
+        // SNORM, unsized, sRGB-without-alpha -- is INVALID_ENUM/null.
+        let apple = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return {
+                        core: [read(0x8058), read(0x8229), read(0x822B), read(0x8051),
+                            read(0x8C43), read(0x8056), read(0x8057), read(0x8D62),
+                            read(0x8059), read(0x81A5), read(0x81A6), read(0x8CAC),
+                            read(0x8D48), read(0x88F0), read(0x8CAD)],
+                        integer: [read(0x8232), read(0x8D70), read(0x906F)],
+                        unsized: [read(0x1907), read(0x1908)],
+                        floats: [read(0x881A), read(0x822D)],
+                        invalid: [read(0x8C41), read(0x8F94), read(0x8C3D)],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            apple,
+            serde_json::json!({
+                "core": [[4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2],
+                    [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2]],
+                "integer": [null, null, null],
+                "unsized": [null, null],
+                "floats": [null, null],
+                "invalid": [null, null, null],
+            })
+        );
+        // EXT_color_buffer_float makes the float formats renderable; RGB9_E5
+        // never becomes renderable.
+        let unlocked = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    gl.getExtension('EXT_color_buffer_float');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return [read(0x881A), read(0x8814), read(0x8C3A), read(0x8C3D)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            unlocked,
+            serde_json::json!([[4, 2], [4, 2], [4, 2], null])
+        );
+        // The Windows/Intel identity keeps the same classes with the D3D11
+        // counts, and an invalid format sets INVALID_ENUM.
+        rt.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+        let intel = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return {
+                        // Probed first: integer formats below set INVALID_ENUM.
+                        errors: [gl.getError(), read(0x8C41), gl.getError()],
+                        core: read(0x8058),
+                        integer: read(0x8232),
+                        floats: read(0x881A),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            intel,
+            serde_json::json!({
+                "core": [8, 4, 2, 1],
+                "integer": null,
+                "floats": null,
+                "errors": [0, null, 1280],
+            })
+        );
+        // The challenge probe's own 53-format list, transcribed from the
+        // captured payload: the null pattern must match Chrome entry for
+        // entry, with only the sample counts scaled to the D3D11 profile.
+        let exact = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const formats = [33321,36756,33330,33329,33332,33331,33334,
+                        33333,33323,36757,33336,33335,33338,33337,33340,33339,
+                        32849,36758,35905,36221,36239,36215,36233,36209,36227,
+                        32856,36759,35907,32857,36220,36238,36975,36214,36232,
+                        36208,36226,34842,34836,35898,35901,33325,33326,33327,
+                        33328,33189,33190,36012,36168,35056,36013,32854,32855,
+                        36194];
+                    return formats.map(fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    });
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            exact,
+            serde_json::json!([
+                [8,4,2,1],null,null,null,null,null,null,null,[8,4,2,1],null,null,
+                null,null,null,null,null,[8,4,2,1],null,null,null,null,null,null,
+                null,null,[8,4,2,1],null,[8,4,2,1],[8,4,2,1],null,null,null,null,
+                null,null,null,null,null,null,null,null,null,null,null,[8,4,2,1],
+                [8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],
+                [8,4,2,1],[8,4,2,1]])
+        );
+    }
+
+    #[test]
+    fn webgl_extension_membership_and_limits_follow_the_intel_profile() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        rt.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl1 = document.createElement('canvas').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const has = (gl, name) => gl.getExtension(name) !== null;
+                    // The capability bitmap a challenge probe walks: the
+                    // mobile/Apple compression formats and provoking vertex
+                    // are absent on D3D11, the desktop ones are present.
+                    const names = [
+                        'WEBGL_compressed_texture_s3tc',
+                        'WEBGL_compressed_texture_s3tc_srgb',
+                        'WEBGL_compressed_texture_astc',
+                        'WEBGL_compressed_texture_etc',
+                        'WEBGL_compressed_texture_etc1',
+                        'WEBGL_compressed_texture_pvrtc',
+                        'WEBGL_compressed_texture_atc',
+                        'EXT_texture_compression_bptc',
+                        'EXT_texture_compression_rgtc',
+                        'EXT_texture_filter_anisotropic',
+                        'WEBKIT_WEBGL_compressed_texture_pvrtc',
+                        'MOZ_WEBGL_compressed_texture_s3tc',
+                        'WEBGL_provoking_vertex',
+                    ];
+                    const astc = gl1.getExtension('WEBGL_compressed_texture_astc');
+                    return {
+                        bitmap: names.map(name => has(gl1, name)),
+                        counts: [gl1.getSupportedExtensions().length,
+                            gl2.getSupportedExtensions().length],
+                        astcProfiles: astc ? astc.getSupportedProfiles() : null,
+                        feedback: [
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS),
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS),
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS),
+                        ],
+                        waitTimeout: gl2.getParameter(gl2.MAX_SERVER_WAIT_TIMEOUT),
+                        sampleCoverage: gl1.getParameter(gl1.SAMPLE_COVERAGE_VALUE),
+                        pointRange: Array.from(gl2.getParameter(gl2.ALIASED_POINT_SIZE_RANGE)),
+                        lineRange: Array.from(gl2.getParameter(gl2.ALIASED_LINE_WIDTH_RANGE)),
+                        unmasked: (() => {
+                            const debugInfo = gl1.getExtension('WEBGL_debug_renderer_info');
+                            return [
+                                gl1.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL),
+                                gl1.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL).includes('Intel'),
+                            ];
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bitmap": [true, true, false, false, false, false, false,
+                    true, true, true, false, false, false],
+                "counts": [35, 30],
+                "astcProfiles": null,
+                "feedback": [4, 120, 4],
+                "waitTimeout": 0,
+                "sampleCoverage": 1,
+                "pointRange": [1, 1024],
+                "lineRange": [1, 1],
+                "unmasked": ["Google Inc. (Intel)", true],
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_peer_connection_offers_a_browser_shaped_sdp_and_trickles_candidates() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -23596,6 +23986,72 @@ RequestRedirect value",
                 "allMdnsHost": true,
                 "gathering": "complete",
                 "redPayloadMapping": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_can_trickle_and_folds_candidates_into_local_sdp() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const before = pc.canTrickleIceCandidates;
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    await pc.setLocalDescription(offer);
+                    const afterLocal = pc.canTrickleIceCandidates;
+                    const sdpAtSet = pc.localDescription.sdp;
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const linesAtComplete = (pc.localDescription.sdp.match(/a=candidate:/g) || []).length;
+                    // Loopback remote description: the offer advertises trickle,
+                    // so canTrickle flips to true only now.
+                    await pc.setRemoteDescription(
+                        {type: 'offer', sdp: pc.localDescription.sdp});
+                    const afterRemote = pc.canTrickleIceCandidates;
+                    // A remote without the trickle option reads false.
+                    const pc2 = new RTCPeerConnection({iceServers: []});
+                    await pc2.setRemoteDescription({
+                        type: 'offer',
+                        sdp: offer.sdp.split('a=ice-options:trickle\r\n').join(''),
+                    });
+                    return {
+                        before, afterLocal, afterRemote,
+                        noTrickleRemote: pc2.canTrickleIceCandidates,
+                        candidatesAtSet: (sdpAtSet.match(/a=candidate:/g) || []).length,
+                        linesAtComplete,
+                        candidateLinesPerSection: (() => {
+                            const sections = pc.localDescription.sdp.split('\r\nm=').slice(1);
+                            return sections.every(section =>
+                                (section.match(/a=candidate:/g) || []).length === 2);
+                        })(),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                // Chrome: null until a remote description exists, then the
+                // remote's `a=ice-options:trickle` decides.
+                "before": null,
+                "afterLocal": null,
+                "afterRemote": true,
+                "noTrickleRemote": false,
+                // The description handed to setLocalDescription has no
+                // candidates yet; gathering folds one per interface per
+                // m-section into it (two interfaces, three m-sections).
+                "candidatesAtSet": 0,
+                "linesAtComplete": 6,
+                "candidateLinesPerSection": true,
             })
         );
     }
@@ -25299,8 +25755,8 @@ RequestRedirect value",
             serde_json::json!({
                 "tag": "[object NetworkInformation]",
                 "own": [],
-                "prototype": ["onchange", "type", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
-                "typeMissing": false,
+                "prototype": ["onchange", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
+                "typeMissing": true,
                 "eventTarget": true,
                 "stable": true,
                 "constructorShape": ["NetworkInformation", 0,

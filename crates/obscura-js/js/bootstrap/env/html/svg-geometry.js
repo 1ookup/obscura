@@ -611,6 +611,31 @@
     return pts[pts.length - 1].slice();
   }
 
+  // Keep the generic Element fallback for compatibility, but publish the
+  // geometry methods on their owning SVG interfaces as Chrome does. Besides
+  // matching the IDL surface, this preserves the receiver interface in the
+  // native call trace (SVGGraphicsElement.getBBox and
+  // SVGSVGElement.getComputedTextLength), which challenge scripts inspect.
+  function _publishSvgMethod(proto, name) {
+    if (!proto || proto === Element.prototype
+        || Object.prototype.hasOwnProperty.call(proto, name)) return;
+    const fn = Element.prototype[name];
+    if (typeof fn !== 'function') return;
+    Object.defineProperty(proto, name, {
+      value: fn, writable: true, enumerable: false, configurable: true,
+    });
+  }
+  const graphicsProto = globalThis.SVGGraphicsElement && globalThis.SVGGraphicsElement.prototype;
+  for (const name of ['getBBox', 'getCTM', 'getScreenCTM', 'getClientRects']) {
+    _publishSvgMethod(graphicsProto, name);
+  }
+  const svgProto = globalThis.SVGSVGElement && globalThis.SVGSVGElement.prototype;
+  for (const name of ['getComputedTextLength', 'getSubStringLength', 'getExtentOfChar',
+                      'getStartPositionOfChar', 'getEndPositionOfChar',
+                      'getRotationOfChar', 'getCharNumAtPosition', 'getNumberOfChars']) {
+    _publishSvgMethod(svgProto, name);
+  }
+
   const GEOMETRY_PROTO = (globalThis.SVGGeometryElement && globalThis.SVGGeometryElement.prototype) || Element.prototype;
   Object.defineProperty(GEOMETRY_PROTO, 'getTotalLength', {
     value: function getTotalLength() {

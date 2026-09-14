@@ -6,7 +6,15 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   get iceGatheringState() { return _rtcSlots(this).iceGatheringState; }
   get signalingState() { return _rtcSlots(this).localDescription ? 'have-local-offer' : 'stable'; }
   get connectionState() { return 'new'; }
-  get canTrickleIceCandidates() { return null; }
+  // Spec/Chrome: null until a remote description is set, then whether that
+  // description advertises trickle ICE (`a=ice-options:trickle`). Measured on
+  // Chrome: null after setLocalDescription, true after a loopback
+  // setRemoteDescription of an offer that carries the trickle option.
+  get canTrickleIceCandidates() {
+    const slots = _rtcSlots(this);
+    if (!slots.remoteDescription) return null;
+    return /a=ice-options:trickle/.test(String(slots.remoteDescription.sdp || ''));
+  }
   get onicecandidate() { return _rtcSlots(this).onicecandidate; }
   set onicecandidate(value) { _rtcSlots(this).onicecandidate = typeof value === 'function' ? value : null; }
   get onicegatheringstatechange() { return _rtcSlots(this).onicegatheringstatechange; }

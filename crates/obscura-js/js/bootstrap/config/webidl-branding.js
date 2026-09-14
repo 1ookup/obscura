@@ -266,6 +266,23 @@
   }
 })();
 
+// The SVG classes are finalized after the media module installs the generic
+// text helpers. Re-publish the root SVG text methods at this final stage so a
+// frame-created <svg> resolves them through SVGSVGElement's own interface.
+(function _finalizeSvgRootMethods() {
+  const owner = globalThis.SVGSVGElement && globalThis.SVGSVGElement.prototype;
+  if (!owner || owner === Element.prototype) return;
+  for (const name of ['getComputedTextLength', 'getSubStringLength', 'getExtentOfChar',
+                      'getStartPositionOfChar', 'getEndPositionOfChar',
+                      'getRotationOfChar', 'getCharNumAtPosition', 'getNumberOfChars']) {
+    const fn = Element.prototype[name];
+    if (typeof fn !== 'function') continue;
+    Object.defineProperty(owner, name, {
+      value: fn, writable: true, enumerable: false, configurable: true,
+    });
+  }
+})();
+
 // Geometry producers hand back plain records, so `Object.prototype.toString`
 // on a rect reads `[object Object]` where a browser reads `[object DOMRect]`,
 // and `rect instanceof DOMRect` is false. The tag alone does not help: the
@@ -308,6 +325,24 @@
 (function _bindLateInterfaces() {
   try {
     if (typeof globalThis.BaseAudioContext === 'function') {
+      // The lightweight AudioContext implementation keeps its factory
+      // methods on AudioContext.prototype.  Chrome exposes those factories
+      // on BaseAudioContext, and OfflineAudioContext inherits that prototype
+      // directly.  Copy the shared methods before rebasing the child classes,
+      // otherwise OfflineAudioContext loses createOscillator() and friends.
+      const audioPrototype = globalThis.AudioContext && globalThis.AudioContext.prototype;
+      const basePrototype = globalThis.BaseAudioContext.prototype;
+      if (audioPrototype) {
+        for (const key of Object.getOwnPropertyNames(audioPrototype)) {
+          if (key === 'constructor' || !(key.startsWith('create') || key === 'decodeAudioData')) {
+            continue;
+          }
+          if (!Object.prototype.hasOwnProperty.call(basePrototype, key)) {
+            const descriptor = Object.getOwnPropertyDescriptor(audioPrototype, key);
+            if (descriptor) Object.defineProperty(basePrototype, key, descriptor);
+          }
+        }
+      }
       for (const name of ['AudioContext', 'OfflineAudioContext']) {
         const ctor = globalThis[name];
         if (typeof ctor === 'function'

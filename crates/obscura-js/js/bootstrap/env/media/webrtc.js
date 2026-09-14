@@ -314,6 +314,41 @@ function _rtcGatherCandidates(connection, slots) {
       try { listener.call(connection, event); } catch (error) { console.error(error); }
     }
   };
+  // Chrome folds each gathered candidate into the current local
+  // description's SDP as it trickles out, so `pc.localDescription.sdp` at
+  // gathering-complete carries an `a=candidate:` line per gathered
+  // candidate (measured: 3 host candidates -> 3 lines, no
+  // a=end-of-candidates). A description frozen at setLocalDescription time
+  // is a shape no real Chrome produces.
+  const applyCandidateToLocal = (mLineIndex, candidateLine) => {
+    const description = slots.localDescription;
+    if (!description || typeof description.sdp !== 'string') return;
+    const lines = description.sdp.split('\r\n');
+    let index = 0;
+    let insertAt = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('m=')) {
+        if (index === mLineIndex) {
+          insertAt = i;
+          break;
+        }
+        index++;
+      }
+    }
+    if (index !== mLineIndex) return;
+    let end = insertAt + 1;
+    while (end < lines.length && !lines[end].startsWith('m=')) end++;
+    // The SDP ends with a trailing CRLF, which split() keeps as a final
+    // empty element; the candidate belongs before it, not after.
+    if (end === lines.length && lines[end - 1] === '') end--;
+    lines.splice(end, 0, 'a=' + candidateLine);
+    try {
+      slots.localDescription = new RTCSessionDescription(
+        { type: description.type, sdp: lines.join('\r\n') });
+    } catch (_error) {
+      description.sdp = lines.join('\r\n');
+    }
+  };
   // Chrome trickles one candidate per interface per m-line, then a null
   // candidate to close gathering. No srflx candidate is produced here: it
   // would have to carry a public address, and inventing one that does not
@@ -346,6 +381,7 @@ function _rtcGatherCandidates(connection, slots) {
         usernameFragment: slots.ufrag,
       });
       emit('icecandidate', { type: 'icecandidate', candidate, target: connection });
+      applyCandidateToLocal(item.sdpMLineIndex, item.candidate);
       _scheduleAfter(1, step);
       return;
     }

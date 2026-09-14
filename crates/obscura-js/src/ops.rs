@@ -4315,11 +4315,12 @@ async fn stealth_fetch_all(
     }
 
     tracing::debug!(
-        "stealth_fetch completed: {} {} -> {} ({} bytes)",
+        "stealth_fetch completed: {} {} -> {} ({} bytes, {} ms)",
         current_method,
         url,
         status,
-        resp_bytes.len()
+        resp_bytes.len(),
+        response_end.as_millis()
     );
 
     Ok(serde_json::json!({
@@ -7678,7 +7679,15 @@ async fn op_load_image_metadata(
                 .to_string();
         };
         if known {
-            return cached_image_metadata_for_node(&gs, node_id, &node_base);
+            let cached = cached_image_metadata_for_node(&gs, node_id, &node_base);
+            if cached.contains("\"ok\":false") || cached.contains("\"dimensions\":null") {
+                tracing::debug!(
+                    "image served from cache as failure: {} -> {}",
+                    selected_url,
+                    cached
+                );
+            }
+            return cached;
         }
         // The referrer and origin of a frame's image request are the frame's,
         // not the embedder's -- Chrome sends the widget document as Referer.
@@ -7775,6 +7784,7 @@ async fn op_load_image_metadata(
         }
     };
     if let Some(receiver) = follower {
+        tracing::debug!("image request joined in-flight leader: {}", selected_url);
         let _ = receiver.await;
         return finish_async_image_metadata(
             &shared,
@@ -7797,6 +7807,14 @@ async fn op_load_image_metadata(
 
     let parsed_url = url::Url::parse(&selected_url).ok();
     let response = if blocked || csp_blocked || parsed_url.is_none() {
+        if blocked || csp_blocked {
+            tracing::debug!(
+                "image fetch not attempted: {} (blocked={} csp_blocked={})",
+                selected_url,
+                blocked,
+                csp_blocked
+            );
+        }
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -7846,6 +7864,16 @@ async fn op_load_image_metadata(
     let resource_timing = response
         .as_ref()
         .map(|response| image_resource_timing_json(response, &initiator_origin));
+    if let Some(response) = response.as_ref() {
+        if !(200..300).contains(&response.status) {
+            tracing::debug!(
+                "image fetch non-2xx: {} -> {} ({} bytes)",
+                selected_url,
+                response.status,
+                response.body.len()
+            );
+        }
+    }
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -7867,11 +7895,21 @@ async fn op_load_image_metadata(
                         // must not invalidate the retained render again.
                         invalidate_render_resource_geometry(&mut gs);
                     } else {
+                        tracing::debug!(
+                            "image bytes undecodable ({} bytes, first: {:02x?}): {}",
+                            bytes.len(),
+                            &bytes.iter().take(8).collect::<Vec<_>>(),
+                            selected_url
+                        );
                         gs.render_resources
                             .seed_image_missing(selected_url.clone(), request_profile);
                     }
                 }
                 None => {
+                    tracing::debug!(
+                        "image fetch produced no usable body: {} (transport error, block, or non-2xx)",
+                        selected_url
+                    );
                     gs.render_resources
                         .seed_image_missing(selected_url.clone(), request_profile);
                 }

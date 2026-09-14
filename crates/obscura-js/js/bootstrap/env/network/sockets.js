@@ -128,6 +128,33 @@ if (typeof OffscreenCanvas === 'undefined') {
     getContext(type, attrs = undefined) {
       const state = _offscreenCanvasState.get(this);
       type = String(type).toLowerCase();
+      if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+        // Chrome's OffscreenCanvas runs the same WebGL families as a canvas
+        // element: the context is cached per surface, the families are
+        // mutually exclusive, and the attributes of the first call are what
+        // getContextAttributes keeps reporting.
+        if (!globalThis.__obscura_webgl_enabled) return null;
+        const powerPreference = attrs && typeof attrs === 'object'
+          ? attrs.powerPreference : undefined;
+        if (powerPreference !== undefined && powerPreference !== 'default'
+            && powerPreference !== 'low-power'
+            && powerPreference !== 'high-performance') {
+          throw new TypeError(
+            'Failed to execute \'getContext\' on \'OffscreenCanvas\': Failed to read '
+            + 'the \'powerPreference\' property from \'WebGLContextAttributes\': The '
+            + 'provided value \'' + powerPreference + '\' is not a valid enum value '
+            + 'of type CanvasPowerPreference.');
+        }
+        const family = type === 'webgl2' ? 'webgl2' : 'webgl';
+        if (state.contextType !== null && state.contextType !== family) return null;
+        if (!state.context) {
+          state.context = family === 'webgl2'
+            ? new globalThis.WebGL2RenderingContext(this, true, attrs)
+            : new globalThis.WebGLRenderingContext(this, false, attrs);
+          state.contextType = family;
+        }
+        return state.context;
+      }
       if (state.contextType !== null && state.contextType !== type) return null;
       if (type !== '2d') return null;
       if (!state.context) {
@@ -150,14 +177,26 @@ if (typeof OffscreenCanvas === 'undefined') {
           "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The canvas has no pixels.",
           'IndexSizeError'));
       }
+      if (!state.context._buf) {
+        // A WebGL surface has no CPU-side 2D buffer to encode here; Chrome
+        // snapshots the drawing buffer, which this consistency layer does
+        // not paint. A blank PNG keeps the promise shape intact.
+        return Promise.resolve(_canvasPngBlob(
+          new _Canvas2D({ width: state.width, height: state.height, getAttribute() { return null; } })));
+      }
       return Promise.resolve(_canvasPngBlob(state.context));
     }
     transferToImageBitmap() {
       const state = _offscreenCanvasState.get(this);
-      const context = state.context || this.getContext('2d');
+      const context = state.context && state.context._buf
+        ? state.context
+        : this.getContext('2d');
+      const pixels = context && context._buf
+        ? context._buf.slice()
+        : new Uint8ClampedArray(state.width * state.height * 4);
       const bitmap = new globalThis.ImageBitmap(_bitmapKey, state.width, state.height,
-        context._buf.slice());
-      context._resizeFromCanvas();
+        pixels);
+      if (context && context._resizeFromCanvas) context._resizeFromCanvas();
       return bitmap;
     }
     get [Symbol.toStringTag]() { return 'OffscreenCanvas'; }

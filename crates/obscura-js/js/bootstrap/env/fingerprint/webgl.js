@@ -22,7 +22,7 @@ const _WEBGL1_EXTENSIONS = [
   'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb',
   'WEBGL_debug_renderer_info', 'WEBGL_debug_shaders', 'WEBGL_depth_texture',
   'WEBGL_draw_buffers', 'WEBGL_lose_context', 'WEBGL_multi_draw',
-  'WEBGL_polygon_mode', 'WEBGL_provoking_vertex',
+  'WEBGL_polygon_mode',
 ];
 const _WEBGL2_EXTENSIONS = [
   'EXT_clip_control', 'EXT_color_buffer_float', 'EXT_color_buffer_half_float',
@@ -33,13 +33,11 @@ const _WEBGL2_EXTENSIONS = [
   'EXT_texture_norm16', 'KHR_parallel_shader_compile',
   'NV_shader_noperspective_interpolation', 'OES_draw_buffers_indexed',
   'OES_sample_variables', 'OES_shader_multisample_interpolation',
-  'OES_texture_float_linear', 'OVR_multiview2', 'WEBGL_blend_func_extended',
+  'OES_texture_float_linear', 'WEBGL_blend_func_extended',
   'WEBGL_clip_cull_distance', 'WEBGL_compressed_texture_s3tc',
   'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
-  'WEBGL_debug_shaders', 'WEBGL_draw_instanced_base_vertex_base_instance',
-  'WEBGL_lose_context', 'WEBGL_multi_draw',
-  'WEBGL_multi_draw_instanced_base_vertex_base_instance', 'WEBGL_polygon_mode',
-  'WEBGL_provoking_vertex', 'WEBGL_stencil_texturing',
+  'WEBGL_debug_shaders', 'WEBGL_lose_context', 'WEBGL_multi_draw',
+  'WEBGL_polygon_mode', 'WEBGL_stencil_texturing',
 ];
 // Every value a desktop ANGLE/D3D11 context reports. Shared by both context
 // versions; the WebGL 2 table below adds the ES 3.0 names on top.
@@ -87,7 +85,7 @@ const _WEBGL1_PARAMETERS = {
   0x8B9A: 0x1401,  // IMPLEMENTATION_COLOR_READ_TYPE -> UNSIGNED_BYTE
   0x8B9B: 0x1908,  // IMPLEMENTATION_COLOR_READ_FORMAT -> RGBA
   // Probed-by-challenge constants that previously answered null.
-  0x80AA: 4352,    // GENERATE_MIPMAP_HINT -> DONT_CARE
+  0x80AA: 1,       // SAMPLE_COVERAGE_VALUE (default 1.0; 4352 was DONT_CARE)
   0x8058: 8,       // MAX_SAMPLES
   0x80E8: 1048576, // MAX_ELEMENTS_INDICES (ANGLE D3D11)
   0x80E9: 1048576, // MAX_ELEMENTS_VERTICES
@@ -141,10 +139,10 @@ const _WEBGL2_PARAMETERS = {
   0x8A34: 256,         // UNIFORM_BUFFER_OFFSET_ALIGNMENT
   0x8A31: 212992,      // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
   0x8A33: 212992,      // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
-  0x8C8A: 120,         // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+  0x8C8A: 120,         // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
   0x8C8B: 4,           // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
-  0x8C80: 120,         // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
-  0x9111: 2147483647,  // MAX_SERVER_WAIT_TIMEOUT
+  0x8C80: 4,           // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS (D3D11 SO)
+  0x9111: 0,           // MAX_SERVER_WAIT_TIMEOUT (ANGLE fences are emulated)
   0x826E: 32,          // MAX_SAMPLES
   0x8D57: 8,           // MAX_SAMPLES (renderbuffer)
   0x9143: 0,           // MAX_ELEMENT_INDEX low word
@@ -285,10 +283,23 @@ const _WEBGL_APPLE = {
     0x0D3A: () => new Int32Array([16384, 16384]),  // MAX_VIEWPORT_DIMS
     0x846D: () => new Float32Array([1, 511]),      // ALIASED_POINT_SIZE_RANGE
   },
-  // getInternalformatParameter(SAMPLES) answers: Apple GPUs top out at 4x
-  // MSAA and only for these renderbuffer formats, everything else is null.
-  samplesFormats: new Set([0x8229, 0x822B, 0x8051, 0x8058, 0x8C43, 0x8059, 0x81A5, 0x81A6, 0x8CAC, 0x8D48, 0x88F0, 0x8CAD, 0x8056, 0x8057, 0x8D62]),
 };
+
+// getInternalformatParameter(RENDERBUFFER, fmt, SAMPLES) answer classes,
+// backend-independent per the WebGL2 validation Chrome applies before the
+// backend answers: the fifteen core color-/depth-/stencil-renderable formats
+// return the profile's sample counts, the float formats only become
+// renderable once EXT_color_buffer_float is enabled, and every other format
+// -- integer, shared-exponent, SNORM, unsized, sRGB-without-alpha -- sets
+// INVALID_ENUM and returns null. Transcribed from the Chrome oracle and the
+// challenge capture, which agree on the fifteen.
+const _WEBGL_IFP_RENDERABLE = new Set([
+  0x8229, 0x822B, 0x8051, 0x8058, 0x8C43, 0x8059, 0x8056, 0x8057, 0x8D62,
+  0x81A5, 0x81A6, 0x8CAC, 0x8D48, 0x88F0, 0x8CAD,
+]);
+const _WEBGL_IFP_FLOAT_RENDERABLE = new Set([
+  0x822D, 0x822E, 0x822F, 0x8230, 0x8814, 0x881A, 0x8C3A,
+]);
 
 // getShaderPrecisionFormat on any desktop GL: IEEE single precision for the
 // float formats and 32-bit two's complement for the integer ones, regardless
@@ -524,6 +535,11 @@ class _WebGLContext {
     return undefined;
   }
   isContextLost() { return this._lost; }
+  // A real context reallocates its drawing buffer when the canvas resizes.
+  _resizeFromCanvas() {
+    this.drawingBufferWidth = this.canvas.width;
+    this.drawingBufferHeight = this.canvas.height;
+  }
 
   // The query surface a capability probe walks. Every one of these was
   // missing, so a probe that called them got a TypeError instead of a value
@@ -537,14 +553,22 @@ class _WebGLContext {
   isEnabled(capability) { return +capability === 0x0BD0; }  // DITHER is on by default
   checkFramebufferStatus() { return 0x8CD5; }               // FRAMEBUFFER_COMPLETE
   getInternalformatParameter(_target, internalformat, pname) {
-    if (+pname !== 0x80A9) return null;
-    if (_webglProfile() === 'apple') {
-      // Apple GPUs answer 4x/2x MSAA for exactly these renderbuffer formats
-      // and nothing else; the D3D11 shape answers 8/4/2/1 everywhere.
-      return _WEBGL_APPLE.samplesFormats.has(+internalformat)
-        ? new Int32Array([4, 2]) : null;
+    // Chrome validates the pname and internalformat shape before the backend
+    // answers; the sample counts themselves are the profile's (Apple GPUs
+    // top out at 4x MSAA, D3D11 FL11 reports 8/4/2/1).
+    if (+pname !== 0x80A9) {
+      if (!this._error) this._error = 0x0500;
+      return null;
     }
-    return new Int32Array([8, 4, 2, 1]);
+    const key = +internalformat;
+    const counts = _webglProfile() === 'apple' ? [4, 2] : [8, 4, 2, 1];
+    if (_WEBGL_IFP_RENDERABLE.has(key)) return new Int32Array(counts);
+    if (_WEBGL_IFP_FLOAT_RENDERABLE.has(key)
+        && this._extensions.has('EXT_color_buffer_float')) {
+      return new Int32Array(counts);
+    }
+    if (!this._error) this._error = 0x0500;
+    return null;
   }
   getIndexedParameter() { return null; }
   getFramebufferAttachmentParameter() { return null; }

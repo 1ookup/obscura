@@ -8,6 +8,21 @@ globalThis.__obscura_performance_record = function(init) {
     entry = new PerformanceNavigationTiming(init);
     const previous = _performanceEntries.findIndex(value => value.entryType === 'navigation');
     if (previous >= 0) _performanceEntries.splice(previous, 1);
+    // A navigation entry is the first event on a document's timeline: it is
+    // created at navigation start, before any script could queue another
+    // entry. Bootstrap-only startTime==0 entries (visibility-state) can
+    // already be in the buffer when the host records a frame navigation
+    // entry, and the stable startTime sort would then keep them ahead of it.
+    // Insert at the head so the buffer order matches Chrome, where
+    // getEntries() always lists the navigation entry first.
+    _performanceEntries.unshift(entry);
+    for (const observer of _performanceObservers) {
+      if (observer._types.has(entry.entryType)) {
+        observer._records.push(entry);
+        observer._schedule();
+      }
+    }
+    return entry;
   } else if (init.entryType === 'paint') {
     entry = new PerformancePaintTiming(init.name, init.startTime);
   } else {

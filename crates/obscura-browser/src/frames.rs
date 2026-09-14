@@ -38,6 +38,11 @@ pub struct BrowsingContext {
     /// Navigation timing for the active document, installed into its Window
     /// realm before preload and author scripts run.
     pub navigation_timing: Option<serde_json::Value>,
+    /// Unix-epoch milliseconds of the navigation's network start. Chrome
+    /// anchors a frame realm's Performance clock to navigation start, not to
+    /// realm creation, so `performance.now()` right after the document loads
+    /// already includes the full network elapsed time.
+    pub navigation_start_ms: Option<f64>,
     /// Child frame ids in creation order.
     pub children: Vec<String>,
 }
@@ -67,6 +72,7 @@ impl FrameRegistry {
                 navigation_generation: 0,
                 loader_id: "1".to_string(),
                 navigation_timing: None,
+                navigation_start_ms: None,
                 children: Vec::new(),
             },
         );
@@ -142,6 +148,7 @@ impl FrameRegistry {
                 navigation_generation: 0,
                 loader_id,
                 navigation_timing: None,
+                navigation_start_ms: None,
                 children: Vec::new(),
             },
         );

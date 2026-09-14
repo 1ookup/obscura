@@ -2861,6 +2861,7 @@ impl Page {
         };
         let generation = frame.document_generation;
         let navigation_timing = frame.navigation_timing.clone();
+        let navigation_start_ms = frame.navigation_start_ms;
 
         let Some(scope) = self
             .js
@@ -2905,6 +2906,29 @@ impl Page {
                 ) {
                     tracing::warn!("frame input strategy install failed ({frame_id}): {error}");
                 }
+            }
+        }
+        if let Some(start_ms) = navigation_start_ms {
+            // Chrome anchors a frame realm's Performance clock to navigation
+            // start, not realm creation: a script running right after the
+            // document commits reads `performance.now()` as the full network
+            // elapsed time, and the navigation entry's duration can never be
+            // smaller than its responseStart. Rebase before the navigation
+            // entry is recorded so the two share one clock.
+            if let Err(error) = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-performance-origin>",
+                &format!(
+                    "try {{ \
+                     globalThis.__obscura_performance_time_origin_ms = {start_ms}; \
+                     globalThis.__obscura_rebasePerformanceOrigin && globalThis.__obscura_rebasePerformanceOrigin({start_ms}); \
+                     globalThis.performance.timeOrigin = {start_ms}; \
+                     globalThis.performance.timing = {{ navigationStart: {start_ms}, domContentLoadedEventEnd: {start_ms}, loadEventEnd: {start_ms} }}; \
+                     }} catch (e) {{}}"
+                ),
+            ) {
+                tracing::warn!("frame performance origin install failed ({frame_id}): {error}");
             }
         }
         if let Some(entry) = navigation_timing {
@@ -3087,10 +3111,6 @@ impl Page {
                 })
             })
             .unwrap_or_default();
-        if scripts.is_empty() {
-            return;
-        }
-
         let Some(js) = self.js.as_mut() else {
             return;
         };
@@ -3485,6 +3505,32 @@ impl Page {
                     }
                 }
             }
+        }
+
+        // A committed frame has its own document lifecycle. The top-level
+        // path emits these hooks after parser/defer/module work; omitting them
+        // in child realms leaves readyState/performance paint entries stale
+        // and changes what frame scripts observe. Dynamic async scripts still
+        // follow the same load-delaying rules as the main document.
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-dom-content-loaded>",
+                "try { globalThis.__obscura_schedule_input_strategy?.(); } catch(e) {}\n\
+                 try { globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); } catch(e) {}\n\
+                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-load-event>",
+                "globalThis.__documentReadyState__ = 'complete';\n\
+                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
+            );
         }
     }
 
@@ -4258,6 +4304,15 @@ impl Page {
             .resolve_base_url()
             .unwrap_or_else(|| document_url.clone());
         let mut candidates = std::collections::BTreeMap::new();
+        // Element-requested ("pending") image candidates carry the initiating
+        // frame's own base URL and referrer policy. Sending them with the top
+        // document as initiator gives cross-origin challenge assets the wrong
+        // Referer, and a session-bound endpoint then answers 4xx -- poisoning
+        // the element's own load through the negative cache entry below.
+        let mut pending_initiators: std::collections::HashMap<
+            (String, Option<obscura_js::ImageRequestProfile>),
+            (String, obscura_net::ReferrerPolicy),
+        > = std::collections::HashMap::new();
 
         if let Some(js) = &self.js {
             for (raw, profile, root) in js.pending_render_image_urls() {
@@ -4279,6 +4334,14 @@ impl Page {
                             );
                             continue;
                         }
+                        let frame_referrer_policy = obscura_net::ReferrerPolicy::parse(
+                            &scope.referrer_policy,
+                        )
+                        .unwrap_or(obscura_net::ReferrerPolicy::StrictOriginWhenCrossOrigin);
+                        pending_initiators.insert(
+                            (url.to_string(), Some(profile)),
+                            (scope.base_url.clone(), frame_referrer_policy),
+                        );
                     }
                     url.set_fragment(None);
                     candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
@@ -4387,7 +4450,10 @@ impl Page {
                 }
             }
             candidates.retain(|(url, profile), _| match profile {
-                Some(profile) => !js.render_image_resource_is_known(url, *profile),
+                Some(profile) => {
+                    !js.render_image_resource_is_known(url, *profile)
+                        && !js.render_image_in_flight(url, *profile)
+                }
                 None => !js.render_resource_is_known(url),
             });
         }
@@ -4419,8 +4485,16 @@ impl Page {
             #[cfg(feature = "stealth")]
             let stealth_client = stealth_client.clone();
             let callbacks = callbacks.clone();
-            let initiator = initiator.clone();
-            let referrer_policy = referrer_policy;
+            let initiator = match pending_initiators.get(&(raw.clone(), profile)) {
+                Some((frame_base, _)) if url::Url::parse(frame_base).is_ok() => {
+                    url::Url::parse(frame_base).expect("validated frame base URL")
+                }
+                _ => initiator.clone(),
+            };
+            let referrer_policy = pending_initiators
+                .get(&(raw.clone(), profile))
+                .map(|(_, policy)| *policy)
+                .unwrap_or(referrer_policy);
             async move {
                 let parsed = url::Url::parse(&raw).expect("validated render resource URL");
                 let mut request = ResourceRequest::subresource(kind, &initiator);
@@ -4494,7 +4568,13 @@ impl Page {
                     if let Some(js) = &mut self.js {
                         match profile {
                             Some(profile) => {
-                                js.seed_render_image_resource(raw, profile, outcome)
+                                // Element-requested images: the element's own
+                                // load owns the failure semantics. A failed
+                                // speculative fetch must not poison the URL
+                                // for the element, so only successes seed.
+                                if outcome.is_some() {
+                                    js.seed_render_image_resource(raw, profile, outcome)
+                                }
                             }
                             None => js.seed_render_resource(raw, outcome),
                         }
@@ -6153,6 +6233,7 @@ impl Page {
                 parent_permissions_policy.clone(),
                 None,
                 None,
+                None,
                 parent_cross_origin_isolated,
             )
         } else {
@@ -6172,6 +6253,7 @@ impl Page {
                     String::new(),
                     parent_csp.clone(),
                     parent_permissions_policy.clone(),
+                    None,
                     None,
                     None,
                     parent_cross_origin_isolated,
@@ -6217,6 +6299,7 @@ impl Page {
                         String::from_utf8_lossy(&body).into_owned(),
                         combine_required_csp(None, required_csp.as_deref()),
                         parent_permissions_policy.clone(),
+                        None,
                         None,
                         None,
                         false,
@@ -6350,6 +6433,17 @@ impl Page {
                     self.record_performance_response(&response, "resource", "iframe");
                     let navigation_timing =
                         Some(Self::frame_navigation_performance_entry(&response));
+                    // Anchor the frame realm's Performance clock to the
+                    // navigation's network start. The response elapsed time
+                    // measures from that start, so subtracting it from the
+                    // current epoch recovers the anchor even though the fetch
+                    // began before this commit point.
+                    let response_end_ms =
+                        response.timing.response_end.as_secs_f64() * 1_000.0;
+                    let navigation_start_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|since| since.as_secs_f64() * 1_000.0 - response_end_ms);
 
                     let final_url = response.url.to_string();
                     let response_csp = response
@@ -6403,13 +6497,11 @@ impl Page {
                     // cross-origin isolation, even when its response carries
                     // COOP/COEP. `allow-same-origin` keeps the tuple origin
                     // and may therefore retain isolation.
-                    // COOP is a top-level browsing-context boundary. A
-                    // A cross-origin child remains in the non-isolated agent
-                    // cluster in Chrome even when the embedding element has
-                    // an `allow="cross-origin-isolated"` token. The token is
-                    // still retained for Permissions Policy reflection, but
-                    // it must not turn a cross-origin frame's own COOP/COEP
-                    // response into an isolated realm.
+                    // A child with its own COOP/COEP response can join an
+                    // isolated agent cluster across an origin boundary when
+                    // the embedding policy delegates `cross-origin-isolated`
+                    // to that origin. Without the delegation, only a
+                    // same-origin child inherits the parent's capability.
                     let document_cross_origin_isolated = frame_document_isolation(
                         &response,
                         &response_origin,
@@ -6443,6 +6535,7 @@ impl Page {
                         response_permissions_policy,
                         last_modified,
                         navigation_timing,
+                        navigation_start_ms,
                         document_cross_origin_isolated,
                     )
                 }
@@ -6457,6 +6550,7 @@ impl Page {
             document_permissions_policy,
             last_modified,
             navigation_timing,
+            navigation_start_ms,
             mut document_cross_origin_isolated,
         ) = resolved_document;
 
@@ -6505,28 +6599,15 @@ impl Page {
             Url::parse(&document_url),
         ) {
             (Some(source), Ok(target)) if matches!(target.scheme(), "http" | "https") => {
-                let policy_value =
-                    obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default();
-                if policy_value.is_empty()
-                    && matches!(source.scheme(), "http" | "https")
-                    && frame_policy == obscura_net::ReferrerPolicy::SameOrigin
-                {
-                    // Chrome keeps an origin floor for a frame document's
-                    // referrer: measured on a page whose response sets
-                    // `Referrer-Policy: same-origin`, a cross-origin iframe
-                    // still reports the embedder's origin as
-                    // document.referrer (the header strips the wire Referer
-                    // header only). An empty scope referrer here makes the
-                    // frame read as if it had no embedder at all.
-                    obscura_net::referrer_value(
-                        &source,
-                        &target,
-                        obscura_net::ReferrerPolicy::StrictOriginWhenCrossOrigin,
-                    )
-                    .unwrap_or_default()
-                } else {
-                    policy_value
-                }
+                // Chrome applies the embedder's referrer policy to a frame
+                // document's own `document.referrer`, not only to the wire
+                // Referer header: measured with a two-port fixture, a
+                // cross-origin child reports the embedder's origin ("/"
+                // appended) under the default strict-origin-when-cross-origin
+                // policy and the empty string when the parent response sets
+                // `Referrer-Policy: same-origin`. An origin "floor" here would
+                // produce a value no real Chrome reports.
+                obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default()
             }
             // about:blank/srcdoc and other non-network documents inherit the
             // creator's source URL as their environment referrer.
@@ -6541,6 +6622,7 @@ impl Page {
             })?;
         if let Some(frame) = self.frames.get_mut(frame_id) {
             frame.navigation_timing = navigation_timing;
+            frame.navigation_start_ms = navigation_start_ms;
         }
         let dom = self.dom.as_ref().expect("checked above");
         dom.set_document_scope(
@@ -8070,6 +8152,95 @@ mod tests {
         assert_eq!(result, serde_json::json!(["status:200", "AbortError"]));
     }
 
+    /// Chrome applies the embedder's referrer policy to a frame document's
+    /// own `document.referrer`: measured with a two-port fixture, a
+    /// cross-origin child reports the embedder's origin ("/" appended) under
+    /// the default strict-origin-when-cross-origin policy, and the empty
+    /// string when the parent response sets `Referrer-Policy: same-origin`.
+    /// There is no origin "floor" for same-origin policies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_frame_referrer_follows_the_embedder_policy() {
+        let parent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_origin = format!("http://{}", child_listener.local_addr().unwrap());
+        let (parent_policy_header, expected_referrer) = {
+            // First decide the variant from a fixed rotation: same-origin
+            // policy strips the child's referrer entirely; the default policy
+            // keeps the embedder origin with a trailing slash.
+            ("Referrer-Policy: same-origin\r\n", String::new())
+        };
+        let parent_body = format!(
+            "<!doctype html><iframe src=\"{child_origin}/child\"></iframe>"
+        );
+        let parent_origin = format!("http://{}", parent_listener.local_addr().unwrap());
+        let expected_default = format!("{parent_origin}/");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            std::thread::spawn(move || {
+                for _ in 0..1 {
+                    let Ok((mut stream, _)) = child_listener.accept() else { break };
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let body = "<!doctype html><p>child</p>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = parent_listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{parent_policy_header}Content-Length: {}\r\nConnection: close\r\n\r\n{parent_body}",
+                    parent_body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-referrer".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-referrer".to_string(), context);
+        page.navigate(&format!("{parent_origin}/main")).await.unwrap();
+
+        let child_id = page
+            .frames
+            .get(page.frames.main_frame_id())
+            .unwrap()
+            .children[0]
+            .clone();
+        let generation = page.frames.get(&child_id).unwrap().document_generation;
+        let child_referrer = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &child_id,
+                generation,
+                "<frame-referrer-probe>",
+                "document.referrer",
+            )
+            .unwrap();
+        assert_eq!(
+            child_referrer,
+            serde_json::json!(expected_referrer),
+            "same-origin policy must strip a cross-origin child's document.referrer",
+        );
+        assert_ne!(
+            child_referrer, serde_json::json!(expected_default),
+            "the old origin floor produced a value Chrome never reports here",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_subframe_document_load_lands_in_the_parents_resource_timeline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8761,7 +8932,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_child_cannot_enable_cross_origin_isolation() {
+    fn cross_origin_child_can_enable_cross_origin_isolation_when_delegated() {
         let response = obscura_net::Response {
             url: url::Url::parse("https://widget.example/frame").unwrap(),
             status: 200,
@@ -8786,7 +8957,7 @@ mod tests {
         assert!(frame_response_grants_cross_origin_isolation(
             &response, &widget, &widget, true,
         ));
-        assert!(!super::frame_document_isolation(
+        assert!(super::frame_document_isolation(
             &response, &widget, &page, true, true, obscura_dom::SandboxFlags::default(),
         ));
         assert!(!super::frame_document_isolation(
@@ -12897,15 +13068,21 @@ fn frame_document_isolation(
     response_origin: &obscura_dom::Origin,
     parent_origin: &obscura_dom::Origin,
     parent_cross_origin_isolated: bool,
-    _allow_cross_origin_isolated: bool,
+    allow_cross_origin_isolated: bool,
     sandbox: obscura_dom::SandboxFlags,
 ) -> bool {
-    let own_isolation = frame_response_grants_cross_origin_isolation(
-        response,
-        response_origin,
-        parent_origin,
-        parent_cross_origin_isolated,
-    );
+    let own_isolation = if response_origin == parent_origin {
+        frame_response_grants_cross_origin_isolation(
+            response,
+            response_origin,
+            parent_origin,
+            parent_cross_origin_isolated,
+        )
+    } else {
+        parent_cross_origin_isolated
+            && allow_cross_origin_isolated
+            && response_grants_cross_origin_isolation(response)
+    };
     own_isolation
         && (!sandbox.active
             || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))

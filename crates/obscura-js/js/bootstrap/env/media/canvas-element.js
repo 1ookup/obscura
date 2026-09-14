@@ -17,14 +17,16 @@ class HTMLCanvasElement extends Element {
   setAttribute(name, value) {
     super.setAttribute(name, value);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+    if (this._ctx && (normalized === 'width' || normalized === 'height')
+        && typeof this._ctx._resizeFromCanvas === 'function') {
       this._ctx._resizeFromCanvas();
     }
   }
   removeAttribute(name) {
     super.removeAttribute(name);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+    if (this._ctx && (normalized === 'width' || normalized === 'height')
+        && typeof this._ctx._resizeFromCanvas === 'function') {
       this._ctx._resizeFromCanvas();
     }
   }
@@ -33,10 +35,15 @@ globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
 HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
   if (type === '2d') {
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this, attrs); }
-      catch (_error) { return null; }
+    // A canvas carries exactly one context family; the first request wins
+    // and everything else, including a repeat with different attributes,
+    // returns the cached context or null, exactly like Chrome.
+    if (this._contextKind) {
+      return this._contextKind === '2d' ? this._ctx : null;
     }
+    try { this._ctx = new _Canvas2D(this, attrs); }
+    catch (_error) { return null; }
+    this._contextKind = '2d';
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
@@ -44,12 +51,36 @@ HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
     // Its values come from the same fingerprint policy as navigator.userAgent;
     // callers that require a real GPU still receive the truthful null default.
     if (!globalThis.__obscura_webgl_enabled) return null;
-    return type === 'webgl2'
+    // WebIDL converts the dictionary before the context is created or
+    // returned, so an invalid powerPreference rejects even a cached canvas.
+    const powerPreference = attrs && typeof attrs === 'object'
+      ? attrs.powerPreference : undefined;
+    if (powerPreference !== undefined && powerPreference !== 'default'
+        && powerPreference !== 'low-power'
+        && powerPreference !== 'high-performance') {
+      throw new TypeError(
+        'Failed to execute \'getContext\' on \'HTMLCanvasElement\': Failed to read '
+        + 'the \'powerPreference\' property from \'WebGLContextAttributes\': The '
+        + 'provided value \'' + powerPreference + '\' is not a valid enum value '
+        + 'of type CanvasPowerPreference.');
+    }
+    // The context is cached per canvas: a later getContext without the
+    // attributes still echoes the original request in getContextAttributes,
+    // and the webgl/webgl2 families are mutually exclusive.
+    const family = type === 'webgl2' ? 'webgl2' : 'webgl';
+    if (this._contextKind) {
+      return this._contextKind === family ? this._ctx : null;
+    }
+    this._ctx = family === 'webgl2'
       ? new globalThis.WebGL2RenderingContext(this, true, attrs)
       : new globalThis.WebGLRenderingContext(this, false, attrs);
+    this._contextKind = family;
+    return this._ctx;
   }
   if (type === 'webgpu') {
     if (!globalThis.__obscura_webgl_enabled || !globalThis.GPUCanvasContext) return null;
+    if (this._contextKind && this._contextKind !== 'webgpu') return null;
+    this._contextKind = 'webgpu';
     if (!this._webgpuCtx) this._webgpuCtx = new globalThis.GPUCanvasContext(this);
     return this._webgpuCtx;
   }
