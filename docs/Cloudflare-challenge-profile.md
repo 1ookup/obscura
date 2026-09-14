@@ -4,7 +4,7 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-08，step 245，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+当前状态（2026-09-13，step 256，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
 指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
@@ -8549,3 +8549,43 @@ Trusted Types sink 名、表单原生 setter），导致 workspace 出现 5 个�
 **"widget 在 `interactiveBegin`/`interactiveEnd` 之后拿不到 `complete` + token"**，
 且有一个每个 widget 都会发生、而参照侧从不发生的可见异常（`reloadApiJsRequest` 被拒）。
 真实 `/1.txt` 404 仍未取得。
+
+### Step 255 - OfflineAudioContext 原型链丢失导致 widget VM 崩溃（2026-09-13，修复完成）
+
+**假设 / 方法**：最新 Obscura 轮在 widget realm 报 `Cannot read properties of undefined (reading 'call')`。
+通过临时环境门控的 VM 指令日志记录失败操作的 receiver 和属性名，并与当前 Turnstile frame 脚本的
+7040 行对齐。
+
+**证据**：失败操作为 `prop=createOscillator`、receiver 为 `[object OfflineAudioContext]`，其 own keys
+只有 `sampleRate,state,currentTime,baseLatency,destination,...`。`OfflineAudioContext` 原本继承
+`AudioContext`，但晚绑定代码把它直接 rebased 到空的 `BaseAudioContext.prototype`，因此丢失了
+`createOscillator` 与其它共享工厂方法。
+
+**修复**：在晚绑定阶段把 `AudioContext.prototype` 的共享 `create*`/`decodeAudioData` 方法复制到
+`BaseAudioContext.prototype`，再建立 Chrome 的 `AudioContext`/`OfflineAudioContext` → `BaseAudioContext`
+链。新增 `offline_audio_context_inherits_base_audio_factories` 回归测试。
+
+**结果**：修复后同一真实轮不再产生该 TypeError；widget 可继续执行音频探针。代理当前仍返回
+Cloudflare challenge，尚未取得目标真实 404，因此这项修复是必要阻塞点的闭环，不能单独视为过盾证据。
+
+### Step 256 - SVG 几何方法归属对齐（2026-09-13，验证完成）
+
+窄 V8 trace 显示 Obscura frame 已实际调用 `getBBox`、`getComputedTextLength` 和 Canvas 测量，返回非零值，
+但调用归属为 `Node.getBBox`/`Node.getComputedTextLength`；HaHaVM 成功轮对应为
+`SVGGraphicsElement.getBBox`/`SVGSVGElement.getComputedTextLength`。保留 `Element.prototype` 的兼容回退，
+同时把几何方法发布到对应 SVG 原型，修正接口归属而不改变测量实现。frame namespace focused test
+确认方法、非零结果和原型自有成员均成立。由于真实轮存在 Cloudflare 时序波动，本项暂未作为独立 404 证据。
+
+### Step 257 - Cross-origin isolated frame policy delegation (2026-09-13)
+
+**假设 / 方法**：HaHaVM 成功环境把 `crossOriginIsolated` 读为 `true`。目标页面和 Turnstile frame 的实际响应都带 `Cross-Origin-Opener-Policy: same-origin` 与 `Cross-Origin-Embedder-Policy: require-corp`，且 widget iframe 委派了 `allow="cross-origin-isolated"`。用本地双端口 fixture 在 Chrome 和 Obscura 的 frame realm 读取 `crossOriginIsolated` 与 `typeof SharedArrayBuffer`，再检查 frame policy 实现。
+
+**证据**：Chrome fixture 返回子 frame `true/function`；修复前 Obscura 返回 `false/undefined`。`frame_document_isolation` 原先忽略了已计算的 allow 委派，并要求子 frame 与父 frame 同源。focused nextest `coop_coep_and_permissions_policy_derive_cross_origin_isolation` 与 `cross_origin_child_can_enable_cross_origin_isolation_when_delegated` 通过 2/2；修复后二端口 Obscura fixture 顶层和跨源子 frame 均返回 `true/function`；真实低开销 trace `/private/tmp/lancet-goal-coi-trace-20260913h/api.jsonl` 记录两个 widget ray 的 `window.crossOriginIsolated=true`。
+
+**修复**：跨源子 frame 在父文档已隔离、子响应具备 COOP/COEP 且 Permissions Policy 委派目标源时允许隔离；无委派仍保持非隔离，同源行为不变。
+
+**结果边界**：修复后的真实点击轮仍收到 `/pat` 401 并最终 403，尚未取得独立 `/1.txt` 404。该项是已由 Chrome 定标的通用 frame 环境修复，不是独立过盾证明。
+
+### Step 258 - Post-fix environment surface audit (2026-09-13)
+
+在修复后的 release binary 上，跨 realm opt-in probe `/private/tmp/lancet-goal-env-live-20260913i/serve.log` 记录了 top、Turnstile frame、重试 frame 和 `about:srcdoc`：均为 `crossOriginIsolated=true`、`typeof SharedArrayBuffer/XSLTProcessor/CSSPseudoElement` 为 `function`，`navigator.languages=["en-US","en"]`、`devicePixelRatio=2`。因此 payload 中 N/F/T 桶的 `SharedArrayBuffer`、`XSLTProcessor`、`CSSPseudoElement` 差异不是当前运行时缺失；没有新的环境修改项。
