@@ -3,3 +3,16 @@ target/
 vendor/rusty_v8/
 .v8trace-probe
 .dsh/
+
+# Private working notes from the Cloudflare parity investigation. They are
+# handover material, not part of the tracked tree.
+progress.md
+findings.md
+task_plan.md
+
+# Captured challenge evidence (HAR, payload dumps) and tool state. Generated
+# artifacts must not be committed.
+assets/har/
+assets/payload/
+assets/payload-2fo/
+.zcode/
