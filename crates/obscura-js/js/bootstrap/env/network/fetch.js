@@ -94,7 +94,6 @@ globalThis.fetch = async (input, init = {}) => {
     if (origin && origin !== "null") {
       url = origin.endsWith("/") ? origin : origin + "/";
     }
-    console.error('[fetch-empty]', JSON.stringify(_environmentSettings()));
   }
   if (!url.includes('://')) {
     try {

@@ -165,10 +165,8 @@ function _deliverWorkerOutMessage(worker, message) {
   const listeners = (worker._listeners['message'] || []).slice();
   if (typeof worker.onmessage !== 'function' && !listeners.length) {
     worker._listener = message;
-    try { console.error('[worker] out queued', String(message).slice(0, 80)); } catch (e) {}
     return;
   }
-  try { console.error('[worker] out deliver', String(message).slice(0, 80)); } catch (e) {}
   const evt = globalThis.__obscura_markTrusted
     ? globalThis.__obscura_markTrusted(new MessageEvent('message', { data: message }))
     : new MessageEvent('message', { data: message });
@@ -211,13 +209,12 @@ function _runPostedWorkerSource(worker, data, type) {
         '(function(hahavm_this){\n' + message + '\n})(globalThis.__obscuraWorkerThis);',
         'about:blank',
       );
-      try { console.error('[worker] source ok', message.slice(0, 100)); } catch (e) {}
     } else {
       (new Function('hahavm_this', message))(worker);
-      try { console.error('[worker] source ok fn', message.slice(0, 100)); } catch (e) {}
     }
   } catch (e) {
-    console.error('Worker posted source error:', e && e.message ? e.message : e);
+    // A throwing task source reports through the page's own error path in
+    // Chrome; echoing it with an engine prefix here is page-visible noise.
   }
   try { delete globalThis.__obscuraWorkerThis; } catch (e) { globalThis.__obscuraWorkerThis = undefined; }
 }
@@ -239,10 +236,7 @@ globalThis.Worker = class Worker {
     if (this._listener !== undefined && this._listener !== null) {
       const pending = this._listener;
       this._listener = undefined;
-      try { console.error('[worker] onmessage replay', String(pending).slice(0, 80)); } catch (e) {}
       _deliverWorkerOutMessage(this, pending);
-    } else {
-      try { console.error('[worker] onmessage set', typeof fn); } catch (e) {}
     }
   }
   get onmessageerror() { return this._handlers.messageerror; }
@@ -315,21 +309,6 @@ globalThis.Worker = class Worker {
     // 600010. Large classic http(s) workers still spawn.
     if (resolved.startsWith('blob:') || href.startsWith('blob:')) {
       this._inlineEvalWorker = true;
-      try {
-        const root = (typeof _callingFrameRoot === 'function') ? _callingFrameRoot() : 0;
-        const info = root > 0 ? (Deno.core.ops.op_dom('document_scope_info', String(root), '') || '{}') : '{}';
-        console.error('[worker] stub blob ctor', resolved.slice(0, 80),
-          'href', String(globalThis.location && globalThis.location.href),
-          'secure', globalThis.isSecureContext,
-          'origin', String(globalThis.origin),
-          'protocol', String(globalThis.location && globalThis.location.protocol),
-          'hostname', String(globalThis.location && globalThis.location.hostname),
-          'base', String(globalThis.document && globalThis.document.baseURI),
-          'docURL', String(globalThis.document && globalThis.document.URL),
-          'scope', info.slice(0, 220));
-      } catch (e) {
-        console.error('[worker] stub blob ctor', resolved.slice(0, 80), 'env-error', e && e.message);
-      }
       return;
     }
     if (resolved.startsWith('data:')) {
@@ -468,16 +447,12 @@ globalThis.Worker = class Worker {
   }
   postMessage(data, type) {
     if (this._terminated) return;
-    if (typeof data === 'string' && (data.indexOf('postMessage') !== -1 || data.indexOf('fetch') !== -1)) {
-      console.error('[worker] post', type || '', data.slice(0, 120));
-    }
     // HaHaVM Worker_postMessage: a string that itself contains postMessage
     // is classic-script source, Function()'d in the creating document. The
     // rewritten source then calls this method again with type "out" to
     // deliver to onmessage. Sending the string into a blob isolate is what
     // produces the PAT request and 600010.
     if (data && data.indexOf) {
-      if (data.indexOf('debugger') !== -1) return;
       // With an isolate behind this worker every post is a message for it: the
       // blob's own bootstrap evals the task inside the worker scope. The
       // document-eval path is only for a worker that has none.
