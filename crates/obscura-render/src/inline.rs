@@ -181,14 +181,68 @@ impl IdentityFace {
         }
     }
 
-    /// The advance of the last-resort glyph a browser draws for a cluster none
-    /// of the stack's faces covers, in font units.
+    /// The advance of the last-resort glyph a browser draws for a cluster the
+    /// face has no glyph for, in font units.
     ///
-    /// The macOS identity carries no emoji font, so an emoji or a ZWJ sequence
-    /// is one uncovered grapheme cluster and one glyph: `😀`, `👨‍👩‍👧‍👦` and
-    /// every other emoji measure the same 999-unit advance, 15.984px at 16px,
-    /// however many code points the cluster holds.
+    /// A face that covers no emoji at all draws one glyph for the whole
+    /// cluster, so `😀` and `👨‍👩‍👧‍👦` measure the same 999-unit advance,
+    /// 15.984px at 16px, however many code points the cluster holds.
     const LAST_RESORT_ADVANCE: f32 = 999.0;
+
+    /// The face's own emoji metric for a shaped cluster, when the cluster
+    /// begins with an emoji the face covers.
+    ///
+    /// The identity's sans face is the one that answers for emoji: its build on
+    /// the capture machine covers them with its own outlines, which is why
+    /// `16px sans-serif` reports per-emoji advances there while the same
+    /// emoji in the default (serif) family is one last-resort glyph. Both facts
+    /// come from the reference trace and they disagree, so they cannot share a
+    /// rule.
+    fn emoji_metric(self, cluster: &str) -> Option<EmojiMetric> {
+        match self {
+            IdentityFace::Sans => macos_sans_emoji_metric(cluster),
+            IdentityFace::Serif => None,
+        }
+    }
+}
+
+/// One emoji's advance in the identity sans face's own 1000-unit em, plus the
+/// ink box the reference reports for it.
+///
+/// The box is placed once per run: the reference's `actualBoundingBox*` for a
+/// repeated emoji are the single-glyph box while the width doubles, so the box
+/// belongs to the emoji, not to the pen position of each copy.
+#[derive(Clone, Copy)]
+struct EmojiMetric {
+    advance: f32,
+    ink: Option<(f32, f32, f32, f32)>,
+}
+
+/// The ink box seven of the ten emoji share: the face draws them from one
+/// component, and a page reads the same rectangle for each.
+const MACOS_SANS_SHARED_EMOJI_INK: Option<(f32, f32, f32, f32)> = Some((42.0, 546.0, 758.0, 14.0));
+
+/// The emoji the identity sans face covers, read off the reference's
+/// `TextMetrics` at 16px. A base character and its emoji presentation selector
+/// shape as one cluster, so the cluster's first character decides.
+fn macos_sans_emoji_metric(cluster: &str) -> Option<EmojiMetric> {
+    let (advance, ink) = match cluster.chars().next()? {
+        '\u{1F600}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F923}' => (1394.0, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F631}' => (1596.5, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F44D}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F525}' => (1594.0, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F680}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F9E0}' => (1260.5, Some((42.0, 2103.0, 834.0, 112.0))),
+        '\u{1F436}' => (1573.5, Some((42.0, 3077.0, 811.0, 93.0))),
+        '\u{1F3E0}' => (1460.5, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{2600}' => (2052.5, Some((42.0, 3066.0, 716.0, 212.0))),
+        // The presentation selector adds no advance and no ink of its own; it
+        // only asks for the emoji-drawn form of the base character.
+        '\u{FE0F}' => (0.0, None),
+        _ => return None,
+    };
+    Some(EmojiMetric { advance, ink })
 }
 
 /// PingFang SC's hmtx advance for U+0020..=U+007E, in font units.
@@ -323,6 +377,9 @@ fn identity_cluster_units(cluster: &str, face: IdentityFace) -> Option<f32> {
     if cluster.is_empty() {
         return None;
     }
+    if let Some(metric) = face.emoji_metric(cluster) {
+        return Some(metric.advance);
+    }
     if cluster.chars().any(identity_last_resort_rune) {
         return Some(IdentityFace::LAST_RESORT_ADVANCE);
     }
@@ -391,6 +448,18 @@ fn macos_sans_ligature_spans(text: &str) -> (Vec<(usize, usize)>, f32) {
 /// rather than merely close.
 fn identity_units_to_px(units: f32, size: f32, units_per_em: f32) -> f32 {
     units * size / units_per_em
+}
+
+/// Union of two ink boxes, each `(left, right, ascent, descent)`.
+fn ink_union(
+    a: Option<(f32, f32, f32, f32)>,
+    b: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1), a.2.max(b.2), a.3.max(b.3))),
+        (Some(box_), None) | (None, Some(box_)) => Some(box_),
+        (None, None) => None,
+    }
 }
 
 /// Apply the identity face's own advances to one shaped line.
@@ -2102,6 +2171,13 @@ impl TextEngine {
         // Collect the shaped glyph specs first: scaling needs &mut font_system
         // while the runs borrow the buffer.
         let mut specs: Vec<(cosmic_text::fontdb::ID, u16, f32, f32)> = Vec::new();
+        // Emoji the identity's sans face covers shape from a fallback face's
+        // missing glyph here, whose ink is not what a page reads. Their box
+        // comes from the built-in table instead, placed at the pen origin of
+        // the first one: a repeated emoji widens the run but does not move the
+        // box, which is what the reference reports for a doubled string.
+        let mut emoji_specs: Vec<((f32, f32, f32, f32), f32)> = Vec::new();
+        let mut emoji_origin: Option<f32> = None;
         // Covered text advances by the identity face's own numbers, so the pen
         // the ink is placed at has to be the same one the reported width came
         // from. Shaping positions come from the bundled stand-in: for a face
@@ -2145,6 +2221,16 @@ impl TextEngine {
                 };
                 let x = pen + glyph.x_offset;
                 pen += advance;
+                let emoji_ink = identity_face
+                    .and_then(|face| cluster.and_then(|cluster| face.emoji_metric(cluster)))
+                    .and_then(|metric| metric.ink);
+                if let Some(ink) = emoji_ink {
+                    if emoji_origin.is_none() {
+                        emoji_origin = Some(x);
+                    }
+                    emoji_specs.push((ink, glyph.font_size));
+                    continue;
+                }
                 specs.push((glyph.font_id, glyph.glyph_id, glyph.font_size, x));
             }
         }
@@ -2200,6 +2286,24 @@ impl TextEngine {
                 // (bounds.max.y), below it negative (bounds.min.y).
                 ascent = ascent.max(y1);
                 descent = descent.max(-y0);
+            }
+        }
+        if let Some(origin) = emoji_origin {
+            let mut emoji_ink: Option<(f32, f32, f32, f32)> = None;
+            for ((left, right, top, bottom), font_size) in emoji_specs {
+                let px = |units: f32| {
+                    identity_units_to_px(units, font_size, MACOS_SANS_METRICS.units_per_em)
+                };
+                emoji_ink = ink_union(
+                    emoji_ink,
+                    Some((origin + px(left), origin + px(right), px(top), px(bottom))),
+                );
+            }
+            if let Some((left, right, top, bottom)) = emoji_ink {
+                min_x = min_x.min(left);
+                max_x = max_x.max(right);
+                ascent = ascent.max(top);
+                descent = descent.max(bottom);
             }
         }
         if min_x.is_finite() {
@@ -6108,17 +6212,100 @@ mod ink_tests {
         );
     }
 
-    /// An emoji or ZWJ cluster is one last-resort glyph: the macOS identity
-    /// carries no emoji font, so the advance is 999/1000 em whatever the
-    /// cluster's code-point count, and every family answers it -- the hidden
-    /// fixture measures its emoji in the default font while it measures the
-    /// hex strings in `serif` at 150px.
+    /// Two emoji rules, pinned to the two places the reference reports them.
+    ///
+    /// The identity's sans face is the one that covers emoji: `16px sans-serif`
+    /// answers the per-emoji advances the canvas probe reads, and a doubled
+    /// string is twice its advance while the ink box stays the single-glyph
+    /// box. Every other family draws one last-resort glyph per cluster, which
+    /// is what the hidden SVG fixture's emoji (default font, 16px) measures:
+    /// 15.984px for a lone emoji and for a seven-code-point family sequence
+    /// alike. The two answers disagree, so neither may quietly replace the
+    /// other.
+    #[test]
+    fn macos_emoji_split_between_canvas_and_element_text() {
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        // The canvas path, at the size and family the challenge's probe uses.
+        let cases: &[(&str, f32, f32, f32, f32, f32)] = &[
+            ("\u{1F600}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F923}", 22.303985595703125, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F631}", 25.543991088867188, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F44D}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F525}", 25.503990173339844, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F680}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F9E0}", 20.167984008789062, 0.671999990940094, 33.64799880981445, 13.343999862670898, 1.792),
+            ("\u{1F436}", 25.175987243652344, 0.671999990940094, 49.231998443603516, 12.97599983215332, 1.488),
+            ("\u{1F3E0}", 23.36798858642578, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{2600}\u{FE0F}", 32.839988708496094, 0.671999990940094, 49.055999755859375, 11.456000328063965, 3.392),
+        ];
+        for (text, width, ink_left, ink_right, ink_ascent, ink_descent) in cases {
+            let metrics = measurer.measure_metrics(text, "16px sans-serif");
+            assert!(
+                (metrics.width - width).abs() < 1e-3,
+                "{text:?} canvas width {} != {width}",
+                metrics.width
+            );
+            assert!(
+                (metrics.ink_left - ink_left).abs() < 1e-3
+                    && (metrics.ink_right - ink_right).abs() < 1e-3
+                    && (metrics.ink_ascent - ink_ascent).abs() < 1e-3
+                    && (metrics.ink_descent - ink_descent).abs() < 1e-3,
+                "{text:?} canvas ink ({}, {}, {}, {})",
+                metrics.ink_left,
+                metrics.ink_right,
+                metrics.ink_ascent,
+                metrics.ink_descent
+            );
+            // The doubled string the challenge measures: twice the advance,
+            // the same single-glyph ink box.
+            let repeated = measurer.measure_metrics(&format!("{text}{text}"), "16px sans-serif");
+            assert!(
+                (repeated.width - 2.0 * width).abs() < 1e-3,
+                "{text:?} doubled canvas width {} != {}",
+                repeated.width,
+                2.0 * width
+            );
+            assert!(
+                (repeated.ink_right - ink_right).abs() < 1e-3
+                    && (repeated.ink_ascent - ink_ascent).abs() < 1e-3,
+                "{text:?} doubled ink box moved with the repeat"
+            );
+        }
+        // The element/SVG side keeps the last-resort glyph: the same emoji in
+        // a family the identity's sans does not answer for, and in the two
+        // faces that carry no emoji, measure one 999-unit glyph.
+        for family in ["serif", "Times", "Arial", "monospace"] {
+            for text in [
+                "\u{1F600}",
+                "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}",
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}",
+            ] {
+                let font = format!("16px {family}");
+                let width = measurer.measure(text, &font);
+                assert_eq!(width, 15.984, "{text} last-resort cluster in {font}");
+            }
+        }
+        // The Windows identity has neither rule: it keeps whatever the shaped
+        // stand-in reports.
+        set_font_platform("Win32");
+        assert_ne!(measurer.measure("\u{1F600}", "16px sans-serif"), 28.703994750976562);
+        assert_ne!(measurer.measure("\u{1F600}", "16px sans-serif"), 15.984);
+    }
+
+    /// An emoji or ZWJ cluster outside the sans face is one last-resort glyph:
+    /// the advance is 999/1000 em whatever the cluster's code-point count, and
+    /// every family except the sans answers it -- the hidden fixture measures
+    /// its emoji in the default font while it measures the hex strings in
+    /// `serif` at 150px.
     #[test]
     fn macos_last_resort_cluster_is_one_glyph() {
         let _guard = PlatformGuard;
         set_font_platform("MacIntel");
         let mut measurer = crate::CanvasTextMeasurer::new();
-        for family in ["sans-serif", "serif", "Times", "Arial", "monospace"] {
+        for family in ["serif", "Times", "Arial", "monospace"] {
             for text in [
                 "\u{1F600}",
                 "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}",
@@ -6161,6 +6348,7 @@ mod ink_tests {
                 "150px serif",
                 4501.65625_f32,
             ),
+
         ] {
             let width = measurer.measure(text, font);
             // Chrome accumulates the run's advance in 1/64px steps, so a
