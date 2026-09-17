@@ -15,4 +15,8 @@ task_plan.md
 assets/har/
 assets/payload/
 assets/payload-2fo/
+assets/*.jsonl
+assets/*.zip
+assets/thelancet-trace/
+__pycache__/
 .zcode/
