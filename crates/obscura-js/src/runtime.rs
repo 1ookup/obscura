@@ -23732,6 +23732,106 @@ RequestRedirect value",
         );
     }
 
+    /// The reference trace reads the limits from two objects: the adapter
+    /// reports the full Apple M-series tier and a device that asks for nothing
+    /// gets Chrome's default-granted tier, which is strictly lower in twenty
+    /// places. Both columns are the reference's own values, field for field.
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_each_tier_reports_the_reference_limits() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    // A page walks the limits by enumeration, so the test does
+                    // too: the members are the prototype's enumerable getters.
+                    const adapterLimits = {};
+                    const deviceLimits = {};
+                    let enumerated = 0;
+                    for (const name in adapter.limits) {
+                        enumerated++;
+                        adapterLimits[name] = adapter.limits[name];
+                        deviceLimits[name] = device.limits[name];
+                    }
+                    const own = Object.getOwnPropertyNames(adapter.limits).length;
+                    return { info: [adapter.info.vendor, adapter.info.architecture,
+                                    adapter.info.device, adapter.info.description],
+                             enumerated, own, adapterLimits, deviceLimits };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(
+            value["info"],
+            serde_json::json!(["apple", "metal-3", "", ""]),
+        );
+        // Chrome's limits object carries no own members: every limit is an
+        // enumerable prototype getter, which is the surface a probe walks.
+        assert_eq!(value["enumerated"].as_u64(), Some(38));
+        assert_eq!(value["own"].as_u64(), Some(0));
+        let adapter = &value["adapterLimits"];
+        let device = &value["deviceLimits"];
+        for (name, high, low) in ADAPTER_VERSUS_DEVICE_LIMITS {
+            assert_eq!(
+                adapter[name].as_u64(),
+                Some(*high),
+                "adapter.limits.{name}"
+            );
+            assert_eq!(device[name].as_u64(), Some(*low), "device.limits.{name}");
+        }
+        // Fields only one tier carries stay pinned too.
+        assert_eq!(adapter["maxImmediateSize"].as_u64(), Some(64));
+        assert_eq!(device["maxImmediateSize"].as_u64(), Some(64));
+    }
+
+    /// The full Apple M-series tier against the default-granted one, from the
+    /// reference trace. Every pair is written out so a table edit that changes
+    /// one tier cannot silently move the other.
+    const ADAPTER_VERSUS_DEVICE_LIMITS: &[(&str, u64, u64)] = &[
+        ("maxBindGroups", 4, 4),
+        ("maxBindGroupsPlusVertexBuffers", 24, 24),
+        ("maxBindingsPerBindGroup", 1000, 1000),
+        ("maxBufferSize", 4294967292, 268435456),
+        ("maxColorAttachmentBytesPerSample", 128, 32),
+        ("maxColorAttachments", 8, 8),
+        ("maxComputeInvocationsPerWorkgroup", 1024, 256),
+        ("maxComputeWorkgroupSizeX", 1024, 256),
+        ("maxComputeWorkgroupSizeY", 1024, 256),
+        ("maxComputeWorkgroupSizeZ", 64, 64),
+        ("maxComputeWorkgroupStorageSize", 32768, 16384),
+        ("maxComputeWorkgroupsPerDimension", 65535, 65535),
+        ("maxDynamicStorageBuffersPerPipelineLayout", 8, 4),
+        ("maxDynamicUniformBuffersPerPipelineLayout", 10, 8),
+        ("maxInterStageShaderVariables", 28, 16),
+        ("maxSampledTexturesPerShaderStage", 48, 16),
+        ("maxSamplersPerShaderStage", 16, 16),
+        ("maxStorageBufferBindingSize", 4294967292, 134217728),
+        ("maxStorageBuffersInFragmentStage", 10, 8),
+        ("maxStorageBuffersInVertexStage", 10, 8),
+        ("maxStorageBuffersPerShaderStage", 10, 8),
+        ("maxStorageTexturesInFragmentStage", 8, 4),
+        ("maxStorageTexturesInVertexStage", 8, 4),
+        ("maxStorageTexturesPerShaderStage", 8, 4),
+        ("maxTextureArrayLayers", 2048, 256),
+        ("maxTextureDimension1D", 16384, 8192),
+        ("maxTextureDimension2D", 16384, 8192),
+        ("maxTextureDimension3D", 2048, 2048),
+        ("maxUniformBufferBindingSize", 65536, 65536),
+        ("maxUniformBuffersPerShaderStage", 12, 12),
+        ("maxVertexAttributes", 30, 16),
+        ("maxVertexBufferArrayStride", 2048, 2048),
+        ("maxVertexBuffers", 8, 8),
+        ("minStorageBufferOffsetAlignment", 256, 256),
+        ("minUniformBufferOffsetAlignment", 256, 256),
+    ];
+
     #[test]
     fn the_gpu_profile_follows_stealth_and_hides_the_adapter_behind_the_debug_extension() {
         let mut rt = setup_runtime("<html><body></body></html>");

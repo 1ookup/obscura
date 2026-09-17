@@ -30,6 +30,7 @@ const _GPU_LIMITS = {
   maxVertexAttributes: 16,
   maxVertexBufferArrayStride: 2048,
   maxInterStageShaderVariables: 28,
+  maxImmediateSize: 64,
   maxColorAttachments: 8,
   maxColorAttachmentBytesPerSample: 64,
   maxComputeWorkgroupStorageSize: 32768,
@@ -61,6 +62,7 @@ const _GPU_DEFAULT_LIMITS = {
   minStorageBufferOffsetAlignment: 256, maxVertexBuffers: 8,
   maxBufferSize: 268435456, maxVertexAttributes: 16,
   maxVertexBufferArrayStride: 2048, maxInterStageShaderVariables: 16,
+  maxImmediateSize: 64,
   maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32,
   maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256,
   maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256,
@@ -106,6 +108,7 @@ const _GPU_APPLE = {
     maxVertexAttributes: 30,
     maxVertexBufferArrayStride: 2048,
     maxInterStageShaderVariables: 28,
+    maxImmediateSize: 64,
     maxColorAttachments: 8,
     maxColorAttachmentBytesPerSample: 128,
     maxComputeWorkgroupStorageSize: 32768,
@@ -150,11 +153,9 @@ function _gpuSupportedLimits(values) {
   }
   // Compatibility for snapshots using the pre-split manifest.
   const limits = Object.create(globalThis.GPUSupportedLimits.prototype);
-  for (const name of Object.keys(values)) {
-    Object.defineProperty(limits, name, {
-      value: values[name], enumerable: false, configurable: true,
-    });
-  }
+  Object.defineProperty(limits, _gpuLimitValues, {
+    value: values, enumerable: false, configurable: true,
+  });
   return limits;
 }
 // GPUSupportedFeatures is a setlike, so it answers `has`, iterates, and

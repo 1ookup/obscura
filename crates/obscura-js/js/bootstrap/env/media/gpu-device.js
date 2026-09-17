@@ -2,12 +2,12 @@ globalThis.GPUDevice = class GPUDevice {
   constructor() { throw new TypeError('Illegal constructor'); }
   get features() { return _gpuSupportedFeatures(['core-features-and-limits']); }
   get limits() {
-    const base = _gpuSupportedLimits(_GPU_DEFAULT_LIMITS);
-    if (_webglProfile() === 'apple') {
-      Object.defineProperty(base, 'minSubgroupSize', { value: null, enumerable: false, configurable: true });
-      Object.defineProperty(base, 'maxSubgroupSize', { value: null, enumerable: false, configurable: true });
-    }
-    return base;
+    // Apple GPUs expose no subgroup sizes; the override belongs in the values
+    // so no own property shadows the prototype getters.
+    const values = _webglProfile() === 'apple'
+      ? Object.assign({}, _GPU_DEFAULT_LIMITS, { minSubgroupSize: null, maxSubgroupSize: null })
+      : _GPU_DEFAULT_LIMITS;
+    return _gpuSupportedLimits(values);
   }
   get adapterInfo() { return Object.create(globalThis.GPUAdapterInfo.prototype); }
   get label() { return ''; }

@@ -6,6 +6,12 @@ globalThis.GPUSupportedLimits = class GPUSupportedLimits {
 // sees the same list a browser does, whatever the instance carries.
 for (const name of Object.keys(_GPU_LIMITS)) {
   Object.defineProperty(globalThis.GPUSupportedLimits.prototype, name, {
-    get() { return undefined; }, enumerable: true, configurable: true,
+    // The values live on the instance under `_gpuLimitValues`, so the getter
+    // answers the profile's number and stays enumerable the way Chrome's is.
+    get() {
+      const values = this[_gpuLimitValues];
+      return values ? values[name] : undefined;
+    },
+    enumerable: true, configurable: true,
   });
 }

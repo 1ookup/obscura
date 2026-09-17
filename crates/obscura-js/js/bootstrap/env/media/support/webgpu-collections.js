@@ -1,13 +1,18 @@
 // WebGPU collection factories.  GPUSupportedLimits and GPUSupportedFeatures
 // are interface objects, not plain records; the shape constructors live in
 // their dedicated modules while profile selection stays in webgpu.js.
+// The per-instance limit values. They ride a symbol rather than own string
+// properties: an own property shadows the prototype's getter, and a page that
+// enumerates the limits (`for...in`, which is how a fingerprint probe walks
+// them) then sees the interface's members and no values. Chrome's own object
+// has no own members at all, every limit being a prototype getter.
+const _gpuLimitValues = Symbol('GPUSupportedLimits values');
+
 function _webgpuMakeSupportedLimits(values) {
   const limits = Object.create(globalThis.GPUSupportedLimits.prototype);
-  for (const name of Object.keys(values)) {
-    Object.defineProperty(limits, name, {
-      value: values[name], enumerable: false, configurable: true,
-    });
-  }
+  Object.defineProperty(limits, _gpuLimitValues, {
+    value: values, enumerable: false, configurable: true,
+  });
   return limits;
 }
 
