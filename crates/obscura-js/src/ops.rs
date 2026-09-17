@@ -6393,11 +6393,15 @@ fn op_canvas_measure_text(
     width
 }
 
-/// Width, grid-fitted font box, and glyph ink extents, as
-/// `"<width>,<ascent>,<descent>,<inkLeft>,<inkRight>,<inkAscent>,<inkDescent>"`.
+/// Width, grid-fitted font box, glyph ink extents and the two font-derived
+/// baselines, as
+/// `"<width>,<ascent>,<descent>,<inkLeft>,<inkRight>,<inkAscent>,<inkDescent>,<hanging>,<ideographic>"`.
 ///
-/// A flat string rather than JSON: seven numbers on a path `measureText` calls
-/// per invocation, where the parse cost is the whole cost.
+/// A flat string rather than JSON: nine numbers on a path `measureText` calls
+/// per invocation, where the parse cost is the whole cost. The baselines ride
+/// here because they are font decisions the layout engine owns, and a page
+/// comparing a `TextMetrics` reading against the element geometry next door
+/// must not see two different answers.
 #[cfg(feature = "render")]
 #[op2]
 #[string]
@@ -6407,18 +6411,21 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
         .borrow_mut()
         .canvas_text_measurer
         .measure_metrics(text, font);
-    eprintln!("[op-canvas-metrics] ink=({},{},{},{}) box=({},{})",
-        metrics.ink_left, metrics.ink_right, metrics.ink_ascent, metrics.ink_descent,
-        metrics.font_ascent, metrics.font_descent);
+    // Every field is f32 upstream, and a page reads the widened value a
+    // browser hands back: `57.407989501953125` for a run a browser computed in
+    // f32, not the shortest decimal that round-trips the same f32. Widening
+    // here keeps a measurement a payload hashes byte for byte.
     format!(
-        "{},{},{},{},{},{},{}",
-        metrics.width,
-        metrics.font_ascent,
-        metrics.font_descent,
-        metrics.ink_left,
-        metrics.ink_right,
-        metrics.ink_ascent,
-        metrics.ink_descent
+        "{},{},{},{},{},{},{},{},{}",
+        metrics.width as f64,
+        metrics.font_ascent as f64,
+        metrics.font_descent as f64,
+        metrics.ink_left as f64,
+        metrics.ink_right as f64,
+        metrics.ink_ascent as f64,
+        metrics.ink_descent as f64,
+        metrics.hanging_baseline as f64,
+        metrics.ideographic_baseline as f64
     )
 }
 

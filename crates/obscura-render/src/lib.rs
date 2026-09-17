@@ -176,6 +176,7 @@ impl CanvasTextMeasurer {
         let (ink_left, ink_right, ink_ascent, ink_descent) =
             self.engine.measure_canvas_ink(text, &style);
         let (font_ascent, font_descent) = self.engine.inline_font_box_metrics(&style);
+        let (hanging_baseline, ideographic_baseline) = self.engine.canvas_baselines(&style);
         CanvasTextMetrics {
             width,
             font_ascent,
@@ -184,6 +185,8 @@ impl CanvasTextMeasurer {
             ink_right,
             ink_ascent,
             ink_descent,
+            hanging_baseline,
+            ideographic_baseline,
         }
     }
 
@@ -216,6 +219,12 @@ pub struct CanvasTextMetrics {
     /// Ink extents above and below the alphabetic baseline.
     pub ink_ascent: f32,
     pub ink_descent: f32,
+    /// 0.8 of the grid-fitted ascent, in f32.
+    pub hanging_baseline: f32,
+    /// Distance to the ideographic baseline; negative, below the alphabetic
+    /// one. Comes from the face's OS/2 sTypoDescender where its identity has
+    /// one, and from the grid-fitted descent otherwise.
+    pub ideographic_baseline: f32,
 }
 
 #[cfg(feature = "paint")]

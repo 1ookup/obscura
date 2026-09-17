@@ -34,12 +34,21 @@ function _measureTextBox(text, font) {
         const inkDescent = Number(parts[6]);
         const ink = Number.isFinite(inkLeft) && Number.isFinite(inkRight)
           && Number.isFinite(inkAscent) && Number.isFinite(inkDescent);
+        // The baselines are font decisions the layout engine owns, so they
+        // come from the same answer as the box instead of a formula repeated
+        // here: on a macOS identity the ideographic baseline is the face's
+        // OS/2 sTypoDescender, which is not the descent. Older payloads
+        // without them keep the descent-based fallback.
+        const hanging = Number(parts[7]);
+        const ideographic = Number(parts[8]);
         return {
           width, ascent, descent,
           inkLeft: ink ? inkLeft : undefined,
           inkRight: ink ? inkRight : undefined,
           inkAscent: ink ? inkAscent : undefined,
           inkDescent: ink ? inkDescent : undefined,
+          hangingBaseline: Number.isFinite(hanging) ? hanging : ascent * 0.8,
+          ideographicBaseline: Number.isFinite(ideographic) ? ideographic : -descent,
         };
       }
     }

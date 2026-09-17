@@ -401,12 +401,14 @@ class _Canvas2D {
       actualBoundingBoxDescent: hasRealInk ? box.inkDescent : (hasInk ? box.descent : 0),
       // Chrome puts the hanging baseline at 80% of the font ascent, the
       // alphabetic one at the origin, and the ideographic one at the font
-      // descent. Checked against Chrome 146 for sans-serif, Arial, Times New
-      // Roman and monospace at 10/16/32px: hanging is 0.8 * ascent in all of
-      // them, alphabetic is 0 in all of them.
-      hangingBaseline: box.ascent * 0.8,
+      // descent -- except where the face carries an OS/2 sTypoDescender, which
+      // is what the macOS sans face answers with (-2.2400054931640625 at
+      // 16px, not -5). Checked against Chrome for sans-serif, Arial, Times New
+      // Roman and monospace at 10/16/32px; the box carries both so the two
+      // readings cannot disagree.
+      hangingBaseline: box.hangingBaseline,
       alphabeticBaseline: 0,
-      ideographicBaseline: -box.descent,
+      ideographicBaseline: box.ideographicBaseline,
     });
   }
   getImageData(x, y, w, h, settings = undefined) {

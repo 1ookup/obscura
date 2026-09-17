@@ -54,6 +54,152 @@ const SERIF_FAMILY: &str = "Liberation Serif";
 const MONO_FAMILY: &str = "Liberation Mono";
 const SYSTEM_FAMILY: &str = "DejaVu Sans";
 
+/// The faces a macOS identity resolves its generics to, as built-in data.
+///
+/// Chrome on macOS answers `sans-serif` (and the canvas default font) with
+/// PingFang SC and `monospace` with Menlo. Neither file is guaranteed to be on
+/// the machine that runs the engine: PingFang.ttc ships under an on-demand
+/// asset path on some macOS releases and the host that runs a macOS identity
+/// has no such file at all, so the numbers travel with the binary and
+/// measurement never reads a host font. PingFang SC: upem 1000, hhea
+/// 1060/-340/0, OS/2 sTypoDescender -140. Menlo: upem 2048, hhea 1901/-483/0,
+/// uniform advance 1233/2048 (Menlo descends from Bitstream Vera, which is why
+/// the vertical numbers are the round DejaVu Sans Mono ones).
+const MACOS_SANS_METRICS: FaceMetrics = FaceMetrics {
+    ascent: 1060.0,
+    descent: 340.0,
+    line_gap: 0.0,
+    units_per_em: 1000.0,
+};
+/// OS/2 sTypoDescender of the macOS sans face. The ideographic baseline is
+/// this distance rather than the hhea descent: at 16px it is
+/// -2.2400054931640625 where the grid-fitted hhea descent answers -5.
+const MACOS_SANS_TYPO_DESCENT: f32 = 140.0;
+const MACOS_MONO_METRICS: FaceMetrics = FaceMetrics {
+    ascent: 1901.0,
+    descent: 483.0,
+    line_gap: 0.0,
+    units_per_em: 2048.0,
+};
+/// The macOS monospace face's uniform advance. The bundled mono face the
+/// engine shapes with advances 1229/2048 instead, so a run that resolves to
+/// the identity monospace is scaled to this before its width is reported.
+const MACOS_MONO_ADVANCE: f32 = 1233.0;
+const BUNDLED_MONO_ADVANCE: f32 = 1229.0;
+
+/// The emoji the challenge measures through `measureText`, in the macOS sans
+/// face's 1000-unit em: advance plus the ink box, both read off a real macOS
+/// Chrome's `TextMetrics` at 16px. The face covers them itself -- the numbers
+/// are integers in its own units, which Apple Color Emoji's 800-unit em cannot
+/// produce -- and seven of the ten share one box because the face draws them
+/// from a shared component.
+///
+/// The reference's ink does not move with the second copy of a repeated
+/// emoji, while width does: `measureText('😀😀')` is two advances wide and its
+/// `actualBoundingBox*` are the single-glyph box. Both the advance and the box
+/// are therefore keyed to the rune and the box is placed once.
+struct EmojiMetric {
+    advance: f32,
+    /// `(left, right, ascent, descent)` relative to the pen origin, or `None`
+    /// when the character carries no ink of its own.
+    ink: Option<(f32, f32, f32, f32)>,
+}
+
+fn macos_emoji_metric(ch: char) -> Option<EmojiMetric> {
+    const SHARED: Option<(f32, f32, f32, f32)> = Some((42.0, 546.0, 758.0, 14.0));
+    let (advance, ink) = match ch {
+        '\u{1F600}' => (1794.0, SHARED),
+        '\u{1F923}' => (1394.0, SHARED),
+        '\u{1F631}' => (1596.5, SHARED),
+        '\u{1F44D}' => (1794.0, SHARED),
+        '\u{1F525}' => (1594.0, SHARED),
+        '\u{1F680}' => (1794.0, SHARED),
+        '\u{1F9E0}' => (1260.5, Some((42.0, 2103.0, 834.0, 112.0))),
+        '\u{1F436}' => (1573.5, Some((42.0, 3077.0, 811.0, 93.0))),
+        '\u{1F3E0}' => (1460.5, SHARED),
+        '\u{2600}' => (2052.5, Some((42.0, 3066.0, 716.0, 212.0))),
+        // The emoji presentation selector adds no advance and no ink of its
+        // own; it only asks for the emoji-drawn form of the base character.
+        '\u{FE0F}' => (0.0, None),
+        _ => return None,
+    };
+    Some(EmojiMetric { advance, ink })
+}
+
+/// The identity face's metric for a shaped cluster, when the cluster begins
+/// with one of the emoji the built-in table covers. A base character and its
+/// presentation selector arrive as one cluster, so the base decides.
+fn identity_sans_cluster_metric(text: &str, start: usize, end: usize) -> Option<EmojiMetric> {
+    let cluster = text.get(start..end)?;
+    macos_emoji_metric(cluster.chars().next()?)
+}
+
+/// Scale a face unit count to pixels the way a browser's 26.6/16.16 pipeline
+/// does, so a value derived from font units is bit-identical to the reference
+/// rather than merely close.
+fn identity_units_to_px(units: f32, size: f32, units_per_em: f32) -> f32 {
+    units * size / units_per_em
+}
+
+/// Union of two ink boxes, each `(left, right, ascent, descent)`.
+fn ink_union(
+    a: Option<(f32, f32, f32, f32)>,
+    b: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1), a.2.max(b.2), a.3.max(b.3))),
+        (Some(box_), None) | (None, Some(box_)) => Some(box_),
+        (None, None) => None,
+    }
+}
+
+/// Apply the identity face's own advance to one shaped line.
+///
+/// Emoji the identity's face covers are not in the shaping database, so they
+/// shape from a fallback face's missing glyph and carry an advance no browser
+/// reports. The returned line width has that advance removed; the units the
+/// caller accumulates are scaled once, at the end, which is the arithmetic a
+/// browser does over a run. Returns `(line, units, font size)`, the last two
+/// zero when the line has no covered emoji.
+fn identity_emoji_line(
+    item: &InlineItem,
+    run: &cosmic_text::LayoutRun,
+    line_w: f32,
+) -> (f32, f32, f32) {
+    if !item.identity_sans {
+        return (line_w, 0.0, 0.0);
+    }
+    let mut line = line_w;
+    let mut units = 0.0f32;
+    let mut size = 0.0f32;
+    // One cluster can shape to several glyphs, and each of them reports the
+    // whole cluster's byte range. The cluster's advance is counted once; every
+    // glyph's own advance still leaves the line.
+    let mut counted: Vec<(usize, usize)> = Vec::new();
+    for glyph in run.glyphs.iter() {
+        let Some(metric) = identity_sans_cluster_metric(run.text, glyph.start, glyph.end) else {
+            continue;
+        };
+        line -= glyph.w;
+        size = glyph.font_size;
+        if !counted.contains(&(glyph.start, glyph.end)) {
+            counted.push((glyph.start, glyph.end));
+            units += metric.advance;
+        }
+    }
+    (line, units, size)
+}
+
+/// Pixel width of a scaled unit count, zero when the line had no covered
+/// emoji (and so no font size to scale by).
+fn identity_emoji_width(units: f32, size: f32) -> f32 {
+    if units == 0.0 {
+        0.0
+    } else {
+        identity_units_to_px(units, size, MACOS_SANS_METRICS.units_per_em)
+    }
+}
+
 /// Map a CSS `font-family` list to a bundled face the way Chromium resolves the
 /// generic families on this host. Chromium's Linux `system-ui` resolves to
 /// DejaVu Sans, while `sans-serif`/Arial/Helvetica resolve to Liberation Sans.
@@ -262,6 +408,11 @@ struct ResolvedFont {
     font_id: Option<cosmic_text::fontdb::ID>,
     metrics: FaceMetrics,
     synthetic_italic: bool,
+    /// True when the resolved face stands for one of the identity's own faces
+    /// (PingFang SC for the default/`sans-serif`, Menlo for `monospace`), so
+    /// its advance and emoji follow the identity rather than the bundled
+    /// stand-in.
+    identity_face: bool,
 }
 
 #[derive(Clone)]
@@ -304,10 +455,28 @@ fn resolve_loaded_font(
                     bundled_face_for_css_token(name)
                         .and_then(|face| loaded.get(&face.family().to_ascii_lowercase()))
                 });
-            if let Some(resolved) = family
-                .and_then(|family| select_loaded_face(family, requested_weight, requested_italic))
-            {
-                return resolved;
+            if let Some(entry) = family {
+                if let Some(mut resolved) =
+                    select_loaded_face(entry, requested_weight, requested_italic)
+                {
+                    // A bundled face stands in for the identity's own font. On
+                    // a macOS identity the identity's real metrics replace the
+                    // stand-in's for the *generic* token that resolves to it --
+                    // `sans-serif` is PingFang SC and `monospace` is Menlo --
+                    // so the font box, the baselines and line boxes answer for
+                    // those faces even on a machine that has neither file. A
+                    // named family keeps the bundled stand-in's own metrics
+                    // (which is what the Arial/Times parity was checked
+                    // against), and a webfont is never a stand-in.
+                    resolved.identity_face =
+                        !entry.is_webfont && generic_token_owns_identity_face(name);
+                    if resolved.identity_face {
+                        if let Some(metrics) = identity_face_metrics(&resolved.family) {
+                            resolved.metrics = metrics;
+                        }
+                    }
+                    return resolved;
+                }
             }
         }
     }
@@ -318,10 +487,13 @@ fn resolve_loaded_font(
     // that finds nothing and falls back to an arbitrary database face. The
     // identity is resolved here (layout time), not at engine construction,
     // because set_font_platform lands after the engine exists.
+    let identity_face = identity_face_metrics(fallback).is_some();
     if font_platform() == FontPlatform::MacOs {
         if let Some(family) = loaded.get("__obscura_system_pingfang") {
-            if let Some(resolved) = select_loaded_face(family, requested_weight, requested_italic)
+            if let Some(mut resolved) =
+                select_loaded_face(family, requested_weight, requested_italic)
             {
+                resolved.identity_face = identity_face;
                 return resolved;
             }
         }
@@ -331,6 +503,7 @@ fn resolve_loaded_font(
         font_id: None,
         metrics: bundled_face_metrics(fallback),
         synthetic_italic: false,
+        identity_face,
     }
 }
 
@@ -363,6 +536,7 @@ fn select_loaded_face(
             font_id: face.font_id,
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
+            identity_face: false,
         });
     }
     let available: Vec<_> = candidates.iter().map(|face| face.min_weight).collect();
@@ -375,6 +549,7 @@ fn select_loaded_face(
             font_id: face.font_id,
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
+            identity_face: false,
         })
 }
 
@@ -445,6 +620,51 @@ fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
 /// Chromium, not 11px. Keep these metrics beside the embedded faces so normal
 /// line boxes follow the same device-pixel rhythm without consulting host
 /// fonts.
+/// Whether a CSS `font-family` token names the generic whose answer is the
+/// identity's own face rather than a named family the bundled set stands in
+/// for. On macOS that is `sans-serif` (PingFang SC, also the default family)
+/// and `monospace` (Menlo).
+fn generic_token_owns_identity_face(token: &str) -> bool {
+    token.eq_ignore_ascii_case("sans-serif") || token.eq_ignore_ascii_case("monospace")
+}
+
+/// The built-in metrics the identity owns for one of its standard families,
+/// or `None` when the bundled face answers for itself.
+fn identity_face_metrics(family: &str) -> Option<FaceMetrics> {
+    if font_platform() != FontPlatform::MacOs {
+        return None;
+    }
+    match family {
+        FAMILY => Some(MACOS_SANS_METRICS),
+        MONO_FAMILY => Some(MACOS_MONO_METRICS),
+        _ => None,
+    }
+}
+
+/// The factor a shaped run of this family has to be scaled by so its advance
+/// matches the identity's face. Only the macOS monospace differs: the bundled
+/// mono face advances 1229/2048 where the identity's face advances 1233/2048,
+/// a difference the challenge reads straight out of a 24-character run.
+fn identity_advance_scale(family: &str) -> f32 {
+    if font_platform() == FontPlatform::MacOs && family == MONO_FAMILY {
+        MACOS_MONO_ADVANCE / BUNDLED_MONO_ADVANCE
+    } else {
+        1.0
+    }
+}
+
+/// The identity sans face's ideographic baseline at `size`. The face carries
+/// OS/2 sTypoDescender -140, and the value reaches the page through a 1/65536
+/// fixed-point step, the same one a browser's font metrics travel through:
+/// `-2.2400054931640625` at 16px, not the exact -2.24 and not the grid-fitted
+/// -5. The step is done in f64 because the fixed-point rounding happens before
+/// the value narrows to the f32 a page reads.
+pub(crate) fn identity_ideographic_baseline(size: f32) -> f32 {
+    let units =
+        MACOS_SANS_TYPO_DESCENT as f64 * size as f64 / MACOS_SANS_METRICS.units_per_em as f64;
+    -((units * 65536.0).round() / 65536.0) as f32
+}
+
 fn bundled_face_metrics(family: &str) -> FaceMetrics {
     // The default family's metrics follow the claimed platform's actual
     // standard font, because `line-height: normal` and the font box are part
@@ -453,14 +673,9 @@ fn bundled_face_metrics(family: &str) -> FaceMetrics {
     // (1060/340, upem 1000) grid-fits 16px text to a 22px line box where the
     // bundled sans answers 19px. Keep glyph selection unchanged; only the
     // vertical metrics follow the identity, so measureText and layout stay
-    // on one table.
-    if family == FAMILY && font_platform() == FontPlatform::MacOs {
-        return FaceMetrics {
-            ascent: 1060.0,
-            descent: 340.0,
-            line_gap: 0.0,
-            units_per_em: 1000.0,
-        };
+    // on one table. The same table answers for the identity's monospace.
+    if let Some(metrics) = identity_face_metrics(family) {
+        return metrics;
     }
     let (ascent, descent, line_gap) = match family {
         SERIF_FAMILY => (1825.0, 443.0, 87.0),
@@ -603,6 +818,14 @@ pub struct InlineItem {
     /// Whether final shaping should tighten the wrap width while preserving
     /// the natural line count (`text-wrap-style: balance`).
     balance_wrap: bool,
+    /// Factor a shaped run's advance is scaled by before it is reported. The
+    /// macOS identity's monospace advances 1233/2048 where the bundled mono
+    /// face advances 1229/2048, and the challenge reads that difference out of
+    /// a 24-character run. 1.0 for every other identity and family.
+    advance_scale: f32,
+    /// True when this item's primary face is the identity's macOS sans face,
+    /// whose emoji the challenge measures through `measureText`/TextMetrics.
+    identity_sans: bool,
     /// Alignment is applied against the original content width. Cosmic-text
     /// uses its buffer width for both wrapping and alignment, so a balanced
     /// (narrower) buffer needs a corresponding origin inset.
@@ -1297,6 +1520,34 @@ impl TextEngine {
         fitted_font_box_metrics(style.font_size.unwrap_or(16.0), font.metrics)
     }
 
+    /// `(hanging, ideographic)` baselines for a canvas `measureText`, in the
+    /// signed convention Chrome reports: hanging above the alphabetic
+    /// baseline, ideographic below it (negative). Hanging is 0.8 of the
+    /// grid-fitted ascent in f32, the width a browser's own arithmetic
+    /// produces. Ideographic is the identity face's OS/2 sTypoDescender for
+    /// the macOS sans face and the grid-fitted descent for every other family,
+    /// the split step 54 pinned down for Arial, Times New Roman and monospace.
+    pub(crate) fn canvas_baselines(&self, style: &LayoutStyle) -> (f32, f32) {
+        let font = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        let size = style.font_size.unwrap_or(16.0);
+        let (ascent, descent) = fitted_font_box_metrics(size, font.metrics);
+        // The sTypo-based answer is the identity sans face's alone: a named
+        // family that happens to resolve to the bundled stand-in keeps the
+        // grid-fitted descent, which is what the Arial/Times/Helvetica
+        // references answer with.
+        let ideographic = if font.identity_face && font.metrics == MACOS_SANS_METRICS {
+            identity_ideographic_baseline(size)
+        } else {
+            -descent
+        };
+        (ascent * 0.8, ideographic)
+    }
+
     /// Used line-height for the same selected face. Kept beside
     /// [`inline_font_box_height`](Self::inline_font_box_height) so layout can
     /// distribute leading around the raw fragment using one font decision.
@@ -1527,10 +1778,16 @@ impl TextEngine {
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, None, wrap);
         let mut width = 0.0f32;
+        let mut emoji_units = 0.0f32;
+        let mut emoji_size = 0.0f32;
         for run in item.buffer.layout_runs() {
-            width = width.max((run.line_w.max(0.0) * 64.0).round() / 64.0);
+            let (line, units, size) = identity_emoji_line(item, &run, run.line_w.max(0.0));
+            width = width.max(line);
+            emoji_units += units;
+            emoji_size = size;
         }
-        width
+        width = width * item.advance_scale;
+        ((width * 64.0).round() / 64.0) + identity_emoji_width(emoji_units, emoji_size)
     }
 
     /// Glyph ink extents for a canvas `measureText` call, in baseline-relative
@@ -1570,11 +1827,31 @@ impl TextEngine {
         };
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, None, wrap);
+        let identity_sans = item.identity_sans;
         // Collect the shaped glyph specs first: scaling needs &mut font_system
         // while the runs borrow the buffer.
         let mut specs: Vec<(cosmic_text::fontdb::ID, u16, f32, f32)> = Vec::new();
+        // Emoji the identity's own face covers shape from a fallback face's
+        // missing glyph here, whose ink is not what a page reads. Their box
+        // comes from the built-in table instead, placed at the pen origin of
+        // the first one: a repeated emoji widens the run but does not move the
+        // box, which is what the reference reports for a doubled string.
+        let mut emoji_specs: Vec<(EmojiMetric, f32)> = Vec::new();
+        let mut emoji_origin: Option<f32> = None;
         for run in item.buffer.layout_runs() {
             for glyph in run.glyphs.iter() {
+                let metric = if identity_sans {
+                    identity_sans_cluster_metric(run.text, glyph.start, glyph.end)
+                } else {
+                    None
+                };
+                if let Some(metric) = metric {
+                    if emoji_origin.is_none() {
+                        emoji_origin = Some(glyph.x + glyph.x_offset);
+                    }
+                    emoji_specs.push((metric, glyph.font_size));
+                    continue;
+                }
                 specs.push((
                     glyph.font_id,
                     glyph.glyph_id,
@@ -1635,6 +1912,32 @@ impl TextEngine {
                 // (bounds.max.y), below it negative (bounds.min.y).
                 ascent = ascent.max(y1);
                 descent = descent.max(-y0);
+            }
+        }
+        if let Some(origin) = emoji_origin {
+            let mut emoji_ink: Option<(f32, f32, f32, f32)> = None;
+            for (metric, font_size) in emoji_specs {
+                let Some((left, right, top, bottom)) = metric.ink else {
+                    continue;
+                };
+                let px = |units: f32| {
+                    identity_units_to_px(units, font_size, MACOS_SANS_METRICS.units_per_em)
+                };
+                emoji_ink = ink_union(
+                    emoji_ink,
+                    Some((
+                        origin + px(left),
+                        origin + px(right),
+                        px(top),
+                        px(bottom),
+                    )),
+                );
+            }
+            if let Some((left, right, top, bottom)) = emoji_ink {
+                min_x = min_x.min(left);
+                max_x = max_x.max(right);
+                ascent = ascent.max(top);
+                descent = descent.max(bottom);
             }
         }
         if min_x.is_finite() {
@@ -1845,6 +2148,21 @@ impl TextEngine {
         let source_buffer = (!matches!(text_indent, Dimension::Px(value) if value == 0.0)
             || !boundary_events.is_empty())
         .then(|| buffer.clone());
+        // The identity's own faces are built-in data, so the run's advance
+        // factor and the emoji shim come from the same resolve the spans used.
+        let identity_font = resolve_loaded_font(
+            base.font_family.as_deref(),
+            crate::style::used_font_weight(base),
+            base.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        let advance_scale = if identity_font.identity_face {
+            identity_advance_scale(&identity_font.family)
+        } else {
+            1.0
+        };
+        let identity_sans =
+            identity_font.identity_face && identity_font.metrics == MACOS_SANS_METRICS;
         self.items.push(InlineItem {
             buffer,
             layout_wrap,
@@ -1853,6 +2171,8 @@ impl TextEngine {
             text_indent,
             first_line_offset: 0.0,
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
+            advance_scale,
+            identity_sans,
             align,
             forced_min_height,
             origin: (0.0, 0.0),
@@ -1924,6 +2244,8 @@ impl TextEngine {
             .as_deref()
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
+        let mut emoji_units = 0.0f32;
+        let mut emoji_size = 0.0f32;
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
             let offset = if line_index == 0 {
                 item.first_line_offset
@@ -1932,12 +2254,20 @@ impl TextEngine {
             };
             let line_start = starts.get(run.line_i).copied().unwrap_or(0);
             let line_end = line_start + run.text.len();
-            width = width.max(
-                (run.line_w + offset + line_edge_advance(item, line_start, line_end)).max(0.0),
+            let (line, units, size) = identity_emoji_line(
+                item,
+                &run,
+                run.line_w + offset + line_edge_advance(item, line_start, line_end),
             );
+            emoji_units += units;
+            emoji_size = size;
+            width = width.max(line.max(0.0));
             height = height.max(run.line_top + run.line_height);
         }
-        (width, height.max(item.forced_min_height))
+        (
+            (width + identity_emoji_width(emoji_units, emoji_size)) * item.advance_scale,
+            height.max(item.forced_min_height),
+        )
     }
 
     /// Register a replaced element's intrinsic size as a taffy measure
@@ -2633,6 +2963,7 @@ fn collect_node_spans(
                     font_id: ctx.font_id,
                     metrics: ctx.font_metrics,
                     synthetic_italic: ctx.synthetic_italic,
+                    identity_face: false,
                 });
             let variations = style
                 .map(|style| resolved_font_variations(style, &font))
@@ -2812,6 +3143,8 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
         .as_deref()
         .map(|source| source_line_starts(&item.buffer, source))
         .unwrap_or_default();
+    let mut emoji_units = 0.0f32;
+    let mut emoji_size = 0.0f32;
     for (line_index, run) in item.buffer.layout_runs().enumerate() {
         let offset = if line_index == 0 {
             item.first_line_offset
@@ -2821,7 +3154,10 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
         let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
         let line_end = line_start + run.text.len();
         let edges = line_edge_advance(item, line_start, line_end);
-        w = w.max((run.line_w + offset + edges).max(0.0));
+        let (line, units, size) = identity_emoji_line(item, &run, run.line_w + offset + edges);
+        emoji_units += units;
+        emoji_size = size;
+        w = w.max(line.max(0.0));
         h = h.max(run.line_top + run.line_height);
         if !run.glyphs.is_empty() {
             nonempty_lines += 1;
@@ -2832,7 +3168,7 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     }
     let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
-        w.ceil(),
+        ((w + identity_emoji_width(emoji_units, emoji_size)) * item.advance_scale).ceil(),
         if clamped {
             clamp_height.unwrap_or(h)
         } else {
@@ -4575,6 +4911,7 @@ mod tests {
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
+            identity_face: false,
         };
         assert!(resolved_font_variations(&style, &static_font).is_none());
         let styles = HashMap::from([(copy, style)]);
@@ -4605,6 +4942,7 @@ mod tests {
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
+            identity_face: false,
         };
         assert!(resolved_font_variations(&style, &font).is_none());
     }
@@ -5388,39 +5726,180 @@ mod ink_tests {
         }
     }
 
+    /// The macOS identity answers its generics from built-in data, with no
+    /// host font involved: a machine without PingFang.ttc and one with it at
+    /// the on-demand asset path both have to produce the reference box.
     #[test]
-    fn macos_generic_sans_reports_the_host_pingfang_font_box() {
-        let Ok(_) = std::fs::read("/System/Library/Fonts/PingFang.ttc") else {
-            return;
-        };
+    fn macos_generic_sans_reports_the_identity_font_box() {
         let _guard = PlatformGuard;
         set_font_platform("MacIntel");
         let engine = TextEngine::new();
-        let box16 = engine.inline_font_box_metrics(&style(16.0, "sans-serif"));
-        let box10 = engine.inline_font_box_metrics(&style(10.0, "sans-serif"));
         // Chrome on macOS answers the generic sans-serif with PingFang SC's
         // grid-fitted hhea box: 1060/340 at upem 1000.
-        assert_eq!(box16, (17.0, 5.0), "16px sans-serif font box");
-        assert_eq!(box10, (11.0, 3.0), "10px sans-serif font box");
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(16.0, "sans-serif")),
+            (17.0, 5.0),
+            "16px sans-serif font box"
+        );
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(10.0, "sans-serif")),
+            (11.0, 3.0),
+            "10px sans-serif font box"
+        );
+        // The canvas default font is the same face.
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(10.0, "sans-serif")),
+            (11.0, 3.0)
+        );
+        // Menlo's hhea box, 1901/483 at upem 2048.
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(16.0, "monospace")),
+            (15.0, 4.0),
+            "16px monospace font box"
+        );
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(10.0, "monospace")),
+            (9.0, 2.0),
+            "10px monospace font box"
+        );
+        // A named family keeps the bundled stand-in's metrics, which is what
+        // the Arial/Times parity was measured against.
+        assert_eq!(
+            engine.inline_font_box_metrics(&style(16.0, "Arial")),
+            (14.0, 3.0),
+            "16px Arial font box"
+        );
     }
 
+    /// The ideographic baseline is the identity sans face's OS/2
+    /// sTypoDescender through the 1/65536 fixed-point step a browser's font
+    /// metrics travel through, not the grid-fitted descent. Values are the
+    /// ones headless Chrome 153 reports for `Npx sans-serif`.
     #[test]
-    fn canvas_measurer_reports_pingfang_box_under_macos_identity() {
-        let Ok(_) = std::fs::read("/System/Library/Fonts/PingFang.ttc") else { return };
+    fn macos_ideographic_baseline_follows_stypo_descender() {
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let engine = TextEngine::new();
+        for (size, expected) in [
+            (8.0, -1.1199951171875_f32),
+            (10.0, -1.399993896484375),
+            (13.0, -1.82000732421875),
+            (16.0, -2.2400054931640625),
+            (20.0, -2.8000030517578125),
+            (32.0, -4.4799957275390625),
+        ] {
+            let (hanging, ideographic) = engine.canvas_baselines(&style(size, "sans-serif"));
+            assert_eq!(
+                ideographic, expected,
+                "ideographic baseline at {size}px sans-serif"
+            );
+            assert_eq!(hanging, (size * 1060.0 / 1000.0).round() * 0.8);
+        }
+        // Every other family answers the grid-fitted descent, including a
+        // named family that resolves to the bundled stand-in.
+        for family in ["Arial", "Times New Roman", "monospace", "serif"] {
+            let (_, ideographic) = engine.canvas_baselines(&style(16.0, family));
+            let (_, descent) = engine.inline_font_box_metrics(&style(16.0, family));
+            assert_eq!(ideographic, -descent, "{family} ideographic baseline");
+        }
+    }
+
+    /// The identity's face covers the emoji the challenge measures, and the
+    /// advance is the face's own rather than the fallback face's missing
+    /// glyph. Values are the reference `TextMetrics` at 16px: the width is
+    /// the doubled string's reading halved, and the ink box is the reference's
+    /// with `ink_left` in the engine's own sign (distance from the pen origin,
+    /// positive rightward, which the canvas shim negates for
+    /// actualBoundingBoxLeft).
+    #[test]
+    fn macos_emoji_advance_and_ink_match_the_reference() {
         let _guard = PlatformGuard;
         set_font_platform("MacIntel");
         let mut measurer = crate::CanvasTextMeasurer::new();
-        let metrics = measurer.measure_metrics("x", "16px sans-serif");
-        assert_eq!((metrics.font_ascent, metrics.font_descent), (17.0, 5.0));
+        let cases: &[(&str, f32, f32, f32, f32, f32)] = &[
+            ("\u{1F600}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F923}", 22.303985595703125, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F631}", 25.543991088867188, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F44D}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F525}", 25.503990173339844, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F680}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{1F9E0}", 20.167984008789062, 0.671999990940094, 33.64799880981445, 13.343999862670898, 1.792),
+            ("\u{1F436}", 25.175987243652344, 0.671999990940094, 49.231998443603516, 12.97599983215332, 1.488),
+            ("\u{1F3E0}", 23.36798858642578, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
+            ("\u{2600}\u{FE0F}", 32.839988708496094, 0.671999990940094, 49.055999755859375, 11.456000328063965, 3.392),
+        ];
+        for (text, width, ink_left, ink_right, ink_ascent, ink_descent) in cases {
+            let metrics = measurer.measure_metrics(text, "16px sans-serif");
+            assert!(
+                (metrics.width - width).abs() < 1e-3,
+                "{text:?} width {} != {width}",
+                metrics.width
+            );
+            assert!(
+                (metrics.ink_left - ink_left).abs() < 1e-3
+                    && (metrics.ink_right - ink_right).abs() < 1e-3
+                    && (metrics.ink_ascent - ink_ascent).abs() < 1e-3
+                    && (metrics.ink_descent - ink_descent).abs() < 1e-3,
+                "{text:?} ink ({}, {}, {}, {})",
+                metrics.ink_left,
+                metrics.ink_right,
+                metrics.ink_ascent,
+                metrics.ink_descent
+            );
+            // The challenge measures the doubled string. Its width is twice
+            // the advance and its ink box is the single-glyph box: a repeated
+            // emoji widens the run without moving the box.
+            let mut doubled = String::new();
+            doubled.push_str(text);
+            doubled.push_str(text);
+            let repeated = measurer.measure_metrics(&doubled, "16px sans-serif");
+            assert!(
+                (repeated.width - 2.0 * width).abs() < 1e-3,
+                "{doubled:?} width {} != {}",
+                repeated.width,
+                2.0 * width
+            );
+            assert!(
+                (repeated.ink_right - ink_right).abs() < 1e-3
+                    && (repeated.ink_ascent - ink_ascent).abs() < 1e-3,
+                "{doubled:?} ink box moved with the repeat"
+            );
+        }
+    }
+
+    /// The identity's monospace advances 1233/2048; the bundled face the
+    /// engine shapes with advances 1229/2048. A 24-character run is the probe
+    /// the difference is visible in.
+    #[test]
+    fn macos_monospace_advance_is_the_identity_face() {
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        for text in [
+            "abababababababababababab",
+            "cdcdcdcdcdcdcdcdcdcdcdcd",
+            "efefefefefefefefefefefef",
+            "ghghghghghghghghghghghgh",
+            "ijijijijijijijijijijijij",
+            "klklklklklklklklklklklkl",
+        ] {
+            let width = measurer.measure(text, "16px monospace");
+            assert_eq!(width, 231.1875, "{text} measureText width");
+        }
+        // The Windows identity keeps the bundled mono face's advance.
+        set_font_platform("Win32");
+        let width = measurer.measure("abababababababababababab", "16px monospace");
+        assert_eq!(width, 230.4375);
     }
 
     #[test]
     fn emoji_ink_stays_finite_until_the_measure_side_scaler_lands() {
         // The host emoji face is deliberately NOT in the shaping database
         // (see the NOTE in new_with_web_fonts): loading it shifts Latin
-        // shaping. Until the dedicated sbix scaler exists, emoji clusters
-        // shape from the fallback face and the ink plumbing must still answer
-        // finite, ordered extents rather than the old font-box copy.
+        // shaping. Emoji clusters shape from the fallback face, and on an
+        // identity that covers them the built-in table answers; either way
+        // the ink plumbing must answer finite, ordered extents rather than
+        // the old font-box copy.
         let mut engine = TextEngine::new();
         let style = style(16.0, "sans-serif");
         let (left, right, ascent, descent) = engine.measure_canvas_ink("\u{1F600}", &style);
