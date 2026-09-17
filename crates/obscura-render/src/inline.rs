@@ -173,6 +173,14 @@ impl IdentityFace {
         }
     }
 
+    /// The face's standard ligatures, longest pattern first.
+    fn ligatures(self) -> &'static [(&'static str, f32)] {
+        match self {
+            IdentityFace::Sans => &MACOS_SANS_LIGATURES,
+            IdentityFace::Serif => &MACOS_SERIF_LIGATURES,
+        }
+    }
+
     /// Punctuation outside the Latin-1 block that the face widens.
     fn punctuation(self) -> &'static [(char, f32)] {
         match self {
@@ -312,15 +320,24 @@ const MACOS_SANS_PUNCTUATION: [(char, f32); 3] =
 const MACOS_SERIF_PUNCTUATION: [(char, f32); 3] =
     [('\u{2022}', 354.0), ('\u{201C}', 389.0), ('\u{2019}', 268.0)];
 
-/// The face's standard ligatures ('liga'), which a browser applies to ordinary
+/// The faces' standard ligatures ('liga'), which a browser applies to ordinary
 /// text and which change a run's width where the shaped stand-in ligates
-/// differently. Longest pattern first.
+/// differently. Longest pattern first. Songti SC's are AAT ligatures and its
+/// 'ff' is 654 units against PingFang's 686, which a 64-character hex string
+/// containing one 'ff' reads as 4.8px at 150px.
 const MACOS_SANS_LIGATURES: [(&str, f32); 5] = [
     ("ffi", 921.0),
     ("ffl", 921.0),
     ("ff", 686.0),
     ("fi", 608.0),
     ("fl", 608.0),
+];
+const MACOS_SERIF_LIGATURES: [(&str, f32); 5] = [
+    ("ffi", 883.0),
+    ("ffl", 899.0),
+    ("ff", 654.0),
+    ("fi", 556.0),
+    ("fl", 572.0),
 ];
 
 /// Whether the identity's faces have no glyph for `ch`, so a browser draws the
@@ -412,18 +429,22 @@ fn identity_measured_cluster(face: Option<IdentityFace>, cluster: &str) -> Optio
 
 /// The ligature the identity face would form at `text[offset..]`, longest
 /// pattern first, with its advance in font units.
-fn macos_sans_ligature_at(text: &str, offset: usize) -> Option<(&'static str, f32)> {
+fn identity_ligature_at(
+    text: &str,
+    offset: usize,
+    face: IdentityFace,
+) -> Option<(&'static str, f32)> {
     let rest = text.get(offset..)?;
-    for (pattern, advance) in MACOS_SANS_LIGATURES {
+    for (pattern, advance) in face.ligatures() {
         if rest.starts_with(pattern) {
-            return Some((pattern, advance));
+            return Some((pattern, *advance));
         }
     }
     None
 }
 
 /// Byte spans of a line that the identity face shapes as one ligature.
-fn macos_sans_ligature_spans(text: &str) -> (Vec<(usize, usize)>, f32) {
+fn identity_ligature_spans(text: &str, face: IdentityFace) -> (Vec<(usize, usize)>, f32) {
     let mut spans = Vec::new();
     let mut units = 0.0f32;
     let mut offset = 0usize;
@@ -432,7 +453,7 @@ fn macos_sans_ligature_spans(text: &str) -> (Vec<(usize, usize)>, f32) {
         if index < offset {
             continue;
         }
-        if let Some((pattern, advance)) = macos_sans_ligature_at(text, index) {
+        if let Some((pattern, advance)) = identity_ligature_at(text, index, face) {
             spans.push((index, index + pattern.len()));
             units += advance;
             offset = index + pattern.len();
@@ -473,10 +494,9 @@ fn ink_union(
 /// no covered text.
 fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -> (f32, f32, f32) {
     let face = item.identity_face;
-    let (ligature_spans, mut units) = if face.is_some() {
-        macos_sans_ligature_spans(run.text)
-    } else {
-        (Vec::new(), 0.0)
+    let (ligature_spans, mut units) = match face {
+        Some(face) => identity_ligature_spans(run.text, face),
+        None => (Vec::new(), 0.0),
     };
     let mut line = line_w;
     let mut size = 0.0f32;
@@ -2185,10 +2205,9 @@ impl TextEngine {
         // ink of a long run several pixels short of its own width.
         let mut pen = 0.0f32;
         for run in item.buffer.layout_runs() {
-            let (ligature_spans, _) = if identity_face.is_some() {
-                macos_sans_ligature_spans(run.text)
-            } else {
-                (Vec::new(), 0.0)
+            let (ligature_spans, _) = match identity_face {
+                Some(face) => identity_ligature_spans(run.text, face),
+                None => (Vec::new(), 0.0),
             };
             for glyph in run.glyphs.iter() {
                 let span = (glyph.start, glyph.end);
@@ -2208,7 +2227,9 @@ impl TextEngine {
                             .any(|(start, _)| *start == span.0);
                     let units = if ligature {
                         if first {
-                            macos_sans_ligature_at(run.text, span.0).map_or(0.0, |(_, u)| u)
+                            identity_face
+                                .and_then(|face| identity_ligature_at(run.text, span.0, face))
+                                .map_or(0.0, |(_, u)| u)
                         } else {
                             0.0
                         }
@@ -6348,7 +6369,20 @@ mod ink_tests {
                 "150px serif",
                 4501.65625_f32,
             ),
-
+            // The two reference strings that carry an 'ff': the serif face
+            // ligates it to its own 654 units, not to the sans face's 686.
+            // Using the sans value put these 4.94px over the reference.
+            (
+                "10b8ecc0d7ffa69355fc2ad96eae450ee66556bf2f10dba7dc85a2fbcddcdea1",
+                "150px serif",
+                4399.0625_f32,
+            ),
+            // Ligature advances themselves: ff, fi, fl, ffi, ffl in units.
+            ("ff", "16px serif", 10.4639892578125_f32),
+            ("fi", "16px serif", 8.89599609375_f32),
+            ("ffi", "16px serif", 14.128000259399414_f32),
+            ("ff", "16px sans-serif", 10.975997924804688_f32),
+            ("ffi", "16px sans-serif", 14.736000061035156_f32),
         ] {
             let width = measurer.measure(text, font);
             // Chrome accumulates the run's advance in 1/64px steps, so a
