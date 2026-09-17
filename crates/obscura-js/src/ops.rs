@@ -7217,6 +7217,41 @@ async fn op_frame_message_recv(state: Rc<RefCell<OpState>>) -> String {
     }
 }
 
+/// Ask a STUN server which address this host wears towards it, as
+/// `"<address> <port>"`, or the empty string when no answer arrives.
+///
+/// An `RTCPeerConnection` whose configuration names a `stun:` server makes a
+/// browser publish what the server echoes back as a `typ srflx` candidate, and
+/// that is the only candidate carrying a public address. The exchange is one
+/// UDP Binding request (RFC 5389), sent directly: ICE bypasses HTTP proxies by
+/// design. The address a page names goes through the same private-network
+/// policy as a fetch URL, and a failure -- unreachable, refused, silent --
+/// answers the empty string so gathering falls back to host candidates.
+#[op2(async)]
+#[string]
+async fn op_stun_binding_request(
+    state: Rc<RefCell<OpState>>,
+    #[string] server: String,
+    #[smi] timeout_ms: u32,
+) -> String {
+    let allow_private_network = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let allowed = shared
+            .borrow()
+            .http_client
+            .as_ref()
+            .is_some_and(|client| client.allow_private_network);
+        // The same two switches `validate_fetch_url` reads.
+        allowed || obscura_net::env_allows_private_network()
+    };
+    let timeout = std::time::Duration::from_millis(timeout_ms.clamp(50, 10_000) as u64);
+    match crate::stun::binding_lookup(&server, timeout, allow_private_network).await {
+        Some((address, port)) => format!("{address} {port}"),
+        None => String::new(),
+    }
+}
+
 pub fn build_extension() -> Extension {
     let ops = vec![
         op_dom(),
@@ -7229,6 +7264,7 @@ pub fn build_extension() -> Extension {
         op_run_classic_script(),
         op_ensure_frame_realm(),
         op_fetch_url(),
+        op_stun_binding_request(),
         op_websocket_open(),
         op_websocket_send(),
         op_websocket_recv(),

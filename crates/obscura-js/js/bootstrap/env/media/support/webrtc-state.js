@@ -14,6 +14,10 @@ function _rtcSlots(connection) {
       fingerprint: _rtcRandomHex(32).join(':'),
       transceivers: [],
       dataChannel: false,
+      // The `stun:` server the configuration named, if any, and whether the
+      // connection has already asked it: one binding request per connection.
+      stunServer: '',
+      srflxAttempted: false,
       localDescription: null,
       remoteDescription: null,
       iceGatheringState: 'new',

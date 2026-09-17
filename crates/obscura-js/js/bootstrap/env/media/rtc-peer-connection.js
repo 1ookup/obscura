@@ -1,5 +1,10 @@
 globalThis.RTCPeerConnection = class RTCPeerConnection {
-  constructor(_configuration) { _rtcSlots(this); }
+  constructor(configuration) {
+    const slots = _rtcSlots(this);
+    // A `stun:` entry means a browser will publish the address that server
+    // reports for it as an srflx candidate when gathering starts.
+    slots.stunServer = _rtcStunServer(configuration);
+  }
   get localDescription() { return _rtcSlots(this).localDescription; }
   get remoteDescription() { return _rtcSlots(this).remoteDescription; }
   get iceConnectionState() { return 'new'; }

@@ -266,6 +266,63 @@ function _rtcMdnsHosts() {
   return _rtcMdnsHosts._cache;
 }
 
+// The STUN server the configuration names, if any. Only `stun:` is usable
+// here: `stuns:` is STUN over TLS/TCP, and a browser reaches it through a
+// different transport.
+function _rtcStunServer(configuration) {
+  const servers = configuration && configuration.iceServers;
+  if (!Array.isArray(servers)) return '';
+  for (const entry of servers) {
+    const urls = entry && entry.urls;
+    const list = Array.isArray(urls) ? urls : (typeof urls === 'string' ? [urls] : []);
+    for (const url of list) {
+      const text = String(url || '');
+      if (/^stuns?:/i.test(text)) {
+        if (/^stun:/i.test(text)) return text.slice(5);
+      }
+    }
+  }
+  return '';
+}
+
+// The SRFLX candidate Chrome publishes when a STUN server answered. Its
+// address is the one the server reported -- the engine learns it, never
+// invents it -- while the port is the base host candidate's, the foundation is
+// its own, and the related address is masked the way a browser masks it.
+const _RTC_SRFLX_PRIORITY = 1677729535;
+const _RTC_STUN_TIMEOUT_MS = 1000;
+
+function _rtcSrflxCandidate(slots, base, mapped) {
+  const space = String(mapped).trim().indexOf(' ');
+  if (space <= 0) return null;
+  const address = String(mapped).slice(0, space).trim();
+  if (!address) return null;
+  const foundation = _rtcRandomUint(10);
+  const tail = `typ srflx raddr 0.0.0.0 rport 0 generation 0`;
+  return {
+    candidate: `candidate:${foundation} 1 udp ${_RTC_SRFLX_PRIORITY} ${address} ${base.port} ${tail} ufrag ${slots.ufrag} network-cost 999`,
+    sdpLine: `candidate:${foundation} 1 udp ${_RTC_SRFLX_PRIORITY} ${address} ${base.port} ${tail} network-cost 999`,
+    sdpMid: base.sdpMid,
+    sdpMLineIndex: base.sdpMLineIndex,
+    gathered: false,
+  };
+}
+
+// One UDP binding request to the server the page named. The answer is the
+// public address, or an empty string when the exchange fails, and gathering
+// then publishes no srflx candidate at all.
+function _rtcStunLookup(server) {
+  try {
+    const op = Deno.core.ops.op_stun_binding_request;
+    if (typeof op !== 'function') return Promise.resolve('');
+    return Promise.resolve(op(String(server), _RTC_STUN_TIMEOUT_MS))
+      .then(answer => String(answer == null ? '' : answer))
+      .catch(() => '');
+  } catch (_error) {
+    return Promise.resolve('');
+  }
+}
+
 function _rtcKinds(slots) {
   const kinds = slots.transceivers.map(item => item.kind);
   if (slots.dataChannel) kinds.push('application');
@@ -295,6 +352,9 @@ function _rtcCandidatePlan(slots) {
         sdpLine: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 network-cost 999`,
         sdpMid: String(index),
         sdpMLineIndex: index,
+        // The srflx candidate reuses its base host candidate's port, the way a
+        // browser reports the socket the mapping was learned on.
+        port,
         gathered: false,
       });
     });
@@ -399,10 +459,46 @@ function _rtcGatherCandidates(connection, slots) {
     }
   };
   // Chrome trickles one candidate per interface per m-line, then a null
-  // candidate to close gathering. No srflx candidate is produced here: it
-  // would have to carry a public address, and inventing one that does not
-  // match the address the request actually came from is a worse mismatch
-  // than not offering one.
+  // candidate to close gathering. The order is host candidates first, the
+  // srflx candidate the STUN server answered with, then the null candidate.
+  const complete = () => {
+    slots.iceGatheringState = 'complete';
+    emit('icegatheringstatechange', { type: 'icegatheringstatechange', target: connection });
+    emit('icecandidate', { type: 'icecandidate', candidate: null, target: connection });
+  };
+  // The srflx candidate follows the host candidates, as it does in Chrome, and
+  // it is the answer to a real binding request: the page named the server, so
+  // the address is the one the server reported.
+  const askStun = () => {
+    if (!slots.stunServer || slots.srflxAttempted) {
+      complete();
+      return;
+    }
+    slots.srflxAttempted = true;
+    const base = queue.find(item => item.sdpMLineIndex === 0) || queue[0];
+    _rtcStunLookup(slots.stunServer).then(mapped => {
+      if (slots.closed) return;
+      const item = mapped ? _rtcSrflxCandidate(slots, base, mapped) : null;
+      if (!item) {
+        complete();
+        return;
+      }
+      emit('icecandidate', {
+        type: 'icecandidate',
+        candidate: new RTCIceCandidate({
+          candidate: item.candidate,
+          sdpMid: item.sdpMid,
+          sdpMLineIndex: item.sdpMLineIndex,
+          usernameFragment: slots.ufrag,
+        }),
+        target: connection,
+      });
+      applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
+      item.gathered = true;
+      slots.candidatePlan.push(item);
+      complete();
+    });
+  };
   const queue = _rtcCandidatePlan(slots);
   let position = 0;
   const step = () => {
@@ -421,9 +517,7 @@ function _rtcGatherCandidates(connection, slots) {
       _scheduleAfter(1, step);
       return;
     }
-    slots.iceGatheringState = 'complete';
-    emit('icegatheringstatechange', { type: 'icegatheringstatechange', target: connection });
-    emit('icecandidate', { type: 'icecandidate', candidate: null, target: connection });
+    askStun();
   };
   _scheduleAfter(1, step);
 }

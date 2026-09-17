@@ -23660,6 +23660,141 @@ RequestRedirect value",
         );
     }
 
+    /// A UDP STUN responder on loopback, answering every binding request with
+    /// `address:port` the way a public server answers with the caller's
+    /// mapping. Returns the `stun:` URL a connection should be pointed at.
+    fn spawn_stun_stub(address: [u8; 4], port: u16) -> (String, std::sync::Arc<std::net::UdpSocket>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let local = socket.local_addr().unwrap();
+        let shared = std::sync::Arc::new(socket);
+        let responder = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            // The connection asks once; a second read just times out and ends
+            // the thread.
+            if let Ok((received, peer)) = responder.recv_from(&mut buffer) {
+                assert_eq!(
+                    u16::from_be_bytes([buffer[0], buffer[1]]),
+                    0x0001,
+                    "the stub answers binding requests only"
+                );
+                assert_eq!(
+                    u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
+                    0x2112_A442,
+                    "the request carries the STUN magic cookie"
+                );
+                assert_eq!(received, 20, "a request carries no attributes");
+                let mut transaction = [0u8; 12];
+                transaction.copy_from_slice(&buffer[8..20]);
+                let value = vec![
+                    0,
+                    1,
+                    (port ^ 0x2112).to_be_bytes()[0],
+                    (port ^ 0x2112).to_be_bytes()[1],
+                    address[0] ^ 0x21,
+                    address[1] ^ 0x12,
+                    address[2] ^ 0xA4,
+                    address[3] ^ 0x42,
+                ];
+                let mut attributes = Vec::new();
+                attributes.extend_from_slice(&0x0020u16.to_be_bytes());
+                attributes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                attributes.extend_from_slice(&value);
+                let mut reply = vec![0u8; 20];
+                reply[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+                // The header's length counts the attributes, header included.
+                reply[2..4].copy_from_slice(&(attributes.len() as u16).to_be_bytes());
+                reply[4..8].copy_from_slice(&0x2112_A442u32.to_be_bytes());
+                reply[8..20].copy_from_slice(&transaction);
+                reply.extend_from_slice(&attributes);
+                let _ = responder.send_to(&reply, peer);
+            }
+        });
+        (format!("stun:{local}"), shared)
+    }
+
+    /// The srflx candidate is the answer to a real binding request: the port
+    /// it carries is its base host candidate's, the address is the one the
+    /// server reported, the foundation and priority are the srflx ones, and
+    /// the related address is masked. A server that never answers leaves the
+    /// candidate set at the host candidates alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn webrtc_publishes_the_srflx_candidate_a_stun_server_reports() {
+        // The stub is on loopback, which the private-network policy allows
+        // only through the same switch the fetch path reads.
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (stun_url, _stub) = spawn_stun_stub([203, 0, 113, 7], 5555);
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        const pc = new RTCPeerConnection({{ iceServers: [{{ urls: '{stun_url}' }}] }});
+                        pc.createDataChannel('probe');
+                        const candidates = [];
+                        const gathered = new Promise(resolve => {{
+                            pc.onicecandidate = event => {{
+                                candidates.push(event.candidate ? event.candidate.candidate : null);
+                                if (!event.candidate) resolve();
+                            }};
+                        }});
+                        await pc.setLocalDescription(await pc.createOffer());
+                        await gathered;
+                        return {{
+                            candidates,
+                            sdp: pc.localDescription.sdp.split('\r\n')
+                                .filter(line => line.startsWith('a=candidate')),
+                            state: pc.iceGatheringState,
+                        }};
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        let candidates = value["candidates"].as_array().unwrap();
+        let srflx: Vec<&str> = candidates
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .filter(|line| line.contains("typ srflx"))
+            .collect();
+        assert_eq!(srflx.len(), 1, "one srflx candidate: {candidates:?}");
+        let line = srflx[0];
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields[0].strip_prefix("candidate:").unwrap().len(), 10);
+        assert_eq!(&fields[1..4], &["1", "udp", "1677729535"]);
+        assert_eq!(fields[4], "203.0.113.7", "the address the server reported");
+        assert_eq!(fields[6..], ["typ", "srflx", "raddr", "0.0.0.0", "rport", "0",
+            "generation", "0", "ufrag",
+            fields[fields.len() - 3], "network-cost", "999"]);
+        // The port is the base host candidate's, and the foundation differs
+        // from it.
+        let host = candidates
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .find(|line| line.contains("typ host"))
+            .expect("host candidates still come first");
+        let host_fields: Vec<&str> = host.split(' ').collect();
+        assert_eq!(fields[5], host_fields[5], "srflx reuses the host port");
+        assert_ne!(fields[0], host_fields[0], "distinct foundation");
+        // The candidate list ends with the null candidate that closes
+        // gathering; the SDP carries one line per gathered candidate.
+        let gathered = candidates.iter().filter(|entry| !entry.is_null()).count();
+        assert_eq!(
+            value["sdp"].as_array().unwrap().len(),
+            gathered,
+            "the SDP carries one line per gathered candidate"
+        );
+        assert_eq!(value["state"], "complete");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
         let mut rt = setup_runtime("<html><body></body></html>");
