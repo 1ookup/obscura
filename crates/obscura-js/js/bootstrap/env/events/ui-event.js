@@ -3,7 +3,15 @@ globalThis.UIEvent = class UIEvent extends Event {
   get view(){return _uiEventState.get(this)?.view??null;}
   get detail(){return _uiEventState.get(this)?.detail??0;}
   get sourceCapabilities(){return _eventSourceCapabilities.has(this)?_eventSourceCapabilities.get(this):null;}
-  get which(){return 0;}
+  // The legacy `which`: a mouse or pointer event reports its button as 1 for
+  // left, 2 for middle, 3 for right, and 0 when no button applies.  Events
+  // that carry no button report 0.  The accessor belongs to UIEvent.prototype,
+  // as it does in Chrome, which is why a mouse event finds it inherited.
+  get which(){
+    const mouse = typeof _mouseEventState !== 'undefined' ? _mouseEventState.get(this) : null;
+    if (mouse) return mouse.button >= 0 ? mouse.button + 1 : 0;
+    return 0;
+  }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initUIEvent(type,canBubble,cancelable,view,detail) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");

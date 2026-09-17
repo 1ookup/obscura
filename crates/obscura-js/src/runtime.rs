@@ -6183,7 +6183,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
     async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
@@ -25285,6 +25284,36 @@ RequestRedirect value",
                     std::f64::consts::FRAC_PI_2, 0, 0, "", false, 0, 0, 0],
                 "mouseValues": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             }),
+        );
+    }
+
+    #[test]
+    fn mouse_event_which_reports_the_button() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const which = button => new MouseEvent('click', {button}).which;
+                    return {
+                        buttons: [which(0), which(1), which(2), which(3), which(-1)],
+                        pointer: new PointerEvent('pointerdown', {button: 1}).which,
+                        plain: new UIEvent('x').which,
+                        inherited: [
+                            Object.getOwnPropertyNames(MouseEvent.prototype).includes('which'),
+                            UIEvent.prototype.hasOwnProperty('which'),
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "buttons": [1, 2, 3, 4, 0],
+                "pointer": 2,
+                "plain": 0,
+                "inherited": [false, true],
+            })
         );
     }
 
