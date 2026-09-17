@@ -8567,6 +8567,226 @@ RequestRedirect value",
         );
     }
 
+    /// The `/fo/` diagnostic capture has to reach the realm the widget's
+    /// attestation actually leaves from: a dedicated worker's fetch is a
+    /// separate isolate and never touches the page's realm. This drives one
+    /// fetch and one XHR from the page and the same from a worker against a
+    /// loopback fixture, then reads the request and response bytes back off
+    /// disk, including a response body that is not valid UTF-8.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fo_capture_writes_request_and_response_bytes_from_every_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let dir = std::env::temp_dir().join(format!("obscura-fo-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("OBSCURA_CAPTURE_FO", &dir);
+
+        let (origin, _server) = fo_capture_fixture(4);
+        let mut rt = fo_capture_runtime(&origin);
+        rt.execute_script(
+            "fo-capture",
+            &format!(
+                r#"(() => {{
+                    const send = url => fetch(url, {{method: 'POST', body: url.slice('{origin}/fo/'.length)}})
+                        .then(response => response.arrayBuffer()).then(body => body.byteLength);
+                    const xhr = url => new Promise(resolve => {{
+                        const request = new XMLHttpRequest();
+                        request.open('POST', url);
+                        request.responseType = 'arraybuffer';
+                        request.onload = () => resolve(request.response.byteLength);
+                        request.send(url.slice('{origin}/fo/'.length) + '-body');
+                    }});
+                    globalThis.__pageBytes = Promise.all([
+                        send('{origin}/fo/page-fetch-body'),
+                        xhr('{origin}/fo/page-xhr'),
+                    ]);
+                    const source = `
+                        const send = url => fetch(url, {{method: 'POST', body: 'worker-fetch-body'}})
+                            .then(response => response.arrayBuffer()).then(body => body.byteLength);
+                        const xhr = url => new Promise(resolve => {{
+                            const request = new XMLHttpRequest();
+                            request.open('POST', url);
+                            request.responseType = 'arraybuffer';
+                            request.onload = () => resolve(request.response.byteLength);
+                            request.send('worker-xhr-body');
+                        }});
+                        Promise.all([send('{origin}/fo/worker-fetch'), xhr('{origin}/fo/worker-xhr')])
+                            .then(() => postMessage('done'));
+                    `;
+                    globalThis.__workerDone = false;
+                    globalThis.__pageDone = false;
+                    const worker = new Worker('data:text/javascript,' + encodeURIComponent(source));
+                    worker.onmessage = () => {{ globalThis.__workerDone = true; }};
+                    globalThis.__pageBytes.then(() => {{ globalThis.__pageDone = true; }});
+                }})()"#
+            ),
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "JSON.stringify([__pageDone, __workerDone])",
+            &serde_json::json!(r#"[true,true]"#),
+        )
+        .await;
+
+        let mut request_files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut response_files: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).unwrap();
+            if name.ends_with("-req.bin") {
+                request_files.push((name, bytes));
+            } else {
+                response_files.push((name, bytes));
+            }
+        }
+        request_files.sort();
+        response_files.sort();
+
+        // Four requests, four responses, and the request bytes are the bodies
+        // the page and the worker actually sent.
+        let expected_requests: Vec<String> = vec![
+            "page-fetch-body".to_string(),
+            "page-xhr-body".to_string(),
+            "worker-fetch-body".to_string(),
+            "worker-xhr-body".to_string(),
+        ];
+        assert_eq!(request_files.len(), 4, "{request_files:?}");
+        assert_eq!(response_files.len(), 4, "{response_files:?}");
+        let realms: Vec<&str> = request_files
+            .iter()
+            .map(|(name, _)| name.split('-').nth(1).unwrap())
+            .collect();
+        let bodies: Vec<String> = request_files
+            .iter()
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).to_string())
+            .collect();
+        let mut sorted_bodies = bodies.clone();
+        sorted_bodies.sort();
+        assert_eq!(sorted_bodies, {
+            let mut sorted = expected_requests.clone();
+            sorted.sort();
+            sorted
+        });
+        // Two from each realm: the worker's attestation traffic is filed beside
+        // the page's, not folded into it.
+        assert_eq!(realms.iter().filter(|realm| **realm == "page").count(), 2);
+        assert_eq!(realms.iter().filter(|realm| **realm == "worker").count(), 2);
+        // The response pair names carry the same sequence and realm as their
+        // request, and the body is the raw bytes: not valid UTF-8, so a capture
+        // that round-tripped through a string would not match.
+        const RESPONSE: &[u8] = b"\x00\x01fo-response\xff\xfe";
+        for (name, bytes) in &response_files {
+            let stem = name.trim_end_matches("-resp.bin");
+            assert!(
+                request_files.iter().any(|(request, _)| request == &format!("{stem}-req.bin")),
+                "response {name} has no request"
+            );
+            assert_eq!(bytes.as_slice(), RESPONSE, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The capture is off unless the flag names a directory, and a run without
+    /// it must not write anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fo_capture_is_inert_without_the_flag() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        // The suite may be run with the flag exported; this case is the
+        // unset one.
+        std::env::remove_var("OBSCURA_CAPTURE_FO");
+        let dir = std::env::temp_dir().join(format!("obscura-fo-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (origin, _server) = fo_capture_fixture(2);
+        let mut rt = fo_capture_runtime(&origin);
+        rt.execute_script(
+            "fo-capture-off",
+            &format!(
+                r#"(() => {{
+                    globalThis.__done = false;
+                    fetch('{origin}/fo/off', {{method: 'POST', body: 'off'}})
+                        .then(response => response.arrayBuffer())
+                        .then(body => {{ globalThis.__done = body.byteLength; }});
+                    const request = new XMLHttpRequest();
+                    request.open('POST', '{origin}/fo/off-xhr');
+                    request.onload = () => {{}};
+                    request.send('off');
+                }})()"#
+            ),
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "String(__done)",
+            &serde_json::json!(std::format!("{}", b"\x00\x01fo-response\xff\xfe".len())),
+        )
+        .await;
+
+        // The requests went out unchanged and nothing was filed.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pump the event loop until `expr` evaluates to `expected`. Worker round
+    /// trips cross an OS thread, so delivery needs wall-clock time.
+    async fn pump_until(rt: &mut ObscuraJsRuntime, expr: &str, expected: &serde_json::Value) {
+        let mut last = serde_json::Value::Null;
+        for _ in 0..400 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            if let Ok(value) = rt.evaluate(expr) {
+                if &value == expected {
+                    return;
+                }
+                last = value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("pump_until: wanted {expected}, last saw {last}");
+    }
+
+    /// A loopback server that answers every request with a fixed binary body.
+    fn fo_capture_fixture(
+        requests: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 8192];
+                let _ = stream.read(&mut request);
+                const BODY: &[u8] = b"\x00\x01fo-response\xff\xfe";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    BODY.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(BODY);
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn fo_capture_runtime(origin: &str) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt
+    }
+
     /// `SharedArrayBuffer` is not a global, on any origin.
     ///
     /// Chrome gates it on cross-origin isolation (COOP+COEP), which is

@@ -1,4 +1,5 @@
 pub mod cdp_watchdog;
+mod diag_capture;
 mod document_all;
 mod import_map;
 pub mod markdown;

@@ -3231,6 +3231,10 @@ fn csp_resource_allows(
     })
 }
 
+/// Scripted fetch/XHR. The request itself runs in `op_fetch_url_inner`; this
+/// wrapper adds the `/fo/` diagnostic capture and nothing else. When
+/// `OBSCURA_CAPTURE_FO` is unset the capture is `None`, so a request takes the
+/// same path as before with one cached flag check in front of it.
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -3242,10 +3246,68 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] referrer_context: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    // The realm is only resolved when a capture actually starts, so a request
+    // that is not a target never touches the state for the diagnostic's sake.
+    let capture = crate::diag_capture::Capture::start(&url, || {
+        capture_realm(&state, &referrer_context)
+    });
+    if let Some(ref capture) = capture {
+        capture.record_request(&body);
+    }
+    let result = op_fetch_url_inner(
+        state,
+        url,
+        method,
+        headers_json,
+        body,
+        origin,
+        mode,
+        credentials,
+        referrer_context,
+    )
+    .await;
+    if let Some(capture) = capture {
+        capture.record_response(&result);
+    }
+    result
+}
+
+/// Which realm a scripted request came from, for the capture's file names. A
+/// worker isolate is the only realm that owns an outbox; a subframe is the one
+/// whose referrer context carries a document root.
+fn capture_realm(state: &Rc<RefCell<OpState>>, referrer_context: &str) -> &'static str {
+    let root = serde_json::from_str::<serde_json::Value>(referrer_context)
+        .ok()
+        .and_then(|value| value.get("root").and_then(|root| root.as_u64()))
+        .unwrap_or(0);
+    // `try_borrow` rather than `borrow`: the flag must not disturb a request
+    // that is already inside the state, and a diagnostic must never panic.
+    let worker = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        shared
+            .try_borrow()
+            .map(|gs| gs.worker_outbox.is_some())
+            .unwrap_or(false)
+    };
+    crate::diag_capture::realm(root, worker)
+}
+
+async fn op_fetch_url_inner(
+    state: Rc<RefCell<OpState>>,
+    url: String,
+    method: String,
+    headers_json: String,
+    body: String,
+    origin: String,
+    mode: String,
+    credentials: String,
     // Carries the referrer url/policy, and Fetch's RequestRedirect under
     // `redirect`. The latter rides along here rather than as its own parameter
     // because deno_core's async op codegen caps the argument count at nine.
-    #[string] referrer_context: String,
+    referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     // The referrer context is built at the JS call site, so its `from` field
     // captures the execution source exactly at fetch() time. The async body
