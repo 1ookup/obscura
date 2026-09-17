@@ -27161,6 +27161,54 @@ RequestRedirect value",
         );
     }
 
+    /// Chrome's offscreen context interface declares the same mixins as the
+    /// canvas one instead of inheriting them: its prototype owns all of them
+    /// (73 members against the canvas interface's 74, the difference being
+    /// drawFocusIfNeeded) and its parent is Object.prototype. Sharing the
+    /// canvas prototype left an offscreen context with no members of its own,
+    /// so anything that names a method by its owning prototype -- including
+    /// the native property tracer -- described an offscreen context as a
+    /// canvas context.
+    #[test]
+    fn offscreen_context_interface_owns_its_members() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const context = new OffscreenCanvas(4, 4).getContext('2d');
+                    const offscreen = OffscreenCanvasRenderingContext2D.prototype;
+                    const canvas = CanvasRenderingContext2D.prototype;
+                    return {
+                        names: Object.getOwnPropertyNames(offscreen).includes('measureText')
+                            && Object.getOwnPropertyNames(offscreen).includes('fillRect')
+                            && !Object.getOwnPropertyNames(offscreen).includes('drawFocusIfNeeded'),
+                        parentIsObject: Object.getPrototypeOf(offscreen) === Object.prototype,
+                        protoIsOffscreen: Object.getPrototypeOf(context) === offscreen,
+                        notCanvasInstance: !(context instanceof CanvasRenderingContext2D),
+                        constructorName: context.constructor.name,
+                        tag: Object.prototype.toString.call(context),
+                        bothHaveFillRect: typeof context.fillRect === 'function'
+                            && typeof canvas.getContext === 'undefined',
+                        measureWidth: context.measureText('a').width,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "names": true,
+                "parentIsObject": true,
+                "protoIsOffscreen": true,
+                "notCanvasInstance": true,
+                "constructorName": "OffscreenCanvasRenderingContext2D",
+                "tag": "[object OffscreenCanvasRenderingContext2D]",
+                "bothHaveFillRect": true,
+                "measureWidth": 5.5625,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn media_devices_is_branded_and_fails_closed_without_fake_hardware() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");

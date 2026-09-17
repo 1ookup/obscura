@@ -84,8 +84,22 @@ if (typeof OffscreenCanvas === 'undefined') {
     constructor() { throw new TypeError('Illegal constructor'); }
     get [Symbol.toStringTag]() { return 'OffscreenCanvasRenderingContext2D'; }
   };
-  Object.setPrototypeOf(globalThis.OffscreenCanvasRenderingContext2D.prototype,
-    _Canvas2D.prototype);
+  // Chrome's offscreen interface declares the same mixins as the canvas one
+  // rather than inheriting from it: its prototype owns all of them (73 members
+  // against the canvas interface's 74, the difference being drawFocusIfNeeded)
+  // and its parent is Object.prototype. Sharing the canvas prototype instead
+  // left the offscreen context with no members of its own, so anything that
+  // names a method by the prototype that owns it -- including the native
+  // property tracer -- called an offscreen context a canvas context.
+  {
+    const offscreen = globalThis.OffscreenCanvasRenderingContext2D.prototype;
+    for (const name of Object.getOwnPropertyNames(_Canvas2D.prototype)) {
+      if (name === 'constructor' || name === 'drawFocusIfNeeded') continue;
+      Object.defineProperty(offscreen, name,
+        Object.getOwnPropertyDescriptor(_Canvas2D.prototype, name));
+    }
+    Object.setPrototypeOf(offscreen, Object.prototype);
+  }
 
   globalThis.ImageBitmap = class ImageBitmap {
     constructor(key, width, height, pixels = undefined) {
