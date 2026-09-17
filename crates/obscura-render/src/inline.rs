@@ -75,6 +75,18 @@ const MACOS_SANS_METRICS: FaceMetrics = FaceMetrics {
 /// this distance rather than the hhea descent: at 16px it is
 /// -2.2400054931640625 where the grid-fitted hhea descent answers -5.
 const MACOS_SANS_TYPO_DESCENT: f32 = 140.0;
+/// The identity's serif face, which is what a macOS browser resolves the
+/// generic `serif` to: Songti SC. Same upem, same hhea 1060/-340/0 and the same
+/// OS/2 sTypoDescender -140 as PingFang SC, so only the advances differ. A page
+/// that measures `serif` text inside a hidden iframe reads these numbers, and
+/// the values are data because the file may not exist on the machine that runs
+/// the engine.
+const MACOS_SERIF_METRICS: FaceMetrics = FaceMetrics {
+    ascent: 1060.0,
+    descent: 340.0,
+    line_gap: 0.0,
+    units_per_em: 1000.0,
+};
 const MACOS_MONO_METRICS: FaceMetrics = FaceMetrics {
     ascent: 1901.0,
     descent: 483.0,
@@ -87,24 +99,97 @@ const MACOS_MONO_METRICS: FaceMetrics = FaceMetrics {
 const MACOS_MONO_ADVANCE: f32 = 1233.0;
 const BUNDLED_MONO_ADVANCE: f32 = 1229.0;
 
-/// One character's advance in the macOS sans face's own 1000-unit em, plus the
-/// ink box when the built-in table owns one.
+/// The faces a macOS identity answers its generics with, as built-in advance
+/// data.
 ///
-/// The face is not on the machine that runs the engine, so its advances are
-/// data: the ASCII block (read from PingFang SC's hmtx), CJK ideographs, the
-/// punctuation the face widens, and the emoji the challenge measures. A run
-/// whose text is covered by this table measures with these numbers instead of
-/// the bundled stand-in's, which is what makes `measureText` agree with a
-/// browser on the other side of the identity.
-struct IdentityGlyph {
-    advance: f32,
-    /// `(left, right, ascent, descent)` relative to the pen origin, or `None`
-    /// when the character carries no ink of its own (or its outline is not in
-    /// the table, as for Latin, whose ink keeps coming from the shaped outline).
-    ink: Option<(f32, f32, f32, f32)>,
+/// The faces are not on the machine that runs the engine, so their advances are
+/// data: the ASCII block, the Latin-1 block, CJK ideographs and the punctuation
+/// the face widens, all in the face's own em. A run whose text is covered by a
+/// table measures with these numbers instead of the bundled stand-in's, which
+/// is what makes `measureText` agree with a browser on the other side of the
+/// identity.
+///
+/// Which table answers is decided by the family the item resolved to, not by
+/// the stand-in that shapes it: `sans-serif` is PingFang SC and `serif` is
+/// Songti SC on macOS, and their stands-in are both Liberation faces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityFace {
+    Sans,
+    Serif,
 }
 
-const IDENTITY_NO_INK: Option<(f32, f32, f32, f32)> = None;
+impl IdentityFace {
+    /// The identity face a CSS `font-family` token names, when the token is a
+    /// generic whose answer is one of the identity's own faces. Only the two
+    /// faces with their own advance tables appear here: `monospace` scales the
+    /// bundled mono face's uniform advance instead, and every other token is a
+    /// named family the bundled set stands in for.
+    ///
+    /// The token decides, not the metrics of the face it routes to: PingFang SC
+    /// and Songti SC carry identical horizontal headers (1060/-340 at upem
+    /// 1000), so resolved metrics cannot tell the two apart.
+    fn of_token(token: &str) -> Option<Self> {
+        if font_platform() != FontPlatform::MacOs {
+            return None;
+        }
+        if token.eq_ignore_ascii_case("sans-serif") {
+            Some(IdentityFace::Sans)
+        } else if token.eq_ignore_ascii_case("serif") {
+            Some(IdentityFace::Serif)
+        } else {
+            None
+        }
+    }
+
+    /// The identity face a bundled family stands for on a macOS identity: the
+    /// default family is PingFang SC and the bundled serif is Songti SC.
+    fn of_family(family: &str) -> Option<Self> {
+        if font_platform() != FontPlatform::MacOs {
+            return None;
+        }
+        match family {
+            FAMILY => Some(IdentityFace::Sans),
+            SERIF_FAMILY => Some(IdentityFace::Serif),
+            _ => None,
+        }
+    }
+
+    /// The face's hmtx advance for U+0020..=U+007E, in font units.
+    fn ascii(self) -> &'static [f32; 95] {
+        match self {
+            IdentityFace::Sans => &MACOS_SANS_ASCII,
+            IdentityFace::Serif => &MACOS_SERIF_ASCII,
+        }
+    }
+
+    /// The face's hmtx advance for U+0080..=U+00FF, the block the challenge's
+    /// byte strings land in: its canvas probes pass UTF-8 bytes as latin-1
+    /// text, so `measureText` sums per-byte advances over 0x80..=0xFF as
+    /// readily as over ASCII.
+    fn latin1(self) -> &'static [f32; 128] {
+        match self {
+            IdentityFace::Sans => &MACOS_SANS_LATIN1,
+            IdentityFace::Serif => &MACOS_SERIF_LATIN1,
+        }
+    }
+
+    /// Punctuation outside the Latin-1 block that the face widens.
+    fn punctuation(self) -> &'static [(char, f32)] {
+        match self {
+            IdentityFace::Sans => &MACOS_SANS_PUNCTUATION,
+            IdentityFace::Serif => &MACOS_SERIF_PUNCTUATION,
+        }
+    }
+
+    /// The advance of the last-resort glyph a browser draws for a cluster none
+    /// of the stack's faces covers, in font units.
+    ///
+    /// The macOS identity carries no emoji font, so an emoji or a ZWJ sequence
+    /// is one uncovered grapheme cluster and one glyph: `😀`, `👨‍👩‍👧‍👦` and
+    /// every other emoji measure the same 999-unit advance, 15.984px at 16px,
+    /// however many code points the cluster holds.
+    const LAST_RESORT_ADVANCE: f32 = 999.0;
+}
 
 /// PingFang SC's hmtx advance for U+0020..=U+007E, in font units.
 const MACOS_SANS_ASCII: [f32; 95] = [
@@ -118,6 +203,61 @@ const MACOS_SANS_ASCII: [f32; 95] = [
     333.0, 195.0, 333.0, 500.0,
 ];
 
+/// Songti SC's hmtx advance for U+0020..=U+007E, in font units. Songti's Latin
+/// design is narrower than PingFang's: a digit is 469 units where PingFang's is
+/// 600, which is the difference a 64-character hex string reads as 4400px
+/// against 5600px at 150px.
+const MACOS_SERIF_ASCII: [f32; 95] = [
+    250.0, 219.0, 406.0, 667.0, 448.0, 823.0, 729.0, 177.0, 292.0, 292.0, 427.0, 667.0, 219.0,
+    313.0, 219.0, 500.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0,
+    219.0, 219.0, 667.0, 667.0, 667.0, 365.0, 917.0, 679.0, 618.0, 635.0, 771.0, 658.0, 566.0,
+    771.0, 766.0, 354.0, 333.0, 741.0, 576.0, 847.0, 773.0, 780.0, 566.0, 770.0, 636.0, 477.0,
+    617.0, 710.0, 680.0, 888.0, 700.0, 659.0, 653.0, 271.0, 500.0, 271.0, 500.0, 501.0, 333.0,
+    504.0, 521.0, 412.0, 514.0, 431.0, 327.0, 469.0, 532.0, 270.0, 224.0, 474.0, 272.0, 785.0,
+    532.0, 508.0, 525.0, 523.0, 362.0, 364.0, 323.0, 518.0, 470.0, 667.0, 457.0, 422.0, 424.0,
+    479.0, 500.0, 479.0, 667.0,
+];
+
+/// PingFang SC's hmtx advance for U+0080..=U+00FF. The C1 controls have no cmap
+/// entry in either identity face and take its .notdef advance, which is what a
+/// byte string shaped inside a PingFang run reads: 1000 units per byte, so a
+/// probe that passes UTF-8 bytes as latin-1 text sums them like any other run.
+const MACOS_SANS_LATIN1: [f32; 128] = [
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 333.0, 333.0, 600.0, 600.0,
+    600.0, 600.0, 195.0, 600.0, 500.0, 802.0, 355.0, 565.0, 605.0, 333.0, 802.0, 683.0, 331.0,
+    605.0, 500.0, 500.0, 333.0, 560.0, 559.0, 500.0, 290.0, 500.0, 385.0, 565.0, 1000.0, 1000.0,
+    1000.0, 537.0, 657.0, 657.0, 657.0, 657.0, 657.0, 657.0, 950.0, 728.0, 637.0, 637.0, 637.0,
+    637.0, 237.0, 237.0, 237.0, 237.0, 714.0, 719.0, 767.0, 767.0, 767.0, 767.0, 767.0, 605.0,
+    767.0, 714.0, 714.0, 714.0, 714.0, 662.0, 642.0, 632.0, 559.0, 559.0, 559.0, 559.0, 559.0,
+    559.0, 910.0, 547.0, 555.0, 555.0, 555.0, 555.0, 256.0, 256.0, 256.0, 256.0, 588.0, 559.0,
+    586.0, 586.0, 586.0, 586.0, 586.0, 605.0, 586.0, 560.0, 560.0, 560.0, 560.0, 496.0, 586.0,
+    496.0,
+];
+
+/// Songti SC's hmtx advance for U+0080..=U+00FF, same convention as the sans
+/// table above.
+const MACOS_SERIF_LATIN1: [f32; 128] = [
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 250.0, 219.0, 417.0, 573.0,
+    1000.0, 692.0, 500.0, 1000.0, 1000.0, 760.0, 260.0, 365.0, 667.0, 1000.0, 760.0, 500.0,
+    1000.0, 1000.0, 313.0, 313.0, 333.0, 532.0, 448.0, 1000.0, 333.0, 313.0, 333.0, 365.0, 813.0,
+    813.0, 823.0, 365.0, 679.0, 679.0, 679.0, 679.0, 679.0, 679.0, 897.0, 635.0, 658.0, 658.0,
+    658.0, 658.0, 354.0, 354.0, 354.0, 354.0, 771.0, 773.0, 780.0, 780.0, 780.0, 781.0, 780.0,
+    1000.0, 781.0, 710.0, 710.0, 710.0, 710.0, 659.0, 566.0, 500.0, 506.0, 506.0, 457.0, 457.0,
+    457.0, 457.0, 583.0, 412.0, 432.0, 432.0, 432.0, 417.0, 229.0, 229.0, 233.0, 233.0, 521.0,
+    511.0, 511.0, 511.0, 507.0, 507.0, 507.0, 1000.0, 510.0, 517.0, 517.0, 493.0, 517.0, 430.0,
+    525.0, 422.0,
+];
+
+/// Punctuation outside the Latin-1 block that the identity faces widen.
+const MACOS_SANS_PUNCTUATION: [(char, f32); 3] =
+    [('\u{2022}', 500.0), ('\u{201C}', 537.0), ('\u{2019}', 340.0)];
+const MACOS_SERIF_PUNCTUATION: [(char, f32); 3] =
+    [('\u{2022}', 354.0), ('\u{201C}', 389.0), ('\u{2019}', 268.0)];
+
 /// The face's standard ligatures ('liga'), which a browser applies to ordinary
 /// text and which change a run's width where the shaped stand-in ligates
 /// differently. Longest pattern first.
@@ -129,66 +269,88 @@ const MACOS_SANS_LIGATURES: [(&str, f32); 5] = [
     ("fl", 608.0),
 ];
 
-fn macos_emoji_glyph(ch: char) -> Option<IdentityGlyph> {
-    const SHARED: Option<(f32, f32, f32, f32)> = Some((42.0, 546.0, 758.0, 14.0));
-    let (advance, ink) = match ch {
-        '\u{1F600}' => (1794.0, SHARED),
-        '\u{1F923}' => (1394.0, SHARED),
-        '\u{1F631}' => (1596.5, SHARED),
-        '\u{1F44D}' => (1794.0, SHARED),
-        '\u{1F525}' => (1594.0, SHARED),
-        '\u{1F680}' => (1794.0, SHARED),
-        '\u{1F9E0}' => (1260.5, Some((42.0, 2103.0, 834.0, 112.0))),
-        '\u{1F436}' => (1573.5, Some((42.0, 3077.0, 811.0, 93.0))),
-        '\u{1F3E0}' => (1460.5, SHARED),
-        '\u{2600}' => (2052.5, Some((42.0, 3066.0, 716.0, 212.0))),
-        // The emoji presentation selector adds no advance and no ink of its
-        // own; it only asks for the emoji-drawn form of the base character.
-        '\u{FE0F}' => (0.0, None),
-        _ => return None,
-    };
-    // The reference's ink does not move with the second copy of a repeated
-    // emoji, while its width does: `measureText('.concat(emoji, emoji)')` is two
-    // advances wide and its `actualBoundingBox*` are the single-glyph box, so
-    // the box is placed once.
-    Some(IdentityGlyph { advance, ink })
+/// Whether the identity's faces have no glyph for `ch`, so a browser draws the
+/// last-resort glyph for the cluster that holds it.
+///
+/// The faces cover Latin, Latin-1, CJK and their punctuation but no emoji at
+/// all: Songti SC and PingFang SC carry nothing above U+2BFF, no emoji
+/// presentation selector and no zero-width joiner, so an emoji or a ZWJ
+/// sequence is exactly the case a stack without an emoji font has to fall back
+/// on.
+fn identity_last_resort_rune(ch: char) -> bool {
+    matches!(ch as u32,
+        // Zero-width joiner: the cluster is a joined emoji sequence.
+        0x200D
+        // Emoji presentation selector.
+        | 0xFE0F
+        // Emoji planes (pictographs, emoticons, transport, flags, ...) and the
+        // supplemental symbol block, none of which either face covers.
+        | 0x1F000..=0x1FAFF
+        | 0x2B00..=0x2BFF
+    )
 }
 
-fn macos_sans_glyph(ch: char) -> Option<IdentityGlyph> {
+/// One character's advance in the identity face's own em, or `None` when the
+/// face has no glyph for it.
+fn identity_glyph(ch: char, face: IdentityFace) -> Option<f32> {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) {
-        return Some(IdentityGlyph {
-            advance: MACOS_SANS_ASCII[(code - 0x20) as usize],
-            ink: IDENTITY_NO_INK,
-        });
+        return Some(face.ascii()[(code - 0x20) as usize]);
+    }
+    if (0x80..=0xFF).contains(&code) {
+        return Some(face.latin1()[(code - 0x80) as usize]);
     }
     // CJK Unified Ideographs carry the face's full-width advance.
     if (0x4E00..=0x9FFF).contains(&code) {
-        return Some(IdentityGlyph { advance: 1000.0, ink: IDENTITY_NO_INK });
+        return Some(1000.0);
     }
-    let advance = match ch {
-        '\u{A0}' => 333.0,   // no-break space
-        '\u{2022}' => 500.0, // bullet
-        '\u{201C}' => 537.0, // left double quotation mark
-        '\u{2019}' => 340.0, // right single quotation mark
-        _ => return macos_emoji_glyph(ch),
-    };
-    Some(IdentityGlyph { advance, ink: IDENTITY_NO_INK })
+    face.punctuation()
+        .iter()
+        .find(|(candidate, _)| *candidate == ch)
+        .map(|(_, advance)| *advance)
 }
 
-/// The identity face's advance for a shaped cluster, when every character in it
-/// is in the table. A cluster that mixes a covered character with an uncovered
-/// one keeps the shaped advance: a partial replacement would answer for neither
-/// face.
-fn identity_sans_cluster_units(cluster: &str) -> Option<f32> {
+/// The identity face's advance for a shaped cluster, when it can answer for
+/// every character in it. A cluster that mixes a covered character with an
+/// uncovered one keeps the shaped advance: a partial replacement would answer
+/// for neither face.
+///
+/// An emoji cluster is the exception. No face of the identity covers it, so
+/// every rune a last-resort fallback would stand in for makes the whole cluster
+/// one glyph: `😀` and `👨‍👩‍👧‍👦` both measure a single 999-unit advance
+/// instead of one advance per code point.
+fn identity_cluster_units(cluster: &str, face: IdentityFace) -> Option<f32> {
     if cluster.is_empty() {
         return None;
     }
+    if cluster.chars().any(identity_last_resort_rune) {
+        return Some(IdentityFace::LAST_RESORT_ADVANCE);
+    }
     let mut units = 0.0f32;
     for ch in cluster.chars() {
-        units += macos_sans_glyph(ch)?.advance;
+        units += identity_glyph(ch, face)?;
     }
     Some(units)
+}
+
+/// The advance a shaped cluster measures by, or `None` when the run keeps the
+/// shaped stand-in's advance for it.
+///
+/// A macOS identity carries no emoji font at all, so the last-resort cluster
+/// answers for *every* family and not only for the two generics that have an
+/// advance table: a page that measures an emoji in the default font sees the
+/// same single 999-unit glyph the generics report.
+fn identity_measured_cluster(face: Option<IdentityFace>, cluster: &str) -> Option<f32> {
+    if cluster.is_empty() {
+        return None;
+    }
+    if let Some(face) = face {
+        return identity_cluster_units(cluster, face);
+    }
+    if font_platform() == FontPlatform::MacOs && cluster.chars().any(identity_last_resort_rune) {
+        return Some(IdentityFace::LAST_RESORT_ADVANCE);
+    }
+    None
 }
 
 /// The ligature the identity face would form at `text[offset..]`, longest
@@ -231,18 +393,6 @@ fn identity_units_to_px(units: f32, size: f32, units_per_em: f32) -> f32 {
     units * size / units_per_em
 }
 
-/// Union of two ink boxes, each `(left, right, ascent, descent)`.
-fn ink_union(
-    a: Option<(f32, f32, f32, f32)>,
-    b: Option<(f32, f32, f32, f32)>,
-) -> Option<(f32, f32, f32, f32)> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1), a.2.max(b.2), a.3.max(b.3))),
-        (Some(box_), None) | (None, Some(box_)) => Some(box_),
-        (None, None) => None,
-    }
-}
-
 /// Apply the identity face's own advances to one shaped line.
 ///
 /// A run the identity covers does not measure with the bundled stand-in's
@@ -252,15 +402,13 @@ fn ink_union(
 /// are scaled once, at the end, which is the arithmetic a browser does over a
 /// run. Returns `(line, units, font size)`, the last two zero when the line has
 /// no covered text.
-fn identity_sans_line(
-    item: &InlineItem,
-    run: &cosmic_text::LayoutRun,
-    line_w: f32,
-) -> (f32, f32, f32) {
-    if !item.identity_sans {
-        return (line_w, 0.0, 0.0);
-    }
-    let (ligature_spans, mut units) = macos_sans_ligature_spans(run.text);
+fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -> (f32, f32, f32) {
+    let face = item.identity_face;
+    let (ligature_spans, mut units) = if face.is_some() {
+        macos_sans_ligature_spans(run.text)
+    } else {
+        (Vec::new(), 0.0)
+    };
     let mut line = line_w;
     let mut size = 0.0f32;
     // One cluster can shape to several glyphs, and each of them reports the
@@ -272,13 +420,11 @@ fn identity_sans_line(
         let ligature = ligature_spans
             .iter()
             .any(|(start, end)| *start <= span.0 && span.1 <= *end);
-        let covered = ligature
-            || run
-                .text
-                .get(span.0..span.1)
-                .and_then(identity_sans_cluster_units)
-                .is_some();
-        if !covered {
+        let cluster_units = run
+            .text
+            .get(span.0..span.1)
+            .and_then(|cluster| identity_measured_cluster(face, cluster));
+        if !ligature && cluster_units.is_none() {
             continue;
         }
         line -= glyph.w;
@@ -290,15 +436,16 @@ fn identity_sans_line(
         if !ligature {
             // The ligature's advance is already in `units`; its clusters must
             // not add their characters' advances on top of it.
-            units += identity_sans_cluster_units(&run.text[span.0..span.1]).unwrap_or(0.0);
+            units += cluster_units.unwrap_or(0.0);
         }
     }
     (line, units, size)
 }
 
 /// Pixel width of a scaled unit count, zero when the line had no covered text
-/// (and so no font size to scale by).
-fn identity_sans_width(units: f32, size: f32) -> f32 {
+/// (and so no font size to scale by). Both identity faces share the 1000-unit
+/// em.
+fn identity_width(units: f32, size: f32) -> f32 {
     if units == 0.0 {
         0.0
     } else {
@@ -514,11 +661,13 @@ struct ResolvedFont {
     font_id: Option<cosmic_text::fontdb::ID>,
     metrics: FaceMetrics,
     synthetic_italic: bool,
-    /// True when the resolved face stands for one of the identity's own faces
-    /// (PingFang SC for the default/`sans-serif`, Menlo for `monospace`), so
-    /// its advance and emoji follow the identity rather than the bundled
-    /// stand-in.
-    identity_face: bool,
+    /// The identity face the resolved family stands for, when it stands for
+    /// one (PingFang SC for the default family and `sans-serif`, Songti SC for
+    /// `serif`), so its advances and its last-resort cluster follow the
+    /// identity rather than the bundled stand-in. `monospace` is absent here:
+    /// it scales the bundled mono face's uniform advance instead of replacing
+    /// it with a table.
+    identity_face: Option<IdentityFace>,
 }
 
 #[derive(Clone)]
@@ -568,16 +717,17 @@ fn resolve_loaded_font(
                     // A bundled face stands in for the identity's own font. On
                     // a macOS identity the identity's real metrics replace the
                     // stand-in's for the *generic* token that resolves to it --
-                    // `sans-serif` is PingFang SC and `monospace` is Menlo --
-                    // so the font box, the baselines and line boxes answer for
-                    // those faces even on a machine that has neither file. A
-                    // named family keeps the bundled stand-in's own metrics
-                    // (which is what the Arial/Times parity was checked
-                    // against), and a webfont is never a stand-in.
+                    // `sans-serif` is PingFang SC, `serif` is Songti SC and
+                    // `monospace` is Menlo -- so the advances, the font box,
+                    // the baselines and line boxes answer for those faces even
+                    // on a machine that has none of the files. A named family
+                    // keeps the bundled stand-in's own metrics (which is what
+                    // the Arial/Times parity was checked against), and a
+                    // webfont is never a stand-in.
                     resolved.identity_face =
-                        !entry.is_webfont && generic_token_owns_identity_face(name);
-                    if resolved.identity_face {
-                        if let Some(metrics) = identity_face_metrics(&resolved.family) {
+                        if entry.is_webfont { None } else { IdentityFace::of_token(name) };
+                    if !entry.is_webfont {
+                        if let Some(metrics) = identity_metrics_for_token(name) {
                             resolved.metrics = metrics;
                         }
                     }
@@ -593,7 +743,7 @@ fn resolve_loaded_font(
     // that finds nothing and falls back to an arbitrary database face. The
     // identity is resolved here (layout time), not at engine construction,
     // because set_font_platform lands after the engine exists.
-    let identity_face = identity_face_metrics(fallback).is_some();
+    let identity_face = IdentityFace::of_family(fallback);
     if font_platform() == FontPlatform::MacOs {
         if let Some(family) = loaded.get("__obscura_system_pingfang") {
             if let Some(mut resolved) =
@@ -642,7 +792,7 @@ fn select_loaded_face(
             font_id: face.font_id,
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
-            identity_face: false,
+            identity_face: None,
         });
     }
     let available: Vec<_> = candidates.iter().map(|face| face.min_weight).collect();
@@ -655,7 +805,7 @@ fn select_loaded_face(
             font_id: face.font_id,
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
-            identity_face: false,
+            identity_face: None,
         })
 }
 
@@ -726,14 +876,6 @@ fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
 /// Chromium, not 11px. Keep these metrics beside the embedded faces so normal
 /// line boxes follow the same device-pixel rhythm without consulting host
 /// fonts.
-/// Whether a CSS `font-family` token names the generic whose answer is the
-/// identity's own face rather than a named family the bundled set stands in
-/// for. On macOS that is `sans-serif` (PingFang SC, also the default family)
-/// and `monospace` (Menlo).
-fn generic_token_owns_identity_face(token: &str) -> bool {
-    token.eq_ignore_ascii_case("sans-serif") || token.eq_ignore_ascii_case("monospace")
-}
-
 /// The built-in metrics the identity owns for one of its standard families,
 /// or `None` when the bundled face answers for itself.
 fn identity_face_metrics(family: &str) -> Option<FaceMetrics> {
@@ -742,8 +884,28 @@ fn identity_face_metrics(family: &str) -> Option<FaceMetrics> {
     }
     match family {
         FAMILY => Some(MACOS_SANS_METRICS),
+        SERIF_FAMILY => Some(MACOS_SERIF_METRICS),
         MONO_FAMILY => Some(MACOS_MONO_METRICS),
         _ => None,
+    }
+}
+
+/// The built-in metrics a *generic* token takes on a macOS identity. Only the
+/// three generics whose answer is a host face the engine carries as data
+/// appear here; a named family keeps the bundled stand-in's metrics, which is
+/// what the Arial/Times parity was checked against.
+fn identity_metrics_for_token(token: &str) -> Option<FaceMetrics> {
+    if font_platform() != FontPlatform::MacOs {
+        return None;
+    }
+    if token.eq_ignore_ascii_case("sans-serif") {
+        Some(MACOS_SANS_METRICS)
+    } else if token.eq_ignore_ascii_case("serif") {
+        Some(MACOS_SERIF_METRICS)
+    } else if token.eq_ignore_ascii_case("monospace") {
+        Some(MACOS_MONO_METRICS)
+    } else {
+        None
     }
 }
 
@@ -929,10 +1091,11 @@ pub struct InlineItem {
     /// face advances 1229/2048, and the challenge reads that difference out of
     /// a 24-character run. 1.0 for every other identity and family.
     advance_scale: f32,
-    /// True when this item's primary face is the identity's macOS sans face.
-    /// Its advances (ASCII, CJK, the punctuation it widens, its emoji) come
-    /// from the built-in table rather than from the bundled stand-in.
-    identity_sans: bool,
+    /// The identity face this item's family resolves to, when it is one of the
+    /// macOS generics. Its advances (ASCII, Latin-1, CJK, the punctuation it
+    /// widens and the last-resort cluster) come from the built-in table rather
+    /// than from the bundled stand-in that shapes the run.
+    identity_face: Option<IdentityFace>,
     /// Alignment is applied against the original content width. Cosmic-text
     /// uses its buffer width for both wrapping and alignment, so a balanced
     /// (narrower) buffer needs a corresponding origin inset.
@@ -1643,11 +1806,12 @@ impl TextEngine {
         );
         let size = style.font_size.unwrap_or(16.0);
         let (ascent, descent) = fitted_font_box_metrics(size, font.metrics);
-        // The sTypo-based answer is the identity sans face's alone: a named
+        // The sTypo-based answer belongs to the identity's own faces alone
+        // (PingFang SC and Songti SC both carry sTypoDescender -140): a named
         // family that happens to resolve to the bundled stand-in keeps the
         // grid-fitted descent, which is what the Arial/Times/Helvetica
         // references answer with.
-        let ideographic = if font.identity_face && font.metrics == MACOS_SANS_METRICS {
+        let ideographic = if font.identity_face.is_some() {
             identity_ideographic_baseline(size)
         } else {
             -descent
@@ -1888,13 +2052,13 @@ impl TextEngine {
         let mut emoji_units = 0.0f32;
         let mut emoji_size = 0.0f32;
         for run in item.buffer.layout_runs() {
-            let (line, units, size) = identity_sans_line(item, &run, run.line_w.max(0.0));
+            let (line, units, size) = identity_line(item, &run, run.line_w.max(0.0));
             width = width.max(line);
             emoji_units += units;
             emoji_size = size;
         }
         width = width * item.advance_scale;
-        ((width * 64.0).round() / 64.0) + identity_sans_width(emoji_units, emoji_size)
+        ((width * 64.0).round() / 64.0) + identity_width(emoji_units, emoji_size)
     }
 
     /// Glyph ink extents for a canvas `measureText` call, in baseline-relative
@@ -1934,17 +2098,10 @@ impl TextEngine {
         };
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, None, wrap);
-        let identity_sans = item.identity_sans;
+        let identity_face = item.identity_face;
         // Collect the shaped glyph specs first: scaling needs &mut font_system
         // while the runs borrow the buffer.
         let mut specs: Vec<(cosmic_text::fontdb::ID, u16, f32, f32)> = Vec::new();
-        // Emoji the identity's own face covers shape from a fallback face's
-        // missing glyph here, whose ink is not what a page reads. Their box
-        // comes from the built-in table instead, placed at the pen origin of
-        // the first one: a repeated emoji widens the run but does not move the
-        // box, which is what the reference reports for a doubled string.
-        let mut emoji_specs: Vec<((f32, f32, f32, f32), f32)> = Vec::new();
-        let mut emoji_origin: Option<f32> = None;
         // Covered text advances by the identity face's own numbers, so the pen
         // the ink is placed at has to be the same one the reported width came
         // from. Shaping positions come from the bundled stand-in: for a face
@@ -1952,7 +2109,7 @@ impl TextEngine {
         // ink of a long run several pixels short of its own width.
         let mut pen = 0.0f32;
         for run in item.buffer.layout_runs() {
-            let (ligature_spans, _) = if identity_sans {
+            let (ligature_spans, _) = if identity_face.is_some() {
                 macos_sans_ligature_spans(run.text)
             } else {
                 (Vec::new(), 0.0)
@@ -1963,9 +2120,9 @@ impl TextEngine {
                     .iter()
                     .any(|(start, end)| *start <= span.0 && span.1 <= *end);
                 let cluster = run.text.get(span.0..span.1);
-                let covered = identity_sans
-                    && (ligature
-                        || cluster.and_then(identity_sans_cluster_units).is_some());
+                let cluster_units =
+                    cluster.and_then(|cluster| identity_measured_cluster(identity_face, cluster));
+                let covered = ligature || cluster_units.is_some();
                 let advance = if covered {
                     // A ligature's advance belongs to its first cluster; the
                     // rest of it adds nothing on top.
@@ -1980,32 +2137,14 @@ impl TextEngine {
                             0.0
                         }
                     } else {
-                        cluster.and_then(identity_sans_cluster_units).unwrap_or(0.0)
+                        cluster_units.unwrap_or(0.0)
                     };
-                    identity_sans_width(units, glyph.font_size)
+                    identity_width(units, glyph.font_size)
                 } else {
                     glyph.w
                 };
                 let x = pen + glyph.x_offset;
-                // Only entries that own an ink box replace the shaped ink:
-                // Latin keeps the outline the shaping database drew, which is
-                // the only ink available for it.
-                let ink = if covered {
-                    cluster
-                        .and_then(|cluster| cluster.chars().next())
-                        .and_then(macos_sans_glyph)
-                        .and_then(|glyph_metric| glyph_metric.ink)
-                } else {
-                    None
-                };
                 pen += advance;
-                if let Some(ink) = ink {
-                    if emoji_origin.is_none() {
-                        emoji_origin = Some(x);
-                    }
-                    emoji_specs.push((ink, glyph.font_size));
-                    continue;
-                }
                 specs.push((glyph.font_id, glyph.glyph_id, glyph.font_size, x));
             }
         }
@@ -2061,29 +2200,6 @@ impl TextEngine {
                 // (bounds.max.y), below it negative (bounds.min.y).
                 ascent = ascent.max(y1);
                 descent = descent.max(-y0);
-            }
-        }
-        if let Some(origin) = emoji_origin {
-            let mut emoji_ink: Option<(f32, f32, f32, f32)> = None;
-            for ((left, right, top, bottom), font_size) in emoji_specs {
-                let px = |units: f32| {
-                    identity_units_to_px(units, font_size, MACOS_SANS_METRICS.units_per_em)
-                };
-                emoji_ink = ink_union(
-                    emoji_ink,
-                    Some((
-                        origin + px(left),
-                        origin + px(right),
-                        px(top),
-                        px(bottom),
-                    )),
-                );
-            }
-            if let Some((left, right, top, bottom)) = emoji_ink {
-                min_x = min_x.min(left);
-                max_x = max_x.max(right);
-                ascent = ascent.max(top);
-                descent = descent.max(bottom);
             }
         }
         if min_x.is_finite() {
@@ -2302,13 +2418,10 @@ impl TextEngine {
             base.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let advance_scale = if identity_font.identity_face {
-            identity_advance_scale(&identity_font.family)
-        } else {
-            1.0
-        };
-        let identity_sans =
-            identity_font.identity_face && identity_font.metrics == MACOS_SANS_METRICS;
+        // 1.0 for every family that is not the identity's monospace, so this
+        // needs no separate identity check.
+        let advance_scale = identity_advance_scale(&identity_font.family);
+        let identity_face = identity_font.identity_face;
         self.items.push(InlineItem {
             buffer,
             layout_wrap,
@@ -2318,7 +2431,7 @@ impl TextEngine {
             first_line_offset: 0.0,
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
             advance_scale,
-            identity_sans,
+            identity_face,
             align,
             forced_min_height,
             origin: (0.0, 0.0),
@@ -2400,7 +2513,7 @@ impl TextEngine {
             };
             let line_start = starts.get(run.line_i).copied().unwrap_or(0);
             let line_end = line_start + run.text.len();
-            let (line, units, size) = identity_sans_line(
+            let (line, units, size) = identity_line(
                 item,
                 &run,
                 run.line_w + offset + line_edge_advance(item, line_start, line_end),
@@ -2411,7 +2524,7 @@ impl TextEngine {
             height = height.max(run.line_top + run.line_height);
         }
         (
-            (width + identity_sans_width(emoji_units, emoji_size)) * item.advance_scale,
+            (width + identity_width(emoji_units, emoji_size)) * item.advance_scale,
             height.max(item.forced_min_height),
         )
     }
@@ -3109,7 +3222,7 @@ fn collect_node_spans(
                     font_id: ctx.font_id,
                     metrics: ctx.font_metrics,
                     synthetic_italic: ctx.synthetic_italic,
-                    identity_face: false,
+                    identity_face: None,
                 });
             let variations = style
                 .map(|style| resolved_font_variations(style, &font))
@@ -3300,7 +3413,7 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
         let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
         let line_end = line_start + run.text.len();
         let edges = line_edge_advance(item, line_start, line_end);
-        let (line, units, size) = identity_sans_line(item, &run, run.line_w + offset + edges);
+        let (line, units, size) = identity_line(item, &run, run.line_w + offset + edges);
         emoji_units += units;
         emoji_size = size;
         w = w.max(line.max(0.0));
@@ -3314,7 +3427,7 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     }
     let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
-        ((w + identity_sans_width(emoji_units, emoji_size)) * item.advance_scale).ceil(),
+        ((w + identity_width(emoji_units, emoji_size)) * item.advance_scale).ceil(),
         if clamped {
             clamp_height.unwrap_or(h)
         } else {
@@ -5057,7 +5170,7 @@ mod tests {
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
-            identity_face: false,
+            identity_face: None,
         };
         assert!(resolved_font_variations(&style, &static_font).is_none());
         let styles = HashMap::from([(copy, style)]);
@@ -5088,7 +5201,7 @@ mod tests {
             font_id: None,
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
-            identity_face: false,
+            identity_face: None,
         };
         assert!(resolved_font_variations(&style, &font).is_none());
     }
@@ -5941,76 +6054,132 @@ mod ink_tests {
             );
             assert_eq!(hanging, (size * 1060.0 / 1000.0).round() * 0.8);
         }
+        // The identity's serif answers the same sTypoDescender: Songti SC also
+        // carries -140, so `serif` joins `sans-serif` here.
+        let (_, serif_ideographic) = engine.canvas_baselines(&style(16.0, "serif"));
+        assert_eq!(serif_ideographic, -2.2400054931640625);
         // Every other family answers the grid-fitted descent, including a
         // named family that resolves to the bundled stand-in.
-        for family in ["Arial", "Times New Roman", "monospace", "serif"] {
+        for family in ["Arial", "Times New Roman", "monospace"] {
             let (_, ideographic) = engine.canvas_baselines(&style(16.0, family));
             let (_, descent) = engine.inline_font_box_metrics(&style(16.0, family));
             assert_eq!(ideographic, -descent, "{family} ideographic baseline");
         }
     }
 
-    /// The identity's face covers the emoji the challenge measures, and the
-    /// advance is the face's own rather than the fallback face's missing
-    /// glyph. Values are the reference `TextMetrics` at 16px: the width is
-    /// the doubled string's reading halved, and the ink box is the reference's
-    /// with `ink_left` in the engine's own sign (distance from the pen origin,
-    /// positive rightward, which the canvas shim negates for
-    /// actualBoundingBoxLeft).
+    /// The canvas probe measures byte strings: the challenge builds each
+    /// `measureText` argument from a UTF-8 emoji's bytes read back as latin-1
+    /// text, so a four-character string is four separate advances, not one
+    /// emoji. The values are the reference `TextMetrics` at 16px sans-serif,
+    /// and the engine's `ink_left` is the sign-flipped `actualBoundingBoxLeft`
+    /// (the shim negates it back).
     #[test]
-    fn macos_emoji_advance_and_ink_match_the_reference() {
+    fn macos_byte_strings_match_the_reference_canvas_probe() {
         let _guard = PlatformGuard;
         set_font_platform("MacIntel");
         let mut measurer = crate::CanvasTextMeasurer::new();
-        let cases: &[(&str, f32, f32, f32, f32, f32)] = &[
-            ("\u{1F600}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F923}", 22.303985595703125, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F631}", 25.543991088867188, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F44D}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F525}", 25.503990173339844, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F680}", 28.703994750976562, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{1F9E0}", 20.167984008789062, 0.671999990940094, 33.64799880981445, 13.343999862670898, 1.792),
-            ("\u{1F436}", 25.175987243652344, 0.671999990940094, 49.231998443603516, 12.97599983215332, 1.488),
-            ("\u{1F3E0}", 23.36798858642578, 0.671999990940094, 8.736000061035156, 12.128000259399414, 0.224),
-            ("\u{2600}\u{FE0F}", 32.839988708496094, 0.671999990940094, 49.055999755859375, 11.456000328063965, 3.392),
+        let cases: &[(&str, &str, f32)] = &[
+            ("\u{F0}\u{9F}\u{98}\u{80}", "1F600", 57.407989501953125),
+            ("\u{F0}\u{9F}\u{A4}\u{A3}", "1F923", 44.60797119140625),
+            ("\u{F0}\u{9F}\u{98}\u{B1}", "1F631", 51.087982177734375),
+            ("\u{F0}\u{9F}\u{91}\u{8D}", "1F44D", 57.407989501953125),
+            ("\u{F0}\u{9F}\u{94}\u{A5}", "1F525", 51.00798034667969),
+            ("\u{F0}\u{9F}\u{9A}\u{80}", "1F680", 57.407989501953125),
+            ("\u{F0}\u{9F}\u{A7}\u{A0}", "1F9E0", 40.335968017578125),
+            ("\u{F0}\u{9F}\u{90}\u{B6}", "1F436", 50.35197448730469),
+            ("\u{F0}\u{9F}\u{8F}\u{A0}", "1F3E0", 46.73597717285156),
+            ("\u{E2}\u{98}\u{80}\u{EF}\u{B8}\u{8F}", "2600+FE0F", 65.67997741699219),
         ];
-        for (text, width, ink_left, ink_right, ink_ascent, ink_descent) in cases {
+        for (text, label, width) in cases {
             let metrics = measurer.measure_metrics(text, "16px sans-serif");
             assert!(
                 (metrics.width - width).abs() < 1e-3,
-                "{text:?} width {} != {width}",
+                "{label} width {} != {width}",
                 metrics.width
             );
+        }
+        // The C1 controls of those strings carry no cmap entry in either
+        // identity face. Inside a PingFang run they take its .notdef advance
+        // (1000 units, a full em) rather than a fallback face's, which is why
+        // a four-byte string measures wider than its four Latin-1 glyphs.
+        assert!(
+            (measurer.measure("\u{9F}", "16px sans-serif") - 16.0).abs() < 1e-6,
+            "a C1 control advances the .notdef"
+        );
+    }
+
+    /// An emoji or ZWJ cluster is one last-resort glyph: the macOS identity
+    /// carries no emoji font, so the advance is 999/1000 em whatever the
+    /// cluster's code-point count, and every family answers it -- the hidden
+    /// fixture measures its emoji in the default font while it measures the
+    /// hex strings in `serif` at 150px.
+    #[test]
+    fn macos_last_resort_cluster_is_one_glyph() {
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        for family in ["sans-serif", "serif", "Times", "Arial", "monospace"] {
+            for text in [
+                "\u{1F600}",
+                "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}",
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}",
+            ] {
+                let font = format!("16px {family}");
+                let width = measurer.measure(text, &font);
+                assert_eq!(width, 15.984, "{text} last-resort cluster in {font}");
+            }
+        }
+        // The Windows identity has no such rule: it keeps whatever the shaped
+        // stand-in reports.
+        set_font_platform("Win32");
+        assert_ne!(measurer.measure("\u{1F600}", "16px sans-serif"), 15.984);
+    }
+
+    /// The identity's serif is Songti SC, whose Latin design is much narrower
+    /// than PingFang's. The reference measures the challenge's 64-character
+    /// hex strings through its SVG text elements at 150px, resolved from a
+    /// stylesheet inside a written iframe document.
+    #[test]
+    fn macos_serif_advances_are_songti() {
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        for (text, font, expected) in [
+            ("0123456789abcdef", "16px serif", 118.38395690917969_f32),
+            (
+                "dc7c811b9561739d9b75bb3e9e1715970a868834e62251b0b9ca02e74d0f42c9",
+                "16px serif",
+                480.1759033203125_f32,
+            ),
+            // The size the challenge's written stylesheet uses. This host's
+            // Chrome answers 4501.65625 for this string; the reference session
+            // answered 4501.5151 for it, a 0.14px difference between the two
+            // Songti SC builds.
+            (
+                "dc7c811b9561739d9b75bb3e9e1715970a868834e62251b0b9ca02e74d0f42c9",
+                "150px serif",
+                4501.65625_f32,
+            ),
+        ] {
+            let width = measurer.measure(text, font);
+            // Chrome accumulates the run's advance in 1/64px steps, so a
+            // 64-glyph run at 150px lands a few thousandths of a pixel away
+            // from the exact sum of the font's units. Keep the comparison
+            // relative: 1e-5 of 4501px is 0.05px, far below the ~0.14px
+            // difference between the two Songti SC builds.
             assert!(
-                (metrics.ink_left - ink_left).abs() < 1e-3
-                    && (metrics.ink_right - ink_right).abs() < 1e-3
-                    && (metrics.ink_ascent - ink_ascent).abs() < 1e-3
-                    && (metrics.ink_descent - ink_descent).abs() < 1e-3,
-                "{text:?} ink ({}, {}, {}, {})",
-                metrics.ink_left,
-                metrics.ink_right,
-                metrics.ink_ascent,
-                metrics.ink_descent
-            );
-            // The challenge measures the doubled string. Its width is twice
-            // the advance and its ink box is the single-glyph box: a repeated
-            // emoji widens the run without moving the box.
-            let mut doubled = String::new();
-            doubled.push_str(text);
-            doubled.push_str(text);
-            let repeated = measurer.measure_metrics(&doubled, "16px sans-serif");
-            assert!(
-                (repeated.width - 2.0 * width).abs() < 1e-3,
-                "{doubled:?} width {} != {}",
-                repeated.width,
-                2.0 * width
-            );
-            assert!(
-                (repeated.ink_right - ink_right).abs() < 1e-3
-                    && (repeated.ink_ascent - ink_ascent).abs() < 1e-3,
-                "{doubled:?} ink box moved with the repeat"
+                (width - expected).abs() < expected * 1e-5,
+                "{text:?} at {font} width {width} != {expected}"
             );
         }
+        // A named family that routes to the same bundled face keeps the
+        // stand-in's advances, so only the generic carries the identity.
+        let georgia = measurer.measure("0123456789abcdef", "16px Georgia");
+        assert!(
+            (georgia - 122.640625).abs() < 1e-3,
+            "Georgia width {georgia} must stay on the bundled stand-in"
+        );
     }
 
     /// The identity's monospace advances 1233/2048; the bundled face the
@@ -6110,3 +6279,4 @@ mod ink_tests {
         assert!(right >= left);
     }
 }
+

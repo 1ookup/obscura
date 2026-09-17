@@ -8459,6 +8459,53 @@ fn prepared_for_frame_root(
     prepared
 }
 
+/// Prepare a frame document's cascade when its content box can not be resolved
+/// from the host's layout, which is every iframe that a page keeps hidden or
+/// zero-sized (probes write their documents into exactly such a frame). The
+/// frame's own viewport is 0x0 in that case, but Chrome still resolves the
+/// document's styles, so answer from the smallest layoutable viewport instead
+/// of the initial values. Only computed-style reads use this: geometry keeps
+/// reporting the host's real, empty box.
+#[cfg(feature = "render")]
+fn prepared_for_hidden_frame_root(
+    dom: &DomTree,
+    frame_root: NodeId,
+    main_prepared: &obscura_render::PreparedRender,
+    resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, FrameRenderState>,
+) -> Option<obscura_render::PreparedRender> {
+    let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
+    if let Some(scope) = dom.document_scope(frame_root) {
+        resources.set_font_csp(scope.csp.as_deref(), &scope.origin.serialize());
+    }
+    let mut stylesheet_cache = std::mem::take(
+        &mut frame_states
+            .entry(frame_root)
+            .or_default()
+            .stylesheet_cache,
+    );
+    let mut animation_timeline = std::mem::take(
+        &mut frame_states
+            .entry(frame_root)
+            .or_default()
+            .animation_timeline,
+    );
+    let prepared = obscura_render::prepare_frame_document(
+        dom,
+        frame_root,
+        (1.0, 1.0),
+        base_url.as_deref(),
+        resources,
+        &mut stylesheet_cache,
+        main_prepared.animation_sample(),
+        &mut animation_timeline,
+    );
+    let frame_state = frame_states.entry(frame_root).or_default();
+    frame_state.stylesheet_cache = stylesheet_cache;
+    frame_state.animation_timeline = animation_timeline;
+    prepared
+}
+
 #[cfg(feature = "render")]
 fn store_frame_prepared(
     dom: &DomTree,
@@ -8751,9 +8798,51 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    let Some(prepared) = ensure_prepared_render(&mut gs) else {
+    if ensure_prepared_render(&mut gs).is_none() {
+        return String::new();
+    }
+    // A node inside an iframe content document is not in the top document's
+    // cascade: that cascade never saw the frame's own `<style>` sheets, so
+    // every frame element fell back to the initial value (16px Times in the
+    // probes). Chrome answers from the frame document's own style, so resolve
+    // the frame's prepared render exactly like `op_layout_geometry` does and
+    // read the snapshot from it.
+    let frame_root = gs.dom.as_ref().and_then(|dom| {
+        dom.containing_document_root_shadow_including(nid)
+            .filter(|root| *root != dom.document())
+    });
+    if let Some(root) = frame_root {
+        let g = &mut *gs;
+        let Some(dom) = g.dom.as_ref() else {
+            return String::new();
+        };
+        let Some(main_prepared) = g.prepared_render.as_ref() else {
+            return String::new();
+        };
+        let resources = &mut g.render_resources;
+        let frame_states = &mut g.frame_render_states;
+        let prepared = prepared_for_frame_root(dom, root, main_prepared, resources, frame_states, 0)
+            .or_else(|| {
+                prepared_for_hidden_frame_root(dom, root, main_prepared, resources, frame_states)
+            });
+        let Some(prepared) = prepared else {
+            return String::new();
+        };
+        let result = computed_style_json(&prepared, nid);
+        store_frame_prepared(dom, root, prepared, frame_states);
+        return result;
+    }
+    let Some(prepared) = gs.prepared_render.as_ref() else {
         return String::new();
     };
+    computed_style_json(prepared, nid)
+}
+
+/// Serialize one computed-style snapshot, plus the custom properties the
+/// cascade carries for the same node. Shared by the top-document and frame
+/// paths so a frame element's style object is byte-identical in structure.
+#[cfg(feature = "render")]
+fn computed_style_json(prepared: &obscura_render::PreparedRender, nid: NodeId) -> String {
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
     };
