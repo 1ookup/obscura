@@ -1,3 +1,68 @@
+// Local tag name -> element interface identifier, for the HTML and SVG
+// namespaces. Two consumers: the per-instance [object XXX] getter, and the
+// per-interface constructor install at the end of this file.
+const HTML_TAGS = {
+  a: 'HTMLAnchorElement', abbr: 'HTMLElement', acronym: 'HTMLElement',
+  address: 'HTMLElement', applet: 'HTMLAppletElement', area: 'HTMLAreaElement',
+  article: 'HTMLElement', aside: 'HTMLElement', audio: 'HTMLAudioElement',
+  b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLBaseFontElement',
+  bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLBGSoundElement',
+  big: 'HTMLElement', blink: 'HTMLElement', blockquote: 'HTMLQuoteElement',
+  body: 'HTMLBodyElement', br: 'HTMLBRElement', button: 'HTMLButtonElement',
+  canvas: 'HTMLCanvasElement', caption: 'HTMLTableCaptionElement',
+  center: 'HTMLElement', cite: 'HTMLElement', code: 'HTMLElement',
+  col: 'HTMLTableColElement', colgroup: 'HTMLTableColElement',
+  data: 'HTMLDataElement', datalist: 'HTMLDataListElement',
+  dd: 'HTMLElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
+  dfn: 'HTMLElement', dialog: 'HTMLDialogElement', dir: 'HTMLDirectoryElement',
+  div: 'HTMLDivElement', dl: 'HTMLDListElement', dt: 'HTMLElement',
+  em: 'HTMLElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
+  figcaption: 'HTMLElement', figure: 'HTMLElement', font: 'HTMLFontElement',
+  footer: 'HTMLElement', form: 'HTMLFormElement', frame: 'HTMLFrameElement',
+  frameset: 'HTMLFrameSetElement', h1: 'HTMLHeadingElement',
+  h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement',
+  h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement', head: 'HTMLHeadElement',
+  header: 'HTMLElement', hgroup: 'HTMLElement', hr: 'HTMLHRElement',
+  html: 'HTMLHtmlElement', i: 'HTMLElement', iframe: 'HTMLIFrameElement',
+  img: 'HTMLImageElement', input: 'HTMLInputElement', ins: 'HTMLModElement',
+  kbd: 'HTMLElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
+  li: 'HTMLLIElement', link: 'HTMLLinkElement', main: 'HTMLElement',
+  map: 'HTMLMapElement', mark: 'HTMLElement', marquee: 'HTMLMarqueeElement',
+  menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
+  nav: 'HTMLElement', nobr: 'HTMLElement', noembed: 'HTMLElement',
+  noframes: 'HTMLElement', noscript: 'HTMLElement', object: 'HTMLObjectElement',
+  ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
+  option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
+  param: 'HTMLParamElement', picture: 'HTMLPictureElement',
+  plaintext: 'HTMLElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
+  q: 'HTMLQuoteElement', rp: 'HTMLElement', rt: 'HTMLElement',
+  ruby: 'HTMLElement', s: 'HTMLElement', samp: 'HTMLElement',
+  script: 'HTMLScriptElement', search: 'HTMLElement', section: 'HTMLElement',
+  select: 'HTMLSelectElement', slot: 'HTMLSlotElement', small: 'HTMLElement',
+  source: 'HTMLSourceElement', span: 'HTMLSpanElement', strike: 'HTMLElement',
+  strong: 'HTMLElement', style: 'HTMLStyleElement', sub: 'HTMLElement',
+  summary: 'HTMLElement', sup: 'HTMLElement', table: 'HTMLTableElement',
+  tbody: 'HTMLTableSectionElement', td: 'HTMLTableCellElement',
+  template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
+  tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement',
+  thead: 'HTMLTableSectionElement', time: 'HTMLTimeElement',
+  title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
+  tt: 'HTMLElement', u: 'HTMLElement', ul: 'HTMLUListElement',
+  var: 'HTMLElement', video: 'HTMLVideoElement', wbr: 'HTMLElement',
+  xmp: 'HTMLElement',
+};
+const SVG_TAGS = {
+  svg: 'SVGSVGElement', path: 'SVGPathElement', text: 'SVGTextElement',
+  g: 'SVGGElement', circle: 'SVGCircleElement', rect: 'SVGRectElement',
+  line: 'SVGLineElement', polyline: 'SVGPolylineElement',
+  polygon: 'SVGPolygonElement', ellipse: 'SVGEllipseElement',
+  image: 'SVGImageElement', use: 'SVGUseElement', tspan: 'SVGTSpanElement',
+  title: 'SVGTitleElement', desc: 'SVGDescElement', defs: 'SVGDefsElement',
+  symbol: 'SVGSymbolElement', marker: 'SVGMarkerElement', clipPath: 'SVGClipPathElement',
+  mask: 'SVGMaskElement', pattern: 'SVGPatternElement', linearGradient: 'SVGLinearGradientElement',
+  radialGradient: 'SVGRadialGradientElement', stop: 'SVGStopElement',
+};
+
 (function _brandWebIDLInterfaces() {
   var names = [
     // Events
@@ -120,67 +185,6 @@
 // from the tag; a prototype getter reproduces that without stamping an own
 // symbol on every instance (Chrome has none).
 (function _installPerElementToStringTags() {
-  const HTML_TAGS = {
-    a: 'HTMLAnchorElement', abbr: 'HTMLElement', acronym: 'HTMLElement',
-    address: 'HTMLElement', applet: 'HTMLAppletElement', area: 'HTMLAreaElement',
-    article: 'HTMLElement', aside: 'HTMLElement', audio: 'HTMLAudioElement',
-    b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLBaseFontElement',
-    bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLBGSoundElement',
-    big: 'HTMLElement', blink: 'HTMLElement', blockquote: 'HTMLQuoteElement',
-    body: 'HTMLBodyElement', br: 'HTMLBRElement', button: 'HTMLButtonElement',
-    canvas: 'HTMLCanvasElement', caption: 'HTMLTableCaptionElement',
-    center: 'HTMLElement', cite: 'HTMLElement', code: 'HTMLElement',
-    col: 'HTMLTableColElement', colgroup: 'HTMLTableColElement',
-    data: 'HTMLDataElement', datalist: 'HTMLDataListElement',
-    dd: 'HTMLElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
-    dfn: 'HTMLElement', dialog: 'HTMLDialogElement', dir: 'HTMLDirectoryElement',
-    div: 'HTMLDivElement', dl: 'HTMLDListElement', dt: 'HTMLElement',
-    em: 'HTMLElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
-    figcaption: 'HTMLElement', figure: 'HTMLElement', font: 'HTMLFontElement',
-    footer: 'HTMLElement', form: 'HTMLFormElement', frame: 'HTMLFrameElement',
-    frameset: 'HTMLFrameSetElement', h1: 'HTMLHeadingElement',
-    h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement',
-    h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement', head: 'HTMLHeadElement',
-    header: 'HTMLElement', hgroup: 'HTMLElement', hr: 'HTMLHRElement',
-    html: 'HTMLHtmlElement', i: 'HTMLElement', iframe: 'HTMLIFrameElement',
-    img: 'HTMLImageElement', input: 'HTMLInputElement', ins: 'HTMLModElement',
-    kbd: 'HTMLElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
-    li: 'HTMLLIElement', link: 'HTMLLinkElement', main: 'HTMLElement',
-    map: 'HTMLMapElement', mark: 'HTMLElement', marquee: 'HTMLMarqueeElement',
-    menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
-    nav: 'HTMLElement', nobr: 'HTMLElement', noembed: 'HTMLElement',
-    noframes: 'HTMLElement', noscript: 'HTMLElement', object: 'HTMLObjectElement',
-    ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
-    option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
-    param: 'HTMLParamElement', picture: 'HTMLPictureElement',
-    plaintext: 'HTMLElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
-    q: 'HTMLQuoteElement', rp: 'HTMLElement', rt: 'HTMLElement',
-    ruby: 'HTMLElement', s: 'HTMLElement', samp: 'HTMLElement',
-    script: 'HTMLScriptElement', search: 'HTMLElement', section: 'HTMLElement',
-    select: 'HTMLSelectElement', slot: 'HTMLSlotElement', small: 'HTMLElement',
-    source: 'HTMLSourceElement', span: 'HTMLSpanElement', strike: 'HTMLElement',
-    strong: 'HTMLElement', style: 'HTMLStyleElement', sub: 'HTMLElement',
-    summary: 'HTMLElement', sup: 'HTMLElement', table: 'HTMLTableElement',
-    tbody: 'HTMLTableSectionElement', td: 'HTMLTableCellElement',
-    template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
-    tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement',
-    thead: 'HTMLTableSectionElement', time: 'HTMLTimeElement',
-    title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
-    tt: 'HTMLElement', u: 'HTMLElement', ul: 'HTMLUListElement',
-    var: 'HTMLElement', video: 'HTMLVideoElement', wbr: 'HTMLElement',
-    xmp: 'HTMLElement',
-  };
-  const SVG_TAGS = {
-    svg: 'SVGSVGElement', path: 'SVGPathElement', text: 'SVGTextElement',
-    g: 'SVGGElement', circle: 'SVGCircleElement', rect: 'SVGRectElement',
-    line: 'SVGLineElement', polyline: 'SVGPolylineElement',
-    polygon: 'SVGPolygonElement', ellipse: 'SVGEllipseElement',
-    image: 'SVGImageElement', use: 'SVGUseElement', tspan: 'SVGTSpanElement',
-    title: 'SVGTitleElement', desc: 'SVGDescElement', defs: 'SVGDefsElement',
-    symbol: 'SVGSymbolElement', marker: 'SVGMarkerElement', clipPath: 'SVGClipPathElement',
-    mask: 'SVGMaskElement', pattern: 'SVGPatternElement', linearGradient: 'SVGLinearGradientElement',
-    radialGradient: 'SVGRadialGradientElement', stop: 'SVGStopElement',
-  };
   const namespaceOf = (el) => {
     try { return el.namespaceURI || el[_nsSym] || 'http://www.w3.org/1999/xhtml'; }
     catch (e) { return 'http://www.w3.org/1999/xhtml'; }
@@ -395,6 +399,76 @@
       } catch (_e) {}
     }
   }
+})();
+
+// Every element interface owns a distinct prototype, and that prototype
+// carries an own `constructor` pointing back at the interface, which is what
+// WebIDL specifies: `document.createElement('div').constructor.name` is
+// "HTMLDivElement" and
+// `Object.getOwnPropertyDescriptor(HTMLDivElement.prototype, 'constructor').value`
+// is HTMLDivElement. Obscura published most of the HTML family as an alias of
+// Element (`globalThis.HTMLTableElement = Element`), so the descriptor
+// resolved through the prototype chain and answered "Element" -- a value no
+// browser produces, readable in one line. Canvas, input, form, iframe, link,
+// body, the media family and the SVG family already own a class; this builds
+// one for every other interface the tag table names, and registers
+// tag -> interface for the wrapper factory in env/dom/iframe-element.js.
+//
+// The parent of every class built here is HTMLElement, which is Element in
+// this engine, so `Object.getPrototypeOf(HTMLDivElement.prototype)` is
+// HTMLElement.prototype either way. Interfaces with a deeper parent
+// (HTMLMediaElement's subclasses) reach this point as real implementations
+// and are left alone.
+(function _installElementInterfaces() {
+  const ElementCtor = globalThis.Element;
+  if (typeof ElementCtor !== 'function' || !ElementCtor.prototype) return;
+  const install = (name) => {
+    const C = { [name]: class extends ElementCtor {
+        constructor(nid, key) {
+          // Internal wrappers pass the node id and env/dom/iframe-element.js's
+          // construction key; page code reaches the TypeError a generated
+          // binding throws for an interface with no constructor.
+          if (arguments.length !== 2 || key !== _elementInterfaceKey) {
+            throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+          }
+          super(nid);
+        }
+        get [Symbol.toStringTag]() { return name; }
+      } }[name];
+    // Generated bindings have no declared arguments, so theirs is 0.
+    Object.defineProperty(C, 'length', { value: 0, configurable: true });
+    Object.defineProperty(globalThis, name, {
+      value: _markNative(C), writable: true, enumerable: false, configurable: true,
+    });
+    return C;
+  };
+  const built = Object.create(null);
+  const interfaceFor = (name) => {
+    if (name === 'HTMLElement') return ElementCtor;
+    const existing = globalThis[name];
+    if (typeof existing === 'function' && existing !== ElementCtor
+        && !_chromeInterfaceShells.has(name)) {
+      // A real implementation owns this interface; only the tag binding is
+      // new.
+      return existing;
+    }
+    if (!built[name]) built[name] = install(name);
+    return built[name];
+  };
+  for (const tag of Object.keys(HTML_TAGS)) {
+    _elementInterfaceByTag[tag] = interfaceFor(HTML_TAGS[tag]);
+  }
+  // The wrapper for a local name no interface claims. Chrome answers
+  // HTMLUnknownElement, except for a valid custom element name, which is an
+  // ordinary HTMLElement until a CustomElementRegistry definition upgrades
+  // it. HTMLUnknownElement was another Element alias, so a class is needed
+  // before it can be a wrapper.
+  built.HTMLUnknownElement = install('HTMLUnknownElement');
+  _elementInterfaceUnknownTag = function (localName) {
+    return _isValidCustomElementName(localName)
+      ? ElementCtor
+      : built.HTMLUnknownElement;
+  };
 })();
 
 // Final native-presentation sweep. _markBuiltinsNative (surface-finalize)

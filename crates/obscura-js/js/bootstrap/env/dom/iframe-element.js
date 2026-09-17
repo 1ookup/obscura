@@ -141,6 +141,36 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
+// Lowercase HTML local name -> the interface wrapper the node is created
+// from. Chrome gives every element interface its own prototype, so a <div> is
+// an HTMLDivElement rather than a bare Element; most of the HTML family here
+// used to be an alias of Element, which made
+// `document.createElement('div').constructor.name` read "Element".
+// config/webidl-branding.js -- the last module -- fills this map once every
+// real interface exists. Until then it is empty and the literal fallbacks
+// below answer, which is all bootstrap-time wrapper creation needs.
+const _elementInterfaceByTag = Object.create(null);
+// Resolver for a local name no interface claims, installed together with the
+// map by config/webidl-branding.js. Null before that.
+let _elementInterfaceUnknownTag = null;
+
+// The interfaces config/webidl-branding.js builds take the node id plus this
+// key, so `new HTMLDivElement(1)` from page code still throws the illegal
+// constructor TypeError. None of the classes reachable here can be built
+// without it.
+const _elementInterfaceKey = Symbol('element interface construction');
+
+// One place where a wrapper class is constructed, so every interface that
+// needs an internal argument beyond the node id is listed once.
+function _wrapElementNode(C, nid) {
+  if (C === HTMLIFrameElement) return new C(nid, _iframeConstructionKey);
+  if (C === HTMLLinkElement) return new C(nid, _linkConstructionKey);
+  if (C === HTMLInputElement) return new C(nid, _inputConstructionKey);
+  // HTMLBodyElement predates the interface key and takes the node id alone.
+  if (C === globalThis.HTMLBodyElement) return new C(nid);
+  return new C(nid, _elementInterfaceKey);
+}
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
@@ -158,6 +188,20 @@ function _elementClassFor(nid) {
       || tag === "polygon" || tag === "polyline" || tag === "rect"
     )) return globalThis.SVGGeometryElement;
     if (globalThis.SVGElement) return globalThis.SVGElement;
+    return Element;
+  }
+  const iface = tag ? _elementInterfaceByTag[tag.toLowerCase()] : null;
+  if (iface) return iface;
+  if (_elementInterfaceUnknownTag) {
+    // An unlisted name only has an interface answer in the HTML namespace.
+    // MathML and any other foreign content keep the plain Element wrapper,
+    // and so does a name that is not ASCII-uppercase, which HTML tag names
+    // always are.
+    if (tag && tag === tag.toUpperCase()
+        && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+      return _elementInterfaceUnknownTag(tag.toLowerCase());
+    }
+    return Element;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
@@ -187,20 +231,25 @@ function _elementClassForKnownName(namespace, qualifiedName) {
       || localName === "polygon" || localName === "polyline" || localName === "rect"
     )) return globalThis.SVGGeometryElement;
     if (globalThis.SVGElement) return globalThis.SVGElement;
+    return Element;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
-    const tag = localName.toUpperCase();
-    if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-    if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
-    if (tag === "BODY" && globalThis.HTMLBodyElement) return globalThis.HTMLBodyElement;
-    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
-    if (tag === "IMG") return HTMLImageElement;
-    if (tag === "LINK" && globalThis.HTMLLinkElement) return globalThis.HTMLLinkElement;
-    if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
-    if (tag === "AUDIO") return HTMLAudioElement;
-    if (tag === "VIDEO") return HTMLVideoElement;
-    if (tag === "OBJECT") return HTMLObjectElement;
-    if (tag === "TRACK") return HTMLTrackElement;
+    const tag = localName.toLowerCase();
+    const iface = _elementInterfaceByTag[tag];
+    if (iface) return iface;
+    if (_elementInterfaceUnknownTag) return _elementInterfaceUnknownTag(tag);
+    const upper = localName.toUpperCase();
+    if (upper === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (upper === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
+    if (upper === "BODY" && globalThis.HTMLBodyElement) return globalThis.HTMLBodyElement;
+    if (upper === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    if (upper === "IMG") return HTMLImageElement;
+    if (upper === "LINK" && globalThis.HTMLLinkElement) return globalThis.HTMLLinkElement;
+    if (upper === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+    if (upper === "AUDIO") return HTMLAudioElement;
+    if (upper === "VIDEO") return HTMLVideoElement;
+    if (upper === "OBJECT") return HTMLObjectElement;
+    if (upper === "TRACK") return HTMLTrackElement;
   }
   return Element;
 }
@@ -211,15 +260,7 @@ function _wrap(nid) {
   let n;
   if (t === 1) {
     const C = _elementClassFor(nid);
-    n = C === HTMLIFrameElement
-      ? new C(nid, _iframeConstructionKey)
-      : C === HTMLLinkElement
-        ? new C(nid, _linkConstructionKey)
-        : C === HTMLInputElement
-          ? new C(nid, _inputConstructionKey)
-          : C === globalThis.HTMLBodyElement
-            ? new C(nid)
-        : new C(nid);
+    n = _wrapElementNode(C, nid);
   }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
@@ -237,15 +278,7 @@ function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
-  const n = C === HTMLIFrameElement
-    ? new C(nid, _iframeConstructionKey)
-    : C === HTMLLinkElement
-      ? new C(nid, _linkConstructionKey)
-      : C === HTMLInputElement
-        ? new C(nid, _inputConstructionKey)
-        : C === globalThis.HTMLBodyElement
-          ? new C(nid)
-      : new C(nid);
+  const n = _wrapElementNode(C, nid);
   _cache.set(nid, n);
   return n;
 }

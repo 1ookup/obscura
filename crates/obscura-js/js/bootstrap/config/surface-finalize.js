@@ -1483,6 +1483,12 @@ const _chromeNavigatorTable = [
   ["xr", 1],
 ];
 
+// Interfaces this module installed as placeholder shells rather than real
+// implementations. config/webidl-branding.js -- the last module -- replaces
+// the ones that are element interfaces with per-tag classes and has to know
+// which globals it may overwrite; a real implementation must never be.
+const _chromeInterfaceShells = new Set();
+
 // Install the window-level interface surface a pinned Chrome exposes: the
 // constructors, namespace objects and constants this engine has no real
 // implementation for. A probe that walks getOwnPropertyNames(window) sees
@@ -1568,6 +1574,7 @@ const _chromeNavigatorTable = [
           { value: ctor, writable: true, enumerable: false, configurable: true });
         _markNative(ctor);
         installed.add(name);
+        _chromeInterfaceShells.add(name);
       } else if (installed.has(name)
           && protoParent !== 'no-proto' && protoParent !== 'Object') {
         const parent = globalThis[protoParent];

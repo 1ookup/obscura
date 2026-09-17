@@ -26785,6 +26785,107 @@ RequestRedirect value",
         );
     }
 
+    /// WebIDL gives every element interface a prototype of its own, and that
+    /// prototype carries an own `constructor` pointing back at the interface.
+    /// Obscura published most of the HTML family as aliases of Element
+    /// (`globalThis.HTMLDivElement = Element`), so a created node's
+    /// `constructor` resolved through the prototype chain and answered
+    /// "Element" -- `document.createElement('div').constructor.name` is one
+    /// line, and no browser answers that. Canvas, input, form, iframe, link,
+    /// body, the media family and the SVG family already owned a class; the
+    /// rest are built by config/webidl-branding.js.
+    #[test]
+    fn element_interfaces_carry_their_own_constructor() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                const SVGS = 'http://www.w3.org/2000/svg';
+                const matrix = [
+                    ['div', 'HTMLDivElement', false],
+                    ['span', 'HTMLSpanElement', false],
+                    ['a', 'HTMLAnchorElement', false],
+                    ['p', 'HTMLParagraphElement', false],
+                    ['img', 'HTMLImageElement', false],
+                    ['input', 'HTMLInputElement', false],
+                    ['button', 'HTMLButtonElement', false],
+                    ['select', 'HTMLSelectElement', false],
+                    ['textarea', 'HTMLTextAreaElement', false],
+                    ['form', 'HTMLFormElement', false],
+                    ['table', 'HTMLTableElement', false],
+                    ['caption', 'HTMLTableCaptionElement', false],
+                    ['ul', 'HTMLUListElement', false],
+                    ['li', 'HTMLLIElement', false],
+                    ['canvas', 'HTMLCanvasElement', false],
+                    ['svg', 'SVGSVGElement', true],
+                    ['path', 'SVGPathElement', true],
+                ];
+                const bad = [];
+                for (const [tag, name, svg] of matrix) {
+                    const el = svg
+                        ? document.createElementNS(SVGS, tag)
+                        : document.createElement(tag);
+                    const C = globalThis[name];
+                    if (typeof C !== 'function') { bad.push(name + ': missing'); continue; }
+                    if (el.constructor !== C) {
+                        bad.push(tag + ': constructor=' + el.constructor.name);
+                    }
+                    if (Object.getPrototypeOf(el) !== C.prototype) {
+                        bad.push(tag + ': prototype mismatch');
+                    }
+                    if (!(el instanceof C)) { bad.push(tag + ': instanceof false'); }
+                    if (!Object.prototype.hasOwnProperty.call(C.prototype, 'constructor')) {
+                        bad.push(name + ': no own constructor');
+                        continue;
+                    }
+                    const d = Object.getOwnPropertyDescriptor(C.prototype, 'constructor');
+                    if (d.value !== C) { bad.push(name + ': descriptor value'); }
+                    if (d.writable !== true) { bad.push(name + ': not writable'); }
+                    if (d.enumerable !== false) { bad.push(name + ': enumerable'); }
+                    if (d.configurable !== true) { bad.push(name + ': not configurable'); }
+                }
+                // The tag/interface pairing has to survive cloneNode, which
+                // rebuilds the wrapper from the native tag, and the interface
+                // has to stay non-constructible from page code.
+                const div = document.createElement('div');
+                if (div.cloneNode().constructor !== HTMLDivElement) {
+                    bad.push('clone: ' + div.cloneNode().constructor.name);
+                }
+                const clone = div.cloneNode(); div.appendChild(clone);
+                if (clone.parentNode.constructor !== HTMLDivElement) {
+                    bad.push('parentNode: ' + clone.parentNode.constructor.name);
+                }
+                for (const name of ['HTMLDivElement', 'HTMLButtonElement',
+                                    'HTMLTableElement', 'HTMLSelectElement']) {
+                    try {
+                        new globalThis[name]();
+                        bad.push(name + ': constructible');
+                    } catch (error) {
+                        if (!(error instanceof TypeError)) {
+                            bad.push(name + ': ' + error.name);
+                        }
+                    }
+                }
+                // A name no interface claims is HTMLUnknownElement. A valid
+                // custom element name is a plain HTMLElement in Chrome; this
+                // engine still publishes HTMLElement as an alias of Element,
+                // so that one case answers "Element" and is not asserted here.
+                if (document.createElement('foo').constructor.name !== 'HTMLUnknownElement') {
+                    bad.push('unknown tag: ' + document.createElement('foo').constructor.name);
+                }
+                // The interfaces must still print as native code.
+                if (HTMLDivElement.toString() !== 'function HTMLDivElement() { [native code] }') {
+                    bad.push('toString: ' + HTMLDivElement.toString());
+                }
+                return bad;
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
     /// A navigator object member is a WebIDL interface instance, so the two
     /// lines a brand check runs -- `navigator.x.constructor.name` and
     /// `Object.prototype.toString.call(navigator.x)` -- both have to name the

@@ -522,13 +522,7 @@ class Document extends Node {
       "http://www.w3.org/1999/xhtml",
       localName,
     );
-    const el = C === HTMLIFrameElement
-      ? new C(nid, _iframeConstructionKey)
-      : C === HTMLLinkElement
-        ? new C(nid, _linkConstructionKey)
-        : C === HTMLInputElement
-          ? new C(nid, _inputConstructionKey)
-        : new C(nid);
+    const el = _wrapElementNode(C, nid);
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
@@ -566,13 +560,7 @@ class Document extends Node {
     );
     const effectiveNamespace = namespace == null ? "" : namespace;
     const C = _elementClassForKnownName(effectiveNamespace, qualified);
-    const el = C === HTMLIFrameElement
-      ? new C(nid, _iframeConstructionKey)
-      : C === HTMLLinkElement
-        ? new C(nid, _linkConstructionKey)
-        : C === HTMLInputElement
-          ? new C(nid, _inputConstructionKey)
-        : new C(nid);
+    const el = _wrapElementNode(C, nid);
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
