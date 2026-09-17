@@ -617,6 +617,20 @@ globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLCon
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLContext {
   get drawingBufferFormat() { return 0x8058; }
 };
+// Cloudflare's challenge reads Function.prototype.toString on WebGL members: the
+// tracelog's ov2.host.tostring records show it probing bufferData, getExtension,
+// getParameter, getShaderPrecisionFormat and getSupportedExtensions, and the
+// reference trace answers `function bufferData() { [native code] }` for each.
+// These contexts are engine shims, so without this sweep the challenge reads
+// their JS source, a fingerprint no browser produces. Every method lives on
+// _WebGLContext.prototype; the two subclass prototypes inherit from it.
+for (const _webglMethod of Object.getOwnPropertyNames(_WebGLContext.prototype)) {
+  if (_webglMethod === 'constructor') continue;
+  const _webglDescriptor = Object.getOwnPropertyDescriptor(_WebGLContext.prototype, _webglMethod);
+  if (_webglDescriptor && typeof _webglDescriptor.value === 'function') {
+    _markNative(_webglDescriptor.value);
+  }
+}
 const _WEBGL1_CONSTANTS = {
   DEPTH_BUFFER_BIT: 0x100, STENCIL_BUFFER_BIT: 0x400, COLOR_BUFFER_BIT: 0x4000, POINTS: 0x0,
   LINES: 0x1, LINE_LOOP: 0x2, LINE_STRIP: 0x3, TRIANGLES: 0x4,

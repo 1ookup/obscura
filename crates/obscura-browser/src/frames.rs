@@ -134,6 +134,16 @@ impl FrameRegistry {
         if !self.frames.contains_key(parent_frame_id) {
             return None;
         }
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_FRAMES").is_some()) {
+                eprintln!(
+                    "[frame-attach] parent={parent_frame_id} host={} already={:?}",
+                    host_nid.raw(),
+                    self.by_host.get(&host_nid).map(String::as_str)
+                );
+            }
+        }
         self.next_frame += 1;
         let frame_id = format!("frame-{}-{}", self.main_frame_id, self.next_frame);
         let loader_id = self.allocate_loader_id();

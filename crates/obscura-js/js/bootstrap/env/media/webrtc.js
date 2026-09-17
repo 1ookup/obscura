@@ -266,9 +266,46 @@ function _rtcMdnsHosts() {
   return _rtcMdnsHosts._cache;
 }
 
-function _rtcBuildOffer(slots) {
+function _rtcKinds(slots) {
   const kinds = slots.transceivers.map(item => item.kind);
   if (slots.dataChannel) kinds.push('application');
+  return kinds;
+}
+// The host candidate set belongs to the connection, not to the moment an offer
+// is built. Planning it once per transceiver set keeps the `a=candidate:` lines
+// an offer carries identical to the candidates trickled as events, so the two
+// views of one connection cannot disagree. The lines follow Chrome's shape:
+// one `typ host` candidate per interface per section, an mDNS name instead of
+// a local address, and no `ufrag` (the media-level `a=ice-ufrag:` covers it).
+function _rtcCandidatePlan(slots) {
+  const kinds = _rtcKinds(slots);
+  const key = kinds.join(',');
+  if (slots.candidatePlan && slots.candidatePlanKey === key) return slots.candidatePlan;
+  const hosts = _rtcMdnsHosts();
+  const plan = [];
+  kinds.forEach((_kind, index) => {
+    hosts.forEach((host, hostIndex) => {
+      const foundation = _rtcRandomUint(10);
+      // The two type-preference/local-preference pairs Chrome emits for its
+      // first two interfaces.
+      const priority = hostIndex === 0 ? 2113937151 : 2113942271;
+      const port = 49152 + Math.floor(crypto.getRandomValues(new Uint16Array(1))[0] / 4);
+      plan.push({
+        candidate: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 ufrag ${slots.ufrag} network-cost 999`,
+        sdpLine: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 network-cost 999`,
+        sdpMid: String(index),
+        sdpMLineIndex: index,
+        gathered: false,
+      });
+    });
+  });
+  slots.candidatePlan = plan;
+  slots.candidatePlanKey = key;
+  return plan;
+}
+
+function _rtcBuildOffer(slots) {
+  const kinds = _rtcKinds(slots);
   if (!kinds.length) {
     // A peer connection with nothing to negotiate still offers a session
     // header; Chrome emits no m-line and no BUNDLE group.
@@ -286,6 +323,15 @@ function _rtcBuildOffer(slots) {
   kinds.forEach((kind, index) => {
     const section = _RTC_SDP_SECTIONS[kind];
     lines.push(...section.head);
+    // Chrome folds the host candidates it has already gathered into the next
+    // offer it builds: the first offer (gathering still "new") carries none,
+    // while a later one repeats them, placed after `a=rtcp:` and before
+    // `a=ice-ufrag:`. Both the placement and the repetition are measured on
+    // Chrome. The plan is shared with the gathering loop so the lines an offer
+    // carries and the candidates trickled as events describe one set.
+    lines.push(..._rtcCandidatePlan(slots)
+      .filter(item => item.sdpMLineIndex === index && item.gathered)
+      .map(item => 'a=' + item.sdpLine));
     lines.push(`a=ice-ufrag:${slots.ufrag}`);
     lines.push(`a=ice-pwd:${slots.pwd}`);
     lines.push('a=ice-options:trickle');
@@ -302,11 +348,9 @@ function _rtcBuildOffer(slots) {
 }
 function _rtcGatherCandidates(connection, slots) {
   if (slots.iceGatheringState !== 'new' || slots.closed) return;
-  const kinds = slots.transceivers.map(item => item.kind);
-  if (slots.dataChannel) kinds.push('application');
+  const kinds = _rtcKinds(slots);
   if (!kinds.length) return;
   slots.iceGatheringState = 'gathering';
-  const hosts = _rtcMdnsHosts();
   const emit = (type, event) => {
     const handler = slots['on' + type];
     if (typeof handler === 'function') { try { handler.call(connection, event); } catch (error) { console.error(error); } }
@@ -336,6 +380,11 @@ function _rtcGatherCandidates(connection, slots) {
       }
     }
     if (index !== mLineIndex) return;
+    // The offer already lists the plan's candidates, so folding a trickled
+    // candidate into a description that came from `createOffer` must not
+    // repeat it: a connection's SDP carries one line per candidate however
+    // many times it is read.
+    if (lines.includes('a=' + candidateLine)) return;
     let end = insertAt + 1;
     while (end < lines.length && !lines[end].startsWith('m=')) end++;
     // The SDP ends with a trailing CRLF, which split() keeps as a final
@@ -354,21 +403,7 @@ function _rtcGatherCandidates(connection, slots) {
   // would have to carry a public address, and inventing one that does not
   // match the address the request actually came from is a worse mismatch
   // than not offering one.
-  const queue = [];
-  kinds.forEach((_kind, index) => {
-    hosts.forEach((host, hostIndex) => {
-      const foundation = _rtcRandomUint(10);
-      // The two type-preference/local-preference pairs Chrome emits for its
-      // first two interfaces.
-      const priority = hostIndex === 0 ? 2113937151 : 2113942271;
-      const port = 49152 + Math.floor(crypto.getRandomValues(new Uint16Array(1))[0] / 4);
-      queue.push({
-        candidate: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 ufrag ${slots.ufrag} network-cost 999`,
-        sdpMid: String(index),
-        sdpMLineIndex: index,
-      });
-    });
-  });
+  const queue = _rtcCandidatePlan(slots);
   let position = 0;
   const step = () => {
     if (slots.closed) return;
@@ -381,7 +416,8 @@ function _rtcGatherCandidates(connection, slots) {
         usernameFragment: slots.ufrag,
       });
       emit('icecandidate', { type: 'icecandidate', candidate, target: connection });
-      applyCandidateToLocal(item.sdpMLineIndex, item.candidate);
+      applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
+      item.gathered = true;
       _scheduleAfter(1, step);
       return;
     }

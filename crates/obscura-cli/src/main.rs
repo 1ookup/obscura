@@ -99,6 +99,16 @@ struct Args {
     #[arg(long, global = true, value_name = "on|off")]
     trace_api_keyed: Option<String>,
 
+    /// Append `window.external.tracelog(key, value)` records to a JSONL file
+    /// (one `{"t","k","v"}` line per call, the shape the instrumented Chrome
+    /// build writes to `<profile>/tracelog/trace.jsonl`). Setting this also
+    /// installs the method for page code in the document and worker realms;
+    /// without it Obscura exposes Chrome's stock `External` surface and the
+    /// page cannot write a file. `OBSCURA_TRACELOG_FROM=1` adds the
+    /// execution-source label as a fourth field.
+    #[arg(long, global = true, value_name = "FILE")]
+    tracelog_file: Option<std::path::PathBuf>,
+
     /// Legacy descriptor-monitor option (not supported by pinned V8 tracing).
     #[arg(long, global = true, value_name = "PATHS")]
     trace_api_ignore: Option<String>,
@@ -598,6 +608,12 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: configured before any V8 isolate or worker starts.
         unsafe { std::env::set_var("OBSCURA_TRACE_OP_FILE", path); }
     }
+    if let Some(path) = args.tracelog_file.as_ref() {
+        // SAFETY: configured before any V8 isolate or worker starts. The sink
+        // resolves this once per process, and the bootstrap installs
+        // window.external.tracelog from the same setting.
+        unsafe { std::env::set_var("OBSCURA_TRACELOG_FILE", path); }
+    }
     // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
     // directly for its SSRF gate. Mirror the CLI flag into the env var so
     // iframe loads and JS fetch() see the same policy the http_client layer
@@ -793,6 +809,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The tracelog writer batches on a background thread, so a command that has
+    // finished can still be holding its last records in memory. Flush before the
+    // process exits; the file's tail is otherwise only as fresh as the writer's
+    // last interval. A no-op when no destination is configured.
+    obscura_js::tracelog::flush();
+
     Ok(())
 }
 
@@ -837,6 +859,14 @@ async fn run_multi_worker_serve(
         }
         if let Some(path) = std::env::var_os("OBSCURA_TRACE_API_FILE") {
             cmd.env("OBSCURA_TRACE_API_FILE", path);
+        }
+        // Every worker of a multi-worker server appends to the one tracelog
+        // file the parent was pointed at, in the same three-field shape unless
+        // the parent was also asked for labels.
+        for name in ["OBSCURA_TRACELOG_FILE", "OBSCURA_TRACELOG_FROM"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
         // The record shape and filters travel with the file they apply to;
         // without them a worker would write default-shaped records into the

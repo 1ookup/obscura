@@ -2104,6 +2104,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "html5ever",
+ "libc",
  "obscura-dom",
  "obscura-net",
  "obscura-render",

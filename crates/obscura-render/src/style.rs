@@ -156,6 +156,28 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
         style.underline = Some(true); // UA default: links are underlined
+    } else if tag == "progress" || tag == "meter" {
+        // Chromium's UA sheet makes the range-style widgets atomic
+        // inline-level controls. Without this they fall through as blocks:
+        // a progress inside a text-less block then skips the line-box strut
+        // and reads 16px tall where Chrome reads 22px.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
+    } else if tag == "summary" {
+        // Chromium's UA sheet makes summary a list-item carrying a
+        // disclosure marker. At narrow widths that outside marker wraps
+        // onto its own line box, adding one strut line inside the summary
+        // (the challenge's sub-pixel probe reads details 66 = marker + two
+        // text lines, not 44). Install the marker as the summary's
+        // before-generated box so it joins the first inline run and takes
+        // part in line breaking; dom.rs promotes its text to the host's
+        // before_content. `list-style:none` authors cannot remove this
+        // approximation, but `::before { content: none }` can.
+        let mut marker = crate::LayoutStyle::default();
+        marker.display = Display::Inline;
+        marker.before_content = Some("\u{25b8} ".to_string());
+        style.before_pseudo = Some(Box::new(marker));
     } else if tag == "iframe" {
         // HTML's UA sheet gives frames a two-pixel inset border. The paint
         // and geometry models share the same four-side used state.

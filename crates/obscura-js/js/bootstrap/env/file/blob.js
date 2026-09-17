@@ -29,7 +29,12 @@ function _blobPartToBytes(p, native) {
   return new TextEncoder().encode(s);
 }
 function _bytesToBinaryString(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; }
-if (typeof Blob === "undefined") globalThis.Blob = class Blob {
+// Frame realms re-run this file against a snapshot that already has Blob/File.
+// Those constructors close over the snapshot WeakMaps; a new map here cannot
+// see their bytes, so createObjectURL stored nothing and new Worker(blob:)
+// threw. Reinstall both so this realm's constructors and _blobBytes share a
+// map, which is also how a browser isolates Blob per realm.
+globalThis.Blob = class Blob {
   constructor(parts, opts) {
     opts = opts || {};
     const endings = opts.endings != null ? String(opts.endings) : "transparent";
@@ -74,7 +79,7 @@ if (typeof Blob === "undefined") globalThis.Blob = class Blob {
     });
   }
 };
-if (typeof File === "undefined") globalThis.File = class File extends Blob {
+globalThis.File = class File extends Blob {
   constructor(parts, name, opts) {
     if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
     opts = opts || {};

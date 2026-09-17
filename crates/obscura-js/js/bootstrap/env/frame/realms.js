@@ -313,7 +313,10 @@ function _frameRealmProxyMethod(realmGlobal, name, delegate) {
   let wrapped = delegate;
   try {
     const parameters = name === 'postMessage' ? 'message' : '';
-    const factory = Reflect.construct(realmGlobal.Function, [
+    // Raw Function: the WindowProxy facade is engine plumbing and must not
+    // become a traced function@ unit (or pay a label push per bridge call).
+    const constructor = realmGlobal.__obscuraTraceRawFunction || realmGlobal.Function;
+    const factory = Reflect.construct(constructor, [
       'delegate',
       'return ({' + name + '(' + parameters
         + '){return Reflect.apply(delegate,this,arguments)}}).' + name,
@@ -714,7 +717,9 @@ async function _frameMessageRecvLoop() {
       try { globalThis.dispatchEvent(evt); } catch (e) { console.error("message dispatch error:", e); }
       if (typeof globalThis.onmessage === "function") {
         try {
-          _withLegacyWindowEvent(evt, () => globalThis.onmessage.call(globalThis, evt));
+          _withLegacyWindowEvent(evt, () => __obscuraTraceCallWith(
+            __obscuraTraceHandlerFrom(globalThis, 'onmessage'),
+            globalThis.onmessage, globalThis, [evt]));
         } catch (e) { console.error("onmessage error:", e); }
       }
     }

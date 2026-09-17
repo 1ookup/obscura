@@ -546,9 +546,31 @@ impl Affine2 {
     }
 
     pub fn around(self, origin: (f32, f32)) -> Self {
-        Self::translate(origin.0, origin.1)
+        let folded = Self::translate(origin.0, origin.1)
             .then(self)
-            .then(Self::translate(-origin.0, -origin.1))
+            .then(Self::translate(-origin.0, -origin.1));
+        // Folding the origin cancelation into one matrix overflows binary32
+        // for extreme scales: `e = ox * (1 - a)` at scale 1e35 is ~1e39, past
+        // f32::MAX, and the inf/NaN entries then turn every mapped corner
+        // into NaN — CSSOM serializes those as null and getBoundingClientRect
+        // reads all-zero. Chromium's layout units saturate instead. Clamp the
+        // folded translation so the matrix stays finite; the scale entries
+        // (a/d) are already finite at this point.
+        let saturate = |value: f32| -> f32 {
+            if value.is_nan() {
+                0.0
+            } else {
+                value.clamp(f32::MIN, f32::MAX)
+            }
+        };
+        Self {
+            a: folded.a,
+            b: folded.b,
+            c: folded.c,
+            d: folded.d,
+            e: saturate(folded.e),
+            f: saturate(folded.f),
+        }
     }
 
     pub fn map_point(self, x: f32, y: f32) -> (f32, f32) {
@@ -559,33 +581,60 @@ impl Affine2 {
     }
 
     pub fn map_rect(self, rect: Rect) -> Rect {
+        // Layout rectangles saturate instead of going non-finite. CSSOM View
+        // serializes non-finite floats as null, which the bootstrap answers
+        // with an all-zero rect — a stronger tell than a clamped
+        // astronomical value, which is what Chromium's saturated layout
+        // units produce for the same `transform: scale(1e32…)` probe. The
+        // corner math runs in f64 so the four corners stay distinct through
+        // an extreme scale (f32 corners would saturate to the same value and
+        // collapse the width to zero); only the final rect saturates to f32.
+        let (a, b, c, d, e, f) = (
+            self.a as f64,
+            self.b as f64,
+            self.c as f64,
+            self.d as f64,
+            self.e as f64,
+            self.f as f64,
+        );
+        let map = |x: f64, y: f64| (a * x + c * y + e, b * x + d * y + f);
         let points = [
-            self.map_point(rect.x, rect.y),
-            self.map_point(rect.x + rect.width, rect.y),
-            self.map_point(rect.x, rect.y + rect.height),
-            self.map_point(rect.x + rect.width, rect.y + rect.height),
+            map(rect.x as f64, rect.y as f64),
+            map(rect.x as f64 + rect.width as f64, rect.y as f64),
+            map(rect.x as f64, rect.y as f64 + rect.height as f64),
+            map(
+                rect.x as f64 + rect.width as f64,
+                rect.y as f64 + rect.height as f64,
+            ),
         ];
         let left = points
             .iter()
             .map(|point| point.0)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let top = points
             .iter()
             .map(|point| point.1)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let right = points
             .iter()
             .map(|point| point.0)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
         let bottom = points
             .iter()
             .map(|point| point.1)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
+        let saturate = |value: f64| -> f32 {
+            if value.is_nan() {
+                0.0
+            } else {
+                value.clamp(f32::MIN as f64, f32::MAX as f64) as f32
+            }
+        };
         Rect {
-            x: left,
-            y: top,
-            width: (right - left).max(0.0),
-            height: (bottom - top).max(0.0),
+            x: saturate(left),
+            y: saturate(top),
+            width: saturate(right - left).max(0.0),
+            height: saturate(bottom - top).max(0.0),
         }
     }
 

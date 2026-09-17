@@ -32,6 +32,11 @@ url = { workspace = true }
 # Public Suffix List and adds no runtime I/O.
 psl = "2"
 tracing = { workspace = true }
+# window.external.tracelog stamps each record with the platform monotonic clock
+# (CLOCK_MONOTONIC), the clock domain the instrumented Chrome build's
+# base::TimeTicks uses, so tracelogs from the two engines order against each
+# other on one host.
+libc = "0.2"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }

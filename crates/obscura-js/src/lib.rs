@@ -8,6 +8,8 @@ mod privacy;
 pub mod realm;
 pub mod runtime;
 mod subtle_asym;
+pub mod trace_source;
+pub mod tracelog;
 pub mod v8_flags;
 pub mod worker;
 

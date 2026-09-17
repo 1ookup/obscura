@@ -14,24 +14,33 @@ class HTMLLinkElement extends Element {
   get href() {
     const raw = this.getAttribute('href');
     if (raw === null) return '';
-    const resolved = _urlResolveOp(raw, _anchorBase());
+    const resolved = _urlResolveOp(raw, this.baseURI || _anchorBase());
     return resolved === null ? raw : resolved;
   }
-  set href(value) { this.setAttribute('href', value); }
+  set href(value) {
+    this.setAttribute('href', value);
+    this._maybePreloadImage();
+  }
   get crossOrigin() { return this.getAttribute('crossorigin'); }
   set crossOrigin(value) {
     if (value === null || value === undefined) this.removeAttribute('crossorigin');
     else this.setAttribute('crossorigin', String(value));
   }
   get rel() { return this.getAttribute('rel') || ''; }
-  set rel(value) { this.setAttribute('rel', String(value)); }
+  set rel(value) {
+    this.setAttribute('rel', String(value));
+    this._maybePreloadImage();
+  }
   get relList() {
     return Object.getOwnPropertyDescriptor(Element.prototype, 'relList').get.call(this);
   }
   get media() { return this.getAttribute('media') || ''; }
   set media(value) { this.setAttribute('media', String(value)); }
   get as() { return this.getAttribute('as') || ''; }
-  set as(value) { this.setAttribute('as', String(value)); }
+  set as(value) {
+    this.setAttribute('as', String(value));
+    this._maybePreloadImage();
+  }
   get type() { return this.getAttribute('type') || ''; }
   set type(value) { this.setAttribute('type', String(value)); }
   get hreflang() { return this.getAttribute('hreflang') || ''; }
@@ -60,6 +69,28 @@ class HTMLLinkElement extends Element {
   set charset(value) { this.setAttribute('charset', String(value)); }
   get rev() { return this.getAttribute('rev') || ''; }
   set rev(value) { this.setAttribute('rev', String(value)); }
+  // The engine-only members live at the end so the enumeration prefix up to
+  // here is exactly Chrome's HTMLLinkElement.prototype member order.
+  setAttribute(name, value) {
+    super.setAttribute(name, value);
+    const n = String(name).toLowerCase();
+    if (n === 'href' || n === 'rel' || n === 'as') this._maybePreloadImage();
+  }
+  // Turnstile preloads `/ci/` with <link rel=preload as=image> and then
+  // assigns the same URL to Image.src. HaHaVM's loadAsset fires an image
+  // GET for both; without a preload fetch here the widget never issues
+  // that request and fails 600010 after PAT 401.
+  _maybePreloadImage() {
+    if (String(this.rel).toLowerCase() !== 'preload') return;
+    if (String(this.as).toLowerCase() !== 'image') return;
+    const href = this.href;
+    if (!href || this._preloadedHref === href) return;
+    this._preloadedHref = href;
+    try {
+      const image = new Image();
+      image.src = href;
+    } catch (e) {}
+  }
   get [Symbol.toStringTag]() { return 'HTMLLinkElement'; }
 }
 _markNative(HTMLLinkElement);

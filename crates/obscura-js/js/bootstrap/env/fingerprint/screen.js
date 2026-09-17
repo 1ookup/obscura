@@ -29,6 +29,22 @@ globalThis.ScreenOrientation = _markNative(ScreenOrientation);
 // running `for..in`, so a non-enumerable `_w` is still one
 // `Object.getOwnPropertyNames(screen)` away from being visible. A browser's
 // screen object has no own string-keyed properties at all.
+// Chromium answers the display's real bit depth rather than a constant, and
+// the answer follows the platform: 30 on macOS, 24 on Windows and Linux. A
+// macOS identity that answered 24 contradicted its own platform on the first
+// screen probe, whether or not an embedder supplied screen metrics.
+var _screenDepthPlatform = null;
+var _screenDepthValue = 24;
+function _screenColorDepth() {
+  const fingerprint = _fingerprint();
+  const platform = String(fingerprint.uaPlatform || fingerprint.navigatorPlatform || '');
+  if (platform !== _screenDepthPlatform) {
+    _screenDepthPlatform = platform;
+    _screenDepthValue = /^mac/i.test(platform) ? 30 : 24;
+  }
+  return _screenDepthValue;
+}
+
 class Screen {
   constructor(w, h, availW, availH, availTop, availLeft) {
     // Every observable value lives behind this one symbol. `colorDepth` and
@@ -43,8 +59,8 @@ class Screen {
   get availHeight() { return _screenSlot(this, 'availH'); }
   get availTop() { return _screenSlot(this, 'availTop'); }
   get availLeft() { return _screenSlot(this, 'availLeft'); }
-  get colorDepth() { return 24; }
-  get pixelDepth() { return 24; }
+  get colorDepth() { return _screenColorDepth(); }
+  get pixelDepth() { return _screenColorDepth(); }
   get orientation() { return _screenOrientationFor(this); }
   // Chrome reports false unless the window spans several displays, which a
   // headless engine never does.
@@ -68,6 +84,22 @@ class Screen {
 ['addEventListener','removeEventListener','dispatchEvent'].forEach(function(k) {
   _markNative(Screen.prototype[k]);
 });
+// Chrome's Screen reaches the event methods through the EventTarget chain
+// rather than owning them: enumerating its prototype yields the getters above
+// and `constructor`, nothing else. Owning them here put four extra names in an
+// enumeration a page can read, so they move onto a base prototype, which leaves
+// `screen.addEventListener` a function (as Chrome's is) without the extra owns.
+if (typeof EventTarget === 'function' && EventTarget.prototype) {
+  var _screenEventBase = Object.create(EventTarget.prototype);
+  ['addEventListener', 'removeEventListener', 'dispatchEvent', 'when'].forEach(function(k) {
+    var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
+    if (d) {
+      Object.defineProperty(_screenEventBase, k, d);
+      delete Screen.prototype[k];
+    }
+  });
+  Object.setPrototypeOf(Screen.prototype, _screenEventBase);
+}
 globalThis.Screen = Screen;
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   globalThis.__obscura_screen_emulated = !!emulated;

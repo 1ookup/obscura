@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -626,13 +626,30 @@ fn host_op_trace_enabled() -> bool {
 }
 
 pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
+    trace_host_op_from(&crate::trace_source::effective(), name, args)
+}
+
+/// `OBSCURA_DEBUG_WORKER=1` reports why a worker receive returned an empty
+/// batch. The JS receive loop treats empty as "the worker is gone" and stops
+/// polling, so a transient cause here strands every later message.
+fn worker_recv_debug(id: u32, reason: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WORKER").is_some()) {
+        eprintln!("[wrecv] id={id} empty batch: {reason}");
+    }
+}
+
+/// `trace_host_op` with an explicit execution source. Async ops whose body
+/// runs after the calling turn ended (fetch) carry the label captured at call
+/// time instead of the thread-local, which may have moved on by then.
+pub(crate) fn trace_host_op_from(from: &str, name: &str, args: &[&str]) {
     if !host_op_trace_enabled() { return }
     static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
     let sink = TRACE.get_or_init(|| {
         let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
-        let _ = writeln!(file, "timestamp_us\toperation\targ1\targ2\targ3\tresult");
+        let _ = writeln!(file, "timestamp_us\tfrom\toperation\targ1\targ2\targ3\tresult");
         Some(std::sync::Mutex::new(file))
     });
     let Some(file) = sink else { return };
@@ -645,7 +662,8 @@ pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
     if let Ok(mut file) = file.lock() {
         let _ = writeln!(
             file,
-            "{timestamp}\t{}\t{arg1}\t{arg2}\t{arg3}\t{result}",
+            "{timestamp}\t{}\t{}\t{arg1}\t{arg2}\t{arg3}\t{result}",
+            clean(from),
             clean(name),
         );
         let _ = file.flush();
@@ -663,10 +681,33 @@ fn trace_console_message(level: &str, message: &str) {
     });
     let Some(file) = sink else { return };
     let timestamp = TRACE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let from = crate::trace_source::effective();
     if let Ok(mut file) = file.lock() {
-        let _ = writeln!(file, "{timestamp}\tconsole.{level}\t{message}");
+        let _ = writeln!(file, "{timestamp}\t{}\tconsole.{level}\t{message}", from.replace(['\t', '\r', '\n'], " "));
         let _ = file.flush();
     }
+}
+
+/// JS-side entry into a labeled execution source (see trace_source.rs). The
+/// bootstrap's own stack is the read side; these ops are the write side that
+/// keeps host-op records attributed while page code runs.
+#[op2(fast)]
+fn op_trace_push_source(#[string] label: &str) {
+    crate::trace_source::js_push(label);
+}
+
+#[op2(fast)]
+fn op_trace_pop_source() {
+    crate::trace_source::js_pop();
+}
+
+/// `window.external.tracelog(key, value)` (tracelog.rs). `json` is the value
+/// the caller already serialized; an empty string means serialization produced
+/// nothing, which is written as `null`. The op never fails: with no destination
+/// configured it warns once and returns.
+#[op2(fast)]
+fn op_tracelog(#[string] key: &str, #[string] json: &str) {
+    crate::tracelog::record(key, json);
 }
 
 static TRACE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -3206,7 +3247,20 @@ async fn op_fetch_url(
     // because deno_core's async op codegen caps the argument count at nine.
     #[string] referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    trace_host_op("fetch", &[&method, &url, &headers_json]);
+    // The referrer context is built at the JS call site, so its `from` field
+    // captures the execution source exactly at fetch() time. The async body
+    // may first run after the calling turn ended, when the thread-local label
+    // has already moved on.
+    let trace_from = serde_json::from_str::<serde_json::Value>(&referrer_context)
+        .ok()
+        .and_then(|context| {
+            context
+                .get("from")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(crate::trace_source::effective);
+    trace_host_op_from(&trace_from, "fetch", &[&method, &url, &headers_json]);
     let performance_started = std::time::Instant::now();
 
     // Scripted requests are governed by the CSP of the document whose realm
@@ -3515,6 +3569,28 @@ async fn op_fetch_url(
         }
     }
 
+    // The cache mode reaches the wire as `Cache-Control`/`Pragma`, but Fetch
+    // appends those in "HTTP-network-or-cache fetch", which runs after the
+    // CORS-preflight decision. They are user-agent headers, not "author request
+    // headers", so they never trigger a preflight: Chrome sends them on a
+    // cross-origin GET as a simple request. Counting them here turned the
+    // Turnstile widget's attestation probe into an OPTIONS the origin does not
+    // answer, and the probe died as a network error. The shim reports the names
+    // it added itself, so an author-supplied `Cache-Control` still preflights
+    // the way it does in Chrome.
+    let ua_generated_headers: Vec<String> = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("uaHeaders"))
+        .and_then(|value| value.as_array())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str())
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let needs_preflight = is_cross_origin
         && mode == "cors"
         && (req_method != reqwest::Method::GET
@@ -3526,6 +3602,7 @@ async fn op_fetch_url(
                     && kl != "accept-language"
                     && kl != "content-language"
                     && kl != "content-type"
+                    && !ua_generated_headers.contains(&kl)
             }));
 
     if needs_preflight {
@@ -5459,6 +5536,7 @@ fn op_navigate_frame(
     #[string] method: &str,
     #[string] body: &str,
 ) {
+    frame_debug("navigate_frame", document_root, url);
     if document_root == 0 {
         let gs = state.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -5477,8 +5555,16 @@ fn op_navigate_frame(
 
 #[op2(fast)]
 fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
+    frame_debug("queue_iframe_navigation", host_nid, "(current src)");
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    if gs
+        .pending_iframe_navigations
+        .iter()
+        .any(|request| request.host_nid == host_nid && request.url.is_none())
+    {
+        frame_debug("queue_iframe_navigation.deduped", host_nid, "(already queued)");
+    }
     if !gs
         .pending_iframe_navigations
         .iter()
@@ -5494,6 +5580,23 @@ fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
     }
 }
 
+/// `OBSCURA_DEBUG_FRAMES=1` reports every iframe navigation the page asks for.
+/// A frame that is navigated twice for one `src` fetches its document twice,
+/// which duplicates whatever session state that document carries.
+fn frame_debug(kind: &str, host_nid: u32, url: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_FRAMES").is_some()) {
+        eprintln!(
+            "[frame-nav] {} host={} from={} url={}",
+            kind,
+            host_nid,
+            crate::trace_source::effective(),
+            url
+        );
+    }
+}
+
+
 #[op2(fast)]
 fn op_navigate_iframe(
     state: &OpState,
@@ -5502,6 +5605,7 @@ fn op_navigate_iframe(
     #[string] method: &str,
     #[string] body: &str,
 ) {
+    frame_debug("navigate_iframe", host_nid, url);
     let gs = state.borrow::<SharedState>().clone();
     gs.borrow_mut()
         .pending_iframe_navigations
@@ -5525,6 +5629,7 @@ fn op_navigate_iframe(
 /// about:blank.
 #[op2(fast)]
 fn op_navigate_iframe_blob(state: &OpState, host_nid: u32, #[string] url: &str, #[string] body: &str) {
+    frame_debug("navigate_iframe_blob", host_nid, url);
     let gs = state.borrow::<SharedState>().clone();
     gs.borrow_mut()
         .pending_iframe_navigations
@@ -6307,6 +6412,168 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
     )
 }
 
+// --- OPFS sync access handles (worker realm, src/worker.rs) ---
+//
+// `FileSystemSyncAccessHandle` is the worker-only OPFS surface, and a browser
+// backs it with real storage: a `write` + `flush` costs milliseconds on the
+// device. An in-memory implementation answers in 0 ms, and the turnstile widget
+// times exactly that (`performance.now()` around `flush()`) and reports the
+// measurement back to the challenge, so the no-op is a fingerprint difference
+// rather than a missing feature (see step 276 of the challenge profile).
+//
+// The backing files live in a per-process temp directory. This is scratch
+// storage for one page's origin, so nothing here needs to outlive the process.
+
+/// Directory holding the OPFS files of this process.
+fn opfs_root() -> &'static PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("obscura-opfs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+fn opfs_table() -> &'static std::sync::Mutex<HashMap<u32, std::fs::File>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, std::fs::File>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// A poisoned table says nothing about these handles, so recover rather than
+/// panic: `op_dom` is not the only op that must not unwind into V8.
+fn opfs_lock() -> std::sync::MutexGuard<'static, HashMap<u32, std::fs::File>> {
+    opfs_table().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn opfs_io(what: &str, error: std::io::Error) -> deno_error::JsErrorBox {
+    deno_error::JsErrorBox::generic(format!("OPFS {what}: {error}"))
+}
+
+/// Open (creating if needed) the backing file for one OPFS file handle and seed
+/// it with the bytes the in-memory node already holds. Returns a handle id.
+#[op2(fast)]
+fn op_opfs_sync_open(
+    _state: Rc<RefCell<OpState>>,
+    #[string] name: &str,
+    #[buffer] initial: &[u8],
+) -> Result<u32, deno_error::JsErrorBox> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(opfs_root().join(safe))
+        .map_err(|e| opfs_io("open", e))?;
+    if !initial.is_empty() {
+        file.write_all(initial).map_err(|e| opfs_io("seed", e))?;
+    }
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let fd = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    opfs_lock().insert(fd, file);
+    Ok(fd)
+}
+
+#[op2(fast)]
+fn op_opfs_sync_write(
+    _state: Rc<RefCell<OpState>>,
+    fd: u32,
+    offset: f64,
+    #[buffer] data: &[u8],
+) -> Result<u32, deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("write", std::io::Error::other("closed handle")))?;
+    file.seek(SeekFrom::Start(offset.max(0.0) as u64))
+        .map_err(|e| opfs_io("seek", e))?;
+    file.write_all(data).map_err(|e| opfs_io("write", e))?;
+    Ok(data.len() as u32)
+}
+
+#[op2]
+#[buffer]
+fn op_opfs_sync_read(
+    _state: Rc<RefCell<OpState>>,
+    fd: u32,
+    offset: f64,
+    len: f64,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("read", std::io::Error::other("closed handle")))?;
+    file.seek(SeekFrom::Start(offset.max(0.0) as u64))
+        .map_err(|e| opfs_io("seek", e))?;
+    let mut out = vec![0u8; len.max(0.0) as usize];
+    let mut filled = 0usize;
+    while filled < out.len() {
+        match file.read(&mut out[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(opfs_io("read", e)),
+        }
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
+/// Writes are already through to the file, so this is the write-back a browser
+/// performs, not an fsync: Chrome's own `flush` on a one-byte write costs ~12 us
+/// of disk work.
+///
+/// It is not free, though, because a browser serves this handle from the
+/// browser process, so every call is an IPC round trip. The reference capture
+/// times exactly that and reports `uUOw3 = 0.54` ms, while an in-process handle
+/// answers in microseconds: a reading no browser can produce, in a field the
+/// challenge measures and sends back. The round trip is therefore modelled
+/// here, the same way `performance.now()` is clamped to Chrome's granularity.
+#[op2(fast)]
+fn op_opfs_sync_flush(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_error::JsErrorBox> {
+    let table = opfs_lock();
+    table
+        .get(&fd)
+        .ok_or_else(|| opfs_io("flush", std::io::Error::other("closed handle")))?;
+    drop(table);
+    std::thread::sleep(std::time::Duration::from_micros(450));
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_opfs_sync_truncate(_state: Rc<RefCell<OpState>>, fd: u32, size: f64) -> Result<(), deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("truncate", std::io::Error::other("closed handle")))?;
+    file.set_len(size.max(0.0) as u64)
+        .map_err(|e| opfs_io("truncate", e))
+}
+
+#[op2(fast)]
+fn op_opfs_sync_size(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<f64, deno_error::JsErrorBox> {
+    let table = opfs_lock();
+    let file = table.get(&fd).ok_or_else(|| opfs_io("size", std::io::Error::other("closed handle")))?;
+    Ok(file.metadata().map_err(|e| opfs_io("size", e))?.len() as f64)
+}
+
+#[op2(fast)]
+fn op_opfs_sync_close(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    if let Some(file) = table.remove(&fd) {
+        file.sync_all().map_err(|e| opfs_io("close", e))?;
+    }
+    Ok(())
+}
+
 // --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
 //
 // Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
@@ -6347,6 +6614,12 @@ fn worker_environment(
     creator_csp: Option<String>,
     fingerprint_json: &str,
     shared_worker: bool,
+    creator_from: &str,
+    // The worker script's own `Content-Security-Policy` response header.
+    // `None` keeps the creator-document inheritance; `Some(header)` is the
+    // Chromium rule for fetched workers: their policy is their own header,
+    // and a fetched worker without one runs with no CSP at all.
+    worker_csp: Option<String>,
 ) -> crate::worker::WorkerEnvironment {
     let gs = shared.borrow();
     let tuple_origin = url::Url::parse(creator_url)
@@ -6383,16 +6656,24 @@ fn worker_environment(
         shared: shared_worker,
         origin,
         secure_context,
-        document_csp: if creator_root > 0 {
-            gs.dom
-                .as_ref()
-                .and_then(|dom| dom.document_scope(obscura_dom::NodeId::new(creator_root)))
-                .and_then(|scope| scope.csp.clone())
-                .or(creator_csp)
-        } else {
-            creator_csp.or_else(|| gs.document_csp.clone())
+        document_csp: match worker_csp {
+            Some(own) => (!own.is_empty()).then_some(own),
+            None => {
+                if creator_root > 0 {
+                    gs.dom
+                        .as_ref()
+                        .and_then(|dom| {
+                            dom.document_scope(obscura_dom::NodeId::new(creator_root))
+                        })
+                        .and_then(|scope| scope.csp.clone())
+                        .or(creator_csp)
+                } else {
+                    creator_csp.or_else(|| gs.document_csp.clone())
+                }
+            }
         },
         fingerprint: serde_json::from_str(fingerprint_json).unwrap_or_default(),
+        trace_label: creator_from.to_string(),
         #[cfg(feature = "stealth")]
         stealth_client: gs.stealth_client.clone(),
     }
@@ -6409,11 +6690,18 @@ fn op_worker_spawn(
     #[string] fingerprint_json: String,
     #[string] creator_root: String,
     #[string] creator_csp: String,
-    shared_worker: bool,
+    #[string] creator_from: String,
+    // The worker script response's own Content-Security-Policy header, read
+    // by the JS fetch path. Empty string when the script had none.
+    #[string] worker_csp: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let creator_root = creator_root.parse::<u32>().unwrap_or(0);
     let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    // Chromium: a *fetched* worker (http/https) carries its own response
+    // policy, with no fallback to the creator's; only local-scheme workers
+    // (blob:, data:, about:) inherit the creating document's policy.
+    let local_scheme = !url.starts_with("http:") && !url.starts_with("https:");
     let environment = worker_environment(
         &shared,
         name.clone(),
@@ -6421,12 +6709,11 @@ fn op_worker_spawn(
         creator_root,
         creator_csp,
         &fingerprint_json,
-        shared_worker,
+        false,
+        &creator_from,
+        if local_scheme { None } else { Some(worker_csp) },
     );
     let mut gs = shared.borrow_mut();
-    if shared_worker {
-        return Err(deno_error::JsErrorBox::generic("shared workers use op_shared_worker_connect"));
-    }
         /*
         // constructing realm's own `location.href`: frame realms each have
         // their own, and `SharedState.url` is the top-level document's, so
@@ -6519,10 +6806,13 @@ fn op_shared_worker_connect(
     #[string] fingerprint_json: String,
     #[string] creator_root: String,
     #[string] creator_csp: String,
+    #[string] creator_from: String,
+    #[string] worker_csp: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
     let creator_root = creator_root.parse::<u32>().unwrap_or(0);
     let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    let local_scheme = !url.starts_with("http:") && !url.starts_with("https:");
     let environment = worker_environment(
         &shared,
         name.clone(),
@@ -6531,6 +6821,8 @@ fn op_shared_worker_connect(
         creator_csp,
         &fingerprint_json,
         true,
+        &creator_from,
+        if local_scheme { None } else { Some(worker_csp) },
     );
     let key = format!("{}\n{}\n{}\n{}", environment.origin, name, url, kind);
     let connection = {
@@ -6576,17 +6868,41 @@ async fn op_shared_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
 #[op2(async)]
 #[string]
 async fn op_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    // Without an executor nothing can drive the worker's receive loop either,
+    // and awaiting a Tokio primitive from here panics inside a v8 callback
+    // frame, which aborts the process rather than failing one call. A caller
+    // with no runtime gets an empty batch and polls again.
+    if tokio::runtime::Handle::try_current().is_err() {
+        worker_recv_debug(id, "no-tokio-runtime");
+        return String::new();
+    }
+    // This op is called from JS while the embedder may hold the same state
+    // borrowed (a page polling a worker reply during one of its own ops, for
+    // instance). A panic here unwinds into a v8::FunctionCallback frame, which
+    // aborts the process instead of failing one call, so contention returns an
+    // empty batch and the caller polls again.
     let outbox = {
-        let state = state.borrow();
+        let Ok(state) = state.try_borrow() else {
+            worker_recv_debug(id, "opstate-borrowed");
+            return String::new();
+        };
         let shared = state.borrow::<SharedState>().clone();
-        let gs = shared.borrow();
-        gs.worker_host.as_ref().and_then(|host| host.outbox(id))
+        let mut found = None;
+        let guard = shared.try_borrow();
+        if let Ok(gs) = guard {
+            found = gs.worker_host.as_ref().and_then(|host| host.outbox(id));
+        } else {
+            worker_recv_debug(id, "shared-state-borrowed");
+        }
+        found
     };
     let Some(outbox) = outbox else {
+        worker_recv_debug(id, "no-outbox");
         return String::new();
     };
     let mut rx = outbox.lock().await;
     let Some(first) = rx.recv().await else {
+        worker_recv_debug(id, "outbox-closed");
         return String::new();
     };
     let mut entries = vec![first];
@@ -6613,7 +6929,7 @@ fn op_worker_terminate(state: &OpState, id: u32) -> bool {
 #[op2(fast)]
 fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
     let shared = state.borrow::<SharedState>().clone();
-    let gs = shared.borrow();
+    let Ok(gs) = shared.try_borrow() else { return false; };
     match gs.worker_outbox.as_ref() {
         Some(tx) => tx.send(crate::worker::message_entry(payload)).is_ok(),
         None => false,
@@ -6623,7 +6939,10 @@ fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
 #[op2(fast)]
 fn op_worker_close(state: &OpState) {
     let shared = state.borrow::<SharedState>().clone();
-    shared.borrow_mut().worker_close_requested = true;
+    let guard = shared.try_borrow_mut();
+    if let Ok(mut gs) = guard {
+        gs.worker_close_requested = true;
+    }
 }
 
 // --- Cross-document postMessage ops (design doc Phase 4) ---
@@ -6934,6 +7253,13 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_opfs_sync_open(),
+        op_opfs_sync_write(),
+        op_opfs_sync_read(),
+        op_opfs_sync_flush(),
+        op_opfs_sync_truncate(),
+        op_opfs_sync_size(),
+        op_opfs_sync_close(),
         op_worker_spawn(),
         op_worker_post_message(),
         op_worker_recv(),
@@ -6946,6 +7272,9 @@ pub fn build_extension() -> Extension {
         op_post_to_frame(),
         op_post_to_parent(),
         op_frame_message_recv(),
+        op_trace_push_source(),
+        op_trace_pop_source(),
+        op_tracelog(),
     ];
     #[cfg(feature = "render")]
     let mut ops = ops;
@@ -8139,9 +8468,35 @@ fn frame_geometry_json(
     nid: NodeId,
     scroll: &obscura_render::ResolvedScrollState,
 ) -> String {
+    let debug = std::env::var_os("OBSCURA_GEOM_DEBUG").is_some();
+    let cssom_src = prepared.layout().cssom_rects.get(&nid).copied();
+    let layout_src = prepared.layout().rects.get(&nid).copied();
+    let transform = prepared.layout().transforms.get(&nid).copied();
     let Some(rect) = prepared.cssom_viewport_rect_with_scroll(nid, scroll) else {
+        if debug {
+            eprintln!(
+                "[geom] nid={} cssom={:?} rects={:?} transform={:?} -> NO CSSOM RECT",
+                nid.raw(),
+                cssom_src,
+                layout_src,
+                transform.map(|t| (t.a, t.d, t.e, t.f))
+            );
+        }
         return String::new();
     };
+    if debug {
+        eprintln!(
+            "[geom] nid={} cssom={:?} rects={:?} transform={:?} -> out=({},{},{},{})",
+            nid.raw(),
+            cssom_src,
+            layout_src,
+            transform.map(|t| (t.a, t.d, t.e, t.f)),
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height
+        );
+    }
     let Some((client_width, client_height)) = prepared.client_size(nid) else {
         return String::new();
     };
@@ -8160,11 +8515,23 @@ fn frame_geometry_json(
         })
         .collect::<Vec<_>>();
     let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
+    // `offsetWidth`/`offsetHeight` report the layout border box and ignore
+    // visual transforms (Chromium: getBoundingClientRect() is the transformed
+    // one, offset* the untransformed one). The transformed rect above can
+    // overflow binary32 for pathological scales, so ship the layout size
+    // alongside it instead of deriving offset* from it in the bootstrap.
+    let layout_size = prepared
+        .layout()
+        .rects
+        .get(&nid)
+        .map(|rect| (rect.width, rect.height));
     serde_json::json!({
         "x": rect.x,
         "y": rect.y,
         "width": rect.width,
         "height": rect.height,
+        "layoutWidth": layout_size.map(|(width, _)| width),
+        "layoutHeight": layout_size.map(|(_, height)| height),
         "clientWidth": client_width,
         "clientHeight": client_height,
         "clientRects": client_rects,

@@ -88,13 +88,15 @@ page eval is labelled `<page-eval>`. Script labels are not reliable realm IDs.
 property resolution, in the shape a HaHaVM `dispatch` trace uses:
 
 ```json
-{"t":76.4,"src":"call Document.createElement (<obscura:bootstrap>:7425:16) <- <page-eval>:1:38","name":"Document.createElement","args":["div"],"result":"<div>"}
-{"t":78.1,"src":"set Element.id (<obscura:bootstrap>:4361:9) <- <page-eval>:12:37","name":"Element.id","args":["probe-id"],"result":"undefined"}
+{"t":76.4,"from":"iframe(3)","src":"call Document.createElement (<obscura:bootstrap>:7425:16) <- <page-eval>:1:38","name":"Document.createElement","args":["div"],"result":"<div>"}
+{"t":78.1,"from":"window","src":"set Element.id (<obscura:bootstrap>:4361:9) <- <page-eval>:12:37","name":"Element.id","args":["probe-id"],"result":"undefined"}
 ```
 
 The record is a contract both sides implement, not an engine-specific dump.
-HaHaVM's `core/tools/toolsFunc.js` writes the same five fields under the same
-rules, so a diff of two runs is a diff of the pages:
+HaHaVM's `core/tools/toolsFunc.js` writes the same fields under the same
+rules, so a diff of two runs is a diff of the pages. `from` is the execution
+source (window / iframe(N) / worker(M)[creator] / script@… / host); see
+below. The remaining fields:
 
 - `t` is milliseconds since this stream's first record, one decimal. The two
   streams start at different events, so only deltas within one stream are
@@ -333,10 +335,153 @@ records complete strings, including long `payloadJSON` output. This works in
 `fetch` as well as `serve`. Objects still undergo normal console formatting;
 serialize deliberately when a structured payload is needed.
 
+Every op row carries the execution source in its second column
+(`timestamp_us \t from \t operation \t arg1..3 \t result`; console rows are
+`timestamp_us \t from \t console.LEVEL \t message`), using the label taxonomy
+below, so a diff of two runs can be grouped by the code unit that produced each
+record rather than only by sequence.
+
+## Execution-source labels (`from`)
+
+The label system mirrors the HaHaVM dispatch trace's `from` field, so a
+differential run aligns by "which context + which code unit" produced each
+record. The authoritative state is a Rust thread-local (ambient label per
+context plus a stack of explicit entries, `crates/obscura-js/src/trace_source.rs`);
+the bootstrap mirrors it for snapshots and keeps both in lockstep through
+`op_trace_push_source` / `op_trace_pop_source` (`js/bootstrap/tools/trace-source.js`).
+
+| label | meaning |
+| --- | --- |
+| `window` | code in the main document's default scope (ambient) |
+| `iframe(N)` | code in a frame realm; N from the host's cross-frame counter, assigned in realm-creation order, placeholder frames included |
+| `worker(M)[creator]` | worker code; M from the host worker counter (dedicated and shared share one sequence per browser context); the creator is the constructing context's label at `new Worker(...)`, so nested workers nest |
+| `script@<url>` | one classic script unit: parser inline and external scripts, frame scripts, dynamic inserts, worker sources |
+| `function@<source>` | a `new Function(...)` product, attributed to its creation source |
+| `eval@<source>` | eval'd string code (see boundaries) |
+| `host` | host-injected code: `Page::evaluate`, CDP `Runtime.evaluate`, preloads, CLI `--eval` |
+
+Coverage of the real execution entries: parser and dynamic scripts (Rust
+brackets in `page.rs` / `__runClassicScript`), timers (`_scheduleAfter`
+snapshots the scheduling site; string timers run under the scheduling label,
+not as a `script@` unit), `requestAnimationFrame` (per-callback snapshot),
+`queueMicrotask`, event listeners (registration-time snapshot in the listener
+entry), `on*` property handlers (assignment-time snapshot on the accessor
+pairs that are also the production, Chromium-shaped handler slots), and
+`Promise.prototype.then` continuations (`.then` call-site snapshot). Worker
+`'out'` messages restore the construction-site label on the page side, since
+a handler runs in the creating context. A fetched worker's own
+`Content-Security-Policy` response header governs the worker (local-scheme
+workers inherit the creator's policy), matching Chromium's worker CSP rules.
+
+Async fetch ops carry the label deterministically: the referrer-context JSON
+built at the JS call site includes `from`, so `op_fetch_url`'s async body
+reports the fetch caller even when it first runs after that turn ended. All
+other traced ops are synchronous and read the thread-local directly.
+
+**Trace off is the production shape.** Without a trace env var the startup
+snapshot is used, no wrapper is installed, `Function` and
+`Promise.prototype.then` stay native, on* slots stay plain writable data
+properties, and no label global is set on any context: zero page-visible
+difference (asserted by the `trace_source` integration test's untraced run).
+`window.external.tracelog` follows the same rule: the method exists only when
+`--tracelog-file` named a destination, so an untraced run's `External` surface
+is Chrome's stock one.
+
+Known boundaries (kept deliberately, matching the reference build's own blind
+spots where noted):
+
+- `await` continuations: V8 resolves them through an internal intrinsic, not
+  the `then` property, so they are attributed to the ambient turn. The HaHaVM
+  reference has the same boundary.
+- Direct `eval(...)`: replacing the global `eval` binding would change
+  direct-eval scope semantics, so direct-eval code keeps the enclosing label.
+  The API trace still distinguishes it by its script name (`<page-eval>`,
+  `<eval>`).
+- ES module graphs and dynamic `import()`: modules are not attributable
+  per-unit on either engine; they run at the ambient label.
+- Inline attribute handlers (`onclick="..."`): compiled as engine plumbing at
+  dispatch time, so they carry the dispatching turn's label rather than an
+  assignment snapshot.
+- Under trace the wrappers have a small observable surface (the same class the
+  HaHaVM reference accepts): `Function.prototype.toString` on a wrapped
+  `new Function` product reads as `[native code]`. The constructor identity
+  (`f.constructor === Function`) is preserved by pointing
+  `Function.prototype.constructor` at the proxy binding.
+- Handler slots follow Chromium's mechanism in production too: Window owns
+  accessor pairs, Document/Element prototypes expose accessors, SVGElement
+  carries its own set, and assignment never creates an own property. The one
+  placement deviation left is that Obscura's HTML interface layer is a single
+  Element class (`globalThis.HTMLElement === Element`), so the HTML half sits
+  on Element.prototype rather than a distinct HTMLElement.prototype; splitting
+  that (like site isolation and per-frame microtask queues) is an
+  architectural change tracked separately.
+
 Neither stream is zero-cost when enabled. Property records are queued in 1 MiB
 chunks and drained by a background thread; normal process exit flushes the
 tail. Abrupt termination can lose buffered records. Separate timing-sensitive
 payload collection from full trace, and retain a trace-off comparison.
+
+## window.external.tracelog
+
+`--tracelog-file FILE` exposes the instrumented Chrome build's tracing
+primitive to page code and appends its records to FILE. Patched challenge
+scripts call it to persist values from inside a runtime that hooks or traps
+`console` and `debugger`:
+
+```js
+window.external.tracelog('ov2.mR.enter', { slot: 212, depth: 4 })
+window.external.tracelog('phase19.note', 'slot 212 read from F98')
+window.external.tracelog('ov2.mR.depth', 33333)
+```
+
+One JSON line per call, in the reference writer's shape:
+
+```json
+{"t":703856484313,"k":"ov2.mR.enter","v":{"slot":212,"depth":4}}
+{"t":703857540462,"k":"ov2.h.globalThis","v":"[object Window]"}
+```
+
+- `t` is microseconds on the platform monotonic clock (`CLOCK_MONOTONIC`), the
+  clock domain the reference's `base::TimeTicks` uses, so tracelogs from either
+  engine on one host order against each other. Only deltas inside one file are
+  meaningful.
+- `k` is the caller's key, JSON-escaped, so a key containing a quote or a line
+  break cannot split one record into two.
+- `v` is the value serialized by `JSON.stringify` on the calling thread, the
+  same place the reference serializes it. A value that produces no JSON
+  (`undefined`, a function, a getter that throws) is written as `null`, and so
+  is a call with no value argument. A `Symbol` key raises a TypeError, as the
+  WebIDL `DOMString` conversion does.
+
+`--tracelog-file` is what installs the method: in the top-level document, in
+every frame realm, and in worker scopes. `obscura-cli`'s own `--eval` and CDP
+`Runtime.evaluate` reach the same method through the realm they run in. Without
+the flag Obscura exposes Chrome's stock `External` surface
+(`AddSearchProvider`, `IsSearchProviderInstalled`, and no `tracelog`), so a run
+that did not ask for a tracelog cannot be made to write one by page code.
+
+A worker scope keeps `window` deleted, because Chromium's
+`DedicatedWorkerGlobalScope` has no such binding and one `typeof window`
+separates the two scopes; the call spelling inside a worker is
+`external.tracelog(...)`, `self.external.tracelog(...)` or
+`globalThis.external.tracelog(...)`. `external` is Window-only in stock Chrome
+and stays in the worker scope here only because that is where the tracing
+method lives.
+
+`OBSCURA_TRACELOG_FROM=1` appends the execution-source label as a fourth field
+(`,"from":"worker(1)[script@https://host/page.html]"`), using the taxonomy
+below. Only that variable asks for labels, so a tracelog run that does not set
+it does not pay for the label wrappers.
+
+The reference writer's two properties carry over. Serialization happens per
+call on the calling thread; writing is batched by one writer thread per process
+(1000 records, 1 MiB or 100 ms, whichever comes first), so every isolate
+(document, frames, workers) and every process (`scrape` workers, a multi-worker
+`serve`) appends to the one file the run was pointed at. A backlog past the
+queue bound (100k records or 64 MiB) drops records and reports the drop once,
+and the CLI flushes the tail before a command's process exits. A run killed by
+the process deadline can still lose the last interval of records, the same
+boundary the other two streams have.
 
 ## Usage And Verification
 
@@ -346,8 +491,12 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 vendor/v8-trace.sh check
 ./target/release/obscura --trace-api-file /tmp/properties.tsv \
   --trace-op-file /tmp/operations.log fetch https://example.com --wait 0
+./target/release/obscura --tracelog-file /tmp/trace.jsonl \
+  fetch https://example.com --wait 3
 cargo nextest run --release --features render -p obscura-cli \
   --test native_trace --config vendor/v8-source.toml
+cargo nextest run --release --features render -p obscura-cli \
+  --test tracelog --config vendor/v8-source.toml
 ```
 
 `check` executes a real author-script HIT/MISS smoke. The presence of a CLI

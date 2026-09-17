@@ -25,7 +25,12 @@ globalThis.__obscura_report_uncaught = function (thrown) {
     const handler = globalThis.onerror;
     if (typeof handler === "function") {
       try {
-        if (handler.call(globalThis, message, filename, lineno, colno, thrown) === true) {
+        // The handler runs under its assignment snapshot's label, not the
+        // failing turn's.
+        if (__obscuraTraceCallWith(
+              __obscuraTraceHandlerFrom(globalThis, 'onerror'),
+              handler, globalThis,
+              [message, filename, lineno, colno, thrown]) === true) {
           handled = true;
         }
       } catch (_handlerError) {}

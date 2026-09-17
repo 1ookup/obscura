@@ -26,7 +26,17 @@ const _Request = class Request {
     else if (typeof URL === 'function' && input instanceof URL) url = input.href;
     else if (input && typeof input === 'object') url = input.url || input.href || String(input);
     else url = String(input);
-    try { url = new URL(String(url), globalThis.location?.href || 'about:blank').href; }
+    try {
+      const settings = typeof _environmentSettings === 'function' ? _environmentSettings() : null;
+      if (String(url) === "" && settings && settings.origin && settings.origin !== "null") {
+        url = settings.origin.endsWith("/") ? settings.origin : settings.origin + "/";
+      } else {
+        const base = (settings && settings.baseUrl)
+          || globalThis.location?.href
+          || 'about:blank';
+        url = new URL(String(url), base).href;
+      }
+    }
     catch (_error) { throw new TypeError("Failed to construct 'Request': Invalid URL"); }
     const state = {
       url: String(url),

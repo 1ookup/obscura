@@ -89,6 +89,19 @@ for (const name of [
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_init', '__obscura_hide_list', '__obscura_filter_prepare_stack_trace',
     '__obscura_csp_allows_unsafe_eval',
+    // Execution-source trace bridge (tools/trace-source.js + Rust
+    // trace_source.rs). The prehide loop preserves values, so the
+    // Rust-set flag/default survive this pass with enumerability fixed.
+    '__obscura_trace_from_enabled', '__obscura_trace_default_from',
+    '__obscura_trace_from',
+    '__obscuraTraceCurrent', '__obscuraTraceEnter', '__obscuraTraceLeave',
+    '__obscuraTraceBind', '__obscuraTraceCallWith', '__obscuraTraceDefineHandler',
+    '__obscuraTraceRecordHandler', '__obscuraTraceHandlerFrom',
+    '__obscuraTraceRawFunction',
+    // Rust-set when --tracelog-file configured a window.external.tracelog
+    // destination (tracelog.rs). Read by env/window/location.js, which installs
+    // the method only then, and preserved here like the flags above.
+    '__obscura_tracelog_enabled',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
@@ -393,11 +406,25 @@ _markNative(globalThis.dispatchEvent);
     try { return !!t && typeof t[_nidSym] === 'number'; }
     catch (_e) { return false; }
   }
+  // __obscura_hide_list is snapshot-time. A global the engine creates later --
+  // the interaction strategy's flags, the embedder-installed policy -- is not
+  // in it, and Cloudflare's challenge payload enumerated exactly those out of
+  // the window (`o.__obscura_click_listener_hooked`, `o.__obscura_click_listener_seen`,
+  // `o.__obscura_input_strategy`). Match the engine's own namespace by name so
+  // a later-created internal cannot come back through reflection. No page
+  // global carries this namespace, so nothing a page owns is hidden here.
+  function _isEngineName(name) {
+    if (typeof name !== 'string' || name.length < 4) { return false; }
+    return name.indexOf('obscura') !== -1 || name.indexOf('Obscura') !== -1 || name === 'Deno';
+  }
   function _filter(t, names) {
     var out = names;
     if (_isGlobal(t)) {
       var set = _set();
-      if (set) out = out.filter(function(name) { return !set.has(name); });
+      out = out.filter(function(name) {
+        if (_isEngineName(name)) { return false; }
+        return !set || !set.has(name);
+      });
       if (_isNonIsolatedFrameGlobal(t)) {
         out = out.filter(function(name) {
           return typeof name !== 'string' || !_nonIsolatedFrameHiddenNames.has(name);
@@ -426,7 +453,10 @@ _markNative(globalThis.dispatchEvent);
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
       var set = _set();
-      if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+      var ks = _oGOPN(all);
+      for (var i = 0; i < ks.length; i++) {
+        if (_isEngineName(ks[i]) || (set && set.has(ks[i]))) { delete all[ks[i]]; }
+      }
       if (_isNonIsolatedFrameGlobal(t)) {
         var frameKeys = _oGOPN(all);
         for (var fi = 0; fi < frameKeys.length; fi++) {
@@ -441,6 +471,31 @@ _markNative(globalThis.dispatchEvent);
       }
     }
     return all;
+  });
+  // Engine globals created after the snapshot-time hide list was captured --
+  // the interaction strategy flags, the embedder's input policy, the measure
+  // and clone helpers -- are installed as ordinary assignments, which makes
+  // them enumerable. The reflection-API filter above hides them from
+  // getOwnPropertyNames / ownKeys / keys / getOwnPropertyDescriptors, but V8
+  // walks `for..in` from the property table itself, so `for (var k in window)`
+  // still listed 19 engine names that no browser has. Enumerability is the only
+  // thing that walk consults, so make every engine-namespaced own global
+  // non-enumerable. `for..in` finds them precisely because our own enumeration
+  // helpers are filtered. Idempotent and cheap: call again after a late install.
+  define(globalThis, '__obscura_hide_engine_globals', function __obscura_hide_engine_globals() {
+    try {
+      for (var name in globalThis) {
+        if (typeof name !== 'string') { continue; }
+        if (!_isEngineName(name) && name.indexOf('__blob') !== 0) { continue; }
+        try {
+          var d = Object.getOwnPropertyDescriptor(globalThis, name);
+          if (d && d.enumerable) {
+            Object.defineProperty(globalThis, name, { enumerable: false });
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return undefined;
   });
 })();
 

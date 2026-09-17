@@ -54,6 +54,11 @@ pub(crate) struct WorkerEnvironment {
     /// Immutable identity copied from the creator realm. The worker installs
     /// it before any author source runs and uses it for its own fetch client.
     pub fingerprint: obscura_net::BrowserFingerprint,
+    /// Execution-source label for the trace streams (`worker(M)[creator]`),
+    /// computed by the host once the worker id is known. The creator half is
+    /// the constructing context's label at `new Worker(...)`, so nested
+    /// workers nest their labels.
+    pub trace_label: String,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
@@ -139,10 +144,15 @@ impl WorkerHost {
         let (out_tx, out_rx) = unbounded_channel::<String>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<IsolateHandle, String>>();
         let id = self.next_id;
+        // The environment carries the creator's label in `trace_label`; the
+        // host owns the worker counter, so the full label is minted here.
+        let mut environment = environment;
+        environment.trace_label = format!("worker({id})[{}]", environment.trace_label);
         let thread = std::thread::Builder::new()
             .name(format!("obscura-worker-{id}"))
             .spawn(move || {
                 worker_thread_main(
+                    id,
                     source,
                     script_url,
                     kind,
@@ -230,6 +240,9 @@ pub fn new_shared_worker_registry() -> SharedWorkerRegistryHandle {
 #[derive(Default)]
 pub struct SharedWorkerRegistry {
     workers: HashMap<String, SharedWorkerProcess>,
+    /// Worker-id counter shared by the trace labels, so dedicated and shared
+    /// workers within one browser context never collide on `worker(M)`.
+    next_worker: u32,
 }
 
 struct SharedWorkerProcess {
@@ -304,6 +317,10 @@ impl SharedWorkerRegistry {
             if self.workers.len() >= MAX_WORKERS {
                 return Err(format!("shared worker limit reached ({MAX_WORKERS} per context)"));
             }
+            self.next_worker = self.next_worker.saturating_add(1).max(1);
+            let mut environment = environment;
+            environment.trace_label =
+                format!("worker({})[{}]", self.next_worker, environment.trace_label);
             self.workers.insert(
                 key.clone(),
                 spawn_shared_worker_process(source, script_url, kind, environment)?,
@@ -350,6 +367,7 @@ fn spawn_shared_worker_process(
         .name("obscura-shared-worker".to_string())
         .spawn(move || {
             worker_thread_main(
+                0,
                 source,
                 script_url,
                 kind,
@@ -444,6 +462,7 @@ fn is_termination(error: &str) -> bool {
 }
 
 fn worker_thread_main(
+    id: u32,
     source: String,
     script_url: String,
     kind: String,
@@ -452,6 +471,10 @@ fn worker_thread_main(
     out_tx: UnboundedSender<String>,
     ready_tx: std_mpsc::Sender<Result<IsolateHandle, String>>,
 ) {
+    worker_debug(
+        id,
+        &format!("spawn kind={kind} url={script_url} source_len={}", source.len()),
+    );
     let panic_out_tx = out_tx.clone();
     let panic_ready_tx = ready_tx.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -479,8 +502,21 @@ fn worker_thread_main(
             let worker_secure = environment.secure_context;
             let worker_csp = environment.document_csp.take();
             let worker_shared = environment.shared;
+            let trace_label = environment.trace_label.clone();
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
             rt.set_fingerprint(&environment.fingerprint);
+            // The worker's ambient execution-source label: author scripts push
+            // script@<url> on top of it and message dispatches run on it.
+            // Skipped entirely in production runs (zero surface difference).
+            rt.set_trace_ambient(&trace_label);
+            if crate::trace_source::enabled() {
+                let label_json =
+                    serde_json::Value::String(trace_label.clone()).to_string();
+                let _ = rt.execute_script(
+                    "<obscura:worker-trace-label>",
+                    format!("globalThis.__obscura_trace_default_from = {label_json};").as_str(),
+                );
+            }
             // reqwest's pooled client is created inside the creator's Tokio
             // runtime. Build the worker's pool on this thread while retaining
             // the browser-context cookie jar, proxy and private-network
@@ -531,6 +567,7 @@ fn worker_thread_main(
                     &worker_origin,
                     worker_secure,
                     worker_shared,
+                    crate::tracelog::enabled(),
                 ),
             ) {
                 let _ = out_tx.send(error_entry(&format!("worker global setup failed: {e}")));
@@ -538,9 +575,13 @@ fn worker_thread_main(
             }
             // HTML "run a worker": the worker source executes exactly once.
             // Later messages only dispatch events (worker_event_loop below).
+            // The classic source is one labeled code unit, like a document
+            // script; modules keep the worker's ambient label (module graphs
+            // are not attributable per-unit on either engine).
             let source_result = if kind == "module" {
                 rt.load_inline_module(&source, &script_url, 30_000).await
             } else {
+                let _trace_script = crate::trace_source::push(&format!("script@{script_url}"));
                 rt.execute_script("<obscura:worker-script>", &source)
             };
             if let Err(e) = source_result {
@@ -549,7 +590,7 @@ fn worker_thread_main(
                     return;
                 }
             }
-            worker_event_loop(&mut rt, &mut inbox, &out_tx).await;
+            worker_event_loop(id, &mut rt, &mut inbox, &out_tx).await;
         });
     }));
     if result.is_err() {
@@ -560,11 +601,22 @@ fn worker_thread_main(
     }
 }
 
+/// `OBSCURA_DEBUG_WORKER=1` reports worker isolate lifecycle. The challenge's
+/// widget keeps a pool of short-lived workers and waits on their replies, so a
+/// worker that exits while it still has queued work is worth seeing directly.
+pub(crate) fn worker_debug(id: u32, message: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WORKER").is_some()) {
+        eprintln!("[worker-life] id={id} {message}");
+    }
+}
+
 /// Pump the worker's own event loop (timers, microtasks, async ops) while
 /// racing the page's message channel. Biased toward messages so a burst
 /// drains before timer work; between tasks `run_event_loop` performs the
 /// microtask checkpoints.
 async fn worker_event_loop(
+    id: u32,
     rt: &mut ObscuraJsRuntime,
     inbox: &mut UnboundedReceiver<String>,
     out_tx: &UnboundedSender<String>,
@@ -575,6 +627,7 @@ async fn worker_event_loop(
     }
     loop {
         if close_requested(rt) {
+            worker_debug(id, "exit: self.close() requested");
             return;
         }
         let turn = tokio::select! {
@@ -584,31 +637,43 @@ async fn worker_event_loop(
         };
         match turn {
             Turn::Message(Some(payload)) => {
+                worker_debug(id, &format!("dispatch {} bytes", payload.len()));
                 if !dispatch_message(rt, &payload, out_tx) {
+                    worker_debug(id, "exit: dispatch failed / terminated");
                     return;
                 }
             }
             // Channel closed: the page terminated us or went away.
-            Turn::Message(None) => return,
+            Turn::Message(None) => {
+                worker_debug(id, "exit: inbox closed (page dropped the worker)");
+                return;
+            }
             Turn::Idle(result) => {
                 if let Err(error) = result {
                     if is_termination(&error) {
+                        worker_debug(id, "exit: event loop terminated");
                         return;
                     }
                     let _ = out_tx.send(error_entry(&error));
                 }
                 if close_requested(rt) {
+                    worker_debug(id, "exit: self.close() after idle");
                     return;
                 }
                 // JS fully idle (no pending timers/ops): park until the next
                 // message or channel close instead of spinning.
                 match inbox.recv().await {
                     Some(payload) => {
+                        worker_debug(id, &format!("dispatch {} bytes (parked)", payload.len()));
                         if !dispatch_message(rt, &payload, out_tx) {
+                            worker_debug(id, "exit: dispatch failed / terminated");
                             return;
                         }
                     }
-                    None => return,
+                    None => {
+                        worker_debug(id, "exit: inbox closed while parked");
+                        return;
+                    }
                 }
             }
         }
@@ -646,6 +711,7 @@ fn worker_prep_script(
     origin: &str,
     secure: bool,
     shared: bool,
+    tracelog: bool,
 ) -> String {
     let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     WORKER_PREP_TEMPLATE
@@ -654,6 +720,7 @@ fn worker_prep_script(
         .replace("__OBSCURA_WORKER_ORIGIN__", &json(origin))
         .replace("__OBSCURA_WORKER_SECURE__", if secure { "true" } else { "false" })
         .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
+        .replace("__OBSCURA_TRACELOG__", if tracelog { "true" } else { "false" })
 }
 
 /// Executed in the fresh worker runtime before the worker source. The
@@ -669,6 +736,14 @@ fn worker_prep_script(
 const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
+  // Snapshot WorkerGlobalScope is a different function object than the one
+  // this prep installs, so `globalThis instanceof WorkerGlobalScope` is false
+  // here. An explicit flag is the only check fetch/Request can trust.
+  try {
+    defineProperty(G, '__obscuraIsWorker', {
+      value: true, writable: false, enumerable: false, configurable: false,
+    });
+  } catch (e) { G.__obscuraIsWorker = true; }
   var getOwnPropertyNames = Object.getOwnPropertyNames;
   // A worker's performance clock counts from the worker's own creation, like
   // Chrome's worker time origin. The startup snapshot otherwise leaves the
@@ -720,7 +795,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // the worker API installs onto a clean global.
   // ---------------------------------------------------------------------
   var WINDOW_ONLY = [
-    // Browsing-context self-references and the document tree
+    // Browsing-context self-references and the document tree.
+    //
+    // `external` is deliberately absent from this list even though stock
+    // Chrome's External is [Exposed=Window]: it is where the tracing primitive
+    // window.external.tracelog lives (tracelog.rs), so a worker that has to
+    // instrument its own VM reaches it as `external.tracelog(...)`. `window`
+    // itself stays deleted, as Chromium's DedicatedWorkerGlobalScope has no
+    // such binding.
     'window', 'document', 'top', 'parent', 'frames', 'frameElement', 'length',
     'opener', 'name',
     // Window-only constructors
@@ -763,6 +845,17 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   ];
   for (var i = 0; i < WINDOW_ONLY.length; i++) {
     try { delete G[WINDOW_ONLY[i]]; } catch (e) {}
+  }
+  // Chrome's DedicatedWorkerGlobalScope has no `document` binding at all.
+  // A leftover `document = null` still answers `typeof document === "object"`,
+  // and a challenge that branches on that (Turnstile's worker source) then
+  // skips fetch("") / /ci/ and takes a failing PAT path instead.
+  try { delete G.document; } catch (e) {}
+  if (Object.prototype.hasOwnProperty.call(G, 'document')) {
+    try {
+      defineProperty(G, 'document', { value: undefined, configurable: true });
+      delete G.document;
+    } catch (e) {}
   }
   // Element interfaces are open-ended (HTMLDivElement, SVGPathElement, ...);
   // matching the prefix covers the ones this build has and any added later.
@@ -996,7 +1089,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       }
       try { delete G.StorageManager.prototype.persist; } catch (e) {}
       nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
-        storageData(this); return { quota: 5000000000, usage: 0, usageDetails: {} };
+        // The same quota the document realm answers: one origin cannot report
+        // two, and the reference capture's worker reads 10 GiB. The challenge
+        // runs its storage probe in this realm, so a flat 5 GB here was the
+        // value that actually reached the payload.
+        storageData(this); return { quota: 10737418240, usage: 0, usageDetails: {} };
       });
       nativeMethod(G.StorageManager.prototype, 'persisted', 0, async function () {
         storageData(this); return false;
@@ -1073,23 +1170,45 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         }
         throw new TypeError('The provided value is not of type BufferSource.');
       }
+      // The backing file is the source of truth for cost, not for content: the
+      // node's `bytes` stay authoritative so a handle opened twice in a row
+      // reads what the other one wrote, and the ops below keep the file in step.
+      function syncOpen(node) {
+        try { return Deno.core.ops.op_opfs_sync_open(node.name || 'file', node.bytes); }
+        catch (e) { return null; }
+      }
       nativeMethod(SyncAccessHandle.prototype, 'close', 0, function () {
         var state = syncData(this);
         state.closed = true;
         state.node.syncOpen = false;
+        if (state.fd !== null) {
+          try { Deno.core.ops.op_opfs_sync_close(state.fd); } catch (e) {}
+          state.fd = null;
+        }
       });
       nativeMethod(SyncAccessHandle.prototype, 'flush', 0, function () {
-        syncData(this);
+        var state = syncData(this);
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_flush(state.fd);
       });
       nativeMethod(SyncAccessHandle.prototype, 'getSize', 0, function () {
-        return syncData(this).node.bytes.length;
+        var state = syncData(this);
+        if (state.fd !== null) {
+          try { return Deno.core.ops.op_opfs_sync_size(state.fd); } catch (e) {}
+        }
+        return state.node.bytes.length;
       });
       nativeMethod(SyncAccessHandle.prototype, 'read', 1, function (buffer, options) {
         var state = syncData(this), out = byteView(buffer);
         var at = options && options.at !== undefined
           ? Math.max(0, Number(options.at) || 0) : state.position;
         var count = Math.min(out.length, Math.max(0, state.node.bytes.length - at));
-        out.set(state.node.bytes.subarray(at, at + count));
+        if (state.fd !== null) {
+          var read = Deno.core.ops.op_opfs_sync_read(state.fd, at, count);
+          count = Math.min(count, read.length);
+          out.set(read.subarray(0, count));
+        } else {
+          out.set(state.node.bytes.subarray(at, at + count));
+        }
         state.position = at + count;
         return count;
       });
@@ -1100,6 +1219,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         next.set(state.node.bytes.subarray(0, size));
         state.node.bytes = next;
         state.position = Math.min(state.position, size);
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_truncate(state.fd, size);
       });
       nativeMethod(SyncAccessHandle.prototype, 'write', 1, function (buffer, options) {
         var state = syncData(this), input = byteView(buffer);
@@ -1109,6 +1229,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         var next = new Uint8Array(size);
         next.set(state.node.bytes); next.set(input, at);
         state.node.bytes = next; state.position = at + input.length;
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_write(state.fd, at, input);
         return input.length;
       });
       nativeGetter(SyncAccessHandle.prototype, 'mode', function () { syncData(this); return 'readwrite'; });
@@ -1122,7 +1243,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
           if (node.syncOpen) throw new DOMException('', 'NoModificationAllowedError');
           node.syncOpen = true;
           var access = Object.create(SyncAccessHandle.prototype);
-          syncAccessState.set(access, { node: node, position: 0, closed: false });
+          syncAccessState.set(access, {
+            node: node, position: 0, closed: false, fd: syncOpen(node),
+          });
           return access;
         });
       nativeGetter(WorkerNavigator.prototype, 'storage', function () { return storageManager; });
@@ -1347,6 +1470,33 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
     }
     try { if (G.crypto) delete G.crypto.subtle; } catch (e) {}
+  }
+
+  // A window realm gets external.tracelog from the bootstrap, gated on whether
+  // the host configured a destination. A worker boots from the page snapshot,
+  // where that gate was already false at snapshot build time, so the primitive
+  // has to be installed here too, or the one scope an anti-bot payload owns
+  // outright is the one scope that cannot be instrumented. Present only when
+  // the host asked for tracing, same as the window realm.
+  if (__OBSCURA_TRACELOG__) {
+    try {
+      var ExternalCtor = G.External;
+      if (ExternalCtor && ExternalCtor.prototype &&
+          typeof ExternalCtor.prototype.tracelog !== 'function') {
+        defineProperty(ExternalCtor.prototype, 'tracelog', {
+          value: function tracelog(key, value) {
+            var json;
+            try { json = JSON.stringify(value); } catch (e) { json = undefined; }
+            try {
+              Deno.core.ops.op_tracelog(
+                typeof key === 'string' ? key : String(key),
+                typeof json === 'string' ? json : '');
+            } catch (e) {}
+          },
+          writable: true, enumerable: true, configurable: true,
+        });
+      }
+    } catch (e) {}
   }
 })();
 "#;
@@ -1783,6 +1933,36 @@ mod tests {
         );
     }
 
+    /// Relative fetch/Request inside a blob worker is resolved against the
+    /// creating document origin, not the blob: script URL. fetch("") from a
+    /// Turnstile widget worker has to hit https://challenges.cloudflare.com/,
+    /// not re-fetch the worker source.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_worker_relative_fetch_uses_creator_origin() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x");
+        rt.run_page_init();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const source = "postMessage({ request: new Request('').url, empty: new URL('', self.origin + '/').href })";
+            const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify([__got[0].request, __got[0].empty])")
+                .unwrap(),
+            serde_json::json!(
+                r#"["https://challenges.cloudflare.com/","https://challenges.cloudflare.com/"]"#
+            ),
+        );
+    }
+
     /// `new Worker(url, {name})` reaches `self.name`, and the default is the
     /// empty string rather than an absent binding.
     #[tokio::test(flavor = "current_thread")]
@@ -2029,6 +2209,39 @@ mod tests {
             ),
         )
         .await;
+    }
+
+    /// Turnstile's widget worker is `onmessage = e => e.isTrusted && eval(e.data)`.
+    /// The posted payload is source, not a structured clone of an object, and
+    /// fetch("") inside it has to resolve to the creating document origin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_worker_evals_posted_source_and_relative_fetch_hits_creator_origin() {
+        // `doc` is the probe: the blob's own bootstrap evals the posted source
+        // inside the worker scope, where `document` does not exist. A scope that
+        // answers "object" evaluated it in the creating document instead.
+        let mut rt = page_runtime();
+        rt.set_url("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x");
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage = function (e) {"
+              + " if (e.isTrusted && e.origin === '' && e.source === null) eval(e.data);"
+              + "};";
+            const url = URL.createObjectURL(new Blob([src], {type: 'text/javascript'}));
+            globalThis.__got = [];
+            const w = new Worker(url);
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.postMessage("postMessage({ doc: typeof document, url: new Request('').url })");
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"doc":"undefined","url":"https://challenges.cloudflare.com/"}"#
+            ),
+        );
     }
 
     /// A MessageEvent has to arrive with its whole IDL, not just `data`. A

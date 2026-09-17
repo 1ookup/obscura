@@ -3,6 +3,32 @@
 // text or hostnames. The click path uses the same trusted activation behavior
 // as CDP Input and the natural type helper emits one input event per code unit.
 
+// Strategy state lives in this module, not on the global object. These flags
+// are written while a page is running, long after __obscura_hide_list was
+// snapshotted, and a plain `globalThis.__obscura_x = true` is an enumerable
+// own property of window: Cloudflare's challenge payload enumerated
+// `o.__obscura_click_listener_hooked` and `o.__obscura_click_listener_seen`
+// straight out of the widget's window and submitted them. `hooked` says the
+// listener strategy already ran, `clickSeen` that the page registered a click
+// handler, `trajectoryFired` that one activation was delivered, and `pending`
+// that one is in flight.
+const _obscuraStrategy = {
+  hooked: false,
+  clickSeen: false,
+  trajectoryFired: false,
+  pending: false,
+  done: false,
+};
+
+// The embedder assigns this before calling the scheduler, so it has to stay on
+// the global object; making it non-enumerable up front keeps that assignment
+// from creating a window property a page can list.
+try {
+  Object.defineProperty(globalThis, '__obscura_input_strategy', {
+    value: undefined, writable: true, enumerable: false, configurable: true,
+  });
+} catch (e) {}
+
 // Recorded approach trajectories. A widget that guards against automation
 // measures the approach, not just the activation, so the delivery below
 // replays a human-shaped path: a run of decreasing pointer steps with
@@ -111,8 +137,8 @@ function __obscura_deliver_activation(target) {
 // the registration only decides *when* to act; the policy selector still
 // decides *where*, keeping the target choice with the embedder.
 function __obscura_install_click_listener_strategy(policy) {
-  if (globalThis.__obscura_click_listener_hooked) return;
-  globalThis.__obscura_click_listener_hooked = true;
+  if (_obscuraStrategy.hooked) return;
+  _obscuraStrategy.hooked = true;
   const proto = globalThis.EventTarget && globalThis.EventTarget.prototype;
   if (!proto || typeof proto.addEventListener !== 'function') return;
   const original = proto.addEventListener;
@@ -149,23 +175,23 @@ function __obscura_install_click_listener_strategy(policy) {
   const schedule = (target) => {
     // One trajectory per document: further handlers are invoked by the single
     // activation, exactly as a real click would.
-    globalThis.__obscura_trajectory_fired = true;
+    _obscuraStrategy.trajectoryFired = true;
     const delay = Math.max(0, Number(policy.delayMs) || 0);
-    globalThis.__obscura_input_strategy_pending = true;
+    _obscuraStrategy.pending = true;
     setTimeout(() => {
-      globalThis.__obscura_input_strategy_pending = false;
+      _obscuraStrategy.pending = false;
       if (__obscura_deliver_activation(target)) {
-        globalThis.__obscura_input_strategy_done = true;
+        _obscuraStrategy.done = true;
       } else {
-        globalThis.__obscura_trajectory_fired = false;
+        _obscuraStrategy.trajectoryFired = false;
       }
     }, delay);
   };
   proto.addEventListener = function(type, listener, options) {
     const result = original.call(this, type, listener, options);
     try {
-      if (String(type) === 'click' && !globalThis.__obscura_trajectory_fired) {
-        globalThis.__obscura_click_listener_seen = true;
+      if (String(type) === 'click' && !_obscuraStrategy.trajectoryFired) {
+        _obscuraStrategy.clickSeen = true;
         const target = resolveTarget(this);
         if (target) schedule(target);
       }
@@ -175,11 +201,11 @@ function __obscura_install_click_listener_strategy(policy) {
   // A delegated handler is registered before the control it guards is
   // necessarily in the tree, so retry briefly once the registration is seen.
   const retry = setInterval(() => {
-    if (globalThis.__obscura_trajectory_fired || globalThis.__obscura_input_strategy_done) {
+    if (_obscuraStrategy.trajectoryFired || _obscuraStrategy.done) {
       clearInterval(retry);
       return;
     }
-    if (!globalThis.__obscura_click_listener_seen) return;
+    if (!_obscuraStrategy.clickSeen) return;
     const target = resolveTarget(null);
     if (target) {
       clearInterval(retry);
@@ -191,26 +217,26 @@ function __obscura_install_click_listener_strategy(policy) {
 
 globalThis.__obscura_schedule_input_strategy = function() {
   const policy = globalThis.__obscura_input_strategy;
-  if (!policy || globalThis.__obscura_input_strategy_done) return;
+  if (!policy || _obscuraStrategy.done) return;
   if (policy.listener) {
     // The control is discovered from the page's own registration, so nothing
     // is polled and no coordinate is guessed.
     __obscura_install_click_listener_strategy(policy);
     return;
   }
-  if (!policy.selector || globalThis.__obscura_input_strategy_pending) return;
+  if (!policy.selector || _obscuraStrategy.pending) return;
   const run = () => {
     let target;
     try { target = document.querySelector(policy.selector); } catch (e) { return; }
     if (!target || (target.matches && target.matches(':disabled'))) return;
-    globalThis.__obscura_input_strategy_pending = true;
+    _obscuraStrategy.pending = true;
     const activate = () => {
-      globalThis.__obscura_input_strategy_pending = false;
+      _obscuraStrategy.pending = false;
       // The recorded approach is shared with the listener strategy, so the
       // event family, ordering and timing are identical however the control
       // was discovered.
       if (__obscura_deliver_activation(target)) {
-        globalThis.__obscura_input_strategy_done = true;
+        _obscuraStrategy.done = true;
       }
     };
     const delay = Math.max(0, Number(policy.delayMs) || 0);
@@ -250,7 +276,7 @@ globalThis.__obscura_schedule_input_strategy = function() {
   // window as the mutation observer, and stop as soon as activation succeeds.
   if (typeof setInterval === 'function') {
     const retry = setInterval(() => {
-      if (globalThis.__obscura_input_strategy_done) {
+      if (_obscuraStrategy.done) {
         clearInterval(retry);
         return;
       }

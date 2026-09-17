@@ -85,10 +85,28 @@ globalThis.fetch = async (input, init = {}) => {
     : (inputRequest
       ? inputRequest.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
-  if (url && !url.includes('://')) {
+  // Any input without a scheme is a relative reference, and the empty string
+  // is one of them: `fetch("")` requests the environment's own URL. Requiring
+  // a non-empty string here left the empty input unresolved and turned a
+  // valid request into a network failure, which is not what a page observes.
+  if (url === "") {
+    const origin = _environmentSettings().origin;
+    if (origin && origin !== "null") {
+      url = origin.endsWith("/") ? origin : origin + "/";
+    }
+    console.error('[fetch-empty]', JSON.stringify(_environmentSettings()));
+  }
+  if (!url.includes('://')) {
     try {
-      const base = _environmentSettings().baseUrl;
-      url = new URL(url, base).href;
+      const settings = _environmentSettings();
+      url = new URL(url, settings.baseUrl).href;
+      // A leftover blob:/data: location.href as the base would make fetch("")
+      // re-fetch the worker source from the in-memory blob store. Turnstile's
+      // widget worker posts `fetch("")` expecting the creating document origin.
+      if (settings.origin && settings.origin !== "null"
+          && (url.startsWith("blob:") || url.startsWith("data:"))) {
+        url = new URL(String(input === "" || input == null ? "" : input), settings.origin + "/").href;
+      }
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (inputRequest ? inputRequest.method : "GET");
@@ -122,6 +140,28 @@ globalThis.fetch = async (input, init = {}) => {
     if (inputRequest.bodyUsed) throw new TypeError('Body is unusable');
     if (inputRequest.body !== null && inputRequest.body !== undefined) inputRequest.bodyUsed = true;
   }
+  // Fetch's `cache` option reaches the server as request headers. The names
+  // and values below are the ones Chrome puts on the wire for each mode, taken
+  // from a same-origin and a cross-origin measurement of all three modes:
+  // `no-store` and `reload` send `no-cache`, `no-cache` sends `max-age=0` and
+  // no `Pragma`. They are appended by the network layer after the CORS check,
+  // so the op is told which of them this shim added and leaves them out of the
+  // preflight decision; an author-supplied `Cache-Control` is still the page's.
+  const fetchCache = init.cache !== undefined
+    ? String(init.cache)
+    : (inputRequest && inputRequest.cache !== undefined ? String(inputRequest.cache) : "default");
+  const uaCacheHeaders = [];
+  if (fetchCache === "no-store" || fetchCache === "no-cache" || fetchCache === "reload") {
+    const hasHeader = (name) => Object.keys(_h).some(key => key.toLowerCase() === name);
+    if (!hasHeader("cache-control")) {
+      _h["Cache-Control"] = fetchCache === "no-cache" ? "max-age=0" : "no-cache";
+      uaCacheHeaders.push("cache-control");
+    }
+    if (fetchCache !== "no-cache" && !hasHeader("pragma")) {
+      _h["Pragma"] = "no-cache";
+      uaCacheHeaders.push("pragma");
+    }
+  }
   const body = _serializeBody(initBody, _h);
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (inputRequest ? inputRequest.mode : "cors");
@@ -154,6 +194,10 @@ globalThis.fetch = async (input, init = {}) => {
         policy: _environmentReferrerPolicy(),
         redirect: fetchRedirect,
         root: _environmentDocumentRoot(),
+        uaHeaders: uaCacheHeaders,
+        // Deterministic execution-source capture for the async op body (see
+        // _environmentReferrerContext).
+        from: __obscuraTraceCurrent(),
       })
     );
     if (fetchSignal) {
@@ -182,7 +226,12 @@ globalThis.fetch = async (input, init = {}) => {
     throw err;
   }
   if (parsed.corsBlocked) {
-    throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
+    // Chrome's message for a CORS-blocked fetch is the same opaque string as a
+    // network error; the reason goes to the console, not into the exception.
+    // The challenge reads this string back out of a worker (`Failed to fetch`)
+    // and compares it against the reference run, so the detail the op carries
+    // must not leak into `message`. It stays in the op's own log.
+    throw new TypeError('Failed to fetch');
   }
   // A redirect the op refused to take. "error" is a network error, and carries
   // no more detail than any other one; "manual" is an opaque-redirect

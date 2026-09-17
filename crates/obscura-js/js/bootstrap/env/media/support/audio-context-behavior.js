@@ -33,13 +33,15 @@ function _audioBufferCopyToChannel(buffer, source, channel, start) {
 }
 
 function _audioParam(value, min = -3.4028235e38, max = 3.4028235e38) {
-  return {
+  // An AudioParam is its own interface, so a probe reading the prototype of a
+  // filter's `frequency` gets `[object AudioParam]`, not a bare object.
+  return _bindInterface({
     value,
     defaultValue: value,
     minValue: min,
     maxValue: max,
     setValueAtTime() {},
-  };
+  }, 'AudioParam');
 }
 
 // Graph plumbing for the offline renderer. Node objects stay inert stubs to
@@ -113,12 +115,12 @@ function _audioContextInitialize(context) {
   context.state = 'running';
   context.currentTime = 0;
   context.baseLatency = _fp('audioBaseLatency');
-  context.destination = {
+  context.destination = _bindInterface({
     maxChannelCount: 2,
     numberOfInputs: 1,
     numberOfOutputs: 0,
     channelCount: 2,
-  };
+  }, 'AudioDestinationNode');
   context._listeners = {};
 }
 function _audioContextAddEventListener(context, type, callback) {
@@ -201,14 +203,14 @@ function _audioContextCreateGain(context) {
   }, 'GainNode');
 }
 function _audioContextCreateBiquadFilter(context) {
-  return {
+  return _bindInterface({
     context,
     type: 'lowpass',
     frequency: _audioParam(350, 0, 22050),
     Q: _audioParam(1, 0.0001, 1000),
     gain: _audioParam(0, -40, 40),
     connect() {}, disconnect() {},
-  };
+  }, 'BiquadFilterNode');
 }
 function _audioContextCreateBufferSource(context) {
   return _bindInterface({

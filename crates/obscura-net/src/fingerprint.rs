@@ -158,7 +158,7 @@ pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
         if !language.is_empty() {
             overrides.language = Some(language.clone());
             if std::env::var("OBSCURA_LANGUAGES").is_err() {
-                overrides.languages = Some(vec![language]);
+                overrides.languages = Some(chrome_languages(&language));
             }
         }
     }
@@ -183,6 +183,61 @@ pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
 pub const MACOS_UA_PLATFORM_VERSION: &str = "26.4.0";
 pub const WINDOWS_UA_PLATFORM_VERSION: &str = "15.0.0";
 
+/// The macOS work area sits below the menu bar, so a real macOS session always
+/// reports `availTop > 0` and `availHeight < height`. A macOS identity that
+/// answered the full screen height at the origin is a shape no macOS Chrome
+/// produces, on a notched or a classic display alike.
+pub const MACOS_MENUBAR_INSET: u32 = 33;
+
+/// Real Chrome builds, by major version.
+///
+/// Chrome's User-Agent is reduced to `M.0.0.0`, but `sec-ch-ua-full-version`,
+/// `sec-ch-ua-full-version-list`, `uaFullVersion` and `fullVersionList` carry
+/// the build Chrome actually shipped, and no Chrome has ever published
+/// `M.0.0.0` there. Answering the reduced token in the full-version fields is
+/// not a conservative unknown: it is a value the browser being claimed cannot
+/// produce, and it is trivially checkable. Majors absent from this table keep
+/// the User-Agent token, because a wrong specific build is no better.
+const CHROME_BUILDS: &[(&str, &str)] = &[
+    ("151", "151.0.7922.76"),
+    ("149", "149.0.7827.0"),
+    ("146", "146.0.7680.80"),
+];
+
+/// The User-Agent's browser token, with a real build substituted when the
+/// token is Chrome's reduced `M.0.0.0` form and the major is a known build.
+fn resolve_browser_version(token: String) -> String {
+    let reduced = token.ends_with(".0.0.0")
+        && token
+            .split('.')
+            .next()
+            .is_some_and(|major| major.chars().all(|c| c.is_ascii_digit()) && !major.is_empty());
+    if !reduced {
+        return token;
+    }
+    let major = token.split('.').next().unwrap_or_default();
+    CHROME_BUILDS
+        .iter()
+        .find(|(known, _)| *known == major)
+        .map(|(_, build)| (*build).to_string())
+        .unwrap_or(token)
+}
+
+/// `navigator.languages` as Chrome derives it: the selected language, then its
+/// base language as a lower-priority fallback. A single `zh-CN` entry is the
+/// one thing Chrome never reports for a `zh-CN` profile, and the same list
+/// backs the `Accept-Language` header (`zh-CN,zh;q=0.9`), so both surfaces
+/// disagree with a real session when the fallback is missing.
+fn chrome_languages(language: &str) -> Vec<String> {
+    let mut languages = vec![language.to_string()];
+    if let Some((base, _)) = language.split_once('-') {
+        if !base.is_empty() && base != language {
+            languages.push(base.to_string());
+        }
+    }
+    languages
+}
+
 impl Default for BrowserFingerprint {
     fn default() -> Self {
         Self::from_user_agent(DEFAULT_USER_AGENT)
@@ -195,7 +250,8 @@ impl BrowserFingerprint {
     /// versions. Embedders with real values supply them as policy overrides.
     pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
         let user_agent = user_agent.into();
-        let browser_version = chrome_version(&user_agent).unwrap_or_default();
+        let browser_version =
+            resolve_browser_version(chrome_version(&user_agent).unwrap_or_default());
         let browser_major = browser_version
             .split('.')
             .next()
@@ -304,8 +360,11 @@ impl BrowserFingerprint {
                     width: 1440,
                     height: 900,
                     avail_width: 1440,
-                    avail_height: 900,
-                    avail_top: 0,
+                    // The macOS work area starts below the menu bar, so the
+                    // default has to be smaller than the screen even before an
+                    // embedder supplies its host's real metrics.
+                    avail_height: 900 - MACOS_MENUBAR_INSET,
+                    avail_top: MACOS_MENUBAR_INSET as i32,
                     avail_left: 0,
                     device_scale_factor: 2.0,
                     outer_width: 0,
@@ -417,7 +476,7 @@ impl BrowserFingerprint {
             }).collect();
         }
         if language_overridden && !languages_overridden {
-            self.languages = vec![self.language.clone()];
+            self.languages = chrome_languages(&self.language);
         } else if languages_overridden && !language_overridden {
             if let Some(first) = self.languages.first().filter(|value| !value.is_empty()) {
                 self.language = first.clone();
@@ -427,7 +486,7 @@ impl BrowserFingerprint {
             self.language = default_language();
         }
         if self.languages.is_empty() {
-            self.languages = vec![self.language.clone()];
+            self.languages = chrome_languages(&self.language);
         }
         self
     }
@@ -662,8 +721,11 @@ mod tests {
             ..FingerprintOverrides::default()
         });
         assert_eq!(fingerprint.language, "zh-CN");
-        assert_eq!(fingerprint.languages, vec!["zh-CN"]);
-        assert_eq!(fingerprint.accept_language(), "zh-CN");
+        // Chrome reports the selected language and its base language as the
+        // fallback, and the same list backs Accept-Language. A bare `zh-CN`
+        // would be the one thing no zh-CN Chrome session reports.
+        assert_eq!(fingerprint.languages, vec!["zh-CN", "zh"]);
+        assert_eq!(fingerprint.accept_language(), "zh-CN,zh;q=0.9");
 
         let languages = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
             languages: Some(vec!["zh-CN".to_string(), "en-US".to_string()]),

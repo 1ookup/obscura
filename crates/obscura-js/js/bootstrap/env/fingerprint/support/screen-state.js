@@ -30,18 +30,30 @@ function _screenSlot(instance, name) { return instance[_screenSlots][name]; }
 function _screenSetSlot(instance, name, value) { instance[_screenSlots][name] = value; }
 function _screenOrientationFor(instance) { return _screenSlot(instance, 'orientation'); }
 function _screenApplySize(w, h, emulated, availW, availH, availTop, availLeft) {
-  const resolvedAvailW = Number.isFinite(availW) ? availW : w;
-  const resolvedAvailH = Number.isFinite(availH) ? availH : (emulated ? h : h - 40);
+  // The available area is the screen minus whatever sits along its edges (menu
+  // bar, taskbar, dock), so it can never extend past the screen. An embedder
+  // that supplies both an offset and a full-height available area contradicts
+  // itself -- `availTop: 30, availHeight: 900, height: 900` describes a menu bar
+  // overhanging the display -- and that contradiction is readable from a page.
+  // The offset is honored and the extent shrinks, which is what a browser
+  // reports.
+  const top = Number.isFinite(availTop) ? Math.max(0, availTop) : 0;
+  const left = Number.isFinite(availLeft) ? Math.max(0, availLeft) : 0;
+  const resolvedAvailW = Math.min(Number.isFinite(availW) ? availW : w, Math.max(0, w - left));
+  const resolvedAvailH = Math.min(
+    Number.isFinite(availH) ? availH : (emulated ? h : h - 40),
+    Math.max(0, h - top),
+  );
   if (globalThis.screen instanceof Screen) {
     const slots = globalThis.screen[_screenSlots];
     slots.w = w;
     slots.h = h;
     slots.availW = resolvedAvailW;
     slots.availH = resolvedAvailH;
-    slots.availTop = Number.isFinite(availTop) ? availTop : 0;
-    slots.availLeft = Number.isFinite(availLeft) ? availLeft : 0;
+    slots.availTop = top;
+    slots.availLeft = left;
   } else {
-    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH, availTop, availLeft);
+    globalThis.screen = new Screen(w, h, resolvedAvailW, resolvedAvailH, top, left);
   }
 }
 // page-init and older realm snippets use the original bridge name. Keep the

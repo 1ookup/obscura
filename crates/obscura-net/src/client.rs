@@ -433,6 +433,21 @@ impl ResourceRequest {
     }
 }
 
+/// Whether this request is a subframe document navigation, which the frame
+/// loader marks with `Sec-Fetch-Dest: iframe`.
+///
+/// The reference challenge run answers the widget document request with both
+/// `Accept-CH` and `Critical-CH` and fetches that document **once**. Retrying it
+/// for the missing hints re-issues the request, and the server then issues a
+/// second widget session for a document only one of which is ever committed.
+/// The hints a retry would add are not permitted in a cross-origin subframe
+/// either, so the retry cannot change the response it is retrying.
+pub(crate) fn is_frame_document_request(request: &ResourceRequest) -> bool {
+    request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("sec-fetch-dest") && value.eq_ignore_ascii_case("iframe")
+    })
+}
+
 pub(crate) fn client_hint_origin(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
@@ -1892,6 +1907,10 @@ impl ObscuraHttpClient {
             }
             if request.mode == RequestMode::Navigate {
                 headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+                // A browser revalidates the document on navigation; the header
+                // belongs to the main-document request alone.
+                headers.entry(HeaderName::from_static("cache-control"))
+                    .or_insert(HeaderValue::from_static("max-age=0"));
             }
             headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
                 HeaderValue::from_static(crate::fingerprint::DEFAULT_USER_AGENT)
@@ -2057,7 +2076,9 @@ impl ObscuraHttpClient {
                     .or_default()
                     .extend(hints);
             }
-            if !client_hint_retry && !critical_hints.is_empty()
+            if !client_hint_retry
+                && !critical_hints.is_empty()
+                && !is_frame_document_request(&request)
                 && critical_hints
                     .iter()
                     .any(|hint| !sent_client_hints.contains(hint))

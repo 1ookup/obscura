@@ -1,3 +1,13 @@
+// One color slot per document, kept in a closure map so the only names the five
+// legacy attributes add to Document.prototype are the five Chrome exposes.
+const _legacyDocColorSlots = new WeakMap();
+function _documentLegacyColor(doc, name, value) {
+  var store = _legacyDocColorSlots.get(doc);
+  if (!store) { store = Object.create(null); _legacyDocColorSlots.set(doc, store); }
+  if (arguments.length > 2) { store[name] = value == null ? '' : String(value); return; }
+  return name in store ? store[name] : '';
+}
+
 class Document extends Node {
   constructor(nid) {
     // Node's constructor stores the handle under _nidSym already, which keeps
@@ -239,7 +249,10 @@ class Document extends Node {
     let requested;
     try { requested = new URL(String(requestedOrigin), this.URL).origin; }
     catch (_error) { throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError'); }
-    if (requested === this.location.origin) return;
+    // Read the Window's location rather than `this.location`: the latter is an
+    // own accessor that page-init installs per realm, and this method must not
+    // depend on that having run.
+    if (requested === globalThis.location.origin) return;
     throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError');
   }
   captureEvents() { _documentPrivacyRoot(this, 'captureEvents'); }
@@ -324,8 +337,27 @@ class Document extends Node {
     }
     return '';
   }
-  get location() { return globalThis.location; }
-  set location(url) { _navigateCurrentContext(_resolveUrl(String(url)), 'GET', ''); }
+  // `location` is deliberately not declared here. It is [LegacyUnforgeable], so
+  // Chrome exposes it as an own accessor of each document instance and
+  // Document.prototype carries no `location` at all (page-init installs the
+  // instance one, per realm). Declaring it in the class body put it on the
+  // prototype as well, where an enumeration sees an extra name in the wrong
+  // position.
+  // The legacy color attributes: Chrome still carries all five on the document
+  // and answers "" while they are unset, which is what a prototype enumeration
+  // and a direct read both see. They are absent without this, and a missing
+  // member is a louder tell than an empty one. The store is a closure rather
+  // than a prototype helper, so nothing extra lands in the enumeration.
+  get fgColor() { return _documentLegacyColor(this, 'fgColor'); }
+  set fgColor(v) { _documentLegacyColor(this, 'fgColor', v); }
+  get linkColor() { return _documentLegacyColor(this, 'linkColor'); }
+  set linkColor(v) { _documentLegacyColor(this, 'linkColor', v); }
+  get vlinkColor() { return _documentLegacyColor(this, 'vlinkColor'); }
+  set vlinkColor(v) { _documentLegacyColor(this, 'vlinkColor', v); }
+  get alinkColor() { return _documentLegacyColor(this, 'alinkColor'); }
+  set alinkColor(v) { _documentLegacyColor(this, 'alinkColor', v); }
+  get bgColor() { return _documentLegacyColor(this, 'bgColor'); }
+  set bgColor(v) { _documentLegacyColor(this, 'bgColor', v); }
   // Scoped frame documents use the same Document prototype as the top-level
   // document. Resolve their WindowProxy through the internal slot so the
   // inherited member keeps Chrome's prototype enumeration position.

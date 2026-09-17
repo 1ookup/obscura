@@ -813,7 +813,10 @@ class Element extends Node {
     if (!src) { cache[name] = null; return null; }
     if (!_inlineEventHandlerCspAllows()) { cache[name] = null; return null; }
     try {
-      cache[name] = new Function('event', src);
+      // Raw Function: an attribute-compiled handler is engine plumbing, not
+      // a page-authored new Function product, so it stays unproxied under
+      // trace and runs on the dispatch turn's ambient label.
+      cache[name] = new (__obscuraTraceRawFunction || Function)('event', src);
     } catch (e) {
       cache[name] = null;
     }
@@ -1551,10 +1554,20 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
+    // Chromium's offset* describe the layout border box and ignore visual
+    // transforms; getBoundingClientRect() is the transformed one.
+    const geometry = this._renderBoxGeometry();
+    if (geometry && Number.isFinite(geometry.layoutWidth)) {
+      return Math.round(Math.max(0, geometry.layoutWidth));
+    }
     return Math.round(this.getBoundingClientRect().width);
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    const geometry = this._renderBoxGeometry();
+    if (geometry && Number.isFinite(geometry.layoutHeight)) {
+      return Math.round(Math.max(0, geometry.layoutHeight));
+    }
     return Math.round(this.getBoundingClientRect().height);
   }
   get offsetTop() { return Math.round(this.getBoundingClientRect().top); }
@@ -1627,11 +1640,11 @@ class Element extends Node {
       const raw = Deno.core.ops.op_layout_geometry(String(this[_nidSym] | 0));
       if (!raw) return null;
       const geometry = JSON.parse(raw);
-      if (geometry
-          && Number.isFinite(geometry.x)
-          && Number.isFinite(geometry.y)
-          && Number.isFinite(geometry.width)
-          && Number.isFinite(geometry.height)) {
+      // Consumers validate the fields they use: getBoundingClientRect() needs
+      // a finite transformed rect, offsetWidth/Height only the layout size.
+      // A pathological transform scale overflows binary32 and nulls the rect
+      // fields in transit while the layout box stays finite.
+      if (geometry && typeof geometry === 'object') {
         return geometry;
       }
     } catch (_error) {}
@@ -1812,7 +1825,13 @@ class Element extends Node {
     // build, so probe with typeof and fall through to the synthetic rect below.
     const geometry = this._renderBoxGeometry();
     if (geometry !== undefined) {
-      if (geometry) return this._rectFromRenderGeometry(geometry);
+      if (geometry
+          && Number.isFinite(geometry.x)
+          && Number.isFinite(geometry.y)
+          && Number.isFinite(geometry.width)
+          && Number.isFinite(geometry.height)) {
+        return this._rectFromRenderGeometry(geometry);
+      }
       // CSSOM View: an element without an associated box has an all-zero
       // bounding rect. Do not leak the non-render 100x20 compatibility cell.
       return {

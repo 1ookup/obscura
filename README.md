@@ -492,6 +492,17 @@ Scrape multiple URLs in parallel with worker processes.
 | `--quiet` | off | Suppress scrape progress on stderr |
 | `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL for all workers |
 
+### Tracing
+
+`--tracelog-file FILE` enables `window.external.tracelog(key, value)` for page
+code, the tracing primitive of the instrumented builds Obscura is compared
+against, and appends one `{"t","k","v"}` JSON line per call to FILE. It is
+reachable from the document, frame and worker realms alike; without the flag
+the `External` surface stays Chrome's stock one. Native property access
+(`--trace-api-file`) and host-op/console (`--trace-op-file`) records are the
+separate streams, all three documented in
+[docs/native-trace.md](docs/native-trace.md).
+
 ## MCP (Model Context Protocol)
 
 Obscura ships an MCP server that exposes browser automation tools to AI agents (Claude Desktop, Cursor, etc.).

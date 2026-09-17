@@ -33,7 +33,7 @@ function _sharedWorkerError(entry, message) {
   for (const worker of entry.workers.slice()) worker._dispatchError(message);
 }
 
-function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
+function _sharedWorkerSpawned(entry, source, finalUrl, workerType, creatorFrom, workerCsp = '') {
   if (entry.failed) return;
   let id;
   const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
@@ -41,7 +41,9 @@ function _sharedWorkerSpawned(entry, source, finalUrl, workerType) {
     id = Deno.core.ops.op_shared_worker_connect(
       String(source), String(finalUrl), String(workerType), String(entry.name),
       creatorUrl, JSON.stringify(_fingerprint()),
-      String(_environmentDocumentRoot()), _environmentDocumentCsp(), true,
+      String(_environmentDocumentRoot()), _environmentDocumentCsp(),
+      String(creatorFrom || 'window'),
+      String(workerCsp || ''),
     );
   } catch (e) { _sharedWorkerError(entry, e && e.message ? e.message : String(e)); return; }
   entry.id = id;
@@ -101,7 +103,8 @@ globalThis.SharedWorker = class SharedWorker {
 
     const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
     if (!(resolved.startsWith('http:') || resolved.startsWith('https:')
-          || resolved.startsWith('data:') || typeof blobSource === 'string')) {
+          || resolved.startsWith('data:') || resolved.startsWith('blob:')
+          || typeof blobSource === 'string')) {
       throw new DOMException(
         "Failed to construct 'SharedWorker': unsupported script URL scheme.", 'SecurityError');
     }
@@ -136,12 +139,15 @@ globalThis.SharedWorker = class SharedWorker {
     _sharedWorkerSend(entry, JSON.stringify({ connect: true, c: connectionId }));
 
     if (!fresh) return;
+    // First construction of this entry mints the worker; its label carries
+    // this constructor call's execution source as the creator.
+    const creatorFrom = __obscuraTraceCurrent();
     if (typeof blobSource === 'string') {
-      _sharedWorkerSpawned(entry, blobSource, resolved, workerType);
+      _sharedWorkerSpawned(entry, blobSource, resolved, workerType, creatorFrom);
       return;
     }
     if (resolved.startsWith('data:')) {
-      _sharedWorkerSpawned(entry, _workerScriptFromDataUrl(resolved), resolved, workerType);
+      _sharedWorkerSpawned(entry, _workerScriptFromDataUrl(resolved), resolved, workerType, creatorFrom);
       return;
     }
     if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
@@ -152,7 +158,11 @@ globalThis.SharedWorker = class SharedWorker {
             credentials: 'same-origin',
           });
           if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 0));
-          _sharedWorkerSpawned(entry, await resp.text(), resp.url || resolved, workerType);
+          // A fetched worker's CSP is its own response header (see the
+          // dedicated Worker path).
+          const workerCsp = resp.headers?.get?.('content-security-policy') || '';
+          _sharedWorkerSpawned(entry, await resp.text(), resp.url || resolved, workerType,
+            creatorFrom, workerCsp);
         } catch (e) { _sharedWorkerError(entry, e && e.message ? e.message : String(e)); }
       })();
       return;

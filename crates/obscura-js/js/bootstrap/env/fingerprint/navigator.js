@@ -198,9 +198,11 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     clearWatch() {},
   })),
   storage: _bootstrapObject('navigator.storage', () => ({
-    // Chrome grants ~60% of free disk space; a stable per-install value in the
-    // 200-300GB band matches a real drive without the flat 5GB tell.
-    estimate() { return Promise.resolve({ quota: 200000000000 + Math.floor(_fpRand(650) * 100000000000), usage: Math.floor(_fpRand(640) * 100000000) }); },
+    // The worker realm answers this too, and one origin cannot report two
+    // quotas: both read 10 GiB, which is what the reference capture's worker
+    // reports. A per-install random band looked plausible on its own but
+    // disagreed with the worker realm's constant.
+    estimate() { return Promise.resolve({ quota: 10737418240, usage: 0 }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   })),

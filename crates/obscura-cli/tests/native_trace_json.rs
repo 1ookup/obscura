@@ -1,5 +1,5 @@
 //! The JSONL trace contract: one record per API access or call, shaped
-//! {t, src, name, args, result}, filtered by name.
+//! {t, from, src, name, args, result}, filtered by name.
 //!
 //! These tests need the pinned source-built V8 (`--config
 //! vendor/v8-source.toml`, as in the sibling native_trace.rs). A stock prebuilt
@@ -89,14 +89,18 @@ fn json_records_carry_time_source_name_arguments_and_result() {
     let records = records(&trace);
     assert!(!records.is_empty(), "no records written");
 
-    // Every record has exactly the documented field set, and the clock never
-    // runs backwards.
+    // Every record has exactly the documented field set, `from` names the
+    // execution source, and the clock never runs backwards.
     let mut previous = f64::NEG_INFINITY;
     for record in &records {
         let object = record.as_object().expect("record is an object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["args", "name", "result", "src", "t"], "record {record}");
+        assert_eq!(keys, ["args", "from", "name", "result", "src", "t"], "record {record}");
+        assert!(
+            record["from"].as_str().is_some_and(|from| !from.is_empty()),
+            "from is a non-empty label: {record}"
+        );
         let t = record["t"].as_f64().expect("numeric t");
         assert!(t >= previous, "clock went backwards: {t} after {previous}");
         previous = t;

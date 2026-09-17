@@ -1,5 +1,5 @@
 use obscura_browser::Page;
-use obscura_dom::{DomTree, NodeData, NodeId};
+use obscura_dom::{DomTree, NodeData, NodeId, ShadowRootMode};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -98,8 +98,17 @@ pub async fn handle(
         "getDocument" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(2);
+            // `pierce` asks for the composed tree: a shadow root is not an
+            // ordinary child of its host, so the walk below cannot reach one.
+            // A widget the page put in a closed shadow root (Turnstile's
+            // checkbox, for one) is only visible to a client that sets this,
+            // which is the whole point of the flag in Puppeteer and friends.
+            let pierce = params.get("pierce").and_then(|v| v.as_bool()).unwrap_or(false);
             page.with_dom(|dom| {
-                let node = serialize_node(dom, dom.document(), depth as u32, 0);
+                let mut node = serialize_node(dom, dom.document(), depth as u32, 0);
+                if pierce {
+                    attach_shadow_roots(dom, &mut node, depth as u32);
+                }
                 json!({ "root": node })
             }).ok_or_else(|| "No DOM loaded".to_string())
         }
@@ -495,6 +504,53 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
                     Some(parent) => parent.built.push(frame.value),
                     None => return frame.value,
                 }
+            }
+        }
+    }
+}
+
+/// Add `shadowRoots` to every shadow host in an already-serialized tree.
+///
+/// CDP carries a shadow root beside its host rather than under `children`,
+/// because it is not an ordinary child: `parentNode` stays scoped to one tree.
+/// The root itself serializes as the detached fragment node it is
+/// (`#document-fragment`, nodeType 11), plus the one field only a client that
+/// asked to pierce needs: whether the page made it open or closed. Walks a
+/// stack, never recurses, so a nested shadow tree cannot overflow a worker
+/// stack the way the depth cap above is meant to prevent.
+fn attach_shadow_roots(dom: &DomTree, value: &mut Value, max_depth: u32) {
+    let mut stack: Vec<(&mut Value, u32)> = vec![(value, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        // `backendNodeId` is the engine's own nid, so the host edge is directly
+        // addressable from the serialized tree.
+        let host = node
+            .get("backendNodeId")
+            .and_then(Value::as_u64)
+            .filter(|_| node.get("nodeType").and_then(Value::as_u64) == Some(1))
+            .map(|id| NodeId::new(id as u32));
+        if let Some(host) = host {
+            if let Some(root) = dom.shadow_root(host) {
+                let mode = match dom.shadow_root_info(root).map(|info| info.mode) {
+                    Some(ShadowRootMode::Open) => "open",
+                    _ => "closed",
+                };
+                let mut serialized = serialize_node(dom, root, max_depth, depth + 1);
+                if let Some(object) = serialized.as_object_mut() {
+                    object.insert("shadowRootType".to_string(), json!(mode));
+                    // CDP reports a shadow root as a document fragment; the
+                    // engine's tree stores it as a document-shaped node, and a
+                    // client that pierces looks for these two fields to tell a
+                    // shadow tree from a real document.
+                    object.insert("nodeType".to_string(), json!(11));
+                    object.insert("nodeName".to_string(), json!("#document-fragment"));
+                    object.insert("localName".to_string(), json!(""));
+                }
+                node["shadowRoots"] = json!([serialized]);
+            }
+        }
+        if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+            for child in children.iter_mut() {
+                stack.push((child, depth + 1));
             }
         }
     }

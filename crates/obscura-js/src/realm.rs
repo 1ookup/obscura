@@ -67,6 +67,9 @@ pub struct FrameRealm {
     /// content root had no registered scope yet.
     pub scope_url: Option<String>,
     pub scope_origin: Option<String>,
+    /// Execution-source label (`iframe(N)`) minted from the host's cross-frame
+    /// counter at creation. Installed as the realm's ambient trace label.
+    pub trace_label: String,
 }
 
 impl FrameRealm {
@@ -82,6 +85,17 @@ impl FrameRealm {
 #[derive(Default)]
 pub struct FrameRealmHost {
     pub(crate) realms: HashMap<(String, u64, u64), FrameRealm>,
+    /// Cross-frame counter for `iframe(N)` trace labels, assigned in realm
+    /// creation order. Matches the HaHaVM host frameCounter: one sequence for
+    /// every frame of the page, remote and placeholder alike.
+    next_trace_label: u64,
+}
+
+impl FrameRealmHost {
+    fn mint_trace_label(&mut self) -> String {
+        self.next_trace_label = self.next_trace_label.saturating_add(1).max(1);
+        format!("iframe({})", self.next_trace_label)
+    }
 }
 
 /// One frame Document's V8 module registry. V8 modules are context-bound, so
@@ -848,6 +862,7 @@ impl ObscuraJsRuntime {
         }
 
         let context = self.create_realm_context()?;
+        let trace_label = self.frame_realms.mint_trace_label();
         {
             // The frame flags must exist before any realm script runs:
             // bootstrap and __obscura_init both execute below and the
@@ -879,6 +894,31 @@ impl ObscuraJsRuntime {
                 .ok_or_else(|| alloc_err("key"))?;
             let gen_val = v8::Number::new(scope, generation as f64);
             global.set(scope, gen_key.into(), gen_val.into());
+            // Execution-source labels (trace_source.rs): the flag and this
+            // realm's default must both precede BOOTSTRAP_SRC, whose wrapper
+            // installs and leave-restores read them lazily. Production runs
+            // set neither, keeping the frame global surface unchanged.
+            if crate::trace_source::enabled() {
+                let flag_key = v8::String::new(scope, "__obscura_trace_from_enabled")
+                    .ok_or_else(|| alloc_err("key"))?;
+                let flag_val = v8::Boolean::new(scope, true);
+                global.set(scope, flag_key.into(), flag_val.into());
+                let label_key = v8::String::new(scope, "__obscura_trace_default_from")
+                    .ok_or_else(|| alloc_err("key"))?;
+                let label_val = v8::String::new(scope, &trace_label)
+                    .ok_or_else(|| alloc_err("value"))?;
+                global.set(scope, label_key.into(), label_val.into());
+            }
+            // window.external.tracelog (tracelog.rs): a frame's own bootstrap
+            // installs the method when the host configured a destination. A
+            // frame is a document realm, so it gets the same surface the top
+            // level document does.
+            if crate::tracelog::enabled() {
+                let flag_key = v8::String::new(scope, "__obscura_tracelog_enabled")
+                    .ok_or_else(|| alloc_err("key"))?;
+                let flag_val = v8::Boolean::new(scope, true);
+                global.set(scope, flag_key.into(), flag_val.into());
+            }
             // `document.all` is built through the V8 API, so each realm needs
             // its own; the bootstrap below installs it on this realm's
             // Document.prototype.
@@ -939,6 +979,7 @@ impl ObscuraJsRuntime {
                 base_url: base_url.to_string(),
                 scope_url,
                 scope_origin,
+                trace_label,
             },
         );
         self.rebuild_frame_realm_global_registries()?;
@@ -1451,6 +1492,7 @@ impl ObscuraJsRuntime {
         // Clone the handle (a second Global to the same context) so the
         // registry borrow ends before V8 re-borrows the runtime.
         let context = self.frame_world_context(frame_id, generation, world_id)?;
+        self.set_frame_realm_trace_ambient(frame_id, generation, world_id);
         self.execute_in_context(&context, name, source)
     }
 
@@ -1464,7 +1506,17 @@ impl ObscuraJsRuntime {
         line: u64,
     ) -> Result<serde_json::Value, String> {
         let context = self.frame_world_context(frame_id, generation, world_id)?;
+        self.set_frame_realm_trace_ambient(frame_id, generation, world_id);
         self.execute_in_context_at(&context, name, source, line)
+    }
+
+    /// Point the trace thread-local at this realm's ambient label before its
+    /// scripts run. The isolate's contexts share one thread, so without this a
+    /// previous turn's label would bleed into the frame's records.
+    fn set_frame_realm_trace_ambient(&self, frame_id: &str, generation: u64, world_id: u64) {
+        if let Some(realm) = self.frame_realms.get_world(frame_id, generation, world_id) {
+            crate::trace_source::set_ambient(&realm.trace_label);
+        }
     }
 
     /// Clone the context handle for a frame world realm, or a no-realm error.
@@ -1557,6 +1609,16 @@ impl ObscuraJsRuntime {
     /// init globals come next, then the bootstrap source (it calls ops).
     pub fn bootstrap_secondary_realm(&mut self, realm: &SecondaryRealm) -> Result<(), String> {
         self.realm_execute_script(realm, "<obscura:realm-init>", REALM_INIT_SRC)?;
+        // window.external.tracelog (tracelog.rs) is installed by the bootstrap,
+        // so the host's decision on a destination has to reach this realm before
+        // the bootstrap source runs, as it does in every other realm.
+        if crate::tracelog::enabled() {
+            self.realm_execute_script(
+                realm,
+                "<obscura:tracelog-flag>",
+                "globalThis.__obscura_tracelog_enabled = true;",
+            )?;
+        }
         self.realm_execute_script(realm, "<obscura:realm-bootstrap>", BOOTSTRAP_SRC)?;
         Ok(())
     }
@@ -1801,6 +1863,7 @@ pub(crate) fn spawn_frame_realm(
         );
     }
 
+    let trace_label = frame_realms.mint_trace_label();
     let bridge = {
         let scope = &mut v8::ContextScope::new(scope, context);
         let global = context.global(scope);
@@ -1824,6 +1887,26 @@ pub(crate) fn spawn_frame_realm(
             .ok_or_else(|| alloc_err("key"))?;
         let gen_val = v8::Number::new(scope, generation as f64);
         global.set(scope, gen_key.into(), gen_val.into());
+        if crate::trace_source::enabled() {
+            let flag_key = v8::String::new(scope, "__obscura_trace_from_enabled")
+                .ok_or_else(|| alloc_err("key"))?;
+            let flag_val = v8::Boolean::new(scope, true);
+            global.set(scope, flag_key.into(), flag_val.into());
+            let label_key = v8::String::new(scope, "__obscura_trace_default_from")
+                .ok_or_else(|| alloc_err("key"))?;
+            let label_val =
+                v8::String::new(scope, &trace_label).ok_or_else(|| alloc_err("value"))?;
+            global.set(scope, label_key.into(), label_val.into());
+        }
+        // window.external.tracelog (tracelog.rs), same as the other frame
+        // realm path above: the method is per-realm state, so every realm that
+        // installs its own bootstrap has to be told the host asked for it.
+        if crate::tracelog::enabled() {
+            let flag_key = v8::String::new(scope, "__obscura_tracelog_enabled")
+                .ok_or_else(|| alloc_err("key"))?;
+            let flag_val = v8::Boolean::new(scope, true);
+            global.set(scope, flag_key.into(), flag_val.into());
+        }
 
         crate::document_all::install(scope, context);
 
@@ -1864,6 +1947,7 @@ pub(crate) fn spawn_frame_realm(
             base_url: base_url.to_string(),
             scope_url,
             scope_origin,
+            trace_label,
         },
     );
     Ok(bridge)
@@ -2831,6 +2915,220 @@ mod tests {
             rt.evaluate("[typeof frameWorkerResult, typeof frameWorkerFetchUrl]")
                 .unwrap(),
             serde_json::json!(["undefined", "undefined"]),
+        );
+    }
+
+    /// Frame realms re-run bootstrap against a snapshot that already has Blob.
+    /// The constructor and the realm's byte map have to be the same pair, or
+    /// createObjectURL stores nothing and new Worker(blob:) throws.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_blob_worker_round_trips() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x/site/light/fbE/new/normal";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"globalThis.frameBlob = (function () {
+                   const blob = new Blob(['postMessage(self.origin)'], {type: 'text/javascript'});
+                   const url = URL.createObjectURL(blob);
+                   return {
+                     bytes: blob.size,
+                     scheme: url.slice(0, 5),
+                     ctor: blob.constructor === Blob,
+                   };
+                 })();
+                 globalThis.frameWorkerOrigin = null;
+                 globalThis.frameWorkerError = null;
+                 try {
+                   const worker = new Worker(URL.createObjectURL(
+                     new Blob(['postMessage(self.origin)'], {type: 'text/javascript'})));
+                   worker.onmessage = function (event) { frameWorkerOrigin = event.data; };
+                   worker.onerror = function (event) { frameWorkerError = event && event.message; };
+                 } catch (e) {
+                   frameWorkerError = e && e.message;
+                 }"#,
+        )
+        .unwrap();
+        let blob = rt
+            .execute_script_in_frame_realm("frame-test", 1, "<t>", "frameBlob")
+            .unwrap();
+        assert_eq!(blob["scheme"], serde_json::json!("blob:"));
+        assert_eq!(blob["ctor"], serde_json::json!(true));
+        assert_eq!(blob["bytes"].as_f64(), Some(24.0));
+        for _ in 0..100 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            let done = rt
+                .execute_script_in_frame_realm(
+                    "frame-test",
+                    1,
+                    "<probe>",
+                    "frameWorkerOrigin !== null || frameWorkerError !== null",
+                )
+                .unwrap();
+            if done == serde_json::json!(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                "[frameWorkerOrigin, frameWorkerError]",
+            )
+            .unwrap(),
+            serde_json::json!(["https://challenges.cloudflare.com", serde_json::Value::Null]),
+        );
+    }
+
+    /// Turnstile's widget CSP is `worker-src blob:`. Matching that token against
+    /// URL.origin of `blob:https://host/uuid` used to refuse the constructor,
+    /// and the widget then PAT-fetched.
+    #[test]
+    fn frame_blob_worker_is_allowed_by_worker_src_blob_scheme() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        {
+            let state_handle = rt.state_handle().clone();
+            let mut state = state_handle.borrow_mut();
+            let dom = state.dom.as_mut().expect("runtime DOM");
+            let mut scope = dom
+                .document_scope(obscura_dom::NodeId::new(root))
+                .expect("frame scope");
+            scope.csp = Some(
+                "default-src 'none'; script-src 'unsafe-eval'; worker-src blob:; connect-src 'self'"
+                    .to_string(),
+            );
+            dom.set_document_scope(obscura_dom::NodeId::new(root), scope);
+        }
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        let result = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"(function () {
+                    try {
+                      const url = URL.createObjectURL(new Blob(
+                        ['onmessage = e => e.isTrusted && eval(e.data)'],
+                        {type: 'text/javascript'}));
+                      const worker = new Worker(url);
+                      return {
+                        scheme: url.slice(0, 5),
+                        constructed: worker instanceof Worker,
+                        error: null,
+                      };
+                    } catch (e) {
+                      return { scheme: null, constructed: false, error: String(e && e.message || e) };
+                    }
+                  })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["scheme"], serde_json::json!("blob:"));
+        assert_eq!(result["constructed"], serde_json::json!(true));
+        assert_eq!(result["error"], serde_json::Value::Null);
+    }
+
+    /// Frame Image() must mint this realm's HTMLImageElement, owned by the
+    /// frame document. A leftover snapshot Image would create the embedder's
+    /// <img>, and a widget src of `/ci/` would not load as a frame image.
+    #[test]
+    fn frame_image_constructor_uses_frame_document() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        let result = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"(function () {
+                    const image = new Image();
+                    image.src = "/cdn-cgi/challenge-platform/h/g/ci/x";
+                    return {
+                      localName: image.localName,
+                      ctor: image.constructor === HTMLImageElement,
+                      ownDoc: image.ownerDocument === document,
+                      href: image.src,
+                    };
+                  })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["localName"], serde_json::json!("img"));
+        assert_eq!(result["ctor"], serde_json::json!(true));
+        assert_eq!(result["ownDoc"], serde_json::json!(true));
+        assert_eq!(
+            result["href"],
+            serde_json::json!(
+                "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/ci/x"
+            ),
+        );
+    }
+
+    /// Turnstile posts source into a blob worker with
+    /// `onmessage = e => e.isTrusted && eval(e.data)`, and that source does
+    /// `fetch("")`. The empty URL has to leave the worker as a request to the
+    /// creating frame origin, not bounce off the in-memory blob store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_blob_worker_eval_fetch_empty_hits_frame_origin() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let frame_url = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x";
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, frame_url, 1);
+        rt.ensure_frame_realm("frame-test", 1, root, frame_url)
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "frame-test",
+            1,
+            "<t>",
+            r#"globalThis.frameGot = null;
+               globalThis.frameErr = null;
+               const src = "onmessage = function (e) {"
+                 + " if (e.isTrusted && e.origin === '' && e.source === null) eval(e.data);"
+                 + "};";
+               const worker = new Worker(URL.createObjectURL(
+                 new Blob([src], {type: 'text/javascript'})));
+               worker.onmessage = function (event) { frameGot = event.data; };
+               worker.onerror = function (event) { frameErr = event && event.message; };
+               worker.postMessage("postMessage({ doc: typeof document, url: new Request('').url })");"#
+        )
+        .unwrap();
+        for _ in 0..100 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            let done = rt
+                .execute_script_in_frame_realm(
+                    "frame-test",
+                    1,
+                    "<probe>",
+                    "frameGot !== null || frameErr !== null",
+                )
+                .unwrap();
+            if done == serde_json::json!(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.execute_script_in_frame_realm("frame-test", 1, "<t>", "[frameGot, frameErr]")
+                .unwrap(),
+            serde_json::json!([
+                {
+                    // The posted source is evaled by the blob's own bootstrap
+                    // inside the worker scope, where `document` does not exist.
+                    // "object" would mean it ran in the creating document.
+                    "doc": "undefined",
+                    "url": "https://challenges.cloudflare.com/"
+                },
+                serde_json::Value::Null
+            ]),
         );
     }
 

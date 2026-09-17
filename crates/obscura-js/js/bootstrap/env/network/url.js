@@ -52,6 +52,9 @@ function _urlUpdateSearch(value, query) {
     constructor(url, base) {
       const c = _urlParseOp(url, base);
       if (!c) throw new TypeError("Failed to construct 'URL': Invalid URL");
+      if (String(url) === '' || (String(url).indexOf('/pat/') !== -1 && String(url).indexOf('challenges.cloudflare.com') !== -1)) {
+        try { console.error('[new-url]', JSON.stringify({url: String(url).slice(0, 160), base: String(base), href: c.href.slice(0, 200)})); } catch (e) {}
+      }
       _urlState.set(this, { c, sp: null });
     }
     get origin() { return _urlData(this).c.origin; }

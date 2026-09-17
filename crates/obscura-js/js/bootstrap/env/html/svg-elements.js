@@ -33,6 +33,18 @@ globalThis.SVGGraphicsElement = SVGGraphicsElement;
 globalThis.SVGGeometryElement = SVGGeometryElement;
 globalThis.SVGPathElement = SVGPathElement;
 globalThis.SVGSVGElement = SVGSVGElement;
+// Chrome implements GlobalEventHandlers on SVGElement.prototype itself, so
+// an SVG element resolves `onclick` there rather than through the Element
+// chain. Shadowing with the same accessor shape keeps that lookup level
+// truthful even though the HTML side still lives on Element.prototype.
+// The check must be own-property based: `in` sees the inherited Element
+// accessors and would skip every name.
+for (const _ev of _GLOBAL_EVENT_HANDLERS) {
+  const _on = "on" + _ev;
+  if (!Object.prototype.hasOwnProperty.call(SVGElement.prototype, _on)) {
+    __obscuraTraceDefineHandler(SVGElement.prototype, _on, false);
+  }
+}
 
 // These aliases are installed here because CharacterData/Text/Comment are the
 // remaining DOM object shapes previously grouped with SVG aliases.

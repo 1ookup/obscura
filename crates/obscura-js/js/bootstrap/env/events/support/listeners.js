@@ -31,6 +31,10 @@ function _eventTargetAdd(target, type, callback, options) {
     passive: !!(options && typeof options === 'object' && options.passive),
     signal,
     abortHandler: null,
+    // Execution-source snapshot at registration: the listener is attributed
+    // to the code that registered it, not to whichever turn dispatched.
+    // Null unless source tracing is on, so dispatch's fast path is unchanged.
+    from: globalThis.__obscura_trace_from_enabled ? __obscuraTraceCurrent() : null,
   };
   listeners.push(entry);
   if (signal && typeof signal.addEventListener === 'function') {

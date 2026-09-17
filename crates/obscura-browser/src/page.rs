@@ -2408,14 +2408,18 @@ impl Page {
                         if let Some(js) = &mut page.js {
                             let _ = js.execute_script(
                                 "<current-script>",
-                                &format!("globalThis.__currentScriptNid={};", script.nid),
+                                &format!(
+                                    "globalThis.__currentScriptNid={};__obscuraTraceEnter({});",
+                                    script.nid,
+                                    serde_json::json!(format!("script@{execution_url}")),
+                                ),
                             );
                             if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
                                 tracing::warn!("Script error ({}): {}", execution_url, error);
                             }
                             let _ = js.execute_script(
                                 "<current-script>",
-                                "globalThis.__currentScriptNid=0;",
+                                "globalThis.__currentScriptNid=0;__obscuraTraceLeave();",
                             );
                         }
                     }
@@ -2423,7 +2427,11 @@ impl Page {
                     if let Some(js) = &mut page.js {
                         let _ = js.execute_script(
                             "<current-script>",
-                            &format!("globalThis.__currentScriptNid={};", script.nid),
+                            &format!(
+                                "globalThis.__currentScriptNid={};__obscuraTraceEnter({});",
+                                script.nid,
+                                serde_json::json!(format!("script@{}", script.base_url)),
+                            ),
                         );
                         if let Err(error) =
                             js.execute_script_guarded_at_line(
@@ -2434,8 +2442,10 @@ impl Page {
                         {
                             tracing::warn!("Inline script error: {}", error);
                         }
-                        let _ = js
-                            .execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
+                        let _ = js.execute_script(
+                            "<current-script>",
+                            "globalThis.__currentScriptNid=0;__obscuraTraceLeave();",
+                        );
                     }
                 }
             };
@@ -2704,6 +2714,24 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
+            // Parser scripts queue page timers while running (api.js
+            // dispatches its onload callback with setTimeout(0)). The parser
+            // script queue above is synchronous and
+            // drive_load_delaying_scripts only ticks when *dynamic* scripts
+            // are pending, so without a poll here those timers stay queued
+            // until an unrelated network completion forces one -- measured
+            // ~300 ms late on the Cloudflare interstitial, whose payload
+            // carries that latency as PWGF4[0].t (reference: 1 ms). A
+            // browser's task loop turns as soon as the parser yields; one
+            // bounded cooperative tick delivers the due timers at this same
+            // boundary. Queued-before-DCL timers run before DCL, as Chrome
+            // orders them.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                js.run_load_delaying_event_loop_tick(),
+            )
+            .await;
+
             // DOMContentLoaded follows parser/defer/module work, but async
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
@@ -2730,7 +2758,7 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 if (typeof window.onload === 'function') { try { __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
             );
@@ -2961,6 +2989,8 @@ impl Page {
         // browser bootstrap and before any author script, including when the
         // sandbox suppresses author execution.
         for preload in frame_preloads {
+            // Operator-injected code: `host` execution-source unit.
+            let _trace_source = js.trace_source_guard("host");
             let result = match preload.world_name.as_deref() {
                 None => js
                     .execute_script_in_frame_realm(
@@ -3296,12 +3326,17 @@ impl Page {
                 if let Some((execution_url, code)) = executable {
                     if let Some(js) = self.js.as_mut() {
                         // currentScript is non-null only for classic script
-                        // evaluation, never for ES modules.
+                        // evaluation, never for ES modules. The same bracket
+                        // carries the execution-source label for tracing.
                         let _ = js.execute_script_in_frame_realm(
                             frame_id,
                             generation,
                             "<current-script>",
-                            &format!("globalThis.__currentScriptNid={};", script.nid),
+                            &format!(
+                                "globalThis.__currentScriptNid={};__obscuraTraceEnter({});",
+                                script.nid,
+                                serde_json::json!(format!("script@{execution_url}")),
+                            ),
                         );
                         let result = if script.src.is_none() {
                             js.execute_script_in_frame_realm_at_line(
@@ -3330,7 +3365,7 @@ impl Page {
                             frame_id,
                             generation,
                             "<current-script>",
-                            "globalThis.__currentScriptNid=0;",
+                            "globalThis.__currentScriptNid=0;__obscuraTraceLeave();",
                         );
                     }
                 }
@@ -3534,7 +3569,7 @@ impl Page {
                 generation,
                 "<frame-load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 if (typeof window.onload === 'function') { try { __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
             );
@@ -5351,6 +5386,14 @@ impl Page {
             ),
             None => return 0,
         };
+        if frame_debug_on() {
+            eprintln!(
+                "[frame-route] process_pending: root={} iframe_requests={} hosts={:?}",
+                root_requests.len(),
+                iframe_requests.len(),
+                iframe_requests.iter().map(|r| (r.host_nid, r.url.clone())).collect::<Vec<_>>()
+            );
+        }
         if root_requests.is_empty() && iframe_requests.is_empty() {
             return 0;
         }
@@ -5400,6 +5443,7 @@ impl Page {
         }
 
         let mut jobs: Vec<(String, FrameNavigationRequest)> = Vec::new();
+        let mut job_sources: Vec<&'static str> = Vec::new();
         let mut latest_by_root = std::collections::HashMap::new();
         for (document_root, url, method, body) in root_requests {
             latest_by_root.insert(document_root, (url, method, body));
@@ -5421,6 +5465,7 @@ impl Page {
                         ..FrameNavigationRequest::default()
                     },
                 ));
+                job_sources.push("root");
             }
         }
 
@@ -5444,18 +5489,23 @@ impl Page {
                     })
                     .unwrap_or_default();
                 jobs.push((frame_id, request));
+                job_sources.push("discovered");
             }
         }
 
+        let mut leftover_iframe_navigations = Vec::new();
         for (host_nid, pending) in explicit_by_host {
             let host = obscura_dom::NodeId::new(host_nid);
             let Some(frame_id) = self.frames.by_host(host).map(|frame| frame.frame_id.clone()) else {
+                leftover_iframe_navigations.push(pending);
                 continue;
             };
             let Some(dom) = self.dom.as_ref() else {
+                leftover_iframe_navigations.push(pending);
                 continue;
             };
             if !dom.is_connected(host) {
+                leftover_iframe_navigations.push(pending);
                 continue;
             }
             let sandbox = dom
@@ -5503,8 +5553,22 @@ impl Page {
                 }
             }
         }
+        if !leftover_iframe_navigations.is_empty() {
+            if let Some(js) = self.js.as_ref() {
+                js.requeue_iframe_navigations(leftover_iframe_navigations);
+            }
+        }
 
         let mut committed = 0;
+        if frame_debug_on() {
+            for (n, (frame_id, request)) in jobs.iter().enumerate() {
+                eprintln!(
+                    "[frame-route] job #{n} source={} frame={frame_id} url={}",
+                    job_sources.get(n).copied().unwrap_or("explicit"),
+                    request.url.as_deref().unwrap_or("(current src)")
+                );
+            }
+        }
         for (frame_id, request) in jobs {
             match self.navigate_frame_for_cdp(&frame_id, request).await {
                 Ok(()) => committed += 1,
@@ -5578,6 +5642,8 @@ impl Page {
             return;
         };
         for script in scripts {
+            // Operator-injected code: one `host` execution-source unit.
+            let _trace_source = js.trace_source_guard("host");
             let result = match script.world_name.as_deref() {
                 None => js.execute_script_guarded("<preload>", &script.source),
                 Some(world_name) => js
@@ -5642,6 +5708,8 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return;
         };
+        // Operator-injected code (CDP runImmediately): `host` label.
+        let _trace_source = js.trace_source_guard("host");
         match script.world_name.as_deref() {
             None => {
                 let _ = js.execute_script_guarded("<preload>", &script.source);
@@ -5844,6 +5912,14 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 /// page fetch-loops before paint ever runs. Blink's kMaxFrameDepth is on the
 /// order of 100; this is deliberately lower but far above real embed stacks.
 pub const MAX_FRAME_DEPTH: usize = 32;
+
+/// OBSCURA_DEBUG_FRAMES=1 reports every frame-navigation route. Two routes can
+/// both discover the same newly connected iframe, and a discovered navigation
+/// followed by an explicit one for the same frame fetches its document twice.
+fn frame_debug_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_FRAMES").is_some())
+}
 
 /// A navigation request for one frame. `srcdoc` takes precedence over `url`,
 /// per the HTML processing model.
@@ -6058,6 +6134,13 @@ impl Page {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), FrameNavigateError>> + 'a>,
     > {
+        if frame_debug_on() {
+            eprintln!(
+                "[frame-route] navigate_frame frame={} url={}",
+                frame_id,
+                request.url.as_deref().unwrap_or("(current src)")
+            );
+        }
         Box::pin(self.navigate_frame_inner(frame_id, request))
     }
 
@@ -6165,6 +6248,21 @@ impl Page {
             .frames
             .begin_navigation(frame_id)
             .ok_or(FrameNavigateError::UnknownFrame)?;
+        // OBSCURA_DEBUG_FRAMES=1: one line per committed frame navigation. Two
+        // navigations for one widget frame mean its document (and the session
+        // state it carries) is created twice.
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_FRAMES").is_some()) {
+                eprintln!(
+                    "[frame-commit] frame={} host={} gen={} url={}",
+                    frame_id,
+                    host_nid,
+                    navigation_generation,
+                    request.url.as_deref().unwrap_or("(current src)")
+                );
+            }
+        }
         if self.frames.depth(frame_id) > MAX_FRAME_DEPTH {
             return Err(FrameNavigateError::DepthExceeded);
         }
@@ -6729,6 +6827,13 @@ impl Page {
             {
                 return Err(FrameNavigateError::Superseded);
             }
+            if frame_debug_on() {
+                eprintln!(
+                    "[frame-route] nested_discovery parent={frame_id} host={} url={}",
+                    nested_host.raw(),
+                    request.url.as_deref().unwrap_or("(none)")
+                );
+            }
             let Some(child_id) = self.frames.attach_child(frame_id, nested_host) else {
                 continue;
             };
@@ -6773,11 +6878,21 @@ impl Page {
             .collect();
         let main_frame_id = self.frames.main_frame_id().to_string();
         let mut started = 0;
+        if frame_debug_on() {
+            eprintln!("[frame-route] discover_main_document: {} new hosts", hosts.len());
+        }
         for (host, request) in hosts {
             let Some(frame_id) = self.frames.attach_child(&main_frame_id, host) else {
                 continue;
             };
             started += 1;
+            if frame_debug_on() {
+                eprintln!(
+                    "[frame-route] discover_main_document -> navigate frame={frame_id} host={} url={}",
+                    host.raw(),
+                    request.url.as_deref().unwrap_or("(none)")
+                );
+            }
             let _ = self.navigate_frame(&frame_id, request).await;
         }
         started
@@ -7748,13 +7863,18 @@ mod tests {
                     })()"#
                 )
                 .unwrap(),
+            // The uncommitted octet-stream frame keeps its initial
+            // about:blank document (body empty, nothing committed), but its
+            // Location reports the creator's document URL: the deliberate
+            // inherited-origin answer in `_environmentSettings`
+            // (env/window/location.js), not the raw about: URL.
             serde_json::json!([
                 "blob:",
                 true,
                 true,
                 "https://top.example",
                 "inner-ok",
-                "about:blank",
+                "https://top.example/app/",
                 "",
             ]),
         );

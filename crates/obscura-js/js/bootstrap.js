@@ -5,6 +5,7 @@
 // env/ is grouped by browser capability. The manifest order remains load-
 // bearing because the source is one lexical V8 bootstrap, not ES modules.
 // @obscura-module config/bootstrap.js
+// @obscura-module tools/trace-source.js
 // @obscura-module tools/script-loader.js
 // @obscura-module tools/dom-query.js
 // @obscura-module tools/error-events.js

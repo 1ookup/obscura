@@ -12,6 +12,7 @@
 //! Fonts are loaded from embedded bytes only, never the OS, so layout is
 //! byte-for-byte deterministic across hosts (the whole engine's guarantee).
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
@@ -60,15 +61,81 @@ const SYSTEM_FAMILY: &str = "DejaVu Sans";
 fn resolve_font_family(fam: Option<&str>) -> &'static str {
     let Some(f) = fam else { return FAMILY };
     for tok in f.split(',') {
-        if let Some(family) = bundled_family_for_css_token(tok) {
-            return family;
+        if let Some(face) = bundled_face_for_css_token(tok) {
+            return face.family();
         }
         // Unrecognized named webfont: keep scanning for a generic fallback.
     }
     FAMILY
 }
 
-fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
+/// The platform whose named font families this engine answers for.
+///
+/// One bundled face set serves every identity, but the *names* it resolves have
+/// to be the names the claimed platform has. A Windows user agent answering a
+/// font-presence probe with `Segoe UI` is consistent, a macOS one answering
+/// `Apple Symbols` is consistent, and a macOS identity still claiming the
+/// Windows set is not: the standard probe measures a string as `'X', monospace`
+/// and again as `'X', sans-serif` and calls X installed when the two agree, so a
+/// single run reveals the whole claimed family list. The reference run on this
+/// host reported `Apple Symbols, Galvji, Geneva, InaiMathi Bold, Luminari,
+/// PingFang HK Light` while the Windows families fell through; the Obscura run
+/// with the same macOS identity reported the inverse (see the tracelog's
+/// `ov2.host.encode` and `ov2.host.ua` records).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FontPlatform {
+    Windows,
+    MacOs,
+}
+
+static FONT_PLATFORM: AtomicU8 = AtomicU8::new(FontPlatform::Windows as u8);
+
+/// Point the family table at the platform the identity claims. Takes the
+/// `navigator.platform` spelling (`MacIntel`, `Win32`, `Linux x86_64`) or a
+/// user-agent-style string; anything unrecognized keeps the Windows set.
+pub fn set_font_platform(platform: &str) {
+    let lowered = platform.to_ascii_lowercase();
+    let platform = if lowered.contains("mac") || lowered.contains("darwin") {
+        FontPlatform::MacOs
+    } else {
+        FontPlatform::Windows
+    };
+    FONT_PLATFORM.store(platform as u8, Ordering::Relaxed);
+}
+
+fn font_platform() -> FontPlatform {
+    if FONT_PLATFORM.load(Ordering::Relaxed) == FontPlatform::MacOs as u8 {
+        FontPlatform::MacOs
+    } else {
+        FontPlatform::Windows
+    }
+}
+
+/// The bundled face a CSS token resolves to. Shared with the canvas text
+/// measurer, which picks its bytes from this same table so a `measureText`
+/// probe and a layout probe cannot disagree about which families exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BundledFace {
+    Sans,
+    System,
+    Mono,
+    Serif,
+}
+
+impl BundledFace {
+    fn family(self) -> &'static str {
+        match self {
+            BundledFace::Sans => FAMILY,
+            BundledFace::System => SYSTEM_FAMILY,
+            BundledFace::Mono => MONO_FAMILY,
+            BundledFace::Serif => SERIF_FAMILY,
+        }
+    }
+}
+
+/// The face a single CSS `font-family` token names, or `None` when the identity
+/// does not have that family (see [`FontPlatform`]).
+pub(crate) fn bundled_face_for_css_token(token: &str) -> Option<BundledFace> {
     let token = token
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -77,8 +144,7 @@ fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     if token.is_empty() {
         return None;
     }
-    // Generic keywords, then families that genuinely exist on the platform the
-    // engine reports. Matching is exact on purpose.
+    // Generic keywords mean the same thing under every identity.
     //
     // These used to be substring rules -- any token containing "mono", "sans",
     // "times" and so on resolved to a bundled face. That is not how a browser
@@ -89,31 +155,79 @@ fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     // `'Imaginary Sans 42'` (both sans-serif), so the engine reported every
     // invented name that happened to contain one of those words as an installed
     // font -- which is how it came to claim a machine with Windows, Linux and
-    // macOS font sets installed at once.
-    let family = match token.as_str() {
-        "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => SYSTEM_FAMILY,
+    // macOS font sets installed at once. Matching stays exact.
+    let generic = match token.as_str() {
+        "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => {
+            Some(BundledFace::System)
+        }
+        "monospace" | "ui-monospace" => Some(BundledFace::Mono),
+        "serif" | "ui-serif" => Some(BundledFace::Serif),
+        "sans-serif" => Some(BundledFace::Sans),
+        _ => None,
+    };
+    if generic.is_some() {
+        return generic;
+    }
+    match font_platform() {
+        FontPlatform::MacOs => macos_face_for_css_token(&token),
+        FontPlatform::Windows => windows_face_for_css_token(&token),
+    }
+}
 
-        "monospace" | "ui-monospace" | "courier new" | "consolas"
-        | "lucida console" | "cascadia mono" | "cascadia code" => MONO_FAMILY,
+/// The named families a Windows identity has. These map onto the bundled faces
+/// so probes see distinct metrics between families, like distinct real fonts.
+fn windows_face_for_css_token(token: &str) -> Option<BundledFace> {
+    let face = match token {
+        "courier new" | "consolas" | "lucida console" | "cascadia mono" | "cascadia code" => {
+            BundledFace::Mono
+        }
 
-        "serif" | "ui-serif" | "times new roman" | "georgia" | "cambria"
-        | "book antiqua" | "palatino linotype" | "constantia" | "sylfaen"
-        | "sitka" | "sitka text" | "sitka heading" => SERIF_FAMILY,
+        "times new roman" | "georgia" | "cambria" | "book antiqua" | "palatino linotype"
+        | "constantia" | "sylfaen" | "sitka" | "sitka text" | "sitka heading" => {
+            BundledFace::Serif
+        }
 
-        // Sans faces split across the two bundled sans faces so probes see
-        // distinct metrics between families, like distinct real fonts would.
-        "sans-serif" | "arial" | "arial narrow" | "calibri" | "candara"
-        | "comic sans ms" | "microsoft sans serif" | "trebuchet ms" => FAMILY,
-        "segoe ui" | "segoe ui variable" | "verdana" | "tahoma" | "impact"
-        | "arial black" | "lucida sans unicode" | "franklin gothic medium"
-        | "segoe ui emoji" | "segoe ui historic" | "segoe ui symbol"
-        | "segoe print" | "segoe script" | "ebrima" | "javanese text"
-        | "malgun gothic" | "mv boli" | "nirmala ui" | "yu gothic"
-        | "webdings" | "wingdings" => SYSTEM_FAMILY,
+        "arial" | "arial narrow" | "calibri" | "candara" | "comic sans ms"
+        | "microsoft sans serif" | "trebuchet ms" => BundledFace::Sans,
+        "segoe ui" | "segoe ui variable" | "verdana" | "tahoma" | "impact" | "arial black"
+        | "lucida sans unicode" | "franklin gothic medium" | "segoe ui emoji"
+        | "segoe ui historic" | "segoe ui symbol" | "segoe print" | "segoe script"
+        | "ebrima" | "javanese text" | "malgun gothic" | "mv boli" | "nirmala ui"
+        | "yu gothic" | "webdings" | "wingdings" => BundledFace::System,
 
         _ => return None,
     };
-    Some(family)
+    Some(face)
+}
+
+/// The named families a macOS identity has. The Windows-only names above
+/// (`Segoe UI`, `Calibri`, `Lucida Console`, `Nirmala UI`, `Javanese Text`,
+/// `Sitka`, ...) are absent here on purpose: a real macOS Chrome does not have
+/// them, and claiming them is exactly the inconsistency this split removes.
+fn macos_face_for_css_token(token: &str) -> Option<BundledFace> {
+    let face = match token {
+        "courier new" | "menlo" | "monaco" | "sf mono" | "andale mono" => BundledFace::Mono,
+
+        "times new roman" | "times" | "georgia" | "baskerville" | "charter" | "cochin"
+        | "didot" | "hoefler text" | "inaimathi" | "inaimathi bold" | "luminari"
+        | "palatino" | "apple garamond" | "bodoni 72" | "optima" | "skia" | "superclarendon" => {
+            BundledFace::Serif
+        }
+
+        "arial" | "arial narrow" | "arial black" | "helvetica" | "helvetica neue" | "geneva"
+        | "lucida grande" | "tahoma" | "verdana" | "trebuchet ms" | "comic sans ms" | "futura"
+        | "avenir" | "avenir next" | "gill sans" | "chalkboard" | "marker felt" | "pt sans" => {
+            BundledFace::Sans
+        }
+        "apple symbols" | "galvji" | "hiragino sans" | "hiragino sans gb"
+        | "hiragino mincho pron" | "pingfang sc" | "pingfang tc" | "pingfang hk"
+        | "pingfang hk light" | "songti sc" | "heiti sc" | "st heiti" | "kaiti sc"
+        | "lantinghei sc" | "yuanti sc" | "weibei sc" | "xingkai sc" | "wawati sc"
+        | "hannotate sc" | "libian sc" | "webdings" | "wingdings" => BundledFace::System,
+
+        _ => return None,
+    };
+    Some(face)
 }
 
 #[derive(Clone)]
@@ -171,8 +285,8 @@ fn resolve_loaded_font(
                 .get(&name.to_ascii_lowercase())
                 .filter(|entry| entry.is_webfont)
                 .or_else(|| {
-                    bundled_family_for_css_token(name)
-                        .and_then(|family| loaded.get(&family.to_ascii_lowercase()))
+                    bundled_face_for_css_token(name)
+                        .and_then(|face| loaded.get(&face.family().to_ascii_lowercase()))
                 });
             if let Some(resolved) = family
                 .and_then(|family| select_loaded_face(family, requested_weight, requested_italic))
@@ -182,6 +296,20 @@ fn resolve_loaded_font(
         }
     }
     let fallback = resolve_font_family(fam);
+    // The default family can be a loaded face: under a macOS identity it is
+    // the host's PingFang SC standing in for the bundled sans, and shaping
+    // must use its real glyphs and hhea metrics, not a family-name query
+    // that finds nothing and falls back to an arbitrary database face. The
+    // identity is resolved here (layout time), not at engine construction,
+    // because set_font_platform lands after the engine exists.
+    if font_platform() == FontPlatform::MacOs {
+        if let Some(family) = loaded.get("__obscura_system_pingfang") {
+            if let Some(resolved) = select_loaded_face(family, requested_weight, requested_italic)
+            {
+                return resolved;
+            }
+        }
+    }
     ResolvedFont {
         family: Arc::from(fallback),
         font_id: None,
@@ -302,6 +430,22 @@ fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
 /// line boxes follow the same device-pixel rhythm without consulting host
 /// fonts.
 fn bundled_face_metrics(family: &str) -> FaceMetrics {
+    // The default family's metrics follow the claimed platform's actual
+    // standard font, because `line-height: normal` and the font box are part
+    // of the layout fingerprint the challenge measures: on a macOS identity
+    // the reference resolves the default font to PingFang SC, whose hhea
+    // (1060/340, upem 1000) grid-fits 16px text to a 22px line box where the
+    // bundled sans answers 19px. Keep glyph selection unchanged; only the
+    // vertical metrics follow the identity, so measureText and layout stay
+    // on one table.
+    if family == FAMILY && font_platform() == FontPlatform::MacOs {
+        return FaceMetrics {
+            ascent: 1060.0,
+            descent: 340.0,
+            line_gap: 0.0,
+            units_per_em: 1000.0,
+        };
+    }
     let (ascent, descent, line_gap) = match family {
         SERIF_FAMILY => (1825.0, 443.0, 87.0),
         MONO_FAMILY => (1705.0, 615.0, 0.0),
@@ -975,6 +1119,31 @@ impl TextEngine {
         // machine to machine and add a multi-millisecond startup scan.
         let mut db = cosmic_text::fontdb::Database::new();
         let mut declarations = Vec::new();
+        // The identity is applied after the engine exists, so the host
+        // PingFang SC is loaded unconditionally and *selected* by identity at
+        // shaping time (see resolve_loaded_font). Deliberate exception to the
+        // no-system-fonts rule: one named host file, kept in its own internal
+        // family that CSS cannot select, so font-presence probes and
+        // authored font-family stacks are untouched. A host without the file
+        // keeps the bundled faces.
+        if let Ok(pingfang) = std::fs::read("/System/Library/Fonts/PingFang.ttc") {
+            for id in
+                db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(pingfang)))
+            {
+                if let Some(face) = db.face(id) {
+                    let is_sc = face.families.iter().any(|(name, _)| name.contains("SC"));
+                    if !is_sc {
+                        continue;
+                    }
+                    declarations.push((
+                        id,
+                        Some("__obscura_system_pingfang".to_string()),
+                        Some((face.weight.0, face.weight.0)),
+                        Some(face.style != cosmic_text::fontdb::Style::Normal),
+                    ));
+                }
+            }
+        }
         for bytes in [
             SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
             MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,

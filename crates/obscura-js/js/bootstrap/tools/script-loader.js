@@ -118,6 +118,10 @@ function _environmentReferrerContext(destination = "") {
     url: globalThis.location?.href || "",
     policy: _environmentReferrerPolicy(),
     root: _environmentDocumentRoot(),
+    // Execution-source label at call time: op_fetch_url's async body may
+    // first run after the calling turn ended, when the thread-local label has
+    // moved on, so the deterministic capture rides here.
+    from: __obscuraTraceCurrent(),
   };
   // The op argument list is already at deno_core's limit, so keep the
   // browser-owned destination in this internal context rather than exposing
@@ -261,8 +265,17 @@ function __startDynClassicFetch(task) {
 // object) are unchanged. `Deno.core.evalContext` is not the answer here: it
 // gives a clean origin but always evaluates in the main realm, so a frame's
 // script would define its globals on the embedder.
-function __runClassicScript(source, url) {
-  const thrown = Deno.core.ops.op_run_classic_script(source, url || "about:blank", globalThis);
+function __runClassicScript(source, url, keepTraceFrom) {
+  // Trace attribution: a classic script is its own script@<url> unit, except
+  // for string timer callbacks, which run under their scheduling label
+  // (keepTraceFrom) the way a browser's timer task does.
+  if (!keepTraceFrom) __obscuraTraceEnter('script@' + (url || "about:blank"));
+  let thrown;
+  try {
+    thrown = Deno.core.ops.op_run_classic_script(source, url || "about:blank", globalThis);
+  } finally {
+    if (!keepTraceFrom) __obscuraTraceLeave();
+  }
   if (thrown.length) throw thrown[0];
 }
 

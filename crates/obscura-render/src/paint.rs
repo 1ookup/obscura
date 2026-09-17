@@ -7013,51 +7013,25 @@ fn paint_text_node(
     Some(())
 }
 
+/// Bytes for the first recognizable family in a CSS list.
+///
+/// The family table lives in `inline`, shared with layout, so a canvas
+/// `measureText` probe and a layout probe answer the same families the same
+/// way: exact names, and only the ones the claimed platform has. The old
+/// substring rules here (`contains("mono")`, `contains("consol")`,
+/// `contains("times")`, `contains("garamond")`) made invented families look
+/// installed, which is what a font-presence probe measures.
 fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     let Some(family) = family else {
         return FONT_BYTES;
     };
     for token in family.split(',') {
-        let token = token
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_lowercase();
-        if token == "system-ui" || token == "ui-sans-serif" {
-            return SYSTEM_FONT_BYTES;
-        }
-        if token == "monospace"
-            || token.contains("mono")
-            || token.contains("courier")
-            || token.contains("consol")
-            || token == "menlo"
-            || token == "monaco"
-            || token == "code"
-        {
-            return MONO_FONT_BYTES;
-        }
-        if token == "serif"
-            || token == "georgia"
-            || token.contains("times")
-            || token == "cambria"
-            || token.contains("garamond")
-            || token.contains("liberation serif")
-            || token == "roman"
-        {
-            return SERIF_FONT_BYTES;
-        }
-        if token == "sans-serif"
-            || token.contains("sans")
-            || token == "arial"
-            || token == "helvetica"
-            || token == "helvetica neue"
-            || token == "-apple-system"
-            || token == "roboto"
-            || token == "segoe ui"
-            || token == "inter"
-            || token == "verdana"
-            || token == "tahoma"
-        {
-            return FONT_BYTES;
+        match crate::inline::bundled_face_for_css_token(token) {
+            Some(crate::inline::BundledFace::Sans) => return FONT_BYTES,
+            Some(crate::inline::BundledFace::System) => return SYSTEM_FONT_BYTES,
+            Some(crate::inline::BundledFace::Mono) => return MONO_FONT_BYTES,
+            Some(crate::inline::BundledFace::Serif) => return SERIF_FONT_BYTES,
+            None => {}
         }
     }
     FONT_BYTES

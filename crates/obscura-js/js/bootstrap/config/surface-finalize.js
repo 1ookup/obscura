@@ -1052,13 +1052,6 @@ const _chromeInterfaceTable = [
   ["ServiceWorkerRegistration",0,0,"EventTarget","",0],
   ["Set",0,1,"Object","Set",0],
   ["ShadowRoot",0,0,"DocumentFragment","",0],
-  ["SharedStorage",0,0,"Object","",0],
-  ["SharedStorageAppendMethod",0,3,"SharedStorageModifierMethod","",2],
-  ["SharedStorageClearMethod",0,1,"SharedStorageModifierMethod","SharedStorageClearMethod",0],
-  ["SharedStorageDeleteMethod",0,2,"SharedStorageModifierMethod","",1],
-  ["SharedStorageModifierMethod",0,0,"Object","",0],
-  ["SharedStorageSetMethod",0,3,"SharedStorageModifierMethod","",2],
-  ["SharedStorageWorklet",0,0,"Object","",0],
   ["SharedWorker",0,2,"EventTarget","",1],
   ["SnapEvent",0,0,"Event","",0],
   ["SourceBuffer",0,0,"EventTarget","",0],
@@ -1597,7 +1590,7 @@ const _chromeNavigatorTable = [
     Object.defineProperty(object, Symbol.toStringTag,
       { value: { cookieStore: 'CookieStore', crashReport: 'CrashReportedDetails',
                  documentPictureInPicture: 'DocumentPictureInPicture',
-                 sharedStorage: 'SharedStorage', viewport: 'Viewport',
+                 viewport: 'Viewport',
                  launchQueue: 'LaunchQueue' }[name], configurable: true });
     Object.defineProperty(globalThis, name,
       { value: object, writable: true, enumerable: false, configurable: true });
@@ -1796,7 +1789,12 @@ const _chromeNavigatorTable = [
 
   method(StorageManager.prototype, 'estimate', async function estimate() {
     requireStorage(this);
-    return { quota: 5000000000, usage: 0, usageDetails: {} };
+    // Chrome grants a share of free disk under a per-origin cap; the reference
+    // capture reports 10 GiB (10737418240) from a worker realm exactly like this
+    // one, where a flat 5 GB is a value no browser produces. This realm and the
+    // document realm must answer alike: one origin reporting two quotas is its
+    // own tell, so both read the same constant.
+    return { quota: 10737418240, usage: 0, usageDetails: {} };
   }, 0);
   method(StorageManager.prototype, 'persisted', async function persisted() {
     requireStorage(this); return false;
@@ -1928,6 +1926,7 @@ const _chromeNavigatorTable = [
     name = validName(name);
     if (node.parent) { node.parent.children.delete(node.name); node.name = name; node.parent.children.set(name, node); }
   }, 1);
+
 
   if (typeof FileSystemWritableFileStream === 'function') {
     const writable = value => {

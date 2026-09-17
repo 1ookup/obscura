@@ -70,8 +70,12 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
     const handlerName = 'on' + event.type;
     const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
     if (typeof inlineFn === 'function') {
+      // An on* handler runs under the label of whoever assigned it (the
+      // accessor snapshot), not of the dispatching turn. Attribute-compiled
+      // inline handlers have no snapshot and keep the dispatch turn's label.
       try {
-        const ret = inlineFn.call(target, event);
+        const ret = __obscuraTraceCallWith(
+          __obscuraTraceHandlerFrom(target, handlerName), inlineFn, target, [event]);
         if (ret === false) event.preventDefault();
       } catch (error) { console.error(error); }
     }
@@ -85,8 +89,11 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
     const callback = entry.callback;
     try {
-      if (typeof callback === "function") callback.call(target, event);
-      else callback.handleEvent.call(callback, event);
+      if (typeof callback === "function") {
+        __obscuraTraceCallWith(entry.from, callback, target, [event]);
+      } else {
+        __obscuraTraceCallWith(entry.from, () => callback.handleEvent.call(callback, event), null, []);
+      }
     } catch (error) {
       console.error(error);
     }

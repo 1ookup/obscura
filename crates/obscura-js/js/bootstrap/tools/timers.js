@@ -11,8 +11,11 @@ const _coerceTimerFn = (fn) => {
     // surfaces a SyntaxError when the timer elapses, matching a real browser,
     // instead of swallowing it eagerly at scheduling. The dynamic-script path
     // uses the same global-scope evaluation for the same reason.
+    // Trace attribution: a string timer runs under its *scheduling* label
+    // (the createBrowserTimer snapshot rule), not as a script@ unit, so the
+    // classic-script entry keeps the ambient label via keepFrom.
     const src = fn;
-    return () => { __runClassicScript(src, globalThis.location?.href); };
+    return () => { __runClassicScript(src, globalThis.location?.href, true); };
   }
   return typeof fn === "function" ? fn : null;
 };
@@ -221,7 +224,10 @@ _defineWindowValue('requestAnimationFrame', (fn) => {
     );
   }
   const id = ++_tid;
-  _rafPending.set(id, fn);
+  // Each animation callback keeps its own registration label; the rendering
+  // opportunity that runs the batch is whoever scheduled a frame, which is
+  // not necessarily who registered this callback.
+  _rafPending.set(id, __obscuraTraceBind(fn));
   _scheduleAnimationFrame();
   return id;
 });
@@ -231,5 +237,6 @@ _defineWindowValue('cancelAnimationFrame', (id) => {
   if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
 });
 if (!globalThis.queueMicrotask) {
-  _defineWindowValue('queueMicrotask', (fn) => Promise.resolve().then(fn));
+  // The microtask inherits its queuing site's execution-source label.
+  _defineWindowValue('queueMicrotask', (fn) => Promise.resolve().then(__obscuraTraceBind(fn)));
 }

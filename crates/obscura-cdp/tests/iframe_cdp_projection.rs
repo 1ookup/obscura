@@ -991,3 +991,28 @@ async fn main_frame_world_stays_isolated_across_navigation() {
         .unwrap();
     assert_eq!(title, json!("main"), "the world binds the new document");
 }
+
+/// The engine's own globals must not be visible through window reflection, in
+/// the main realm or a frame realm. Cloudflare's challenge payload enumerated
+/// `o.__obscura_click_listener_hooked`, `o.__obscura_click_listener_seen` and
+/// `o.__obscura_input_strategy` out of the widget frame's window and submitted
+/// them. The click-listener flags and the embedder-installed policy are created
+/// while the page runs, so the snapshot-time name list cannot cover them; the
+/// reflection filter therefore matches the engine namespace by name.
+#[tokio::test(flavor = "current_thread")]
+async fn window_reflection_hides_engine_globals_in_every_realm() {
+    let (mut ctx, sid, _page_id, _url) = setup().await;
+    let (child, _nested) = child_frame_ids(&mut ctx, &sid).await;
+    let child_context = default_context_id(&ctx, &child);
+    // A name created after page init stands in for the strategy flags: it is
+    // not in __obscura_hide_list, and before the fix it was enumerable.
+    let expr = "(() => { globalThis.__obscura_late_probe = true; \
+                return JSON.stringify(Object.getOwnPropertyNames(globalThis)\
+                .filter(n => /obscura/i.test(n))); })()";
+    let main = eval_value(&mut ctx, 3, expr, None, &sid).await.unwrap();
+    assert_eq!(main, json!("[]"), "main realm window: {main}");
+    let frame = eval_value(&mut ctx, 4, expr, Some(child_context), &sid)
+        .await
+        .unwrap();
+    assert_eq!(frame, json!("[]"), "frame realm window: {frame}");
+}

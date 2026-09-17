@@ -58,6 +58,7 @@ class HTMLImageElement extends Element {
   get onload() { return this._imageOnload || null; }
   set onload(value) {
     this._imageOnload = typeof value === "function" ? value : null;
+    __obscuraTraceRecordHandler(this, 'onload');
     if (this._imageOnload) {
       this._refreshImageFromCache();
       this._queueImageRequest();
@@ -66,6 +67,7 @@ class HTMLImageElement extends Element {
   get onerror() { return this._imageOnerror || null; }
   set onerror(value) {
     this._imageOnerror = typeof value === "function" ? value : null;
+    __obscuraTraceRecordHandler(this, 'onerror');
     if (this._imageOnerror) {
       this._refreshImageFromCache();
       this._queueImageRequest();

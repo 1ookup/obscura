@@ -10,7 +10,19 @@ globalThis.GPU = class GPU {
     return Promise.resolve(Object.create(globalThis.GPUAdapter.prototype));
   }
   getPreferredCanvasFormat() { return 'bgra8unorm'; }
-  get wgslLanguageFeatures() { return _gpuSupportedFeatures(_GPU_WGSL_FEATURES); }
+  get wgslLanguageFeatures() {
+    // WGSL feature sets carry their own interface, so the read answers
+    // `[object WGSLLanguageFeatures]` and not the adapter's feature set.
+    const features = _gpuSupportedFeatures(_GPU_WGSL_FEATURES);
+    try {
+      // Brand only: replacing the prototype would drop the setlike surface
+      // (size/has/iteration) that the feature set shares with the adapter.
+      Object.defineProperty(features, Symbol.toStringTag, {
+        value: 'WGSLLanguageFeatures', configurable: true,
+      });
+    } catch (_error) {}
+    return features;
+  }
   get [Symbol.toStringTag]() { return 'GPU'; }
 };
 navigator.gpu = Object.create(globalThis.GPU.prototype);

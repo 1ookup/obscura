@@ -75,8 +75,10 @@ globalThis.__obscura_init = function() {
     registryState.roots.add(globalThis.document);
   } catch (_e) {}
   try { _applyCrossOriginIsolation?.(frameRootNid || 0); } catch (_e) {}
-  if (frameRootNid > 0 && _crossOriginIsolatedValue
-      && !Object.getOwnPropertyDescriptor(Navigator.prototype, 'cpuPerformance')) {
+  // The challenge enumerates the page realm's navigator and expects this member
+  // there, so it is not limited to cross-origin isolated frames: a real Chrome
+  // answers `navigator.cpuPerformance` in the top document too.
+  if (!Object.getOwnPropertyDescriptor(Navigator.prototype, 'cpuPerformance')) {
     const getter = _markNativeAs(function cpuPerformance() {
       const cores = Number(_fingerprint().hardwareConcurrency) || 8;
       return Math.max(1, Math.min(4, Math.round(cores / 3)));
@@ -355,6 +357,9 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  if (typeof globalThis.__obscura_hide_engine_globals === 'function') {
+    globalThis.__obscura_hide_engine_globals();
+  }
   // Re-taken per page, before any page script runs. The snapshot-time capture
   // at the bottom of this file misses the globals V8 installs per isolate
   // rather than into the snapshot (Temporal, Float16Array, WebAssembly and the
@@ -433,7 +438,11 @@ globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k
 // enumerates the frame global across realms, so append them explicitly rather
 // than let a frame's own identity leak through Object.getOwnPropertyNames.
 for (const _frameFlag of ['__obscura_frame_document_nid', '__obscura_frame_base_url',
-    '__obscura_frame_id', '__obscura_frame_generation']) {
+    '__obscura_frame_id', '__obscura_frame_generation',
+    // Rust also sets the execution-source trace flag/default on a fresh frame
+    // context before its bootstrap runs; same leak path, same fix.
+    '__obscura_trace_from_enabled', '__obscura_trace_default_from',
+    '__obscura_trace_from']) {
   globalThis.__obscura_hide_list.push(_frameFlag);
 }
 

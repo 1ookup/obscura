@@ -4,8 +4,149 @@
 按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
 它们标出了不必再走的路。
 
-当前状态（2026-09-13，step 256，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
-指定代理当前可达，console-op trace持续取得完整payload；本轮两项修复和设备对齐后，参考枚举面剩11项差异。
+当前状态（2026-09-17，step 297，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
+指定代理可达；带点击的单轮在 30s 预算内稳定完成三次 `/fo/` 提交（顶层 #1、widget #1、widget #2 证明），
+此后停滞；75s 窗口同样停在同一处，因此是「停住」而不是「太慢」。
+停滞点已收敛到**一条语句**：widget 在收到证明响应后的程序里 `new Worker(blob:)` 之后不再前进，
+调用方既没有 `push`、没有赋 `onmessage`、也没有 `postMessage`（Proxy 观测下对该 worker 零属性读写）。
+参考同一阶段是 5 个 worker 连发并在 ~215µs 内 `push → onmessage → postMessage`，116ms 后收到 `graIf9` 结果。
+四个候选机制已逐一实测排除：worker 回复被空批次抛弃（实测均为 `outbox-closed`，无瞬时争用）、
+V8 watchdog 静默切断（两个 watchdog 均未触发）、跨 realm `postMessage` 投递失败（双向心跳 seq 到 31+ 正常）、
+blob worker fan-out 本身不可用（本地同形 fixture 5/5 回复正常）。
+页面停在 `honk` eval 等待循环（`0, /.*honk.*/, <ts>`，前导 1337331 空格）——参考也走同一循环，不是分岔。
+**step 290 新增**：修掉 caption/表格宽度协商的两层——① 原生 table 无行时
+`build_table` 直接 `return None`（退化成普通块拉伸 1264/0），caption-only 表格
+现在合成一行、caption 作为单元盒进 grid；② 表格 grid 节点 width auto 时
+`align_self: FLEX_START`（CSS 表格是 shrink-to-fit，不随块级拉伸）。双引擎对拍：
+table 0/1264 → 63（Chrome 60.313，与容器宽度无关）；caption 4 → 37.844
+（Chrome 39.516；残差 ~1.7px 为字形 advance、高度差 4px 为竖向边框细节，
+与 p9 的 0.5px 文本噪声同级）。render 589/589。
+**step 291 新增**：复查 192.168.3.57 反汇编文档仍为 Sep 16 22:31 版本
+（无 timer/timing 族新文件，uGyjw9/ZMSOw0/tZwbF3 归属继续挂起）。会话轮换后
+再跑一轮 30s 点击流程：判决不变（8 次 /fo/、收官 3240B、无 POST /1.txt），
+PWGF4 t=59ms 为历轮最佳；两条 cf_clearance 均为失败路径下发（按判定口径非
+通过证据）。
+**step 294 新增**：远端反汇编文档连续三次复查无更新。caption「竖向边框未计入」
+的前提被计算样式证伪：border 已计入（content 25 + 2+2 = 29），4px 高度差的真因是
+**shaping 字体度量**——caption 文本用捆绑 Liberation 的 hhea 排版（行高 25、
+advance 33.8），Chrome 用 PingFang SC（29、35.5）。修复方向 = identity 感知的
+shaping 字体加载（macOS 身份下装载系统 PingFang SC 参与 shaping），属字体层工程。
+会话轮换后再跑 30s 点击流程：判决不变（8 次 /fo/、收官 3240B、无 POST /1.txt），
+PWGF4 t=279ms。
+**step 296 新增**：identity 感知 shaping 字体加载已落地但**本机不生效**——
+第五次复查远端文档仍无更新；实现为引擎构建时装载 `/System/Library/Fonts/PingFang.ttc`
+的 SC 面到内部家族 `__obscura_system_pingfang`、shaping 解析（resolve_loaded_font
+fallback）在 macOS 身份下优先选取，**但本机没有该文件**（受限系统只有
+STHeiti/Hiragino GB），故 caption 行高差（shaping Liberation 25 vs Chrome 替换字体 29）
+保持原状；宿主有 PingFang 的部署即自动生效。剩余收敛路径：IFC leaf 高度按
+`lines × used_line_height` 抬升，或捆绑一个 PingFang 度量的替代字体。
+30s 流程：8 次 /fo/、收官 3240B、无 POST /1.txt，PWGF4 t=285ms。
+**step 297 新增**：PWGF4 投递残差根因定位并修复——timers 全 trace 抓到
+`next_timeout_ms=Some(0.0)` 却 `delivered=0`、repair 循环上百次不投递：deno_core
+的 mutable timer sleep 持有过期 waker，yield-only op 唤醒不重置 sleep。修复：repair
+时额外入队一个一次性 0ms 丢弃 timer，强制 `queue_timer` 走 `change(now)` 将 sleep
+标记 ready（runtime.rs）。修复轮实测 PWGF4 t=**5ms**（历史 548→59-516），与 Chrome
+的 1ms 同级；后续 183/1009 的散布为挑战流程调用顺序方差（onload 已早触发），非
+投递延迟。套件：obscura-js 618/621、browser 124/125（既有失败不变）。
+**step 289 新增**：插桩 `frame_geometry_json`（OBSCURA_GEOM_DEBUG=1，dump
+cssom/rects/transform/out）命中 p1 归零根因：`Affine2::around` 把 origin 折叠进矩阵时
+`e = ox×(1−a)` 在 scale 1e35 下 ≈1e39 溢出 f32 → e=inf、f=NaN，之后所有角点
+inf−inf=NaN → 序列化 null → JS 全零。修复：`around` 折叠平移饱和到 f32 界 +
+`map_rect` 角点改 f64 中间运算、末端饱和（f32 角点会同时饱和到同值、宽塌成 0）。
+双引擎对拍 p1 gBCR height/y 364.77/−35.885 与 Chrome 逐位一致、宽度为有限巨大值
+（33554430 vs 6.8e32，各自引擎钳位上限，类别相同）——挑战探针 **10/10 OK**。
+caption 4 vs 39.5 仍开放（表格宽度协商架构项）。
+**step 288 新增**：修掉 summary 的 disclosure marker——UA 默认给 summary 装
+before 生成盒（`style.rs`，`before_pseudo = marker`），`dom.rs` 在样式表伪元素提取
+为空时保留 UA 元素默认（否则被无条件覆写）。双引擎对拍 details/summary/p5 全部
+与 Chrome 一致（66=66、[4,70]=[4,70]），挑战探针 10 项里 9 项 OK。`map_rect`
+输出做饱和（非有限值钳到 f32 界；CSSOM 序列化 null → JS 全零回退是更强 tell）。
+p1 gBCR 仍 0：computed transform 解析正确（matrix(1e35,…))，归零发生在 geometry
+op 链更深处（`compute_absolute_unrounded_rects` 之后的某个环节），待插桩定位。
+caption 4 vs 39.5 仍未修（caption 需在 grid 之外独立成盒并参与表格宽度协商——
+表格布局架构工作）。
+**step 287 新增**：修掉「仅含内联级原子盒的块没有匿名行盒 strut」——① `dom.rs` 的
+run 包装器 strut 不再以「run 含文本节点」为条件（CSS 行盒无条件带块的 strut），
+img-only 块 16 → 22；② `style.rs` 给 progress/meter 补 UA 默认 `inline-block`
+（此前落为 block，根本不进 Run）。双引擎对拍：挑战探针 p6 26=26、p7 27≈26 转 OK，
+img-only/progress-only 块 22=22；render 套 589/589 无回归。PWGF4 t 本轮实测 **67ms**
+（548 → 114-354 → 67）。仍未修：p5 details 48 vs 70（Chrome 的 summary 是
+list-item，0 宽下 marker 行多出一行，66=3×22 vs 我们 44）、caption 4 vs 39.5
+（caption 文本未参与表格 shrink-to-fit）、gBCR 病态 scale 0 vs 6.8e32。
+**step 286 新增**：修掉 offsetWidth/offsetHeight 与 transform 的纠缠（`ops.rs`
+geometry JSON 增加 transform-free 的 `layoutWidth/layoutHeight`，`element-object.js` 的
+offset* 优先读取；双引擎对拍 `p1` scale(1e32) 下 offset [4,193] 与 Chrome 逐值一致，
+修复前是 33554430/0）。gBCR 在病态 scale 下仍为 0（transformed rect 二进制32 溢出 →
+序列化为 null → JS 端全零回退；Chrome 用饱和的 layout 单位答 6.8e32，未复刻）。
+新表征一处一类缺口：**仅含内联级原子盒的块没有匿名 IFC strut**（img-only/progress-only
+块高 = 原子高 16，Chrome 答 max(strut 22, …)=22；`is_pure_text_ifc` 拒绝原子 → taffy
+直排）——挑战探针 p5 details 48 vs 70、p6 progress 20 vs 26、p7 select 23 vs 26 全部
+由此而来。修复需要给「全原子子div」合成匿名行盒，动核心布局构建器，留作下一轮。
+**step 285 新增**：带点击的 30s 轮已稳定走完全部五次 `/fo/` 提交，服务端在顶层收官 `/fo/`
+（3240B vs 参考 3660B）后仍回「重开一轮」而非 `POST /1.txt`。两处修复：① 解析脚本排队的页面
+timer 现在在 DCL 边界投递（`page.rs`，api.js 用 `setTimeout(0)` 派发 onload 回调，`PWGF4[0].t`
+548ms → 114-354ms，残差是 chl_page 自己的 `/fo/` 等待与 VM 吞吐）；② macOS 身份的默认字体度量
+改用 PingFang SC hhea（`inline.rs`，挑战自有布局探针（ENV-DETECT pc 204513-207205 重建）的行盒
+高度与 Chrome 逐值一致：p2 92=92、p4 55.938=55.938 等）。新发现未修缺陷：serve+CDP 导航
+loopback URL 提交空文档（`--allow-private-network` 与环境变量都不生效）。
+**step 275 新增**：拿到本会话**第一个运行时 `(pc,key,op)` trace**（24200 个状态，入口 `pc=0,key=121,op=17`，
+解码常数 `+251`），并据此证明操作者的 spec 是**按 build 生成**的：其 69 op 表与本 build 只有 26 个重合，
+`keyRunInit=241` 对我们是错的，所以静态管线必然只出 1 个状态、`dynamicReachable=0`、操作数全是 `h[?]`。
+入口 handler 是**分支型**（`widthByBranch=[5,2,3,2,2,2]`），宽度必须由运行时状态决定 ⇒ `pcstates` 是必需输入
+而非加速器。同时纠正 step 274 的「94.58% 覆盖率」：任一 pc 上 256 个 key 里有 69 个能解出合法 op，
+该比例几乎无鉴别力，不构成「解出一条连贯路径」的证据。
+**step 281 新增**：用「同一 fixture 两个引擎对跑」的方式做表面对拍，修掉两处——`Screen.prototype` 多出 4 个自有属性（Chrome 的 12 个名字现在完全一致，方法改为继承）、`Document` 缺 5 个 legacy 颜色属性（Chrome 返回 `""`，我们原本 undefined）；并记录仍未修的命名差异（window 插入顺序第 61 位起不同、多出 8 个 `SharedStorage*` 全局、缺 `navigator.cpuPerformance`/`HTMLCameraElement`/`HTMLMicrophoneElement`、`Document.prototype.location` 位置、渲染计时 1ms vs 548ms）。
+**step 280 新增**：用 `Target.setAutoAttach` 抓到真实 Chrome 的 payload 字段（341 个带标签字段），逐项对拍后发现并修复两处存储组差异——`navigator.storage.estimate().quota` 在 **worker realm** 里是平 5GB（参考 10 GiB，`RPKTR7`），以及 `flush()` 成本为 0（参考 0.54ms，`uUOw3`）；两处都已在 live payload 里核实为 `10737418240` 与 `0.6`。
+**step 279 新增**：插桩改为**只挂宿主面**（`Worker`/`Blob`，注入到文档自身的 nonce `<script>`），不再解析
+VM 的混淆代码，因此不再受会话轮换影响；据此拿到**当前**变体的完整探针集（含两个此前未见的探针：`eval("debugger")`
+与一个 4×3 计时矩阵 `jixMq8`，以及 5 个 worker 的 `graIf9` 结果——**五个结果都回来了**，step 271 的「new Worker
+之后调用方提前返回」已被推翻，停点更靠后）。另用真实 Chrome 走**同一代理同一 URL**带点击对拍：Chrome（有头/无头）
+当前只走到**顶层 `/fo/` #1 + widget 文档**就停住，一次 widget 提交都没有，而 Obscura 能走完 8 次 `/fo/` 并两次
+拿到 `cf_clearance` ⇒ **当前环境下 Chrome 比我们走得更短**，所以「stage-3 变短」不能单独作为 Obscura 特有指纹的
+证据（能产出参考那份成功抓包的客户端现在也走不到那一步）。
+**step 278 新增**：把所有**能命名**的探针输入与参考侧逐项对拍，结论是**全部一致**：时钟分辨率两边都是
+0.1ms（文档与 worker 两个 realm 都用真实 Chrome 跑同一 fixture 比对；参考 trace 里的 15µs 是插桩 build 的
+钳位前内部值）、navigator 字段一致（参考的 `Navigator.languages` 也是长度 1）、PAT 探针两边都是
+`401 + PrivateToken challenge` 且都不带 auth 头、brunhild 跨域抓取参考侧同样是 `status 0` 失败、请求清单与
+参考 HAR 同类同量。OPFS `flush()` 按参考实测修正为**亚分辨率 0ms**（Chrome `flush` 实测仅 12µs，写入 477µs、
+关闭 76µs），文件后端保留。另发现 **widget 文档按会话轮换**（409959 → 449509B，解码常数 251 → 57），
+旧插桩锚点失效；按 build 稳定的锚点是 `arr[pc++]` 字节码读与 `case <op>: <obj>[<lookup>](this)` 的 switch。
+**step 272 新增**：turnstile widget 文档被请求两次的机制已定位并修复——不是重复 attach（该 host 只有一次
+提交导航），而是 `Critical-CH` 重试在客户端内部把同一请求发了第二遍；参考（Chrome）面对同样的
+`Accept-CH`/`Critical-CH` 只发一次。修复后 widget 文档请求 2→1（3 轮实测，修前 2/2/4）。
+但**实测该重复与停滞无关**：请求数为 1 的轮次同样停在三次提交之后，因此它是独立缺陷而非停滞的原因或症状。
+本轮还确认证明载荷的字段面与参考逐名一致（53 个非数字名全同，仅记录顺序与两个列表长度不同）。
+新增 `OBSCURA_DEBUG_FRAMES`（host 侧 opt-in，报每条 frame 导航路由、每次 attach、每次提交导航）。
+待解：仍要给当前会话的 widget 程序在 `TH.yg` 处做程序侧插桩（build 每会话重随机）；
+另记一处未归因隐患——`navigate_frame_inner` 的 nested discovery 不查 `frames.by_host`，三轮回放未复现。
+**step 273 新增（程序侧直接测量）**：`runProgram(text,b)` 只**构造**程序并返回执行器（3-24ms，返回 native 函数），
+每个程序的执行器被**调用一次**并同步返回 `undefined`；答复证明的 71571B 程序跑 **107ms**，其全部可观测宿主活动是
+`revokeObjectURL → new Blob(292) → createObjectURL → new Worker(blob:) → return`，既不赋 `onmessage` 也不发
+`postMessage`，且未注册任何续体 ⇒ 调用方不执行参考侧三步的原因是**它返回了**（不是被阻塞、不是丢消息、不是被切断）。
+参考同一阶段窗口单独就有 9 个 Blob / 58 次 createObjectURL / 5 个 Worker 之后才 push→onmessage→postMessage。
+另测出 **native 属性 trace 无法用于该阶段**：`--trace-api-keyed off`（175MB）与 `keyed on + filter URL,Blob,Worker`
+（160MB）两种配置下都**一次 `/fo/` POST 都到不了**，trace 自身开销先把流程掐死。
+另测出流程是**会话相关**的：有一轮完整走完 5 次提交（widget #3 resp 5136、顶层收官 resp 3240，参考 7164/3660），
+即 step 262 的「更短 clearance」在现 build 复现，之后页面**开新一轮**而非 POST 表单到 `/1.txt`。
+本轮打通并验证了本会话程序的解码+反汇编管线（7 个响应全部 b64frac=1.000；`bc_02` 用操作者 spec 解出 94.58% 字节
+覆盖、0 unresolved、17356 条指令），并确认**宿主 API 名不在字节码里**（`bc_01`/`bc_02` 都搜不到 Worker/postMessage/Blob）
+⇒ 下一次归因必须「程序 + 解释器（widget 文档）」一起读。
+**step 274 新增**：本地代理跳（direct vs hopped，各 3 轮）**不改变结果**，两臂都是 3 次 `/fo/` POST 后停滞
+⇒ 三次提交停滞是常态，step 273 那次走完 5 次提交是会话运气（本会话约 1/8），两个失败签名都真实存在。
+实测出一处**具体引擎缺陷**：worker realm 里 OPFS 同步句柄 `write`/`flush` 都是 **0 ms**
+（逐字节 fixture：`writeMs:0, flushMs:0`），而参考同模式测得 **10.6 ms**（即 payload 里的 `uUOw3`）；
+形状是对的（`storage_manager_and_origin_private_file_system_match_chrome_shape` 通过），但
+`flush()` 只是 `syncData(this)`（worker.rs:1174），文件节点是内存里的 `Uint8Array`，**从不落盘**。
+（API 在页面 realm 不存在是正确的：Chrome 同样只在 worker 暴露。）
+另**证伪**「handoff literals」读法：用参考自身 HAR 解出它五个 `/fo/` 响应（全部 b64frac=1.000），
+两侧的 stage-3 程序都搜不到 `postMessage`/`_cf_chl_opt`/`widgetId`/`token`/`source`；
+且 stage-2 程序两侧仅差 7 字节（71571 vs 71564）却行为不同 ⇒ **分岔输入不在程序文本里**，是更早读到的值。
+另测出**静态读分支不可得**：操作者反汇编器把我们的 blob 渲染出 94.58% 覆盖、0 unresolved，但所有操作数都是
+`h[?]`——anchors 输入带的是每 pc 的**代表键**而非入口链推导键，我们的 blob `dynamicReachable=0`。
+三条程序侧路线（native trace 成本、handoff literals、静态操作数）均已实测关闭，剩下的是**本会话的运行时
+`(pc,key)` trace**（操作者管线正是从 `ov1-N-pcstates.jsonl` 取这个）。
+
+历史状态（2026-09-13，step 256）：指定代理当前可达，console-op trace持续取得完整payload；
 初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
 Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
 CDP实际点击触发目标二次导航，仍为HTTP403 challenge，后续需继续对拍完整payload行为差异。
@@ -8589,3 +8730,2134 @@ Cloudflare challenge，尚未取得目标真实 404，因此这项修复是必�
 ### Step 258 - Post-fix environment surface audit (2026-09-13)
 
 在修复后的 release binary 上，跨 realm opt-in probe `/private/tmp/lancet-goal-env-live-20260913i/serve.log` 记录了 top、Turnstile frame、重试 frame 和 `about:srcdoc`：均为 `crossOriginIsolated=true`、`typeof SharedArrayBuffer/XSLTProcessor/CSSPseudoElement` 为 `function`，`navigator.languages=["en-US","en"]`、`devicePixelRatio=2`。因此 payload 中 N/F/T 桶的 `SharedArrayBuffer`、`XSLTProcessor`、`CSSPseudoElement` 差异不是当前运行时缺失；没有新的环境修改项。
+
+### Step 259 - Chromium-151 fingerprint trace as the oracle; blob workers are real (2026-09-16)
+
+**假设 / 方法**：新一轮参考不再是 HaHaVM 或旧 tracelog，而是 `assets/thelancet-trace/`：一个
+`Chromium-151.0.7922.76-macos-arm64`（`--enable-fingerprint-trace --fingerprint-trace-values=full
+--js-flags=--no-turbo-fast-api-calls`）的抓包 + fp-trace + HAR。三者同一次通过轮（HAR 末条
+`POST https://www.thelancet.com/1.txt → 404`）。因此这一轮按用户要求改成
+「用同一代理跑我们的一轮 → 与参考的抓包/trace 逐项对拍 → 定位分岔」。新增对拍工具
+`scripts/fptrace_diff.py`（把 fp-trace 的 enter/exit 配对、`.get/.set` 归一，再按**参考的名字空间**
+过滤我们的 jsonl trace）。
+
+**证据（wire 级，必须用解压后长度）**：HAR 的 `bodySize` 是压缩传输长度，`content.size` 才是解压长度；
+用错会得出「我们的响应大 3 倍」的假结论。按 `content.size` 对齐后：
+
+| 请求 | 参考 | Obscura | 判定 |
+|---|---|---|---|
+| orchestrate/chl_page/v1 | 241710 | 237617 | 同形 |
+| api.js | 86603 | 86603（引擎侧 ResourceTiming） | 同 |
+| 顶层 `/fo/` 响应 | 113772 | 113760 | 同 |
+| widget `/fo/` #1 响应 | 822624 | 822648 | 同 |
+| widget `/fo/` #2（点击后的证明）响应 | 127228 | 127228 | **逐字节同长** |
+| widget `/fo/` #3 响应 | 7164 | 5160 | **分岔** |
+| 顶层 `/fo/`（收官）响应 | 3660（带 `cf_clearance`+`cf-chl-out`） | 3240（无 clearance） | **分岔 → 换 ray 重来** |
+
+也就是说：CF 对我们前两个 `/fo/` 提交的响应与对真 Chrome **完全同长**（同一决策），分岔出现在第三个
+widget `/fo/` 与收官顶层 `/fo/`。顶层 `/fo/` 请求体我们又比参考小 ~1.2KB。
+
+**证据（realm 级，fp-trace）**：`fptrace_diff.py realms` 给出参考的 realm 清单——
+`window` 10440、**`worker` 23575（两个 `blob:https://challenges.cloudflare.com/<uuid>`）**、
+`unknown`（纯 v8 点）20975。那两个 worker 里跑的是 CF 的真实测量：`WorkerNavigator.platform /
+hardwareConcurrency / deviceMemory / userAgent` 上报、`TrustedTypePolicy.createScript` +
+`WorkerGlobalScope.fetch("https://brunhild.../i/...")`（`Response.status → 401`）、
+`setTimeout(function(){self.postMessage({CpvME3:"1"})},55)` 计时回路。我们的 trace **worker 记录为 0**：
+`dedicated-worker.js` 把 `blob:` Worker 构造成 stub，只把页面 post 过去的字符串
+`Function()` 在创建者文档里跑（`self.` 被剥掉、`postMessage` 改写成 `hahavm_this.postMessage`）。
+这是本轮唯一的结构性分岔。
+
+**被证伪的假设（要保留）**：把 `blob:` Worker 改成真 spawn（最小补丁：blob 文本已知时走既有 `_spawn`）
+之后，真实点击轮仍是 **0/6**，与改动前 0/6 相同 —— 所以「我们的 blob worker 是 stub」虽与真 Chrome 不同，
+**它本身不足以解释当前失败**。但同一个补丁让 4 个此前失败的 worker 回归测试转绿
+（`blob_worker_evals_posted_source_and_relative_fetch_hits_creator_origin`、
+`blob_worker_reports_the_creating_origin`、`blob_worker_relative_fetch_uses_creator_origin`、
+`worker_from_blob_url_round_trips`、`worker_inherits_the_creator_fingerprint_contract`）：
+测试与质询结果不一致，说明「stub」是先前为 600010 做的**有意取舍**，不能靠测试转绿就翻。
+该补丁已回退，保留为「已测量、未改变结果」的实验记录。
+
+**另两处被排除的怀疑**：
+- `brunhild` 502 是环境：`curl -x http://192.168.3.57:9000 https://brunhild.../i/...` 对**任何**客户端都返回
+  `server: mitmproxy 9.0.1` 的 502（链路上 Reqable → mitmweb 的 MITM 失败）。参考 HAR 里 brunhild 只有
+  `CONNECT`（从未被 MITM，所以没有内层记录），既不能证明成功也不能证明失败。
+- `rPAC6`（payload 里的 locale 形状字段）在参考 payload 与我们的 payload 里都是 `en-us`，不是差异。
+
+**测量盲区（本轮新增）**：
+- **我们的 native trace 没有 V8 builtin 快路径记录**。参考的 Chromium 带 `--no-turbo-fast-api-calls`，
+  能记录 `Date.now`(222)、`Number.parseInt`(5269)、`TextEncoder.encode`、`SubtleCrypto.digest`、
+  `BigInt`、`Object.getOwnPropertyNames` 等；我们的 bytecode 探针在这些调用上**一条都不出**
+  （`grep '"name":"Date\.' → 0`）。因此「参考调过、我们没调过」的名单里混着大量这类假缺失，
+  用两份流做「缺失 API」结论前必须先按名字空间+可表达性裁剪。
+- **嵌套 MITM 代理会把上游不可 MITM 的请求变成 502**：本地 `mitmdump --mode upstream:` 落盘的 502
+  来自本地那层（`server: mitmproxy`），与 Reqable 无关。上一轮把 brunhild 502 记成「代理/上游问题」时
+  就踩了这个坑。
+
+**本轮改动（都是与参考自洽性对齐，无站点特判）**：`screen.colorDepth/pixelDepth` 平台相关
+（macOS=30，参考 `Screen.colorDepth → 30`；原先硬编码 24）；macOS 默认工作区不再等于整屏
+（`availTop=33`、`availHeight=height-33`；参考 33/860 对 982）；UA-CH 全版本不再发布被削减的
+`151.0.0.0`（改用可考的真实 build：151.0.7922.76 / 149.0.7827.0 / 146.0.7680.80，两条 transport 与 JS
+同源）；`navigator.languages` 与 `Accept-Language` 补上基础语言（`zh-CN,zh;q=0.9`，与参考头一致）。
+
+**量化**：改动前后各 6 轮真实点击轮，均 **0/6** 拿到目标 404；改动的可测效果是
+`colorDepth 24→30`、`availTop 0→33`、`uaFullVersion 151.0.0.0→151.0.7922.76`、
+`accept-language zh-CN→zh-CN,zh;q=0.9`（`screen_probe.py`/`ua_probe.py`/`identity_probe.py` 直读）。
+`obscura-net` 103/103 通过（两处断言按新口径更新）。
+
+**结论**：这一轮把「参考」换成真 Chrome 的同轮 fp-trace 后，前两个提交的响应与参考同长，
+分岔精确落在点击后的证明与收官提交；结构性差异只剩「真 worker realm vs 在创建者文档里 eval」，
+而把它改成真 spawn 后通过率不变（0/6）。下一步优先级：①按 `fptrace_diff.py` 的名字空间裁剪出
+「参考表达得出、我们确实没有」的最小 API 集（含 worker realm 上的身份面）；②收官顶层 `/fo/`
+少掉的 ~1.2KB 内容型差异需要解密对拍（我们侧已有 payloadJSON 通路，参考侧需要同 stage 明文）。
+
+### Step 260 - 插桩构建让 Obscura 产出 ov2 tracelog；payload 边界的无侵入捕获（2026-09-16）
+
+**目标**：让 Obscura 轮也产出 `ov2.*` tracelog（参考 `assets/tracelog-0916-11.jsonl`），并用它定位
+收官顶层 `/fo/` 比参考少掉的约 1.2KB。
+
+**方法（不动上游 mitmweb）**：上游 9000 链路里的 mitmweb 只把它自己那份 `ov2.js`（411543 B，与 CF 当前
+下发的内联脚本逐字节相同）替换进 widget 文档；那份脚本**没有** `window.external.tracelog` 调用点，
+所以任何引擎都产不出 tracelog。改为在**本机**加一层 mitmdump（`upstream:http://192.168.3.57:9000`），
+对 widget 文档的内联脚本做二次替换，换成操作者生成器的插桩版本
+`ov2-0916-11.stage3.js`（414092 B，md5 `67c8a9f895807337a881a01be2f46c2b`，来自
+`cf5s/chanllenge/ov2/`，由 `instrument_0916_11.py --stage 3` 从 `ov2-0916-11.pristine.js` 生成）。
+插桩版调用 `W.external.tracelog(k,v)`，正是 Obscura `--tracelog-file` 的 sink。
+复现：`mitmdump --ssl-insecure --mode upstream:http://192.168.3.57:9000 --listen-port 8897 -s instrument.py`，
+引擎 `--proxy http://127.0.0.1:8897`。
+
+**结果（① 达成）**：一次点击轮产出 5163 条 `ov2.*` 记录（另一轮 2261），含 payload 全部阶段：
+`ov2.payload.json_plaintext` / `framed` / `deflate` / `rsa_header` / `keyQBLZ6` / `keystream` /
+`encrypted` / `final` / `send` / `send2`。
+
+**对拍（`tracelog_diff.py values`）**：keys 参考 74 / 我们 58；**value-equal 37、same-format-differs 20、
+FORMAT DIFFERS 0**；只在参考里的 17 个键是 handler 入口键（`ov2.h.m8/m7/cp/cY/ct/cP/cE`，
+按 op 命名，程序跑得越长出现越多）与 `ov2.recov.fire` / `ov2.host.padstart` / `ov2.host.canvas`。
+`segments` 给出量级差异的根因：参考一轮 301292 条 / 12.3s / 4 个 VM 实例 / `send(s)=3`；
+我们一轮 2902 条 / 5.4s + 2261 条 / 3.0s、每片段 1 个实例。**即同一程序我们只跑了约 1/4 的时长与
+1/60 的记录量** —— 这是「观测到的覆盖差异」，不是格式差异（0 FORMAT DIFFERS）。
+
+**payload 字段级对拍（同阶段，均取 `json_plaintext` 第一条 = `chl_api_m` 模式）**：两侧都 47 键、
+**0 类型不符**；差异全是值（会话/上下文相关）。要点：`PWGF4[0].t`（turnstile load→render 的毫秒）
+参考 9539 对 我们 157；计数类 `Blsob5` 11/2、`TzZRB1` 19/6、`WHTpH6` 21/6；尺寸类 `ZMSOw0`/`twvE0`
+1196/751；而 `eaaP6` 1038→2676、`wOvYJ5` 1055→2689。注意参考这一份来自 `/123.txt` harness
+（`vXDzj6` 字段自证），上下文不同，值差不能单独归因引擎。
+
+**② 无侵入 payload 捕获（新手法，已验证）**：把一段安装器**前置**到响应文本里——对 JS 响应与
+**interstitial 内联脚本**（它是文档里最先执行的脚本，早于任何 fetched 脚本；挂钩晚了会被缓存的
+原生引用绕过）——安装器只做包装并写 `window.external.tracelog`，不改挑战代码、不改端点。
+它捕获到：
+- 顶层 `/fo/` 的**最终 payload 字符串**：首个 2380 B、收官 **7799 B**（参考 HAR 同阶段 2359 / 9026）；
+- CF 回包的 base64 解码结果（`paydump.atob.out`，仍是压缩+keystream，未解出明文）；
+- **worker bootstrap 源码**：`onmessage=function(e){e.isTrusted&&''===e.origin&&null===e.source&&eval(...)}`
+  —— 即质询要求 worker 侧消息同时满足 `isTrusted && origin==='' && source===null` 才 eval；
+- 我们的引擎有 `CompressionStream`；`subtle.encrypt` 一次都没被包装到（说明该 payload 的
+  对称加密是 VM 自己实现的 keystream，与 `ov2.payload.keystream` 记录一致）。
+
+**收官顶层 payload 明文仍不可得**：把捕获到的 7799 B 字符串按 CF 字母表还原后得 5849 B 密文，
+在 0..400 全偏移上 raw-deflate/zlib 全部失败 ⇒ 压缩后确有 keystream 加密，离线无会话密钥不可解。
+要拿到它的**字段级**内容，必须像 ov2 那样**在顶层 VM 自己的 builder 上插桩**（操作者的生成器只覆盖
+ov2；顶层是 `orchestrate/chl_page/v1`，其脚本文本里没有 crypto/btoa/CompressionStream 词表，
+构造与加密都在被 eval 的程序内部）。
+
+**关键警示（插桩的固有污染）**：插桩版是**静态捕获**，里面写死了它那一轮的会话值。实测 stage3 里
+硬编码了旧一轮的 fo 端点 `1167067879:1789524309:...`，于是引擎会向它 POST，CF 回 **400**，widget
+随即在 payload 里上报 `{"QJDyx5":400,"qcMvE9":"600010"}` —— 这正是先前会话反复看到的 600010。
+对照：**未插桩的轮从不发这两个请求、也从不出现 400**。同理，上游那份 `ov2.js` 也写死了
+`2923738842:1789549508:rDGb...`（各轮 widget `/fo/` 的 URL 恒为它，而顶层 fo id 每轮都新）。
+结论：**插桩轮只能用于「格式/早期阶段」对拍，其失败码不得当作引擎证据**；要做同上下文的值级对拍，
+需要一份**同一轮内**生成、会话值是最新的插桩脚本（或在引擎侧直接 hook 构造点）。
+
+
+### Step 261 - 当轮新鲜（in-flight）插桩：两个 realm 都在原位打点（2026-09-16）
+
+**做法（不改挑战源码、不服务静态捕获）**：本机 mitmdump 在**当轮响应文本**里**前置**一段安装器，
+覆盖三个入口：interstitial 的内联脚本（`/1.txt` 的 403 文档，文档里第一个执行的脚本）、
+`orchestrate/chl_page/v1`、`api.js`、以及 widget 文档自己的内联脚本（`/turnstile/f/.../normal`）。
+安装器只做包装并写 `window.external.tracelog`，因此**端点与会话值保持当轮新鲜**（自证：本轮
+`api.js` 86603 = CF 原版；widget 的 fo id 每轮不同；轮内不出现注入轮那种 400）。
+**关键实现点**：引擎的全局是**不可写**的（`W.postMessage = f` 在 sloppy 模式下静默失败），
+必须用 `Object.defineProperty(obj, name, {value, writable, configurable})` 才能挂上；这一点决定了
+前几轮「挂了但什么都没捕到」。
+
+**拿到的东西（widget realm，当轮新鲜）**：
+- `crypto.subtle.digest` 的**输入**：3054 次调用。主导项是同一个**常量** 165 字节串
+  （`a3bf5f6d8e8aea25|1789556493151|0|…`，distinct=1、重复 3039 次）被反复哈希 **3040 次**；
+  **参考 Chromium 同项是 457 次**（`len=165` ×457）⇒ 6.7 倍循环计数差。
+- 其余测量输入：CSS 属性名清单 29237 B（`{"0":"accent-color",…`）、字体清单 74 B、
+  音频通道数据 22018 B ×2、keyframe CSS 20234 B，以及若干个**以 0 开头**的缓冲（11820/8624×2/
+  13499/4448 B）。
+- 顶层 payload 边界：首个 2380 B、收官 **7799 B**（参考 HAR 同阶段 2359 / 9026）；builder 帧定位到
+  活脚本里 `orchestrate/chl_page/v1` 的 `gR`：
+  `function gR(E,Iy,wI){return Iy={E:327,W:1747,zk:1270},wI=EW,f[wI(Iy.E)][wI(Iy.W)]&&f[wI(Iy.E)][wI(Iy.W)][wI(Iy.zk)](E)}`
+  —— 它只是**编码助手**（把字符串交给 TextEncoder 一类原生方法），明文在它之前就已产出。
+
+**这轮证伪的两条**：
+1. **不是 canvas 缺陷**。直读我们的引擎：2D `getImageData` 像素正确（`255,0,0,255`）、
+   绘制区域 4096/16384 非零、`toDataURL` 产 22046 字符、`OffscreenCanvas` 512/4096 非零。
+   所以那些「以 0 开头」的 digest 缓冲不是渲染为零。
+2. **CF 自己的 worker 门槛在我们引擎里能过**。用 CF 的原样 worker 源码（`onmessage=function(e){e.isTrusted
+   &&''===e.origin&&null===e.source&&eval(...)}`）实测：blob Worker 可构造、`instanceof Worker` 为真、
+   门槛通过、`postMessage({ok:1})` 的回复到达；`trustedTypes.createPolicy`/`createScript` 均正常。
+   ⇒ stub 路径交付的消息满足该门槛，worker 缺失不是「门槛不过」造成的。
+
+**时间/循环计数的解释与既有反证**：165 字节常量被哈希的**次数**差 6.7 倍，与我们引擎比 Chrome 快得多
+一致（`PWGF4[0].t` 157 ms 对 9539 ms 同源）。但上一轮在**通过侧**做过的可逆扰动实验
+（E2：取消 setTimeout 压缩、恢复真实延时 → token 10.7s 仍通过）已经**证伪「挑战时长/计时决定判定」**，
+所以这类计数差更可能是「更快的引擎」的产物，而不是判定门。
+
+**收官顶层 payload 的明文仍不可得（本轮把可达边界穷尽了一遍）**：它不是 `JSON.stringify` 的产物、
+不经 `btoa`、不经 `subtle.encrypt`、不经 `CompressionStream`、不经 `Blob`/`Response`、
+不经 `join`（带 payload 形状的过滤器无命中），构造与对称加密都在被 eval 的混淆程序内部完成。
+`gR` 之上没有可挂钩的主机边界；要拿字段级明文只能**像 ov2 那样给这个程序本身插桩**
+（操作者的 `instrument_0916_11.py` 只覆盖 ov2；`chl_page` 这个程序需要同类的锚点/派发表分析，
+分析工作区 `jsvmp-engine-0916-11` 的解码器/CFG 工具目前只对 ov2 建成）。
+
+
+### Step 262 - 判定发生在加密交换内部：我们拿到的是「更短」的 clearance（2026-09-16）
+
+**先纠正一条被沿用很久的错误前提**：先前记的「收官顶层 `/fo/` 无 `cf_clearance`」是错的（当时只记了
+status/长度）。按响应头实测（干净路径，CF 原版脚本、fo id 每轮新鲜）：
+
+| 步骤 | 我们 | 参考 HAR |
+|---|---|---|
+| 顶层 `/fo/` #1 | req 2380 → resp 113768，无 chl | 2359 → 113772，无 chl |
+| widget `/fo/` #1 | 4994 → 822–846K，无 chl | 4674 → 822624，无 chl |
+| `/pat/` | 401 | 401 |
+| widget `/fo/` #2（证明） | 89228–91500 → **127228**，无 chl | 89804 → **127228**，无 chl |
+| widget `/fo/` #3 | 92994–94690 → **5160**，`cf-chl-out: 133`，**`Set-Cookie: cf_clearance`** | 93026 → 7164，`cf-chl-out: 153`，**无** set-cookie |
+| 顶层 `/fo/` 收官 | 7810–7895 → **3240**，`cf-chl-out: 133`，**`Set-Cookie: cf_clearance`** | 9026 → 3660，`cf-chl-out: 177`，**`Set-Cookie: cf_clearance`** |
+| 目标 | **无** | `POST /1.txt`（form-urlencoded，`sec-fetch-mode: navigate`，referer 带 `__cf_chl_tk`）→ **404** |
+
+即：**我们确实拿到 `cf-chl-out` 与 `cf_clearance`，只是比参考短（133 vs 153/177）**，而收官顶层请求体
+少约 1.2KB（7810 vs 9026）。然后我们的页面**重新加载**（GET `/1.txt` → 新一轮 orchestrate），
+参考的页面**提交表单**（POST `/1.txt`）拿到真实 404。
+
+**分支差异已定位到「客户端导航之前」**。把六个可产生导航的入口全部包装后跑完整一轮：
+`HTMLFormElement.prototype.submit`、`requestSubmit`、`Location.prototype.assign/replace`、
+`Location.prototype.href` 的 setter、`Window.open`、`HTMLElement.prototype.click` —— **零命中**。
+我们的 interstitial 文档里也**没有 `<form>`/`<input>`**（只有一段带 `cf_chl_o​pt.cOgUHash/cOgUQuery`
+的内联脚本），`chl_page` 程序里 `requestSubmit` 出现 0 次、`createElement` 2 次、`submit` 2 次。
+⇒ 我们这一侧的「重试」不是这些入口之一（很可能是 `location.reload()`，未在本次包装范围内），
+而参考那一侧的「完成」是表单 POST。**两侧都拿 clearance，却分到不同分支**：说明判定发生在
+**收到加密响应并解出决策**之后、**客户端动作之前**，即决策数据在 `/fo/` 的加密响应体里。
+
+**这些 `/fo/` 响应是不可读的加密块**：收官顶层响应（3240 B）与 widget #3 响应（5232 B）首字节是
+`hLeHiJm+iJeL…` / `cXF3hm1yWVdd…`，与请求体同一套自定义字母表，离线无会话密钥不可解；
+它们不是 HTML，所以「读响应看 CF 说什么」这条路在本环境不成立。
+
+**本轮顺带证伪（都曾是候选检测点）**：
+- 表单 POST 导航本身在引擎里正常：attached `form.submit()`、**detached** `form.submit()`、
+  `requestSubmit()` 三种都发出 POST（本地 8099 服务器实测收到 `tokattached=vattached`）。
+  （第一次探针的 `None` 是我的探针顺序错：attached 那次已经导航走了，后续调用自然无函数可调。）
+- CF 自己的 worker 门槛（`isTrusted && origin==='' && source===null` → `eval`）在引擎里能过。
+- canvas 读回非退化（像素/`toDataURL`/`OffscreenCanvas` 都正确）。
+
+**结论与下一步**：判定点在服务端对**我们提交内容**的评估里（1444 字节差：请求 7810 vs 9026 与
+clearance 长度 133 vs 153/177 同源）。要闭环只剩两条路，都需要分析侧：
+① 解出 `/fo/` 加密响应（需要该会话的对称密钥，密钥在 VM 内部由 JS 生成）；
+② 或按 step 261 的办法给 `chl_page` 程序的 payload builder + 决策分支插桩（需要该程序的锚点/派发表，
+现有 `jsvmp-engine-0916-11` 工具只对 ov2 建成）。
+
+### Step 263 - 引擎内部全局经 `for..in` 泄漏：19 个 `__obscura_*` 在 window 上可枚举（2026-09-16，已修）
+
+**假设 / 方法**：不再追 payload 明文，改为直接问「真浏览器不会有的东西」——在引擎里枚举
+`window`。探针：`for (var k in window) if (/obscura|Obscura|Deno|^__blob/.test(k)) ...`，并对命中项读
+`Object.getOwnPropertyDescriptor(window, k)`。
+
+**证据（修前）**：`Object.getOwnPropertyNames(window)` 被 JS 层过滤后**看不到**任何引擎名（先前会话做的
+`_isEngineName` 过滤 + `__obscura_hide_list` 生效），但 **`for..in` 枚举出 19 个**：
+
+```
+__obscura_schedule_input_strategy  __obscura_natural_type  __obscura_set_screen_override
+__obscura_recompute_resizes  __obscura_shadowHostNames  __obscura_recompute_intersections
+__obscura_report_uncaught  __obscura_window_origin_x  __obscura_window_origin_y
+__obscura_pointer_release  __obscura_setFieldValue  __obscura_setInputFiles
+__obscura_rebasePerformanceOrigin  __obscura_queue_event_timing  __obscura_seed_visibility_entry
+__obscura_measure_task  __obscura_performance_record  __obscura_performance_lifecycle
+__obscura_clone_hooks
+```
+每一个都是 `window` 的**自有且 enumerable** 属性（`getOwnPropertyDescriptor` 直接命中，depth 0）。
+修前 `for..in` 总键数 263，其中 19 个是引擎名；Chrome 一个都不会有。
+
+**根因**：`__obscura_hide_list` 是**快照期**捕获的，而其中 19 个全局是运行时才安装的
+（`tools/interaction.js`、`env/crypto/*`、`env/dom/shadow-custom-elements.js`、`env/media/canvas.js`、
+`env/performance/*`，以及 Rust 注入的 input policy 等），所以它们没进 hide list、保持 enumerable；
+而 `bootstrap.js` 的反射过滤只覆盖 `Object.getOwnPropertyNames` / `Reflect.ownKeys` / `Object.keys` /
+`Object.getOwnPropertyDescriptors`——**`for..in` 由 V8 直接遍历属性表，绕过所有 JS 层过滤**。
+
+**修复**：在 `bootstrap.js` 增加 `__obscura_hide_engine_globals()`（用 `for..in` 找出自身可枚举的
+引擎命名空间全局，逐个 `Object.defineProperty(..., {enumerable:false})`，幂等、自带 try/catch），
+并在 `page-init.js` 的 hide 循环之后调用一次（带 `typeof === 'function'` 守卫，兼容不跑该 bundle 的 realm）。
+
+**量化**：`for..in` 泄漏数 **19 → 0**；`for..in` 总键数 263 → 244；frame realm 同样 0。
+`obscura-js` 620 项：610 通过 / 10 失败，10 项全部**既存**（7 项 worker 家族、1 项 link 属性顺序、
+2 项 about:blank 家族）；两处断言按本轮已定标的口径更新
+（`languages` 现在含基础语言 `["zh-CN","zh"]`；清掉 screen override 后默认 macOS 工作区
+`availTop > 0` 且 `availHeight < height`）。真实点击轮 6 轮：**0/6**（与修前一致），
+即这处泄漏是**真实指纹缺口**，但不是当前判定的门。
+
+**附**：同轮还验证了三条「真浏览器该有的行为」我们是对的（用直读探针，避免再猜）——
+表单 POST 导航（attached/detached/`requestSubmit` 三种都发出 POST）、CF 的 worker 门槛
+（`isTrusted && origin==='' && source===null` → `eval`）、canvas/Offscreen 读回均正确。
+
+### Step 264 - `/fo/` 的载荷是「加密的 VM 字节码」，所以主机侧永远看不到程序（2026-09-16）
+
+**假设**：既然 `/fo/` 决策不可读，先确定它**是什么**——是 JS 文本（可被 eval/script/blob 捕获），
+还是别的形态（只能被 VM 解释）。
+
+**方法与证据**：
+1. 把主机侧所有「程序会变成可执行代码」的入口都包装后跑完整轮：`eval`、`Function`、
+   `Node.appendChild/insertBefore/replaceChild` 上的 script 文本、`createElement('script')`、
+   `Worker.prototype.postMessage`、`URL.createObjectURL`/Blob 文本。
+2. 直接读引擎的 blob 库（本引擎把 blob 文本放在页面可见的 `globalThis.__blobStore`）：
+   一轮点击结束后库里**只有 1 项**、292 字节，内容是 worker bootstrap
+   （`var _p=null;if(self.trustedTypes)…onmessage=function(e){e.isTrusted&&''===e.origin&&null===e.source&&eval(...)}`）。
+   即**解密后的程序没有变成任何 JS 文本**。
+3. 比对字母表：插桩轮 tracelog 里 VM 的**用户字节码**记录为
+   `ov2.bc.user {bc_len: 6944, dst: 210, bc_kind: '[object Uint8Array]'}`，其 `bc_head` 是
+   `sKHDVzg+P0lAOCk9KvKZl5yVnJWSmabFrZODGCJGLyliNW1VxszR+gam9W1P…`；而我们抓到的 `/fo/` 响应体首字节是
+   `kMOTlKXKlKOXzZyhnpzAqqjApdG5lMuZztPB2suz06PR…`、`cXF3hm1yWVddVFlZbJJebV2Td2CAm5Z4eop7bYexnoZy…`、
+   `hLeHiJm+iJeLwZCVkpC0npyzjMavw8eQs6HTyMKRtanD…`、`RVpZb5Bab2NgX2dtYoR3fZpb…`、
+   `mpqgr5abgoCGfYKClbuHloa8oImpxL+ho7OklrDax6+b…` —— 同一类自定义 base64 字母表，且同一 URL 的不同轮
+   前缀不同（会话密钥不同）。
+
+**结论**：`/fo/` 请求与响应都是**加密的 VM 字节码**，由 ov2 解释器解密后**在自己的 dispatch 循环里执行**，
+不经过任何 JS 执行入口。这一个事实解释了此前所有「主机侧挂钩零命中」：不是挂少了，而是**没有可挂的边界**。
+它同时与操作者工具链的设计一致——`jsvmp-engine-0916-11` 的锚点/派发表工具正是为了给**这个 VM** 插桩
+（`instrument_0916_11.py` 生成 stage1/2/3），而不是给页面级 JS 插桩。
+
+**因此收官 `/fo/` 的字段级明文只有两条路**（都不是主机侧包装能做到的）：
+① 拿到该会话的对称密钥（密钥在 VM 内由 JS 运算生成，不在任何原生 API 的入参里）；
+② 用 ov2 的插桩**比较两轮的 dispatch 轨迹**——这是**现有工具就能做**的下一条路：我们的 tracelog 已能
+产出（step 260），参考 tracelog 在 `assets/tracelog-0916-11.jsonl`，`tracelog_diff.py` 的 `values`/`diverge`
+可直接对齐 key 与值。注意先消除**插桩自身开销**带来的速率差：参考 301292 条/12.3s，我们一轮
+2902 条/5.4s + 2261 条/3.0s（每片 1 个实例），速率差主要来自两侧 tl() 落盘实现不同，不能据此下结论。
+
+## Step 265: the /fo/ responses decode without a session key, and our build is not the operator's
+
+**Why this step.** Step 264 left one gap: the decision data is inside the `/fo/` response
+bytecode, and the only routes were "the session symmetric key" or "VM-internal
+instrumentation". The operator's `jsvmp-engine-0916-11/decode-ov1.mjs` header publishes the whole
+response transform, and its only input besides the body is the session ray. So the responses are
+decodable from our own capture, with no key handed over. This step does that, then checks whether
+the operator's build-level tooling applies to our session.
+
+**Decoder.** `.claude/skills/obscura-challenge-probe/scripts/ov1_decode.py` (byte for byte the
+published pipeline: `seed = 32 ^ xor(charCodeAt(ray + "_0"))`, `stage1 = atob(body)`,
+`out[i] = js_mod((255 & s1[i]) - seed - (i % 65535) + 65535, 255)`, `bytecode = atob(out)`).
+
+Validity is not asserted, it is proved twice:
+
+1. Run on the operator's own HAR it reproduces their three hard-metric artifacts exactly:
+   `a814b14a54e09ce35c3d6528d081c890` (462740 B), `1b343b06bd03b55cf01c17278884e61a` (71567 B),
+   `8ee7e511a0bda63fd54c813c4d9c7226` (4029 B).
+2. The seed is provably the server's, not merely a working guess. `out[i]` is the canonical
+   stage-2 text shifted by `(Uk_true - Uk_used) mod 255`, a per-byte constant, and the canonical
+   stage-2 is pure base64 (the VM feeds it to `atob`). Over the 65-char alphabet a shift maps the
+   alphabet onto itself only for `d = 0` (checked exhaustively), so a wrong seed cannot produce
+   the pure-base64 stage-2 that every one of our five responses produced
+   (`b64frac = 1.000`). Per-entry ray: the ray is in each `/fo/` URL
+   (`/fo/<hash>/<16 hex ray>/<token>`), which matters because our HAR holds two challenge rounds;
+   the operator's `--index all` uses one global ray and reports `[E] 最大公共前缀=0 → DIVERGENT`
+   plus 12 B / 399632 B / 64884 B artifacts on our HAR.
+
+**What our session was served** (widget level, ray `a3bf882b8bec564b`):
+
+| stage | our bytecode | reference bytecode | delta |
+|---|---|---|---|
+| 1st `/fo/` response | 462979 B | 462740 B | +239 B |
+| 2nd `/fo/` response | 71570 B | 71567 B | +3 B |
+| 3rd `/fo/` response | 2900 B | 4029 B | **-1129 B** |
+
+The reference's third program carries the widget handoff literals (`_cf_chl_opt`, `postMessage`,
+`widgetId`, `token`, `source`); ours is a different, smaller program. Page-level `/fo/` responses
+(63988 B and 1821 B) have no counterpart in the filtered reference HAR.
+
+**Our blobs are not in the operator's build encoding.** Three independent checks, all with the
+operator's own tooling run on a scratch copy of their tree (`/tmp/ov2-our`, their production tree
+untouched):
+
+1. Entry decode: at `(pc=0, key=241)` the reference blobs decode to `op=84 = cl`; ours decode to
+   `op=56`, which is absent from `spec.opToHandler`, so the entry chain dies
+   (`宽度未覆盖`, `dynamicReachable = 0`, 181 rendered instructions against the reference's 295).
+2. String table: `scripts/ov1_strprobe.py` inverts the VM's own string encoding
+   (`plaintext = Uk ^ ((b+245)&255) ^ 120`, searched over all 256 per-string keys). On the
+   reference's stage-3 blob it recovers exactly the documented literals; on all three of our blobs
+   it finds none of them, and none of `document`, `Date`, `window`, `length`, `indexOf` either.
+3. Control: the same scratch pipeline fed the reference blobs reproduces production byte for byte
+   (295 rendered instructions, `入口链自洽性 ✅`), so this is not an environment artifact.
+
+**The challenge program itself is per-session.** Two loads inside one session are 94.25% identical
+(217839 B identical block, same 235598 B size and different md5), while our program against the
+operator's `ov2-0916-11.pristine.js` (400800 B) shares 8.63% with a largest common block of 446 B
+(against `ov2-0916-11.js`, 225721 B: 7.69%, largest 691 B). A later round fetched 243573 B. So a
+saved pristine is not this session's VM, and the anchor/dispatch tables derived from it describe a
+different build. The `_cf_chl_opt` field vocabularies are identical across sessions (13-key page
+block, 26-key widget block, same names), so those names are stable and cannot be used as a build
+fingerprint.
+
+**In-flight seam that does work.** `scripts/inject-runprogram-probe.py` wraps the VM's own global
+`runProgram(text, b)` (the consumer at pristine:3406 and the source-embedded literal at
+pristine:5072) through an accessor on the global, plus `Function`, `fetch`, and
+`XMLHttpRequest.open/send`. A 30 s round produced 17889 `rp.call` records, all from
+`https://www.thelancet.com/1.txt`, all the **same** 6032-char standard-base64 program text
+(`head bdUluwUbHBYdBRNMvy6Ymoech5yRmI2J7BmHLTcbBD53…`), which is the page realm's inline program
+re-run per event. No `/fo/` text and no `new Function` argument appeared.
+
+**Where the payload builder actually runs.** The run log shows four `blob:` worker scripts, and the
+`/fo/` POSTs never pass through the page's `fetch` or `XMLHttpRequest` even though both were wrapped
+before the first page statement. The tracelog sink exists only in window realms
+(`realm.rs` sets `globalThis.__obscura_tracelog_enabled` for frames and installs `External.tracelog`;
+`env/worker/dedicated-worker.js` has no `external`). So the requested "insert
+`window.external.tracelog` into the payload builder" cannot work as written: the builder's realm has
+neither `window` nor a tracelog sink, and the addon snippet's `var W = window` throws there and is
+swallowed by its own guard.
+
+**Ruled out this round.** `GET .../pat/<ray>/...` returns `401` with a 1 byte body in the reference
+session as well, so it is not a divergence.
+
+**Status.** `https://www.thelancet.com/1.txt` still answers with the challenge; the click run is
+still 0/6. New next action: give the worker realm a sink (postMessage forwarding, or a
+`self.external.tracelog` in `dedicated-worker.js`), then log the `/fo/` fetch body and the decoded
+program text inside the worker, which is the realm that builds the payload. Instrumentation of the
+*current* session's `orchestrate/chl_page/v1` is required, because the build is re-randomized per
+session.
+
+## Step 266: a probe the challenge does not detect, the worker realm, and a correction to step 265
+
+**Why this step.** Step 265 concluded that our bytecode "is not in the operator's build encoding" and that
+the build is re-randomized per session. Both were wrong, and the error came from comparing a decode of one
+session against program text from another. This step re-derives the decoder against the live VM, lands the
+worker-scope instrumentation the objective asked for, and records the divergences that are left.
+
+**The decoder is now validated against the VM itself, not just against the operator's HAR.** A run with the
+probe installed captures both the response body and what the VM does with it. For one session:
+
+| response chars | VM `atob` output | our stage-2 text | VM's `runProgram` text |
+|---|---|---|---|
+| 113768 | 85324 B, head `81 84 76 8e` | 85324 B, head `bdUluwUbHBYdBRNMvy2Lg…` | 85324 chars, head `bdUluwUbHBYdBRNMvy2Lg…` |
+| 845964 | 617340 B | 634472 B, head `7GQ/BcWvrrStxa4EoGE…` | 634472 chars, head `7GQ/BcWvrrStxa4EoGE…` |
+| 127240 | 95428 B | 95428 B, head `7GQ/BcWvrrStxa4EoGE…` | same family |
+
+The program text the VM hands to `runProgram` **is** the pipeline's stage-2 output, byte for byte, and the
+relation `stage2[i] = js_mod((255 & s1[i]) - seed - (i % 65535) + 65535, 255)` holds for the first bytes
+with the session's ray-derived seed (checked analytically: seed 23 in one session, and the per-entry ray from
+the `/fo/` URL). Nothing is session-keyed beyond that seed.
+
+**Correction to step 265.** Fed VM-verified blobs, the operator's `spec-0916-11.mjs` decodes our entry bytes
+to **legal handlers** with a **self-consistent entry chain**, so our bytecode is in the same encoding as the
+build their tables came from:
+
+```
+ov1#0 bcLen=63992  bc[0]=0x6d key=241 -> op=147 handler=m7
+ov1#1 bcLen=475853 bc[0]=0xec key=241 -> op=16  handler=ce fixedW=3
+ov1#2 bcLen=71569  bc[0]=0xec key=241 -> op=16  handler=ce fixedW=3
+ov1#1 入口链自洽性: (0,241) 的第一步（w=3）落在 pc=3 且 key=58 有行 ✅
+```
+
+And our program's string pool is readable with the same per-string-key scheme step 265 introduced
+(`plaintext = Uk ^ ((b+245)&255) ^ 120`, key searched over all 256 values). On the 475853 B widget program:
+`_cf_chl_opt` x93, `postMessage` x31, `document` x132, `hardwareConcurrency`, `deviceMemory`, `platform`,
+`userAgent`, `webdriver`, `getDirectory`, `attachShadow`, `getContext`, `digest`, `WebAssembly`,
+`performance`. So the earlier "no readable strings" and "unknown op" readings were artifacts of a
+mis-seeded decode in that session, and the "per-session build" claim is retracted: what is per-session is
+the *program*, not the encoding.
+
+**The probe that the challenge does not detect.** The earlier attempts stopped the flow before `/fo/`
+(because a `runProgram` wrapper called itself and blew the VM's stack), so a run with a probe present looked
+like a run with an engine defect. The probe now: passes the original switch in `camo()` (`name`, `length`,
+and `toString()` answering exactly the original's text), preserves each property's original descriptor flags
+(a WebIDL global operation is enumerable; redefining one as non-enumerable is what a `for..in` audit reads),
+keeps the prototype chain when wrapping `Worker` (a fresh prototype drops `terminate`), and owns no
+enumerable global. Bisecting the seams one at a time is a one-character edit (`var ON = 'fabxwre'`).
+Measured: all seams on, the run makes 6 `/fo/` POSTs, the same as the clean control.
+
+**Worker-realm instrumentation works now.** Two engine changes:
+
+1. `worker_prep_script` installs `external.tracelog` in the worker realm when the host asked for a
+   destination (`crate::tracelog::enabled()`), mirroring what the window bootstrap does. Without it the one
+   scope an anti-bot payload owns outright is the one scope that cannot be instrumented.
+2. The observer itself rides into a worker by prepending to the posted classic source (the realm a CDP
+   preload cannot reach). In a run it reports `hasExt: true, hasTL: true, dwsc: function, syncHandle:
+   function, tag: [object DedicatedWorkerGlobalScope]`.
+
+**Divergences measured against the reference trace** (`assets/tracelog-0916-11.jsonl`, which is the passing
+real-Chrome run and carries the same probe fields):
+
+| probe | reference | ours |
+|---|---|---|
+| `uUOw3` storage flush duration | 10.6 ms (succeeded) | error string in the stub path; `0` when the worker ran as an isolate |
+| `gQTuX1` fetch rejection text | `TypeError: Failed to fetch` | `TypeError: Failed to fetch: CORS error: Origin '…' not in Access-Control-Allow-Origin ''` |
+| `vVsCr9` min `performance.now()` delta | `0.09999990463256836` | `0.09999999999990905` (unclamped double) |
+| `graIf9` compute shard | 2658, 2717-2972 ms | 10822, 22363-23015 ms |
+| `rMor4`/`eSLoU7` `/pat/` result | 1 / 401 / 0 | 1 / 401 / 0 (match) |
+| timer and trusted-types probes | `1`, `TWnkF5` | `1`, `TWnkF5` (match) |
+
+Two of those are engine defects with a clear fix: the fetch rejection text (fixed here: Chrome keeps the
+reason out of `message`, and the challenge reads that string back out of a worker) and timer quantization.
+The compute probe is the large one: the same workload takes about 22.9 s here against 2.9 s in Chrome, which
+is why the flow never reaches its final handoff inside the harness window.
+
+**What was tried and reverted.** Making a blob worker spawn its own isolate (its blob text is the
+challenge's bootstrap, and the widget CSP allows `'unsafe-eval'` with `worker-src blob:`). It makes the
+storage probe succeed and gives 15 worker realms, but it breaks the documented document-eval contract that
+three tests guard, including one that aborts the process, and it does not make the challenge pass. The
+revert restores the earlier state; `cargo nextest -p obscura-js` reports the same 10 pre-existing failures
+before and after, so nothing here regressed.
+
+**Status.** `1.txt` still answers with the challenge and no `POST /1.txt` is ever issued; the objective is
+not met. Next actions, in order: the compute-probe slowdown (profile the worker realm's JS throughput
+against the page realm), the `performance.now()` clamp, and the blob-worker eval path whose own tests fail on
+this tree.
+
+## Step 267: the compute probe is workload, not a slow realm
+
+**Why this step.** Step 266 left the compute probe as the leading candidate: our session reported
+`graIf9` = 10822 iterations in 22363 ms where the reference reported 2658 in 2904 ms, an 8x gap. The
+next action was to attribute that to a realm-level slowdown (V8 flags, tiering, profile) and fix it.
+
+**The realm is not slow.** `scripts/realm-bench.js` runs three probes (an arithmetic loop the
+optimizing tier handles, a `charCodeAt`/`slice` string loop shaped like the challenge's compute, and a
+float loop) in the page realm and in a real worker isolate (a `data:` URL worker, which the engine does
+spawn). Iterations and warmup are identical in both realms:
+
+| probe | page realm | worker realm | node 22 (V8 reference) |
+|---|---|---|---|
+| arithmetic, 300k iterations | 2.80 ms | 2.40 ms | 5.65 ms |
+| string/charCodeAt, 1500 rounds | 1.10 ms | 1.10 ms | 3.41 ms |
+| float, 200k iterations | 6.90 ms | 7.10 ms | 7.85 ms |
+
+So there is no worker-realm tiering or flag defect: both realms land in the same place, at or above a
+stock V8. The published claim that "the same worker script is 2658/2.9 s in Chrome and 10822/22.9 s in
+Obscura" therefore compares two different *sessions*, not the same workload: `PySu2` carries the
+session's ray and timestamp plus a per-session count, and `WrTo7` differs (15 against 10-11), so the
+nonce landed by each session is a different draw from a per-session search. Dividing through gives 2.12
+ms per unit here against 1.09 ms there, which is a real but unexplained ~2x on that one script, not the
+8x the totals suggest. The engine-side implementation of `graIf9`'s script is what to profile next, not
+the realm.
+
+**Where the flow actually stops, measured.** After the second widget response the process is *idle*:
+sampling `ps -o %cpu` through a 70 s run gives 26% at t=5 s, 15.7% at t=10 s, 13.2% at t=15 s, 3 /fo/
+POSTs by t=20 s, then 1.6-3.4% for the next 50 s. A host-side API trace
+(`--trace-api-file --trace-api-format jsonl --trace-api-keyed off --trace-api-filter …`) records 8
+entries and stops at t=7.4 s, so the stall is not an awaited API either. What the engine is waiting for
+after the second widget program is still open, and it is the next thing to instrument (the filter used
+drops the VM's computed-key accesses by design, so the op stream, not the API stream, is the right
+instrument there).
+
+**What our session sends at that point is the same as the reference's.** The widget's second round trip
+is the reference's second: 127232 response characters on both sides, decoding to a 71567 B program
+there and 71569 B here. The divergence is what happens next: the reference answers with a third POST
+(91724 chars) and receives the small final program (7164 chars), and one of our runs did reach that
+shape (a third POST answered with 5160 characters, followed by a page-level POST answered with 3240),
+while the last four runs stopped after the second response.
+
+**Attempted: let a blob worker run its own bootstrap in an isolate.** Its blob text is the challenge's
+`onmessage -> eval` bootstrap, and the widget CSP allows it (`script-src 'nonce-…' 'unsafe-eval'` with
+`worker-src blob:`). Measured effect: the storage probe reports `{"uUOw3":0}` instead of
+`"createSyncAccessHandle is not a function"` (the reference reports 10.6 ms), 15 worker realms run, one
+5000-iteration run reached all twelve probes including the compute, and one run produced the final
+handoff shape above. Cost: it breaks the documented document-eval contract that four tests guard, and
+the test that spawns a blob worker in a frame realm aborts the process on a Tokio-runtime panic inside
+`op_worker_recv`. Reverted, so the tree keeps its contract and its recorded 10 pre-existing failures.
+Adopting it deliberately means updating those tests and giving that one a runtime; the measurements
+above are the justification to do that, not this round.
+
+**Landed this round (both verified):**
+
+1. The fetch rejection message is now Chrome's opaque `TypeError: Failed to fetch` with the CORS reason
+   kept out of it. A live run's worker reply reads `{"AXuey2":1,"gQTuX1":"TypeError: Failed to fetch"}`,
+   byte for byte what the reference trace records.
+2. `op_worker_recv`, `op_worker_post_to_page` and `op_worker_close` no longer panic when the embedder
+   already holds the shared state borrowed. The first abort seen this round was that `RefCell`
+   double-borrow unwinding into a `v8::FunctionCallback` frame (`panic_cannot_unwind`), which aborts the
+   process rather than failing one call; they now degrade (empty batch, false, no-op) and the caller
+   polls again. Both changes leave `cargo nextest -p obscura-js` at 610/620, the same 10 pre-existing
+   failures recorded before this round.
+
+**Surface parity against the reference payload.** The operator's decoded reference payloads
+(`assets/payload/*.json`, captured pre-encryption in Chrome) carry a bucket table of every property the
+VM reads. Running `scripts/diff_payload_enum.py assets/payload/2.json assets/payload/3.json` against our
+engine: navigator 81 read, 1 missing (`modelContext`); document 295 read, 0 missing; screen 15, 0;
+screen.orientation 9, 0; window 1238 read, 2 missing (`ModelContext`, `WebMCPEvent`). The two reference
+payloads also show the profile that session presented: `rPAC6: "en-us"`, UA `Chrome/149.0.0.0`, platform
+`MacIntel`. Our instrumented runs were forcing `zh-CN` and `Chrome/151`; running with the engine's own
+defaults (Chrome 149, en-US) changes the interstitial's language and nothing else, so that override is
+not the blocker.
+
+**Status.** Unmet: `1.txt` still answers with the challenge, no `POST /1.txt`, and the last four runs
+stop after the widget's second response. Next actions: instrument the *op* stream (not the API stream)
+across that stop, profile the engine's execution of `graIf9`'s script specifically, and then adopt the
+worker-isolate path with its tests updated, since it is the only configuration measured to reach the
+final handoff.
+
+## Step 268: the worker-isolate path is adopted, and seven tests come with it
+
+**Why this step.** Step 267 measured that letting a blob worker run its own bootstrap in an isolate is
+the only configuration that reached the challenge's final handoff, and left it reverted because it broke
+guarded tests. This step adopts it properly, which means settling the contract those tests encode.
+
+**The tests already described the browser contract.** The blob-worker tests build a blob *containing a
+script* (`onmessage = function (e) { if (e.isTrusted && e.origin === '' && e.source === null) eval(e.data); }`)
+and expect it to run: `blob_worker_reports_the_creating_origin`,
+`blob_worker_relative_fetch_uses_creator_origin`, `worker_from_blob_url_round_trips`,
+`worker_inherits_the_creator_fingerprint_contract`, `blob_worker_evals_posted_source_and_relative_fetch_hits_creator_origin`,
+`frame_blob_worker_eval_fetch_empty_hits_frame_origin`. The tree's document-eval stub answered none of
+them, which is why they were among the ten failures carried since step 266. Running the blob's text in the
+isolate satisfies them.
+
+**What changed:**
+
+1. `Worker` construction for a blob with text spawns its isolate with that text, and a post goes to the
+   isolate (the blob's bootstrap evals it there) whenever one exists; the document-eval stub remains only
+   for a blob whose text is missing. Measured effect on the challenge: the storage probe reports
+   `{"uUOw3":0}` instead of `"createSyncAccessHandle is not a function"`, and 15 worker realms run.
+2. Two expectations moved to the worker scope, which is the contract they were probing for: `typeof
+   document` inside the worker-evaled source is `"undefined"`, not `"object"` (a scope answering "object"
+   evaluated the source in the creating document), while `new Request('').url` still resolves against the
+   creator's origin. Both tests document that reasoning at the assertion.
+3. `op_worker_recv` returns an empty batch when there is no Tokio runtime instead of awaiting a Tokio
+   primitive, which panicked inside a `v8::FunctionCallback` frame and aborted the process. That is what
+   `frame_blob_worker_is_allowed_by_worker_src_blob_scheme` hit once the blob worker really spawned; it
+   now passes.
+
+**Test effect, measured:** `cargo nextest -p obscura-js` goes from **610/620 to 617/620**. The three
+remaining failures are the unrelated pre-existing ones (`link_elements_use_their_own_interface_and_resolve_urls`,
+`initial_about_blank_inherits_creator_origin_domain_and_referrer`,
+`sandboxed_initial_about_blank_keeps_opaque_origin_and_domain`), untouched by this work. The release build
+passes.
+
+**Where the flow stands on the final build, inside the 30 s budget.** A compliant run (click at 10 s, read
+at 17 s) makes the reference's three round trips: 2370/113760, 4994/823024, 88546/127240 characters, with
+no `POST /1.txt`. Host-op tracing (`--trace-op-file`) shows the flow is still *working* where the earlier
+stub build had already gone quiet: at 17.6-18.8 s the widget script is probing the DOM it just built
+(`option` attributes, a `range` input) and posting a second round of worker tasks, while about 60% of that
+window is spent inside `op_dom` calls from the widget's own script. The challenge's compute probe alone
+reports ~23 s here against ~3 s in the reference, so the step after the second response lands at or past
+the 30 s boundary, which is why a 26 s read sees the harness's "still on the challenge" rather than a
+submit.
+
+**Status.** Objective still unmet: `1.txt` answers with the challenge, `POST /1.txt` never happens. The
+engine is materially closer (worker realm faithful, seven tests recovered, fetch text and op robustness
+fixed) and the remaining gap is quantified: the post-second-response step, dominated by DOM-op cost and
+the compute probe's own ~23 s.
+
+## Step 269: the payload plaintext is in the console log, and the field-level diff
+
+**Why this step.** Every previous round treated the `/fo/` bodies as opaque because they are encrypted, and
+went looking for a session key. They are not opaque at the source: the challenge logs its payload object
+before encoding it (`console.log('payloadJSON:', …)`), and the engine's console stream captures that line
+in full. One compliant run therefore yields our session's *field-level plaintext* payloads, no key needed.
+
+**How to get them.** `grep -o 'payloadJSON: .*' <run>/serve.log` (strip ANSI first). A run yields one line
+per submission: the widget's payload (47 fields) and the page's (91 numbered records). Saved copies of one
+session's pair are `assets/payload/obscura-1.json` and `assets/payload/obscura-2.json`-equivalent.
+
+**Field-level diff against the reference.** `assets/payload/1.json` is the operator's decoded capture of a
+passing Chrome session. Our payload 1 has **the same 47 keys, none missing and none extra**. Values split
+into three groups:
+
+- Per-session by construction: the ray (`BkYo5`), the issued tokens (`oPhMk5`, `JWTz7`, `oQJEH1`,
+  `WbdgY0`), the timestamp (`Uheo3`), the target URL (their capture was `123.txt`, ours `1.txt`), and the
+  api.js URL string.
+- Counters and durations of the collection phase: `ZMSOw0`/`twvE0` 1181 (reference) against 466 (ours),
+  `NnqX6` 1284 against 569, `uGyjw9` 4 against **508**, `Blsob5` 9 against 3, `poqG1` 2 against 1,
+  `TzZRB1` 16 against 17, `WHTpH6` 17 against 18, `tZwbF3` 5178 against 3797, `wOvYJ5` 2123 against 3792,
+  `eaaP6` 2108 against 3280.
+- Resource timing records (`rPXg2`), where ours are inflated: the api.js entry reads `EazF1` 2932 and
+  `gtlhH0` 1383 where the reference reads 561 and 280, and the widget frame reads 2417 against 1623. The
+  run log shows api.js completing in 245-620 ms, so a ~2.9 s duration is not the fetch.
+- The error record (`PWGF4`) carries the same api.js stack in both sessions but a different time
+  (`t` = 5 ms here against 3054 ms there).
+
+**Field names are per-session, so compare by shape.** The page payload's record field names differ between
+the two captures (`gsLi5`/`XCvwf5` here against `omMvP9`/`zIyO8` there); only their *shape* is comparable,
+which is what `scripts/diff_payload_enum.py` does when it pulls the property-path bucket out of whichever
+key holds it. That bucket is present in our payload with the same `n.`/`d.`/`s.`/`so.` prefixed paths, and
+the enum diff already covers it (only `modelContext`, `ModelContext` and `WebMCPEvent` missing).
+
+**Op-stream cost, measured on the same run.** 47041 host-op crossings over 33.4 s, of which 46993 are
+`dom`. The collection burst is only ~2 s (43k of them at 11-12 s, ~47 us each), and the remaining ~30 s is
+idle: 37 gaps over 100 ms account for 29.8 s of the 33.4 s span, and after 19 s the widget frame does a
+~900 ms poll (`is_connected`, `query_selector_scoped #cf-chl-widget-…`, `iframe_content_document_root`,
+`iframe_scopes_same_origin`) whose last query returns -1. So the DOM-op *cost* is not what crowds the 30 s
+window; the flow is waiting, and the page-side program has gone quiet by then.
+
+**Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. What changed is that
+the decision data is now readable in plaintext from our own runs, so the next round can diff values (the
+inflated resource timings above are the most concrete candidate, since they are 5x off and land in the
+payload) instead of hunting for a key.
+
+## Step 270: resource timing is not inflated, worker timers fire, and the local proxy hop is not it
+
+**Why this step.** Step 269 left three candidates: the resource-timing entries (ours read 2932/1383 where the
+reference read 561/280), the payload counters (`uGyjw9` 4 against 508, `ZMSOw0`/`twvE0` 1181 against 466),
+and the possibility that the last leg before `POST /1.txt` never runs. This step tested the first and closed
+two other possibilities with controls.
+
+**Resource timing is not inflated.** `scripts/dump-resource-timings.js` dumps this realm's
+`performance.getEntriesByType('resource')` entries after 20 s, so they can be read against the same run's
+engine log. Measured on one run: orchestrate `startTime` 1273, `duration` 466, `responseStart`/`responseEnd`
+1739, `transferSize` 232975; the `/fo/` XHR `duration` 219 with sizes 114072/113772; the widget frame
+`duration` 2272; and api.js `duration` 1169 with `requestStart`/`responseStart` and every size at **0**,
+which is what Chrome exposes for a cross-origin resource without Timing-Allow-Origin. The engine log for the
+same run reports api.js completing in 1169 ms, i.e. the entry's `duration` is the transport time the client
+measured, not an inflation. The payload's larger number came from a session where api.js really did take
+about 2.9 s; the reference's 561 ms is a faster path, not a different formula.
+
+**Worker timers fire at every delay tested.** A page creating one worker per delay (0, 55, 500, 1500, 5000,
+10000 ms), each posting its delay back, reports `final:[0,55,500,1500,5000,10000]`. So the isolate path does
+not strand long timers, and the stall after the third response is not a missing timer reply.
+
+**The local proxy hop is not the difference either.** Every instrumented run this session went through a
+local `mitmdump` in front of the operator's proxy. Running straight at `http://192.168.3.57:9000` reproduces
+the same shape: three `/fo/` submissions (2380, 4983, 88919 bytes of request against 113776, 822944, 127232
+characters of response), no `POST /1.txt`, and api.js at 1390 ms against 1169 ms with the hop. So the extra
+hop costs tens of milliseconds, not the flow.
+
+**What the runs agree on.** Three submissions then silence, with the widget frame polling
+`#cf-chl-widget-…` every ~900 ms and the page-side program quiet, whether or not a local proxy sits in
+front, whether the click lands at 6 s or 12 s, and in both the instrumented and clean configurations. The
+step after the third response is where the reference posts its fourth submission, and that is the thing to
+instrument next; the counters (`uGyjw9`, `ZMSOw0`/`twvE0`) are per-session field names, so they have to be
+matched by shape before they can be compared at all.
+
+**Status.** Unmet: `1.txt` still returns the challenge and there is still no `POST /1.txt`.
+
+## Step 271: the stall is one statement after `new Worker`, measured in both realms
+
+**Why this step.** Step 270 closed with "the step after the third response is where the reference posts its
+fourth submission, and that is the thing to instrument next". This step instruments it, with the native host-op
+stream as the primary instrument and the validated in-flight realm probe (`challenge-realm-probe.js`) only as
+the seam that names the statement. It also rules out four candidates that each had a plausible mechanism.
+
+**The stall is not slowness.** A 75 s window (click at 10 s, read at 70 s) still ends with exactly three
+submissions: top-level `/fo/` #1, widget `/fo/` #1, widget `/fo/` #2 (the proof). Nothing after that, ever.
+So the flow is parked, not slow, and the 30 s budget is not the binding constraint.
+
+**CPU sampling says "parked", with a caveat.** `ps -o %cpu=` through one round reads 52.7 / 9.1 / 9.7 / 31.3 /
+72.6 / 86.2 / 100.4 % up to t=20 s, then 0.6 / 1.3 % from t=22 s on. The burst is real work and the tail is
+idle. Caveat: macOS `ps -o %cpu` is not an instantaneous rate, so this is corroboration only — the "parked"
+claim rests on the host-op stream going silent, not on the percentage.
+
+**The page's `honk` loop is a wait primitive, not the divergence.** The op stream's last 40 records are a loop
+of `eval` calls, one every ~0.55 s, forever. The argument is a 1 337 359-character string: **1 337 331 leading
+spaces** followed by `0, /.*honk.*/, <epoch ms>`. Its stack names the caller: `nO.nn` in
+`orchestrate/chl_page/v1` — the page realm, not the widget. The reference does the same thing (35 `globalThis.eval`
+points carrying the identical padded `honk` expression, ~175-550 ms apart over 7.7 s, stopping when the widget
+finishes). So `honk` is the challenge's own yield/wait primitive, and the page sitting in it means the page is
+waiting for the widget's handoff.
+
+**`meow`/`food` is the keepalive handshake, not the handoff.** The widget document carries the handler
+(recovered from the reference HAR at the same stage):
+`if (e.source === 'cloudflare-challenge' && e.event === 'meow' && e.widgetId === window._cf_chl_opt.EnOnL8)
+window.parent.postMessage({source:'cloudflare-challenge', widgetId:…, event:'food', seq: e.seq}, '*')`.
+Our run exchanges this pair to `seq` 31+ with both realms alive, which is why "the widget is dead" is the wrong
+reading; the widget is up and its program is not advancing.
+
+**Where the widget stops, exactly.** The widget realm's exit sequence in one round, in order:
+
+| # | event |
+|---|---|
+| 126 | `URL.revokeObjectURL` (at `TH.yU`) |
+| 127-129 | XHR `POST /fo/315550264:…/<ray>` — the proof, 91 074 bytes |
+| 131 | response 200, 127 240 characters |
+| 132-134 | `atob(127240) → 95424`; `runProgram(95424)`; `atob(95424)` |
+| 135 | `URL.createObjectURL(blob)` — a 292-byte `text/javascript` blob |
+| 136 | **`new Worker(blob:https://challenges.cloudflare.com/<uuid>)` at `TH.yg`** |
+| 137+ | nothing from this realm; only the page's `honk` loop and the `food` keepalives |
+
+Three independent instruments agree that the caller does nothing with that worker: no
+`Worker.prototype.postMessage` (probe wrapper), no `onmessage` assignment and no `addEventListener`
+(descriptor-preserving probe seams), and — decisively — **zero property `get`/`set` on the returned worker
+object** while it was wrapped in a `Proxy`. So execution stops on the statement immediately after `new Worker`,
+with no exception (the constructor wrapper's `ctor.threw` seam never fired) and no error on the page.
+
+**What the reference does there.** After the same stage's program (95 428 B) the reference constructs five
+workers ~400 µs apart and then, per the ov2 host trace, runs
+`ov2.host.call2 {method:"push", recv:"[object Array]", args:["[object Worker]"]}` →
+`ov2.host.write {obj:"[object Worker]", key:"onmessage", val:"fn:bound m0"}` →
+`ov2.host.call2 {method:"postMessage", recv:"[object Worker]", args:["var nSMXN7={…"]}`, and receives
+`MessageEvent.data.graIf9` with `OMba9` shard timings 116 ms later. So the divergence is exactly one statement
+wide: the reference pushes the worker, assigns `onmessage`, and posts the task; we do none of the three.
+
+**Ruled out this round, each with its own measurement.**
+
+1. **`op_worker_recv` empty-batch contention stranding the reply.** The JS receive loop treats an empty batch as
+   "the worker is gone" and stops polling, and the Rust op returns an empty string on transient borrow
+   contention, so a single transient hit would strand every later message. Instrumented
+   (`OBSCURA_DEBUG_WORKER`), the empty batches that occurred were all `outbox-closed` — the worker thread really
+   had exited — and no `opstate-borrowed` / `shared-state-borrowed` / `no-tokio-runtime` case was observed. The
+   hazard is real but it is not what happens here.
+2. **The V8 watchdog killing the task mid-script.** `cdp_watchdog` (5 500 ms per autonomous turn) and
+   `arm_watchdog` were both instrumented. Neither fired: `disarm_watchdog`'s
+   `"V8 watchdog fired: terminated a synchronous overrun"` warning is absent from all seven runs, and the
+   autonomous-turn counter never incremented. A silent `terminate_execution` cutoff would have matched the
+   symptom exactly; it does not occur.
+3. **Cross-realm `postMessage` delivery.** Both directions flow continuously (`meow`/`food`, `seq` to 31+), so the
+   handoff channel is healthy; what is missing is the handoff message, not its transport.
+4. **A broken blob-worker fan-out in general.** A local fixture reproducing the reference's exact sequence
+   (`new Blob` → `createObjectURL` → `new Worker` → `arr.push(w)` → `w.onmessage = fn` → `w.postMessage(task)`,
+   five shards, the same 292-byte `onmessage -> eval` bootstrap) completes 5/5 replies in the engine. So the
+   constructor, the blob store, the postMessage path and the recv loop all work for this shape; whatever breaks
+   is specific to the challenge's state at that point.
+
+**Also measured, not yet attributed.** Our session loads the turnstile widget document **twice** (two
+`rp.installed` for `challenges.cloudflare.com/…/turnstile/…` realms, at indices 17 and 189 of one run), where
+the reference HAR holds exactly one `/turnstile/f/av0/rch/…` document request. The second realm is the one that
+runs the proof step and then stops. Whether that second load is a cause or a symptom is open.
+
+**Instrumentation added (all host-side, opt-in, off by default).** `OBSCURA_DEBUG_WORKER=1` reports worker
+isolate spawn/exit and the reason a receive returned empty; `OBSCURA_DEBUG_WATCHDOG=1` reports a watchdog budget
+overrun. Both write to stderr, so neither is page-visible — which matters here, because a page-visible probe
+stops the flow before the stage under observation (see `honk` above and step 266).
+
+**Measurement pitfalls found this round.**
+
+- **A page-visible install probe perturbs the run.** Extending the `rp.installed` record with
+  `document.scripts.length`, `documentElement.outerHTML.length` and a `Math.random()`-derived realm id made the
+  page go blank (62 trace records instead of ~300, empty body). `Math.random()` shifts the PRNG the challenge
+  samples, and an early DOM serialization is itself observable. Keep the install record minimal.
+- **A `Proxy` around the worker changes identity** (`instanceof`, `String()`, descriptor reads). It is acceptable
+  for the "what does the caller touch next" question and nothing else; the answer it gave (no touch at all) was
+  cross-checked with the non-invasive postMessage/onmessage seams.
+- **The page-side `[worker] out queued` / `out deliver` logs no longer fire** since the blob-worker isolate path
+  landed (step 268), because those are logs of the document-eval stub. Worker→page traffic now has to be read at
+  the host (`OBSCURA_DEBUG_WORKER`) or inside the worker realm; reading only the page-side logs makes the worker
+  look mute.
+
+**Status.** Unmet: `https://www.thelancet.com/1.txt` still answers with the challenge, no `POST /1.txt`, and the
+click run is still 0/6. The divergence is now pinned to a single statement — the one after the widget's
+`new Worker(blob:)` in the program that answers the proof submission — and the four candidate mechanisms that
+could cut a caller off there (stranded worker reply, watchdog termination, message-transport failure, a broken
+blob-worker fan-out) are each measured and excluded. Next actions: attribute the widget program's stop at
+`TH.yg` from the program side, which needs the *current* session's program (the build is re-randomized per
+session, step 266), and settle whether the duplicated turnstile document load is causal.
+
+## Step 272: the duplicate widget document is a Critical-CH retry, and it is not the stall
+
+**Why this step.** Step 271 left two open questions from the objective's next action: instrument the widget
+program at the stop, and settle whether the duplicated turnstile document load is a cause or a symptom. This
+step answers the second with a wire capture and a call stack, lands a fix for it, and adds the frame-route
+instrumentation the program-side question needs.
+
+**The duplicate is real, and it is not a second frame attachment.** A local `mitmdump` in front of the operator
+proxy (`--mode upstream:http://192.168.3.57:9000`, port 8896) records the same widget URL requested twice in one
+round, back to back, with identical headers and `sec-fetch-dest: iframe`, both before any widget script runs. The
+reference HAR holds exactly one such request. It is *not* caused by two browsing contexts: `OBSCURA_DEBUG_FRAMES`
+shows **one** committed navigation for that host in the round (`[frame-commit] … host=NodeId(67) gen=1`), and a
+call stack taken inside `StealthHttpClient::fetch_with_profile` is entered **once**:
+
+```
+obscura_net::wreq_client::StealthHttpClient::fetch_with_profile
+obscura_browser::page::Page::navigate_frame_inner
+obscura_browser::page::Page::process_pending_frame_navigations
+```
+
+So the second HTTP request is issued *inside the client*, by the `Critical-CH` retry.
+
+**Proven from the headers.** The widget document request carries the low-entropy trio only
+(`sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`). The response carries
+
+```
+Accept-CH:   Sec-CH-UA-Bitness, Sec-CH-UA-Arch, Sec-CH-UA-Full-Version, Sec-CH-UA-Mobile,
+             Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List, …
+Critical-CH: (same list)
+```
+
+The client retries because those hints are not in `sent_client_hints`, and the retry request then carries **nine**
+`Sec-CH-UA-*` headers. The reference sees the *same* response: its HAR shows the widget document request with the
+same trio and the same `Accept-CH`/`Critical-CH` list, and **one** request for it. Chrome does not retry.
+
+**Fix.** `is_frame_document_request` (crates/obscura-net/src/client.rs) — a subframe document navigation is not
+re-issued for `Critical-CH`. Both transports are guarded (`wreq_client.rs` for the stealth path that a stealth
+run uses, `client.rs` for the fallback). The hints a retry would add are not permitted in a cross-origin
+subframe, so the retry cannot change the response it is retrying; the only effect measured was a second document
+load, and therefore a second widget session for a document only one of which is ever committed.
+
+**Quantified.** Same build, same identity, three rounds through the wire capture:
+
+| round | widget document requests before | after | `sec-ch-ua-*` count per request |
+|---|---|---|---|
+| 1 | 2 | **1** | `[3]` |
+| 2 | 2 | 2 (a genuine second navigation) | `[3, 9]` |
+| 3 | 4 | **1** | `[3]` |
+
+The pre-existing tests still pass (`stealth_client_retries_critical_client_hints` and
+`stealth_extra_low_entropy_headers_do_not_duplicate_defaults`), so the retry is preserved where it is legitimate.
+The new test `stealth_frame_document_is_not_retried_for_critical_client_hints` **fails without the guard** and
+passes with it. `obscura-net` is 104/104.
+
+**Cause or symptom: settled as "neither".** Rounds whose wire capture shows exactly **one** widget document still
+stall identically — three `/fo/` POSTs (top #1, widget #1, widget #2 proof) and then silence, final URL still on
+the challenge. So the duplicate load is a separate engine defect that creates an extra widget session; it is not
+required for the stall, and removing it does not advance the flow. Both are true at once and neither explains the
+other.
+
+**Program-side instrumentation for the stop (the other half of the ask).** `OBSCURA_DEBUG_FRAMES=1` now reports
+every frame-navigation route, every `attach_child` (with the host's current frame, if any), and every committed
+frame navigation. Everything is on stderr, so nothing is page-visible.
+
+**A latent defect found on the way, recorded but not attributed.** `navigate_frame_inner`'s nested-frame
+discovery attaches a child for every iframe in the committed content root **without** the
+`frames.by_host(host).is_none()` guard that the other two discovery passes (`discover_main_document` and
+`process_pending_frame_navigations`'s `discovered` loop) apply. A host that survives into a second commit can
+therefore acquire a second browsing context. It did **not** reproduce in the three sampled rounds (each attached
+host 67 exactly once, `already=None`), so it is a hazard rather than the measured cause; the log line exists so
+the next round can catch it if it fires.
+
+**Payload 对拍, from this session's own console stream.** The engine's op trace records the challenge's
+`console.log('payloadJSON:', …)` lines in full, so a clean run yields the session's field-level plaintext without
+any instrumentation of the page (`grep -a 'payloadJSON' ops.tsv`; note `serve.log` does not forward frame-realm
+`console.log`, which is why earlier rounds read 0 there). Our proof payload has the **same 53-name non-numeric
+field vocabulary** as the operator's proof captures `2.json`, `2-2.json` and `3.json` — the names match
+one-for-one — and the same record types; only the ordering of some numbered records differs (`ours[4]` ==
+`ref[5]`, `ours[7]` == `ref[8]`), and two named fields differ in list length (`rPXg2` 4 against 5, `maNnU6` 39
+against 37). So the proof payload is *structurally aligned*; the divergence is not a missing or extra payload
+field.
+
+**Measurement pitfalls added to the table.**
+
+- **macOS `ps -o %cpu=` is not an instantaneous rate.** A reading that drops from 100 % to 1 % across a stall is
+  corroboration, not a measurement; the "parked" claim has to rest on the host-op stream going silent.
+- **An install-time probe that calls `Math.random()` or reads `document.scripts.length` /
+  `documentElement.outerHTML.length` perturbs the run** — the page went blank (62 trace records against ~300,
+  empty body). `Math.random()` shifts the PRNG the challenge samples. Keep the install record minimal.
+- **A `mitmdump` addon must take its log path from the environment.** A hardcoded path silently merges successive
+  runs, so a per-run request count reads as the sum of all of them.
+- **`grep` treats the op trace and `serve.log` as binary** (ANSI escapes, control bytes). Use `grep -a`, or a
+  count of 0 will look like "absent" when it is "not searched".
+
+**Status.** Unmet: `https://www.thelancet.com/1.txt` still answers with the challenge, no `POST /1.txt`, click
+run still 0/6. Removed this round: one real defect (a duplicate widget document, and with it a second widget
+session) with a regression test. Next: the widget program's stop at `TH.yg` still needs the program side — the
+current session's `orchestrate`/proof-response program, disassembled or instrumented in place — and the
+`nested_discovery` attach path needs a guard test if it is confirmed to fire.
+
+## Step 273: the caller returns — program-side measurement of the `new Worker` stop
+
+**Why this step.** Step 271/272 localized the stop to the statement after `new Worker` in the program that
+answers the proof submission. This step asks the program side directly: what does that program do, and how does
+it end?
+
+**How each program is driven (new, measured).** The `runProgram` seam was extended to record the call's
+*outcome*, and the executor it returns was wrapped too. Two findings:
+
+1. `runProgram(text, b)` **builds** the program and returns its executor. It returns **synchronously** in
+   3-24 ms with a `function () { [native code] }`; it does not run the program.
+2. Each program is then executed by **one** call to that executor, which returns `undefined` synchronously and is
+   **never called again** (`call=1`, observed for 16 s afterwards).
+
+| program | executor duration |
+|---|---|
+| page inline (6032 B) | 634 ms |
+| page, answers top #1 (85324 B) | 108 ms |
+| widget inline (6944 B) | 915 ms |
+| widget, answers `/fo/` #1 (634516 B) | 627 ms |
+| **widget, answers the proof (95428 B)** | **107 ms** |
+
+**What the proof-response program actually does.** Its complete observable host activity, in order, from the
+probe: `URL.revokeObjectURL` → `new Blob(292, text/javascript)` → `URL.createObjectURL` → `new Worker(blob:)` →
+**return**. It never assigns `onmessage`, never calls `Worker.prototype.postMessage`, and registers no
+continuation (no timer, no message handler, no promise) — so nothing re-drives it. The constructor-throw seam
+stayed silent, and the host-op stream goes silent at the same point, so the same reading is reached from two
+independent instruments.
+
+Whole-run counts in that round: **5** `new Blob`, **5** `createObjectURL`, 7 `Worker` constructions. The
+reference's post-proof window *alone* holds **9** Blobs, **58** `createObjectURL` calls and 5 `Worker`
+constructions before it does `push → onmessage → postMessage`. So the two runs are not doing the same work at
+that stage; ours leaves the fan-out after one iteration.
+
+**Answer to the asked question, as far as measurement reaches:** the caller does not execute
+`push → onmessage → postMessage` because **it returns** immediately after constructing the worker. That is a
+program-level early exit, not a blocked call, not a lost message, and not a terminated script — the three
+mechanisms that could produce the same symptom were each excluded in step 271 and are consistent with this.
+
+**The native property trace cannot serve as the program-side instrument here (measured).** Two runs:
+
+| flags | trace size | `/fo/` POSTs reached |
+|---|---|---|
+| `--trace-api-keyed off` (no filter) | 842 746 lines / 175 MB | **0** |
+| `--trace-api-keyed on --trace-api-filter 'URL,Blob,Worker'` | 831 499 lines / 160 MB | **0** |
+
+Under either, the run never issues a single `/fo/` POST — the trace's own overhead stops the flow long before
+the stage under study (the interstitial even renders its slow-device message). So the objective's
+"compare with our own environment and V8 native trace" is, for *this* stage, not available: the trace cannot
+observe what its cost prevents from happening. Recorded as a hard limitation rather than a method.
+
+**The flow is session-dependent, not permanently stalled at three submissions.** One round through the local wire
+capture completed the reference's full sequence:
+
+| # | request | ours | reference |
+|---|---|---|---|
+| 1 | top-level `/fo/` #1 | req 2380 → resp 113768 | req 2359 → resp 113772 |
+| 2 | widget `/fo/` #1 | req 4802 → resp 822864 | req 4674 → resp 822624 |
+| 3 | widget `/fo/` #2 (proof) | req 87938 → resp 127240 | req 89804 → resp 127228 |
+| 4 | widget `/fo/` #3 | req 91180 → **resp 5136** | req 93026 → **resp 7164** |
+| 5 | top-level `/fo/` final | req 7820 → **resp 3240** | req 9026 → **resp 3660** |
+
+That is step 262's finding reproduced on the current build: we do reach the end, the final response is the
+*shorter* one, and the page then starts a **new round** instead of submitting the form to `/1.txt`. So the
+30 s budget is not the binding constraint, and the four-submission stall seen on other rounds is one of two
+outcomes rather than the blocker.
+
+**The decode and disassembly pipeline now runs on our own programs (new, validated).** `/fo/` response bodies
+were captured through a local mitmdump and decoded with the published pipeline
+(`seed = 32 ^ xor(charCodeAt(ray + "_0"))`, `stage1 = atob(body)`,
+`out[i] = js_mod((255 & s1[i]) - seed - (i % 65535) + 65535, 255)`, `bytecode = atob(out)`). All seven responses
+decode with **`b64frac = 1.000`** — stage 2 is pure base64, which is what proves the ray-derived seed is the
+server's rather than a working guess.
+
+| file | program | stage1 | bytecode |
+|---|---|---|---|
+| `bc_00` | page, answers top #1 | 85324 | 63993 B |
+| `bc_01` | widget, answers `/fo/` #1 | 617148 | 462859 B |
+| **`bc_02`** | **widget, answers the proof** | 95428 | **71571 B** |
+| `bc_03` | widget, answers `/fo/` #3 | 3852 | 2887 B |
+| `bc_04` | page, final | 2428 | 1821 B |
+
+The operator's toolchain was copied to `/tmp/ov2-our` (their tree untouched) and, as a control, reproduces their
+own sample analysis (ov1#2 span coverage 100 %). Fed our `bc_02`, it decodes **67 695 / 71 571 bytes = 94.58 %**
+with **0 unresolved roles** and renders **17 356 instructions**; role distribution `objectInit 15379`,
+`binaryMux 460`, `methodCall 450`, `condJump 210`, `hostRead 138`, `hostWrite 116`, `hostNew 32`,
+`literalLoad 43`, `tryPush 32`, `hashJump 32`, `jump 30`. So the program is statically legible, and it is
+branch-heavy: 210 conditional jumps over 17 k instructions.
+
+**Where the names are — scope correction for the next round.** `ov1_strprobe.py` (the VM's own string encoding,
+key searched over all 256 values) finds **none** of `Worker`, `postMessage`, `onmessage`, `createObjectURL`,
+`revokeObjectURL`, `Blob`, `push`, `_cf_chl_opt` in `bc_02` (71 KB) **or in `bc_01`** (463 KB) — while step 266
+recovered exactly those kinds of name from a 475 KB program of another session. So in this session's programs the
+host-API names are **not** bytecode constants; they live in the VM interpreter, which is the widget document
+itself. A branch can therefore only be attributed by combining the program with the interpreter's handler
+semantics (the operator's `spec-0916-11.mjs` plus the widget document text), not from the program bytes alone.
+
+**Artifacts.** Bytecode: `/tmp/lancet-prog/bc_0{0..6}.bin` (+ `fo_index.jsonl` with ray, status, sizes).
+Disassembly: `/tmp/ov2-mine/anchor-cfg-out/ov1-2-disasm.txt` (1.1 MB) and `.json` (4.1 MB), with the toolchain at
+`/tmp/ov2-our` (a control copy) and `/tmp/ov2-mine` (our program as sample 2).
+
+**Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. Gained this round: the
+program-side statement (the caller returns after constructing the worker, with no continuation registered), the
+measured impossibility of using the native property trace at this stage, the session-dependence of the stall, and
+a working decode + disassembly pipeline for the current session's programs with the scope of the next step
+narrowed to program-plus-interpreter.
+
+## Step 274: the OPFS flush is a no-op, and the stall is the norm (not a proxy artefact)
+
+**Why this step.** Step 273 narrowed the next action to reading the program together with the interpreter. Before
+investing in static work I removed a confound that had been muddying every conclusion, and while measuring the
+environment surface I found a concrete engine defect with a measured signature.
+
+**The local proxy hop is not a confound (n=3 + 3).** Step 273's run that completed all five `/fo/` submissions went
+through a local `mitmdump`; the direct-proxy runs stalled after three. Measured, same build, same identity, six
+rounds, counting `/fo/` POSTs from the engine's own op trace:
+
+| arm | rounds | `/fo/` POSTs | verdict |
+|---|---|---|---|
+| direct (`--proxy http://192.168.3.57:9000`) | 3 | 3 / 3 / 3 | still on the challenge |
+| hopped (`--proxy http://127.0.0.1:88xx`, upstream = the same operator proxy) | 3 | 3 / 3 / 3 | still on the challenge |
+
+So the hop changes nothing, and **the three-submission stall is the norm**; step 273's five-submission run was
+session luck (about one round in eight across this session's sampling). Both failure signatures therefore exist and
+neither the hop nor the 30 s budget selects between them.
+
+**A concrete engine defect: the OPFS sync access handle never does I/O.** The reference's environment probe times a
+`FileSystemSyncAccessHandle` write and flush and reports the duration (`uUOw3` = **10.6 ms**). A worker-realm
+fixture in our engine, running the same pattern, measures:
+
+```
+{"gotDir":true,"hasSync":"function","writeMs":0,"flushMs":0,"size":64,"closed":true}
+```
+
+The shape is right — `getDirectory` → `getFileHandle({create})` → `createSyncAccessHandle` → `write` → `flush` →
+`getSize` → `close` all work, and the shape test
+`storage_manager_and_origin_private_file_system_match_chrome_shape` passes. But `flush()` is
+`nativeMethod(SyncAccessHandle.prototype, 'flush', 0, function () { syncData(this); })` — it validates state and
+returns, and the file node is a `Uint8Array` on an in-memory tree, so nothing is ever written to or synced with a
+device. Hence 0 ms where the reference measures 10.6 ms.
+
+Two notes on scope, so the finding is not over-read:
+
+- **The API is worker-scoped in our engine and in Chrome**, so a page-realm fixture correctly reports
+  `fh.createSyncAccessHandle is not a function` (`hasSync: undefined`). That is not the defect; the worker-realm
+  path is the one the challenge uses, and that is where the duration is degenerate.
+- Making the duration realistic is a **feature, not a patch**: it needs the OPFS node backed by real files (the CLI
+  already has `--storage-dir`, but it is not plumbed to the worker realm's handle tree), with per-origin
+  directories, permission handling and cleanup. Recorded as the concrete next action rather than half-done here.
+
+**Refuted, with a validated decode on both sides: the "handoff literals" reading.** Step 265 claimed the reference's
+third program carries `_cf_chl_opt` / `postMessage` / `widgetId` / `token` / `source` and ours does not; step 266
+retracted it as a mis-seeded decode. Decoding both sides properly settles it — the reference's own HAR carries all
+five `/fo/` response bodies, and all five decode with **`b64frac = 1.000`** (pure-base64 stage 2, i.e. the
+ray-derived seed is the server's):
+
+| stage | reference | ours | delta |
+|---|---|---|---|
+| #0 page, answers top #1 | 63994 B | 63993 B | +1 |
+| #1 widget, answers `/fo/` #1 | 462724 B | 462859 B | -135 |
+| #2 widget, answers the proof | 71564 B | 71571 B | -7 |
+| **#3 widget, answers `/fo/` #3** | **4029 B** | **2887 B** | **-1142** |
+| #4 page, final | 2056 B | 1821 B | -235 |
+
+`ov1_strprobe.py` (the VM's own string encoding, key searched over all 256 values) finds **none** of `postMessage`,
+`_cf_chl_opt`, `widgetId`, `token`, `source`, `onmessage`, `Worker` in **either** side's stage-3 program. So the
+names are not bytecode constants on either side, and the size difference at stage 3 is not a missing handoff
+literal. Consistent with step 273: the host-API names live in the VM interpreter.
+
+**And the divergence is not the stage-2 program either.** Ours and the reference's stage-2 programs are 71571 and
+71564 B — seven bytes apart. The same program leads the reference to widget #3 and leads us to a return after
+`new Worker` (and sometimes, one round in eight, to widget #3 as well). So the branch input is **not** in the
+program text; it is a value the program read earlier, which is why the proof-response program's 107 ms contains no
+host reads at all.
+
+**Static reading of the branch is not available either (measured limitation).** The operator's disassembler renders
+our blob at 94.58 % byte coverage and 0 unresolved roles, but every operand prints as `h[?]` — the anchors input
+carries a *representative* `(pc, key)` per pc, not the entry-chain-derived one, and for our blob
+`dynamicReachable = 0`. The header states it outright: the input "不含入口链的第二步". Without the path-derived key
+the operands (and therefore the branch constants) do not resolve, so the executed branch cannot be read statically
+for a session whose bytecode was never run under the operator's own instrumentation.
+
+**Where that leaves the program-side attribution.** Three routes are now measured and closed: the native property
+trace (too expensive to reach the stage), the reference's handoff-literal claim (refuted on both sides), and static
+operand resolution for our blob (keys are representative, not path-derived). The route that remains is a runtime
+`(pc, key)` trace from *our* session — which is exactly what the operator's pipeline expects in
+`ov1-N-pcstates.jsonl` and obtains from an instrumented build.
+
+**Artifacts.** Reference bytecode `/tmp/refprog/rbc_{0..4}.bin` (decoded from
+`assets/thelancet-trace/www.thelancet.com_2026_09_16_17_43_57.har`, all `b64frac = 1.000`); ours
+`/tmp/lancet-prog/bc_0{0..6}.bin`; disassembly `/tmp/ov2-mine/anchor-cfg-out/ov1-2-disasm.{txt,json}`; six-round
+A/B under `/tmp/lancet-ab/{direct,hopped}{1,2,3}`; OPFS fixtures `/tmp/opfs/{index,worker}.html`.
+
+**Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. Gained this round: the hop
+confound removed with n=3+3, the stall calibrated as the norm, the "handoff literals" reading refuted on both sides
+with a validated decode, the stage-by-stage size table refreshed, the static-operand limitation measured, and one
+concrete engine defect isolated — the OPFS sync access handle performs no I/O, so the challenge's storage probe
+reads 0 ms where a browser reads 10.6 ms.
+
+## Step 275: a runtime `(pc, key)` trace from our own session, and why the operator's spec cannot read our blob
+
+Step 274 asked for runtime states because the static route is closed. This round produced the first runtime
+`(pc, key, op)` trace of our session, and in doing so measured that the operator's spec is a *per-build* artefact
+that our session's build does not match. Both facts are independent of the proxy and of the challenge's network.
+
+**Why the static pipeline could never work for our blob (measured, not inferred).** `anchor-cfg.mjs` hardcodes the
+entry as `(pc=0, key=241)` in three places (lines 384, 998, 1286) and asserts it (`SPEC.keyRunInit === 241`). Run
+against our stage-2 blob the pipeline emits exactly one state —
+`{"pc":0,"key":241,"op":147,"handler":"m7","status":"noWidth","coverBytes":null,"advanceBytes":null}` — so nothing
+propagates and `dynamicReachable` stays 0, which is why every operand renders as `h[?]`.
+
+- Their own key-oracle probe settles the cause. `tools/probe_key_oracle.mjs 0 0 40` on *their* program walks 20 steps
+  at `key=241` with `approx=0` (`op=84`, handler `cl`) — the tool and the seed are correct for their build. The same
+  probe at `pc=0` of our stage-2 program finds **no key that walks past 4 steps** (best: `key=48`, `op=82`, handler
+  `cS`, `approx=1`), and the tool prints its own verdict: `对位本身错了，不是 key 公式问题`.
+- The width oracle returns `null` there because `cS` is a *branchy* handler (`loopWidths.base = 5`,
+  `widthByBranch = [5,2,3,2,2,2]`): its width is a function of runtime state, which is the one input the static pass
+  does not have. So `pcstates` is required *input*, not an accelerator, and the entry state the tool hardcodes is
+  both wrong for us and unusable.
+- **A structural, key-independent proof that the opcode numbering is per-build.** Our own widget document carries the
+  dispatch switch in readable form, one decode site (offset 56447) inside a single `<script nonce=…>`:
+  `switch (Tb[TR] = Z + 1, Z = Tb[Tv] ^ 251 + TY[Z] & 255.28, Th = Tb[Tv] + Z, Tb[Tv] = <lcg>, Z) { case 0:
+  yj[GI(Ba.Ts)](this); break; … }`. It lists **69 ops** — the same count as the operator's table — but only **26
+  are in common**. Two builds, two 69-element sets, 43 members different on each side. Our decode constant is `+251`;
+  theirs is `+245`. Note also that the 138 extracted `case` labels are 69 distinct values appearing twice (a
+  duplicate-label switch), so the second copy is dead code and one patch site covers the running dispatch.
+- This also corrects step 274's reading of "94.58 % byte coverage / 0 unresolved". At any pc, 69 of 256 keys decode to
+  a valid op, so a byte is "covered" if *some* key maps it; the figure is near-vacuous and is not evidence that a
+  coherent path was decoded.
+
+**The runtime trace itself.** Captured by patching the widget document in flight (mitmproxy upstream through
+`192.168.3.57:9000`) so the VM dispatch loop calls `external.tracelog('ovpc', "pc,key,op,…")`; written with
+`--tracelog-file` to `/tmp/ovpc/trace.jsonl`. 24 200 `(pc, key, op)` states, 242 batches.
+
+- Entry is **`(pc=0, key=121, op=17)`**, three times over (indices 0, 214 and 23773) — one program instantiated
+  three times. `(251 + bc[0]) & 255 = 121 ^ 17 = 104` ⇒ `bc[0] = 0x6d`, the widget-family entry byte measured last
+  round, so the trace and the on-disk blob agree.
+- pc runs to **462 923**, i.e. the 462 859-byte widget program (`bc_01`), not the 71 571-byte stage-2 program, and
+  47 of the 69 ops are exercised. Only a prefix of the run is in the file: the helper flushes every 100 dispatches
+  and the process kill drops the last partial batch.
+- The trace contains a **key fixed point**: a run of `op=17` at `key=215` repeats `215 → 215 → 215` across
+  consecutive pcs (90, 100, 112), i.e. our build's LCG takes a fixed point at that `(key, op)`. Their published
+  step `(key+op)*37188+36086 & 255` does **not** reproduce our observed transitions (predicted 158, observed 131 at
+  the entry), so the runtime trace — not their formula — is the authority for our build.
+- `(key, op) → next key` is a function on linear steps: 1316 distinct transitions, 96 ambiguous, and the ambiguity
+  sits on jump edges, where the taken target computes the key differently.
+
+**Two harness facts this round cost runs to learn.** (1) Modifying a Brotli response through
+`flow.response.content` corrupts delivery: that run's top-level body arrived as mojibake, the challenge never
+started, and neither the widget document nor a single `/fo/` was ever fetched. `flow.response.set_text()` delivers
+correctly, and after switching to it the patch took effect. (2) Only **one** heartbeat fired, so the patched text
+executes in exactly one realm — the worker realm does not build its blob from the response we patch, which is why
+this trace covers the document realm's program and not the worker-side one.
+
+**Realm exfil, verified on our engine.** The document realm has `window.external.tracelog`; the worker realm has a
+bare `external` global and **no `window` at all** (`new Worker(blob:)` scripts that touch `window` throw
+`ReferenceError: window is not defined`). Both `external.tracelog(k, v)` and `console.log` (which reaches
+`obscura::console`) write from a worker. `--tracelog-file` must be passed **before** the subcommand; after it the
+file is never created.
+
+**Artifacts.** Patcher `/tmp/ovpc/patch.py` (structural, identifier-agnostic; validated offline — one site, one
+script block, `node --check` clean); addon `/tmp/ovpc/addon.py`; runner `/tmp/ovpc/run.sh`; trace
+`/tmp/ovpc/trace.jsonl`; probe spec `/tmp/ovpc/probe/{addon.py,index.html}`.
+
+**Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. Gained this round: the first
+runtime `(pc, key, op)` trace of our session, our build's VM entry state (`key=121`, `op=17`) and decode constant
+(`+251`), a key-independent proof that the opcode table is renumbered per build (26/69 overlap), the measured reason
+the static pass yields one state (branchy entry handler, width needs runtime state), a correction to the 94.58 %
+coverage reading, and the two harness facts above (Brotli `set_text`, worker realm has no `window`).
+
+## Step 276: the worker handoff works, the OPFS sync access handle did not (fixed), and where the flow now ends
+
+Step 275 left the worker realm's VM copy unfound. This round found it, measured every probe the widget runs,
+and fixed the one engine defect those measurements exposed.
+
+**The worker's code arrives by `postMessage`, and the widget ships a three-condition gate.** The
+`new Worker(blob:)` at the stall is not the VM: the blob is a 292-byte bootstrap
+
+```js
+var _p=null; if(self.trustedTypes) try{_p=self.trustedTypes.createPolicy('FHMZS9',{createScript:function(s){return s}})}
+catch(e){self.postMessage({type:'tt-policy-error',msg:e.message})}
+onmessage=function(e){ e.isTrusted && ''===e.origin && null===e.source && eval(_p?_p.createScript(e.data):e.data) }
+```
+
+(a second, 13-byte blob is `"you"==="bot"`). **All three conditions hold in Obscura** — instrumenting that exact
+handler prints `isTrusted=true origin="" sourceNull=true srcType=null dataLen=…` for every message, and each worker
+evals its program and replies. So the gate is not the blocker, and the earlier "the caller never touches the worker"
+reading (step 271's Proxy) missed it only because the VM drives the worker through host references, not JS property
+access. This is also how the worker realm gets instrumented later: patch the *blob*, not the response.
+
+**What the workers are actually asked.** Every probe is a small script, and we now have our side's answers:
+
+| probe | our reply |
+| --- | --- |
+| `navigator` fields | `{"hIup0":"MacIntel","ztyKk8":["zh-CN"],"TpsmW1":6,"APSY2":8,"jKeeJ4":"Mozilla/5.0 … Chrome/151.0.0.0 …"}` |
+| OPFS sync access handle, `performance.now()` around `flush()` | `{"uUOw3":0}` (step 274's defect) |
+| `performance.now()` minimum non-zero resolution, 5000 iterations | `{"vVsCr9":0.09999999999990905}` |
+| cross-origin CORS fetch of `brunhild.challenges.cloudflare.com` | `{"AXuey2":1,"gQTuX1":"TypeError: Failed to fetch"}` |
+| timer liveness (`setTimeout` 55 ms / 5 s / 10 s) | `{"CpvME3":"1"}`, `{"qmxM8":1}`, `{"pvIO8":"1"}`, `{"IySL7":"1"}` |
+
+The `brunhild` failure is not an engine divergence: that URL answers **502 from the specified proxy** in both
+transport shapes, and a 502 without ACAO fails a `mode:'cors'` fetch in any browser, so the reference's own
+`catch` branch produces the same value. The OPFS probe *was* ours to fix.
+
+**Fixed: the OPFS sync access handle now does real I/O.** `flush()` was a no-op over an in-memory `Uint8Array`, so
+the widget's own timing probe read 0 ms where a browser reads milliseconds — a fingerprint difference, not a missing
+feature. `createSyncAccessHandle` is now backed by a real file under a per-process temp directory
+(`op_opfs_sync_open/write/read/flush/truncate/size/close` in `obscura-js/src/ops.rs`), with the node's `bytes` kept
+authoritative for content and the file kept in step, so a second handle still reads what the first wrote.
+
+- Measured on the local fixture, same page as step 274: `{"writeMs":0,"flushMs":0,…}` →
+  `{"writeMs":0.09999999999999987,"flushMs":4.4,"size":64,"closed":true}` (reference: 10.6 ms).
+- The page realm still reports `hasSync:"undefined"` — `createSyncAccessHandle` stays worker-only, as in Chrome.
+- `cargo nextest -p obscura-js --features render`: **617/620**, the three failures being the previously recorded
+  unrelated ones (`link_elements_use_their_own_interface_and_resolve_urls`,
+  `initial_about_blank_inherits_creator_origin_domain_and_referrer`,
+  `sandboxed_initial_about_blank_keeps_opaque_origin_and_domain`). Release build clean.
+
+**The reference's success signature, read off the HAR.** `assets/thelancet-trace/*.har` is unambiguous about what
+"passing" looks like: `403 GET /1.txt` ×2, then the three widget `/fo/` POSTs, then **the final top-level `/fo/`
+carrying `Set-Cookie: cf_clearance=…`**, and then — the success criterion itself — **`POST /1.txt` → `404`** with
+`Set-Cookie: JSESSIONID=…`. The form is *POSTed*, not re-fetched.
+
+**Where our flow ends now.** With the fix in, a run reaches the whole five-submission cycle (top #1 → widget #1 →
+#2 → #3 → top final), the final top-level `/fo/` issues `cf_clearance` for `www.thelancet.com` (and the widget's
+`/fo/` issues one for `challenges.cloudflare.com`), our jar **stores it and replays it** on the next `/1.txt`
+request — and the site nevertheless re-challenges, after which the page starts a new round and the run ends on the
+interstitial. **No `POST /1.txt` is ever issued**, so what remains is not the clearance and not the cookie jar: it is
+the interstitial's own form submission, which the reference performs and we do not.
+
+**Form submission itself works — and that made a second engine bug findable.** A local fixture shows
+`form.submit()` producing `POST /submit-target` with `body=b'a=1'` and
+`Content-Type: application/x-www-form-urlencoded`, so the submit path
+(`element-object.js:1458 _navigateSubmit` → `_navigateCurrentContext(url, 'POST', encoded)`) is implemented, and
+`FrameNavigationRequest` already carries `method` and `body`.
+
+But the reference's success request is a **form POST** (`POST /1.txt`, `application/x-www-form-urlencoded`, body
+`<token>=<value>` → 404), and the interstitial's CSP is
+`default-src 'none'; script-src 'nonce-…' 'unsafe-eval' https://challenges.cloudflare.com; script-src-attr 'none';
+style-src 'unsafe-inline'; img-src 'self' …` — **no `form-action`**. `_cspResourceAllows`
+(`bootstrap/env/worker/dedicated-worker.js`) fell back to `default-src` for *every* directive, and `form-action` is
+one of the directives that per CSP spec has **no** `default-src` fallback, so our check resolved it to `'none'` and
+returned before the navigation. **Fixed**: `form-action`, `base-uri` and `frame-ancestors` no longer inherit
+`default-src`. Verified both ways on a local fixture:
+
+- `default-src 'none'` + no `form-action` → `POST /submit-target body=b'a=1'` (allowed, correct);
+- `default-src 'none'` + `form-action 'none'` → only the `GET`, no POST (still blocked, correct).
+
+Two live runs with the fix still end with the interstitial and only `GET /1.txt` 403s (one reached the full
+five-submission cycle with two clearances issued, the other stalled at three submissions — the variance of step 274
+is unchanged). So the CSP check was real but not the operative blocker.
+
+**And the interstitial never calls submit at all.** Wrapping the function at its real owner (`Element.prototype`,
+found by walking `document.createElement('form')`'s prototype chain — `HTMLFormElement.prototype` owns only
+`constructor`, `elements`, `length`, `reset`) and logging through `external.tracelog` from both realms shows the
+wrapper installed in the page and in the widget document, and **zero `call:submit` / `call:requestSubmit` /
+`evt:submit` records** in a run that reached the interstitial twice. So the page takes its re-challenge path before
+it ever builds or submits the answering form — the divergence is upstream of the submission, in whichever input
+makes the program decide to retry, which is where step 275's runtime trace applies.
+
+**A regression test pins the CSP fix.** `form_action_csp_does_not_inherit_default_src` (`obscura-js/src/runtime.rs`)
+submits a form under `default-src 'none'` with no `form-action` and asserts the navigation proceeds
+(`https://app.example/submit?x=1`), next to the existing `form_action_csp_blocks_form_navigation`, which keeps the
+explicit `form-action 'none'` blocking. Suite: **618/621**, the three failures being the documented pre-existing ones.
+
+**Harness pitfall that cost two runs.** `mitmdump` binds its port and, if an earlier run leaked, the new one dies
+with `[Errno 48] address already in use` while the engine silently keeps talking to the *stale* proxy — a run that
+looks normal, logs nothing, and (in one shape) delivers a Brotli body it re-encoded wrongly, so the top-level page
+arrived as mojibake and the challenge never started. Ports have to be confirmed free (`lsof -nP -iTCP:<port>
+-sTCP:LISTEN`) before a run is believed.
+
+**Artifacts.** Patcher `/tmp/ovpc/patch.py` (dispatch chain, `__ovlog`, Blob wrapper, worker-bootstrap gate probe);
+recording-only proxy `/tmp/ovclean/addon.py` + `run.sh`; wire logs `/tmp/ovclean/{wire-1,wire-2,fix-wire-1,fix-wire-2}.log`;
+form/CSP fixtures `/tmp/formprobe/{server.py,server_neg.py}`; OPFS fixture `/tmp/opfs/{index,worker}.html`; the
+reference `assets/thelancet-trace/www.thelancet.com_2026_09_16_17_43_57.har`.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the worker handoff and its gate measured (passing),
+the full probe inventory with our values, the reference's exact success signature, **two engine fixes** — OPFS sync
+access handles now hit real storage (`flush()` 0 → 4.4 ms, obscura-js suite 617/620 with only the three documented
+pre-existing failures) and `form-action` no longer inherits `default-src` (verified with a positive and a negative
+control) — plus the divergence narrowed to the interstitial's own submit step.
+
+## Step 277: the reference's OPFS timings, a correction to step 274, and where the decision is actually made
+
+Two measurements this round change what the earlier evidence means, and one of them corrects a fix from step 276.
+
+**The reference's own OPFS durations, from its FPTRACE records.** `assets/thelancet-trace/renderer-trace.log` carries
+per-call durations for the very probe the widget runs, in the real Chrome run:
+
+| call | reference duration |
+| --- | --- |
+| `FileSystemSyncAccessHandle.write` (1 byte) | 477 us |
+| `FileSystemSyncAccessHandle.flush` | **12 us** |
+| `FileSystemSyncAccessHandle.close` | 76 us |
+| `FileSystemFileHandle.createSyncAccessHandle` | 39 us |
+
+So a browser's `flush()` is **12 us**, three orders of magnitude below step 274's "reference 10.6 ms". That figure
+was not the flush cost (it came from a wider measurement of the promise chain, not from the probed call), and it
+misled the fix: with `performance.now()` resolving at 0.1 ms in both engines (`vVsCr9` = 0.1), Chrome's probe reads
+**0**.
+
+- Step 276 backed the handle with a real file and made `flush()` an `fsync`, which measured 4.4 ms — that is a
+  *worse* fingerprint than the 0 ms it replaced, and it is exactly the measurement the widget takes.
+- Corrected: the file stays real (`write` is still write-through, `getSize` still reads it: `size:64`), but
+  `flush()` is now the cheap write-back a browser performs instead of an fsync. Fixture: `{"writeMs":0.0999,
+  "flushMs":0,"size":64,"closed":true}` — flush back under the clock resolution, as in Chrome.
+- Two clean live runs with all fixes in: **8 `/fo/` POSTs, 2 `cf_clearance` cookies issued, and still only
+  `GET /1.txt` → 403, zero `POST /1.txt`.** Neither engine fix moved the server's decision, which is consistent with
+  the OPFS probe never having been the decisive input.
+
+**The widget document is rotated between sessions, so the step-275 anchor is dead.** The current session's document
+is **449509 bytes** (md5 `9450f3681128a0403e512e39944af7a3`) against step 275's **409959**, and its decode is a
+different shape entirely: `op = key ^ ((bc[pc] + 57) & 255)` built as
+`jy = <mask>(bcarr[pcidx], 57 + 256 & 255.87); op = <xor>(keyreg, jy)`, where step 275's was `^ 251 + arr[pc] & mask`
+in the switch's comma chain. So the chain regex matches one build and not the next; the per-build-stable anchors are
+the bytecode read with post-increment (`arr[pc++]`, the operator's `Uf[UX++]`) and the `switch` whose body is
+`case <op>: <obj>[<lookup>](this)`. Anything instrumented for the next round has to be anchored there.
+
+**And the server-visible divergence is already at stage 2.** Comparing response sizes for a full cycle
+(`/tmp/ovclean/fix-wire-1.log`, encoded bytes, decoded = /1.778):
+
+| stage | ours | reference |
+| --- | --- | --- |
+| page `/fo/` #1 | 113772 -> 63993 | 113768 -> 63994 |
+| widget `/fo/` #1 | 822972 -> 462856 | 822968 -> 462859 |
+| widget `/fo/` #2 (proof) | 127228 -> 71569 | 127240 -> 71571 |
+| widget `/fo/` #3 | 5160 -> ~2900 | 7164 -> 4029 |
+| page `/fo/` final | 3240 -> ~1822 | 3660 -> 2056 |
+
+Stages 1 and 2 are the reference's programs, byte for byte in size; **stage 3 onward is a different, shorter
+program**. The server therefore decides from what our *stage-2 submission* carries, and the inputs to that
+submission are the worker probe replies measured in step 276 — navigator fields, `uUOw3`, `vVsCr9`, the timer
+heartbeats and the `rMor4/eSLoU7/deuYr4/LrrA4` group. That is the short list to diff next, one input at a time.
+
+**What cannot be diffed.** The `/fo/` bodies are single opaque tokens (no `=` separator, `$`/`+`/`-` alphabet), so
+the payload is not readable on either side; the reference trace records payload keys only as *names*
+(`Number.parseInt("PWGF4")`, `hasOwnProperty("WqxKW9")`), never values. Value-level comparison has to go through
+per-call API durations, which is how the OPFS row above was settled.
+
+**Artifacts.** Reference durations extracted from `assets/thelancet-trace/renderer-trace.log`; current widget
+document `/tmp/widgetdoc/widgetdoc.html` (449509 B, md5 `9450f3681128a0403e512e39944af7a3`); live wire logs
+`/tmp/ovclean/flushfix-wire-{1,2}.log`; OPFS fixture `/tmp/opfs/worker.html`.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the reference's OPFS API durations (flush 12 us,
+write 477 us, close 76 us), a correction that makes our sync access handle read *and* cost like a browser's
+(`flush()` back to 0 ms with a real backing file), the measured fact that the widget document rotates per session
+(and which anchors survive that), and the localization of the server's decision to our stage-2 submission. Suite:
+obscura-js 618/621, the three failures the documented pre-existing ones.
+
+## Step 278: two probe candidates cleared by direct two-engine comparison, one left
+
+The objective's method here is comparison, so this round compared **the same fixture in real Chrome and in Obscura**
+rather than reasoning from the reference's logs. Chrome is installed on this host
+(`/Applications/Google Chrome.app`), and a minimal CDP client (get `/json`, connect, `Runtime.evaluate`) is enough
+to read a page's globals; `/tmp/clockprobe/cdpeval.py` is that client.
+
+**Clock resolution (`vVsCr9`): identical, so not a detection.** Our engine floors `performance.now()` to 100 us
+(`_PERF_CLAMP_MS = 0.1` in `bootstrap/env/performance/support/clock.js`, "Chrome floors a DOMHighResTimeStamp to 100
+microseconds outside a cross-origin isolated context"). The reference trace's raw `Performance.now` values show
+15 us spacing, which looked like a 6.7x divergence — but those are **pre-clamp internals of the instrumented
+build**, not the value JS receives. The fixture runs the widget's exact loop (`for(...5E3...){e=now();f=now();...}`
+taking the minimum non-zero delta) in both the document and a blob worker:
+
+| realm | Chrome (real, no virtual time) | Obscura |
+| --- | --- | --- |
+| document | 0.10000002384185791 | 0.09999999999999432 |
+| blob worker | 0.09999990463256836 | 0.09999999999999987 |
+
+Both 0.1 ms, `crossOriginIsolated=false` in both. Our clamp is right and `vVsCr9` matches; nothing to fix. (A
+`--virtual-time-budget` run is useless here: virtual time freezes the clock, so Chrome's worker probe returns its
+1.0 initializer.)
+
+**`navigator` fields: aligned.** The reference trace's `Navigator.languages` getter result is an Array with
+`length: 1` and `Navigator.language` is a 5-char string, i.e. `["zh-CN"]` / `"zh-CN"` — which is what our challenge
+run reports (`{"ztyKk8":["zh-CN"],"TpsmW1":6,"APSY2":8,...}`). A default headless Chrome on this host shows
+`["zh-CN","zh"]`, but that is the host's locale, not the reference configuration; ours is intentional.
+
+**The one identified probe divergence left: the PAT fetch.** The `rMor4` group is
+`fetch("<pat URL>", {cache:"no-cache", redirect:"follow"}).then(r => r.text().then(b => postMessage({rMor4:1,
+eSLoU7:r.status, deuYr4:r.ok?1:0, LrrA4:b}))).catch(e => postMessage({rMor4:1, OshSk8:String(e)}))` — i.e. it reads
+`status`, `ok` and the body of `https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/pat/…`. Our run
+reports **`{"rMor4":1,"eSLoU7":401,"deuYr4":0,"LrrA4":"J"}`: HTTP 401, `ok=false`, one-byte body `"J"`**, captured on
+the wire twice as `RESP 401 len=1 body0=b'J'`.
+
+- The reference's value for the same probe is **not recoverable**: the trace records payload/probe keys as *names*
+  only, it has no `Response.status` / `Response.text` records at all, and the PAT URL is single-use — replays of a
+  captured one return `404` both direct and through the specified proxy. Settling it needs the fetch replayed in
+  Chrome *while the session is live* (or the widget instrumented to log the probe script and its reply, which needs
+  the anchor re-based per step 277).
+- A 401 for a client that presents no Private Access Token is plausible and may be exactly what Chrome gets, so this
+  is a **candidate, not a verdict** — it is listed because it is the only probe whose reported value we can name and
+  whose counterpart we cannot yet read.
+
+**What is now ruled out for the stage-2 divergence.** OPFS timing (`uUOw3`, fixed and re-corrected to sub-resolution
+0 ms), clock resolution (`vVsCr9`, verified identical), navigator fields (verified aligned), the worker handoff and
+its `isTrusted`/`origin`/`source` gate (measured passing, step 276), and the payload itself (opaque on both sides).
+The remaining candidate is the PAT fetch, next to anything the widget computes that has not been enumerated yet.
+
+**Artifacts.** `/tmp/clockprobe/{clock2.html,nav.html,cdpeval.py}` (two-engine fixtures and CDP client); reference
+durations and getter results from `assets/thelancet-trace/renderer-trace.log`; PAT evidence in
+`/tmp/ovclean/wire.log` (`RESP 401 len=1 body0=b'J'`).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: two candidate inputs cleared by direct comparison
+against real Chrome on identical fixtures (clock resolution identical at 0.1 ms, navigator aligned), one correction
+that makes our OPFS handle cost like a browser's, and one remaining identified candidate — the PAT fetch's
+401/`"J"` — with the exact probe source and the reason its counterpart value is unreadable today.
+
+### Step 278a: the PAT candidate is closed too, and so is the request inventory
+Checked immediately after writing the above, and it clears the last named candidate:
+
+- **The PAT fetch matches the reference exactly.** Our `RESP 401 len=1 body0=b'J'` is answered by Cloudflare
+  (`Server: cloudflare`, `CF-RAY: a3c140c5cd24504a-ICN`) with
+  `www-authenticate: PrivateToken challenge="AAIAGXBhdC1pc3N1ZXIuY2xvdWRmbGFyZS5jb20g…"`, and our request carries
+  **no** auth header. The reference HAR's own PAT entry is the same shape: **`status 401`**, no auth header on the
+  request, the same `PrivateToken` challenge on the response. A browser satisfies that challenge through its Private
+  Access Token infrastructure; a client that presents none gets 401 in both engines, so `rMor4` is not a divergence.
+- **The brunhild CORS fetch matches too.** The reference HAR records those requests with `status 0` — they fail
+  there as well, so our `{"AXuey2":1,"gQTuX1":"TypeError: Failed to fetch"}` is the same outcome for the same reason
+  (a 502 from the proxy carries no ACAO, so a `mode:'cors'` fetch rejects).
+- **The request inventory matches.** Deduping our live wire by path class gives `fo` (5), `pat` (2), `i` (2), `ci`
+  (1), `turnstile/f/` (2 doc loads), `turnstile/v0/g/…/api.js` (1), `/1.txt` (4) — the same classes as the 18-entry
+  reference HAR. Nothing missing, nothing extra.
+
+So every input we can *name* now checks out against the reference: navigator fields, OPFS timing, clock resolution,
+PAT, brunhild, the worker handoff and its gate, and the request inventory. The stage-2 submission still earns a
+shorter stage-3 program (step 277), so the remaining difference is in what the payload carries that has not been
+enumerated — the values the VM computes for itself — and reading those needs the widget instrumentation re-based on
+the rotated document using the anchors step 277 identifies.
+
+## Step 279: the widget instrumentation re-based on host surface, and a live Chrome run that stops earlier than we do
+
+**The instrumentation no longer touches the VM's obfuscated code at all.** Step 277's rotation killed the decode
+chain anchor, so the helper now goes in at the document's own `<script nonce="…">` and wraps **host surface only**
+(`Worker`, `Blob`) — variant-independent, because it never reads the VM's internals. `Worker.prototype.postMessage`
+is wrapped to log every probe script handed to a worker, `onmessage` and `addEventListener('message')` are wrapped to
+log every reply, and `Blob` logs the worker bootstrap text. It works: `/tmp/ovprobe/{addon.py,run.sh}`.
+
+It recovered the **current** variant's complete probe set with our replies, including two probes the earlier capture
+never showed (the document rotates the probe list too):
+
+| probe (script sent to a worker) | our reply |
+| --- | --- |
+| `navigator` snapshot | `{"hIup0":"MacIntel","ztyKk8":["zh-CN"],"TpsmW1":6,"APSY2":8,"jKeeJ4":"…Chrome/151.0.0.0…"}` |
+| PAT fetch | `{"rMor4":1,"eSLoU7":401,"deuYr4":0,"LrrA4":"J"}` |
+| brunhild CORS fetch | `{"AXuey2":1,"gQTuX1":"TypeError: Failed to fetch"}` |
+| OPFS sync access handle | `{"uUOw3":0}` and `{"uUOw3":0.0999…}` — sub-resolution, as Chrome reads it |
+| `performance.now()` loop | `{"vVsCr9":0.09999999999990905}` |
+| `eval("debugger")` liveness | `{"yNiq8":"TWnkF5"}` |
+| timers 55 ms / 1.5 s / 10 s | `{"CpvME3":"1"}` / `{"pvIO8":"1"}` / `{"IySL7":"1"}` |
+| timing matrix | `{"jixMq8":{"jBVrk8":[[6.1,3.7,3.7],[5.5,3.8,3.6],[6.8,5.6,5.9],[32.2,4.9,4.9]],"qdVjJ1":1,"hCKCP8":88.5}}` ×4 |
+| work packet, 5 workers | `{"graIf9":{"PySu2":"<ray>|<ts>|0|15274","OMba9":23420,"WrTo7":14}}` ×5 |
+
+Two things follow. (1) **The five `graIf9` work results do arrive** — step 271's "the caller returns early after
+`new Worker`" is superseded: with the worker path healthy, all five workers return, so the stop is later than that
+was. (2) `jixMq8` is a 4×3 timing matrix with a 32.2 ms outlier and an `hCKCP8` total of 88.5 ms, and the five
+`OMba9` work results sit around 23 k each. Those are the VM-computed payload fields the objective asked for; the
+reference's values for them are not recorded anywhere (its trace keeps payload keys as *names*), so they cannot be
+diffed as-is.
+
+**A live Chrome comparison reframes the remaining gate.** Driving real Chrome (this host's
+`/Applications/Google Chrome.app`) through the *same* proxy at the *same* URL, with the UA set to the reference's
+and a click on the widget frame via CDP `Input.dispatchMouseEvent` (trusted events):
+
+| client | flow observed now |
+| --- | --- |
+| real Chrome, headful, 110 s window | `GET /1.txt` 403 → `chl_page/v1` 200 → `api.js` 200 → **top `/fo/` #1** 200 → **widget document** 200 → *stops*. No widget `/fo/`, no `POST /1.txt` |
+| real Chrome, `--headless=new` | same, one top `/fo/`, stops there |
+| Obscura (same proxy, same click) | 8 `/fo/` (top #1 → widget #1/#2/#3 → top final), two `cf_clearance` cookies, then a re-challenge |
+
+So right now **real Chrome stops earlier than Obscura does**: it never gets a widget submission, where we get three
+and a clearance. The reference capture that *did* pass (`assets/thelancet-trace`, 2026-09-16 17:43) is from before
+this, and both my Chrome runs are hours later, so the egress/proxy path's treatment by the challenge has changed in
+between. That is a measurement, not a claim about the cause: it means a shorter stage-3 program for us (step 277) is
+not by itself evidence of an Obscura-specific tell, since the client that produced the reference cannot currently
+get that far either.
+
+**Artifacts.** `/tmp/ovprobe/{addon.py,run.sh,trace.jsonl}` (host-surface instrumentation and the reply set);
+`/tmp/chromeref/{drive.py,watch.py,drive.txt}` (Chrome driver with widget-frame click, full request log).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the widget instrumentation re-based on host surface
+alone (survives the rotation, and recovered the current probe set, two probes of which were previously unknown), the
+confirmation that all five worker results now return, and the live finding that real Chrome through the same proxy
+stops earlier than Obscura does — which changes what the remaining gap can be attributed to.
+
+## Step 280: the reference payload values, and two storage fields fixed from them
+
+Step 279's next action was to get real Chrome to pass in the same window and capture its `payloadJSON`. Chrome still
+did not pass, but the payload does not require passing: the challenge logs it field by field, and the console calls
+come from the **worker** realm, which needs `Target.setAutoAttach` (flattened) to be visible over CDP at all. With
+that, `/tmp/chromeref/drive2.py` collected 33 682 `payloadJSON:` records from Chrome and parsed **341 labelled
+reference fields** (`/tmp/chromeref/ref_fields.json`) — a real reference for the fields our own payload carries.
+
+Diffing the storage group against ours (`/tmp/chromeref/our_fields.json`, from our own console) found **two
+divergences**, both in the group the challenge fills from its OPFS probe, which runs in a worker:
+
+| field | reference (real Chrome) | ours, before | ours, after |
+| --- | --- | --- | --- |
+| `RPKTR7` — `navigator.storage.estimate().quota` | **10737418240** (10 GiB) | **5000000000** (flat 5 GB) | 10737418240 |
+| `uUOw3` — `flush()` cost the challenge times | **0.54 ms** | 0 | 0.60 ms |
+| `DdIVt1` / `pobRy9` / `uxzT2` / `quDo6` | `null` / `true` / `true` / `3` | same | same |
+
+**The quota had three implementations and the worker's was the flat tell.** `bootstrap/env/fingerprint/navigator.js`
+already avoided the flat value in the document realm (a per-install 200-850 GB band, with a comment calling 5 GB
+"the flat 5GB tell"), but `bootstrap/config/surface-finalize.js` and `src/worker.rs` each returned
+`5000000000` — and the worker is where the challenge reads it. All three now answer **10737418240**, which is both
+the reference's value and the value `queryUsageAndQuota` in the same file already used. One origin reporting two
+different quotas would have been its own tell, so they share one constant.
+
+**`flush()` now costs what a browser's costs.** Step 278 landed on 0 ms by reading Chrome's `flush` *disk* cost
+(12 us) and ignoring where the call runs: a browser serves a sync access handle from the browser process, so the
+probe times an IPC round trip, which is the 0.54 ms the reference reports. An in-process handle answers in
+microseconds — a reading no browser produces, in the one field this probe exists to measure. The round trip is
+modelled (450 us of it) the same way `performance.now()` is clamped to Chrome's granularity, and the fixture now
+reads `flushMs: 0.6` against the reference's 0.54.
+
+Both fixes are confirmed in the live flow, not only on fixtures: our payload now logs
+`RPKTR7":10737418240`, `uUOw3":0.6000000000000001`, `DdIVt1":null`, `pobRy9":true` — the whole group matching the
+reference. Suite after the change: obscura-js **618/621**, the same three documented pre-existing failures.
+
+**Still unmet.** No `POST /1.txt`, no 404. This round's runs reached between two and five `/fo/` with no clearance,
+i.e. the fixes have not moved the server's decision yet in the windows observed, and step 279's environment finding
+stands: real Chrome through the same proxy also fails to get a widget submission. The remaining named difference in
+the payload is now none of the fields we can pair; whatever is left needs either a passing reference run for the
+same window or the fields we still cannot name.
+
+**Artifacts.** `/tmp/chromeref/{drive2.py,payload.txt,ref_fields.json,our_fields.json}` (Chrome driver with worker
+auto-attach, reference payload log, parsed reference fields, our parsed fields);
+`/tmp/ovclean/quota-fix-{1,2}.log`; `/tmp/storprobe/idx.html` (both-realm quota fixture).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the reference's labelled payload values (341 fields,
+via worker auto-attach), two storage-group divergences found by diffing them, and both fixed and verified live —
+the quota now reads the browser's 10 GiB in every realm, and `flush()` costs 0.6 ms where the reference's costs 0.54.
+
+## Step 281: payload field diff, and two prototype surfaces fixed from a two-engine enumeration
+
+Step 280's diff used the reference's *own* payload values. This round adds the complementary method — run the **same
+fixture in both engines** and compare the surfaces directly — and it found more, because the reference payload only
+shows fields the challenge chose to read.
+
+**The broad payload diff.** The reference's 341 parsed fields match 211 of ours (598 flattened entries); the 130
+unmatched are mostly my parser mis-pairing in the reference's field-by-field console stream, plus session tokens.
+The real differences it surfaced were the storage group fixed in step 280, plus timing-shaped fields where we are
+systematically larger (`NnqX6` 227 vs 9700, `tZwbF3` 1006 vs 2644, `ZMSOw0`/`twvE0` 124 vs 390, `uGyjw9` 1 vs 291)
+and the render entry in the error log `PWGF4`, whose `t` is **1 ms** in the reference against **548 ms** here. Those
+are not yet attributed.
+
+**The surface diff, in both engines, on one fixture** (`/tmp/surfprobe/idx.html`, driven by CDP for Chrome and
+`--eval` for Obscura; `cdp_probe`-style enumeration of `getOwnPropertyNames`):
+
+| surface | Chrome | ours, before | ours, after |
+| --- | --- | --- | --- |
+| `Screen.prototype` own names | 12: the getters + `orientation`, `constructor`, `onchange`, `isExtended` | 16 — the same plus `addEventListener`, `removeEventListener`, `dispatchEvent`, `when` as **own** properties | 12, matching; the methods are now reached through a base prototype, so `screen.addEventListener` is still a function (Chrome's is) without the extra owns |
+| `document.fgColor` / `linkColor` / `vlinkColor` / `alinkColor` / `bgColor` | `""` each (unset) | **absent** (undefined) | `""` each |
+| `Document.prototype` own names | 251 | 247 (same five missing) | 252 |
+
+Both fixes are verified on the fixture, and the suite is unchanged at obscura-js **618/621** with the same three
+documented pre-existing failures.
+
+**What the same enumeration says is still different** (recorded, not yet fixed):
+
+- `Document.prototype` carries `location` as an own accessor; Chrome does not (it is `[LegacyUnforgeable]`, so each
+  document instance holds it). Ours puts it one level up, which an enumeration sees.
+- `window`'s insertion order diverges at index 61: Chrome `Option, Image, Audio, webkitURL, …` against ours
+  `queueMicrotask, location, length, screenX, …`. The challenge enumerates window properties, so order is read.
+- Ours exposes eight extra globals (`SharedStorage` and its seven siblings) where Chrome 153 exposes none as window
+  properties, and ours lacks `HTMLCameraElement` / `HTMLMicrophoneElement` and `navigator.cpuPerformance`, which this
+  Chrome has.
+- The render timing `PWGF4[0].t`: 1 ms in the reference, 548 ms here.
+
+**Still unmet.** No `POST /1.txt`, no 404. This round's live run reached only two widget `/fo/` with no clearance —
+the environment remains the constraint step 279 measured (real Chrome through the same proxy also fails to reach a
+widget submission), so no flow claim can be drawn from a single window.
+
+**Artifacts.** `/tmp/surfprobe/{idx.html,probe.html,ours.json,chrome.json}` (surface fixtures and both engines'
+dumps); `/tmp/clockprobe/cdpeval.py` (uncapped CDP evaluator); `/tmp/chromeref/{ref_fields.json,our_fields.json}`.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the two-engine surface enumeration and two faithful
+fixes from it — `Screen.prototype` now owns exactly Chrome's twelve names while still inheriting the event methods,
+and the five legacy document color attributes exist and answer `""` — plus a recorded list of the remaining named
+surface differences (window ordering, the eight extra `SharedStorage*` globals, the missing `cpuPerformance` /
+`HTMLCameraElement` / `HTMLMicrophoneElement`, `Document.prototype.location`'s placement, and the 1 ms-vs-548 ms
+render timing).
+
+## Step 282: cpuPerformance was gated, SharedStorage was invented, and a test caught my first fix
+
+Working down step 281's list, with a click flow after each change as the objective asks.
+
+**`navigator.cpuPerformance` already existed — behind the wrong condition.** The reference's own payload enumerates
+`n.cpuPerformance` in the **page** realm. Ours had the member only in cross-origin isolated *frames*: `page-init.js`
+installs it inside `if (frameRootNid > 0 && _crossOriginIsolatedValue && …)`. My first attempt added a fresh constant
+getter on the navigator surface, and `isolated_frame_exposes_cpu_performance_projection` failed — that test asserts
+the *existing* projection (`["number", 3, true, "function"]`, the frame's `max(1, min(4, round(cores / 3)))`), so a
+second getter was both redundant and value-wrong. Reverted, and the guard dropped instead: the getter now installs in
+every realm, keeping the projection's own formula. Page realm with `hardwareConcurrency: 8` answers
+`navigator.cpuPerformance === 3`, listed in the prototype enumeration; the frame test passes again.
+
+**The eight `SharedStorage*` globals were ours, not Chrome's.** Two independent checks agree they should not exist:
+the reference's payload never mentions `SharedStorage` in any of its 341 fields, and a direct measurement in Chrome
+reports `typeof SharedStorage === "undefined"` while `HTMLCameraElement` / `HTMLMicrophoneElement` are functions —
+so those two, which the first surface diff flagged as "missing", are Chrome-153-only additions the reference does not
+have and were correctly left alone. The seven `_chromeInterfaceTable` rows and the `sharedStorage: 'SharedStorage'`
+navigator mapping are gone: `window` now owns no `SharedStorage*` name, `navigator.sharedStorage` and
+`SharedStorage` are both `undefined`.
+
+**Checks after both changes.** Fixture: `{"cpu":3,"type":"number","listed":true,"hc":8,"ss":"undefined"}`. Suite:
+obscura-js **618/621**, the same three documented pre-existing failures (the fourth failure of the intermediate state
+was mine and is gone). Click flow in the same window: **5 `/fo/` POSTs, no `cf_clearance`, no `POST /1.txt`, only
+`GET /1.txt` → 403** — so neither change moves the server's decision in this window, exactly as step 279's
+environment measurement predicts.
+
+**Still on the list, unchanged:** `window` insertion order from index 61, `Document.prototype.location`'s placement
+(Chrome keeps it instance-level as `[LegacyUnforgeable]`), the render timing `PWGF4[0].t` (1 ms reference, 548 ms
+here) and the timing-shaped payload fields (`NnqX6` 227 vs 9700, `tZwbF3` 1006 vs 2644).
+
+**Artifacts.** `/tmp/surfprobe/{probe.html,idx.html}`; `/tmp/surface-finalize.js.bak` (pre-removal copy of the table);
+the reference fields in `/tmp/chromeref/ref_fields.json`.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: `navigator.cpuPerformance` now exists in the page
+realm the reference enumerates (un-gated, not duplicated — the existing test caught the duplicate), the eight
+invented `SharedStorage*` globals are gone, and both are verified on fixtures with the suite back to 618/621.
+
+## Step 283: the environment still blocks Chrome, and screen metrics are now self-consistent
+
+**Environment check first, as the objective asks.** Real Chrome, headful, through the specified proxy at the same
+URL, three clicks on the widget frame, 75 s: **7 top-level `/fo/` POSTs, 8 widget-document loads, zero widget `/fo/`
+submissions, no `POST /1.txt`** — it restarts the challenge instead. So the window is still not passable, for Chrome
+as much as for us, and no conclusion about Obscura can be drawn from a flow result here.
+
+**The numeric payload fields are a value-to-aliases map, not an ordered enumeration.** Step 281 read the reference's
+numeric-keyed fields as chunks of a window enumeration and inferred that `window` order is read. Re-reading them
+whole shows what they are — the key is a *value*, the value is the list of names that produced it:
+
+| reference field | meaning |
+| --- | --- |
+| `1440: ["outerWidth","s.height"]` | outerWidth and screen.height are both 1440 |
+| `900: ["outerHeight"]` | outerHeight is 900 |
+| `3440: ["s.availWidth","s.width"]` | the screen is 3440 wide |
+| `1312: ["s.availHeight"]` | its available height is 1312 |
+
+so the challenge is checking that our aliases *agree*, not what order they enumerate in. (The reference machine's own
+screen was 3440x1440 with availHeight 1312; ours is the configured 1440x900.) That correction matters because it
+re-ranks the remaining list: window insertion order was step 281's priority and the evidence for it does not hold.
+
+**What the map does show is a contradiction we were emitting.** Our runner's profile sets `availTop: 30` *and*
+`availHeight: 900` on a 900-tall screen — a menu bar overhanging the display, which no browser reports, and exactly
+the kind of self-inconsistency an alias map is built to catch. `_screenApplySize` passed the fingerprint through
+untouched; it now clamps the available area to the screen minus the offsets, so our profile answers
+`{w:1440, h:900, aw:1440, ah:870, at:30}`.
+
+**Checks.** Suite: obscura-js **618/621**, the same three documented pre-existing failures. Click flow in the same
+window: **5 `/fo/` POSTs, no `cf_clearance`, no `POST /1.txt`, only `GET /1.txt` → 403**.
+
+**Still on the list:** `Document.prototype.location`'s placement, the render timing `PWGF4[0].t` (1 ms reference vs
+548 ms here), the timing-shaped payload fields (`NnqX6` 227 vs 9700, `tZwbF3` 1006 vs 2644), and the window order
+question — which stays recorded but demoted, since the evidence that the challenge reads order is now gone.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the environment re-checked in this window (Chrome
+stops before any widget submission too), the reference's numeric payload fields correctly identified as a
+value-to-aliases consistency map, and the screen metrics made self-consistent (`availTop` no longer overhangs).
+
+## Step 284: `document.location` placed exactly as Chrome places it
+
+Measured both engines on one fixture (`Object.getOwnPropertyDescriptor` on the instance and on the prototype):
+
+| | Chrome | ours, before | ours, after |
+| --- | --- | --- | --- |
+| `document.location` as an own property | `{enumerable: true, configurable: false}`, getter | same (installed per realm) | same |
+| `Document.prototype` owns `location` | **no** | **yes** | no |
+| first own names of `document` | `location` first | `location` first | `location` first |
+| `Document.prototype` prefix | `implementation, URL, documentURI, compatMode` | `location, implementation, URL, documentURI` | `implementation, URL, documentURI, compatMode` |
+
+`location` is `[LegacyUnforgeable]` in the HTML spec, which is why Chrome has it as an instance accessor and not on
+the prototype. `page-init.js` already installed exactly that, with a comment citing the spec — the class-body
+`get location()`/`set location()` in `document.js` was a second, redundant declaration that put the name on the
+prototype and shifted its enumeration. It is gone, and `requestStorageAccessFor` now reads `globalThis.location`
+instead of `this.location` so it no longer depends on the per-realm install having run.
+
+**Process note.** My first attempt at that edit mangled the region (it duplicated `get defaultView()` and orphaned two
+comment blocks); the structure was checked and repaired before the build, and the file now has one `defaultView`,
+one `fgColor` getter and no class-body `location`.
+
+**Checks.** Fixture: `{"own":{"enum":true,"conf":false,"hasGet":true},"proto":false,"listed":0,"protoNames":
+["implementation","URL","documentURI","compatMode"],"loc":"http://127.0.0.1:8893/probe.html"}` — identical to
+Chrome's answer, and `document.location.href` still resolves. Suite: obscura-js **618/621** plus one leaky test
+nextest reports separately, the same three documented pre-existing failures. Click flow in the same window: **5 `/fo/`
+POSTs, no `cf_clearance`, no `POST /1.txt`, only `GET /1.txt` → 403**.
+
+**Environment re-checked in the same window, as asked.** Real Chrome, headful, through the specified proxy, three
+clicks: **7 top-level `/fo/` POSTs, 0 widget `/fo/` submissions, no `POST /1.txt`**, restarting the challenge
+instead. So the reference-payload final check still has no window to run in: no client, ours or Chrome, has reached a
+widget submission since the reference capture.
+
+**Still on the list:** the render timing `PWGF4[0].t` (1 ms reference vs 548 ms here) and the timing-shaped payload
+fields (`NnqX6` 227 vs 9700, `tZwbF3` 1006 vs 2644).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: `document.location` now matches Chrome's own-property
+shape *and* its prototype's absence, with the prototype prefix identical, and the environment re-checked in the same
+window.
+
+## Step 285: two fixes from objective-directed comparison (timer delivery at DCL, macOS default font metrics)
+
+Method per the objective: no reliance on the operator's instrumented tracelog; comparison against
+`assets/thelancet-trace` (the passing Chromium-151 fp-trace + HAR) using our own engine's instruments
+(`--trace-op-file`, `--trace-api-file`, the wire addon, and a real-Chrome two-engine fixture).
+
+**The full five-submission flow now completes in the 30 s window.** Wire for a fresh round: top `/fo/` (2380 B)
+→ widget doc → widget `/fo/` #1 (4.8 kB → 822 kB) → `/pat/` 401 + `/ci/` + brunhild → widget proof `/fo/` #2
+(89 kB → 127 kB) → widget `/fo/` #3 (92 kB → 5 kB) → top final `/fo/` (7.8 kB → 3.2 kB). The reference's final
+answer is 3.66 kB and then `POST /1.txt → 404`; ours is 3.24 kB and then a **re-challenge** (GET `/1.txt` →
+new `orchestrate`). The server's deny lives in what our submissions carry, not in a missing request class.
+
+**Fix 1: page timers queued by parser scripts now fire at the DCL boundary** (`page.rs`, one bounded
+`run_load_delaying_event_loop_tick` before the `<dom-content-loaded>` dispatch in
+`execute_scripts_with_module_budget`). Attribution: api.js stamps `turnstileLoadInitTimeTsMs` at boot and
+dispatches its `onload=khCN8` callback with `setTimeout(0)`; the interstitial's inline handler then calls
+`turnstile.render`, and `PWGF4[0].t` (carried in every `/fo/` payload) is `Y() - init` at that render entry.
+Reference: **1 ms**. Ours: **548/300 ms**. Host-op stream (`--trace-op-file`) showed api.js's boot ops ending
+at +1.7 ms and the render walk starting at +315.8 ms with *zero* host crossings in between: the due 0 ms timer
+waited for the /fo/ completion to force the next event-loop poll, then ran behind 150+ ms of VM response
+processing. `drive_load_delaying_scripts` never ticks when no *dynamic* scripts are pending, so nothing
+delivered the timer. A `data:` URL fixture through serve+CDP proves the timer machinery itself is sound
+(parse-phase `setTimeout(0)` fires at 7 ms with a cross-origin fetch in flight), so the fix is a delivery
+boundary, not a timer rewrite. After the fix: 114/214/354/190 ms across rounds - the residual is
+`chl_page`'s own pre-render work (its `/fo/` wait and VM processing sit between api.js boot and the render
+call; the filtered trace `Object.turnstile` boot → chl_page `render` call brackets it), an engine-throughput
+gap, not a delivery bug.
+
+**Fix 2: `line-height: normal` / font box metrics follow the claimed platform's default font**
+(`inline.rs`, `bundled_face_metrics` answers PingFang SC hhea 1060/340/0, upem 1000 for the default family
+when `FontPlatform::MacOs`). Two-engine measurement of the challenge's own layout probe (reconstructed from
+`ENV-DETECT-0916-11` pc 204513-207205: sub-pixel `px/pt/rem/scale` boxes + `getBoundingClientRect`; fixture
+`/tmp/timerlat/layout.html`, Chrome headless vs ours via CDP): unit conversion and sub-pixel x were already
+identical, but every line box was ~17 % short because Chrome resolves this host's default font to
+**PingFang SC** (16px → 22px line, 45px → 63px; `getComputedStyle` confirms) while our bundled sans answered
+19px. After the fix, measured heights match Chrome exactly on the probe set: p2 92 = 92, p3 48 = 48,
+p4 55.938 = 55.938, p8 88 = 88, caption height 33 = 33, m1/m2 22/63 = 22/63. Still divergent: `p1`
+`transform:scale(1e32…,1.89)` reads 0x0 here vs Chrome's 6.8e+32 rect; `details` 48 vs 70; `progress` 20 vs 26;
+caption width 4 vs 39.5 (its border+margin are not applied). Those are default-widget geometry work, recorded
+for the next round.
+
+**fp-trace counts comparison** (`fptrace_diff.py counts` vs `renderer-trace.log`, our `--trace-api-keyed off`
+jsonl): the MISSING builtin entries (`Date.now`, `Number.parseInt`, `Promise.*`, `Function.toString`,
+`TextEncoder`, `BigInt`, `Object.*`) are the documented probe blind spot, not findings. Checked the two
+suspicious DOM classes directly instead: WebRTC ICE is healthy (two mDNS host candidates + null terminator,
+complete `candidate` fields - the reference's 106 `RTCPeerConnectionIceEvent.candidate` reads are covered);
+CSSOM (`styleSheets`/`cssRules`/`cssText`) is implemented and returns rules - the volume difference
+(415/410/204 reads there vs ~1 here) tracks the smaller stylesheet set our interstitial exposes and stays on
+the watch list.
+
+**New engine defect found, not yet fixed:** `serve` + CDP `Page.navigate` to a loopback URL commits an **empty
+document** (scripts.length 0) even with `--allow-private-network` and `OBSCURA_ALLOW_PRIVATE_NETWORK=1`; the
+same URL through `fetch` loads fine and public URLs through serve load fine. No net-layer log at all - the
+fetch is swallowed before `SsrfGuardResolver`. It cost one wasted diagnostic round (`/tmp/lancet-s3`'s first
+attempt) before the addon failure was separated from it.
+
+**Suites.** obscura-js 618/621 (the three documented pre-existing), obscura-render 589/589,
+obscura-browser 124/125 - `blob_url_iframe_navigation_commits_the_stored_document` fails on the uncommitted
+tree with my two hunks mechanically disabled, i.e. it is prior work-tree state (the about:blank location
+attribution from the reverted step-268 experiment), not this round's regression. The obstacle course repo is
+not present on this host, so the 33/33 gate could not run; render-repros were not exercised because the
+metrics change is platform-gated to the macOS identity the fixtures do not select.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Gained: the DCL timer-delivery fix (PWGF4 548 → ~114-354,
+residual attributed to VM throughput), the PingFang default-metric fix with exact height parity on the
+challenge's own layout probe, the layout-probe divergence table, and the serve+CDP loopback defect.
+
+## Step 286: offset* no longer include transforms; the atomic-only strut gap characterized
+
+**Fix: `offsetWidth`/`offsetHeight` now report the layout border box and ignore visual transforms.**
+They were `Math.round(getBoundingClientRect().width/height)`, so any transformed element answered the
+*transformed* size: an element under `transform:scale(1e32,1.89)` reported `offsetWidth 33554430`
+(binary32-clamped) where Chrome reports the untransformed `4`, and inside the challenge's hidden
+measurement container the same element answered `0` twice over. `frame_geometry_json` now ships
+`layoutWidth`/`layoutHeight` (straight from `layout.rects`, transform-free) alongside the transformed
+rect, and `element-object.js`'s offset* read those when finite, falling back to the old path. The
+gBCR finiteness validation moved into `getBoundingClientRect` itself so the pathological-scale case
+still cannot leak a rect with null fields. Two-engine check (clip-container fixture, Chrome headless
+vs ours): `p1` offset **[4, 193] = [4, 193]** exactly; a plain `scale(100,1.89)` case `a1` and the
+scientific-notation `1e32` case `a6` likewise read [4,193] instead of 400 / 33554430.
+
+**gBCR for the pathological scale stays 0** (Chrome: 6.8056e32). Our transformed rect overflows
+binary32 and serializes through JSON as null, which the bootstrap answers with the all-zero rect;
+Chrome's layout units saturate instead of overflowing, so it keeps a finite astronomical value.
+Reproducing that needs saturating layout-unit math in `Affine2::map_rect`, not a one-line change.
+
+**New characterization: blocks whose in-flow children are all inline-level atomics have no anonymous
+IFC strut.** `<div><img 16px></div>` measures height 16 here and 22 in Chrome; the same for
+progress-only (16 vs 22) — `is_pure_text_ifc` rejects atomic children, so the container lays its
+children out as taffy boxes and no line box exists to impose the strut. In the challenge's own
+sub-pixel probe this is exactly `p5` details (48 vs 70), `p6` progress (20 vs 26 = 16+4 vs
+strut 22+4), and `p7` select (23 vs 26). The fix is to synthesize an anonymous line box for
+"block whose children are all inline-level atomics" in the layout builder; it touches the core
+build path, so it is recorded here rather than rushed. Caption geometry (4 vs 39.5: caption text
+not contributing width to the table's shrink-to-fit) is in the same family.
+
+**Flow.** Same window, 30 s round with one click: 8 `/fo/` submissions across two challenge rounds,
+top final response 3240 B, then a re-challenge. **No `POST /1.txt`, no 404.**
+
+**Suites.** obscura-js 618/621 (the three documented pre-existing). obscura-render/obscura-browser
+not re-run this round (no changes to their sources since step 285's runs).
+
+## Step 287: the line-box strut reaches atomic-only runs; p6/p7 parity
+
+**Fix 1 (`dom.rs`):** the anonymous run wrapper's strut was gated on the run containing a *text*
+node, so an img-only or progress-only line box collapsed to the atomic height. CSS line boxes carry
+the containing block's strut unconditionally — `<div><img style="height:16px"></div>` is 22px in
+Chromium (the 16px-font PingFang strut), not 16. `has_text_strut` is now "the run is non-empty".
+**Fix 2 (`style.rs`):** `progress`/`meter` had no UA default display, fell through as blocks, and
+never even reached the run grouping; they now default to `display: inline` + `is_inline_block`
+(Chromium's UA sheet: inline-block), matching button/select/input.
+
+**Two-engine verification** (data:-URL fixtures, Chrome headless vs ours over CDP):
+img-only 16 → **22 = 22**; progress-only 16 → **22 = 22**; button-only 24 (own height ≥ strut)
+unchanged. Challenge sub-pixel probe: `p6` 20 → **26 = 26**, `p7` 23 → **27 ≈ 26**, both now in
+the OK column; p2/p3/p4/p8/p9 and offset metrics stay exact.
+
+**Suites.** render **589/589** (the change is in the core layout builder), obscura-js 618/621 (the
+three documented pre-existing), obscura-browser 124/125 (the pre-existing blob/location one).
+
+**Flow.** 30 s round with one click: 8 `/fo/` submissions, top final 3240 B, re-challenge.
+**No `POST /1.txt`, no 404.** `PWGF4[0].t` read **67 ms** this round (548 at step 284 → 114-354
+after the DCL delivery fix → 67 now; the residual is chl_page's own `/fo/` wait plus VM throughput
+between api.js boot and the render call — engine-throughput class, not a delivery bug).
+
+**Remaining named divergences.** `p5` details 48 vs 70: Chrome's `summary` is `display: list-item`
+and at zero content width its marker occupies its own line — summary 66 = 3 × 22 where ours is 44 =
+2 × 22; needs summary list-item/marker defaults. `caption` 4 vs 39.5: the caption's text does not
+participate in the table's shrink-to-fit width negotiation. gBCR under `scale(1e32)` 0 vs 6.8e32
+(saturating layout units). All three are scoped in `/tmp/timerlat/` fixtures.
+
+**Status.** Unmet: no `POST /1.txt`, no 404.
+
+## Step 288: summary marker parity (p5 now exact); map_rect saturation
+
+**Fix 1 (`style.rs` + `dom.rs`): the summary disclosure marker.** Chromium's UA sheet makes
+`summary` a list-item; at the probe's zero content width the outside marker wraps onto its own
+line — measured in Chrome: summary height = (text lines + 1) × 22 for every variant tried, and
+`summary::marker{content:none}` collapses it back, which pinned the extra line on the marker.
+The engine's UA defaults are code (not CSS rules), so the marker is installed as a
+`before_pseudo` generated box (`before_content = "▸ "`); `dom.rs`'s pseudo extraction
+unconditionally overwrote `style.before_pseudo`, so the merge now keeps a UA-element default
+only when no stylesheet `::before` rule matched. The existing flex-wrap run wrapper then gives
+the marker its own line at zero width, exactly like Chrome.
+
+**Two-engine verification:** details 66 = 66, summary 66 = 66, `p5` **[4, 70] = [4, 70]** —
+the challenge sub-pixel probe is now 9/10 OK (p2/p3/p4/p5/p6/p7/p8/p9/offset metrics exact;
+only `p1` remains).
+
+**Fix 2 (`lib.rs`): `Affine2::map_rect` saturates** non-finite corners and extents instead of
+emitting infinities (CSSOM serializes those as null, which the bootstrap answers with an
+all-zero rect — a stronger tell than a clamped astronomical value).
+
+**`p1` gBCR is still 0** (Chrome 6.8e32), with a new datapoint that narrows it:
+`getComputedStyle(p1).transform` parses the pathological decimal correctly
+(`matrix(100000000000000000000000000000000000, 0, 0, 1.89, 0, 0)` — the authored value is 1e35,
+not the 1e32 the ENV-DETECT abbreviation suggested), so the zeroing is not transform parsing nor
+`map_rect` arithmetic; it originates between the cssom-rect pass and the geometry JSON for this
+box (next instrument: dump `frame_geometry_json`'s inputs for that node).
+
+**caption 4 vs 39.5 stays open** and is bigger than a default-style tweak: Chrome lays the
+caption outside the table's grid and grows the table to the caption's fit-content width; ours
+routes the caption through the grid tracks, so its width collapses to the empty track. Real
+caption/table width negotiation is a table-layout architecture item.
+
+**Suites.** render **589/589** after all three changes. obscura-js/browser unchanged from step
+287's runs (no JS-side or page.rs changes this round).
+
+**Flow.** 30 s round with one click: 8 `/fo/` submissions, top final 3240 B, re-challenge.
+**No `POST /1.txt`, no 404.** `PWGF4[0].t` = 336 ms this round (round-to-round 67-354;
+the residual is chl_page's `/fo/` wait plus VM throughput between api.js boot and the render
+call).
+
+**Status.** Unmet: no `POST /1.txt`, no 404.
+
+## Step 289: instrumenting the geometry op fixed p1 — the matrix folded origin overflowed
+
+**Instrument.** `frame_geometry_json` now dumps its inputs under `OBSCURA_GEOM_DEBUG=1` (cssom
+rect, layout rect, matrix a/d/e/f, output rect). One data:-URL probe run pointed straight at it:
+
+```
+[geom] nid=9 cssom=Some((-10000,50,4,193)) rects=Some(same) transform=Some((1e35, 1.89, inf, NaN)) -> out=(0,0,0,0)
+```
+
+**Root cause.** `Affine2::around(origin)` folds the origin cancelation into one matrix:
+`e = ox*(1 - a)` at scale 1e35 is ~1e39 — past f32::MAX — so the stored matrix carried
+`e = inf`, and the composition produced `f = NaN`. Every mapped corner then evaluated
+`inf - inf = NaN`, serde_json serialized the rect as nulls, and the bootstrap answered the
+all-zero rect. The transform parse itself was correct (computed style showed
+`matrix(1e35, …)`), which is why step 288's saturation of `map_rect` alone changed nothing:
+the non-finite entries entered through `around`.
+
+**Fix.** `around` saturates the folded translation (e/f) to the f32 range, and `map_rect`
+computes its corners in f64 — saturating only the final rect. The f64 intermediates matter:
+f32 corners would saturate to the same value and collapse the width to zero, while f64 keeps
+them distinct (4e35 apart) until the final clamp.
+
+**Two-engine verification:** `p1` gBCR ours `[33554430, 364.77, 33554430, -35.885]` against
+Chrome `[6.8e32, 364.77, -3.4e32, -35.885]` — height and y now match bit-for-bit, and the width
+is a finite astronomical value on both sides (the exact clamp differs: 2^25-2 in our pipeline,
+Chromium's layout-unit max there). The challenge's sub-pixel probe reads **10/10 OK** for the
+first time. render suite **589/589**.
+
+**Flow.** 30 s round with one click: 8 `/fo/` submissions, top final 3240 B, re-challenge.
+**No `POST /1.txt`, no 404.** `PWGF4[0].t` = 100 ms.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Every named, value-level divergence in the
+challenge's sub-pixel layout probe now matches Chrome; the remaining suspects are the
+throughput-class timing fields (PWGF4 residual, tZwbF3/uGyjw9/ZMSOw0 — semantics await the
+operator's updated disassembly), the caption/table width negotiation, and whatever the
+payload carries that we cannot name.
+
+## Step 290: caption-only tables join the grid, and tables shrink-to-fit
+
+Two layers, both verified against Chrome on the bare caption fixture
+(`<div id=cfh 0x0 fixed><table><caption>cap</caption></table>` plus the same table in normal flow):
+
+**Fix 1 (`dom.rs`, build_table):** a native `<table>` with no rows bailed out of the dedicated
+table path entirely (`return None`), so a caption-only table fell back to ordinary block
+construction and stretched across the container (0 px inside the 0-width measurement container,
+1264 px in normal flow). When `collect_table_rows` finds no rows but the table has a `<caption>`
+child, one synthetic row is pushed (`synthetic_caption_row`) and the caption classifies as a cell
+for that row, so the caption's content feeds the grid's min/max-content measurement.
+
+**Fix 2 (`dom.rs`, build_table):** the grid table node now opts out of block stretching —
+`align_self: FLEX_START` whenever its inline size is auto. CSS tables are shrink-to-fit; taffy's
+block parent stretched an auto-width child to the full container (1264 px in normal flow where
+Chrome reads 60.313, independent of the container). Percentage widths keep the stretch so they
+still resolve against the container.
+
+**Two-engine result.** table 0/1264 → **63 (Chrome 60.313)** and identical in both containers;
+caption 4 → **37.844×29 (Chrome 39.516×33)**. The residual is ~1.7 px of glyph advance on
+'cap' plus a 4 px vertical-border inclusion detail — the same text-advance noise class as p9
+(26.703 vs 27.203). In the challenge's sub-pixel probe `pc` moved from `[4, 33]` to
+`[37.844, 29, -9977.2, 337]` against Chrome `[39.516, 33, -9979.2, 335]` — structural parity,
+with only sub-glyph metrics left.
+
+**Suites.** render **589/589** after the table-path change.
+
+**Flow.** 30 s round with one click: 8 `/fo/` submissions, top final 3240 B, re-challenge.
+**No `POST /1.txt`, no 404.** `PWGF4[0].t` = 418 ms this round (round spread 67-418, network-bound).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. The challenge's environment probe now measures a
+layout surface that matches Chromium on every named, value-level check available to this host;
+what remains open is the throughput-class timing residual, caption glyph-advance minutiae, and
+the payload content we cannot name. The egress verdict (the final `/fo/` answer still routes to a
+re-challenge) is unchanged by seven engine fixes this session, consistent with the server weighting
+inputs we cannot observe from here.
+
+## Step 291: doc re-check and a post-rotation flow round
+
+The operator's disassembly workspace (`jsvmp-engine-0916-11`) is unchanged since Sep 16 22:31 —
+no timer/timing-family files, so `uGyjw9`/`ZMSOw0`/`tZwbF3` attribution stays blocked on the
+next analysis drop.
+
+A fresh 30 s round with one click after the session rotation: 8 `/fo/` submissions across two
+challenge rounds, top final 3240 B, re-challenge. **No `POST /1.txt`, no 404.** `PWGF4[0].t` =
+**59 ms** — the best reading this session (548 at step 284), leaving the residual entirely in
+chl_page's own `/fo/` wait and VM throughput. Two `cf_clearance` cookies were issued; per the
+verdict rules those also arrive on failure paths and are not pass evidence.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. The server verdict has been stable across every
+round this session (steps 284-291, seven engine fixes landed), so the remaining divergence lives
+where this host cannot name it: the payload contents the VM computes, and the throughput-shaped
+timings those payloads carry.
+
+## Step 292: pacing comparison against the reference HAR
+
+Re-checked the operator's workspace: still no timer/timing-family files
+(`uGyjw9`/`ZMSOw0`/`tZwbF3` attribution remains blocked).
+
+Two more instrumented rounds (wire timestamps + host-op trace). One (`/tmp/lancet-s15`) showed a
+one-off 10.7 s wire hole between the favicon 403s and the widget-document request; the repeat run
+(`/tmp/lancet-s16`) has no such hole and completes 8 `/fo/` submissions across two rounds — the
+hole was environmental, not a regression from this session's changes.
+
+Pacing comparison against the passing reference HAR (`assets/thelancet-trace`): Chrome's
+inter-request gaps run 0.82/0.85/0.94/0.90/2.13 s across the five submissions (8.5 s total to the
+`POST /1.txt → 404`); ours run 1.7-3.7 s over 24.2 s. Same stage shape, ~1.5-2x per stage — the
+throughput class already carried by `PWGF4[0].t` (59-516 ms round spread) and friends. Nothing
+new to fix from the wire side: the stage-to-stage waits are the VM's own compute, not delivery
+or polling stalls (those were fixed in steps 285/289).
+
+**Status.** Unmet: no `POST /1.txt`, no 404. The remaining lever this host cannot pull is the
+VM-computed payload content and its throughput-shaped numbers; attribution needs the operator's
+next disassembly drop.
+
+## Step 293: full-trace round is flow-degrading as documented; verdict stable
+
+Re-checked the operator's workspace once more: unchanged. Two more rounds: the full-trace config
+(`--trace-api-file --trace-api-calls`) degraded the flow exactly as documented in the measurement
+notes — 2 `/fo/` submissions and `PWGF4[0].t` = 4131 ms, so its flow shape is observation-only,
+never a verdict sample. The clean companion round (`--trace-op-file` only) reached 3 `/fo/`
+submissions inside the window (network slower tonight), top final not reached. **No
+`POST /1.txt`, no 404** in either. `uGyjw9`/`ZMSOw0`/`tZwbF3` attribution remains blocked on the
+operator's next disassembly drop.
+
+**Status.** Unmet: no `POST /1.txt`, no 404.
+
+## Step 294: the caption's vertical border was never missing — the gap is shaping-font metrics
+
+Third consecutive check of the operator's workspace: unchanged, `uGyjw9`/`ZMSOw0`/`tZwbF3`
+attribution still blocked.
+
+The "caption vertical border not counted" premise from step 289 is **refuted by computed style**:
+our caption answers `content-height 25px, border 2px/2px` — the vertical border *is* included
+(25 + 2 + 2 = 29, the measured border-box height). The 4 px height delta against Chrome
+(33 = 29 + 2 + 2) is in the *content*: our caption text is shaped with the bundled Liberation
+face's hhea metrics (line 25, advance 33.844) while Chrome shapes it with **PingFang SC**
+(line 29, advance 35.516). The same advance delta explains the 1.7 px width gap. Fixing it means
+identity-aware shaping-font loading — on a macOS identity, load the host's PingFang SC into the
+font database as the default shaping face (glyphs *and* metrics), which is a font-layer project,
+not a default-style tweak.
+
+**Flow.** Fresh 30 s round with one click after session rotation: 8 `/fo/` submissions, top final
+3240 B, re-challenge. **No `POST /1.txt`, no 404.** `PWGF4[0].t` = 279 ms.
+
+**Status.** Unmet: no `POST /1.txt`, no 404. Open items: identity-aware shaping fonts (PingFang
+SC on macOS), caption glyph-advance minutiae (same root), throughput-class timing attribution
+(operator docs pending).
+
+## Step 295: caption border confirmed counted; fast-path leaves carry the strut; identity shaping fonts scoped
+
+Fourth check of the operator's workspace: unchanged — `uGyjw9`/`ZMSOw0`/`tZwbF3` attribution stays
+blocked.
+
+**The "caption vertical border not counted" premise is refuted.** Computed style on the caption:
+content height 25px + border 2px/2px = the measured 29px border box — the border *is* included.
+The 4 px height delta against Chrome (33 = 29 + 2 + 2) is in the *content*: the caption's text
+shapes with the bundled Liberation face's hhea (line 25, advance 33.844) where Chrome shapes with
+PingFang SC (line 29, advance 35.516 — the same delta on the width axis). The real fix is
+identity-aware shaping-font loading: on a macOS identity, load the host's PingFang SC into the
+font database so shaping glyphs *and* metrics match the claimed platform. That is a font-layer
+project (fontdb source loading, family registration, weight matching, canvas-measure
+consistency), scoped and recorded here rather than rushed.
+
+**Landed anyway (correct CSS, no probe change): fast-path run leaves now carry the block's strut
+as a minimum height** (`dom.rs`, fast-path leaf in the `Seg::Run` handler). The split-run wrapper
+already had it; the single-run fast path did not. The caption's text turned out to take the
+pure-text IFC promotion path instead, whose sizing needs the shaping-font fix above, so the
+probe's caption numbers are unchanged this round. render suite **589/589**.
+
+**Flow.** 30 s round with one click after session rotation: 8 `/fo/` submissions, top final
+3240 B, re-challenge. **No `POST /1.txt`, no 404.** `PWGF4[0].t` = 299 ms.
+
+**Status.** Unmet: no `POST /1.txt`, no 404.
+
+## Step 296: identity-aware PingFang loading landed — inert on this host by absence of the file
+
+**Implemented** (`inline.rs`, `new_with_web_fonts` + `resolve_loaded_font`): the engine loads
+`/System/Library/Fonts/PingFang.ttc` at construction, registers its SC faces in the internal
+family `__obscura_system_pingfang` (CSS-unselectable, so font-presence probes and authored
+stacks are untouched), and `resolve_loaded_font`'s default-fallback selects that family when
+`font_platform()` is macOS — giving the default text real PingFang glyphs *and* hhea metrics
+(1060/340, upem 1000) through shaping, which is exactly Chromium's measured 22px/29px line boxes
+on a host that has the file.
+
+**On this host it is inert:** `/System/Library/Fonts/PingFang.ttc` does not exist (the CJK set
+here is STHeiti/Hiragino Sans GB), so the caption still shapes at 25/29 content lines. Closing
+the delta here needs one of: (a) the IFC leaf height lifted to `lines × used_line_height`
+(the identity strut — one sizing change in the shaped-leaf builder), or (b) bundling a
+PingFang-metric-matched font. Chrome's own 29px line on this host comes from its substitution
+for the missing family, computed against its layout units — not reproducible from file metrics
+that are absent.
+
+**Fifth operator-workspace check:** unchanged; the timing-field attribution stays blocked.
+
+**Suites.** render **589/589**.
+
+**Flow.** 30 s round with one click: 8 `/fo/` submissions, top final 3240 B, re-challenge.
+**No `POST /1.txt`, no 404.** `PWGF4[0].t` = 285 ms.
+
+**Status.** Unmet: no `POST /1.txt`, no 404.
+
+## Step 297: the overdue-timer repair now re-arms deno_core's sleep — PWGF4 delivery at 5 ms
+
+**Root cause nailed with `obscura::timers=trace`.** A tick reported
+`next_timeout_ms=Some(0.0)` while delivering nothing (`delivered=0`), followed by hundreds of
+repair cycles that never delivered: deno_core's mutable timer sleep held a waker from a dropped
+poll future, and the yield-only `op_posted_task()` wake — the entire repair — re-pollled a sleep
+that never resolved. Delivery then piggybacked on unrelated network wakes, which is why
+`PWGF4[0].t` tracked the `/fo/` fetch (59-516 ms) instead of the 0 ms deadline.
+
+**Fix (`runtime.rs`, queue_overdue_timer_wake_repair):** when a browser timer is overdue, the
+repair now also enqueues a throwaway zero-delay user timer. `queue_timer` sees the earliest
+deadline and calls `change(now)`, which replaces the stale sleep and marks it ready — the next
+poll observes it and delivers every due timer, including the real one. One extra no-op callback
+per repair.
+
+**Measured.** Repair round: `PWGF4[0].t` = **5 ms** (history: 548 → 59-516 after the DCL fix → 5).
+Follow-up rounds read 183/1009 ms; the spread is challenge-flow ordering variance (the onload
+timer now fires early; when the explicit `turnstile.render` call happens depends on the
+server-driven challenge state of that round), not delivery latency — delivery is at the deadline.
+
+**Suites.** obscura-js 618/621, obscura-browser 124/125 (the documented pre-existing failures).
+
+**Flow.** 30 s round with one click: 3 `/fo/` submissions inside the window (network slower this
+round), top final not reached. **No `POST /1.txt`, no 404.**
+
+**Status.** Unmet: no `POST /1.txt`, no 404. The on-load render now happens on Chrome's timing;
+the remaining payload deltas are the throughput/throughput-shaped numbers and the unnamed
+contents, pending the operator's next disassembly drop.
+
+## Step 297: the overdue-timer repair now re-arms deno_core's sleep — PWGF4 delivery at 5 ms
+
+**Root cause nailed with `obscura::timers=trace`.** A tick reported
+`next_timeout_ms=Some(0.0)` while delivering nothing (`delivered=0`), followed by hundreds of
+repair cycles that never delivered: deno_core's mutable timer sleep held a waker from a dropped
+poll future, and the yield-only `op_posted_task()` wake — the entire repair — re-pollled a sleep
+that never resolved. Delivery then piggybacked on unrelated network wakes, which is why
+`PWGF4[0].t` tracked the `/fo/` fetch (59-516 ms) instead of the 0 ms deadline.
+
+**Fix (`runtime.rs`, queue_overdue_timer_wake_repair):** when a browser timer is overdue, the
+repair now also enqueues a throwaway zero-delay user timer. `queue_timer` sees the earliest
+deadline and calls `change(now)`, which replaces the stale sleep and marks it ready — the next
+poll observes it and delivers every due timer, including the real one. One extra no-op callback
+per repair.
+
+**Measured.** Repair round: `PWGF4[0].t` = **5 ms** (history: 548 → 59-516 after the DCL fix → 5).
+Follow-up rounds read 183/1009 ms; the spread is challenge-flow ordering variance (the onload
+timer now fires early; when the explicit `turnstile.render` call happens depends on the
+server-driven challenge state of that round), not delivery latency — delivery is at the deadline.
+
+**Suites.** obscura-js 618/621, obscura-browser 124/125 (the documented pre-existing failures).
+
+**Flow.** 30 s round with one click: 3 `/fo/` submissions inside the window (network slower this
+round), top final not reached. **No `POST /1.txt`, no 404.**
+
+**Status.** Unmet: no `POST /1.txt`, no 404.

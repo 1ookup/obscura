@@ -425,6 +425,11 @@ pub struct ObscuraJsRuntime {
     /// their first event-loop turn once an active frame realm exists and leave
     /// it parked on the queue notify.
     frame_message_pump_started: bool,
+    /// Ambient execution-source label for this runtime's main context
+    /// ("window" for a page, "worker(M)[creator]" for a worker isolate).
+    /// Installed into the trace thread-local by the classic-script funnel
+    /// before each execution. Only read when a trace stream is active.
+    trace_ambient_label: std::cell::RefCell<String>,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -548,6 +553,16 @@ impl WatchdogToken {
 // already started receives this bounded completion allowance, matching the
 // fixed-wait path while retaining an absolute backstop for infinite script.
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
+
+/// OBSCURA_DEBUG_WATCHDOG=1 reports each time a V8 watchdog budget is exceeded.
+/// The isolate's execution is terminated when one fires, which cuts a page's
+/// running script off mid-task with no error on the page side.
+fn watchdog_debug(site: &str, budget_ms: u64) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WATCHDOG").is_some()) {
+        eprintln!("[watchdog] {site}: budget {budget_ms}ms exceeded, isolate terminated");
+    }
+}
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// Upper bound on chained cross-document message rounds inside one drain
 /// (Phase 4): delivering a message can enqueue further messages, so the drain
@@ -600,11 +615,16 @@ impl ObscuraJsRuntime {
             // race an isolate being built on another connection thread.
             crate::v8_flags::apply_baseline_v8_flags();
 
-            let trace_requested = std::env::var_os("OBSCURA_TRACE_API_FILE").is_some();
+            // Either trace stream opts the runtime out of the startup
+            // snapshot: op tracing needs the JS-side source-label wrappers, and
+            // the tracelog sink installs window.external.tracelog from the
+            // bootstrap, which the snapshot was built without.
+            let trace_requested = crate::trace_source::enabled();
+            let tracelog_requested = crate::tracelog::enabled();
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
-                startup_snapshot: (!trace_requested).then_some(SNAPSHOT),
+                startup_snapshot: (!(trace_requested || tracelog_requested)).then_some(SNAPSHOT),
                 ..Default::default()
             });
             // A trace-enabled runtime executes bootstrap after context
@@ -612,7 +632,22 @@ impl ObscuraJsRuntime {
             // its early DOM ops need the same op-state registration that the
             // snapshot path already has by the time page init runs.
             runtime.op_state().borrow_mut().put(state_clone);
-            if trace_requested {
+            if trace_requested || tracelog_requested {
+                // Must precede the bootstrap: the source-attribution wrappers
+                // (Function proxy, Promise.then, on* snapshots) install only
+                // when their flag is set, and so does the tracelog method whose
+                // caller decided on a destination. The snapshot was built with
+                // neither, which is exactly why it is skipped here.
+                let mut mode_flags = String::new();
+                if trace_requested {
+                    mode_flags.push_str("globalThis.__obscura_trace_from_enabled = true;");
+                }
+                if tracelog_requested {
+                    mode_flags.push_str("globalThis.__obscura_tracelog_enabled = true;");
+                }
+                runtime
+                    .execute_script("<obscura:trace-mode>", mode_flags)
+                    .expect("trace-mode flag should not fail");
                 runtime
                     .execute_script("<obscura:bootstrap>", BOOTSTRAP_SRC.to_string())
                     .expect("bootstrap.js should not fail in native trace mode");
@@ -656,6 +691,7 @@ impl ObscuraJsRuntime {
             frame_realms: Box::new(crate::realm::FrameRealmHost::default()),
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
+            trace_ambient_label: std::cell::RefCell::new("window".to_string()),
         };
         {
             // Share a stable pointer to the realm registry into the op-visible
@@ -883,6 +919,16 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_iframe_navigations)
     }
 
+    pub fn requeue_iframe_navigations(&self, leftover: Vec<PendingIframeNavigation>) {
+        if leftover.is_empty() {
+            return;
+        }
+        self.state
+            .borrow_mut()
+            .pending_iframe_navigations
+            .extend(leftover);
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
@@ -933,6 +979,12 @@ impl ObscuraJsRuntime {
                 .as_ref()
                 .and_then(|client| client.proxy_url().map(str::to_string));
             obscura_render::set_image_transport(proxy, fingerprint.user_agent.clone());
+            // The font-family table answers for one platform's named families.
+            // An identity that claims macOS while resolving the Windows set is a
+            // cross-check a challenge reads out of two text measurements, so the
+            // table follows `navigator.platform` from the same fingerprint that
+            // drives the user agent.
+            obscura_render::inline::set_font_platform(&fingerprint.navigator_platform);
         }
         let Ok(json) = serde_json::to_string(fingerprint) else {
             return;
@@ -1657,8 +1709,27 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Ambient execution-source label for this runtime's main context
+    /// (trace_source.rs). Worker isolates set it to their `worker(M)[creator]`
+    /// label right after construction.
+    pub fn set_trace_ambient(&self, label: &str) {
+        *self.trace_ambient_label.borrow_mut() = label.to_string();
+        crate::trace_source::set_ambient(label);
+    }
+
+    /// Push an explicit execution-source label for host-injected code
+    /// (preloads, isolated-world injections). The guard pops on drop.
+    pub fn trace_source_guard(
+        &self,
+        label: &str,
+    ) -> crate::trace_source::TraceSourceGuard {
+        crate::trace_source::push(label)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         self.begin_javascript_task();
+        // Host-injected code (`Page::evaluate`, `--eval`): one labeled unit.
+        let _trace_source = crate::trace_source::push("host");
         let wrapped = Self::wrap_expression(expression);
         let result = self
             .runtime
@@ -1699,6 +1770,8 @@ impl ObscuraJsRuntime {
             })
             .collect();
         self.begin_javascript_task();
+        // Host-injected code (CDP Runtime.evaluate with awaitPromise).
+        let _trace_source = crate::trace_source::push("host");
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let done_counter = self.object_counter;
@@ -1850,6 +1923,8 @@ impl ObscuraJsRuntime {
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
+        // Host-injected code (CDP Runtime.evaluate without returnByValue).
+        let _trace_source = crate::trace_source::push("host");
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
@@ -2897,6 +2972,11 @@ impl ObscuraJsRuntime {
         line_offset: i32,
     ) -> Result<(), String> {
         self.begin_javascript_task();
+        // Refresh the ambient trace label for this runtime's main context:
+        // the thread-local is shared by every realm in the isolate, so a
+        // previous frame-realm turn must not bleed into this one. No-op when
+        // tracing is off.
+        crate::trace_source::set_ambient(&self.trace_ambient_label.borrow());
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
@@ -3424,9 +3504,14 @@ impl ObscuraJsRuntime {
 
     /// Restore a live wake path after an embedder cancels a pending
     /// run-to-idle poll. deno_core's mutable timer sleep can retain the waker
-    /// from that dropped future. When a browser timer is already overdue, a
-    /// yield-only async op wakes the next event-loop poll without changing the
-    /// timer's native deadline or ordering.
+    /// from that dropped future, so a due timer then never resolves it. Two
+    /// prongs, both run only when a browser timer is already overdue:
+    /// enqueueing a throwaway zero-delay user timer forces deno_core's
+    /// `queue_timer` to re-arm that sleep at a deadline that has already
+    /// passed (its `change()` marks the sleep ready), and the yield-only
+    /// async op wakes the next event-loop poll so the ready sleep is
+    /// actually observed. Neither touches the overdue timer's own deadline
+    /// or ordering.
     fn queue_overdue_timer_wake_repair(&mut self) -> bool {
         let now = std::time::Instant::now();
         let overdue_timer = self
@@ -3441,7 +3526,8 @@ impl ObscuraJsRuntime {
         tracing::trace!(target: "obscura::timers", "queued overdue timer wake repair");
         let _ = self.execute_script(
             "<obscura:timer-wake>",
-            "void Deno.core.ops.op_posted_task().catch(() => {});",
+            "try { Deno.core.queueUserTimer(0, false, 0, function () {}); } catch (_e) {}\n\
+             void Deno.core.ops.op_posted_task().catch(() => {});",
         );
         true
     }
@@ -3664,6 +3750,7 @@ impl ObscuraJsRuntime {
         );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+            watchdog_debug("autonomous-checkpoint", AUTONOMOUS_TASK_WATCHDOG_MS);
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
@@ -3680,6 +3767,7 @@ impl ObscuraJsRuntime {
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
+                watchdog_debug("autonomous-poll", AUTONOMOUS_TASK_WATCHDOG_MS);
                 self.runtime.v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
@@ -3872,6 +3960,7 @@ impl ObscuraJsRuntime {
             return self.evaluate(expression);
         }
         self.begin_javascript_task();
+        let _trace_source = crate::trace_source::push("host");
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
         let result = self.runtime.execute_script("<eval>", wrapped);
@@ -6643,6 +6732,25 @@ mod tests {
             })()"#)
             .unwrap();
         assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
+    #[test]
+    fn form_action_csp_does_not_inherit_default_src() {
+        // `form-action` is one of the directives with no default-src fallback,
+        // so a policy that omits it allows the submission whatever `default-src`
+        // says. Challenge interstitials are `default-src 'none'` with no
+        // `form-action`, and inheriting `'none'` there swallowed the submission
+        // that answers the challenge.
+        let mut rt = setup_runtime("<html><body><form id='f' action='https://app.example/submit'><input name='x' value='1'></form></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                document.querySelector('#f').submit();
+                return location.href;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/submit?x=1"));
     }
 
     #[test]
@@ -11686,15 +11794,20 @@ RequestRedirect value",
         );
 
         rt.set_screen_size_override(None, false);
+        // Clearing the override returns the default macOS work area, which is
+        // smaller than the screen: the menu bar always takes a strip off the
+        // top, so `availHeight === height` together with `availTop === 0` is a
+        // shape no macOS session reports.
         assert_eq!(
             rt.evaluate(
                 "[innerWidth, innerHeight, screen.width === __screenSizeBefore[0],\
                   screen.height === __screenSizeBefore[1],\
                   screen.availHeight === screen.height,\
+                  screen.availTop > 0,\
                   screen === __screenBefore]"
             )
             .unwrap(),
-            serde_json::json!([1024, 768, true, true, true, true])
+            serde_json::json!([1024, 768, true, true, false, true, true])
         );
     }
 
@@ -16622,9 +16735,12 @@ RequestRedirect value",
                 })()"#,
             )
             .unwrap();
+        // Chrome reports the selected language followed by its base language,
+        // in the main realm and in a frame realm alike. A lone `zh-CN` entry is
+        // the one list a real zh-CN session never reports.
         assert_eq!(
             values,
-            serde_json::json!(["zh-CN", ["zh-CN"], "zh-CN", ["zh-CN"]])
+            serde_json::json!(["zh-CN", ["zh-CN", "zh"], "zh-CN", ["zh-CN", "zh"]])
         );
     }
 
@@ -16648,15 +16764,21 @@ RequestRedirect value",
             frame.contentDocument.body.append(nested);
             return {child, nested: read(nested)};
         })()"#).unwrap();
+        // locationOrigin is the deliberate creator-URL answer, not the spec
+        // one: inherited-origin about:blank frames report a Location on the
+        // creator's document URL (see `_environmentSettings` in
+        // env/window/location.js for the Cloudflare measurement behind it).
+        // `document.URL` stays "about:blank" and `window.origin`/`domain`
+        // still prove the inheritance this test is named for.
         assert_eq!(result, serde_json::json!({
             "child": {
-                "url": "about:blank", "locationOrigin": "null",
+                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
                 "origin": "https://creator.example:8443", "domain": "creator.example",
                 "referrer": "https://creator.example:8443/parent/path",
                 "base": "https://creator.example:8443/parent/path",
             },
             "nested": {
-                "url": "about:blank", "locationOrigin": "null",
+                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
                 "origin": "https://creator.example:8443", "domain": "creator.example",
                 "referrer": "about:blank", "base": "https://creator.example:8443/parent/path",
             },
@@ -16695,6 +16817,11 @@ RequestRedirect value",
             "[origin, location.origin, document.domain, document.referrer]",
             true, true, 1_000,
         ).await.unwrap().value.unwrap();
+        // Opaque-origin frames keep the spec answer: the deliberate
+        // creator-URL Location for inherited about:blank frames (see
+        // `_environmentSettings` in env/window/location.js) is gated on the
+        // tuple origin, so a sandboxed frame still reports location.origin
+        // "null" like Chrome.
         assert_eq!(result, serde_json::json!([
             "null", "null", "", "http://example.com/test",
         ]));
@@ -22431,6 +22558,91 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetch_cache_option_sends_chrome_headers_and_marks_them_user_agent_generated() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const sent = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body, origin, mode, credentials, context) => {
+                                sent.push({ url, headers: JSON.parse(headers), context: JSON.parse(context) });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+                        await fetch("/no-store", { cache: "no-store" });
+                        await fetch("/no-cache", { cache: "no-cache" });
+                        await fetch("/reload", { cache: "reload" });
+                        await fetch("/default");
+                        await fetch("/author", {
+                            cache: "no-cache",
+                            headers: { "Cache-Control": "public, max-age=60" },
+                        });
+                        return sent.map(entry => ({
+                            url: entry.url,
+                            cacheControl: entry.headers["Cache-Control"] ?? null,
+                            pragma: entry.headers["Pragma"] ?? null,
+                            uaHeaders: entry.context.uaHeaders,
+                        }));
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Values are the ones Chrome was measured sending for each mode.
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                {
+                    "url": "http://example.com/no-store",
+                    "cacheControl": "no-cache",
+                    "pragma": "no-cache",
+                    "uaHeaders": ["cache-control", "pragma"],
+                },
+                {
+                    "url": "http://example.com/no-cache",
+                    "cacheControl": "max-age=0",
+                    "pragma": null,
+                    "uaHeaders": ["cache-control"],
+                },
+                {
+                    "url": "http://example.com/reload",
+                    "cacheControl": "no-cache",
+                    "pragma": "no-cache",
+                    "uaHeaders": ["cache-control", "pragma"],
+                },
+                {
+                    "url": "http://example.com/default",
+                    "cacheControl": null,
+                    "pragma": null,
+                    "uaHeaders": [],
+                },
+                // A page that sets the header itself keeps ownership of it, so
+                // the op still counts it as an author header and preflights.
+                {
+                    "url": "http://example.com/author",
+                    "cacheControl": "public, max-age=60",
+                    "pragma": null,
+                    "uaHeaders": [],
+                },
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fetch_and_xhr_forward_browser_credentials_modes() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -23269,53 +23481,86 @@ RequestRedirect value",
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_local_font_source_fails_for_a_family_this_machine_does_not_have() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt
-            .call_function_on_for_cdp(
-                r#"async () => {
-                    const probe = async family => {
+    /// A `FontFace` with a `local()` source resolves only for a family the
+    /// claimed platform has. The family table answers for one platform at a
+    /// time and the platform comes from the identity, so a macOS identity that
+    /// resolves the macOS families and not the Windows ones, and a Windows
+    /// identity that is the exact inverse, is what a font-presence probe reads
+    /// out of two text measurements. Resolving both sets at once is how the
+    /// engine came to claim Windows, Linux and macOS font sets simultaneously.
+    async fn probe_local_font_sources(rt: &mut ObscuraJsRuntime, ua: &str) -> serde_json::Value {
+        rt.set_fingerprint(&obscura_net::BrowserFingerprint::from_user_agent(ua));
+        rt.call_function_on_for_cdp(
+            r#"async () => {
+                const probe = async family => {
+                    try {
+                        await new FontFace('p', `local("${family}")`).load();
+                        return 'loaded';
+                    } catch (error) { return error.name; }
+                };
+                return {
+                    // Both platforms ship these two.
+                    generic: await probe('Courier New'),
+                    // A macOS family, from the reference round's own list.
+                    macFamily: await probe('Geneva'),
+                    // A Windows-only family.
+                    windowsFamily: await probe('Javanese Text'),
+                    invented: await probe('ZZZ No Such Font 12345'),
+                    // A source with no local() is unaffected.
+                    remote: await (async () => {
                         try {
-                            await new FontFace('p', `local("${family}")`).load();
+                            await new FontFace('p', 'url(https://example.test/f.woff2)').load();
                             return 'loaded';
                         } catch (error) { return error.name; }
-                    };
-                    return {
-                        // Present: a family the renderer actually resolves.
-                        present: await probe('Courier New'),
-                        // Absent: fonts from other platforms, and a name that
-                        // cannot exist anywhere. Resolving these is how the
-                        // engine came to claim Windows, Linux and macOS font
-                        // sets at once.
-                        windows: await probe('Segoe Fluent Icons'),
-                        mac: await probe('Skia'),
-                        invented: await probe('ZZZ No Such Font 12345'),
-                        // A source with no local() is unaffected.
-                        remote: await (async () => {
-                            try {
-                                await new FontFace('p', 'url(https://example.test/f.woff2)').load();
-                                return 'loaded';
-                            } catch (error) { return error.name; }
-                        })(),
-                    };
-                }"#,
-                None,
-                &[],
-                true,
-                true,
-            )
-            .await
-            .unwrap();
+                    })(),
+                };
+            }"#,
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap()
+        .value
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_local_font_source_fails_for_a_family_the_claimed_platform_lacks() {
+        const MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+        const WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+        // One runtime per identity: the probe's availability answers are cached
+        // per isolate, which matches production, where a page cannot change its
+        // own identity mid-flight.
+        let mut mac_rt = setup_runtime("<html><body></body></html>");
+        let mac = probe_local_font_sources(&mut mac_rt, MAC_UA).await;
         assert_eq!(
-            result.value.unwrap(),
+            mac,
             serde_json::json!({
-                "present": "loaded",
-                "windows": "NetworkError",
-                "mac": "NetworkError",
+                "generic": "loaded",
+                "macFamily": "loaded",
+                "windowsFamily": "NetworkError",
                 "invented": "NetworkError",
                 "remote": "loaded",
-            })
+            }),
+            "macOS identity"
+        );
+
+        let mut windows_rt = setup_runtime("<html><body></body></html>");
+        let windows = probe_local_font_sources(&mut windows_rt, WINDOWS_UA).await;
+        assert_eq!(
+            windows,
+            serde_json::json!({
+                "generic": "loaded",
+                "macFamily": "NetworkError",
+                "windowsFamily": "loaded",
+                "invented": "NetworkError",
+                "remote": "loaded",
+            }),
+            "Windows identity"
         );
     }
 

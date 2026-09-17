@@ -145,4 +145,9 @@ async fn main() {
         let _ = stdout.write_all(out.as_bytes()).await;
         let _ = stdout.flush().await;
     }
+
+    // Records from this worker's pages are batched on a background thread; hold
+    // the process open long enough to write the tail. A no-op when the parent
+    // did not pass OBSCURA_TRACELOG_FILE.
+    obscura_js::tracelog::flush();
 }

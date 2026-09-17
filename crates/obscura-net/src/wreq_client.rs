@@ -477,6 +477,13 @@ impl StealthHttpClient {
                 if !is_frame_navigation && !has_header("sec-fetch-user") {
                     req = req.header("sec-fetch-user", "?1");
                 }
+                // Chrome revalidates the document on a navigation instead of
+                // taking it from cache: `max-age=0` rides on the main-document
+                // request and on nothing else, so a navigation without it is
+                // one no browser sends.
+                if !has_header("cache-control") {
+                    req = req.header("cache-control", "max-age=0");
+                }
             }
             if let Some(referer) = request_referrer(&request, &current_url) {
                 req = req.header("referer", referer);
@@ -592,7 +599,9 @@ impl StealthHttpClient {
                     .or_default()
                     .extend(hints);
             }
-            if !client_hint_retry && !critical_hints.is_empty()
+            if !client_hint_retry
+                && !critical_hints.is_empty()
+                && !crate::client::is_frame_document_request(&request)
                 && critical_hints.iter().any(|hint| !sent_client_hints.contains(hint))
             {
                 client_hint_retry = true;
@@ -722,6 +731,13 @@ impl StealthHttpClient {
             // subresource paths use `u=0, i` / `i`, set in fetch_with_profile).
             req = req.header("priority", "u=1, i");
         }
+        if !has_header("sec-fetch-storage-access") {
+            // Chrome attaches its storage-access state to every request it
+            // sends. This client never holds a storage access grant, so `none`
+            // is the only truthful value, and a request without the header is
+            // one a server cannot match against a browser's.
+            req = req.header("sec-fetch-storage-access", "none");
+        }
         if !fingerprint.brands.is_empty() {
             if !has_header("sec-ch-ua") {
                 req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
@@ -731,6 +747,37 @@ impl StealthHttpClient {
             }
             if !has_header("sec-ch-ua-platform") {
                 req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
+            }
+        }
+        // Chromium remembers the high-entropy UA hints a response asked for in
+        // Accept-CH and sends them on every later request to that origin, not
+        // only on navigations. A server that lists them in Critical-CH may
+        // treat a request without them as an error, so a scripted fetch/XHR
+        // submission that omits them is observably unlike the browser it
+        // claims to be.
+        let hint_origin = client_hint_origin(url);
+        // Same rule as fetch_with_profile: the low-entropy trio was already
+        // emitted above from the fingerprint, and an Accept-CH entry for one
+        // of them must not append a second value to a header this request
+        // carries once. `sec-ch-ua-mobile: ?0, ?0` is a value no browser
+        // produces, and the challenge platform lists Sec-CH-UA in Accept-CH,
+        // so without this every scripted request carried it.
+        let mut sent_client_hints: HashSet<String> = HashSet::new();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            if has_header(name) || !fingerprint.brands.is_empty() {
+                sent_client_hints.insert(name.to_string());
+            }
+        }
+        if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
+            for name in accepted {
+                if has_header(name) || sent_client_hints.contains(name) {
+                    sent_client_hints.insert(name.clone());
+                    continue;
+                }
+                if let Some(value) = client_hint_value(name, &fingerprint) {
+                    req = req.header(name.as_str(), value);
+                    sent_client_hints.insert(name.clone());
+                }
             }
         }
 
@@ -760,6 +807,22 @@ impl StealthHttpClient {
         let response_start = fetch_started.elapsed();
 
         let status = resp.status();
+        // Learn this origin's hint policy here too: a response that answers
+        // Accept-CH is the only place the policy is published, and a scripted
+        // request is just as able to receive it as a navigation.
+        if let Some(hints) = resp
+            .headers()
+            .get("accept-ch")
+            .and_then(|value| value.to_str().ok())
+            .map(parse_client_hint_list)
+        {
+            self.accepted_client_hints
+                .write()
+                .await
+                .entry(client_hint_origin(url))
+                .or_default()
+                .extend(hints);
+        }
         if store_cookies {
             let set_cookie_count = resp.headers().get_all("set-cookie").iter().count();
             if set_cookie_count != 0 {
@@ -1033,7 +1096,10 @@ mod tests {
         assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-bitness: \"64\"\r\n"), "{captured:?}");
         let retry_lower = captured[1].to_ascii_lowercase();
         assert!(retry_lower.contains("\r\nsec-ch-ua-full-version-list: "), "{captured:?}");
-        assert!(retry_lower.contains("\"chromium\";v=\"149.0.0.0\""), "{captured:?}");
+        // The User-Agent carries Chrome's reduced `149.0.0.0` token; the
+        // full-version list carries a build Chrome shipped, because the
+        // reduced token is a value no Chrome has ever published there.
+        assert!(retry_lower.contains("\"chromium\";v=\"149.0.7827.0\""), "{captured:?}");
         assert!(retry_lower.contains("\"not)a;brand\";v=\"24.0.0.0\""), "{captured:?}");
         assert_eq!(retry_lower.matches("\r\nsec-ch-ua:").count(), 1, "{captured:?}");
         // The legacy spellings in Accept-CH (`UA`, `UA-Full-Version-List`) are
@@ -1041,6 +1107,78 @@ mod tests {
         // nor any `ua-*` header is sent.
         assert!(!retry_lower.contains("\r\nua:"), "{captured:?}");
         assert!(!retry_lower.contains("\r\nua-full-version-list:"), "{captured:?}");
+    }
+
+    /// A subframe document navigation is not retried for `Critical-CH`.
+    ///
+    /// The reference challenge run answers the widget document request with
+    /// both `Accept-CH` and `Critical-CH` naming hints it did not send, and the
+    /// document is fetched **once**. Retrying re-issues the request, which makes
+    /// the server open a second widget session for a document only one of which
+    /// is ever committed; the hints the retry would add are not permitted in a
+    /// cross-origin subframe either, so the retry cannot change the response.
+    #[tokio::test]
+    async fn stealth_frame_document_is_not_retried_for_critical_client_hints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            // Every response carries the same Critical-CH list, so a client
+            // that retries keeps retrying; one request proves it did not.
+            for _ in 0..1 {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 { break; }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                }
+                captured.push(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\naccept-ch: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\ncritical-ch: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\nconnection: close\r\n\r\nhello",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+            let _ = tx.send(captured);
+        });
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("http://{address}/widget")).unwrap();
+        let response = client
+            .fetch_frame_document_with_referrer_headers(
+                &url,
+                None,
+                None,
+                ReferrerPolicy::default(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let captured = rx.await.unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a frame document must be fetched once, got {} requests: {captured:?}",
+            captured.len()
+        );
+        assert!(
+            captured[0].to_ascii_lowercase().contains("\r\nsec-fetch-dest: iframe\r\n"),
+            "{captured:?}"
+        );
+        // The frame still learns Accept-CH for later requests, it just does not
+        // re-issue this one.
+        assert_eq!(response.status, 200);
     }
 
     #[tokio::test]
@@ -1061,6 +1199,41 @@ mod tests {
         let request = request.await.unwrap().to_ascii_lowercase();
         for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
             assert_eq!(request.matches(&format!("\r\n{name}:")).count(), 1, "{name}: {request}");
+        }
+    }
+
+    // A scripted fetch/XHR takes send_single, which emits the low-entropy trio
+    // from the fingerprint and then applies the remembered Accept-CH list. The
+    // challenge platform lists Sec-CH-UA itself in Accept-CH, so an entry for a
+    // hint the request already carries must not append a second value:
+    // `sec-ch-ua-mobile: ?0, ?0` is a value no browser produces.
+    #[tokio::test]
+    async fn scripted_accept_ch_entry_for_low_entropy_hints_does_not_duplicate_them() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT);
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.accepted_client_hints.write().await.insert(
+            super::client_hint_origin(&url),
+            std::collections::HashSet::from([
+                "sec-ch-ua".to_string(),
+                "sec-ch-ua-mobile".to_string(),
+                "sec-ch-ua-platform".to_string(),
+                "sec-ch-ua-arch".to_string(),
+            ]),
+        );
+        client
+            .send_single("GET", &url, &HashMap::new(), "", false, false)
+            .await
+            .expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-arch"] {
+            assert_eq!(
+                request.matches(&format!("\r\n{name}:")).count(),
+                1,
+                "{name} must be sent exactly once: {request}"
+            );
         }
     }
 

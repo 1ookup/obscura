@@ -99,9 +99,14 @@ globalThis.postMessage = ({ postMessage(message, targetOrigin) {
     }));
     try { globalThis.dispatchEvent(evt); } catch (e) {}
     // `onmessage` is not routed through dispatchEvent for the Window, so the
-    // handler slot is invoked here the same way the frame receive loop does.
+    // handler slot is invoked here the same way the frame receive loop does,
+    // under the assigning code's snapshot label.
     if (typeof globalThis.onmessage === "function") {
-      try { _withLegacyWindowEvent(evt, () => globalThis.onmessage.call(globalThis, evt)); } catch (e) {}
+      try {
+        _withLegacyWindowEvent(evt, () => __obscuraTraceCallWith(
+          __obscuraTraceHandlerFrom(globalThis, 'onmessage'),
+          globalThis.onmessage, globalThis, [evt]));
+      } catch (e) {}
     }
   });
 } }).postMessage;

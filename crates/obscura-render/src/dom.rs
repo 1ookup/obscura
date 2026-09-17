@@ -2878,6 +2878,12 @@ fn cascade_walk(
             &style,
             container_evaluator.as_deref_mut(),
         );
+        // A UA-element default can install a generated box (the summary's
+        // disclosure marker). Author and UA-sheet ::before rules replace
+        // that default; when no rule matched, keep it.
+        if before_pseudo.is_none() {
+            before_pseudo = style.before_pseudo.take().map(|boxed| *boxed);
+        }
         for pseudo in [&mut before_pseudo, &mut after_pseudo]
             .into_iter()
             .flatten()
@@ -11097,10 +11103,28 @@ fn build_table(
         Some(flattened)
     };
     let mut rows: Vec<(NodeId, usize)> = Vec::new();
+    let mut synthetic_caption_row = false;
     if native_html_table {
         collect_table_rows(tree, id, &mut rows);
         if rows.is_empty() {
-            return None;
+            // Chromium still renders a caption-only table: the caption sits
+            // in its own box and the table shrink-wraps to it. Bailing here
+            // dropped the dedicated path entirely and stretched the table
+            // across the container (the challenge's sub-pixel probe reads a
+            // 4px-wide caption where Chromium reads 39.5px). Route the
+            // caption children through one synthetic row so the grid
+            // measurement includes them.
+            let has_caption = tree.children(id).into_iter().any(|cid| {
+                tree.get_node(cid).is_some_and(|n| {
+                    n.as_element()
+                        .is_some_and(|e| e.local.as_ref() == "caption")
+                })
+            });
+            if !has_caption {
+                return None;
+            }
+            rows.push((id, 1));
+            synthetic_caption_row = true;
         }
     } else {
         // CSS table fixup inserts an anonymous row around table-cell children
@@ -11149,6 +11173,7 @@ fn build_table(
                 .and_then(|n| n.as_element().map(|e| e.local.to_string()));
             let is_cell = if native_html_table {
                 matches!(local.as_deref(), Some("td") | Some("th"))
+                    || (synthetic_caption_row && local.as_deref() == Some("caption"))
             } else {
                 styles
                     .get(&cid)
@@ -11480,6 +11505,15 @@ fn build_table(
     // to auto here so that pass can measure content before choosing the width.
     if !matches!(style.width, crate::Dimension::Percent(_)) {
         tstyle.size.width = Dimension::auto();
+    }
+    // CSS tables are shrink-to-fit: with an auto inline size a table never
+    // stretches to the container the way an ordinary block child does
+    // (measured in Chromium: 60.3px of content inside a 0-width container,
+    // 60.3px inside a 1400px one). Taffy's block parent would stretch an
+    // auto-width child, so opt this node out; a percentage width keeps the
+    // stretch to resolve against.
+    if tstyle.size.width == Dimension::auto() {
+        tstyle.align_self = Some(taffy::AlignItems::FLEX_START);
     }
     tstyle.grid_template_columns = (0..ncols).map(col).collect();
     tstyle.grid_template_rows = (0..nrows).map(row_track).collect();
@@ -13073,11 +13107,15 @@ fn build_mixed_block(
                 child_ids.extend(built);
             }
             Seg::Run(run) => {
-                let has_text_strut = run.iter().any(|&cid| {
-                    tree.get_node(cid).map_or(false, |node| {
-                        matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
-                    })
-                });
+                // Every CSS line box carries the containing block's strut,
+                // whether or not the run happens to contain a text node: an
+                // img-only or progress-only line is still a line box, and
+                // Chromium answers 22px (the 16px-font strut) for
+                // `<div><img style="height:16px"></div>`, not the image's 16.
+                // Gating the strut on a text node made atomic-only containers
+                // one line short — the challenge's own sub-pixel probe reads
+                // exactly those boxes.
+                let has_text_strut = !run.is_empty();
                 // Collapsible source formatting at the start/end of an inline
                 // run does not create line width. Preserve whitespace between
                 // inline siblings, but trim indentation adjacent to block
@@ -13101,15 +13139,23 @@ fn build_mixed_block(
                 let join_before = before_pending && i == 0;
                 let join_after = after_pending && i + 1 == n_segs;
                 // Fast path: the whole run folds to one shaped leaf, unless
-                // pseudo-content word leaves must share its lines.
+                // pseudo-content word leaves must share its lines. The leaf
+                // still carries the block's strut as a minimum height: every
+                // CSS line box is at least the parent's used line height,
+                // even when the shaped buffer's own font metrics are smaller
+                // (a 20.99px caption line shapes to 25px on the bundled face
+                // while the identity strut reads 29px).
                 if !join_before && !join_after {
                     let chains = std::mem::take(&mut ifc_items.flattened_owner_chains);
                     let folded =
                         engine.try_build_run(tree, id, run, styles, &chains);
                     ifc_items.flattened_owner_chains = chains;
                     if let Some(item) = folded {
+                        let mut leaf_style = run_leaf_style();
+                        leaf_style.min_size.height =
+                            taffy::Dimension::length(crate::inline::used_line_height(style).max(0.0));
                         let leaf = taffy_tree
-                            .new_leaf_with_context(run_leaf_style(), item)
+                            .new_leaf_with_context(leaf_style, item)
                             .ok()?;
                         ifc_items.runs.entry(id).or_default().push(item);
                         child_ids.push(leaf);

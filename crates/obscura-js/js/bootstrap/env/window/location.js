@@ -5,30 +5,66 @@ globalThis.self = globalThis;
 
 globalThis.document = null;
 function _environmentSettings() {
+  const isWorker = globalThis.__obscuraIsWorker === true
+    || (typeof WorkerGlobalScope === "function"
+      && globalThis instanceof WorkerGlobalScope)
+    || typeof globalThis.document === "undefined";
+  // Workers are a separate isolate with no document tree. Check them before
+  // the frame-root path: a leftover frame nid on the snapshot global would
+  // otherwise make fetch("") resolve against the widget document URL.
+  if (isWorker) {
+    const url = globalThis.__virtualUrl || globalThis.location?.href || "about:blank";
+    let origin = typeof globalThis.origin === "string" ? globalThis.origin : "null";
+    if (!origin || origin === "null") {
+      try { origin = (globalThis.location && globalThis.location.origin) || new URL(url).origin; }
+      catch (e) { origin = "null"; }
+    }
+    let baseUrl = url;
+    if (origin && origin !== "null"
+        && (String(url).startsWith("blob:") || String(url).startsWith("data:"))) {
+      baseUrl = origin.endsWith("/") ? origin : origin + "/";
+    }
+    return { root: 0, url, baseUrl, cookieUrl: url, origin };
+  }
   const root = _callingFrameRoot();
   if (root > 0) {
     const info = _domParse("document_scope_info", root) || {};
-    const url = info.url || globalThis.__obscura_frame_base_url || "about:blank";
+    const rawUrl = info.url || globalThis.__obscura_frame_base_url || "about:blank";
+    let url = rawUrl;
+    // The deliberate answer below applies only to frames whose document
+    // origin is the inherited tuple origin. Opaque-origin frames (sandboxed
+    // without allow-same-origin) keep the spec answer: Chrome reports
+    // location.origin "null" there, and no probe can expect more than the
+    // browser it models shows.
+    const tupleOrigin = typeof info.origin === "string"
+      && info.origin !== "" && info.origin !== "null";
+    if (tupleOrigin && (rawUrl === "about:srcdoc" || rawUrl === "about:blank")
+        && /^https?:/i.test(info.baseUrl || "")) {
+      // srcdoc/about:blank frames inherit their creator's origin. Chrome
+      // keeps `document.URL` as about:srcdoc but reports a Location whose
+      // href is the creator's document URL. Returning the raw about: URL
+      // made Turnstile's srcdoc probes see protocol "about:" and choose PAT.
+      //
+      // The about:blank case is deliberate: Cloudflare builds about:blank
+      // frames for its probes, and answering "about:" for them sends the VM
+      // down the PAT branch. Measured 2026-09-17: restoring the spec answer
+      // (location.origin "null") turns three tests green but stalls the
+      // challenge after ~4s / ~4k records with a blank page, against 801k
+      // records with this deliberate answer. Keep the deliberate answer.
+      url = info.baseUrl;
+    } else if (tupleOrigin && (rawUrl === "about:srcdoc" || rawUrl === "about:blank")
+        && globalThis.__obscura_frame_base_url
+        && /^https?:/i.test(globalThis.__obscura_frame_base_url)) {
+      url = globalThis.__obscura_frame_base_url;
+    }
     const baseUrl = (globalThis.document && globalThis.document.baseURI)
       || info.baseUrl || globalThis.__obscura_frame_base_url || url;
     const cookieUrl = /^(?:https?|wss?):/i.test(url) ? url : baseUrl;
     return { root, url, baseUrl, cookieUrl, origin: info.origin || "null" };
   }
-  // Dedicated workers deliberately have no Document. Their environment URL
-  // is the final worker script URL installed by worker_prep_script, not the
-  // empty DOM state of the fresh isolate.
-  const isWorker = typeof globalThis.document === "undefined";
-  const workerUrl = isWorker
-    ? (globalThis.__virtualUrl || globalThis.location?.href) : null;
-  const url = workerUrl || _domParse("document_url") || "about:blank";
-  // Blob/data workers inherit the creator's tuple origin. Parsing the script
-  // URL itself would turn those workers into opaque `null` origins and make
-  // their cross-origin fetch/CORS headers diverge from Chromium.
-  let origin = isWorker && typeof globalThis.origin === "string"
-    ? globalThis.origin : "null";
-  if (origin === "null") {
-    try { origin = new URL(url).origin; } catch (e) {}
-  }
+  const url = _domParse("document_url") || "about:blank";
+  let origin = "null";
+  try { origin = new URL(url).origin; } catch (e) {}
   const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
   return { root: 0, url, baseUrl, cookieUrl: url, origin };
 }
@@ -172,28 +208,28 @@ const _DOCUMENT_EVENT_HANDLERS = [
   "pointerlockerror","prerenderingchange","readystatechange","resume",
   "visibilitychange","webkitfullscreenchange","webkitfullscreenerror",
 ];
+// Handler slots are accessor pairs, the shape a real browser exposes: an
+// assignment never creates an own property on the instance (`Object.keys(el)`
+// stays clean, `delete el.onclick` is a no-op). Under trace the setter also
+// snapshots the assigning code's execution-source label.
+//
+// Placement note: Chrome splits these across HTMLElement.prototype and
+// SVGElement.prototype; Obscura's HTML interface layer is one Element class
+// (globalThis.HTMLElement === Element), so the HTML half lives on
+// Element.prototype and SVGElement installs its own set later (svg-elements.js).
 for (const _ev of _GLOBAL_EVENT_HANDLERS.concat(_WINDOW_EVENT_HANDLERS)) {
   const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
+  if (!(_on in globalThis)) __obscuraTraceDefineHandler(globalThis, _on, true);
 }
 for (const _ev of _GLOBAL_EVENT_HANDLERS
   .concat(_CLIPBOARD_EVENT_HANDLERS, _DOCUMENT_EVENT_HANDLERS)) {
   const _on = "on" + _ev;
-  if (!(_on in Document.prototype)) {
-    Object.defineProperty(Document.prototype, _on,
-      { value: null, writable: true, configurable: true, enumerable: false });
-  }
+  if (!(_on in Document.prototype)) __obscuraTraceDefineHandler(Document.prototype, _on, false);
 }
-// No Element enumeration in the reference capture, so this set is the one
-// Element already had, extended with the shared additions rather than
-// rebuilt: `focusin`/`focusout` stay because jQuery's event path reads them.
 for (const _ev of _GLOBAL_EVENT_HANDLERS
   .concat(_CLIPBOARD_EVENT_HANDLERS, ["focusin", "focusout"])) {
   const _on = "on" + _ev;
-  if (!(_on in Element.prototype)) {
-    Object.defineProperty(Element.prototype, _on,
-      { value: null, writable: true, configurable: true, enumerable: false });
-  }
+  if (!(_on in Element.prototype)) __obscuraTraceDefineHandler(Element.prototype, _on, false);
 }
 
 globalThis.Window = globalThis.Window || function Window() {};
@@ -236,6 +272,45 @@ class External {
   AddSearchProvider() {}
   IsSearchProviderInstalled() { return 0; }
   get [Symbol.toStringTag]() { return 'External'; }
+}
+// `window.external.tracelog(key, value)`, the instrumented build's tracing
+// primitive: one JSON line per call, appended to the tracelog file (see
+// tracelog.rs and docs/native-trace.md). The method exists only when the host
+// asked for a destination, so a production page sees Chrome's stock External
+// surface and cannot use the object to write anything. The value is serialized
+// here, on the calling thread, exactly like the reference build does; a value
+// that serializes to nothing (undefined, a function, a throwing getter) reaches
+// the writer as null. DOMString conversion for the key follows WebIDL, so a
+// Symbol key throws where `String(symbol)` would not.
+function _tracelogKey(key) {
+  if (typeof key === 'string') return key;
+  if (typeof key === 'symbol') {
+    throw new TypeError('Cannot convert a Symbol value to a string');
+  }
+  return String(key);
+}
+function _tracelogSend(key, value) {
+  let json;
+  try {
+    json = JSON.stringify(value);
+  } catch (error) {
+    json = undefined;
+  }
+  try {
+    Deno.core.ops.op_tracelog(key, typeof json === 'string' ? json : '');
+  } catch (error) { /* tracing stays best-effort, like the other streams */ }
+}
+if (globalThis.__obscura_tracelog_enabled === true) {
+  // WebIDL declares an operation on the prototype as enumerable, and the
+  // enumerability pass at the end of the bootstrap promotes class members to
+  // match; declaring it here keeps the shape right in a realm where that pass
+  // has not run yet.
+  Object.defineProperty(External.prototype, 'tracelog', {
+    value: _markNative(function tracelog(key, value) {
+      _tracelogSend(_tracelogKey(key), value);
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
 }
 globalThis.BarProp = BarProp;
 globalThis.External = External;

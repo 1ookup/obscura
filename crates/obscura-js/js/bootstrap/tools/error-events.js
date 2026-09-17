@@ -43,16 +43,12 @@ const _scheduleAfter = (delay, fn) => {
     return undefined;
   }
   // The callback runs only when the embedder pumps the event loop, after the
-  // current microtask checkpoint.
+  // current microtask checkpoint. Bind the scheduling site's execution-source
+  // label now: everything the fire does (bookkeeping ops included) must be
+  // attributed to whoever scheduled the timer, not to whichever code ran last.
+  const labeled = __obscuraTraceBind(fn);
   let nativeId;
-  nativeId = Deno.core.queueUserTimer(0, false, d, () => {
-    Deno.core.ops.op_browser_timer_complete(nativeId);
-    // HTML timer/observer/rAF delivery starts a new task. Freeze animation
-    // time lazily on that task's first style/layout read so a callback that
-    // waited in the host queue samples its actual delivery instant.
-    Deno.core.ops.op_begin_render_task?.();
-    return fn();
-  });
+  nativeId = Deno.core.queueUserTimer(0, false, d, labeled);
   Deno.core.ops.op_browser_timer_schedule(nativeId, d);
   return nativeId;
 };
