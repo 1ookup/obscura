@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["stealth"]
+# Pure forwarding, mirroring `render` below: obscura-cdp has no stealth-gated
+# code of its own, but without this `cargo build -p obscura-cdp` would silently
+# link a non-stealth browser/js/net while every other entry point gets stealth.
+stealth = ["obscura-browser/stealth", "obscura-js/stealth", "obscura-net/stealth"]
 # Enable Page.captureScreenshot via obscura-render. Propagates render to
 # obscura-browser so Page::screenshot is available.
 render = ["obscura-browser/render", "dep:image", "dep:png"]

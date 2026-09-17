@@ -1,0 +1,487 @@
+const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+// Standard CSS property names (camelCase). Real CSSStyleDeclaration exposes every
+// property as an enumerable accessor, so feature-detection code (`'gap' in
+// el.style`) and enumeration (`Object.keys(el.style)`) see the whole set, not
+// just the ones that happen to be assigned (issue #356).
+const _CSS_PROPERTY_NAMES = [
+  "accentColor","alignContent","alignItems","alignSelf","all","animation","animationDelay",
+  "animationDirection","animationDuration","animationFillMode","animationIterationCount",
+  "animationName","animationPlayState","animationTimingFunction","appearance","aspectRatio",
+  "backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode",
+  "backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition",
+  "backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","blockSize",
+  "border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle",
+  "borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle",
+  "borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor",
+  "borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth",
+  "borderCollapse","borderColor","borderImage","borderImageOutset","borderImageRepeat",
+  "borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor",
+  "borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth",
+  "borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth",
+  "borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle",
+  "borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle",
+  "borderRightWidth","borderSpacing","borderStyle","borderTop","borderTopColor","borderTopLeftRadius",
+  "borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxShadow",
+  "boxSizing","breakAfter","breakBefore","breakInside","captionSide","caretColor","clear","clip",
+  "clipPath","color","colorScheme","columnCount","columnFill","columnGap","columnRule","columnRuleColor",
+  "columnRuleStyle","columnRuleWidth","columnSpan","columnWidth","columns","contain","container",
+  "containerName","containerType","content","counterIncrement","counterReset","counterSet","cssFloat",
+  "cursor","direction","display","emptyCells","filter","flex","flexBasis","flexDirection","flexFlow",
+  "flexGrow","flexShrink","flexWrap","float","font","fontFamily","fontFeatureSettings","fontKerning",
+  "fontOpticalSizing","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontVariant",
+  "fontVariantCaps","fontVariantLigatures","fontVariantNumeric","fontWeight","gap","grid","gridArea",
+  "gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap",
+  "gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate",
+  "gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphens","imageRendering",
+  "inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd",
+  "insetInlineStart","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing",
+  "lineBreak","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin",
+  "marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd",
+  "marginInlineStart","marginLeft","marginRight","marginTop","mask","maxBlockSize","maxHeight",
+  "maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode",
+  "objectFit","objectPosition","offset","opacity","order","outline","outlineColor","outlineOffset",
+  "outlineStyle","outlineWidth","overflow","overflowAnchor","overflowWrap","overflowX","overflowY",
+  "overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX",
+  "overscrollBehaviorY","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom",
+  "paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop",
+  "pageBreakAfter","pageBreakBefore","pageBreakInside","perspective","perspectiveOrigin","placeContent",
+  "placeItems","placeSelf","pointerEvents","position","quotes","resize","right","rotate","rowGap",
+  "scale","scrollBehavior","scrollMargin","scrollPadding","scrollSnapAlign","scrollSnapStop",
+  "scrollSnapType","tabSize","tableLayout","textAlign","textAlignLast","textCombineUpright",
+  "textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk",
+  "textDecorationStyle","textDecorationThickness","textEmphasis","textIndent","textJustify",
+  "textOrientation","textOverflow","textRendering","textShadow","textTransform","textUnderlineOffset",
+  "textUnderlinePosition","top","touchAction","transform","transformBox","transformOrigin",
+  "transformStyle","transition","transitionDelay","transitionDuration","transitionProperty",
+  "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
+  "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
+];
+const _CSS_ADDITIONAL_PROPERTY_NAMES = `
+additiveSymbols alignmentBaseline anchorName anchorScope animationComposition animationRange animationRangeEnd
+animationRangeStart animationTimeline animationTrigger appRegion ascentOverride basePalette baselineShift
+baselineSource borderEndEndRadius borderEndStartRadius borderShape borderStartEndRadius borderStartStartRadius
+boxDecorationBreak bufferedRendering caretAnimation caretShape clipRule colorInterpolation
+colorInterpolationFilters colorRendering columnHeight columnRuleBreak columnRuleInset columnRuleInsetCap
+columnRuleInsetCapEnd columnRuleInsetCapStart columnRuleInsetEnd columnRuleInsetJunction
+columnRuleInsetJunctionEnd columnRuleInsetJunctionStart columnRuleInsetStart columnRuleVisibilityItems columnWrap
+containIntrinsicBlockSize containIntrinsicHeight containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth
+contentVisibility cornerBlockEndShape cornerBlockStartShape cornerBottomLeftShape cornerBottomRightShape
+cornerBottomShape cornerEndEndShape cornerEndStartShape cornerInlineEndShape cornerInlineStartShape cornerLeftShape
+cornerRightShape cornerShape cornerStartEndShape cornerStartStartShape cornerTopLeftShape cornerTopRightShape
+cornerTopShape cx cy d descentOverride dominantBaseline dynamicRangeLimit epubCaptionSide epubTextCombine
+epubTextEmphasis epubTextEmphasisColor epubTextEmphasisStyle epubTextOrientation epubTextTransform epubWordBreak
+epubWritingMode fallback fieldSizing fill fillOpacity fillRule flexLineCount floodColor floodOpacity fontDisplay
+fontLanguageOverride fontPalette fontSynthesis fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight
+fontVariantAlternates fontVariantEastAsian fontVariantEmoji fontVariantPosition fontVariationSettings
+forcedColorAdjust hyphenateCharacter hyphenateLimitChars imageOrientation inherits initialLetter initialValue
+interactivity interestDelay interestDelayEnd interestDelayStart interpolateSize lightingColor lineGapOverride marker
+markerEnd markerMid markerStart maskClip maskComposite maskImage maskMode maskOrigin maskPosition maskRepeat maskSize
+maskType mathDepth mathShift mathStyle navigation negative objectViewBox offsetAnchor offsetDistance offsetPath
+offsetPosition offsetRotate orphans overflowBlock overflowClipMargin overflowInline overlay overrideColors pad page
+pageMarginSafety pageOrientation paintOrder positionAnchor positionArea positionTry positionTryFallbacks
+positionTryOrder positionVisibility prefix printColorAdjust r range readingFlow readingOrder result rowRule
+rowRuleBreak rowRuleColor rowRuleInset rowRuleInsetCap rowRuleInsetCapEnd rowRuleInsetCapStart rowRuleInsetEnd
+rowRuleInsetJunction rowRuleInsetJunctionEnd rowRuleInsetJunctionStart rowRuleInsetStart rowRuleStyle
+rowRuleVisibilityItems rowRuleWidth rubyAlign rubyOverhang rubyPosition rule ruleBreak ruleColor ruleInset ruleInsetCap
+ruleInsetEnd ruleInsetJunction ruleInsetStart ruleOverlap ruleStyle ruleVisibilityItems ruleWidth rx ry
+scrollInitialTarget scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom
+scrollMarginInline scrollMarginInlineEnd scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop
+scrollMarkerGroup scrollPaddingBlock scrollPaddingBlockEnd scrollPaddingBlockStart scrollPaddingBottom
+scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight
+scrollPaddingTop scrollTargetGroup scrollTimeline scrollTimelineAxis scrollTimelineName scrollbarColor scrollbarGutter
+scrollbarWidth shapeImageThreshold shapeMargin shapeOutside shapeRendering size sizeAdjust speak speakAs src stopColor
+stopOpacity stroke strokeDasharray strokeDashoffset strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity
+strokeWidth suffix symbols syntax system textAnchor textAutospace textBox textBoxEdge textBoxTrim textEmphasisColor
+textEmphasisPosition textEmphasisStyle textFit textSizeAdjust textSpacingTrim textWrap textWrapMode textWrapStyle
+timelineScope timelineTrigger timelineTriggerActivationRange timelineTriggerActivationRangeEnd
+timelineTriggerActivationRangeStart timelineTriggerActiveRange timelineTriggerActiveRangeEnd
+timelineTriggerActiveRangeStart timelineTriggerName timelineTriggerSource transitionBehavior triggerScope types
+unicodeRange vectorEffect viewTimeline viewTimelineAxis viewTimelineInset viewTimelineName viewTransitionClass
+viewTransitionGroup viewTransitionName viewTransitionScope webkitAlignContent webkitAlignItems webkitAlignSelf
+webkitAnimation webkitAnimationDelay webkitAnimationDirection webkitAnimationDuration webkitAnimationFillMode
+webkitAnimationIterationCount webkitAnimationName webkitAnimationPlayState webkitAnimationTimingFunction
+webkitAppRegion webkitAppearance webkitBackfaceVisibility webkitBackgroundClip webkitBackgroundOrigin
+webkitBackgroundSize webkitBorderAfter webkitBorderAfterColor webkitBorderAfterStyle webkitBorderAfterWidth
+webkitBorderBefore webkitBorderBeforeColor webkitBorderBeforeStyle webkitBorderBeforeWidth
+webkitBorderBottomLeftRadius webkitBorderBottomRightRadius webkitBorderEnd webkitBorderEndColor webkitBorderEndStyle
+webkitBorderEndWidth webkitBorderHorizontalSpacing webkitBorderImage webkitBorderRadius webkitBorderStart
+webkitBorderStartColor webkitBorderStartStyle webkitBorderStartWidth webkitBorderTopLeftRadius
+webkitBorderTopRightRadius webkitBorderVerticalSpacing webkitBoxAlign webkitBoxDecorationBreak webkitBoxDirection
+webkitBoxFlex webkitBoxOrdinalGroup webkitBoxOrient webkitBoxPack webkitBoxReflect webkitBoxShadow webkitBoxSizing
+webkitClipPath webkitColumnBreakAfter webkitColumnBreakBefore webkitColumnBreakInside webkitColumnCount
+webkitColumnGap webkitColumnRule webkitColumnRuleColor webkitColumnRuleStyle webkitColumnRuleWidth webkitColumnSpan
+webkitColumnWidth webkitColumns webkitFilter webkitFlex webkitFlexBasis webkitFlexDirection webkitFlexFlow
+webkitFlexGrow webkitFlexShrink webkitFlexWrap webkitFontFeatureSettings webkitFontSmoothing
+webkitHyphenateCharacter webkitJustifyContent webkitLineBreak webkitLineClamp webkitLocale webkitLogicalHeight
+webkitLogicalWidth webkitMarginAfter webkitMarginBefore webkitMarginEnd webkitMarginStart webkitMask
+webkitMaskBoxImage webkitMaskBoxImageOutset webkitMaskBoxImageRepeat webkitMaskBoxImageSlice
+webkitMaskBoxImageSource webkitMaskBoxImageWidth webkitMaskClip webkitMaskComposite webkitMaskImage webkitMaskOrigin
+webkitMaskPosition webkitMaskPositionX webkitMaskPositionY webkitMaskRepeat webkitMaskSize webkitMaxLogicalHeight
+webkitMaxLogicalWidth webkitMinLogicalHeight webkitMinLogicalWidth webkitOpacity webkitOrder webkitPaddingAfter
+webkitPaddingBefore webkitPaddingEnd webkitPaddingStart webkitPerspective webkitPerspectiveOrigin
+webkitPerspectiveOriginX webkitPerspectiveOriginY webkitPrintColorAdjust webkitRtlOrdering webkitRubyPosition
+webkitShapeImageThreshold webkitShapeMargin webkitShapeOutside webkitTapHighlightColor webkitTextCombine
+webkitTextDecorationsInEffect webkitTextEmphasis webkitTextEmphasisColor webkitTextEmphasisPosition
+webkitTextEmphasisStyle webkitTextFillColor webkitTextOrientation webkitTextSecurity webkitTextSizeAdjust
+webkitTextStroke webkitTextStrokeColor webkitTextStrokeWidth webkitTransform webkitTransformOrigin
+webkitTransformOriginX webkitTransformOriginY webkitTransformOriginZ webkitTransformStyle webkitTransition
+webkitTransitionDelay webkitTransitionDuration webkitTransitionProperty webkitTransitionTimingFunction
+webkitUserDrag webkitUserModify webkitUserSelect webkitWritingMode whiteSpaceCollapse widows x y
+`.trim().split(/\s+/);
+_CSS_PROPERTY_NAMES.splice(_CSS_PROPERTY_NAMES.indexOf('cssFloat'), 1);
+_CSS_PROPERTY_NAMES.push(..._CSS_ADDITIONAL_PROPERTY_NAMES);
+_CSS_PROPERTY_NAMES.sort();
+
+const _CSS_COMPUTED_PROPERTY_NAMES = `
+accent-color align-content align-items align-self alignment-baseline anchor-name anchor-scope animation-composition
+animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-range-end
+animation-range-start animation-timeline animation-timing-function animation-trigger app-region appearance aspect-ratio backdrop-filter
+backface-visibility background-attachment background-blend-mode background-clip background-color background-image background-origin background-position
+background-repeat background-size baseline-shift baseline-source block-size border-block-end-color border-block-end-style border-block-end-width
+border-block-start-color border-block-start-style border-block-start-width border-bottom-color border-bottom-left-radius border-bottom-right-radius border-bottom-style border-bottom-width
+border-collapse border-end-end-radius border-end-start-radius border-image-outset border-image-repeat border-image-slice border-image-source border-image-width
+border-inline-end-color border-inline-end-style border-inline-end-width border-inline-start-color border-inline-start-style border-inline-start-width border-left-color border-left-style
+border-left-width border-right-color border-right-style border-right-width border-shape border-start-end-radius border-start-start-radius border-top-color
+border-top-left-radius border-top-right-radius border-top-style border-top-width bottom box-decoration-break box-shadow box-sizing
+break-after break-before break-inside buffered-rendering caption-side caret-animation caret-color caret-shape
+clear clip clip-path clip-rule color color-interpolation color-interpolation-filters color-rendering
+color-scheme column-count column-fill column-gap column-height column-rule-color column-rule-style column-rule-width
+column-span column-width column-wrap contain contain-intrinsic-block-size contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-size
+contain-intrinsic-width container-name container-type content content-visibility corner-bottom-left-shape corner-bottom-right-shape corner-end-end-shape
+corner-end-start-shape corner-start-end-shape corner-start-start-shape corner-top-left-shape corner-top-right-shape counter-increment counter-reset counter-set
+cursor cx cy d direction display dominant-baseline dynamic-range-limit
+empty-cells field-sizing fill fill-opacity fill-rule filter flex-basis flex-direction
+flex-grow flex-shrink flex-wrap float flood-color flood-opacity font-family font-feature-settings
+font-kerning font-language-override font-optical-sizing font-palette font-size font-size-adjust font-stretch font-style
+font-synthesis-small-caps font-synthesis-style font-synthesis-weight font-variant font-variant-alternates font-variant-caps font-variant-east-asian font-variant-emoji
+font-variant-ligatures font-variant-numeric font-variant-position font-variation-settings font-weight forced-color-adjust grid-auto-columns grid-auto-flow
+grid-auto-rows grid-column-end grid-column-start grid-row-end grid-row-start grid-template-areas grid-template-columns grid-template-rows
+height hyphenate-character hyphenate-limit-chars hyphens image-orientation image-rendering initial-letter inline-size
+inset-block-end inset-block-start inset-inline-end inset-inline-start interactivity interest-delay-end interest-delay-start interpolate-size
+isolation justify-content justify-items justify-self left letter-spacing lighting-color line-break
+line-height list-style-image list-style-position list-style-type margin-block-end margin-block-start margin-bottom margin-inline-end
+margin-inline-start margin-left margin-right margin-top marker-end marker-mid marker-start mask-clip
+mask-composite mask-image mask-mode mask-origin mask-position mask-repeat mask-size mask-type
+math-depth math-shift math-style max-block-size max-height max-inline-size max-width min-block-size
+min-height min-inline-size min-width mix-blend-mode object-fit object-position object-view-box offset-anchor
+offset-distance offset-path offset-position offset-rotate opacity order orphans outline-color
+outline-offset outline-style outline-width overflow-anchor overflow-block overflow-clip-margin overflow-inline overflow-wrap
+overflow-x overflow-y overlay overscroll-behavior-block overscroll-behavior-inline overscroll-behavior-x overscroll-behavior-y padding-block-end
+padding-block-start padding-bottom padding-inline-end padding-inline-start padding-left padding-right padding-top paint-order
+perspective perspective-origin pointer-events position position-anchor position-area position-try-fallbacks position-try-order
+position-visibility print-color-adjust quotes r reading-flow reading-order resize right
+rotate row-gap ruby-align ruby-position rx ry scale scroll-behavior
+scroll-initial-target scroll-margin-block-end scroll-margin-block-start scroll-margin-bottom scroll-margin-inline-end scroll-margin-inline-start scroll-margin-left scroll-margin-right
+scroll-margin-top scroll-marker-group scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left
+scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop scroll-snap-type scroll-target-group scroll-timeline-axis scroll-timeline-name
+scrollbar-color scrollbar-gutter scrollbar-width shape-image-threshold shape-margin shape-outside shape-rendering speak
+stop-color stop-opacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin stroke-miterlimit
+stroke-opacity stroke-width tab-size table-layout text-align text-align-last text-anchor text-autospace
+text-box-edge text-box-trim text-combine-upright text-decoration text-decoration-color text-decoration-line text-decoration-skip-ink text-decoration-style
+text-decoration-thickness text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-justify text-orientation text-overflow
+text-rendering text-shadow text-size-adjust text-spacing-trim text-transform text-underline-offset text-underline-position text-wrap-mode
+text-wrap-style timeline-scope timeline-trigger-activation-range-end timeline-trigger-activation-range-start timeline-trigger-active-range-end timeline-trigger-active-range-start timeline-trigger-name timeline-trigger-source
+top touch-action transform transform-box transform-origin transform-style transition-behavior transition-delay
+transition-duration transition-property transition-timing-function translate trigger-scope unicode-bidi user-select vector-effect
+vertical-align view-timeline-axis view-timeline-inset view-timeline-name view-transition-class view-transition-group view-transition-name view-transition-scope
+visibility white-space-collapse widows width will-change word-break word-spacing writing-mode
+x y z-index zoom -webkit-border-horizontal-spacing -webkit-border-image -webkit-border-vertical-spacing -webkit-box-align
+-webkit-box-decoration-break -webkit-box-direction -webkit-box-flex -webkit-box-ordinal-group -webkit-box-orient -webkit-box-pack -webkit-box-reflect -webkit-font-smoothing
+-webkit-line-break -webkit-line-clamp -webkit-locale -webkit-mask-box-image -webkit-mask-box-image-outset -webkit-mask-box-image-repeat -webkit-mask-box-image-slice -webkit-mask-box-image-source
+-webkit-mask-box-image-width -webkit-mask-position-x -webkit-mask-position-y -webkit-rtl-ordering -webkit-ruby-position -webkit-tap-highlight-color -webkit-text-combine -webkit-text-decorations-in-effect
+-webkit-text-fill-color -webkit-text-orientation -webkit-text-security -webkit-text-stroke-color -webkit-text-stroke-width -webkit-user-drag -webkit-user-modify -webkit-writing-mode
+`.trim().split(/\s+/);
+// Chrome exposes the computed style's non-indexed own keys in camelCase
+// (including descriptor reflections like additiveSymbols), not dashed.
+const _CSS_COMPUTED_CAMEL_KEYS = `
+accentColor additiveSymbols alignContent alignItems alignSelf alignmentBaseline all anchorName
+anchorScope animation animationComposition animationDelay animationDirection animationDuration animationFillMode animationIterationCount
+animationName animationPlayState animationRange animationRangeEnd animationRangeStart animationTimeline animationTimingFunction animationTrigger
+appRegion appearance ascentOverride aspectRatio backdropFilter backfaceVisibility background backgroundAttachment
+backgroundBlendMode backgroundClip backgroundColor backgroundImage backgroundOrigin backgroundPosition backgroundPositionX backgroundPositionY
+backgroundRepeat backgroundSize basePalette baselineShift baselineSource blockSize border borderBlock
+borderBlockColor borderBlockEnd borderBlockEndColor borderBlockEndStyle borderBlockEndWidth borderBlockStart borderBlockStartColor borderBlockStartStyle
+borderBlockStartWidth borderBlockStyle borderBlockWidth borderBottom borderBottomColor borderBottomLeftRadius borderBottomRightRadius borderBottomStyle
+borderBottomWidth borderCollapse borderColor borderEndEndRadius borderEndStartRadius borderImage borderImageOutset borderImageRepeat
+borderImageSlice borderImageSource borderImageWidth borderInline borderInlineColor borderInlineEnd borderInlineEndColor borderInlineEndStyle
+borderInlineEndWidth borderInlineStart borderInlineStartColor borderInlineStartStyle borderInlineStartWidth borderInlineStyle borderInlineWidth borderLeft
+borderLeftColor borderLeftStyle borderLeftWidth borderRadius borderRight borderRightColor borderRightStyle borderRightWidth
+borderShape borderSpacing borderStartEndRadius borderStartStartRadius borderStyle borderTop borderTopColor borderTopLeftRadius
+borderTopRightRadius borderTopStyle borderTopWidth borderWidth bottom boxDecorationBreak boxShadow boxSizing
+breakAfter breakBefore breakInside bufferedRendering captionSide caretAnimation caretColor caretShape
+clear clip clipPath clipRule color colorInterpolation colorInterpolationFilters colorRendering
+colorScheme columnCount columnFill columnGap columnHeight columnRule columnRuleColor columnRuleStyle
+columnRuleWidth columnSpan columnWidth columnWrap columns contain containIntrinsicBlockSize containIntrinsicHeight
+containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth container containerName containerType content contentVisibility
+cornerBlockEndShape cornerBlockStartShape cornerBottomLeftShape cornerBottomRightShape cornerBottomShape cornerEndEndShape cornerEndStartShape cornerInlineEndShape
+cornerInlineStartShape cornerLeftShape cornerRightShape cornerShape cornerStartEndShape cornerStartStartShape cornerTopLeftShape cornerTopRightShape
+cornerTopShape counterIncrement counterReset counterSet cursor cx cy d
+descentOverride direction display dominantBaseline dynamicRangeLimit emptyCells fallback fieldSizing
+fill fillOpacity fillRule filter flex flexBasis flexDirection flexFlow
+flexGrow flexShrink flexWrap float floodColor floodOpacity font fontDisplay
+fontFamily fontFeatureSettings fontKerning fontLanguageOverride fontOpticalSizing fontPalette fontSize fontSizeAdjust
+fontStretch fontStyle fontSynthesis fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight fontVariant fontVariantAlternates
+fontVariantCaps fontVariantEastAsian fontVariantEmoji fontVariantLigatures fontVariantNumeric fontVariantPosition fontVariationSettings fontWeight
+forcedColorAdjust gap grid gridArea gridAutoColumns gridAutoFlow gridAutoRows gridColumn
+gridColumnEnd gridColumnGap gridColumnStart gridGap gridRow gridRowEnd gridRowGap gridRowStart
+gridTemplate gridTemplateAreas gridTemplateColumns gridTemplateRows height hyphenateCharacter hyphenateLimitChars hyphens
+imageOrientation imageRendering inherits initialLetter initialValue inlineSize inset insetBlock
+insetBlockEnd insetBlockStart insetInline insetInlineEnd insetInlineStart interactivity interestDelay interestDelayEnd
+interestDelayStart interpolateSize isolation justifyContent justifyItems justifySelf left letterSpacing
+lightingColor lineBreak lineGapOverride lineHeight listStyle listStyleImage listStylePosition listStyleType
+margin marginBlock marginBlockEnd marginBlockStart marginBottom marginInline marginInlineEnd marginInlineStart
+marginLeft marginRight marginTop marker markerEnd markerMid markerStart mask
+maskClip maskComposite maskImage maskMode maskOrigin maskPosition maskRepeat maskSize
+maskType mathDepth mathShift mathStyle maxBlockSize maxHeight maxInlineSize maxWidth
+minBlockSize minHeight minInlineSize minWidth mixBlendMode navigation negative objectFit
+objectPosition objectViewBox offset offsetAnchor offsetDistance offsetPath offsetPosition offsetRotate
+opacity order orphans outline outlineColor outlineOffset outlineStyle outlineWidth
+overflow overflowAnchor overflowBlock overflowClipMargin overflowInline overflowWrap overflowX overflowY
+overlay overrideColors overscrollBehavior overscrollBehaviorBlock overscrollBehaviorInline overscrollBehaviorX overscrollBehaviorY pad
+padding paddingBlock paddingBlockEnd paddingBlockStart paddingBottom paddingInline paddingInlineEnd paddingInlineStart
+paddingLeft paddingRight paddingTop page pageBreakAfter pageBreakBefore pageBreakInside pageOrientation
+paintOrder perspective perspectiveOrigin placeContent placeItems placeSelf pointerEvents position
+positionAnchor positionArea positionTry positionTryFallbacks positionTryOrder positionVisibility prefix printColorAdjust
+quotes r range readingFlow readingOrder resize result right
+rotate rowGap rubyAlign rubyPosition rx ry scale scrollBehavior
+scrollInitialTarget scrollMargin scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom scrollMarginInline scrollMarginInlineEnd
+scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop scrollMarkerGroup scrollPadding scrollPaddingBlock scrollPaddingBlockEnd
+scrollPaddingBlockStart scrollPaddingBottom scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight scrollPaddingTop
+scrollSnapAlign scrollSnapStop scrollSnapType scrollTargetGroup scrollTimeline scrollTimelineAxis scrollTimelineName scrollbarColor
+scrollbarGutter scrollbarWidth shapeImageThreshold shapeMargin shapeOutside shapeRendering size sizeAdjust
+speak speakAs src stopColor stopOpacity stroke strokeDasharray strokeDashoffset
+strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity strokeWidth suffix symbols syntax
+system tabSize tableLayout textAlign textAlignLast textAnchor textAutospace textBox
+textBoxEdge textBoxTrim textCombineUpright textDecoration textDecorationColor textDecorationLine textDecorationSkipInk textDecorationStyle
+textDecorationThickness textEmphasis textEmphasisColor textEmphasisPosition textEmphasisStyle textIndent textJustify textOrientation
+textOverflow textRendering textShadow textSizeAdjust textSpacingTrim textTransform textUnderlineOffset textUnderlinePosition
+textWrap textWrapMode textWrapStyle timelineScope timelineTrigger timelineTriggerActivationRange timelineTriggerActivationRangeEnd timelineTriggerActivationRangeStart
+timelineTriggerActiveRange timelineTriggerActiveRangeEnd timelineTriggerActiveRangeStart timelineTriggerName timelineTriggerSource top touchAction transform
+transformBox transformOrigin transformStyle transition transitionBehavior transitionDelay transitionDuration transitionProperty
+transitionTimingFunction translate triggerScope types unicodeBidi unicodeRange userSelect vectorEffect
+verticalAlign viewTimeline viewTimelineAxis viewTimelineInset viewTimelineName viewTransitionClass viewTransitionGroup viewTransitionName
+viewTransitionScope visibility webkitAlignContent webkitAlignItems webkitAlignSelf webkitAnimation webkitAnimationDelay webkitAnimationDirection
+webkitAnimationDuration webkitAnimationFillMode webkitAnimationIterationCount webkitAnimationName webkitAnimationPlayState webkitAnimationTimingFunction webkitAppRegion webkitAppearance
+webkitBackfaceVisibility webkitBackgroundClip webkitBackgroundOrigin webkitBackgroundSize webkitBorderAfter webkitBorderAfterColor webkitBorderAfterStyle webkitBorderAfterWidth
+webkitBorderBefore webkitBorderBeforeColor webkitBorderBeforeStyle webkitBorderBeforeWidth webkitBorderBottomLeftRadius webkitBorderBottomRightRadius webkitBorderEnd webkitBorderEndColor
+webkitBorderEndStyle webkitBorderEndWidth webkitBorderHorizontalSpacing webkitBorderImage webkitBorderRadius webkitBorderStart webkitBorderStartColor webkitBorderStartStyle
+webkitBorderStartWidth webkitBorderTopLeftRadius webkitBorderTopRightRadius webkitBorderVerticalSpacing webkitBoxAlign webkitBoxDecorationBreak webkitBoxDirection webkitBoxFlex
+webkitBoxOrdinalGroup webkitBoxOrient webkitBoxPack webkitBoxReflect webkitBoxShadow webkitBoxSizing webkitClipPath webkitColumnBreakAfter
+webkitColumnBreakBefore webkitColumnBreakInside webkitColumnCount webkitColumnGap webkitColumnRule webkitColumnRuleColor webkitColumnRuleStyle webkitColumnRuleWidth
+webkitColumnSpan webkitColumnWidth webkitColumns webkitFilter webkitFlex webkitFlexBasis webkitFlexDirection webkitFlexFlow
+webkitFlexGrow webkitFlexShrink webkitFlexWrap webkitFontFeatureSettings webkitFontSmoothing webkitHyphenateCharacter webkitJustifyContent webkitLineBreak
+webkitLineClamp webkitLocale webkitLogicalHeight webkitLogicalWidth webkitMarginAfter webkitMarginBefore webkitMarginEnd webkitMarginStart
+webkitMask webkitMaskBoxImage webkitMaskBoxImageOutset webkitMaskBoxImageRepeat webkitMaskBoxImageSlice webkitMaskBoxImageSource webkitMaskBoxImageWidth webkitMaskClip
+webkitMaskComposite webkitMaskImage webkitMaskOrigin webkitMaskPosition webkitMaskPositionX webkitMaskPositionY webkitMaskRepeat webkitMaskSize
+webkitMaxLogicalHeight webkitMaxLogicalWidth webkitMinLogicalHeight webkitMinLogicalWidth webkitOpacity webkitOrder webkitPaddingAfter webkitPaddingBefore
+webkitPaddingEnd webkitPaddingStart webkitPerspective webkitPerspectiveOrigin webkitPerspectiveOriginX webkitPerspectiveOriginY webkitPrintColorAdjust webkitRtlOrdering
+webkitRubyPosition webkitShapeImageThreshold webkitShapeMargin webkitShapeOutside webkitTapHighlightColor webkitTextCombine webkitTextDecorationsInEffect webkitTextEmphasis
+webkitTextEmphasisColor webkitTextEmphasisPosition webkitTextEmphasisStyle webkitTextFillColor webkitTextOrientation webkitTextSecurity webkitTextSizeAdjust webkitTextStroke
+webkitTextStrokeColor webkitTextStrokeWidth webkitTransform webkitTransformOrigin webkitTransformOriginX webkitTransformOriginY webkitTransformOriginZ webkitTransformStyle
+webkitTransition webkitTransitionDelay webkitTransitionDuration webkitTransitionProperty webkitTransitionTimingFunction webkitUserDrag webkitUserModify webkitUserSelect
+webkitWritingMode whiteSpace whiteSpaceCollapse widows width willChange wordBreak wordSpacing
+wordWrap writingMode x y zIndex zoom
+`.trim().split(/\s+/);
+const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
+const _CSS_COMPUTED_CAMEL_SET = new Set(_CSS_COMPUTED_CAMEL_KEYS);
+
+// Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
+// dashed-key store, replacing its contents in place.
+// A declaration's priority is stored inline with its value so the serialized
+// form round-trips through the `style` attribute, and split off again for
+// `getPropertyValue` / `getPropertyPriority`.
+const _CSS_PRIORITY_RE = /!\s*important\s*$/i;
+function _cssHasPriority(value) {
+  return typeof value === 'string' && _CSS_PRIORITY_RE.test(value);
+}
+function _cssStripPriority(value) {
+  if (!_cssHasPriority(value)) return value;
+  return value.replace(_CSS_PRIORITY_RE, '').trim();
+}
+
+function _parseCssInto(props, text) {
+  for (const k in props) delete props[k];
+  if (text) _splitCssDeclarations(text).forEach((p) => {
+    const i = p.indexOf(":");
+    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+  });
+}
+// Declaration values routinely contain semicolons in quoted `content`, data
+// URLs, gradients, and custom-property token streams. Split only at the
+// declaration-list level so reflecting a CSSStyleRule through CSSOM does not
+// corrupt otherwise valid CSS before the renderer sees it.
+function _splitCssDeclarations(value) {
+  const text = String(value || "");
+  const declarations = [];
+  let start = 0, quote = "", escaped = false, comment = false;
+  let parens = 0, brackets = 0, braces = 0;
+  const push = (end) => {
+    const declaration = text.slice(start, end).trim();
+    if (declaration) declarations.push(declaration);
+  };
+  for (let index = 0; index < text.length; index++) {
+    const ch = text[index], next = text[index + 1];
+    if (comment) {
+      if (ch === "*" && next === "/") { comment = false; index++; }
+      continue;
+    }
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote) { if (ch === quote) quote = ""; continue; }
+    if (ch === "/" && next === "*") { comment = true; index++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "(") { parens++; continue; }
+    if (ch === ")") { parens = Math.max(0, parens - 1); continue; }
+    if (ch === "[") { brackets++; continue; }
+    if (ch === "]") { brackets = Math.max(0, brackets - 1); continue; }
+    if (ch === "{") { braces++; continue; }
+    if (ch === "}") { braces = Math.max(0, braces - 1); continue; }
+    if (ch === ";" && !parens && !brackets && !braces) {
+      push(index);
+      start = index + 1;
+    }
+  }
+  push(text.length);
+  return declarations;
+}
+function _serializeCss(props) {
+  const e = Object.entries(props);
+  return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+}
+
+const _cssStyleState = new WeakMap();
+function _cssStyleFor(value) {
+  const state = _cssStyleState.get(value);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+function _cssStylePull(value) {
+  const state = _cssStyleFor(value);
+  if (state.loaded) return state;
+  _parseCssInto(state.props, state.owner.getAttribute('style'));
+  state.loaded = true;
+  return state;
+}
+function _cssStyleReplaceFromAttribute(value, text) {
+  const state = _cssStyleFor(value);
+  _parseCssInto(state.props, text);
+  state.loaded = true;
+}
+function _cssStylePush(value) {
+  const state = _cssStyleFor(value);
+  if (state.owner) {
+    const text = _serializeCss(state.props);
+    if (text) state.owner.setAttribute('style', text);
+    else state.owner.removeAttribute('style');
+  } else if (state.onChange) {
+    state.onChange();
+  }
+}
+
+class CSSStyleDeclaration {
+  constructor(owner = null, onChange = null, parentRule = null) {
+    _cssStyleState.set(this, {
+      props: {}, owner, onChange, parentRule, loaded: !owner,
+    });
+  }
+  get cssText() { return _serializeCss(_cssStylePull(this).props); }
+  set cssText(value) {
+    const state = _cssStyleFor(this);
+    _parseCssInto(state.props, value);
+    state.loaded = true;
+    _cssStylePush(this);
+  }
+  get length() { return Object.keys(_cssStylePull(this).props).length; }
+  get parentRule() { return _cssStyleFor(this).parentRule; }
+  get cssFloat() { return this.getPropertyValue('float'); }
+  set cssFloat(value) { this.setProperty('float', value); }
+  getPropertyPriority(name) {
+    const value = _cssStylePull(this).props[_cssCamelToKebab(String(name))];
+    return _cssHasPriority(value) ? 'important' : '';
+  }
+  getPropertyValue(name) {
+    const value = _cssStylePull(this).props[_cssCamelToKebab(String(name))];
+    if (!value) return '';
+    // The declaration's priority is reported through getPropertyPriority, not
+    // through the value, so a stored "150px !important" reads back as "150px".
+    return _cssStripPriority(value);
+  }
+  item(index) { return Object.keys(_cssStylePull(this).props)[index] || ''; }
+  removeProperty(name) {
+    const state = _cssStylePull(this);
+    const key = _cssCamelToKebab(String(name));
+    const old = state.props[key];
+    delete state.props[key];
+    _cssStylePush(this);
+    return old || '';
+  }
+  setProperty(name, value, priority = '') {
+    const state = _cssStylePull(this);
+    const k = _cssCamelToKebab(String(name));
+    if (value === '' || value == null) { delete state.props[k]; _cssStylePush(this); return; }
+    const text = String(value);
+    // `!important` is not part of a declaration value: it belongs to the
+    // separate priority argument. Chrome drops the whole declaration when it
+    // appears in the value, which is what an IDL assignment such as
+    // `el.style.fontSize = "150px !important"` goes through.
+    if (_cssHasPriority(text)) { _cssStylePush(this); return; }
+    const flag = String(priority == null ? '' : priority).trim().toLowerCase();
+    if (flag !== '' && flag !== 'important') { _cssStylePush(this); return; }
+    state.props[k] = flag === 'important' ? `${text} !important` : text;
+    _cssStylePush(this);
+  }
+}
+const _cssStyleConstructor = Object.getOwnPropertyDescriptor(
+  CSSStyleDeclaration.prototype, 'constructor');
+delete CSSStyleDeclaration.prototype.constructor;
+if (_cssStyleConstructor) Object.defineProperty(
+  CSSStyleDeclaration.prototype, 'constructor', _cssStyleConstructor);
+
+const _styleProxy = (decl) => {
+  const proxy = new Proxy(decl, {
+  get(t, p) {
+    if (typeof p === "symbol" || p in t) return t[p];
+    if (/^\d+$/.test(p)) return t.item(+p);
+    return t.getPropertyValue(p);
+  },
+  set(t, p, v) {
+    if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "cssText") { t.cssText = v; return true; }
+    if (p in t) { Reflect.set(t, p, v); return true; }
+    if (/^\d+$/.test(p)) return true;
+    t.setProperty(p, v);
+    return true;
+  },
+  has(t, p) {
+    if (typeof p !== "string") return Reflect.has(t, p);
+    if (p in Object.getPrototypeOf(t)) return true;
+    const props = _cssStylePull(t).props;
+    if (_cssCamelToKebab(p) in props) return true;
+    if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
+    return /^\d+$/.test(p) && +p < t.length;
+  },
+  ownKeys(t) {
+    const props = _cssStylePull(t).props;
+    const keys = [];
+    const n = t.length;
+    for (let i = 0; i < n; i++) keys.push(String(i));
+    const names = new Set(_CSS_PROPERTY_NAMES);
+    for (const k of Object.keys(props)) names.add(_cssKebabToCamel(k));
+    for (const name of names) keys.push(name);
+    return keys;
+  },
+  getOwnPropertyDescriptor(t, p) {
+    if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    const props = _cssStylePull(t).props;
+    if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
+    if (_cssCamelToKebab(p) in props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+      return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
+    }
+    return undefined;
+  },
+  });
+  _cssStyleState.set(proxy, _cssStyleFor(decl));
+  return proxy;
+};

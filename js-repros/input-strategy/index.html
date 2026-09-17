@@ -1,0 +1,6 @@
+<!doctype html><button id="target">target</button><output id="events"></output><script>
+globalThis.inputFixture = [];
+const record = value => { inputFixture.push(value); document.querySelector('#events').textContent = inputFixture.join(','); };
+target.addEventListener('pointerdown', () => record('pointerdown'));
+target.addEventListener('click', () => record('click'));
+</script>

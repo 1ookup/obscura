@@ -9,6 +9,18 @@ use obscura_dom::{DomTree, NodeId};
 /// isolate handle without taking a direct dependency on deno_core.
 pub use deno_core::v8::IsolateHandle;
 
+#[derive(Clone, Debug)]
+pub struct DebuggerScript {
+    pub script_id: String,
+    pub url: String,
+    pub start_line: i64,
+    pub start_column: i64,
+    pub end_line: i64,
+    pub end_column: i64,
+    pub hash: String,
+    pub length: u64,
+}
+
 use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
@@ -21,6 +33,34 @@ use crate::ops::{
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
+
+fn obscura_prepare_stack_trace_callback<'s>(
+    scope: &mut deno_core::v8::HandleScope<'s>,
+    error: deno_core::v8::Local<'s, deno_core::v8::Value>,
+    callsites: deno_core::v8::Local<'s, deno_core::v8::Array>,
+) -> deno_core::v8::Local<'s, deno_core::v8::Value> {
+    let global = scope.get_current_context().global(scope);
+    let helper = deno_core::v8::String::new(scope, "__obscura_filter_prepare_stack_trace")
+        .and_then(|key| global.get(scope, key.into()))
+        .and_then(|value| deno_core::v8::Local::<deno_core::v8::Function>::try_from(value).ok());
+    if let Some(helper) = helper {
+        if let Some(value) = helper.call(scope, global.into(), &[error, callsites.into()]) {
+            if value.is_string() {
+                let rendered = value.to_rust_string_lossy(scope);
+                let filtered = rendered
+                    .lines()
+                    .filter(|line| !line.contains("<cdp-"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(value) = deno_core::v8::String::new(scope, &filtered) {
+                    return value.into();
+                }
+            }
+            return value;
+        }
+    }
+    deno_core::error::prepare_stack_trace_callback(scope, error, callsites)
+}
 
 #[cfg(feature = "render")]
 struct RuntimeCanvasSurfaceSource<'a>(
@@ -103,21 +143,44 @@ fn render_frame_tree_into(
     if depth > 32 {
         return;
     }
-    let base_url = dom.document_scope(root).map(|scope| scope.base_url);
-    // Per-root stylesheet and animation state is retained across geometry,
-    // hit-test, and capture rebuilds. The prepared frame scene is disposable;
-    // the animation instance epoch is document state and is not.
-    let frame_state = frame_states.entry(root).or_default();
-    let Some(mut prepared) = obscura_render::prepare_frame_document(
-        dom,
-        root,
-        viewport,
-        base_url.as_deref(),
-        resources,
-        &mut frame_state.stylesheet_cache,
-        animation_sample,
-        &mut frame_state.animation_timeline,
-    ) else {
+    let scope = dom.document_scope(root);
+    let base_url = scope.as_ref().map(|scope| scope.base_url.clone());
+    let document_generation = scope.as_ref().map(|scope| scope.document_generation).unwrap_or(0);
+    // Retain one prepared scene per frame/document generation. DOM mutation
+    // invalidation clears this field; repeated geometry and paint reads reuse
+    // the same cascade/layout snapshot.
+    // Take the frame-owned caches out of the map while preparing this scene.
+    // Child traversal below needs mutable access to the same map, so keeping
+    // an entry borrow alive here would violate Rust's aliasing rules.
+    let (mut prepared, mut stylesheet_cache, mut animation_timeline) = {
+        let frame_state = frame_states.entry(root).or_default();
+        let cached = frame_state.prepared_render.take().filter(|cached| {
+            cached.viewport() == viewport
+                && cached.animation_sample() == animation_sample
+                && frame_state.cached_generation == document_generation
+        });
+        (
+            cached,
+            std::mem::take(&mut frame_state.stylesheet_cache),
+            std::mem::take(&mut frame_state.animation_timeline),
+        )
+    };
+    if prepared.is_none() {
+        prepared = obscura_render::prepare_frame_document(
+            dom,
+            root,
+            viewport,
+            base_url.as_deref(),
+            resources,
+            &mut stylesheet_cache,
+            animation_sample,
+            &mut animation_timeline,
+        );
+    }
+    let Some(mut prepared) = prepared else {
+        let frame_state = frame_states.entry(root).or_default();
+        frame_state.stylesheet_cache = stylesheet_cache;
+        frame_state.animation_timeline = animation_timeline;
         return;
     };
     for nested_host in dom.iframe_hosts_in_shadow_including_subtree(root) {
@@ -147,6 +210,11 @@ fn render_frame_tree_into(
     {
         out.insert(host, pixmap);
     }
+    let frame_state = frame_states.entry(root).or_default();
+    frame_state.stylesheet_cache = stylesheet_cache;
+    frame_state.animation_timeline = animation_timeline;
+    frame_state.cached_generation = document_generation;
+    frame_state.prepared_render = Some(prepared);
 }
 
 /// Render every active iframe content document of the page, deepest first,
@@ -265,6 +333,11 @@ fn input_hit_in_document(
 }
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
+// Trace-enabled runtimes intentionally skip the startup snapshot so
+// deno_core can apply the global-template middleware that installs the native
+// Window interceptor. The generated source is still snapshotted for normal
+// runs.
+static BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
@@ -311,6 +384,15 @@ pub struct RemoteObjectInfo {
 pub struct ObscuraJsRuntime {
     runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
+    /// The value-level browser identity installed in every Window/Worker
+    /// realm. Keeping it on the runtime lets lazily-created iframe realms
+    /// inherit the same contract as the main realm and live overrides update
+    /// already-existing realms.
+    pub(crate) fingerprint: obscura_net::BrowserFingerprint,
+    /// Whether this page runs with stealth on. The GPU consistency profile
+    /// follows it: stealth's whole purpose is presenting one coherent machine,
+    /// and a context that exists but answers nothing is not one.
+    pub(crate) stealth: bool,
     object_store: HashMap<String, String>,
     /// Routing for RemoteObject handles that live in a frame world realm
     /// rather than the main context (Phase 6.2): objectId ->
@@ -329,17 +411,25 @@ pub struct ObscuraJsRuntime {
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
-    /// pages without iframes; the main-context path never touches it.
-    pub(crate) frame_realms: crate::realm::FrameRealmHost,
+    /// pages without iframes; the main-context path never touches it. Boxed so
+    /// a raw pointer to it can be shared into `ObscuraState` and used from ops
+    /// for the synchronous realm path, without moving the runtime.
+    pub(crate) frame_realms: Box<crate::realm::FrameRealmHost>,
     /// Per-document ES module maps for frame realms. These are separate from
     /// deno_core's top-level module map because each Window realm has its own
     /// module identities and import-map resolution state.
     pub(crate) frame_module_maps: HashMap<(String, u64), Box<crate::realm::FrameModuleMap>>,
     /// Whether the main realm's cross-document message recv loop (bootstrap
     /// `_frameMessageRecvLoop`, Phase 4) has been started. It spawns an async
-    /// op, which requires a live tokio context, so the pump paths start it
-    /// lazily once a MainRealm-targeted message exists.
+    /// op, which requires a live tokio context, so the pump paths start it on
+    /// their first event-loop turn once an active frame realm exists and leave
+    /// it parked on the queue notify.
     frame_message_pump_started: bool,
+    /// Ambient execution-source label for this runtime's main context
+    /// ("window" for a page, "worker(M)[creator]" for a worker isolate).
+    /// Installed into the trace thread-local by the classic-script funnel
+    /// before each execution. Only read when a trace stream is active.
+    trace_ambient_label: std::cell::RefCell<String>,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -463,6 +553,16 @@ impl WatchdogToken {
 // already started receives this bounded completion allowance, matching the
 // fixed-wait path while retaining an absolute backstop for infinite script.
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
+
+/// OBSCURA_DEBUG_WATCHDOG=1 reports each time a V8 watchdog budget is exceeded.
+/// The isolate's execution is terminated when one fires, which cuts a page's
+/// running script off mid-task with no error on the page side.
+fn watchdog_debug(site: &str, budget_ms: u64) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WATCHDOG").is_some()) {
+        eprintln!("[watchdog] {site}: budget {budget_ms}ms exceeded, isolate terminated");
+    }
+}
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// Upper bound on chained cross-document message rounds inside one drain
 /// (Phase 4): delivering a message can enqueue further messages, so the drain
@@ -510,14 +610,61 @@ impl ObscuraJsRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+            // Must precede the first isolate: V8 ignores flag changes once the
+            // platform is up. Under the same lock so the check-then-set cannot
+            // race an isolate being built on another connection thread.
+            crate::v8_flags::apply_baseline_v8_flags();
+
+            // Either trace stream opts the runtime out of the startup
+            // snapshot: op tracing needs the JS-side source-label wrappers, and
+            // the tracelog sink installs window.external.tracelog from the
+            // bootstrap, which the snapshot was built without.
+            let trace_requested = crate::trace_source::enabled();
+            let tracelog_requested = crate::tracelog::enabled();
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
-                startup_snapshot: Some(SNAPSHOT),
+                startup_snapshot: (!(trace_requested || tracelog_requested)).then_some(SNAPSHOT),
                 ..Default::default()
             });
-
+            // A trace-enabled runtime executes bootstrap after context
+            // creation (the startup snapshot is intentionally skipped), so
+            // its early DOM ops need the same op-state registration that the
+            // snapshot path already has by the time page init runs.
             runtime.op_state().borrow_mut().put(state_clone);
+            if trace_requested || tracelog_requested {
+                // Must precede the bootstrap: the source-attribution wrappers
+                // (Function proxy, Promise.then, on* snapshots) install only
+                // when their flag is set, and so does the tracelog method whose
+                // caller decided on a destination. The snapshot was built with
+                // neither, which is exactly why it is skipped here.
+                let mut mode_flags = String::new();
+                if trace_requested {
+                    mode_flags.push_str("globalThis.__obscura_trace_from_enabled = true;");
+                }
+                if tracelog_requested {
+                    mode_flags.push_str("globalThis.__obscura_tracelog_enabled = true;");
+                }
+                runtime
+                    .execute_script("<obscura:trace-mode>", mode_flags)
+                    .expect("trace-mode flag should not fail");
+                runtime
+                    .execute_script("<obscura:bootstrap>", BOOTSTRAP_SRC.to_string())
+                    .expect("bootstrap.js should not fail in native trace mode");
+            }
+            runtime
+                .v8_isolate()
+                .set_modify_code_generation_from_strings_callback();
+            // Route every eval()/Function string through the callback so the
+            // realm-local CSP `unsafe-eval` flag can be enforced. The callback
+            // explicitly allows ordinary strings when no policy blocks them.
+            runtime
+                .handle_scope()
+                .get_current_context()
+                .set_allow_generation_from_strings(false);
+            runtime
+                .v8_isolate()
+                .set_prepare_stack_trace_callback(obscura_prepare_stack_trace_callback);
 
             runtime
                 .execute_script(
@@ -530,19 +677,31 @@ impl ObscuraJsRuntime {
             (runtime, isolate_handle)
         };
 
-        ObscuraJsRuntime {
+        let mut runtime = ObscuraJsRuntime {
             runtime,
             state,
+            fingerprint: obscura_net::BrowserFingerprint::default(),
+            stealth: false,
             object_store: HashMap::new(),
             object_realm: HashMap::new(),
             object_counter: 0,
             import_map,
             module_load_activity,
             isolate_handle,
-            frame_realms: crate::realm::FrameRealmHost::default(),
+            frame_realms: Box::new(crate::realm::FrameRealmHost::default()),
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
+            trace_ambient_label: std::cell::RefCell::new("window".to_string()),
+        };
+        {
+            // Share a stable pointer to the realm registry into the op-visible
+            // state. The Box pointee is heap-allocated, so its address survives
+            // the runtime moving into its final owner.
+            let mut state = runtime.state.borrow_mut();
+            state.frame_realms_ptr = runtime.frame_realms.as_mut() as *mut crate::realm::FrameRealmHost;
         }
+        runtime.set_fingerprint(&obscura_net::BrowserFingerprint::default());
+        runtime
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -561,6 +720,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Configure the persistent profile directory used by origin-keyed
+    /// IndexedDB files. The path is embedder-controlled and never inferred
+    /// from page URLs.
+    pub fn set_storage_dir(&self, dir: Option<std::path::PathBuf>) {
+        self.state.borrow_mut().storage_dir = dir;
+    }
+
     pub fn set_storage_areas(
         &self,
         local_storage: SharedStorageAreas,
@@ -571,8 +737,23 @@ impl ObscuraJsRuntime {
         state.session_storage = session_storage;
     }
 
+    pub fn set_privacy_policy(&self, policy: crate::PrivacyPolicy) {
+        self.state.borrow_mut().privacy_policy = policy;
+    }
+
+    pub fn set_private_token_query_state(&self, state: crate::PrivateTokenQueryState) {
+        self.state.borrow_mut().private_token_query_state = state;
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
+    }
+
+    pub fn set_shared_worker_registry(
+        &self,
+        registry: crate::worker::SharedWorkerRegistryHandle,
+    ) {
+        self.state.borrow_mut().shared_worker_registry = registry;
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -640,6 +821,29 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Set the enforced CSP header for the top-level document. Frame realms
+    /// read their own policy from `document_scope_info`.
+    pub fn set_content_security_policy(&self, csp: Option<&str>) {
+        self.state.borrow_mut().document_csp = csp.map(str::to_string);
+    }
+
+    /// Set the raw Permissions-Policy header for the top-level document.
+    /// Frame documents keep their own value in DocumentScope.
+    pub fn set_permissions_policy(&self, policy: Option<&str>) {
+        self.state.borrow_mut().document_permissions_policy = policy.map(str::to_string);
+    }
+
+    pub fn set_cross_origin_isolated(&self, isolated: bool) {
+        self.state.borrow_mut().cross_origin_isolated = isolated;
+    }
+
+    /// Set the raw Last-Modified response header for the top-level document.
+    /// The JS getter parses it in the realm's local timezone and falls back to
+    /// document creation time when the value is absent or invalid.
+    pub fn set_last_modified(&self, value: Option<&str>) {
+        self.state.borrow_mut().document_last_modified = value.map(str::to_string);
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -659,12 +863,52 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().referrer = referrer.to_string();
     }
 
+    /// Install the current document's Referrer-Policy for fetch/XHR and other
+    /// browser-owned requests initiated from this realm.
+    pub fn set_referrer_policy(&mut self, policy: &str) {
+        let escaped = policy.replace('\\', "\\\\").replace('\'', "\\'");
+        let _ = self.runtime.execute_script(
+            "<referrer-policy>",
+            format!("globalThis.__obscura_referrer_policy='{}';", escaped),
+        );
+    }
+
+    /// Set the Unix-epoch timestamp captured when the document navigation
+    /// started. The bootstrap uses this as Performance.timeOrigin.
+    pub fn set_performance_time_origin(&mut self, milliseconds: f64) {
+        if milliseconds.is_finite() && milliseconds > 0.0 {
+            let _ = self.runtime.execute_script(
+                "<performance-time-origin>",
+                format!("globalThis.__obscura_performance_time_origin_ms={milliseconds};"),
+            );
+        }
+    }
+
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
     }
 
+    /// Configure the generic selector/timing interaction policy. The policy
+    /// is installed before page scripts run and schedules only after the DOM
+    /// has had a chance to materialize the selected control.
+    pub fn set_input_strategy(&mut self, selector: Option<&str>, delay_ms: u64, key_delay_ms: u64) {
+        let Some(selector) = selector else { return };
+        let Ok(value) = serde_json::to_string(selector) else { return };
+        let _ = self.runtime.execute_script(
+            "<input-strategy>",
+            format!("globalThis.__obscura_input_strategy={{selector:{value},delayMs:{delay_ms},keyDelayMs:{key_delay_ms}}}; globalThis.__obscura_schedule_input_strategy?.();"),
+        );
+    }
+
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
+    }
+
+    /// Whether script has queued a navigation that has not been committed yet.
+    /// Peeking lets a settling page decide to commit one without consuming the
+    /// queue when it does not.
+    pub fn has_pending_navigation(&self) -> bool {
+        self.state.borrow().pending_navigation.is_some()
     }
 
     pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
@@ -673,6 +917,16 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_iframe_navigations(&self) -> Vec<PendingIframeNavigation> {
         std::mem::take(&mut self.state.borrow_mut().pending_iframe_navigations)
+    }
+
+    pub fn requeue_iframe_navigations(&self, leftover: Vec<PendingIframeNavigation>) {
+        if leftover.is_empty() {
+            return;
+        }
+        self.state
+            .borrow_mut()
+            .pending_iframe_navigations
+            .extend(leftover);
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
@@ -711,31 +965,97 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = enabled;
     }
 
-    pub fn set_user_agent(&mut self, ua: &str) {
-        let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
+    pub fn set_fingerprint(&mut self, fingerprint: &obscura_net::BrowserFingerprint) {
+        self.fingerprint = fingerprint.clone();
+        // Image subresources ride the renderer's own loader; keep its proxy and
+        // User-Agent identical to the page transport so a CDN never sees the
+        // same session arrive from two clients.
+        #[cfg(feature = "render")]
+        {
+            let proxy = self
+                .state
+                .borrow()
+                .http_client
+                .as_ref()
+                .and_then(|client| client.proxy_url().map(str::to_string));
+            obscura_render::set_image_transport(proxy, fingerprint.user_agent.clone());
+            // The font-family table answers for one platform's named families.
+            // An identity that claims macOS while resolving the Windows set is a
+            // cross-check a challenge reads out of two text measurements, so the
+            // table follows `navigator.platform` from the same fingerprint that
+            // drives the user agent.
+            obscura_render::inline::set_font_platform(&fingerprint.navigator_platform);
+        }
+        let Ok(json) = serde_json::to_string(fingerprint) else {
+            return;
+        };
+        let webgl_enabled = self.gpu_profile_enabled();
+        {
+            let mut state = self.state.borrow_mut();
+            state.fingerprint_json = json.clone();
+            state.stealth = self.stealth;
+            state.webgl_enabled = webgl_enabled;
+        }
         let _ = self.runtime.execute_script(
-            "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            "<set-fingerprint>",
+            format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
         );
+        let frame_contexts: Vec<_> = self
+            .frame_realms
+            .realms
+            .values()
+            .map(|realm| realm.context.clone())
+            .collect();
+        for context in frame_contexts {
+            let _ = self.execute_in_context(
+                &context,
+                "<set-fingerprint>",
+                &format!("globalThis.__obscura_set_fingerprint({json}); globalThis.__obscura_webgl_enabled={webgl_enabled};"),
+            );
+        }
+    }
+
+    /// Compatibility adapter for embedders which previously set only the UA.
+    /// New code should install a complete `BrowserFingerprint` contract.
+    pub fn set_user_agent(&mut self, ua: &str) {
+        self.set_fingerprint(&obscura_net::BrowserFingerprint::from_user_agent(ua));
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let p = platform.replace('\'', "\\'");
-        let uap = ua_platform.replace('\'', "\\'");
-        let uapv = ua_platform_version.replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
-            "<set-platform>",
-            format!(
-                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
-                p, uap, uapv
-            ),
-        );
+        let mut fingerprint = self.fingerprint.clone();
+        fingerprint.navigator_platform = platform.to_string();
+        fingerprint.ua_platform = ua_platform.to_string();
+        fingerprint.ua_platform_version = ua_platform_version.to_string();
+        self.set_fingerprint(&fingerprint);
+    }
+
+    /// Whether the GPU consistency profile is on. Without stealth it stays
+    /// opt-in through the environment, because the truthful answer for an
+    /// engine that paints no GPU pixels is that there is no context.
+    pub(crate) fn gpu_profile_enabled(&self) -> bool {
+        self.stealth
+            || std::env::var("OBSCURA_WEBGL_PROFILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .is_some()
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
+        self.stealth = enabled;
+        {
+            let mut state = self.state.borrow_mut();
+            state.stealth = enabled;
+            state.webgl_enabled = self.gpu_profile_enabled();
+        }
+        // set_fingerprint may have already run for this page, so push the
+        // profile flag from here too rather than relying on call order.
+        let webgl_enabled = self.gpu_profile_enabled();
         let _ = self.runtime.execute_script(
             "<set-stealth>",
-            format!("globalThis.__obscura_stealth = {};", enabled),
+            format!(
+                "globalThis.__obscura_stealth = {enabled}; \
+                 globalThis.__obscura_webgl_enabled = {webgl_enabled};"
+            ),
         );
     }
 
@@ -1174,7 +1494,9 @@ impl ObscuraJsRuntime {
     /// browser layer can then fetch them concurrently through the page-owned
     /// transport before synchronous layout or paint observes the cache.
     #[cfg(feature = "render")]
-    pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
+    pub fn pending_render_image_urls(
+        &self,
+    ) -> Vec<(String, crate::ops::ImageRequestProfile, obscura_dom::NodeId)> {
         let state = self.state.borrow();
         let base_url = document_base_url(&state);
         let Some(dom) = state.dom.as_ref() else {
@@ -1239,11 +1561,15 @@ impl ObscuraJsRuntime {
                     continue;
                 };
                 if !known && !url.starts_with("data:") {
-                    urls.push((url, profile));
+                    urls.push((url, profile, root));
                 }
             }
         }
-        urls.sort();
+        urls.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.2.raw().cmp(&right.2.raw()))
+        });
         urls.dedup();
         urls
     }
@@ -1308,13 +1634,46 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    /// True when an element-driven image load for this exact URL and CORS
+    /// profile is still in flight. A speculative warmup must not race it:
+    /// single-use challenge assets answer the second request with 4xx even
+    /// though the element's own request would have succeeded.
+    #[cfg(feature = "render")]
+    pub fn render_image_in_flight(
+        &self,
+        url: &str,
+        profile: crate::ops::ImageRequestProfile,
+    ) -> bool {
+        let state = self.state.borrow();
+        state
+            .render_image_in_flight
+            .keys()
+            .any(|(generation, in_flight_url, in_flight_profile)| {
+                *generation == state.document_generation
+                    && in_flight_url == url
+                    && *in_flight_profile == profile
+            })
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        // Before __obscura_init, which is where the bootstrap picks the
+        // collection up and hangs it off Document.prototype.
+        self.install_document_all();
         let _ = self.runtime.execute_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+    }
+
+    /// Put `document.all`'s backing object on the main realm's global. It has
+    /// to be built through the V8 API -- see crate::document_all -- so it
+    /// cannot come from the bootstrap like the rest of the DOM.
+    pub(crate) fn install_document_all(&mut self) {
+        let scope = &mut self.runtime.handle_scope();
+        let context = scope.get_current_context();
+        crate::document_all::install(scope, context);
     }
 
     /// Direct access to the deno_core runtime for the realm host
@@ -1350,8 +1709,27 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Ambient execution-source label for this runtime's main context
+    /// (trace_source.rs). Worker isolates set it to their `worker(M)[creator]`
+    /// label right after construction.
+    pub fn set_trace_ambient(&self, label: &str) {
+        *self.trace_ambient_label.borrow_mut() = label.to_string();
+        crate::trace_source::set_ambient(label);
+    }
+
+    /// Push an explicit execution-source label for host-injected code
+    /// (preloads, isolated-world injections). The guard pops on drop.
+    pub fn trace_source_guard(
+        &self,
+        label: &str,
+    ) -> crate::trace_source::TraceSourceGuard {
+        crate::trace_source::push(label)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         self.begin_javascript_task();
+        // Host-injected code (`Page::evaluate`, `--eval`): one labeled unit.
+        let _trace_source = crate::trace_source::push("host");
         let wrapped = Self::wrap_expression(expression);
         let result = self
             .runtime
@@ -1392,6 +1770,8 @@ impl ObscuraJsRuntime {
             })
             .collect();
         self.begin_javascript_task();
+        // Host-injected code (CDP Runtime.evaluate with awaitPromise).
+        let _trace_source = crate::trace_source::push("host");
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let done_counter = self.object_counter;
@@ -1543,6 +1923,8 @@ impl ObscuraJsRuntime {
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
+        // Host-injected code (CDP Runtime.evaluate without returnByValue).
+        let _trace_source = crate::trace_source::push("host");
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
@@ -2580,7 +2962,21 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.execute_classic_script_at(name, source, 0)
+    }
+
+    fn execute_classic_script_at(
+        &mut self,
+        name: &str,
+        source: &str,
+        line_offset: i32,
+    ) -> Result<(), String> {
         self.begin_javascript_task();
+        // Refresh the ambient trace label for this runtime's main context:
+        // the thread-local is shared by every realm in the isolate, so a
+        // previous frame-realm turn must not bleed into this one. No-op when
+        // tracing is off.
+        crate::trace_source::set_ambient(&self.trace_ambient_label.borrow());
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
@@ -2593,7 +2989,7 @@ impl ObscuraJsRuntime {
         let origin = deno_core::v8::ScriptOrigin::new(
             scope,
             name.into(),
-            0,
+            line_offset,
             0,
             false,
             0,
@@ -2638,11 +3034,122 @@ impl ObscuraJsRuntime {
         self.execute_classic_script(name, source)
     }
 
+    async fn inspector_post_message(
+        &mut self,
+        session: &mut deno_core::LocalInspectorSession,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let request = Box::pin(session.post_message(method, params));
+        self.runtime
+            .with_event_loop_future(request, deno_core::PollEventLoopOptions::default())
+            .await
+            .map_err(|error| format!("inspector {method} failed: {error}"))
+    }
+
+    fn local_inspector_session(&mut self) -> deno_core::LocalInspectorSession {
+        self.runtime.maybe_init_inspector();
+        self.runtime
+            .inspector()
+            .borrow()
+            .create_local_session(deno_core::InspectorSessionOptions {
+                kind: deno_core::InspectorSessionKind::NonBlocking {
+                    wait_for_disconnect: false,
+                },
+            })
+    }
+
+    pub fn enable_debugger(&mut self) {
+        self.runtime.maybe_init_inspector();
+    }
+
+    /// Snapshot every script V8 currently retains in this isolate. This also
+    /// includes scripts compiled through page `eval()`/`Function`, which do not
+    /// pass through the embedder's classic-script execution methods.
+    pub async fn debugger_scripts(&mut self) -> Result<Vec<DebuggerScript>, String> {
+        let mut session = self.local_inspector_session();
+        let mut notifications = session.take_notification_rx();
+        self.inspector_post_message(&mut session, "Debugger.enable", None)
+            .await?;
+
+        let mut scripts = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if notification.get("method").and_then(serde_json::Value::as_str)
+                != Some("Debugger.scriptParsed")
+            {
+                continue;
+            }
+            let Some(params) = notification.get("params") else { continue };
+            let Some(script_id) = params.get("scriptId").and_then(serde_json::Value::as_str)
+            else { continue };
+            scripts.push(DebuggerScript {
+                script_id: script_id.to_string(),
+                url: params.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                start_line: params.get("startLine").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                start_column: params.get("startColumn").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                end_line: params.get("endLine").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                end_column: params.get("endColumn").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                hash: params.get("hash").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                length: params.get("length").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            });
+        }
+        Ok(scripts)
+    }
+
+    pub async fn debugger_script_source(&mut self, script_id: &str) -> Result<String, String> {
+        let mut session = self.local_inspector_session();
+        self.inspector_post_message(&mut session, "Debugger.enable", None)
+            .await?;
+        let result = self
+            .inspector_post_message(
+                &mut session,
+                "Debugger.getScriptSource",
+                Some(serde_json::json!({"scriptId": script_id})),
+            )
+            .await?;
+        result
+            .get("scriptSource")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "inspector response did not contain scriptSource".to_string())
+    }
+
+    /// Execute a classic script with the parser-provided document line of its
+    /// first source line. External scripts pass zero; inline scripts pass the
+    /// HTML start-tag line minus one.
+    pub fn execute_script_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        line_offset: u64,
+    ) -> Result<(), String> {
+        let line_offset = line_offset.saturating_sub(1).min(i32::MAX as u64) as i32;
+        self.execute_classic_script_at(name, source, line_offset)
+    }
+
     pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
         if source.len() < 10_000 {
             self.execute_script(name, source)
         } else {
             self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
+        }
+    }
+
+    pub fn execute_script_guarded_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        line: u64,
+    ) -> Result<(), String> {
+        if source.len() < 10_000 {
+            self.execute_script_at_line(name, source, line)
+        } else {
+            self.execute_script_with_timeout_at_line(
+                name,
+                source,
+                std::time::Duration::from_secs(5),
+                line,
+            )
         }
     }
 
@@ -2652,8 +3159,18 @@ impl ObscuraJsRuntime {
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        self.execute_script_with_timeout_at_line(name, source, timeout, 0)
+    }
+
+    fn execute_script_with_timeout_at_line(
+        &mut self,
+        name: &str,
+        source: &str,
+        timeout: std::time::Duration,
+        line: u64,
+    ) -> Result<(), String> {
         if timeout.is_zero() {
-            return self.execute_classic_script(name, source);
+            return self.execute_script_at_line(name, source, line);
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -2681,7 +3198,7 @@ impl ObscuraJsRuntime {
             }
         });
 
-        let result = self.execute_classic_script(name, source);
+        let result = self.execute_script_at_line(name, source, line);
 
         {
             let (lock, cvar) = &*pair;
@@ -2746,23 +3263,21 @@ impl ObscuraJsRuntime {
         result
     }
 
-    /// Start the main realm's cross-document message recv loop the first
-    /// time a MainRealm-targeted entry is queued (Phase 4). Must only be
-    /// called from an async pump path: the loop's `op_frame_message_recv`
-    /// can only be spawned inside a live tokio context. Messages queue in
-    /// Rust until the loop's first scan, so nothing is lost by the lazy
-    /// start; pages that never receive frame messages pay one bool check.
+    /// Start the main realm's cross-document message recv loop on the first
+    /// event-loop turn (Phase 4). Must only be called from an async pump path:
+    /// the loop's `op_frame_message_recv` can only be spawned inside a live
+    /// tokio context. Starting it before a message exists is required because
+    /// a frame can post while the event loop is already parked on network or
+    /// timer work; a queue-only check here would miss that first notification.
     fn ensure_frame_message_pump(&mut self) {
         if self.frame_message_pump_started {
             return;
         }
-        let has_main_entry = self
-            .state
-            .borrow()
-            .frame_messages
-            .iter()
-            .any(|msg| matches!(msg.target, crate::ops::FrameMessageTarget::Main));
-        if !has_main_entry {
+        // Pages without frames should retain the ordinary event-loop shape and
+        // pay no async-op cost. Frame realms are registered before their
+        // scripts can call parent/top.postMessage, so this remains safe for
+        // messages that arrive later while the loop is already parked.
+        if self.frame_realms.active_count() == 0 {
             return;
         }
         self.frame_message_pump_started = true;
@@ -2816,6 +3331,16 @@ impl ObscuraJsRuntime {
                 };
                 // Target generation destroyed (navigation/detach): drop.
                 if !self.frame_realms.contains(&frame_id, generation) {
+                    if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+                        let payload = serde_json::to_string(&msg.payload).unwrap_or_default();
+                        eprintln!(
+                            "[pmsg] DROPPED to frame {} gen {} (realm gone) payload_bytes={} payload={}",
+                            frame_id,
+                            generation,
+                            payload.len(),
+                            payload
+                        );
+                    }
                     continue;
                 }
                 let source_expr = match msg.source {
@@ -2977,6 +3502,36 @@ impl ObscuraJsRuntime {
         nearest
     }
 
+    /// Restore a live wake path after an embedder cancels a pending
+    /// run-to-idle poll. deno_core's mutable timer sleep can retain the waker
+    /// from that dropped future, so a due timer then never resolves it. Two
+    /// prongs, both run only when a browser timer is already overdue:
+    /// enqueueing a throwaway zero-delay user timer forces deno_core's
+    /// `queue_timer` to re-arm that sleep at a deadline that has already
+    /// passed (its `change()` marks the sleep ready), and the yield-only
+    /// async op wakes the next event-loop poll so the ready sleep is
+    /// actually observed. Neither touches the overdue timer's own deadline
+    /// or ordering.
+    fn queue_overdue_timer_wake_repair(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let overdue_timer = self
+            .state
+            .borrow()
+            .browser_timer_deadlines
+            .values()
+            .any(|deadline| *deadline <= now);
+        if !overdue_timer {
+            return false;
+        }
+        tracing::trace!(target: "obscura::timers", "queued overdue timer wake repair");
+        let _ = self.execute_script(
+            "<obscura:timer-wake>",
+            "try { Deno.core.queueUserTimer(0, false, 0, function () {}); } catch (_e) {}\n\
+             void Deno.core.ops.op_posted_task().catch(() => {});",
+        );
+        true
+    }
+
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
@@ -3095,6 +3650,21 @@ impl ObscuraJsRuntime {
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
+        let tick_started = std::time::Instant::now();
+        self.queue_overdue_timer_wake_repair();
+        if tracing::enabled!(target: "obscura::timers", tracing::Level::TRACE) {
+            let now_ms = self
+                .evaluate("performance.now()")
+                .ok()
+                .and_then(|value| value.as_f64());
+            let next_timeout_ms = self.next_pending_timeout_delay_ms();
+            tracing::trace!(
+                target: "obscura::timers",
+                now_ms = ?now_ms,
+                next_timeout_ms = ?next_timeout_ms,
+                "event loop tick started"
+            );
+        }
         self.begin_javascript_task();
         // Messages queued by the previous turn precede work polled in this
         // one. This also guarantees progress when recurring page work keeps
@@ -3115,9 +3685,15 @@ impl ObscuraJsRuntime {
                     "Event loop error: {error}"
                 ))),
                 std::task::Poll::Pending if waiting_for_wake => {
+                    tracing::trace!(
+                        target: "obscura::timers",
+                        elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
+                        "event loop wake returned pending"
+                    );
                     std::task::Poll::Ready(Ok(false))
                 }
                 std::task::Poll::Pending => {
+                    tracing::trace!(target: "obscura::timers", "event loop parked");
                     waiting_for_wake = true;
                     std::task::Poll::Pending
                 }
@@ -3131,6 +3707,14 @@ impl ObscuraJsRuntime {
             // resolves on the next tick, so callers must keep pumping.
             Ok(idle) => {
                 let delivered_after_poll = self.drain_frame_messages();
+                tracing::trace!(
+                    target: "obscura::timers",
+                    elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
+                    idle,
+                    delivered_before_poll,
+                    delivered_after_poll,
+                    "event loop tick complete"
+                );
                 Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
             }
             Err(error) => Err(error),
@@ -3153,6 +3737,7 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        let repair_queued = self.queue_overdue_timer_wake_repair();
         self.begin_javascript_task();
         // Preserve postMessage task ordering and make already-queued frame
         // traffic progress before a long-lived runtime poll can park.
@@ -3165,12 +3750,13 @@ impl ObscuraJsRuntime {
         );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+            watchdog_debug("autonomous-checkpoint", AUTONOMOUS_TASK_WATCHDOG_MS);
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
 
         let isolate_handle = self.isolate_handle();
-        let mut waiting_for_wake = false;
+        let mut pending_polls = 0u8;
         let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
@@ -3181,6 +3767,7 @@ impl ObscuraJsRuntime {
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
+                watchdog_debug("autonomous-poll", AUTONOMOUS_TASK_WATCHDOG_MS);
                 self.runtime.v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
@@ -3191,12 +3778,15 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
-                }
                 std::task::Poll::Pending => {
-                    waiting_for_wake = true;
-                    std::task::Poll::Pending
+                    pending_polls = pending_polls.saturating_add(1);
+                    // The repair wake refreshes deno_core's timer sleep waker;
+                    // one further poll is needed to deliver the overdue timer.
+                    if pending_polls == 1 || (repair_queued && pending_polls == 2) {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(false))
+                    }
                 }
             }
         })
@@ -3272,11 +3862,19 @@ impl ObscuraJsRuntime {
             // are intentionally excluded, and distant one-shots are treated
             // like Chromium after `load`: callers needing an arbitrary fixed
             // delay can request strict settle.
-            let near_timeout = self
-                .next_pending_timeout_delay_ms()
+            let next_timeout_ms = self.next_pending_timeout_delay_ms();
+            let near_timeout = next_timeout_ms
                 .is_some_and(|delay| delay <= quiet.as_secs_f64() * 2_000.0);
             let external_work_pending = now < external_work_deadline
                 && (self.has_pending_network_requests() || self.has_pending_dynamic_scripts());
+            tracing::trace!(
+                target: "obscura::timers",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                next_timeout_ms = ?next_timeout_ms,
+                near_timeout,
+                external_work_pending,
+                "settle policy"
+            );
             if external_work_pending {
                 activity_deadline = deadline.min(external_work_deadline + activity_tail);
                 generation = next_generation;
@@ -3327,6 +3925,11 @@ impl ObscuraJsRuntime {
                 self.run_cooperative_event_loop_tick(),
             )
             .await;
+            tracing::trace!(
+                target: "obscura::timers",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "settle tick returned"
+            );
             let tick_fired = self.disarm_watchdog(tick_watchdog);
             if tick_fired {
                 break Ok(());
@@ -3357,6 +3960,7 @@ impl ObscuraJsRuntime {
             return self.evaluate(expression);
         }
         self.begin_javascript_task();
+        let _trace_source = crate::trace_source::push("host");
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
         let result = self.runtime.execute_script("<eval>", wrapped);
@@ -3579,7 +4183,7 @@ impl ObscuraJsRuntime {
                     st = 'array'; cn = 'Array';
                     desc = 'Array(' + v.length + ')';
                 }}
-                else if (t === 'object' && typeof v._nid === 'number') {{
+                else if (t === 'object' && typeof v[Symbol.for('obscura.nid')] === 'number') {{
                     st = 'node';
                     cn = v.constructor ? v.constructor.name : 'Node';
                     if (v.nodeType === 9) cn = 'HTMLDocument';
@@ -3811,6 +4415,4216 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    /// `setup_runtime` on an origin that is a secure context. Chrome exposes
+    /// serviceWorker, crypto.subtle, caches, storage, clipboard, wakeLock,
+    /// credentials, locks and mediaDevices *only* there, so a test that
+    /// touches any of them has to say which kind of origin it means. The
+    /// plain `setup_runtime` origin is `http://example.com`, which is
+    /// insecure -- most of the suite predates the distinction existing.
+    fn setup_secure_runtime(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://example.com/test");
+        rt.set_title("Test Page");
+        rt.run_page_init();
+        rt
+    }
+
+    fn setup_privacy_runtime() -> ObscuraJsRuntime {
+        let rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://top.example/page");
+        rt.set_top_origin(obscura_dom::Origin::from_url("https://top.example/page"));
+        rt
+    }
+
+    /// SVG fragments have to participate in the geometry interfaces the way
+    /// Chrome does (verified against headless Chrome on the same fixture):
+    /// getCTM composes the element's own transform, ancestor transforms and
+    /// the viewBox map; getScreenCTM adds the root svg's viewport origin plus
+    /// the window origin; getBoundingClientRect maps the fragment bbox corners
+    /// through the viewport CTM (rotate swaps width/height); getBBox of a
+    /// container unions its children; geometry elements answer path lengths.
+    /// Before env/html/svg-geometry.js every SVG child answered gBCR with an
+    /// all-zero rect and getCTM/getScreenCTM/getTotalLength did not exist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn svg_fragment_geometry_matches_chrome_mapping() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+<svg id="s1" width="300" height="100" style="position:absolute;left:40px;top:30px">
+  <g id="g1" transform="translate(10,20) scale(2)"><text id="t1" font-size="12">MMMM</text></g>
+  <g id="gr" transform="rotate(90 10 10)"><text id="t4" font-size="12">MMMM</text></g>
+  <g id="gg"><text id="a1" x="0" y="0" font-size="12">AAAA</text><text id="a2" x="0" y="30" font-size="12">BBBB</text></g>
+</svg>
+<svg id="s2" width="200" height="100" viewBox="50 25 100 50" style="position:absolute;left:0;top:200px"><rect id="r2" x="0" y="0" width="40" height="20"/></svg>
+<svg id="s3" width="120" height="60" style="position:absolute;left:0;top:320px"><circle id="c1" cx="50" cy="30" r="20"/><rect id="r3" x="10" y="10" width="30" height="15"/><path id="p1" d="M0 0 L100 0"/></svg>
+</body></html>"#,
+        );
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const $ = id => document.getElementById(id);
+                    const root = $("s1");
+                    const rootRect = root.getBoundingClientRect();
+                    const ctm = $("t1").getCTM();
+                    const sctm = $("t1").getScreenCTM();
+                    const bbox = $("t1").getBBox();
+                    const rect = $("t1").getBoundingClientRect();
+                    const rotated = $("t4").getBoundingClientRect();
+                    const rotatedBox = $("t4").getBBox();
+                    const union = $("gg").getBBox();
+                    const one = $("a1").getBBox();
+                    const vb = $("r2").getCTM();
+                    const circleLen = $("c1").getTotalLength();
+                    const p = $("p1").getPointAtLength(50);
+                    const list = $("t1").getClientRects();
+                    const div = document.createElement("div");
+                    return {
+                        // The root keeps its real layout box; children map
+                        // through it. (The unit environment sizes the root
+                        // through its default intrinsic box without render
+                        // warmup; the exact 300x100 attribute sizing is
+                        // covered by the fixture runs against the binary.)
+                        rootBoxFromLayout: rootRect.width > 0 && rootRect.height > 0
+                            && rootRect.width === root.getBoundingClientRect().width,
+                        ctmScaled: [ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f]
+                            .every((v, i) => Math.abs(v - [2, 0, 0, 2, 10, 20][i]) < 1e-9),
+                        screenCtmAddsOrigins:
+                            Math.abs(sctm.e - (window.screenX + rootRect.x + 10)) < 1e-6
+                            && Math.abs(sctm.f - (window.screenY + rootRect.y + 20)) < 1e-6,
+                        gBCRScaledBox:
+                            Math.abs(rect.x - (rootRect.x + 10)) < 1e-6
+                            && Math.abs(rect.y - (rootRect.y + 20 + bbox.y * 2)) < 1e-6
+                            && Math.abs(rect.width - bbox.width * 2) < 1e-6
+                            && Math.abs(rect.height - bbox.height * 2) < 1e-6,
+                        gBCRRotateSwaps:
+                            Math.abs(rotated.width - rotatedBox.height) < 1e-6
+                            && Math.abs(rotated.height - rotatedBox.width) < 1e-6,
+                        viewBoxCtm: [vb.a, vb.b, vb.c, vb.d, vb.e, vb.f]
+                            .every((v, i) => Math.abs(v - [2, 0, 0, 2, -100, -50][i]) < 1e-9),
+                        containerUnionGapsByBaseline:
+                            Math.abs((union.height - one.height) - 30) < 1e-6
+                            && Math.abs(union.y - one.y) < 1e-6,
+                        circleLengthNearCircumference:
+                            Math.abs(circleLen - 2 * Math.PI * 20) < 0.5,
+                        rectPerimeter: $("r3").getTotalLength() === 90,
+                        pointAtLengthExact: p.x === 50 && p.y === 0,
+                        clientRectsSingleFragment: list.length === 1
+                            && Math.abs(list.item(0).x - rect.x) < 1e-6,
+                        htmlOutsideSvgHasNoCtm: div.getCTM() === null && div.getScreenCTM() === null,
+                        textIsNotGeometry: typeof $("t1").getTotalLength === "undefined",
+                        circleIsGeometry: $("c1") instanceof SVGGeometryElement,
+                        rectShapeIsGeometry: $("r3") instanceof SVGGeometryElement,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "rootBoxFromLayout": true,
+                "ctmScaled": true,
+                "screenCtmAddsOrigins": true,
+                "gBCRScaledBox": true,
+                "gBCRRotateSwaps": true,
+                "viewBoxCtm": true,
+                "containerUnionGapsByBaseline": true,
+                "circleLengthNearCircumference": true,
+                "rectPerimeter": true,
+                "pointAtLengthExact": true,
+                "clientRectsSingleFragment": true,
+                "htmlOutsideSvgHasNoCtm": true,
+                "textIsNotGeometry": true,
+                "circleIsGeometry": true,
+                "rectShapeIsGeometry": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_privacy_apis_match_chrome_shape_defaults_and_failures() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const describe = name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        return {
+                            name: descriptor.value.name,
+                            length: descriptor.value.length,
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                            writable: descriptor.writable,
+                            string: String(descriptor.value),
+                        };
+                    };
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name }; }
+                    };
+                    const tokenPromise = document.hasPrivateToken("https://one.example/path");
+                    const tokenOne = await tokenPromise;
+                    const tokenTwo = await document.hasPrivateToken("https://two.example");
+                    return {
+                        descriptors: {
+                            token: describe("hasPrivateToken"),
+                            redemption: describe("hasRedemptionRecord"),
+                            storage: describe("hasStorageAccess"),
+                        },
+                        tokenPromise: tokenPromise instanceof Promise,
+                        tokenOne,
+                        tokenTwo,
+                        tokenThird: await outcome(() => document.hasPrivateToken("https://three.example")),
+                        redemptionThird: await outcome(() => document.hasRedemptionRecord("https://three.example")),
+                        invalidIssuer: await outcome(() => document.hasRedemptionRecord("http://issuer.example")),
+                        missingArgument: await outcome(() => document.hasRedemptionRecord()),
+                        illegalInvocation: await outcome(() => Document.prototype.hasPrivateToken.call({})),
+                        detached: await outcome(() => Document.prototype.hasPrivateToken.call(
+                            document.implementation.createHTMLDocument("detached"),
+                            "https://issuer.example")),
+                        storage: await document.hasStorageAccess(),
+                        detachedStorage: await outcome(() => Document.prototype.hasStorageAccess.call(
+                            document.implementation.createHTMLDocument("detached"))),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "descriptors": {
+                    "token": {
+                        "name": "hasPrivateToken", "length": 1, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasPrivateToken() { [native code] }",
+                    },
+                    "redemption": {
+                        "name": "hasRedemptionRecord", "length": 1, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasRedemptionRecord() { [native code] }",
+                    },
+                    "storage": {
+                        "name": "hasStorageAccess", "length": 0, "enumerable": true,
+                        "configurable": true, "writable": true,
+                        "string": "function hasStorageAccess() { [native code] }",
+                    },
+                },
+                "tokenPromise": true,
+                "tokenOne": false,
+                "tokenTwo": false,
+                "tokenThird": { "name": "OperationError" },
+                "redemptionThird": { "value": false },
+                "invalidIssuer": { "name": "TypeError" },
+                "missingArgument": { "name": "TypeError" },
+                "illegalInvocation": { "name": "TypeError" },
+                "detached": { "name": "InvalidStateError" },
+                "storage": true,
+                "detachedStorage": { "name": "InvalidStateError" },
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_legacy_and_capability_methods_match_chrome_shape_and_defaults() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const lengths = {
+                        ariaNotify: 1, browsingTopics: 0,
+                        hasUnpartitionedCookieAccess: 0,
+                        captureEvents: 0, releaseEvents: 0, clear: 0,
+                        exitPointerLock: 0, webkitCancelFullScreen: 0,
+                        webkitExitFullscreen: 0, queryCommandEnabled: 1,
+                        queryCommandIndeterm: 1, queryCommandState: 1,
+                        queryCommandSupported: 1, queryCommandValue: 1,
+                    };
+                    const descriptors = Object.entries(lengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        let constructError = null;
+                        try { Reflect.construct(descriptor.value, []); }
+                        catch (error) { constructError = error.name; }
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                            Function.prototype.toString.call(descriptor.value), constructError];
+                    });
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    const syncNames = ['captureEvents', 'releaseEvents', 'clear',
+                        'exitPointerLock', 'webkitCancelFullScreen', 'webkitExitFullscreen'];
+                    const sync = Object.fromEntries(syncNames.map(name => [name, [
+                        typeof document[name](),
+                        (() => { try { Document.prototype[name].call({}); return null; }
+                                  catch (error) { return error.name; } })(),
+                    ]]));
+                    const idle = {
+                        bold: [document.queryCommandEnabled('bold'),
+                            document.queryCommandState('bold'),
+                            document.queryCommandValue('bold')],
+                        selectAll: document.queryCommandEnabled('selectAll'),
+                        styleWithCSS: document.queryCommandEnabled('styleWithCSS'),
+                        unknown: [document.queryCommandEnabled('unknown'),
+                            document.queryCommandSupported('unknown'),
+                            document.queryCommandValue('unknown')],
+                    };
+                    const editable = document.createElement('div');
+                    editable.contentEditable = 'true';
+                    editable.innerHTML = '<b>bold</b> plain';
+                    document.body.appendChild(editable);
+                    editable.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(editable.firstChild);
+                    const selection = document.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return {
+                        descriptors,
+                        sync,
+                        topics: await document.browsingTopics(),
+                        topicsPromise: document.browsingTopics() instanceof Promise,
+                        unpartitioned: await document.hasUnpartitionedCookieAccess(),
+                        unpartitionedPromise:
+                            document.hasUnpartitionedCookieAccess() instanceof Promise,
+                        aria: typeof document.ariaNotify('updated'),
+                        ariaMissing: await outcome(() => document.ariaNotify()),
+                        syncBadReceiver: await outcome(() =>
+                            Document.prototype.clear.call({})),
+                        asyncBadReceiver: await outcome(() =>
+                            Document.prototype.browsingTopics.call({})),
+                        queryMissing: await outcome(() => document.queryCommandEnabled()),
+                        idle,
+                        editable: {
+                            bold: [document.queryCommandEnabled('bold'),
+                                document.queryCommandState('bold'),
+                                document.queryCommandValue('bold')],
+                            italic: document.queryCommandEnabled('italic'),
+                            insertText: document.queryCommandEnabled('insertText'),
+                            createLink: document.queryCommandEnabled('createLink'),
+                            indeterm: document.queryCommandIndeterm('bold'),
+                            supported: document.queryCommandSupported('bold'),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            ("ariaNotify", 1), ("browsingTopics", 0),
+            ("hasUnpartitionedCookieAccess", 0), ("captureEvents", 0),
+            ("releaseEvents", 0), ("clear", 0), ("exitPointerLock", 0),
+            ("webkitCancelFullScreen", 0), ("webkitExitFullscreen", 0),
+            ("queryCommandEnabled", 1), ("queryCommandIndeterm", 1),
+            ("queryCommandState", 1), ("queryCommandSupported", 1),
+            ("queryCommandValue", 1),
+        ];
+        let descriptors = names.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true, true, true,
+            format!("function {name}() {{ [native code] }}"), "TypeError"
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "descriptors": descriptors,
+                "sync": {
+                    "captureEvents": ["undefined", "TypeError"],
+                    "releaseEvents": ["undefined", "TypeError"],
+                    "clear": ["undefined", "TypeError"],
+                    "exitPointerLock": ["undefined", "TypeError"],
+                    "webkitCancelFullScreen": ["undefined", "TypeError"],
+                    "webkitExitFullscreen": ["undefined", "TypeError"],
+                },
+                "topics": [], "topicsPromise": true,
+                "unpartitioned": true, "unpartitionedPromise": true,
+                "aria": "undefined",
+                "ariaMissing": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'ariaNotify' on 'Document': 1 argument required, but only 0 present.",
+                },
+                "syncBadReceiver": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'clear' on 'Document': Illegal invocation",
+                },
+                "asyncBadReceiver": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'browsingTopics' on 'Document': Illegal invocation",
+                },
+                "queryMissing": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'queryCommandEnabled' on 'Document': 1 argument required, but only 0 present.",
+                },
+                "idle": {
+                    "bold": [false, false, "false"],
+                    "selectAll": true, "styleWithCSS": true,
+                    "unknown": [false, false, ""],
+                },
+                "editable": {
+                    "bold": [true, true, "true"], "italic": true,
+                    "insertText": true, "createLink": true,
+                    "indeterm": false, "supported": true,
+                },
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_target_when_and_observable_match_chrome_shape_and_delivery() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const methodLengths = {
+                        catch: 1, drop: 1, every: 1, filter: 1, finally: 1,
+                        find: 1, first: 0, flatMap: 1, forEach: 1, inspect: 0,
+                        last: 0, map: 1, reduce: 1, some: 1, subscribe: 0,
+                        switchMap: 1, take: 1, takeUntil: 1, toArray: 0,
+                    };
+                    const methodShapes = Object.entries(methodLengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Observable.prototype, name);
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.enumerable,
+                            Function.prototype.toString.call(descriptor.value)];
+                    });
+                    let constructorError = null, subscriberError = null;
+                    try { new Observable(); } catch (error) { constructorError = [error.name, error.message]; }
+                    try { new Subscriber(); } catch (error) { subscriberError = [error.name, error.message]; }
+                    const run = {};
+                    const values = new Observable(subscriber => {
+                        run.subscriber = [Object.prototype.toString.call(subscriber),
+                            subscriber.active, subscriber.signal instanceof AbortSignal,
+                            Object.getOwnPropertyNames(subscriber)];
+                        subscriber.addTeardown(() => { run.teardown = (run.teardown || 0) + 1; });
+                        subscriber.next(1); subscriber.next(2); subscriber.next(3);
+                        subscriber.complete();
+                    });
+                    run.subscribeReturn = typeof values.subscribe({
+                        next(value) { (run.values || (run.values = [])).push(value); },
+                        complete() { run.complete = true; },
+                    });
+                    run.toArray = await values.toArray();
+                    run.mapFilterTake = await values.map(value => value * 2)
+                        .filter(value => value > 2).take(1).toArray();
+                    run.first = await values.first();
+                    run.last = await values.last();
+                    run.reduce = await values.reduce((sum, value) => sum + value, 0);
+                    const eventResults = [];
+                    const observable = document.when('oracle-event');
+                    const subscribeReturn = observable.subscribe(event =>
+                        eventResults.push([event.type, event.target === document]));
+                    document.dispatchEvent(new Event('oracle-event'));
+                    const controller = new AbortController();
+                    let abortedDeliveries = 0;
+                    document.when('abort-event').subscribe(() => abortedDeliveries++,
+                        { signal: controller.signal });
+                    controller.abort();
+                    document.dispatchEvent(new Event('abort-event'));
+                    const outcome = callback => {
+                        try { callback(); return null; }
+                        catch (error) { return [error.name, error.message]; }
+                    };
+                    return {
+                        constructors: {
+                            observable: [Observable.name, Observable.length,
+                                Function.prototype.toString.call(Observable), constructorError],
+                            subscriber: [Subscriber.name, Subscriber.length,
+                                Function.prototype.toString.call(Subscriber), subscriberError],
+                        },
+                        methodShapes,
+                        observableKeys: Object.getOwnPropertyNames(Observable.prototype).sort(),
+                        subscriberKeys: Object.getOwnPropertyNames(Subscriber.prototype).sort(),
+                        run,
+                        event: {
+                            tag: Object.prototype.toString.call(observable),
+                            subscribeReturn: typeof subscribeReturn,
+                            eventResults, abortedDeliveries,
+                            paths: [typeof globalThis.when, typeof document.when,
+                                typeof screen.when, typeof screen.orientation.when],
+                            own: [Object.prototype.hasOwnProperty.call(globalThis, 'when'),
+                                Object.prototype.hasOwnProperty.call(document, 'when'),
+                                Object.prototype.hasOwnProperty.call(screen, 'when'),
+                                Object.prototype.hasOwnProperty.call(screen.orientation, 'when')],
+                            shape: [document.when.name, document.when.length,
+                                Function.prototype.toString.call(document.when)],
+                            missing: outcome(() => document.when()),
+                            badReceiver: outcome(() => Node.prototype.when.call({}, 'x')),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let method_lengths = [
+            ("catch", 1), ("drop", 1), ("every", 1), ("filter", 1),
+            ("finally", 1), ("find", 1), ("first", 0), ("flatMap", 1),
+            ("forEach", 1), ("inspect", 0), ("last", 0), ("map", 1),
+            ("reduce", 1), ("some", 1), ("subscribe", 0), ("switchMap", 1),
+            ("take", 1), ("takeUntil", 1), ("toArray", 0),
+        ];
+        let method_shapes = method_lengths.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true,
+            format!("function {name}() {{ [native code] }}")
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructors": {
+                    "observable": ["Observable", 1,
+                        "function Observable() { [native code] }",
+                        ["TypeError", "Failed to construct 'Observable': 1 argument required, but only 0 present."]],
+                    "subscriber": ["Subscriber", 0,
+                        "function Subscriber() { [native code] }",
+                        ["TypeError", "Failed to construct 'Subscriber': Illegal constructor"]],
+                },
+                "methodShapes": method_shapes,
+                "observableKeys": ["catch", "constructor", "drop", "every", "filter",
+                    "finally", "find", "first", "flatMap", "forEach", "inspect", "last",
+                    "map", "reduce", "some", "subscribe", "switchMap", "take", "takeUntil",
+                    "toArray"],
+                "subscriberKeys": ["active", "addTeardown", "complete", "constructor",
+                    "error", "next", "signal"],
+                "run": {
+                    "subscriber": ["[object Subscriber]", true, true, []],
+                    "teardown": 6, "values": [1, 2, 3], "complete": true,
+                    "subscribeReturn": "undefined", "toArray": [1, 2, 3],
+                    "mapFilterTake": [4], "first": 1, "last": 3, "reduce": 6,
+                },
+                "event": {
+                    "tag": "[object Observable]", "subscribeReturn": "undefined",
+                    "eventResults": [["oracle-event", true]], "abortedDeliveries": 0,
+                    "paths": ["function", "function", "function", "function"],
+                    "own": [false, false, false, false],
+                    "shape": ["when", 1, "function when() { [native code] }"],
+                    "missing": ["TypeError",
+                        "Failed to execute 'when' on 'EventTarget': 1 argument required, but only 0 present."],
+                    "badReceiver": ["TypeError", "Illegal invocation"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn xpath_expression_and_namespace_resolver_match_chrome_shape_and_results() {
+        let mut rt = setup_runtime("<html><body><p>one</p><p>two</p></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+                const describe = name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                    return [descriptor.value.name, descriptor.value.length,
+                        descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                        Function.prototype.toString.call(descriptor.value)];
+                };
+                const error = callback => {
+                    try { callback(); return null; }
+                    catch (value) { return [value.name, value.message]; }
+                };
+                const expression = document.createExpression('//p', null);
+                const evaluated = expression.evaluate(
+                    document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                const resolver = document.createNSResolver(document.documentElement);
+                return {
+                    constructor: [XPathExpression.name, XPathExpression.length,
+                        Function.prototype.toString.call(XPathExpression),
+                        error(() => new XPathExpression())],
+                    methods: {
+                        expression: describe('createExpression'),
+                        resolver: describe('createNSResolver'),
+                        evaluate: [XPathExpression.prototype.evaluate.name,
+                            XPathExpression.prototype.evaluate.length,
+                            Object.getOwnPropertyDescriptor(
+                                XPathExpression.prototype, 'evaluate').enumerable,
+                            Function.prototype.toString.call(
+                                XPathExpression.prototype.evaluate)],
+                    },
+                    expression: [Object.prototype.toString.call(expression),
+                        Object.getOwnPropertyNames(expression),
+                        Object.getOwnPropertyNames(XPathExpression.prototype).sort()],
+                    result: [evaluated.resultType, evaluated.snapshotLength,
+                        evaluated.snapshotItem(0).tagName,
+                        evaluated.snapshotItem(1).textContent],
+                    resolver: [resolver === document.documentElement, resolver.nodeName],
+                    missingExpression: error(() => document.createExpression()),
+                    missingResolver: error(() => document.createNSResolver()),
+                    badDocument: error(() =>
+                        Document.prototype.createExpression.call({}, '//p')),
+                    badExpression: error(() =>
+                        XPathExpression.prototype.evaluate.call({}, document)),
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["XPathExpression", 0,
+                    "function XPathExpression() { [native code] }",
+                    ["TypeError", "Failed to construct 'XPathExpression': Illegal constructor"]],
+                "methods": {
+                    "expression": ["createExpression", 1, true, true, true,
+                        "function createExpression() { [native code] }"],
+                    "resolver": ["createNSResolver", 1, true, true, true,
+                        "function createNSResolver() { [native code] }"],
+                    "evaluate": ["evaluate", 1, true,
+                        "function evaluate() { [native code] }"],
+                },
+                "expression": ["[object XPathExpression]", [],
+                    ["constructor", "evaluate"]],
+                "result": [7, 2, "P", "two"],
+                "resolver": [true, "HTML"],
+                "missingExpression": ["TypeError",
+                    "Failed to execute 'createExpression' on 'Document': 1 argument required, but only 0 present."],
+                "missingResolver": ["TypeError",
+                    "Failed to execute 'createNSResolver' on 'Document': 1 argument required, but only 0 present."],
+                "badDocument": ["TypeError",
+                    "Failed to execute 'createExpression' on 'Document': Illegal invocation"],
+                "badExpression": ["TypeError", "Illegal invocation"],
+            })
+        );
+    }
+
+    #[test]
+    fn caret_position_and_legacy_range_match_chrome_shape_and_invariants() {
+        let mut rt = setup_runtime("<html><body><p>caret text</p></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+                const shape = name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                    return [descriptor.value.name, descriptor.value.length,
+                        descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                        Function.prototype.toString.call(descriptor.value)];
+                };
+                const error = callback => {
+                    try { callback(); return null; }
+                    catch (value) { return [value.name, value.message]; }
+                };
+                const position = document.caretPositionFromPoint(1, 1);
+                const range0 = document.caretRangeFromPoint();
+                const range = document.caretRangeFromPoint(1, 1);
+                const nodeLength = position.offsetNode.nodeType === 3
+                    ? position.offsetNode.data.length : position.offsetNode.childNodes.length;
+                const offsetGetter = Object.getOwnPropertyDescriptor(
+                    CaretPosition.prototype, 'offset').get;
+                return {
+                    constructor: [CaretPosition.name, CaretPosition.length,
+                        Function.prototype.toString.call(CaretPosition),
+                        error(() => new CaretPosition())],
+                    methods: {
+                        position: shape('caretPositionFromPoint'),
+                        range: shape('caretRangeFromPoint'),
+                        rect: [CaretPosition.prototype.getClientRect.name,
+                            CaretPosition.prototype.getClientRect.length,
+                            Object.getOwnPropertyDescriptor(
+                                CaretPosition.prototype, 'getClientRect').enumerable,
+                            Function.prototype.toString.call(
+                                CaretPosition.prototype.getClientRect)],
+                    },
+                    position: [Object.prototype.toString.call(position),
+                        Object.getOwnPropertyNames(position),
+                        Object.getOwnPropertyNames(CaretPosition.prototype).sort(),
+                        position.offsetNode.nodeType,
+                        position.offset >= 0 && position.offset <= nodeLength,
+                        Object.prototype.toString.call(position.getClientRect())],
+                    ranges: [range0 instanceof Range, range0.collapsed,
+                        range instanceof Range, range.collapsed,
+                        range.startContainer === range.endContainer,
+                        range.startOffset === range.endOffset],
+                    missing: error(() => document.caretPositionFromPoint()),
+                    badDocument: error(() =>
+                        Document.prototype.caretRangeFromPoint.call({})),
+                    badPosition: error(() => offsetGetter.call({})),
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["CaretPosition", 0,
+                    "function CaretPosition() { [native code] }",
+                    ["TypeError", "Failed to construct 'CaretPosition': Illegal constructor"]],
+                "methods": {
+                    "position": ["caretPositionFromPoint", 2, true, true, true,
+                        "function caretPositionFromPoint() { [native code] }"],
+                    "range": ["caretRangeFromPoint", 0, true, true, true,
+                        "function caretRangeFromPoint() { [native code] }"],
+                    "rect": ["getClientRect", 0, true,
+                        "function getClientRect() { [native code] }"],
+                },
+                "position": ["[object CaretPosition]", [],
+                    ["constructor", "getClientRect", "offset", "offsetNode"],
+                    3, true, "[object DOMRect]"],
+                "ranges": [true, true, true, true, true, true],
+                "missing": ["TypeError",
+                    "Failed to execute 'caretPositionFromPoint' on 'Document': 2 arguments required, but only 0 present."],
+                "badDocument": ["TypeError",
+                    "Failed to execute 'caretRangeFromPoint' on 'Document': Illegal invocation"],
+                "badPosition": ["TypeError", "Illegal invocation"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_transition_storage_exit_and_move_before_match_chrome() {
+        let mut rt = setup_privacy_runtime();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const lengths = {
+                        requestStorageAccess: 0, requestStorageAccessFor: 1,
+                        exitFullscreen: 0, exitPictureInPicture: 0,
+                        startViewTransition: 0, moveBefore: 2,
+                    };
+                    const shapes = Object.entries(lengths).map(([name, length]) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+                        let constructError = null;
+                        try { Reflect.construct(descriptor.value, []); }
+                        catch (error) { constructError = error.name; }
+                        return [name, descriptor.value.name, descriptor.value.length, length,
+                            descriptor.writable, descriptor.enumerable, descriptor.configurable,
+                            Function.prototype.toString.call(descriptor.value), constructError];
+                    });
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    let callbackCount = 0;
+                    const transition = document.startViewTransition({
+                        update() { callbackCount++; return Promise.resolve('done'); },
+                        types: ['alpha'],
+                    });
+                    const callbackBefore = callbackCount;
+                    transition.waitUntil(Promise.resolve());
+                    transition.types.add('beta');
+                    const promises = [transition.ready, transition.updateCallbackDone,
+                        transition.finished].map(value => value instanceof Promise);
+                    await transition.updateCallbackDone;
+                    await transition.ready;
+                    await transition.finished;
+                    const skipped = document.startViewTransition();
+                    skipped.skipTransition();
+                    await skipped.finished;
+                    const moved = document;
+                    const first = document.createComment('first');
+                    const second = document.createComment('second');
+                    moved.insertBefore(first, moved.documentElement);
+                    moved.insertBefore(second, moved.documentElement);
+                    const moveReturn = moved.moveBefore(second, first);
+                    const badMove = await outcome(() =>
+                        moved.moveBefore(moved.body, moved.head));
+                    const finishedGetter = Object.getOwnPropertyDescriptor(
+                        ViewTransition.prototype, 'finished').get;
+                    return {
+                        shapes,
+                        storage: {
+                            request: await outcome(() => document.requestStorageAccess()),
+                            same: await outcome(() =>
+                                document.requestStorageAccessFor(document.location.origin)),
+                            other: await outcome(() =>
+                                document.requestStorageAccessFor('https://other.example')),
+                            missing: await outcome(() => document.requestStorageAccessFor()),
+                        },
+                        exits: {
+                            fullscreen: await outcome(() => document.exitFullscreen()),
+                            picture: await outcome(() => document.exitPictureInPicture()),
+                        },
+                        transition: {
+                            constructor: [ViewTransition.name, ViewTransition.length,
+                                Function.prototype.toString.call(ViewTransition)],
+                            tag: Object.prototype.toString.call(transition),
+                            own: Object.getOwnPropertyNames(transition),
+                            keys: Object.getOwnPropertyNames(ViewTransition.prototype).sort(),
+                            callbackBefore, callbackAfter: callbackCount, promises,
+                            root: transition.transitionRoot === document.documentElement,
+                            types: [Object.prototype.toString.call(transition.types),
+                                transition.types.size, Array.from(transition.types.values())],
+                            skipped: await outcome(() => skipped.finished),
+                            badGetter: await outcome(() => finishedGetter.call({})),
+                        },
+                        move: {
+                            returnType: typeof moveReturn,
+                            children: Array.from(moved.childNodes)
+                                .map(node => [node.nodeType, node.nodeValue || node.nodeName]),
+                            sameParents: first.parentNode === moved && second.parentNode === moved,
+                            bad: badMove,
+                            badReceiver: await outcome(() =>
+                                Document.prototype.moveBefore.call({}, first, null)),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            ("requestStorageAccess", 0), ("requestStorageAccessFor", 1),
+            ("exitFullscreen", 0), ("exitPictureInPicture", 0),
+            ("startViewTransition", 0), ("moveBefore", 2),
+        ];
+        let shapes = names.iter().map(|(name, length)| serde_json::json!([
+            name, name, length, length, true, true, true,
+            format!("function {name}() {{ [native code] }}"), "TypeError"
+        ])).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "shapes": shapes,
+                "storage": {
+                    "request": {}, "same": {},
+                    "other": {"name": "NotAllowedError",
+                        "message": "requestStorageAccessFor not allowed"},
+                    "missing": {"name": "TypeError",
+                        "message": "Failed to execute 'requestStorageAccessFor' on 'Document': 1 argument required, but only 0 present."},
+                },
+                "exits": {
+                    "fullscreen": {"name": "TypeError",
+                        "message": "Failed to execute 'exitFullscreen' on 'Document': Document not active"},
+                    "picture": {"name": "InvalidStateError",
+                        "message": "Failed to execute 'exitPictureInPicture' on 'Document': There is no Picture-in-Picture element in this document."},
+                },
+                "transition": {
+                    "constructor": ["ViewTransition", 0,
+                        "function ViewTransition() { [native code] }"],
+                    "tag": "[object ViewTransition]", "own": [],
+                    "keys": ["constructor", "finished", "ready", "skipTransition",
+                        "transitionRoot", "types", "updateCallbackDone", "waitUntil"],
+                    "callbackBefore": 0, "callbackAfter": 1,
+                    "promises": [true, true, true], "root": true,
+                    "types": ["[object ViewTransitionTypeSet]", 2, ["alpha", "beta"]],
+                    "skipped": {}, "badGetter": {"name": "TypeError", "message": "Illegal invocation"},
+                },
+                "move": {
+                    "returnType": "undefined",
+                    "children": [[8, "second"], [8, "first"], [1, "HTML"]],
+                    "sameParents": true,
+                    "bad": {"name": "NotFoundError",
+                        "message": "Failed to execute 'moveBefore' on 'Document': The node before which the new node is to be inserted is not a child of this node."},
+                    "badReceiver": {"name": "TypeError",
+                        "message": "Failed to execute 'moveBefore' on 'Document': Illegal invocation"},
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn zok_non_native_object_and_state_buckets_match_chrome() {
+        let mut rt = setup_runtime(
+            "<html><body><a name=anchor-name></a><applet></applet>\
+             <embed id=plugin name=plugin></embed></body></html>",
+        );
+        let result = rt.evaluate(
+            r#"(() => {
+                const groups = {
+                    o: ['d.anchors','d.applets','d.children','d.customElementRegistry',
+                        'd.embeds','d.featurePolicy','d.fragmentDirective','d.plugins',
+                        'external','locationbar','menubar','personalbar','scrollbars',
+                        'statusbar','styleMedia','toolbar'],
+                    x: ['d.activeViewTransition','d.fullscreenElement',
+                        'd.pictureInPictureElement','d.pointerLockElement','d.rootElement',
+                        'd.textContent','d.webkitCurrentFullScreenElement',
+                        'd.webkitFullscreenElement','d.xmlEncoding','d.xmlVersion','fence'],
+                    F: ['credentialless','d.fullscreen','d.prerendering','d.wasDiscarded',
+                        'd.webkitIsFullScreen','d.xmlStandalone',
+                        'n.deprecatedRunAdAuctionEnforcesKAnonymity'],
+                    T: ['d.fullscreenEnabled','d.pictureInPictureEnabled',
+                        'd.webkitFullscreenEnabled','offscreenBuffering','originAgentCluster'],
+                };
+                const resolve = path => path.startsWith('d.')
+                    ? document[path.slice(2)]
+                    : path.startsWith('n.') ? navigator[path.slice(2)] : globalThis[path];
+                const classify = value => value == null
+                    ? (value === null ? 'x' : 'u')
+                    : Array.isArray(value) ? 'a'
+                    : value === true ? 'T'
+                    : value === false ? 'F'
+                    : typeof value === 'function' ? 'f'
+                    : typeof value === 'object' ? 'o' : typeof value;
+                const bucketFailures = Object.entries(groups).flatMap(([bucket, paths]) =>
+                    paths.flatMap(path => classify(resolve(path)) === bucket
+                        ? [] : [[path, classify(resolve(path))]]));
+                const collection = document.children;
+                let constructorError = null;
+                try { new HTMLCollection(); } catch (error) { constructorError = [error.name, error.message]; }
+                return {
+                    bucketCounts: Object.fromEntries(
+                        Object.entries(groups).map(([bucket, paths]) => [bucket, paths.length])),
+                    bucketFailures,
+                    collection: {
+                        tag: Object.prototype.toString.call(collection),
+                        array: Array.isArray(collection),
+                        instance: collection instanceof HTMLCollection,
+                        constructor: [HTMLCollection.name, HTMLCollection.length,
+                            Function.prototype.toString.call(HTMLCollection), constructorError],
+                        prototype: Object.getOwnPropertyNames(HTMLCollection.prototype).sort(),
+                        own: Object.getOwnPropertyNames(collection),
+                        keys: Object.keys(collection),
+                        item: collection.item(0) === document.documentElement,
+                        index: collection[0] === document.documentElement,
+                        repeated: collection === document.children,
+                        anchor: [document.anchors.length,
+                            document.anchors.namedItem('anchor-name') === document.querySelector('a'),
+                            document.anchors['anchor-name'] === document.querySelector('a')],
+                        embeds: [document.embeds.length, document.plugins === document.embeds,
+                            document.plugins.namedItem('plugin') === document.querySelector('embed')],
+                        iterable: Array.from(document.children).length,
+                    },
+                    documentObjects: {
+                        registry: document.customElementRegistry === customElements,
+                        policy: [Object.prototype.toString.call(document.featurePolicy),
+                            Object.getOwnPropertyNames(FeaturePolicy.prototype).sort(),
+                            document.featurePolicy.allowsFeature('geolocation'),
+                            document.featurePolicy.getAllowlistForFeature('geolocation')],
+                        fragment: [Object.prototype.toString.call(document.fragmentDirective),
+                            Object.getOwnPropertyNames(document.fragmentDirective),
+                            Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(document.fragmentDirective)).sort()],
+                    },
+                    windowObjects: {
+                        external: [Object.prototype.toString.call(external),
+                            Object.getOwnPropertyNames(external),
+                            Object.getOwnPropertyNames(External.prototype).sort()],
+                        bars: [locationbar, menubar, personalbar, scrollbars, statusbar, toolbar]
+                            .map(value => [Object.prototype.toString.call(value), value.visible,
+                                Object.getOwnPropertyNames(value)]),
+                        distinctBars: new Set(
+                            [locationbar, menubar, personalbar, scrollbars, statusbar, toolbar]).size,
+                        styleMedia: [Object.prototype.toString.call(styleMedia), styleMedia.type,
+                            styleMedia.matchMedium('screen'),
+                            Object.getOwnPropertyNames(Object.getPrototypeOf(styleMedia)).sort()],
+                    },
+                };
+            })()"#,
+        ).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bucketCounts": {"o": 16, "x": 11, "F": 7, "T": 5},
+                "bucketFailures": [],
+                "collection": {
+                    "tag": "[object HTMLCollection]", "array": false, "instance": true,
+                    "constructor": ["HTMLCollection", 0,
+                        "function HTMLCollection() { [native code] }",
+                        ["TypeError", "Failed to construct 'HTMLCollection': Illegal constructor"]],
+                    "prototype": ["constructor", "item", "length", "namedItem"],
+                    "own": ["0"], "keys": ["0"], "item": true, "index": true,
+                    "repeated": true, "anchor": [1, true, true],
+                    "embeds": [1, true, true], "iterable": 1,
+                },
+                "documentObjects": {
+                    "registry": true,
+                    "policy": ["[object FeaturePolicy]",
+                        ["allowedFeatures", "allowsFeature", "constructor", "features",
+                            "getAllowlistForFeature"], true, ["http://example.com"]],
+                    "fragment": ["[object FragmentDirective]", [], ["constructor"]],
+                },
+                "windowObjects": {
+                    "external": ["[object External]", [],
+                        ["AddSearchProvider", "IsSearchProviderInstalled", "constructor"]],
+                    "bars": [
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                        ["[object BarProp]", true, []], ["[object BarProp]", true, []],
+                    ],
+                    "distinctBars": 6,
+                    "styleMedia": ["[object StyleMedia]", "screen", true,
+                        ["matchMedium", "type"]],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn window_storage_constants_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const descriptor = (object, name) => {
+                        const d = Object.getOwnPropertyDescriptor(object, name);
+                        return d && [d.value, d.writable, d.enumerable, d.configurable];
+                    };
+                    return {
+                        values: [Window.TEMPORARY, Window.PERSISTENT,
+                            window.TEMPORARY, window.PERSISTENT],
+                        constructor: [descriptor(Window, 'TEMPORARY'),
+                            descriptor(Window, 'PERSISTENT')],
+                        prototype: [descriptor(Window.prototype, 'TEMPORARY'),
+                            descriptor(Window.prototype, 'PERSISTENT')],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": [0, 1, 0, 1],
+                "constructor": [[0, false, true, false], [1, false, true, false]],
+                "prototype": [[0, false, true, false], [1, false, true, false]],
+            })
+        );
+    }
+
+    #[test]
+    fn iframe_elements_use_the_dedicated_chrome_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(
+                            HTMLIFrameElement.prototype, name);
+                        return d ? {
+                            enumerable: d.enumerable,
+                            configurable: d.configurable,
+                            getter: d.get ? [d.get.name, d.get.length,
+                                Function.prototype.toString.call(d.get)] : null,
+                            setter: d.set ? [d.set.name, d.set.length,
+                                Function.prototype.toString.call(d.set)] : null,
+                            value: d.value ? [d.value.name, d.value.length,
+                                Function.prototype.toString.call(d.value)] : null,
+                        } : null;
+                    };
+                    frame.allow = 'camera *';
+                    frame.allowFullscreen = true;
+                    frame.allowPaymentRequest = true;
+                    frame.loading = 'lazy';
+                    frame.align = 'left';
+                    frame.scrolling = 'no';
+                    frame.frameBorder = '2';
+                    frame.longDesc = '/frame-desc';
+                    frame.marginHeight = '3';
+                    frame.marginWidth = '4';
+                    frame.credentialless = true;
+                    frame.csp = "connect-src 'none'";
+                    return {
+                        constructor: [HTMLIFrameElement.name, HTMLIFrameElement.length,
+                            Function.prototype.toString.call(HTMLIFrameElement)],
+                        brand: Object.prototype.toString.call(frame),
+                        instances: [frame instanceof HTMLIFrameElement,
+                            frame instanceof HTMLElement, frame instanceof Element],
+                        prototype: Object.getOwnPropertyNames(HTMLIFrameElement.prototype),
+                        descriptors: {
+                            csp: descriptor('csp'), allow: descriptor('allow'),
+                            sandbox: descriptor('sandbox'), loading: descriptor('loading'),
+                            contentWindow: descriptor('contentWindow'),
+                            getSVGDocument: descriptor('getSVGDocument'),
+                        },
+                        values: [frame.allow, frame.allowFullscreen,
+                            frame.allowPaymentRequest, frame.loading, frame.align,
+                            frame.scrolling, frame.frameBorder, frame.longDesc,
+                            frame.marginHeight, frame.marginWidth, frame.credentialless,
+                            frame.csp],
+                        elementIframeMembers: Object.getOwnPropertyNames(Element.prototype)
+                            .filter(name => ['sandbox', 'srcdoc', 'csp', 'contentDocument',
+                                'contentWindow'].includes(name)),
+                        featurePolicy: {
+                            tag: Object.prototype.toString.call(frame.featurePolicy),
+                            own: Object.getOwnPropertyNames(frame.featurePolicy),
+                            prototype: Object.getOwnPropertyNames(PermissionsPolicy.prototype),
+                            constructor: [PermissionsPolicy.name, PermissionsPolicy.length,
+                                Function.prototype.toString.call(PermissionsPolicy)],
+                        },
+                        featurePolicySame: frame.featurePolicy === frame.featurePolicy,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructor": ["HTMLIFrameElement", 0,
+                    "function HTMLIFrameElement() { [native code] }"],
+                "brand": "[object HTMLIFrameElement]",
+                "instances": [true, true, true],
+                "prototype": [
+                    "src", "srcdoc", "name", "sandbox", "allowFullscreen", "width",
+                    "height", "contentDocument", "contentWindow", "referrerPolicy", "csp",
+                    "allow", "featurePolicy", "loading", "align", "scrolling", "frameBorder",
+                    "longDesc", "marginHeight", "marginWidth", "getSVGDocument", "credentialless",
+                    "allowPaymentRequest", "constructor",
+                ],
+                "descriptors": {
+                    "csp": {"enumerable": true, "configurable": true,
+                        "getter": ["get csp", 0, "function get csp() { [native code] }"],
+                        "setter": ["set csp", 1, "function set csp() { [native code] }"],
+                        "value": null},
+                    "allow": {"enumerable": true, "configurable": true,
+                        "getter": ["get allow", 0, "function get allow() { [native code] }"],
+                        "setter": ["set allow", 1, "function set allow() { [native code] }"],
+                        "value": null},
+                    "sandbox": {"enumerable": true, "configurable": true,
+                        "getter": ["get sandbox", 0, "function get sandbox() { [native code] }"],
+                        "setter": ["set sandbox", 1, "function set sandbox() { [native code] }"],
+                        "value": null},
+                    "loading": {"enumerable": true, "configurable": true,
+                        "getter": ["get loading", 0, "function get loading() { [native code] }"],
+                        "setter": ["set loading", 1, "function set loading() { [native code] }"],
+                        "value": null},
+                    "contentWindow": {"enumerable": true, "configurable": true,
+                        "getter": ["get contentWindow", 0, "function get contentWindow() { [native code] }"],
+                        "setter": null, "value": null},
+                    "getSVGDocument": {"enumerable": true, "configurable": true,
+                        "getter": null, "setter": null,
+                        "value": ["getSVGDocument", 0, "function getSVGDocument() { [native code] }"]},
+                },
+                "values": ["camera *", true, true, "lazy", "left", "no", "2", "/frame-desc", "3", "4", true, "connect-src 'none'"],
+                "elementIframeMembers": [],
+                "featurePolicy": {
+                    "tag": "[object PermissionsPolicy]",
+                    "own": [],
+                    "prototype": ["allowedFeatures", "allowsFeature", "features",
+                        "getAllowlistForFeature", "constructor"],
+                    "constructor": ["PermissionsPolicy", 0,
+                        "function PermissionsPolicy() { [native code] }"],
+                },
+                "featurePolicySame": true,
+            }),
+        );
+    }
+
+    /// Canvas text metrics must come from the real layout engine, so they vary
+    /// with the font and agree with element measurement. They previously did
+    /// neither: `length * 6 * scale` ignored the font entirely, leaving the
+    /// canvas font fingerprint perfectly flat. See js-repros/font-fingerprint/.
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_text_metrics_vary_with_font_and_match_element_layout() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const TEXT = "mmmmmmmmmmlliWQ@%#";
+                    const ctx = document.createElement("canvas").getContext("2d");
+                    const width = font => {
+                        ctx.font = font;
+                        return ctx.measureText(TEXT).width;
+                    };
+                    const span = document.createElement("span");
+                    span.textContent = TEXT;
+                    span.style.cssText =
+                        "position:absolute;left:-9999px;white-space:pre;";
+                    document.body.appendChild(span);
+                    const nodesBefore = document.querySelectorAll("*").length;
+                    const elementWidth = font => {
+                        span.style.font = font;
+                        return span.getBoundingClientRect().width;
+                    };
+                    const mono = width("72px monospace");
+                    const sans = width('72px "Arial", monospace');
+                    const missing = width('72px "NonexistentFontXYZ123", monospace');
+                    const probe = width("10px sans-serif");
+                    const nodesAfterCanvas = document.querySelectorAll("*").length;
+                    return {
+                        // Different families must not measure the same.
+                        monoDiffersFromSans: mono !== sans,
+                        // An unresolvable family falls back to the generic.
+                        missingFallsBackToGeneric: missing === mono,
+                        // Longer text is wider; the metric tracks content.
+                        longerIsWider:
+                            width("72px monospace") <
+                            (ctx.font = "72px monospace", ctx.measureText(TEXT + TEXT).width),
+                        emptyIsZero: (ctx.font = "72px monospace",
+                                      ctx.measureText("").width) === 0,
+                        // Canvas and DOMRect expose the same 26.6 subpixel
+                        // advance. Integer CSSOM metrics such as offsetWidth
+                        // round separately at their API boundary.
+                        agreesWithElement:
+                            Math.abs(mono - elementWidth("72px monospace")) <= 1 / 64
+                            && Math.abs(sans - elementWidth('72px "Arial", monospace')) <= 1 / 64,
+                        // The 10px probe string must land on a fractional
+                        // 1/64 boundary, not an integer pixel.
+                        subpixel: probe % 1 !== 0
+                            && Math.abs(probe * 64 - Math.round(probe * 64)) < 1e-6,
+                        positive: mono > 0 && sans > 0,
+                        canvasLeavesDomUntouched: nodesAfterCanvas === nodesBefore,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "monoDiffersFromSans": true,
+                "missingFallsBackToGeneric": true,
+                "longerIsWider": true,
+                "emptyIsZero": true,
+                "agreesWithElement": true,
+                "subpixel": true,
+                "positive": true,
+                "canvasLeavesDomUntouched": true,
+            })
+        );
+    }
+
+    /// Media capability reporting. Chrome applies API-specific format rules:
+    /// canPlayType, MediaSource and MediaCapabilities intentionally disagree
+    /// for formats such as Ogg. Keep those rules and the WebIDL object shape
+    /// aligned while playback itself remains unavailable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capability_declarations_match_chrome_api_specific_rules() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const video = document.createElement("video");
+                    const audio = document.createElement("audio");
+                    const ask = type => (type.startsWith("audio/") ? audio : video)
+                        .canPlayType(type);
+                    const decoding = async contentType =>
+                        (await navigator.mediaCapabilities.decodingInfo({
+                            type: "file",
+                            video: {contentType, width: 640, height: 480,
+                                    bitrate: 1000, framerate: 30},
+                        }));
+                    const decodingAudio = async contentType =>
+                        (await navigator.mediaCapabilities.decodingInfo({
+                            type: "file",
+                            audio: {contentType, channels: "2", bitrate: 128000,
+                                    samplerate: 48000},
+                        }));
+                    const mp4 = await decoding('video/mp4; codecs="avc1.42E01E"');
+                    const bogus = await decoding("video/nonsense");
+                    const ogg = await decodingAudio('audio/ogg; codecs="vorbis"');
+                    return {
+                        canPlay: [
+                            ask("video/mp4"),
+                            ask('video/mp4; codecs="avc1.42E01E"'),
+                            ask('video/webm; codecs="vp9"'),
+                            ask("video/ogg"),
+                            // Chrome answers "" for theora and quicktime.
+                            ask('video/ogg; codecs="theora"'),
+                            ask("video/quicktime"),
+                            ask("video/nonsense"),
+                            ask(""),
+                            ask("audio/mpeg"),
+                            ask("audio/wav"),
+                            ask('audio/wav; codecs="1"'),
+                            ask('audio/mp4; codecs="ac-3"'),
+                            ask('video/mp4; codecs="hev1.1.6.L93.B0"'),
+                        ],
+                        playRejects: await video.play().then(
+                            () => "fulfilled", error => error.name),
+                        readyStateStillZero: video.readyState,
+                        videoWidthStillZero: video.videoWidth,
+                        bufferedTag: Object.prototype.toString.call(video.buffered),
+                        bufferedLength: video.buffered.length,
+                        bufferedFresh: video.buffered !== video.buffered,
+                        bufferedStartThrows: (() => {
+                            try { video.buffered.start(0); return "no-throw"; }
+                            catch (error) { return error.name; }
+                        })(),
+                        qualityTag: Object.prototype.toString.call(
+                            video.getVideoPlaybackQuality()),
+                        qualityEnumerableKeys:
+                            Object.keys(VideoPlaybackQuality.prototype).length,
+                        frameCallbackHandle:
+                            typeof video.requestVideoFrameCallback(() => {}),
+                        decodingSupported: mp4.supported,
+                        decodingSmooth: mp4.smooth,
+                        decodingPowerEfficient: mp4.powerEfficient,
+                        decodingBogus: bogus.supported,
+                        decodingOgg: ogg.supported,
+                        decodingKeys: Object.keys(mp4),
+                        mediaCapabilitiesShape: {
+                            tag: Object.prototype.toString.call(
+                                navigator.mediaCapabilities),
+                            own: Object.getOwnPropertyNames(
+                                navigator.mediaCapabilities),
+                            proto: Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(navigator.mediaCapabilities)),
+                            navigatorOwn: Object.hasOwn(navigator, "mediaCapabilities"),
+                            stable: navigator.mediaCapabilities === navigator.mediaCapabilities,
+                            constructorError: (() => {
+                                try { new MediaCapabilities(); return "no-throw"; }
+                                catch (error) { return error.name; }
+                            })(),
+                        },
+                        mediaSourceMp4:
+                            MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+                        mediaSourceBogus: MediaSource.isTypeSupported("video/nonsense"),
+                        mediaSourceAudio: [
+                            'audio/mp4; codecs="mp4a.40.2"',
+                            'audio/mp4; codecs="ac-3"',
+                            'audio/mp4; codecs="ec-3"',
+                            'audio/mp4; codecs="opus"',
+                            'audio/webm; codecs="opus"',
+                            'audio/webm; codecs="vorbis"',
+                            'audio/ogg; codecs="vorbis"',
+                            'audio/ogg; codecs="flac"',
+                        ].map(type => MediaSource.isTypeSupported(type)),
+                        mediaSourceVideo: [
+                            'video/mp4; codecs="avc1.42E01E"',
+                            'video/mp4; codecs="avc1.4D401E"',
+                            'video/mp4; codecs="avc1.64001E"',
+                            'video/mp4; codecs="hev1.1.6.L93.B0"',
+                            'video/mp4; codecs="av01.0.01M.08"',
+                            'video/mp4; codecs="vp09.00.10.08"',
+                            'video/webm; codecs="vp8"',
+                            'video/webm; codecs="vp09.00.10.08"',
+                            'video/webm; codecs="av01.0.01M.08"',
+                            'video/ogg; codecs="theora"',
+                        ].map(type => MediaSource.isTypeSupported(type)),
+                        mediaSourceReadyState: new MediaSource().readyState,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "canPlay": [
+                    "maybe", "probably", "probably", "maybe",
+                    "", "", "", "",
+                    "probably", "maybe", "probably",
+                    "", "probably",
+                ],
+                "playRejects": "NotAllowedError",
+                "readyStateStillZero": 0,
+                "videoWidthStillZero": 0,
+                "bufferedTag": "[object TimeRanges]",
+                "bufferedLength": 0,
+                "bufferedFresh": true,
+                "bufferedStartThrows": "IndexSizeError",
+                "qualityTag": "[object VideoPlaybackQuality]",
+                "qualityEnumerableKeys": 4,
+                "frameCallbackHandle": "number",
+                "decodingSupported": true,
+                "decodingSmooth": true,
+                "decodingPowerEfficient": false,
+                "decodingBogus": false,
+                "decodingOgg": true,
+                "decodingKeys": [
+                    "powerEfficient", "smooth", "supported", "keySystemAccess"
+                ],
+                "mediaCapabilitiesShape": {
+                    "tag": "[object MediaCapabilities]",
+                    "own": [],
+                    "proto": ["decodingInfo", "encodingInfo", "constructor"],
+                    "navigatorOwn": false,
+                    "stable": true,
+                    "constructorError": "TypeError",
+                },
+                "mediaSourceMp4": true,
+                "mediaSourceBogus": false,
+                "mediaSourceAudio": [
+                    true, false, false, true, true, true, false, false
+                ],
+                "mediaSourceVideo": [
+                    true, true, true, true, true, true, true, true, true, false
+                ],
+                "mediaSourceReadyState": "closed",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_and_performance_memory_share_fresh_branded_wrappers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const consoleDescriptor = Object.getOwnPropertyDescriptor(
+                        console, "memory");
+                    const performanceDescriptor = Object.getOwnPropertyDescriptor(
+                        Performance.prototype, "memory");
+                    const consoleFirst = console.memory;
+                    const consoleSecond = console.memory;
+                    const performanceFirst = performance.memory;
+                    const performanceSecond = performance.memory;
+                    const prototype = Object.getPrototypeOf(consoleFirst);
+                    const valueNames = [
+                        "totalJSHeapSize", "usedJSHeapSize", "jsHeapSizeLimit"
+                    ];
+                    const values = value => valueNames.map(name => value[name]);
+                    const getterDescriptors = valueNames.map(name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+                        return [
+                            descriptor.get.name,
+                            descriptor.get.length,
+                            Function.prototype.toString.call(descriptor.get),
+                            descriptor.set === undefined,
+                            descriptor.enumerable,
+                            descriptor.configurable,
+                        ];
+                    });
+                    let invalidReceiver;
+                    try {
+                        Object.getOwnPropertyDescriptor(
+                            prototype, "totalJSHeapSize").get.call({});
+                        invalidReceiver = "no-throw";
+                    } catch (error) {
+                        invalidReceiver = error.name + ":" + error.message;
+                    }
+                    console.memory = { fake: true };
+                    const consoleValues = values(consoleFirst);
+                    return {
+                        consoleDescriptor: {
+                            getName: consoleDescriptor.get.name,
+                            getLength: consoleDescriptor.get.length,
+                            getText: Function.prototype.toString.call(consoleDescriptor.get),
+                            setName: consoleDescriptor.set.name,
+                            setLength: consoleDescriptor.set.length,
+                            setText: Function.prototype.toString.call(consoleDescriptor.set),
+                            enumerable: consoleDescriptor.enumerable,
+                            configurable: consoleDescriptor.configurable,
+                        },
+                        performanceOwn: Object.hasOwn(performance, "memory"),
+                        performanceDescriptor: {
+                            getName: performanceDescriptor.get.name,
+                            getLength: performanceDescriptor.get.length,
+                            getText: Function.prototype.toString.call(
+                                performanceDescriptor.get),
+                            noSetter: performanceDescriptor.set === undefined,
+                            enumerable: performanceDescriptor.enumerable,
+                            configurable: performanceDescriptor.configurable,
+                        },
+                        fresh: consoleFirst !== consoleSecond
+                            && performanceFirst !== performanceSecond,
+                        crossFresh: consoleFirst !== performanceFirst,
+                        samePrototype: prototype === Object.getPrototypeOf(performanceFirst),
+                        ownNames: Object.getOwnPropertyNames(consoleFirst),
+                        prototypeNames: Object.getOwnPropertyNames(prototype),
+                        prototypeParent: Object.getPrototypeOf(prototype) === Object.prototype,
+                        tag: Object.prototype.toString.call(consoleFirst),
+                        constructorName: consoleFirst.constructor.name,
+                        globalConstructor: typeof globalThis.MemoryInfo,
+                        getterDescriptors,
+                        invalidReceiver,
+                        valuesMatch: JSON.stringify(consoleValues)
+                            === JSON.stringify(values(performanceFirst)),
+                        valuesSane: consoleValues.every(Number.isFinite)
+                            && consoleValues[1] <= consoleValues[0]
+                            && consoleValues[0] <= consoleValues[2],
+                        heapLimit: consoleValues[2],
+                        assignmentIgnored: Object.prototype.toString.call(console.memory),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "consoleDescriptor": {
+                    "getName": "", "getLength": 0,
+                    "getText": "function () { [native code] }",
+                    "setName": "", "setLength": 1,
+                    "setText": "function () { [native code] }",
+                    "enumerable": true, "configurable": true,
+                },
+                "performanceOwn": false,
+                "performanceDescriptor": {
+                    "getName": "get memory", "getLength": 0,
+                    "getText": "function get memory() { [native code] }",
+                    "noSetter": true, "enumerable": true, "configurable": true,
+                },
+                "fresh": true,
+                "crossFresh": true,
+                "samePrototype": true,
+                "ownNames": [],
+                "prototypeNames": [
+                    "totalJSHeapSize", "usedJSHeapSize", "jsHeapSizeLimit"
+                ],
+                "prototypeParent": true,
+                "tag": "[object MemoryInfo]",
+                "constructorName": "Object",
+                "globalConstructor": "undefined",
+                "getterDescriptors": [
+                    ["get totalJSHeapSize", 0,
+                     "function get totalJSHeapSize() { [native code] }",
+                     true, true, true],
+                    ["get usedJSHeapSize", 0,
+                     "function get usedJSHeapSize() { [native code] }",
+                     true, true, true],
+                    ["get jsHeapSizeLimit", 0,
+                     "function get jsHeapSizeLimit() { [native code] }",
+                     true, true, true],
+                ],
+                "invalidReceiver": "TypeError:Illegal invocation",
+                "valuesMatch": true,
+                "valuesSane": true,
+                "heapLimit": 4395630592i64,
+                "assignmentIgnored": "[object MemoryInfo]",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_methods_context_and_tasks_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const expectedNames = [
+                        "debug", "error", "info", "log", "warn", "dir", "dirxml",
+                        "table", "trace", "group", "groupCollapsed", "groupEnd",
+                        "clear", "count", "countReset", "assert", "profile",
+                        "profileEnd", "time", "timeLog", "timeEnd", "timeStamp",
+                        "context", "createTask", "memory",
+                    ];
+                    const methodShape = (object, names) => names.map(name => {
+                        const method = object[name];
+                        const descriptor = Object.getOwnPropertyDescriptor(object, name);
+                        return [name, method.name, method.length,
+                            Function.prototype.toString.call(method),
+                            descriptor.writable, descriptor.enumerable,
+                            descriptor.configurable];
+                    });
+                    const methods = expectedNames.slice(0, -1);
+                    const context = console.context("fixture");
+                    const contextNames = [
+                        "dir", "dirXml", "table", "groupEnd", "clear", "count",
+                        "countReset", "profile", "profileEnd", "debug", "error",
+                        "info", "log", "warn", "trace", "group", "groupCollapsed",
+                        "assert", "time", "timeLog", "timeEnd", "timeStamp",
+                    ];
+                    const task = console.createTask("fixture");
+                    let callbackThis;
+                    let callbackArgs;
+                    const taskResult = task.run(function() {
+                        callbackThis = this;
+                        callbackArgs = arguments.length;
+                        return 42;
+                    }, "ignored");
+                    let nonFunction;
+                    try { task.run(1); } catch (error) {
+                        nonFunction = error.name + ":" + error.message;
+                    }
+                    let invalidReceiver;
+                    try { task.run.call({}, () => {}); } catch (error) {
+                        invalidReceiver = error.name + ":" + error.message;
+                    }
+                    return {
+                        names: Object.getOwnPropertyNames(console),
+                        methodShape: methodShape(console, methods),
+                        tag: Object.prototype.toString.call(console),
+                        context: {
+                            names: Object.getOwnPropertyNames(context),
+                            shape: methodShape(context, contextNames),
+                            noContext: !("context" in context),
+                            noMemory: !("memory" in context),
+                            independent: context.log !== console.log,
+                        },
+                        task: {
+                            tag: Object.prototype.toString.call(task),
+                            names: Object.getOwnPropertyNames(task),
+                            prototypeNames: Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(task)),
+                            run: methodShape(task, ["run"])[0],
+                            result: taskResult,
+                            callbackThisIsWindow: callbackThis === window,
+                            callbackArgs,
+                            nonFunction,
+                            invalidReceiver,
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let names = [
+            "debug", "error", "info", "log", "warn", "dir", "dirxml", "table",
+            "trace", "group", "groupCollapsed", "groupEnd", "clear", "count",
+            "countReset", "assert", "profile", "profileEnd", "time", "timeLog",
+            "timeEnd", "timeStamp", "context", "createTask",
+        ];
+        let method_shape = names.iter().map(|name| {
+            serde_json::json!([name, name, if *name == "context" { 1 } else { 0 },
+                format!("function {}() {{ [native code] }}", name), true, true, true])
+        }).collect::<Vec<_>>();
+        let context_names = [
+            "dir", "dirXml", "table", "groupEnd", "clear", "count", "countReset",
+            "profile", "profileEnd", "debug", "error", "info", "log", "warn",
+            "trace", "group", "groupCollapsed", "assert", "time", "timeLog",
+            "timeEnd", "timeStamp",
+        ];
+        let context_shape = context_names.iter().map(|name| {
+            serde_json::json!([name, name, 1,
+                format!("function {}() {{ [native code] }}", name), true, true, true])
+        }).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "names": [
+                    "debug", "error", "info", "log", "warn", "dir", "dirxml",
+                    "table", "trace", "group", "groupCollapsed", "groupEnd",
+                    "clear", "count", "countReset", "assert", "profile",
+                    "profileEnd", "time", "timeLog", "timeEnd", "timeStamp",
+                    "context", "createTask", "memory"
+                ],
+                "methodShape": method_shape,
+                "tag": "[object console]",
+                "context": {
+                    "names": context_names,
+                    "shape": context_shape,
+                    "noContext": true,
+                    "noMemory": true,
+                    "independent": true,
+                },
+                "task": {
+                    "tag": "[object Object]",
+                    "names": ["run"],
+                    "prototypeNames": ["constructor"],
+                    "run": ["run", "run", 0,
+                        "function run() { [native code] }", true, true, true],
+                    "result": 42,
+                    "callbackThisIsWindow": true,
+                    "callbackArgs": 0,
+                    "nonFunction": "Error:First argument must be a function.",
+                    "invalidReceiver": "Error:'run' called with illegal receiver.",
+                },
+            })
+        );
+    }
+
+    /// Worklet entry points exist and fail closed: no module can load, so
+    /// `addModule` always rejects with the error Chrome raises for a module it
+    /// cannot fetch. Pinned in js-repros/worklet-entrypoints/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worklet_entry_points_exist_and_fail_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                seen_thread.lock().unwrap().push(
+                    request.split_whitespace().nth(1).unwrap_or("/").to_string(),
+                );
+                let body = "registerPaint('x', class {});";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/index.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const settle = async thunk => {
+                        try { await thunk(); return "fulfilled"; }
+                        catch (error) {
+                            return {
+                                name: error.name,
+                                isDOMException: error instanceof DOMException,
+                                message: error.message,
+                            };
+                        }
+                    };
+                    const paint = CSS.paintWorklet;
+                    const context = new AudioContext();
+                    return {
+                        paintTag: Object.prototype.toString.call(paint),
+                        paintCtor: paint.constructor.name,
+                        paintIsWorklet: paint instanceof Worklet,
+                        paintStable: CSS.paintWorklet === CSS.paintWorklet,
+                        addModuleLength: paint.addModule.length,
+                        audioTag: Object.prototype.toString.call(context.audioWorklet),
+                        audioCtor: context.audioWorklet.constructor.name,
+                        audioIsWorklet: context.audioWorklet instanceof Worklet,
+                        audioStable: context.audioWorklet === context.audioWorklet,
+                        // Each context owns its worklet.
+                        audioPerContext: context.audioWorklet !== new AudioContext().audioWorklet,
+                        illegalAudioWorklet: (() => {
+                            try { new AudioWorklet(); return "constructed"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        noArgs: await settle(() => paint.addModule()),
+                        withUrl: await settle(() => paint.addModule("/paint.js")),
+                        audioWithUrl: await settle(
+                            () => context.audioWorklet.addModule("/audio.js")),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "paintTag": "[object Worklet]",
+                "paintCtor": "Worklet",
+                "paintIsWorklet": true,
+                "paintStable": true,
+                "addModuleLength": 1,
+                "audioTag": "[object AudioWorklet]",
+                "audioCtor": "AudioWorklet",
+                "audioIsWorklet": true,
+                "audioStable": true,
+                "audioPerContext": true,
+                "illegalAudioWorklet":
+                    "Failed to construct 'AudioWorklet': Illegal constructor",
+                "noArgs": {
+                    "name": "TypeError", "isDOMException": false,
+                    "message": "Failed to execute 'addModule' on 'Worklet': \
+1 argument required, but only 0 present.",
+                },
+                "withUrl": {
+                    "name": "AbortError", "isDOMException": true,
+                    "message": "Unable to load a worklet's module.",
+                },
+                "audioWithUrl": {
+                    "name": "AbortError", "isDOMException": true,
+                    "message": "Unable to load a worklet's module.",
+                },
+            })
+        );
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(requested, vec!["/audio.js", "/paint.js"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyser_node_exposes_all_four_readback_views() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const context = new OfflineAudioContext(1, 4096, 44100);
+                    const analyser = context.createAnalyser();
+                    const oscillator = context.createOscillator();
+                    oscillator.connect(analyser);
+                    await context.startRendering();
+                    const frequency = new Float32Array(analyser.frequencyBinCount);
+                    const byteFrequency = new Uint8Array(analyser.frequencyBinCount);
+                    const time = new Float32Array(analyser.fftSize);
+                    const byteTime = new Uint8Array(analyser.fftSize);
+                    analyser.getFloatFrequencyData(frequency);
+                    analyser.getByteFrequencyData(byteFrequency);
+                    analyser.getFloatTimeDomainData(time);
+                    analyser.getByteTimeDomainData(byteTime);
+                    return {
+                        sizes: [analyser.fftSize, analyser.frequencyBinCount],
+                        frequencyFilled: frequency.every(value => Number.isFinite(value)),
+                        timeSilent: time.every(value => value === 0),
+                        byteTimeMidpoint: byteTime.every(value => value === 128),
+                        tags: [Object.prototype.toString.call(analyser),
+                            Object.prototype.toString.call(frequency)],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sizes": [2048, 1024],
+                "frequencyFilled": true,
+                "timeSilent": true,
+                "byteTimeMidpoint": true,
+                "tags": ["[object AnalyserNode]", "[object Float32Array]"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    const texture = device.createTexture(
+                        {size: [16, 16], format: 'rgba8unorm', usage: 17});
+                    const module = device.createShaderModule({code:
+                        '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{'
+                        + 'var p=array<vec2f,3>(vec2f(0,.5),vec2f(-.5,-.5),vec2f(.5,-.5));'
+                        + 'return vec4f(p[i],0,1);}'
+                        + '@fragment fn fs()->@location(0) vec4f{return vec4f(0,1,0,1);}'});
+                    const pipeline = device.createRenderPipeline({layout: 'auto',
+                        vertex: {module, entryPoint: 'vs'},
+                        fragment: {module, entryPoint: 'fs', targets: [{format: 'rgba8unorm'}]}});
+                    const encoder = device.createCommandEncoder();
+                    const pass = encoder.beginRenderPass({colorAttachments: [{
+                        view: texture.createView(), loadOp: 'clear',
+                        clearValue: {r: 0, g: 0, b: 0, a: 1}, storeOp: 'store'}]});
+                    pass.setPipeline(pipeline);
+                    pass.draw(3);
+                    pass.end();
+                    const buffer = device.createBuffer({size: 4096, usage: 9});
+                    encoder.copyTextureToBuffer(
+                        {texture}, {buffer, bytesPerRow: 256}, [16, 16]);
+                    device.queue.submit([encoder.finish()]);
+                    await buffer.mapAsync(1);
+                    const pixels = new Uint8Array(buffer.getMappedRange());
+                    const inside = Array.from(pixels.slice(8 * 256 + 8 * 4, 8 * 256 + 8 * 4 + 4));
+                    const outside = Array.from(pixels.slice(8 * 4, 8 * 4 + 4));
+                    let unmapError = null;
+                    buffer.unmap();
+                    try { buffer.getMappedRange(); } catch (error) { unmapError = error.name; }
+                    const compilation = await module.getCompilationInfo();
+                    return {
+                        extents: [texture.width, texture.height, texture.format],
+                        inside, outside,
+                        pitch: pixels.length,
+                        messages: compilation.messages.length,
+                        unmapError,
+                        mapState: buffer.mapState,
+                        tags: [Object.prototype.toString.call(texture),
+                            Object.prototype.toString.call(buffer),
+                            Object.prototype.toString.call(device.queue)],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "extents": [16, 16, "rgba8unorm"],
+                "inside": [0, 255, 0, 255],
+                "outside": [0, 0, 0, 255],
+                "pitch": 4096,
+                "messages": 0,
+                "unmapError": "TypeError",
+                "mapState": "unmapped",
+                "tags": ["[object GPUTexture]", "[object GPUBuffer]", "[object GPUQueue]"],
+            })
+        );
+    }
+
+    #[test]
+    fn offscreen_canvas_runs_webgl_families_with_cached_contexts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(8, 8);
+                    const gl1 = canvas.getContext('webgl2', {powerPreference: 'low-power'});
+                    const gl2 = canvas.getContext('webgl2');
+                    const wrongFamily = canvas.getContext('webgl');
+                    const attrs = gl2.getContextAttributes();
+                    let invalidEnum = null;
+                    try { new OffscreenCanvas(4, 4).getContext('webgl', {powerPreference: 'banana'}); }
+                    catch (error) { invalidEnum = error.name; }
+                    const aliased = new OffscreenCanvas(4, 4);
+                    const webgl = aliased.getContext('experimental-webgl', {powerPreference: 'low-power'});
+                    const aliasedAgain = aliased.getContext('webgl');
+                    return [
+                        gl1 instanceof WebGL2RenderingContext,
+                        gl1 === gl2,
+                        wrongFamily === null,
+                        attrs.powerPreference,
+                        invalidEnum,
+                        webgl instanceof WebGLRenderingContext,
+                        webgl === aliasedAgain,
+                        aliasedAgain.getContextAttributes().powerPreference,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, "low-power", "TypeError", true, true, "low-power"
+            ])
+        );
+    }
+
+    #[test]
+    fn offline_audio_context_inherits_base_audio_factories() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const context = new OfflineAudioContext(1, 16, 44100);
+                    const oscillator = context.createOscillator();
+                    return [
+                        typeof context.createOscillator,
+                        typeof context.createDynamicsCompressor,
+                        oscillator instanceof OscillatorNode,
+                        Object.getPrototypeOf(OfflineAudioContext.prototype) === BaseAudioContext.prototype,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["function", "function", true, true])
+        );
+    }
+
+    #[test]
+    fn shared_worker_sync_failure_does_not_poison_the_registry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const attempt = () => {
+                        try { new SharedWorker("ftp://example.com/worker.js"); return "ok"; }
+                        catch (error) { return error.name; }
+                    };
+                    return [attempt(), attempt()];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
+    }
+
+    /// The Trusted Types API is exposed, including CSP policy-name checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_surface_is_exposed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => ["trustedTypes", "TrustedHTML", "TrustedScript",
+                           "TrustedScriptURL", "TrustedTypePolicy",
+                           "TrustedTypePolicyFactory"]
+                          .filter(name => name in globalThis))()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!([
+            "trustedTypes", "TrustedHTML", "TrustedScript", "TrustedScriptURL",
+            "TrustedTypePolicy", "TrustedTypePolicyFactory"
+        ]));
+
+        rt.set_content_security_policy(Some("default-src 'none'; trusted-types allowed default"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const ok = trustedTypes.createPolicy('allowed', {createHTML: x => x});
+                let rejected = false;
+                try { trustedTypes.createPolicy('probe', {}); } catch (_) { rejected = true; }
+                return [String(ok.createHTML('x')), rejected];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["x", true]));
+
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types allowed default script; require-trusted-types-for 'script'",
+        ));
+        rt.execute_script(
+            "<refresh-csp>",
+            "globalThis.__obscura_csp_allows_unsafe_eval=false;",
+        )
+            .unwrap();
+        let result = rt
+            .evaluate(r#"(() => {
+                const div = document.createElement('div');
+                let rejected = false;
+                try { div.innerHTML = '<b>x</b>'; } catch (error) { rejected = error.name === 'TypeError'; }
+                let plainEval = 'allowed';
+                try { eval('1 + 1'); } catch (error) { plainEval = error.name; }
+                let functionCtor = 'allowed';
+                try { new Function('return 1'); } catch (error) { functionCtor = error.name; }
+                const policy = trustedTypes.createPolicy('default', {createHTML: x => x});
+                div.innerHTML = policy.createHTML('<i>ok</i>');
+                const scriptPolicy = trustedTypes.createPolicy('script', {createScript: x => x});
+                const evalResult = eval(scriptPolicy.createScript('1 + 1'));
+                return [rejected, plainEval, functionCtor, div.innerHTML, evalResult];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "EvalError", "EvalError", "<i>ok</i>", 2]));
+    }
+
+    #[test]
+    fn script_src_attr_controls_inline_event_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'none'",
+        ));
+        let blocked = rt
+            .evaluate(r#"(() => {
+                globalThis.__clicked = 0;
+                const button = document.createElement('button');
+                button.setAttribute('onclick', 'globalThis.__clicked = 1');
+                document.body.appendChild(button);
+                button.click();
+                return globalThis.__clicked;
+            })()"#)
+            .unwrap();
+        assert_eq!(blocked, serde_json::json!(0.0));
+
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'unsafe-inline'",
+        ));
+        let allowed = rt
+            .evaluate(r#"(() => {
+                globalThis.__clicked = 0;
+                const button = document.createElement('button');
+                button.setAttribute('onclick', 'globalThis.__clicked = 1');
+                document.body.appendChild(button);
+                button.click();
+                return globalThis.__clicked;
+            })()"#)
+            .unwrap();
+        assert_eq!(allowed, serde_json::json!(1.0));
+    }
+
+    /// With `require-trusted-types-for 'script'` and a default policy, a plain
+    /// string at a sink is passed to that policy's callback, and the callback
+    /// returns a string: the policy is what brands it. Demanding a branded
+    /// value back from the callback made every sink throw whenever a default
+    /// policy existed, which is the only case this path exists to serve. The
+    /// test above never caught it because it only ever assigned values the
+    /// policy had already branded.
+    #[test]
+    fn a_default_policy_converts_plain_strings_at_trusted_type_sinks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                trustedTypes.createPolicy('default', {
+                    createHTML: value => value.replace('RAW', 'converted'),
+                });
+                const div = document.createElement('div');
+                div.innerHTML = '<b>RAW</b>';
+                const iframe = document.createElement('iframe');
+                iframe.srcdoc = '<p>RAW</p>';
+                return [div.innerHTML, iframe.getAttribute('srcdoc')];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["<b>converted</b>", "<p>converted</p>"])
+        );
+    }
+
+    /// Chrome hands the default policy three arguments: the value, the expected
+    /// type, and the name of the sink being covered. A policy is allowed to
+    /// branch on the sink, and cannot tell them apart from the value alone.
+    /// `script.src` is a sink as well; leaving it out meant `createScriptURL`
+    /// never ran, so a policy that records which of its rules fired saw a
+    /// different set than it does in a browser.
+    #[test]
+    fn sinks_hand_the_default_policy_the_expected_type_and_the_sink_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const seen = [];
+                const record = rule => (value, expectedType, sink) => {
+                    seen.push([rule, expectedType, sink]);
+                    return value;
+                };
+                trustedTypes.createPolicy('default', {
+                    createHTML: record('createHTML'),
+                    createScript: record('createScript'),
+                    createScriptURL: record('createScriptURL'),
+                });
+                document.createElement('div').innerHTML = '<b>x</b>';
+                const script = document.createElement('script');
+                script.textContent = 'void 0';
+                script.src = 'https://cdn.example/a.js';
+                document.createElement('iframe').srcdoc = '<p>x</p>';
+                // An image src is not a sink and must not reach the policy.
+                document.createElement('img').src = 'https://cdn.example/a.png';
+                return seen;
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["createHTML", "TrustedHTML", "Element innerHTML"],
+                ["createScript", "TrustedScript", "HTMLScriptElement textContent"],
+                ["createScriptURL", "TrustedScriptURL", "HTMLScriptElement src"],
+                ["createHTML", "TrustedHTML", "HTMLIFrameElement srcdoc"],
+            ])
+        );
+    }
+
+    /// `script.text` delegates to textContent, which is itself a sink. Chrome
+    /// runs the policy once per assignment; enforcing at both layers ran it
+    /// twice, and stringifying on the way through discarded the brand on a
+    /// value the caller had already made trusted.
+    #[test]
+    fn assigning_script_text_runs_the_default_policy_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default keep; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                let calls = 0;
+                trustedTypes.createPolicy('default', {
+                    createScript: value => { calls += 1; return value; },
+                });
+                const plain = document.createElement('script');
+                plain.text = 'void 0';
+                const viaPolicy = trustedTypes.createPolicy('keep', {createScript: v => v});
+                const trusted = document.createElement('script');
+                trusted.text = viaPolicy.createScript('void 1');
+                return [calls, plain.textContent, trusted.textContent];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, "void 0", "void 1"]));
+    }
+
+    #[test]
+    fn worker_src_csp_blocks_dedicated_and_shared_workers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; worker-src 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const attempt = Ctor => {
+                    try { new Ctor('data:text/javascript,postMessage(1)'); return 'allowed'; }
+                    catch (error) { return error.name; }
+                };
+                return [attempt(Worker), attempt(SharedWorker)];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["SecurityError", "SecurityError"]));
+
+    }
+
+    /// A subframe's fetch is governed by the CSP of that frame's document, not
+    /// the page's. The two genuinely differ in the wild: a Cloudflare challenge
+    /// page allows only its own challenge host, while the widget document it
+    /// embeds names the sibling hosts the widget needs. Resolving the page's
+    /// policy for a frame request blocked a request Chrome sends, and the block
+    /// was invisible in the request log because a rejected request produces an
+    /// `op_fetch_url called` line and no completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subframe_fetch_uses_its_own_document_csp_rather_than_the_pages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        let origin = format!("http://{address}");
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe><iframe id=g></iframe></body></html>"));
+        rt.set_url("http://top.example/index.html");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        // The page forbids every connection; the frame allows its own origin.
+        rt.set_content_security_policy(Some("default-src 'none'; connect-src 'none'"));
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("f", "<html><body></body></html>",
+                        "{origin}/frame", "default-src 'none'; connect-src 'self'");
+                }})()"#
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, &format!("{origin}/frame"))
+            .unwrap();
+
+        let probe = format!(
+            r#"(async () => {{
+                try {{
+                    const response = await fetch("{origin}/ok");
+                    return "status:" + response.status;
+                }} catch (error) {{ return error.name; }}
+            }})()"#
+        );
+        let from_frame = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                &probe,
+                true,
+                true,
+                5_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let from_page = rt
+            .evaluate_for_cdp_with_timeout(&probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            (from_frame, from_page),
+            (
+                serde_json::json!("status:200"),
+                serde_json::json!("AbortError")
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_svg_elements_expose_geometry_methods_after_namespace_creation() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://top.example/index.html");
+        rt.run_page_init();
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("f", "<svg xmlns='http://www.w3.org/2000/svg'><text id='t'>MMMM</text></svg>", "https://widget.example/frame", "");
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("svg-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        let result = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "svg-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"(() => {
+                    const ns = "http://www.w3.org/2000/svg";
+                    const svg = document.createElementNS(ns, "svg");
+                    const text = document.createElementNS(ns, "text");
+                    text.textContent = "MMMM";
+                    svg.appendChild(text);
+                    return [typeof svg.getBBox, typeof text.getComputedTextLength,
+                        svg.getBBox().width > 0, text.getComputedTextLength() > 0,
+                        Object.prototype.hasOwnProperty.call(SVGGraphicsElement.prototype, "getBBox"),
+                        Object.prototype.hasOwnProperty.call(SVGSVGElement.prototype, "getComputedTextLength")];
+                })()"#,
+                true,
+                true,
+                5_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["function", "function", true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn media_src_csp_marks_blocked_media_as_no_source() {
+        let mut rt = setup_runtime("<html><body><video id='v' src='https://cdn.example/movie.mp4'></video></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; media-src 'self'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const v = document.querySelector('#v');
+                return [v.networkState, HTMLMediaElement.NETWORK_NO_SOURCE, v.src];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([3, 3, "https://cdn.example/movie.mp4"]));
+    }
+
+    #[test]
+    fn object_elements_use_object_src_csp_surface() {
+        let mut rt = setup_runtime("<html><body><object id='o' data='https://cdn.example/app.swf'></object></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; object-src 'self'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                const o = document.querySelector('#o');
+                return [o instanceof HTMLObjectElement, o.data, o.contentDocument];
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "https://cdn.example/app.swf", null]));
+    }
+
+    #[test]
+    fn form_action_csp_blocks_form_navigation() {
+        let mut rt = setup_runtime("<html><body><form id='f' action='https://evil.example/submit'><input name='x' value='1'></form></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; form-action 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                document.querySelector('#f').submit();
+                return location.href;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
+    #[test]
+    fn form_action_csp_does_not_inherit_default_src() {
+        // `form-action` is one of the directives with no default-src fallback,
+        // so a policy that omits it allows the submission whatever `default-src`
+        // says. Challenge interstitials are `default-src 'none'` with no
+        // `form-action`, and inheriting `'none'` there swallowed the submission
+        // that answers the challenge.
+        let mut rt = setup_runtime("<html><body><form id='f' action='https://app.example/submit'><input name='x' value='1'></form></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'"));
+        let result = rt
+            .evaluate(r#"(() => {
+                document.querySelector('#f').submit();
+                return location.href;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/submit?x=1"));
+    }
+
+    #[test]
+    fn base_uri_csp_ignores_disallowed_base_element() {
+        let mut rt = setup_runtime("<html><head><base href='https://evil.example/assets/'></head><body></body></html>");
+        rt.set_url("https://app.example/index.html");
+        rt.set_content_security_policy(Some("default-src 'none'; base-uri 'self'"));
+        let result = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
+    /// `console.log` must not walk the objects handed to it.
+    ///
+    /// With devtools closed Chrome keeps a reference and formats lazily, so an
+    /// author-defined getter is never invoked by a bare `console.log`. That
+    /// asymmetry is what devtools-detection code tests for, and Cloudflare's
+    /// challenge runs it on every log line as
+    /// `console.log("%c%d", "font-size:0;color:transparent", probe)` where
+    /// `probe` carries accessors that record being read. The old formatter
+    /// called `JSON.stringify` on every object argument, which walks each
+    /// enumerable property, so the answer was "devtools is open" every time.
+    /// Verified against Chrome 146: both lists come back empty there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_log_does_not_invoke_getters_on_its_arguments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const hits = [];
+                    const probe = {};
+                    for (const key of ["id", "name", "length", "className", "_nid"]) {
+                        Object.defineProperty(probe, key, {
+                            get() { hits.push(key); return "x"; },
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                    console.log("%c%d", "font-size:0;color:transparent", probe);
+                    const element = document.createElement("div");
+                    const elementHits = [];
+                    Object.defineProperty(element, "__trap", {
+                        get() { elementHits.push("trap"); return 1; },
+                        enumerable: true, configurable: true,
+                    });
+                    console.log(element);
+                    // An Error argument must still report its stack: that path
+                    // reads no author property and diagnostics depend on it.
+                    let reportedError = false;
+                    const seen = [];
+                    const op = Deno.core.ops.op_console_msg;
+                    Deno.core.ops.op_console_msg = (level, msg) => { seen.push(msg); };
+                    try {
+                        console.error(new TypeError("boom-probe"));
+                        reportedError = seen.some(m => m.includes("boom-probe"));
+                    } finally {
+                        Deno.core.ops.op_console_msg = op;
+                    }
+                    return { hits, elementHits, reportedError };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "hits": [],
+                "elementHits": [],
+                "reportedError": true,
+            }),
+        );
+    }
+
+    /// `measureText` must return a branded `TextMetrics` whose numbers live on
+    /// the prototype, the way Chrome does. It used to hand back a plain object
+    /// with three own properties, so `Object.prototype.toString.call(...)` read
+    /// `[object Object]` and six of Chrome 146's nine numbers were missing --
+    /// `fontBoundingBoxAscent` among them. The ascent/descent were also
+    /// constants derived from the font size alone, so they did not move when
+    /// the family did; they now come from the layout engine's grid-fitted font
+    /// box. Values pinned against Chrome 146 for 16px Arial, where the bundled
+    /// face metrics agree with it exactly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn measure_text_returns_a_branded_text_metrics_matching_chrome_members() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const ctx = document.createElement("canvas").getContext("2d");
+                    ctx.font = "16px Arial";
+                    const m = ctx.measureText("Mg");
+                    const round = v => Math.round(v * 1000) / 1000;
+                    const ink = value => ({
+                        width: value.width,
+                        left: value.actualBoundingBoxLeft,
+                        right: value.actualBoundingBoxRight,
+                        ascent: value.actualBoundingBoxAscent,
+                        descent: value.actualBoundingBoxDescent,
+                    });
+                    ctx.textAlign = 'left';
+                    const blank = ink(ctx.measureText(''));
+                    const spaceLeft = ink(ctx.measureText(' '));
+                    ctx.textAlign = 'center';
+                    const spaceCenter = ink(ctx.measureText(' '));
+                    ctx.textAlign = 'right';
+                    const spaceRight = ink(ctx.measureText(' '));
+                    ctx.direction = 'rtl';
+                    ctx.textAlign = 'start';
+                    const spaceRtlStart = ink(ctx.measureText(' '));
+                    ctx.save();
+                    ctx.direction = 'ltr';
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'top';
+                    ctx.restore();
+                    const restoredState = [ctx.direction, ctx.textAlign, ctx.textBaseline];
+                    const alignmentMatchesChrome =
+                        blank.width === 0 && blank.left === 0 && blank.right === 0
+                        && blank.ascent === 0 && blank.descent === 0
+                        && spaceLeft.left === 0 && spaceLeft.right === 0
+                        && spaceLeft.ascent === 0 && spaceLeft.descent === 0
+                        && spaceCenter.left === spaceCenter.width / 2
+                        && spaceCenter.right === -spaceCenter.width / 2
+                        && spaceRight.left === spaceRight.width
+                        && spaceRight.right === -spaceRight.width
+                        && spaceRtlStart.left === spaceRtlStart.width
+                        && spaceRtlStart.right === -spaceRtlStart.width;
+                    ctx.direction = 'inherit';
+                    ctx.textAlign = 'start';
+                    return {
+                        tag: Object.prototype.toString.call(m),
+                        ownProps: Object.getOwnPropertyNames(m),
+                        members: Object.getOwnPropertyNames(Object.getPrototypeOf(m)),
+                        globalEnumerable: Object.getOwnPropertyDescriptor(
+                            globalThis, "TextMetrics").enumerable,
+                        illegalConstructor: (() => {
+                            try { new TextMetrics(); return "no-throw"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        fontBoundingBoxAscent: round(m.fontBoundingBoxAscent),
+                        fontBoundingBoxDescent: round(m.fontBoundingBoxDescent),
+                        hangingBaseline: round(m.hangingBaseline),
+                        alphabeticBaseline: round(m.alphabeticBaseline),
+                        ideographicBaseline: round(m.ideographicBaseline),
+                        alignmentMatchesChrome,
+                        restoredState,
+                        // The font box must track the family, not just the size.
+                        movesWithFamily: (() => {
+                            ctx.font = "16px monospace";
+                            const mono = ctx.measureText("Mg");
+                            ctx.font = "16px Arial";
+                            return mono.fontBoundingBoxAscent !== m.fontBoundingBoxAscent
+                                || mono.width !== m.width;
+                        })(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object TextMetrics]",
+                "ownProps": [],
+                "members": [
+                    "constructor",
+                    "width",
+                    "actualBoundingBoxLeft",
+                    "actualBoundingBoxRight",
+                    "fontBoundingBoxAscent",
+                    "fontBoundingBoxDescent",
+                    "actualBoundingBoxAscent",
+                    "actualBoundingBoxDescent",
+                    "hangingBaseline",
+                    "alphabeticBaseline",
+                    "ideographicBaseline",
+                ],
+                "globalEnumerable": false,
+                "illegalConstructor":
+                    "Failed to construct 'TextMetrics': Illegal constructor",
+                "fontBoundingBoxAscent": 14,
+                "fontBoundingBoxDescent": 3,
+                "hangingBaseline": 11.2,
+                "alphabeticBaseline": 0,
+                "ideographicBaseline": -3,
+                "alignmentMatchesChrome": true,
+                "restoredState": ["rtl", "start", "alphabetic"],
+                "movesWithFamily": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_manager_and_origin_private_file_system_match_chrome_shape() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const outcome = async callback => {
+                        try { return { value: await callback() }; }
+                        catch (error) { return { name: error.name, message: error.message }; }
+                    };
+                    const method = (prototype, name) => {
+                        const value = Object.getOwnPropertyDescriptor(prototype, name).value;
+                        return [value.name, value.length,
+                            /\{\s*\[native code\]\s*\}/.test(
+                                Function.prototype.toString.call(value))];
+                    };
+                    const storageDescriptor = Object.getOwnPropertyDescriptor(
+                        Navigator.prototype, 'storage');
+                    const storage = navigator.storage;
+                    const estimate = await storage.estimate();
+                    const root = await storage.getDirectory();
+                    const directory = await root.getDirectoryHandle('sub', { create: true });
+                    const file = await directory.getFileHandle('probe.txt', { create: true });
+                    const writable = await file.createWritable();
+                    await writable.write('abc');
+                    await writable.seek(1);
+                    await writable.write('Z');
+                    await writable.close();
+                    const snapshot = await file.getFile();
+                    const entries = [];
+                    for await (const [name, handle] of root) {
+                        entries.push([name, handle.kind]);
+                    }
+                    const construct = constructor => {
+                        try { new constructor(); return null; }
+                        catch (error) { return [error.name, error.message]; }
+                    };
+                    return {
+                        storage: {
+                            own: Object.prototype.hasOwnProperty.call(navigator, 'storage'),
+                            stable: storage === navigator.storage,
+                            instance: storage instanceof StorageManager,
+                            tag: Object.prototype.toString.call(storage),
+                            getter: [storageDescriptor.get.name, storageDescriptor.get.length,
+                                Function.prototype.toString.call(storageDescriptor.get)],
+                            keys: Object.getOwnPropertyNames(StorageManager.prototype).sort(),
+                            methods: ['estimate', 'persisted', 'getDirectory', 'persist']
+                                .map(name => method(StorageManager.prototype, name)),
+                            estimate: [estimate.quota > 0, estimate.usage,
+                                Object.keys(estimate.usageDetails)],
+                        },
+                        root: {
+                            tag: Object.prototype.toString.call(root),
+                            own: Object.getOwnPropertyNames(root),
+                            kind: root.kind,
+                            name: root.name,
+                            directory: root instanceof FileSystemDirectoryHandle,
+                            handle: root instanceof FileSystemHandle,
+                            same: await root.isSameEntry(root),
+                            resolveRoot: await root.resolve(root),
+                            resolveDirectory: await root.resolve(directory),
+                            entries,
+                        },
+                        file: {
+                            tag: Object.prototype.toString.call(file),
+                            kind: file.kind,
+                            name: file.name,
+                            file: file instanceof FileSystemFileHandle,
+                            handle: file instanceof FileSystemHandle,
+                            text: await snapshot.text(),
+                            size: snapshot.size,
+                            type: snapshot.type,
+                        },
+                        methods: {
+                            directory: Object.getOwnPropertyNames(
+                                FileSystemDirectoryHandle.prototype).sort(),
+                            file: Object.getOwnPropertyNames(
+                                FileSystemFileHandle.prototype).sort(),
+                            handle: Object.getOwnPropertyNames(
+                                FileSystemHandle.prototype).sort(),
+                        },
+                        errors: {
+                            constructors: [StorageManager, FileSystemHandle,
+                                FileSystemDirectoryHandle, FileSystemFileHandle].map(construct),
+                            badStorage: await outcome(() =>
+                                StorageManager.prototype.getDirectory.call({})),
+                            badHandle: await outcome(() =>
+                                FileSystemHandle.prototype.isSameEntry.call({}, root)),
+                            missing: await outcome(() =>
+                                root.getFileHandle('missing.txt')),
+                        },
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "storage": {
+                    "own": false,
+                    "stable": true,
+                    "instance": true,
+                    "tag": "[object StorageManager]",
+                    "getter": ["get storage", 0, "function get storage() { [native code] }"],
+                    "keys": ["constructor", "estimate", "getDirectory", "persist", "persisted"],
+                    "methods": [
+                        ["estimate", 0, true], ["persisted", 0, true],
+                        ["getDirectory", 0, true], ["persist", 0, true]
+                    ],
+                    "estimate": [true, 0, []],
+                },
+                "root": {
+                    "tag": "[object FileSystemDirectoryHandle]",
+                    "own": [],
+                    "kind": "directory",
+                    "name": "",
+                    "directory": true,
+                    "handle": true,
+                    "same": true,
+                    "resolveRoot": [],
+                    "resolveDirectory": ["sub"],
+                    "entries": [["sub", "directory"]],
+                },
+                "file": {
+                    "tag": "[object FileSystemFileHandle]",
+                    "kind": "file",
+                    "name": "probe.txt",
+                    "file": true,
+                    "handle": true,
+                    "text": "aZc",
+                    "size": 3,
+                    "type": "text/plain",
+                },
+                "methods": {
+                    "directory": ["constructor", "entries", "getDirectoryHandle",
+                        "getFileHandle", "keys", "removeEntry", "resolve", "values"],
+                    "file": ["constructor", "createWritable", "getFile", "move"],
+                    "handle": ["constructor", "isSameEntry", "kind", "name",
+                        "queryPermission", "remove", "requestPermission"],
+                },
+                "errors": {
+                    "constructors": [
+                        ["TypeError", "Failed to construct 'StorageManager': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemHandle': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemDirectoryHandle': Illegal constructor"],
+                        ["TypeError", "Failed to construct 'FileSystemFileHandle': Illegal constructor"],
+                    ],
+                    "badStorage": {"name": "TypeError", "message": "Illegal invocation"},
+                    "badHandle": {"name": "TypeError", "message": "Illegal invocation"},
+                    "missing": {"name": "NotFoundError",
+                        "message": "A requested file or directory could not be found."},
+                },
+            }),
+        );
+    }
+
+    /// Engine internals must not be enumerable on the global. `Deno` plus six
+    /// Rust-injected `__obscura_*` globals were missing from the pre-hide list,
+    /// so `Object.keys(window)` named the engine outright. Hiding them cannot
+    /// clear them either: `Deno` already holds a value by the time bootstrap
+    /// runs, and every op call goes through it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_internals_are_not_enumerable_on_the_global() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const internal = key => /^(Deno$|__obscura|__markParserScripts)/.test(key);
+                    const button = document.createElement('button');
+                    document.body.appendChild(button);
+                    button.focus();
+                    button.getBoundingClientRect();
+                    button.scrollIntoView();
+                    const forIn = [];
+                    for (const key in globalThis) if (internal(key)) forIn.push(key);
+                    return {
+                        forIn: forIn.sort(),
+                        ownKeys: Object.keys(globalThis).filter(internal).sort(),
+                        legacyInputNames: Object.getOwnPropertyNames(globalThis).filter(
+                            key => ['__obscura_focused','__obscura_click_target',
+                                '__obscura_hover_target','__obscura_mouse_down'].includes(key)),
+                        focused: document.activeElement === button,
+                        denoStillWorks: typeof Deno?.core?.ops === "object",
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "forIn": [],
+                "ownKeys": [],
+                "legacyInputNames": [],
+                "focused": true,
+                "denoStillWorks": true,
+            }),
+        );
+    }
+
+    /// `crossOriginIsolated` exists on every Chrome global and reads `false`
+    /// without COOP+COEP. Answering `undefined` while `SharedArrayBuffer` is
+    /// withheld is self-contradictory, and both are one line to check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_isolated_reads_false_rather_than_undefined() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const d = Object.getOwnPropertyDescriptor(
+                        globalThis, "crossOriginIsolated");
+                    return {
+                        value: globalThis.crossOriginIsolated,
+                        type: typeof globalThis.crossOriginIsolated,
+                        accessor: typeof d.get === "function" && d.set === undefined,
+                        enumerable: d.enumerable,
+                        sharedArrayBuffer: typeof globalThis.SharedArrayBuffer,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "value": false,
+                "type": "boolean",
+                "accessor": true,
+                "enumerable": true,
+                "sharedArrayBuffer": "undefined",
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_isolation_restores_shared_array_buffer_in_page_and_frame_realms() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://isolated.example/page");
+        rt.set_cross_origin_isolated(true);
+        rt.run_page_init();
+        let main = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        globalThis, 'SharedArrayBuffer');
+                    const buffer = new SharedArrayBuffer(16);
+                    return [crossOriginIsolated, typeof SharedArrayBuffer,
+                        buffer.byteLength, descriptor.enumerable,
+                        descriptor.writable, descriptor.configurable,
+                        Object.prototype.toString.call(buffer)];
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(main, serde_json::json!([
+            true, "function", 16, false, true, true, "[object SharedArrayBuffer]",
+        ]));
+
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://isolated.example/frame', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "isolated-frame",
+            1,
+            root,
+            "https://isolated.example/frame",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm(
+                "isolated-frame",
+                1,
+                "<isolation>",
+                "[crossOriginIsolated, typeof SharedArrayBuffer, new SharedArrayBuffer(8).byteLength]",
+        )
+        .unwrap();
+        assert_eq!(frame, serde_json::json!([true, "function", 8]));
+
+        let nonisolated_root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    const root = {root};
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ''), String(a2 ?? ''));
+                    op('set_document_scope', root, JSON.stringify({{
+                        url: 'https://isolated.example/child',
+                        originUrl: 'https://isolated.example/child',
+                        frameId: 'test-frame-child', documentGeneration: 2,
+                        crossOriginIsolated: false,
+                    }}));
+                    return root;
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "nonisolated-frame",
+            1,
+            nonisolated_root,
+            "https://isolated.example/child",
+        )
+        .unwrap();
+        let nonisolated = rt
+            .execute_script_in_frame_realm(
+                "nonisolated-frame",
+                1,
+                "<isolation>",
+                "[crossOriginIsolated, typeof SharedArrayBuffer]",
+            )
+            .unwrap();
+        assert_eq!(nonisolated, serde_json::json!([false, "undefined"]));
+    }
+
+    /// Trusted Types shape, brand checks and sink tables. Pinned against
+    /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
+    /// enforcement is out of scope (no directive is parsed anywhere yet), so
+    /// this covers the surface a document with no CSP observes.
+    ///
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_match_chrome_shape_brands_and_sink_tables() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const attempt = thunk => {
+                        try { return { ok: true, value: thunk() }; }
+                        catch (error) { return { ok: false, name: error.name, message: error.message }; }
+                    };
+                    const policy = trustedTypes.createPolicy("probe", {
+                        createHTML: input => input.replace(/</g, "&lt;"),
+                        createScript: input => "/*c*/" + input,
+                        createScriptURL: input => input + "?c",
+                    });
+                    const html = policy.createHTML("<img>");
+                    const reparented = policy.createHTML("<b>");
+                    Object.setPrototypeOf(reparented, null);
+                    const bare = trustedTypes.createPolicy("bare", {});
+                    const fallback = trustedTypes.createPolicy(
+                        "default", { createHTML: input => "D:" + input });
+                    return {
+                        factoryTag: Object.prototype.toString.call(trustedTypes),
+                        factoryOwn: Object.prototype.hasOwnProperty.call(globalThis, "trustedTypes"),
+                        illegalFactory: attempt(() => new TrustedTypePolicyFactory()).message,
+                        illegalHtml: attempt(() => new TrustedHTML()).message,
+                        policyTag: Object.prototype.toString.call(policy),
+                        policyName: policy.name,
+                        htmlTag: Object.prototype.toString.call(html),
+                        htmlString: String(html),
+                        htmlJson: html.toJSON(),
+                        scriptString: String(policy.createScript("x")),
+                        scriptUrlString: String(policy.createScriptURL("https://a.example/s.js")),
+                        isHTML: trustedTypes.isHTML(html),
+                        brandSurvivesPrototypeChange: trustedTypes.isHTML(reparented),
+                        isHTMLOnString: trustedTypes.isHTML("<b>"),
+                        // A prototype-only forgery must not pass the brand check.
+                        forged: trustedTypes.isHTML(Object.create(TrustedHTML.prototype)),
+                        instanceOf: html instanceof TrustedHTML,
+                        emptyHTML: String(trustedTypes.emptyHTML),
+                        emptyHTMLTag: Object.prototype.toString.call(trustedTypes.emptyHTML),
+                        bareCreateHTML: attempt(() => bare.createHTML("x")),
+                        noArgs: attempt(() => policy.createHTML()).message,
+                        defaultIsSame: trustedTypes.defaultPolicy === fallback,
+                        attributeTypes: [
+                            trustedTypes.getAttributeType("script", "src"),
+                            trustedTypes.getAttributeType("SCRIPT", "SRC"),
+                            trustedTypes.getAttributeType("iframe", "srcdoc"),
+                            trustedTypes.getAttributeType("div", "onclick"),
+                            trustedTypes.getAttributeType("img", "src"),
+                            trustedTypes.getAttributeType("div", "id"),
+                        ],
+                        propertyTypes: [
+                            trustedTypes.getPropertyType("div", "innerHTML"),
+                            trustedTypes.getPropertyType("DIV", "outerHTML"),
+                            trustedTypes.getPropertyType("script", "text"),
+                            trustedTypes.getPropertyType("script", "src"),
+                            trustedTypes.getPropertyType("div", "textContent"),
+                            trustedTypes.getPropertyType("div", "innerHTMLX"),
+                        ],
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "factoryTag": "[object TrustedTypePolicyFactory]",
+                "factoryOwn": true,
+                "illegalFactory":
+                    "Failed to construct 'TrustedTypePolicyFactory': Illegal constructor",
+                "illegalHtml": "Failed to construct 'TrustedHTML': Illegal constructor",
+                "policyTag": "[object TrustedTypePolicy]",
+                "policyName": "probe",
+                "htmlTag": "[object TrustedHTML]",
+                "htmlString": "&lt;img>",
+                "htmlJson": "&lt;img>",
+                "scriptString": "/*c*/x",
+                "scriptUrlString": "https://a.example/s.js?c",
+                        "isHTML": true,
+                        "brandSurvivesPrototypeChange": true,
+                "isHTMLOnString": false,
+                "forged": false,
+                "instanceOf": true,
+                "emptyHTML": "",
+                "emptyHTMLTag": "[object TrustedHTML]",
+                "bareCreateHTML": {
+                    "ok": false, "name": "TypeError",
+                    "message": "Failed to execute 'createHTML' on 'TrustedTypePolicy': \
+Policy bare's TrustedTypePolicyOptions did not specify a 'createHTML' member.",
+                },
+                "noArgs": "Failed to execute 'createHTML' on 'TrustedTypePolicy': \
+1 argument required, but only 0 present.",
+                "defaultIsSame": true,
+                "attributeTypes": [
+                    "TrustedScriptURL", "TrustedScriptURL", "TrustedHTML",
+                    "TrustedScript", null, null,
+                ],
+                "propertyTypes": [
+                    "TrustedHTML", "TrustedHTML", "TrustedScript",
+                    "TrustedScriptURL", null, null,
+                ],
+            })
+        );
+    }
+
+    /// Service Workers are fail-closed, but everything observable without a
+    /// worker must match Chrome. Values pinned against Chrome 146 in
+    /// js-repros/service-worker-fail-closed/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_worker_container_matches_chrome_shape_and_refuses_registration() {
+        // navigator.serviceWorker does not exist on an insecure origin at all,
+        // which is what setup_runtime's http:// origin is.
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const sw = navigator.serviceWorker;
+                    const settle = async thunk => {
+                        try {
+                            const value = await thunk();
+                            return { settled: "fulfilled", isUndefined: value === undefined };
+                        } catch (error) {
+                            return {
+                                settled: "rejected",
+                                name: error.name,
+                                isDOMException: error instanceof DOMException,
+                                isTypeError: error instanceof TypeError,
+                                message: error.message,
+                            };
+                        }
+                    };
+                    // `ready` must never settle: drain the microtask queue far
+                    // past any resolution that a stub would have scheduled.
+                    let readyState = "pending";
+                    sw.ready.then(() => { readyState = "resolved"; },
+                                  () => { readyState = "rejected"; });
+                    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+                    const descriptor =
+                        Object.getOwnPropertyDescriptor(Navigator.prototype, "serviceWorker");
+                    return {
+                        tag: Object.prototype.toString.call(sw),
+                        constructorName: sw.constructor.name,
+                        instanceOfContainer: sw instanceof ServiceWorkerContainer,
+                        isEventTarget: sw instanceof EventTarget,
+                        ownOnNavigator:
+                            Object.prototype.hasOwnProperty.call(navigator, "serviceWorker"),
+                        descriptor: {
+                            isAccessor: typeof descriptor.get === "function",
+                            setter: descriptor.set === undefined,
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                        },
+                        identityStable: navigator.serviceWorker === navigator.serviceWorker,
+                        controller: sw.controller,
+                        registerLength: sw.register.length,
+                        registerString: String(sw.register),
+                        readyState,
+                        readyIdentityStable: sw.ready === sw.ready,
+                        startMessagesReturnsUndefined: sw.startMessages() === undefined,
+                        illegalConstruct: (() => {
+                            try { new ServiceWorkerContainer(); return "constructed"; }
+                            catch (error) { return error.message; }
+                        })(),
+                        noArgs: await settle(() => sw.register()),
+                        crossOriginScript:
+                            await settle(() => sw.register("https://other.example/sw.js")),
+                        dataUrlScript:
+                            await settle(() => sw.register("data:text/javascript,//")),
+                        crossOriginScope: await settle(
+                            () => sw.register("/sw.js", { scope: "https://other.example/" })),
+                        sameOriginScript: await settle(() => sw.register("/sw.js")),
+                        getRegistration: await settle(() => sw.getRegistration()),
+                        crossOriginGetRegistration: await settle(
+                            () => sw.getRegistration("https://other.example/page")),
+                        registrations: await sw.getRegistrations(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object ServiceWorkerContainer]",
+                "constructorName": "ServiceWorkerContainer",
+                "instanceOfContainer": true,
+                "isEventTarget": true,
+                "ownOnNavigator": false,
+                "descriptor": {
+                    "isAccessor": true, "setter": true,
+                    "enumerable": true, "configurable": true,
+                },
+                "identityStable": true,
+                "controller": null,
+                "registerLength": 1,
+                "registerString": "function register() { [native code] }",
+                "readyState": "pending",
+                "readyIdentityStable": true,
+                "startMessagesReturnsUndefined": true,
+                "illegalConstruct":
+                    "Failed to construct 'ServiceWorkerContainer': Illegal constructor",
+                "noArgs": {
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to execute 'register' on 'ServiceWorkerContainer': \
+1 argument required, but only 0 present.",
+                },
+                "crossOriginScript": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to register a ServiceWorker: The origin of the provided \
+scriptURL ('https://other.example') does not match the current origin \
+('https://example.com').",
+                },
+                "dataUrlScript": {
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to register a ServiceWorker: The URL protocol of the \
+script ('data:text/javascript,//') is not supported.",
+                },
+                "crossOriginScope": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to register a ServiceWorker: The origin of the provided \
+scope ('https://other.example') does not match the current origin \
+('https://example.com').",
+                },
+                // Fetching the script needs no worker, so it happens for real
+                // and the 404 is reported the way Chrome reports it. The
+                // worker-less refusal now sits behind this, reachable only by
+                // a script that actually fetches with a JavaScript MIME type
+                // -- which is why this assertion is a 404 and not the refusal.
+                "sameOriginScript": {
+                    "settled": "rejected", "name": "TypeError",
+                    "isDOMException": false, "isTypeError": true,
+                    "message": "Failed to register a ServiceWorker for scope \
+('https://example.com/') with script ('https://example.com/sw.js'): A bad HTTP response code \
+(404) was received when fetching the script.",
+                },
+                "getRegistration": { "settled": "fulfilled", "isUndefined": true },
+                "crossOriginGetRegistration": {
+                    "settled": "rejected", "name": "SecurityError",
+                    "isDOMException": true, "isTypeError": false,
+                    "message": "Failed to get a ServiceWorkerRegistration: The origin of the \
+provided documentURL ('https://other.example') does not match the current origin \
+('https://example.com').",
+                },
+                "registrations": [],
+            })
+        );
+    }
+
+    /// Compares this engine against a Chrome capture stored in js-repros/.
+    ///
+    /// The fixtures hold 577 observables across twelve directories, and until
+    /// now nothing in the tree read any of them: they were documentation that
+    /// happened to contain data, verified only when someone remembered to run
+    /// the shell commands in their README. The hand-written assertions beside
+    /// this helper cover a deliberate subset; this reads the whole capture.
+    ///
+    /// `known_differences` is a list of JSON paths that are expected to differ,
+    /// each with the reason. An empty reason is not allowed -- a difference
+    /// worth keeping is worth explaining, and the fixture README has to say the
+    /// same thing.
+    async fn assert_probe_matches_chrome_oracle(
+        rt: &mut ObscuraJsRuntime,
+        probe: &str,
+        promise_global: &str,
+        oracle_json: &str,
+        known_differences: &[(&str, &str)],
+    ) {
+        fn walk(
+            chrome: &serde_json::Value,
+            ours: &serde_json::Value,
+            path: &str,
+            found: &mut Vec<(String, String, String)>,
+        ) {
+            if let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (chrome, ours) {
+                let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let next = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(
+                        a.get(key).unwrap_or(&serde_json::Value::Null),
+                        b.get(key).unwrap_or(&serde_json::Value::Null),
+                        &next,
+                        found,
+                    );
+                }
+                return;
+            }
+            if chrome != ours {
+                found.push((path.to_string(), chrome.to_string(), ours.to_string()));
+            }
+        }
+
+        rt.execute_script("<fixture-probe>", probe).unwrap();
+        let ours = rt
+            .evaluate_for_cdp(promise_global, true, true)
+            .await
+            .unwrap()
+            .value
+            .expect("probe promise produced no value");
+        let raw: serde_json::Value =
+            serde_json::from_str(oracle_json).expect("chrome-oracle.json is not valid JSON");
+        // The early fixtures wrap their capture in metadata -- `browser`,
+        // `captured`, `note` -- with the observables under `result`; the later
+        // ones put the observables at the top level. Unwrap the former so both
+        // conventions can be read the same way.
+        let chrome = match (raw.get("browser"), raw.get("result")) {
+            (Some(_), Some(result)) => result.clone(),
+            _ => raw,
+        };
+
+        let mut found = Vec::new();
+        walk(&chrome, &ours, "", &mut found);
+
+        let expected: std::collections::HashMap<&str, &str> =
+            known_differences.iter().copied().collect();
+        assert!(
+            !expected.values().any(|reason| reason.trim().is_empty()),
+            "every known difference needs a reason",
+        );
+
+        let mut unexpected = Vec::new();
+        for (path, chrome_value, our_value) in &found {
+            if !expected.contains_key(path.as_str()) {
+                unexpected.push(format!(
+                    "  {path}\n      chrome:  {chrome_value}\n      obscura: {our_value}"
+                ));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "{} observable(s) drifted from the Chrome capture:\n{}",
+            unexpected.len(),
+            unexpected.join("\n"),
+        );
+
+        // A known difference that has since been fixed must be removed from the
+        // list, or the list slowly becomes a place where regressions hide.
+        let still_differing: std::collections::HashSet<&str> =
+            found.iter().map(|(path, _, _)| path.as_str()).collect();
+        let stale: Vec<&str> = expected
+            .keys()
+            .copied()
+            .filter(|path| !still_differing.contains(path))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these paths match Chrome now -- drop them from known_differences: {stale:?}",
+        );
+    }
+
+    /// The Trusted Types capture, read in full rather than sampled.
+    ///
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_matches_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/trusted-types/probe.js"),
+            "ttFixturePromise",
+            include_str!("../../../js-repros/trusted-types/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The worklet capture, read in full rather than sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worklet_entry_points_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Keep the fetch-before-reject behavior deterministic and offline.
+        rt.set_url("http://127.0.0.1:9/index.html");
+        let probe = include_str!("../../../js-repros/worklet-entrypoints/probe.js")
+            .replace("https://example.com/worklet.js", "http://127.0.0.1:9/worklet.js");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            &probe,
+            "workletFixturePromise",
+            include_str!("../../../js-repros/worklet-entrypoints/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The media capability capture, read in full rather than sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capabilities_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/media-capability-honesty/probe.js"),
+            "mediaFixturePromise",
+            include_str!("../../../js-repros/media-capability-honesty/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The Private State Token / storage access capture.
+    #[tokio::test(flavor = "current_thread")]
+    async fn private_state_tokens_match_the_full_chrome_capture() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/private-state-and-storage-access/probe.js"),
+            "privateStateFixturePromise",
+            include_str!("../../../js-repros/private-state-and-storage-access/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The SharedWorker capture, read in full rather than sampled.
+    ///
+    /// Needs a server: the probe constructs `new SharedWorker('/shared-worker.js')`
+    /// four times, and the point of the fixture is that a message reaches a
+    /// real SharedWorkerGlobalScope and comes back. A blob URL would test a
+    /// different thing -- the connection counter only proves worker reuse if
+    /// the same url reaches the same worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_workers_match_the_full_chrome_capture() {
+        const WORKER_SOURCE: &str = include_str!("../../../js-repros/shared-worker/shared-worker.js");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let response = if path == "/shared-worker.js" {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: \
+{}\r\nConnection: close\r\n\r\n{WORKER_SOURCE}",
+                        WORKER_SOURCE.len(),
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("http://{address}/index.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        assert_probe_matches_chrome_oracle(
+            &mut rt,
+            include_str!("../../../js-repros/shared-worker/probe.js"),
+            "sharedWorkerFixturePromise",
+            include_str!("../../../js-repros/shared-worker/chrome-oracle.json"),
+            &[],
+        )
+        .await;
+    }
+
+    /// The timer capture, read for the properties it actually pins.
+    ///
+    /// This one cannot go through `assert_probe_matches_chrome_oracle`: the
+    /// `elapsed` and `chain` values are one real wall-clock capture, and the
+    /// oracle says so in its own `note`. What is comparable is the *shape* --
+    /// which callback ran in which order, how late each was allowed to be, and
+    /// where the nested zero-delay floor kicks in. Every bound below is read
+    /// out of the capture rather than written here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_ordering_and_lateness_match_the_chrome_capture() {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../js-repros/timer-fidelity/chrome-oracle.json"
+        ))
+        .unwrap();
+        let chrome = &oracle["result"];
+        let assertions = &oracle["assertions"];
+        let lateness_bound = assertions["oneShotLatenessUpperBoundMs"]
+            .as_f64()
+            .expect("capture must state the lateness bound");
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "<timer-fixture-probe>",
+            include_str!("../../../js-repros/timer-fidelity/probe.js"),
+        )
+        .unwrap();
+        let ours = rt
+            .evaluate_for_cdp("timerFixturePromise", true, true)
+            .await
+            .unwrap()
+            .value
+            .expect("probe promise produced no value");
+
+        let shape = |value: &serde_json::Value| -> Vec<(String, f64)> {
+            value["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|event| {
+                    (
+                        event["kind"].as_str().unwrap().to_string(),
+                        event["expected"].as_f64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        // Which callback ran, in which order, at which deadline. The interval
+        // sits between the 1ms and 50ms timeouts in Chrome, and that placement
+        // is the whole point: it is a deadline ordering, not a queue ordering.
+        assert_eq!(
+            shape(&ours),
+            shape(chrome),
+            "callback order or deadlines drifted from the capture",
+        );
+        assert_eq!(
+            ours["intervalTicks"], chrome["intervalTicks"],
+            "setInterval must fire exactly as often before clearInterval",
+        );
+        assert_eq!(
+            ours["events"][0]["kind"],
+            serde_json::json!("microtask"),
+            "a microtask must run before the first timer task",
+        );
+
+        for event in ours["events"].as_array().unwrap() {
+            let lateness = event["elapsed"].as_f64().unwrap() - event["expected"].as_f64().unwrap();
+            assert!(
+                (0.0..=lateness_bound).contains(&lateness),
+                "{} timer for {}ms was {lateness:.1}ms late (bound {lateness_bound}ms); \
+a timer firing *early* is as wrong as one firing late",
+                event["kind"].as_str().unwrap(),
+                event["expected"],
+            );
+        }
+
+        // The nested zero-delay floor. Chrome clamps `setTimeout(f, 0)` to
+        // ~4ms once the chain is more than five deep, so the last steps are
+        // visibly slower than the first ones. An engine with no floor at all
+        // runs the whole chain at the same speed -- which is both a difference
+        // and a fingerprint.
+        let steps = |value: &serde_json::Value| -> Vec<f64> {
+            let chain: Vec<f64> = value["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap())
+                .collect();
+            chain.windows(2).map(|pair| pair[1] - pair[0]).collect()
+        };
+        let ours_steps = steps(&ours);
+        assert_eq!(
+            ours_steps.len(),
+            steps(chrome).len(),
+            "the chain must run to the same depth",
+        );
+        // Half the capture's floor: enough to tell "clamped" from "not
+        // clamped" without pinning a wall-clock value.
+        const FLOOR_EVIDENCE_MS: f64 = 3.5;
+        let (early, late) = ours_steps.split_at(5);
+        assert!(
+            late.iter().all(|step| *step >= FLOOR_EVIDENCE_MS),
+            "steps past the fifth nesting must be clamped, got {late:?} from {ours_steps:?}",
+        );
+        assert!(
+            early.iter().filter(|step| **step < FLOOR_EVIDENCE_MS).count() >= 4,
+            "the first five nestings must not be clamped, got {early:?}",
+        );
+    }
+
+    // Six fixtures are not read through the helper above, and the reason is
+    // not "later":
+    //
+    // - font-fingerprint compares text metrics that differ by design. Obscura
+    //   ships embedded fonts instead of scanning the host's, so widths land
+    //   within ~2px of Chrome rather than on it (948.87 vs 949). Reading it
+    //   here needs a numeric tolerance, not equality; all 98 values differ.
+    // - fingerprint-derivation drives a real iframe's contentWindow, which
+    //   needs a frame realm this helper does not set up.
+    // - service-worker-fail-closed needs an HTTP server that answers with
+    //   specific status codes, MIME types and redirects; its decision chain is
+    //   covered by service_worker_registration_fetches_the_script_before_refusing.
+    // - secure-context needs three different origins in one run, including a
+    //   non-loopback one; covered by secure_context_gates_the_same_apis_chrome_gates
+    //   and shared_array_buffer_is_withheld_the_way_chrome_withholds_it.
+    // - timer-fidelity's numbers are one wall-clock capture and the oracle says
+    //   so itself; equality would be asserting that this machine is as fast as
+    //   the one that recorded it. Its ordering, lateness bound and nested
+    //   zero-delay floor are read in
+    //   timer_ordering_and_lateness_match_the_chrome_capture, with the bounds
+    //   taken from the capture rather than written into the test.
+    // - stack-realm-referrer spans four documents (same.html, cross.html, an
+    //   external script, a stylesheet) and pins what each realm sees of the
+    //   others; one runtime with one document cannot stage it.
+    // - performance-timeline needs a served page plus a served subresource so
+    //   the resource entry has real network phases to report, and has no
+    //   promise global to await -- the probe writes into the document.
+
+    /// `isSecureContext` existed on worker scopes (worker.rs) but not on the
+    /// window, so two lines of script caught the engine disagreeing with
+    /// itself -- and the powerful APIs it gates were handed out on every
+    /// origin. Values pinned against Chrome 146 in
+    /// js-repros/secure-context/chrome-oracle.json, captured over a LAN
+    /// address: 127.0.0.1 and localhost are potentially trustworthy, so a
+    /// loopback fixture cannot show what an insecure origin looks like.
+    #[test]
+    fn secure_context_gates_the_same_apis_chrome_gates() {
+        let probe = r#"(() => ({
+            isSecureContext: globalThis.isSecureContext,
+            origin: globalThis.origin,
+            subtle: typeof crypto.subtle,
+            serviceWorker: typeof navigator.serviceWorker,
+            mediaDevices: typeof navigator.mediaDevices,
+            storage: typeof navigator.storage,
+            clipboard: typeof navigator.clipboard,
+            wakeLock: typeof navigator.wakeLock,
+            credentials: typeof navigator.credentials,
+            locks: typeof navigator.locks,
+            caches: typeof globalThis.caches,
+            cachesIn: 'caches' in globalThis,
+            geolocation: typeof navigator.geolocation,
+            Notification: typeof globalThis.Notification,
+        }))()"#;
+
+        // http://example.com -- insecure.
+        let mut insecure = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            insecure.evaluate(probe).unwrap(),
+            serde_json::json!({
+                "isSecureContext": false,
+                "origin": "http://example.com",
+                "subtle": "undefined",
+                "serviceWorker": "undefined",
+                "mediaDevices": "undefined",
+                "storage": "undefined",
+                "clipboard": "undefined",
+                "wakeLock": "undefined",
+                "credentials": "undefined",
+                "locks": "undefined",
+                "caches": "undefined",
+                // Removed, not shadowed: Chrome leaves no trace of it.
+                "cachesIn": false,
+                // Chrome keeps both of these on an insecure origin and refuses
+                // at call time instead. Removing them would be a difference,
+                // not a fix -- the oracle is what stopped that.
+                "geolocation": "object",
+                "Notification": "function",
+            }),
+        );
+
+        // https://example.com -- secure. Everything comes back.
+        let mut secure = setup_secure_runtime("<html><body></body></html>");
+        assert_eq!(
+            secure.evaluate(probe).unwrap(),
+            serde_json::json!({
+                "isSecureContext": true,
+                "origin": "https://example.com",
+                "subtle": "object",
+                "serviceWorker": "object",
+                "mediaDevices": "object",
+                "storage": "object",
+                "clipboard": "object",
+                "wakeLock": "object",
+                "credentials": "object",
+                "locks": "object",
+                "caches": "object",
+                "cachesIn": true,
+                "geolocation": "object",
+                "Notification": "function",
+            }),
+        );
+
+        // Loopback is potentially trustworthy even over plain HTTP; a file URL
+        // is too, and serialises its origin to "null" while staying secure.
+        for (url, expected) in [
+            ("http://127.0.0.1:8080/page", true),
+            ("http://localhost:8080/page", true),
+            ("http://app.localhost/page", true),
+            ("https://example.com/page", true),
+            ("http://192.168.1.5/page", false),
+            ("http://example.com/page", false),
+        ] {
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(parse_html("<html><body></body></html>"));
+            rt.set_url(url);
+            rt.run_page_init();
+            assert_eq!(
+                rt.evaluate("globalThis.isSecureContext").unwrap(),
+                serde_json::json!(expected),
+                "{url}",
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_fetch_transport_failure_is_a_type_error() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.execute_script(
+                "fetch-transport-error",
+                r#"fetch("http://127.0.0.1:1/").catch(error => ({
+                    name: error.name,
+                    constructor: error.constructor.name,
+                    message: error.message,
+                })).then(value => { globalThis.__fetchError = value; })"#,
+            )
+            .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__fetchError").unwrap(),
+            serde_json::json!({
+                "name": "TypeError",
+                "constructor": "TypeError",
+                "message": "Failed to fetch",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_fetch_honors_abort_signal_before_response() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        rt.execute_script(
+            "fetch-abort-signal",
+            r#"(() => {
+                const controller = new AbortController();
+                fetch('/hydrate', { signal: controller.signal }).catch(error => {
+                    globalThis.__fetchAbort = [error.name, error.constructor.name, error.message];
+                });
+                setTimeout(() => controller.abort(), 30);
+            })()"#,
+        ).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        accepted.recv_timeout(std::time::Duration::from_millis(100))
+            .expect("fixture fetch was not issued");
+        assert_eq!(rt.evaluate("__fetchAbort").unwrap(),
+            serde_json::json!(["AbortError", "DOMException", "This operation was aborted"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_timeout_aborts_its_underlying_fetch() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        rt.execute_script(
+            "xhr-timeout-abort",
+            r#"(() => {
+                const xhr = new XMLHttpRequest();
+                xhr.timeout = 30;
+                xhr.ontimeout = () => { globalThis.__xhrTimeout = [xhr.readyState, xhr.status]; };
+                xhr.open('GET', '/hydrate');
+                xhr.send();
+            })()"#,
+        ).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        accepted.recv_timeout(std::time::Duration::from_millis(100))
+            .expect("fixture XHR was not issued");
+        assert_eq!(rt.evaluate("__xhrTimeout").unwrap(), serde_json::json!([4, 0]));
+    }
+
+    /// Fetching the worker script needs no worker, so every check that depends
+    /// on the *response* -- status, redirect, MIME type, scope cap -- is
+    /// reachable, and the refusal has to sit behind all of them. Refusing in
+    /// front of the fetch would also mean never requesting the script, which
+    /// shows up in any server's access log with no page-side check involved.
+    /// Values pinned against Chrome 146 in
+    /// js-repros/service-worker-fail-closed/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_worker_registration_fetches_the_script_before_refusing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            fn script(content_type: Option<&str>, extra: &str) -> String {
+                let body = "// service worker\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\n{}{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    content_type
+                        .map(|value| format!("Content-Type: {value}\r\n"))
+                        .unwrap_or_default(),
+                    body.len(),
+                )
+            }
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                // `Service-Worker: script` rides on no other kind of request,
+                // so recording it proves this is the worker script fetch and
+                // not some other path that happened to ask for the same URL.
+                let branded = request
+                    .to_ascii_lowercase()
+                    .contains("service-worker: script");
+                seen_thread.lock().unwrap().push(if branded {
+                    path.clone()
+                } else {
+                    format!("{path} (unbranded)")
+                });
+                let response = match path.as_str() {
+                    "/sw-500.js" => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: \
+text/javascript\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    "/sw-redirect.js" => "HTTP/1.1 302 Found\r\nLocation: /sw-ok.js\r\n\
+Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    "/sw-bad-mime.js" => script(Some("application/json"), ""),
+                    "/sw-no-mime.js" => script(None, ""),
+                    "/nested/sw-allowed.js" => {
+                        script(Some("text/javascript"), "Service-Worker-Allowed: /\r\n")
+                    }
+                    "/nested/sw-ok.js" | "/sw-ok.js" => script(Some("text/javascript"), ""),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: \
+close\r\n\r\n"
+                        .to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const sw = navigator.serviceWorker;
+                    const settle = async thunk => {
+                        try { await thunk(); return "RESOLVED"; }
+                        catch (error) { return error.name + ": " + error.message; }
+                    };
+                    return {
+                        serverError: await settle(() => sw.register("/sw-500.js")),
+                        redirected: await settle(() => sw.register("/sw-redirect.js")),
+                        badMime: await settle(() => sw.register("/sw-bad-mime.js")),
+                        noMime: await settle(() => sw.register("/sw-no-mime.js")),
+                        scopeTooBroad: await settle(
+                            () => sw.register("/nested/sw-ok.js", { scope: "/" })),
+                        allowedByHeader: await settle(
+                            () => sw.register("/nested/sw-allowed.js", { scope: "/" })),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "serverError": format!("TypeError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-500.js'): A bad HTTP response code (500) was \
+received when fetching the script."),
+                // The redirect outranks the status code of what it points at.
+                "redirected": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-redirect.js'): The script resource is behind a \
+redirect, which is disallowed."),
+                "badMime": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-bad-mime.js'): The script has an unsupported \
+MIME type ('application/json')."),
+                // A missing type is a different message from a wrong one.
+                "noMime": format!("SecurityError: Failed to register a ServiceWorker for \
+scope ('{origin}/') with script ('{origin}/sw-no-mime.js'): The script does not have a MIME \
+type."),
+                "scopeTooBroad": format!("SecurityError: Failed to register a ServiceWorker \
+for scope ('{origin}/') with script ('{origin}/nested/sw-ok.js'): The path of the provided \
+scope ('/') is not under the max scope allowed ('/nested/'). Adjust the scope, move the \
+Service Worker script, or use the Service-Worker-Allowed HTTP header to allow the scope."),
+                // Fetched, typed correctly and scoped legally: Chrome resolves
+                // here, and this is the one place the refusal belongs.
+                "allowedByHeader": "SecurityError: Failed to register a ServiceWorker: \
+The user denied permission to use Service Worker.",
+            })
+        );
+
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "/nested/sw-allowed.js",
+                "/nested/sw-ok.js",
+                "/sw-500.js",
+                "/sw-bad-mime.js",
+                "/sw-no-mime.js",
+                "/sw-redirect.js",
+            ],
+            "each register() fetches its script exactly once and carries the \
+Service-Worker header; /sw-ok.js must be absent because the redirect to it is \
+never followed",
+        );
+    }
+
+    /// fetch()'s three redirect modes, against the js-repros/fetch-redirect-modes
+    /// capture of Chrome 146.
+    ///
+    /// `Request` recorded `init.redirect` from the day it was written and the
+    /// value went nowhere, so `error` and `manual` both silently behaved as
+    /// `follow`. The visible half of that is the response the page gets; the
+    /// invisible half is the request the *server* gets, which is why the hop
+    /// counts are asserted too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_redirect_modes_match_chrome() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            fn redirect(location: &str, body: &str) -> String {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: \
+text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+            }
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                seen_thread.lock().unwrap().push(path.clone());
+                let response = match path.as_str() {
+                    "/target.txt" => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Final: \
+yes\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfinal body"
+                        .to_string(),
+                    "/redirect-once" => redirect("/target.txt", ""),
+                    "/redirect-twice" => redirect("/redirect-once", ""),
+                    "/redirect-with-body" => redirect("/target.txt", "redirect body"),
+                    // A 3xx with no Location is not a redirect. `error` lets it
+                    // through; `manual` does not look, and still calls it one.
+                    "/redirect-no-location" => "HTTP/1.1 302 Found\r\nContent-Type: \
+text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nno location here"
+                        .to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: \
+9\r\nConnection: close\r\n\r\nnot found"
+                        .to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const scrub = value => String(value).split(location.origin).join("");
+                    const settle = async (path, init) => {
+                        try {
+                            const response = await fetch(path, init);
+                            return [
+                                response.status,
+                                response.type,
+                                scrub(response.url),
+                                response.redirected,
+                                await response.text(),
+                                [...response.headers.keys()].length,
+                            ].join("|");
+                        } catch (error) { return error.name + ": " + error.message; }
+                    };
+                    return {
+                        follow: await settle("/redirect-once"),
+                        followTwoHops: await settle("/redirect-twice", {redirect: "follow"}),
+                        errorOnRedirect: await settle("/redirect-once", {redirect: "error"}),
+                        errorOnTwoHops: await settle("/redirect-twice", {redirect: "error"}),
+                        errorOnPlain: await settle("/target.txt", {redirect: "error"}),
+                        errorOnNoLocation: await settle(
+                            "/redirect-no-location", {redirect: "error"}),
+                        manualOnRedirect: await settle("/redirect-once", {redirect: "manual"}),
+                        manualWithBody: await settle(
+                            "/redirect-with-body", {redirect: "manual"}),
+                        manualOnPlain: await settle("/target.txt", {redirect: "manual"}),
+                        manualOnNoLocation: await settle(
+                            "/redirect-no-location", {redirect: "manual"}),
+                        viaRequestObject: await settle(
+                            new Request(location.origin + "/redirect-once",
+                                {redirect: "error"})),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "follow": "200|basic|/target.txt|true|final body|4",
+                "followTwoHops": "200|basic|/target.txt|true|final body|4",
+                // A network error, carrying no more detail than any other one:
+                // the page must not learn where the hop pointed.
+                "errorOnRedirect": "TypeError: Failed to fetch",
+                "errorOnTwoHops": "TypeError: Failed to fetch",
+                "errorOnPlain": "200|basic|/target.txt|false|final body|4",
+                // No Location, so no redirect was meant, so `error` has
+                // nothing to fail on and the 3xx comes through as a response.
+                "errorOnNoLocation": "302|basic|/redirect-no-location|false|no location here|3",
+                // An opaque redirect: status, headers and body all withheld,
+                // the *requested* url reported, and `redirected` false because
+                // no hop was taken.
+                "manualOnRedirect": "0|opaqueredirect|/redirect-once|false||0",
+                "manualWithBody": "0|opaqueredirect|/redirect-with-body|false||0",
+                "manualOnPlain": "200|basic|/target.txt|false|final body|4",
+                // The asymmetry Chrome was asked about directly: `manual` is
+                // decided by the status code alone, so the same response
+                // `error` lets through becomes an opaque redirect here.
+                "manualOnNoLocation": "0|opaqueredirect|/redirect-no-location|false||0",
+                // fetch(request) honours what the Request was built with.
+                "viaRequestObject": "TypeError: Failed to fetch",
+            })
+        );
+
+        let mut requested = seen.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "/redirect-no-location",
+                "/redirect-no-location",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-once",
+                "/redirect-twice",
+                "/redirect-twice",
+                "/redirect-with-body",
+                "/target.txt",
+                "/target.txt",
+                "/target.txt",
+                "/target.txt",
+            ],
+            "the half of this no page-side check can see: /target.txt is \
+fetched only by the two `follow` cases and the two that ask for it directly, \
+and /redirect-twice never reaches /redirect-once except under `follow`",
+        );
+    }
+
+    /// An invalid RequestRedirect is a WebIDL failure, rejected before the
+    /// algorithm runs rather than treated as `follow`.
+    ///
+    /// The `Request` constructor throws where the value is read; `fetch()`
+    /// rejects, because Fetch has it construct a Request inside a promise.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_invalid_redirect_mode_is_refused_rather_than_ignored() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const settle = thunk => {
+                        try { thunk(); return "NO THROW"; }
+                        catch (error) {
+                            return (error instanceof TypeError) + ": " + error.message;
+                        }
+                    };
+                    const settleAsync = async thunk => {
+                        try { await thunk(); return "NO REJECT"; }
+                        catch (error) {
+                            return (error instanceof TypeError) + ": " + error.message;
+                        }
+                    };
+                    return {
+                        request: settle(
+                            () => new Request("https://example.com/", {redirect: "sideways"})),
+                        fetch: await settleAsync(
+                            () => fetch("https://example.com/", {redirect: "sideways"})),
+                        readback: [
+                            new Request("https://example.com/").redirect,
+                            new Request("https://example.com/", {redirect: "error"}).redirect,
+                            new Request("https://example.com/", {redirect: "manual"}).redirect,
+                        ].join(","),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "request": "true: Failed to construct 'Request': 'sideways' is not a valid \
+RequestRedirect value",
+                "fetch": "true: Failed to execute 'fetch': 'sideways' is not a valid \
+RequestRedirect value",
+                "readback": "follow,error,manual",
+            })
+        );
+    }
+
+    /// `SharedArrayBuffer` is not a global, on any origin.
+    ///
+    /// Chrome gates it on cross-origin isolation (COOP+COEP), which is
+    /// stricter than a secure context -- it is absent on loopback too. It does
+    /// *not* remove the constructor: a shared `WebAssembly.Memory`'s buffer
+    /// still reports `SharedArrayBuffer` for its constructor name and its
+    /// `Symbol.toStringTag`, while `constructor === globalThis.SharedArrayBuffer`
+    /// is false because the global is undefined. Deleting the binding in
+    /// bootstrap.js would have matched the first half and broken the second --
+    /// and could not work anyway, because bootstrap runs while the snapshot is
+    /// created and V8's Genesis reinstalls the property when it is loaded.
+    /// Captured in js-repros/secure-context/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_array_buffer_is_withheld_the_way_chrome_withholds_it() {
+        const PROBE: &str = r#"({
+            typeofGlobal: typeof globalThis.SharedArrayBuffer,
+            hasOwn: Object.prototype.hasOwnProperty.call(
+                globalThis, 'SharedArrayBuffer'),
+            inGlobalNames: Object.getOwnPropertyNames(globalThis)
+                .includes('SharedArrayBuffer'),
+            hasDescriptor: Object.getOwnPropertyDescriptor(
+                globalThis, 'SharedArrayBuffer') !== undefined,
+            // Atomics stays -- it works on ordinary ArrayBuffers.
+            typeofAtomics: typeof globalThis.Atomics,
+            typeofAtomicsWait: typeof globalThis.Atomics?.wait,
+            wasm: (() => {
+                try {
+                    const memory = new WebAssembly.Memory(
+                        {initial: 1, maximum: 1, shared: true});
+                    return {
+                        threw: false,
+                        bufferCtorName: memory.buffer?.constructor?.name ?? null,
+                        bufferTag: Object.prototype.toString.call(memory.buffer),
+                        ctorIsGlobalSAB:
+                            memory.buffer?.constructor === globalThis.SharedArrayBuffer,
+                    };
+                } catch (error) {
+                    return {threw: true, name: error?.name || null};
+                }
+            })(),
+        })"#;
+
+        let expected = serde_json::json!({
+            "typeofGlobal": "undefined",
+            "hasOwn": false,
+            "inGlobalNames": false,
+            "hasDescriptor": false,
+            "typeofAtomics": "object",
+            "typeofAtomicsWait": "function",
+            // Chrome does not remove the constructor, only the global binding.
+            "wasm": {
+                "threw": false,
+                "bufferCtorName": "SharedArrayBuffer",
+                "bufferTag": "[object SharedArrayBuffer]",
+                "ctorIsGlobalSAB": false,
+            },
+        });
+
+        // One runtime at a time: two live isolates on one thread trip V8's
+        // current-isolate check.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let insecure = rt.evaluate_for_cdp(PROBE, true, true).await.unwrap().value.unwrap();
+        drop(rt);
+        assert_eq!(insecure, expected, "insecure origin");
+
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let secure = rt.evaluate_for_cdp(PROBE, true, true).await.unwrap().value.unwrap();
+        drop(rt);
+        assert_eq!(secure, expected, "secure origin");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_privacy_api_values_come_from_the_origin_policy() {
+        let policy = crate::PrivacyPolicy::new();
+        policy
+            .set_private_token(
+                "https://top.example",
+                "https://top.example",
+                "https://issuer.example/path",
+                true,
+            )
+            .unwrap();
+        policy
+            .set_redemption_record(
+                "https://top.example",
+                "https://top.example",
+                "https://issuer.example",
+                true,
+            )
+            .unwrap();
+        let mut rt = setup_privacy_runtime();
+        rt.set_privacy_policy(policy);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"Promise.all([
+                    document.hasPrivateToken("https://issuer.example:443/other"),
+                    document.hasRedemptionRecord("https://issuer.example/record"),
+                    document.hasPrivateToken("https://unconfigured.example"),
+                ])"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_storage_access_uses_its_own_origin_partition() {
+        let policy = crate::PrivacyPolicy::new();
+        let mut rt = setup_privacy_runtime();
+        rt.set_privacy_policy(policy.clone());
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    document.body.innerHTML = '<iframe id="privacy-frame"></iframe>';
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("privacy-frame", "<html><body></body></html>",
+                        "https://frame.example/content");
+                }})()"#
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "test-frame",
+            1,
+            root,
+            "https://frame.example/content",
+        )
+        .unwrap();
+
+        let denied = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "document.hasStorageAccess()",
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(denied, serde_json::json!(false));
+
+        policy
+            .set_storage_access_grant(
+                "https://top.example",
+                "https://frame.example",
+                true,
+            )
+            .unwrap();
+        let granted = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "document.hasStorageAccess()",
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(granted, serde_json::json!(true));
     }
 
     #[cfg(feature = "render")]
@@ -4080,8 +8894,8 @@ mod tests {
     const FRAME_OPS_PRELUDE: &str = r#"
         const op = (cmd, a1, a2) =>
             Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
-        const setupFrame = (hostId, html, originUrl) => {
-            const host = document.getElementById(hostId)._nid;
+        const setupFrame = (hostId, html, originUrl, csp, isolated) => {
+            const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));
             if (html) op("parse_into_subtree", created.root, html);
             op("set_document_scope", created.root, JSON.stringify({
@@ -4089,6 +8903,8 @@ mod tests {
                 originUrl,
                 frameId: "test-frame",
                 documentGeneration: 1,
+                csp: csp ?? null,
+                ...(isolated === undefined ? {} : {crossOriginIsolated: !!isolated}),
             }));
             return created.root;
         };
@@ -4150,6 +8966,86 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_frame_exposes_cpu_performance_projection() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "https://widget.example/frame", null, true);
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            "[typeof navigator.cpuPerformance, navigator.cpuPerformance, 'cpuPerformance' in navigator, typeof SharedArrayBuffer]",
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!(["number", 3, true, "function"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_subtle_generate_key_material_is_realm_local() {
+        // generateKey stores op_random_bytes output as key material; without a
+        // realm-local copy the frame's `instanceof Uint8Array` check in
+        // keyBytes rejects every generated key with "Argument is not a valid
+        // CryptoKey", so encrypt/decrypt/sign become unusable in frames.
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "https://widget.example/frame", null, true);
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(async () => {
+                const subtle = crypto.subtle;
+                const aes = await subtle.generateKey({name: "AES-GCM", length: 128}, true, ["encrypt", "decrypt"]);
+                const iv = crypto.getRandomValues(new Uint8Array(12));
+                const data = new TextEncoder().encode("frame-key");
+                const ct = await subtle.encrypt({name: "AES-GCM", iv}, aes, data);
+                const pt = new TextDecoder().decode(await subtle.decrypt({name: "AES-GCM", iv}, aes, ct));
+                const mac = await subtle.generateKey({name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+                const sig = await subtle.sign("HMAC", mac, data);
+                return [pt, ct.byteLength > data.length, sig.byteLength];
+            })()"#,
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!(["frame-key", true, 32]));
+    }
+
+    #[test]
+    fn scoped_document_domain_persists_the_relaxed_value() {
+        let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://deep.assets.example.co.uk/page");
+        rt.run_page_init();
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                setupFrame("f", '<html><body></body></html>',
+                    "https://deep.assets.example.co.uk/frame");
+                const doc = document.getElementById("f").contentDocument;
+                const initial = doc.domain;
+                doc.domain = "assets.example.co.uk";
+                const relaxed = doc.domain;
+                doc.domain = "example.co.uk";
+                return [initial, relaxed, doc.domain];
+            }})()"#
+        );
+        assert_eq!(
+            rt.evaluate(&script).unwrap(),
+            serde_json::json!([
+                "deep.assets.example.co.uk",
+                "assets.example.co.uk",
+                "example.co.uk",
+            ])
+        );
+    }
+
     #[test]
     fn native_iframe_cross_origin_access_is_blocked() {
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
@@ -4171,6 +9067,8 @@ mod tests {
                     locationHrefThrows: thrown(() => win.location.href),
                     locationOriginThrows: thrown(() => win.location.origin),
                     frameElementThrows: thrown(() => win.frameElement),
+                    globalThisThrows: thrown(() => win.globalThis),
+                    globalThisIn: "globalThis" in win,
                     expandoThrows: thrown(() => win.someExpando),
                     replaceIsFunction: typeof win.location.replace === "function",
                     topIsMain: win.top === globalThis,
@@ -4191,6 +9089,8 @@ mod tests {
                 "locationHrefThrows": "SecurityError",
                 "locationOriginThrows": "SecurityError",
                 "frameElementThrows": "SecurityError",
+                "globalThisThrows": "SecurityError",
+                "globalThisIn": false,
                 "expandoThrows": "SecurityError",
                 "replaceIsFunction": true,
                 "topIsMain": true,
@@ -4216,7 +9116,7 @@ mod tests {
         let script = format!(
             r#"(() => {{
                 {FRAME_OPS_PRELUDE}
-                const host = document.getElementById("f")._nid;
+                const host = document.getElementById("f")[Symbol.for('obscura.nid')];
                 const created = JSON.parse(op("create_iframe_content_document", host));
                 op("parse_into_subtree", created.root, "<html><body></body></html>");
                 op("set_document_scope", created.root, JSON.stringify({{
@@ -4489,6 +9389,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn timer_callback_stacks_hide_the_browser_scheduler() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/timer-stack.js",
+            r#"
+                globalThis.__timerStackProbe = { intervalTicks: 0 };
+                setTimeout(function timeoutCapture(first, second) {
+                    __timerStackProbe.timeoutStack = new Error().stack;
+                    __timerStackProbe.timeoutThis = this === window;
+                    __timerStackProbe.timeoutArgs = [first, second];
+                }, 0, "alpha", 7);
+                const intervalId = setInterval(function intervalCapture() {
+                    __timerStackProbe.intervalTicks++;
+                    __timerStackProbe.intervalStack = new Error().stack;
+                    __timerStackProbe.intervalThis = this === window;
+                    clearInterval(intervalId);
+                }, 0);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        let result = rt.evaluate("__timerStackProbe").unwrap();
+        assert_eq!(result["timeoutThis"], serde_json::json!(true));
+        assert_eq!(result["timeoutArgs"], serde_json::json!(["alpha", 7]));
+        assert_eq!(result["intervalThis"], serde_json::json!(true));
+        assert_eq!(result["intervalTicks"], serde_json::json!(1));
+        for key in ["timeoutStack", "intervalStack"] {
+            let stack = result[key].as_str().expect("timer stack string");
+            assert!(
+                stack.contains("https://example.test/timer-stack.js"),
+                "{key} lost the page script origin: {stack}",
+            );
+            assert!(
+                !stack.contains("_runAtNesting")
+                    && !stack.contains("obscura:bootstrap")
+                    && !stack.contains("ext:core"),
+                "{key} leaked browser scheduler frames: {stack}",
+            );
+        }
+    }
+
+    #[test]
+    fn custom_prepare_stack_trace_receives_filtered_callsites() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/custom-stack.js",
+            r#"
+                const savedPrepareStackTrace = Error.prepareStackTrace;
+                Error.prepareStackTrace = function(error, callsites) {
+                    return {
+                        marker: error.message,
+                        files: callsites.map(site => site.getScriptNameOrSourceURL()),
+                    };
+                };
+                function customStackCapture() { return new Error('custom').stack; }
+                globalThis.__customPreparedStack = customStackCapture();
+                Error.prepareStackTrace = savedPrepareStackTrace;
+            "#,
+        )
+        .unwrap();
+
+        let result = rt.evaluate("__customPreparedStack").unwrap();
+        assert_eq!(result["marker"], serde_json::json!("custom"));
+        let files = result["files"].as_array().expect("custom callsite files");
+        assert!(
+            files.iter().any(|file| {
+                file.as_str() == Some("https://example.test/custom-stack.js")
+            }),
+            "custom prepareStackTrace lost page callsites: {result}",
+        );
+        assert!(
+            files.iter().all(|file| {
+                !file.as_str().is_some_and(|name| {
+                    name.starts_with("<obscura:")
+                        || name.starts_with("ext:")
+                        || name.starts_with("deno:")
+                })
+            }),
+            "custom prepareStackTrace received browser callsites: {result}",
+        );
+    }
+
+    #[test]
+    fn cdp_injected_script_names_are_hidden_from_error_stacks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("<cdp-input>", "globalThis.__cdpStack = new Error('click').stack;")
+            .unwrap();
+        let stack = rt.evaluate("__cdpStack").unwrap().as_str().unwrap_or_default().to_string();
+        assert!(!stack.contains("<cdp-input>"), "{stack}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn zero_delay_timer_runs_as_a_task_after_microtasks() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -4506,6 +9499,38 @@ mod tests {
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timers_keep_their_deadline_after_an_interrupted_event_loop_poll() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "timer-deadline-after-interruption",
+            r#"
+                globalThis.__timerDeadlineProbe = [];
+                const started = performance.now();
+                [0, 50, 100].forEach(delay => setTimeout(() => {
+                    __timerDeadlineProbe.push([delay, performance.now() - started]);
+                }, delay));
+            "#,
+        )
+        .unwrap();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(10),
+            rt.run_event_loop(),
+        )
+        .await;
+        rt.run_event_loop_for_duration(140).await.unwrap();
+        let result = rt.evaluate("__timerDeadlineProbe").unwrap();
+        let values = result.as_array().expect("timer probe array");
+        assert_eq!(values.len(), 3, "all timers should fire: {result}");
+        for (value, expected) in values.iter().zip([0.0, 50.0, 100.0]) {
+            let elapsed = value[1].as_f64().expect("timer elapsed");
+            assert!(
+                elapsed >= expected && elapsed < expected + 35.0,
+                "timer {expected}ms fired at {elapsed}ms after an interrupted poll: {result}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5058,6 +10083,121 @@ mod tests {
     }
 
     #[test]
+    fn navigation_entry_recorded_after_bootstrap_still_leads_the_timeline() {
+        // The host records a frame's navigation entry after the realm's
+        // bootstrap ran, so other startTime==0 entries (visibility-state)
+        // are already buffered. Chrome creates the navigation entry first
+        // (it is the earliest event on the document's timeline), so a stable
+        // startTime sort alone would keep the bootstrap entries ahead of it.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    performance.mark('before-navigation', { startTime: 0 });
+                    __obscura_performance_record({
+                        name: 'https://example.test/frame.html', entryType: 'navigation',
+                        type: 'navigate', startTime: 0, duration: 3,
+                    });
+                    const types = performance.getEntries().map(entry => entry.entryType);
+                    const first = performance.getEntries()[0];
+                    const navByType = performance.getEntriesByType('navigation');
+                    return {
+                        types,
+                        firstName: first.name,
+                        firstType: first.entryType,
+                        navCount: navByType.length,
+                        observerOrder: (() => {
+                            const observer = new PerformanceObserver(() => {});
+                            observer.observe({ type: 'navigation', buffered: true });
+                            return observer.takeRecords().map(entry => entry.entryType);
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "types": ["navigation", "visibility-state", "mark"],
+                "firstName": "https://example.test/frame.html",
+                "firstType": "navigation",
+                "navCount": 1,
+                "observerOrder": ["navigation"],
+            }),
+        );
+    }
+
+    #[test]
+    fn performance_timeline_buffers_user_and_resource_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    performance.mark('begin', { startTime: 4, detail: { source: 'fixture' } });
+                    performance.mark('end', { startTime: 10 });
+                    const measure = performance.measure('span', 'begin', 'end');
+                    __obscura_performance_record({
+                        name: 'https://example.test/app.js', entryType: 'resource',
+                        initiatorType: 'script', startTime: 12, duration: 8,
+                        fetchStart: 12, requestStart: 13, responseStart: 16,
+                        responseEnd: 20, transferSize: 7, encodedBodySize: 7,
+                        decodedBodySize: 7, responseStatus: 200,
+                    });
+                    const observer = new PerformanceObserver(() => {});
+                    observer.observe({ type: 'resource', buffered: true });
+                    const resource = performance.getEntriesByType('resource')[0];
+                    return {
+                        entryTypes: performance.getEntries().map(entry => entry.entryType),
+                        measure: [measure.startTime, measure.duration, measure instanceof PerformanceMeasure],
+                        resource: [resource.initiatorType, resource.requestStart,
+                            resource.responseStart, resource.responseEnd,
+                            resource.transferSize, resource.responseStatus,
+                            resource instanceof PerformanceResourceTiming],
+                        bufferedRecords: observer.takeRecords().length,
+                        supported: ['mark', 'measure', 'navigation', 'paint', 'resource']
+                            .every(type => PerformanceObserver.supportedEntryTypes.includes(type)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "entryTypes": ["visibility-state", "mark", "measure", "mark", "resource"],
+                "measure": [4, 6, true],
+                "resource": ["script", 13, 16, 20, 7, 200, true],
+                "bufferedRecords": 1,
+                "supported": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_delivers_entries_at_a_microtask_checkpoint() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-fixture",
+            r#"
+                globalThis.__performanceObserved = [];
+                const observer = new PerformanceObserver((list, source) => {
+                    __performanceObserved.push({
+                        names: list.getEntries().map(entry => entry.name),
+                        sameObserver: source === observer,
+                    });
+                });
+                observer.observe({ entryTypes: ['mark'] });
+                performance.mark('observer-mark');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__performanceObserved").unwrap(),
+            serde_json::json!([{"names": ["observer-mark"], "sameObserver": true}]),
+        );
+    }
+
+    #[test]
     fn performance_now_does_not_outrun_elapsed_time() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let lead = rt
@@ -5435,9 +10575,14 @@ mod tests {
     fn dom_parser_accepts_well_formed_xml() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ok = rt
-            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return [d.querySelector('parsererror') ? 'ERR' : 'OK',Object.prototype.toString.call(d),d.constructor.name,d instanceof Document,d instanceof XMLDocument,Object.getPrototypeOf(d)===XMLDocument.prototype,d.documentElement.ownerDocument===d];})()")
             .unwrap();
-        assert_eq!(ok, serde_json::json!("OK"));
+        assert_eq!(
+            ok,
+            serde_json::json!([
+                "OK", "[object XMLDocument]", "XMLDocument", true, true, true, true
+            ]),
+        );
     }
 
     #[test]
@@ -5448,6 +10593,154 @@ mod tests {
             .evaluate("(function(){var d=new DOMParser().parseFromString('<div><p>hi</a>','text/html'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
             .unwrap();
         assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
+    fn dom_parser_html_builds_a_document_skeleton_and_body_content() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const empty = new DOMParser().parseFromString('', 'text/html');
+                    const fragment = new DOMParser().parseFromString(
+                        '<p>Rqaf3</p><p>XGKq7</p>', 'text/html');
+                    const attribute = new DOMParser().parseFromString(
+                        `<div data-foo='"'></div>`, 'text/html');
+                    const full = new DOMParser().parseFromString(
+                        '<!doctype html><html><head><title>T</title></head>' +
+                        '<body><p>B</p></body></html>', 'text/html');
+                    return {
+                        empty: [empty.documentElement.tagName, empty.head.tagName,
+                                empty.body.tagName, empty.body.innerHTML],
+                        fragment: fragment.body.innerHTML,
+                        attribute: attribute.body.innerHTML,
+                        full: [full.title, full.head.innerHTML, full.body.innerHTML],
+                        identity: [
+                            Object.prototype.toString.call(fragment),
+                            fragment.constructor.name,
+                            fragment instanceof Document,
+                            fragment instanceof HTMLDocument,
+                            Object.getPrototypeOf(fragment) === HTMLDocument.prototype,
+                            fragment.documentElement.ownerDocument === fragment,
+                            fragment.body.ownerDocument === fragment,
+                            fragment.createElement('div').ownerDocument === fragment,
+                            Document.prototype.querySelector.call(fragment, 'p').textContent,
+                            Document.prototype.createElement.call(fragment, 'i').ownerDocument === fragment,
+                            Object.getOwnPropertyNames(fragment).join(','),
+                            fragment.location,
+                            (() => {
+                                const descriptor = Object.getOwnPropertyDescriptor(fragment, 'location');
+                                return [descriptor.enumerable, descriptor.configurable,
+                                        typeof descriptor.get, typeof descriptor.set];
+                            })(),
+                            [
+                                'createTreeWalker', 'createNodeIterator', 'querySelector',
+                                'querySelectorAll', 'getElementById', 'getElementsByTagName',
+                                'getElementsByClassName', 'getElementsByName', 'createElement',
+                                'createElementNS', 'createTextNode', 'createComment',
+                                'createDocumentFragment', 'createRange', 'createEvent',
+                                'createCDATASection', 'createProcessingInstruction',
+                                'adoptNode', 'importNode', 'addEventListener',
+                                'removeEventListener', 'dispatchEvent',
+                            ].every(name => fragment[name] === Document.prototype[name]),
+                            fragment.documentElement.parentNode === fragment,
+                            fragment.documentElement.getRootNode() === fragment,
+                            fragment.body.getRootNode() === fragment,
+                            fragment.contains(fragment.documentElement),
+                            fragment.compareDocumentPosition(fragment.documentElement),
+                            fragment.documentElement.compareDocumentPosition(fragment),
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "empty": ["HTML", "HEAD", "BODY", ""],
+                "fragment": "<p>Rqaf3</p><p>XGKq7</p>",
+                "attribute": "<div data-foo=\"&quot;\"></div>",
+                "full": ["T", "<title>T</title>", "<p>B</p>"],
+                "identity": [
+                    "[object HTMLDocument]", "HTMLDocument", true, true, true,
+                    true, true, true, "Rqaf3", true,
+                    "location", null, [true, false, "function", "function"],
+                    true, true, true, true, true, 20, 10,
+                ],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debugger_reads_sources_compiled_through_eval() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.enable_debugger();
+        const EVAL_SOURCE: &str = "globalThis.__debugger_eval_marker = 611;";
+        rt.execute_script(
+            "https://example.test/author.js",
+            &format!("eval({});", serde_json::to_string(EVAL_SOURCE).unwrap()),
+        )
+        .unwrap();
+
+        let scripts = rt.debugger_scripts().await.unwrap();
+        let eval_script = scripts
+            .iter()
+            .find(|script| script.length == EVAL_SOURCE.len() as u64)
+            .unwrap_or_else(|| panic!("eval script should be reported by V8 inspector: {scripts:#?}"));
+        let source = rt
+            .debugger_script_source(&eval_script.script_id)
+            .await
+            .unwrap();
+        assert_eq!(source, EVAL_SOURCE);
+    }
+
+    #[test]
+    fn create_html_document_reuses_one_skeleton_and_converts_optional_title() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const run = source => {
+                        const doc = document.implementation.createHTMLDocument('');
+                        const root = doc.documentElement;
+                        const before = Array.from(root.children, child => child.tagName);
+                        root.lastElementChild.innerHTML = source;
+                        return [before, doc.body === root.lastElementChild,
+                                doc.body.innerHTML, root.lastElementChild.innerHTML];
+                    };
+                    const titleCases = [
+                        document.implementation.createHTMLDocument(),
+                        document.implementation.createHTMLDocument(''),
+                        document.implementation.createHTMLDocument(null),
+                        document.implementation.createHTMLDocument(0),
+                    ].map(doc => [doc.title, doc.head.innerHTML]);
+                    return {
+                        fragment: run('<p>Rqaf3</p><p>XGKq7</p>'),
+                        attribute: run(`<div data-foo='"'></div>`),
+                        titleCases,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "fragment": [
+                    ["HEAD", "BODY"], true,
+                    "<p>Rqaf3</p><p>XGKq7</p>",
+                    "<p>Rqaf3</p><p>XGKq7</p>",
+                ],
+                "attribute": [
+                    ["HEAD", "BODY"], true,
+                    "<div data-foo=\"&quot;\"></div>",
+                    "<div data-foo=\"&quot;\"></div>",
+                ],
+                "titleCases": [
+                    ["", ""], ["", "<title></title>"],
+                    ["null", "<title>null</title>"], ["0", "<title>0</title>"],
+                ],
+            }),
+        );
     }
 
     #[test]
@@ -5863,6 +11156,83 @@ mod tests {
     }
 
     #[test]
+    fn scoped_custom_element_registry_matches_chrome_initialize_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const registry = new CustomElementRegistry();
+                    const host = document.createElement('div');
+                    document.body.appendChild(host);
+                    const shadow = host.attachShadow({
+                        mode: 'open', customElementRegistry: registry,
+                    });
+                    shadow.innerHTML = '<scope-probe></scope-probe><div id=scoped-div></div>';
+                    document.body.insertAdjacentHTML('beforeend',
+                        '<scope-probe id=global-probe></scope-probe>');
+                    let constructors = 0, connected = 0;
+                    class ScopeProbe extends HTMLElement {
+                        constructor() { super(); constructors++; }
+                        connectedCallback() { connected++; }
+                    }
+                    registry.define('scope-probe', ScopeProbe);
+                    const before = [constructors, connected];
+                    registry.initialize(shadow);
+                    let missing;
+                    try { registry.initialize(); missing = null; }
+                    catch (error) { missing = error.name; }
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        CustomElementRegistry.prototype, 'initialize');
+                    const elementRegistryDescriptor = Object.getOwnPropertyDescriptor(
+                        Element.prototype, 'customElementRegistry');
+                    return {
+                        own: Object.getOwnPropertyNames(registry),
+                        tag: Object.prototype.toString.call(registry),
+                        prototype: Object.getOwnPropertyNames(
+                            CustomElementRegistry.prototype),
+                        initialize: [descriptor.value.name, descriptor.value.length,
+                            descriptor.enumerable, descriptor.configurable,
+                            descriptor.writable,
+                            Function.prototype.toString.call(descriptor.value)],
+                        rootRegistry: shadow.customElementRegistry === registry,
+                        elementRegistry: [
+                            shadow.querySelector('#scoped-div').customElementRegistry === registry,
+                            host.customElementRegistry === customElements,
+                            document.getElementById('global-probe').customElementRegistry === customElements,
+                            elementRegistryDescriptor.get.name,
+                            elementRegistryDescriptor.get.length,
+                            elementRegistryDescriptor.enumerable,
+                            elementRegistryDescriptor.configurable,
+                            Function.prototype.toString.call(elementRegistryDescriptor.get),
+                        ],
+                        before, after: [constructors, connected], missing,
+                        scoped: shadow.querySelector('scope-probe').constructor.name,
+                        globalNotScoped:
+                            !(document.getElementById('global-probe') instanceof ScopeProbe),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "own": [],
+            "tag": "[object CustomElementRegistry]",
+            "prototype": ["define", "get", "getName", "upgrade", "whenDefined",
+                "initialize", "constructor"],
+            "initialize": ["initialize", 1, true, true, true,
+                "function initialize() { [native code] }"],
+            "rootRegistry": true,
+            "elementRegistry": [true, true, true, "get customElementRegistry", 0,
+                true, true,
+                "function get customElementRegistry() { [native code] }"],
+            "before": [1, 1],
+            "after": [1, 1],
+            "missing": "TypeError",
+            "scoped": "ScopeProbe",
+            "globalNotScoped": true,
+        }));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();
@@ -5974,6 +11344,73 @@ mod tests {
     }
 
     #[test]
+    fn window_legacy_attributes_and_event_target_shape_match_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(window, name);
+                        return d && [d.get.name, d.set && d.set.name,
+                            d.enumerable, d.configurable];
+                    };
+                    window.name = 42;
+                    window.status = 7;
+                    return {
+                        values: [window.name, window.status, window.closed],
+                        own: Object.getOwnPropertyNames(window).filter(name =>
+                            ['name', 'status', 'closed', 'addEventListener',
+                             'removeEventListener', 'dispatchEvent'].includes(name)),
+                        descriptors: [descriptor('name'), descriptor('status'),
+                            descriptor('closed')],
+                        eventTarget: window instanceof EventTarget,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": ["42", "7", false],
+                "own": ["name", "status", "closed"],
+                "descriptors": [
+                    ["get name", "set name", true, true],
+                    ["get status", "set status", true, true],
+                    ["get closed", null, true, true],
+                ],
+                "eventTarget": true,
+            })
+        );
+    }
+
+    #[test]
+    fn window_webidl_constructors_are_not_enumerable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const enumerableConstructors = Object.keys(window)
+                        .filter(name => /^[A-Z]/.test(name));
+                    const samples = ['Image', 'XMLSerializer', 'Element', 'FontFaceSet']
+                        .map(name => {
+                            const descriptor = Object.getOwnPropertyDescriptor(window, name);
+                            return [name, descriptor && descriptor.enumerable];
+                        });
+                    return [enumerableConstructors, samples];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [],
+                [["Image", false], ["XMLSerializer", false],
+                 ["Element", false], ["FontFaceSet", false]],
+            ])
+        );
+    }
+
+    #[test]
     fn window_named_access_exposes_ids_and_eligible_names() {
         let mut rt = setup_runtime(
             r#"<html><body>
@@ -5989,6 +11426,8 @@ mod tests {
                 return [
                     window.payload === document.getElementById("payload"),
                     window.payload.text,
+                    !Object.getOwnPropertyNames(window).includes("payload"),
+                    !Object.keys(window).includes("payload"),
                     window.duplicate instanceof HTMLCollection,
                     window.duplicate.length,
                     window.login === document.querySelector("form"),
@@ -6003,6 +11442,8 @@ mod tests {
             serde_json::json!([
                 true,
                 "{\"ready\":true}",
+                true,
+                true,
                 true,
                 2,
                 true,
@@ -6102,6 +11543,233 @@ mod tests {
     }
 
     #[test]
+    fn viewport_override_preserves_fingerprinted_window_placement() {
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 3440,
+                    height: 1440,
+                    avail_width: 3440,
+                    avail_height: 1326,
+                    avail_top: 25,
+                    avail_left: 0,
+                    device_scale_factor: 2.0,
+                    outer_width: 2309,
+                    outer_height: 1326,
+                    screen_x: 674,
+                    screen_y: 25,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_viewport(1024.0, 768.0);
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate("[innerWidth,innerHeight,outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]")
+                .unwrap(),
+            serde_json::json!([1024, 768, 2309, 1326, 674, 25, 674, 25])
+        );
+    }
+
+    #[test]
+    fn navigator_has_no_own_idl_members() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const prototype = Object.getPrototypeOf(navigator);
+                    const descriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(prototype, name);
+                        return d && [d.get ? d.get.name : null, d.enumerable, d.configurable];
+                    };
+                    return {
+                        own: Object.getOwnPropertyNames(navigator),
+                        members: ['connection', 'permissions', 'gpu', 'geolocation', 'getBattery']
+                            .map(descriptor),
+                        values: [navigator.connection !== undefined,
+                            navigator.permissions !== undefined,
+                            navigator.gpu !== undefined,
+                            navigator.geolocation !== undefined],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "own": [],
+                "members": [
+                    ["get connection", true, true],
+                    ["get permissions", true, true],
+                    ["get gpu", true, true],
+                    ["get geolocation", true, true],
+                    [null, true, true],
+                ],
+                "values": [true, true, true, true],
+            })
+        );
+    }
+
+    #[test]
+    fn link_elements_use_their_own_interface_and_resolve_urls() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const link = document.createElement('link');
+                    link.href = '/assets/app.css';
+                    link.rel = 'stylesheet';
+                    link.media = 'print';
+                    link.fetchPriority = 'high';
+                    link.crossOrigin = 'anonymous';
+                    return {
+                        ctor: link.constructor.name,
+                        instance: link instanceof HTMLLinkElement,
+                        elementInstance: link instanceof Element,
+                        href: link.href,
+                        media: link.media,
+                        fetchPriority: link.fetchPriority,
+                        crossOrigin: link.crossOrigin,
+                        illegal: (() => { try { new HTMLLinkElement(); return false; }
+                            catch (error) { return error.name; } })(),
+                        own: Object.getOwnPropertyNames(link),
+                        proto: Object.getOwnPropertyNames(HTMLLinkElement.prototype).filter(
+                            name => ['href', 'media', 'as', 'type', 'crossOrigin',
+                                'referrerPolicy', 'fetchPriority', 'integrity', 'blocking']
+                                .includes(name)),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "ctor": "HTMLLinkElement",
+                "instance": true,
+                "elementInstance": true,
+                "href": "http://example.com/assets/app.css",
+                "media": "print",
+                "fetchPriority": "high",
+                "crossOrigin": "anonymous",
+                "illegal": "TypeError",
+                "own": [],
+                "proto": [
+                    "href", "crossOrigin", "media", "as", "type",
+                    "referrerPolicy", "fetchPriority", "integrity", "blocking",
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn chrome149_payload_interfaces_are_present_on_secure_documents() {
+        // ModelContext/WebMCPEvent existed only behind a Chrome 153+ origin
+        // trial (the earlier capture ran a headful trial build). The UA this
+        // engine presents is stable Chrome 148, which does not expose them,
+        // and the passing baseline enumerates neither. Keep the surface free
+        // of both so the payload cannot contradict its own user agent.
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => ({
+                    modelContext: typeof navigator.modelContext,
+                    modelContextTag: Object.prototype.toString.call(navigator.modelContext),
+                    modelContextCtor: typeof ModelContext,
+                    webMcpEvent: typeof WebMCPEvent,
+                    designMode: document.designMode,
+                    navigatorOwn: Object.getOwnPropertyNames(navigator),
+                }))()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "modelContext": "undefined",
+                "modelContextTag": "[object Undefined]",
+                "modelContextCtor": "undefined",
+                "webMcpEvent": "undefined",
+                "designMode": "off",
+                "navigatorOwn": [],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_contract_drives_navigator_ua_ch_and_screen() {
+        let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.80 Safari/537.36",
+        ).with_overrides(&obscura_net::FingerprintOverrides {
+            architecture: Some("arm".to_string()),
+            hardware_concurrency: Some(12),
+            screen: Some(obscura_net::ScreenFingerprint {
+                width: 1512,
+                height: 982,
+                avail_width: 1512,
+                avail_height: 944,
+                avail_top: 30,
+                avail_left: 0,
+                device_scale_factor: 2.0,
+                outer_width: 1200,
+                outer_height: 1120,
+                screen_x: 22,
+                screen_y: 51,
+            }),
+            ..obscura_net::FingerprintOverrides::default()
+        });
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+              const high = await navigator.userAgentData.getHighEntropyValues([
+                'architecture','bitness','fullVersionList','model',
+                'platformVersion','uaFullVersion','wow64'
+              ]);
+              return {
+                ua:navigator.userAgent, appVersion:navigator.appVersion,
+                platform:navigator.platform, hardwareConcurrency:navigator.hardwareConcurrency,
+                deviceMemory:navigator.deviceMemory, low:navigator.userAgentData.toJSON(), high,
+                screen:[screen.width,screen.height,screen.availWidth,screen.availHeight,screen.availTop,screen.availLeft,devicePixelRatio],
+                window:[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]
+              };
+            })()"#,
+            true,
+            true,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result, serde_json::json!({
+            "ua": fingerprint.user_agent,
+            "appVersion": fingerprint.user_agent.trim_start_matches("Mozilla/"),
+            "platform": "MacIntel",
+            "hardwareConcurrency": 12,
+            "deviceMemory": 8,
+            "low": {
+                "brands": fingerprint.brands,
+                "mobile": false,
+                "platform": "macOS"
+            },
+            "high": {
+                "architecture": "arm",
+                "bitness": "64",
+                "brands": fingerprint.brands,
+                "fullVersionList": fingerprint.full_version_list,
+                "mobile": false,
+                "model": "",
+                "platform": "macOS",
+                // The 14_6 UA token is frozen Chrome boilerplate; the claimed
+                // platform version is the macOS constant, not the token.
+                "platformVersion": obscura_net::MACOS_UA_PLATFORM_VERSION,
+                "uaFullVersion": "146.0.7680.80",
+                "wow64": false
+            },
+            "screen": [1512,982,1512,944,30,0,2],
+            "window": [1200,1120,22,51,22,51]
+        }));
+    }
+
+    #[test]
     fn screen_override_is_independent_live_and_preserves_screen_identity() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
@@ -6126,16 +11794,101 @@ mod tests {
         );
 
         rt.set_screen_size_override(None, false);
+        // Clearing the override returns the default macOS work area, which is
+        // smaller than the screen: the menu bar always takes a strip off the
+        // top, so `availHeight === height` together with `availTop === 0` is a
+        // shape no macOS session reports.
         assert_eq!(
             rt.evaluate(
                 "[innerWidth, innerHeight, screen.width === __screenSizeBefore[0],\
                   screen.height === __screenSizeBefore[1],\
-                  screen.availHeight === screen.height - 40,\
+                  screen.availHeight === screen.height,\
+                  screen.availTop > 0,\
                   screen === __screenBefore]"
             )
             .unwrap(),
-            serde_json::json!([1024, 768, true, true, true, true])
+            serde_json::json!([1024, 768, true, true, false, true, true])
         );
+    }
+
+    #[test]
+    fn screen_orientation_methods_follow_chrome_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "Object.keys(ScreenOrientation.prototype).filter(name => name !== 'constructor')",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "type", "angle", "onchange", "lock", "unlock",
+                "addEventListener", "dispatchEvent", "removeEventListener", "when",
+            ])
+        );
+    }
+
+    #[test]
+    fn callback_key_range_and_window_methods_match_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(
+            r#"(() => {
+              const constructError = value => {
+                try { Reflect.construct(value, []); return null; }
+                catch (error) { return error.name; }
+              };
+              const globals = Object.fromEntries(
+                ['blur', 'close', 'focus', 'postMessage'].map(name => {
+                  const value = globalThis[name];
+                  return [name, [value.name, value.length, 'prototype' in value,
+                    Object.getOwnPropertyDescriptor(globalThis, name).enumerable,
+                    Function.prototype.toString.call(value), constructError(value)]];
+                }));
+              const range = IDBKeyRange.bound(1, 3, true, false);
+              const lowerGetter = Object.getOwnPropertyDescriptor(
+                IDBKeyRange.prototype, 'lower').get;
+              let invalidGetterError = null;
+              try { lowerGetter.call({}); }
+              catch (error) { invalidGetterError = [error.name, error.message]; }
+              return {
+                webkitAudioContext: typeof webkitAudioContext,
+                nodeFilter: [typeof NodeFilter, NodeFilter.name, NodeFilter.length,
+                  'prototype' in NodeFilter,
+                  Object.getOwnPropertyDescriptor(globalThis, 'NodeFilter').enumerable,
+                  Function.prototype.toString.call(NodeFilter), constructError(NodeFilter),
+                  NodeFilter.FILTER_ACCEPT, NodeFilter.SHOW_ALL],
+                keyRange: [typeof IDBKeyRange, IDBKeyRange.name, IDBKeyRange.length,
+                  Object.getOwnPropertyDescriptor(globalThis, 'IDBKeyRange').enumerable,
+                  Function.prototype.toString.call(IDBKeyRange), constructError(IDBKeyRange),
+                  Object.getOwnPropertyNames(IDBKeyRange.prototype).sort(),
+                  Object.prototype.toString.call(range), range.lower, range.upper,
+                  range.lowerOpen, range.upperOpen, range.includes(1), range.includes(2),
+                  invalidGetterError],
+                globals,
+              };
+            })()"#,
+        ).unwrap();
+
+        assert_eq!(result, serde_json::json!({
+            "webkitAudioContext": "undefined",
+            "nodeFilter": ["function", "NodeFilter", 0, false, false,
+                "function NodeFilter() { [native code] }", "TypeError", 1, 4294967295u64],
+            "keyRange": ["function", "IDBKeyRange", 0, false,
+                "function IDBKeyRange() { [native code] }", "TypeError",
+                ["constructor", "includes", "lower", "lowerOpen", "upper", "upperOpen"],
+                "[object IDBKeyRange]", 1, 3, true, false, false, true,
+                ["TypeError", "Illegal invocation"]],
+            "globals": {
+                "blur": ["blur", 0, false, true,
+                    "function blur() { [native code] }", "TypeError"],
+                "close": ["close", 0, false, true,
+                    "function close() { [native code] }", "TypeError"],
+                "focus": ["focus", 0, false, true,
+                    "function focus() { [native code] }", "TypeError"],
+                "postMessage": ["postMessage", 1, false, true,
+                    "function postMessage() { [native code] }", "TypeError"],
+            }
+        }));
     }
 
     #[test]
@@ -6202,6 +11955,58 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!([false, true, true])
+        );
+    }
+
+    #[test]
+    fn match_media_returns_a_branded_event_target() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const list = matchMedia('(min-width: 1px)');
+                    let construct;
+                    try { new MediaQueryList(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    let dispatched = 0;
+                    list.addListener(() => dispatched++);
+                    list.dispatchEvent(new Event('change'));
+                    return {
+                        construct,
+                        constructorLength: MediaQueryList.length,
+                        instance: list instanceof MediaQueryList,
+                        eventTarget: list instanceof EventTarget,
+                        parent: Object.getPrototypeOf(MediaQueryList.prototype).constructor.name,
+                        tag: Object.prototype.toString.call(list),
+                        own: Object.getOwnPropertyNames(list),
+                        prototype: Object.getOwnPropertyNames(MediaQueryList.prototype),
+                        media: list.media,
+                        matches: list.matches,
+                        onchange: list.onchange,
+                        methods: [typeof list.addListener, typeof list.removeListener,
+                            typeof list.addEventListener, typeof list.removeEventListener],
+                        dispatched,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'MediaQueryList': Illegal constructor",
+                "constructorLength": 0,
+                "instance": true,
+                "eventTarget": true,
+                "parent": "EventTarget",
+                "tag": "[object MediaQueryList]",
+                "own": [],
+                "prototype": ["constructor", "media", "matches", "onchange", "addListener", "removeListener"],
+                "media": "(min-width: 1px)",
+                "matches": true,
+                "onchange": null,
+                "methods": ["function", "function", "function", "function"],
+                "dispatched": 1,
+            })
         );
     }
 
@@ -6281,6 +12086,35 @@ mod tests {
                 ],
                 "de-DE",
                 "origin"
+            ])
+        );
+    }
+
+    #[test]
+    fn draggable_and_spellcheck_use_chrome_boolean_reflection_defaults() {
+        let mut rt = setup_runtime(r#"<div id="probe"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const probe = document.getElementById('probe');
+                const initial = [probe.draggable, probe.spellcheck,
+                    probe.hasAttribute('draggable'), probe.hasAttribute('spellcheck')];
+                probe.draggable = true;
+                probe.spellcheck = false;
+                const assigned = [probe.draggable, probe.spellcheck,
+                    probe.getAttribute('draggable'), probe.getAttribute('spellcheck')];
+                probe.setAttribute('draggable', 'invalid');
+                probe.setAttribute('spellcheck', 'invalid');
+                return [initial, assigned, [probe.draggable, probe.spellcheck]];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [false, true, false, false],
+                [true, false, "true", "false"],
+                [false, true]
             ])
         );
     }
@@ -8018,6 +13852,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn traversal_factories_return_branded_interface_objects() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                const iterator = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                let walkerError = null;
+                let iteratorError = null;
+                try { new TreeWalker(); } catch (error) { walkerError = error.name; }
+                try { new NodeIterator(); } catch (error) { iteratorError = error.name; }
+                return {
+                    walker: [walker instanceof TreeWalker,
+                        Object.getPrototypeOf(walker) === TreeWalker.prototype,
+                        Object.keys(walker), walker.root === root,
+                        typeof walker.nextNode, Object.prototype.toString.call(walker),
+                        walkerError],
+                    iterator: [iterator instanceof NodeIterator,
+                        Object.getPrototypeOf(iterator) === NodeIterator.prototype,
+                        Object.keys(iterator), iterator.root === root,
+                        typeof iterator.nextNode, Object.prototype.toString.call(iterator),
+                        iteratorError],
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "walker": [true, true, [], true, "function", "[object TreeWalker]", "TypeError"],
+                "iterator": [true, true, [], true, "function", "[object NodeIterator]", "TypeError"],
+            })
+        );
+    }
+
     /// Issue #467: previousNode() retraces the iterator, and the root is the
     /// last node it yields going backwards.
     #[test]
@@ -8815,8 +14686,13 @@ mod tests {
         assert_eq!(initial["tracker"], serde_json::json!([320, 200, 320, 200]));
         assert_eq!(initial["box"][0], serde_json::json!(116));
         assert_eq!(initial["box"][1], serde_json::json!(62));
-        assert!((initial["box"][2].as_f64().unwrap() - 123.0).abs() < 0.05);
-        assert_eq!(initial["box"][3], serde_json::json!(67));
+        // Chrome 153 (headless, 1x) on this exact box: border box
+        // 122.765625 x 66.59375. Blink floors each used length onto its 1/64
+        // LayoutUnit grid and composes the border box from the snapped pieces,
+        // so the authored 123.0 is never reported verbatim. Previously pinned
+        // to 123.0 / 66.6, which was this engine's unsnapped value.
+        assert_eq!(initial["box"][2], serde_json::json!(122.765625));
+        assert_eq!(initial["box"][3], serde_json::json!(66.59375));
 
         // Attribute-backed inline-style changes invalidate the retained
         // render. Borders do not change the padding box; padding does.
@@ -8838,7 +14714,9 @@ mod tests {
             .unwrap();
         assert_eq!(mutated[0], serde_json::json!(100));
         assert_eq!(mutated[1], serde_json::json!(126));
-        assert_eq!(mutated[2], serde_json::json!(143));
+        // Chrome 153 on the same mutation (border-left 13px, padding-left 17px):
+        // 142.578125, not the unsnapped 142.7.
+        assert_eq!(mutated[2], serde_json::json!(142.578125));
 
         // A later CDP/emulation viewport update invalidates the layout too;
         // both the root special case and an ordinary 100vh box are live.
@@ -10803,16 +16681,27 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fingerprinted_screen_does_not_invent_a_device_scale_factor() {
         let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 2560,
+                    height: 1440,
+                    avail_width: 2560,
+                    avail_height: 1400,
+                    avail_top: 0,
+                    avail_left: 0,
+                    device_scale_factor: 1.0,
+                    outer_width: 0,
+                    outer_height: 0,
+                    screen_x: 0,
+                    screen_y: 0,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        rt.set_fingerprint(&fingerprint);
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_viewport(300.0, 200.0);
-        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
-        // That physical screen must not silently turn a 1x render surface into
-        // a 2x devicePixelContentBoxSize surface.
-        rt.execute_script(
-            "deterministic-high-resolution-screen",
-            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
-        )
-        .unwrap();
         rt.run_page_init();
 
         assert_eq!(
@@ -10820,6 +16709,122 @@ mod tests {
                 .unwrap(),
             serde_json::json!([2560, 1440, 1])
         );
+    }
+
+    #[test]
+    fn fingerprint_language_reaches_main_and_initial_frame_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                language: Some("zh-CN".to_string()),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        rt.set_fingerprint(&fingerprint);
+        let values = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    return [
+                        navigator.language,
+                        navigator.languages,
+                        frame.contentWindow.navigator.language,
+                        frame.contentWindow.navigator.languages,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        // Chrome reports the selected language followed by its base language,
+        // in the main realm and in a frame realm alike. A lone `zh-CN` entry is
+        // the one list a real zh-CN session never reports.
+        assert_eq!(
+            values,
+            serde_json::json!(["zh-CN", ["zh-CN", "zh"], "zh-CN", ["zh-CN", "zh"]])
+        );
+    }
+
+    #[test]
+    fn initial_about_blank_inherits_creator_origin_domain_and_referrer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example:8443/parent/path");
+        let result = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            const read = frame => ({
+                url: frame.contentDocument.URL,
+                locationOrigin: frame.contentWindow.location.origin,
+                origin: frame.contentWindow.origin,
+                domain: frame.contentDocument.domain,
+                referrer: frame.contentDocument.referrer,
+                base: frame.contentDocument.baseURI,
+            });
+            const child = read(frame);
+            const nested = frame.contentDocument.createElement('iframe');
+            frame.contentDocument.body.append(nested);
+            return {child, nested: read(nested)};
+        })()"#).unwrap();
+        // locationOrigin is the deliberate creator-URL answer, not the spec
+        // one: inherited-origin about:blank frames report a Location on the
+        // creator's document URL (see `_environmentSettings` in
+        // env/window/location.js for the Cloudflare measurement behind it).
+        // `document.URL` stays "about:blank" and `window.origin`/`domain`
+        // still prove the inheritance this test is named for.
+        assert_eq!(result, serde_json::json!({
+            "child": {
+                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
+                "origin": "https://creator.example:8443", "domain": "creator.example",
+                "referrer": "https://creator.example:8443/parent/path",
+                "base": "https://creator.example:8443/parent/path",
+            },
+            "nested": {
+                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
+                "origin": "https://creator.example:8443", "domain": "creator.example",
+                "referrer": "about:blank", "base": "https://creator.example:8443/parent/path",
+            },
+        }));
+    }
+
+    #[test]
+    fn initial_about_blank_iframe_is_back_compat_synchronously() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    return [frame.contentDocument.compatMode, frame.contentDocument.doctype === null];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["BackCompat", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandboxed_initial_about_blank_keeps_opaque_origin_and_domain() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            frame.sandbox = 'allow-scripts';
+            document.body.append(frame);
+            if (frame.contentDocument !== null) throw new Error('sandbox access');
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("opaque-initial", 1, root, "about:blank").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "opaque-initial", 1, crate::realm::MAIN_WORLD,
+            "[origin, location.origin, document.domain, document.referrer]",
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        // Opaque-origin frames keep the spec answer: the deliberate
+        // creator-URL Location for inherited about:blank frames (see
+        // `_environmentSettings` in env/window/location.js) is gated on the
+        // tuple origin, so a sandboxed frame still reports location.origin
+        // "null" like Chrome.
+        assert_eq!(result, serde_json::json!([
+            "null", "null", "", "http://example.com/test",
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -10877,7 +16882,9 @@ mod tests {
                 "contentRect": [7, 5, 102, 66],
                 "content": [102, 66],
                 "border": [120, 80],
-                "device": [102, 66],
+                // Device pixels are CSS size times the fingerprint's
+                // devicePixelRatio, 2.0 under the default macOS identity.
+                "device": [204, 132],
             }])
         );
 
@@ -12190,6 +18197,144 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, true, 1, 1]));
     }
 
+    /// `btoa`/`atob` are byte-oriented: one code unit is one byte, and the
+    /// decoded string is Latin-1. Encoding through TextEncoder keeps
+    /// `atob(btoa(s)) === s` true while inflating every unit above 0x7F to two
+    /// bytes, which corrupts every binary round trip -- a FileReader data URL, a
+    /// JWK byte field, an exported ECDSA key. The expected values are Chrome
+    /// 152's, measured on the same bytes.
+    #[test]
+    fn atob_and_btoa_are_byte_oriented() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const bytes = new Uint8Array([0x41, 0x80, 0xA1, 0xFF, 0x42]);
+                    let binary = "";
+                    for (const byte of bytes) binary += String.fromCharCode(byte);
+                    const encoded = btoa(binary);
+                    const decoded = atob(encoded);
+                    const codes = [];
+                    for (let i = 0; i < decoded.length; i++) codes.push(decoded.charCodeAt(i));
+                    let over255 = "none";
+                    try { btoa("\u0100"); } catch (e) { over255 = e.name; }
+                    return [encoded, decoded.length, codes, atob("QQ").length, over255];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["QYCh/0I=", 5, [65, 128, 161, 255, 66], 1, "InvalidCharacterError"])
+        );
+    }
+
+    /// The public-key half of `crypto.subtle` runs in Rust (`op_subtle_asym`),
+    /// which is synchronous, so the round trips below are asserted directly.
+    /// The shim's own parameter and usage rules sit on top of this and are
+    /// covered by the values pinned here.
+    #[test]
+    fn asymmetric_webcrypto_round_trips() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (command, request) =>
+                        JSON.parse(Deno.core.ops.op_subtle_asym(command, JSON.stringify(request)));
+                    const encode = (bytes) => btoa(String.fromCharCode(...bytes));
+                    const decode = (text) => {
+                        const binary = atob(text);
+                        const out = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+                        return out;
+                    };
+                    const out = {};
+
+                    // ECDSA: sign, verify, tamper, and the canonical encodings.
+                    const ecdsa = op("generate", { kind: "ECDSA", curve: "P-256" });
+                    const scalar = decode(ecdsa.private), point = decode(ecdsa.public);
+                    out.privateLength = scalar.length;
+                    out.publicLength = point.length;
+                    const message = new TextEncoder().encode("obscura");
+                    const signed = op("ec_sign", {
+                        curve: "P-256", hash: "SHA-256",
+                        key: encode(scalar), data: encode(message),
+                    });
+                    const signature = decode(signed.sig);
+                    out.signatureLength = signature.length;
+                    const verify = (candidate) => op("ec_verify", {
+                        curve: "P-256", hash: "SHA-256", key: encode(point),
+                        signature: encode(candidate), data: encode(message),
+                    }).ok;
+                    out.verifies = verify(signature);
+                    const tampered = new Uint8Array(signature);
+                    tampered[0] ^= 1;
+                    out.rejectsTampered = !verify(tampered);
+                    out.rejectsTruncated = !verify(signature.slice(2));
+
+                    // SPKI and PKCS#8 are the round-trip forms used on the wire.
+                    const spki = decode(op("ec_export", {
+                        curve: "P-256", format: "spki", type: "public", key: encode(point),
+                    }).data);
+                    const pkcs8 = decode(op("ec_export", {
+                        curve: "P-256", format: "pkcs8", type: "private", key: encode(scalar),
+                    }).data);
+                    out.spkiLength = spki.length;
+                    out.pkcs8Length = pkcs8.length;
+                    const fromSpki = op("ec_import", {
+                        curve: "P-256", format: "spki", type: "public", data: encode(spki),
+                    });
+                    out.spkiRoundTrip = fromSpki.key === ecdsa.public;
+                    const fromPkcs8 = op("ec_import", {
+                        curve: "P-256", format: "pkcs8", type: "private", data: encode(pkcs8),
+                    });
+                    out.pkcs8RoundTrip = fromPkcs8.key === ecdsa.private;
+
+                    // ECDH agrees in both directions and honours the length cap.
+                    const peer = op("generate", { kind: "ECDH", curve: "P-256" });
+                    const derive = (mine, theirs) => op("ec_derive", {
+                        curve: "P-256", private: mine, public: theirs, length: 256,
+                    }).bits;
+                    out.ecdhAgrees = derive(ecdsa.private, peer.public) ===
+                        derive(peer.private, ecdsa.public);
+                    let tooLong = "none";
+                    try {
+                        op("ec_derive", {
+                            curve: "P-256", private: ecdsa.private, public: peer.public, length: 264,
+                        });
+                    } catch (error) { tooLong = String(error.message).split(":")[0]; }
+                    out.ecdhTooLong = tooLong;
+
+                    // RSA-OAEP, plus the algorithm mismatch Chrome reports.
+                    const rsa = op("generate", {
+                        kind: "RSA-OAEP", modulusLength: 2048, publicExponent: encode([1, 0, 1]),
+                        hash: "SHA-256",
+                    });
+                    const encrypted = op("rsa_encrypt", {
+                        hash: "SHA-256", key: rsa.public, data: encode(message),
+                    });
+                    const cipher = decode(encrypted.data);
+                    out.rsaCipherLength = cipher.length;
+                    const decrypted = op("rsa_decrypt", {
+                        hash: "SHA-256", key: rsa.private, data: encode(cipher),
+                    });
+                    out.rsaPlain = new TextDecoder().decode(decode(decrypted.data));
+                    let mismatch = "none";
+                    try {
+                        op("ec_sign", {
+                            curve: "P-256", hash: "SHA-256", key: rsa.private, data: encode(message),
+                        });
+                    } catch (error) { mismatch = String(error.message).split(":")[0]; }
+                    out.ecKeyMismatch = mismatch;
+                    return JSON.stringify(out);
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"privateLength":32,"publicLength":65,"signatureLength":64,"verifies":true,"rejectsTampered":true,"rejectsTruncated":true,"spkiLength":91,"pkcs8Length":138,"spkiRoundTrip":true,"pkcs8RoundTrip":true,"ecdhAgrees":true,"ecdhTooLong":"OperationError","rsaCipherLength":256,"rsaPlain":"obscura","ecKeyMismatch":"DataError"}"#)
+        );
+    }
+
     #[test]
     fn atob_decodes_large_payload_without_argument_stack_overflow() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -12353,6 +18498,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn css_style_sheet_inherits_the_style_sheet_interface() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style id="sheet">.a { color: red }</style></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const sheet = document.getElementById('sheet').sheet;
+                let constructorError = null;
+                try { new StyleSheet(); } catch (error) { constructorError = error.name; }
+                const before = sheet.disabled;
+                sheet.disabled = true;
+                return [
+                    sheet instanceof CSSStyleSheet,
+                    sheet instanceof StyleSheet,
+                    Object.getPrototypeOf(CSSStyleSheet.prototype) === StyleSheet.prototype,
+                    sheet.type,
+                    before,
+                    sheet.disabled,
+                    Object.prototype.toString.call(sheet),
+                    constructorError,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, true, true, "text/css", false, true,
+                "[object CSSStyleSheet]", "TypeError"
+            ])
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn stylesheet_cssom_mutations_update_the_live_cascade() {
@@ -12479,6 +18659,14 @@ mod tests {
                     const firstAdopted = first.adoptedStyleSheets;
                     const secondAdopted = second.adoptedStyleSheets;
                     const documentAdopted = document.adoptedStyleSheets;
+                    const adoptionDescriptors = [Document.prototype, ShadowRoot.prototype].map(proto => {
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'adoptedStyleSheets');
+                        return [descriptor.enumerable, descriptor.configurable];
+                    });
+                    const adoptionEnumerated = [document, first].map(root => {
+                        for (const key in root) if (key === 'adoptedStyleSheets') return true;
+                        return false;
+                    });
 
                     const shared = new CSSStyleSheet();
                     first.adoptedStyleSheets = [shared];
@@ -12528,7 +18716,8 @@ mod tests {
                         firstList.length,
                         inlineSheet.ownerNode,
                     ];
-                    return { initial, synchronized, afterRemoval, inlineRemoval };
+                    return { initial, synchronized, afterRemoval, inlineRemoval,
+                        adoptionDescriptors, adoptionEnumerated };
                 })()
                 "#,
             )
@@ -12545,6 +18734,8 @@ mod tests {
                 "synchronized": [true, true, true],
                 "afterRemoval": [true, 0, null, 0, true, true, true],
                 "inlineRemoval": [true, 0, null],
+                "adoptionDescriptors": [[true, true], [true, true]],
+                "adoptionEnumerated": [true, true],
             })
         );
     }
@@ -12642,6 +18833,358 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([null, null, null, true, "static fallback"])
+        );
+    }
+
+    #[test]
+    fn canvas_paths_capture_transforms_and_rects_preserve_the_current_path() {
+        let mut rt = setup_runtime("<html><body><canvas width=40 height=24></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    const hasInk = (x0, y0, width, height) => {
+                        const data = ctx.getImageData(x0, y0, width, height).data;
+                        return Array.from(data).some((value, index) => index % 4 === 3 && value > 0);
+                    };
+                    ctx.strokeStyle = 'red';
+                    ctx.beginPath(); ctx.moveTo(1, 2); ctx.lineTo(8, 2); ctx.stroke();
+                    const twoPointStroke = hasInk(0, 0, 10, 5);
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.resetTransform(); ctx.translate(10, 0); ctx.scale(2, 2);
+                    const matrix = ctx.getTransform();
+                    ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 1, 1);
+                    const transformedRect = [hasInk(10, 0, 2, 2), hasInk(20, 0, 2, 2)];
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.resetTransform(); ctx.beginPath(); ctx.moveTo(1, 8);
+                    ctx.translate(10, 0); ctx.lineTo(1, 8); ctx.resetTransform(); ctx.stroke();
+                    const pathCapturedTransform = hasInk(0, 6, 13, 5);
+
+                    ctx.clearRect(0, 0, 40, 24);
+                    ctx.beginPath(); ctx.moveTo(1, 14); ctx.lineTo(9, 14);
+                    ctx.lineTo(5, 20); ctx.closePath(); ctx.translate(20, 0);
+                    ctx.fillStyle = 'blue'; ctx.fillRect(0, 0, 1, 1);
+                    ctx.resetTransform(); ctx.strokeStyle = 'red'; ctx.stroke();
+                    const fillRectPreservedPath = hasInk(0, 12, 12, 10);
+                    return {
+                        twoPointStroke,
+                        matrix: [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f],
+                        transformedRect, pathCapturedTransform, fillRectPreservedPath,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "twoPointStroke": true,
+                "matrix": [2, 0, 0, 2, 10, 0],
+                "transformedRect": [true, false],
+                "pathCapturedTransform": true,
+                "fillRectPreservedPath": true,
+            })
+        );
+    }
+
+    #[test]
+    fn image_data_settings_color_spaces_and_float16_match_chrome() {
+        let mut rt = setup_runtime("<html><body><canvas width=1 height=1></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summary = image => [image.width, image.height, image.colorSpace,
+                        image.pixelFormat, image.data.constructor.name, ...image.data];
+                    const canvas = document.querySelector('canvas');
+                    const ctx = canvas.getContext('2d',
+                        {colorSpace: 'display-p3', willReadFrequently: true});
+                    const read = (colorSpace, pixelFormat, color) => {
+                        ctx.clearRect(0, 0, 1, 1);
+                        ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
+                        const values = summary(ctx.getImageData(0, 0, 1, 1,
+                            {colorSpace, pixelFormat}));
+                        if (pixelFormat === 'rgba-float16') {
+                            for (let index = 5; index < values.length; index++)
+                                values[index] = Math.round(values[index] * 1000) / 1000;
+                        }
+                        return values;
+                    };
+                    const error = callback => {
+                        try { callback(); return null; }
+                        catch (caught) { return caught.name; }
+                    };
+                    const floatContextRead = colorSpace => {
+                        const surface = new OffscreenCanvas(2, 2);
+                        const context = surface.getContext('2d', {
+                            colorSpace, colorType: 'float16', willReadFrequently: true,
+                        });
+                        context.fillStyle = 'color(display-p3 1 0.25 0.5)';
+                        context.fillRect(0, 0, 2, 2);
+                        const attrs = context.getContextAttributes();
+                        return [attrs.colorSpace, attrs.colorType, ...context.getImageData(
+                            0, 0, 1, 1, {colorSpace, pixelFormat: 'rgba-float16'}).data];
+                    };
+                    return {
+                        basic: summary(new ImageData(1, 1)),
+                        p3: summary(new ImageData(new Uint8ClampedArray(
+                            [255, 64, 127, 255]), 1, 1, {colorSpace: 'display-p3'})),
+                        float: summary(new ImageData(new Float16Array([1, .25, .5, 1]),
+                            1, 1, {colorSpace: 'display-p3', pixelFormat: 'rgba-float16'})),
+                        attrs: ctx.getContextAttributes(),
+                        created: summary(ctx.createImageData(1, 1,
+                            {colorSpace: 'display-p3', pixelFormat: 'rgba-float16'})),
+                        reads: [
+                            read('srgb', 'rgba-unorm8', 'color(srgb 1.1 0.1 0.5)'),
+                            read('display-p3', 'rgba-unorm8', 'color(display-p3 1 0.25 0.5)'),
+                            read('srgb', 'rgba-float16', 'color(srgb 1.1 0.1 0.5)'),
+                            read('display-p3', 'rgba-float16', 'color(display-p3 1 0.25 0.5)'),
+                        ],
+                        floatContexts: [floatContextRead('srgb'),
+                            floatContextRead('display-p3')],
+                        errors: [
+                            error(() => new ImageData(0, 1)),
+                            error(() => new ImageData(new Uint8ClampedArray(4), 1, 1,
+                                {pixelFormat: 'rgba-float16'})),
+                            error(() => ctx.getImageData(0, 0, 1, 1, {pixelFormat: 'bogus'})),
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "basic": [1, 1, "srgb", "rgba-unorm8", "Uint8ClampedArray", 0, 0, 0, 0],
+                "p3": [1, 1, "display-p3", "rgba-unorm8", "Uint8ClampedArray",
+                    255, 64, 127, 255],
+                "float": [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                    1, 0.25, 0.5, 1],
+                "attrs": {
+                    "alpha": true, "colorSpace": "display-p3", "colorType": "unorm8",
+                    "desynchronized": false, "toneMapping": {"mode": "standard"},
+                    "willReadFrequently": true,
+                },
+                "created": [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                    0, 0, 0, 0],
+                "reads": [
+                    [1, 1, "srgb", "rgba-unorm8", "Uint8ClampedArray", 255, 28, 127, 255],
+                    [1, 1, "display-p3", "rgba-unorm8", "Uint8ClampedArray", 255, 64, 127, 255],
+                    [1, 1, "srgb", "rgba-float16", "Float16Array",
+                        1.089, 0.108, 0.499, 1],
+                    [1, 1, "display-p3", "rgba-float16", "Float16Array",
+                        1, 0.251, 0.498, 1],
+                ],
+                "floatContexts": [
+                    ["srgb", "float16", 1.0888671875, 0.10601806640625,
+                        0.497314453125, 1],
+                    ["display-p3", "float16", 1, 0.25, 0.5, 1],
+                ],
+                "errors": ["IndexSizeError", "InvalidStateError", "TypeError"],
+            }),
+        );
+    }
+
+    #[test]
+    fn canvas_text_preparation_replaces_c1_controls_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(80, 24);
+                    const context = canvas.getContext('2d');
+                    context.font = '16px sans-serif';
+                    const binary = String.fromCodePoint(240, 159, 152, 128);
+                    const replacement = String.fromCodePoint(240, 65533, 65533, 65533);
+                    const pixels = text => {
+                        context.clearRect(0, 0, 80, 24);
+                        context.fillText(text, 2, 18);
+                        return Array.from(context.getImageData(0, 0, 80, 24).data);
+                    };
+                    return {
+                        widths: [context.measureText(binary).width,
+                            context.measureText(replacement).width],
+                        samePixels: JSON.stringify(pixels(binary))
+                            === JSON.stringify(pixels(replacement)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["widths"][0], result["widths"][1]);
+        assert_eq!(result["samePixels"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn inline_rects_keep_chromes_subpixel_width_while_offset_width_rounds() {
+        let mut rt = setup_runtime(
+            r#"<html><body style="margin:0"><span id="probe"
+               style="display:inline-block;margin:0;padding:0;border:0;font:16px Arial">Cloudflare</span>
+               <canvas></canvas></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const probe = document.getElementById('probe');
+                    const context = document.querySelector('canvas').getContext('2d');
+                    context.font = '16px Arial';
+                    return [probe.getBoundingClientRect().width, probe.offsetWidth,
+                        context.measureText(probe.textContent).width];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([72.9375, 73, 72.9375]));
+    }
+
+    #[test]
+    fn canvas_multiply_evenodd_and_edge_alpha_match_browser_semantics() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = new OffscreenCanvas(49, 44);
+                    const context = canvas.getContext('2d');
+                    context.scale(0.4, 0.4);
+                    context.fillStyle = '#f2f';
+                    context.beginPath();
+                    context.arc(40, 40, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.globalCompositeOperation = 'multiply';
+                    context.fillStyle = '#2ff';
+                    context.beginPath();
+                    context.arc(80, 40, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.fillStyle = '#ff2';
+                    context.beginPath();
+                    context.arc(60, 80, 40, 0, Math.PI * 2, true);
+                    context.closePath();
+                    context.fill();
+                    context.globalCompositeOperation = 'source-over';
+                    context.fillStyle = '#fff';
+                    context.beginPath();
+                    context.arc(61, 53, 20, 0, Math.PI * 2, true);
+                    context.arc(61, 53, 10, 0, Math.PI * 2, true);
+                    context.fill('evenodd');
+
+                    const directionCanvas = new OffscreenCanvas(2, 2);
+                    const directionContext = directionCanvas.getContext('2d');
+                    directionContext.fillStyle = '#000';
+                    directionContext.fillRect(0, 0, 2, 2);
+                    directionContext.fillStyle = '#fff';
+                    directionContext.beginPath();
+                    directionContext.arc(0, 0, 2, 0, 1, true);
+                    directionContext.closePath();
+                    directionContext.fill();
+                    const directionPixels = Array.from(
+                        directionContext.getImageData(0, 0, 2, 2).data);
+                    let negativeRadius = null;
+                    try { directionContext.arc(0, 0, -1, 0, 1); }
+                    catch (error) { negativeRadius = error.name; }
+
+                    const data = context.getImageData(0, 0, 49, 44).data;
+                    const pixel = (x, y) => Array.from(
+                        data.slice((y * 49 + x) * 4, (y * 49 + x) * 4 + 4));
+                    let edge = null;
+                    for (let index = 0; index < data.length && !edge; index += 4) {
+                        if (data[index + 3] > 0 && data[index + 3] < 255) {
+                            edge = Array.from(data.slice(index, index + 4));
+                        }
+                    }
+                    context.globalCompositeOperation = 'multiply';
+                    context.save();
+                    context.globalCompositeOperation = 'source-over';
+                    context.restore();
+                    return {
+                        pixels: [pixel(8, 8), pixel(16, 16), pixel(24, 24),
+                            pixel(24, 32), pixel(40, 16)],
+                        edge,
+                        directionPixels,
+                        negativeRadius,
+                        restoredComposite: context.globalCompositeOperation,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result["pixels"],
+            serde_json::json!([
+                [255, 34, 255, 255],
+                [34, 34, 255, 255],
+                [34, 34, 34, 255],
+                [255, 255, 34, 255],
+                [34, 255, 255, 255],
+            ]),
+        );
+        let edge = result["edge"].as_array().expect("partial edge pixel");
+        assert_eq!(edge[0], serde_json::json!(255));
+        assert_eq!(edge[1], serde_json::json!(34));
+        assert_eq!(edge[2], serde_json::json!(255));
+        let alpha = edge[3].as_u64().unwrap();
+        assert!(alpha > 0 && alpha < 255);
+        assert_eq!(
+            result["directionPixels"],
+            serde_json::json!([
+                255, 255, 255, 255,
+                191, 191, 191, 255,
+                239, 239, 239, 255,
+                48, 48, 48, 255,
+            ]),
+        );
+        assert_eq!(result["negativeRadius"], serde_json::json!("IndexSizeError"));
+        assert_eq!(result["restoredComposite"], serde_json::json!("multiply"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offscreen_canvas_exports_and_transfers_its_real_backing_store() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const canvas = new OffscreenCanvas(49, 44);
+                    const context = canvas.getContext('2d');
+                    context.fillStyle = 'rgb(255, 64, 127)';
+                    context.fillRect(0, 0, 49, 44);
+                    const blob = await canvas.convertToBlob();
+                    const bytes = new Uint8Array(await blob.arrayBuffer());
+                    const decoded = await createImageBitmap(blob);
+                    const transferred = canvas.transferToImageBitmap();
+                    const after = Array.from(context.getImageData(0, 0, 1, 1).data);
+                    const fromImageData = await createImageBitmap(new ImageData(3, 2));
+                    let missingContextError = null;
+                    try { await new OffscreenCanvas(1, 1).convertToBlob(); }
+                    catch (error) { missingContextError = error.name; }
+                    return {
+                        tags: [Object.prototype.toString.call(canvas),
+                            Object.prototype.toString.call(context),
+                            Object.prototype.toString.call(decoded),
+                            Object.prototype.toString.call(transferred)],
+                        blob: [blob.size > 0, blob.type, Array.from(bytes.slice(0, 8))],
+                        decoded: [decoded.width, decoded.height],
+                        transferred: [transferred.width, transferred.height],
+                        after, imageData: [fromImageData.width, fromImageData.height],
+                        sameContext: context === canvas.getContext('2d'),
+                        missingContextError,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "tags": ["[object OffscreenCanvas]",
+                    "[object OffscreenCanvasRenderingContext2D]",
+                    "[object ImageBitmap]", "[object ImageBitmap]"],
+                "blob": [true, "image/png", [137, 80, 78, 71, 13, 10, 26, 10]],
+                "decoded": [49, 44], "transferred": [49, 44],
+                "after": [0, 0, 0, 0], "imageData": [3, 2],
+                "sameContext": true, "missingContextError": "InvalidStateError",
+            }),
         );
     }
 
@@ -12969,7 +19512,7 @@ mod tests {
                     el.style.fontSize = '14px';
                     el.dataset.foo = 'bar';
                     const keys = Object.keys(el.style);
-                    return JSON.stringify({
+                    return {
                         colorInStyle: 'color' in el.style,
                         objectFitInStyle: 'object-fit' in el.style,
                         keysHasSet: keys.includes('color') && keys.includes('fontSize'),
@@ -12980,11 +19523,14 @@ mod tests {
                         length: el.style.length,
                         getByDash: el.style.getPropertyValue('font-size'),
                         reflectedAttribute: el.getAttribute('style')
-                    });
+                    };
                 })()"#,
             )
             .unwrap();
-        let p: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        let p: serde_json::Value = match result {
+            serde_json::Value::String(value) => serde_json::from_str(&value).unwrap(),
+            value => value,
+        };
         assert_eq!(p["colorInStyle"], true);
         assert_eq!(p["objectFitInStyle"], true);
         assert_eq!(p["keysHasSet"], true);
@@ -12995,6 +19541,69 @@ mod tests {
         assert_eq!(p["length"], 2);
         assert_eq!(p["getByDash"], "14px");
         assert_eq!(p["reflectedAttribute"], "color: red; font-size: 14px;");
+    }
+
+    #[test]
+    fn css_style_declaration_matches_chrome_named_and_computed_enumeration() {
+        let mut rt = setup_runtime(
+            "<html><head><style>#x { display:block }</style></head><body>\
+             <div id=x style='color:red;margin-top:2px'></div><div id=e></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summarize = style => {
+                        const own = Object.getOwnPropertyNames(style);
+                        const numeric = own.filter(name => /^\d+$/.test(name));
+                        return {
+                            tag: Object.prototype.toString.call(style),
+                            length: style.length,
+                            ownCount: own.length,
+                            numericCount: numeric.length,
+                            namedCount: own.length - numeric.length,
+                            ownHas: ['anchorName', 'fieldSizing', 'webkitAlignContent', 'zoom']
+                                .every(name => Object.prototype.hasOwnProperty.call(style, name)),
+                        };
+                    };
+                    const rule = document.styleSheets[0].cssRules[0];
+                    const inline = document.getElementById('x').style;
+                    inline.cssFloat = 'left';
+                    return {
+                        empty: summarize(document.getElementById('e').style),
+                        inline: summarize(inline),
+                        computed: summarize(getComputedStyle(document.getElementById('x'))),
+                        prototype: Object.getOwnPropertyNames(CSSStyleDeclaration.prototype),
+                        cssFloat: [inline.cssFloat, inline.getPropertyValue('float')],
+                        parentRule: rule.style.parentRule === rule,
+                        noInternalOwn: !Object.getOwnPropertyNames(inline)
+                            .some(name => name.startsWith('_')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "empty": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 0,
+                    "ownCount": 745, "numericCount": 0, "namedCount": 745, "ownHas": true,
+                },
+                "inline": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 3,
+                    "ownCount": 748, "numericCount": 3, "namedCount": 745, "ownHas": true,
+                },
+                "computed": {
+                    "tag": "[object CSSStyleDeclaration]", "length": 456,
+                    "ownCount": 1150, "numericCount": 456, "namedCount": 694, "ownHas": true,
+                },
+                "prototype": ["cssText", "length", "parentRule", "cssFloat",
+                    "getPropertyPriority", "getPropertyValue", "item", "removeProperty",
+                    "setProperty", "constructor"],
+                "cssFloat": ["left", "left"],
+                "parentRule": true,
+                "noInternalOwn": true,
+            })
+        );
     }
 
     #[test]
@@ -13529,6 +20138,32 @@ mod tests {
         assert_eq!(
             *requests.lock().unwrap(),
             vec!["http://example.com/page/promoted.png".to_string()]
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_image_src_fetches_without_a_lifecycle_observer() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<html><body></body></html>",
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "create-unobserved-image",
+            "const image = new Image(); image.src = 'dynamic.png';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "setting Image.src must start the fetch before complete/load is observed",
         );
     }
 
@@ -14221,6 +20856,33 @@ mod tests {
     }
 
     #[test]
+    fn window_event_is_current_only_during_dispatch() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const button = document.getElementById('go');
+            const idle = [typeof event, event === undefined, 'event' in window];
+            let during;
+            button.addEventListener('click', e => {
+                during = [event === e, event.type, Object.prototype.toString.call(event)];
+            });
+            button.dispatchEvent(new MouseEvent('click'));
+            return { idle, during, after: event === undefined };
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "idle": ["undefined", true, true],
+                "during": [true, "click", "[object MouseEvent]"],
+                "after": true,
+            })
+        );
+    }
+
+    #[test]
     fn composed_event_crosses_shadow_boundary_to_the_host() {
         let mut rt = setup_runtime(r#"<div id="host"></div>"#);
         let result = rt
@@ -14639,6 +21301,24 @@ mod tests {
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
+        let gamepads = rt
+            .evaluate(
+                r#"(() => {
+                    const first = navigator.getGamepads();
+                    const second = navigator.getGamepads();
+                    return [Object.prototype.toString.call(first), Array.isArray(first),
+                        first.length, Array.from(first), first === second,
+                        navigator.getGamepads.name, navigator.getGamepads.length,
+                        Function.prototype.toString.call(navigator.getGamepads)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            gamepads,
+            serde_json::json!(["[object Array]", true, 4,
+                [null, null, null, null], false, "getGamepads", 0,
+                "function getGamepads() { [native code] }"])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15505,6 +22185,337 @@ mod tests {
         );
     }
 
+    #[test]
+    fn url_and_search_params_hide_internal_slots_and_stay_bound() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const url = new URL('https://user:pass@example.com:8443/a?x=1#h');
+                    const params = url.searchParams;
+                    const errors = [];
+                    for (const callback of [
+                        () => URL.prototype.toString.call({}),
+                        () => URLSearchParams.prototype.append.call({}, 'x', '1'),
+                    ]) {
+                        try { callback(); errors.push(null); }
+                        catch (error) { errors.push(error.name); }
+                    }
+                    const before = url.href;
+                    params.append('y', '2');
+                    const mutated = url.href;
+                    url.search = '?z=3';
+                    return {
+                        urlOwn: Object.getOwnPropertyNames(url),
+                        paramsOwn: Object.getOwnPropertyNames(params),
+                        urlPrototype: Object.getOwnPropertyNames(URL.prototype),
+                        paramsPrototype: Object.getOwnPropertyNames(URLSearchParams.prototype),
+                        tags: [Object.prototype.toString.call(url),
+                            Object.prototype.toString.call(params)],
+                        stable: url.searchParams === params,
+                        before, mutated, refreshed: params.toString(), errors,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "urlOwn": [],
+                "paramsOwn": [],
+                "urlPrototype": ["origin", "protocol", "username", "password",
+                    "host", "hostname", "port", "pathname", "search", "searchParams",
+                    "hash", "href", "toJSON", "toString", "constructor"],
+                "paramsPrototype": ["size", "append", "delete", "get", "getAll",
+                    "has", "set", "sort", "toString", "entries", "forEach", "keys",
+                    "values", "constructor"],
+                "tags": ["[object URL]", "[object URLSearchParams]"],
+                "stable": true,
+                "before": "https://user:pass@example.com:8443/a?x=1#h",
+                "mutated": "https://user:pass@example.com:8443/a?x=1&y=2#h",
+                "refreshed": "z=3",
+                "errors": ["TypeError", "TypeError"],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_objects_use_internal_slots_and_webidl_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const headers = new Headers([['X-Test', 'one'], ['x-test', 'two']]);
+                    const request = new Request('/submit', {
+                        method: 'POST', headers, body: 'payload', mode: 'same-origin',
+                    });
+                    const response = new Response('done', {
+                        status: 201, statusText: 'Created', headers: { 'X-Test': 'ok' },
+                        url: 'http://example.com/submit',
+                    });
+                    const cloned = request.clone();
+                    const responseText = await response.text();
+                    let cloneError = null;
+                    try { response.clone(); } catch (error) { cloneError = error.name; }
+                    let missingRequestError = null;
+                    try { new Request(); } catch (error) { missingRequestError = error.name; }
+                    const redirected = Response.redirect('/next');
+                    return {
+                        own: [Object.getOwnPropertyNames(headers), Object.getOwnPropertyNames(request),
+                            Object.getOwnPropertyNames(response)],
+                        prototypes: [Object.getOwnPropertyNames(Headers.prototype),
+                            Object.getOwnPropertyNames(Request.prototype),
+                            Object.getOwnPropertyNames(Response.prototype)],
+                        headers: [headers.get('x-test'), Array.from(headers.keys()),
+                            headers.getSetCookie()],
+                        request: [request.method, request.url, request.mode,
+                            request.headers.get('x-test'), cloned.bodyUsed, request.bodyUsed,
+                            missingRequestError],
+                        response: [response.status, response.statusText, response.ok,
+                            response.headers.get('x-test'), responseText, response.bodyUsed, cloneError],
+                        redirected: [redirected.status, redirected.type,
+                            redirected.headers.get('location')],
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "own": [[], [], []],
+                "prototypes": [
+                    ["append", "delete", "get", "getSetCookie", "has", "set", "entries",
+                        "forEach", "keys", "values", "constructor"],
+                    ["method", "url", "headers", "destination", "referrer", "referrerPolicy",
+                        "mode", "credentials", "cache", "redirect", "integrity", "keepalive",
+                        "signal", "duplex", "isHistoryNavigation", "bodyUsed", "arrayBuffer",
+                        "blob", "clone", "formData", "json", "text", "targetAddressSpace",
+                        "isReloadNavigation", "body", "bytes", "textStream", "constructor"],
+                    ["type", "url", "redirected", "status", "ok", "statusText", "headers", "body",
+                        "bodyUsed", "arrayBuffer", "blob", "clone", "formData", "json", "text",
+                        "bytes", "textStream", "constructor"],
+                ],
+                "headers": ["one, two", ["x-test"], []],
+                "request": ["POST", "http://example.com/submit", "same-origin", "one, two", false, false, "TypeError"],
+                "response": [201, "Created", true, "ok", "done", true, "TypeError"],
+                "redirected": [302, "basic", "http://example.com/next"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_and_file_use_internal_slots_and_chrome_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const seed = new Blob([
+                        'A', new Uint8Array([0, 255]), new Blob(['B']), null, undefined,
+                    ], {type: 'Text/PLAIN'});
+                    const file = new File(['x\r\ny', new Uint8Array([1, 2])], 'a/b.txt', {
+                        type: 'TEXT/PLAIN', lastModified: 123.9, endings: 'native',
+                    });
+                    const sliced = seed.slice(1, -1, 'IMAGE/PNG');
+                    const byteReader = seed.stream().getReader();
+                    const byteChunk = await byteReader.read();
+                    const byteEnd = await byteReader.read();
+                    const textReader = seed.textStream().getReader();
+                    const textChunk = await textReader.read();
+                    const textEnd = await textReader.read();
+                    const errors = [];
+                    for (const callback of [
+                        () => Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get.call({}),
+                        () => Blob.prototype.slice.call({}),
+                        () => Object.getOwnPropertyDescriptor(File.prototype, 'name').get.call({}),
+                    ]) {
+                        try { callback(); errors.push(null); }
+                        catch (error) { errors.push(error.name); }
+                    }
+                    return JSON.stringify({
+                        constructors: [Blob.length, File.length],
+                        prototypes: [
+                            Object.getOwnPropertyNames(Blob.prototype),
+                            Object.getOwnPropertyNames(File.prototype),
+                        ],
+                        own: [Object.getOwnPropertyNames(seed), Object.getOwnPropertyNames(file)],
+                        tags: [Object.prototype.toString.call(seed), Object.prototype.toString.call(file)],
+                        seed: {
+                            size: seed.size, type: seed.type, text: await seed.text(),
+                            bytes: Array.from(await seed.bytes()),
+                            arrayBuffer: Array.from(new Uint8Array(await seed.arrayBuffer())),
+                        },
+                        file: {
+                            size: file.size, type: file.type, name: file.name,
+                            lastModified: file.lastModified,
+                            date: file.lastModifiedDate.getTime(),
+                            freshDate: file.lastModifiedDate !== file.lastModifiedDate,
+                            webkitRelativePath: file.webkitRelativePath,
+                            bytes: Array.from(await file.bytes()),
+                        },
+                        sliced: {
+                            size: sliced.size, type: sliced.type,
+                            bytes: Array.from(await sliced.bytes()),
+                        },
+                        streams: {
+                            bytes: Array.from(byteChunk.value), byteDone: byteChunk.done,
+                            byteEnd: byteEnd.done, text: textChunk.value,
+                            textDone: textChunk.done, textEnd: textEnd.done,
+                        },
+                        descriptors: {
+                            sizeEnumerable: Object.getOwnPropertyDescriptor(Blob.prototype, 'size').enumerable,
+                            sliceLength: Blob.prototype.slice.length,
+                            sliceNative: Function.prototype.toString.call(Blob.prototype.slice),
+                            nameEnumerable: Object.getOwnPropertyDescriptor(File.prototype, 'name').enumerable,
+                        },
+                        types: [
+                            new Blob([], {type: 'A/B;C=D'}).type,
+                            new Blob([], {type: 'a/\u0080'}).type,
+                        ],
+                        errors,
+                    });
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(
+            result.value.unwrap().as_str().expect("JSON string result"),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "constructors": [0, 2],
+                "prototypes": [
+                    ["size", "type", "arrayBuffer", "slice", "stream", "text",
+                        "bytes", "textStream", "constructor"],
+                    ["name", "lastModified", "lastModifiedDate", "webkitRelativePath",
+                        "constructor"],
+                ],
+                "own": [[], []],
+                "tags": ["[object Blob]", "[object File]"],
+                "seed": {
+                    "size": 17, "type": "text/plain", "text": "A\u{0000}\u{fffd}Bnullundefined",
+                    "bytes": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100, 101,
+                        102, 105, 110, 101, 100],
+                    "arrayBuffer": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100,
+                        101, 102, 105, 110, 101, 100],
+                },
+                "file": {
+                    "size": 5, "type": "text/plain", "name": "a/b.txt",
+                    "lastModified": 123, "date": 123, "freshDate": true,
+                    "webkitRelativePath": "", "bytes": [120, 10, 121, 1, 2],
+                },
+                "sliced": {
+                    "size": 15, "type": "image/png",
+                    "bytes": [0, 255, 66, 110, 117, 108, 108, 117, 110, 100, 101,
+                        102, 105, 110, 101],
+                },
+                "streams": {
+                    "bytes": [65, 0, 255, 66, 110, 117, 108, 108, 117, 110, 100,
+                        101, 102, 105, 110, 101, 100],
+                    "byteDone": false, "byteEnd": true,
+                    "text": "A\u{0000}\u{fffd}Bnullundefined", "textDone": false,
+                    "textEnd": true,
+                },
+                "descriptors": {
+                    "sizeEnumerable": true, "sliceLength": 0,
+                    "sliceNative": "function slice() { [native code] }",
+                    "nameEnumerable": true,
+                },
+                "types": ["a/b;c=d", ""],
+                "errors": ["TypeError", "TypeError", "TypeError"],
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_url_fetch_exposes_bytes_metadata_and_revoke_lifecycle() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const blob = new Blob([new Uint8Array([0, 255, 65])], {
+                        type: 'Application/octet-stream',
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const get = await fetch(url);
+                    const getBytes = Array.from(new Uint8Array(await get.arrayBuffer()));
+                    const head = await fetch(url, { method: 'HEAD' });
+                    const headBytes = Array.from(new Uint8Array(await head.arrayBuffer()));
+                    const request = await fetch(new Request(url));
+                    const requestBytes = Array.from(new Uint8Array(await request.arrayBuffer()));
+                    URL.revokeObjectURL(url);
+                    let revokeError = null;
+                    try { await fetch(url); }
+                    catch (error) { revokeError = { name: error.name, type: typeof error }; }
+                    return {
+                        urlPrefix: url.startsWith('blob:http://example.com/'),
+                        get: {
+                            type: get.type,
+                            status: get.status,
+                            statusText: get.statusText,
+                            ok: get.ok,
+                            urlMatches: get.url === url,
+                            contentType: get.headers.get('content-type'),
+                            bytes: getBytes,
+                        },
+                        head: {
+                            type: head.type,
+                            status: head.status,
+                            statusText: head.statusText,
+                            urlMatches: head.url === url,
+                            contentType: head.headers.get('content-type'),
+                            bytes: headBytes,
+                        },
+                        requestBytes,
+                        revokeError,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "urlPrefix": true,
+                "get": {
+                    "type": "basic",
+                    "status": 200,
+                    "statusText": "OK",
+                    "ok": true,
+                    "urlMatches": true,
+                    "contentType": "application/octet-stream",
+                    "bytes": [0, 255, 65],
+                },
+                "head": {
+                    "type": "basic",
+                    "status": 200,
+                    "statusText": "OK",
+                    "urlMatches": true,
+                    "contentType": "application/octet-stream",
+                    "bytes": [],
+                },
+                "requestBytes": [0, 255, 65],
+                "revokeError": { "name": "TypeError", "type": "object" },
+            }),
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -15543,6 +22554,91 @@ mod tests {
                 "url": "http://example.com/pkg/app_bg.wasm",
                 "bytes": [0, 97, 115, 109, 1, 0, 0, 0],
             })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_cache_option_sends_chrome_headers_and_marks_them_user_agent_generated() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const sent = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body, origin, mode, credentials, context) => {
+                                sent.push({ url, headers: JSON.parse(headers), context: JSON.parse(context) });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+                        await fetch("/no-store", { cache: "no-store" });
+                        await fetch("/no-cache", { cache: "no-cache" });
+                        await fetch("/reload", { cache: "reload" });
+                        await fetch("/default");
+                        await fetch("/author", {
+                            cache: "no-cache",
+                            headers: { "Cache-Control": "public, max-age=60" },
+                        });
+                        return sent.map(entry => ({
+                            url: entry.url,
+                            cacheControl: entry.headers["Cache-Control"] ?? null,
+                            pragma: entry.headers["Pragma"] ?? null,
+                            uaHeaders: entry.context.uaHeaders,
+                        }));
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Values are the ones Chrome was measured sending for each mode.
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                {
+                    "url": "http://example.com/no-store",
+                    "cacheControl": "no-cache",
+                    "pragma": "no-cache",
+                    "uaHeaders": ["cache-control", "pragma"],
+                },
+                {
+                    "url": "http://example.com/no-cache",
+                    "cacheControl": "max-age=0",
+                    "pragma": null,
+                    "uaHeaders": ["cache-control"],
+                },
+                {
+                    "url": "http://example.com/reload",
+                    "cacheControl": "no-cache",
+                    "pragma": "no-cache",
+                    "uaHeaders": ["cache-control", "pragma"],
+                },
+                {
+                    "url": "http://example.com/default",
+                    "cacheControl": null,
+                    "pragma": null,
+                    "uaHeaders": [],
+                },
+                // A page that sets the header itself keeps ownership of it, so
+                // the op still counts it as an author header and preflights.
+                {
+                    "url": "http://example.com/author",
+                    "cacheControl": "public, max-age=60",
+                    "pragma": null,
+                    "uaHeaders": [],
+                },
+            ])
         );
     }
 
@@ -15618,6 +22714,194 @@ mod tests {
                 ],
                 "invalidFetchRejected": true,
             })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_uses_internal_slots_and_chrome_event_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body, origin, mode, credentials) => {
+                                calls.push({url, method, headers: JSON.parse(headers), body,
+                                    origin, mode, credentials});
+                                return JSON.stringify({
+                                    status: 201, statusText: 'Created', url,
+                                    headers: {
+                                        'content-length': '5',
+                                        'content-type': 'text/plain; charset=utf-8',
+                                        'x-one': 'alpha',
+                                    },
+                                    body: 'hello',
+                                });
+                            };
+                        const xhr = new XMLHttpRequest();
+                        const upload = xhr.upload;
+                        const initial = {
+                            own: Object.getOwnPropertyNames(xhr),
+                            ownSymbols: Object.getOwnPropertySymbols(xhr).length,
+                            uploadOwn: Object.getOwnPropertyNames(upload),
+                            uploadSymbols: Object.getOwnPropertySymbols(upload).length,
+                            tags: [Object.prototype.toString.call(xhr),
+                                Object.prototype.toString.call(upload)],
+                            values: [xhr.readyState, xhr.timeout, xhr.withCredentials,
+                                xhr.responseURL, xhr.status, xhr.statusText, xhr.responseType,
+                                xhr.response, xhr.responseText, xhr.responseXML],
+                            handlers: ['readystatechange','loadstart','progress','abort','error',
+                                'load','timeout','loadend'].map(name => xhr['on' + name]),
+                            uploadStable: xhr.upload === upload,
+                        };
+                        const prototypes = {
+                            xhr: Object.getOwnPropertyNames(XMLHttpRequest.prototype),
+                            eventTarget: Object.getOwnPropertyNames(XMLHttpRequestEventTarget.prototype),
+                            upload: Object.getOwnPropertyNames(XMLHttpRequestUpload.prototype),
+                            chains: [
+                                Object.getPrototypeOf(XMLHttpRequest.prototype) ===
+                                    XMLHttpRequestEventTarget.prototype,
+                                Object.getPrototypeOf(XMLHttpRequestEventTarget.prototype) ===
+                                    EventTarget.prototype,
+                                Object.getPrototypeOf(XMLHttpRequestUpload.prototype) ===
+                                    XMLHttpRequestEventTarget.prototype,
+                                xhr instanceof EventTarget, upload instanceof EventTarget,
+                            ],
+                            lengths: [XMLHttpRequest.length, XMLHttpRequestEventTarget.length,
+                                XMLHttpRequestUpload.length, XMLHttpRequest.prototype.open.length,
+                                XMLHttpRequest.prototype.send.length],
+                            native: [XMLHttpRequest, XMLHttpRequestEventTarget,
+                                XMLHttpRequestUpload, XMLHttpRequest.prototype.open]
+                                .map(fn => Function.prototype.toString.call(fn)),
+                        };
+                        const errors = [];
+                        for (const callback of [
+                            () => new XMLHttpRequestEventTarget(),
+                            () => new XMLHttpRequestUpload(),
+                            () => new XMLHttpRequest().send(),
+                            () => new XMLHttpRequest().setRequestHeader('x', 'y'),
+                            () => XMLHttpRequest.prototype.open.call({}, 'GET', '/x'),
+                            () => Object.getOwnPropertyDescriptor(
+                                XMLHttpRequest.prototype, 'readyState').get.call({}),
+                        ]) {
+                            try { callback(); errors.push(null); }
+                            catch (error) { errors.push(error.name); }
+                        }
+                        const openedEvents = [];
+                        xhr.addEventListener('readystatechange', event => openedEvents.push([
+                            event.type, xhr.readyState, event.isTrusted,
+                            Object.prototype.toString.call(event), event.target === xhr,
+                        ]));
+                        xhr.open('GET', '/xhr');
+                        const opened = [xhr.readyState, xhr.status, xhr.responseText,
+                            xhr.getAllResponseHeaders(), xhr.getResponseHeader('x-one'),
+                            openedEvents.slice()];
+                        xhr.timeout = 123; xhr.withCredentials = true; xhr.responseType = 'text';
+                        xhr.abort();
+                        const unsentAbort = [xhr.readyState, xhr.timeout, xhr.withCredentials,
+                            xhr.responseType, openedEvents.slice()];
+
+                        const net = new XMLHttpRequest();
+                        const events = [];
+                        for (const type of ['readystatechange','loadstart','progress','load','loadend']) {
+                            net.addEventListener(type, event => events.push([
+                                type, net.readyState, event.isTrusted,
+                                Object.prototype.toString.call(event),
+                                event.target === net, event.currentTarget === net,
+                                event.lengthComputable ?? null,
+                                event.loaded ?? null, event.total ?? null,
+                            ]));
+                        }
+                        net.open('GET', '/xhr');
+                        net.send();
+                        await new Promise((resolve, reject) => {
+                            net.onloadend = resolve; net.onerror = reject;
+                        });
+                        return {
+                            initial, prototypes, errors, opened, unsentAbort,
+                            completed: {
+                                values: [net.readyState, net.status, net.statusText,
+                                    net.responseURL, net.responseType, net.response,
+                                    net.responseText, net.responseXML],
+                                headers: [net.getAllResponseHeaders(),
+                                    net.getResponseHeader('X-One'),
+                                    net.getResponseHeader('missing')],
+                                events,
+                            },
+                            request: calls[0],
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "initial": {
+                    "own": [], "ownSymbols": 0, "uploadOwn": [], "uploadSymbols": 0,
+                    "tags": ["[object XMLHttpRequest]", "[object XMLHttpRequestUpload]"],
+                    "values": [0, 0, false, "", 0, "", "", "", "", null],
+                    "handlers": [null, null, null, null, null, null, null, null],
+                    "uploadStable": true,
+                },
+                "prototypes": {
+                    "xhr": ["onreadystatechange", "readyState", "timeout", "withCredentials",
+                        "upload", "responseURL", "status", "statusText", "responseType",
+                        "response", "responseText", "UNSENT", "OPENED", "HEADERS_RECEIVED",
+                        "LOADING", "DONE", "abort", "getAllResponseHeaders",
+                        "getResponseHeader", "open", "overrideMimeType", "send",
+                        "setRequestHeader", "constructor", "responseXML",
+                        "setAttributionReporting", "setPrivateToken"],
+                    "eventTarget": ["onloadstart", "onprogress", "onabort", "onerror",
+                        "onload", "ontimeout", "onloadend", "constructor"],
+                    "upload": ["constructor"],
+                    "chains": [true, true, true, true, true],
+                    "lengths": [0, 0, 0, 2, 0],
+                    "native": [
+                        "function XMLHttpRequest() { [native code] }",
+                        "function XMLHttpRequestEventTarget() { [native code] }",
+                        "function XMLHttpRequestUpload() { [native code] }",
+                        "function open() { [native code] }",
+                    ],
+                },
+                "errors": ["TypeError", "TypeError", "InvalidStateError",
+                    "InvalidStateError", "TypeError", "TypeError"],
+                "opened": [1, 0, "", "", null,
+                    [["readystatechange", 1, true, "[object Event]", true]]],
+                "unsentAbort": [1, 123, true, "text",
+                    [["readystatechange", 1, true, "[object Event]", true]]],
+                "completed": {
+                    "values": [4, 201, "Created", "http://example.com/xhr", "",
+                        "hello", "hello", null],
+                    "headers": ["content-length: 5\r\ncontent-type: text/plain; charset=utf-8\r\nx-one: alpha\r\n",
+                        "alpha", null],
+                    "events": [
+                        ["readystatechange",1,true,"[object Event]",true,true,null,null,null],
+                        ["loadstart",1,true,"[object ProgressEvent]",true,true,false,0,0],
+                        ["readystatechange",2,true,"[object Event]",true,true,null,null,null],
+                        ["readystatechange",3,true,"[object Event]",true,true,null,null,null],
+                        ["progress",3,true,"[object ProgressEvent]",true,true,true,5,5],
+                        ["readystatechange",4,true,"[object Event]",true,true,null,null,null],
+                        ["load",4,true,"[object ProgressEvent]",true,true,true,5,5],
+                        ["loadend",4,true,"[object ProgressEvent]",true,true,true,5,5],
+                    ],
+                },
+                "request": {
+                    "url": "http://example.com/xhr", "method": "GET", "headers": {},
+                    "body": "", "origin": "http://example.com", "mode": "cors",
+                    "credentials": "same-origin",
+                },
+            }),
         );
     }
 
@@ -15708,6 +22992,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_linked_stylesheet_uses_frame_style_csp_and_creator_origin() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_content_security_policy(Some("default-src *; style-src 'none'"));
+        let blocked = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    let calls = 0;
+                    try {
+                        Deno.core.ops.op_fetch_url = () => {
+                            calls++;
+                            return JSON.stringify({status:200, headers:{}, body:'', url:''});
+                        };
+                        const link = document.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = '/blocked.css';
+                        const outcome = await new Promise(resolve => {
+                            link.onload = () => resolve('load');
+                            link.onerror = () => resolve('error');
+                            document.head.appendChild(link);
+                        });
+                        return [outcome, calls, !!document.querySelector('style[data-obscura-linked]')];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.value.unwrap(), serde_json::json!(["error", 0, false]));
+
+        rt.set_content_security_policy(Some("default-src *; style-src *"));
+        let allowed = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const origins = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headers, body, origin) => {
+                            origins.push(origin);
+                            return JSON.stringify({status:200, headers:{'content-type':'text/css'}, body:'.x{color:red}', url});
+                        };
+                        const link = document.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = 'https://cdn.example.test/theme.css';
+                        const outcome = await new Promise(resolve => {
+                            link.onload = () => resolve('load');
+                            link.onerror = () => resolve('error');
+                            document.head.appendChild(link);
+                        });
+                        return [outcome, origins, !!document.querySelector('style[data-obscura-linked]')];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.value.unwrap(),
+            serde_json::json!(["load", ["http://example.com"], true])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unsuccessful_dynamic_script_response_fires_error_without_evaluating_body() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
@@ -15750,6 +23107,1410 @@ mod tests {
                 "outcome": "error",
                 "executed": false,
             })
+        );
+    }
+
+    #[test]
+    fn document_all_is_undetectable_and_still_a_collection() {
+        let mut rt = setup_runtime("<html><head></head><body><div id=probe></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const all = document.all;
+                    return {
+                        // The [[IsHTMLDDA]] behaviour, which is why this cannot
+                        // be built from JavaScript: typeof lies, the object is
+                        // falsy, and loose comparison against both null and
+                        // undefined succeeds -- while strict comparison fails,
+                        // because the object is really there.
+                        typeofIs: typeof all,
+                        falsy: !all,
+                        looseNull: all == null,
+                        looseUndefined: all == undefined,
+                        strictNull: all === null,
+                        strictUndefined: all === undefined,
+                        present: 'all' in document,
+                        brand: Object.prototype.toString.call(all),
+                        // A collection in document order, starting at <html>.
+                        head: [all[0].tagName, all[1].tagName],
+                        outOfRange: all[99999] === undefined,
+                        // Callable, which no ordinary object is.
+                        callIndex: all(0).tagName,
+                        callNamed: all('probe').id,
+                        callMissing: all('absent'),
+                        item: all.item(0).tagName,
+                        namedItem: all.namedItem('probe').id,
+                        named: all.probe.id,
+                        // Same object every read, as a live collection is.
+                        identity: document.all === all,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "typeofIs": "undefined",
+                "falsy": true,
+                "looseNull": true,
+                "looseUndefined": true,
+                "strictNull": false,
+                "strictUndefined": false,
+                "present": true,
+                "brand": "[object HTMLAllCollection]",
+                "head": ["HTML", "HEAD"],
+                "outOfRange": true,
+                "callIndex": "HTML",
+                "callNamed": "probe",
+                "callMissing": null,
+                "item": "HTML",
+                "namedItem": "probe",
+                "named": "probe",
+                "identity": true,
+            })
+        );
+    }
+
+    /// The window enumeration a challenge script collects: every own name on
+    /// the global paired with its value. Anything the engine leaves there in
+    /// its own shape is reported verbatim, so the engine has to leave nothing.
+    #[test]
+    fn enumerating_the_global_reveals_no_engine_internals() {
+        let mut rt = setup_runtime("<html><body><iframe></iframe></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = Object.getOwnPropertyNames(globalThis);
+                    const documentKeys = [];
+                    for (const key in document) documentKeys.push(key);
+                    // A function whose source is not `[native code]` puts that
+                    // source into the report as a value.
+                    const sources = [];
+                    for (const name of names) {
+                        let value;
+                        try { value = globalThis[name]; } catch (e) { continue; }
+                        if (typeof value !== 'function') continue;
+                        if (!/\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(value))) {
+                            sources.push(name);
+                        }
+                    }
+                    return {
+                        deno: names.includes('Deno'),
+                        // Indexed properties are the child browsing contexts,
+                        // so there are exactly `length` of them. A fixed block
+                        // of 50 used to sit here next to a length of 0.
+                        indices: names.filter(n => /^\d+$/.test(n)),
+                        length: window.length,
+                        indexedIsFrame: window[0] === document.querySelector('iframe').contentWindow,
+                        openSources: sources,
+                        // Null until the page assigns them, as in a browser.
+                        onerror: window.onerror,
+                        onunhandledrejection: window.onunhandledrejection,
+                        documentInternals: documentKeys.filter(k => k.startsWith('_')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "deno": false,
+                "indices": ["0"],
+                "length": 1,
+                "indexedIsFrame": true,
+                "openSources": [],
+                "onerror": null,
+                "onunhandledrejection": null,
+                "documentInternals": [],
+            })
+        );
+    }
+
+    /// HTML gives a connected iframe its initial about:blank document before
+    /// the insertion steps return. It used to get a hand-written stand-in
+    /// instead, whose surface a probe could tell from a Document's in one
+    /// `for..in`.
+    #[test]
+    fn a_connected_iframe_has_its_initial_about_blank_document_at_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const frame = document.createElement('iframe');
+                    // No browsing context until it is connected, so no window.
+                    const beforeInsert = frame.contentWindow;
+                    document.body.appendChild(frame);
+                    const doc = frame.contentDocument;
+                    const win = frame.contentWindow;
+                    const documentKeys = [];
+                    for (const key in doc) documentKeys.push(key);
+                    const pageKeys = [];
+                    for (const key in document) pageKeys.push(key);
+                    return {
+                        beforeInsert,
+                        url: doc.URL,
+                        brand: Object.prototype.toString.call(doc),
+                        // about:blank is not an empty document.
+                        skeleton: [doc.documentElement.tagName, !!doc.head, !!doc.body],
+                        // The same enumeration surface the page's document
+                        // has, give or take `designMode`, which _ScopedDocument
+                        // implements and Document.prototype still does not.
+                        missingFromFrame: pageKeys.filter(k => !documentKeys.includes(k)),
+                        defaultView: doc.defaultView === win,
+                        windowDocument: win.document === doc,
+                        // A frame is its own realm: constructors are distinct,
+                        // but they still construct and still carry statics.
+                        distinctIntrinsics: win.Object !== Object && win.Promise !== Promise,
+                        constructs: new win.Object() instanceof win.Object,
+                        statics: win.Object.keys({ first: 1 })[0] === 'first',
+                        selfReference: win.globalThis === win,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "beforeInsert": null,
+                "url": "about:blank",
+                "brand": "[object HTMLDocument]",
+                "skeleton": ["HTML", true, true],
+                "missingFromFrame": [],
+                "defaultView": true,
+                "windowDocument": true,
+                "distinctIntrinsics": true,
+                "constructs": true,
+                "statics": true,
+                "selfReference": true,
+            })
+        );
+    }
+
+    /// What a fresh frame's window must NOT have is whatever the page put on
+    /// its own global: that difference is what a fingerprinting probe reads.
+    #[test]
+    fn a_blank_frames_window_carries_the_platform_surface_and_not_the_pages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    globalThis.__pageOwnGlobal = 1;
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const frameNames = Object.getOwnPropertyNames(frame.contentWindow);
+                    const pageNames = Object.getOwnPropertyNames(globalThis);
+                    return {
+                        pageAdditionStaysOnThePage:
+                            pageNames.includes('__pageOwnGlobal')
+                            && !frameNames.includes('__pageOwnGlobal'),
+                        platformIsShared: ['XMLHttpRequest', 'MutationObserver', 'fetch',
+                            'Promise', 'setTimeout'].every(n => frameNames.includes(n)),
+                        // window[0] is this window's child frame; the child has none.
+                        extraOnPage: pageNames.filter(n => !frameNames.includes(n)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "pageAdditionStaysOnThePage": true,
+                "platformIsShared": true,
+                "extraOnPage": ["0", "__pageOwnGlobal"],
+            })
+        );
+    }
+
+    #[test]
+    fn optional_zero_argument_platform_methods_do_not_throw_synchronously() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const call = (owner, name) => {
+                        try {
+                            const value = owner[name]();
+                            if (value && typeof value.catch === 'function') value.catch(() => {});
+                            return value instanceof Promise ? 'promise' : typeof value;
+                        } catch (error) {
+                            return error.name + ':' + error.message;
+                        }
+                    };
+                    return {
+                        find: call(globalThis, 'find'),
+                        captureEvents: call(globalThis, 'captureEvents'),
+                        releaseEvents: call(globalThis, 'releaseEvents'),
+                        showOpenFilePicker: call(globalThis, 'showOpenFilePicker'),
+                        queryLocalFonts: call(globalThis, 'queryLocalFonts'),
+                        getScreenDetails: call(globalThis, 'getScreenDetails'),
+                        requestMIDIAccess: call(navigator, 'requestMIDIAccess'),
+                        getInstalledRelatedApps: call(navigator, 'getInstalledRelatedApps'),
+                        updateAdInterestGroups: call(navigator, 'updateAdInterestGroups'),
+                        clearAppBadge: call(navigator, 'clearAppBadge'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "find": "boolean", "captureEvents": "undefined",
+                "releaseEvents": "undefined", "showOpenFilePicker": "promise",
+                "queryLocalFonts": "promise", "getScreenDetails": "promise",
+                "requestMIDIAccess": "promise", "getInstalledRelatedApps": "promise",
+                "updateAdInterestGroups": "promise", "clearAppBadge": "promise",
+            })
+        );
+    }
+
+    /// Window and Document expose different event-handler mixins. One shared
+    /// list used to put both sets on both objects, which is why Document
+    /// answered to `onbeforeunload`.
+    #[test]
+    fn the_event_handler_attributes_follow_the_interface_that_defines_them() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => ({
+                    // WindowEventHandlers: Window only.
+                    windowOnlyOnWindow: 'onbeforeunload' in window && 'onhashchange' in window,
+                    windowOnlyOnDocument: 'onbeforeunload' in document || 'onhashchange' in document,
+                    // Document-specific.
+                    documentOnlyOnDocument: 'onreadystatechange' in document
+                        && 'onvisibilitychange' in document,
+                    documentOnlyOnWindow: 'onreadystatechange' in window
+                        || 'onvisibilitychange' in window,
+                    // DocumentAndElementEventHandlers: not on Window.
+                    clipboardOnDocument: 'oncopy' in document && 'onpaste' in document,
+                    clipboardOnWindow: 'oncopy' in window || 'onpaste' in window,
+                    // GlobalEventHandlers: all three.
+                    sharedEverywhere: 'onclick' in window && 'onclick' in document
+                        && 'onclick' in document.body && 'onanimationend' in window,
+                    // Still null until assigned, and still a working slot.
+                    initial: window.onhashchange,
+                }))()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "windowOnlyOnWindow": true,
+                "windowOnlyOnDocument": false,
+                "documentOnlyOnDocument": true,
+                "documentOnlyOnWindow": false,
+                "clipboardOnDocument": true,
+                "clipboardOnWindow": false,
+                "sharedEverywhere": true,
+                "initial": null,
+            })
+        );
+    }
+
+    /// Removing the last iframe takes `window[0]` with it; the indices are not
+    /// a high-water mark.
+    #[test]
+    fn the_window_indices_follow_the_frames_in_both_directions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const seen = [];
+                    const snapshot = () => seen.push([
+                        window.length,
+                        Object.getOwnPropertyNames(globalThis).filter(n => /^\d+$/.test(n)).length,
+                    ]);
+                    snapshot();
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    snapshot();
+                    frame.remove();
+                    snapshot();
+                    return seen;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([[0, 0], [1, 1], [0, 0]]));
+    }
+
+    #[test]
+    fn assigning_outer_html_replaces_the_element_and_offset_parent_resolves() {
+        let mut rt = setup_runtime(
+            "<html><body><div id=host><span id=old></span></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const host = document.getElementById('host');
+                    // Only a getter existed, so in sloppy mode this assignment
+                    // silently did nothing and the replacement was never there
+                    // for the next query to find.
+                    document.getElementById('old').outerHTML =
+                        '<span class="fresh">replaced</span>';
+                    const fresh = document.querySelector('.fresh');
+                    let detachedThrew = '';
+                    try { document.createElement('i').outerHTML = '<b></b>'; }
+                    catch (error) { detachedThrew = error.name; }
+                    const positioned = document.createElement('div');
+                    positioned.style.position = 'relative';
+                    const child = document.createElement('span');
+                    positioned.appendChild(child);
+                    document.body.appendChild(positioned);
+                    return {
+                        replaced: fresh ? fresh.innerHTML : null,
+                        oldIsGone: document.getElementById('old') === null,
+                        hostHtml: host.innerHTML,
+                        // A parentless element cannot be replaced.
+                        detachedThrew,
+                        // Never `undefined`: a browser answers an element or null.
+                        offsetParent: child.offsetParent === positioned,
+                        bodyHasNone: document.body.offsetParent,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "replaced": "replaced",
+                "oldIsGone": true,
+                "hostHtml": "<span class=\"fresh\">replaced</span>",
+                "detachedThrew": "NoModificationAllowedError",
+                "offsetParent": true,
+                "bodyHasNone": null,
+            })
+        );
+    }
+
+    /// A `FontFace` with a `local()` source resolves only for a family the
+    /// claimed platform has. The family table answers for one platform at a
+    /// time and the platform comes from the identity, so a macOS identity that
+    /// resolves the macOS families and not the Windows ones, and a Windows
+    /// identity that is the exact inverse, is what a font-presence probe reads
+    /// out of two text measurements. Resolving both sets at once is how the
+    /// engine came to claim Windows, Linux and macOS font sets simultaneously.
+    async fn probe_local_font_sources(rt: &mut ObscuraJsRuntime, ua: &str) -> serde_json::Value {
+        rt.set_fingerprint(&obscura_net::BrowserFingerprint::from_user_agent(ua));
+        rt.call_function_on_for_cdp(
+            r#"async () => {
+                const probe = async family => {
+                    try {
+                        await new FontFace('p', `local("${family}")`).load();
+                        return 'loaded';
+                    } catch (error) { return error.name; }
+                };
+                return {
+                    // Both platforms ship these two.
+                    generic: await probe('Courier New'),
+                    // A macOS family, from the reference round's own list.
+                    macFamily: await probe('Geneva'),
+                    // A Windows-only family.
+                    windowsFamily: await probe('Javanese Text'),
+                    invented: await probe('ZZZ No Such Font 12345'),
+                    // A source with no local() is unaffected.
+                    remote: await (async () => {
+                        try {
+                            await new FontFace('p', 'url(https://example.test/f.woff2)').load();
+                            return 'loaded';
+                        } catch (error) { return error.name; }
+                    })(),
+                };
+            }"#,
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap()
+        .value
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_local_font_source_fails_for_a_family_the_claimed_platform_lacks() {
+        const MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+        const WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+        // One runtime per identity: the probe's availability answers are cached
+        // per isolate, which matches production, where a page cannot change its
+        // own identity mid-flight.
+        let mut mac_rt = setup_runtime("<html><body></body></html>");
+        let mac = probe_local_font_sources(&mut mac_rt, MAC_UA).await;
+        assert_eq!(
+            mac,
+            serde_json::json!({
+                "generic": "loaded",
+                "macFamily": "loaded",
+                "windowsFamily": "NetworkError",
+                "invented": "NetworkError",
+                "remote": "loaded",
+            }),
+            "macOS identity"
+        );
+
+        let mut windows_rt = setup_runtime("<html><body></body></html>");
+        let windows = probe_local_font_sources(&mut windows_rt, WINDOWS_UA).await;
+        assert_eq!(
+            windows,
+            serde_json::json!({
+                "generic": "loaded",
+                "macFamily": "NetworkError",
+                "windowsFamily": "loaded",
+                "invented": "NetworkError",
+                "remote": "loaded",
+            }),
+            "Windows identity"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_keyboard_layout_map_describes_a_physical_ansi_board() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const map = await navigator.keyboard.getLayoutMap();
+                    return {
+                        size: map.size,
+                        // maplike and read-only: a plain Map would answer `set`.
+                        readOnly: typeof map.set === 'undefined',
+                        brand: String(map),
+                        letters: [map.get('KeyA'), map.get('KeyZ')],
+                        backslash: map.get('Backslash'),
+                        // The extra key an ISO board has and an ANSI one does
+                        // not; claiming it under a US layout is a mismatch.
+                        noIsoKey: map.has('IntlBackslash') === false,
+                        iterates: [...map].length,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "size": 47,
+                "readOnly": true,
+                "brand": "[object KeyboardLayoutMap]",
+                "letters": ["a", "z"],
+                "backslash": "\\",
+                "noIsoKey": true,
+                "iterates": 47,
+            })
+        );
+    }
+
+    #[test]
+    fn rtp_capabilities_are_derived_from_the_same_sdp_the_offer_uses() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const audio = RTCRtpSender.getCapabilities('audio');
+                    const video = RTCRtpReceiver.getCapabilities('video');
+                    const red = audio.codecs.find(c => c.mimeType === 'audio/red');
+                    const name = codec => codec.mimeType
+                        + (codec.sdpFmtpLine ? ';' + codec.sdpFmtpLine : '');
+                    return {
+                        // telephone-event is offered at two clock rates; a
+                        // codec's identity includes the rate.
+                        audio: audio.codecs.map(codec => codec.mimeType + '/' + codec.clockRate),
+                        // Retransmission collapses to one entry however many
+                        // payload types carry it.
+                        rtxOnce: video.codecs.filter(c => c.mimeType === 'video/rtx').length,
+                        videoCount: video.codecs.length,
+                        h264Profiles: video.codecs.filter(c => c.mimeType === 'video/H264').length,
+                        firstVideo: name(video.codecs[0]),
+                        redHasFmtp: 'sdpFmtpLine' in red,
+                        redFmtp: red.sdpFmtpLine ?? null,
+                        senderReceiverAgree: JSON.stringify(audio) === JSON.stringify(
+                            RTCRtpReceiver.getCapabilities('audio')),
+                        headerExtensions: [audio.headerExtensions.length,
+                            video.headerExtensions.length],
+                        // Only the two media kinds have capabilities.
+                        data: RTCRtpSender.getCapabilities('data'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "audio": ["audio/opus/48000", "audio/red/48000", "audio/G722/8000",
+                    "audio/PCMU/8000", "audio/PCMA/8000", "audio/CN/8000",
+                    "audio/telephone-event/48000", "audio/telephone-event/8000"],
+                "rtxOnce": 1,
+                "videoCount": 21,
+                "h264Profiles": 8,
+                "firstVideo": "video/VP8",
+                "redHasFmtp": false,
+                "redFmtp": null,
+                "senderReceiverAgree": true,
+                "headerExtensions": [4, 11],
+                "data": null,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // No profile, no adapter -- which is also Chrome's answer when the GPU
+        // is unavailable.
+        let without = rt
+            .call_function_on_for_cdp(
+                "async () => (await navigator.gpu.requestAdapter()) === null",
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(without.value.unwrap(), serde_json::json!(true));
+
+        rt.set_stealth(true);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    return {
+                        vendor: adapter.info.vendor,
+                        // setlike, not an array: `has` and iteration both work.
+                        featuresAreSetlike: typeof adapter.features.has === 'function'
+                            && adapter.features.has('texture-compression-bc')
+                            && [...adapter.features].length > 10,
+                        // The default macOS identity is Apple silicon, whose
+                        // adapter carries the ASTC/ETC2 compression formats.
+                        appleFormats: [...adapter.features]
+                            .some(name => name.includes('astc') || name.includes('etc2')),
+                        // A device that asks for nothing gets the spec defaults,
+                        // which are below what the adapter itself reports.
+                        deviceBelowAdapter: device.limits.maxTextureDimension2D
+                            < adapter.limits.maxTextureDimension2D,
+                        preferredFormat: navigator.gpu.getPreferredCanvasFormat(),
+                        wgslCount: [...navigator.gpu.wgslLanguageFeatures].length,
+                        // Apple GPUs expose no subgroup sizes.
+                        subgroupNull: adapter.limits.minSubgroupSize === null
+                            && device.limits.maxSubgroupSize === null,
+                        // No SwiftShader behind the hardware profile.
+                        fallbackNull: (await navigator.gpu.requestAdapter(
+                            {forceFallbackAdapter: true})) === null,
+                        brands: [String(adapter), String(adapter.limits), String(device)],
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "vendor": "apple",
+                "featuresAreSetlike": true,
+                "appleFormats": true,
+                "deviceBelowAdapter": true,
+                "preferredFormat": "bgra8unorm",
+                "wgslCount": 9,
+                "subgroupNull": true,
+                "fallbackNull": true,
+                "brands": ["[object GPUAdapter]", "[object GPUSupportedLimits]",
+                    "[object GPUDevice]"],
+            })
+        );
+    }
+
+    #[test]
+    fn the_gpu_profile_follows_stealth_and_hides_the_adapter_behind_the_debug_extension() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Without stealth the truthful answer is that there is no context.
+        assert_eq!(
+            rt.evaluate("document.createElement('canvas').getContext('webgl')")
+                .unwrap(),
+            serde_json::json!(null),
+        );
+
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                    const float = gl.getShaderPrecisionFormat(0x8B30, 0x8DF2);
+                    const int = gl.getShaderPrecisionFormat(0x8B30, 0x8DF5);
+                    return {
+                        // Every Chrome answers these two, whatever the adapter.
+                        vendor: gl.getParameter(0x1F00),
+                        renderer: gl.getParameter(0x1F01),
+                        unmaskedIsAdapter: gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+                            .includes('ANGLE'),
+                        shadingLanguage: gl.getParameter(0x1F03),
+                        version2: gl2.getParameter(0x1F02),
+                        uniformBufferBindings: gl2.getParameter(0x8A2F),
+                        hasDebugExtension: gl.getSupportedExtensions()
+                            .includes('WEBGL_debug_renderer_info'),
+                        // A context returning a handful of extensions is as
+                        // distinctive as one returning none.
+                        manyExtensions: gl.getSupportedExtensions().length > 30
+                            && gl2.getSupportedExtensions().length > 30,
+                        precision: [float.rangeMin, float.rangeMax, float.precision,
+                            int.rangeMin, int.rangeMax, int.precision],
+                        viewport: Array.from(gl.getParameter(0x0D3A)),
+                        // The Apple shape carries the mobile compression
+                        // extensions and tops out at 4x MSAA.
+                        appleCompression: gl.getSupportedExtensions()
+                            .includes('WEBGL_compressed_texture_astc')
+                            && !gl.getSupportedExtensions()
+                                .includes('WEBGL_provoking_vertex'),
+                        samples: [
+                            Array.from(gl2.getInternalformatParameter(0x8D41, 0x8058, 0x80A9)),
+                            gl2.getInternalformatParameter(0x8D41, 0x8229, 0x80A9) === null,
+                        ],
+                        attrsEcho: document.createElement('canvas')
+                            .getContext('webgl2', {powerPreference: 'low-power', antialias: false})
+                            .getContextAttributes(),
+                        colorSpace: gl.drawingBufferColorSpace,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "vendor": "WebKit",
+                "renderer": "WebKit WebGL",
+                "unmaskedIsAdapter": true,
+                "shadingLanguage": "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
+                "version2": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+                "uniformBufferBindings": 32,
+                "hasDebugExtension": true,
+                "manyExtensions": true,
+                "precision": [127, 127, 23, 31, 30, 0],
+                "viewport": [16384, 16384],
+                "appleCompression": true,
+                "samples": [[4, 2], false],
+                "attrsEcho": {
+                    "alpha": true, "antialias": false, "depth": true,
+                    "desynchronized": false, "failIfMajorPerformanceCaveat": false,
+                    "powerPreference": "low-power", "premultipliedAlpha": true,
+                    "preserveDrawingBuffer": false, "stencil": false, "xrCompatible": false,
+                },
+                "colorSpace": "srgb",
+            })
+        );
+    }
+
+    #[test]
+    fn webgl_standard_constants_and_parameter_defaults_match_chrome() {
+        let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl1 = document.getElementById('c').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const shape = (object, name) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(object, name);
+                        return [descriptor.value, descriptor.writable,
+                            descriptor.enumerable, descriptor.configurable];
+                    };
+                    const names = ['BYTE','UNSIGNED_BYTE','SHORT','UNSIGNED_SHORT','INT',
+                        'UNSIGNED_INT','FLOAT','DEPTH_COMPONENT','ALPHA','RGB','RGBA',
+                        'LUMINANCE','LUMINANCE_ALPHA','UNSIGNED_SHORT_4_4_4_4',
+                        'UNSIGNED_SHORT_5_5_5_1','UNSIGNED_SHORT_5_6_5',
+                        'IMPLEMENTATION_COLOR_READ_TYPE','IMPLEMENTATION_COLOR_READ_FORMAT'];
+                    return {
+                        values: names.map(name => [gl1[name], gl2[name]]),
+                        instanceOwn: [Object.hasOwn(gl1, 'RGBA'), Object.hasOwn(gl2, 'RGBA')],
+                        constantCounts: [
+                            Object.getOwnPropertyNames(WebGLRenderingContext.prototype)
+                                .filter(name => typeof WebGLRenderingContext.prototype[name]
+                                    === 'number').length,
+                            Object.getOwnPropertyNames(WebGL2RenderingContext.prototype)
+                                .filter(name => typeof WebGL2RenderingContext.prototype[name]
+                                    === 'number').length,
+                            Object.getOwnPropertyNames(WebGLRenderingContext)
+                                .filter(name => name !== 'length'
+                                    && typeof WebGLRenderingContext[name] === 'number').length,
+                            Object.getOwnPropertyNames(WebGL2RenderingContext)
+                                .filter(name => name !== 'length'
+                                    && typeof WebGL2RenderingContext[name] === 'number').length,
+                        ],
+                        gl1: [shape(WebGLRenderingContext, 'RGBA'),
+                            shape(WebGLRenderingContext.prototype, 'RGBA'),
+                            shape(WebGLRenderingContext.prototype, 'UNSIGNED_BYTE'),
+                            shape(WebGLRenderingContext.prototype, 'GENERATE_MIPMAP_HINT')],
+                        gl2: [shape(WebGL2RenderingContext, 'RGBA'),
+                            shape(WebGL2RenderingContext.prototype, 'RGBA'),
+                            shape(WebGL2RenderingContext.prototype, 'UNSIGNED_BYTE'),
+                            shape(WebGL2RenderingContext.prototype,
+                                'MAX_CLIENT_WAIT_TIMEOUT_WEBGL')],
+                        implementationRead: [
+                            gl1.getParameter(gl1.IMPLEMENTATION_COLOR_READ_FORMAT),
+                            gl1.getParameter(gl1.IMPLEMENTATION_COLOR_READ_TYPE),
+                            gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_FORMAT),
+                            gl2.getParameter(gl2.IMPLEMENTATION_COLOR_READ_TYPE),
+                        ],
+                        drawingBufferFormat: [
+                            typeof gl1.drawingBufferFormat,
+                            gl2.drawingBufferFormat,
+                            Object.hasOwn(gl2, 'drawingBufferFormat'),
+                            Object.getOwnPropertyDescriptor(
+                                WebGL2RenderingContext.prototype,
+                                'drawingBufferFormat').enumerable,
+                        ],
+                        standardRead: [
+                            gl1.getParameter(gl1.GENERATE_MIPMAP_HINT),
+                            gl1.getParameter(gl1.POLYGON_OFFSET_FILL),
+                            gl1.getParameter(gl1.STENCIL_VALUE_MASK),
+                            gl1.getParameter(gl1.STENCIL_WRITEMASK),
+                            gl2.getParameter(gl2.STENCIL_BACK_VALUE_MASK),
+                            gl2.getParameter(gl2.STENCIL_BACK_WRITEMASK),
+                        ],
+                        edgeValues: [gl1.DEPTH_BUFFER_BIT, gl1.RGBA8,
+                            gl2.READ_BUFFER, gl2.INVALID_INDEX, gl2.TIMEOUT_IGNORED,
+                            gl2.MAX_CLIENT_WAIT_TIMEOUT_WEBGL],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": [[5120,5120],[5121,5121],[5122,5122],[5123,5123],
+                    [5124,5124],[5125,5125],[5126,5126],[6402,6402],[6406,6406],
+                    [6407,6407],[6408,6408],[6409,6409],[6410,6410],[32819,32819],
+                    [32820,32820],[33635,33635],[35738,35738],[35739,35739]],
+                "instanceOwn": [false, false],
+                "constantCounts": [298,560,298,559],
+                "gl1": [[6408,false,true,false],[6408,false,true,false],
+                    [5121,false,true,false],[33170,false,true,false]],
+                "gl2": [[6408,false,true,false],[6408,false,true,false],
+                    [5121,false,true,false],[37447,false,true,false]],
+                "implementationRead": [6408,5121,6408,5121],
+                "drawingBufferFormat": ["undefined",32856,false,true],
+                "standardRead": [4352,false,4294967295_u64,4294967295_u64,
+                    4294967295_u64,4294967295_u64],
+                "edgeValues": [256,32856,3074,4294967295_u64,-1,37447],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl1_extension_parameters_follow_enablement_and_chrome_shape() {
+        let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.getElementById('c').getContext('webgl');
+                    const read = pname => [gl.getParameter(pname), gl.getError()];
+                    const before = [read(0x8B8B), read(0x8FBB)];
+                    const derivatives = gl.getExtension('OES_standard_derivatives');
+                    const timer = gl.getExtension('EXT_disjoint_timer_query');
+                    const descriptor = (value, name) => {
+                        const entry = Object.getOwnPropertyDescriptor(
+                            Object.getPrototypeOf(value), name);
+                        return [entry.value, entry.writable,
+                            entry.enumerable, entry.configurable];
+                    };
+                    return {
+                        before,
+                        constants: [derivatives.FRAGMENT_SHADER_DERIVATIVE_HINT_OES,
+                            timer.GPU_DISJOINT_EXT],
+                        after: [read(derivatives.FRAGMENT_SHADER_DERIVATIVE_HINT_OES),
+                            read(timer.GPU_DISJOINT_EXT)],
+                        own: [Object.getOwnPropertyNames(derivatives),
+                            Object.getOwnPropertyNames(timer)],
+                        tags: [Object.prototype.toString.call(derivatives),
+                            Object.prototype.toString.call(timer)],
+                        descriptors: [descriptor(derivatives,
+                            'FRAGMENT_SHADER_DERIVATIVE_HINT_OES'),
+                            descriptor(timer, 'GPU_DISJOINT_EXT')],
+                        timerPrototype: Object.getOwnPropertyNames(
+                            Object.getPrototypeOf(timer)),
+                        same: [derivatives === gl.getExtension('OES_standard_derivatives'),
+                            timer === gl.getExtension('EXT_disjoint_timer_query')],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "before": [[null,1280],[null,1280]],
+                "constants": [35723,36795],
+                "after": [[4352,0],[false,0]],
+                "own": [[],[]],
+                "tags": ["[object OESStandardDerivatives]",
+                    "[object EXTDisjointTimerQuery]"],
+                "descriptors": [[35723,false,true,false],[36795,false,true,false]],
+                "timerPrototype": ["QUERY_COUNTER_BITS_EXT","CURRENT_QUERY_EXT",
+                    "QUERY_RESULT_EXT","QUERY_RESULT_AVAILABLE_EXT","TIME_ELAPSED_EXT",
+                    "TIMESTAMP_EXT","GPU_DISJOINT_EXT","beginQueryEXT","createQueryEXT",
+                    "deleteQueryEXT","endQueryEXT","getQueryEXT","getQueryObjectEXT",
+                    "isQueryEXT","queryCounterEXT"],
+                "same": [true,true],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl_astc_extension_matches_chrome_shape_and_profiles() {
+        let mut rt = setup_runtime("<html><body><canvas id=a></canvas><canvas id=b></canvas></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const summarize = context => {
+                        const extension = context.getExtension(
+                            'WEBGL_compressed_texture_astc');
+                        const prototype = Object.getPrototypeOf(extension);
+                        const descriptor = Object.getOwnPropertyDescriptor(
+                            prototype, 'getSupportedProfiles');
+                        const first = extension.getSupportedProfiles();
+                        return {
+                            tag: Object.prototype.toString.call(extension),
+                            own: Object.getOwnPropertyNames(extension),
+                            prototype: Object.getOwnPropertyNames(prototype),
+                            bounds: [extension.COMPRESSED_RGBA_ASTC_4x4_KHR,
+                                extension.COMPRESSED_RGBA_ASTC_12x12_KHR,
+                                extension.COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,
+                                extension.COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR],
+                            profiles: first,
+                            fresh: first !== extension.getSupportedProfiles(),
+                            descriptor: [descriptor.writable, descriptor.enumerable,
+                                descriptor.configurable],
+                            native: Function.prototype.toString.call(
+                                extension.getSupportedProfiles),
+                            same: extension === context.getExtension(
+                                'WEBGL_compressed_texture_astc'),
+                        };
+                    };
+                    return {
+                        gl1: summarize(document.getElementById('a').getContext('webgl')),
+                        gl2: summarize(document.getElementById('b').getContext('webgl2')),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let prototype = serde_json::json!([
+            "COMPRESSED_RGBA_ASTC_4x4_KHR","COMPRESSED_RGBA_ASTC_5x4_KHR",
+            "COMPRESSED_RGBA_ASTC_5x5_KHR","COMPRESSED_RGBA_ASTC_6x5_KHR",
+            "COMPRESSED_RGBA_ASTC_6x6_KHR","COMPRESSED_RGBA_ASTC_8x5_KHR",
+            "COMPRESSED_RGBA_ASTC_8x6_KHR","COMPRESSED_RGBA_ASTC_8x8_KHR",
+            "COMPRESSED_RGBA_ASTC_10x5_KHR","COMPRESSED_RGBA_ASTC_10x6_KHR",
+            "COMPRESSED_RGBA_ASTC_10x8_KHR","COMPRESSED_RGBA_ASTC_10x10_KHR",
+            "COMPRESSED_RGBA_ASTC_12x10_KHR","COMPRESSED_RGBA_ASTC_12x12_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR",
+            "COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR","COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR",
+            "getSupportedProfiles"
+        ]);
+        for context in ["gl1", "gl2"] {
+            assert_eq!(result[context]["tag"], "[object WebGLCompressedTextureASTC]");
+            assert_eq!(result[context]["own"], serde_json::json!([]));
+            assert_eq!(result[context]["prototype"], prototype);
+            assert_eq!(result[context]["bounds"], serde_json::json!([37808,37821,37840,37853]));
+            assert_eq!(result[context]["profiles"], serde_json::json!(["ldr","hdr"]));
+            assert_eq!(result[context]["fresh"], true);
+            assert_eq!(result[context]["descriptor"], serde_json::json!([true,true,true]));
+            assert_eq!(result[context]["native"],
+                "function getSupportedProfiles() { [native code] }");
+            assert_eq!(result[context]["same"], true);
+        }
+    }
+
+    #[test]
+    fn webgl_context_is_cached_per_canvas_and_echoes_power_preference() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const canvas = document.createElement('canvas');
+                    const first = canvas.getContext('webgl2', {powerPreference: 'low-power'});
+                    // A re-fetch without attributes returns the same context,
+                    // so getContextAttributes still echoes the request.
+                    const refetch = canvas.getContext('webgl2');
+                    const alias = document.createElement('canvas');
+                    const webgl1 = alias.getContext('webgl', {powerPreference: 'high-performance'});
+                    let threw = null;
+                    try { canvas.getContext('webgl2', {powerPreference: 'banana'}); }
+                    catch (error) { threw = error.name; }
+                    const resized = document.createElement('canvas');
+                    const resizedContext = resized.getContext('webgl');
+                    resized.setAttribute('width', '17');
+                    const webglFirst = document.createElement('canvas');
+                    webglFirst.getContext('webgl');
+                    const twoDFirst = document.createElement('canvas');
+                    twoDFirst.getContext('2d');
+                    return {
+                        sameObject: refetch === first,
+                        echoed: refetch.getContextAttributes().powerPreference,
+                        aliasSame: alias.getContext('experimental-webgl') === webgl1,
+                        aliasEcho: webgl1.getContextAttributes().powerPreference,
+                        familiesExclusive: canvas.getContext('webgl') === null,
+                        webglThenTwoD: webglFirst.getContext('2d') === null,
+                        twoDThenWebgl: twoDFirst.getContext('webgl2') === null,
+                        invalidEnumThrows: threw,
+                        freshDefaults: document.createElement('canvas')
+                            .getContext('webgl2').getContextAttributes().powerPreference,
+                        drawingBufferFollowsResize: [
+                            resizedContext.drawingBufferWidth,
+                            resizedContext.drawingBufferHeight,
+                        ],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sameObject": true,
+                "echoed": "low-power",
+                "aliasSame": true,
+                "aliasEcho": "high-performance",
+                "familiesExclusive": true,
+                "webglThenTwoD": true,
+                "twoDThenWebgl": true,
+                "invalidEnumThrows": "TypeError",
+                "freshDefaults": "default",
+                "drawingBufferFollowsResize": [17, 150],
+            })
+        );
+    }
+
+    #[test]
+    fn webgl_internalformat_samples_follow_chrome_format_classes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        // The default macOS identity selects the Apple profile: the fifteen
+        // core renderable formats at 4x/2x, everything else -- integer, float,
+        // SNORM, unsized, sRGB-without-alpha -- is INVALID_ENUM/null.
+        let apple = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return {
+                        core: [read(0x8058), read(0x8229), read(0x822B), read(0x8051),
+                            read(0x8C43), read(0x8056), read(0x8057), read(0x8D62),
+                            read(0x8059), read(0x81A5), read(0x81A6), read(0x8CAC),
+                            read(0x8D48), read(0x88F0), read(0x8CAD)],
+                        integer: [read(0x8232), read(0x8D70), read(0x906F)],
+                        unsized: [read(0x1907), read(0x1908)],
+                        floats: [read(0x881A), read(0x822D)],
+                        invalid: [read(0x8C41), read(0x8F94), read(0x8C3D)],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            apple,
+            serde_json::json!({
+                "core": [[4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2],
+                    [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2], [4, 2]],
+                "integer": [null, null, null],
+                "unsized": [null, null],
+                "floats": [null, null],
+                "invalid": [null, null, null],
+            })
+        );
+        // EXT_color_buffer_float makes the float formats renderable; RGB9_E5
+        // never becomes renderable.
+        let unlocked = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    gl.getExtension('EXT_color_buffer_float');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return [read(0x881A), read(0x8814), read(0x8C3A), read(0x8C3D)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            unlocked,
+            serde_json::json!([[4, 2], [4, 2], [4, 2], null])
+        );
+        // The Windows/Intel identity keeps the same classes with the D3D11
+        // counts, and an invalid format sets INVALID_ENUM.
+        rt.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+        let intel = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const read = fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    };
+                    return {
+                        // Probed first: integer formats below set INVALID_ENUM.
+                        errors: [gl.getError(), read(0x8C41), gl.getError()],
+                        core: read(0x8058),
+                        integer: read(0x8232),
+                        floats: read(0x881A),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            intel,
+            serde_json::json!({
+                "core": [8, 4, 2, 1],
+                "integer": null,
+                "floats": null,
+                "errors": [0, null, 1280],
+            })
+        );
+        // The challenge probe's own 53-format list, transcribed from the
+        // captured payload: the null pattern must match Chrome entry for
+        // entry, with only the sample counts scaled to the D3D11 profile.
+        let exact = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.createElement('canvas').getContext('webgl2');
+                    const formats = [33321,36756,33330,33329,33332,33331,33334,
+                        33333,33323,36757,33336,33335,33338,33337,33340,33339,
+                        32849,36758,35905,36221,36239,36215,36233,36209,36227,
+                        32856,36759,35907,32857,36220,36238,36975,36214,36232,
+                        36208,36226,34842,34836,35898,35901,33325,33326,33327,
+                        33328,33189,33190,36012,36168,35056,36013,32854,32855,
+                        36194];
+                    return formats.map(fmt => {
+                        const value = gl.getInternalformatParameter(
+                            gl.RENDERBUFFER, fmt, gl.SAMPLES);
+                        return value === null ? null : Array.from(value);
+                    });
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            exact,
+            serde_json::json!([
+                [8,4,2,1],null,null,null,null,null,null,null,[8,4,2,1],null,null,
+                null,null,null,null,null,[8,4,2,1],null,null,null,null,null,null,
+                null,null,[8,4,2,1],null,[8,4,2,1],[8,4,2,1],null,null,null,null,
+                null,null,null,null,null,null,null,null,null,null,null,[8,4,2,1],
+                [8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],[8,4,2,1],
+                [8,4,2,1],[8,4,2,1]])
+        );
+    }
+
+    #[test]
+    fn webgl_extension_membership_and_limits_follow_the_intel_profile() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_stealth(true);
+        rt.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl1 = document.createElement('canvas').getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const has = (gl, name) => gl.getExtension(name) !== null;
+                    // The capability bitmap a challenge probe walks: the
+                    // mobile/Apple compression formats and provoking vertex
+                    // are absent on D3D11, the desktop ones are present.
+                    const names = [
+                        'WEBGL_compressed_texture_s3tc',
+                        'WEBGL_compressed_texture_s3tc_srgb',
+                        'WEBGL_compressed_texture_astc',
+                        'WEBGL_compressed_texture_etc',
+                        'WEBGL_compressed_texture_etc1',
+                        'WEBGL_compressed_texture_pvrtc',
+                        'WEBGL_compressed_texture_atc',
+                        'EXT_texture_compression_bptc',
+                        'EXT_texture_compression_rgtc',
+                        'EXT_texture_filter_anisotropic',
+                        'WEBKIT_WEBGL_compressed_texture_pvrtc',
+                        'MOZ_WEBGL_compressed_texture_s3tc',
+                        'WEBGL_provoking_vertex',
+                    ];
+                    const astc = gl1.getExtension('WEBGL_compressed_texture_astc');
+                    return {
+                        bitmap: names.map(name => has(gl1, name)),
+                        counts: [gl1.getSupportedExtensions().length,
+                            gl2.getSupportedExtensions().length],
+                        astcProfiles: astc ? astc.getSupportedProfiles() : null,
+                        feedback: [
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS),
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS),
+                            gl2.getParameter(gl2.MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS),
+                        ],
+                        waitTimeout: gl2.getParameter(gl2.MAX_SERVER_WAIT_TIMEOUT),
+                        sampleCoverage: gl1.getParameter(gl1.SAMPLE_COVERAGE_VALUE),
+                        pointRange: Array.from(gl2.getParameter(gl2.ALIASED_POINT_SIZE_RANGE)),
+                        lineRange: Array.from(gl2.getParameter(gl2.ALIASED_LINE_WIDTH_RANGE)),
+                        unmasked: (() => {
+                            const debugInfo = gl1.getExtension('WEBGL_debug_renderer_info');
+                            return [
+                                gl1.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL),
+                                gl1.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL).includes('Intel'),
+                            ];
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bitmap": [true, true, false, false, false, false, false,
+                    true, true, true, false, false, false],
+                "counts": [35, 30],
+                "astcProfiles": null,
+                "feedback": [4, 120, 4],
+                "waitTimeout": 0,
+                "sampleCoverage": 1,
+                "pointRange": [1, 1024],
+                "lineRange": [1, 1],
+                "unmasked": ["Google Inc. (Intel)", true],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_connection_offers_a_browser_shaped_sdp_and_trickles_candidates() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    const candidates = [];
+                    pc.onicecandidate = event => candidates.push(
+                        event.candidate ? event.candidate.candidate : null);
+                    await pc.setLocalDescription(offer);
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const lines = offer.sdp.split('\r\n');
+                    const line = prefix => lines.find(value => value.startsWith(prefix)) || '';
+                    return {
+                        kinds: lines.filter(value => value.startsWith('m='))
+                            .map(value => value.slice(2).split(' ')[0]),
+                        bundle: line('a=group:BUNDLE'),
+                        // Every m-section carries the same credentials and
+                        // fingerprint; three of each for three sections.
+                        ufrags: lines.filter(value => value.startsWith('a=ice-ufrag:')).length,
+                        fingerprints: new Set(
+                            lines.filter(value => value.startsWith('a=fingerprint:'))).size,
+                        sessionLeadingZero: line('o=- ').split(' ')[1].startsWith('0'),
+                        // One per interface per section, then a null to close
+                        // gathering.
+                        candidateCount: candidates.length,
+                        trailingNull: candidates[candidates.length - 1] === null,
+                        allMdnsHost: candidates.slice(0, -1).every(value =>
+                            / typ host /.test(value) && /\.local /.test(value)),
+                        gathering: pc.iceGatheringState,
+                        redPayloadMapping: lines.includes('a=fmtp:63 111/111'),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "kinds": ["audio", "video", "application"],
+                "bundle": "a=group:BUNDLE 0 1 2",
+                "ufrags": 3,
+                "fingerprints": 1,
+                "sessionLeadingZero": false,
+                "candidateCount": 7,
+                "trailingNull": true,
+                "allMdnsHost": true,
+                "gathering": "complete",
+                "redPayloadMapping": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_can_trickle_and_folds_candidates_into_local_sdp() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const before = pc.canTrickleIceCandidates;
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    await pc.setLocalDescription(offer);
+                    const afterLocal = pc.canTrickleIceCandidates;
+                    const sdpAtSet = pc.localDescription.sdp;
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const linesAtComplete = (pc.localDescription.sdp.match(/a=candidate:/g) || []).length;
+                    // Loopback remote description: the offer advertises trickle,
+                    // so canTrickle flips to true only now.
+                    await pc.setRemoteDescription(
+                        {type: 'offer', sdp: pc.localDescription.sdp});
+                    const afterRemote = pc.canTrickleIceCandidates;
+                    // A remote without the trickle option reads false.
+                    const pc2 = new RTCPeerConnection({iceServers: []});
+                    await pc2.setRemoteDescription({
+                        type: 'offer',
+                        sdp: offer.sdp.split('a=ice-options:trickle\r\n').join(''),
+                    });
+                    return {
+                        before, afterLocal, afterRemote,
+                        noTrickleRemote: pc2.canTrickleIceCandidates,
+                        candidatesAtSet: (sdpAtSet.match(/a=candidate:/g) || []).length,
+                        linesAtComplete,
+                        candidateLinesPerSection: (() => {
+                            const sections = pc.localDescription.sdp.split('\r\nm=').slice(1);
+                            return sections.every(section =>
+                                (section.match(/a=candidate:/g) || []).length === 2);
+                        })(),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                // Chrome: null until a remote description exists, then the
+                // remote's `a=ice-options:trickle` decides.
+                "before": null,
+                "afterLocal": null,
+                "afterRemote": true,
+                "noTrickleRemote": false,
+                // The description handed to setLocalDescription has no
+                // candidates yet; gathering folds one per interface per
+                // m-section into it (two interfaces, three m-sections).
+                "candidatesAtSet": 0,
+                "linesAtComplete": 6,
+                "candidateLinesPerSection": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dynamic_script_files_a_resource_timing_entry() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "text/javascript" },
+                            body: "globalThis.__ran = true",
+                            url: "https://cdn.example/widget.js",
+                            timing: { responseStart: 4, responseEnd: 9, redirectCount: 0 },
+                        });
+                        const script = document.createElement("script");
+                        script.src = "https://cdn.example/widget.js";
+                        await new Promise(resolve => {
+                            script.onload = resolve;
+                            script.onerror = resolve;
+                            document.head.appendChild(script);
+                        });
+                        const entry = performance.getEntriesByType("resource")
+                            .find(value => value.name === "https://cdn.example/widget.js");
+                        return entry && [
+                            entry.initiatorType,
+                            entry.nextHopProtocol,
+                            entry.encodedBodySize,
+                            entry.transferSize,
+                            entry.responseStatus,
+                        ];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // A cross-origin response without Timing-Allow-Origin exposes neither
+        // sizes nor protocol, so the fixture grants nothing and the entry is
+        // still expected to exist -- its presence is the point.
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["script", "", 0, 0, 0])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_transfer_size_covers_the_response_headers() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                            status: 200,
+                            headers: { "timing-allow-origin": "*" },
+                            body: "0123456789",
+                            url: "https://cdn.example/data.json",
+                            timing: { responseStart: 2, responseEnd: 5, redirectCount: 0 },
+                        });
+                        await fetch("https://cdn.example/data.json");
+                        const entry = performance.getEntriesByType("resource")
+                            .find(value => value.name === "https://cdn.example/data.json");
+                        return entry && [
+                            entry.initiatorType,
+                            entry.nextHopProtocol,
+                            entry.encodedBodySize,
+                            entry.transferSize,
+                        ];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["fetch", "h2", 10, 310])
         );
     }
 
@@ -15872,6 +24633,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_script_stack_uses_document_absolute_line_offset() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script_at_line(
+            "https://example.test/page.html",
+            &("function capture() { return new Error().stack; }\n"
+                .to_owned()
+                + "globalThis.__inlineStack = capture();"),
+            12,
+        )
+        .unwrap();
+        let stack = rt.evaluate("globalThis.__inlineStack").unwrap();
+        let stack = stack.as_str().unwrap();
+        assert!(stack.contains("https://example.test/page.html:13"), "{stack}");
+        assert!(!stack.contains("obscura:bootstrap"), "{stack}");
+    }
+
     /// An event handler that throws is reported, not swallowed. Without this a
     /// page that dies inside its own XHR callback is indistinguishable from one
     /// that simply stopped making requests -- which is how a stalled challenge
@@ -15983,6 +24761,25 @@ mod tests {
             .evaluate("new TextDecoder().decode(new Uint8Array([65, 66, 67]).subarray(1, 2))")
             .unwrap();
         assert_eq!(result.as_str().unwrap(), "B");
+
+        let invalid = rt
+            .evaluate(
+                r#"[
+                    [0xff], [0xc0, 0xaf], [0xe0, 0x80, 0x80],
+                    [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80],
+                    [0xe2, 0x82], [0xe2, 0x28, 0xa1],
+                    [0xf0, 0x9f, 0x92, 0xa9], [0x61, 0x80, 0x62],
+                ].map(bytes => Array.from(
+                    new TextDecoder().decode(new Uint8Array(bytes)),
+                    value => value.codePointAt(0),
+                ))"#,
+            )
+            .unwrap();
+        assert_eq!(invalid, serde_json::json!([
+            [65533], [65533, 65533], [65533, 65533, 65533],
+            [65533, 65533, 65533], [65533, 65533, 65533, 65533],
+            [65533], [65533, 40, 65533], [128169], [97, 65533, 98],
+        ]));
     }
 
     #[test]
@@ -16124,6 +24921,132 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!("TypeError|TypeError|123:string|null|7|click|\"\"")
+        );
+    }
+
+    #[test]
+    fn security_policy_violation_event_matches_chrome_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const event = new SecurityPolicyViolationEvent(
+                        'securitypolicyviolation', {
+                            blockedURI: 'https://cdn.example/app.js',
+                            effectiveDirective: 'script-src',
+                            violatedDirective: 'script-src',
+                            documentURI: 'https://app.example/',
+                            originalPolicy: "script-src 'self'",
+                            sourceFile: 'https://app.example/index.js',
+                            sample: 'alert(1)', lineNumber: 4, columnNumber: 5,
+                            statusCode: 403, disposition: 'enforce',
+                        });
+                    const names = Object.getOwnPropertyNames(
+                        SecurityPolicyViolationEvent.prototype);
+                    return {
+                        instance: event instanceof Event,
+                        tag: Object.prototype.toString.call(event),
+                        own: Object.getOwnPropertyNames(event),
+                        names,
+                        values: [event.blockedURI, event.effectiveDirective,
+                            event.violatedDirective, event.documentURI,
+                            event.originalPolicy, event.sourceFile, event.sample,
+                            event.lineNumber, event.columnNumber, event.statusCode,
+                            event.disposition, event.referrer],
+                        defaults: (() => {
+                            const empty = new SecurityPolicyViolationEvent('x');
+                            return [empty.disposition, empty.blockedURI,
+                                empty.lineNumber, empty.statusCode];
+                        })(),
+                        missingArgThrows: (() => {
+                            try { new SecurityPolicyViolationEvent(); return false; }
+                            catch (error) { return error instanceof TypeError; }
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "tag": "[object SecurityPolicyViolationEvent]",
+                "own": ["isTrusted"],
+                "names": [
+                    "documentURI", "referrer", "blockedURI", "violatedDirective",
+                    "effectiveDirective", "originalPolicy", "disposition", "sourceFile",
+                    "statusCode", "lineNumber", "columnNumber", "sample", "constructor"
+                ],
+                "values": [
+                    "https://cdn.example/app.js", "script-src", "script-src",
+                    "https://app.example/", "script-src 'self'",
+                    "https://app.example/index.js", "alert(1)", 4, 5, 403,
+                    "enforce", ""
+                ],
+                "defaults": ["enforce", "", 0, 0],
+                "missingArgThrows": true,
+            })
+        );
+    }
+
+    #[test]
+    fn mouse_and_pointer_events_match_chrome_internal_slot_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const base = new Event('x');
+                    const pointer = new PointerEvent('x');
+                    const trusted = Object.getOwnPropertyDescriptor(base, 'isTrusted');
+                    return {
+                        baseOwn: Object.getOwnPropertyNames(base),
+                        pointerOwn: Object.getOwnPropertyNames(pointer),
+                        eventPrototype: Object.getOwnPropertyNames(Event.prototype),
+                        mousePrototype: Object.getOwnPropertyNames(MouseEvent.prototype),
+                        pointerPrototype: Object.getOwnPropertyNames(PointerEvent.prototype),
+                        trusted: [trusted.enumerable, trusted.configurable,
+                            typeof trusted.get === 'function'],
+                        sourceTypes: [typeof base.sourceCapabilities,
+                            new MouseEvent('x').sourceCapabilities === null],
+                        pointerValues: [pointer.pointerId, pointer.width, pointer.height,
+                            pointer.pressure, pointer.tiltX, pointer.tiltY,
+                            pointer.azimuthAngle, pointer.altitudeAngle,
+                            pointer.tangentialPressure, pointer.twist,
+                            pointer.pointerType, pointer.isPrimary,
+                            pointer.persistentDeviceId, pointer.getPredictedEvents().length,
+                            pointer.getCoalescedEvents().length],
+                        mouseValues: [pointer.pageX, pointer.pageY, pointer.x, pointer.y,
+                            pointer.offsetX, pointer.offsetY, pointer.movementX,
+                            pointer.movementY, pointer.layerX, pointer.layerY],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "baseOwn": ["isTrusted"],
+                "pointerOwn": ["isTrusted"],
+                "eventPrototype": ["type", "target", "currentTarget", "eventPhase",
+                    "bubbles", "cancelable", "defaultPrevented", "composed", "timeStamp",
+                    "srcElement", "returnValue", "cancelBubble", "NONE", "CAPTURING_PHASE",
+                    "AT_TARGET", "BUBBLING_PHASE", "composedPath", "initEvent",
+                    "preventDefault", "stopImmediatePropagation", "stopPropagation", "constructor"],
+                "mousePrototype": ["screenX", "screenY", "clientX", "clientY", "ctrlKey",
+                    "shiftKey", "altKey", "metaKey", "button", "buttons", "relatedTarget",
+                    "pageX", "pageY", "x", "y", "offsetX", "offsetY", "movementX",
+                    "movementY", "fromElement", "toElement", "layerX", "layerY",
+                    "getModifierState", "initMouseEvent", "constructor"],
+                "pointerPrototype": ["pointerId", "width", "height", "pressure", "tiltX",
+                    "tiltY", "azimuthAngle", "altitudeAngle", "tangentialPressure", "twist",
+                    "pointerType", "isPrimary", "getPredictedEvents", "persistentDeviceId",
+                    "constructor", "getCoalescedEvents"],
+                "trusted": [true, false, true],
+                "sourceTypes": ["undefined", true],
+                "pointerValues": [0, 1, 1, 0, 0, 0, 0,
+                    std::f64::consts::FRAC_PI_2, 0, 0, "", false, 0, 0, 0],
+                "mouseValues": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }),
         );
     }
 
@@ -17103,7 +26026,8 @@ mod tests {
     /// "addEventListener is not a function".
     #[test]
     fn navigator_eventtarget_stubs_expose_add_event_listener() {
-        let mut rt = setup_runtime("<div></div>");
+        // Reads navigator.serviceWorker, which only exists on a secure origin.
+        let mut rt = setup_secure_runtime("<div></div>");
         let result = rt
             .evaluate(
                 r#"
@@ -17137,6 +26061,78 @@ mod tests {
     }
 
     #[test]
+    fn network_information_matches_chrome_desktop_shape() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const connection = navigator.connection;
+                    const prototype = Object.getPrototypeOf(connection);
+                    const descriptorShape = name => {
+                        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+                        return {
+                            get: descriptor.get && [descriptor.get.name, descriptor.get.length,
+                                Function.prototype.toString.call(descriptor.get)],
+                            set: descriptor.set && [descriptor.set.name, descriptor.set.length,
+                                Function.prototype.toString.call(descriptor.set)],
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                        };
+                    };
+                    let construct;
+                    try { new NetworkInformation(); construct = null; }
+                    catch (error) { construct = [error.name, error.message]; }
+                    return {
+                        tag: Object.prototype.toString.call(connection),
+                        own: Object.getOwnPropertyNames(connection),
+                        prototype: Object.getOwnPropertyNames(prototype),
+                        typeMissing: !('type' in connection) && connection.type === undefined,
+                        eventTarget: connection instanceof EventTarget,
+                        stable: connection === navigator.connection,
+                        constructorShape: [NetworkInformation.name, NetworkInformation.length,
+                            Function.prototype.toString.call(NetworkInformation)],
+                        construct,
+                        descriptors: Object.fromEntries(
+                            ['onchange', 'effectiveType', 'rtt', 'downlink', 'saveData']
+                                .map(name => [name, descriptorShape(name)])),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let getter = |name: &str| serde_json::json!({
+            "get": [format!("get {name}"), 0, format!("function get {name}() {{ [native code] }}")],
+            "enumerable": true,
+            "configurable": true,
+        });
+        let mut descriptors = serde_json::Map::new();
+        descriptors.insert("onchange".into(), serde_json::json!({
+            "get": ["get onchange", 0, "function get onchange() { [native code] }"],
+            "set": ["set onchange", 1, "function set onchange() { [native code] }"],
+            "enumerable": true,
+            "configurable": true,
+        }));
+        for name in ["effectiveType", "rtt", "downlink", "saveData"] {
+            descriptors.insert(name.into(), getter(name));
+        }
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "tag": "[object NetworkInformation]",
+                "own": [],
+                "prototype": ["onchange", "effectiveType", "rtt", "downlink", "saveData", "constructor"],
+                "typeMissing": true,
+                "eventTarget": true,
+                "stable": true,
+                "constructorShape": ["NetworkInformation", 0,
+                    "function NetworkInformation() { [native code] }"],
+                "construct": ["TypeError",
+                    "Failed to construct 'NetworkInformation': Illegal constructor"],
+                "descriptors": serde_json::Value::Object(descriptors),
+            })
+        );
+    }
+
+    #[test]
     fn text_codec_streams_expose_browser_shape() {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
@@ -17144,6 +26140,10 @@ mod tests {
                 r#"
                 const encoder = new TextEncoderStream();
                 const decoder = new TextDecoderStream();
+                const readable = new ReadableStream();
+                const reader = readable.getReader();
+                const lockedWhileOwned = readable.locked;
+                reader.releaseLock();
                 return {
                     encoder: encoder.encoding,
                     encoderReadable: typeof encoder.readable.getReader,
@@ -17151,6 +26151,13 @@ mod tests {
                     decoder: decoder.encoding,
                     decoderReadable: typeof decoder.readable.getReader,
                     decoderWritable: typeof decoder.writable.getWriter,
+                    readableOwn: Object.getOwnPropertyNames(readable),
+                    readableValues: typeof readable.values,
+                    iteratorAlias:
+                        ReadableStream.prototype[Symbol.asyncIterator]
+                            === ReadableStream.prototype.values,
+                    lockedWhileOwned,
+                    lockedAfterRelease: readable.locked,
                 };
                 "#,
             )
@@ -17164,6 +26171,11 @@ mod tests {
                 "decoder": "utf-8",
                 "decoderReadable": "function",
                 "decoderWritable": "function",
+                "readableOwn": [],
+                "readableValues": "function",
+                "iteratorAlias": true,
+                "lockedWhileOwned": true,
+                "lockedAfterRelease": false,
             })
         );
     }
@@ -17317,6 +26329,36 @@ mod tests {
         assert_eq!(result, serde_json::json!(["menu", "true"]));
     }
 
+    #[test]
+    fn event_target_is_not_node_and_window_has_no_node_members() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            const target = new EventTarget();
+            const element = document.querySelector('div');
+            const xhr = new XMLHttpRequest();
+            return {
+                distinct: EventTarget !== Node,
+                nodeParent: Object.getPrototypeOf(Node.prototype) === EventTarget.prototype,
+                instance: target instanceof EventTarget && !(target instanceof Node),
+                element: element instanceof Node && element instanceof EventTarget,
+                window: window instanceof EventTarget && !(window instanceof Node),
+                clean: ['nodeType', 'appendChild', 'childNodes', 'ELEMENT_NODE'].every(
+                    name => !(name in window) && !(name in target) && !(name in xhr)),
+                xhrParent: Object.getPrototypeOf(XMLHttpRequestEventTarget.prototype)
+                    === EventTarget.prototype,
+                ownNames: Object.getOwnPropertyNames(target),
+                brand: Object.prototype.toString.call(target),
+                inherited: !Object.hasOwn(Node.prototype, 'addEventListener')
+                    && Node.prototype.addEventListener === EventTarget.prototype.addEventListener,
+            };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "distinct": true, "nodeParent": true, "instance": true,
+            "element": true, "window": true, "clean": true, "xhrParent": true,
+            "ownNames": [], "brand": "[object EventTarget]", "inherited": true,
+        }));
+    }
+
     /// Framework schedulers commonly subclass EventTarget for their own
     /// lifecycle events. These targets have no backing DOM node, but must
     /// still deliver callbacks (including object, once, and signal listeners).
@@ -17411,8 +26453,14 @@ mod tests {
         );
     }
 
+    /// Renamed from `unsupported_media_capabilities_and_readiness_are_honest`:
+    /// the capability *declaration* now matches Chrome (see
+    /// `media_capability_declarations_match_chrome_and_agree_with_each_other`),
+    /// while readiness stays honest. What this pins is the second half — no
+    /// frame, no duration, no currentSrc, still paused — which is what
+    /// "nothing is decoded" actually looks like from JS.
     #[test]
-    fn unsupported_media_capabilities_and_readiness_are_honest() {
+    fn media_readiness_stays_empty_while_capabilities_are_declared() {
         let mut rt = setup_runtime(
             r#"<video id="media" src="https://example.test/movie.mp4"
                 poster="https://example.test/poster.png"></video>"#,
@@ -17438,8 +26486,9 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                "",
-                "",
+                // Declared support, as Chrome declares it; playback never happens.
+                "maybe",
+                "probably",
                 0,
                 0,
                 0,
@@ -17567,7 +26616,7 @@ mod tests {
                 var scriptTestSetup = true;
                 globalThis.__cloneScriptRuns = 0;
                 const parser = document.getElementById("parser");
-                globalThis.__markParserScripts([parser._nid]);
+                globalThis.__markParserScripts([parser[Symbol.for('obscura.nid')]]);
                 document.head.appendChild(parser);
                 document.body.appendChild(parser.cloneNode(true));
 
@@ -17633,9 +26682,15 @@ mod tests {
                     'WheelEvent', 'ProgressEvent', 'PopStateEvent', 'HashChangeEvent',
                     'ClipboardEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent',
                     'CompositionEvent', 'PerformanceObserver', 'MutationObserver',
-                    'Node', 'Element', 'Document', 'Headers', 'Request', 'Response',
+                    // Element and Document carry per-instance tag getters
+                    // ([object HTMLDivElement], [object HTMLDocument]); their
+                    // prototype tags are intentionally not the interface name.
+                    'Node', 'Headers', 'Request', 'Response',
+                    'HTMLInputElement',
                     'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
-                    'Navigator', 'Location',
+                    'Navigator', 'Location', 'XSLTProcessor', 'HTMLUserMediaElement',
+                    'InteractionContentfulPaint', 'PerformanceSoftNavigation', 'NodeRange',
+                    'OpaqueRange',
                 ];
                 const bad = [];
                 for (const n of names) {
@@ -17669,7 +26724,9 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
+                (function() {
                 const e = new MessageEvent('m');
+                const input = document.createElement('input');
                 return {
                     instanceTag: Object.prototype.toString.call(e),
                     customEventTag: Object.prototype.toString.call(new CustomEvent('c')),
@@ -17687,11 +26744,19 @@ mod tests {
                     // Aliased element interfaces share one prototype, so the
                     // brand must stay on the owner rather than the last alias.
                     elementTag: Object.prototype.toString.call(document.createElement('div')),
+                    inputTag: Object.prototype.toString.call(input),
+                    inputInstance: input instanceof HTMLInputElement && input instanceof Element,
+                    inputCtorToString: HTMLInputElement.toString(),
+                    bodyTag: Object.prototype.toString.call(document.body),
+                    bodyInstance: document.body instanceof HTMLBodyElement
+                        && document.body instanceof HTMLElement,
+                    bodyCtorToString: HTMLBodyElement.toString(),
                     // ECMAScript builtins must not have been swept up.
                     dateUntouched:
                         Object.getOwnPropertyDescriptor(Date.prototype, Symbol.toStringTag) === undefined
                         && Object.getOwnPropertyDescriptor(RegExp.prototype, Symbol.toStringTag) === undefined,
                 };
+                })()
                 "#,
             )
             .unwrap();
@@ -17708,8 +26773,531 @@ mod tests {
                 "navigatorIsNavigator": true,
                 "locationTag": "[object Location]",
                 "navigatorTag": "[object Navigator]",
-                "elementTag": "[object Element]",
+                "elementTag": "[object HTMLDivElement]",
+                "inputTag": "[object HTMLInputElement]",
+                "inputInstance": true,
+                "inputCtorToString": "function HTMLInputElement() { [native code] }",
+                "bodyTag": "[object HTMLBodyElement]",
+                "bodyInstance": true,
+                "bodyCtorToString": "function HTMLBodyElement() { [native code] }",
                 "dateUntouched": true,
+            })
+        );
+    }
+
+    /// A navigator object member is a WebIDL interface instance, so the two
+    /// lines a brand check runs -- `navigator.x.constructor.name` and
+    /// `Object.prototype.toString.call(navigator.x)` -- both have to name the
+    /// interface, and the instance must carry no own string-keyed members.
+    /// Every one of these answered "Object" / "[object Object]" (or a name
+    /// invented from the member name, as in "[object Usb]") because the
+    /// capability module that owns the behavior built it as an object literal.
+    /// Values pinned against headless Chrome 152; see
+    /// `navigator_interface_prototypes_carry_the_captured_members` for the
+    /// prototype surface around them.
+    #[test]
+    fn navigator_object_members_report_their_interface_brand() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const table = [
+                        ['credentials', 'CredentialsContainer'],
+                        ['geolocation', 'Geolocation'],
+                        ['clipboard', 'Clipboard'],
+                        ['locks', 'LockManager'],
+                        ['wakeLock', 'WakeLock'],
+                        ['usb', 'USB'],
+                        ['hid', 'HID'],
+                        ['xr', 'XRSystem'],
+                        ['login', 'NavigatorLogin'],
+                        ['managed', 'NavigatorManagedData'],
+                        ['storageBuckets', 'StorageBucketManager'],
+                        ['userAgentData', 'NavigatorUAData'],
+                        ['webkitPersistentStorage', 'DeprecatedStorageQuota'],
+                        ['webkitTemporaryStorage', 'DeprecatedStorageQuota'],
+                    ];
+                    const bad = [];
+                    for (const [member, interfaceName] of table) {
+                        const value = navigator[member];
+                        if (!value || typeof value !== 'object') {
+                            bad.push(member + ':missing');
+                            continue;
+                        }
+                        const tag = Object.prototype.toString.call(value);
+                        if (tag !== '[object ' + interfaceName + ']') {
+                            bad.push(member + ':tag=' + tag);
+                        }
+                        // DeprecatedStorageQuota is [LegacyNoInterfaceObject].
+                        // Neither engine exposes a constructor for it, so its
+                        // instances inherit Object's -- exactly as Chrome does.
+                        const ctor = globalThis[interfaceName];
+                        const expectedCtor = ctor ? interfaceName : 'Object';
+                        const name = value.constructor && value.constructor.name;
+                        if (name !== expectedCtor) {
+                            bad.push(member + ':ctor=' + name);
+                        }
+                        // Chrome keeps every IDL member on the prototype: the
+                        // instance itself has no own string-keyed property.
+                        const own = Object.getOwnPropertyNames(value);
+                        if (own.length) bad.push(member + ':own=' + own.join('|'));
+                        if (Object.prototype.hasOwnProperty.call(value, Symbol.toStringTag)) {
+                            bad.push(member + ':ownToStringTag');
+                        }
+                        if (ctor) {
+                            if (Object.getPrototypeOf(value) !== ctor.prototype) {
+                                bad.push(member + ':prototype');
+                            }
+                            if (!(value instanceof ctor)) bad.push(member + ':instanceof');
+                        }
+                    }
+                    return bad;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
+    /// The prototype surface around those brands: the own members the capture
+    /// recorded, their arity, their descriptor shape, and the nullable
+    /// event-handler attributes. Together with the brand test above this is the
+    /// whole two-object shape a challenge script reads off `navigator`.
+    #[test]
+    fn navigator_interface_prototypes_carry_the_captured_members() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    // The capture's list for StorageBucketManager also carries
+                    // `open`, left out on purpose: the captured Chrome never
+                    // settled that promise on any origin, so neither a resolved
+                    // nor a rejected answer could be pinned for it.
+                    // In the capture's own order: Chrome lists an interface's
+                    // members in IDL declaration order, and property
+                    // enumeration order is specified, so the joined names are
+                    // compared as a sequence rather than as a set.
+                    const expected = {
+                        CredentialsContainer: 'create,get,preventSilentAccess,store',
+                        Geolocation: 'clearWatch,getCurrentPosition,watchPosition',
+                        Clipboard: 'onclipboardchange,read,readText,write,writeText',
+                        LockManager: 'query,request',
+                        WakeLock: 'request',
+                        USB: 'onconnect,ondisconnect,getDevices,requestDevice',
+                        HID: 'onconnect,ondisconnect,getDevices,requestDevice',
+                        XRSystem: 'ondevicechange,isSessionSupported,requestSession',
+                        NavigatorLogin: 'setStatus',
+                        NavigatorManagedData:
+                            'onmanagedconfigurationchange,getManagedConfiguration',
+                        StorageBucketManager: 'delete,keys',
+                        NavigatorUAData: 'brands,mobile,platform,getHighEntropyValues,toJSON',
+                        DeprecatedStorageQuota: 'queryUsageAndQuota,requestQuota',
+                    };
+                    // Declared arity, as the capture reported it. Several of
+                    // these disagree with the shim's own parameter list, which
+                    // the prototype pass pins to Chrome's.
+                    const lengths = {
+                        'CredentialsContainer.get': 0,
+                        'CredentialsContainer.create': 0,
+                        'CredentialsContainer.store': 1,
+                        'CredentialsContainer.preventSilentAccess': 0,
+                        'Geolocation.getCurrentPosition': 1,
+                        'Geolocation.watchPosition': 1,
+                        'Geolocation.clearWatch': 1,
+                        'Clipboard.read': 0,
+                        'Clipboard.readText': 0,
+                        'Clipboard.write': 1,
+                        'Clipboard.writeText': 1,
+                        'LockManager.request': 2,
+                        'LockManager.query': 0,
+                        'WakeLock.request': 0,
+                        'USB.getDevices': 0,
+                        'USB.requestDevice': 1,
+                        'HID.getDevices': 0,
+                        'HID.requestDevice': 1,
+                        'XRSystem.isSessionSupported': 1,
+                        'XRSystem.requestSession': 1,
+                        'NavigatorLogin.setStatus': 1,
+                        'NavigatorManagedData.getManagedConfiguration': 1,
+                        'StorageBucketManager.delete': 1,
+                        'StorageBucketManager.keys': 0,
+                        'NavigatorUAData.getHighEntropyValues': 1,
+                        'NavigatorUAData.toJSON': 0,
+                        'DeprecatedStorageQuota.queryUsageAndQuota': 1,
+                        'DeprecatedStorageQuota.requestQuota': 1,
+                    };
+                    // The legacy quota interface has no interface object, so
+                    // its prototype is reached through a member.
+                    const quotaPrototype =
+                        Object.getPrototypeOf(navigator.webkitTemporaryStorage);
+                    const prototypeFor = interfaceName => {
+                        const ctor = globalThis[interfaceName];
+                        return ctor ? ctor.prototype : quotaPrototype;
+                    };
+                    const bad = [];
+                    for (const interfaceName of Object.keys(expected)) {
+                        const proto = prototypeFor(interfaceName);
+                        const names = Object.getOwnPropertyNames(proto)
+                            .filter(name => name !== 'constructor').join(',');
+                        if (names !== expected[interfaceName]) {
+                            bad.push(interfaceName + '=' + names);
+                        }
+                        for (const name of expected[interfaceName].split(',')) {
+                            const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+                            if (!descriptor) {
+                                bad.push(interfaceName + '.' + name + ':missing');
+                                continue;
+                            }
+                            if (!descriptor.enumerable || !descriptor.configurable) {
+                                bad.push(interfaceName + '.' + name + ':descriptor');
+                            }
+                        }
+                    }
+                    for (const key of Object.keys(lengths)) {
+                        const dot = key.indexOf('.');
+                        const proto = prototypeFor(key.slice(0, dot));
+                        const descriptor =
+                            Object.getOwnPropertyDescriptor(proto, key.slice(dot + 1));
+                        if (!descriptor || typeof descriptor.value !== 'function') {
+                            bad.push(key + ':notMethod');
+                            continue;
+                        }
+                        if (descriptor.value.length !== lengths[key]) {
+                            bad.push(key + ':length=' + descriptor.value.length);
+                        }
+                    }
+                    // Chrome keeps these five interfaces on the EventTarget
+                    // chain and the rest directly on Object.
+                    for (const interfaceName of
+                        ['Clipboard', 'USB', 'HID', 'XRSystem', 'NavigatorManagedData']) {
+                        if (Object.getPrototypeOf(prototypeFor(interfaceName))
+                            !== EventTarget.prototype) {
+                            bad.push(interfaceName + ':parent');
+                        }
+                    }
+                    for (const interfaceName of
+                        ['CredentialsContainer', 'Geolocation', 'LockManager', 'WakeLock',
+                         'NavigatorLogin', 'StorageBucketManager', 'NavigatorUAData']) {
+                        if (Object.getPrototypeOf(prototypeFor(interfaceName))
+                            !== Object.prototype) {
+                            bad.push(interfaceName + ':parent');
+                        }
+                    }
+                    // One shared DeprecatedStorageQuota prototype for the two
+                    // legacy members, and no own constructor on it -- which is
+                    // why both report `constructor.name === 'Object'`.
+                    if (Object.getPrototypeOf(navigator.webkitPersistentStorage)
+                        !== quotaPrototype) {
+                        bad.push('DeprecatedStorageQuota:sharedPrototype');
+                    }
+                    if (Object.getPrototypeOf(quotaPrototype) !== Object.prototype) {
+                        bad.push('DeprecatedStorageQuota:parent');
+                    }
+                    // Event-handler attributes: null until assigned, function
+                    // only, and stored per instance rather than on the
+                    // prototype.
+                    for (const [target, slot] of [
+                        [navigator.usb, 'onconnect'],
+                        [navigator.usb, 'ondisconnect'],
+                        [navigator.hid, 'onconnect'],
+                        [navigator.hid, 'ondisconnect'],
+                        [navigator.clipboard, 'onclipboardchange'],
+                        [navigator.xr, 'ondevicechange'],
+                        [navigator.managed, 'onmanagedconfigurationchange'],
+                    ]) {
+                        if (target[slot] !== null) {
+                            bad.push(slot + ':default=' + String(target[slot]));
+                        }
+                        const listener = function () {};
+                        target[slot] = listener;
+                        if (target[slot] !== listener) bad.push(slot + ':assign');
+                        target[slot] = 'not a function';
+                        if (target[slot] !== null) bad.push(slot + ':coerce');
+                    }
+                    if (navigator.usb.onconnect !== null) bad.push('onconnect:leaked');
+                    if (navigator.hid.onconnect !== null) bad.push('onconnect:leaked');
+                    return bad;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
+    #[test]
+    fn canvas_2d_context_uses_the_public_illegal_constructor_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const context = document.createElement('canvas').getContext('2d');
+                    let construct;
+                    try { new CanvasRenderingContext2D(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    return {
+                        construct,
+                        samePrototype:
+                            Object.getPrototypeOf(context) === CanvasRenderingContext2D.prototype,
+                        parentIsObject:
+                            Object.getPrototypeOf(CanvasRenderingContext2D.prototype) === Object.prototype,
+                        constructorName: context.constructor.name,
+                        instance: context instanceof CanvasRenderingContext2D,
+                        tag: Object.prototype.toString.call(context),
+                        methods: [typeof context.fillRect, typeof context.measureText],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'CanvasRenderingContext2D': Illegal constructor",
+                "samePrototype": true,
+                "parentIsObject": true,
+                "constructorName": "CanvasRenderingContext2D",
+                "instance": true,
+                "tag": "[object CanvasRenderingContext2D]",
+                "methods": ["function", "function"],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_devices_is_branded_and_fails_closed_without_fake_hardware() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const devices = navigator.mediaDevices;
+                    let construct;
+                    try { new MediaDevices(); construct = 'constructed'; }
+                    catch (error) { construct = error.message; }
+                    const capture = async method => {
+                        try { await devices[method]({audio: true}); return 'fulfilled'; }
+                        catch (error) { return error.name; }
+                    };
+                    return {
+                        construct,
+                        instance: devices instanceof MediaDevices,
+                        eventTarget: devices instanceof EventTarget,
+                        constructorLength: MediaDevices.length,
+                        parent: Object.getPrototypeOf(MediaDevices.prototype).constructor.name,
+                        tag: Object.prototype.toString.call(devices),
+                        own: Object.getOwnPropertyNames(devices),
+                        stable: devices === navigator.mediaDevices,
+                        methods: [
+                            typeof devices.enumerateDevices,
+                            typeof devices.getSupportedConstraints,
+                            typeof devices.getUserMedia,
+                            typeof devices.getDisplayMedia,
+                            typeof devices.setCaptureHandleConfig,
+                        ],
+                        enumerated: await devices.enumerateDevices(),
+                        constraints: devices.getSupportedConstraints(),
+                        userMedia: await capture('getUserMedia'),
+                        displayMedia: await capture('getDisplayMedia'),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "construct": "Failed to construct 'MediaDevices': Illegal constructor",
+                "instance": true,
+                        "eventTarget": true,
+                        "constructorLength": 0,
+                "parent": "EventTarget",
+                "tag": "[object MediaDevices]",
+                "own": [],
+                "stable": true,
+                "methods": ["function", "function", "function", "function", "function"],
+                "enumerated": [],
+                "constraints": {},
+                "userMedia": "NotAllowedError",
+                "displayMedia": "NotAllowedError",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigator_battery_returns_a_stable_branded_manager() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const first = await navigator.getBattery();
+                    const second = await navigator.getBattery();
+                    let construct;
+                    try { new BatteryManager(); construct = 'constructed'; }
+                    catch (error) { construct = error.name; }
+                    const descriptor = name => {
+                        const value = Object.getOwnPropertyDescriptor(BatteryManager.prototype, name);
+                        return [!!value, !!value?.get, !!value?.set, value?.enumerable];
+                    };
+                    return {
+                        stable: first === second,
+                        instance: first instanceof BatteryManager,
+                        eventTarget: first instanceof EventTarget,
+                        tag: Object.prototype.toString.call(first),
+                        own: Object.getOwnPropertyNames(first),
+                        construct,
+                        values: [typeof first.charging, typeof first.chargingTime,
+                            typeof first.dischargingTime, typeof first.level],
+                        desktop: [first.charging, first.chargingTime,
+                            first.dischargingTime === Infinity, first.level],
+                        events: [descriptor('onchargingchange'), descriptor('onchargingtimechange'),
+                            descriptor('ondischargingtimechange'), descriptor('onlevelchange')],
+                        handler: (() => {
+                            const before = first.onlevelchange;
+                            first.onlevelchange = () => {};
+                            return [before, typeof first.onlevelchange];
+                        })(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "stable": true,
+                "instance": true,
+                "eventTarget": true,
+                "tag": "[object BatteryManager]",
+                "own": [],
+                "construct": "TypeError",
+                "values": ["boolean", "number", "number", "number"],
+                "desktop": [true, 0, true, 1],
+                "events": [
+                    [true, true, true, true], [true, true, true, true],
+                    [true, true, true, true], [true, true, true, true],
+                ],
+                "handler": [null, "function"],
+            })
+        );
+    }
+
+    #[test]
+    fn performance_surface_members_live_on_the_interface_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = [
+                        'now', 'timeOrigin', 'timing', 'navigation', 'memory',
+                        'mark', 'measure', 'clearMarks', 'clearMeasures',
+                        'clearResourceTimings', 'getEntries', 'getEntriesByName',
+                        'getEntriesByType', 'setResourceTimingBufferSize',
+                        'onresourcetimingbufferfull',
+                    ];
+                    return {
+                        own: Object.getOwnPropertyNames(performance),
+                        prototypeMembers: names.map(name =>
+                            Object.prototype.hasOwnProperty.call(Performance.prototype, name)),
+                        stable: [performance.timing === performance.timing,
+                            performance.navigation === performance.navigation],
+                        values: [typeof performance.now, typeof performance.mark,
+                            typeof performance.getEntries, performance.timeOrigin > 0],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "own": [],
+                "prototypeMembers": [true, true, true, true, true,
+                    true, true, true, true, true, true, true, true, true, true],
+                "stable": [true, true],
+                "values": ["function", "function", "function", true],
+            })
+        );
+    }
+
+    #[test]
+    fn performance_timing_uses_the_legacy_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const timing = performance.timing;
+                    return {
+                        instance: timing instanceof PerformanceTiming,
+                        tag: Object.prototype.toString.call(timing),
+                        own: Object.getOwnPropertyNames(timing),
+                        prototype: Object.getOwnPropertyNames(PerformanceTiming.prototype),
+                        values: [typeof timing.navigationStart, typeof timing.loadEventEnd,
+                            typeof timing.toJSON, timing === performance.timing],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "tag": "[object PerformanceTiming]",
+                "own": [],
+                "prototype": [
+                    "navigationStart", "unloadEventStart", "unloadEventEnd",
+                    "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart",
+                    "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart",
+                    "requestStart", "responseStart", "responseEnd", "domLoading",
+                    "domInteractive", "domContentLoadedEventStart", "domContentLoadedEventEnd",
+                    "domComplete", "loadEventStart", "loadEventEnd", "toJSON", "constructor",
+                ],
+                "values": ["number", "number", "function", true],
+            })
+        );
+    }
+
+    #[test]
+    fn navigator_virtual_keyboard_uses_the_interface_shape_without_fake_geometry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const keyboard = navigator.virtualKeyboard;
+                    let construct;
+                    try { new VirtualKeyboard(); construct = 'constructed'; }
+                    catch (error) { construct = error.name; }
+                    keyboard.ongeometrychange = () => {};
+                    return {
+                        instance: keyboard instanceof VirtualKeyboard,
+                        eventTarget: keyboard instanceof EventTarget,
+                        tag: Object.prototype.toString.call(keyboard),
+                        own: Object.getOwnPropertyNames(keyboard),
+                        prototype: Object.getOwnPropertyNames(VirtualKeyboard.prototype),
+                        construct,
+                        overlays: keyboard.overlaysContent,
+                        rect: [keyboard.boundingRect.x, keyboard.boundingRect.y,
+                            keyboard.boundingRect.width, keyboard.boundingRect.height],
+                        handler: typeof keyboard.ongeometrychange,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "instance": true,
+                "eventTarget": true,
+                "tag": "[object VirtualKeyboard]",
+                "own": [],
+                "prototype": ["constructor", "boundingRect", "overlaysContent",
+                    "ongeometrychange", "hide", "show"],
+                "construct": "TypeError",
+                "overlays": false,
+                "rect": [0, 0, 0, 0],
+                "handler": "function",
             })
         );
     }

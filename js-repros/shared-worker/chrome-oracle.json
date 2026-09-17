@@ -1,0 +1,60 @@
+{
+  "interfaceType": "function",
+  "instanceTag": "[object SharedWorker]",
+  "constructorName": "SharedWorker",
+  "isEventTarget": true,
+  "portTag": "[object MessagePort]",
+  "portIsMessagePort": true,
+  "hasOnerror": true,
+  "hasTerminate": "undefined",
+  "memberTypes": {
+    "postMessage": "function",
+    "start": "function",
+    "close": "function",
+    "addEventListener": "function"
+  },
+  "firstReply": {
+    "data": {
+      "echo": "ping-1",
+      "connections": 1,
+      "workerName": "alpha",
+      "scopeTag": "[object SharedWorkerGlobalScope]",
+      "hasWindow": false,
+      "hasDocument": false,
+      "selfPostMessage": "undefined"
+    }
+  },
+  "sameNameReply": {
+    "data": {
+      "echo": "ping-2",
+      "connections": 2,
+      "workerName": "alpha",
+      "scopeTag": "[object SharedWorkerGlobalScope]",
+      "hasWindow": false,
+      "hasDocument": false,
+      "selfPostMessage": "undefined"
+    }
+  },
+  "distinctWrapper": true,
+  "otherNameReply": {
+    "data": {
+      "echo": "ping-3",
+      "connections": 1,
+      "workerName": "beta",
+      "scopeTag": "[object SharedWorkerGlobalScope]",
+      "hasWindow": false,
+      "hasDocument": false,
+      "selfPostMessage": "undefined"
+    }
+  },
+  "beforeStart": "no-delivery-before-start",
+  "afterStart": "delivered",
+  "crossOrigin": {
+    "name": "SecurityError",
+    "message": "Failed to construct 'SharedWorker': Script at 'https://example.com/sw.js' cannot be accessed from origin '<origin>'."
+  },
+  "badUrl": {
+    "name": "SyntaxError",
+    "message": "Failed to construct 'SharedWorker': 'http://[' is not a valid URL."
+  }
+}

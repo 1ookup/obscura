@@ -61,12 +61,12 @@ body:
     id: build
     attributes:
       label: Build variant
-      description: Official default and stealth archives include rendering. No-render archives and source builds without the render feature do not.
+      description: Official default and stealth archives include rendering. No-render archives and source builds without the render feature do not. In a source checkout stealth is a default feature, so --no-default-features is what turns stealth off.
       options:
-        - Render-enabled (official default archive or --features render)
-        - Render-enabled with stealth (official stealth archive or --features render,stealth)
-        - No-render (official no-render archive or source build without render)
-        - No-render with stealth (official no-render-stealth archive or --features stealth)
+        - Render-enabled (official default archive or --no-default-features --features render)
+        - Render-enabled with stealth (official stealth archive or --features render)
+        - No-render (official no-render archive or --no-default-features)
+        - No-render with stealth (official no-render-stealth archive or a plain source build with default features)
         - I do not know
     validations:
       required: true

@@ -133,7 +133,7 @@ pub use paint::{
     screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces,
     validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
     CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
-    ResolvedScrollState, SelectedImage,
+    ResolvedScrollState, SelectedImage, set_image_transport,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
 
@@ -142,6 +142,75 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
+
+#[cfg(feature = "paint")]
+pub struct CanvasTextMeasurer {
+    engine: inline::TextEngine,
+}
+
+#[cfg(feature = "paint")]
+impl CanvasTextMeasurer {
+    pub fn new() -> Self {
+        Self { engine: inline::TextEngine::new() }
+    }
+
+    pub fn measure(&mut self, text: &str, font: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let style = self.style_for(font);
+        self.engine.measure_canvas_text(text, &style)
+    }
+
+    /// Advance width plus the grid-fitted font box for a canvas `font` string.
+    ///
+    /// The font box is the same one inline layout uses, so a TextMetrics answer
+    /// cannot contradict the element heights the engine produces next door.
+    pub fn measure_metrics(&mut self, text: &str, font: &str) -> CanvasTextMetrics {
+        let style = self.style_for(font);
+        let width = if text.is_empty() {
+            0.0
+        } else {
+            self.engine.measure_canvas_text(text, &style)
+        };
+        let (font_ascent, font_descent) = self.engine.inline_font_box_metrics(&style);
+        CanvasTextMetrics {
+            width,
+            font_ascent,
+            font_descent,
+        }
+    }
+
+    fn style_for(&self, font: &str) -> LayoutStyle {
+        let mut style = LayoutStyle::default();
+        style.font_size = Some(10.0);
+        style.font_family = Some("sans-serif".to_string());
+        style.white_space = Some(WhiteSpace::Pre);
+        style::apply_font_shorthand(&mut style, font);
+        style
+    }
+}
+
+/// What `CanvasRenderingContext2D.measureText` needs from the layout engine.
+///
+/// Only the two font-box numbers are reported alongside the width: they come
+/// from the face's horizontal header, grid-fitted the same way inline layout
+/// fits them, which is what makes them integers in Chrome too. Ink extents
+/// (the `actualBoundingBox*` family) would need per-glyph outlines and are
+/// derived from this box by the caller instead of being invented here.
+#[cfg(feature = "paint")]
+pub struct CanvasTextMetrics {
+    pub width: f32,
+    pub font_ascent: f32,
+    pub font_descent: f32,
+}
+
+#[cfg(feature = "paint")]
+impl Default for CanvasTextMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -203,6 +272,7 @@ pub mod inline {
             _parent: NodeId,
             _run: &[NodeId],
             _styles: &HashMap<NodeId, crate::LayoutStyle>,
+            _flattened_owner_chains: &HashMap<NodeId, Vec<NodeId>>,
         ) -> Option<usize> {
             None
         }
@@ -236,6 +306,13 @@ pub mod inline {
 
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
+        }
+
+        /// Whole-IFC items never exist in layout-only builds (`try_build`
+        /// declines), so the CSSOM subpixel replacement loop never reaches
+        /// this.
+        pub(crate) fn measure_canvas_width(&mut self, _idx: usize) -> f32 {
+            0.0
         }
     }
 
@@ -469,9 +546,31 @@ impl Affine2 {
     }
 
     pub fn around(self, origin: (f32, f32)) -> Self {
-        Self::translate(origin.0, origin.1)
+        let folded = Self::translate(origin.0, origin.1)
             .then(self)
-            .then(Self::translate(-origin.0, -origin.1))
+            .then(Self::translate(-origin.0, -origin.1));
+        // Folding the origin cancelation into one matrix overflows binary32
+        // for extreme scales: `e = ox * (1 - a)` at scale 1e35 is ~1e39, past
+        // f32::MAX, and the inf/NaN entries then turn every mapped corner
+        // into NaN — CSSOM serializes those as null and getBoundingClientRect
+        // reads all-zero. Chromium's layout units saturate instead. Clamp the
+        // folded translation so the matrix stays finite; the scale entries
+        // (a/d) are already finite at this point.
+        let saturate = |value: f32| -> f32 {
+            if value.is_nan() {
+                0.0
+            } else {
+                value.clamp(f32::MIN, f32::MAX)
+            }
+        };
+        Self {
+            a: folded.a,
+            b: folded.b,
+            c: folded.c,
+            d: folded.d,
+            e: saturate(folded.e),
+            f: saturate(folded.f),
+        }
     }
 
     pub fn map_point(self, x: f32, y: f32) -> (f32, f32) {
@@ -482,33 +581,60 @@ impl Affine2 {
     }
 
     pub fn map_rect(self, rect: Rect) -> Rect {
+        // Layout rectangles saturate instead of going non-finite. CSSOM View
+        // serializes non-finite floats as null, which the bootstrap answers
+        // with an all-zero rect — a stronger tell than a clamped
+        // astronomical value, which is what Chromium's saturated layout
+        // units produce for the same `transform: scale(1e32…)` probe. The
+        // corner math runs in f64 so the four corners stay distinct through
+        // an extreme scale (f32 corners would saturate to the same value and
+        // collapse the width to zero); only the final rect saturates to f32.
+        let (a, b, c, d, e, f) = (
+            self.a as f64,
+            self.b as f64,
+            self.c as f64,
+            self.d as f64,
+            self.e as f64,
+            self.f as f64,
+        );
+        let map = |x: f64, y: f64| (a * x + c * y + e, b * x + d * y + f);
         let points = [
-            self.map_point(rect.x, rect.y),
-            self.map_point(rect.x + rect.width, rect.y),
-            self.map_point(rect.x, rect.y + rect.height),
-            self.map_point(rect.x + rect.width, rect.y + rect.height),
+            map(rect.x as f64, rect.y as f64),
+            map(rect.x as f64 + rect.width as f64, rect.y as f64),
+            map(rect.x as f64, rect.y as f64 + rect.height as f64),
+            map(
+                rect.x as f64 + rect.width as f64,
+                rect.y as f64 + rect.height as f64,
+            ),
         ];
         let left = points
             .iter()
             .map(|point| point.0)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let top = points
             .iter()
             .map(|point| point.1)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let right = points
             .iter()
             .map(|point| point.0)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
         let bottom = points
             .iter()
             .map(|point| point.1)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
+        let saturate = |value: f64| -> f32 {
+            if value.is_nan() {
+                0.0
+            } else {
+                value.clamp(f32::MIN as f64, f32::MAX as f64) as f32
+            }
+        };
         Rect {
-            x: left,
-            y: top,
-            width: (right - left).max(0.0),
-            height: (bottom - top).max(0.0),
+            x: saturate(left),
+            y: saturate(top),
+            width: saturate(right - left).max(0.0),
+            height: saturate(bottom - top).max(0.0),
         }
     }
 

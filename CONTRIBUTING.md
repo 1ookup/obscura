@@ -32,12 +32,15 @@ A few notes to keep the project maintainable:
 Obscura supports four release configurations. Keep all four building when you
 change feature gates or shared code:
 
+`stealth` is part of `default`, so the configurations without it are the ones
+that need an explicit `--no-default-features`:
+
 | Configuration | Command |
 | --- | --- |
-| Rendering | `cargo build --release -p obscura-cli --bins --features render` |
-| Rendering and stealth | `cargo build --release -p obscura-cli --bins --features render,stealth` |
-| No rendering | `cargo build --release -p obscura-cli --bins --no-default-features` |
-| No rendering, with stealth | `cargo build --release -p obscura-cli --bins --no-default-features --features stealth` |
+| Rendering and stealth | `cargo build --release -p obscura-cli --bins --features render` |
+| Rendering only | `cargo build --release -p obscura-cli --bins --no-default-features --features render` |
+| Stealth only | `cargo build --release -p obscura-cli --bins` |
+| Neither | `cargo build --release -p obscura-cli --bins --no-default-features` |
 
 The standard release archives and Docker image include rendering. The
 `-no-render` release variants keep the smaller DOM, JavaScript, networking,
@@ -52,10 +55,11 @@ cargo build --release -p obscura-cli --bins --features render
 - The first build compiles V8 from source: roughly 5 minutes and a few GB of
   disk. Incremental builds are seconds.
 - Iterating on one crate? Scope it: `cargo build -p obscura-cli`.
-- **Stealth** (`--features render,stealth`) retains rendering and adds the
-  wreq/BoringSSL transport, browser-identity protections, and tracker blocklist.
-  BoringSSL builds through CMake, so `cmake` must be installed. The rendering
-  build uses rustls and needs neither CMake nor OpenSSL.
+- **Stealth** is on by default and adds the wreq/BoringSSL transport,
+  browser-identity protections, and tracker blocklist. BoringSSL builds through
+  CMake, so `cmake` must be installed for any default build. Opting out with
+  `--no-default-features` falls back to rustls and needs neither CMake nor
+  OpenSSL — that is the shape the Docker image and `pre-push` build.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
@@ -137,18 +141,20 @@ For any code change:
 1. `cargo nextest run --release --features render` passes for the crates you touched.
 2. The full render-feature nextest command above passes.
 3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render` compiles clean.
-4. The obstacle course still reports **33/33**.
-5. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
+4. If you touched feature gates, `cargo check -p obscura-js -p obscura-cli --no-default-features` also compiles. Nothing else builds that shape, which is why `pre-push` guards it.
+5. The obstacle course still reports **33/33**.
+6. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
    about 6x less memory than headless Chrome on framework pages. Keep native
    Rust fast paths and add a JS fallback only for real spec edge cases. If your
    change could affect performance, benchmark old and new revisions interleaved
    with identical release builds, fixtures, networks, viewport, settle policy,
    and capture path. Report a distribution and memory use; the noise floor is
    about plus or minus 10%.
-6. For rendering changes, complete the rendering checks above. For shared or
+7. For rendering changes, complete the rendering checks above. For shared or
    feature-gated changes, also build and test without the `render` feature.
-7. For stealth changes, re-test with `--stealth`. A non-stealth binary does not
-   exercise the `wreq` path.
+8. For stealth changes, re-test with `--stealth`. A default build has the `wreq`
+   path compiled in; build with `--no-default-features` when you need to check
+   the fallback behaviour instead.
 
 Keep ops panic-safe: a panic in an op must degrade to a null result, never
 unwind into V8's FFI frame. Do not remove the robustness guards described in

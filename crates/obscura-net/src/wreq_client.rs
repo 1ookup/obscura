@@ -1,11 +1,13 @@
 #[cfg(feature = "stealth")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "stealth")]
 use std::error::Error;
 #[cfg(feature = "stealth")]
+use std::path::PathBuf;
+#[cfg(feature = "stealth")]
 use std::sync::Arc;
 #[cfg(feature = "stealth")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "stealth")]
 use futures_util::StreamExt;
@@ -18,26 +20,69 @@ use url::Url;
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{
-    CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, cors_required, fetch_file_url, redirect_taints_origin,
+    CallbackRegistry, InFlightGuard, ObscuraNetError, ReferrerPolicy, RequestInfo, RequestMode,
+    ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
     request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
-    validate_cors_response, validate_request_mode, validate_url,
+    client_hint_origin, client_hint_value, parse_client_hint_list,
+    validate_cors_response, validate_request_mode, validate_url, origin_header_required,
 };
 
+// The default stealth identity is the same macOS Chrome 149 the fingerprint
+// derives; the wire layer and the JS layer must never disagree on it.
 #[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+pub const STEALTH_USER_AGENT: &str = crate::fingerprint::DEFAULT_USER_AGENT;
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
 #[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+fn configured_cert_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
+        paths.push(path.into());
+    }
+    if let Some(directory) = std::env::var_os("SSL_CERT_DIR").filter(|path| !path.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            paths.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// Build the wreq trust store without replacing the platform roots when a
+/// private MITM CA is configured. `set_default_paths` consults SSL_CERT_FILE
+/// itself, so briefly hide the override while loading the system store, then
+/// append the configured PEM/DER certificates explicitly.
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+fn configured_cert_store() -> Result<wreq::tls::trust::CertStore, wreq::Error> {
+    let paths = configured_cert_paths();
+    let saved_file = std::env::var_os("SSL_CERT_FILE");
+    let saved_dir = std::env::var_os("SSL_CERT_DIR");
+    if saved_file.is_some() {
+        std::env::remove_var("SSL_CERT_FILE");
+    }
+    if saved_dir.is_some() {
+        std::env::remove_var("SSL_CERT_DIR");
+    }
+    let mut builder = wreq::tls::trust::CertStore::builder().set_default_paths();
+    if let Some(value) = saved_file {
+        std::env::set_var("SSL_CERT_FILE", value);
+    }
+    if let Some(value) = saved_dir {
+        std::env::set_var("SSL_CERT_DIR", value);
+    }
+
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            tracing::warn!(path = %path.display(), "failed to read configured CA certificate");
+            continue;
+        };
+        if bytes.windows(10).any(|window| window == b"BEGIN CERT") {
+            builder = builder.add_stack_pem_certs(bytes);
+        } else {
+            builder = builder.add_der_cert(&bytes);
+        }
+    }
+    builder.build()
+}
 
 #[cfg(feature = "stealth")]
 fn wreq_response_header_value<'a>(
@@ -123,8 +168,17 @@ async fn read_wreq_body_limited(
 pub struct StealthHttpClient {
     client: wreq::Client,
     pub cookie_jar: Arc<CookieJar>,
+    pub fingerprint: RwLock<crate::fingerprint::BrowserFingerprint>,
     pub extra_headers: RwLock<HashMap<String, String>>,
+    accepted_client_hints: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Mirrors `ObscuraHttpClient::allow_private_network`. `validate_url` ORs
+    /// this with `OBSCURA_ALLOW_PRIVATE_NETWORK`, so the CLI flag reaches this
+    /// client either way -- but only the env var did, because this field did
+    /// not exist and every call site passed a literal `false`. That left the
+    /// two transports with different APIs for the same policy, and left this
+    /// module's own loopback fixtures unreachable by its own tests.
+    allow_private_network: bool,
 }
 
 #[cfg(feature = "stealth")]
@@ -134,15 +188,74 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_proxy_and_fingerprint(
+            cookie_jar,
+            proxy_url,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT)
+                .with_overrides(&crate::fingerprint::fingerprint_overrides_from_env()),
+        )
+    }
+
+    pub fn with_proxy_and_fingerprint(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
+        Self::with_full_options_and_fingerprint(cookie_jar, proxy_url, false, fingerprint)
+    }
+
+    pub fn with_full_options_and_fingerprint(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
+        // Chrome148 is the closest profile wreq-util ships to 149. The
+        // platform must agree with the fingerprint identity the page reports
+        // (Win32/D3D11 etc.): a macOS-marked transport under a Windows
+        // identity is a cross-layer mismatch. Requests still carry an
+        // explicit UA and sec-ch-ua from the fingerprint, so the emulation
+        // mostly contributes TLS and HTTP/2 framing.
+        let platform = if fingerprint.user_agent.contains("Windows") {
+            wreq_util::Platform::Windows
+        } else if fingerprint.user_agent.contains("Macintosh") {
+            wreq_util::Platform::MacOS
+        } else if fingerprint.user_agent.contains("Android") {
+            wreq_util::Platform::Android
+        } else if fingerprint.user_agent.contains("iPhone") || fingerprint.user_agent.contains("iPad") {
+            wreq_util::Platform::IOS
+        } else {
+            wreq_util::Platform::Linux
+        };
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
+            .profile(wreq_util::Profile::Chrome148)
+            .platform(platform)
             .build();
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
+            // Keep emulation's TLS/HTTP2 fingerprint, but generate request
+            // headers in this module so default and explicit Client-Hints
+            // can never be serialized twice by the transport layer.
+            .default_headers(wreq::header::HeaderMap::new())
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none());
+        if proxy_url.is_some() {
+            // An intercepting proxy's HTTP/2 upload path is not trustworthy:
+            // its inbound flow-control accounting kills the connection partway
+            // through a large POST (measured against mitmproxy on ~90KB
+            // challenge submissions, which then surface to the page as a
+            // failed request and a challenge failure code). HTTP/1.1 has no
+            // stream flow control and the same proxy carries the whole body,
+            // so proxied sessions pin h1. Direct connections keep the h2
+            // fingerprint.
+            builder = builder.http1_only();
+        }
+        let mut builder = builder
+            // Keep certificate verification enabled by default. The explicit
+            // opt-out is for local MITM/debugging only and does not alter the
+            // emulated TLS handshake profile.
+            .tls_cert_verification(!crate::client::insecure_tls_requested());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //
@@ -168,7 +281,7 @@ impl StealthHttpClient {
             std::env::var_os("SSL_CERT_FILE").as_deref(),
             std::env::var_os("SSL_CERT_DIR").as_deref(),
         ) {
-            match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
+            match configured_cert_store() {
                 Ok(store) => builder = builder.tls_cert_store(store),
                 Err(error) => tracing::warn!(
                     %error,
@@ -180,7 +293,7 @@ impl StealthHttpClient {
 
         if let Some(proxy) = proxy_url {
             if let Ok(p) = wreq::Proxy::all(proxy) {
-                builder = builder.proxy(p);
+                builder = builder.proxy(p.no_proxy(wreq::NoProxy::from_env()));
             }
         }
 
@@ -189,8 +302,11 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             cookie_jar,
+            fingerprint: RwLock::new(fingerprint),
             extra_headers: RwLock::new(HashMap::new()),
+            accepted_client_hints: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network,
         }
     }
 
@@ -205,6 +321,41 @@ impl StealthHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
             .await
+    }
+
+    pub async fn fetch_document_with_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<Url>,
+        policy: ReferrerPolicy,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let mut request = ResourceRequest::navigation();
+        request.referrer = referrer;
+        request.referrer_policy = policy;
+        self.fetch_with_profile(url, request, callbacks).await
+    }
+
+    /// Fetch a GET iframe document with the child-frame Fetch Metadata
+    /// profile. Navigation remains a separate operation from scripted fetches
+    /// so the same stealth transport and cookie jar are used for the widget's
+    /// initial document as for its later proof requests.
+    pub async fn fetch_frame_document_with_referrer_headers(
+        &self,
+        url: &Url,
+        referrer: Option<Url>,
+        initiator: Option<Url>,
+        policy: ReferrerPolicy,
+        mut headers: HashMap<String, String>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        headers.insert("Sec-Fetch-Dest".to_string(), "iframe".to_string());
+        let mut request = ResourceRequest::navigation();
+        request.initiator = initiator;
+        request.referrer = referrer;
+        request.referrer_policy = policy;
+        request.headers = headers;
+        self.fetch_with_profile(url, request, callbacks).await
     }
 
     pub async fn fetch_resource_with_callbacks(
@@ -222,7 +373,8 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, false)?;
+        let fetch_started = Instant::now();
+        validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes).await;
@@ -239,6 +391,7 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    timing: ResponseTiming::default(),
                 });
             }
         }
@@ -246,20 +399,91 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut redirect_end = Duration::ZERO;
+        let mut client_hint_retry = false;
 
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
+            // The emulation profile carries Chrome's own default headers.
+            // RequestBuilder::header appends, so leaving those defaults on
+            // would serialize duplicate sec-ch-ua fields. Keep emulation's
+            // TLS/HTTP2 settings but build the wire headers exactly once.
+            let mut req = self
+                .client
+                .get(current_url.as_str())
+                .default_headers(false);
+            let fingerprint = self.fingerprint.read().await.clone();
+            let extra_headers: HashMap<String, String> = self
+                .extra_headers
+                .read()
+                .await
+                .iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+                .collect();
+            let request_headers: HashMap<String, String> = request
+                .headers
+                .iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+                .collect();
+            let is_frame_navigation = request_headers
+                .get("sec-fetch-dest")
+                .is_some_and(|value| value.eq_ignore_ascii_case("iframe"));
+            let has_header = |name: &str| {
+                extra_headers.contains_key(name) || request_headers.contains_key(name)
+            };
 
-            req = req
-                .header("accept", request.accept())
-                .header("sec-fetch-site", request_fetch_site(&request, &current_url))
-                .header("sec-fetch-mode", request.mode.header_value())
-                .header("sec-fetch-dest", request.destination());
+            if !has_header("user-agent") && !fingerprint.user_agent.is_empty() {
+                req = req.header("user-agent", &fingerprint.user_agent);
+            }
+            if !has_header("accept") {
+                req = req.header("accept", request.accept());
+            }
+            if !has_header("accept-language") {
+                req = req.header("accept-language", fingerprint.accept_language());
+            }
+            if !has_header("accept-encoding") {
+                req = req.header("accept-encoding", "gzip, deflate, br, zstd");
+            }
+            if !has_header("priority") {
+                req = req.header(
+                    "priority",
+                    crate::client::request_priority(request.mode, request.destination()),
+                );
+            }
+            if !has_header("sec-fetch-site") {
+                req = req.header("sec-fetch-site", request_fetch_site(&request, &current_url));
+            }
+            if !has_header("sec-fetch-mode") {
+                req = req.header("sec-fetch-mode", request.mode.header_value());
+            }
+            if !has_header("sec-fetch-dest") {
+                req = req.header("sec-fetch-dest", request.destination());
+            }
+            if !fingerprint.brands.is_empty() {
+                if !has_header("sec-ch-ua") {
+                    req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
+                }
+                if !has_header("sec-ch-ua-mobile") {
+                    req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
+                }
+                if !has_header("sec-ch-ua-platform") {
+                    req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
+                }
+            }
             if request.mode == RequestMode::Navigate {
-                req = req
-                    .header("upgrade-insecure-requests", "1")
-                    .header("sec-fetch-user", "?1");
+                if !has_header("upgrade-insecure-requests") {
+                    req = req.header("upgrade-insecure-requests", "1");
+                }
+                if !is_frame_navigation && !has_header("sec-fetch-user") {
+                    req = req.header("sec-fetch-user", "?1");
+                }
+                // Chrome revalidates the document on a navigation instead of
+                // taking it from cache: `max-age=0` rides on the main-document
+                // request and on nothing else, so a navigation without it is
+                // one no browser sends.
+                if !has_header("cache-control") {
+                    req = req.header("cache-control", "max-age=0");
+                }
             }
             if let Some(referer) = request_referrer(&request, &current_url) {
                 req = req.header("referer", referer);
@@ -272,23 +496,67 @@ impl StealthHttpClient {
                 String::new()
             };
             if !cookie_header.is_empty() {
+                let cookie_names = cookie_header
+                    .split(';')
+                    .filter_map(|part| part.trim().split_once('=').map(|(name, _)| name.trim()))
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    %current_url,
+                    ?cookie_names,
+                    "navigation request carries cookies"
+                );
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            for (k, v) in extra_headers.iter() {
+                if request_headers.contains_key(k) {
+                    continue;
+                }
                 if k.eq_ignore_ascii_case("origin") {
                     continue;
                 }
                 req = req.header(k.as_str(), v.as_str());
             }
-            if cors_required(&request, &current_url) {
+            for (k, v) in &request_headers {
+                if k.eq_ignore_ascii_case("origin") {
+                    continue;
+                }
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if origin_header_required(&request, &current_url, "GET") {
                 req = req.header("origin", &request_origin);
             }
 
+            let hint_origin = client_hint_origin(&current_url);
+            // Low-entropy UA-CH fields may already have been emitted above
+            // from the fingerprint. Keep them in the sent set so an
+            // Accept-CH response cannot append a second value for the same
+            // field on this request.
+            let mut sent_client_hints = HashSet::new();
+            for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+                if has_header(name) || !fingerprint.brands.is_empty() {
+                    sent_client_hints.insert(name.to_string());
+                }
+            }
+            if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
+                for name in accepted {
+                    if has_header(name) || sent_client_hints.contains(name) {
+                        sent_client_hints.insert(name.clone());
+                        continue;
+                    }
+                    if let Some(value) = client_hint_value(name, &fingerprint) {
+                        req = req.header(name.as_str(), value);
+                        sent_client_hints.insert(name.clone());
+                    }
+                }
+            }
+
+            let mut callback_headers = extra_headers;
+            callback_headers.extend(request_headers);
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: callback_headers,
                 resource_type: request.resource_type,
             };
             if !request_callback_fired {
@@ -302,6 +570,7 @@ impl StealthHttpClient {
             let resp = req.send().await.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
+            let response_start = fetch_started.elapsed();
 
             let status = resp.status();
             validate_wreq_cors_response(
@@ -310,6 +579,35 @@ impl StealthHttpClient {
                 &request_origin,
                 resp.headers(),
             )?;
+
+            let accepted_hints = resp
+                .headers()
+                .get("accept-ch")
+                .and_then(|value| value.to_str().ok())
+                .map(parse_client_hint_list);
+            let critical_hints = resp
+                .headers()
+                .get("critical-ch")
+                .and_then(|value| value.to_str().ok())
+                .map(parse_client_hint_list)
+                .unwrap_or_default();
+            if let Some(hints) = accepted_hints {
+                self.accepted_client_hints
+                    .write()
+                    .await
+                    .entry(client_hint_origin(&current_url))
+                    .or_default()
+                    .extend(hints);
+            }
+            if !client_hint_retry
+                && !critical_hints.is_empty()
+                && !crate::client::is_frame_document_request(&request)
+                && critical_hints.iter().any(|hint| !sent_client_hints.contains(hint))
+            {
+                client_hint_retry = true;
+                drop(resp);
+                continue;
+            }
 
             if request.sends_credentials_to(&current_url) {
                 for val in resp.headers().get_all("set-cookie") {
@@ -333,11 +631,12 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, false)?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
+                    redirect_end = fetch_started.elapsed();
                     current_url = next_url;
                     continue;
                 }
@@ -345,6 +644,7 @@ impl StealthHttpClient {
 
             let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
                 .await?;
+            let response_end = fetch_started.elapsed();
             drop(in_flight);
 
             let response = Response {
@@ -353,6 +653,12 @@ impl StealthHttpClient {
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
+                timing: ResponseTiming {
+                    start: fetch_started,
+                    response_start,
+                    response_end,
+                    redirect_end,
+                },
             };
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
@@ -375,6 +681,7 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let fetch_started = Instant::now();
         if let Some(host) = url.host_str() {
             if crate::blocklist::is_blocked(host) {
                 tracing::debug!("Blocked tracker: {}", url);
@@ -384,6 +691,7 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    timing: ResponseTiming::default(),
                 });
             }
         }
@@ -391,7 +699,87 @@ impl StealthHttpClient {
         let req_method = method
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
-        let mut req = self.client.request(req_method, url.as_str());
+        // See fetch_with_profile: emulation defaults are transport metadata,
+        // not a second source of request headers.
+        let mut req = self
+            .client
+            .request(req_method, url.as_str())
+            .default_headers(false);
+        let fingerprint = self.fingerprint.read().await.clone();
+        let extra_headers: HashMap<String, String> = self
+            .extra_headers
+            .read()
+            .await
+            .iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+            .collect();
+        let request_headers: HashMap<String, String> = headers
+            .iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+            .collect();
+        let has_header = |name: &str| {
+            extra_headers.contains_key(name) || request_headers.contains_key(name)
+        };
+        if !has_header("user-agent") && !fingerprint.user_agent.is_empty() {
+            req = req.header("user-agent", &fingerprint.user_agent);
+        }
+        if !has_header("accept-encoding") {
+            req = req.header("accept-encoding", "gzip, deflate, br, zstd");
+        }
+        if !has_header("priority") {
+            // Scripted fetch/XHR: Chrome sends `u=1, i` here (its navigation and
+            // subresource paths use `u=0, i` / `i`, set in fetch_with_profile).
+            req = req.header("priority", "u=1, i");
+        }
+        if !has_header("sec-fetch-storage-access") {
+            // Chrome attaches its storage-access state to every request it
+            // sends. This client never holds a storage access grant, so `none`
+            // is the only truthful value, and a request without the header is
+            // one a server cannot match against a browser's.
+            req = req.header("sec-fetch-storage-access", "none");
+        }
+        if !fingerprint.brands.is_empty() {
+            if !has_header("sec-ch-ua") {
+                req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
+            }
+            if !has_header("sec-ch-ua-mobile") {
+                req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
+            }
+            if !has_header("sec-ch-ua-platform") {
+                req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
+            }
+        }
+        // Chromium remembers the high-entropy UA hints a response asked for in
+        // Accept-CH and sends them on every later request to that origin, not
+        // only on navigations. A server that lists them in Critical-CH may
+        // treat a request without them as an error, so a scripted fetch/XHR
+        // submission that omits them is observably unlike the browser it
+        // claims to be.
+        let hint_origin = client_hint_origin(url);
+        // Same rule as fetch_with_profile: the low-entropy trio was already
+        // emitted above from the fingerprint, and an Accept-CH entry for one
+        // of them must not append a second value to a header this request
+        // carries once. `sec-ch-ua-mobile: ?0, ?0` is a value no browser
+        // produces, and the challenge platform lists Sec-CH-UA in Accept-CH,
+        // so without this every scripted request carried it.
+        let mut sent_client_hints: HashSet<String> = HashSet::new();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            if has_header(name) || !fingerprint.brands.is_empty() {
+                sent_client_hints.insert(name.to_string());
+            }
+        }
+        if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
+            for name in accepted {
+                if has_header(name) || sent_client_hints.contains(name) {
+                    sent_client_hints.insert(name.clone());
+                    continue;
+                }
+                if let Some(value) = client_hint_value(name, &fingerprint) {
+                    req = req.header(name.as_str(), value);
+                    sent_client_hints.insert(name.clone());
+                }
+            }
+        }
 
         if send_cookies {
             let cookie_header = self.cookie_jar.get_cookie_header(url);
@@ -399,10 +787,13 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
+        for (k, v) in extra_headers.iter() {
+            if request_headers.contains_key(k) {
+                continue;
+            }
             req = req.header(k.as_str(), v.as_str());
         }
-        for (k, v) in headers.iter() {
+        for (k, v) in request_headers.iter() {
             req = req.header(k.as_str(), v.as_str());
         }
         if !body.is_empty() {
@@ -413,9 +804,66 @@ impl StealthHttpClient {
         let resp = req.send().await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, e))
         })?;
+        let response_start = fetch_started.elapsed();
 
         let status = resp.status();
+        // Learn this origin's hint policy here too: a response that answers
+        // Accept-CH is the only place the policy is published, and a scripted
+        // request is just as able to receive it as a navigation.
+        if let Some(hints) = resp
+            .headers()
+            .get("accept-ch")
+            .and_then(|value| value.to_str().ok())
+            .map(parse_client_hint_list)
+        {
+            self.accepted_client_hints
+                .write()
+                .await
+                .entry(client_hint_origin(url))
+                .or_default()
+                .extend(hints);
+        }
         if store_cookies {
+            let set_cookie_count = resp.headers().get_all("set-cookie").iter().count();
+            if set_cookie_count != 0 {
+                let set_cookie_names = resp
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .filter_map(|value| value.split_once('=').map(|(name, _)| name.trim()))
+                    .collect::<Vec<_>>();
+                let set_cookie_attributes = resp
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .map(|value| {
+                        value
+                            .split(';')
+                            .enumerate()
+                            .map(|(index, part)| {
+                                if index == 0 {
+                                    part.split_once('=')
+                                        .map(|(name, _)| format!("{}=<redacted>", name.trim()))
+                                        .unwrap_or_else(|| part.trim().to_string())
+                                } else {
+                                    part.trim().to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    %url,
+                    status = status.as_u16(),
+                    count = set_cookie_count,
+                    ?set_cookie_names,
+                    ?set_cookie_attributes,
+                    "stealth_fetch response carries Set-Cookie"
+                );
+            }
             for val in resp.headers().get_all("set-cookie") {
                 if let Ok(s) = val.to_str() {
                     self.cookie_jar.set_cookie(s, url);
@@ -428,6 +876,7 @@ impl StealthHttpClient {
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        let response_end = fetch_started.elapsed();
         drop(in_flight);
 
         Ok(Response {
@@ -436,11 +885,25 @@ impl StealthHttpClient {
             headers: response_headers,
             body: resp_body,
             redirected_from: Vec::new(),
+            timing: ResponseTiming {
+                start: fetch_started,
+                response_start,
+                response_end,
+                redirect_end: Duration::ZERO,
+            },
         })
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
+    }
+
+    pub async fn set_fingerprint(&self, fingerprint: crate::fingerprint::BrowserFingerprint) {
+        *self.fingerprint.write().await = fingerprint;
+    }
+
+    pub async fn browser_fingerprint(&self) -> crate::fingerprint::BrowserFingerprint {
+        self.fingerprint.read().await.clone()
     }
 
     pub fn active_requests(&self) -> u32 {
@@ -454,8 +917,10 @@ impl StealthHttpClient {
 
 #[cfg(all(test, feature = "stealth"))]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::ReferrerPolicy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
 
@@ -500,16 +965,301 @@ mod tests {
         port
     }
 
+    async fn header_fixture() -> (Url, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 { break; }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+            ).await;
+            let _ = stream.shutdown().await;
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), rx)
+    }
+
     // The emulation profile advertises gzip, so origins compress. Without the
     // decoder the raw gzip bytes reach the HTML parser as document text.
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        // The fixture is on loopback, which the SSRF gate blocks by default.
+        // Opting in per-client rather than via OBSCURA_ALLOW_PRIVATE_NETWORK
+        // keeps the ssrf_tests in this crate -- which exist to prove loopback
+        // *is* blocked -- unaffected when the suite runs in one process.
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT),
+        );
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    // The opt-in above must stay opt-in. A default-constructed stealth client
+    // still refuses loopback, so the new parameter widened an API rather than
+    // the SSRF gate.
+    #[tokio::test]
+    async fn a_default_stealth_client_still_refuses_loopback() {
+        let port = gzip_fixture().await;
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let error = client.fetch(&url).await.expect_err("loopback must be refused");
+        assert!(
+            error.to_string().contains("private/internal IP address"),
+            "{error}",
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_request_uses_the_same_derived_low_entropy_identity() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint.clone(),
+        );
+        client.fetch(&url).await.expect("fixture must be reachable");
+
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains(&format!(
+            "\r\nuser-agent: {}\r\n",
+            fingerprint.user_agent.to_ascii_lowercase()
+        )), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-platform: \"macos\"\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
+        assert!(request.contains(
+            "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
+        ), "{request}");
+    }
+
+    #[tokio::test]
+    async fn stealth_client_retries_critical_client_hints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for response in [
+                "HTTP/1.1 200 OK\r\ncontent-length: 5\r\naccept-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, UA, UA-Arch, UA-Bitness, UA-Full-Version-List\r\ncritical-ch: Sec-CH-UA, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, UA, UA-Arch, UA-Bitness, UA-Full-Version-List\r\nconnection: close\r\n\r\nfirst",
+                "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecond",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 { break; }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                }
+                captured.push(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            let _ = tx.send(captured);
+        });
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("http://{address}/")).unwrap();
+        let response = client.fetch(&url).await.unwrap();
+        assert_eq!(response.status, 200);
+        let captured = rx.await.unwrap();
+        assert_eq!(captured.len(), 2, "{captured:?}");
+        let initial_lower = captured[0].to_ascii_lowercase();
+        assert_eq!(initial_lower.matches("\r\nsec-ch-ua:").count(), 1, "{captured:?}");
+        assert!(!captured[0].to_ascii_lowercase().contains("sec-ch-ua-arch:"), "{captured:?}");
+        assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-arch: \"arm\"\r\n"), "{captured:?}");
+        assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-bitness: \"64\"\r\n"), "{captured:?}");
+        let retry_lower = captured[1].to_ascii_lowercase();
+        assert!(retry_lower.contains("\r\nsec-ch-ua-full-version-list: "), "{captured:?}");
+        // The User-Agent carries Chrome's reduced `149.0.0.0` token; the
+        // full-version list carries a build Chrome shipped, because the
+        // reduced token is a value no Chrome has ever published there.
+        assert!(retry_lower.contains("\"chromium\";v=\"149.0.7827.0\""), "{captured:?}");
+        assert!(retry_lower.contains("\"not)a;brand\";v=\"24.0.0.0\""), "{captured:?}");
+        assert_eq!(retry_lower.matches("\r\nsec-ch-ua:").count(), 1, "{captured:?}");
+        // The legacy spellings in Accept-CH (`UA`, `UA-Full-Version-List`) are
+        // ignored the way Chrome ignores them, so neither the bare `ua` header
+        // nor any `ua-*` header is sent.
+        assert!(!retry_lower.contains("\r\nua:"), "{captured:?}");
+        assert!(!retry_lower.contains("\r\nua-full-version-list:"), "{captured:?}");
+    }
+
+    /// A subframe document navigation is not retried for `Critical-CH`.
+    ///
+    /// The reference challenge run answers the widget document request with
+    /// both `Accept-CH` and `Critical-CH` naming hints it did not send, and the
+    /// document is fetched **once**. Retrying re-issues the request, which makes
+    /// the server open a second widget session for a document only one of which
+    /// is ever committed; the hints the retry would add are not permitted in a
+    /// cross-origin subframe either, so the retry cannot change the response.
+    #[tokio::test]
+    async fn stealth_frame_document_is_not_retried_for_critical_client_hints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            // Every response carries the same Critical-CH list, so a client
+            // that retries keeps retrying; one request proves it did not.
+            for _ in 0..1 {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 { break; }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                }
+                captured.push(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\naccept-ch: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\ncritical-ch: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\nconnection: close\r\n\r\nhello",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+            let _ = tx.send(captured);
+        });
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("http://{address}/widget")).unwrap();
+        let response = client
+            .fetch_frame_document_with_referrer_headers(
+                &url,
+                None,
+                None,
+                ReferrerPolicy::default(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let captured = rx.await.unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a frame document must be fetched once, got {} requests: {captured:?}",
+            captured.len()
+        );
+        assert!(
+            captured[0].to_ascii_lowercase().contains("\r\nsec-fetch-dest: iframe\r\n"),
+            "{captured:?}"
+        );
+        // The frame still learns Accept-CH for later requests, it just does not
+        // re-issue this one.
+        assert_eq!(response.status, 200);
+    }
+
+    #[tokio::test]
+    async fn stealth_extra_low_entropy_headers_do_not_duplicate_defaults() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.set_extra_headers(HashMap::from([
+            ("Sec-CH-UA".into(), "\"Google Chrome\";v=\"149\"".into()),
+            ("SEC-CH-UA-MOBILE".into(), "?0".into()),
+            ("Sec-Ch-Ua-Platform".into(), "\"macOS\"".into()),
+        ])).await;
+        client.fetch(&url).await.expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            assert_eq!(request.matches(&format!("\r\n{name}:")).count(), 1, "{name}: {request}");
+        }
+    }
+
+    // A scripted fetch/XHR takes send_single, which emits the low-entropy trio
+    // from the fingerprint and then applies the remembered Accept-CH list. The
+    // challenge platform lists Sec-CH-UA itself in Accept-CH, so an entry for a
+    // hint the request already carries must not append a second value:
+    // `sec-ch-ua-mobile: ?0, ?0` is a value no browser produces.
+    #[tokio::test]
+    async fn scripted_accept_ch_entry_for_low_entropy_hints_does_not_duplicate_them() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT);
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.accepted_client_hints.write().await.insert(
+            super::client_hint_origin(&url),
+            std::collections::HashSet::from([
+                "sec-ch-ua".to_string(),
+                "sec-ch-ua-mobile".to_string(),
+                "sec-ch-ua-platform".to_string(),
+                "sec-ch-ua-arch".to_string(),
+            ]),
+        );
+        client
+            .send_single("GET", &url, &HashMap::new(), "", false, false)
+            .await
+            .expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-arch"] {
+            assert_eq!(
+                request.matches(&format!("\r\n{name}:")).count(),
+                1,
+                "{name} must be sent exactly once: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stealth_frame_navigation_uses_iframe_fetch_metadata() {
+        let (url, request) = header_fixture().await;
+        let initiator = Url::parse("https://www.example.test/page").unwrap();
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::default(),
+        );
+        client
+            .fetch_frame_document_with_referrer_headers(
+                &url,
+                Some(initiator.clone()),
+                Some(initiator),
+                ReferrerPolicy::default(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("frame fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("\r\nsec-fetch-dest: iframe\r\n"), "{request}");
+        assert!(!request.contains("\r\nsec-fetch-user:"), "{request}");
     }
 }

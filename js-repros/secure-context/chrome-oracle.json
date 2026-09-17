@@ -1,0 +1,146 @@
+{
+  "insecureHttpByIp": {
+    "isSecureContext": false,
+    "typeofIsSecureContext": "boolean",
+    "hasOwn": true,
+    "descriptor": {
+      "isAccessor": true,
+      "hasSetter": false,
+      "enumerable": true,
+      "configurable": true
+    },
+    "origin": "http://<lan>:<port>",
+    "locationProtocol": "http:",
+    "gated": {
+      "crypto.subtle": "undefined",
+      "navigator.serviceWorker": "undefined",
+      "navigator.mediaDevices": "undefined",
+      "navigator.geolocation": "object",
+      "navigator.storage": "undefined",
+      "navigator.clipboard": "undefined",
+      "navigator.wakeLock": "undefined",
+      "Notification": "function",
+      "caches": "undefined",
+      "navigator.credentials": "undefined",
+      "navigator.locks": "undefined",
+      "SharedArrayBuffer": "undefined"
+    },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
+    },
+    "worker": {
+      "isSecureContext": false,
+      "typeofValue": "boolean",
+      "subtle": "undefined",
+      "caches": "undefined"
+    }
+  },
+  "secureHttpLoopbackIp": {
+    "isSecureContext": true,
+    "typeofIsSecureContext": "boolean",
+    "hasOwn": true,
+    "descriptor": {
+      "isAccessor": true,
+      "hasSetter": false,
+      "enumerable": true,
+      "configurable": true
+    },
+    "origin": "http://127.0.0.1:<port>",
+    "locationProtocol": "http:",
+    "gated": {
+      "crypto.subtle": "object",
+      "navigator.serviceWorker": "object",
+      "navigator.mediaDevices": "object",
+      "navigator.geolocation": "object",
+      "navigator.storage": "object",
+      "navigator.clipboard": "object",
+      "navigator.wakeLock": "object",
+      "Notification": "function",
+      "caches": "object",
+      "navigator.credentials": "object",
+      "navigator.locks": "object",
+      "SharedArrayBuffer": "undefined"
+    },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
+    },
+    "worker": {
+      "isSecureContext": true,
+      "typeofValue": "boolean",
+      "subtle": "object",
+      "caches": "object"
+    }
+  },
+  "secureHttpLocalhost": {
+    "isSecureContext": true,
+    "typeofIsSecureContext": "boolean",
+    "hasOwn": true,
+    "descriptor": {
+      "isAccessor": true,
+      "hasSetter": false,
+      "enumerable": true,
+      "configurable": true
+    },
+    "origin": "http://localhost:<port>",
+    "locationProtocol": "http:",
+    "gated": {
+      "crypto.subtle": "object",
+      "navigator.serviceWorker": "object",
+      "navigator.mediaDevices": "object",
+      "navigator.geolocation": "object",
+      "navigator.storage": "object",
+      "navigator.clipboard": "object",
+      "navigator.wakeLock": "object",
+      "Notification": "function",
+      "caches": "object",
+      "navigator.credentials": "object",
+      "navigator.locks": "object",
+      "SharedArrayBuffer": "undefined"
+    },
+    "crossOriginIsolation": {
+      "crossOriginIsolated": false,
+      "typeofCrossOriginIsolated": "boolean",
+      "hasOwnSAB": false,
+      "sabInDescriptor": false,
+      "sabInGlobalNames": false,
+      "typeofAtomics": "object",
+      "typeofAtomicsWait": "function",
+      "wasmSharedMemory": {
+        "threw": false,
+        "bufferCtorName": "SharedArrayBuffer",
+        "bufferTag": "[object SharedArrayBuffer]",
+        "ctorIsGlobalSAB": false
+      }
+    },
+    "worker": {
+      "isSecureContext": true,
+      "typeofValue": "boolean",
+      "subtle": "object",
+      "caches": "object"
+    }
+  }
+}

@@ -1,0 +1,238 @@
+{
+  "interfaceObjects": {
+    "ServiceWorkerContainer": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'ServiceWorkerContainer': Illegal constructor"
+    },
+    "ServiceWorker": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'ServiceWorker': Illegal constructor"
+    },
+    "ServiceWorkerRegistration": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'ServiceWorkerRegistration': Illegal constructor"
+    },
+    "Worklet": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'Worklet': Illegal constructor"
+    },
+    "NavigationPreloadManager": {
+      "type": "function",
+      "construct": "TypeError: Failed to construct 'NavigationPreloadManager': Illegal constructor"
+    }
+  },
+  "containerExists": true,
+  "toStringTag": "[object ServiceWorkerContainer]",
+  "constructorName": "ServiceWorkerContainer",
+  "globalClassType": "function",
+  "instanceOfContainer": true,
+  "isEventTarget": true,
+  "ownPropertyOnNavigator": false,
+  "protoDescriptor": {
+    "kind": "accessor",
+    "setter": "undefined",
+    "enumerable": true,
+    "configurable": true
+  },
+  "identityStable": true,
+  "memberTypes": {
+    "register": "function",
+    "getRegistration": "function",
+    "getRegistrations": "function",
+    "startMessages": "function",
+    "addEventListener": "function",
+    "removeEventListener": "function",
+    "dispatchEvent": "function"
+  },
+  "registerIsNative": true,
+  "registerLength": 1,
+  "controller": null,
+  "eventHandlers": {
+    "oncontrollerchange": "null",
+    "onmessage": "null",
+    "onmessageerror": "null"
+  },
+  "readyIsPromise": true,
+  "readyIdentityStable": true,
+  "readyStateAfter500ms": "pending",
+  "registerCrossOrigin": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker: The origin of the provided scriptURL ('https://example.com') does not match the current origin ('<origin>')."
+  },
+  "registerDataUrl": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker: The URL protocol of the script ('data:text/javascript,//') is not supported."
+  },
+  "registerBadScope": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker: The origin of the provided scope ('https://example.com') does not match the current origin ('<origin>')."
+  },
+  "registerInvalidUrl": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker: The URL protocol of the script ('http://[/') is not supported."
+  },
+  "registerMissingScript": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/definitely-missing-sw.js'): A bad HTTP response code (404) was received when fetching the script."
+  },
+  "registerNoArgs": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to execute 'register' on 'ServiceWorkerContainer': 1 argument required, but only 0 present."
+  },
+  "registerServerError": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/sw-500.js'): A bad HTTP response code (500) was received when fetching the script."
+  },
+  "registerRedirected": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/sw-redirect.js'): The script resource is behind a redirect, which is disallowed."
+  },
+  "registerRedirectToMissing": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/sw-redirect-404.js'): The script resource is behind a redirect, which is disallowed."
+  },
+  "registerBadMime": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/sw-bad-mime.js'): The script has an unsupported MIME type ('application/json')."
+  },
+  "registerNoMime": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/sw-no-mime.js'): The script does not have a MIME type."
+  },
+  "registerScopeTooBroad": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/nested/sw-ok.js'): The path of the provided scope ('/') is not under the max scope allowed ('/nested/'). Adjust the scope, move the Service Worker script, or use the Service-Worker-Allowed HTTP header to allow the scope."
+  },
+  "registerScopeAllowedNarrower": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to register a ServiceWorker for scope ('<origin>/') with script ('<origin>/nested/sw-allowed-narrow.js'): The path of the provided scope ('/') is not under the max scope allowed (set by Service-Worker-Allowed: '/nested/deep/'). Adjust the scope, move the Service Worker script, or use the Service-Worker-Allowed HTTP header to allow the scope."
+  },
+  "registerEscapedScript": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker: The provided scope ('<origin>/') or scriptURL ('<origin>/a%2Fb-sw.js') includes a disallowed escape character."
+  },
+  "registerEscapedBackslash": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker: The provided scope ('<origin>/') or scriptURL ('<origin>/a%5Cb-sw.js') includes a disallowed escape character."
+  },
+  "registerEscapedScope": {
+    "settled": "rejected",
+    "name": "TypeError",
+    "constructor": "TypeError",
+    "isDOMException": false,
+    "isTypeError": true,
+    "message": "Failed to register a ServiceWorker: The provided scope ('<origin>/a%2Fb/') or scriptURL ('<origin>/sw-ok.js') includes a disallowed escape character."
+  },
+  "getRegistration": {
+    "settled": "fulfilled",
+    "valueTag": "[object Undefined]",
+    "isUndefined": true
+  },
+  "getRegistrationCrossOrigin": {
+    "settled": "rejected",
+    "name": "SecurityError",
+    "constructor": "DOMException",
+    "isDOMException": true,
+    "isTypeError": false,
+    "message": "Failed to get a ServiceWorkerRegistration: The origin of the provided documentURL ('https://example.com') does not match the current origin ('<origin>')."
+  },
+  "startMessages": {
+    "returned": "undefined"
+  },
+  "getRegistrations": {
+    "settled": "fulfilled",
+    "valueTag": "[object Array]",
+    "isUndefined": false,
+    "isArray": true,
+    "length": 0
+  },
+  "registerMimeWithParams": {
+    "settled": "fulfilled",
+    "valueTag": "[object ServiceWorkerRegistration]",
+    "isUndefined": false
+  },
+  "registerScopeAllowedByHeader": {
+    "settled": "fulfilled",
+    "valueTag": "[object ServiceWorkerRegistration]",
+    "isUndefined": false
+  },
+  "registerValidScript": {
+    "settled": "fulfilled",
+    "valueTag": "[object ServiceWorkerRegistration]",
+    "isUndefined": false
+  },
+  "__serverSawScriptFetches": [
+    "/definitely-missing-sw.js",
+    "/sw-500.js",
+    "/sw-redirect.js",
+    "/sw-redirect-404.js",
+    "/sw-bad-mime.js",
+    "/sw-no-mime.js",
+    "/nested/sw-ok.js",
+    "/nested/sw-allowed-narrow.js",
+    "/sw-mime-params.js",
+    "/nested/sw-allowed.js",
+    "/sw-ok.js"
+  ],
+  "__serverSawNonScriptFetches": []
+}

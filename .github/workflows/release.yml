@@ -102,8 +102,14 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render-stealth/
           fi
 
+      # Every variant below spells its features out with --no-default-features.
+      # `default` carries `stealth`, so a bare `--features render` would build
+      # render+stealth and make this artifact byte-identical to the next one --
+      # four archives, two distinct binaries. The unsuffixed archive is
+      # deliberately NOT cargo's default feature set; it is the render-only
+      # build the suffix table in README.md documents.
       - name: Build render-enabled release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features render
 
       - name: Stage default release binary
         shell: bash
@@ -117,7 +123,7 @@ jobs:
           fi
 
       - name: Build render-enabled stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features render,stealth
 
       - name: Stage stealth release binary
         shell: bash

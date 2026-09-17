@@ -3,6 +3,35 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+// Debug-only detach tracing (OBSCURA_DEBUG_TREE_DETACH=1): every detach of a
+// connected element is logged with its identity and, when the subtree hosts
+// an iframe, a captured backtrace. Used to locate engine-side subtree
+// replacements that orphan a live frame's ancestors.
+fn tree_detach_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some())
+}
+
+fn describe_node_for_detach(inner: &DomTreeInner, id: NodeId) -> String {
+    match inner.nodes.get(id.index()).and_then(|n| n.as_ref()) {
+        Some(node) => {
+            let kind = match &node.data {
+                NodeData::Element { name, .. } => {
+                    let id_attr = node.get_attribute("id").unwrap_or_default();
+                    let class = node.get_attribute("class").unwrap_or_default();
+                    format!("{}#{}.{}", name.local, id_attr, class)
+                }
+                NodeData::Text { .. } => "text".to_string(),
+                NodeData::Document => "document".to_string(),
+                _ => "other".to_string(),
+            };
+            format!("{}:{}(conn={})", id.index(), kind, node.connected)
+        }
+        None => format!("{}:missing", id.index()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
 
@@ -259,14 +288,27 @@ pub struct DocumentScope {
     pub url: String,
     pub origin: Origin,
     pub base_url: String,
+    /// Raw Last-Modified response header for this committed document.
+    pub last_modified: Option<String>,
     pub sandbox: SandboxFlags,
     pub csp: Option<String>,
+    /// Raw Permissions-Policy header for this document, used by the JS
+    /// FeaturePolicy/PermissionsPolicy wrappers and frame inheritance.
+    pub permissions_policy: Option<String>,
+    /// Referrer-Policy selected by the response/document metadata.
+    pub referrer_policy: String,
+    /// Referrer value exposed by this document's environment settings object.
+    pub referrer: String,
     /// Browsing-context id, stable across navigations of the same frame.
     pub frame_id: String,
     /// Increments for every committed cross-document navigation of the frame.
     pub document_generation: u64,
     /// Whether this content document was parsed in (full) quirks mode.
     pub quirks: bool,
+    /// Whether this document's own response grants cross-origin isolation.
+    /// about:blank and srcdoc documents inherit the creator's value; network
+    /// documents derive it from their COOP/COEP response headers.
+    pub cross_origin_isolated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,6 +556,10 @@ pub(crate) struct DomTreeInner {
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
+    /// HTML tokenizer line at which parser-created elements begin. This is
+    /// source metadata only; DOM-created nodes are deliberately absent.
+    source_lines: HashMap<NodeId, u64>,
+    current_parse_line: u64,
 }
 
 impl DomTree {
@@ -542,6 +588,8 @@ impl DomTree {
                 document_scopes: HashMap::new(),
                 allow_declarative_shadow_roots: false,
                 quirks: false,
+                source_lines: HashMap::new(),
+                current_parse_line: 1,
             }),
         }
     }
@@ -1010,6 +1058,27 @@ impl DomTree {
         id
     }
 
+    /// Record the parser's current source line for a node created by
+    /// html5ever. Kept separate from NodeData so cloned or script-created DOM
+    /// nodes do not acquire misleading document locations.
+    pub(crate) fn record_source_line(&self, node: NodeId) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.current_parse_line > 0 {
+            let line = inner.current_parse_line;
+            inner.source_lines.insert(node, line);
+        }
+    }
+
+    /// Update the line supplied by html5ever's TreeSink callback.
+    pub(crate) fn set_current_parse_line(&self, line: u64) {
+        self.inner.borrow_mut().current_parse_line = line.max(1);
+    }
+
+    /// Return the parser source line for a parser-created node, if available.
+    pub fn source_line(&self, node: NodeId) -> Option<u64> {
+        self.inner.borrow().source_lines.get(&node).copied()
+    }
+
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.borrow().nodes.get(id.index())?.clone()
     }
@@ -1204,6 +1273,59 @@ impl DomTree {
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
+        if tree_detach_debug_enabled() {
+            let is_element = inner
+                .nodes
+                .get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .is_some_and(|n| matches!(n.data, NodeData::Element { .. }));
+            let was_connected = inner
+                .nodes
+                .get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .is_some_and(|n| n.connected);
+            if is_element && was_connected {
+                let parent_desc = inner
+                    .nodes
+                    .get(node_id.index())
+                    .and_then(|n| n.as_ref())
+                    .and_then(|n| n.parent)
+                    .map(|p| describe_node_for_detach(&inner, p))
+                    .unwrap_or_else(|| "none".to_string());
+                let subtree_hosts_iframe = {
+                    let mut hosts = false;
+                    let mut stack = vec![node_id];
+                    while let Some(cur) = stack.pop() {
+                        if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                            if let NodeData::Element { name, .. } = &node.data {
+                                if name.local.as_ref() == "iframe" {
+                                    hosts = true;
+                                    break;
+                                }
+                            }
+                            let mut child = node.first_child;
+                            while let Some(c) = child {
+                                stack.push(c);
+                                child = inner.nodes.get(c.index())
+                                    .and_then(|n| n.as_ref())
+                                    .and_then(|n| n.next_sibling);
+                            }
+                        }
+                    }
+                    hosts
+                };
+                eprintln!(
+                    "[treedetach] node={} parent={} hosts_iframe={}",
+                    describe_node_for_detach(&inner, node_id),
+                    parent_desc,
+                    subtree_hosts_iframe
+                );
+                if subtree_hosts_iframe {
+                    eprintln!("[treedetach] backtrace:\n{}",
+                        std::backtrace::Backtrace::force_capture());
+                }
+            }
+        }
 
         // The document, registered ShadowRoots and iframe content documents
         // have no ordinary parent and cannot be detached through light-tree
@@ -1335,6 +1457,7 @@ impl DomTree {
                 inner.iframe_content_documents_by_root.remove(&root_id);
             }
             inner.document_scopes.remove(&id);
+            inner.source_lines.remove(&id);
         }
 
         // Only free slots that are currently live. Freeing an out-of-range id
@@ -2100,6 +2223,9 @@ impl DomTree {
             };
 
             let new_id = self.new_node(node_data);
+            if let Some(line) = source.source_line(src_id) {
+                self.inner.borrow_mut().source_lines.insert(new_id, line);
+            }
             self.append_child(dest_parent, new_id);
 
             // A <template>'s children hang off a separate contents document, so
@@ -2383,11 +2509,16 @@ mod tests {
                 url: "https://frame.example/".into(),
                 origin: Origin::from_url("https://frame.example/"),
                 base_url: "https://frame.example/".into(),
+                last_modified: None,
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                permissions_policy: None,
+                referrer_policy: "strict-origin-when-cross-origin".into(),
+                referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,
+                cross_origin_isolated: false,
             },
         );
 
@@ -2466,11 +2597,16 @@ mod tests {
                 url: "about:blank".into(),
                 origin: Origin::Opaque(OpaqueOriginId::new()),
                 base_url: "about:blank".into(),
+                last_modified: None,
                 sandbox: SandboxFlags::default(),
                 csp: None,
+                permissions_policy: None,
+                referrer_policy: "strict-origin-when-cross-origin".into(),
+                referrer: String::new(),
                 frame_id: "frame-1".into(),
                 document_generation: 1,
                 quirks: false,
+                cross_origin_isolated: false,
             },
         );
 

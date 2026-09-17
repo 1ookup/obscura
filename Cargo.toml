@@ -19,13 +19,20 @@ license = "Apache-2.0"
 repository = "https://github.com/h4ckf0r0day/obscura"
 
 [workspace.dependencies]
-obscura-dom = { path = "crates/obscura-dom" }
-obscura-net = { path = "crates/obscura-net" }
-obscura-browser = { path = "crates/obscura-browser" }
-obscura-cdp = { path = "crates/obscura-cdp" }
-obscura-js = { path = "crates/obscura-js" }
-obscura-mcp = { path = "crates/obscura-mcp" }
-obscura-render = { path = "crates/obscura-render" }
+# Internal edges never inherit defaults. `default` carries `stealth`, so a single
+# edge left on defaults would pull BoringSSL back into the whole graph through
+# feature unification and make --no-default-features a no-op -- collapsing the
+# four release variants in .github/workflows/release.yml into two.
+# This must live here, not on the members: `{ workspace = true,
+# default-features = false }` is ignored (with a warning) unless the workspace
+# entry sets it.
+obscura-dom = { path = "crates/obscura-dom", default-features = false }
+obscura-net = { path = "crates/obscura-net", default-features = false }
+obscura-browser = { path = "crates/obscura-browser", default-features = false }
+obscura-cdp = { path = "crates/obscura-cdp", default-features = false }
+obscura-js = { path = "crates/obscura-js", default-features = false }
+obscura-mcp = { path = "crates/obscura-mcp", default-features = false }
+obscura-render = { path = "crates/obscura-render", default-features = false }
 
 html5ever = "0.39"
 markup5ever = "0.39"
@@ -39,12 +46,12 @@ tiny-skia = "0.12"
 # Pure-Rust glyph rasterizer for the render layer's text step.
 ab_glyph = "0.2"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # No "cookies" feature: obscura manages cookies through its own CookieJar
 # (obscura-net/src/cookies.rs) and never uses reqwest's cookie store. Pulling
 # it in only added the cookie/cookie_store crates, and cookie 0.18.1's blanket
 # From impl fails to compile under coherence on some toolchains (issue #295).
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks"], default-features = false }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks", "http2"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
@@ -57,6 +64,10 @@ anyhow = "1"
 base64 = "0.22"
 
 [patch.crates-io]
+# Keep deno_core's error conversion re-entrant. Its source-map RefCell is
+# optional presentation state and must not panic when V8 formats an exception
+# while another frame is being inspected.
+deno_core = { path = "vendor/deno_core" }
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and

@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/release/obscura"
 OUTDIR="/tmp/zencare-test"
-TRACE="$OUTDIR/trace.tsv"
+TRACE="$OUTDIR/trace.log"
 SCREENSHOT="$OUTDIR/screenshot.png"
 
 # 代理证书（根据实际代理工具修改）
@@ -39,8 +39,7 @@ cmd_run() {
   [[ -f "$REQABLE_CA" ]] || die "Proxy CA cert not found at $REQABLE_CA"
 
   SSL_CERT_FILE="$REQABLE_CA" OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
-    "$BIN" \
-    --v8-flags "--trace --trace-property-lookup --no-lazy-feedback-allocation --trace-property-lookup-file=$TRACE" \
+    "$ROOT/vendor/v8-trace.sh" run "$TRACE" -- \
     fetch "$URL" \
     --dump text \
     --proxy "$PROXY" \
@@ -62,41 +61,16 @@ cmd_report() {
   echo "Records: $(wc -l < "$TRACE")"
 
   echo
-  echo "--- Record Types ---"
-  cut -f1 "$TRACE" | sort | uniq -c | sort -rn
+  echo "--- API Records ---"
+  grep -E -- '^(实例访问|原型访问) - ' "$TRACE" | head -30 || true
 
   echo
-  echo "--- Script Origins (top 8) ---"
-  cut -f4 "$TRACE" | sort | uniq -c | sort -rn | head -8
+  echo "--- Missing API Probes ---"
+  grep -E -- ' -> getter -> undefined$' "$TRACE" | head -50 || true
 
   echo
-  echo "--- Error Signals ---"
-  grep "RET" "$TRACE" | awk -F'\t' '$4=="<page-eval>"' \
-    | grep -iE "error|turnstile|fail|unsupported|exception" \
-    | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn | head -12
-
-  echo
-  echo "--- MISS (non-existent property probes) ---"
-  awk -F'\t' '$1=="MISS" && $4=="<page-eval>"' "$TRACE" \
-    | while IFS=$'\t' read t rcv prop scr ln col v st; do
-        echo "  $rcv.$prop  $ln:$col"
-      done
-
-  echo
-  echo "--- cf_chl Response Codes ---"
-  grep "cf_chl" "$TRACE" | awk -F'\t' '$1=="RET" && $4=="<page-eval>"' \
-    | awk -F'\t' '{print $7}' | sort | uniq -c | sort -rn
-
-  echo
-  echo "--- XHR Requests ---"
-  grep -E "XMLHttpRequest.*(open|send)" "$TRACE" \
-    | awk -F'\t' '$1=="CALL" && $4=="<page-eval>"' \
-    | awk -F'\t' '{print $7}' | cut -c1-90 | head -8
-
-  echo
-  echo "--- Resources Loaded ---"
-  grep "set src" "$TRACE" | awk -F'\t' '$1=="CALL"' \
-    | grep -v "obscura\|ext:" | awk -F'\t' '{print $7}' | sort -u | head -8
+  echo "--- API Calls ---"
+  grep -E -- ' -> call -> ' "$TRACE" | head -50 || true
 
   echo
   echo "--- Screenshot ---"

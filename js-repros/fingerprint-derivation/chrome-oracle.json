@@ -1,0 +1,69 @@
+{
+  "chromeVersion": "146.0.7680.80",
+  "captureMode": "native headless identity",
+  "result": {
+    "main": {
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/146.0.0.0 Safari/537.36",
+      "appVersion": "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/146.0.0.0 Safari/537.36",
+      "platform": "MacIntel",
+      "hardwareConcurrency": 15,
+      "deviceMemory": 8,
+      "userAgentData": {
+        "low": {
+          "brands": [
+            {"brand": "Chromium", "version": "146"},
+            {"brand": "Not-A.Brand", "version": "24"},
+            {"brand": "Google Chrome", "version": "146"}
+          ],
+          "mobile": false,
+          "platform": "macOS"
+        },
+        "high": {
+          "architecture": "arm",
+          "bitness": "64",
+          "brands": [
+            {"brand": "Chromium", "version": "146"},
+            {"brand": "Not-A.Brand", "version": "24"},
+            {"brand": "Google Chrome", "version": "146"}
+          ],
+          "fullVersionList": [
+            {"brand": "Chromium", "version": "146.0.7680.80"},
+            {"brand": "Not-A.Brand", "version": "24.0.0.0"},
+            {"brand": "Google Chrome", "version": "146.0.7680.80"}
+          ],
+          "mobile": false,
+          "model": "",
+          "platform": "macOS",
+          "platformVersion": "26.3.2",
+          "uaFullVersion": "146.0.7680.80",
+          "wow64": false
+        }
+      }
+    },
+    "childMatchesMain": true,
+    "worker": {
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/146.0.0.0 Safari/537.36",
+      "platform": "MacIntel",
+      "hardwareConcurrency": 15,
+      "deviceMemory": 8,
+      "userAgentData": {
+        "brands": [
+          {"brand": "Chromium", "version": "146"},
+          {"brand": "Not-A.Brand", "version": "24"},
+          {"brand": "Google Chrome", "version": "146"}
+        ],
+        "mobile": false,
+        "platform": "macOS"
+      }
+    },
+    "workerMatchesLowEntropy": true,
+    "screen": {
+      "width": 800,
+      "height": 600,
+      "availWidth": 800,
+      "availHeight": 600,
+      "devicePixelRatio": 1
+    },
+    "webglAvailable": false
+  }
+}

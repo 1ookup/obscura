@@ -196,7 +196,7 @@ usable on common LTS servers with glibc 2.35+.
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed. The image is built with `--no-default-features --features render`, so it has rendering but not the stealth transport; use a `-stealth` release archive if you need that.
 
 ### Build from source
 
@@ -204,29 +204,32 @@ Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
 
-# Rendering
+# Rendering and stealth (stealth is in the default feature set)
 cargo build --release -p obscura-cli --bins --features render
 
-# Rendering and stealth
-cargo build --release -p obscura-cli --bins --features render,stealth
+# Rendering only — stealth is a default, so dropping it is an explicit opt-out
+cargo build --release -p obscura-cli --bins --no-default-features --features render
 
-# No rendering
+# Stealth only, no rendering
+cargo build --release -p obscura-cli --bins
+
+# Neither
 cargo build --release -p obscura-cli --bins --no-default-features
-
-# No rendering, with stealth
-cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
-The stealth build also compiles BoringSSL and generates bindings, so it needs
-CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
+
+`stealth` is part of the default feature set, and it compiles BoringSSL and
+generates bindings, so a default build needs CMake, Clang, and the
+libclang/LLVM development libraries. On Ubuntu/Debian:
 
 ```bash
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-The rendering build uses rustls. The rendering-and-stealth build uses
-wreq/BoringSSL and therefore needs the additional build tools above.
+Builds that opt out with `--no-default-features` use rustls and need none of
+those — that is what the unsuffixed and `-no-render` release archives are, and
+what the Docker image ships.
 
 ## Quick Start
 
@@ -388,10 +391,14 @@ The full benchmark suite (WPT conformance, obstacle course, real-world corpus, a
 
 ## Stealth Mode
 
-Build with `--features render,stealth`, then enable stealth at runtime with the
-global `--stealth` flag. The stealth build includes the complete rendering
-engine; enabling stealth does not remove screenshot, screencast, PDF, CDP, or
-MCP functionality.
+The stealth transport is compiled in by default; add `--features render` for the
+rendering engine, then enable stealth at runtime with the global `--stealth`
+flag. Building it in changes nothing until that flag is passed, and enabling it
+does not remove screenshot, screencast, PDF, CDP, or MCP functionality.
+
+Binaries built with `--no-default-features` lack the transport entirely: there
+`--stealth` still blocks trackers, but requests keep the default TLS fingerprint
+and User-Agent.
 
 ### Anti-fingerprinting
 - Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
@@ -484,6 +491,17 @@ Scrape multiple URLs in parallel with worker processes.
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
 | `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL for all workers |
+
+### Tracing
+
+`--tracelog-file FILE` enables `window.external.tracelog(key, value)` for page
+code, the tracing primitive of the instrumented builds Obscura is compared
+against, and appends one `{"t","k","v"}` JSON line per call to FILE. It is
+reachable from the document, frame and worker realms alike; without the flag
+the `External` surface stays Chrome's stock one. Native property access
+(`--trace-api-file`) and host-op/console (`--trace-op-file`) records are the
+separate streams, all three documented in
+[docs/native-trace.md](docs/native-trace.md).
 
 ## MCP (Model Context Protocol)
 

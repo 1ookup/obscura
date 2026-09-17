@@ -12,37 +12,80 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Build
 
+Native property tracing is implemented directly in the pinned vendored V8
+bytecode builder/runtime. The previous Rust/V8 descriptor-trampoline monitor
+has been removed. `--trace-api-file` requires the source build selected
+by `--config vendor/v8-source.toml`; a stock prebuilt V8 cannot provide these
+probes. Host-op and console tracing (`--trace-op-file`) is independent. See
+`docs/native-trace.md` for exact coverage and remaining call-trace limitations.
+
+Verify a trace-capable binary with `vendor/v8-trace.sh check` before a run.
+The first source build takes ~30 minutes; incremental builds are seconds.
+
+The aliases in `.cargo/config.toml` wrap the common shapes: `cargo v8-build`,
+`cargo v8-build-lean`, `cargo v8-check`, `cargo v8-test`.
+
+`vendor/v8-trace.sh build` optionally builds from the vendored source and runs
+`vendor/v8-rusty-extras.sh` (two `ObjectTemplate` bindings rusty_v8 leaves
+unbound, which `document.all` needs). The extras are absent from a prebuilt-V8
+build, and `document.all` is then simply undefined -- the behaviour those builds
+have today, not a regression.
+
 ```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
+# Rendering and stealth. `stealth` is in the default feature set, so --features
+# render adds to it rather than replacing it.
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins \
+  --features render \
+  --config vendor/v8-source.toml
 
-# Rendering and stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
+# Rendering only -- dropping stealth is an explicit opt-out
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins \
+  --no-default-features --features render \
+  --config vendor/v8-source.toml
 
-# No rendering, with rustls or stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+# Stealth only, no rendering
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins \
+  --config vendor/v8-source.toml
+
+# Neither
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins \
+  --no-default-features \
+  --config vendor/v8-source.toml
 ```
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.
   Incremental builds are seconds.
-- **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
-  `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
-  avoid touching it when you don't need to.
-- **Stealth:** `--features render,stealth` retains the complete rendering
-  surface and adds the wreq/BoringSSL transport, fingerprint protections, and
-  tracker blocklist. BoringSSL builds through CMake, so `cmake` must be
-  installed. The rendering build uses rustls and needs neither CMake nor OpenSSL.
+- **Iterating on one crate? Scope it:** `cargo build -p obscura-cli --config
+  vendor/v8-source.toml`. A bare `cargo build` can re-link the whole workspace;
+  the V8 compile is the cost, so avoid touching it when you don't need to.
+- **Stealth:** on by default. It adds the wreq/BoringSSL transport, fingerprint
+  protections, and tracker blocklist on top of whatever rendering surface the
+  build has. BoringSSL builds through CMake, so `cmake`, `clang` and
+  `libclang-dev` are required for any default build. `--no-default-features`
+  falls back to rustls and needs none of them — that is what the Docker image
+  and the `pre-push` first step build.
+- Compiling stealth in changes nothing at runtime until the `--stealth` flag is
+  passed; it is a strict superset of the non-stealth binary.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
 ## Test
 
-Run tests with **`cargo nextest`, not `cargo test`**:
+Run tests with **`cargo nextest`, not `cargo test`**, and use the source override
+(`--config vendor/v8-source.toml`) for the supported source-build test shape:
 
 ```bash
-cargo nextest run --release --features render -p <crate>
-cargo nextest run --release --features render --no-fail-fast
+cargo nextest run --release --features render -p <crate> \
+  --config vendor/v8-source.toml
+cargo nextest run --release --features render --no-fail-fast \
+  --config vendor/v8-source.toml
+
+# or, for the second one: cargo v8-test
 ```
+
+These carry `stealth` through `default`, so the stealth code paths in
+obscura-js and obscura-browser are compiled and exercised. Add
+`--no-default-features` to test the opt-out shape instead.
 
 `cargo test` runs the whole test binary in one process, but the engine holds a
 single V8 isolate per process, so the runtime tests fail under it. `nextest`
@@ -64,13 +107,19 @@ pass %, not whole-file pass.
 For any code change:
 
 1. Run focused release-mode nextest coverage for the crates and repro involved.
-2. Run `cargo nextest run --release --features render --no-fail-fast`.
+2. Run `cargo nextest run --release --features render --no-fail-fast --config
+   vendor/v8-source.toml` (or `cargo v8-test`).
 3. Run the exact release build shown above.
 4. The obstacle course still reports **33/33**.
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
    captures using the methodology below.
-6. For stealth changes, re-test with `--stealth` (a non-stealth binary won't
-   exercise the `wreq` path).
+6. For stealth changes, re-test with `--stealth`. A default build has the `wreq`
+   path compiled in; a `--no-default-features` build does not, so use one when
+   you need to check the fallback behaviour.
+7. For feature-gate changes, check the opt-out shape too: `cargo check -p
+   obscura-js -p obscura-cli --no-default-features --config
+   vendor/v8-source.toml`. Nothing else builds it, which is what `pre-push`
+   guards.
 
 Do not bulk-run `cargo fmt`: the tree is not rustfmt-clean, so a blanket format
 produces a huge unrelated diff. Match the surrounding style in the files you

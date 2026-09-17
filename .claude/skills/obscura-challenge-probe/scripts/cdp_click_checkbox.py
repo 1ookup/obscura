@@ -101,6 +101,12 @@ async def run(endpoint, url, offset, timeout, settle):
                    {"source": PRELOAD}, session=session, msg_id=5)
         await call(ws, "Page.navigate", {"url": url}, session=session, msg_id=6)
 
+        # Never evaluate in the first seconds after navigation: a
+        # Runtime.evaluate landing at t~=1s permanently blanks obscura's
+        # document (known, unfixed obscura defect; Chrome is unaffected),
+        # after which the widget never appears. 3s+ is safe.
+        await asyncio.sleep(3.0)
+
         # Poll the timeline until interactiveBegin (or timeout).
         began = False
         msg_id = 10

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# Local gate. There is no CI running tests on this repo -- the GitHub workflows
+# only build a Docker image and a release binary -- so this hook is the only
+# thing standing between a green local edit and a broken push.
+#
+# Install once:
+#     git config core.hooksPath .githooks
+#
+# Skip deliberately (rebases, doc-only pushes, a known-broken WIP branch):
+#     SKIP_OBSCURA_PREPUSH=1 git push
+set -uo pipefail
+
+if [ "${SKIP_OBSCURA_PREPUSH:-0}" = "1" ]; then
+  echo "pre-push: skipped via SKIP_OBSCURA_PREPUSH=1"
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root" || exit 1
+
+# EVERY cargo invocation below carries this. Without it cargo relinks stock V8,
+# silently dropping the trace patch, and rewrites Cargo.lock's `v8` source and
+# checksum lines -- whose absence is intentional (docs/Trace-page-script.md).
+# A gate that corrupts the thing it is guarding is worse than no gate.
+#
+# The file also sets V8_FROM_SOURCE=1 (force), so it no longer has to be
+# exported here -- the two have to travel together, and keeping them in one
+# place is why the file exists.
+V8_PATCH=(--config vendor/v8-source.toml)
+
+fail() { printf '\n\033[31mpre-push: %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[36mpre-push: %s\033[0m\n' "$1"; }
+
+lock_before="$(git hash-object Cargo.lock 2>/dev/null || echo missing)"
+
+# 1. The feature set nothing else builds. This used to be the *default* set,
+# back when obscura-js and obscura-cli defaulted to no features -- that gap is
+# how a `cannot find type ReferrerPolicy` error survived in ops.rs unnoticed,
+# since every build and every test run passed --features render.
+#
+# `stealth` has since moved into `default`, so the exposure inverted: the
+# default set is now what release.yml builds on every tag, and the shape at risk
+# of rotting is the one WITHOUT it. Hence --no-default-features. It also keeps
+# this step free of the cmake/clang toolchain that BoringSSL would otherwise
+# demand on every push.
+step "checking the --no-default-features feature set (nothing else builds it)"
+cargo check -p obscura-js -p obscura-cli --no-default-features "${V8_PATCH[@]}" >/dev/null 2>&1 \
+  || fail "--no-default-features feature set does not compile -- rerun without >/dev/null to see it"
+
+# 2. The tests.
+step "running the workspace tests"
+if command -v cargo-nextest >/dev/null 2>&1; then
+  cargo nextest run --release --no-fail-fast \
+    -p obscura-js -p obscura-browser -p obscura-cdp \
+    --features render "${V8_PATCH[@]}" \
+    || fail "tests failed"
+else
+  cargo test --release -p obscura-js -p obscura-browser -p obscura-cdp \
+    --features render "${V8_PATCH[@]}" \
+    || fail "tests failed"
+fi
+
+# 2b. obscura-render, in BOTH feature shapes. Its text tests need `paint`
+# (cosmic-text shaping); without it they measured fallback advances and 28 of
+# them failed, which nobody saw because nothing ran this crate. They now carry
+# `#[cfg(feature = "paint")]`, so the default run must still be green AND the
+# paint run must actually exercise them -- checking only one shape would let
+# either half rot. The `paint` shape had never been run at all: it was hiding
+# `attempt to add with overflow` in a test predicate.
+step "running obscura-render (default, then paint)"
+if command -v cargo-nextest >/dev/null 2>&1; then
+  cargo nextest run --release --no-fail-fast -p obscura-render "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (default features)"
+  cargo nextest run --release --no-fail-fast -p obscura-render --features paint \
+    "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (--features paint)"
+else
+  cargo test --release -p obscura-render "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (default features)"
+  cargo test --release -p obscura-render --features paint "${V8_PATCH[@]}" \
+    || fail "obscura-render tests failed (--features paint)"
+fi
+
+# 3. Cargo.lock must come out byte-identical. If it moved, some command above
+# ran without the patch config and the pushed tree would build a V8 without the
+# trace patch.
+lock_after="$(git hash-object Cargo.lock 2>/dev/null || echo missing)"
+if [ "$lock_before" != "$lock_after" ]; then
+  git diff --stat Cargo.lock >&2
+  fail "Cargo.lock was rewritten -- restore it with 'git checkout Cargo.lock'"
+fi
+
+step "ok"

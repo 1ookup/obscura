@@ -1,0 +1,43 @@
+{
+  "browser": "Google Chrome 146.0.7680.80 headless",
+  "captured": "2026-08-14",
+  "result": {
+    "descriptors": {
+      "token": {
+        "name": "hasPrivateToken",
+        "length": 1,
+        "enumerable": true,
+        "configurable": true,
+        "writable": true,
+        "string": "function hasPrivateToken() { [native code] }"
+      },
+      "redemption": {
+        "name": "hasRedemptionRecord",
+        "length": 1,
+        "enumerable": true,
+        "configurable": true,
+        "writable": true,
+        "string": "function hasRedemptionRecord() { [native code] }"
+      },
+      "storage": {
+        "name": "hasStorageAccess",
+        "length": 0,
+        "enumerable": true,
+        "configurable": true,
+        "writable": true,
+        "string": "function hasStorageAccess() { [native code] }"
+      }
+    },
+    "returnsPromise": true,
+    "tokenFirst": false,
+    "tokenSecond": false,
+    "tokenThird": { "kind": "reject", "name": "OperationError" },
+    "redemptionThird": { "kind": "resolve", "value": false },
+    "invalidIssuer": { "kind": "reject", "name": "TypeError" },
+    "missingArgument": { "kind": "reject", "name": "TypeError" },
+    "detachedToken": { "kind": "reject", "name": "InvalidStateError" },
+    "topLevelStorageAccess": true,
+    "detachedStorage": { "kind": "reject", "name": "InvalidStateError" }
+  },
+  "note": "Token and redemption values use a fresh profile with no configured browser state. The two-issuer token-query quota is observable independently of token presence."
+}

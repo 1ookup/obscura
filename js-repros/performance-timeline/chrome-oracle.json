@@ -1,0 +1,15 @@
+{
+  "browser": "Google Chrome 146.0.7680.80 headless",
+  "captured": "2026-08-14",
+  "result": {
+    "supportedCoreTypes": true,
+    "navigationCount": 1,
+    "navigationOrdered": true,
+    "resourceCount": 1,
+    "resourceOrdered": true,
+    "responseStatus": 200,
+    "measure": [4, 6],
+    "resourceLoaded": true
+  },
+  "note": "Durations are deliberately reduced to ordering predicates because network timing values are real measurements, not fixture constants."
+}

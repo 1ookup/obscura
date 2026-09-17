@@ -19,6 +19,7 @@ pub enum FrameBlockedReason {
     XFrameOptionsSameOrigin,
     CspFrameAncestors,
     CspFrameSrc,
+    CspEmbeddedEnforcement,
 }
 
 impl std::fmt::Display for FrameBlockedReason {
@@ -28,6 +29,9 @@ impl std::fmt::Display for FrameBlockedReason {
             Self::XFrameOptionsSameOrigin => "blocked by X-Frame-Options: SAMEORIGIN",
             Self::CspFrameAncestors => "blocked by Content-Security-Policy frame-ancestors",
             Self::CspFrameSrc => "blocked by embedder Content-Security-Policy frame-src",
+            Self::CspEmbeddedEnforcement => {
+                "blocked by iframe embedded Content-Security-Policy enforcement"
+            }
         };
         f.write_str(message)
     }
@@ -67,6 +71,16 @@ impl ContentSecurityPolicy {
         self.directive("frame-ancestors").is_some()
     }
 
+    /// Convert the CSP `sandbox` directive into the same restriction model
+    /// used by an iframe `sandbox` attribute. Presence of the directive is
+    /// significant even when it has no tokens; unknown tokens never grant a
+    /// capability, matching the fail-closed parser for iframe attributes.
+    pub fn sandbox_flags(&self) -> Option<obscura_dom::SandboxFlags> {
+        let tokens = self.directive("sandbox")?;
+        let value = tokens.join(" ");
+        Some(obscura_dom::SandboxFlags::parse(Some(&value)))
+    }
+
     /// Evaluate `frame-ancestors` against the complete ancestor-origin chain.
     /// Every ancestor must match the source list.
     pub fn frame_ancestors_allow(
@@ -100,6 +114,224 @@ impl ContentSecurityPolicy {
             .iter()
             .any(|source| source_matches_url(source, url, &target, self_origin))
     }
+
+    /// Evaluate whether a script URL is allowed by the document policy.
+    /// `script-src-elem` takes precedence over `script-src`, followed by
+    /// `default-src`, matching the CSP fallback used for script elements.
+    pub fn script_src_allows(&self, url: &str, self_origin: &Origin) -> bool {
+        let sources = self
+            .directive("script-src-elem")
+            .or_else(|| self.directive("script-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else {
+            return true;
+        };
+        let target = Origin::from_url(url);
+        sources
+            .iter()
+            .any(|source| source_matches_url(source, url, &target, self_origin))
+    }
+
+    /// Evaluate an inline script element against the nonce/inline keywords.
+    /// Hash sources are deliberately rejected until CSP hash computation is
+    /// wired into the script loader.
+    pub fn inline_script_allows(&self, nonce: Option<&str>) -> bool {
+        let sources = self
+            .directive("script-src-elem")
+            .or_else(|| self.directive("script-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else {
+            return true;
+        };
+        sources.iter().any(|source| {
+            source.eq_ignore_ascii_case("'unsafe-inline'")
+                || nonce.is_some_and(|value| {
+                    source.strip_prefix("'nonce-")
+                        .and_then(|token| token.strip_suffix('\''))
+                        .is_some_and(|expected| expected == value)
+                })
+        })
+    }
+
+    /// Evaluate an external stylesheet URL using `style-src` then
+    /// `default-src`. Inline style handling is separate because this method
+    /// only applies to network-backed sheets and imports.
+    pub fn style_src_allows(&self, url: &str, self_origin: &Origin) -> bool {
+        let sources = self
+            .directive("style-src-elem")
+            .or_else(|| self.directive("style-src"))
+            .or_else(|| self.directive("default-src"));
+        let Some(sources) = sources else { return true };
+        let target = Origin::from_url(url);
+        sources
+            .iter()
+            .any(|source| source_matches_url(source, url, &target, self_origin))
+    }
+
+    /// Evaluate a URL-backed resource against an arbitrary fetch directive
+    /// (`img-src`, `font-src`, `media-src`, and similar). Render warmup uses
+    /// this before issuing speculative requests so a frame's own policy is
+    /// respected even when the resource is discovered outside its realm.
+    pub fn resource_src_allows(&self, directive: &str, url: &str, self_origin: &Origin) -> bool {
+        let Some(sources) = self.effective_sources(directive) else {
+            return true;
+        };
+        let target = Origin::from_url(url);
+        sources
+            .iter()
+            .any(|source| source_matches_url(source, url, &target, self_origin))
+    }
+
+    fn effective_sources(&self, directive: &str) -> Option<&[String]> {
+        match directive {
+            "script-src-elem" => self
+                .directive("script-src-elem")
+                .or_else(|| self.directive("script-src"))
+                .or_else(|| self.directive("default-src")),
+            "script-src" => self
+                .directive("script-src")
+                .or_else(|| self.directive("default-src")),
+            "style-src-elem" => self
+                .directive("style-src-elem")
+                .or_else(|| self.directive("style-src"))
+                .or_else(|| self.directive("default-src")),
+            "style-src" => self
+                .directive("style-src")
+                .or_else(|| self.directive("default-src")),
+            "worker-src" => self
+                .directive("worker-src")
+                .or_else(|| self.directive("child-src"))
+                .or_else(|| self.directive("script-src"))
+                .or_else(|| self.directive("default-src")),
+            "frame-src" => self
+                .directive("frame-src")
+                .or_else(|| self.directive("child-src"))
+                .or_else(|| self.directive("default-src")),
+            "child-src" | "connect-src" | "img-src" | "font-src" | "media-src"
+            | "object-src" | "manifest-src" => self
+                .directive(directive)
+                .or_else(|| self.directive("default-src")),
+            "default-src" => self.directive("default-src"),
+            _ => self.directive(directive),
+        }
+    }
+
+    /// Whether this response policy is at least as restrictive as an iframe's
+    /// required policy. Unsupported source relationships fail closed.
+    pub fn subsumes_required(&self, required: &ContentSecurityPolicy) -> bool {
+        for (name, required_sources) in &required.directives {
+            if name == "report-uri" || name == "report-to" {
+                continue;
+            }
+            if name == "require-trusted-types-for" {
+                let response = self.directive(name).unwrap_or(&[]);
+                if !required_sources.iter().all(|source| {
+                    response.iter().any(|candidate| source_token_eq(candidate, source))
+                }) {
+                    return false;
+                }
+                continue;
+            }
+            let Some(response_sources) = self.effective_sources(name) else {
+                return false;
+            };
+            if !source_list_is_subset(response_sources, required_sources) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Project two enforced policies into one policy for the DocumentScope.
+    /// Only directives explicitly required by the iframe need materializing;
+    /// every unrelated response/creator directive stays intact.
+    pub fn combined_with_required(&self, required: &ContentSecurityPolicy) -> String {
+        let mut directives = self.directives.clone();
+        for (name, required_sources) in &required.directives {
+            if name == "report-uri" || name == "report-to" {
+                continue;
+            }
+            let combined = match self.effective_sources(name) {
+                Some(existing) => intersect_source_lists(existing, required_sources),
+                None => required_sources.clone(),
+            };
+            if let Some((_, values)) = directives.iter_mut().find(|(current, _)| current == name) {
+                *values = combined;
+            } else {
+                directives.push((name.clone(), combined));
+            }
+        }
+        serialize_directives(&directives)
+    }
+
+    pub fn serialized(&self) -> String {
+        serialize_directives(&self.directives)
+    }
+}
+
+fn source_token_eq(left: &str, right: &str) -> bool {
+    if left.starts_with('\'') || right.starts_with('\'') {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn source_list_is_subset(candidate: &[String], required: &[String]) -> bool {
+    if candidate.is_empty() || candidate.iter().any(|source| source.eq_ignore_ascii_case("'none'")) {
+        return true;
+    }
+    if required.is_empty() || required.iter().any(|source| source.eq_ignore_ascii_case("'none'")) {
+        return false;
+    }
+    candidate.iter().all(|source| {
+        required.iter().any(|allowed| {
+            allowed == "*" || source_token_eq(source, allowed)
+        })
+    })
+}
+
+fn intersect_source_lists(left: &[String], right: &[String]) -> Vec<String> {
+    if left.is_empty()
+        || right.is_empty()
+        || left.iter().any(|source| source.eq_ignore_ascii_case("'none'"))
+        || right.iter().any(|source| source.eq_ignore_ascii_case("'none'"))
+    {
+        return vec!["'none'".to_string()];
+    }
+    if left.iter().any(|source| source == "*") {
+        return right.to_vec();
+    }
+    if right.iter().any(|source| source == "*") {
+        return left.to_vec();
+    }
+    let mut result: Vec<String> = Vec::new();
+    for source in left {
+        if right.iter().any(|candidate| source_token_eq(source, candidate))
+            && !result.iter().any(|candidate| source_token_eq(candidate, source))
+        {
+            result.push(source.clone());
+        }
+    }
+    if result.is_empty() {
+        vec!["'none'".to_string()]
+    } else {
+        result
+    }
+}
+
+fn serialize_directives(directives: &[(String, Vec<String>)]) -> String {
+    directives
+        .iter()
+        .map(|(name, sources)| {
+            if sources.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {}", sources.join(" "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Match one frame-ancestors source expression against an ancestor origin.
@@ -425,6 +657,52 @@ mod tests {
     }
 
     #[test]
+    fn script_src_and_inline_nonce_enforcement() {
+        let self_origin = origin("https://app.example/");
+        let policy = ContentSecurityPolicy::parse(
+            "default-src 'none'; script-src 'self' https://cdn.example 'nonce-abc'",
+        );
+        assert!(policy.script_src_allows("https://app.example/app.js", &self_origin));
+        assert!(policy.script_src_allows("https://cdn.example/app.js", &self_origin));
+        assert!(!policy.script_src_allows("https://evil.example/app.js", &self_origin));
+        assert!(policy.inline_script_allows(Some("abc")));
+        assert!(!policy.inline_script_allows(Some("wrong")));
+        assert!(!policy.inline_script_allows(None));
+
+        let elem = ContentSecurityPolicy::parse(
+            "script-src 'self' 'unsafe-inline'; script-src-elem https://cdn.example",
+        );
+        assert!(elem.script_src_allows("https://cdn.example/app.js", &self_origin));
+        assert!(!elem.script_src_allows("https://app.example/app.js", &self_origin));
+        assert!(!elem.inline_script_allows(None));
+        let style = ContentSecurityPolicy::parse("default-src 'none'; style-src https://cdn.example");
+        assert!(style.style_src_allows("https://cdn.example/theme.css", &self_origin));
+        assert!(!style.style_src_allows("https://evil.example/theme.css", &self_origin));
+    }
+
+    #[test]
+    fn csp_sandbox_directive_maps_to_restrictions() {
+        let unrestricted = ContentSecurityPolicy::parse("default-src 'none'");
+        assert!(unrestricted.sandbox_flags().is_none());
+
+        let strict = ContentSecurityPolicy::parse("sandbox");
+        let strict_flags = strict.sandbox_flags().expect("sandbox directive");
+        assert!(strict_flags.active);
+        assert!(!strict_flags.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(!strict_flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+
+        let relaxed = ContentSecurityPolicy::parse(
+            "sandbox allow-scripts allow-same-origin allow-forms",
+        );
+        let relaxed_flags = relaxed.sandbox_flags().expect("sandbox directive");
+        assert!(relaxed_flags.active);
+        assert!(relaxed_flags.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(relaxed_flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+        assert!(relaxed_flags.allows(obscura_dom::SandboxFlags::ALLOW_FORMS));
+        assert!(!relaxed_flags.allows(obscura_dom::SandboxFlags::ALLOW_POPUPS));
+    }
+
+    #[test]
     fn host_source_ports_and_default_ports() {
         let resp = origin("https://widget.example/");
         let with_port = ContentSecurityPolicy::parse("frame-ancestors https://app.example:8443");
@@ -435,5 +713,34 @@ mod tests {
         // Default port in the source matches an origin with elided port.
         let default_port = ContentSecurityPolicy::parse("frame-ancestors https://app.example:443");
         assert!(default_port.frame_ancestors_allow(&resp, &[origin("https://app.example/")]));
+    }
+
+    #[test]
+    fn embedded_policy_subsumption_and_combination_are_fail_closed() {
+        let required = ContentSecurityPolicy::parse("connect-src 'none'");
+        assert!(ContentSecurityPolicy::parse("default-src 'none'")
+            .subsumes_required(&required));
+        assert!(ContentSecurityPolicy::parse("connect-src 'none'; img-src *")
+            .subsumes_required(&required));
+        assert!(!ContentSecurityPolicy::parse("connect-src *")
+            .subsumes_required(&required));
+        assert!(!ContentSecurityPolicy::parse("img-src 'none'")
+            .subsumes_required(&required));
+
+        let creator = ContentSecurityPolicy::parse(
+            "default-src *; script-src 'unsafe-inline' 'unsafe-eval'; connect-src *",
+        );
+        assert_eq!(
+            creator.combined_with_required(&required),
+            "default-src *; script-src 'unsafe-inline' 'unsafe-eval'; connect-src 'none'",
+        );
+        let response = ContentSecurityPolicy::parse("default-src 'none'; img-src https://img.example");
+        let combined = response.combined_with_required(
+            &ContentSecurityPolicy::parse("img-src *; connect-src 'self'"),
+        );
+        assert_eq!(
+            combined,
+            "default-src 'none'; img-src https://img.example; connect-src 'none'",
+        );
     }
 }

@@ -145,6 +145,12 @@ impl CookieJar {
             same_site,
         };
 
+        tracing::debug!(
+            cookie_name = %entry.name,
+            domain = %entry.domain,
+            path = %entry.path,
+            "cookie jar stored Set-Cookie"
+        );
         let mut cookies = self.cookies.write().unwrap();
         cookies.entry(domain).or_default().insert((name, path), entry);
     }
@@ -943,7 +949,6 @@ mod tests {
     #[test]
     fn test_cookie_from_file_load_then_send_in_request() {
         // Simulate what happens: load cookies from file → navigate → cookie should be in request
-        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
         

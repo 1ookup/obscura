@@ -1,0 +1,1 @@
+globalThis.InputEvent = class InputEvent extends Event { constructor(t,o={}) { super(t,o);_uiEventState.set(this,{view:o.view||null,detail:Number(o.detail)||0});this.data=o.data||null;this.inputType=o.inputType||""; } };

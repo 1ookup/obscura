@@ -12,6 +12,13 @@ Top-level flags apply to every subcommand.
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
+    --trace-api-file <FILE>  Write pinned V8 property trace (source build required)
+    --trace-op-file <FILE>   Write host operations and complete console strings
+    --trace-api-ignore <PATHS>
+                             Retired descriptor-monitor option (returns an error)
+    --trace-api-watch <PATHS>
+                             Retired descriptor-monitor option (returns an error)
+    --trace-api-devtools       Retired descriptor-monitor option (returns an error)
 -h, --help                   Help
 -V, --version                Version
 ```

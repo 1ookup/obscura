@@ -1,0 +1,31 @@
+# The pinned vendored V8 source, in one place.
+#
+# Load it with `cargo --config vendor/v8-source.toml ...`, or via the aliases in
+# .cargo/config.toml (`cargo v8-build`, `cargo v8-test`, ...).
+#
+# Why this is not in the root Cargo.toml's [patch.crates-io]: vendor/rusty_v8 is
+# several GB of upstream source and is gitignored, so a committed patch entry
+# would break `cargo metadata` on every fresh clone. Official builds
+# (.github/workflows/release.yml, Dockerfile) deliberately link the prebuilt
+# librusty_v8.a instead.
+#
+# Why V8_FROM_SOURCE lives here rather than in .cargo/config.toml's [env]: that
+# table applies to every invocation in the repo, including release and Docker
+# builds, dragging both into a ~30 min V8 source build they do not want. Loading
+# it through --config scopes it to the commands that ask for it.
+#
+# The two must travel together. Passing the patch without V8_FROM_SOURCE makes
+# rusty_v8 take the prebuilt path and fail on a missing
+# gen/src_binding_release_<target>.rs, an error that says nothing about the
+# actual cause.
+
+[patch.crates-io]
+# Pinned to v137.3.0: deno_core 0.350 requires v8 ^137.1.0, and cargo's [patch]
+# must satisfy the original semver range, so rusty_v8's default branch (v152.x)
+# is rejected outright. See docs/Build-from-source.md.
+v8 = { path = "vendor/rusty_v8" }
+
+[env]
+# force = true because [env] otherwise yields to an already-exported value: a
+# stray V8_FROM_SOURCE=0 in the developer's shell would silently defeat this.
+V8_FROM_SOURCE = { value = "1", force = true }

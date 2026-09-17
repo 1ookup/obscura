@@ -50,8 +50,11 @@ docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 
 Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, with no shell or package manager in the runtime image.
 
-Official archives and the Docker image include the rendering engine. Source
-builders must pass `--features render`; see [Build from source](Build-from-source.md).
+The default archive and the Docker image include the rendering engine but not
+the stealth transport; the suffixes below cover the other combinations. Source
+builders must pass `--features render` for rendering, while stealth is in the
+default feature set and is excluded with `--no-default-features`. See
+[Build from source](Build-from-source.md).
 
 ## From source
 

@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -16,15 +18,40 @@ use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
+// ReferrerPolicy is used by op_fetch_url, which is not feature-gated: keeping
+// it in the render-only import broke the default feature set.
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    CallbackRegistry, CookieJar, ObscuraHttpClient, ReferrerPolicy, RequestInfo, ResourceType,
+    Response,
 };
 use tokio::sync::Mutex;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Notify};
+use tokio_tungstenite::tungstenite::Message;
 
 #[cfg(feature = "render")]
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::import_map::ImportMap;
+use crate::privacy::{normalize_private_token_issuer, PrivateTokenQueryState, PrivacyPolicy};
+
+/// Extract the enforced CSP `sandbox` directive for the top-level document.
+/// The browser crate owns the full CSP parser, but `document_scope_info` is
+/// served by this crate and only needs the sandbox capability bits. Keep the
+/// first-directive-wins rule aligned with CSP parsing and let the shared DOM
+/// parser handle known and unknown sandbox tokens.
+fn csp_sandbox_flags(header: &str) -> Option<obscura_dom::SandboxFlags> {
+    for chunk in header.split(';') {
+        let mut tokens = chunk.split_ascii_whitespace();
+        let Some(name) = tokens.next() else { continue };
+        if name.eq_ignore_ascii_case("sandbox") {
+            let value = tokens.collect::<Vec<_>>().join(" ");
+            return Some(obscura_dom::SandboxFlags::parse(Some(&value)));
+        }
+    }
+    None
+}
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -77,6 +104,11 @@ pub struct PendingIframeNavigation {
     pub url: Option<String>,
     pub method: String,
     pub body: String,
+    /// Document text for a script-created `blob:` navigation, already
+    /// resolved from the page's blob URL store by the bootstrap. Those bytes
+    /// never exist on the network, so the frame loader must commit them
+    /// directly instead of issuing a request for `url`.
+    pub inline_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +190,21 @@ pub(crate) struct PendingFrameMessage {
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    /// Stable pointer to the runtime's frame-realm registry (a heap Box), so the
+    /// synchronous realm op can register a realm it creates inside an op. Null
+    /// until the runtime installs it at construction.
+    pub(crate) frame_realms_ptr: *mut crate::realm::FrameRealmHost,
+    /// Serialized browser identity installed into every lazily-created frame
+    /// realm. Mirrors the runtime's fingerprint/stealth contract so the
+    /// synchronous realm op can apply it without reaching the runtime.
+    pub(crate) fingerprint_json: String,
+    pub(crate) stealth: bool,
+    pub(crate) webgl_enabled: bool,
     pub url: String,
+    pub document_csp: Option<String>,
+    pub document_permissions_policy: Option<String>,
+    pub cross_origin_isolated: bool,
+    pub document_last_modified: Option<String>,
     /// Typed origin of the top-level document, derived exactly once per
     /// committed document. Same-origin checks against frame scopes must use
     /// this instance: re-deriving from `url` would mint a fresh opaque id on
@@ -181,6 +227,11 @@ pub struct ObscuraState {
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
     pub callbacks: Option<Arc<CallbackRegistry>>,
+    /// Optional persistent profile directory. IndexedDB uses an origin-keyed
+    /// JSON file here, alongside the existing cookie store.
+    pub storage_dir: Option<PathBuf>,
+    pub(crate) websockets: HashMap<u64, WebSocketState>,
+    pub websocket_counter: u64,
     /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
@@ -197,6 +248,11 @@ pub struct ObscuraState {
     /// order for Storage.key().
     pub local_storage: SharedStorageAreas,
     pub session_storage: SharedStorageAreas,
+    /// BrowserContext-owned values for origin-partitioned privacy APIs.
+    pub privacy_policy: PrivacyPolicy,
+    /// BrowserContext-owned issuer associations used by the Private State
+    /// Token information limit. Shared across same-context navigations.
+    pub private_token_query_state: PrivateTokenQueryState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -223,6 +279,10 @@ pub struct ObscuraState {
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
     pub activity_generation: u64,
+    /// Native deno_core timer id to its real monotonic deadline. The runtime
+    /// uses this only to repair a stale event-loop waker after an embedder
+    /// cancels a pending poll; deno_core still owns timer ordering and firing.
+    pub(crate) browser_timer_deadlines: HashMap<u64, std::time::Instant>,
     /// Monotonic identity of the currently installed document. Async resource
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
@@ -287,6 +347,8 @@ pub struct ObscuraState {
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
+    pub(crate) canvas_text_measurer: obscura_render::CanvasTextMeasurer,
+    #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
     /// clamped against the cached document overflow and is the single source
@@ -312,6 +374,8 @@ pub struct ObscuraState {
     /// Dedicated Worker registry (src/worker.rs, Phase 3.11). Lazily created
     /// on the first `new Worker(...)`, so pages without workers pay nothing.
     pub(crate) worker_host: Option<crate::worker::WorkerHost>,
+    pub(crate) shared_worker_registry: crate::worker::SharedWorkerRegistryHandle,
+    pub(crate) shared_worker_host: crate::worker::SharedWorkerPageHost,
     /// Set only inside a worker's own runtime: channel back to the page,
     /// drained by the page-side Worker recv loop (op_worker_recv).
     pub(crate) worker_outbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -340,13 +404,23 @@ pub struct ObscuraState {
 pub(crate) struct FrameRenderState {
     pub stylesheet_cache: obscura_render::StylesheetCache,
     pub animation_timeline: obscura_render::AnimationTimelineState,
+    pub prepared_render: Option<obscura_render::PreparedRender>,
+    pub cached_generation: u64,
 }
 
 impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
             dom: None,
+            frame_realms_ptr: std::ptr::null_mut(),
+            fingerprint_json: String::new(),
+            stealth: false,
+            webgl_enabled: false,
             url: "about:blank".to_string(),
+            document_csp: None,
+            document_permissions_policy: None,
+            cross_origin_isolated: false,
+            document_last_modified: None,
             top_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
@@ -355,6 +429,9 @@ impl ObscuraState {
             cookie_jar: None,
             http_client: None,
             callbacks: None,
+            storage_dir: None,
+            websockets: HashMap::new(),
+            websocket_counter: 0,
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
@@ -362,6 +439,8 @@ impl ObscuraState {
             pending_iframe_navigations: Vec::new(),
             local_storage: new_storage_areas(),
             session_storage: new_storage_areas(),
+            privacy_policy: PrivacyPolicy::new(),
+            private_token_query_state: PrivateTokenQueryState::new(),
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -373,6 +452,7 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
+            browser_timer_deadlines: HashMap::new(),
             document_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -403,6 +483,8 @@ impl ObscuraState {
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
+            canvas_text_measurer: obscura_render::CanvasTextMeasurer::new(),
+            #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
@@ -415,6 +497,8 @@ impl ObscuraState {
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
             worker_host: None,
+            shared_worker_registry: crate::worker::new_shared_worker_registry(),
+            shared_worker_host: crate::worker::SharedWorkerPageHost::default(),
             worker_outbox: None,
             inherited_origin: None,
             inherited_secure_context: false,
@@ -527,6 +611,106 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+pub(crate) struct WebSocketState {
+    pub sender: mpsc::UnboundedSender<Message>,
+    pub events: Arc<Mutex<VecDeque<String>>>,
+    pub notify: Arc<Notify>,
+}
+
+/// Opt-in host-operation trace. Native deno ops do not always have a V8
+/// function frame, so this stream complements the V8 property trace.
+fn host_op_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_TRACE_OP_FILE").is_some())
+}
+
+pub(crate) fn trace_host_op(name: &str, args: &[&str]) {
+    trace_host_op_from(&crate::trace_source::effective(), name, args)
+}
+
+/// `OBSCURA_DEBUG_WORKER=1` reports why a worker receive returned an empty
+/// batch. The JS receive loop treats empty as "the worker is gone" and stops
+/// polling, so a transient cause here strands every later message.
+fn worker_recv_debug(id: u32, reason: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WORKER").is_some()) {
+        eprintln!("[wrecv] id={id} empty batch: {reason}");
+    }
+}
+
+/// `trace_host_op` with an explicit execution source. Async ops whose body
+/// runs after the calling turn ended (fetch) carry the label captured at call
+/// time instead of the thread-local, which may have moved on by then.
+pub(crate) fn trace_host_op_from(from: &str, name: &str, args: &[&str]) {
+    if !host_op_trace_enabled() { return }
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = TRACE.get_or_init(|| {
+        let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let _ = writeln!(file, "timestamp_us\tfrom\toperation\targ1\targ2\targ3\tresult");
+        Some(std::sync::Mutex::new(file))
+    });
+    let Some(file) = sink else { return };
+    let timestamp = TRACE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let clean = |value: &str| value.replace(['\t', '\r', '\n'], " ").chars().take(2048).collect::<String>();
+    let arg1 = args.first().map_or_else(String::new, |value| clean(value));
+    let arg2 = args.get(1).map_or_else(String::new, |value| clean(value));
+    let arg3 = args.get(2).map_or_else(String::new, |value| clean(value));
+    let result = args.get(3).map_or_else(String::new, |value| clean(value));
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(
+            file,
+            "{timestamp}\t{}\t{}\t{arg1}\t{arg2}\t{arg3}\t{result}",
+            clean(from),
+            clean(name),
+        );
+        let _ = file.flush();
+    }
+}
+
+fn trace_console_message(level: &str, message: &str) {
+    if !host_op_trace_enabled() { return; }
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = TRACE.get_or_init(|| {
+        let path = std::env::var_os("OBSCURA_TRACE_OP_FILE")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(file))
+    });
+    let Some(file) = sink else { return };
+    let timestamp = TRACE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let from = crate::trace_source::effective();
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{timestamp}\t{}\tconsole.{level}\t{message}", from.replace(['\t', '\r', '\n'], " "));
+        let _ = file.flush();
+    }
+}
+
+/// JS-side entry into a labeled execution source (see trace_source.rs). The
+/// bootstrap's own stack is the read side; these ops are the write side that
+/// keeps host-op records attributed while page code runs.
+#[op2(fast)]
+fn op_trace_push_source(#[string] label: &str) {
+    crate::trace_source::js_push(label);
+}
+
+#[op2(fast)]
+fn op_trace_pop_source() {
+    crate::trace_source::js_pop();
+}
+
+/// `window.external.tracelog(key, value)` (tracelog.rs). `json` is the value
+/// the caller already serialized; an empty string means serialization produced
+/// nothing, which is written as `null`. The op never fails: with no destination
+/// configured it warns once and returns.
+#[op2(fast)]
+fn op_tracelog(#[string] key: &str, #[string] json: &str) {
+    crate::tracelog::record(key, json);
+}
+
+static TRACE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderMutationImpact {
@@ -1096,13 +1280,18 @@ fn op_dom(
     // inconsistent tree node degrades to a null result for that single call.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let trace_args = host_op_trace_enabled().then(|| (cmd.clone(), arg1.clone(), arg2.clone()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         op_dom_inner(state, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
         "null".to_string()
-    })
+    });
+    if let Some((trace_cmd, trace_arg1, trace_arg2)) = trace_args {
+        trace_host_op("dom", &[&trace_cmd, &trace_arg1, &trace_arg2, &result]);
+    }
+    result
 }
 
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
@@ -1177,6 +1366,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
+            #[cfg(feature = "render")]
+            for frame_state in state.frame_render_states.values_mut() {
+                frame_state.prepared_render = None;
+            }
         }
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
@@ -1426,6 +1619,29 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        // Same as "query_selector_scoped", but the walk also enters hosted
+        // (including closed) shadow trees. A page query cannot cross that
+        // boundary, yet the engine may need to reach a widget control rendered
+        // into a closed shadow root -- for example to answer the click listener
+        // the widget registered for it.
+        "query_selector_all_shadow_including" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            let ids: Vec<i32> = dom
+                .query_selector_all_shadow_including(NodeId::new(root_nid), &arg2)
+                .unwrap_or_default()
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
+        "query_selector_shadow_including" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.query_selector_shadow_including(NodeId::new(root_nid), &arg2)
+                .ok()
+                .flatten()
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
+        }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom
@@ -1490,6 +1706,144 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             dom.iframe_content_document(NodeId::new(host))
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
+        }
+        // The initial about:blank document, committed synchronously when the
+        // <iframe> is connected.
+        //
+        // HTML gives an iframe that document before the insertion steps
+        // return, so `iframe.contentDocument` is a real Document on the very
+        // next line. The Rust frame loader runs on the event loop and cannot
+        // meet that deadline, and until it did the getters answered with a
+        // hand-written stand-in whose surface was nothing like a Document's --
+        // 43 enumerable names against a browser's 295. A page that creates an
+        // iframe and enumerates it reads that difference directly.
+        //
+        // The loader's own commit replaces this root a moment later through
+        // the ordinary navigation path; that is exactly what a browser does to
+        // the initial about:blank as well.
+        "create_blank_iframe_document" => {
+            let host = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => NodeId::new(n),
+                _ => return "-1".into(),
+            };
+            if dom.iframe_content_document(host).is_some() {
+                return "-1".into();
+            }
+            // A sandboxed frame without allow-same-origin gets a fresh opaque
+            // origin, so it must not read as same-origin with its embedder.
+            let own_sandbox = dom
+                .get_node(host)
+                .map(|node| obscura_dom::SandboxFlags::parse(node.get_attribute("sandbox")))
+                .unwrap_or_default();
+            // Shadow-including: a widget that builds itself inside a closed
+            // shadow root -- Turnstile among them -- puts the <iframe> in a
+            // tree scope that is not the content document. Resolving only the
+            // node's own tree scope answered "no containing document" there
+            // and fell back to the top origin, which made the frame read
+            // cross-origin to the very document that created it.
+            let parent_scope = dom
+                .containing_document_root_shadow_including(host)
+                .and_then(|root| dom.document_scope(root));
+            let (
+                parent_origin,
+                base_url,
+                csp,
+                permissions_policy,
+                referrer,
+                referrer_policy,
+                parent_sandbox,
+                parent_cross_origin_isolated,
+            ) = match parent_scope {
+                Some(scope) => (
+                    scope.origin,
+                    scope.base_url,
+                    scope.csp,
+                    scope.permissions_policy,
+                    scope.url,
+                    scope.referrer_policy,
+                    scope.sandbox,
+                    scope.cross_origin_isolated,
+                ),
+                None => (
+                    gs.top_origin
+                        .clone()
+                        .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url)),
+                    gs.url.clone(),
+                    gs.document_csp.clone(),
+                    gs.document_permissions_policy.clone(),
+                    gs.url.clone(),
+                    // The top document's policy is not on the shared state;
+                    // the loader's commit records the real one moments later.
+                    String::new(),
+                    obscura_dom::SandboxFlags::default(),
+                    gs.cross_origin_isolated,
+                ),
+            };
+            // Sandboxing is inherited through every nested browsing context.
+            // The controller repeats this merge at navigation commit, but the
+            // initial about:blank document is exposed synchronously from the
+            // insertion algorithm and must already have the same restrictions.
+            let sandbox = own_sandbox.merged_with_parent(parent_sandbox);
+            let origin = if sandbox.active
+                && !sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)
+            {
+                obscura_dom::Origin::Opaque(obscura_dom::OpaqueOriginId::new())
+            } else {
+                parent_origin.clone()
+            };
+            // The initial about:blank used by an iframe that is about to
+            // navigate cross-origin is not an isolated document in Chrome.
+            // It can run briefly before the network response commits and is
+            // observable by early fingerprint probes. Do not leak the
+            // parent's isolation bit into that transient cross-origin
+            // browsing context; the committed navigation computes it again
+            // from the response and the real parent scope.
+            let iframe_src = dom
+                .get_node(host)
+                .and_then(|node| node.get_attribute("src").map(str::to_string));
+            let initial_cross_origin_isolated = initial_iframe_cross_origin_isolated(
+                &parent_origin,
+                parent_cross_origin_isolated,
+                &base_url,
+                iframe_src.as_deref(),
+            );
+            let Ok((root, _previous)) = dom.create_iframe_content_document(host) else {
+                return "-1".into();
+            };
+            // An empty body is not what about:blank is: it has a documentElement,
+            // a head and a body, and scripts read all three.
+            obscura_dom::parse_into_subtree(
+                dom,
+                root,
+                "<html><head></head><body></body></html>",
+            );
+            dom.set_document_scope(
+                root,
+                obscura_dom::DocumentScope {
+                    url: "about:blank".to_string(),
+                    origin,
+                    base_url,
+                    last_modified: None,
+                    sandbox,
+                    csp,
+                    permissions_policy,
+                    referrer_policy,
+                    referrer,
+                    // The frame registry names the browsing context when the
+                    // loader commits. Until then this document belongs to no
+                    // registered frame, which is what an empty id means to
+                    // every reader of the scope.
+                    frame_id: String::new(),
+                    document_generation: 0,
+                    // about:blank has no doctype and is therefore in
+                    // BackCompat from the moment the iframe is inserted;
+                    // author code can read this before the async navigation
+                    // controller replaces the document.
+                    quirks: true,
+                    cross_origin_isolated: initial_cross_origin_isolated,
+                },
+            );
+            root.index().to_string()
         }
         // Parse a complete HTML document and graft it under a content root.
         // Returns the parsed document's quirks bool, which is also recorded on
@@ -1596,13 +1950,157 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 None => serde_json::json!({ "host": -1, "parentRoot": -1 }).to_string(),
             }
         }
+        // Permissions Policy's iframe inheritance for the permission-backed
+        // features exposed by navigator.permissions. Most have a default
+        // allowlist of `self`: each cross-origin boundary must explicitly
+        // delegate the feature through the host iframe's `allow` attribute.
+        // Notifications are not delegable and stay denied below any
+        // cross-origin ancestor.
+        "frame_permission_allowed" => {
+            let feature = arg2.trim().to_ascii_lowercase();
+            let mut child_root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let top_origin = gs
+                .top_origin
+                .clone()
+                .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url));
+            // A document's Permissions-Policy header constrains both that
+            // document and every descendant. Evaluate it at each boundary
+            // before applying the iframe's `allow` delegation.
+            let policy_allows = |header: Option<&str>, subject: &obscura_dom::Origin,
+                                 owner: &obscura_dom::Origin| {
+                let Some(header) = header else { return true };
+                let mut found = None;
+                for part in header.split([',', ';']) {
+                    let Some((name, value)) = part.split_once('=') else { continue };
+                    if name.trim().eq_ignore_ascii_case(&feature) {
+                        found = Some(value.trim());
+                        break;
+                    }
+                }
+                let Some(value) = found else { return true };
+                let value = value.trim();
+                if value == "()" { return false; }
+                let value = value.trim_start_matches('(').trim_end_matches(')');
+                value.split_ascii_whitespace().any(|token| {
+                    let token = token.trim_matches(['\'', '"']);
+                    token == "*"
+                        || token.eq_ignore_ascii_case("self") && subject.same_origin(owner)
+                        || token == subject.serialize()
+                })
+            };
+            let mut allowed = true;
+            for _ in 0..=dom.len() {
+                let Some(host) = dom.iframe_host(child_root) else {
+                    break;
+                };
+                let parent_root = dom.containing_iframe_content_document(host);
+                let Some(child_origin) = dom
+                    .document_scope(child_root)
+                    .map(|scope| scope.origin)
+                else {
+                    allowed = false;
+                    break;
+                };
+                let parent_origin = parent_root
+                    .and_then(|root| dom.document_scope(root).map(|scope| scope.origin))
+                    .unwrap_or_else(|| top_origin.clone());
+                let same_origin = child_origin.same_origin(&parent_origin);
+
+                let child_policy = dom
+                    .document_scope(child_root)
+                    .and_then(|scope| scope.permissions_policy.as_deref().map(str::to_owned));
+                if !policy_allows(child_policy.as_deref(), &child_origin, &child_origin) {
+                    allowed = false;
+                    break;
+                }
+                let parent_policy = parent_root
+                    .and_then(|root| dom.document_scope(root))
+                    .and_then(|scope| scope.permissions_policy)
+                    .or_else(|| gs.document_permissions_policy.clone());
+                if !policy_allows(parent_policy.as_deref(), &child_origin, &parent_origin) {
+                    allowed = false;
+                    break;
+                }
+
+                if feature == "notifications" {
+                    if !same_origin {
+                        allowed = false;
+                        break;
+                    }
+                } else {
+                    let directive = dom
+                        .get_node(host)
+                        .and_then(|node| node.get_attribute("allow").map(str::to_owned))
+                        .and_then(|raw| {
+                            raw.split(';').find_map(|part| {
+                                let mut tokens = part.split_ascii_whitespace();
+                                let name = tokens.next()?;
+                                name.eq_ignore_ascii_case(&feature)
+                                    .then(|| tokens.map(str::to_owned).collect::<Vec<_>>())
+                            })
+                        });
+                    let boundary_allowed = match directive {
+                        None => same_origin,
+                        Some(tokens) if tokens.is_empty() => true,
+                        Some(tokens) => {
+                            let child = child_origin.serialize();
+                            tokens.into_iter().any(|token| {
+                                let token = token.trim_matches(['\'', '"']);
+                                token == "*"
+                                    || token.eq_ignore_ascii_case("src")
+                                    || token.eq_ignore_ascii_case("self") && same_origin
+                                    || token == child
+                            })
+                        }
+                    };
+                    if !boundary_allowed {
+                        allowed = false;
+                        break;
+                    }
+                }
+
+                let Some(parent_root) = parent_root else {
+                    break;
+                };
+                child_root = parent_root;
+            }
+            allowed.to_string()
+        }
         "document_scope_info" => {
             let root = arg1.parse::<u32>().unwrap_or(0);
+            if root == 0 {
+                let sandbox = gs
+                    .document_csp
+                    .as_deref()
+                    .and_then(csp_sandbox_flags);
+                return serde_json::json!({
+                    "url": gs.url,
+                    "origin": gs.top_origin.as_ref().map(|origin| origin.serialize()),
+                    "csp": gs.document_csp,
+                    "sandboxActive": sandbox.is_some_and(|flags| flags.active),
+                    "allowScripts": sandbox
+                        .as_ref()
+                        .is_none_or(|flags| flags.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS)),
+                    "allowSameOrigin": sandbox
+                        .as_ref()
+                        .is_none_or(|flags| flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)),
+                    "permissionsPolicy": gs.document_permissions_policy,
+                    "crossOriginIsolated": gs.cross_origin_isolated,
+                    "lastModified": gs.document_last_modified,
+                    // The top document's parse mode: doctypeless and
+                    // about:blank documents are BackCompat in Chrome.
+                    "quirks": dom.is_quirks(),
+                })
+                .to_string();
+            }
             match dom.document_scope(NodeId::new(root)) {
                 Some(scope) => serde_json::json!({
                     "url": scope.url,
                     "origin": scope.origin.serialize(),
                     "baseUrl": scope.base_url,
+                    "lastModified": scope.last_modified,
+                    "referrer": scope.referrer,
+                    "referrerPolicy": scope.referrer_policy,
                     "sandboxActive": scope.sandbox.active,
                     "allowScripts": scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS),
                     "allowSameOrigin": scope
@@ -1611,6 +2109,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "frameId": scope.frame_id,
                     "documentGeneration": scope.document_generation,
                     "quirks": scope.quirks,
+                    "csp": scope.csp,
+                    "permissionsPolicy": scope.permissions_policy,
+                    "crossOriginIsolated": scope.cross_origin_isolated,
                 })
                 .to_string(),
                 None => "null".into(),
@@ -1683,18 +2184,58 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .unwrap_or(0);
             let existing = dom.document_scope(root);
             let quirks = existing.as_ref().map(|scope| scope.quirks).unwrap_or(false);
-            let csp = existing.and_then(|scope| scope.csp);
+            let csp = existing.as_ref().and_then(|scope| scope.csp.clone());
+            let existing_permissions_policy = existing
+                .as_ref()
+                .and_then(|scope| scope.permissions_policy.clone());
+            let permissions_policy = spec
+                .get("permissionsPolicy")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_permissions_policy);
+            let existing_referrer_policy = existing
+                .as_ref()
+                .map(|scope| scope.referrer_policy.clone());
+            let existing_referrer = existing.as_ref().map(|scope| scope.referrer.clone());
+            let existing_last_modified = existing
+                .as_ref()
+                .and_then(|scope| scope.last_modified.clone());
+            let referrer_policy = spec
+                .get("referrerPolicy")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_referrer_policy)
+                .unwrap_or_else(|| "strict-origin-when-cross-origin".to_string());
+            let referrer = spec
+                .get("referrer")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_referrer)
+                .unwrap_or_default();
+            let last_modified = spec
+                .get("lastModified")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or(existing_last_modified);
             dom.set_document_scope(
                 root,
                 obscura_dom::DocumentScope {
                     url,
                     origin,
                     base_url,
+                    last_modified,
                     sandbox,
                     csp,
+                    permissions_policy,
+                    referrer_policy,
+                    referrer,
                     frame_id,
                     document_generation,
                     quirks,
+                    cross_origin_isolated: spec
+                        .get("crossOriginIsolated")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(gs.cross_origin_isolated),
                 },
             );
             "true".into()
@@ -2311,6 +2852,83 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
     }
 }
 
+/// Synchronously materialize the Window realm for a freshly-connected iframe.
+///
+/// The Rust frame loader builds realms on the event loop, but a page can read
+/// `iframe.contentWindow` on the line after appending it, and a fingerprinting
+/// probe then enumerates the JS wrapper fallback instead of a real realm. This
+/// op creates the realm inside the op's own handle scope so the getter has a
+/// real (V8-native constructor surface) realm to return. Returns the realm's
+/// bridge object, or `undefined` when the host has no content document yet.
+#[op2(reentrant)]
+fn op_ensure_frame_realm<'a>(
+    scope: &mut v8::HandleScope<'a>,
+    state: &OpState,
+    host_nid: u32,
+) -> v8::Local<'a, v8::Value> {
+    // Collect inputs and drop the state borrow before the realm bootstrap runs
+    // below: bootstrap's __obscura_init calls back into op_dom, and a held
+    // RefCell borrow would panic that re-entrant dispatch.
+    let (frame_realms_ptr, content_root, base_url, frame_id, fingerprint_json, stealth, webgl_enabled, scope_url, scope_origin) = {
+        let shared = state.borrow::<SharedState>().clone();
+        let shared = shared.borrow();
+        let content = shared.dom.as_ref().and_then(|dom| {
+            dom.iframe_content_document(obscura_dom::NodeId::new(host_nid))
+        });
+        let scope = content.and_then(|root| {
+            shared.dom.as_ref().and_then(|dom| dom.document_scope(root))
+        });
+        let (base_url, scope_url, scope_origin) = match &scope {
+            Some(s) => (
+                s.base_url.clone(),
+                Some(s.url.clone()),
+                Some(s.origin.serialize()),
+            ),
+            None => ("about:blank".to_string(), None, None),
+        };
+        (
+            shared.frame_realms_ptr,
+            content.map(|root| root.index() as u32),
+            base_url,
+            format!("blank-{host_nid}"),
+            shared.fingerprint_json.clone(),
+            shared.stealth,
+            shared.webgl_enabled,
+            scope_url,
+            scope_origin,
+        )
+    };
+
+    if frame_realms_ptr.is_null() {
+        return v8::undefined(scope).into();
+    }
+    let Some(content_root) = content_root else {
+        return v8::undefined(scope).into();
+    };
+    let frame_realms = unsafe { &mut *frame_realms_ptr };
+
+    match crate::realm::spawn_frame_realm(
+        scope,
+        frame_realms,
+        &frame_id,
+        0,
+        content_root,
+        &base_url,
+        &fingerprint_json,
+        stealth,
+        webgl_enabled,
+        scope_url,
+        scope_origin,
+    ) {
+        Ok(Some(bridge)) => v8::Local::new(scope, &bridge).into(),
+        Ok(None) => v8::undefined(scope).into(),
+        Err(err) => {
+            tracing::warn!("op_ensure_frame_realm failed: {err}");
+            v8::undefined(scope).into()
+        }
+    }
+}
+
 /// Evaluate a classic script body in the *calling* realm, named by its URL.
 ///
 /// Indirect eval keeps the right realm but stamps every frame with an eval
@@ -2394,6 +3012,7 @@ fn op_monotonic_ms() -> f64 {
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
+    trace_console_message(level, msg);
     match level {
         "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
@@ -2458,7 +3077,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
-        builder = builder.proxy(p);
+        builder = builder.proxy(p.no_proxy(reqwest::NoProxy::from_env()));
     }
     builder
         .build()
@@ -2510,6 +3129,33 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Return the isolation bit visible from an iframe's initial about:blank
+/// document. A network `src` with a different origin will replace that
+/// document asynchronously, so Chrome keeps the transient realm
+/// non-isolated even when its parent is isolated.
+fn initial_iframe_cross_origin_isolated(
+    parent_origin: &obscura_dom::Origin,
+    parent_cross_origin_isolated: bool,
+    parent_base_url: &str,
+    src: Option<&str>,
+) -> bool {
+    if !parent_cross_origin_isolated {
+        return false;
+    }
+    // The initial about:blank document has a transient, non-isolated realm.
+    // Isolation is recalculated only after a committed response grants it.
+    let Some(raw) = src.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return false;
+    };
+    let Some(target) = url::Url::parse(parent_base_url)
+        .ok()
+        .and_then(|base| base.join(raw).ok())
+    else {
+        return true;
+    };
+    obscura_dom::Origin::from_url(target.as_str()) == *parent_origin
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2523,6 +3169,68 @@ fn cors_response_allows(
     }
 }
 
+/// One directive's source list, or `None` when the header does not name it.
+///
+/// A specific directive replaces `default-src` outright, so the two must be
+/// looked up separately: a single scan that accepts either would let whichever
+/// appears first in the header win, and `default-src 'none'` is conventionally
+/// written first. That ordering silently turned every other directive into
+/// `'none'`.
+fn csp_sources(header: &str, directive: &str) -> Option<Vec<String>> {
+    header.split(';').find_map(|part| {
+        let mut tokens = part.split_ascii_whitespace();
+        let name = tokens.next()?.to_ascii_lowercase();
+        (name == directive).then(|| tokens.map(str::to_string).collect())
+    })
+}
+
+/// Fetch directives fall back to `default-src`; document directives do not.
+#[cfg(any(feature = "render", test))]
+fn csp_falls_back_to_default(directive: &str) -> bool {
+    !matches!(directive, "base-uri" | "form-action" | "frame-ancestors")
+}
+
+fn csp_connect_allows(header: Option<&str>, request_url: &str, page_origin: &str) -> bool {
+    let Some(header) = header else { return true };
+    let sources = csp_sources(header, "connect-src")
+        .or_else(|| csp_sources(header, "default-src"));
+    let Some(sources) = sources else { return true };
+    let Ok(target) = url::Url::parse(request_url) else { return false };
+    let target_origin = target.origin().ascii_serialization();
+    sources.iter().any(|source| match source.to_ascii_lowercase().as_str() {
+        "'none'" => false,
+        "'self'" => target_origin == page_origin,
+        "*" => matches!(target.scheme(), "http" | "https" | "ws" | "wss"),
+        value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+        value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+    })
+}
+
+#[cfg(any(feature = "render", test))]
+fn csp_resource_allows(
+    header: Option<&str>,
+    directive: &str,
+    request_url: &str,
+    page_origin: &str,
+) -> bool {
+    let Some(header) = header else { return true };
+    let sources = csp_sources(header, directive).or_else(|| {
+        csp_falls_back_to_default(directive)
+            .then(|| csp_sources(header, "default-src"))
+            .flatten()
+    });
+    let Some(sources) = sources else { return true };
+    let Ok(target) = url::Url::parse(request_url) else { return false };
+    let target_origin = target.origin().ascii_serialization();
+    sources.iter().any(|source| match source.to_ascii_lowercase().as_str() {
+        "'none'" => false,
+        "'self'" => target_origin == page_origin,
+        "*" => matches!(target.scheme(), "http" | "https" | "data" | "blob"),
+        value if value.ends_with(':') => target.scheme().eq_ignore_ascii_case(value.trim_end_matches(':')),
+        value => target_origin.eq_ignore_ascii_case(value.trim_end_matches('/')),
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2534,17 +3242,97 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    // Carries the referrer url/policy, and Fetch's RequestRedirect under
+    // `redirect`. The latter rides along here rather than as its own parameter
+    // because deno_core's async op codegen caps the argument count at nine.
+    #[string] referrer_context: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    tracing::debug!(
-        "op_fetch_url called: {} {} (intercept check pending)",
-        method,
-        url
-    );
+    // The referrer context is built at the JS call site, so its `from` field
+    // captures the execution source exactly at fetch() time. The async body
+    // may first run after the calling turn ended, when the thread-local label
+    // has already moved on.
+    let trace_from = serde_json::from_str::<serde_json::Value>(&referrer_context)
+        .ok()
+        .and_then(|context| {
+            context
+                .get("from")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(crate::trace_source::effective);
+    trace_host_op_from(&trace_from, "fetch", &[&method, &url, &headers_json]);
+    let performance_started = std::time::Instant::now();
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    // Scripted requests are governed by the CSP of the document whose realm
+    // initiated them. The bootstrap carries that document root in the
+    // referrer context; resolve the policy before borrowing shared state for
+    // the rest of the request.
+    let referrer_context = serde_json::from_str::<serde_json::Value>(&referrer_context).ok();
+    let request_destination = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("destination"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let request_root = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("root"))
+        .and_then(|value| value.as_u64())
+        .and_then(|root| u32::try_from(root).ok())
+        .map(NodeId::new)
+        .unwrap_or_else(|| NodeId::new(0));
+
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, request_csp) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
+        let request_csp = if request_root.raw() == 0 {
+            gs.document_csp.clone()
+        } else {
+            gs.dom
+                .as_ref()
+                .and_then(|dom| dom.document_scope(request_root))
+                .and_then(|scope| scope.csp)
+        };
+        // `root` names the document whose policy governs this request. Without
+        // it a subframe request is indistinguishable from a top-document one,
+        // and the two are checked against different policies.
+        tracing::debug!(
+            "op_fetch_url called: {} {} (root={}, csp={}, origin={}, mode={}, credentials={}, intercept check pending)",
+            method,
+            url,
+            request_root.raw(),
+            match (request_root.raw(), request_csp.is_some()) {
+                (0, true) => "page",
+                (0, false) => "page:none",
+                (_, true) => "frame",
+                (_, false) => "frame:none",
+            },
+            origin,
+            mode,
+            credentials,
+        );
+        if !csp_connect_allows(request_csp.as_deref(), &url, &origin) {
+            // A blocked request otherwise leaves no trace at all: it has an
+            // `op_fetch_url called` line and no completion, which reads exactly
+            // like a request still in flight. Say which policy rejected it and
+            // which document that policy came from.
+            tracing::debug!(
+                "op_fetch_url blocked by connect-src: {} (origin={}, root={}, csp={:?})",
+                url,
+                origin,
+                request_root.raw(),
+                request_csp.as_deref().unwrap_or("<none>")
+            );
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "cspBlocked": true,
+            }).to_string());
+        }
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
                 return Ok(serde_json::json!({
@@ -2591,6 +3379,7 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            request_csp,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -2731,6 +3520,31 @@ async fn op_fetch_url(
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
+    let referrer_url = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("url"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let referrer_policy = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("policy"))
+        .and_then(|value| value.as_str())
+        .and_then(ReferrerPolicy::parse)
+        .unwrap_or_default();
+    // Fetch's RequestRedirect. "error" and "manual" both stop at the first 3xx
+    // -- taking the hop would put a request in the server's log that Chrome
+    // never sends -- but they disagree about a 3xx that carries no Location:
+    // "manual" decides on the status code alone and hands back an opaque
+    // redirect, while "error" only fails once a Location proves a hop was
+    // actually meant, and otherwise lets the 3xx through as an ordinary
+    // response. Chrome 146 was asked; see js-repros/fetch-redirect-modes.
+    let redirect_mode = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("redirect"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("follow")
+        .to_string();
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -2755,6 +3569,28 @@ async fn op_fetch_url(
         }
     }
 
+    // The cache mode reaches the wire as `Cache-Control`/`Pragma`, but Fetch
+    // appends those in "HTTP-network-or-cache fetch", which runs after the
+    // CORS-preflight decision. They are user-agent headers, not "author request
+    // headers", so they never trigger a preflight: Chrome sends them on a
+    // cross-origin GET as a simple request. Counting them here turned the
+    // Turnstile widget's attestation probe into an OPTIONS the origin does not
+    // answer, and the probe died as a network error. The shim reports the names
+    // it added itself, so an author-supplied `Cache-Control` still preflights
+    // the way it does in Chrome.
+    let ua_generated_headers: Vec<String> = referrer_context
+        .as_ref()
+        .and_then(|value| value.get("uaHeaders"))
+        .and_then(|value| value.as_array())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str())
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let needs_preflight = is_cross_origin
         && mode == "cors"
         && (req_method != reqwest::Method::GET
@@ -2766,6 +3602,7 @@ async fn op_fetch_url(
                     && kl != "accept-language"
                     && kl != "content-language"
                     && kl != "content-type"
+                    && !ua_generated_headers.contains(&kl)
             }));
 
     if needs_preflight {
@@ -2828,8 +3665,13 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                referrer_url.clone(),
+                referrer_policy,
+                redirect_mode.clone(),
                 callbacks.clone(),
                 allow_private_network,
+                request_csp.clone(),
+                request_destination.clone(),
             )
             .await;
         }
@@ -2843,7 +3685,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
-    let response = loop {
+    let mut redirect_end = std::time::Duration::ZERO;
+    let (response, response_start) = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
@@ -2853,6 +3696,19 @@ async fn op_fetch_url(
             .unwrap_or(false);
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
+        }
+        if !request_destination.is_empty() {
+            req = req
+                .header("Sec-Fetch-Mode", &mode)
+                .header("Sec-Fetch-Dest", &request_destination);
+        }
+        if let (Ok(source), Ok(target)) = (
+            url::Url::parse(&referrer_url),
+            url::Url::parse(&current_url),
+        ) {
+            if let Some(value) = obscura_net::referrer_value(&source, &target, referrer_policy) {
+                req = req.header("Referer", value);
+            }
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -2872,14 +3728,22 @@ async fn op_fetch_url(
         // the profile's UA while every scripted request announced a different
         // OS and Chrome version -- comparing those two is a basic bot check.
         // Honor an explicit override.
-        if !custom_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            if let Some(client) = http_client.as_ref() {
-                let ua = client.user_agent.read().await.clone();
-                if !ua.is_empty() {
-                    req = req.header("User-Agent", &ua);
+        if let Some(client) = http_client.as_ref() {
+            let fingerprint = client.browser_fingerprint().await;
+            if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("user-agent"))
+                && !fingerprint.user_agent.is_empty()
+            {
+                req = req.header("User-Agent", &fingerprint.user_agent);
+            }
+            if !fingerprint.brands.is_empty() {
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua")) {
+                    req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
+                }
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua-mobile")) {
+                    req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
+                }
+                if !custom_headers.keys().any(|key| key.eq_ignore_ascii_case("sec-ch-ua-platform")) {
+                    req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
                 }
             }
         }
@@ -2902,6 +3766,7 @@ async fn op_fetch_url(
             }
             deno_error::JsErrorBox::generic(e.to_string())
         })?;
+        let current_response_start = performance_started.elapsed();
 
         if let Some(ref counter) = in_flight {
             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2920,7 +3785,21 @@ async fn op_fetch_url(
         }
 
         if !resp.status().is_redirection() {
-            break resp;
+            break (resp, current_response_start);
+        }
+
+        // "manual" is decided by the status code alone: no Location is read,
+        // so a 3xx without one still becomes an opaque redirect.
+        if redirect_mode == "manual" {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+                "redirectMode": "manual",
+            })
+            .to_string());
         }
 
         let location_header = resp
@@ -2929,17 +3808,34 @@ async fn op_fetch_url(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let Some(location) = location_header else {
-            // 3xx without a Location header is not actually a redirect.
-            break resp;
+            // 3xx without a Location header is not actually a redirect, so
+            // even "error" lets it through.
+            break (resp, current_response_start);
         };
+
+        // "error": the redirect itself is the outcome, and the hop is never
+        // taken. A Service Worker script is fetched this way, so following it
+        // here would put a request in the server's log that Chrome never
+        // sends -- visible without any client-side check.
+        if redirect_mode == "error" {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+                "redirectMode": "error",
+            })
+            .to_string());
+        }
 
         let base = match url::Url::parse(&current_url) {
             Ok(b) => b,
-            Err(_) => break resp,
+            Err(_) => break (resp, current_response_start),
         };
         let next_url = match base.join(&location) {
             Ok(u) => u,
-            Err(_) => break resp,
+            Err(_) => break (resp, current_response_start),
         };
 
         // Re-validate every redirect target against the SSRF policy.
@@ -2954,8 +3850,15 @@ async fn op_fetch_url(
             })
             .to_string());
         }
+        if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true, "cspBlocked": true,
+            }).to_string());
+        }
 
         redirects_followed += 1;
+        redirect_end = performance_started.elapsed();
         if redirects_followed > FETCH_REDIRECT_LIMIT {
             return Ok(serde_json::json!({
                 "status": 0,
@@ -2980,6 +3883,11 @@ async fn op_fetch_url(
     };
 
     let status = response.status().as_u16();
+    let status_text = response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_string();
 
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
@@ -3024,6 +3932,7 @@ async fn op_fetch_url(
         .bytes()
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let response_end = performance_started.elapsed();
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -3095,13 +4004,126 @@ async fn op_fetch_url(
 
     Ok(serde_json::json!({
         "status": status,
+        "statusText": status_text,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
+        "timing": {
+            "responseStart": response_start.as_secs_f64() * 1_000.0,
+            "responseEnd": response_end.as_secs_f64() * 1_000.0,
+            "redirectEnd": redirect_end.as_secs_f64() * 1_000.0,
+            "redirectCount": redirects_followed,
+        },
     })
     .to_string())
+}
+
+#[op2(async)]
+#[string]
+async fn op_websocket_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[string] protocols: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    trace_host_op("websocket.open", &[&url, &protocols]);
+    let parsed = url::Url::parse(&url)
+        .map_err(|error| deno_error::JsErrorBox::generic(format!("WebSocket URL is invalid: {error}")))?;
+    if !matches!(parsed.scheme(), "ws" | "wss") {
+        return Err(deno_error::JsErrorBox::generic("WebSocket URL must use ws:// or wss://"));
+    }
+    // WebSocket connections share fetch's private-network policy. Reuse the
+    // same host validation after translating the transport scheme; this keeps
+    // loopback and RFC1918 literals out of the raw tungstenite connector.
+    let mut fetch_url = parsed.clone();
+    let _ = fetch_url.set_scheme(if parsed.scheme() == "wss" { "https" } else { "http" });
+    let allow_private_network = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let allowed = shared
+            .borrow()
+            .http_client
+            .as_ref()
+            .is_some_and(|client| client.allow_private_network);
+        allowed
+    };
+    validate_fetch_url(&fetch_url, allow_private_network)
+        .map_err(deno_error::JsErrorBox::generic)?;
+    let (socket, _) = tokio_tungstenite::connect_async(url.clone())
+        .await
+        .map_err(|error| deno_error::JsErrorBox::generic(format!("WebSocket connection failed: {error}")))?;
+    let shared = {
+        let state = state.borrow();
+        state.borrow::<SharedState>().clone()
+    };
+    let (sender, mut outgoing) = mpsc::unbounded_channel();
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let notify = Arc::new(Notify::new());
+    let events_task = events.clone();
+    let notify_task = notify.clone();
+    let (mut writer, mut reader) = socket.split();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(message) = outgoing.recv() => {
+                    if writer.send(message).await.is_err() { break; }
+                }
+                incoming = reader.next() => {
+                    match incoming {
+                        Some(Ok(Message::Text(text))) => { events_task.lock().await.push_back(json!({"type":"message","data":text.to_string()}).to_string()); notify_task.notify_waiters(); }
+                        Some(Ok(Message::Binary(bytes))) => { events_task.lock().await.push_back(json!({"type":"message","data":base64::engine::general_purpose::STANDARD.encode(bytes),"binary":true}).to_string()); notify_task.notify_waiters(); }
+                        Some(Ok(Message::Close(frame))) => { let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1000, String::new())); events_task.lock().await.push_back(json!({"type":"close","code":code,"reason":reason,"wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => { events_task.lock().await.push_back(json!({"type":"error","message":error.to_string()}).to_string()); notify_task.notify_waiters(); break; }
+                        None => { events_task.lock().await.push_back(json!({"type":"close","code":1000,"reason":"","wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                    }
+                }
+            }
+        }
+    });
+    let id = {
+        let mut gs = shared.borrow_mut();
+        gs.websocket_counter = gs.websocket_counter.wrapping_add(1).max(1);
+        let id = gs.websocket_counter;
+        gs.websockets.insert(id, WebSocketState { sender, events: events.clone(), notify: notify.clone() });
+        id
+    };
+    events.lock().await.push_back(json!({"type":"open","protocol":protocols,"extensions":""}).to_string());
+    notify.notify_waiters();
+    Ok(id.to_string())
+}
+
+#[op2(fast)]
+fn op_websocket_send(state: &OpState, id: u32, #[string] data: &str) -> bool {
+    trace_host_op("websocket.send", &[&id.to_string(), data]);
+    let shared = state.borrow::<SharedState>().clone();
+    let sender = shared.borrow().websockets.get(&(id as u64)).map(|socket| socket.sender.clone());
+    sender.map(|tx| tx.send(Message::Text(data.to_string().into())).is_ok()).unwrap_or(false)
+}
+
+#[op2(async)]
+#[string]
+async fn op_websocket_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    let shared = {
+        let state = state.borrow();
+        state.borrow::<SharedState>().clone()
+    };
+    let Some((events, notify)) = shared.borrow().websockets.get(&(id as u64)).map(|socket| (socket.events.clone(), socket.notify.clone())) else { return String::new() };
+    loop {
+        if let Some(event) = events.lock().await.pop_front() { return event; }
+        notify.notified().await;
+    }
+}
+
+#[op2(fast)]
+fn op_websocket_close(state: &OpState, id: u32, code: u16, #[string] reason: &str) {
+    trace_host_op("websocket.close", &[&id.to_string(), reason]);
+    let shared = state.borrow::<SharedState>().clone();
+    let socket = { shared.borrow_mut().websockets.remove(&(id as u64)) };
+    if let Some(socket) = socket {
+        let _ = socket.sender.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame { code: code.into(), reason: reason.to_string().into() })));
+    }
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -3119,6 +4141,7 @@ fn fetch_response(
         headers,
         body,
         redirected_from: Vec::new(),
+        timing: obscura_net::ResponseTiming::default(),
     }
 }
 
@@ -3128,6 +4151,28 @@ fn fetch_response(
 /// handling lives inside StealthHttpClient::send_single, which shares the
 /// context jar. Response bodies are not mirrored into the CDP
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+#[cfg(any(feature = "stealth", test))]
+fn scripted_fetch_site(page_origin: &str, target: &url::Url) -> &'static str {
+    let Ok(initiator) = url::Url::parse(page_origin) else {
+        return "cross-site";
+    };
+    if initiator.origin() == target.origin() {
+        return "same-origin";
+    }
+    let registrable = |url: &url::Url| {
+        let labels: Vec<&str> = url.host_str().unwrap_or_default().split('.').collect();
+        labels
+            .get(labels.len().saturating_sub(2)..)
+            .map(|parts| parts.join("."))
+            .unwrap_or_default()
+    };
+    if registrable(&initiator) == registrable(target) {
+        "same-site"
+    } else {
+        "cross-site"
+    }
+}
+
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
@@ -3138,15 +4183,27 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    referrer_url: String,
+    referrer_policy: ReferrerPolicy,
+    redirect_mode: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    request_csp: Option<String>,
+    request_destination: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirect_end = std::time::Duration::ZERO;
 
-    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+    let (status, resp_headers, resp_bytes, response_start): (
+        u16,
+        HashMap<String, String>,
+        Vec<u8>,
+        std::time::Duration,
+    ) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -3159,15 +4216,62 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
-        if current_is_cross_origin {
+        // Origin is present on every non-GET/HEAD request, including a
+        // same-origin form POST, and on cross-origin CORS GET/HEAD requests.
+        // The former is what the challenge's proof POSTs use; checking only
+        // target origin drops a browser-visible header.
+        let origin_required = (!current_method.eq_ignore_ascii_case("GET")
+            && !current_method.eq_ignore_ascii_case("HEAD"))
+            || (mode == "cors" && current_is_cross_origin);
+        if origin_required {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
+        if let Some(value) = url::Url::parse(&referrer_url)
+            .ok()
+            .and_then(|source| obscura_net::referrer_value(&source, &parsed_current, referrer_policy))
+        {
+            req_headers.insert("referer".to_string(), value);
+        }
+        req_headers.entry("accept".to_string()).or_insert_with(|| "*/*".to_string());
+        let accept_language = stealth.browser_fingerprint().await.accept_language();
+        req_headers
+            .entry("accept-language".to_string())
+            .or_insert(accept_language);
+        req_headers
+            .entry("sec-fetch-site".to_string())
+            .or_insert_with(|| scripted_fetch_site(&page_origin, &parsed_current).to_string());
+        req_headers
+            .entry("sec-fetch-mode".to_string())
+            .or_insert_with(|| match mode.as_str() {
+                "no-cors" => "no-cors".to_string(),
+                "same-origin" => "same-origin".to_string(),
+                _ => "cors".to_string(),
+            });
+        req_headers
+            .entry("sec-fetch-dest".to_string())
+            .or_insert_with(|| {
+                if request_destination.is_empty() {
+                    "empty".to_string()
+                } else {
+                    request_destination.clone()
+                }
+            });
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
+        tracing::debug!(
+            "stealth_fetch request: {} {} origin={:?} referer={:?} referrer_source={:?} policy={}",
+            current_method,
+            current_url,
+            req_headers.get("origin"),
+            req_headers.get("referer"),
+            if referrer_url.is_empty() { None } else { Some(referrer_url.as_str()) },
+            referrer_policy.as_str(),
+        );
+
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
-        let r = stealth
+        let r = match stealth
             .send_single(
                 &current_method,
                 &parsed_current,
@@ -3177,17 +4281,52 @@ async fn stealth_fetch_all(
                 credentials_allowed,
             )
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    "stealth_fetch failed: {} {} after {:?}: {}",
+                    current_method,
+                    current_url,
+                    performance_started.elapsed(),
+                    error,
+                );
+                return Err(deno_error::JsErrorBox::generic(error.to_string()));
+            }
+        };
+        let current_response_start = performance_started.elapsed();
 
         if !(300..400).contains(&r.status) {
-            break (r.status, r.headers, r.body);
+            break (r.status, r.headers, r.body, current_response_start);
+        }
+        if redirect_mode == "manual" {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": current_url,
+                "headers": {},
+                "redirected": true,
+                "redirectMode": "manual",
+            })
+            .to_string());
         }
         let Some(location) = r.headers.get("location").cloned() else {
-            break (r.status, r.headers, r.body);
+            break (r.status, r.headers, r.body, current_response_start);
         };
+        if redirect_mode == "error" {
+            return Ok(serde_json::json!({
+                "status": r.status,
+                "body": "",
+                "url": current_url,
+                "headers": r.headers,
+                "redirected": true,
+                "redirectMode": "error",
+            })
+            .to_string());
+        }
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break (r.status, r.headers, r.body),
+            Err(_) => break (r.status, r.headers, r.body, current_response_start),
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -3199,7 +4338,14 @@ async fn stealth_fetch_all(
             })
             .to_string());
         }
+        if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
+                "blocked": true, "cspBlocked": true,
+            }).to_string());
+        }
         redirects_followed += 1;
+        redirect_end = performance_started.elapsed();
         if redirects_followed > FETCH_REDIRECT_LIMIT {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
@@ -3249,6 +4395,11 @@ async fn stealth_fetch_all(
     }
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let status_text = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .map(|code| code.canonical_reason().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let response_end = performance_started.elapsed();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
@@ -3264,19 +4415,27 @@ async fn stealth_fetch_all(
     }
 
     tracing::debug!(
-        "stealth_fetch completed: {} {} -> {} ({} bytes)",
+        "stealth_fetch completed: {} {} -> {} ({} bytes, {} ms)",
         current_method,
         url,
         status,
-        resp_bytes.len()
+        resp_bytes.len(),
+        response_end.as_millis()
     );
 
     Ok(serde_json::json!({
         "status": status,
+        "statusText": status_text,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
+        "timing": {
+            "responseStart": response_start.as_secs_f64() * 1_000.0,
+            "responseEnd": response_end.as_secs_f64() * 1_000.0,
+            "redirectEnd": redirect_end.as_secs_f64() * 1_000.0,
+            "redirectCount": redirects_followed,
+        },
     })
     .to_string())
 }
@@ -3310,9 +4469,48 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, csp_connect_allows, csp_resource_allows, glob_match,
+        initial_iframe_cross_origin_isolated, is_potentially_trustworthy, scripted_fetch_site,
+        validate_fetch_url, FetchCredentials,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    /// `default-src 'none'` is conventionally written first. Accepting whichever
+    /// directive a single scan reached first therefore turned every later one
+    /// into `'none'`, which refused a same-origin image that `img-src 'self'`
+    /// plainly allows. The refusal only surfaced as an `error` event on the
+    /// element, indistinguishable from a network failure.
+    #[test]
+    fn a_specific_directive_replaces_default_src_whatever_the_header_order() {
+        let header = "default-src 'none'; img-src 'self'; connect-src 'self' https://api.example";
+        assert!(csp_resource_allows(
+            Some(header),
+            "img-src",
+            "https://app.example/a.png",
+            "https://app.example",
+        ));
+        assert!(csp_connect_allows(
+            Some(header),
+            "https://api.example/x",
+            "https://app.example",
+        ));
+        // A directive the header omits still falls back to default-src.
+        assert!(!csp_resource_allows(
+            Some(header),
+            "font-src",
+            "https://app.example/f.woff",
+            "https://app.example",
+        ));
+        // Document directives have no default-src fallback at all.
+        assert!(csp_resource_allows(
+            Some("default-src 'none'"),
+            "form-action",
+            "https://app.example/post",
+            "https://app.example",
+        ));
+    }
 
     #[cfg(feature = "render")]
     use super::{
@@ -3363,6 +4561,72 @@ mod tests {
 
         assert!(FetchCredentials::Include.allows(page_origin, same_origin_url));
         assert!(FetchCredentials::Include.allows(page_origin, cross_origin_url));
+    }
+
+    #[test]
+    fn scripted_fetch_site_distinguishes_origin_and_site_boundaries() {
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://challenges.cloudflare.com/cdn-cgi").unwrap(),
+            ),
+            "same-origin"
+        );
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://brunhild.challenges.cloudflare.com/cdn-cgi").unwrap(),
+            ),
+            "same-site"
+        );
+        assert_eq!(
+            scripted_fetch_site(
+                "https://challenges.cloudflare.com",
+                &url::Url::parse("https://example.test/cdn-cgi").unwrap(),
+            ),
+            "cross-site"
+        );
+    }
+
+    #[test]
+    fn initial_cross_origin_iframe_about_blank_is_not_isolated() {
+        let parent = obscura_dom::Origin::from_url("https://page.example/");
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            Some("https://widget.example/frame"),
+        ));
+        assert!(initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            Some("/same-origin-frame"),
+        ));
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            None,
+        ));
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            false,
+            "https://page.example/",
+            Some("/same-origin-frame"),
+        ));
+    }
+
+    #[test]
+    fn worker_secure_context_requires_a_real_trustworthy_host() {
+        assert!(is_potentially_trustworthy("http://localhost:8080"));
+        assert!(is_potentially_trustworthy("http://dev.localhost:8080"));
+        assert!(is_potentially_trustworthy("http://127.42.1.9:8080"));
+        assert!(is_potentially_trustworthy("http://[::1]:8080"));
+        assert!(is_potentially_trustworthy("https://example.com"));
+        assert!(!is_potentially_trustworthy("http://localhost.evil"));
+        assert!(!is_potentially_trustworthy("http://notlocalhost"));
+        assert!(!is_potentially_trustworthy("http://192.168.1.10"));
     }
 
     #[test]
@@ -3515,12 +4779,18 @@ mod tests {
                 "url": "https://frame.example/page",
                 "origin": "https://frame.example",
                 "baseUrl": "https://frame.example/",
+                "lastModified": null,
+                "referrer": "",
+                "referrerPolicy": "strict-origin-when-cross-origin",
                 "sandboxActive": true,
                 "allowScripts": true,
                 "allowSameOrigin": false,
                 "frameId": "frame-1",
                 "documentGeneration": 3,
                 "quirks": false,
+                "csp": null,
+                "permissionsPolicy": null,
+                "crossOriginIsolated": false,
             }),
         );
         // A doctype-less document parses in quirks mode; the parse writes the
@@ -3951,6 +5221,139 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+fn privacy_document_origins(
+    state: &ObscuraState,
+    document_root: i32,
+) -> Option<(obscura_dom::Origin, obscura_dom::Origin)> {
+    if document_root < 0 {
+        return None;
+    }
+    let top = state
+        .top_origin
+        .clone()
+        .unwrap_or_else(|| obscura_dom::Origin::from_url(&state.url));
+    let document = if document_root == 0 {
+        top.clone()
+    } else {
+        state
+            .dom
+            .as_ref()?
+            .document_scope(NodeId::new(document_root as u32))?
+            .origin
+    };
+    Some((top, document))
+}
+
+fn http_origin_serialization(origin: &obscura_dom::Origin) -> Option<String> {
+    match origin {
+        obscura_dom::Origin::Tuple { scheme, .. }
+            if matches!(scheme.as_str(), "http" | "https") =>
+        {
+            Some(origin.serialize())
+        }
+        _ => None,
+    }
+}
+
+/// Query Private State Token metadata. The result is a small status envelope
+/// because WebIDL requires all validation failures to become Promise
+/// rejections in JavaScript, including illegal issuer input and quota errors.
+#[op2]
+#[string]
+fn op_private_state_query(
+    state: &OpState,
+    #[string] operation: String,
+    #[string] issuer: String,
+    document_root: i32,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some((top, document)) = privacy_document_origins(&state, document_root) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let (Some(top_level_origin), Some(document_origin)) = (
+        http_origin_serialization(&top),
+        http_origin_serialization(&document),
+    ) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let Some(issuer_origin) = normalize_private_token_issuer(&issuer) else {
+        return r#"{"status":"invalid-issuer"}"#.to_string();
+    };
+
+    if operation == "token"
+        && !state
+            .private_token_query_state
+            .associate(&top_level_origin, &issuer_origin)
+    {
+        tracing::debug!(
+            target: "obscura::privacy",
+            api = "hasPrivateToken",
+            %top_level_origin,
+            %document_origin,
+            %issuer_origin,
+            status = "quota-exceeded",
+        );
+        return r#"{"status":"quota"}"#.to_string();
+    }
+
+    let value = match operation.as_str() {
+        "token" => state.privacy_policy.has_private_token(
+            &top_level_origin,
+            &document_origin,
+            &issuer_origin,
+        ),
+        "redemption" => state.privacy_policy.has_redemption_record(
+            &top_level_origin,
+            &document_origin,
+            &issuer_origin,
+        ),
+        _ => false,
+    };
+    let api = if operation == "token" {
+        "hasPrivateToken"
+    } else {
+        "hasRedemptionRecord"
+    };
+    tracing::debug!(
+        target: "obscura::privacy",
+        api,
+        %top_level_origin,
+        %document_origin,
+        %issuer_origin,
+        value,
+    );
+    serde_json::json!({ "status": "ok", "value": value }).to_string()
+}
+
+#[op2]
+#[string]
+fn op_has_storage_access(state: &OpState, document_root: i32) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some((top, document)) = privacy_document_origins(&state, document_root) else {
+        return r#"{"status":"invalid-state"}"#.to_string();
+    };
+    let Some(top_level_origin) = http_origin_serialization(&top) else {
+        return r#"{"status":"ok","value":false}"#.to_string();
+    };
+    let Some(document_origin) = http_origin_serialization(&document) else {
+        return r#"{"status":"ok","value":false}"#.to_string();
+    };
+    let value = top.same_origin(&document)
+        || state
+            .privacy_policy
+            .has_storage_access_grant(&top_level_origin, &document_origin);
+    tracing::debug!(
+        target: "obscura::privacy",
+        api = "hasStorageAccess",
+        %top_level_origin,
+        %document_origin,
+        value,
+    );
+    serde_json::json!({ "status": "ok", "value": value }).to_string()
+}
+
 #[op2]
 #[string]
 fn op_get_cookies(state: &OpState) -> String {
@@ -4075,6 +5478,48 @@ fn op_origin_storage(
     }
 }
 
+fn indexed_db_path(state: &SharedState, name: &str) -> Option<PathBuf> {
+    let gs = state.borrow();
+    let dir = gs.storage_dir.as_ref()?.clone();
+    let origin = url::Url::parse(&gs.url).ok()?.origin().ascii_serialization();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    origin.hash(&mut hash);
+    name.hash(&mut hash);
+    Some(dir.join(format!("indexeddb-{:016x}.json", hash.finish())))
+}
+
+#[op2]
+#[string]
+fn op_indexeddb_load(state: &OpState, #[string] name: &str) -> String {
+    trace_host_op("indexeddb.load", &[name]);
+    let shared = state.borrow::<SharedState>().clone();
+    indexed_db_path(&shared, name)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+#[op2(fast)]
+fn op_indexeddb_save(state: &OpState, #[string] name: &str, #[string] value: &str) {
+    trace_host_op("indexeddb.save", &[name]);
+    let shared = state.borrow::<SharedState>().clone();
+    let Some(path) = indexed_db_path(&shared, name) else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() { return; }
+    let temporary = path.with_extension("json.tmp");
+    if std::fs::write(&temporary, value.as_bytes()).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+#[op2(fast)]
+fn op_indexeddb_delete(state: &OpState, #[string] name: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    if let Some(path) = indexed_db_path(&shared, name) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[op2(fast)]
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
@@ -4091,6 +5536,7 @@ fn op_navigate_frame(
     #[string] method: &str,
     #[string] body: &str,
 ) {
+    frame_debug("navigate_frame", document_root, url);
     if document_root == 0 {
         let gs = state.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4109,8 +5555,16 @@ fn op_navigate_frame(
 
 #[op2(fast)]
 fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
+    frame_debug("queue_iframe_navigation", host_nid, "(current src)");
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    if gs
+        .pending_iframe_navigations
+        .iter()
+        .any(|request| request.host_nid == host_nid && request.url.is_none())
+    {
+        frame_debug("queue_iframe_navigation.deduped", host_nid, "(already queued)");
+    }
     if !gs
         .pending_iframe_navigations
         .iter()
@@ -4121,9 +5575,27 @@ fn op_queue_iframe_navigation(state: &OpState, host_nid: u32) {
             url: None,
             method: "GET".to_string(),
             body: String::new(),
+            inline_body: None,
         });
     }
 }
+
+/// `OBSCURA_DEBUG_FRAMES=1` reports every iframe navigation the page asks for.
+/// A frame that is navigated twice for one `src` fetches its document twice,
+/// which duplicates whatever session state that document carries.
+fn frame_debug(kind: &str, host_nid: u32, url: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_FRAMES").is_some()) {
+        eprintln!(
+            "[frame-nav] {} host={} from={} url={}",
+            kind,
+            host_nid,
+            crate::trace_source::effective(),
+            url
+        );
+    }
+}
+
 
 #[op2(fast)]
 fn op_navigate_iframe(
@@ -4133,6 +5605,7 @@ fn op_navigate_iframe(
     #[string] method: &str,
     #[string] body: &str,
 ) {
+    frame_debug("navigate_iframe", host_nid, url);
     let gs = state.borrow::<SharedState>().clone();
     gs.borrow_mut()
         .pending_iframe_navigations
@@ -4141,6 +5614,31 @@ fn op_navigate_iframe(
             url: Some(url.to_string()),
             method: method.to_string(),
             body: body.to_string(),
+            inline_body: None,
+        });
+}
+
+/// Queue a `blob:` document navigation for an iframe.
+///
+/// A blob URL's bytes live in the page's blob URL store, so there is nothing
+/// for the loader to request: the bootstrap resolves the text (the same store
+/// `fetch()`/`XHR` read) and hands it over with the URL that the frame's
+/// `location.href` and `document.URL` must report. Sending the URL alone to
+/// `op_queue_iframe_navigation` made the loader ask the network client for it,
+/// which rejects every non-http(s) scheme, so the frame silently stayed at
+/// about:blank.
+#[op2(fast)]
+fn op_navigate_iframe_blob(state: &OpState, host_nid: u32, #[string] url: &str, #[string] body: &str) {
+    frame_debug("navigate_iframe_blob", host_nid, url);
+    let gs = state.borrow::<SharedState>().clone();
+    gs.borrow_mut()
+        .pending_iframe_navigations
+        .push(PendingIframeNavigation {
+            host_nid,
+            url: Some(url.to_string()),
+            method: "GET".to_string(),
+            body: String::new(),
+            inline_body: Some(body.to_string()),
         });
 }
 
@@ -4154,6 +5652,34 @@ fn op_navigate_iframe(
 #[op2(fast)]
 fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+#[op2(fast)]
+fn op_browser_timer_schedule(state: &OpState, native_id: f64, delay_ms: f64) {
+    if !native_id.is_finite() || native_id < 0.0 || !delay_ms.is_finite() {
+        return;
+    }
+    let delay = std::time::Duration::from_millis(delay_ms.max(0.0) as u64);
+    let Some(deadline) = std::time::Instant::now().checked_add(delay) else {
+        return;
+    };
+    let shared = state.borrow::<SharedState>().clone();
+    shared
+        .borrow_mut()
+        .browser_timer_deadlines
+        .insert(native_id as u64, deadline);
+}
+
+#[op2(fast)]
+fn op_browser_timer_complete(state: &OpState, native_id: f64) {
+    if !native_id.is_finite() || native_id < 0.0 {
+        return;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    shared
+        .borrow_mut()
+        .browser_timer_deadlines
+        .remove(&(native_id as u64));
 }
 
 /// Wake one browser posted task without routing through Tokio's timer wheel.
@@ -4855,6 +6381,199 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_measure_text(
+    state: &OpState,
+    #[string] text: &str,
+    #[string] font: &str,
+) -> f64 {
+    let shared = state.borrow::<SharedState>().clone();
+    let width = shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64;
+    width
+}
+
+/// Width plus the grid-fitted font box, as `"<width>,<ascent>,<descent>"`.
+///
+/// A flat string rather than JSON: three numbers on a path `measureText` calls
+/// per invocation, where the parse cost is the whole cost.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let metrics = shared
+        .borrow_mut()
+        .canvas_text_measurer
+        .measure_metrics(text, font);
+    format!(
+        "{},{},{}",
+        metrics.width, metrics.font_ascent, metrics.font_descent
+    )
+}
+
+// --- OPFS sync access handles (worker realm, src/worker.rs) ---
+//
+// `FileSystemSyncAccessHandle` is the worker-only OPFS surface, and a browser
+// backs it with real storage: a `write` + `flush` costs milliseconds on the
+// device. An in-memory implementation answers in 0 ms, and the turnstile widget
+// times exactly that (`performance.now()` around `flush()`) and reports the
+// measurement back to the challenge, so the no-op is a fingerprint difference
+// rather than a missing feature (see step 276 of the challenge profile).
+//
+// The backing files live in a per-process temp directory. This is scratch
+// storage for one page's origin, so nothing here needs to outlive the process.
+
+/// Directory holding the OPFS files of this process.
+fn opfs_root() -> &'static PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("obscura-opfs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+fn opfs_table() -> &'static std::sync::Mutex<HashMap<u32, std::fs::File>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, std::fs::File>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// A poisoned table says nothing about these handles, so recover rather than
+/// panic: `op_dom` is not the only op that must not unwind into V8.
+fn opfs_lock() -> std::sync::MutexGuard<'static, HashMap<u32, std::fs::File>> {
+    opfs_table().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn opfs_io(what: &str, error: std::io::Error) -> deno_error::JsErrorBox {
+    deno_error::JsErrorBox::generic(format!("OPFS {what}: {error}"))
+}
+
+/// Open (creating if needed) the backing file for one OPFS file handle and seed
+/// it with the bytes the in-memory node already holds. Returns a handle id.
+#[op2(fast)]
+fn op_opfs_sync_open(
+    _state: Rc<RefCell<OpState>>,
+    #[string] name: &str,
+    #[buffer] initial: &[u8],
+) -> Result<u32, deno_error::JsErrorBox> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(opfs_root().join(safe))
+        .map_err(|e| opfs_io("open", e))?;
+    if !initial.is_empty() {
+        file.write_all(initial).map_err(|e| opfs_io("seed", e))?;
+    }
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let fd = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    opfs_lock().insert(fd, file);
+    Ok(fd)
+}
+
+#[op2(fast)]
+fn op_opfs_sync_write(
+    _state: Rc<RefCell<OpState>>,
+    fd: u32,
+    offset: f64,
+    #[buffer] data: &[u8],
+) -> Result<u32, deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("write", std::io::Error::other("closed handle")))?;
+    file.seek(SeekFrom::Start(offset.max(0.0) as u64))
+        .map_err(|e| opfs_io("seek", e))?;
+    file.write_all(data).map_err(|e| opfs_io("write", e))?;
+    Ok(data.len() as u32)
+}
+
+#[op2]
+#[buffer]
+fn op_opfs_sync_read(
+    _state: Rc<RefCell<OpState>>,
+    fd: u32,
+    offset: f64,
+    len: f64,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("read", std::io::Error::other("closed handle")))?;
+    file.seek(SeekFrom::Start(offset.max(0.0) as u64))
+        .map_err(|e| opfs_io("seek", e))?;
+    let mut out = vec![0u8; len.max(0.0) as usize];
+    let mut filled = 0usize;
+    while filled < out.len() {
+        match file.read(&mut out[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(opfs_io("read", e)),
+        }
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
+/// Writes are already through to the file, so this is the write-back a browser
+/// performs, not an fsync: Chrome's own `flush` on a one-byte write costs ~12 us
+/// of disk work.
+///
+/// It is not free, though, because a browser serves this handle from the
+/// browser process, so every call is an IPC round trip. The reference capture
+/// times exactly that and reports `uUOw3 = 0.54` ms, while an in-process handle
+/// answers in microseconds: a reading no browser can produce, in a field the
+/// challenge measures and sends back. The round trip is therefore modelled
+/// here, the same way `performance.now()` is clamped to Chrome's granularity.
+#[op2(fast)]
+fn op_opfs_sync_flush(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_error::JsErrorBox> {
+    let table = opfs_lock();
+    table
+        .get(&fd)
+        .ok_or_else(|| opfs_io("flush", std::io::Error::other("closed handle")))?;
+    drop(table);
+    std::thread::sleep(std::time::Duration::from_micros(450));
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_opfs_sync_truncate(_state: Rc<RefCell<OpState>>, fd: u32, size: f64) -> Result<(), deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    let file = table.get_mut(&fd).ok_or_else(|| opfs_io("truncate", std::io::Error::other("closed handle")))?;
+    file.set_len(size.max(0.0) as u64)
+        .map_err(|e| opfs_io("truncate", e))
+}
+
+#[op2(fast)]
+fn op_opfs_sync_size(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<f64, deno_error::JsErrorBox> {
+    let table = opfs_lock();
+    let file = table.get(&fd).ok_or_else(|| opfs_io("size", std::io::Error::other("closed handle")))?;
+    Ok(file.metadata().map_err(|e| opfs_io("size", e))?.len() as f64)
+}
+
+#[op2(fast)]
+fn op_opfs_sync_close(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_error::JsErrorBox> {
+    let mut table = opfs_lock();
+    if let Some(file) = table.remove(&fd) {
+        file.sync_all().map_err(|e| opfs_io("close", e))?;
+    }
+    Ok(())
+}
+
 // --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
 //
 // Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
@@ -4867,11 +6586,97 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 /// Whether a serialized origin is a "potentially trustworthy origin" in the
 /// sense the secure-context definition uses: TLS-backed, or loopback.
 fn is_potentially_trustworthy(origin: &str) -> bool {
-    origin.starts_with("https://")
-        || origin.starts_with("wss://")
-        || origin.starts_with("http://localhost")
-        || origin.starts_with("http://127.0.0.1")
-        || origin.starts_with("http://[::1]")
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if matches!(parsed.scheme(), "https" | "wss" | "file") {
+        return true;
+    }
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn worker_environment(
+    shared: &SharedState,
+    name: String,
+    creator_url: &str,
+    creator_root: u32,
+    creator_csp: Option<String>,
+    fingerprint_json: &str,
+    shared_worker: bool,
+    creator_from: &str,
+    // The worker script's own `Content-Security-Policy` response header.
+    // `None` keeps the creator-document inheritance; `Some(header)` is the
+    // Chromium rule for fetched workers: their policy is their own header,
+    // and a fetched worker without one runs with no CSP at all.
+    worker_csp: Option<String>,
+) -> crate::worker::WorkerEnvironment {
+    let gs = shared.borrow();
+    let tuple_origin = url::Url::parse(creator_url)
+        .ok()
+        .map(|parsed| parsed.origin())
+        .filter(url::Origin::is_tuple);
+    let (origin, secure_context) = match tuple_origin {
+        Some(parsed) => {
+            let serialized = parsed.ascii_serialization();
+            let secure = is_potentially_trustworthy(&serialized);
+            (serialized, secure)
+        }
+        None => match gs.inherited_origin.clone() {
+            Some(inherited) => (inherited, gs.inherited_secure_context),
+            None => {
+                let page = url::Url::parse(&gs.url).ok();
+                let origin = page.as_ref().map(|parsed| parsed.origin())
+                    .filter(url::Origin::is_tuple)
+                    .map(|parsed| parsed.ascii_serialization())
+                    .unwrap_or_else(|| "null".to_string());
+                let secure = is_potentially_trustworthy(&origin)
+                    || page.as_ref().is_some_and(|parsed| parsed.scheme() == "file");
+                (origin, secure)
+            }
+        },
+    };
+    crate::worker::WorkerEnvironment {
+        cookie_jar: gs.cookie_jar.clone(),
+        http_client: gs.http_client.clone(),
+        callbacks: gs.callbacks.clone(),
+        blocked_urls: gs.blocked_urls.clone(),
+        page_in_flight: Arc::clone(&gs.page_in_flight),
+        name,
+        shared: shared_worker,
+        origin,
+        secure_context,
+        document_csp: match worker_csp {
+            Some(own) => (!own.is_empty()).then_some(own),
+            None => {
+                if creator_root > 0 {
+                    gs.dom
+                        .as_ref()
+                        .and_then(|dom| {
+                            dom.document_scope(obscura_dom::NodeId::new(creator_root))
+                        })
+                        .and_then(|scope| scope.csp.clone())
+                        .or(creator_csp)
+                } else {
+                    creator_csp.or_else(|| gs.document_csp.clone())
+                }
+            }
+        },
+        fingerprint: serde_json::from_str(fingerprint_json).unwrap_or_default(),
+        trace_label: creator_from.to_string(),
+        #[cfg(feature = "stealth")]
+        stealth_client: gs.stealth_client.clone(),
+    }
 }
 
 #[op2(fast)]
@@ -4882,11 +6687,34 @@ fn op_worker_spawn(
     #[string] kind: String,
     #[string] name: String,
     #[string] creator_url: String,
+    #[string] fingerprint_json: String,
+    #[string] creator_root: String,
+    #[string] creator_csp: String,
+    #[string] creator_from: String,
+    // The worker script response's own Content-Security-Policy header, read
+    // by the JS fetch path. Empty string when the script had none.
+    #[string] worker_csp: String,
 ) -> Result<u32, deno_error::JsErrorBox> {
     let shared = state.borrow::<SharedState>().clone();
-    let environment = {
-        let gs = shared.borrow();
-        // A worker's origin is its creator's. `creator_url` is the
+    let creator_root = creator_root.parse::<u32>().unwrap_or(0);
+    let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    // Chromium: a *fetched* worker (http/https) carries its own response
+    // policy, with no fallback to the creator's; only local-scheme workers
+    // (blob:, data:, about:) inherit the creating document's policy.
+    let local_scheme = !url.starts_with("http:") && !url.starts_with("https:");
+    let environment = worker_environment(
+        &shared,
+        name.clone(),
+        &creator_url,
+        creator_root,
+        creator_csp,
+        &fingerprint_json,
+        false,
+        &creator_from,
+        if local_scheme { None } else { Some(worker_csp) },
+    );
+    let mut gs = shared.borrow_mut();
+        /*
         // constructing realm's own `location.href`: frame realms each have
         // their own, and `SharedState.url` is the top-level document's, so
         // reading the state would give a cross-origin frame's worker the
@@ -4936,13 +6764,14 @@ fn op_worker_spawn(
             blocked_urls: gs.blocked_urls.clone(),
             page_in_flight: Arc::clone(&gs.page_in_flight),
             name,
+            shared: shared_worker,
             origin,
             secure_context,
+            fingerprint: serde_json::from_str(&fingerprint_json).unwrap_or_default(),
             #[cfg(feature = "stealth")]
             stealth_client: gs.stealth_client.clone(),
         }
-    };
-    let mut gs = shared.borrow_mut();
+        */
     let host = gs
         .worker_host
         .get_or_insert_with(crate::worker::WorkerHost::new);
@@ -4966,23 +6795,114 @@ fn op_worker_post_message(state: &OpState, id: u32, #[string] payload: &str) -> 
         .is_some_and(|host| host.post_message(id, payload))
 }
 
+#[op2(fast)]
+fn op_shared_worker_connect(
+    state: &OpState,
+    #[string] source: String,
+    #[string] url: String,
+    #[string] kind: String,
+    #[string] name: String,
+    #[string] creator_url: String,
+    #[string] fingerprint_json: String,
+    #[string] creator_root: String,
+    #[string] creator_csp: String,
+    #[string] creator_from: String,
+    #[string] worker_csp: String,
+) -> Result<u32, deno_error::JsErrorBox> {
+    let shared = state.borrow::<SharedState>().clone();
+    let creator_root = creator_root.parse::<u32>().unwrap_or(0);
+    let creator_csp = (!creator_csp.is_empty()).then_some(creator_csp);
+    let local_scheme = !url.starts_with("http:") && !url.starts_with("https:");
+    let environment = worker_environment(
+        &shared,
+        name.clone(),
+        &creator_url,
+        creator_root,
+        creator_csp,
+        &fingerprint_json,
+        true,
+        &creator_from,
+        if local_scheme { None } else { Some(worker_csp) },
+    );
+    let key = format!("{}\n{}\n{}\n{}", environment.origin, name, url, kind);
+    let connection = {
+        let registry = { shared.borrow().shared_worker_registry.clone() };
+        let mut registry = registry.lock().map_err(|_| deno_error::JsErrorBox::generic("shared worker registry poisoned"))?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.connect(key, source, url, kind, environment)
+        }))
+        .map_err(|_| deno_error::JsErrorBox::generic("shared worker connect panicked"))?
+        .map_err(deno_error::JsErrorBox::generic)?
+    };
+    let id = shared.borrow_mut().shared_worker_host.insert(connection);
+    Ok(id)
+}
+
+#[op2(fast)]
+fn op_shared_worker_post_message(state: &OpState, id: u32, #[string] payload: &str) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let result = shared.borrow().shared_worker_host.post_message(id, payload);
+    result
+}
+
+#[op2(async)]
+#[string]
+async fn op_shared_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    let outbox = {
+        let state = state.borrow();
+        let shared = state.borrow::<SharedState>().clone();
+        let result = shared.borrow().shared_worker_host.outbox(id);
+        result
+    };
+    let Some(outbox) = outbox else { return String::new() };
+    let mut rx = outbox.lock().await;
+    let Some(first) = rx.recv().await else { return String::new() };
+    let mut entries = vec![first];
+    while let Ok(next) = rx.try_recv() { entries.push(next); }
+    format!("[{}]", entries.join(","))
+}
+
 /// Await the worker's next outbox batch. Returns a JSON array of entries, or
 /// an empty string once the worker is terminated/gone. The bootstrap recv
 /// loop unrefs the promise so an idle page with live workers still settles.
 #[op2(async)]
 #[string]
 async fn op_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
+    // Without an executor nothing can drive the worker's receive loop either,
+    // and awaiting a Tokio primitive from here panics inside a v8 callback
+    // frame, which aborts the process rather than failing one call. A caller
+    // with no runtime gets an empty batch and polls again.
+    if tokio::runtime::Handle::try_current().is_err() {
+        worker_recv_debug(id, "no-tokio-runtime");
+        return String::new();
+    }
+    // This op is called from JS while the embedder may hold the same state
+    // borrowed (a page polling a worker reply during one of its own ops, for
+    // instance). A panic here unwinds into a v8::FunctionCallback frame, which
+    // aborts the process instead of failing one call, so contention returns an
+    // empty batch and the caller polls again.
     let outbox = {
-        let state = state.borrow();
+        let Ok(state) = state.try_borrow() else {
+            worker_recv_debug(id, "opstate-borrowed");
+            return String::new();
+        };
         let shared = state.borrow::<SharedState>().clone();
-        let gs = shared.borrow();
-        gs.worker_host.as_ref().and_then(|host| host.outbox(id))
+        let mut found = None;
+        let guard = shared.try_borrow();
+        if let Ok(gs) = guard {
+            found = gs.worker_host.as_ref().and_then(|host| host.outbox(id));
+        } else {
+            worker_recv_debug(id, "shared-state-borrowed");
+        }
+        found
     };
     let Some(outbox) = outbox else {
+        worker_recv_debug(id, "no-outbox");
         return String::new();
     };
     let mut rx = outbox.lock().await;
     let Some(first) = rx.recv().await else {
+        worker_recv_debug(id, "outbox-closed");
         return String::new();
     };
     let mut entries = vec![first];
@@ -5009,7 +6929,7 @@ fn op_worker_terminate(state: &OpState, id: u32) -> bool {
 #[op2(fast)]
 fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
     let shared = state.borrow::<SharedState>().clone();
-    let gs = shared.borrow();
+    let Ok(gs) = shared.try_borrow() else { return false; };
     match gs.worker_outbox.as_ref() {
         Some(tx) => tx.send(crate::worker::message_entry(payload)).is_ok(),
         None => false,
@@ -5019,7 +6939,10 @@ fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
 #[op2(fast)]
 fn op_worker_close(state: &OpState) {
     let shared = state.borrow::<SharedState>().clone();
-    shared.borrow_mut().worker_close_requested = true;
+    let guard = shared.try_borrow_mut();
+    if let Ok(mut gs) = guard {
+        gs.worker_close_requested = true;
+    }
 }
 
 // --- Cross-document postMessage ops (design doc Phase 4) ---
@@ -5075,10 +6998,17 @@ fn op_post_to_frame(
             return "no-frame".into();
         };
         let host = NodeId::new(host_nid);
+        let __dbg = std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some();
         let Some(target_root) = dom.iframe_content_document(host) else {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> no-frame payload_bytes={} payload={}", host_nid, payload.len(), payload);
+            }
             return "no-frame".into();
         };
         let Some(target_scope) = dom.document_scope(target_root) else {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> no-scope payload_bytes={} payload={}", host_nid, payload.len(), payload);
+            }
             return "no-frame".into();
         };
         let sender_origin = if sender_root > 0 {
@@ -5093,7 +7023,15 @@ fn op_post_to_frame(
                 .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url))
         };
         if !post_message_target_allows(target_origin, &sender_origin, &target_scope.origin) {
+            if __dbg {
+                eprintln!("[pmsg] post_to_frame host={} -> dropped(origin) target={} payload_bytes={} payload={}",
+                    host_nid, target_origin, payload.len(), payload);
+            }
             return "dropped".into();
+        }
+        if __dbg {
+            eprintln!("[pmsg] post_to_frame host={} -> queued payload_bytes={} payload={}",
+                host_nid, payload.len(), payload);
         }
         // MessageEvent.source, reconstructed in the target realm: `parent`
         // when the sender document directly contains the host, `top` when the
@@ -5195,6 +7133,19 @@ fn op_post_to_parent(
     if to_main {
         gs.frame_message_notify.notify_one();
     }
+    // The frame-to-embedder direction carries the challenge verdict: the
+    // widget announces `complete` with a token or a failure code. Logging it
+    // under the same opt-in switch as the reverse direction makes the
+    // decision visible without changing what the page observes.
+    if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+        eprintln!(
+            "[pmsg] post_to_parent sender_root={} to_top={} -> queued payload_bytes={} payload={}",
+            sender_root,
+            to_top,
+            payload.len(),
+            payload
+        );
+    }
     "ok".into()
 }
 
@@ -5250,7 +7201,7 @@ async fn op_frame_message_recv(state: Rc<RefCell<OpState>>) -> String {
 }
 
 pub fn build_extension() -> Extension {
-    let mut ops = vec![
+    let ops = vec![
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
@@ -5259,17 +7210,30 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_monotonic_ms(),
         op_run_classic_script(),
+        op_ensure_frame_realm(),
         op_fetch_url(),
+        op_websocket_open(),
+        op_websocket_send(),
+        op_websocket_recv(),
+        op_websocket_close(),
+        op_private_state_query(),
+        op_has_storage_access(),
         op_get_cookies(),
         op_get_cookies_for_url(),
         op_set_cookie(),
         op_set_cookie_for_url(),
         op_origin_storage(),
+        op_indexeddb_load(),
+        op_indexeddb_save(),
+        op_indexeddb_delete(),
         op_navigate(),
         op_navigate_frame(),
         op_queue_iframe_navigation(),
         op_navigate_iframe(),
+        op_navigate_iframe_blob(),
         op_async_runtime_available(),
+        op_browser_timer_schedule(),
+        op_browser_timer_complete(),
         op_posted_task(),
         op_binding_called(),
         op_subtle_digest(),
@@ -5279,6 +7243,7 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_ctr(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
+        crate::subtle_asym::op_subtle_asym(),
         op_random_bytes(),
         op_url_parse(),
         op_url_set(),
@@ -5288,16 +7253,31 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_opfs_sync_open(),
+        op_opfs_sync_write(),
+        op_opfs_sync_read(),
+        op_opfs_sync_flush(),
+        op_opfs_sync_truncate(),
+        op_opfs_sync_size(),
+        op_opfs_sync_close(),
         op_worker_spawn(),
         op_worker_post_message(),
         op_worker_recv(),
         op_worker_terminate(),
+        op_shared_worker_connect(),
+        op_shared_worker_post_message(),
+        op_shared_worker_recv(),
         op_worker_post_to_page(),
         op_worker_close(),
         op_post_to_frame(),
         op_post_to_parent(),
         op_frame_message_recv(),
+        op_trace_push_source(),
+        op_trace_pop_source(),
+        op_tracelog(),
     ];
+    #[cfg(feature = "render")]
+    let mut ops = ops;
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
@@ -5307,6 +7287,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
+        ops.push(op_canvas_measure_text());
+        ops.push(op_canvas_text_metrics());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
@@ -5325,6 +7307,7 @@ pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
+        global_template_middleware: None,
         ..Default::default()
     }
 }
@@ -5512,6 +7495,18 @@ pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
+    let csp_origin = state
+        .top_origin
+        .as_ref()
+        .map(|origin| origin.serialize())
+        .unwrap_or_else(|| {
+            url::Url::parse(&state.url)
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "null".to_string())
+        });
+    state
+        .render_resources
+        .set_font_csp(state.document_csp.as_deref(), &csp_origin);
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
@@ -5938,6 +7933,69 @@ fn finish_async_image_metadata(
     image_metadata_json(current_src, density, known, dimensions)
 }
 
+/// Transport milestones of an image response, in the shape the element's realm
+/// needs to file a `PerformanceResourceTiming` entry. Durations are relative to
+/// the start of the fetch -- the realm owns the time origin and adds its own
+/// `fetchStart`, so no page-level clock has to cross the op boundary.
+///
+/// Timing-Allow-Origin gating happens here rather than in JS because the op
+/// already knows the initiator's origin and the raw response headers. When it
+/// is denied, the caller only learns `responseEnd`, matching what Chrome
+/// exposes for an opaque cross-origin resource.
+#[cfg(feature = "render")]
+fn image_resource_timing_json(
+    response: &obscura_net::Response,
+    initiator_origin: &str,
+) -> serde_json::Value {
+    let same_origin = response.url.origin().ascii_serialization() == initiator_origin;
+    let timing_allowed = same_origin
+        || response.header("timing-allow-origin").is_some_and(|value| {
+            value.split(',').map(str::trim).any(|allowed| {
+                allowed == "*" || (!initiator_origin.is_empty() && allowed == initiator_origin)
+            })
+        });
+    let response_start = response.timing.response_start.as_secs_f64() * 1_000.0;
+    let response_end = response.timing.response_end.as_secs_f64() * 1_000.0;
+    tracing::debug!(
+        target: "obscura::performance",
+        initiator_type = "img",
+        url = %response.url,
+        response_start_ms = response_start,
+        response_end_ms = response_end,
+        body_size = response.body.len(),
+        timing_allowed,
+        "image transport timing handed to the element's realm",
+    );
+    serde_json::json!({
+        "url": response.url.as_str(),
+        "status": response.status,
+        "responseStart": response_start,
+        "responseEnd": response_end,
+        "redirectEnd": response.timing.redirect_end.as_secs_f64() * 1_000.0,
+        "redirectCount": response.redirected_from.len(),
+        "encodedBodySize": response.body.len(),
+        "timingAllowed": timing_allowed,
+    })
+}
+
+/// Attach transport timing to an image metadata payload without disturbing its
+/// lifecycle fields. Only the request's leader carries timing: followers that
+/// joined an in-flight fetch, and cache hits, produce no second network sample
+/// and therefore no duplicate entry.
+#[cfg(feature = "render")]
+fn with_image_resource_timing(metadata: String, timing: Option<serde_json::Value>) -> String {
+    let Some(timing) = timing else {
+        return metadata;
+    };
+    match serde_json::from_str::<serde_json::Value>(&metadata) {
+        Ok(serde_json::Value::Object(mut fields)) => {
+            fields.insert("timing".to_string(), timing);
+            serde_json::Value::Object(fields).to_string()
+        }
+        _ => metadata,
+    }
+}
+
 /// Load HTMLImageElement bytes through the owning page's async transport.
 /// Network runs after every RefCell borrow is released, requests for the same
 /// navigation/URL/profile share one fetch, and completion revalidates both the
@@ -5964,6 +8022,8 @@ async fn op_load_image_metadata(
         callbacks,
         page_in_flight,
         blocked,
+        initiator_origin,
+        csp_blocked,
     ) = {
         let gs = shared.borrow();
         let Some(dom) = gs.dom.as_ref() else {
@@ -5984,7 +8044,15 @@ async fn op_load_image_metadata(
                 .to_string();
         };
         if known {
-            return cached_image_metadata_for_node(&gs, node_id, &node_base);
+            let cached = cached_image_metadata_for_node(&gs, node_id, &node_base);
+            if cached.contains("\"ok\":false") || cached.contains("\"dimensions\":null") {
+                tracing::debug!(
+                    "image served from cache as failure: {} -> {}",
+                    selected_url,
+                    cached
+                );
+            }
+            return cached;
         }
         // The referrer and origin of a frame's image request are the frame's,
         // not the embedder's -- Chrome sends the widget document as Referer.
@@ -6007,6 +8075,38 @@ async fn op_load_image_metadata(
         let blocked = gs.blocked_urls.iter().any(|pattern| {
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
+        let initiator_origin = initiator.origin().ascii_serialization();
+        let (csp_header, csp_origin) = dom
+            .containing_document_root_shadow_including(node_id)
+            .and_then(|root| {
+                dom.document_scope(root).map(|scope| (scope.csp, scope.origin.serialize()))
+            })
+            .unwrap_or_else(|| {
+                (
+                    gs.document_csp.clone(),
+                    gs.top_origin
+                        .as_ref()
+                        .map(|origin| origin.serialize())
+                        .unwrap_or_else(|| initiator_origin.clone()),
+                )
+            });
+        let csp_blocked = !csp_resource_allows(
+            csp_header.as_deref(),
+            "img-src",
+            &selected_url,
+            &csp_origin,
+        );
+        if csp_blocked {
+            // Same reason as the connect-src log: a refused image only surfaces
+            // as an `error` event on the element, which is also what a network
+            // failure looks like. Name the policy and the document it came from.
+            tracing::debug!(
+                "image blocked by img-src: {} (csp-origin={}, csp={:?})",
+                selected_url,
+                csp_origin,
+                csp_header.as_deref().unwrap_or("<none>")
+            );
+        }
         (
             gs.document_generation,
             selected_url,
@@ -6016,6 +8116,8 @@ async fn op_load_image_metadata(
             gs.callbacks.clone(),
             Arc::clone(&gs.page_in_flight),
             blocked,
+            initiator_origin,
+            csp_blocked,
         )
     };
 
@@ -6047,6 +8149,7 @@ async fn op_load_image_metadata(
         }
     };
     if let Some(receiver) = follower {
+        tracing::debug!("image request joined in-flight leader: {}", selected_url);
         let _ = receiver.await;
         return finish_async_image_metadata(
             &shared,
@@ -6068,7 +8171,15 @@ async fn op_load_image_metadata(
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let response = if blocked || csp_blocked || parsed_url.is_none() {
+        if blocked || csp_blocked {
+            tracing::debug!(
+                "image fetch not attempted: {} (blocked={} csp_blocked={})",
+                selected_url,
+                blocked,
+                csp_blocked
+            );
+        }
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -6110,6 +8221,24 @@ async fn op_load_image_metadata(
                 .ok()
         }
     };
+    // Chrome exposes every image fetch in the Performance Timeline, including
+    // the ones whose bytes are never decoded. The entry is built here because
+    // this is the only place holding the transport timing; the element's realm
+    // records it (see `_runImageRequest`), so a frame's image lands in that
+    // frame's timeline rather than the embedder's.
+    let resource_timing = response
+        .as_ref()
+        .map(|response| image_resource_timing_json(response, &initiator_origin));
+    if let Some(response) = response.as_ref() {
+        if !(200..300).contains(&response.status) {
+            tracing::debug!(
+                "image fetch non-2xx: {} -> {} ({} bytes)",
+                selected_url,
+                response.status,
+                response.body.len()
+            );
+        }
+    }
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -6131,11 +8260,21 @@ async fn op_load_image_metadata(
                         // must not invalidate the retained render again.
                         invalidate_render_resource_geometry(&mut gs);
                     } else {
+                        tracing::debug!(
+                            "image bytes undecodable ({} bytes, first: {:02x?}): {}",
+                            bytes.len(),
+                            &bytes.iter().take(8).collect::<Vec<_>>(),
+                            selected_url
+                        );
                         gs.render_resources
                             .seed_image_missing(selected_url.clone(), request_profile);
                     }
                 }
                 None => {
+                    tracing::debug!(
+                        "image fetch produced no usable body: {} (transport error, block, or non-2xx)",
+                        selected_url
+                    );
                     gs.render_resources
                         .seed_image_missing(selected_url.clone(), request_profile);
                 }
@@ -6148,14 +8287,15 @@ async fn op_load_image_metadata(
     for waiter in waiters {
         let _ = waiter.send(());
     }
-    finish_async_image_metadata(
+    let metadata = finish_async_image_metadata(
         &shared,
         node_id,
         document_generation,
         &selected_url,
         request_profile,
         &node_base,
-    )
+    );
+    with_image_resource_timing(metadata, resource_timing)
 }
 
 #[cfg(feature = "render")]
@@ -6251,29 +8391,71 @@ fn prepared_for_frame_root(
     let viewport = if parent_root == dom.document() {
         frame_content_box_from_parent(main_prepared, host)?
     } else {
-        let parent =
-            prepared_for_frame_root(
-                dom,
-                parent_root,
-                main_prepared,
-                resources,
-                frame_states,
-                depth + 1,
-            )?;
-        frame_content_box_from_parent(&parent, host)?
+        let parent = prepared_for_frame_root(
+            dom,
+            parent_root,
+            main_prepared,
+            resources,
+            frame_states,
+            depth + 1,
+        )?;
+        let result = frame_content_box_from_parent(&parent, host);
+        store_frame_prepared(dom, parent_root, parent, frame_states);
+        result?
     };
     let base_url = dom.document_scope(frame_root).map(|scope| scope.base_url);
+    if let Some(scope) = dom.document_scope(frame_root) {
+        resources.set_font_csp(scope.csp.as_deref(), &scope.origin.serialize());
+    }
+    let generation = dom
+        .document_scope(frame_root)
+        .map(|scope| scope.document_generation)
+        .unwrap_or(0);
+    let (cached, mut stylesheet_cache, mut animation_timeline) = {
+        let frame_state = frame_states.entry(frame_root).or_default();
+        let cached = frame_state.prepared_render.take().filter(|prepared| {
+            prepared.viewport() == viewport
+                && prepared.animation_sample() == main_prepared.animation_sample()
+                && frame_state.cached_generation == generation
+        });
+        (
+            cached,
+            std::mem::take(&mut frame_state.stylesheet_cache),
+            std::mem::take(&mut frame_state.animation_timeline),
+        )
+    };
+    let prepared = cached.or_else(|| {
+        obscura_render::prepare_frame_document(
+            dom,
+            frame_root,
+            viewport,
+            base_url.as_deref(),
+            resources,
+            &mut stylesheet_cache,
+            main_prepared.animation_sample(),
+            &mut animation_timeline,
+        )
+    });
     let frame_state = frame_states.entry(frame_root).or_default();
-    obscura_render::prepare_frame_document(
-        dom,
-        frame_root,
-        viewport,
-        base_url.as_deref(),
-        resources,
-        &mut frame_state.stylesheet_cache,
-        main_prepared.animation_sample(),
-        &mut frame_state.animation_timeline,
-    )
+    frame_state.stylesheet_cache = stylesheet_cache;
+    frame_state.animation_timeline = animation_timeline;
+    prepared
+}
+
+#[cfg(feature = "render")]
+fn store_frame_prepared(
+    dom: &DomTree,
+    frame_root: NodeId,
+    prepared: obscura_render::PreparedRender,
+    frame_states: &mut HashMap<NodeId, FrameRenderState>,
+) {
+    let generation = dom
+        .document_scope(frame_root)
+        .map(|scope| scope.document_generation)
+        .unwrap_or(0);
+    let frame_state = frame_states.entry(frame_root).or_default();
+    frame_state.cached_generation = generation;
+    frame_state.prepared_render = Some(prepared);
 }
 
 /// Serialize one node's viewport-relative geometry from a prepared layout, in
@@ -6286,9 +8468,35 @@ fn frame_geometry_json(
     nid: NodeId,
     scroll: &obscura_render::ResolvedScrollState,
 ) -> String {
-    let Some(rect) = prepared.viewport_rect_with_scroll(nid, scroll) else {
+    let debug = std::env::var_os("OBSCURA_GEOM_DEBUG").is_some();
+    let cssom_src = prepared.layout().cssom_rects.get(&nid).copied();
+    let layout_src = prepared.layout().rects.get(&nid).copied();
+    let transform = prepared.layout().transforms.get(&nid).copied();
+    let Some(rect) = prepared.cssom_viewport_rect_with_scroll(nid, scroll) else {
+        if debug {
+            eprintln!(
+                "[geom] nid={} cssom={:?} rects={:?} transform={:?} -> NO CSSOM RECT",
+                nid.raw(),
+                cssom_src,
+                layout_src,
+                transform.map(|t| (t.a, t.d, t.e, t.f))
+            );
+        }
         return String::new();
     };
+    if debug {
+        eprintln!(
+            "[geom] nid={} cssom={:?} rects={:?} transform={:?} -> out=({},{},{},{})",
+            nid.raw(),
+            cssom_src,
+            layout_src,
+            transform.map(|t| (t.a, t.d, t.e, t.f)),
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height
+        );
+    }
     let Some((client_width, client_height)) = prepared.client_size(nid) else {
         return String::new();
     };
@@ -6307,11 +8515,23 @@ fn frame_geometry_json(
         })
         .collect::<Vec<_>>();
     let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
+    // `offsetWidth`/`offsetHeight` report the layout border box and ignore
+    // visual transforms (Chromium: getBoundingClientRect() is the transformed
+    // one, offset* the untransformed one). The transformed rect above can
+    // overflow binary32 for pathological scales, so ship the layout size
+    // alongside it instead of deriving offset* from it in the bootstrap.
+    let layout_size = prepared
+        .layout()
+        .rects
+        .get(&nid)
+        .map(|rect| (rect.width, rect.height));
     serde_json::json!({
         "x": rect.x,
         "y": rect.y,
         "width": rect.width,
         "height": rect.height,
+        "layoutWidth": layout_size.map(|(width, _)| width),
+        "layoutHeight": layout_size.map(|(_, height)| height),
         "clientWidth": client_width,
         "clientHeight": client_height,
         "clientRects": client_rects,
@@ -6355,7 +8575,9 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
                 return String::new();
             };
             let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
-            return frame_geometry_json(&prepared, nid, &scroll);
+            let result = frame_geometry_json(&prepared, nid, &scroll);
+            store_frame_prepared(dom, root, prepared, frame_states);
+            return result;
         }
 
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
@@ -6553,23 +8775,29 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
     // that document's layout, not the top-level page's -- a frame previously
     // reported the embedder's viewport as its own innerWidth/scrollWidth.
     let frame_root = NodeId::new(frame_root_str.parse().unwrap_or(0));
-    let is_frame = gs
-        .dom
-        .as_ref()
-        .is_some_and(|dom| dom.iframe_host(frame_root).is_some());
+    let top_root = gs.dom.as_ref().map(|dom| dom.document());
+    // Decide by caller identity, not by resolving the host: a detached or
+    // navigated-away frame root used to fall into the top-level branch and
+    // leak the page viewport into the frame realm.
+    let is_frame = frame_root.raw() != 0 && Some(frame_root) != top_root;
+    // A frame whose layout cannot be resolved reports an explicit unrendered
+    // zero: Chrome gives a display:none or 0x0 iframe a 0x0 viewport, while an
+    // empty string told bootstrap to fall back to the screen-derived value.
+    let unrendered = "\
+        {\"scrollWidth\":0,\"scrollHeight\":0,\"clientWidth\":0,\"clientHeight\":0,\"rendered\":false}";
     let (viewport, content) = if is_frame {
         // The frame viewport is read from its host's box in the parent layout,
         // so the top document must be prepared first. At frame-realm init time
         // the main `prepared_render` is not built yet.
         if ensure_prepared_geometry(&mut gs).is_none() {
-            return String::new();
+            return unrendered.to_string();
         }
         let g = &mut *gs;
         let Some(dom) = g.dom.as_ref() else {
-            return String::new();
+            return unrendered.to_string();
         };
         let Some(main_prepared) = g.prepared_render.as_ref() else {
-            return String::new();
+            return unrendered.to_string();
         };
         let resources = &mut g.render_resources;
         let frame_states = &mut g.frame_render_states;
@@ -6582,9 +8810,11 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
             0,
         )
         else {
-            return String::new();
+            return unrendered.to_string();
         };
-        (prepared.viewport(), prepared.content_size())
+        let result = (prepared.viewport(), prepared.content_size());
+        store_frame_prepared(dom, frame_root, prepared, frame_states);
+        result
     } else {
         let viewport = gs.viewport;
         let content = ensure_prepared_geometry(&mut gs)
@@ -6632,7 +8862,9 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
             return String::new();
         };
         let scroll = prepared.resolve_scroll_state(dom, (0.0, 0.0), element_offsets);
-        prepared.element_scroll_metrics(nid, &scroll)
+        let metrics = prepared.element_scroll_metrics(nid, &scroll);
+        store_frame_prepared(dom, root, prepared, frame_states);
+        metrics
     } else {
         let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
             return String::new();

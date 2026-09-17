@@ -8,13 +8,23 @@ repository = "https://github.com/h4ckf0r0day/obscura"
 license = "Apache-2.0"
 
 [features]
-default = ["api"]
+default = ["api", "stealth"]
 api = ["obscura-browser", "obscura-net", "tokio"]
+# Forwarding only -- the facade has no stealth-gated code (Config::stealth in
+# src/config.rs is a runtime flag, independent of this). It pulls in `api`
+# because activating obscura-browser/stealth alone would enable the optional
+# dependency without `tokio`, which does not compile. Downstream opts out with
+# `default-features = false, features = ["api"]`; that also drops the cmake and
+# clang build requirements that BoringSSL imposes.
+stealth = ["api", "obscura-browser/stealth", "obscura-net/stealth"]
 render = ["api", "obscura-browser/render"]
 
 [dependencies]
-obscura-browser = { path = "../obscura-browser", optional = true }
-obscura-net = { path = "../obscura-net", optional = true }
+# Not `workspace = true`, so these carry their own default-features = false --
+# same reason as the workspace entries: the facade's `stealth` feature has to be
+# the only thing that turns BoringSSL on, or downstream cannot turn it off.
+obscura-browser = { path = "../obscura-browser", optional = true, default-features = false }
+obscura-net = { path = "../obscura-net", optional = true, default-features = false }
 anyhow = "1"
 tokio = { version = "1", features = ["rt"], optional = true }
 thiserror = "1"
@@ -24,3 +34,10 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# docs.rs has no cmake, and building BoringSSL there would fail the doc build
+# outright. Document the API and render surfaces instead; `stealth` adds no
+# public items, only a different transport behind the same signatures.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["api", "render"]

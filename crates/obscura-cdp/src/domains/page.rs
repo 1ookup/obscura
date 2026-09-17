@@ -1425,6 +1425,18 @@ pub fn emit_navigation_events(
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
     // via `requestId === loaderId && type === "Document"` (issue #189).
+    // Frame navigations are collected alongside the top-level response. Keep
+    // their owning frame and loader available while emitting the combined
+    // event stream, so an iframe 404 is not projected onto the main frame.
+    let frame_metadata: std::collections::HashMap<String, (String, String)> = ctx
+        .get_page(page_id)
+        .map(|page| {
+            collect_child_frames(page)
+                .into_iter()
+                .map(|frame| (frame.frame_id, (frame.loader_id, frame.url)))
+                .collect()
+        })
+        .unwrap_or_default();
     let nav_request_ids: Vec<String> = {
         let mut nav_seen = false;
         network_events
@@ -1482,6 +1494,8 @@ pub fn emit_navigation_events(
     // executionContextCreated events are emitted. Issue #407: previously this
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
+    ctx.debugger_scripts
+        .retain(|(script_session, _)| script_session != &es);
     // Keep the execution-context table in lockstep with the id set. The
     // teardown above already emitted Destroyed for (and removed) every entry
     // of this page's frames; this clears any cross-page leftovers so no table
@@ -1512,6 +1526,10 @@ pub fn emit_navigation_events(
             session_id: es.clone(),
         },
     ];
+    // Debugger.scriptParsed is a lifecycle notification, not a response to a
+    // Runtime command. Emit it alongside the newly committed document so a
+    // debugger enabled before navigation sees the same ordering as Chrome.
+    super::debugger::emit_navigation_script(ctx, &es, page_id, page_url);
     // The default world is re-created as context id 2; re-register it. Isolated
     // worlds register themselves via next_isolated_context in the loop below.
     ctx.valid_context_ids.insert(2);
@@ -1570,6 +1588,7 @@ pub fn emit_navigation_events(
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
             let rid = &nav_request_ids[i];
+            let event_frame_id = net_event.frame_id.as_deref().unwrap_or(frame_id);
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -1579,7 +1598,7 @@ pub fn emit_navigation_events(
                         "method": net_event.method,
                         "headers": net_event.headers,
                     },
-                    "frameId": frame_id,
+                    "frameId": event_frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
                 }),
@@ -1590,16 +1609,25 @@ pub fn emit_navigation_events(
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
+        let event_frame_id = net_event.frame_id.as_deref().unwrap_or(frame_id);
+        let event_loader_id = frame_metadata
+            .get(event_frame_id)
+            .map(|(loader_id, _)| loader_id.as_str())
+            .unwrap_or(loader_id);
+        let event_document_url = frame_metadata
+            .get(event_frame_id)
+            .map(|(_, url)| url.as_str())
+            .unwrap_or(page_url);
         if Some(i) != nav_idx {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": event_loader_id, "documentURL": event_document_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": event_frame_id}),
                 session_id: es.clone(),
             });
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": event_loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": event_frame_id}),
             session_id: es.clone(),
         });
         ctx.pending_events.push(CdpEvent {
@@ -1740,6 +1768,88 @@ pub(crate) fn emit_runtime_network_events(
     }
 }
 
+/// Emit the network portion of a direct child-frame navigation. This path does
+/// not use the top-level `emit_navigation_events` batch, but clients still
+/// expect the request/response/body events for the frame's loader.
+fn emit_frame_network_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    document_url: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+) {
+    for network_event in network_events {
+        let request_id = &network_event.request_id;
+        if ctx.fetch_intercept.enabled {
+            ctx.pending_events.push(CdpEvent {
+                method: "Fetch.requestPaused".into(),
+                params: json!({
+                    "requestId": request_id,
+                    "request": {
+                        "url": network_event.url,
+                        "method": network_event.method,
+                        "headers": network_event.headers,
+                    },
+                    "frameId": frame_id,
+                    "resourceType": network_event.resource_type,
+                    "networkId": request_id,
+                }),
+                session_id: session_id.clone(),
+            });
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "documentURL": document_url,
+                "request": {
+                    "url": network_event.url,
+                    "method": network_event.method,
+                    "headers": network_event.headers,
+                },
+                "timestamp": network_event.timestamp,
+                "wallTime": network_event.timestamp,
+                "initiator": {"type": "other"},
+                "type": network_event.resource_type,
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.responseReceived".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "timestamp": network_event.timestamp,
+                "type": network_event.resource_type,
+                "response": {
+                    "url": network_event.url,
+                    "status": network_event.status,
+                    "statusText": "",
+                    "headers": &*network_event.response_headers,
+                    "mimeType": network_event.response_headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.loadingFinished".into(),
+            params: json!({
+                "requestId": request_id,
+                "timestamp": network_event.timestamp,
+                "encodedDataLength": network_event.body_size,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
 /// `Page.navigate`.
 pub fn parse_wait_until(params: &Value) -> WaitUntil {
@@ -1828,21 +1938,43 @@ async fn navigate_child_frame(
         sandbox,
         ..Default::default()
     };
-    let loader_id = {
+    let (loader_id, document_url, network_events) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         page.navigate_frame_for_cdp(frame_id, request)
             .await
             .map_err(|error| error.to_string())?;
-        page.frames
+        let loader_id = page
+            .frames
             .get(frame_id)
             .map(|frame| frame.loader_id.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let document_url = page
+            .frames
+            .get(frame_id)
+            .and_then(|frame| frame.active_document_root)
+            .and_then(|root| page.with_dom(|dom| dom.document_scope(root)).flatten())
+            .map(|scope| scope.url)
+            .unwrap_or_else(|| url.to_string());
+        let all_events = std::mem::take(&mut page.network_events);
+        let (frame_events, other_events): (Vec<_>, Vec<_>) = all_events
+            .into_iter()
+            .partition(|event| event.frame_id.as_deref() == Some(frame_id));
+        page.network_events = other_events;
+        (loader_id, document_url, frame_events)
     };
     // Old-document contexts (and any removed descendant frames) go first,
     // then the navigated subtree's lifecycle and fresh realm contexts.
     emit_frame_teardown_events(ctx, session_id, &page_id);
+    emit_frame_network_events(
+        ctx,
+        session_id,
+        frame_id,
+        &loader_id,
+        &document_url,
+        &network_events,
+    );
     emit_frame_rollout_events(ctx, session_id, &page_id);
     Ok(json!({
         "frameId": frame_id,
@@ -2502,6 +2634,7 @@ mod tests {
             resource_type: "Fetch".into(),
             status: 200,
             headers: std::collections::HashMap::new(),
+            frame_id: None,
             response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
                 "content-type".into(),
                 "application/json".into(),
@@ -2531,6 +2664,52 @@ mod tests {
                 "Page.frameNavigated" | "Page.lifecycleEvent"
             )
         }));
+    }
+
+    #[test]
+    fn frame_network_events_keep_child_frame_identity() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+        let main_frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+        let event = obscura_browser::NetworkEvent {
+            request_id: "page.2".into(),
+            url: "https://child.example/missing".into(),
+            method: "GET".into(),
+            resource_type: "Document".into(),
+            frame_id: Some("frame-child".into()),
+            status: 404,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
+                "content-type".into(),
+                "text/html".into(),
+            )])),
+            body_size: 12,
+            timestamp: 42.0,
+        };
+
+        emit_navigation_events(
+            &mut ctx,
+            &session_id,
+            &main_frame_id,
+            "loader-main",
+            "about:blank",
+            &page_id,
+            &[event],
+            WaitUntil::DomContentLoaded,
+            false,
+        );
+
+        let response = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Network.responseReceived")
+            .expect("child response event");
+        assert_eq!(response.params["frameId"], "frame-child");
+        assert_eq!(response.params["response"]["status"], 404);
+        assert_eq!(response.params["loaderId"], "loader-main");
     }
 
     #[tokio::test]
@@ -2645,6 +2824,15 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // The screenshot raster scales with the fingerprint's devicePixelRatio
+        // (2.0 under the default macOS identity). These dimension assertions
+        // pin a 1x fingerprint so the pixel expectations stay stable.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((100.0, 80.0));
@@ -2671,6 +2859,14 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // 1x fingerprint so clip rasters keep their pixel dimensions; see
+        // the comment in screenshot_fixture.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((100.0, 80.0));
@@ -3384,6 +3580,15 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
+        // Pin a 1x fingerprint: the default macOS identity doubles every
+        // raster through devicePixelRatio and pushes this 17000px body past
+        // the striped-capture pixel limit.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_browser_fingerprint(obscura_net::BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            ))
+            .await;
         ctx.get_session_page_mut(&session)
             .expect("page")
             .set_viewport((1000.0, 700.0));

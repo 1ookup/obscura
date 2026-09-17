@@ -42,6 +42,9 @@ impl WorkerResponse {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if let Ok(flags) = std::env::var("OBSCURA_V8_FLAGS") {
+        obscura_js::set_v8_flags(&flags);
+    }
     tracing_subscriber::fmt()
         .with_env_filter("warn")
         .with_writer(std::io::stderr)
@@ -142,4 +145,9 @@ async fn main() {
         let _ = stdout.write_all(out.as_bytes()).await;
         let _ = stdout.flush().await;
     }
+
+    // Records from this worker's pages are batched on a background thread; hold
+    // the process open long enough to write the tail. A no-op when the parent
+    // did not pass OBSCURA_TRACELOG_FILE.
+    obscura_js::tracelog::flush();
 }

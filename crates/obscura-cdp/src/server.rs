@@ -647,14 +647,22 @@ fn handle_http_json_blocking(
     let _ = stream.read(&mut buf)?;
 
     let body = match endpoint {
-        "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/145.0.0.0",
-            "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            "V8-Version": "14.5.0.0",
-            "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
-        }))?,
+        "version" => {
+            // Derived from the same contract as navigator so DevTools clients
+            // see the same browser version the page reports.
+            let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+                obscura_net::DEFAULT_USER_AGENT,
+            )
+            .with_overrides(&obscura_net::fingerprint_overrides_from_env());
+            serde_json::to_string_pretty(&json!({
+                "Browser": format!("Chrome/{}", fingerprint.browser_version),
+                "Protocol-Version": "1.3",
+                "User-Agent": obscura_net::DEFAULT_USER_AGENT,
+                "V8-Version": "14.6.0.0",
+                "WebKit-Version": "537.36",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+            }))?
+        }
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
             "devtoolsFrontendUrl": "",
@@ -1146,7 +1154,8 @@ async fn process_with_interception(
         }
     };
 
-    tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
+    let nav_url = req.params.get("url").and_then(|value| value.as_str()).unwrap_or("");
+    tracing::info!("INTERCEPTION navigate: {} (id={}, url={})", req.method, req.id, nav_url);
 
     let session_id = &req.session_id;
     let page_id = session_id
@@ -1484,19 +1493,10 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
+        "Inspector.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
         "Target.setAutoAttach" => {
             Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
-                "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-                "jsVersion": "14.5.0.0",
-            }))
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))

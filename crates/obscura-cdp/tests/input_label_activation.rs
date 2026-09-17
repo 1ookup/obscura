@@ -53,9 +53,10 @@ async fn serve_fixture() -> String {
 
           <script>
             window.log = [];
+            window.targetTags = {};
             for (const id of ['cb', 'ext', 'cb2', 'cb3']) {
               document.getElementById(id).addEventListener(
-                'click', () => window.log.push(id));
+                'click', event => { window.log.push(id); window.targetTags[id] = Object.prototype.toString.call(event.target); });
             }
             document.getElementById('btn').addEventListener(
               'click', () => window.log.push('btn'));
@@ -140,7 +141,7 @@ async fn state(ctx: &mut CdpContext, id: u64, session: &str) -> Value {
            cb:document.getElementById('cb').checked,\
            ext:document.getElementById('ext').checked,\
            cb2:document.getElementById('cb2').checked,\
-           cb3:document.getElementById('cb3').checked});})()",
+           cb3:document.getElementById('cb3').checked,tags:window.targetTags});})()",
         session,
     )
     .await;
@@ -161,6 +162,7 @@ async fn clicking_inside_a_label_activates_its_nested_control() {
         "the label's checkbox should have received exactly one click"
     );
     assert_eq!(state["cb"], Value::Bool(true), "checkedness should have flipped");
+    assert_eq!(state["tags"]["cb"], "[object HTMLInputElement]");
 }
 
 #[tokio::test]

@@ -52,8 +52,8 @@ async fn serve_iframe_fixture() -> String {
                     html,body { margin:0; width:100%; height:100%; }
                     #child { position:absolute; left:20px; top:30px; width:100px; height:50px; }
                     #nested { position:absolute; left:150px; top:20px; width:100px; height:80px; border:5px solid black; }
-                </style><button id=child>child</button><input id=field><iframe id=nested src=/grand></iframe>
-                <script>globalThis.childLog=[];globalThis.childWheel=[]; child.addEventListener('click',e=>{childLog.push([e.clientX,e.clientY,globalThis===window]);field.focus()});child.addEventListener('wheel',e=>{childWheel.push([e.clientX,e.clientY,e.deltaY,globalThis===window]);e.preventDefault()});</script>"#,
+                    </style><button id=child>child</button><input id=field><iframe id=nested src=/grand></iframe>
+                <script>globalThis.childLog=[];globalThis.childWheel=[]; child.addEventListener('click',e=>{childLog.push([e.clientX,e.clientY,e.screenX,e.screenY,globalThis===window]);field.focus()});child.addEventListener('wheel',e=>{childWheel.push([e.clientX,e.clientY,e.deltaY,globalThis===window]);e.preventDefault()});</script>"#,
                 "/grand" => r#"<!doctype html><style>html,body{margin:0}#grand{position:absolute;left:10px;top:10px;width:60px;height:30px}</style>
                     <button id=grand>grand</button><script>globalThis.grandLog=[];grand.addEventListener('click',e=>grandLog.push([e.clientX,e.clientY,globalThis===window]));</script>"#,
                 _ => r#"<!doctype html><style>
@@ -327,7 +327,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
             const target = document.getElementById('check');
             document.elementFromPoint = () => target;
             globalThis.mouseLog = [];
-            for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
+            for (const type of ['mousedown', 'focus', 'mouseup', 'click', 'input', 'change']) {
                 target.addEventListener(type, event => mouseLog.push({
                     type, checked: target.checked, x: event.clientX,
                     ctrl: event.ctrlKey, shift: event.shiftKey, trusted: event.isTrusted
@@ -359,7 +359,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
     let pressed: Value = serde_json::from_str(pressed["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(pressed["checked"], false, "checkbox activation must wait for release");
     assert_eq!(pressed["log"][0]["type"], "mousedown");
-    assert_eq!(pressed["log"].as_array().unwrap().len(), 1, "press must not synthesize click");
+    assert_eq!(pressed["log"].as_array().unwrap().len(), 2, "press must not synthesize click");
 
     cdp(
         &mut ctx,
@@ -386,13 +386,13 @@ async fn press_release_orders_events_and_defers_click_activation() {
         .iter()
         .map(|entry| entry["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["mousedown", "mouseup", "click", "input", "change"]);
+    assert_eq!(types, ["mousedown", "focus", "mouseup", "click", "input", "change"]);
     assert_eq!(released["checked"], true);
-    assert_eq!(released["log"][2]["checked"], true, "click sees checkbox pre-activation");
-    assert_eq!(released["log"][2]["x"], 31.0);
-    assert_eq!(released["log"][2]["ctrl"], true);
-    assert_eq!(released["log"][2]["shift"], true);
-    assert_eq!(released["log"][2]["trusted"], true);
+    assert_eq!(released["log"][3]["checked"], true, "click sees checkbox pre-activation");
+    assert_eq!(released["log"][3]["x"], 31.0);
+    assert_eq!(released["log"][3]["ctrl"], true);
+    assert_eq!(released["log"][3]["shift"], true);
+    assert_eq!(released["log"][3]["trusted"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -408,7 +408,16 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
             for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                 target.addEventListener(type, event => pLog.push({
                     type, pointerType: event.pointerType, pointerId: event.pointerId,
-                    composed: event.composed, x: event.clientX, trusted: event.isTrusted
+                    composed: event.composed, x: event.clientX, trusted: event.isTrusted,
+                    altitude: event.altitudeAngle, azimuth: event.azimuthAngle,
+                    movement: [event.movementX, event.movementY],
+                    offset: [event.offsetX, event.offsetY],
+                    layer: [event.layerX, event.layerY],
+                    expectedOffset: (() => { const r = target.getBoundingClientRect();
+                        return [event.clientX - r.left, event.clientY - r.top]; })(),
+                    predicted: event.getPredictedEvents?.().length,
+                    coalesced: event.getCoalescedEvents?.().length,
+                    own: Object.getOwnPropertyNames(event)
                 }));
             }
         })()"#,
@@ -435,7 +444,29 @@ async fn click_dispatches_pointer_events_with_pointer_metadata_and_composed() {
     assert_eq!(out[0]["composed"], true, "pointer events must compose across shadow boundaries");
     assert_eq!(out[0]["x"], 31.0);
     assert_eq!(out[0]["trusted"], true);
+    assert_eq!(out[0]["altitude"], std::f64::consts::FRAC_PI_2);
+    assert_eq!(out[0]["azimuth"], 0.0);
+    assert_eq!(out[0]["movement"], json!([0, 0]));
+    assert_eq!(out[0]["offset"], out[0]["expectedOffset"]);
+    assert_eq!(out[0]["layer"], out[0]["expectedOffset"]);
+    assert_eq!(out[0]["predicted"], 0);
+    // CDP input rides the real input pipeline, so Chrome's coalesced list
+    // holds at least the event itself; a synthetic dispatch stays empty.
+    assert_eq!(out[0]["coalesced"], 1);
+    assert_eq!(out[0]["own"], json!(["isTrusted"]));
     assert_eq!(out[4]["composed"], true, "click must compose across shadow boundaries");
+    assert_eq!(out[4]["pointerType"], "mouse", "CDP click is a PointerEvent in Chrome");
+    assert_eq!(out[4]["pointerId"], 1);
+    assert_eq!(out[4]["altitude"], std::f64::consts::FRAC_PI_2);
+    assert_eq!(out[4]["azimuth"], 0.0);
+    let leaked = evaluate(
+        &mut ctx,
+        4,
+        "JSON.stringify(Object.getOwnPropertyNames(globalThis).filter(name => ['__obscura_focused','__obscura_click_target','__obscura_hover_target','__obscura_mouse_down'].includes(name)))",
+        &sid,
+    )
+    .await;
+    assert_eq!(leaked["result"]["value"], "[]");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -709,7 +740,7 @@ async fn mouse_events_enter_iframe_realm_with_local_client_coordinates() {
     )
     .await;
     let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
-    assert_eq!(log, json!([[30, 40, true]]));
+    assert_eq!(log, json!([[30, 40, 140, 130, true]]));
 
     cdp(
         &mut ctx,
@@ -774,4 +805,94 @@ async fn clipped_iframe_content_does_not_receive_mouse_events() {
     .await;
     let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(log, json!([]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn click_pointer_ids_increment_per_activation_and_pair_within_a_cycle() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.pidLog = [];
+            for (const type of ['pointerdown', 'pointerup']) {
+                target.addEventListener(type, e => pidLog.push([type, e.pointerId]));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(&mut ctx, 3, "JSON.stringify(pidLog)", &sid).await;
+    let log: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log,
+        json!([["pointerdown", 1], ["pointerup", 1], ["pointerdown", 2], ["pointerup", 2]]),
+        "each press cycle mints a fresh pointerId shared by its down/up pair: {log}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trusted_input_events_carry_mouse_source_capabilities() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.capsLog = [];
+            for (const type of ['mousedown', 'click']) {
+                target.addEventListener(type, e => capsLog.push(
+                    e.sourceCapabilities instanceof InputDeviceCapabilities
+                        ? ['caps', e.sourceCapabilities.firesTouchEvents]
+                        : ['bare', String(e.sourceCapabilities)]));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    click(&mut ctx, &sid, 31.0, 42.0).await;
+
+    let out = evaluate(&mut ctx, 3, "JSON.stringify(capsLog)", &sid).await;
+    let log: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log,
+        json!([["caps", false], ["caps", false]]),
+        "CDP mouse input reports a mouse InputDeviceCapabilities: {log}"
+    );
+
+    let out = evaluate(
+        &mut ctx,
+        4,
+        r#"JSON.stringify({
+            scriptMouseEventIsNull: new MouseEvent('click').sourceCapabilities === null,
+            scriptEventIsUndefined: new Event('x').sourceCapabilities === undefined,
+            scriptKeyEventIsNull: new KeyboardEvent('keydown').sourceCapabilities === null,
+            ctorIsFunction: typeof InputDeviceCapabilities === 'function',
+            ctorName: InputDeviceCapabilities.name,
+            ctorNative: String(InputDeviceCapabilities).includes('[native code]'),
+            defaultFiresTouch: new InputDeviceCapabilities().firesTouchEvents,
+            touchCtorFiresTouch: new InputDeviceCapabilities({firesTouchEvents: true}).firesTouchEvents,
+            instanceOwnKeys: Object.keys(new InputDeviceCapabilities({firesTouchEvents: true}))
+        })"#,
+        &sid,
+    )
+    .await;
+    let intro: Value = serde_json::from_str(out["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(intro["scriptMouseEventIsNull"], true, "{intro}");
+    assert_eq!(intro["scriptEventIsUndefined"], true, "{intro}");
+    assert_eq!(intro["scriptKeyEventIsNull"], true, "{intro}");
+    assert_eq!(intro["ctorIsFunction"], true, "{intro}");
+    assert_eq!(intro["ctorName"], "InputDeviceCapabilities", "{intro}");
+    assert_eq!(intro["ctorNative"], true, "{intro}");
+    assert_eq!(intro["defaultFiresTouch"], false, "{intro}");
+    assert_eq!(intro["touchCtorFiresTouch"], true, "{intro}");
+    assert_eq!(intro["instanceOwnKeys"], json!([]), "{intro}");
 }

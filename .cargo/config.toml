@@ -1,2 +1,18 @@
 [env]
 RUST_TEST_THREADS = "1"
+
+# Shorthands for the trace-patched V8 build. vendor/v8-source.toml carries both
+# the [patch.crates-io] entry and V8_FROM_SOURCE=1, which must always travel
+# together -- see the comments there.
+#
+# These are aliases rather than a repo-wide [patch] or [env] on purpose: an
+# alias is inert until invoked, so release.yml and Dockerfile keep linking the
+# prebuilt librusty_v8.a and never pay for a V8 source build.
+#
+# `default` now includes `stealth`, so v8-build produces the full binary and
+# v8-build-lean is the opt-out shape (no BoringSSL, no cmake/clang needed).
+[alias]
+v8-build = ["build", "--release", "-p", "obscura-cli", "--bins", "--features", "render", "--config", "vendor/v8-source.toml"]
+v8-build-lean = ["build", "--release", "-p", "obscura-cli", "--bins", "--no-default-features", "--features", "render", "--config", "vendor/v8-source.toml"]
+v8-check = ["check", "-p", "obscura-js", "-p", "obscura-cli", "--config", "vendor/v8-source.toml"]
+v8-test = ["nextest", "run", "--release", "--no-fail-fast", "--features", "render", "--config", "vendor/v8-source.toml"]

@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="referrer" content="origin">
+<title>Stack, realm, and referrer fixture</title>
+<link rel="stylesheet" href="/fixture.css">
+<script src="/external.js"></script>
+<iframe id="same" src="/same.html"></iframe>
+<iframe id="cross" src="__CROSS_ORIGIN__/cross.html" referrerpolicy="no-referrer"></iframe>
+<script>
+globalThis.fixtureCrossOrigin = "__CROSS_ORIGIN__";
+function captureInlineStack() {
+  return new Error().stack;
+}
+
+globalThis.fixturePromise = (async () => {
+  const same = document.getElementById('same');
+  const cross = document.getElementById('cross');
+  // The embedder may commit child documents before parser scripts run. A
+  // short task boundary covers both that case and a transport-backed frame.
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  const security = {};
+  for (const key of ['document', 'location.href', 'location.origin', 'frameElement']) {
+    try {
+      const value = key === 'document' ? cross.contentWindow.document :
+        key === 'location.href' ? cross.contentWindow.location.href :
+        key === 'location.origin' ? cross.contentWindow.location.origin :
+        cross.contentWindow.frameElement;
+      security[key] = { threw: false, value: value == null ? null : String(value) };
+    } catch (error) {
+      security[key] = { threw: true, name: error && error.name };
+    }
+  }
+
+  const sameEcho = await fetch('/echo').then(response => response.json());
+  const crossEcho = await fetch(`${globalThis.fixtureCrossOrigin}/echo`, {
+    mode: 'cors',
+  }).then(response => response.json());
+  return {
+    documentReferrer: document.referrer,
+    sameFrameReferrer: same.contentWindow.document.referrer,
+    crossFrameReferrer: cross.contentWindow.document.referrer,
+    security,
+    inlineStack: captureInlineStack(),
+    externalStack: globalThis.externalStack,
+    fetchReferers: {
+      same: sameEcho.referer || null,
+      cross: crossEcho.referer || null,
+    },
+  };
+})().then(result => {
+  globalThis.fixtureResult = result;
+  const output = document.createElement('pre');
+  output.id = 'fixture-result';
+  output.textContent = JSON.stringify(result);
+  document.body.appendChild(output);
+  return result;
+});
+</script>

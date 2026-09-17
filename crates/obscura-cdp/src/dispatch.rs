@@ -144,6 +144,16 @@ pub struct CdpContext {
     /// process-wide lock, so connections run in parallel (measured ~2x at
     /// concurrency 2, ~3x at 4) instead of serializing all V8 on one mutex.
     pub v8_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-session diagnostic domain state. Keeping this in the CDP context
+    /// makes enable/disable lifetimes match a flattened session exactly.
+    pub(crate) debugger_enabled: HashSet<Option<String>>,
+    pub(crate) debugger_scripts: HashSet<(Option<String>, String)>,
+    pub(crate) debugger_breakpoints: HashMap<String, (String, i64, i64)>,
+    pub(crate) debugger_pause_next: HashSet<Option<String>>,
+    pub(crate) profiler_enabled: HashSet<Option<String>>,
+    pub(crate) profiler_running: HashSet<Option<String>>,
+    pub(crate) heap_profiler_enabled: HashSet<Option<String>>,
+    pub(crate) heap_profiler_running: HashSet<Option<String>>,
 }
 
 impl CdpContext {
@@ -224,6 +234,14 @@ impl CdpContext {
             advertised_frames: Vec::new(),
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
+            debugger_enabled: HashSet::new(),
+            debugger_scripts: HashSet::new(),
+            debugger_breakpoints: HashMap::new(),
+            debugger_pause_next: HashSet::new(),
+            profiler_enabled: HashSet::new(),
+            profiler_running: HashSet::new(),
+            heap_profiler_enabled: HashSet::new(),
+            heap_profiler_running: HashSet::new(),
         }
     }
 
@@ -551,7 +569,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
-        "Browser" => domains::browser::handle(method, &req.params).await,
+        "Browser" => domains::browser::handle(method, &req.params, ctx).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
@@ -571,8 +589,11 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
-        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
+        "Debugger" => domains::debugger::handle(&method, &req.params, ctx, &req.session_id).await,
+        "Profiler" => domains::debugger::profiler(&method, ctx, &req.session_id).await,
+        "HeapProfiler" => domains::debugger::heap_profiler(&method, ctx, &req.session_id).await,
+        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector"
+        | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 

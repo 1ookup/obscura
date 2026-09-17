@@ -156,6 +156,28 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "a" {
         style.color = Some([0, 0, 238, 255]); // blue
         style.underline = Some(true); // UA default: links are underlined
+    } else if tag == "progress" || tag == "meter" {
+        // Chromium's UA sheet makes the range-style widgets atomic
+        // inline-level controls. Without this they fall through as blocks:
+        // a progress inside a text-less block then skips the line-box strut
+        // and reads 16px tall where Chrome reads 22px.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
+    } else if tag == "summary" {
+        // Chromium's UA sheet makes summary a list-item carrying a
+        // disclosure marker. At narrow widths that outside marker wraps
+        // onto its own line box, adding one strut line inside the summary
+        // (the challenge's sub-pixel probe reads details 66 = marker + two
+        // text lines, not 44). Install the marker as the summary's
+        // before-generated box so it joins the first inline run and takes
+        // part in line breaking; dom.rs promotes its text to the host's
+        // before_content. `list-style:none` authors cannot remove this
+        // approximation, but `::before { content: none }` can.
+        let mut marker = crate::LayoutStyle::default();
+        marker.display = Display::Inline;
+        marker.before_content = Some("\u{25b8} ".to_string());
+        style.before_pseudo = Some(Box::new(marker));
     } else if tag == "iframe" {
         // HTML's UA sheet gives frames a two-pixel inset border. The paint
         // and geometry models share the same four-side used state.
@@ -7113,7 +7135,7 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// We do not model variant/stretch, but still accept their keywords before
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
-fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+pub(crate) fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {
@@ -7432,6 +7454,11 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
 }
 
 fn set_margin_px(margin: &mut Edges, idx: usize, px: f32) {
+    // Used margins live on Blink's LayoutUnit grid like every other length; a
+    // box that ends flush against a snapped container edge derives its size from
+    // the snapped margins, so `margin-left:12.12px` in an 800px container reports
+    // width 800 - 12.109375 = 787.890625 rather than floor(787.88) = 787.875.
+    let px = crate::dom::snap_to_layout_unit(px);
     match idx {
         0 => margin.top = px,
         1 => margin.right = px,
@@ -7483,6 +7510,8 @@ fn set_padding_side(style: &mut LayoutStyle, idx: usize, value: &str) {
 }
 
 fn set_padding_px(padding: &mut Edges, idx: usize, px: f32) {
+    // Used padding lives on Blink's LayoutUnit grid like every other length.
+    let px = crate::dom::snap_padding_px(px);
     match idx {
         0 => padding.top = px,
         1 => padding.right = px,

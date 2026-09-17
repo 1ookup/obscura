@@ -1,0 +1,52 @@
+# Timing-sensitive tests must not share the machine with sixteen V8 instances.
+#
+# `autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll`
+# failed roughly one run in three with this shape:
+#
+#     events: [[50, 163.2], [100, 163.2]]
+#     chain:  [2.1, 2.8, 163.1]
+#
+# Both timers firing at the same instant, and a nested chain jumping from 2.8ms
+# to 163ms, is not a timer arriving late -- it is the whole thread being
+# preempted for ~160ms and every timer then catching up at once. Widening the
+# 35ms tolerance would hide exactly the regression these tests exist to catch
+# (§3.1-#5: timers arriving 600-2500ms late), so the fix is to stop the
+# contention instead of loosening the assertion.
+#
+# `threads-required = "num-test-threads"` makes a test take every slot, so it
+# runs with the machine to itself. These tests are short; the wall-clock cost
+# of serialising them is a few hundred milliseconds.
+#
+# Add a test here when it asserts on wall-clock durations. Do not add one to
+# silence a failure whose numbers look like a real delay -- the signature above
+# (everything landing on one identical timestamp) is what host preemption looks
+# like; a genuine regression shows up as consistently late, not simultaneously
+# late.
+
+[test-groups.timing-sensitive]
+max-threads = 1
+
+# Each MCP stdio integration test starts a complete `obscura mcp` process,
+# including a V8 isolate and renderer, and serves a private TCP fixture. Running
+# the sixteen tests together can starve the fixture/client startup path and
+# turn a successful navigation into an empty-page evaluation. Keep this group
+# isolated so a workspace run exercises the same deterministic process shape as
+# the focused MCP regression.
+[test-groups.mcp-processes]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = '''
+  test(autonomous_event_loop_delivers_timers_after_a_cancelled_navigation_poll)
+  or test(posted_task_chains_complete_without_zero_delay_timer_floor)
+  or test(fixed_settle_delivers_timers_at_their_deadlines_after_navigation)
+  or test(load_delaying_script_driver_respects_absolute_deadline)
+  or test(timer_ordering_and_lateness_match_the_chrome_capture)
+'''
+test-group = 'timing-sensitive'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+filter = 'binary(mcp_client)'
+test-group = 'mcp-processes'
+threads-required = 'num-test-threads'

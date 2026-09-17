@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["stealth"]
 # Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
 # fetch()/XHR be routed through it so JS-level requests carry the same Chrome
 # TLS fingerprint and client hints as stealth navigation.
@@ -22,6 +22,8 @@ obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 deno_core = "0.350"
 tokio = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
@@ -30,13 +32,20 @@ url = { workspace = true }
 # Public Suffix List and adds no runtime I/O.
 psl = "2"
 tracing = { workspace = true }
+# window.external.tracelog stamps each record with the platform monotonic clock
+# (CLOCK_MONOTONIC), the clock domain the instrumented Chrome build's
+# base::TimeTicks uses, so tracelogs from the two engines order against each
+# other on one host.
+libc = "0.2"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 html5ever = { workspace = true }
 deno_error = "0.6"
 base64 = { workspace = true }
-sha1 = "0.10"
+# `oid` gives `AssociatedOid`, which the RSA pkcs1v15/pss key types
+# require; SHA-1 is a legal WebCrypto RSA hash, so it has to be selectable.
+sha1 = { version = "0.10", features = ["oid"] }
 sha2 = "0.10"
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,
 # and they unify on the digest 0.10 / cipher 0.4 stack already in the tree.
@@ -47,6 +56,13 @@ cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
+# WebCrypto public-key primitives (ECDSA, ECDH, RSA-*). RustCrypto again, on
+# the same digest 0.10 stack the secret-key ops above use, so one sha2/sha1
+# instance serves both halves. `getrandom` on rsa gives OsRng for key
+# generation. `pkcs8` on the curve crates brings spki/pkcs8/sec1 encoding.
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8"] }
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }

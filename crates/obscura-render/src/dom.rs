@@ -307,6 +307,9 @@ pub struct DomLayout {
     /// per-document render roots can coexist on one arena.
     pub root: NodeId,
     pub rects: HashMap<NodeId, Rect>,
+    /// Unrounded Taffy border boxes exposed only through CSSOM View. Paint,
+    /// hit testing, scroll extents, and layout convergence keep using rects.
+    pub cssom_rects: HashMap<NodeId, Rect>,
     /// Per-line border-box fragments for ordinary non-replaced inline
     /// elements. `rects` retains their union for `getBoundingClientRect()`;
     /// this list is the source for background/border painting and
@@ -1933,16 +1936,16 @@ fn sync_resolved_percentage_padding(
 
     fn sync(style: &mut crate::LayoutStyle, containing_block_width: f32) {
         if let Some(percent) = style.padding_percent[0] {
-            style.padding.top = percent * containing_block_width;
+            style.padding.top = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[1] {
-            style.padding.right = percent * containing_block_width;
+            style.padding.right = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[2] {
-            style.padding.bottom = percent * containing_block_width;
+            style.padding.bottom = snap_padding_px(percent * containing_block_width);
         }
         if let Some(percent) = style.padding_percent[3] {
-            style.padding.left = percent * containing_block_width;
+            style.padding.left = snap_padding_px(percent * containing_block_width);
         }
     }
 
@@ -2136,7 +2139,7 @@ fn sync_positioned_pseudo_percentage_padding(
         }
         for (index, percent) in pseudo.padding_percent.into_iter().enumerate() {
             let Some(percent) = percent else { continue };
-            let value = percent * containing_block_width;
+            let value = snap_padding_px(percent * containing_block_width);
             match index {
                 0 => pseudo.padding.top = value,
                 1 => pseudo.padding.right = value,
@@ -2168,6 +2171,11 @@ fn sync_positioned_pseudo_percentage_padding(
 #[derive(Default)]
 struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
+    /// For each node surfaced by `flatten_boxless_inline_children`, the
+    /// chain of flattened boxless-inline ancestors that were removed above
+    /// it (outermost first). Run collection re-opens each as an inline
+    /// owner so the element keeps a getBoundingClientRect box.
+    flattened_owner_chains: HashMap<NodeId, Vec<NodeId>>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
     generated: Vec<GeneratedBoxBuild>,
@@ -2870,6 +2878,12 @@ fn cascade_walk(
             &style,
             container_evaluator.as_deref_mut(),
         );
+        // A UA-element default can install a generated box (the summary's
+        // disclosure marker). Author and UA-sheet ::before rules replace
+        // that default; when no rule matched, keep it.
+        if before_pseudo.is_none() {
+            before_pseudo = style.before_pseudo.take().map(|boxed| *boxed);
+        }
         for pseudo in [&mut before_pseudo, &mut after_pseudo]
             .into_iter()
             .flatten()
@@ -4736,6 +4750,7 @@ fn layout_dom_once(
         .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
 
     let mut rects = HashMap::new();
+    let mut cssom_rects = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
     // Final absolute rects of anonymous inline-run leaves, keyed by the
@@ -5471,10 +5486,10 @@ fn layout_dom_once(
                             expression, em_px, root_fs, vw, vh, cb_w,
                         ) {
                             match i {
-                                0 => style.padding.top = px.max(0.0),
-                                1 => style.padding.right = px.max(0.0),
-                                2 => style.padding.bottom = px.max(0.0),
-                                _ => style.padding.left = px.max(0.0),
+                                0 => style.padding.top = snap_padding_px(px),
+                                1 => style.padding.right = snap_padding_px(px),
+                                2 => style.padding.bottom = snap_padding_px(px),
+                                _ => style.padding.left = snap_padding_px(px),
                             }
                         }
                     }
@@ -5483,40 +5498,40 @@ fn layout_dom_once(
                             expression, em_px, root_fs, vw, vh, cb_w,
                         ) {
                             match i {
-                                0 => style.margin.top = px,
-                                1 => style.margin.right = px,
-                                2 => style.margin.bottom = px,
-                                _ => style.margin.left = px,
+                                0 => style.margin.top = snap_to_layout_unit(px),
+                                1 => style.margin.right = snap_to_layout_unit(px),
+                                2 => style.margin.bottom = snap_to_layout_unit(px),
+                                _ => style.margin.left = snap_to_layout_unit(px),
                             }
                         }
                     }
                     if let Some(relative) = style.padding_relative[i] {
                         if let crate::Dimension::Px(px) = relative.resolve(em_px, root_fs, vw, vh) {
                             match i {
-                                0 => style.padding.top = px.max(0.0),
-                                1 => style.padding.right = px.max(0.0),
-                                2 => style.padding.bottom = px.max(0.0),
-                                _ => style.padding.left = px.max(0.0),
+                                0 => style.padding.top = snap_padding_px(px),
+                                1 => style.padding.right = snap_padding_px(px),
+                                2 => style.padding.bottom = snap_padding_px(px),
+                                _ => style.padding.left = snap_padding_px(px),
                             }
                         }
                     }
                     if let Some(relative) = style.margin_relative[i] {
                         if let crate::Dimension::Px(px) = relative.resolve(em_px, root_fs, vw, vh) {
                             match i {
-                                0 => style.margin.top = px,
-                                1 => style.margin.right = px,
-                                2 => style.margin.bottom = px,
-                                _ => style.margin.left = px,
+                                0 => style.margin.top = snap_to_layout_unit(px),
+                                1 => style.margin.right = snap_to_layout_unit(px),
+                                2 => style.margin.bottom = snap_to_layout_unit(px),
+                                _ => style.margin.left = snap_to_layout_unit(px),
                             }
                         }
                     }
                     if let Some(frac) = style.margin_percent[i] {
                         let px = frac * cb_w;
                         match i {
-                            0 => style.margin.top = px,
-                            1 => style.margin.right = px,
-                            2 => style.margin.bottom = px,
-                            _ => style.margin.left = px,
+                            0 => style.margin.top = snap_to_layout_unit(px),
+                            1 => style.margin.right = snap_to_layout_unit(px),
+                            2 => style.margin.bottom = snap_to_layout_unit(px),
+                            _ => style.margin.left = snap_to_layout_unit(px),
                         }
                     }
                 }
@@ -5688,10 +5703,10 @@ fn layout_dom_once(
                                 relative.resolve(pseudo_em, root_fs, vw, vh)
                             {
                                 match index {
-                                    0 => pseudo.padding.top = px.max(0.0),
-                                    1 => pseudo.padding.right = px.max(0.0),
-                                    2 => pseudo.padding.bottom = px.max(0.0),
-                                    _ => pseudo.padding.left = px.max(0.0),
+                                    0 => pseudo.padding.top = snap_padding_px(px),
+                                    1 => pseudo.padding.right = snap_padding_px(px),
+                                    2 => pseudo.padding.bottom = snap_padding_px(px),
+                                    _ => pseudo.padding.left = snap_padding_px(px),
                                 }
                             }
                         }
@@ -5700,20 +5715,20 @@ fn layout_dom_once(
                                 relative.resolve(pseudo_em, root_fs, vw, vh)
                             {
                                 match index {
-                                    0 => pseudo.margin.top = px,
-                                    1 => pseudo.margin.right = px,
-                                    2 => pseudo.margin.bottom = px,
-                                    _ => pseudo.margin.left = px,
+                                    0 => pseudo.margin.top = snap_to_layout_unit(px),
+                                    1 => pseudo.margin.right = snap_to_layout_unit(px),
+                                    2 => pseudo.margin.bottom = snap_to_layout_unit(px),
+                                    _ => pseudo.margin.left = snap_to_layout_unit(px),
                                 }
                             }
                         }
                         if let Some(percent) = pseudo.margin_percent[index] {
                             let px = percent * cb_w;
                             match index {
-                                0 => pseudo.margin.top = px,
-                                1 => pseudo.margin.right = px,
-                                2 => pseudo.margin.bottom = px,
-                                _ => pseudo.margin.left = px,
+                                0 => pseudo.margin.top = snap_to_layout_unit(px),
+                                1 => pseudo.margin.right = snap_to_layout_unit(px),
+                                2 => pseudo.margin.bottom = snap_to_layout_unit(px),
+                                _ => pseudo.margin.left = snap_to_layout_unit(px),
                             }
                         }
                         if let Some(inset) = pseudo.inset[index] {
@@ -6978,6 +6993,35 @@ fn layout_dom_once(
                 &generated_nodes,
                 &mut generated_rects,
             );
+            compute_absolute_unrounded_rects(
+                &taffy_tree,
+                taffy_root,
+                initial_cb_x,
+                0.0,
+                &id_map,
+                &mut cssom_rects,
+            );
+            // Taffy intentionally keeps the engine's established rounded
+            // intrinsic sizing for reflow and paint. CSSOM View, however,
+            // exposes the shaped 26.6 advance for auto-sized inline formatting
+            // contexts. Replace only the matching rounded text width.
+            for (&nid, &idx) in &ifc_items.whole {
+                let Some(rect) = cssom_rects.get_mut(&nid) else {
+                    continue;
+                };
+                let Some(style) = styles.get(&nid) else {
+                    continue;
+                };
+                let advance = engine.measure_canvas_width(idx);
+                let edges = style.padding.left
+                    + style.padding.right
+                    + style.border.left
+                    + style.border.right;
+                let rounded = rects.get(&nid).map(|value| value.width).unwrap_or(rect.width);
+                if (rounded - (advance.ceil() + edges)).abs() <= 0.01 {
+                    rect.width = advance + edges;
+                }
+            }
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
             synthesize_row_rects(tree, layout_root, &mut rects);
         }
@@ -7175,6 +7219,7 @@ fn layout_dom_once(
         DomLayout {
             root: layout_root,
             rects,
+            cssom_rects,
             inline_fragments,
             styles,
             custom_properties,
@@ -8199,6 +8244,70 @@ fn resolve_named_placement(
             start: line(s),
             end: taffy::GridPlacement::Auto,
         })
+    }
+}
+
+/// Blink keeps every layout length in a LayoutUnit, i.e. a 1/64 px grid, so
+/// CSSOM View can only ever report multiples of 1/64. Measured on Chrome 153
+/// (headless, 1x): a `width:123.4px` box reports 123.390625 = 7897/64 and
+/// `width:12.12px` reports 12.109375 = 775/64, i.e. the authored length is
+/// floored onto the grid rather than rounded to nearest. Taffy stores f32, so
+/// the raw unrounded layout has to be floored onto the same grid before it is
+/// exposed: otherwise the exposed value is off-grid and differs from Chrome in
+/// the low bits (12.119999885559082 where Chrome reports 12.109375).
+#[inline]
+pub(crate) fn snap_to_layout_unit(value: f32) -> f32 {
+    (value * 64.0).floor() / 64.0
+}
+
+/// Used padding is resolved onto the same LayoutUnit grid, at every place a
+/// padding length becomes pixels (fixed lengths at parse time, `em`/`rem`/`vw`
+/// contextual lengths and percentages at layout time). Measured on Chrome 153:
+/// `padding-left:8.2px` contributes 524/64 and `padding-left:7.5%` of a 333px
+/// containing block contributes 1598/64, i.e. floor, matching `width`/`height`.
+#[inline]
+pub(crate) fn snap_padding_px(px: f32) -> f32 {
+    snap_to_layout_unit(px.max(0.0))
+}
+
+fn compute_absolute_unrounded_rects(
+    taffy_tree: &TaffyTree<usize>,
+    taffy_id: taffy::NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    rects: &mut HashMap<NodeId, Rect>,
+) {
+    let layout = taffy_tree.unrounded_layout(taffy_id);
+    // Children accumulate on the snapped parent edge, the same way a LayoutUnit
+    // child offset is added to the parent's LayoutUnit origin in Blink.
+    let left = abs_x + layout.location.x;
+    let top = abs_y + layout.location.y;
+    let x = snap_to_layout_unit(left);
+    let y = snap_to_layout_unit(top);
+    // Blink snaps each edge independently and derives the size from the two
+    // snapped edges, so a box that ends on a snapped edge keeps that edge
+    // exactly: `margin-left:12.12px` in an 800px container reports
+    // x=12.109375 (775/64) and width=800-12.109375=787.890625 (50425/64).
+    // Snapping the taffy size instead loses one 1/64 step whenever the
+    // unrounded origin is not already on the grid.
+    let right = snap_to_layout_unit(left + layout.size.width);
+    let bottom = snap_to_layout_unit(top + layout.size.height);
+    if let Some(dom_id) = id_map.get(&taffy_id) {
+        rects.insert(
+            *dom_id,
+            Rect {
+                x,
+                y,
+                width: right - x,
+                height: bottom - y,
+            },
+        );
+    }
+    for child_id in taffy_tree.children(taffy_id).unwrap_or_default() {
+        compute_absolute_unrounded_rects(
+            taffy_tree, child_id, x, y, id_map, rects,
+        );
     }
 }
 
@@ -9606,7 +9715,9 @@ fn build_flex_grid_children(
             run.push(node);
             index += 1;
         }
-        if let Some(item) = engine.try_build_run(tree, parent, &run, styles) {
+        if let Some(item) =
+            engine.try_build_run(tree, parent, &run, styles, &ifc_items.flattened_owner_chains)
+        {
             let style = taffy::Style {
                 display: taffy::style::Display::Block,
                 ..Default::default()
@@ -10992,10 +11103,28 @@ fn build_table(
         Some(flattened)
     };
     let mut rows: Vec<(NodeId, usize)> = Vec::new();
+    let mut synthetic_caption_row = false;
     if native_html_table {
         collect_table_rows(tree, id, &mut rows);
         if rows.is_empty() {
-            return None;
+            // Chromium still renders a caption-only table: the caption sits
+            // in its own box and the table shrink-wraps to it. Bailing here
+            // dropped the dedicated path entirely and stretched the table
+            // across the container (the challenge's sub-pixel probe reads a
+            // 4px-wide caption where Chromium reads 39.5px). Route the
+            // caption children through one synthetic row so the grid
+            // measurement includes them.
+            let has_caption = tree.children(id).into_iter().any(|cid| {
+                tree.get_node(cid).is_some_and(|n| {
+                    n.as_element()
+                        .is_some_and(|e| e.local.as_ref() == "caption")
+                })
+            });
+            if !has_caption {
+                return None;
+            }
+            rows.push((id, 1));
+            synthetic_caption_row = true;
         }
     } else {
         // CSS table fixup inserts an anonymous row around table-cell children
@@ -11044,6 +11173,7 @@ fn build_table(
                 .and_then(|n| n.as_element().map(|e| e.local.to_string()));
             let is_cell = if native_html_table {
                 matches!(local.as_deref(), Some("td") | Some("th"))
+                    || (synthetic_caption_row && local.as_deref() == Some("caption"))
             } else {
                 styles
                     .get(&cid)
@@ -11375,6 +11505,15 @@ fn build_table(
     // to auto here so that pass can measure content before choosing the width.
     if !matches!(style.width, crate::Dimension::Percent(_)) {
         tstyle.size.width = Dimension::auto();
+    }
+    // CSS tables are shrink-to-fit: with an auto inline size a table never
+    // stretches to the container the way an ordinary block child does
+    // (measured in Chromium: 60.3px of content inside a 0-width container,
+    // 60.3px inside a 1400px one). Taffy's block parent would stretch an
+    // auto-width child, so opt this node out; a percentage width keeps the
+    // stretch to resolve against.
+    if tstyle.size.width == Dimension::auto() {
+        tstyle.align_self = Some(taffy::AlignItems::FLEX_START);
     }
     tstyle.grid_template_columns = (0..ncols).map(col).collect();
     tstyle.grid_template_rows = (0..nrows).map(row_track).collect();
@@ -12420,7 +12559,16 @@ fn build(
     // containing block formatting context.
     if style.display == crate::Display::Block || style.internal_flex_container {
         let mut flattened = Vec::new();
-        flatten_boxless_inline_children(tree, &dom_children, styles, &mut flattened);
+        let mut chains = std::mem::take(&mut ifc_items.flattened_owner_chains);
+        flatten_boxless_inline_chained(
+            tree,
+            &dom_children,
+            styles,
+            &mut flattened,
+            &[],
+            &mut chains,
+        );
+        ifc_items.flattened_owner_chains = chains;
         dom_children = flattened;
     }
     let internal_mixed_block_flow = style.internal_flex_container
@@ -12959,11 +13107,15 @@ fn build_mixed_block(
                 child_ids.extend(built);
             }
             Seg::Run(run) => {
-                let has_text_strut = run.iter().any(|&cid| {
-                    tree.get_node(cid).map_or(false, |node| {
-                        matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
-                    })
-                });
+                // Every CSS line box carries the containing block's strut,
+                // whether or not the run happens to contain a text node: an
+                // img-only or progress-only line is still a line box, and
+                // Chromium answers 22px (the 16px-font strut) for
+                // `<div><img style="height:16px"></div>`, not the image's 16.
+                // Gating the strut on a text node made atomic-only containers
+                // one line short — the challenge's own sub-pixel probe reads
+                // exactly those boxes.
+                let has_text_strut = !run.is_empty();
                 // Collapsible source formatting at the start/end of an inline
                 // run does not create line width. Preserve whitespace between
                 // inline siblings, but trim indentation adjacent to block
@@ -12987,11 +13139,23 @@ fn build_mixed_block(
                 let join_before = before_pending && i == 0;
                 let join_after = after_pending && i + 1 == n_segs;
                 // Fast path: the whole run folds to one shaped leaf, unless
-                // pseudo-content word leaves must share its lines.
+                // pseudo-content word leaves must share its lines. The leaf
+                // still carries the block's strut as a minimum height: every
+                // CSS line box is at least the parent's used line height,
+                // even when the shaped buffer's own font metrics are smaller
+                // (a 20.99px caption line shapes to 25px on the bundled face
+                // while the identity strut reads 29px).
                 if !join_before && !join_after {
-                    if let Some(item) = engine.try_build_run(tree, id, run, styles) {
+                    let chains = std::mem::take(&mut ifc_items.flattened_owner_chains);
+                    let folded =
+                        engine.try_build_run(tree, id, run, styles, &chains);
+                    ifc_items.flattened_owner_chains = chains;
+                    if let Some(item) = folded {
+                        let mut leaf_style = run_leaf_style();
+                        leaf_style.min_size.height =
+                            taffy::Dimension::length(crate::inline::used_line_height(style).max(0.0));
                         let leaf = taffy_tree
-                            .new_leaf_with_context(run_leaf_style(), item)
+                            .new_leaf_with_context(leaf_style, item)
                             .ok()?;
                         ifc_items.runs.entry(id).or_default().push(item);
                         child_ids.push(leaf);
@@ -13266,18 +13430,43 @@ fn flatten_boxless_inline_children(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     out: &mut Vec<NodeId>,
 ) {
+    flatten_boxless_inline_chained(tree, children, styles, out, &[], &mut HashMap::new());
+}
+
+fn flatten_boxless_inline_chained(
+    tree: &DomTree,
+    children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    out: &mut Vec<NodeId>,
+    chain: &[NodeId],
+    owner_chains: &mut HashMap<NodeId, Vec<NodeId>>,
+) {
     for &cid in children {
         let display_contents = styles
             .get(&cid)
             .map(|style| style.display_contents && style.display != crate::Display::None)
             .unwrap_or(false);
         if display_contents
-            || is_flattenable_inline(tree, cid, styles)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
+            // Structural transparency: nothing above it changes except that
+            // display:contents and block-wrapping inlines contribute no box of
+            // their own in any engine.
             let kids = rendered_children(tree, cid);
-            flatten_boxless_inline_children(tree, &kids, styles, out);
+            flatten_boxless_inline_chained(tree, &kids, styles, out, chain, owner_chains);
+        } else if is_flattenable_inline(tree, cid, styles) {
+            // A plain boxless inline is transparent to the box tree, but it is
+            // still an element with a getBoundingClientRect box in every real
+            // browser. Record it on the chain so run collection can reopen it
+            // as an inline owner; the flattened descendants inherit it.
+            let mut nested = chain.to_vec();
+            nested.push(cid);
+            let kids = rendered_children(tree, cid);
+            flatten_boxless_inline_chained(tree, &kids, styles, out, &nested, owner_chains);
         } else {
+            if !chain.is_empty() {
+                owner_chains.insert(cid, chain.to_vec());
+            }
             out.push(cid);
         }
     }
@@ -16103,6 +16292,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn auto_width_float_uses_its_own_bfc_for_nested_float_max_content() {
         // A float establishes a BFC. Its auto inline size must therefore be
@@ -18301,6 +18491,7 @@ mod tests {
         assert!((second.y - first.y - 100.0).abs() < 0.1, "{second:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn direct_flex_text_is_one_wrapping_anonymous_item() {
         // Chromium 140: the pseudo is one flex item and the direct text run
@@ -18321,6 +18512,7 @@ mod tests {
         assert!((quote.height - 60.0).abs() < 0.1, "{quote:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn auto_width_column_flex_text_uses_fit_content_width() {
         // Chromium 145: the outer row leaves 533px beside the fixed 203px
@@ -18367,6 +18559,7 @@ mod tests {
         assert!((logo.width - 203.0).abs() < 0.1, "{logo:?}");
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn column_flex_fit_content_preserves_unbreakable_min_content() {
         // Chromium 145 keeps the unbreakable quote at 2561.25px and lets the
@@ -18743,6 +18936,7 @@ mod tests {
         assert_eq!(width("border-cell"), 100.0);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_table_layout_uses_only_first_row_for_column_geometry() {
         let tree = parse_html(
@@ -18766,6 +18960,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_table_layout_accounts_for_separate_border_spacing() {
         let tree = parse_html(
@@ -18786,6 +18981,7 @@ mod tests {
         assert!((rect("second").width - 212.0).abs() < 0.1, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_content_box_table_keeps_border_spacing_inside_declared_width() {
         let tree = parse_html(
@@ -18804,6 +19000,7 @@ mod tests {
         assert!((rect("second").width - 220.0).abs() < 0.1, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_percentage_table_resolves_tracks_against_final_used_width() {
         let tree = parse_html(
@@ -18824,6 +19021,7 @@ mod tests {
         assert!((rect("second").width - 277.5).abs() <= 0.5, "{:?}", rect("second"));
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn fixed_columns_win_over_first_row_spanning_cell_widths() {
         let tree = parse_html(
@@ -19142,6 +19340,7 @@ mod tests {
         assert!(auto_table_percentage_intrinsic_floor(&[16.0, 106.71875], &percentages) > 1000.0);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn white_space_inherits_into_a_block_descendant_inline_context() {
         let tree = parse_html(
@@ -19461,6 +19660,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn wrapped_decorated_inline_exposes_three_ordered_font_box_fragments() {
         let tree = parse_html(
@@ -19513,6 +19713,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_horizontal_edges_advance_adjacent_content_but_margins_stay_outside_rect() {
         let tree = parse_html(
@@ -19543,6 +19744,7 @@ mod tests {
         assert!((rect("after").x - (rect("token").x + rect("token").width) - 5.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_edges_participate_in_wrapping_and_slice_only_outer_continuation_sides() {
         let tree = parse_html(
@@ -19606,6 +19808,7 @@ mod tests {
         assert!((decorated_after - plain_after - 20.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn inline_provenance_maps_repeated_multibyte_text_across_hard_breaks() {
         let tree = parse_html(
@@ -19630,6 +19833,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn relative_inline_offsets_move_canonical_fragments_in_pixels_and_percentages() {
         let tree = parse_html(
@@ -19672,6 +19876,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn canonical_inline_fragments_shape_with_the_loaded_webfont() {
         let tree = parse_html(
@@ -19763,6 +19968,7 @@ mod tests {
         assert!((crate::style::resolve_grid_calc(handle, 1000.0) - 136.0).abs() < 0.01);
     }
 
+    #[cfg(feature = "paint")]
     #[test]
     fn positioned_pseudo_does_not_wrap_shrink_to_fit_host_text() {
         let tree = parse_html(

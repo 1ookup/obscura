@@ -46,6 +46,19 @@ Default proxy URL used by `obscura-worker` for the parallel `scrape` command whe
 OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 ```
 
+### `OBSCURA_INSECURE_TLS`
+
+Opt out of TLS certificate verification for both the standard and stealth HTTP
+clients. This is intended only for local MITM debugging when installing the
+proxy CA is not possible; it accepts forged, expired, or otherwise invalid
+certificates for every host. The default is secure verification.
+
+Truthy values: `1`, `true`, `yes`, `on`.
+
+```bash
+OBSCURA_INSECURE_TLS=1 obscura --proxy http://127.0.0.1:8080 --stealth serve
+```
+
 ## Stealth and identity
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.
@@ -56,6 +69,19 @@ Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`
 
 ```bash
 OBSCURA_TIMEZONE=America/New_York obscura serve
+```
+
+### `OBSCURA_LANGUAGE` / `OBSCURA_LANGUAGES` / `OBSCURA_LOCALE`
+
+Set the browser language preference consistently across `navigator.language`,
+`navigator.languages`, iframe and worker realms, and the `Accept-Language`
+request header and V8/ICU's default locale. `OBSCURA_LANGUAGE` sets a single preferred language; use the
+comma-separated `OBSCURA_LANGUAGES` form when the browser advertises fallbacks.
+The default remains `en-US,en`. `OBSCURA_LOCALE` can pin an explicit host locale
+when the language tag is not one of the built-in mappings.
+
+```bash
+OBSCURA_LANGUAGE=zh-CN OBSCURA_TIMEZONE=Asia/Shanghai obscura serve
 ```
 
 ### `OBSCURA_GEOLOCATION`
@@ -129,3 +155,11 @@ Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-s
 ## HTTP proxy environment
 
 Obscura does not honor `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. Use `--proxy` or `OBSCURA_PROXY`.
+
+`OBSCURA_TRACE_API_FILE` selects the pinned V8 property trace destination. The
+CLI automatically enables the V8 instrumentation flag; its equivalent option
+is `--trace-api-file`. Embedders must also enable `--trace-property-lookup`
+before isolate creation. `OBSCURA_TRACE_OP_FILE` selects host-operation and
+complete console-string tracing (`--trace-op-file`). The old API IGNORE/WATCH/
+DEVTOOLS environment variables are not implemented by the new monitor. See
+[Native Trace](native-trace.md) for supported operations and limitations.

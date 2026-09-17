@@ -25,6 +25,7 @@ const MAIN_PAGE: &str = r#"<html><head><title>main</title></head><body>
 </body></html>"#;
 
 const FRAME_PAGE: &str = r#"<html><head><title>navd</title></head><body><div id="navdiv">NV</div><script>var navvar=99;</script></body></html>"#;
+const MISSING_FRAME_PAGE: &str = r#"<html><head><title>Not Found</title></head><body><h1 id="missing">404</h1></body></html>"#;
 
 /// A page whose iframe carries no script at all, like an ad, an embedded
 /// player or any static include. Nothing on the page creates a realm on its
@@ -46,13 +47,20 @@ async fn serve() -> String {
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let body = if request.starts_with("GET /frame") {
                     FRAME_PAGE
+                } else if request.starts_with("GET /missing") {
+                    MISSING_FRAME_PAGE
                 } else if request.starts_with("GET /plain") {
                     PLAIN_PAGE
                 } else {
                     MAIN_PAGE
                 };
+                let status = if request.starts_with("GET /missing") {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(resp.as_bytes()).await;
@@ -676,6 +684,44 @@ async fn navigate_with_frame_id_navigates_a_single_frame() {
         .expect_err("old context must be rejected");
     assert!(error.contains("Cannot find context with specified id"));
 
+    // A direct child-frame navigation must expose its real error response and
+    // keep the response body under the request id seen by Network events.
+    ctx.pending_events.clear();
+    let missing_url = format!("{url}missing");
+    let missing = cdp_ok(
+        &mut ctx,
+        29,
+        "Page.navigate",
+        json!({"url": missing_url, "frameId": outer}),
+        &sid,
+    )
+    .await;
+    let missing_loader = missing["loaderId"].as_str().unwrap();
+    let response_event = ctx
+        .pending_events
+        .iter()
+        .find(|event| {
+            event.method == "Network.responseReceived"
+                && event.params["frameId"] == outer
+                && event.params["response"]["status"] == 404
+        })
+        .expect("child 404 response event");
+    assert_eq!(response_event.params["loaderId"], json!(missing_loader));
+    let request_id = response_event.params["requestId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let body = cdp_ok(
+        &mut ctx,
+        30,
+        "Network.getResponseBody",
+        json!({"requestId": request_id}),
+        &sid,
+    )
+    .await;
+    assert_eq!(body["base64Encoded"], json!(false));
+    assert!(body["body"].as_str().unwrap().contains("404"));
+
     // The main document still sees its own content.
     let main_title = eval_value(&mut ctx, 28, "document.title", None, &sid)
         .await
@@ -944,4 +990,29 @@ async fn main_frame_world_stays_isolated_across_navigation() {
         .await
         .unwrap();
     assert_eq!(title, json!("main"), "the world binds the new document");
+}
+
+/// The engine's own globals must not be visible through window reflection, in
+/// the main realm or a frame realm. Cloudflare's challenge payload enumerated
+/// `o.__obscura_click_listener_hooked`, `o.__obscura_click_listener_seen` and
+/// `o.__obscura_input_strategy` out of the widget frame's window and submitted
+/// them. The click-listener flags and the embedder-installed policy are created
+/// while the page runs, so the snapshot-time name list cannot cover them; the
+/// reflection filter therefore matches the engine namespace by name.
+#[tokio::test(flavor = "current_thread")]
+async fn window_reflection_hides_engine_globals_in_every_realm() {
+    let (mut ctx, sid, _page_id, _url) = setup().await;
+    let (child, _nested) = child_frame_ids(&mut ctx, &sid).await;
+    let child_context = default_context_id(&ctx, &child);
+    // A name created after page init stands in for the strategy flags: it is
+    // not in __obscura_hide_list, and before the fix it was enumerable.
+    let expr = "(() => { globalThis.__obscura_late_probe = true; \
+                return JSON.stringify(Object.getOwnPropertyNames(globalThis)\
+                .filter(n => /obscura/i.test(n))); })()";
+    let main = eval_value(&mut ctx, 3, expr, None, &sid).await.unwrap();
+    assert_eq!(main, json!("[]"), "main realm window: {main}");
+    let frame = eval_value(&mut ctx, 4, expr, Some(child_context), &sid)
+        .await
+        .unwrap();
+    assert_eq!(frame, json!("[]"), "frame realm window: {frame}");
 }

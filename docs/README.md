@@ -46,6 +46,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 - [Architecture overview](Architecture-overview.md)
 - [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
+- [HaHaVM environment parity ledger](HaHaVM-environment-parity.md)
 - [Testing and debugging](Testing-and-debugging.md)
 
 ## Links

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deno_core::v8::IsolateHandle;
@@ -35,6 +35,10 @@ pub(crate) struct WorkerEnvironment {
     /// worker constructed without one -- not `undefined`, which is what an
     /// absent binding would report and what marks a scope as not-a-worker.
     pub name: String,
+    /// Brands the global as a SharedWorkerGlobalScope and routes messages
+    /// through connection ports instead of the scope's own `postMessage`,
+    /// which a shared scope does not have.
+    pub shared: bool,
     /// The creator's origin. A worker's origin is inherited from the document
     /// that created it, so a `blob:`/`data:` worker still reports the page's
     /// origin rather than deriving one from its own script URL.
@@ -43,6 +47,18 @@ pub(crate) struct WorkerEnvironment {
     /// opaque origin serializes to "null" and cannot be re-inspected for its
     /// scheme.
     pub secure_context: bool,
+    /// The enforced CSP of the document that created this worker. Worker
+    /// fetches are governed by the creator document's `connect-src`; a frame
+    /// worker must not silently fall back to the top-level page policy.
+    pub document_csp: Option<String>,
+    /// Immutable identity copied from the creator realm. The worker installs
+    /// it before any author source runs and uses it for its own fetch client.
+    pub fingerprint: obscura_net::BrowserFingerprint,
+    /// Execution-source label for the trace streams (`worker(M)[creator]`),
+    /// computed by the host once the worker id is known. The creator half is
+    /// the constructing context's label at `new Worker(...)`, so nested
+    /// workers nest their labels.
+    pub trace_label: String,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
@@ -128,10 +144,15 @@ impl WorkerHost {
         let (out_tx, out_rx) = unbounded_channel::<String>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<IsolateHandle, String>>();
         let id = self.next_id;
+        // The environment carries the creator's label in `trace_label`; the
+        // host owns the worker counter, so the full label is minted here.
+        let mut environment = environment;
+        environment.trace_label = format!("worker({id})[{}]", environment.trace_label);
         let thread = std::thread::Builder::new()
             .name(format!("obscura-worker-{id}"))
             .spawn(move || {
                 worker_thread_main(
+                    id,
                     source,
                     script_url,
                     kind,
@@ -210,6 +231,220 @@ impl WorkerHost {
     }
 }
 
+pub type SharedWorkerRegistryHandle = Arc<Mutex<SharedWorkerRegistry>>;
+
+pub fn new_shared_worker_registry() -> SharedWorkerRegistryHandle {
+    Arc::new(Mutex::new(SharedWorkerRegistry::default()))
+}
+
+#[derive(Default)]
+pub struct SharedWorkerRegistry {
+    workers: HashMap<String, SharedWorkerProcess>,
+    /// Worker-id counter shared by the trace labels, so dedicated and shared
+    /// workers within one browser context never collide on `worker(M)`.
+    next_worker: u32,
+}
+
+struct SharedWorkerProcess {
+    to_worker: UnboundedSender<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    next_connection: u64,
+    isolate_handle: IsolateHandle,
+    worker_join: Option<std::thread::JoinHandle<()>>,
+    router_join: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(crate) struct SharedWorkerConnection {
+    to_worker: UnboundedSender<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    connection_id: u64,
+    outbox_rx: Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>,
+}
+
+impl Drop for SharedWorkerConnection {
+    fn drop(&mut self) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&self.connection_id);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SharedWorkerPageHost {
+    next_id: u32,
+    connections: HashMap<u32, SharedWorkerConnection>,
+}
+
+impl SharedWorkerPageHost {
+    pub(crate) fn insert(&mut self, connection: SharedWorkerConnection) -> u32 {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.connections.insert(id, connection);
+        id
+    }
+
+    pub(crate) fn post_message(&self, id: u32, payload: &str) -> bool {
+        let Some(connection) = self.connections.get(&id) else { return false };
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return false;
+        };
+        let Some(_object) = envelope.as_object() else { return false };
+        // The page-side connection id is preserved in the envelope. A page
+        // normally has one native connection per SharedWorker entry; when
+        // several JS ports share that connection, the single-route fallback
+        // below still delivers the envelope so bootstrap can select its port.
+        connection.to_worker.send(envelope.to_string()).is_ok()
+    }
+
+    pub(crate) fn outbox(
+        &self,
+        id: u32,
+    ) -> Option<Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>> {
+        self.connections.get(&id).map(|connection| connection.outbox_rx.clone())
+    }
+}
+
+impl SharedWorkerRegistry {
+    pub(crate) fn connect(
+        &mut self,
+        key: String,
+        source: String,
+        script_url: String,
+        kind: String,
+        environment: WorkerEnvironment,
+    ) -> Result<SharedWorkerConnection, String> {
+        if !self.workers.contains_key(&key) {
+            if self.workers.len() >= MAX_WORKERS {
+                return Err(format!("shared worker limit reached ({MAX_WORKERS} per context)"));
+            }
+            self.next_worker = self.next_worker.saturating_add(1).max(1);
+            let mut environment = environment;
+            environment.trace_label =
+                format!("worker({})[{}]", self.next_worker, environment.trace_label);
+            self.workers.insert(
+                key.clone(),
+                spawn_shared_worker_process(source, script_url, kind, environment)?,
+            );
+        }
+        let process = self.workers.get_mut(&key).expect("shared worker inserted");
+        let connection_id = process.next_connection;
+        process.next_connection = process.next_connection.wrapping_add(1).max(1);
+        let (outbox_tx, outbox_rx) = unbounded_channel();
+        process
+            .routes
+            .lock()
+            .map_err(|_| "shared worker route registry poisoned".to_string())?
+            .insert(connection_id, outbox_tx);
+        if process
+            .to_worker
+            .send(serde_json::json!({ "connect": true, "c": connection_id }).to_string())
+            .is_err()
+        {
+            if let Ok(mut routes) = process.routes.lock() {
+                routes.remove(&connection_id);
+            }
+            return Err("shared worker thread exited".to_string());
+        }
+        Ok(SharedWorkerConnection {
+            to_worker: process.to_worker.clone(),
+            routes: Arc::clone(&process.routes),
+            connection_id,
+            outbox_rx: Rc::new(tokio::sync::Mutex::new(outbox_rx)),
+        })
+    }
+}
+
+fn spawn_shared_worker_process(
+    source: String,
+    script_url: String,
+    kind: String,
+    environment: WorkerEnvironment,
+) -> Result<SharedWorkerProcess, String> {
+    let (msg_tx, msg_rx) = unbounded_channel::<String>();
+    let (out_tx, out_rx) = unbounded_channel::<String>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<IsolateHandle, String>>();
+    let worker_thread = std::thread::Builder::new()
+        .name("obscura-shared-worker".to_string())
+        .spawn(move || {
+            worker_thread_main(
+                0,
+                source,
+                script_url,
+                kind,
+                environment,
+                msg_rx,
+                out_tx,
+                ready_tx,
+            )
+        })
+        .map_err(|error| format!("failed to spawn shared worker thread: {error}"))?;
+    let isolate_handle = match ready_rx.recv_timeout(SPAWN_READY_TIMEOUT) {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(message)) => {
+            let _ = worker_thread.join();
+            return Err(message);
+        }
+        Err(_) => return Err("shared worker runtime did not start in time".to_string()),
+    };
+    let routes = Arc::new(Mutex::new(HashMap::new()));
+    let router_routes = Arc::clone(&routes);
+    let router_thread = std::thread::Builder::new()
+        .name("obscura-shared-worker-router".to_string())
+        .spawn(move || route_shared_worker_outbox(out_rx, router_routes))
+        .map_err(|error| format!("failed to spawn shared worker router: {error}"))?;
+    Ok(SharedWorkerProcess {
+        to_worker: msg_tx,
+        routes,
+        next_connection: 1,
+        isolate_handle,
+        worker_join: Some(worker_thread),
+        router_join: Some(router_thread),
+    })
+}
+
+fn route_shared_worker_outbox(
+    mut outbox: UnboundedReceiver<String>,
+    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+) {
+    while let Some(entry) = outbox.blocking_recv() {
+        let parsed = serde_json::from_str::<serde_json::Value>(&entry).ok();
+        let connection_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("data"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .and_then(|envelope| envelope.get("c").and_then(serde_json::Value::as_u64));
+        let Ok(routes) = routes.lock() else { return };
+        if let Some(connection_id) = connection_id {
+            if let Some(route) = routes.get(&connection_id) {
+                let _ = route.send(entry);
+            } else if routes.len() == 1 {
+                if let Some(route) = routes.values().next() {
+                    let _ = route.send(entry);
+                }
+            }
+        } else {
+            for route in routes.values() {
+                let _ = route.send(entry.clone());
+            }
+        }
+    }
+}
+
+impl Drop for SharedWorkerProcess {
+    fn drop(&mut self) {
+        self.isolate_handle.terminate_execution();
+        // Do not synchronously join isolate threads during page/context
+        // teardown. V8 termination is asynchronous and an isolate parked in
+        // its event loop may take a scheduling turn before observing it;
+        // blocking here can wedge the owning page indefinitely. Dropping the
+        // handles detaches the threads, which then exit when their channels
+        // close (the same lifecycle used by dedicated workers).
+        self.worker_join.take();
+        self.router_join.take();
+    }
+}
+
 /// Outbox entry for a worker `postMessage` payload (an already-serialized
 /// clone envelope). Kept as strings so the page-side recv op can frame a
 /// batch without re-parsing.
@@ -227,6 +462,7 @@ fn is_termination(error: &str) -> bool {
 }
 
 fn worker_thread_main(
+    id: u32,
     source: String,
     script_url: String,
     kind: String,
@@ -235,6 +471,10 @@ fn worker_thread_main(
     out_tx: UnboundedSender<String>,
     ready_tx: std_mpsc::Sender<Result<IsolateHandle, String>>,
 ) {
+    worker_debug(
+        id,
+        &format!("spawn kind={kind} url={script_url} source_len={}", source.len()),
+    );
     let panic_out_tx = out_tx.clone();
     let panic_ready_tx = ready_tx.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -260,20 +500,37 @@ fn worker_thread_main(
             let worker_name = std::mem::take(&mut environment.name);
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
+            let worker_csp = environment.document_csp.take();
+            let worker_shared = environment.shared;
+            let trace_label = environment.trace_label.clone();
             let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(&script_url, proxy_url);
+            rt.set_fingerprint(&environment.fingerprint);
+            // The worker's ambient execution-source label: author scripts push
+            // script@<url> on top of it and message dispatches run on it.
+            // Skipped entirely in production runs (zero surface difference).
+            rt.set_trace_ambient(&trace_label);
+            if crate::trace_source::enabled() {
+                let label_json =
+                    serde_json::Value::String(trace_label.clone()).to_string();
+                let _ = rt.execute_script(
+                    "<obscura:worker-trace-label>",
+                    format!("globalThis.__obscura_trace_default_from = {label_json};").as_str(),
+                );
+            }
             // reqwest's pooled client is created inside the creator's Tokio
             // runtime. Build the worker's pool on this thread while retaining
             // the browser-context cookie jar, proxy and private-network
             // policy; moving the initialized pool across runtimes produces a
             // reqwest builder error on the first worker fetch.
             let worker_http_client = environment.http_client.as_ref().map(|creator| {
-                Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+                Arc::new(obscura_net::ObscuraHttpClient::with_full_options_and_fingerprint(
                     environment
                         .cookie_jar
                         .clone()
                         .unwrap_or_else(|| Arc::new(obscura_net::CookieJar::new())),
                     creator.proxy_url(),
                     creator.allow_private_network,
+                    environment.fingerprint.clone(),
                 ))
             });
             {
@@ -286,6 +543,7 @@ fn worker_thread_main(
                 // URL, which describes no origin to inherit from.
                 gs.inherited_origin = Some(worker_origin.clone());
                 gs.inherited_secure_context = worker_secure;
+                gs.document_csp = worker_csp;
                 gs.cookie_jar = environment.cookie_jar;
                 gs.http_client = worker_http_client;
                 gs.callbacks = environment.callbacks;
@@ -303,16 +561,27 @@ fn worker_thread_main(
             }
             if let Err(e) = rt.execute_script(
                 "<obscura:worker-prep>",
-                &worker_prep_script(&script_url, &worker_name, &worker_origin, worker_secure),
+                &worker_prep_script(
+                    &script_url,
+                    &worker_name,
+                    &worker_origin,
+                    worker_secure,
+                    worker_shared,
+                    crate::tracelog::enabled(),
+                ),
             ) {
                 let _ = out_tx.send(error_entry(&format!("worker global setup failed: {e}")));
                 return;
             }
             // HTML "run a worker": the worker source executes exactly once.
             // Later messages only dispatch events (worker_event_loop below).
+            // The classic source is one labeled code unit, like a document
+            // script; modules keep the worker's ambient label (module graphs
+            // are not attributable per-unit on either engine).
             let source_result = if kind == "module" {
                 rt.load_inline_module(&source, &script_url, 30_000).await
             } else {
+                let _trace_script = crate::trace_source::push(&format!("script@{script_url}"));
                 rt.execute_script("<obscura:worker-script>", &source)
             };
             if let Err(e) = source_result {
@@ -321,7 +590,7 @@ fn worker_thread_main(
                     return;
                 }
             }
-            worker_event_loop(&mut rt, &mut inbox, &out_tx).await;
+            worker_event_loop(id, &mut rt, &mut inbox, &out_tx).await;
         });
     }));
     if result.is_err() {
@@ -332,11 +601,22 @@ fn worker_thread_main(
     }
 }
 
+/// `OBSCURA_DEBUG_WORKER=1` reports worker isolate lifecycle. The challenge's
+/// widget keeps a pool of short-lived workers and waits on their replies, so a
+/// worker that exits while it still has queued work is worth seeing directly.
+pub(crate) fn worker_debug(id: u32, message: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_DEBUG_WORKER").is_some()) {
+        eprintln!("[worker-life] id={id} {message}");
+    }
+}
+
 /// Pump the worker's own event loop (timers, microtasks, async ops) while
 /// racing the page's message channel. Biased toward messages so a burst
 /// drains before timer work; between tasks `run_event_loop` performs the
 /// microtask checkpoints.
 async fn worker_event_loop(
+    id: u32,
     rt: &mut ObscuraJsRuntime,
     inbox: &mut UnboundedReceiver<String>,
     out_tx: &UnboundedSender<String>,
@@ -347,6 +627,7 @@ async fn worker_event_loop(
     }
     loop {
         if close_requested(rt) {
+            worker_debug(id, "exit: self.close() requested");
             return;
         }
         let turn = tokio::select! {
@@ -356,31 +637,43 @@ async fn worker_event_loop(
         };
         match turn {
             Turn::Message(Some(payload)) => {
+                worker_debug(id, &format!("dispatch {} bytes", payload.len()));
                 if !dispatch_message(rt, &payload, out_tx) {
+                    worker_debug(id, "exit: dispatch failed / terminated");
                     return;
                 }
             }
             // Channel closed: the page terminated us or went away.
-            Turn::Message(None) => return,
+            Turn::Message(None) => {
+                worker_debug(id, "exit: inbox closed (page dropped the worker)");
+                return;
+            }
             Turn::Idle(result) => {
                 if let Err(error) = result {
                     if is_termination(&error) {
+                        worker_debug(id, "exit: event loop terminated");
                         return;
                     }
                     let _ = out_tx.send(error_entry(&error));
                 }
                 if close_requested(rt) {
+                    worker_debug(id, "exit: self.close() after idle");
                     return;
                 }
                 // JS fully idle (no pending timers/ops): park until the next
                 // message or channel close instead of spinning.
                 match inbox.recv().await {
                     Some(payload) => {
+                        worker_debug(id, &format!("dispatch {} bytes (parked)", payload.len()));
                         if !dispatch_message(rt, &payload, out_tx) {
+                            worker_debug(id, "exit: dispatch failed / terminated");
                             return;
                         }
                     }
-                    None => return,
+                    None => {
+                        worker_debug(id, "exit: inbox closed while parked");
+                        return;
+                    }
                 }
             }
         }
@@ -412,13 +705,22 @@ fn dispatch_message(
     }
 }
 
-fn worker_prep_script(script_url: &str, name: &str, origin: &str, secure: bool) -> String {
+fn worker_prep_script(
+    script_url: &str,
+    name: &str,
+    origin: &str,
+    secure: bool,
+    shared: bool,
+    tracelog: bool,
+) -> String {
     let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     WORKER_PREP_TEMPLATE
         .replace("__OBSCURA_WORKER_URL__", &json(script_url))
         .replace("__OBSCURA_WORKER_NAME__", &json(name))
         .replace("__OBSCURA_WORKER_ORIGIN__", &json(origin))
         .replace("__OBSCURA_WORKER_SECURE__", if secure { "true" } else { "false" })
+        .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
+        .replace("__OBSCURA_TRACELOG__", if tracelog { "true" } else { "false" })
 }
 
 /// Executed in the fresh worker runtime before the worker source. The
@@ -434,7 +736,31 @@ fn worker_prep_script(script_url: &str, name: &str, origin: &str, secure: bool) 
 const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
+  // Snapshot WorkerGlobalScope is a different function object than the one
+  // this prep installs, so `globalThis instanceof WorkerGlobalScope` is false
+  // here. An explicit flag is the only check fetch/Request can trust.
+  try {
+    defineProperty(G, '__obscuraIsWorker', {
+      value: true, writable: false, enumerable: false, configurable: false,
+    });
+  } catch (e) { G.__obscuraIsWorker = true; }
   var getOwnPropertyNames = Object.getOwnPropertyNames;
+  // A worker's performance clock counts from the worker's own creation, like
+  // Chrome's worker time origin. The startup snapshot otherwise leaves the
+  // monotonic base at process start, so worker `performance.now()` reports
+  // process uptime -- a proof-of-work shard then claims milliseconds-since-
+  // boot as its compute duration, which no real browser produces.
+  try {
+    if (typeof G.__obscura_rebasePerformanceOrigin === 'function') {
+      G.__obscura_rebasePerformanceOrigin(Date.now());
+      G.performance.timeOrigin = Date.now();
+    }
+  } catch (e) {}
+  // A shared worker's scope is branded SharedWorkerGlobalScope, reaches its
+  // pages over connection ports rather than a scope-level `postMessage`, and
+  // exposes `onconnect` where a dedicated scope exposes `onmessage`.
+  var IS_SHARED = __OBSCURA_WORKER_SHARED__;
+  var SCOPE_NAME = IS_SHARED ? 'SharedWorkerGlobalScope' : 'DedicatedWorkerGlobalScope';
 
   function def(target, name, value, enumerable) {
     defineProperty(target, name, {
@@ -469,7 +795,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // the worker API installs onto a clean global.
   // ---------------------------------------------------------------------
   var WINDOW_ONLY = [
-    // Browsing-context self-references and the document tree
+    // Browsing-context self-references and the document tree.
+    //
+    // `external` is deliberately absent from this list even though stock
+    // Chrome's External is [Exposed=Window]: it is where the tracing primitive
+    // window.external.tracelog lives (tracelog.rs), so a worker that has to
+    // instrument its own VM reaches it as `external.tracelog(...)`. `window`
+    // itself stays deleted, as Chromium's DedicatedWorkerGlobalScope has no
+    // such binding.
     'window', 'document', 'top', 'parent', 'frames', 'frameElement', 'length',
     'opener', 'name',
     // Window-only constructors
@@ -513,6 +846,17 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   for (var i = 0; i < WINDOW_ONLY.length; i++) {
     try { delete G[WINDOW_ONLY[i]]; } catch (e) {}
   }
+  // Chrome's DedicatedWorkerGlobalScope has no `document` binding at all.
+  // A leftover `document = null` still answers `typeof document === "object"`,
+  // and a challenge that branches on that (Turnstile's worker source) then
+  // skips fetch("") / /ci/ and takes a failing PAT path instead.
+  try { delete G.document; } catch (e) {}
+  if (Object.prototype.hasOwnProperty.call(G, 'document')) {
+    try {
+      defineProperty(G, 'document', { value: undefined, configurable: true });
+      delete G.document;
+    } catch (e) {}
+  }
   // Element interfaces are open-ended (HTMLDivElement, SVGPathElement, ...);
   // matching the prefix covers the ones this build has and any added later.
   var globalNames = getOwnPropertyNames(G);
@@ -527,9 +871,15 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // GlobalEventHandlers install. The worker keeps only its own set, added
   // further down; anything else advertises DOM events a worker cannot fire.
   var WORKER_HANDLERS = {
-    onmessage: 1, onmessageerror: 1, onerror: 1, onlanguagechange: 1,
+    onerror: 1, onlanguagechange: 1,
     onoffline: 1, ononline: 1, onrejectionhandled: 1, onunhandledrejection: 1,
   };
+  if (IS_SHARED) {
+    WORKER_HANDLERS.onconnect = 1;
+  } else {
+    WORKER_HANDLERS.onmessage = 1;
+    WORKER_HANDLERS.onmessageerror = 1;
+  }
   var leftover = getOwnPropertyNames(G);
   for (var k = 0; k < leftover.length; k++) {
     var handler = leftover[k];
@@ -579,11 +929,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   }
 
-  var DedicatedWorkerGlobalScope = illegalConstructor('DedicatedWorkerGlobalScope');
+  var DedicatedWorkerGlobalScope = illegalConstructor(SCOPE_NAME);
   DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
   def(DedicatedWorkerGlobalScope.prototype, 'constructor', DedicatedWorkerGlobalScope);
   defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
-    value: 'DedicatedWorkerGlobalScope', configurable: true,
+    value: SCOPE_NAME, configurable: true,
   });
   try { Object.setPrototypeOf(G, DedicatedWorkerGlobalScope.prototype); } catch (e) {}
 
@@ -605,7 +955,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   }
 
   def(G, 'WorkerGlobalScope', WorkerGlobalScope);
-  def(G, 'DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+  def(G, SCOPE_NAME, DedicatedWorkerGlobalScope);
   // `self` is a getter-only attribute in a browser, not a data property.
   defGet(G, 'self', function () { return G; }, true);
 
@@ -665,7 +1015,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       'productSub', 'userAgent', 'vendor', 'vendorSub',
       'language', 'languages', 'onLine',
       'hardwareConcurrency', 'deviceMemory',
-      'userAgentData', 'connection', 'storage', 'locks', 'permissions',
+      'userAgentData', 'connection', 'locks', 'permissions',
       'mediaCapabilities', 'serviceWorker', 'sendBeacon',
     ];
     for (var n = 0; n < NAV_ALLOW.length; n++) {
@@ -678,6 +1028,227 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       var found = own || inherited;
       if (!found) continue;
       try { defineProperty(workerNav, prop, found); } catch (e) {}
+    }
+    if (__OBSCURA_WORKER_SECURE__ && typeof G.StorageManager === 'function'
+        && typeof G.FileSystemHandle === 'function'
+        && typeof G.FileSystemDirectoryHandle === 'function'
+        && typeof G.FileSystemFileHandle === 'function') {
+      var storageBrands = new WeakSet();
+      var handleState = new WeakMap();
+      var syncAccessState = new WeakMap();
+      var rootNode = { kind: 'directory', name: '', parent: null, children: new Map() };
+      var storageManager = Object.create(G.StorageManager.prototype);
+      storageBrands.add(storageManager);
+      var nativeRegistry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+      function nativeMethod(proto, name, length, fn) {
+        try { defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+        try { defineProperty(fn, 'length', { value: length, configurable: true }); } catch (e) {}
+        try { if (nativeRegistry) nativeRegistry.fns.add(fn); } catch (e) {}
+        defineProperty(proto, name, {
+          value: fn, writable: true, enumerable: true, configurable: true,
+        });
+      }
+      function nativeGetter(proto, name, fn) {
+        try { defineProperty(fn, 'name', { value: 'get ' + name, configurable: true }); } catch (e) {}
+        try {
+          if (nativeRegistry) {
+            nativeRegistry.fns.add(fn);
+            nativeRegistry.strings.set(fn, 'function get ' + name + '() { [native code] }');
+          }
+        } catch (e) {}
+        defGet(proto, name, fn, true);
+      }
+      function storageData(value) {
+        if (!storageBrands.has(value)) throw new TypeError('Illegal invocation');
+      }
+      function handleData(value) {
+        var state = handleState.get(value);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+      }
+      function makeHandle(node) {
+        var proto = node.kind === 'directory'
+          ? G.FileSystemDirectoryHandle.prototype : G.FileSystemFileHandle.prototype;
+        var handle = Object.create(proto);
+        handleState.set(handle, node);
+        return handle;
+      }
+      function validName(value) {
+        var name = String(value);
+        if (!name || name === '.' || name === '..' || name.indexOf('/') !== -1) {
+          throw new TypeError('Name is not allowed.');
+        }
+        return name;
+      }
+      var rootHandle = makeHandle(rootNode);
+      var storageCtorDescriptor = Object.getOwnPropertyDescriptor(
+        G.StorageManager.prototype, 'constructor');
+      for (var smi = 0; smi < 4; smi++) {
+        try { delete G.StorageManager.prototype[
+          ['constructor', 'estimate', 'persisted', 'getDirectory'][smi]]; } catch (e) {}
+      }
+      try { delete G.StorageManager.prototype.persist; } catch (e) {}
+      nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
+        // The same quota the document realm answers: one origin cannot report
+        // two, and the reference capture's worker reads 10 GiB. The challenge
+        // runs its storage probe in this realm, so a flat 5 GB here was the
+        // value that actually reached the payload.
+        storageData(this); return { quota: 10737418240, usage: 0, usageDetails: {} };
+      });
+      nativeMethod(G.StorageManager.prototype, 'persisted', 0, async function () {
+        storageData(this); return false;
+      });
+      if (storageCtorDescriptor) {
+        defineProperty(G.StorageManager.prototype, 'constructor', storageCtorDescriptor);
+      }
+      nativeMethod(G.StorageManager.prototype, 'getDirectory', 0, async function () {
+        storageData(this); return rootHandle;
+      });
+      nativeGetter(G.FileSystemHandle.prototype, 'kind', function () {
+        return handleData(this).kind;
+      });
+      nativeGetter(G.FileSystemHandle.prototype, 'name', function () {
+        return handleData(this).name;
+      });
+      nativeMethod(G.FileSystemHandle.prototype, 'isSameEntry', 1, async function (other) {
+        return handleData(this) === handleData(other);
+      });
+      function child(directory, value, kind, options) {
+        var parent = handleData(directory);
+        if (parent.kind !== 'directory') throw new TypeError('Illegal invocation');
+        var name = validName(value);
+        var node = parent.children.get(name);
+        if (node && node.kind !== kind) throw new DOMException('', 'TypeMismatchError');
+        if (!node) {
+          if (!(options && options.create === true)) throw new DOMException('', 'NotFoundError');
+          node = kind === 'directory'
+            ? { kind: kind, name: name, parent: parent, children: new Map() }
+            : { kind: kind, name: name, parent: parent, bytes: new Uint8Array(0) };
+          parent.children.set(name, node);
+        }
+        return makeHandle(node);
+      }
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', 1,
+        async function (name, options) { return child(this, name, 'directory', options); });
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getFileHandle', 1,
+        async function (name, options) { return child(this, name, 'file', options); });
+      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'resolve', 1, async function (possible) {
+        var directory = handleData(this), node = handleData(possible), path = [];
+        while (node && node !== directory) { path.unshift(node.name); node = node.parent; }
+        return node === directory ? path : null;
+      });
+      nativeMethod(G.FileSystemFileHandle.prototype, 'getFile', 0, async function () {
+        var node = handleData(this);
+        if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+        return new File([node.bytes], node.name);
+      });
+      var SyncAccessHandle = G.FileSystemSyncAccessHandle;
+      if (typeof SyncAccessHandle !== 'function') {
+        SyncAccessHandle = illegalConstructor('FileSystemSyncAccessHandle');
+        defineProperty(SyncAccessHandle.prototype, Symbol.toStringTag, {
+          value: 'FileSystemSyncAccessHandle', configurable: true,
+        });
+        def(G, 'FileSystemSyncAccessHandle', SyncAccessHandle);
+      }
+      try { if (nativeRegistry) nativeRegistry.fns.add(SyncAccessHandle); } catch (e) {}
+      var syncCtorDescriptor = Object.getOwnPropertyDescriptor(
+        SyncAccessHandle.prototype, 'constructor');
+      for (var sai = 0; sai < 8; sai++) {
+        try { delete SyncAccessHandle.prototype[
+          ['constructor', 'close', 'flush', 'getSize', 'read', 'truncate', 'write', 'mode'][sai]]; }
+        catch (e) {}
+      }
+      function syncData(value) {
+        var state = syncAccessState.get(value);
+        if (!state || state.closed) throw new DOMException('', 'InvalidStateError');
+        return state;
+      }
+      function byteView(value) {
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) {
+          return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        throw new TypeError('The provided value is not of type BufferSource.');
+      }
+      // The backing file is the source of truth for cost, not for content: the
+      // node's `bytes` stay authoritative so a handle opened twice in a row
+      // reads what the other one wrote, and the ops below keep the file in step.
+      function syncOpen(node) {
+        try { return Deno.core.ops.op_opfs_sync_open(node.name || 'file', node.bytes); }
+        catch (e) { return null; }
+      }
+      nativeMethod(SyncAccessHandle.prototype, 'close', 0, function () {
+        var state = syncData(this);
+        state.closed = true;
+        state.node.syncOpen = false;
+        if (state.fd !== null) {
+          try { Deno.core.ops.op_opfs_sync_close(state.fd); } catch (e) {}
+          state.fd = null;
+        }
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'flush', 0, function () {
+        var state = syncData(this);
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_flush(state.fd);
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'getSize', 0, function () {
+        var state = syncData(this);
+        if (state.fd !== null) {
+          try { return Deno.core.ops.op_opfs_sync_size(state.fd); } catch (e) {}
+        }
+        return state.node.bytes.length;
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'read', 1, function (buffer, options) {
+        var state = syncData(this), out = byteView(buffer);
+        var at = options && options.at !== undefined
+          ? Math.max(0, Number(options.at) || 0) : state.position;
+        var count = Math.min(out.length, Math.max(0, state.node.bytes.length - at));
+        if (state.fd !== null) {
+          var read = Deno.core.ops.op_opfs_sync_read(state.fd, at, count);
+          count = Math.min(count, read.length);
+          out.set(read.subarray(0, count));
+        } else {
+          out.set(state.node.bytes.subarray(at, at + count));
+        }
+        state.position = at + count;
+        return count;
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'truncate', 1, function (size) {
+        var state = syncData(this);
+        size = Math.max(0, Math.trunc(Number(size) || 0));
+        var next = new Uint8Array(size);
+        next.set(state.node.bytes.subarray(0, size));
+        state.node.bytes = next;
+        state.position = Math.min(state.position, size);
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_truncate(state.fd, size);
+      });
+      nativeMethod(SyncAccessHandle.prototype, 'write', 1, function (buffer, options) {
+        var state = syncData(this), input = byteView(buffer);
+        var at = options && options.at !== undefined
+          ? Math.max(0, Number(options.at) || 0) : state.position;
+        var size = Math.max(state.node.bytes.length, at + input.length);
+        var next = new Uint8Array(size);
+        next.set(state.node.bytes); next.set(input, at);
+        state.node.bytes = next; state.position = at + input.length;
+        if (state.fd !== null) Deno.core.ops.op_opfs_sync_write(state.fd, at, input);
+        return input.length;
+      });
+      nativeGetter(SyncAccessHandle.prototype, 'mode', function () { syncData(this); return 'readwrite'; });
+      if (syncCtorDescriptor) {
+        defineProperty(SyncAccessHandle.prototype, 'constructor', syncCtorDescriptor);
+      }
+      nativeMethod(G.FileSystemFileHandle.prototype, 'createSyncAccessHandle', 0,
+        async function () {
+          var node = handleData(this);
+          if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+          if (node.syncOpen) throw new DOMException('', 'NoModificationAllowedError');
+          node.syncOpen = true;
+          var access = Object.create(SyncAccessHandle.prototype);
+          syncAccessState.set(access, {
+            node: node, position: 0, closed: false, fd: syncOpen(node),
+          });
+          return access;
+        });
+      nativeGetter(WorkerNavigator.prototype, 'storage', function () { return storageManager; });
     }
     defineProperty(G, 'navigator', {
       get: function () { return workerNav; },
@@ -731,6 +1302,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   });
   function fire(event, type) {
+    var previousEvent;
+    try { previousEvent = G.event; G.event = event; } catch (_) { previousEvent = undefined; }
+    try {
     var handlerProp = G['on' + type];
     if (typeof handlerProp === 'function') {
       try { handlerProp.call(G, event); }
@@ -744,6 +1318,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (entry.once) removeEventListener(type, entry.original);
       try { entry.handler.call(G, event); }
       catch (e) { try { console.error('Worker ' + type + ' listener error:', e); } catch (_) {} }
+    }
+    } finally {
+      try { G.event = previousEvent; } catch (_) {}
     }
   }
   def(G, 'dispatchEvent', function dispatchEvent(event) {
@@ -763,16 +1340,22 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // Structured clone, JSON-clonable subset; `{v: data}` envelope so an
   // `undefined` payload round-trips as an absent property.
   // TODO(phase 3.11 follow-up): full structured clone + transfer lists.
-  def(G, 'postMessage', function postMessage(data) {
-    if (typeof data === 'function' || typeof data === 'symbol') {
-      throw new DOMException('The object could not be cloned.', 'DataCloneError');
-    }
-    var payload;
-    try { payload = JSON.stringify({ v: data }); }
-    catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
-    if (payload === undefined) payload = '{}';
-    Deno.core.ops.op_worker_post_to_page(payload);
-  });
+  // A SharedWorkerGlobalScope has no `postMessage`: everything travels over
+  // the ports handed out by `connect` events.
+  if (!IS_SHARED) {
+    def(G, 'postMessage', function postMessage(data) {
+      if (typeof data === 'function' || typeof data === 'symbol') {
+        throw new DOMException('The object could not be cloned.', 'DataCloneError');
+      }
+      var payload;
+      try { payload = JSON.stringify({ v: data }); }
+      catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+      if (payload === undefined) payload = '{}';
+      Deno.core.ops.op_worker_post_to_page(payload);
+    });
+  } else {
+    try { delete G.postMessage; } catch (e) {}
+  }
 
   def(G, 'close', function close() {
     G.__obscura_worker_closed = true;
@@ -814,8 +1397,49 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // Entry point for the Rust side. Routed through the same `fire` path as
   // dispatchEvent so `onmessage` and `addEventListener('message')` observe
   // one ordering rather than two independent ones.
+  // Shared workers: one MessageChannel per page-side connection. The page
+  // holds one end, the worker script gets the other through the `connect`
+  // event, and the bridge end forwards in both directions tagged with the
+  // connection id. Reusing MessagePort rather than inventing a port type
+  // keeps `ports[0] instanceof MessagePort`, structured cloning and the
+  // start()/queue semantics exactly as the page bootstrap implements them.
+  var SHARED_BRIDGES = IS_SHARED ? new Map() : null;
+
+  function sharedConnect(connectionId) {
+    if (SHARED_BRIDGES.has(connectionId)) return;
+    var channel = new MessageChannel();
+    var bridge = channel.port2;
+    SHARED_BRIDGES.set(connectionId, bridge);
+    bridge.onmessage = function (event) {
+      var payload;
+      try { payload = JSON.stringify({ v: event.data, c: connectionId }); }
+      catch (e) { return; }
+      if (payload === undefined) return;
+      Deno.core.ops.op_worker_post_to_page(payload);
+    };
+    var event = new MessageEvent('connect', {
+      data: '', origin: '', lastEventId: '', source: null,
+      ports: [channel.port1],
+    });
+    if (typeof G.__obscura_markTrusted === 'function') G.__obscura_markTrusted(event);
+    try { defineProperty(event, 'target', { value: G, configurable: true }); } catch (e) {}
+    try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
+    fire(event, 'connect');
+  }
+
   G.__obscura_worker_dispatch_message = function (payload) {
     if (G.__obscura_worker_closed) return;
+    if (IS_SHARED) {
+      var envelope;
+      try { envelope = JSON.parse(payload); } catch (e) { return; }
+      if (!envelope || typeof envelope.c !== 'number') return;
+      if (envelope.connect) { sharedConnect(envelope.c); return; }
+      var bridge = SHARED_BRIDGES.get(envelope.c);
+      // Delivering through the bridge end runs the page's own port queue and
+      // start() gating on the worker script's end.
+      if (bridge) { try { bridge.postMessage(envelope.v); } catch (e) {} }
+      return;
+    }
     var data;
     try { data = JSON.parse(payload).v; } catch (e) { return; }
     // The user agent dispatches this one, so it is trusted. Worker payloads
@@ -829,6 +1453,51 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     try { defineProperty(event, 'currentTarget', { value: G, configurable: true }); } catch (e) {}
     fire(event, 'message');
   };
+
+  // A worker inherits its creator's secure-context status, and the same APIs
+  // go away here as on the page. Last in the prep script so it removes what
+  // the steps above have finished installing. `isSecureContext` matching while
+  // `crypto.subtle` still answered would be an engine-internal contradiction
+  // any script could read in two lines. Checked against Chrome 146 in
+  // js-repros/secure-context/chrome-oracle.json.
+  if (!__OBSCURA_WORKER_SECURE__) {
+    var gatedGlobals = ['caches', 'CacheStorage', 'Cache'];
+    for (var gi = 0; gi < gatedGlobals.length; gi++) {
+      try { delete G[gatedGlobals[gi]]; } catch (e) {}
+    }
+    var gatedOnNavigator = ['serviceWorker', 'storage', 'locks', 'mediaDevices'];
+    for (var ni = 0; ni < gatedOnNavigator.length; ni++) {
+      try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
+    }
+    try { if (G.crypto) delete G.crypto.subtle; } catch (e) {}
+  }
+
+  // A window realm gets external.tracelog from the bootstrap, gated on whether
+  // the host configured a destination. A worker boots from the page snapshot,
+  // where that gate was already false at snapshot build time, so the primitive
+  // has to be installed here too, or the one scope an anti-bot payload owns
+  // outright is the one scope that cannot be instrumented. Present only when
+  // the host asked for tracing, same as the window realm.
+  if (__OBSCURA_TRACELOG__) {
+    try {
+      var ExternalCtor = G.External;
+      if (ExternalCtor && ExternalCtor.prototype &&
+          typeof ExternalCtor.prototype.tracelog !== 'function') {
+        defineProperty(ExternalCtor.prototype, 'tracelog', {
+          value: function tracelog(key, value) {
+            var json;
+            try { json = JSON.stringify(value); } catch (e) { json = undefined; }
+            try {
+              Deno.core.ops.op_tracelog(
+                typeof key === 'string' ? key : String(key),
+                typeof json === 'string' ? json : '');
+            } catch (e) {}
+          },
+          writable: true, enumerable: true, configurable: true,
+        });
+      }
+    } catch (e) {}
+  }
 })();
 "#;
 
@@ -891,6 +1560,154 @@ mod tests {
             ),
         )
         .await;
+    }
+
+    /// A shared worker runs one thread per (name, url) within the page, hands
+    /// each construction its own MessagePort, and brands its scope
+    /// SharedWorkerGlobalScope with no scope-level postMessage. Pinned against
+    /// Chrome 146 in js-repros/shared-worker/chrome-oracle.json.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_worker_connects_reuses_one_thread_and_brands_its_scope() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "let seen = 0;"
+              + "self.onconnect = function (e) {"
+              + "  seen++;"
+              + "  const port = e.ports[0];"
+              + "  const connection = seen;"
+              + "  port.onmessage = function (m) {"
+              + "    port.postMessage({ echo: m.data, connection: connection,"
+              + "      tag: Object.prototype.toString.call(self),"
+              + "      post: typeof self.postMessage, name: self.name,"
+              + "      dom: typeof document });"
+              + "  };"
+              + "};";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            // Same name: one worker thread, two connections.
+            const first = new SharedWorker(url, { name: 'alpha' });
+            const second = new SharedWorker(url, { name: 'alpha' });
+            // Different name: a separate thread whose counter restarts.
+            const other = new SharedWorker(url, { name: 'beta' });
+            globalThis.__portIsMessagePort = first.port instanceof MessagePort;
+            globalThis.__distinct = first !== second;
+            globalThis.__hasTerminate = typeof first.terminate;
+            for (const [worker, tag] of [[first, 'a'], [second, 'b'], [other, 'c']]) {
+              worker.port.onmessage = (e) => {
+                globalThis.__got.push(tag + ':' + e.data.connection + ':' + e.data.echo
+                  + ':' + e.data.tag + ':' + e.data.post + ':' + e.data.name
+                  + ':' + e.data.dom);
+              };
+              worker.port.postMessage('ping');
+            }
+            globalThis.__crossOrigin = (() => {
+              try { new SharedWorker('https://other.example/w.js'); return 'constructed'; }
+              catch (error) { return error.name; }
+            })();
+            "#,
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "globalThis.__got.length === 3 ? JSON.stringify(globalThis.__got.slice().sort()) : ''",
+            &serde_json::json!(
+                r#"["a:1:ping:[object SharedWorkerGlobalScope]:undefined:alpha:undefined",\
+"b:2:ping:[object SharedWorkerGlobalScope]:undefined:alpha:undefined",\
+"c:1:ping:[object SharedWorkerGlobalScope]:undefined:beta:undefined"]"#
+                    .replace("\\\n", "")
+            ),
+        )
+        .await;
+        assert_eq!(rt.evaluate("globalThis.__portIsMessagePort").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("globalThis.__distinct").unwrap(), serde_json::json!(true));
+        assert_eq!(
+            rt.evaluate("globalThis.__hasTerminate").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__crossOrigin").unwrap(),
+            serde_json::json!("SecurityError")
+        );
+    }
+
+    /// A port the page never start()s queues its messages instead of
+    /// delivering them; start() then flushes the queue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_worker_port_delivery_waits_for_start() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "self.onconnect = function (e) {"
+              + "  const port = e.ports[0];"
+              + "  port.onmessage = function (m) { port.postMessage('reply:' + m.data); };"
+              + "};";
+            const worker = new SharedWorker(
+              'data:text/javascript,' + encodeURIComponent(src), { name: 'gated' });
+            globalThis.__delivered = [];
+            // addEventListener alone must not enable delivery.
+            worker.port.addEventListener('message', (e) => {
+              globalThis.__delivered.push(e.data);
+            });
+            worker.port.postMessage('one');
+            globalThis.__startPort = () => worker.port.start();
+            "#,
+        )
+        .unwrap();
+        // Give the round trip room to arrive at the unstarted port.
+        for _ in 0..40 {
+            let _ = rt.run_event_loop_bounded(25).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.evaluate("JSON.stringify(globalThis.__delivered)").unwrap(),
+            serde_json::json!("[]"),
+            "an unstarted port must queue, not deliver"
+        );
+        rt.execute_script("<start>", "globalThis.__startPort();").unwrap();
+        pump_until(
+            &mut rt,
+            "JSON.stringify(globalThis.__delivered)",
+            &serde_json::json!(r#"["reply:one"]"#),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_inherits_the_creator_fingerprint_contract() {
+        let mut rt = ObscuraJsRuntime::new();
+        let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        ).with_overrides(&obscura_net::FingerprintOverrides {
+            hardware_concurrency: Some(12),
+            device_memory: Some(4.0),
+            ..obscura_net::FingerprintOverrides::default()
+        });
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/app/");
+        rt.run_page_init();
+        rt.execute_script(
+            "<fingerprint-worker>",
+            r#"
+            const source = `postMessage({
+              userAgent:navigator.userAgent,
+              platform:navigator.platform,
+              hardwareConcurrency:navigator.hardwareConcurrency,
+              deviceMemory:navigator.deviceMemory,
+              userAgentData:navigator.userAgentData.toJSON()
+            })`;
+            globalThis.__got = [];
+            new Worker(URL.createObjectURL(new Blob([source], {type:'text/javascript'})))
+              .onmessage = event => globalThis.__got.push(event.data);
+            "#,
+        ).unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(rt.evaluate("JSON.stringify(globalThis.__got[0])").unwrap(), serde_json::json!(
+            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"deviceMemory":4,"userAgentData":{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"Linux"}}"#
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1116,6 +1933,36 @@ mod tests {
         );
     }
 
+    /// Relative fetch/Request inside a blob worker is resolved against the
+    /// creating document origin, not the blob: script URL. fetch("") from a
+    /// Turnstile widget worker has to hit https://challenges.cloudflare.com/,
+    /// not re-fetch the worker source.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_worker_relative_fetch_uses_creator_origin() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x");
+        rt.run_page_init();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const source = "postMessage({ request: new Request('').url, empty: new URL('', self.origin + '/').href })";
+            const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify([__got[0].request, __got[0].empty])")
+                .unwrap(),
+            serde_json::json!(
+                r#"["https://challenges.cloudflare.com/","https://challenges.cloudflare.com/"]"#
+            ),
+        );
+    }
+
     /// `new Worker(url, {name})` reaches `self.name`, and the default is the
     /// empty string rather than an absent binding.
     #[tokio::test(flavor = "current_thread")]
@@ -1183,7 +2030,11 @@ mod tests {
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         assert_eq!(
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
-            serde_json::json!(r#"{"leaked":[],"dropped":[],"indexed":0}"#),
+            // `caches` is gone because this worker's creator is
+            // http://example.com -- an insecure origin, where Chrome exposes
+            // no CacheStorage either. The rest of the WorkerGlobalScope set is
+            // unaffected. See js-repros/secure-context/.
+            serde_json::json!(r#"{"leaked":[],"dropped":["caches"],"indexed":0}"#),
         );
     }
 
@@ -1217,6 +2068,52 @@ mod tests {
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
             serde_json::json!(
                 r#"{"navCtor":"WorkerNavigator","navTag":"[object WorkerNavigator]","ua":"string","cores":"number","windowOnly":[],"locCtor":"WorkerLocation","locTag":"[object WorkerLocation]","navMethods":[]}"#
+            ),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn secure_worker_storage_exposes_branded_origin_private_root() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/app/index.html");
+        rt.run_page_init();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage=async()=>{try{" +
+              "const storage=navigator.storage;const root=await storage.getDirectory();" +
+              "const child=await root.getDirectoryHandle('sub',{create:true});" +
+              "const file=await root.getFileHandle('probe.bin',{create:true});" +
+              "const access=await file.createSyncAccessHandle();" +
+              "const written=access.write(new Uint8Array([7,8,9]),{at:0});access.flush();" +
+              "const readBytes=new Uint8Array(3);const read=access.read(readBytes,{at:0});" +
+              "postMessage({navOwn:Object.prototype.hasOwnProperty.call(navigator,'storage')," +
+              "storageTag:Object.prototype.toString.call(storage)," +
+              "storageInstance:storage instanceof StorageManager," +
+              "storageProto:Object.getOwnPropertyNames(StorageManager.prototype)," +
+              "rootTag:Object.prototype.toString.call(root),kind:root.kind,name:root.name," +
+              "directory:root instanceof FileSystemDirectoryHandle," +
+              "handle:root instanceof FileSystemHandle,stable:storage===navigator.storage," +
+              "resolve:await root.resolve(child),syncTag:Object.prototype.toString.call(access)," +
+              "syncInstance:access instanceof FileSystemSyncAccessHandle," +
+              "syncOwn:Object.getOwnPropertyNames(access)," +
+              "syncProto:Object.getOwnPropertyNames(FileSystemSyncAccessHandle.prototype)," +
+              "written,read,bytes:Array.from(readBytes),size:access.getSize(),mode:access.mode});" +
+              "access.close();}catch(error){postMessage({error:error.name+': '+error.message})}}";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            const worker = new Worker(url);
+            worker.onmessage = (event) => { globalThis.__got.push(event.data); };
+            worker.postMessage(1);
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"navOwn":false,"storageTag":"[object StorageManager]","storageInstance":true,"storageProto":["estimate","persisted","constructor","getDirectory"],"rootTag":"[object FileSystemDirectoryHandle]","kind":"directory","name":"","directory":true,"handle":true,"stable":true,"resolve":["sub"],"syncTag":"[object FileSystemSyncAccessHandle]","syncInstance":true,"syncOwn":[],"syncProto":["close","flush","getSize","read","truncate","write","mode","constructor"],"written":3,"read":3,"bytes":[7,8,9],"size":3,"mode":"readwrite"}"#
             ),
         );
     }
@@ -1312,6 +2209,39 @@ mod tests {
             ),
         )
         .await;
+    }
+
+    /// Turnstile's widget worker is `onmessage = e => e.isTrusted && eval(e.data)`.
+    /// The posted payload is source, not a structured clone of an object, and
+    /// fetch("") inside it has to resolve to the creating document origin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_worker_evals_posted_source_and_relative_fetch_hits_creator_origin() {
+        // `doc` is the probe: the blob's own bootstrap evals the posted source
+        // inside the worker scope, where `document` does not exist. A scope that
+        // answers "object" evaluated it in the creating document instead.
+        let mut rt = page_runtime();
+        rt.set_url("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/x");
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage = function (e) {"
+              + " if (e.isTrusted && e.origin === '' && e.source === null) eval(e.data);"
+              + "};";
+            const url = URL.createObjectURL(new Blob([src], {type: 'text/javascript'}));
+            globalThis.__got = [];
+            const w = new Worker(url);
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.postMessage("postMessage({ doc: typeof document, url: new Request('').url })");
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"doc":"undefined","url":"https://challenges.cloudflare.com/"}"#
+            ),
+        );
     }
 
     /// A MessageEvent has to arrive with its whole IDL, not just `data`. A

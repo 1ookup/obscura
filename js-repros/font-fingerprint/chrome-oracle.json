@@ -1,0 +1,249 @@
+{
+  "fontsApi": "object",
+  "fontsShape": {
+    "tag": "[object FontFaceSet]",
+    "ctor": "FontFaceSet",
+    "size": 0,
+    "status": "loaded",
+    "checkType": "function",
+    "readyIsPromise": true
+  },
+  "fontsCheck": {
+    "Arial": true,
+    "Helvetica": true,
+    "Times New Roman": true,
+    "Courier New": true,
+    "Verdana": true,
+    "Georgia": true,
+    "Tahoma": true,
+    "Trebuchet MS": true,
+    "Impact": true,
+    "Comic Sans MS": true,
+    "Segoe UI": true,
+    "Calibri": true,
+    "Cambria": true,
+    "Consolas": true,
+    "Candara": true,
+    "Franklin Gothic Medium": true,
+    "Lucida Console": true,
+    "MS Gothic": true,
+    "SimSun": true,
+    "Microsoft YaHei": true,
+    "Menlo": true,
+    "Monaco": true,
+    "Helvetica Neue": true,
+    "Apple Chancery": true,
+    "Zapfino": true,
+    "Geneva": true,
+    "Optima": true,
+    "NonexistentFontXYZ123": true,
+    "ObscuraTestFace": true
+  },
+  "fontsCheckGeneric": {
+    "monospace": true,
+    "sans-serif": true,
+    "serif": true
+  },
+  "baseline": {
+    "monospace": {
+      "w": 780,
+      "h": 84
+    },
+    "sans-serif": {
+      "w": 965,
+      "h": 100
+    },
+    "serif": {
+      "w": 917,
+      "h": 100
+    }
+  },
+  "detected": {
+    "Arial": true,
+    "Helvetica": true,
+    "Times New Roman": true,
+    "Courier New": true,
+    "Verdana": true,
+    "Georgia": true,
+    "Tahoma": true,
+    "Trebuchet MS": true,
+    "Impact": true,
+    "Comic Sans MS": true,
+    "Segoe UI": false,
+    "Calibri": false,
+    "Cambria": false,
+    "Consolas": false,
+    "Candara": false,
+    "Franklin Gothic Medium": false,
+    "Lucida Console": false,
+    "MS Gothic": false,
+    "SimSun": false,
+    "Microsoft YaHei": false,
+    "Menlo": true,
+    "Monaco": true,
+    "Helvetica Neue": true,
+    "Apple Chancery": true,
+    "Zapfino": true,
+    "Geneva": true,
+    "Optima": true,
+    "NonexistentFontXYZ123": false,
+    "ObscuraTestFace": false
+  },
+  "widths": {
+    "Arial": {
+      "monospace": 949,
+      "sans-serif": 949,
+      "serif": 949
+    },
+    "Helvetica": {
+      "monospace": 949,
+      "sans-serif": 949,
+      "serif": 949
+    },
+    "Times New Roman": {
+      "monospace": 902,
+      "sans-serif": 902,
+      "serif": 902
+    },
+    "Courier New": {
+      "monospace": 778,
+      "sans-serif": 778,
+      "serif": 778
+    },
+    "Verdana": {
+      "monospace": 1096,
+      "sans-serif": 1096,
+      "serif": 1096
+    },
+    "Georgia": {
+      "monospace": 992,
+      "sans-serif": 992,
+      "serif": 992
+    },
+    "Tahoma": {
+      "monospace": 958,
+      "sans-serif": 958,
+      "serif": 958
+    },
+    "Trebuchet MS": {
+      "monospace": 907,
+      "sans-serif": 907,
+      "serif": 907
+    },
+    "Impact": {
+      "monospace": 863,
+      "sans-serif": 863,
+      "serif": 863
+    },
+    "Comic Sans MS": {
+      "monospace": 944,
+      "sans-serif": 944,
+      "serif": 944
+    },
+    "Segoe UI": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Calibri": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Cambria": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Consolas": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Candara": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Franklin Gothic Medium": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Lucida Console": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "MS Gothic": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "SimSun": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Microsoft YaHei": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "Menlo": {
+      "monospace": 780,
+      "sans-serif": 780,
+      "serif": 780
+    },
+    "Monaco": {
+      "monospace": 778,
+      "sans-serif": 778,
+      "serif": 778
+    },
+    "Helvetica Neue": {
+      "monospace": 953,
+      "sans-serif": 953,
+      "serif": 953
+    },
+    "Apple Chancery": {
+      "monospace": 886,
+      "sans-serif": 886,
+      "serif": 886
+    },
+    "Zapfino": {
+      "monospace": 1259,
+      "sans-serif": 1259,
+      "serif": 1259
+    },
+    "Geneva": {
+      "monospace": 991,
+      "sans-serif": 991,
+      "serif": 991
+    },
+    "Optima": {
+      "monospace": 953,
+      "sans-serif": 953,
+      "serif": 953
+    },
+    "NonexistentFontXYZ123": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    },
+    "ObscuraTestFace": {
+      "monospace": 780,
+      "sans-serif": 965,
+      "serif": 917
+    }
+  },
+  "detectedCount": 17,
+  "distinctWidths": 16,
+  "canvasContext": true,
+  "canvasWidths": {
+    "monospace": 780.26,
+    "\"Arial\", monospace": 948.87,
+    "\"NonexistentFontXYZ123\", monospace": 780.26,
+    "\"Segoe UI\", sans-serif": 964.87,
+    "\"Menlo\", monospace": 780.26
+  }
+}

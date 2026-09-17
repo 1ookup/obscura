@@ -759,6 +759,73 @@ impl DomTree {
         }
     }
 
+    /// Every element matching `selector` in the shadow-including subtree of
+    /// `root`, in shadow-including tree order.
+    pub fn query_selector_all_shadow_including(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Vec<NodeId>, String> {
+        let selector_list = parse_selector(selector)?;
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            self.selector_quirks_mode(),
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let mut results = Vec::new();
+        for desc_id in self.descendants_including_shadow(root) {
+            let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
+            if !is_element {
+                continue;
+            }
+            let element = DomElement::new(self, desc_id);
+            if selectors::matching::matches_selector_list(&selector_list, &element, &mut context) {
+                results.push(desc_id);
+            }
+        }
+        Ok(results)
+    }
+
+    /// First element matching `selector` in the shadow-including subtree of
+    /// `root`. A page query cannot cross a shadow boundary, so a control that
+    /// a widget renders into a closed shadow root is invisible to
+    /// [`Self::query_selector_from`] even though the engine's tree holds it.
+    /// The engine itself may still need to find such a control -- for example
+    /// to answer the click listener the widget registered for it -- so this
+    /// walks hosted shadow trees as well as light children.
+    pub fn query_selector_shadow_including(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Option<NodeId>, String> {
+        let selector_list = parse_selector(selector)?;
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            self.selector_quirks_mode(),
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+
+        for desc_id in self.descendants_including_shadow(root) {
+            let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
+            if !is_element {
+                continue;
+            }
+            let element = DomElement::new(self, desc_id);
+            if selectors::matching::matches_selector_list(&selector_list, &element, &mut context) {
+                return Ok(Some(desc_id));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn query_selector_all_from(
         &self,
         root: NodeId,
