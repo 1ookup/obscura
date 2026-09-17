@@ -1,769 +1,46 @@
 # Cloudflare 挑战：诊断记录
 
 针对 `zencare.co` 的 Cloudflare Turnstile 托管质询（5 秒盾）的逐步排查记录。
-按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。被证伪的假设一并保留——
-它们标出了不必再走的路。
-
-当前状态（2026-09-17，step 297，调查中）：**质询仍未通过，唯一成功判据为目标 URL 真实 404**。
-指定代理可达；带点击的单轮在 30s 预算内稳定完成三次 `/fo/` 提交（顶层 #1、widget #1、widget #2 证明），
-此后停滞；75s 窗口同样停在同一处，因此是「停住」而不是「太慢」。
-停滞点已收敛到**一条语句**：widget 在收到证明响应后的程序里 `new Worker(blob:)` 之后不再前进，
-调用方既没有 `push`、没有赋 `onmessage`、也没有 `postMessage`（Proxy 观测下对该 worker 零属性读写）。
-参考同一阶段是 5 个 worker 连发并在 ~215µs 内 `push → onmessage → postMessage`，116ms 后收到 `graIf9` 结果。
-四个候选机制已逐一实测排除：worker 回复被空批次抛弃（实测均为 `outbox-closed`，无瞬时争用）、
-V8 watchdog 静默切断（两个 watchdog 均未触发）、跨 realm `postMessage` 投递失败（双向心跳 seq 到 31+ 正常）、
-blob worker fan-out 本身不可用（本地同形 fixture 5/5 回复正常）。
-页面停在 `honk` eval 等待循环（`0, /.*honk.*/, <ts>`，前导 1337331 空格）——参考也走同一循环，不是分岔。
-**step 290 新增**：修掉 caption/表格宽度协商的两层——① 原生 table 无行时
-`build_table` 直接 `return None`（退化成普通块拉伸 1264/0），caption-only 表格
-现在合成一行、caption 作为单元盒进 grid；② 表格 grid 节点 width auto 时
-`align_self: FLEX_START`（CSS 表格是 shrink-to-fit，不随块级拉伸）。双引擎对拍：
-table 0/1264 → 63（Chrome 60.313，与容器宽度无关）；caption 4 → 37.844
-（Chrome 39.516；残差 ~1.7px 为字形 advance、高度差 4px 为竖向边框细节，
-与 p9 的 0.5px 文本噪声同级）。render 589/589。
-**step 291 新增**：复查 192.168.3.57 反汇编文档仍为 Sep 16 22:31 版本
-（无 timer/timing 族新文件，uGyjw9/ZMSOw0/tZwbF3 归属继续挂起）。会话轮换后
-再跑一轮 30s 点击流程：判决不变（8 次 /fo/、收官 3240B、无 POST /1.txt），
-PWGF4 t=59ms 为历轮最佳；两条 cf_clearance 均为失败路径下发（按判定口径非
-通过证据）。
-**step 294 新增**：远端反汇编文档连续三次复查无更新。caption「竖向边框未计入」
-的前提被计算样式证伪：border 已计入（content 25 + 2+2 = 29），4px 高度差的真因是
-**shaping 字体度量**——caption 文本用捆绑 Liberation 的 hhea 排版（行高 25、
-advance 33.8），Chrome 用 PingFang SC（29、35.5）。修复方向 = identity 感知的
-shaping 字体加载（macOS 身份下装载系统 PingFang SC 参与 shaping），属字体层工程。
-会话轮换后再跑 30s 点击流程：判决不变（8 次 /fo/、收官 3240B、无 POST /1.txt），
-PWGF4 t=279ms。
-**step 296 新增**：identity 感知 shaping 字体加载已落地但**本机不生效**——
-第五次复查远端文档仍无更新；实现为引擎构建时装载 `/System/Library/Fonts/PingFang.ttc`
-的 SC 面到内部家族 `__obscura_system_pingfang`、shaping 解析（resolve_loaded_font
-fallback）在 macOS 身份下优先选取，**但本机没有该文件**（受限系统只有
-STHeiti/Hiragino GB），故 caption 行高差（shaping Liberation 25 vs Chrome 替换字体 29）
-保持原状；宿主有 PingFang 的部署即自动生效。剩余收敛路径：IFC leaf 高度按
-`lines × used_line_height` 抬升，或捆绑一个 PingFang 度量的替代字体。
-30s 流程：8 次 /fo/、收官 3240B、无 POST /1.txt，PWGF4 t=285ms。
-**step 297 新增**：PWGF4 投递残差根因定位并修复——timers 全 trace 抓到
-`next_timeout_ms=Some(0.0)` 却 `delivered=0`、repair 循环上百次不投递：deno_core
-的 mutable timer sleep 持有过期 waker，yield-only op 唤醒不重置 sleep。修复：repair
-时额外入队一个一次性 0ms 丢弃 timer，强制 `queue_timer` 走 `change(now)` 将 sleep
-标记 ready（runtime.rs）。修复轮实测 PWGF4 t=**5ms**（历史 548→59-516），与 Chrome
-的 1ms 同级；后续 183/1009 的散布为挑战流程调用顺序方差（onload 已早触发），非
-投递延迟。套件：obscura-js 618/621、browser 124/125（既有失败不变）。
-**step 289 新增**：插桩 `frame_geometry_json`（OBSCURA_GEOM_DEBUG=1，dump
-cssom/rects/transform/out）命中 p1 归零根因：`Affine2::around` 把 origin 折叠进矩阵时
-`e = ox×(1−a)` 在 scale 1e35 下 ≈1e39 溢出 f32 → e=inf、f=NaN，之后所有角点
-inf−inf=NaN → 序列化 null → JS 全零。修复：`around` 折叠平移饱和到 f32 界 +
-`map_rect` 角点改 f64 中间运算、末端饱和（f32 角点会同时饱和到同值、宽塌成 0）。
-双引擎对拍 p1 gBCR height/y 364.77/−35.885 与 Chrome 逐位一致、宽度为有限巨大值
-（33554430 vs 6.8e32，各自引擎钳位上限，类别相同）——挑战探针 **10/10 OK**。
-caption 4 vs 39.5 仍开放（表格宽度协商架构项）。
-**step 288 新增**：修掉 summary 的 disclosure marker——UA 默认给 summary 装
-before 生成盒（`style.rs`，`before_pseudo = marker`），`dom.rs` 在样式表伪元素提取
-为空时保留 UA 元素默认（否则被无条件覆写）。双引擎对拍 details/summary/p5 全部
-与 Chrome 一致（66=66、[4,70]=[4,70]），挑战探针 10 项里 9 项 OK。`map_rect`
-输出做饱和（非有限值钳到 f32 界；CSSOM 序列化 null → JS 全零回退是更强 tell）。
-p1 gBCR 仍 0：computed transform 解析正确（matrix(1e35,…))，归零发生在 geometry
-op 链更深处（`compute_absolute_unrounded_rects` 之后的某个环节），待插桩定位。
-caption 4 vs 39.5 仍未修（caption 需在 grid 之外独立成盒并参与表格宽度协商——
-表格布局架构工作）。
-**step 287 新增**：修掉「仅含内联级原子盒的块没有匿名行盒 strut」——① `dom.rs` 的
-run 包装器 strut 不再以「run 含文本节点」为条件（CSS 行盒无条件带块的 strut），
-img-only 块 16 → 22；② `style.rs` 给 progress/meter 补 UA 默认 `inline-block`
-（此前落为 block，根本不进 Run）。双引擎对拍：挑战探针 p6 26=26、p7 27≈26 转 OK，
-img-only/progress-only 块 22=22；render 套 589/589 无回归。PWGF4 t 本轮实测 **67ms**
-（548 → 114-354 → 67）。仍未修：p5 details 48 vs 70（Chrome 的 summary 是
-list-item，0 宽下 marker 行多出一行，66=3×22 vs 我们 44）、caption 4 vs 39.5
-（caption 文本未参与表格 shrink-to-fit）、gBCR 病态 scale 0 vs 6.8e32。
-**step 286 新增**：修掉 offsetWidth/offsetHeight 与 transform 的纠缠（`ops.rs`
-geometry JSON 增加 transform-free 的 `layoutWidth/layoutHeight`，`element-object.js` 的
-offset* 优先读取；双引擎对拍 `p1` scale(1e32) 下 offset [4,193] 与 Chrome 逐值一致，
-修复前是 33554430/0）。gBCR 在病态 scale 下仍为 0（transformed rect 二进制32 溢出 →
-序列化为 null → JS 端全零回退；Chrome 用饱和的 layout 单位答 6.8e32，未复刻）。
-新表征一处一类缺口：**仅含内联级原子盒的块没有匿名 IFC strut**（img-only/progress-only
-块高 = 原子高 16，Chrome 答 max(strut 22, …)=22；`is_pure_text_ifc` 拒绝原子 → taffy
-直排）——挑战探针 p5 details 48 vs 70、p6 progress 20 vs 26、p7 select 23 vs 26 全部
-由此而来。修复需要给「全原子子div」合成匿名行盒，动核心布局构建器，留作下一轮。
-**step 285 新增**：带点击的 30s 轮已稳定走完全部五次 `/fo/` 提交，服务端在顶层收官 `/fo/`
-（3240B vs 参考 3660B）后仍回「重开一轮」而非 `POST /1.txt`。两处修复：① 解析脚本排队的页面
-timer 现在在 DCL 边界投递（`page.rs`，api.js 用 `setTimeout(0)` 派发 onload 回调，`PWGF4[0].t`
-548ms → 114-354ms，残差是 chl_page 自己的 `/fo/` 等待与 VM 吞吐）；② macOS 身份的默认字体度量
-改用 PingFang SC hhea（`inline.rs`，挑战自有布局探针（ENV-DETECT pc 204513-207205 重建）的行盒
-高度与 Chrome 逐值一致：p2 92=92、p4 55.938=55.938 等）。新发现未修缺陷：serve+CDP 导航
-loopback URL 提交空文档（`--allow-private-network` 与环境变量都不生效）。
-**step 275 新增**：拿到本会话**第一个运行时 `(pc,key,op)` trace**（24200 个状态，入口 `pc=0,key=121,op=17`，
-解码常数 `+251`），并据此证明操作者的 spec 是**按 build 生成**的：其 69 op 表与本 build 只有 26 个重合，
-`keyRunInit=241` 对我们是错的，所以静态管线必然只出 1 个状态、`dynamicReachable=0`、操作数全是 `h[?]`。
-入口 handler 是**分支型**（`widthByBranch=[5,2,3,2,2,2]`），宽度必须由运行时状态决定 ⇒ `pcstates` 是必需输入
-而非加速器。同时纠正 step 274 的「94.58% 覆盖率」：任一 pc 上 256 个 key 里有 69 个能解出合法 op，
-该比例几乎无鉴别力，不构成「解出一条连贯路径」的证据。
-**step 281 新增**：用「同一 fixture 两个引擎对跑」的方式做表面对拍，修掉两处——`Screen.prototype` 多出 4 个自有属性（Chrome 的 12 个名字现在完全一致，方法改为继承）、`Document` 缺 5 个 legacy 颜色属性（Chrome 返回 `""`，我们原本 undefined）；并记录仍未修的命名差异（window 插入顺序第 61 位起不同、多出 8 个 `SharedStorage*` 全局、缺 `navigator.cpuPerformance`/`HTMLCameraElement`/`HTMLMicrophoneElement`、`Document.prototype.location` 位置、渲染计时 1ms vs 548ms）。
-**step 280 新增**：用 `Target.setAutoAttach` 抓到真实 Chrome 的 payload 字段（341 个带标签字段），逐项对拍后发现并修复两处存储组差异——`navigator.storage.estimate().quota` 在 **worker realm** 里是平 5GB（参考 10 GiB，`RPKTR7`），以及 `flush()` 成本为 0（参考 0.54ms，`uUOw3`）；两处都已在 live payload 里核实为 `10737418240` 与 `0.6`。
-**step 279 新增**：插桩改为**只挂宿主面**（`Worker`/`Blob`，注入到文档自身的 nonce `<script>`），不再解析
-VM 的混淆代码，因此不再受会话轮换影响；据此拿到**当前**变体的完整探针集（含两个此前未见的探针：`eval("debugger")`
-与一个 4×3 计时矩阵 `jixMq8`，以及 5 个 worker 的 `graIf9` 结果——**五个结果都回来了**，step 271 的「new Worker
-之后调用方提前返回」已被推翻，停点更靠后）。另用真实 Chrome 走**同一代理同一 URL**带点击对拍：Chrome（有头/无头）
-当前只走到**顶层 `/fo/` #1 + widget 文档**就停住，一次 widget 提交都没有，而 Obscura 能走完 8 次 `/fo/` 并两次
-拿到 `cf_clearance` ⇒ **当前环境下 Chrome 比我们走得更短**，所以「stage-3 变短」不能单独作为 Obscura 特有指纹的
-证据（能产出参考那份成功抓包的客户端现在也走不到那一步）。
-**step 278 新增**：把所有**能命名**的探针输入与参考侧逐项对拍，结论是**全部一致**：时钟分辨率两边都是
-0.1ms（文档与 worker 两个 realm 都用真实 Chrome 跑同一 fixture 比对；参考 trace 里的 15µs 是插桩 build 的
-钳位前内部值）、navigator 字段一致（参考的 `Navigator.languages` 也是长度 1）、PAT 探针两边都是
-`401 + PrivateToken challenge` 且都不带 auth 头、brunhild 跨域抓取参考侧同样是 `status 0` 失败、请求清单与
-参考 HAR 同类同量。OPFS `flush()` 按参考实测修正为**亚分辨率 0ms**（Chrome `flush` 实测仅 12µs，写入 477µs、
-关闭 76µs），文件后端保留。另发现 **widget 文档按会话轮换**（409959 → 449509B，解码常数 251 → 57），
-旧插桩锚点失效；按 build 稳定的锚点是 `arr[pc++]` 字节码读与 `case <op>: <obj>[<lookup>](this)` 的 switch。
-**step 272 新增**：turnstile widget 文档被请求两次的机制已定位并修复——不是重复 attach（该 host 只有一次
-提交导航），而是 `Critical-CH` 重试在客户端内部把同一请求发了第二遍；参考（Chrome）面对同样的
-`Accept-CH`/`Critical-CH` 只发一次。修复后 widget 文档请求 2→1（3 轮实测，修前 2/2/4）。
-但**实测该重复与停滞无关**：请求数为 1 的轮次同样停在三次提交之后，因此它是独立缺陷而非停滞的原因或症状。
-本轮还确认证明载荷的字段面与参考逐名一致（53 个非数字名全同，仅记录顺序与两个列表长度不同）。
-新增 `OBSCURA_DEBUG_FRAMES`（host 侧 opt-in，报每条 frame 导航路由、每次 attach、每次提交导航）。
-待解：仍要给当前会话的 widget 程序在 `TH.yg` 处做程序侧插桩（build 每会话重随机）；
-另记一处未归因隐患——`navigate_frame_inner` 的 nested discovery 不查 `frames.by_host`，三轮回放未复现。
-**step 273 新增（程序侧直接测量）**：`runProgram(text,b)` 只**构造**程序并返回执行器（3-24ms，返回 native 函数），
-每个程序的执行器被**调用一次**并同步返回 `undefined`；答复证明的 71571B 程序跑 **107ms**，其全部可观测宿主活动是
-`revokeObjectURL → new Blob(292) → createObjectURL → new Worker(blob:) → return`，既不赋 `onmessage` 也不发
-`postMessage`，且未注册任何续体 ⇒ 调用方不执行参考侧三步的原因是**它返回了**（不是被阻塞、不是丢消息、不是被切断）。
-参考同一阶段窗口单独就有 9 个 Blob / 58 次 createObjectURL / 5 个 Worker 之后才 push→onmessage→postMessage。
-另测出 **native 属性 trace 无法用于该阶段**：`--trace-api-keyed off`（175MB）与 `keyed on + filter URL,Blob,Worker`
-（160MB）两种配置下都**一次 `/fo/` POST 都到不了**，trace 自身开销先把流程掐死。
-另测出流程是**会话相关**的：有一轮完整走完 5 次提交（widget #3 resp 5136、顶层收官 resp 3240，参考 7164/3660），
-即 step 262 的「更短 clearance」在现 build 复现，之后页面**开新一轮**而非 POST 表单到 `/1.txt`。
-本轮打通并验证了本会话程序的解码+反汇编管线（7 个响应全部 b64frac=1.000；`bc_02` 用操作者 spec 解出 94.58% 字节
-覆盖、0 unresolved、17356 条指令），并确认**宿主 API 名不在字节码里**（`bc_01`/`bc_02` 都搜不到 Worker/postMessage/Blob）
-⇒ 下一次归因必须「程序 + 解释器（widget 文档）」一起读。
-**step 274 新增**：本地代理跳（direct vs hopped，各 3 轮）**不改变结果**，两臂都是 3 次 `/fo/` POST 后停滞
-⇒ 三次提交停滞是常态，step 273 那次走完 5 次提交是会话运气（本会话约 1/8），两个失败签名都真实存在。
-实测出一处**具体引擎缺陷**：worker realm 里 OPFS 同步句柄 `write`/`flush` 都是 **0 ms**
-（逐字节 fixture：`writeMs:0, flushMs:0`），而参考同模式测得 **10.6 ms**（即 payload 里的 `uUOw3`）；
-形状是对的（`storage_manager_and_origin_private_file_system_match_chrome_shape` 通过），但
-`flush()` 只是 `syncData(this)`（worker.rs:1174），文件节点是内存里的 `Uint8Array`，**从不落盘**。
-（API 在页面 realm 不存在是正确的：Chrome 同样只在 worker 暴露。）
-另**证伪**「handoff literals」读法：用参考自身 HAR 解出它五个 `/fo/` 响应（全部 b64frac=1.000），
-两侧的 stage-3 程序都搜不到 `postMessage`/`_cf_chl_opt`/`widgetId`/`token`/`source`；
-且 stage-2 程序两侧仅差 7 字节（71571 vs 71564）却行为不同 ⇒ **分岔输入不在程序文本里**，是更早读到的值。
-另测出**静态读分支不可得**：操作者反汇编器把我们的 blob 渲染出 94.58% 覆盖、0 unresolved，但所有操作数都是
-`h[?]`——anchors 输入带的是每 pc 的**代表键**而非入口链推导键，我们的 blob `dynamicReachable=0`。
-三条程序侧路线（native trace 成本、handoff literals、静态操作数）均已实测关闭，剩下的是**本会话的运行时
-`(pc,key)` trace**（操作者管线正是从 `ov1-N-pcstates.jsonl` 取这个）。
-
-历史状态（2026-09-13，step 256）：指定代理当前可达，console-op trace持续取得完整payload；
-初始 about:blank 的 Window origin、document.domain 和 referrer 继承错误已修复，三轮真实 payload 验证通过。
-Document.adoptedStyleSheets描述符也已修复，三轮payload均恢复该路径；设备对齐后仍有11项原始参考差异。
-CDP实际点击触发目标二次导航，仍为HTTP403 challenge，后续需继续对拍完整payload行为差异。
-本轮继续参考 HaHaVM-General 并修复 wreq Critical-CH 重复头、跨源 iframe 初始隔离位、初始 about:blank
-兼容模式及可配置屏幕工作区指标；最新 payload 已对齐 `crossOriginIsolated=F`、`compatMode=BackCompat`、
-`screen.availTop=30`、DPR/语言/UA-CH 关键值。通过真实点击可执行
-frame proof/PAT/top proof，但 `brunhild.challenges.cloudflare.com` 经 `192.168.3.57:9000` 仍返回 `502`，
-页面换 ray，尚无目标 404。剩余分歧继续以明文 payload/事件时序对拍，不增加域名特判。
-step128存档：XHR修复与完整门通过，proof/top/new-ray链完整但仍无404。
-参考HaHaVM-General的XHR接口分层继续审计，已确认Obscura实例泄漏状态/请求/监听器字段、upload为普通
-对象且prototype层级错误；下一步以Chrome151完整shape/state oracle限定通用修复范围，不迁HaHa固定请求头。
-step130存档：参考HaHaVM-General继续核对Blob/Worker环境后，Obscura补齐Blob URL本地fetch的二进制GET/HEAD、
-Response元数据、MIME、Request输入和revoke生命周期，focused回归1/1通过，已有Blob Worker回归也通过。
-零预注入真实轮在新Reqable CA下完整走完fo/proof链但仍换ray；`tQcZu4`仍为`fetch_error`，Chrome对应为`timeout`。
-两边均未收到 `brunhild/.../i` 的response，当前差异由代理侧502/请求取消时序造成，不能据此增加站点特判。
-workspace nextest在shadow identity既有测试超过180秒中止，936通过/4失败/4 skipped/755未运行，完整门待后续清理。
-step131：修复 `Allow-CSP-From` 的通用 origin 比较。旧逻辑按原始字符串精确匹配，会误拒大小写不同、默认
-端口或尾随 `/` 的合法来源；现在解析 URL origin，拒绝凭据、路径、query、fragment和 opaque `null`，保留 `*`。
-`allow_csp_from_compares_origins_not_raw_header_strings` 与完整 embedded-CSP focused 均通过（2/2）。
-当前 Reqable CA 下零注入真实轮仍完整产生 proof/top/new-ray 后换 ray，没有 404；该修复未改变真实挑战结果，
-因为目标 Turnstile iframe 不携带 `csp`，仍不能作为当前站点阻塞根因。
-step132：参考 HaHaVM-General 的独立 HTMLIFrameElement 原型，Obscura 不再把 `HTMLIFrameElement` 别名为
-`Element`。新增专属 wrapper、Chrome 24 项 prototype 顺序/descriptor/brand、iframe 专属属性与节点映射，
-并保留 frame navigation/CSP/跨 realm 行为；shape focused、iframe navigation/CSP focused 与 obscura-js
-552 项（排除已知 shadow identity hang）均通过。真实 clean click 仍 proof/top/new-ray 后换 ray，没有 404。
-step133：Chrome/iframe 矩阵确认 `crossOriginIsolated` 是每个 Document 的状态：about:blank/srcdoc 继承父值，
-network iframe 依据自身 COOP/COEP。Obscura 将该值加入 `DocumentScope`，network frame 从响应头计算，
-blank/srcdoc 继承，frame realm 的 `document_scope_info` 改读 scope 值；隔离 focused 与 workspace 排除 hang 的
-1696/1696 全部通过。当前 Reqable CA 下真实 clean click 仍无 404，继续保留网络失败时序为未决。
-step134：在最终 release 二进制上复测 iframe 原型清理与 frame-level isolation；零预注入 clean click 仍稳定产生
-8 次 `/fo/`（含 proof/top/new-ray），页面显示 `Verification successful` 后换 ray，最终 URL 仍未真实返回404。
-这确认本轮 iframe 通用修复无回归，但也未改变当前代理/挑战失败判定。
-
-### Step 135 — Chrome 152 长尾接口面收敛（2026-09-02，完成）
-
-**假设**：当前 Chrome/Obscura 明文 payload 的 `N`/`o` 桶仍有稳定构造器差异；这些差异来自通用接口表，
-不是 `brunhild` 网络失败本身。参考 HaHaVM-General 的全局接口壳，并以当前 Chrome 152 CDP descriptor oracle
-确认具体形状。
-
-**方法与证据**：Chrome 多出 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
-`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`。其中 XSLTProcessor 可构造，其余为 illegal constructor；
-原型父级分别为 Object、HTMLElement、PerformanceEntry、PerformanceEntry、AbstractRange、AbstractRange，
-并核对了公开 accessor/method 名称、length、brand。Obscura 同时多出当前 Chrome 不公开的 `ModelContext`、
-`WebMCPEvent` 及 `navigator.modelContext`。
-
-**修复**：扩展 `_chromeInterfaceTable`，为六个接口安装 Chrome 152 的原型成员和 native descriptor；移除
-`ModelContext`/`WebMCPEvent` 及 `navigator.modelContext` 壳。实现位于 `crates/obscura-js/js/bootstrap.js`，
-未加入目标域名逻辑。
-
-**量化结果**：同轮零注入 payload 的 `N` 桶由 1167 收敛到 Chrome 的 1171，`o` 桶由 121 收敛到 120；
-六个构造器均为 `function`，两个旧壳为 `undefined`。无注入真实导航仍完整产生初始 fo、proof/top 转发并在
-`Verification successful` 后换 ray，`tQcZu4` 仍为 `fetch_error`（Chrome 为 `timeout`），目标未返回真实 404。
-
-**结论**：长尾全局接口差异已闭环且无回归，但不是当前 404 的唯一阻塞；剩余分歧继续限定在
-`brunhild/.../i` 请求的网络失败/取消时序，禁止加入站点特判。
-
-### Step 136 — 请求头/事件/worker 环境收尾与外部网络盲区（2026-09-02，调查中）
-
-**假设**：HaHaVM-General 对 worker creator origin、Window event 和脚本请求元数据的处理，仍可能与
-Obscura 在当前 Chrome 152 质询中存在通用差异；这些应先由独立回归和请求头观测确认，不能用目标域名逻辑补偿。
-
-**修复与证据**：Obscura 现在在事件 dispatch 期间暴露当前 `window.event`，空闲时恢复 `undefined`，并在
-worker `fire()` 中同样设置/恢复；blob/data worker 的环境优先继承 creator origin；stealth scripted fetch
-补齐 `Accept`、`Accept-Language`、`Sec-Fetch-Site`、`Sec-Fetch-Mode`、`Sec-Fetch-Dest`。Chrome 152
-长尾接口表同时补齐 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
-`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`，移除不公开的 `ModelContext`、`WebMCPEvent` 与
-`navigator.modelContext`。零注入 payload 结构从 `N=1167/o=121` 收敛到 `N=1171/o=120`。
-
-**回归**：`window_event_is_current_only_during_dispatch` 1/1，三个 worker origin 测试 3/3，
-`scripted_fetch_site_distinguishes_origin_and_site_boundaries` 1/1；带 trace-patched V8 的精确 release build
-和 `vendor/v8-trace.sh check` 均通过。完整 workspace nextest 排除已知会挂起的
-`shadow_root_identity_and_children_are_native_tree_backed` 后为 1697 passed / 1 flaky failure / 5 skipped；
-失败项 `test_navigate_and_snapshot` 单独以 `--retries 2` 复跑通过。
-
-**真实站复测与测量盲区**：本轮启动的最终 release serve 已确认 stealth TLS 与 Chrome 149 macOS UA，但
-`cdp_click_fast` 40 秒内没有 widget，服务端导航在 60 秒超时关闭；同一代理 `http://192.168.3.57:9000`
-对目标直接返回 Cloudflare 403 challenge，未产生可比较的 proof 请求或 `/1.txt` 404。因此本轮不能证明
-代码改变了真实判定，也不能把外部 403/Brunhild pending 归因于 Obscura。下一轮只有在代理恢复可完成挑战时，
-才继续做零注入点击和 404 验收；不增加 hostname 特判。
-
-### Step 137 — frame 文档 `script-src` 执行门（2026-09-02，完成）
-
-**假设**：frame controller 已把网络响应 CSP 写入 `DocumentScope`，但 frame 脚本调度器可能没有读取它；
-若 frame 中的 nonce/来源限制未执行，挑战 widget 的子文档会暴露与 Chrome 不同的脚本执行面。
-
-**证据与修复**：审计 `execute_frame_scripts_for` 确认 classic、module、inline 和 import map 原先均无
-`script-src` 校验，外部 frame script 即使不在响应 CSP allowlist 中也会被抓取。现在 frame 调度使用自身
-`DocumentScope.csp`：外部 classic/module 按 `script-src-elem`/`script-src`/`default-src` 检查，inline
-classic/module/import map 按 nonce/`unsafe-inline` 检查，阻断发生在网络请求和执行之前；主文档逻辑保持不变。
-
-**回归**：新增 `frame_document_csp_gates_inline_nonce_and_external_scripts`，验证无 nonce inline 被阻止、
-正确 nonce 执行、未允许的外部脚本不产生请求；该测试与既有 embedded CSP、frame module、external script
-共 4/4 通过。`obscura-browser` release+render crate 全部 111/111 通过。
-
-**结论**：这是已由独立 HTTP fixture 证明的通用 iframe CSP 缺陷，已修复且没有站点特判。当前真实 404
-仍待代理恢复后验收；本次修复本身不改变此前 `brunhild` 外部请求 pending 的结论。
-
-### Step 138 — CSP 脚本门后的真实站复测（2026-09-02，调查中）
-
-**假设**：frame `script-src` 缺口修复后，若代理恢复，挑战 widget 应至少进入可交互阶段；这次只使用
-trace-patched release、stealth、对齐 Chrome 149 UA 和零注入点击，不使用会污染 payload 的 DOM hook。
-
-**代码证据**：`execute_frame_scripts_for` 现在在 frame 自身 `DocumentScope.csp` 下 gate 外部 classic/module，
-并按 nonce/`unsafe-inline` gate inline classic/module/import map。新增 HTTP fixture 已证明禁止脚本不产生
-网络请求，允许 nonce 脚本仍执行；frame CSP/module/external focused 4/4，`obscura-browser` 111/111，
-workspace（排除已知 shadow hang）1699/1699，release/no-default/trace patch 均通过。
-
-**真实站证据**：最终 release serve 日志确认 stealth TLS 与 Chrome 149 macOS UA。对
-`https://www.thelancet.com/1.txt` 的 `cdp_click_fast --deadline 40` 连续复测仍在 40 秒内无 widget，
-页面 title/body 为空，服务端导航约 60 秒后关闭；同一代理直接响应 Cloudflare 403 challenge。没有 proof、
-`complete` 或目标 `/1.txt` 404，因此不能宣称本修复已过盾，也没有足够证据继续归因某个 Obscura iframe API。
-
-**结论**：iframe 文档 `script-src` 执行机制已闭环；当前真实 404 验收仍被代理/上游挑战状态阻断。后续
-需要代理恢复或新的可完成挑战网络条件，再按零注入流程验证，不加入站点特判。
-
-### Step 139 — 动态 frame script CSP sink（2026-09-02，完成）
-
-**假设**：即使 parser-discovered frame scripts 遵守 CSP，动态插入的 `<script>` 仍可能绕过 `script-src`；
-挑战 widget 常在运行时创建 script 元素，这会让 frame realm 的执行面与 Chrome 不一致。
-
-**修复**：`__prepareInsertedScript` 现在读取当前 frame 的 `DocumentScope.csp`，在调度 fetch/eval 前检查
-外部 classic/module 的 `script-src-elem`/`script-src`/`default-src` 来源，以及 inline classic/module/import
-map 的 nonce/`unsafe-inline`。阻断脚本仍标记为 started，避免后续连接重复执行；主文档和 worker 路径不受影响。
-
-**证据**：扩展 `frame_document_csp_gates_inline_nonce_and_external_scripts` fixture，验证动态无 nonce
-脚本不执行、动态正确 nonce 脚本执行、未授权外部动态脚本不产生请求；该测试与 frame CSP/module/external
-集合通过，workspace 排除已知 shadow hang 后 `1699/1699` 通过，no-default check 通过，release 二进制保持
-trace-patched。
-
-**结论**：动态 frame script CSP sink 已按通用规则闭环，未加入目标域名逻辑。真实 404 仍因代理当前直接
-返回 Cloudflare 403、无 widget 而无法验收。
-
-### Step 140 — frame ES module graph CSP（2026-09-02，完成）
-
-**假设**：入口 `<script type="module">` 已校验 frame `script-src`，但模块图的静态 `import` 由独立
-realm loader 抓取，可能绕过同一策略并加载未授权依赖。
-
-**修复**：新增 `FrameModuleCsp`，把 frame 的 CSP header 与 origin 传入 `prepare_module_in_frame_realm`；
-每个静态及重写的 dynamic import 在入队/抓取前按 `script-src-elem` 优先、`script-src`、`default-src`
-回退规则校验来源，处理 `self`、scheme、host wildcard、端口、`data:`/`blob:`，并遵守重复 directive
-首项规则。被阻止的依赖不会发起网络请求。
-
-**证据**：新增 frame fixture 使用 nonce 允许 module 入口、用 `https://blocked.example` 依赖验证 graph
-被 CSP 拒绝且 module body 不执行；Chrome 规则的 directive precedence、scheme-less host 与 duplicate
-directive focused 断言通过。workspace release nextest（排除已知 shadow identity hang）`1700/1700 passed`
-（1 leaky、5 skipped），no-default check、精确 release build 与 trace patch 均通过。
-
-**结论**：frame 静态 module graph 的 CSP 机制已闭环，未加入站点特判；真实 `/1.txt` 404 仍等待可完成的
-Cloudflare 上游挑战网络条件。
-
-### Step 141 — frame render warmup 的资源 CSP（2026-09-02，完成）
-
-**假设**：render 资源 warmup 在 frame realm 外扫描 CSS `url()` 并统一预取，可能绕过 frame 自身的
-`img-src`/`font-src`，在后续渲染前就发出被 CSP 禁止的请求。
-
-**修复**：`prepare_screenshot_resources` 现在保留每个 document root 的 CSP 与 origin；生成 frame 图片/字体
-候选时按 `img-src`/`font-src`（及对应 fallback）过滤，禁止候选不会进入 transport 或 renderer cache。顶层
-文档和允许资源路径保持原有行为。
-
-**证据**：新增 `frame_csp_blocks_render_warmup_resource_prefetch`，HTTP fixture 返回 frame `img-src 'none'`
-及 CSS 图片 URL，断言只收到顶层和 frame 文档请求、没有图片请求；release+render focused 通过。
-
-**结论**：frame CSP 对 speculative render warmup 已闭环，未加入站点特判；真实 404 仍取决于 Cloudflare
-挑战上游恢复。
-
-### Step 142 — frame `<img>` renderer fallback 的 CSP（2026-09-02，完成）
-
-**假设**：即使 warmup 候选过滤了 frame 图片，首次布局/绘制仍可能在 `RenderResourceCache` 的同步
-`collect_image_intrinsics` 路径直接加载图片，从而绕过 JS `op_load_image_metadata` 的 `img-src` 检查。
-
-**证据与修复**：独立 fixture 在 frame 文档声明 `img-src 'none'` 并包含真实 `<img src>`；原实现仍会
-收到图片请求。`RenderResourceCache` 现维护当前 root 的 CSP/origin（与已有 font context 同步），
-`get_or_load_image` 在调用兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入成功或失败缓存。
-候选 API 同时携带所属 root，避免同一 URL 在不同 frame policy 下错误去重。
-
-**回归**：`image_resource_cache_enforces_img_src_before_loader` 与
-`frame_csp_blocks_render_warmup_resource_prefetch` 均通过，后者覆盖 frame CSS URL 和真实 `<img>`；
-workspace release nextest（排除已知 shadow identity hang）`1702/1702 passed`，no-default、精确 release
-build、trace patch 和 `git diff --check` 均通过。
-
-**结论**：frame 图片在 JS、warmup、renderer fallback 三条路径都遵守 `img-src`，没有 hostname 特判。
-真实 `/1.txt` 404 仍未验收，当前 Cloudflare 响应是 403 challenge。
-
-### Step 143 — frame 图片的同步 renderer loader CSP（2026-09-02，完成）
-
-**假设**：frame `<img>` 的 JS 异步路径已经执行 `img-src`，但首次布局中的
-`collect_image_intrinsics` 可能通过 `RenderResourceCache` 同步 loader 直接取图，绕过 frame policy。
-
-**证据与修复**：加入真实 frame `<img src>` 后，warmup 关闭时仍观测到图片请求；CSS URL 过滤并未覆盖
-该路径。`RenderResourceCache` 现在与 font context 一起保存当前 document 的 CSP/origin，
-`get_or_load_image` 在兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入缓存；
-`pending_render_image_urls` 同时携带所属 root，避免跨 frame policy 去重。
-
-**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 调用计数为零，
-`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 frame CSS URL 与真实 `<img>` 且仅收到文档请求。
-两项及 frame CSP focused 均通过；workspace release（排除已知 shadow identity hang）保持全通过。
-
-**结论**：frame 图片 CSP 已覆盖 JS、speculative warmup 和同步 renderer fallback 三条路径，未加入目标域名
-特判；真实 404 仍待 Cloudflare challenge 上游恢复。
-
-### Step 144 — frame `<img>` root 归属与 renderer fallback 修复（2026-09-02，完成）
-
-**假设**：warmup 过滤按 frame root 处理 CSS URL 后，普通 `<img>` 候选仍只返回 URL/profile；统一 transport
-无法知道它来自哪个 Document，可能在跨 frame policy 去重或首次布局时重新放行。
-
-**方法与证据**：把真实 `<img src>` 加入 `img-src 'none'` frame fixture，关闭自动 warmup 后仍观察到图片请求；
-`pending_render_image_urls` 返回的候选确认 root nid 为 frame content document，但原调用方丢弃了该信息。
-同步 renderer 的 `collect_image_intrinsics` 也通过共享 cache loader 直接发起请求，JS image op 的 CSP 日志不会覆盖它。
-
-**修复**：候选现在携带所属 root；page transport 在候选生成阶段按该 root 的 `img-src`/`default-src` 过滤；
-`RenderResourceCache` 与 font context 同步保存 CSP/origin，并在 `get_or_load_image` 调用兼容 loader 前 gate，
-禁止 URL 不写入成功/失败缓存，避免后续 policy 复用错误结果。
-
-**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 计数为零；
-`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 CSS `url()` 与真实 `<img>`，只收到 `/` 和 frame 文档请求。
-相关 focused 全部通过，workspace release（排除已知 shadow identity hang）`1702/1702 passed`，no-default、
-精确 release build、trace patch、`git diff --check` 均通过。
-
-**结论**：frame 图片请求现在在 JS、warmup、renderer fallback 和 root 归属四个层面遵守 CSP；真实 `/1.txt`
-404 仍受当前 Cloudflare 403 challenge 网络状态阻断。
-
-### Step 145 — 真实站传输层状态复核（2026-09-02，调查中）
-
-**方法**：用最新 trace-patched release 做短超时 `fetch`，分别测试直连和
-`http://192.168.3.57:9000` 代理；不启用页面注入或 payload hook。
-
-**证据**：直连路径在 TLS handshake 因 Reqable CA 不匹配而 `CERTIFICATE_VERIFY_FAILED`；代理路径在
-20 秒 navigation deadline 内未收到响应 body，最终为 `navigation exceeded 20000ms deadline`。此前 `curl`
-直连/代理均能看到 Cloudflare 403 challenge，但当前 Obscura transport 未得到可执行页面，因此没有
-widget、proof、`complete` 或 `/1.txt` 404 可比较。
-
-**结论**：当前阻塞明确位于外部 TLS/代理/上游响应时序，不足以归因 frame CSP 或其他环境 API。待代理
-能够稳定返回挑战资源后，再按零注入流程复测真实 404；不加入站点特判。
-
-### Step 146 — frame `unsafe-eval` 与 V8 code-generation policy（2026-09-02，完成）
-
-**假设**：frame 文档的 `script-src` 即使限制了 script 来源，V8 默认仍允许 `eval()`/`new Function()`；
-这会让 CSP `script-src` 与 Chrome 不同，并可能改变挑战 widget 的反检测分支。
-
-**证据与修复**：原 V8 callback 只转换 `TrustedScript`，且 Context 默认允许 string code generation，
-所以普通字符串不会进入 callback。现在 main/frame/isolated contexts 设置
-`AllowCodeGenerationFromStrings(false)`，每个 realm 在 `__obscura_init` 根据自身 CSP 的
-`script-src`/`default-src` 写入隐藏 flag；V8 callback 读取该 flag，在没有 `'unsafe-eval'` 时拒绝字符串代码生成，
-同时保留 TrustedScript 转换和 intrinsic direct-eval 语义。flag 加入 pre-hide 列表，避免环境枚举泄漏。
-
-**回归**：top CSP 测试验证 plain `eval` 和 `new Function` 返回 `EvalError`、TrustedScript 仍执行；frame
-script fixture 同样验证 `EvalError`。focused 2/2、workspace release（排除已知 shadow identity hang）
-`1702/1702 passed`，no-default、精确 release build、trace patch 和 `git diff --check` 均通过。
-
-**真实站复测**：最新 release 经 `192.168.3.57:9000` 代理请求目标时仍在 20 秒 navigation deadline 超时，
-无 challenge body/proof/complete/404；外部传输状态继续作为未决项，不加入站点特判。
-
-### Step 147 — frame CSP 完整代码生成门验证（2026-09-02，完成）
-
-**假设**：`unsafe-eval` gate 可能只覆盖普通 frame realm，而不覆盖 V8 创建的 isolated world 或新建
-frame context；任一 realm 漏洞都会让挑战看到不一致的 string-codegen 行为。
-
-**验证与修复确认**：main context、frame main world、CDP isolated world 创建时均调用
-`AllowCodeGenerationFromStrings(false)`；V8 callback 读取各自 bootstrap 写入的 CSP flag。无明确
-`'unsafe-eval'` 时 plain `eval`/`new Function` 被拒，TrustedScript 仍按 brand 转换，未替换 intrinsic
-eval，保持 direct-eval 作用域语义。flag 已加入 pre-hide 内部字段集合。
-
-**量化回归**：top Trusted Types CSP 测试与 frame script CSP fixture 均通过（2/2）；workspace release
-nextest（排除已知 shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、
-trace patch、`git diff --check` 均通过。
-
-**结论**：CSP `unsafe-eval` 在 main/frame/isolated realm 的代码生成路径已闭环，未加入域名特判。真实
-`/1.txt` 404 仍因当前代理 navigation timeout 未验收。
-
-### Step 148 — codegen 修复后的真实站复测（2026-09-02，调查中）
-
-**方法**：使用包含 V8 `unsafe-eval` callback、frame module/image CSP 修复的最新 release，stealth、
-Chrome 149 macOS UA，经 `192.168.3.57:9000` 请求目标，timeout 20s，零注入。
-
-**证据**：请求仍在 `navigation exceeded 20000ms deadline` 失败，没有 challenge body、widget、proof、
-`complete` 或 `/1.txt` 404。该结果与代码修复前的代理时序一致，无法证明目标页面执行到了 CSP 或 frame realm。
-
-**结论**：真实验收仍被外部代理/上游响应阻断；保持未完成状态，等待可返回并执行 challenge 的网络条件，
-不添加站点特判。
-
-### Step 149 — CSP 代码生成门的最终回归（2026-09-02，完成）
-
-**假设**：CSP `unsafe-eval` gate 可能通过 V8 callback 改变正常页面的 direct-eval 作用域，或在 frame
-context 创建前后出现时序窗口；需要用现有 Trusted Types 和 frame script fixture 共同验证。
-
-**结果**：main、frame main world、CDP isolated world 创建时均禁用 Context 默认 string codegen；bootstrap
-在 `__obscura_init` 根据各自 `DocumentScope.csp` 设置 hidden allow flag，V8 callback 仅在 flag 允许时放行
-普通字符串，并继续将 TrustedScript 转换为源码。plain `eval`/`new Function` 在无 `'unsafe-eval'` 时返回
-`EvalError`，无 CSP 时的 direct-eval 行为和现有脚本保持不变；flag 纳入 pre-hide，未新增可枚举引擎字段。
-
-**验证**：Trusted Types top 测试、frame CSP（含 eval/function）测试 2/2；workspace release（排除已知
-shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、trace patch、
-`git diff --check` 均通过。
-
-**结论**：CSP 代码生成机制已在所有 Obscura Window realm 覆盖，未加入域名特判。真实 `/1.txt` 404 仍受
-代理 navigation timeout 阻断。
-
-### Step 150 — `script-src-attr` inline handler CSP（2026-09-02，完成）
-
-**假设**：CSP `script-src-attr 'none'` 只限制 event-handler content attributes；如果仍通过
-`Element._resolveInlineHandler` 的 `new Function` 编译，代码生成 flag 不足以复现 Chrome 的 handler 行为。
-
-**修复**：inline handler 解析前读取当前 realm 的 CSP，按 `script-src-attr` 优先、`script-src`、`default-src`
-回退；只有存在 `'unsafe-inline'` 才编译属性 handler，`'unsafe-hashes'`/未授权属性保持阻断。该检查与
-`unsafe-eval` callback 独立，避免把 event attribute 当作普通 eval。
-
-**证据**：新增 `script_src_attr_controls_inline_event_handlers`，验证 `script-src-attr 'none'` 下
-`onclick` 不执行、改为 `'unsafe-inline'` 后执行；frame CSP fixture 也覆盖 frame realm 的 eval/function
-gate。focused 3/3、workspace release（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped，
-release/no-default/trace patch/diff check 均通过。
-
-**结论**：inline event-handler CSP 已按 realm 生效，未加入站点特判；真实 `/1.txt` 404 仍待代理恢复。
-
-### Step 151 — `script-src-attr` 修复后的真实站复测（2026-09-02，调查中）
-
-**方法**：使用包含 frame parser/dynamic/module/image CSP、V8 `unsafe-eval` 和 `script-src-attr` 修复的
-最新 release，stealth、Chrome 149 macOS UA，经 `192.168.3.57:9000` 访问目标，timeout 20s，零注入。
-
-**证据**：仍返回 `navigation exceeded 20000ms deadline`，没有 challenge body、widget、proof、complete
-或目标 `/1.txt` 404。目标直连的 curl 同时仍为 `HTTP/2 403` + `cf-mitigated: challenge`。
-
-**结论**：外部代理/上游仍未提供可执行挑战，无法对本轮 inline handler 修复做真实过盾归因；真实 404
-验收继续保持未完成，不加入站点特判。
-
-### Step 152 — external script nonce 反射与真实挑战链恢复（2026-09-02，完成）
-
-**假设**：Cloudflare challenge 的动态 `chl_page` script 使用 `a.nonce = ...`；如果 Obscura 缺少
-`HTMLScriptElement.nonce` 反射，frame-local CSP gate 会把合法 external script 误判为未授权，页面停在
-“Enable JavaScript and cookies to continue”。
-
-**证据与修复**：实际目标 HTML 的 inline script nonce 与 CSP header 一致，并明确执行
-`a.nonce = '<nonce>'; a.src = '/cdn-cgi/.../chl_page/v1?...'; head.appendChild(a)`。新增通用 `nonce` getter/setter
-（HTML element wrapper），动态 CSP gate 对 external script 同样匹配 nonce；本地 fixture 改用 `script.nonce`
-赋值并验证 external script 请求/执行恢复。未授权外部 script 仍阻断。
-
-**真实量化结果**：最新 release 直连零注入 CDP 轮在 `t=5.3s` 点击 300x65 widget，收到 `interactiveBegin`。
-Rust 日志确认 `chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200
-（约823KB）、`/pat` 401、点击后的 proof/top 3256B；页面显示 “Verification successful”。修复前同类轮次
-在动态 `chl_page` 处即被 CSP 阻断，只有“Enable JavaScript”。
-
-**当前断点**：`brunhild.challenges.cloudflare.com/cdn-cgi/.../i` 请求在 Connect 阶段失败，随后 frame `/fo`
-仍返回 200，但站点没有发放最终响应，目标未真实返回 `/1.txt` 404。该 Connect 失败与 Chrome 同轮无 response
-一致，不能继续归因 iframe CSP；等待可访问 Brunhild 的网络条件再验收。
-
-**回归**：frame CSP focused 通过；workspace release（排除已知 shadow identity hang）`1703/1703 passed`、
-5 skipped，release/no-default/trace patch/diff check 全通过。无 hostname 特判。
-
-### Step 153 — nonce 修复后的无注入真实点击证据（2026-09-02，调查中）
-
-**方法**：使用包含 `HTMLScriptElement.nonce` 反射和 external nonce CSP gate 的最新 release，直连（不经过
-失效代理）启动 CDP，执行零注入 `cdp_click_fast --deadline 40 --settle 20`，同时开启
-`RUST_LOG=obscura_js=debug` 请求日志。
-
-**证据**：页面在 `t=5.3s` 取得 300x65 widget box 并点击，随后收到 `interactiveBegin`。请求时间线中
-`chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200（约823KB）、
-`/pat` 401、点击后 frame proof `/fo` 200、top `/fo` 3256B 均出现；页面显示
-`Verification successful. Waiting for www.thelancet.com to respond`。这证明 nonce/CSP 修复已消除此前
-“Enable JavaScript and cookies to continue”的直接阻断。
-
-**当前断点**：challenge 随后请求
-`https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/i/...`，约1.1s 后在 Connect
-阶段失败；Chrome 同网络条件也没有该请求的 response。其后 frame 转发仍返回 200，但没有站点最终响应，
-目标未真实返回 `/1.txt` 404。
-
-**结论**：iframe CSP/nonce 环境已经把执行链推进到交互后最后的 Brunhild 网络请求；剩余失败是外部 fake-DNS/
-代理/上游可达性问题，不足以继续推断 Obscura iframe API。待该 host 可达时再进行 404 验收，不加入域名特判。
-
-### Step 154 — nonce/CSP 修复后的最终代码门禁（2026-09-02，完成）
-
-**验证范围**：在 nonce 反射、external nonce 匹配、frame script/module/image CSP、`script-src-attr` 和 V8
-`unsafe-eval` 全部落地后，重新执行精确 release build、no-default feature check 与 workspace release nextest。
-
-**结果**：workspace（排除已知 `shadow_root_identity_and_children_are_native_tree_backed` hang）
-`1703/1703 passed`、5 skipped；no-default check 通过；精确二进制晚于全部相关源码；
-`vendor/v8-trace.sh check` 为 `patched`；`git diff --check` 通过。真实目标的无注入 CDP 轮仍能在 5.3s
-点击并收到 `interactiveBegin`，但 Brunhild `/i` Connect 失败，未获得站点 404。
-
-**结论**：当前代码侧 iframe/CSP 环境修复已通过完整门禁；最终 404 仍需外部 Brunhild host/fake-DNS 可达，
-不能用站点特判或测试 fixture 代替。
-
-### Step 155 — Brunhild 请求归属与最终网络断点（2026-09-02，调查中）
-
-**方法**：从最新无注入 CDP serve 的 `RUST_LOG=obscura_js=debug` 中按时序核对 Brunhild 请求、
-后续 frame/top 转发和页面状态；同时检查 DNS 与路由，不修改请求 URL 或 Host。
-
-**证据**：`brunhild.challenges.cloudflare.com` 请求由 frame challenge 触发，日志显示
-`Origin: https://challenges.cloudflare.com`、无 Referer；约 1.1 秒后 `stealth_fetch failed ... client error (Connect)`。
-同一轮之后 frame `/fo` 仍返回 200（约127KB），页面继续显示 `Verification successful`，但没有新的站点响应。
-DNS 将 Brunhild 解析到 198.18.0.157（utun fake-DNS 路由），IPv4/IPv6 直连均 TLS syscall 失败；代理
-`192.168.3.57:9000` 当前 host down。Chrome 同条件的 Brunhild 请求也没有 response。
-
-**结论**：请求 realm、Origin 和 challenge 提交链均已正确；剩余断点是外部 fake-DNS/代理可达性，不能通过
-Obscura 的 iframe CSP 或 hostname 特判修复。真实 `/1.txt` 404 仍未取得，待 Brunhild host 可达后继续验收。
-
-### Step 156 — nonce 后真实链路与代码门禁汇总（2026-09-02，调查中）
-
-**代码状态**：`HTMLScriptElement.nonce` 反射、external nonce CSP、frame parser/dynamic/module/image CSP、
-`script-src-attr` 和 V8 `unsafe-eval` 均已落地；对应 focused fixtures 与完整 workspace 均通过。
-
-**真实状态**：直连最新 release 的无注入 CDP 轮在 5.3 秒点击并收到 `interactiveBegin`，top/frame `/fo`、
-proof、`/pat` 401 和 `Verification successful` 均可观测。唯一未完成的是 Brunhild `/i` 的 Connect/TLS；
-DNS 解析到 198.18.x fake-DNS，IPv4/IPv6 均无 response，Chrome 同条件也无 response。目标 URL 仍未真实返回
-404，故不宣称过盾成功。
-
-**门禁**：workspace release nextest（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped；
-no-default check、精确 release build、trace patch 和 `git diff --check` 均通过。后续只需在 Brunhild host
-可达的网络条件下重复同一无注入点击验收，不再继续猜测已排除的 iframe CSP 根因。
-
-### Step 157 — HaHaVM-General 内存上限与 Window 常量（2026-09-02，完成）
-
-**假设**：HaHaVM-General 最新通用环境提交仍有少量可由 Chrome oracle 直接证明的公开面差异；这些差异应在
-Obscura 中按 WebIDL 语义补齐，不应与 Cloudflare 主机或质询分支绑定。
-
-**证据与修复**：本机 Chrome 152 的 `performance.memory.jsHeapSizeLimit` 和 `console.memory.jsHeapSizeLimit`
-均为 `4395630592`，Obscura 原先固定为 `4294705152`；已统一初始化、fallback 和导航重置值。Chrome 还在
-`Window` 构造器及 `Window.prototype` 上暴露不可写、可枚举、不可配置的 `TEMPORARY=0` 与 `PERSISTENT=1`，
-Obscura 原先缺失；已补齐这两组常量和 focused descriptor 回归。
-
-**验证**：`window_storage_constants_match_chrome_shape` 与
-`console_and_performance_memory_share_fresh_branded_wrappers` focused nextest 2/2 通过；精确
-trace-patched release build、no-default feature check、`vendor/v8-trace.sh check` 和 `git diff --check` 通过。
-`obscura-js` 全 crate 在既有 `shadow_root_identity_and_children_are_native_tree_backed` 挂起及宿主字体/渲染
-断言失败处中止，新增测试本身未失败。
-
-**结论**：本步完成两个通用环境差异的修复，没有改变请求或站点逻辑。代理 `192.168.3.57:9000` 当前仍
-不可达，Brunhild `/i` 无 response，目标 `/1.txt` 仍未取得真实 404。
-
-### Step 158 — frame Worker 继承 creator CSP（2026-09-02，完成）
-
-**假设**：真实 challenge 的 Brunhild `/i` 请求由 widget frame 派生的 Worker 发起；Worker 没有自己的
-Document root，若不继承创建它的 frame CSP，`op_fetch_url` 会错误地按顶层页面策略处理请求。
-
-**证据与修复**：修复前同一轮日志中 frame `/fo` 为 `root=75, csp=frame`，而 Brunhild `/i` 为
-`root=0, csp=page:none`，但 Origin 已是 `https://challenges.cloudflare.com`。新增 WorkerEnvironment 的
-creator CSP 字段和 `creator_root`/`creator_csp` op 参数；Worker 与 SharedWorker 现在将创建文档的 CSP 写入
-自身运行时，嵌套 Worker 继续沿用该策略。新增跨 frame data Worker fixture，`connect-src 'none'` 返回
-`AbortError` 且本地 HTTP 请求数为 0，证明在网络前阻断。
-
-**验证**：`frame_worker_fetch_uses_the_creator_document_csp` 及既有 frame worker 三项 focused nextest
-均通过；workspace（排除已知 shadow identity hang）`1703 passed / 2 failed`，两项失败为既有 MCP
-时序测试，单独 `--retries 2` 全部通过。精确 release build、no-default check、V8 trace patch 和 diff check
-通过。新 release 的真实轮仍稳定进入 interactiveBegin、frame/top `/fo` 和 proof/top 转发；Brunhild `/i`
-仍在 Connect/TLS 失败，目标 URL 尚未返回真实 404。
-
-**结论**：本步修复了 frame Worker CSP 传播的通用缺陷，真实请求日志中的 Worker 已从 `csp=page:none`
-迁移为有 CSP 的运行时策略；剩余 Brunhild 失败仍是外部网络可达性，未加入 hostname 特判。
-
-### Step 159 — Brunhild 真实网络路径恢复（2026-09-02，调查中）
-
-**方法**：本机 DNS 将 Brunhild 映射到 `198.18.x` fake-DNS/utun 路由，直连 TLS syscall 失败。为分离网络
-与引擎因素，使用仅作测试的本地 CONNECT 转发，将该连接送到真实 Cloudflare IP，同时保留原始 Host/SNI；
-没有修改 Obscura 请求 URL 或加入 hostname 特判。
-
-**证据**：通过该转发，Brunhild `/i` 从 Connect failure 变为真实 `204`；Obscura 仍完成 frame/top `/fo`、
-`/pat` 401 与 proof/top 转发，随后 challenge 换 ray。相同转发下 headless/headful Chrome 也停在 challenge，
-因此此前的网络失败已被独立，剩余是 challenge 判定/环境分歧。
-
-### Step 160 — 干净点击与硬件指纹 A/B（2026-09-02，调查中）
-
-**测量修正**：现有 `cdp_click_fast.py` preload 会包装 `attachShadow`，会污染函数 identity；新增固定坐标无
-preload 点击脚本，避免把探针副作用当成页面行为。动态 `Image.src` 的本地 fixture 也确认无生命周期观察时
-仍会发起 eager fetch，排除 `/ci` 缺失的 lazy-image 假设。
-
-**A/B 证据**：本机 Chrome152 同 UA 返回 `hardwareConcurrency=12`、`deviceMemory=32`，Obscura 默认 `8/8`。
-使用 `--fingerprint '{"hardwareConcurrency":12,"deviceMemory":32}'` 重跑 challenge，请求序列和结果未变：
-Brunhild `204`、`/pat` 401、proof 后换 ray，未出现真实 404。当前没有足够证据改变默认硬件策略。
-
-**结论**：iframe CSP、Worker creator CSP、图片 eager-fetch 和硬件指纹均有独立 fixture/oracle 证据；当前
-challenge 仍未返回目标真实 404，后续应继续从明文 payload/事件时序找通用差异，不添加 Cloudflare 域名分支。
-
-### Step 161 — Navigator 自有属性迁移（2026-09-02，完成）
-
-**假设**：Obscura 的 Navigator 兼容对象仍把公开 IDL 成员放在实例自身，形成 Chrome 不存在的枚举面；
-这类结构差异可能被 challenge 的全局对象探针直接读取。
-
-**证据与修复**：Chrome 152 的 `Object.getOwnPropertyNames(navigator)` 为空，`connection`、`permissions`、
-`gpu`、`geolocation`、`getBattery` 等均位于 Navigator 原型；Obscura 原先有 21 个自有成员。新增末端迁移
-层，将兼容对象的稳定值转为原型 getter、方法转为原型函数，保留对象 identity、secure-context 删除和
-`Navigator.prototype` 后续接口安装逻辑。
-
-**验证**：`navigator_has_no_own_idl_members`、fingerprint 和 StorageManager focused `3/3` 通过；workspace
-release nextest（排除已知 shadow identity hang）`1707/1707 passed`、5 skipped；精确 release build、
-no-default check、V8 trace patch 和 `git diff --check` 通过。临时真实-IP CONNECT 转发下，最新无 preload
-点击仍完成 Brunhild `204`、`/pat 401`、proof/top 转发后换 ray，目标未返回真实 404。
-
-**结论**：Navigator 枚举结构已与 Chrome 对齐，未引入站点特判；challenge 剩余分歧仍需从明文 payload 和
-事件时序继续定位。
-
-step127存档：Blob/File、UTF-8、三ray与完整门均通过，仍无真实404。
-参考HaHaVM-General的Blob分片修复继续审计公开面，Chrome151证明Obscura既有实现泄漏实例字段且把
-null/undefined分片丢弃；已迁WeakMap internal slots、补完整Blob/File接口与流读取，并修正非法UTF-8
-热路径为U+FFFD。Chrome parity focused1/1、相关6/6、obscura-js546/546与workspace1686/1686通过；
-三clean ray完整，条件点击proof/top/new-ray链完整但仍无404。step126存档：console三ray迁移与完整门均通过。
-
-Step105新增通用修复已由真实payload验证：counterclockwise arc首2x2迁移到白/191/239/48
-（Chrome白/192/244/53）；float16 context四组颜色4/4对齐；C1 Canvas文本把十宽度最大误差从
-约31px降到2.21px。49x44 Skia AA/hash、TextMetrics outline/font box、hG31项与Zok postMessage分类
-仍未决。完整门为obscura-js533/533、workspace1673/1673（4 skipped）、精确release、trace patch、
-no-default与diff check通过；deterministic 63个fixture的Obscura行为断言全过，10条checker失败
-均为Chrome151对旧参考不匹配。障碍课程未跑（本机无companion仓库）。
-
-step 104存档：**DOMParser skeleton崩溃已修，最后有效明文样本的hGgWW0有31项差异且lNCr3
-未恢复；当时迁移待测，质询仍未通过**。ZokK1最后有效payload的
-N/o/x/F/T本地分类缺口已静态覆盖，
-RTP capabilities的audio RED已从`audio/red/48000;111/111`对齐为`audio/red/48000`；
-CSSOM-only unrounded geometry已让受控inline rect从73对齐为72.9375，同时offsetWidth保持73；
-detached HTMLDocument/XMLDocument身份、owner与Document根关系已按Chrome151对齐。direct live已到
-widget proof fo 200后，但仍没有目标真实响应；
-真实payload迁移仍等待Reqable注入key刷新。ZokK1中六个已存在接口的type/native外壳已按Chrome151修复，
-本地fixture与全量门通过；真实bucket迁移待payload-2恢复。JSVMP取证已证伪frame VM和top
-secondary runProgram，并把旧ray `uA`主VM映射到新ray `nT/FX`结构；临时register probe已命中
-62/44/5 calls后删除。当前Reqable会话仍只到payload-1后600010，不能产生hG证据；按测量盲区
-应先刷新代理注入的challenge JS/key，再重复三轮payload-2。本轮已用Chrome151 oracle实现最后
-有效payload中全部34个Chrome-only N路径，并通过release CLI 34/34静态分类检查；这仍不能替代
-真实payload或过盾成功判据。后续仍按
-受控 main/frame realm oracle 拆分 parser/serializer 与其他 API。step 95 已隐藏 Error.stack 的
-Obscura/deno 内部帧；step 94 的 jdnfg5 iframe rch item 已修复（3/3）。step 95 不伪造 QqYk7，也不改变 timer 调度，
-而是在 V8 把 CallSite 交给默认或页面 formatter 前过滤内部脚本来源。thelancet 三个独立 ray
-的 payload-1 均只保留真实 `api.js`/`chl_page` URL，内部来源命中 0/3。
-`http://192.168.3.57:9000` + `https://www.thelancet.com/1.txt` 三轮均走完初始 fo、点击 proof
-和顶层 3256B 转发，随后换 ray 重开挑战，没有 `complete` 或真实 404。Chrome 149 三 payload
-按探针字段名对拍确认核心指纹面已收敛，但仍有 6 个 Chrome-only 探针、ZokK1 长尾、UA-CH
-brand、文本/canvas 与 ICE 差异；全量 V8 trace 复证 console native 绑定不可观测参数。
-B0-B7 全批次落地
-（见 step 91 与 `Challenge-fingerprint-fix-plans.md`）：UA-CH arm/26.4.0、WebGL 39 项逐项
-一致、WebGPU apple 档、SAMPLES 15 格式、N 桶 399→1137（Chrome 1164）。质询三轮提交链路
-正常（600010 回退已修）。剩余长尾：N 桶 27、o 桶 14、x/F 桶、brands 形态、sans-serif 字体
-残差、ICE srflx；障碍课程未跑（本机无 companion 仓库）。step 90 存档：step 90 用 MITM 代理注入的 `console.log("payloadJSON:…")`
-拿到 obscura 全部三轮**明文提交体**（含点击后 proof 轮），与 Chrome 三 payload 按「探针字段名」对拍
-（分片号两边错位，不能按 part 对齐）。结论：navigator 42 缺口只是冰山一角——枚举桶里 **N 桶（window
-构造器）缺 773 个、o 桶缺 49 个**；**UA-CH 高熵字段错**（x86/10.15.7 vs arm/26.4.0，brands 多一个
-"Google Chrome"）；**WebGPU adapter 报 intel gen-9**（参考 macOS Chrome 是 apple）；iframe 内
-`document.domain` 报顶层域、`compatMode` 应为 BackCompat、`innerWidth/innerHeight` 应为 0；
-WebGL 少 4 个 Apple GPU 压缩纹理扩展、limits 表多值不同；canvas 像素全 255、文本测量无亚像素；
-ICE 缺 srflx。此前 step 89 的三个缺口（默认 UA、navigator 42 API、`__obscura_click_target`）
-依然成立。step 90 补充调查确认 **`/ci/` 打点没有回归**（HEAD 多数轮次第一轮 widget 早期
-就发，~1/3 轮次推迟是 CF 端波动；iframe 修复排除），顺带发现动态 iframe about:blank
-`body=null` 的老缺陷。下一步按本 step 的影响排序表推进。
-
-step 89 存档：step 88 把 document 的 8 个内部字段改 Symbol 键后，实测
-`Object.getOwnPropertyNames(document)` 泄漏归零（主/frame realm 均 `[]`，晚快照只剩合法的
-`lang`/`dir`）。step 89 对拍 Chrome 三 payload 确认：①默认 stealth 指纹是 Windows Chrome
-145/146，参考是 macOS Chrome 149（`--user-agent` 可即时对齐）；②navigator 缺 42 个 Chrome 有的
-属性；③`__obscura_click_target` 运行时泄漏到 `globalThis`。
-
-以下为 step 67–74 的状态记录。战线从「链路走不通」转成
-「**提交载荷的内容对不上**」——`http://192.168.3.57:9000` 上的 MITM 代理把 CF 的
-提交对象以明文打了出来，第一次可以逐字段对拍（step 66）。本轮按字段修了 8 处,
-tokenB 载荷从 Chrome 的 **56% 提到 78%**（38529 → 53275 B）,
-并把 **11 处引擎内部字段泄漏清零**：
-
-| 字段 | 内容 | Chrome | 修前 | 修后 |
-|------|------|--------|------|------|
-| `YIwy3` | WebRTC SDP offer | 7277 | 2 | **7277** |
-| `EnxW1` | WebGPU 适配器 | 2293 | 8 | **2176** |
-| `fyCZH9` | 全局/文档枚举面 | 30881 | 14187 | 15047（`d.` 12→43 等） |
-| `FgjO3` 等 8 项 | WebGL 能力 | 2594 | 60（全是错误哨兵） | **2552** |
-| `DrTW4` | ICE 候选 | 1465 | 2 | **985** |
-| `ZpxzX5` | RTP 能力表 | 1273 | 7 | 本地已对齐（CF 侧未量测） |
-| `Swui9` | 键盘布局 | 596 | 2 | 本地 576（CF 侧未量测） |
-| `gqGB4` | 字体列表 | 83 | 738（三套 OS） | 已修根因（CF 侧未量测） |
-| `yQYB9` | resource timing | 366 | 缺失 | **已补齐** |
-
-**注意**：step 72 起第一次 `/fo/` 就返回 400 + `600010`,tokenB 不再下发,
-后三项只有本地量测。**原因是代理里那份被改写的 JS 的加密 key 过期**（见 step 72 的
-更正），不是引擎侧的问题,也不是 CF 对 IP 的升级。更新代理的 JS 后需重跑一轮补齐。
-最大的剩余项仍是 `fyCZH9`,根因已定位为**动态 iframe 在 Rust 帧加载器提交前拿到的是
-JS 兼容垫片**（step 68 末尾）。
-
-以下为更早的状态记录。**未通过,但断点已前移到最后一步**(2026-08-16,step 55/56)。`/pat/`(401)与
-`/ci/`(200)均已发出且状态码与 Chrome 一致,`interactiveBegin` → 点击 → **5052B 提交** →
-**3256B 回传**全链路打通;唯一没走通的是最后的判定——CF 不发 `complete`,直接换 ray 重来。
-**`fail code=600010` 现在是唯一实质阻塞**,失败码在加密响应体内。挂了六个 step 的
-「`/pat/` 从不发出」已解除:它来自 `709cb1b..HEAD` 的 parity 改进,此前被 `1f963b7` 的
-Trusted Types 回归挡住(step 49-52 定位并修复)。
-
-以下为 2026-08-15 及以前的状态记录:**未通过**。P0 五项 parity 修复（step 40）后输入链路保持打通、时间线全面提速，
-但**断点始终未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40/44/45/46/47），
-`complete` 依旧为 0。点击被接受（Verifying…）→ 提交 5052B → 回传 3256B → 仍被判失败
-（`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。机制定位已收敛（step 45/46）：`/pat/`
-**从未被 JS 构造**（网络钩子 + URL 构造器 + PAT API 三面全覆盖，零命中），`/ci/` 则
-**发出且 200**（step 45 追加修正作废了「op 吞请求」）；两者都在 **822KB→127KB 的 managed
-分流窗口**，不在点击后（step 44 的「点击后窗口」作废）。step 47（2026-08-15）修掉了
-Image 请求不记录 resource timing 这个确定缺陷（含两条回归测试），`/pat/` **仍未出现**
-——本轮 CF 在 `/ci/` 之后根本没读过 performance，该假设未被验证到。当前阻塞点：
-①**`/pat/` 从不发出**；②**frame 文档缺 navigation timing**（step 47 证据 3：CF 在两个
-widget realm 各读一次 `getEntriesByType('navigation')`，两次全空——当前唯一「已证实被
-读取且明确异常」的环境面，下一个修复目标）；③**`fail code=600010`**（step 37 起稳定）。
-**2026-08-16 回归警报（step 49/50/51）**：HEAD 相对 step 47 出现**代码回归**，已二分定位到
-唯一根因 **`1f963b7`（Trusted Types API 面按规范补齐）**。该 commit 补齐了 TT 的 API 外壳
-但没给 `eval` 接入 TT——`eval(TrustedScript)` 不执行代码（Chrome 返回 `2`，obscura 返回
-`"1+1"`）。CF 探测到 `trustedTypes` 存在就切到 TT 路径，JSVMP 静默停摆，流程从
-`realm=3/xhr=3//ci/=1` 退到 `realm=2/xhr=1//ci/=0`。**修 TT 的 eval 行为（或暂不暴露该入口）
-是当前第一优先级**，在此之前其他质询结论都跑在退化的基线上。
-
-step 48（2026-08-16）用双向被动 message 对拍**结掉一条长期未决项**：父窗口**确实回应了**
-`requestExtraParams`（widget 在自身 realm 的 41ms 收到完整 managed 配置，`food`/`meow`
-心跳 32 对双向闭环）——**断点不在 postMessage 通道，在 widget realm 内部**。同轮复现了
-`cs` 栈底的 `<obscura:bootstrap>` 两帧（step 8 未决项，CF 主动采集并传输的指纹面）。
-
-判据链：`interactiveBegin` → 点击（须在 interactiveBegin 之后 + 带 widget 外 pre-move，
-`cdp_click_fast --start 12`）→ 点击后 ~5s 的 **4976B 提交 POST** → 3256B 主页面回传 →
-`complete`+token → 站点真实 404。`interactiveEnd` 消息间歇性出现（CF 端波动，step 41），
-**不可作提交链判据**（step 43）。判成败一律看 `cf_chl_rc_ni` 是否出现。
-
-关键结论演进（被推翻的假设就地标记，详见各 step）：
-
-| step | 当时结论 | 后来 |
-|------|----------|------|
-| 22 | 分流由 IP 干净程度决定 | 被 step 33 推翻（同 IP 下 Chrome 免质询而 obscura 被拦） |
-| 29 | 怀疑预注入/观测停在主文档 realm | 被 step 30 证伪（真因是缺 `<label>` 激活行为） |
-| 34 | 「心跳停止 = 失败信号」 | 被 step 36 作废（成功路径同样停止） |
-| 36 | 断点是交互确认失败 | step 37 修事件字段后 `interactiveEnd` 首次出现 |
-| 37 | 断点 = 错误码 `600010` | 现唯一实质阻塞（排在 `/pat/` 之后） |
-
-时序约束：**检测到复选框就要立刻点**。该页 129 秒会自动换 ray（用户经验 30s+ 即可能刷新），
-刷新会作废当前 widget 的 token，迟到的点击落在死 realm 上，表现和「点了没反应」一模一样。
+按 step 追加，每步记录**假设 / 方法 / 证据 / 结论**。结论后来被推翻的 step 不再整段保留：
+核心主张即错误的压缩为一行墓碑（编号保持连续、指明推翻者），仍含有效修复或证据的就地
+更正（`> 更正：` 注记指向推翻者）。
+
+## 当前状态（2026-09-17，step 297）
+
+**质询仍未通过，唯一成功判据为目标 URL 真实 404。**
+
+- 指定代理可达。带点击的单轮在 30s 预算内稳定走完 8 次 `/fo/` 提交（含 widget 证明与
+  顶层收官 3240B），服务端以「重开一轮」作答而非 `POST /1.txt`；75s 窗口停在同一处，
+  是「停住」不是「太慢」（step 271/285/291）。
+- 停滞点：widget 在收到证明响应后的程序里 `new Worker(blob:)` 之后不再前进。step 271 曾把
+  停点钉在该语句本身、断言调用方提前返回；**step 279 推翻**——worker 路径修好后五个
+  `graIf9` worker 结果都回来了，停点在该语句之后更远处。页面停在 `honk` eval 等待循环
+  （`0, /.*honk.*/, <ts>`，1 337 331 个前导空格），参考也走同一循环，不是分岔。
+- 已实测排除的机制：worker 回复被空批次抛弃（均为 `outbox-closed`，无瞬时争用）、V8
+  watchdog 静默切断（两个 watchdog 均未触发）、跨 realm `postMessage` 投递失败（双向心跳
+  seq 31+ 正常）、blob worker fan-out 不可用（本地同形 fixture 5/5 回复正常）（以上
+  step 271）；本地代理跳 direct vs hopped 各 3 轮不变（step 274）；widget 文档重复加载是
+  Critical-CH 重试、已修且与停滞无关（step 272）；native 属性 trace 自身开销掐死流程
+  （step 273）。
+- 关键环境事实：程序文本按会话轮换、字节码编码不变（step 266）；当前环境下真实 Chrome
+  走同一代理同一 URL 只到顶层 `/fo/` #1 + widget 文档即停，比 Obscura 走得更短，故
+  「stage-3 变短」不能单独作为 Obscura 特有指纹的证据（step 279）；失败路径同样下发
+  `cf_clearance`，只是更短（133 vs 153/177，step 262）；服务端判定发生在加密交换内部、
+  客户端导航之前（step 262）。
+
+主要已修复缺陷（详情见对应 step）：Trusted Types 入口回归（50-52）、`/pat/` 发出（55）、
+CSP 指令优先级与 realm 归属（62-63）、TT 默认策略返回值（64-65）、label 激活行为（30）、
+鼠标事件字段对齐（37）、UA 双来源分裂（38）、XHR/Blob/Worker 公开面（128/130）、
+iframe 原型与隔离位（132-134/211-212）、OPFS 真落盘与 flush 成本口径（276-277）、
+Critical-CH 重复请求（272）、overdue timer 投递（297）、病态 scale 下的几何
+NaN/饱和（289）、表格与 caption 宽度协商（290）、summary disclosure marker（288）、
+原子盒匿名行盒 strut（287）、offsetWidth 与 transform 纠缠（286）、DCL 边界 timer 投递与
+PingFang 字体度量（285）、引擎全局 `for..in` 泄漏（263）。
+
+剩余收敛路径：identity 感知 shaping 字体加载已落地但本机无 PingFang 文件、宿主有即生效
+（step 296），或 IFC leaf 高度按 `lines × used_line_height` 抬升；caption 字形 advance
+残差（~1.7px）；`brunhild` 经指定代理 502 类外部阻塞。停滞归因的下一步是本会话运行时
+`(pc,key)` trace 加「程序 + 解释器」联读（step 274/275）。
 
 ## 复现
 
@@ -1351,43 +628,13 @@ checkbox / radio **显式清空 border 和 padding**（这是对的，复选框�
 确认代码是否真被编译的最快办法：往里塞一行必然编译失败的语句，看构建是否报错。
 本次正是靠这一招才发现的。
 
-### Step 16 — 那个复选框画不出来，是因为 iframe 的绘制表面根本不跟随 DOM
+### Step 16 —（已删除）「跨源 iframe 的绘制表面陈旧、不随 DOM 更新」（结论错误）
 
-step 15 补了原生 checkbox 绘制后，Turnstile 的框**依旧是空的**。于是去读 widget
-frame 内部的真实标记——新增 `scripts/cdp_frame_dom.py`，用
-`Page.getFrameTree` + `Page.createIsolatedWorld` 在跨源 frame 内部求值（页面自己
-够不到，截图只反映画了什么，两者都答不了「那是个什么元素」）。
-
-三个 frame 的实测：
-
-| frame | body 子元素 | 含 `Verify you are human` | 文档大小 |
-|-------|------------|--------------------------|---------|
-| `zencare.co/1.txt`（父） | 3 | 否 | 27 KB |
-| Turnstile widget | **0** | 否 | 266 KB（内联脚本 246 KB + 样式 16 KB） |
-| `about:srcdoc` | 0 | 否 | 291 B |
-
-widget 的 body 在 6 s 和 14 s 都是空的，`readyState: complete`，标题
-`Checking your Browser…`，`document.body.getBoundingClientRect()` 是 **0×0**。
-父页面的 closed shadow root 里也只有那个 iframe（485 字节），同样不含该文案
-（用截获 `attachShadow` 的探针读的）。
-
-**这段文字在任何一份 DOM 里都不存在，却被画了出来。** 做因果测试：在 widget frame
-的 isolated world 里把 body 换成一个红色方块，确认 DOM 真的改了
-（`kids:1`、`innerHTML` 回读到 PROBE div），再截图——**画面纹丝不动**，红块没出现。
-
-与胶片对上了：step 14 里 9 s 到 36 s 的帧**逐帧哈希完全相同**。
-
-结论：**跨源 iframe 的绘制表面是陈旧的，不随��� DOM 更新**。我们一直在看一张早期
-快照，所以任何后续变化（包括那个复选框）都不可能出现在截图里。这同时意味着
-step 15 之前基于「框是空的」做的推断都不成立——它不是没画，是画的不是当前状态。
-
-未定：那张早期快照本身从何而来（widget 一度建过 UI 又清空？还是首帧合成后就没再
-更新？）。下一步应当给 frame surface 的合成路径插桩，而不是继续从截图反推。
-
-第一次做这个因果测试时 `Runtime.evaluate` 返回 `{}`，我差点据此断言「isolated world
-看到的不是被绘制的文档」。实际是表达式形式不被支持、求值**根本没执行**。包上
-`JSON.stringify(...)` 并回读确认后才拿到真结果——**探针没生效和被测对象没反应，
-表现完全一样**。
+原记录据「往 body 塞红块、截图不变」的因果测试断言跨源 iframe 绘制表面陈旧。
+被 Step 17 推翻：整个 Turnstile UI 挂在 body 的 closed shadow root 里，light DOM
+子节点本就不参与渲染，截图不变是正确行为；真因是 obscura 的 body 尺寸 0×0
+（step 17 定位现象，step 18 定位根因）。本步新增的 `scripts/cdp_frame_dom.py` 工具
+与「探针没生效和被测对象没反应表现完全一样」的教训已并入「测量盲区」表。
 
 ### Step 17 — 用 js-reverse 对照真实浏览器：推翻 step 16，真因是 body 尺寸 0×0
 
@@ -1601,18 +848,17 @@ innerWidth 全部正确之后，剩下的断点仍在 JSVMP——它依旧不发
    穿透 shadow。checkbox 挂在 frame 的 body 的 closed shadow root 里，所以**画得出来、
    点不到**（命中会落在 body 而不是 shadow 里的 checkbox）。
 
-**结论**（经用户更正：managed vs interactive 的分流主要由 **IP 干净程度**决定）：
+**结论**：
 
-> **本步的 IP 归因已被 step 33 推翻**：同一出口 IP 下 Chrome 免质询而 obscura 被拦，
-> 分流不由 IP 决定，差异只能来自客户端指纹。本步保留的价值：「需要点击」的结论经
-> step 28 量化证实成立；命中测试不穿透 shadow 的缺口经 step 23 修复。
+> 更正：本步原把「托管 vs 交互」的分流归因于出口 IP 干净程度（「浏览器 IP 干净走托管、
+> obscura 走代理 IP 脏走交互」），已被 Step 33 推翻：同一出口 IP 下 Chrome 免质询而
+> obscura 被拦，分流不由 IP 决定，差异来自客户端指纹。
 
-- HAR / js-reverse 里浏览器能一次性自动过，是因为当时出口 IP 干净 → 分流到托管
-  （managed）分支，无需点击。obscura 走 Reqable 代理，出口 IP 不干净 → 被分流到
-  **交互（interactive）分支、需要点击**。这是 Cloudflare 的正常行为，不是 obscura 的
-  JSVMP「执行坏了」。
-- 因此「点击 checkbox」**不是兜底，而是代理 IP 场景下必须打通的正路**。用户原假设成立。
-- obscura 当前有两个缺口：①它从不发起点击（被动 fetch）；②即使想点也点不到——
+保留成立的结论：
+
+- 「点击 checkbox」在交互分支下是必须打通的正路，不是兜底。经 step 28 量化证实：
+  同一代理下，真实浏览器点击 checkbox 是过盾的唯一触发条件。
+- obscura 当时的两个缺口：①它从不发起点击（被动 fetch）；②即使想点也点不到——
   `input_hit_in_document`（`runtime.rs:246`）用 `dom.descendants()`，不穿透 closed
   shadow root，命中落在 body 而非 shadow 里的 checkbox（渲染路径穿透、输入路径不穿透）。
 - 下一步：修命中测试穿透 closed shadow root + 在 `interactiveBegin` 时自动点击，
@@ -1630,7 +876,7 @@ shadow root（commit 80ac9a2）；再补 pointer 事件派发 + `composed:true`�
    边框 rgb(74,74,74) 位于 (201..224, 325..348)，中心 ≈ (212,336) = iframe 相对 (20.5,32.5)。
    点击 (216,336) 落在复选框内。
 2. 点击后消息时间线只有 `food` 心跳继续，**无 `complete`、无 `interactiveEnd`、无 `/pat/`**。
-3. `init` 消息确认 `"mode":"managed"`，~10–15s 被 IP 分流到 `interactiveBegin`。
+3. `init` 消息确认 `"mode":"managed"`，~10–15s 被分流到 `interactiveBegin`。
 4. frame 树里 widget（frame-page-1-1）内还有一层 **`about:srcdoc` 空 frame**
    （frame-page-1-2，body 为空）——很可能是叠在复选框上的透明 click 捕获层。
 
@@ -1831,51 +1077,13 @@ checkbox 坐标由截图定位：viewport 1200×739、dpr=2，widget 复选框�
 managed 分支。本 step 起，代理场景的正确基线是「managed 走完 → 停在 checkbox → 点击 →
 放行」这条 interactive 链路。
 
-### Step 29 — 同一探针对 obscura：点击命中却零反应（最新二进制复测）
+### Step 29 —（已删除）「点击命中却零反应，怀疑预注入/观测注入错了 realm」（归因错误）
 
-> **本步的归因已被 step 30 证伪**：「点击无效」的观察是对的（三张截图字节恒等），但
-> 「怀疑 realm 注入/观测错位」不成立——派发链路本身完全正常，真因是缺 `<label>` 激活行为。
-
-**假设**：step 26/27 的一致性修复之后，同样的 CDP 点击应当能在 obscura 上复现 step 28
-的放行链路。
-
-**方法**：先 `V8_FROM_SOURCE=1 cargo build --release ... --features render,stealth` 重建
-（**注意**：工作区里的二进制比 `0d58c6c` 旧了一小时，直接跑会测到旧代码——这正是
-本文「测量盲区」里记过的坑，本轮先撞了一次）。然后用 step 28 在真实 Chrome 上验证过的
-同一个探针 `scripts/cdp_click_fast.py` 打 `obscura serve --stealth --proxy`。
-
-**证据**：
-
-1. **探针在真实 Chrome 上是好的**：t=6.3s 点击 →+2s 就拿到 Zencare 真实 404。
-2. **同一探针对 obscura 全程 `box=null`**——但这是**探针失真，不是 obscura 没渲染**。
-   单独诊断（单行表达式）证明 obscura 侧一切正常：closed shadow root 1 个、其中 iframe
-   1 个、**box=[192,304,300,65]**（与 step 23 一致）、`[id^=cf-chl-widget]` 存在、
-   27 条 postMessage（含 `init/mode:"managed"`）。真因是 obscura 的 `Runtime.evaluate`
-   对**多行 `JSON.stringify((function(){...})())` 形式静默不返回值**；改单行 IIFE 后正常。
-   已补进「测量盲区」。
-3. **改用截图做观测面**（不依赖 JS 求值）：等 14s 后 obscura 确实渲染出
-   `Verify you are human` 复选框，widget 在 (192,304)–(492,368)，复选框中心 ≈ (212,336)。
-4. **点击 (213,335) 后完全无反应**：`before` / `after4s` / `after10s` 三张 PNG
-   **字节数完全相同（32492）**，像素级零变化。对照 step 28 的真实浏览器：同样的点击
-   2 秒内就发出证明 POST 并放行。
-
-**结论**：**两件事都成立，必须分开说**——
-
-- 卡住的**直接原因**确实是没有点击（step 28 已量化证实：不点则静止，点则 2 秒放行）。
-- 但**光是「让 obscura 去点」并不够**：obscura 在正确坐标上派发完整
-  move→press→release 之后，Turnstile 零反应。命中测试（step 23）、composed
-  （step 24）、mouseMoved（step 25）都已修且有单测，事件也确认命中了 frame 内的
-  复选框 span（step 24 插桩），却仍然驱动不了 handler。
-
-**下一步（收敛后的首要怀疑）**：step 24/25 说「预注入包 `addEventListener` 抓不到任何
-click 绑定」，当时归因为 handler 用了 `onclick` 或缓存引用。但更可能是**注入错了 realm**
-——`Page.addScriptToEvaluateOnNewDocument` 只作用于主文档，而复选框的 handler 活在
-**widget iframe（challenges.cloudflare.com）自己的 realm** 里，主文档的钩子根本看不见它。
-所以要先验证 obscura 的预注入是否覆盖子 frame realm；若不覆盖，就在 frame realm 内插桩
-`addEventListener` / `_eventTargetDispatch`，直接看点击有没有走到 handler。
-
-**判据（沿用 step 28）**：点击后 ~2 秒内出现新的
-`POST challenges.cloudflare.com/.../fo/<tokenB>` 才算事件真正送达。
+「点击无效」的观察本身正确（点击 (213,335) 后三张截图字节恒等 32492，widget
+box=[192,304,300,65]），但「预注入/观测注入错 realm」的怀疑被 Step 30 证伪：
+派发链路完全正常（capture→target→bubble 三站齐全、handler 注册完整），真因是
+obscura 缺 `<label>` 激活行为，点击到不了绑 handler 的 `<input>`。
+本步附带发现的多行 `JSON.stringify` 探针失真教训已并入「测量盲区」表。
 
 ### Step 30 — 真因：缺 `<label>` 激活行为，点击到不了 Turnstile 绑 handler 的 `<input>`
 
@@ -2089,11 +1297,11 @@ worker session 一律跳过：`Page.enable` 在 worker 上永不返回，十几�
 **结论**：握手、事件序列、worker 并行度这三块**都不是差异点**——obscura 在这些面上与 Chrome
 一致。真正的行为差异只有一处：**点击提交后 obscura 的 widget 心跳停了，Chrome 的还在跳**。
 结合 step 31 的 `cf_chl_rc_ni=1`，这说明 obscura 提交的证明被**当场判失败**、widget 随即收摊；
-Chrome 则继续保持会话。心跳停止因此是一个**比截图更快的失败信号**（点击后 ~2s 即可判定）。
+Chrome 则继续保持会话。
 
-> **本判据已被 step 36 作废**：成功路径里 `food` 心跳同样在 `complete` 前后停止
-> （最后一次 7571ms），「心跳停止 = 失败信号」不成立。正确判据是
-> `interactiveEnd → complete`+token 链。
+> 更正：本步曾把「心跳停止 = 失败信号」当作比截图更快的失败判据，已被 Step 36 作废：
+> 成功路径里 `food` 心跳同样在 `complete` 前后停止（最后一次 7571ms），该判据不成立。
+> 正确判据是 `interactiveEnd → complete`+token 链。
 
 **取 Chrome `cs` 的可复现配方**（第一次尝试失败，第二次成功）：每次都要**全新
 `--user-data-dir`**（旧 profile 捕获两次质询后即被放行）；OOPIF 注入必须**等
@@ -2371,6 +1579,88 @@ hasPrivateToken 0   hasRedemptionRecord 0   hasStorageAccess 0   requestStorageA
 补丁必须注入**每一帧**，只在顶层打补丁会导致子帧崩溃、父页面收不到 token、不发最终
 提交。obscura 的 frame realm 预注入（page.rs:2379）已满足这一点。
 
+### Step 40 — P0 五项 parity 修复后的基线：断点未移动，`/pat/` 依旧从不发出
+
+**背景**：`feat/web-platform-parity` 分支合入五项 P0 修复（79e1238 Performance Timeline、
+f4a1201 PAT API 族、43cb4d4 指纹推导引擎、76b6ae5 Stack/realm/referrer、827028d 定时器保真），
+逐条对应本文「未决」清单（step 10 / 39 / 38 / 32 / 9）。roadmap 明确要求「补齐后回填
+step 39 验证」——本 step 就是回填。
+
+**方法**：`V8_FROM_SOURCE=1 cargo build --release --features render,stealth` 重建后，
+起新 serve（端口 9225，proxy+stealth）跑 messages 探针 + 点击探针 + `RUST_LOG=obscura_js=debug`
+请求日志。
+
+**证据**：
+
+1. **时间线全面提速，但形状不变**（旧进程 vs 新二进制，同一 URL）：
+
+   | 事件 | 旧二进制（8/14 构建） | 新二进制（P0 修复后） |
+   |------|----------------------|----------------------|
+   | `init` | 4803 ms | **2333 ms** |
+   | `translationInit` | 5381 ms | 2912 ms |
+   | `interactiveBegin` | 10614 ms | **7420 ms** |
+
+   定时器修复（step 9 回填）生效，但流程仍停在 interactive 分支，无 `complete`。
+
+2. **请求序列（点击流程，P0 修复后）**——与浏览器基线的差异一目了然：
+
+   ```
+   42.6s  GET  zencare.co/.../chl_page/v1 → 200 (230KB)
+   42.9s  GET  challenges.cloudflare.com/.../api.js → 200 (82KB)
+   43.0s  POST zencare.co/.../fo/<tokenA> → 200 (113KB)
+   45.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (822KB JSVMP)
+   46.6s  GET  brunhild.challenges.cloudflare.com/.../i/...      ← worker fetch（预期失败，浏览器同）
+   50.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (127KB 交互变体)   ← interactiveBegin 后拉取（step 22 归因）
+   54.1s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (4976B)             ← 点击后 ~5.4s
+   54.6s  POST zencare.co/.../fo/<tokenA> → 200 (3256B)          ← 回传主页面（结构对应成功链路的最后一步）
+   57.3s  GET  zencare.co/.../chl_page/v1（新 ray）              ← 换 ray 重来
+   ```
+
+   **`GET /pat/` 与 `GET /ci/` 依旧零出现。** 对比 step 28 浏览器交互基线
+   （`/fo/` 822KB → `/pat/` 401 → `/ci/` png → `/fo/` 7KB 提交）：P0 五项修复后 obscura
+   比 step 22 时代前进了一步（当时 127KB 交互变体后停滞；现在多出 4976B 提交与 3256B
+   主页面回传——后者结构上对应浏览器成功链路的回传步，但结果仍是失败），**证明仍被判
+   失败**（widget 重置 → 换 ray 重来），且 `/pat/` 这条链路上的前置环节依旧缺失。
+
+3. **`interactiveEnd` 未出现**：本步点击后 postMessage 事件列表停在 `interactiveBegin`，
+   无任何新事件——但页面状态确实进入了 `Verifying you are human`（点击被接受，label
+   activation 生效）再重置。
+
+   > 更正：本步曾把「interactiveEnd 消失」列为可疑回归、怀疑 43cb4d4 重写 bootstrap.js
+   > 牵连了 step 37 的鼠标事件字段。Step 41 澄清：这是 CF 端波动（不同 ray 的 widget
+   > 版本差异）叠加点击时机不对（必须等 `interactiveBegin` 再点），不是代码回归；
+   > 时机修正后 `interactiveBegin → interactiveEnd → fail 600010` 完整复现。
+
+**测量坑（本轮新踩）**：
+
+- **9223 端口上是 8/14 01:15 启动的旧进程**（会话外遗留），我启动 serve 时静默绑定失败，
+  前两轮探针实际打在旧代码上。判据：`ps -o lstart -p <pid>` 与二进制 mtime 对比。
+  **这又是一次「进程比二进制旧」的盲区变体，已补进测量盲区表。**
+- `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询——踩中「导航早期 t≈1s
+  求值永久清空文档」的坑（测量盲区表已有），表现为 `box=null`、title/body 全空。改法：
+  首轮求值延迟 5s（`/tmp/cdp_click_fast_delayed.py`），随后一切正常。
+- `RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 的日志——它的 target 是模块路径
+  `obscura_js::ops`，不是 `obscura::js`。请求序列要用 `RUST_LOG=obscura_js=debug`。
+- 图片加载三模式对照（fetch / serve / MCP 同二进制）：本地页实测三者请求序列完全一致
+  （index.html + red.png + green.png，`naturalWidth: 64`）。**图片不加载与模式无关**，
+  是流程深度问题（`/ci/` 排在 `/pat/` 之后）。唯一真实的差异渠道是独立构建的 MCP
+  二进制不带 `--features render`（obscura-mcp `default = []`，图片 op 整组不注册）。
+  另：serve 不带 `OBSCURA_ALLOW_PRIVATE_NETWORK=1` 时本地导航直接被拒（
+  `Access to private/internal IP address`），会伪装成「serve 模式不加载」。
+
+**结论**：P0 五项修复（PAT API、Performance Timeline、指纹推导、栈/行号、定时器）
+**没有移动断点**——`/pat/` 依旧从不发出（首要阻塞，step 39 结论维持），`complete` 依旧为 0。
+HaHaVM 侧确认：`/pat/` 由
+Turnstile widget JSVMP 自身发起（`sec-fetch-mode: cors, dest: empty`，即 fetch/XHR），
+HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式的 `/pat/` 打补丁——
+因此 `/pat/` 缺失 = JSVMP 在 822KB 载荷之后没走到「发证明请求」那一步。
+
+**下一步（按信息量）**：
+1. v8 trace 追 JSVMP：822KB 载荷执行期间页面读到的差异面（trace 需 100MB+ 才算完整
+   一轮，step 39 的 6MB 不算数）。
+2. 用 `RUST_LOG=obscura_js=debug` 的请求序列作为后续每轮的固定观测面（URL+字节数，
+   比 postMessage 更直接）。
+
 ### Step 41 — TextEncoder 拦截实验：`/fo/` 明文不走 TextEncoder.encode；interactiveEnd 回归疑云澄清
 
 **假设**（用户提出）：参考 HaHaVM 的 TextEncoder hook（`envFunc.TextEncoder_encode` 覆盖），
@@ -2532,238 +1822,14 @@ interactiveEnd——是不是 P1/P2 之后能力回退了？图片 `/ci/` 为什
    **点击后 ~5s 的 4976B 提交**作可靠观测面，不要等 interactiveEnd。
 
 **结论**：① 无回退——点击→Verifying→4976B 提交→3256B 回传→失败的链在新二进制上
-完整复现；② `/ci/` 0% 是因为它与 `/pat/` 在同一 tick 由 JSVMP 发出（step 10），
-而 `/pat/` 从未发出（首要阻塞）——图片请求不是独立能力缺口（step 11 的 URL 解析
-修复正确但从未被走到）；③ 点击配方的两个必要条件（interactiveBegin 后、pre-move）
+完整复现；② `/ci/` 的日志 0% 是**观测盲区**而非能力缺口：Image 走 wreq stealth_client、
+不打 `stealth_fetch completed` 日志（本步误读为「与 /pat/ 同 tick、从未被走到」，
+Step 45 wreq 插桩证实 `/ci/` 实际发出且 200、解码出正确尺寸，step 11 的 URL 解析修复
+真实生效）；③ 点击配方的两个必要条件（interactiveBegin 后、pre-move）
 已固化，`cdp_click_fast --start 12` 是当前可复现提交链的配方。
 
 **下一步（不变）**：`/pat/` 缺失 = JSVMP 在 822KB 后没走到证明请求步——v8 trace 追
 widget 主线程执行路径。
-
-## 测量盲区
-
-### Step 40 — P0 五项 parity 修复后的基线：断点未移动，`/pat/` 依旧从不发出
-
-**背景**：`feat/web-platform-parity` 分支合入五项 P0 修复（79e1238 Performance Timeline、
-f4a1201 PAT API 族、43cb4d4 指纹推导引擎、76b6ae5 Stack/realm/referrer、827028d 定时器保真），
-逐条对应本文「未决」清单（step 10 / 39 / 38 / 32 / 9）。roadmap 明确要求「补齐后回填
-step 39 验证」——本 step 就是回填。
-
-**方法**：`V8_FROM_SOURCE=1 cargo build --release --features render,stealth` 重建后，
-起新 serve（端口 9225，proxy+stealth）跑 messages 探针 + 点击探针 + `RUST_LOG=obscura_js=debug`
-请求日志。
-
-**证据**：
-
-1. **时间线全面提速，但形状不变**（旧进程 vs 新二进制，同一 URL）：
-
-   | 事件 | 旧二进制（8/14 构建） | 新二进制（P0 修复后） |
-   |------|----------------------|----------------------|
-   | `init` | 4803 ms | **2333 ms** |
-   | `translationInit` | 5381 ms | 2912 ms |
-   | `interactiveBegin` | 10614 ms | **7420 ms** |
-
-   定时器修复（step 9 回填）生效，但流程仍停在 interactive 分支，无 `complete`。
-
-2. **请求序列（点击流程，P0 修复后）**——与浏览器基线的差异一目了然：
-
-   ```
-   42.6s  GET  zencare.co/.../chl_page/v1 → 200 (230KB)
-   42.9s  GET  challenges.cloudflare.com/.../api.js → 200 (82KB)
-   43.0s  POST zencare.co/.../fo/<tokenA> → 200 (113KB)
-   45.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (822KB JSVMP)
-   46.6s  GET  brunhild.challenges.cloudflare.com/.../i/...      ← worker fetch（预期失败，浏览器同）
-   50.3s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (127KB 交互变体)   ← interactiveBegin 后拉取（step 22 归因）
-   54.1s  POST challenges.cloudflare.com/.../fo/<tokenB> → 200 (4976B)             ← 点击后 ~5.4s
-   54.6s  POST zencare.co/.../fo/<tokenA> → 200 (3256B)          ← 回传主页面（结构对应成功链路的最后一步）
-   57.3s  GET  zencare.co/.../chl_page/v1（新 ray）              ← 换 ray 重来
-   ```
-
-   **`GET /pat/` 与 `GET /ci/` 依旧零出现。** 对比 step 28 浏览器交互基线
-   （`/fo/` 822KB → `/pat/` 401 → `/ci/` png → `/fo/` 7KB 提交）：P0 五项修复后 obscura
-   比 step 22 时代前进了一步（当时 127KB 交互变体后停滞；现在多出 4976B 提交与 3256B
-   主页面回传——后者结构上对应浏览器成功链路的回传步，但结果仍是失败），**证明仍被判
-   失败**（widget 重置 → 换 ray 重来），且 `/pat/` 这条链路上的前置环节依旧缺失。
-
-3. **`interactiveEnd` 未出现**（可疑回归）：step 37–38 时代旧二进制在点击后稳定出现
-   `interactiveEnd`（随后 `fail code=600010`）；本步点击后 postMessage 事件列表停在
-   `interactiveBegin`，无任何新事件——但页面状态确实进入了 `Verifying you are human`
-   （点击被接受，label activation 生效）再重置。43cb4d4 指纹推导引擎重写了 bootstrap.js
-   241 行，step 37 修的鼠标事件字段（timeStamp/screenX/button/detail/pressure/cancelable）
-   是否被牵连，待查。
-
-**测量坑（本轮新踩）**：
-
-- **9223 端口上是 8/14 01:15 启动的旧进程**（会话外遗留），我启动 serve 时静默绑定失败，
-  前两轮探针实际打在旧代码上。判据：`ps -o lstart -p <pid>` 与二进制 mtime 对比。
-  **这又是一次「进程比二进制旧」的盲区变体，已补进测量盲区表。**
-- `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询——踩中「导航早期 t≈1s
-  求值永久清空文档」的坑（测量盲区表已有），表现为 `box=null`、title/body 全空。改法：
-  首轮求值延迟 5s（`/tmp/cdp_click_fast_delayed.py`），随后一切正常。
-- `RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 的日志——它的 target 是模块路径
-  `obscura_js::ops`，不是 `obscura::js`。请求序列要用 `RUST_LOG=obscura_js=debug`。
-- 图片加载三模式对照（fetch / serve / MCP 同二进制）：本地页实测三者请求序列完全一致
-  （index.html + red.png + green.png，`naturalWidth: 64`）。**图片不加载与模式无关**，
-  是流程深度问题（`/ci/` 排在 `/pat/` 之后）。唯一真实的差异渠道是独立构建的 MCP
-  二进制不带 `--features render`（obscura-mcp `default = []`，图片 op 整组不注册）。
-  另：serve 不带 `OBSCURA_ALLOW_PRIVATE_NETWORK=1` 时本地导航直接被拒（
-  `Access to private/internal IP address`），会伪装成「serve 模式不加载」。
-
-**结论**：P0 五项修复（PAT API、Performance Timeline、指纹推导、栈/行号、定时器）
-**没有移动断点**——`/pat/` 依旧从不发出（首要阻塞，step 39 结论维持），`complete` 依旧为 0。
-`interactiveEnd` 的消失是新的可疑项（排在 `/pat/` 之后）。HaHaVM 侧确认：`/pat/` 由
-Turnstile widget JSVMP 自身发起（`sec-fetch-mode: cors, dest: empty`，即 fetch/XHR），
-HaHaVM 只负责让请求走通并提供 resource-timing 画像，没有显式的 `/pat/` 打补丁——
-因此 `/pat/` 缺失 = JSVMP 在 822KB 载荷之后没走到「发证明请求」那一步。
-
-**下一步（按信息量）**：
-1. 重跑 `cdp_event_trace.py` 对比 Chrome/obscura 事件字段，确认 step 37 修复是否被
-   43cb4d4 的 bootstrap.js 重写牵连（interactiveEnd 缺失的根因）。
-2. v8 trace 追 JSVMP：822KB 载荷执行期间页面读到的差异面（trace 需 100MB+ 才算完整
-   一轮，step 39 的 6MB 不算数）。
-3. 用 `RUST_LOG=obscura_js=debug` 的请求序列作为后续每轮的固定观测面（URL+字节数，
-   比 postMessage 更直接）。
-
-## 测量盲区
-
-排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
-
-| 盲区 | 后果 | 正确做法 |
-|------|------|----------|
-| `querySelectorAll` 不穿透 shadow；closed 模式下 `el.shadowRoot` 为 `null` | 误判「iframe 从未插入 DOM」 | CDP `Page.addScriptToEvaluateOnNewDocument` 预注入钩子截获 `attachShadow`，保留 root 引用 |
-| frame 导航路径**不打印 URL**（只有 `op_fetch_url` 打印） | 误判「iframe 文档从未被请求」 | 看 `starting new connection` / `Cookie header for <host>`，或直接插桩 |
-| 混淆代码的字符串解码表会「返回」大量错误字符串 | 把 `unsupportedbrowser` / `invalidsitekey` 等误当作被触发的错误 | 看调用形态：`CALL Window.g(<数字>)` → `RET object:Array` → `RET string:"..."` 是查表，不是触发 |
-| trace 的脚本名列对动态脚本一律记为 `<page-eval>` | 无法区分主页面代码与 iframe 内挑战代码；`challenges.cloudflare.com` 名下 0 条不代表没执行 | 该列不可用于分辨 realm；需要 realm 内注入 |
-| Cloudflare 在**失败路径上也会下发** `cf_clearance` | 误判「过盾成功」 | 判据是 `cf_chl_rc_ni`（Not Interested）等结果码，以及复用该 cookie 能否拿到真实内容 |
-| 页面脚本会在加载时缓存原生方法引用 | `--eval` 阶段（页面脚本之后）挂的钩子无效 | 用 CDP 预注入，在页面脚本之前挂 |
-| 包装 DOM 访问器（如 `contentWindow` getter）会改变被测行为 | step 6 中 `translationInit` 与心跳一并消失，整次测量作废 | 先用可控用例验证同一机制，再决定是否需要在真实页面上挂钩 |
-| 事件处理器里的异常被 `catch(e) {}` 静默吞掉 | 整整一轮排查看不到任何错误，误以为「代码没报错」 | 先把上报补上（step 7），再采信「零错误」这个结论 |
-| stealth 模式的 fetch/XHR 走 `stealth_fetch_all`，它**没有** `op_fetch_url` 的完成日志 | 看不到响应状态与大小，无法判断载荷是否送达 | 两条路径都要有完成日志 |
-| `console.error` 可被页面覆盖，但上报路径直接调内部格式化函数 | 测试里改 `console.error` 收不到消息，误判上报没生效 | 在 `op_console_msg` 这一层挂钩 |
-| `cargo build` 的输出用 `grep -E "^error"` 过滤会漏掉真正的失败行 | 拿着**没构建成功**的旧二进制跑了一轮，结论全错 | 过滤时必须同时匹配 `Finished` / `could not compile`，确认构建真的成功 |
-| 跨源 iframe 的截图是陈旧表面，不反映其当前 DOM | 依据截图推断 widget「没渲染出复选框」，方向全错 | 先做因果测试：改 frame 内的 DOM 看截图是否跟着变 |
-| `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
-| **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
-| **第一次 `/fo/` 直接 400 + `600010`,tokenB 不再下发** | 所有依赖大载荷的对拍突然全部失效,看起来像「刚才那次改动把链路打断了」 | **这是代理里被改写的那份 JS 的加密 key 过期**,不是引擎侧也不是 CF 侧。看到这个形态就**直接告诉用户去更新 JS**,不要继续排查引擎 |
-| **对照实验只能排除,不能定位**：撤掉改动重跑、形态相同,只证明「不是这次改动」 | step 72 据此得出「CF 对本出口 IP 升级」——一个完全编造出来的归因。真因是代理的 JS key 过期 | 排除掉自己的改动之后,剩下的空白**就让它空着**,写「原因未知」。不要用一个听起来合理的外部故事把它填上 |
-| **`obscura fetch --eval` 不 await Promise**；CDP `Runtime.evaluate` 对**多行** async IIFE 也静默返回 `{}` | 异步探针（WebRTC / getCapabilities / fetch 链）一律读到空结果，看起来像「这个 API 什么都没返回」 | 走 CDP 且带 `awaitPromise: true`，并把表达式**压成单行**；先用 `Promise.resolve(42)` 自检一次求值路径是否真的 await |
-| **探针的预注入钩子本身会被写进指纹**（`cdp_click_fast.py` 的 PRELOAD 包 `attachShadow` 并定义 `__roots`/`__pm`/`__t0`） | step 66 第一轮里 CF 载荷的 `YIjU8` 记下了钩子函数源码、`fyCZH9` 多出 `o.__pm`/`o.__roots`/`o.__t0`——**测的是探针不是引擎**，整轮作废 | 凡是要拿载荷/指纹做对拍的轮次，用零注入探针（`/tmp/clean_click.py`）；只有需要穿透 closed shadow 定位 widget 时才用带钩子的版本，且不得用该轮数据下指纹结论 |
-| MITM 代理换机器后 **CA 也换了**（本机 `Sep 30, 2025` vs 远端 `Apr 4, 2026`） | 用旧 `SSL_CERT_FILE` 会在握手阶段就失败，症状像「代理不通」 | `curl -s http://<proxy-host>:<port>/ca` 直接取 PEM，再对 `openssl s_client -proxy` 看到的 issuer 核对 CN |
-| 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
-| **把「有 CALL、无 COMPLETE」直接判成被拦截** | 这个特征同时也是长轮询在飞的样子；据此把 brunhild 判成被 CSP 拦截，整个 Step 61 的根因认定作废 | 让被判定的分支自己发声：在拦截处打日志（url + 生效策略 + 策略来源），再用「有没有这条日志」判定，而不是用别的日志的缺失去反推 |
-| **资源被 CSP 拒绝只表现为元素的 `error` 事件** | 与网络失败完全同形；`/ci/` 的 error 一度被当成超时 | 图片/媒体等资源路径的拦截也要打日志，否则无法与网络失败区分 |
-| **只 grep `stealth_fetch completed`，把「没有完成」当成「没有调用」** | brunhild `/i/` 被判成「JS 从未构造」，真相是它有 `op_fetch_url called`、被 CSP 提前返回，整整一个 step 的归因作废 | 请求序列一律把 `op_fetch_url called` 与 completed **按时序一起列**；只有 CALL 没有 COMPLETE 正是被拦截的特征 |
-| **`serve` 日志含 ANSI 转义，`grep` 视其为二进制**（`file` 报 `data`） | `grep -c` 直接返回 0 匹配、无任何输出，误判「这一轮没有请求日志」 | 一律 `LC_ALL=C grep -a`；先用 `wc -l` 与 `tail` 确认文件确实有内容
-| **图片请求不经过 `op_fetch_url`**（走 render 的图像管线） | `/ci/` 被判成「当前版本缺失的请求」，其实一直正常加载 | 图片是否发出用元素的 `load`/`error` 事件与 `naturalWidth` 判定，不看 fetch 日志
-| 把「日志里没有」等同于「没发生」，而不先确认该路径是否在日志覆盖内 | 同上两条的共同根因 | 每次用日志缺失作论据前，先找一个**已知发生**的同类事件验证它确实会被记录
-| **二进制比代码旧**（改完代码没重建就跑真实探测） | step 29 首轮拿 20:12 的二进制去测 21:10 的提交 | 每轮实测前 `stat` 二进制时间与 `git log -1` 对一下，并确认构建输出里有 `Finished` |
-| **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空** | step 30 的胶片探针从 t=1s 开始轮询，之后每帧都是 0 元素/0 字节截图，看着像「obscura 没渲染出页面」 | 同进程对照可复现：start=20 正常 → start=1 全空 → start=20 又正常。**探针首次求值必须延后**（脚本里 `--start`，默认 12s）。这本身是待修的真实缺陷 |
-| 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
-| 注入脚本读不到 bootstrap 的 script 作用域 `const` | 探针里 `_eventTargetListeners` 恒 undefined，被静默当成「没有监听器」，得出「整条链零 listener」的错误结论 | 任何读内部变量的探针都要先打印 `typeof`，确认它真的可见 |
-| **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
-| **widget-realm 预注入钩子 + 高频（≤0.3s）Runtime.evaluate 轮询 = widget 流程稳定停滞**（step 42，3/3 复现；同一 preload 单次求值 4/4 正常） | 一度把停滞归因于钩子形态（eval/Function 替换、console.warn 等），结论全错；「大载荷进 worker」的推断也由此而来，被 Rust 探针证伪 | wrap 存在时不要轮询：单次求值；或改用 Rust 侧插桩（零页面扰动）。钩子形态层面的结论需在无轮询条件下重新验证 |
-| 页面 console 日志 target 是 **`obscura::console`** 而非 `obscura_js::ops` | `RUST_LOG=obscura_js=debug` 下 grep 不到页面 console，误以为页面没输出 | `RUST_LOG='obscura_js=debug,obscura::console=info'` |
-| **obscura 不实现 `Runtime.consoleAPICalled`** | 脚本里订阅 consoleAPICalled 收零事件，误以为钩子没触发 | obscura 侧从 serve 日志读 console（Chrome 侧才用 consoleAPICalled） |
-| Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时换**全新 `--user-data-dir`**（最有效），或改用受控测试页 |
-| **`waitForDebuggerOnStart` 会暂停每一个新 target，包括 worker** | step 36：跳过 worker session 不 resume → Turnstile 的十几个 blob worker 全部挂起 → widget 永远 `Verifying...`。据此得出的「Chrome 也过不了盾」「IP 被惩罚」「overrunBegin 是真实判定」**三个结论全错** | 每个 attached target 都要 `runIfWaitingForDebugger`；worker 不发 `Page.*`，且 resume 用 fire-and-forget（worker session 可能永不回包） |
-| **把「页面没加载」当成「功能不工作」**（第二次犯） | step 38：受控页在 serve 路径下 DOM 为空、JS 未执行，据此得出「obscura 不加载图片」，复核后 4 个 png 请求全部正常 | 任何「某功能没发生」的结论，先断言页面真的加载了（`document.querySelectorAll('*').length` 或一个已知元素的文本） |
-| 过盾后页面**导航到新文档**，`window.__msgs` 随之清空 | 点击后 3 秒再 dump 就已经什么都读不到，成功样本连抓两次落空 | 让 hook 同时 `console.warn`，订阅 `Runtime.consoleAPICalled` **实时收流**，不依赖 dump 时机 |
-| 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
-| **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
-| **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
-| `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
-| **用不点击的探针判断提交链**（step 52-55 全部轮次） | `cdp_ci_timing_hook.py` 只导航加等待,点击之后的 5052B 提交与 3256B 回传因此永远不出现,却被当成「链路到此为止」 | 判据链凡是涉及点击之后的部分,必须用 `cdp_click_fast.py`(`--start` 要落在 `interactiveBegin` 之后);不点击的轮次只能用来看点击**之前**的阶段 |
-| **预注入 net-hook 看不到 `op_fetch_url` 直发的请求**（`has_tx=false`） | step 45/46 据此得出「`/pat/` 从未被 JS 构造」,而 `/pat/` 恰好走这条路;step 55 用 Rust 日志才看到它 | 判断「某请求是否发出」以 `RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` / `stealth_fetch completed` 为准,JS 钩子只能回答「由页面脚本的哪个 API 构造」 |
-| **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined。据此得出「删掉 TT 仍不恢复 → 还有第二处回归」的错误结论（step 51/52） | 要真正移除就只 `delete`，并当场用 `name in globalThis` 和 `Object.getOwnPropertyNames` 复验，而不是用 `typeof` |
-| **单次测量当判据**（本页多数 A/B 结论早期只测 1-2 次） | step 52 实测同一二进制 5 轮里有 1 轮偏离（`xhr=1` vs `3`），说明判据存在 CF 端偶发波动 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值；差异要在多轮上稳定才算数 |
-| **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | step 52 一度在 HEAD（距目标 commit 还有 22 个提交）上删 TT，用结果推断该 commit 的行为 | 干预实验必须跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 复现 |
-| **包装 `performance.getEntries*` 的钩子只在页面主动读取时产生记录**（被动观测面） | step 47 修完 `/ci/` 的 entry 后日志里看不到它，差点误判「修复没生效」——实际是 CF 在 `/ci/` 之后再没读过 performance | 「日志里没有」只能证明**没被读**，不能证明**不存在**；条目是否真的写入必须用可控用例断言（本步落成两条回归测试），实测日志只用来判断 CF 读没读、读到什么 |
-| **出口 IP 决定拿到哪种页面，1020 硬封锁态下一切诊断无效**（step 48 证据 4） | 封锁页会加载源站的 `rocket-loader.min.js` 与 `cloudflareinsights` beacon，serve 日志看着像「正常站点资源」，一度误判为过盾；而它既不是质询也不是真实响应 | 每轮开跑探针前先看 `Page loaded` 的 title：`Just a moment...` = 质询可诊断，`Attention Required! \| Cloudflare` = 1020 封锁需换 IP，其余才可能是真实响应 |
-| **质询页 DOM 里预置了全部状态文案** | `--dump text` 出现 "Verification successful. Waiting for zencare.co to respond"，误读为已通过 | 该串是静态文案不是状态；判据仍为目标 URL 返回真实 404（`/1.txt` 本就不存在） |
-| **`fetch` 模式不转发页面 console**（step 90） | fetch 轮本地测 ICE（console.log 6 条）与质询页 payloadJSON 全部静默丢弃，一度把「fetch 轮 0 条 payloadJSON」归因成「质询没跑完」——两个原因里真正致命的是这个 | 凡要读页面 console（payloadJSON/探针 console.warn）必须起 `serve`，从 serve 日志拿 |
-| **全量 `--trace` 让质询在窗口内跑不完**（step 90） | trace 轮 90 万 CALL 把页面拖慢数倍：fetch 轮 35s 到不了提交；serve 轮页面任务直接被 `autonomous browser task exceeded its task budget` 杀掉，payloadJSON=0 | trace 轮只用于看调用形态/MISS，**不用于拿提交体**；提交体用无 trace 轮，两轮分开跑 |
-| **V8 property-lookup trace 不覆盖普通 JS 对象的属性访问**（step 90） | trace 的 MISS 仅 19 条，据此会误判「CF 没探测不存在的属性」；实际 bootstrap 的 navigator 等 JS shim 的 typeof/in 走 V8 fast path，根本不进 hook——step 89 的 42 个 navigator 缺口在 trace 里不可见 | 枚举面/缺 API 类结论只能用 `enum_realm.py`/`diff_payload_enum.py` 对拍；trace 的 MISS 只回答「window 级全局查找失败」 |
-| **`console.log` 等 native 绑定不产生 CALL 行**（postMessage 同理，step 90 复证） | 想从 trace 里读 console.log 的参数（payloadJSON），CALL/HIT 里 0 条，像「没调用过」 | payloadJSON 靠 serve 日志；trace 只见 JS→JS 与 bootstrap 实现的 API 调用 |
-| **对拍脚本不先做同侧 sanity check**（step 90） | 摊平脚本「后片覆盖前片」的 bug 把 Math 指纹 184 项**完全相同**的值误报成「144→0 缺失」，差点写进文档成为假缺口 | 任何对拍脚本先跑「自己 vs 自己」的相邻批（chrome-2 vs chrome-3、obsc-2 vs obsc-3 应≈零差）再跑跨侧对比，覆盖 bug 立刻暴露 |
-| **`diff_payload_enum.py` 只识别旧字段 `fyCZH9`**（step 92） | 当前三 payload 的枚举桶名是 `ZokK1`，脚本静默输出 `n=d=s=so=bare=0`，看起来像 CF 没读任何属性 | 先断言提取总数非零；当前 payload 直接解析数字 part 中的 `ZokK1`，按探针字段名跨 part 合并后再对拍 |
-| **Performance entry 的 Rust `recording` 日志不等于 observer 已收到**（step 93） | iframe entry 的构造日志早于 payload，容易据此误判 CF 应已采集；实际 `PerformanceObserver` 回调还在 microtask 队列里 | 同时记录 `__obscura_performance_record`、`performance.getEntries()` 和 observer 回调；区分构造、入 timeline、交付 observer 三个时刻 |
-| **按分片号（part N）对齐两边 payload**（step 90） | 同一探针在 chrome 落 part 27、obscura 落 part 20，按 part 号 diff 全是假差异；第二批提交还是**增量**的（payload-3 = payload-2 + part 40），字段集合随批增长 | 对拍一律按**探针字段名**（混淆名跨边稳定）对齐，跨 part 合并同名值；先认清「增量批」语义再解释 only-字段 |
-| **`capture_challenge.py` 的 attachShadow 注入仍在污染指纹**（step 66 证据 0 重演，step 90） | `__roots`/`__cap`/`__capHooked` 进了 ZokK1 枚举桶，包装后的 attachShadow 源码进了 payload 尾部 | 该脚本抓通信可用；凡涉及枚举面/函数源码的字段要用无注入轮次（如纯 Input domain 的导航+点击），或先给脚本去注入 |
-
-另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
-（见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
-
-## 未决
-
-按当前怀疑程度排序：
-
-- **`/pat/` 从不发出**（step 39/40/44/45，现首要）：Chrome 在大载荷后 366ms 必发
-  `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`。step 44/45 修正机制定位：
-  **执行路径完整走到 127KB 交互变体，但 `/pat/` 请求从未被构造**（step 45 trace：XHR
-  open/send 一一配对 5 次无第 5 次、页面脚本名下零 fetch）。触发机制三项假设已证伪：
-  ①`hasPrivateToken` 探测（step 39 发现 3）；②XHR/fetch `privateToken` 选项（step 44）；
-  ③**「点击后窗口」**（step 45：`/pat/` 缺失在 822KB→127KB 的 **managed 分流窗口**，
-  不在点击后——回读 step 28，浏览器 `/pat/` 在第一轮 managed 阶段）；④**PAT API 探测**
-  （step 46 补充：getter 包装下 `hasPrivateToken`/`hasRedemptionRecord`/`hasStorageAccess`
-  零读取）；⑤**`/ci/` 被吞**（step 45 追加修正：`/ci/` 发出且 200，不是缺陷）；
-  ⑥**Image 缺 resource timing**（step 47 已修，`/pat/` 仍不出现——且本轮 CF 在 `/ci/`
-  之后没读过 performance，该链路根本没被走到）。下一步见「frame 缺 navigation timing」。
-- **frame 文档缺 navigation timing**（step 47 证据 3，新增，仅次于 `/pat/`）：CF 在两个
-  widget realm 各读一次 `getEntriesByType('navigation')`，**两次都是 0 条**；主文档 realm
-  正常有条目。代码侧一致——`record_performance_response(.., "navigation", ..)` 只在
-  page.rs:3536 为顶层文档调用。这是当前唯一「已证实被 CF 读取、且读到异常值」的环境面。
-- **`interactiveEnd` 疑云已澄清**（step 41）：step 40 记的「消失」是 CF 端波动——点击
-  时机修正（等 interactiveBegin 再点）后事件链完整出现（interactiveEnd@9361 →
-  fail 600010@10056）。**不是代码回归**。
-- **`/fo/` 明文获取**（step 41）：v8 trace 不可行（TextEncoder 是 deno_core native，
-  参数捕获只对 JS 帧有效）；预注入包装 TextEncoder.encode 实测主 realm 提交阶段零调用
-  ——明文不走 TextEncoder。待确认：证明计算是否跑在 worker（预注入不覆盖 worker realm）。
-- **缺 PAT 一族 Document API**（step 39）：`hasPrivateToken`/`hasRedemptionRecord`/
-  `hasStorageAccess` 均未实现（grep 确认 0 处），HaHaVM 照 Chrome 接口补齐了这一组。
-- **`fail code=600010`**（step 37）：`interactiveEnd` 稳定后仍以此码失败，并返回
-  `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表对应的分支。
-  判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
-- **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
-  行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
-  `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始
-  行/列偏移。（注意：本次 `cs` 的 10 帧全是外部脚本，尚未证明它就是判失败的直接原因。）
-- **label activation 剩余项**（step 30，正式实现已落地 `7521680`）：`labels`/`control`
-  IDL 补真（`htmlFor` 已有），`HTMLElement.click()` 路径的 label 转发（程序化点击仍到不了
-  input）。
-- **导航早期 `Runtime.evaluate` 清空文档**（step 30 发现）：可复现、与质询无关的真实
-  缺陷，但会持续毒化任何早期轮询的探针，值得单独修 + 回归测试。
-- **obscura 不尊重 `no_proxy`/`NO_PROXY`**（step 32 顺带发现）：设了 `no_proxy='*'` 仍会把
-  `127.0.0.1` 的请求送进 `http_proxy`，且**静默失败**——CLI 照样打印 `Page loaded`，只是
-  内容为空。只能靠 `env -u http_proxy -u https_proxy -u all_proxy` 绕开。
-- **自动点击策略**（step 28 时序约束）：一旦上一条打通，fetch 流程需要在复选框渲染的
-  **第一时间**点击，不能先等待观测——129s 会换 ray，token 作废。归属（调用方 / CLI
-  工作流 / `--solve-interactive` 之类开关）待定。
-- **obscura `Runtime.evaluate` 的多行表达式静默失败**（step 29 发现）：与质询无关，但
-  会持续毒化探针，且是真实的 CDP 一致性缺陷，值得单独修 + 回归测试。
-- **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
-  吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
-- **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
-  缺失——后者是一行即可命中的检测点。
-- 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:890:9)` + `<obscura:bootstrap>:905:5`
-  （step 8 提出，step 48 复现，行号随 bootstrap 变动）。浏览器里 setTimeout 回调的栈到
-  回调那一帧就结束，下面没有引擎帧。CF 经 `{"event":"execute"}` 的 `cs` 字段主动采集并
-  传输该栈，是确定被读取、且与 Chrome 确定有差异的指纹面。
-- ~~父窗口是否回应了子窗口的 `requestExtraParams` 未证实。~~ **step 48 已证实：回应了。**
-  双向被动监听对拍显示 widget 在自身 realm 的 41ms 即收到完整 managed 配置，且 `food`/`meow`
-  心跳 32 对双向闭环。断点不在 postMessage 通道，在 widget realm 内部。
-- 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
-  可被检测的差异，未修。
-
-### 通用能力回填（路线图 P1/P2，2026-08-15）
-
-本记录中的 `labels/control`、`NO_PROXY` 和“fetch 不自动交互”观察已分别回填为通用
-实现：表单 IDL/程序化 label 激活已完成；reqwest、脚本 fetch 与 stealth/wreq 现在遵守
-`NoProxy::from_env`；输入策略通过 embedder 提供 selector/timing policy，不读取挑战文案、
-主机名或 Cloudflare 状态。真实挑战仍以 `600010` 为独立未解决项。
-
-新增的 WebSocket、WebGL、indexedDB、HTTP/2、frame layout cache 与 Debugger/host trace
-均有独立 `js-repros/` fixture。当前主机没有 Chrome/Chromium 可执行文件，故没有伪造
-Chrome 146 oracle；各 fixture README 标明了这一验证边界。
 
 ### Step 44 — v8 trace 追 822KB 后执行路径：/pat/ 触发机制排除两项假设；全量 --trace 在新二进制上不可用（2026-08-15）
 
@@ -2813,12 +1879,15 @@ Chrome 146 oracle；各 fixture README 标明了这一验证边界。
 
 1. 全量 `--trace` 与 P0 定时器保真机制恶性耦合，挑战页上不可用；**lookups 模式是唯一可用 trace 模式**（流程无退化，8s 全链）。「100MB+ 才算完整一轮」判据作废，替换为「lookups 6MB + 请求序列确认 822KB+127KB 到达」。
 2. `/pat/` 缺失**不是**「822KB 后 JSVMP 没走到证明请求步」——执行路径完整走到 127KB 交互变体，但**从未构造 /pat/ 请求**（无 XHR/fetch/Image 痕迹）。触发机制与 `hasPrivateToken` 探测无关、与 `privateToken` 选项无关。
-3. `/pat/` 触发窗口大概率在**点击后**（浏览器交互基线：点击 → /pat/ → /ci/ → 7KB 提交；obscura 点击后直接 4976B 提交，跳过 /pat/+/ci/——4976B vs 浏览器 7KB 的 2KB 差值可能正是缺失的证明输入）。该窗口当前不可 trace（fetch 无点击、serve 不支持 --v8-flags）。
+3. > 更正：本步曾推断「`/pat/` 触发窗口大概率在**点击后**（点击 → /pat/ → /ci/ → 7KB
+   > 提交），且该窗口不可 trace」。已被 Step 45 推翻：`/pat/`（与 `/ci/`）的缺失发生在
+   > **822KB→127KB 的 managed 窗口**，不在点击后（step 28 证据回读：浏览器 `/pat/` 出现
+   > 在第一轮 managed 阶段）；serve 也实际支持 `--v8-flags`（本步记的「不支持」是参数
+   > 位置问题，见 step 45 证据 1）。
 
 **下一步（按信息量）**：
-1. **追点击后窗口**：让 serve/CDP 路径支持 `--v8-flags`（查 CLI 参数透传，serve 不支持的原因），或给 fetch 模式加预注入自动点击；跑 lookups trace 覆盖 点击 → 4976B 窗口，确认该窗口 JSVMP 是否构造 /pat/。
-2. 对照 HaHaVM `core/env/Document.js:2062` 的 hasPrivateToken **实现与返回值**——若 HaHaVM 返回 true 且 CF 据此走 PAT 流程，则 obscura 的 f4a1201 返回值语义是下一个检查点（虽然 trace 显示 CF 没读该属性——两者矛盾时需要合理解释）。
-3. 若点击后窗口也无 /pat/ 构造：/pat/ 由 Chrome 原生 PAT 握手发出（非 JS），obscura 需实现浏览器级 PAT 支持——该方向工作量大，先确认前两条。
+1. 对照 HaHaVM `core/env/Document.js:2062` 的 hasPrivateToken **实现与返回值**——若 HaHaVM 返回 true 且 CF 据此走 PAT 流程，则 obscura 的 f4a1201 返回值语义是下一个检查点（虽然 trace 显示 CF 没读该属性——两者矛盾时需要合理解释）。
+2. 若 managed 窗口内也无 /pat/ 构造：/pat/ 由 Chrome 原生 PAT 握手发出（非 JS），obscura 需实现浏览器级 PAT 支持——该方向工作量大，先确认前一条。
 
 **Step 44 补充（2026-08-15，trace 工具链升级后复测）**：全量 `--trace` 补丁升级
 （timer-wake 等引擎脚本过滤 + 队列异步写，见 Trace-page-script.md「2026-08-15 升级」）
@@ -3135,13 +2204,17 @@ widget 发 `food` seq N，父页回 `meow` seq N，32 对无一缺失，一直�
 **结论 B（结掉一条未决项）**：未决清单「父窗口是否回应了子窗口的 `requestExtraParams`
 未证实」——**已证实：回应了**。step 6 留下的这条就此关闭。
 
-**证据 2 — 本轮 CF 分流比 step 47 更浅**：`hook-installed` 只有 2 个 realm（step 47 为 3 个），
+**证据 2 — 本轮分流比 step 47 更浅**：`hook-installed` 只有 2 个 realm（step 47 为 3 个），
 net-hook 全部请求仅 `img.src /favicon.ico` 与 tokenA 的 `xhr.open POST /cdn-cgi/challenge-platform/h/g/fo/...`
 （zencare 源）。**无 822KB 的 challenges `/fo/`、无 `/ci/`、无 `/pat/`、无 `interactiveBegin`**。
 perf-hook 因此只在主文档 realm 触发（`getEntries()=3` 含 navigation 条目），
 **widget realm 的 `getEntriesByType('navigation')` 本轮一次都没被调用**——step 47 证据 3
-指出的那个断点，本轮 CF 还没走到就 overrun 了。故 step 47 的「frame 缺 navigation timing」
-本轮既未复现也未被否定。
+指出的那个断点，本轮既未复现也未被否定。
+
+> 更正：本步曾把「本轮更浅」归因为 CF 端分流波动（「CF 还没走到就 overrun 了」）。
+> 已被 Step 49 推翻：同 IP 同代理同一分钟内 Chrome 走完整 managed 链，而 obscura 连
+> tokenB 的 `/fo/` 都不发——回退在 obscura 侧（step 50/51 定位到 `1f963b7` 的
+> Trusted Types 回归），不是 CF 分流差异。
 
 **证据 3 — `cs` 栈底的引擎帧仍在（step 8 未决项复现）**：父页发给 widget 的
 `{"event":"execute"}` 消息携带 CF 采集的调用栈，栈底两帧为：
@@ -3818,11 +2891,12 @@ v8 property trace。
 
 4. **三条假设被证伪**：
 
-   - **CSP `connect-src` 拦截**：拦截点 `csp_connect_allows` 在 `op_fetch_url`
-     **内部**（`crates/obscura-js/src/ops.rs:2712`），而 `op_fetch_url called`
-     的 debug 行在其之前打印。brunhild 连这条都没有，说明 JS 从未调用 fetch，
-     是分支没进去，不是被拦。（该函数确实只做精确 origin 匹配、不支持通配子域，
-     这是独立缺口，但不是本现象的原因。）
+   - **CSP `connect-src` 拦截（当时的证伪读法，后被两次更正）**：本步只 grep
+     `stealth_fetch completed`，brunhild 无完成日志，据此判「JS 从未调用 fetch，
+     是分支没进去」。Step 61 以 CALL/COMPLETE 时序证明请求确实发起过；Step 63 加显式
+     拦截日志后实测 **0 次拦截**，brunhild 是长 pending 的长轮询，与 Chrome 一致。
+     （顺带发现：`csp_connect_allows` 只做精确 origin 匹配、不支持通配子域，
+     这是独立缺口。）
    - **缺超时/中止类 API**：`AbortSignal.timeout/any/abort`、`fetch+signal`、
      `Request(init)`、`URL.parse`、`URLPattern`、`Promise.withResolvers`、
      `structuredClone`、`navigator.connection`、`reportError`、`scheduler`
@@ -3837,11 +2911,12 @@ v8 property trace。
    845.8KB，与 Chrome 首轮同尺寸，所以尺寸不能简单等同于「可信/不可信」，只能确认
    「首轮拿到的程序不同」。
 
-**结论（部分作废，见 Step 61）**：`/eb/` 与 brunhild `/i/` 是同一个下游症状、
-`/ci/` 差异不存在，这两条成立。但「brunhild 从未被 JS 调用、不是被拦」是**错的**：
-本步只 grep 了 `stealth_fetch completed`，而被 CSP 拦下的请求有 `op_fetch_url called`、
-没有完成日志。Step 61 给出真因。tokenB 822.5KB vs 845.8KB 的差异属实，但它是 CSP
-拦截的下游结果，不是独立的分歧点。
+**结论（部分更正，见 Step 61/63）**：`/ci/` 差异不存在（图片走 render 图像管线、
+不进 fetch 日志），这条成立。「brunhild 从未被 JS 调用、不是被拦」是**错的**：请求
+确实发起过（Step 61 的 CALL/COMPLETE 时序），且后来证明它从未被拦——是长 pending 的
+长轮询，与 Chrome 一致（Step 63 的显式拦截日志，0 次拦截）。tokenB 822.5KB vs 845.8KB
+的差异属实；「`/eb/` 与 brunhild `/i/` 是同一下游症状」的因果链先后被 Step 62/63
+证伪，该差异也不再作为独立分歧点。
 
 **附带发现（未修）**：
 
@@ -3858,7 +2933,14 @@ v8 property trace。
 **下一步**：比对两边 tokenB `/fo/` 的**请求体**（obscura 与 Chrome 各自 POST 上去的
 指纹载荷），而不是继续在 `/eb/` 槽位上找。
 
-### Step 61 — 真因：跨 realm 用错 CSP，widget 的 fetch 被顶层文档的 `connect-src` 拦掉（2026-08-16）
+### Step 61 — fetch 的 CSP realm 缺陷：页面级策略被应用到所有 realm（2026-08-16）
+
+> 更正：本步原标题为「真因：跨 realm 用错 CSP，widget 的 fetch 被顶层文档的
+> `connect-src` 拦掉」，并把「brunhild 被拦 → 走 `/eb/…/chl_api_m` 上报 →
+> `fail code=600010`」判为因果链。该根因认定已被 Step 63 推翻：补显式拦截日志后
+> 实测 0 次拦截，brunhild 是长期 pending 的长轮询（与 Chrome 一致）；`/eb/` 与
+> 600010 另有成因（step 64）。本步保留的有效内容是 fetch 的 CSP realm 缺陷本身
+> （真实引擎缺陷，step 62 修复生效）。
 
 **触发**（用户追问）：这跟当天下午的 CSP / Trusted Types 改动有关，此前会发 `/ci/`、
 不会发 `/eb/`。到底是不是被 CSP 拦了？如果是，为什么浏览器不拦？
@@ -3866,7 +2948,7 @@ v8 property trace。
 **方法**：把日志从「只看 `stealth_fetch completed`」改成「`op_fetch_url called` 与
 completed 一起按时序列出」，再取两边的 CSP 响应头对照。
 
-**证据 1 — 请求确实发起过，只是没有完成**：
+**证据 1 — brunhild 确实被 JS 发起过（纠正 step 60 的「从未调用」）**：
 
 ```
 CALL      POST CF/fo/…            COMPLETE -> 200 822780B
@@ -3875,9 +2957,9 @@ CALL      GET  CF/pat/…
 CALL      POST CF/eb/…            COMPLETE -> 200 2B
 ```
 
-`op_fetch_url` 先打 `called` 再做 CSP 检查（`ops.rs:2702` 与 `:2712`），被拦时提前
-返回 `cspBlocked: true`，因此有 CALL 没有 COMPLETE。Step 60 只 grep 完成日志，
-据此得出「JS 从未调用」，**结论错误**。
+`op_fetch_url` 先打 `called` 再做 CSP 检查（`ops.rs:2702` 与 `:2712`）。（当时把
+「有 CALL 无 COMPLETE」读作「被 CSP 拦截」；step 63 证明 0 次拦截——该特征与长轮询
+pending 同形，已记入「测量盲区」表：不能用日志缺失去反推，要让被判定的分支自己发声。）
 
 **证据 2 — 两份 CSP 在这一点上恰好不同**：
 
@@ -3900,7 +2982,7 @@ connect-src 'self' https://hagen.challenges.cloudflare.com https://brunhild.chal
 
 CF **特意**给 widget 文档配了允许 `hagen` / `brunhild` 两个兄弟子域的 `connect-src`。
 
-**证据 3 — obscura 取错了哪一份**：
+**证据 3 — obscura 的取值缺陷（有效发现）**：
 
 | 路径 | CSP 来源 | 代码位置 |
 |------|----------|----------|
@@ -3908,32 +2990,9 @@ CF **特意**给 widget 文档配了允许 `hagen` / `brunhild` 两个兄弟子�
 | fetch / XHR | `SharedState.document_csp`，**全 page 一份** | `ops.rs:2712` |
 
 `SharedState.document_csp` 只在**主文档**导航时写入（`page.rs:3524`）；frame 文档的
-CSP 写进 `DocumentScope`（`page.rs:5678`），fetch 路径从不读它。于是 widget realm 发出的
-fetch 被拿 **zencare.co 的策略**去校验。
-
-**根因**：`0ebf07f`（feat: enforce CSP connect-src for scripted fetches）引入
-`csp_connect_allows(gs.document_csp, …)`，把**页面级**的 CSP 应用到**所有 realm**。
-对 brunhild：
-
-- 目标 origin = `https://brunhild.challenges.cloudflare.com`
-- 传入的 `page_origin` = widget 自身 origin `https://challenges.cloudflare.com`
-- 顶层策略里 `'self'` 不匹配，显式项 `https://challenges.cloudflare.com` 也不匹配
-- → 拦截
-
-**为什么浏览器不拦**：Chrome 按规范用**发起请求的那个文档**的 CSP。widget 文档的
-`connect-src` 明确列了 brunhild，因此放行。这不是通配子域匹配的问题——widget 的策略是
-逐个主机写死的；obscura 只是用错了策略。
-
-**为什么 `/ci/` 没受影响**：图片路径本来就按文档 scope 取 CSP，而且 `/ci/` 在
-`challenges.cloudflare.com` 上，对 widget 是 `'self'`、对顶层是显式项，两份策略都放行。
-所以它在这次改动前后都正常，也解释了「以前发 ci、现在还发 ci」。
-
-**下游链条**：brunhild `/i/` 被拦 → widget 侧该步失败 → 走 `/eb/…/chl_api_m` 上报
-（Chrome 全程不发）→ 后续 tokenB 程序、提交体积（4976 vs 7244）与
-`fail code=600010` 都是这一拦截的下游结果。
-
-**结论**：`600010` 的当前直接成因是 **CSP 的 realm 归属错误**，不是 Trusted Types，
-也不是指纹面。
+CSP 写进 `DocumentScope`（`page.rs:5678`），fetch 路径从不读它。Chrome 按规范用
+**发起请求的那个文档**的 CSP；obscura 把**页面级**策略应用到了**所有 realm**
+（`0ebf07f` 引入 `csp_connect_allows(gs.document_csp, …)`）。
 
 **修法**：fetch 路径要拿发起 realm 所属文档的 CSP，而不是 `SharedState.document_csp`。
 钩子已经现成：frame realm 在 bootstrap 之前就定义了 `__obscura_frame_document_nid`
@@ -4373,7 +3432,7 @@ CF 载荷侧：1.json 的 `yQYB9` 从缺失变成 1 条（api.js，`QUyj4`/`aelS
 obscura 更快；`NWUB3`/`WpIu5` 28 vs 1849 等计数属于页面差异。要拿这些当判据，
 必须换成同一个 URL 的浏览器 HAR。
 
-### Step 68 — `fyCZH9` 的枚举语义查清：`for..in` ∪ 自有属性名；引擎内部字段全部下线（2026-08-17）
+### Step 68 — `fyCZH9` 的枚举语义查清：`for..in` ∪ 自有属性名（2026-08-17）
 
 `fyCZH9` 是 2.json 里最大的一个字段（Chrome 30881 B / obscura 14187 B）。它是
 一张「属性路径 → 值」的倒排表，路径带前缀 `d.` `n.` `s.` `so.`，以及不带前缀的一批。
@@ -4436,6 +3495,11 @@ obscura 更快；`NWUB3`/`WpIu5` 28 vs 1849 等计数属于页面差异。要拿
 | `so.` | 9 | 5 | **8** |
 | `n.` | 81 | 37 | **39** |
 | 内部字段泄漏 | 0 | **11 条** | **0** |
+
+> 更正：本步曾据上表记「内部字段泄漏 11 → 0、引擎内部字段全部下线」。Step 79 用同一套
+> 分桶复算推翻：当时的 0 只覆盖了部分子桶，实际仍剩五处泄漏（`Deno`、`window[0..49]`
+> 数字槽、元素 `_nid`/`_scopeRoot`、事件处理器源码、4 个非 native 方法），修复见 Step 79。
+> 本步确立的枚举语义（`for..in` ∪ `Object.getOwnPropertyNames`）本身正确，被后续沿用。
 
 **仍未对齐（下一步的根因，已定位）**：`<bare>` 305 vs 1238、`o.` 493 vs 28
 都出自同一个东西——**动态创建的 iframe 在 Rust 帧加载器提交之前，
@@ -4610,7 +3674,7 @@ getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
 无移动端压缩格式、device 限额低于 adapter 限额、品牌串是
 `[object GPUAdapter]` / `[object GPUSupportedLimits]` / `[object GPUDevice]`。
 
-### Step 72 — `ZpxzX5`：RTP 能力表由 SDP 反推；CF 侧升级导致本轮无法量测（2026-08-17）
+### Step 72 — `ZpxzX5`：RTP 能力表由 SDP 反推（2026-08-17）
 
 **现状**：`RTCRtpSender` / `RTCRtpReceiver` 两个接口在 obscura 里**根本不存在**,
 `RTCRtpSender.getCapabilities('audio')` 直接抛 TypeError,
@@ -4643,10 +3707,10 @@ getPreferredCanvasFormat(), wgslLanguageFeatures 9 项, limits 的 37 个名字,
 **真因（当日由代理维护者指出，此处为更正）：代理里那份被改写的 JS 的加密 key 过期了。**
 更新那份 JS 即可恢复,与引擎侧无关。
 
-**~~判定为 CF 对本出口 IP 的升级~~（作废）。** 这条结论是编的:对照实验只证明了
-「不是这次改动」,并没有指向任何外部原因;我却拿「今天跑了约 20 轮」凑出一个听起来
-合理的故事把空白填上,还据此写进了测量盲区表。**排除自己的改动之后剩下的空白,
-应该老老实实写「原因未知」。**
+> 更正：本步曾把「CF 对本出口 IP 的升级」写成本轮无法量测的原因，该归因是编造的：
+> 对照实验只证明了「不是这次改动」，并不指向任何外部原因，我却拿「今天跑了约 20 轮」
+> 凑出一个听起来合理的故事把空白填上。教训已固化在「测量盲区」表：排除自己的改动
+> 之后，剩下的空白应老老实实写「原因未知」。
 
 **操作约定**：以后只要看到**第一次 `/fo/` 返回 400 + `600010`**,
 就直接提示使用者**更新代理里的那份 JS**,不要继续往引擎上排查——
@@ -4967,9 +4031,11 @@ all.namedItem('probe')   该元素           document.all === all true
 **结论（推翻两处旧记录）**：
 
 1. **方向记反了。** 30881 是 **Chrome** 的，obscura 是 15390。obscura 不是多报，
-   是**少报一半**。`o.` 只值 28 条，iframe 垫片根本不是这 15KB 的来源——
-   来源是 obscura 的平台面比 Chrome 小：`N` 386 vs 1164、`d.` 212 vs 295、
-   `n.` 34 vs 81。
+   是**少报一半**——来源是 obscura 的平台面比 Chrome 小：`N` 386 vs 1164、
+   `d.` 212 vs 295、`n.` 34 vs 81。（本步曾顺带断言「`o.` 只值 28 条、iframe 垫片
+   根本不是这 15KB 的来源」，被 Step 80 收回：本地实验测错了对象——CF 枚举的是
+   **新建 iframe 的** window/document，不是页面的；垫片是 `d.` 43 vs 295、
+   `o.` 493 vs 28 两项异常的唯一来源。）
 2. **step 68 记的「泄漏 11 → 0」不成立。** 用同一套分桶在本地复算，还剩五处：
 
    | 泄漏 | 表现 |
@@ -5495,6 +4561,59 @@ obscura-js 513、obscura-browser 105 全绿。
 WebGL/WebGPU 三组的共同根因是 `fingerprint.rs::from_user_agent` 的 macOS 分支
 （architecture:"x86" + Intel GPU 串），必须一个提交内原子翻转。
 
+### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
+
+**假设**（用户提出）：`/ci/` 是 CF 用动态 img 打的点（`sec-fetch-dest: image` + `new
+Image().src`，读 naturalWidth/naturalHeight 验真实解码），**必须发**；之前 obscura 一直发，
+step 90 轮 A 里第一个 widget 全程不发（拖到点击后第二个 widget，12:54:18）——疑似最近的
+iframe 修复（bc0e0cf 同步 about:blank / 4ed91e1 同步 realm）导致 iframe 内标签解析出问题、
+图片无法创建。
+
+**方法**：机制三环逐环验证 + 跨版本对照（每版 `--user-agent` 对齐、同代理、同探针
+`capture_challenge --click`，判据 = 前 3 条 `payloadJSON`（约前 15s）的 jdnfg5 里有无
+`/cdn-cgi/challenge-platform/h/g/ci/`）。
+
+**证据**：
+
+1. **机制三环全部正常**（当前 HEAD 二进制）：
+   - 顶层 `new Image()` + HTTP src：onload 265ms、`naturalWidth=48x48`（challenges.cloudflare.com
+     favicon）——加载/解码/宽高三环正常；
+   - **iframe 上下文** `new w.Image()`：onload、48×48——iframe realm 的图片创建与解析正常
+     （初次测得 `Connect` 失败是 serve 忘带 `SSL_CERT_FILE`，观测环境错，非引擎问题）；
+   - data: 1×1 PNG：onload 5ms、1×1。
+2. **「无 ci 轮」里 CF 根本没构造 img**：184 万行 V8 trace 中 widget realm 的
+   `HTMLImageElement set src` **零条**（仅主页面 chl_page 的 `/favicon.ico` 探测两条）——
+   不是「img 创建了但解析失败」，是 CF 的 JSVMP 分支没走到 `set src` 那一步。
+3. **跨版本对照**（ci 是否在前 3 条上报内出现）：
+   | 二进制 | 轮次 | 结果 |
+   |---|---|---|
+   | a0071cf（8-17，对拍轮代码） | 1 | 第 2 条（4s）有 ci |
+   | bc0e0cf（同步 about:blank） | 1 | 第 2 条（4s）有 ci —— **用户假设的提交排除** |
+   | 4ed91e1（同步 frame realm） | 1 | 第 2 条（10s）有 ci —— **排除** |
+   | e487e85（Symbol 键隐藏内部字段） | 2 | 轮 1 推迟到第 5 条（24s）；**轮 2 第 2 条就有**——单轮差点定罪，复测推翻 |
+   | HEAD（9244312） | 4 | 轮 A 与 r1 推迟/不发；**r2（4s）、r3（6s）第 2 条就有** |
+4. **HEAD 大多数轮次早期就发 ci**（3 轮里 2 轮），代理侧同期也能看到（用户确认）。各版本
+   均出现约 1/3 的「推迟轮」——**ci 发送时机存在轮间波动，非回归**。旧版全 ✓ 是小样本运气。
+5. **独立真缺陷（本轮新发现）**：动态 `createElement('iframe')`（无 src，about:blank）在
+   onload 时 **`contentDocument.body === null`**（`d.body.innerHTML` 抛 TypeError）——
+   a0071cf 与 HEAD **都有**（早于 bc0e0cf，非新回归），Chrome 中动态 iframe 的 about:blank
+   文档必有 `<body>`。若 CF 的 JSVMP 在自建辅助 iframe 里碰 body 会静默炸掉——与
+   `hGgWW0` 探针三轮全空、ci 推迟轮的同族嫌疑，值得单独修。
+
+**结论**：
+- 「/ci/ 不发了」不成立：没有回归，HEAD 上多数轮次第一轮 widget 早期（4-6s）就打点，
+  机制三环（构造/加载/宽高）全部正常；约 1/3 轮次推迟/不发是 CF 端分支波动（与 step 41
+  `interactiveEnd` 间歇出现同族）。
+- bc0e0cf/4ed91e1（iframe 修复）与 ci 行为无关，排除。
+- 顺带发现的 `body=null` 是确凿的 iframe parity 缺陷（但非新引入），列入修复清单。
+- 「单次测量当判据」盲区在本轮两次立功：e487e85 单轮异常差点被定为回归根因，HEAD 单轮
+  （轮 A）差点被当成稳定退化——**行为判据必须多轮**。
+
+**下一步**：
+1. 修动态 iframe about:blank 的 `body` 缺失（应同步建 `<html><head></head><body></body>`）。
+2. 若要进一步压 ci 波动：对比「早发轮 vs 推迟轮」的 payloadJSON 差异（错误序列 `YySko4`
+   / `QqYk7`），找 CF 分流的观测点。
+
 ### Step 91 — B0-B7 全批次落地：核心指纹面收敛到 149 基线（2026-08-28）
 
 **假设**：step 90 的六组缺陷按 `Challenge-fingerprint-fix-plans.md` 的批次全部修复后，
@@ -5598,7 +4717,7 @@ check 均过。
 但现有证据不能把拒绝因果唯一归到某一个字段。下一步先定位完全无产出的 `hGgWW0` / `lNCr3`
 探针抛错点，再处理 canvas/text 指纹；其后是 ZokK1 长尾、UA-CH brand 与 ICE srflx。
 
-### Step 93 — `jdnfg5` 缺 iframe：entry 已写入，observer microtask 未及时交付（2026-08-28）
+### Step 93 — `jdnfg5` 缺 iframe：entry 已写入 timeline 的时序证据（2026-08-28）
 
 **假设**：`payload-1.jdnfg5` 少 `rch/...` iframe URL，是 frame 导航没有写入父页面的
 Performance Timeline。
@@ -5621,18 +4740,18 @@ Performance Timeline。
 4. `_queuePerformanceEntry` 会立即把 entry 放入 `_performanceEntries`，但 observer 的 callback
    用 `queueMicrotask` 调度（`bootstrap.js:12362`）。Rust 的 `execute_script` 只执行 classic
    script、不做 checkpoint（`runtime.rs:2832`）；checkpoint 只在 `run_event_loop` 边界
-   （`runtime.rs:2956`）。动态 frame 路径 flush entry 后立刻执行 frame subtree scripts
-   （`page.rs:5488-5490`），frame 的 postMessage 因而能先触发 `chl_api_m`，observer microtask
-   还没把 iframe item 加进 CF 的累计数组。
+   （`runtime.rs:2956`）。（本步曾据此把根因判为「observer microtask 未及时交付」，已被
+   Step 94 证伪，见下方更正。）
 5. `btnGW2` 与 `MhAgV7` 是同一个毫秒差值的两个别名：
    `_cf_chl_opt.erXEv3 = Date.now(); value = erXEv3 - JCXT5`。Chrome 为 1044，obscura 多轮为
    27-67（本轮 51），说明同一 widget 初始化/可见性流程在 obscura 提前结束；它不是尺寸字段，
    也不是 iframe item 缺失的直接原因。
 
-**结论（被 step 94 证伪）**：本步曾把直接根因判为 PerformanceObserver 交付顺序错误。
-step 94 的 `[PO-LIST]` 证明 parent iframe resource 已在 payload 前进入 observer callback；真正
-缺失的是 child frame realm 的 navigation entry。本步的原始证据与错误假设保留，避免以后再次
-把 Rust `recording`、parent resource 和 child navigation 三种不同观测面混为一谈。
+> 更正：本步曾把 `jdnfg5` 缺 iframe item 的直接根因判为 PerformanceObserver 交付顺序
+> 错误（microtask 未及时交付）。Step 94 的 `[PO-LIST]` 证明 parent iframe resource
+> 早在 payload 前就已进入 observer callback；真正缺失的是 child frame realm 自身的
+> navigation timing entry，修复见 Step 94。本步保留的时序证据同时立下一条纪律：
+> Rust `recording` 日志、parent resource、child navigation 是三种不可混用的观测面。
 
 ### Step 94 — jdnfg5 iframe item：补 frame realm navigation timing（2026-08-28）
 
@@ -6351,58 +5470,6 @@ patch和diff check通过。最终条件轮在第二次widget fo822728B后识别3
 一次；随后proof fo5160B、top3256B，约2秒后换ray，仍无目标/1.txt真实404。三项Zok迁移没有
 改变最终判定。
 
-### Step 90 补充 — `/ci/` 打点「消失」调查：无回归，是时机波动 + 一个真 iframe 缺陷（2026-08-27）
-
-**假设**（用户提出）：`/ci/` 是 CF 用动态 img 打的点（`sec-fetch-dest: image` + `new
-Image().src`，读 naturalWidth/naturalHeight 验真实解码），**必须发**；之前 obscura 一直发，
-step 90 轮 A 里第一个 widget 全程不发（拖到点击后第二个 widget，12:54:18）——疑似最近的
-iframe 修复（bc0e0cf 同步 about:blank / 4ed91e1 同步 realm）导致 iframe 内标签解析出问题、
-图片无法创建。
-
-**方法**：机制三环逐环验证 + 跨版本对照（每版 `--user-agent` 对齐、同代理、同探针
-`capture_challenge --click`，判据 = 前 3 条 `payloadJSON`（约前 15s）的 jdnfg5 里有无
-`/cdn-cgi/challenge-platform/h/g/ci/`）。
-
-**证据**：
-
-1. **机制三环全部正常**（当前 HEAD 二进制）：
-   - 顶层 `new Image()` + HTTP src：onload 265ms、`naturalWidth=48x48`（challenges.cloudflare.com
-     favicon）——加载/解码/宽高三环正常；
-   - **iframe 上下文** `new w.Image()`：onload、48×48——iframe realm 的图片创建与解析正常
-     （初次测得 `Connect` 失败是 serve 忘带 `SSL_CERT_FILE`，观测环境错，非引擎问题）；
-   - data: 1×1 PNG：onload 5ms、1×1。
-2. **「无 ci 轮」里 CF 根本没构造 img**：184 万行 V8 trace 中 widget realm 的
-   `HTMLImageElement set src` **零条**（仅主页面 chl_page 的 `/favicon.ico` 探测两条）——
-   不是「img 创建了但解析失败」，是 CF 的 JSVMP 分支没走到 `set src` 那一步。
-3. **跨版本对照**（ci 是否在前 3 条上报内出现）：
-   | 二进制 | 轮次 | 结果 |
-   |---|---|---|
-   | a0071cf（8-17，对拍轮代码） | 1 | 第 2 条（4s）有 ci |
-   | bc0e0cf（同步 about:blank） | 1 | 第 2 条（4s）有 ci —— **用户假设的提交排除** |
-   | 4ed91e1（同步 frame realm） | 1 | 第 2 条（10s）有 ci —— **排除** |
-   | e487e85（Symbol 键隐藏内部字段） | 2 | 轮 1 推迟到第 5 条（24s）；**轮 2 第 2 条就有**——单轮差点定罪，复测推翻 |
-   | HEAD（9244312） | 4 | 轮 A 与 r1 推迟/不发；**r2（4s）、r3（6s）第 2 条就有** |
-4. **HEAD 大多数轮次早期就发 ci**（3 轮里 2 轮），代理侧同期也能看到（用户确认）。各版本
-   均出现约 1/3 的「推迟轮」——**ci 发送时机存在轮间波动，非回归**。旧版全 ✓ 是小样本运气。
-5. **独立真缺陷（本轮新发现）**：动态 `createElement('iframe')`（无 src，about:blank）在
-   onload 时 **`contentDocument.body === null`**（`d.body.innerHTML` 抛 TypeError）——
-   a0071cf 与 HEAD **都有**（早于 bc0e0cf，非新回归），Chrome 中动态 iframe 的 about:blank
-   文档必有 `<body>`。若 CF 的 JSVMP 在自建辅助 iframe 里碰 body 会静默炸掉——与
-   `hGgWW0` 探针三轮全空、ci 推迟轮的同族嫌疑，值得单独修。
-
-**结论**：
-- 「/ci/ 不发了」不成立：没有回归，HEAD 上多数轮次第一轮 widget 早期（4-6s）就打点，
-  机制三环（构造/加载/宽高）全部正常；约 1/3 轮次推迟/不发是 CF 端分支波动（与 step 41
-  `interactiveEnd` 间歇出现同族）。
-- bc0e0cf/4ed91e1（iframe 修复）与 ci 行为无关，排除。
-- 顺带发现的 `body=null` 是确凿的 iframe parity 缺陷（但非新引入），列入修复清单。
-- 「单次测量当判据」盲区在本轮两次立功：e487e85 单轮异常差点被定为回归根因，HEAD 单轮
-  （轮 A）差点被当成稳定退化——**行为判据必须多轮**。
-
-**下一步**：
-1. 修动态 iframe about:blank 的 `body` 缺失（应同步建 `<html><head></head><body></body>`）。
-2. 若要进一步压 ci 波动：对比「早发轮 vs 推迟轮」的 payloadJSON 差异（错误序列 `YySko4`
-   / `QqYk7`），找 CF 分流的观测点。
 ### Step 107 — frame classifier真实执行边界（2026-08-30，验证中）
 
 **假设**：Step106剩余的`postMessage/o.postMessage`对调来自`/rch/` classifier实际取得的函数与
@@ -7252,6 +6319,632 @@ Element.children和Node.childNodes在插入、class mutation与detach后实时�
 通过。workspace nextest实际运行到937/1694后因试验性live childNodes路径在shadow identity测试中超时而
 中断；该试验已回退，完整门尚未在回退后的干净基线重跑。真实目标仍未取得404。
 
+### Step 130 - Blob URL 本地 fetch 的二进制 GET/HEAD、Response 元数据与 revoke 生命周期（存档回填）
+
+参考 HaHaVM-General 核对 Blob/Worker 环境后，Obscura 补齐 Blob URL 本地 fetch 的二进制
+GET/HEAD、Response 元数据、MIME、Request 输入和 revoke 生命周期；focused 回归 1/1 通过，
+已有 Blob Worker 回归也通过。零预注入真实轮在新 Reqable CA 下完整走完 fo/proof 链但仍换
+ray；`tQcZu4` 仍为 `fetch_error`，Chrome 对应为 `timeout`。两边均未收到
+`brunhild/.../i` 的 response，当时差异由代理侧 502/请求取消时序造成，不据此增加站点特判。
+（存档注：当时 workspace nextest 在 shadow identity 既有测试超过 180 秒中止，936 通过/
+4 失败/4 skipped/755 未运行，完整门待后续清理。）
+
+### Step 131 - `Allow-CSP-From` 的通用 origin 比较（存档回填）
+
+旧逻辑按原始字符串精确匹配，会误拒大小写不同、默认端口或尾随 `/` 的合法来源；改为解析
+URL origin，拒绝凭据、路径、query、fragment 和 opaque `null`，保留 `*`。
+`allow_csp_from_compares_origins_not_raw_header_strings` 与完整 embedded-CSP focused 均通过
+（2/2）。当前 Reqable CA 下零注入真实轮仍完整产生 proof/top/new-ray 后换 ray，没有 404；
+该修复未改变真实挑战结果——目标 Turnstile iframe 不携带 `csp`，不构成当前站点阻塞根因。
+
+### Step 132 - 独立 `HTMLIFrameElement` 原型（存档回填）
+
+参考 HaHaVM-General 的独立 HTMLIFrameElement 原型，Obscura 不再把 `HTMLIFrameElement`
+别名为 `Element`。新增专属 wrapper、Chrome 24 项 prototype 顺序/descriptor/brand、iframe
+专属属性与节点映射，并保留 frame navigation/CSP/跨 realm 行为；shape focused、iframe
+navigation/CSP focused 与 obscura-js 552 项（排除已知 shadow identity hang）均通过。真实
+clean click 仍 proof/top/new-ray 后换 ray，没有 404。
+
+### Step 133 - `crossOriginIsolated` 落到每个 Document（存档回填）
+
+Chrome/iframe 矩阵确认 `crossOriginIsolated` 是每个 Document 的状态：about:blank/srcdoc
+继承父值，network iframe 依据自身 COOP/COEP。Obscura 将该值加入 `DocumentScope`，network
+frame 从响应头计算，blank/srcdoc 继承，frame realm 的 `document_scope_info` 改读 scope 值；
+隔离 focused 与 workspace 排除 hang 的 1696/1696 全部通过。当前 Reqable CA 下真实 clean
+click 仍无 404，网络失败时序保留为未决。
+
+### Step 134 - iframe 原型清理与 frame-level isolation 的 release 复测（存档回填）
+
+在最终 release 二进制上复测 iframe 原型清理与 frame-level isolation；零预注入 clean click
+仍稳定产生 8 次 `/fo/`（含 proof/top/new-ray），页面显示 `Verification successful` 后换
+ray，最终 URL 仍未真实返回 404。确认本轮 iframe 通用修复无回归，也未改变当前代理/挑战
+失败判定。
+
+### Step 135 — Chrome 152 长尾接口面收敛（2026-09-02，完成）
+
+**假设**：当前 Chrome/Obscura 明文 payload 的 `N`/`o` 桶仍有稳定构造器差异；这些差异来自通用接口表，
+不是 `brunhild` 网络失败本身。参考 HaHaVM-General 的全局接口壳，并以当前 Chrome 152 CDP descriptor oracle
+确认具体形状。
+
+**方法与证据**：Chrome 多出 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
+`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`。其中 XSLTProcessor 可构造，其余为 illegal constructor；
+原型父级分别为 Object、HTMLElement、PerformanceEntry、PerformanceEntry、AbstractRange、AbstractRange，
+并核对了公开 accessor/method 名称、length、brand。Obscura 同时多出当前 Chrome 不公开的 `ModelContext`、
+`WebMCPEvent` 及 `navigator.modelContext`。
+
+**修复**：扩展 `_chromeInterfaceTable`，为六个接口安装 Chrome 152 的原型成员和 native descriptor；移除
+`ModelContext`/`WebMCPEvent` 及 `navigator.modelContext` 壳。实现位于 `crates/obscura-js/js/bootstrap.js`，
+未加入目标域名逻辑。
+
+**量化结果**：同轮零注入 payload 的 `N` 桶由 1167 收敛到 Chrome 的 1171，`o` 桶由 121 收敛到 120；
+六个构造器均为 `function`，两个旧壳为 `undefined`。无注入真实导航仍完整产生初始 fo、proof/top 转发并在
+`Verification successful` 后换 ray，`tQcZu4` 仍为 `fetch_error`（Chrome 为 `timeout`），目标未返回真实 404。
+
+**结论**：长尾全局接口差异已闭环且无回归，但不是当前 404 的唯一阻塞；剩余分歧继续限定在
+`brunhild/.../i` 请求的网络失败/取消时序，禁止加入站点特判。
+
+### Step 136 — 请求头/事件/worker 环境收尾与外部网络盲区（2026-09-02，调查中）
+
+**假设**：HaHaVM-General 对 worker creator origin、Window event 和脚本请求元数据的处理，仍可能与
+Obscura 在当前 Chrome 152 质询中存在通用差异；这些应先由独立回归和请求头观测确认，不能用目标域名逻辑补偿。
+
+**修复与证据**：Obscura 现在在事件 dispatch 期间暴露当前 `window.event`，空闲时恢复 `undefined`，并在
+worker `fire()` 中同样设置/恢复；blob/data worker 的环境优先继承 creator origin；stealth scripted fetch
+补齐 `Accept`、`Accept-Language`、`Sec-Fetch-Site`、`Sec-Fetch-Mode`、`Sec-Fetch-Dest`。Chrome 152
+长尾接口表同时补齐 `XSLTProcessor`、`HTMLUserMediaElement`、`InteractionContentfulPaint`、
+`PerformanceSoftNavigation`、`NodeRange`、`OpaqueRange`，移除不公开的 `ModelContext`、`WebMCPEvent` 与
+`navigator.modelContext`。零注入 payload 结构从 `N=1167/o=121` 收敛到 `N=1171/o=120`。
+
+**回归**：`window_event_is_current_only_during_dispatch` 1/1，三个 worker origin 测试 3/3，
+`scripted_fetch_site_distinguishes_origin_and_site_boundaries` 1/1；带 trace-patched V8 的精确 release build
+和 `vendor/v8-trace.sh check` 均通过。完整 workspace nextest 排除已知会挂起的
+`shadow_root_identity_and_children_are_native_tree_backed` 后为 1697 passed / 1 flaky failure / 5 skipped；
+失败项 `test_navigate_and_snapshot` 单独以 `--retries 2` 复跑通过。
+
+**真实站复测与测量盲区**：本轮启动的最终 release serve 已确认 stealth TLS 与 Chrome 149 macOS UA，但
+`cdp_click_fast` 40 秒内没有 widget，服务端导航在 60 秒超时关闭；同一代理 `http://192.168.3.57:9000`
+对目标直接返回 Cloudflare 403 challenge，未产生可比较的 proof 请求或 `/1.txt` 404。因此本轮不能证明
+代码改变了真实判定，也不能把外部 403/Brunhild pending 归因于 Obscura。下一轮只有在代理恢复可完成挑战时，
+才继续做零注入点击和 404 验收；不增加 hostname 特判。
+
+### Step 137 — frame 文档 `script-src` 执行门（2026-09-02，完成）
+
+**假设**：frame controller 已把网络响应 CSP 写入 `DocumentScope`，但 frame 脚本调度器可能没有读取它；
+若 frame 中的 nonce/来源限制未执行，挑战 widget 的子文档会暴露与 Chrome 不同的脚本执行面。
+
+**证据与修复**：审计 `execute_frame_scripts_for` 确认 classic、module、inline 和 import map 原先均无
+`script-src` 校验，外部 frame script 即使不在响应 CSP allowlist 中也会被抓取。现在 frame 调度使用自身
+`DocumentScope.csp`：外部 classic/module 按 `script-src-elem`/`script-src`/`default-src` 检查，inline
+classic/module/import map 按 nonce/`unsafe-inline` 检查，阻断发生在网络请求和执行之前；主文档逻辑保持不变。
+
+**回归**：新增 `frame_document_csp_gates_inline_nonce_and_external_scripts`，验证无 nonce inline 被阻止、
+正确 nonce 执行、未允许的外部脚本不产生请求；该测试与既有 embedded CSP、frame module、external script
+共 4/4 通过。`obscura-browser` release+render crate 全部 111/111 通过。
+
+**结论**：这是已由独立 HTTP fixture 证明的通用 iframe CSP 缺陷，已修复且没有站点特判。当前真实 404
+仍待代理恢复后验收；本次修复本身不改变此前 `brunhild` 外部请求 pending 的结论。
+
+### Step 138 — CSP 脚本门后的真实站复测（2026-09-02，调查中）
+
+**假设**：frame `script-src` 缺口修复后，若代理恢复，挑战 widget 应至少进入可交互阶段；这次只使用
+trace-patched release、stealth、对齐 Chrome 149 UA 和零注入点击，不使用会污染 payload 的 DOM hook。
+
+**代码证据**：`execute_frame_scripts_for` 现在在 frame 自身 `DocumentScope.csp` 下 gate 外部 classic/module，
+并按 nonce/`unsafe-inline` gate inline classic/module/import map。新增 HTTP fixture 已证明禁止脚本不产生
+网络请求，允许 nonce 脚本仍执行；frame CSP/module/external focused 4/4，`obscura-browser` 111/111，
+workspace（排除已知 shadow hang）1699/1699，release/no-default/trace patch 均通过。
+
+**真实站证据**：最终 release serve 日志确认 stealth TLS 与 Chrome 149 macOS UA。对
+`https://www.thelancet.com/1.txt` 的 `cdp_click_fast --deadline 40` 连续复测仍在 40 秒内无 widget，
+页面 title/body 为空，服务端导航约 60 秒后关闭；同一代理直接响应 Cloudflare 403 challenge。没有 proof、
+`complete` 或目标 `/1.txt` 404，因此不能宣称本修复已过盾，也没有足够证据继续归因某个 Obscura iframe API。
+
+**结论**：iframe 文档 `script-src` 执行机制已闭环；当前真实 404 验收仍被代理/上游挑战状态阻断。后续
+需要代理恢复或新的可完成挑战网络条件，再按零注入流程验证，不加入站点特判。
+
+### Step 139 — 动态 frame script CSP sink（2026-09-02，完成）
+
+**假设**：即使 parser-discovered frame scripts 遵守 CSP，动态插入的 `<script>` 仍可能绕过 `script-src`；
+挑战 widget 常在运行时创建 script 元素，这会让 frame realm 的执行面与 Chrome 不一致。
+
+**修复**：`__prepareInsertedScript` 现在读取当前 frame 的 `DocumentScope.csp`，在调度 fetch/eval 前检查
+外部 classic/module 的 `script-src-elem`/`script-src`/`default-src` 来源，以及 inline classic/module/import
+map 的 nonce/`unsafe-inline`。阻断脚本仍标记为 started，避免后续连接重复执行；主文档和 worker 路径不受影响。
+
+**证据**：扩展 `frame_document_csp_gates_inline_nonce_and_external_scripts` fixture，验证动态无 nonce
+脚本不执行、动态正确 nonce 脚本执行、未授权外部动态脚本不产生请求；该测试与 frame CSP/module/external
+集合通过，workspace 排除已知 shadow hang 后 `1699/1699` 通过，no-default check 通过，release 二进制保持
+trace-patched。
+
+**结论**：动态 frame script CSP sink 已按通用规则闭环，未加入目标域名逻辑。真实 404 仍因代理当前直接
+返回 Cloudflare 403、无 widget 而无法验收。
+
+### Step 140 — frame ES module graph CSP（2026-09-02，完成）
+
+**假设**：入口 `<script type="module">` 已校验 frame `script-src`，但模块图的静态 `import` 由独立
+realm loader 抓取，可能绕过同一策略并加载未授权依赖。
+
+**修复**：新增 `FrameModuleCsp`，把 frame 的 CSP header 与 origin 传入 `prepare_module_in_frame_realm`；
+每个静态及重写的 dynamic import 在入队/抓取前按 `script-src-elem` 优先、`script-src`、`default-src`
+回退规则校验来源，处理 `self`、scheme、host wildcard、端口、`data:`/`blob:`，并遵守重复 directive
+首项规则。被阻止的依赖不会发起网络请求。
+
+**证据**：新增 frame fixture 使用 nonce 允许 module 入口、用 `https://blocked.example` 依赖验证 graph
+被 CSP 拒绝且 module body 不执行；Chrome 规则的 directive precedence、scheme-less host 与 duplicate
+directive focused 断言通过。workspace release nextest（排除已知 shadow identity hang）`1700/1700 passed`
+（1 leaky、5 skipped），no-default check、精确 release build 与 trace patch 均通过。
+
+**结论**：frame 静态 module graph 的 CSP 机制已闭环，未加入站点特判；真实 `/1.txt` 404 仍等待可完成的
+Cloudflare 上游挑战网络条件。
+
+### Step 141 — frame render warmup 的资源 CSP（2026-09-02，完成）
+
+**假设**：render 资源 warmup 在 frame realm 外扫描 CSS `url()` 并统一预取，可能绕过 frame 自身的
+`img-src`/`font-src`，在后续渲染前就发出被 CSP 禁止的请求。
+
+**修复**：`prepare_screenshot_resources` 现在保留每个 document root 的 CSP 与 origin；生成 frame 图片/字体
+候选时按 `img-src`/`font-src`（及对应 fallback）过滤，禁止候选不会进入 transport 或 renderer cache。顶层
+文档和允许资源路径保持原有行为。
+
+**证据**：新增 `frame_csp_blocks_render_warmup_resource_prefetch`，HTTP fixture 返回 frame `img-src 'none'`
+及 CSS 图片 URL，断言只收到顶层和 frame 文档请求、没有图片请求；release+render focused 通过。
+
+**结论**：frame CSP 对 speculative render warmup 已闭环，未加入站点特判；真实 404 仍取决于 Cloudflare
+挑战上游恢复。
+
+### Step 142 — frame `<img>` renderer fallback 的 CSP（2026-09-02，完成）
+
+**假设**：即使 warmup 候选过滤了 frame 图片，首次布局/绘制仍可能在 `RenderResourceCache` 的同步
+`collect_image_intrinsics` 路径直接加载图片，从而绕过 JS `op_load_image_metadata` 的 `img-src` 检查。
+
+**证据与修复**：独立 fixture 在 frame 文档声明 `img-src 'none'` 并包含真实 `<img src>`；原实现仍会
+收到图片请求。`RenderResourceCache` 现维护当前 root 的 CSP/origin（与已有 font context 同步），
+`get_or_load_image` 在调用兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入成功或失败缓存。
+候选 API 同时携带所属 root，避免同一 URL 在不同 frame policy 下错误去重。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 与
+`frame_csp_blocks_render_warmup_resource_prefetch` 均通过，后者覆盖 frame CSS URL 和真实 `<img>`；
+workspace release nextest（排除已知 shadow identity hang）`1702/1702 passed`，no-default、精确 release
+build、trace patch 和 `git diff --check` 均通过。
+
+**结论**：frame 图片在 JS、warmup、renderer fallback 三条路径都遵守 `img-src`，没有 hostname 特判。
+真实 `/1.txt` 404 仍未验收，当前 Cloudflare 响应是 403 challenge。
+
+### Step 143 — frame 图片的同步 renderer loader CSP（2026-09-02，完成）
+
+**假设**：frame `<img>` 的 JS 异步路径已经执行 `img-src`，但首次布局中的
+`collect_image_intrinsics` 可能通过 `RenderResourceCache` 同步 loader 直接取图，绕过 frame policy。
+
+**证据与修复**：加入真实 frame `<img src>` 后，warmup 关闭时仍观测到图片请求；CSS URL 过滤并未覆盖
+该路径。`RenderResourceCache` 现在与 font context 一起保存当前 document 的 CSP/origin，
+`get_or_load_image` 在兼容 loader 前执行 `img-src`/`default-src`，被阻止的 URL 不写入缓存；
+`pending_render_image_urls` 同时携带所属 root，避免跨 frame policy 去重。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 调用计数为零，
+`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 frame CSS URL 与真实 `<img>` 且仅收到文档请求。
+两项及 frame CSP focused 均通过；workspace release（排除已知 shadow identity hang）保持全通过。
+
+**结论**：frame 图片 CSP 已覆盖 JS、speculative warmup 和同步 renderer fallback 三条路径，未加入目标域名
+特判；真实 404 仍待 Cloudflare challenge 上游恢复。
+
+### Step 144 — frame `<img>` root 归属与 renderer fallback 修复（2026-09-02，完成）
+
+**假设**：warmup 过滤按 frame root 处理 CSS URL 后，普通 `<img>` 候选仍只返回 URL/profile；统一 transport
+无法知道它来自哪个 Document，可能在跨 frame policy 去重或首次布局时重新放行。
+
+**方法与证据**：把真实 `<img src>` 加入 `img-src 'none'` frame fixture，关闭自动 warmup 后仍观察到图片请求；
+`pending_render_image_urls` 返回的候选确认 root nid 为 frame content document，但原调用方丢弃了该信息。
+同步 renderer 的 `collect_image_intrinsics` 也通过共享 cache loader 直接发起请求，JS image op 的 CSP 日志不会覆盖它。
+
+**修复**：候选现在携带所属 root；page transport 在候选生成阶段按该 root 的 `img-src`/`default-src` 过滤；
+`RenderResourceCache` 与 font context 同步保存 CSP/origin，并在 `get_or_load_image` 调用兼容 loader 前 gate，
+禁止 URL 不写入成功/失败缓存，避免后续 policy 复用错误结果。
+
+**回归**：`image_resource_cache_enforces_img_src_before_loader` 验证 loader 计数为零；
+`frame_csp_blocks_render_warmup_resource_prefetch` 覆盖 CSS `url()` 与真实 `<img>`，只收到 `/` 和 frame 文档请求。
+相关 focused 全部通过，workspace release（排除已知 shadow identity hang）`1702/1702 passed`，no-default、
+精确 release build、trace patch、`git diff --check` 均通过。
+
+**结论**：frame 图片请求现在在 JS、warmup、renderer fallback 和 root 归属四个层面遵守 CSP；真实 `/1.txt`
+404 仍受当前 Cloudflare 403 challenge 网络状态阻断。
+
+### Step 145 — 真实站传输层状态复核（2026-09-02，调查中）
+
+**方法**：用最新 trace-patched release 做短超时 `fetch`，分别测试直连和
+`http://192.168.3.57:9000` 代理；不启用页面注入或 payload hook。
+
+**证据**：直连路径在 TLS handshake 因 Reqable CA 不匹配而 `CERTIFICATE_VERIFY_FAILED`；代理路径在
+20 秒 navigation deadline 内未收到响应 body，最终为 `navigation exceeded 20000ms deadline`。此前 `curl`
+直连/代理均能看到 Cloudflare 403 challenge，但当前 Obscura transport 未得到可执行页面，因此没有
+widget、proof、`complete` 或 `/1.txt` 404 可比较。
+
+**结论**：当前阻塞明确位于外部 TLS/代理/上游响应时序，不足以归因 frame CSP 或其他环境 API。待代理
+能够稳定返回挑战资源后，再按零注入流程复测真实 404；不加入站点特判。
+
+### Step 146 — frame `unsafe-eval` 与 V8 code-generation policy（2026-09-02，完成）
+
+**假设**：frame 文档的 `script-src` 即使限制了 script 来源，V8 默认仍允许 `eval()`/`new Function()`；
+这会让 CSP `script-src` 与 Chrome 不同，并可能改变挑战 widget 的反检测分支。
+
+**证据与修复**：原 V8 callback 只转换 `TrustedScript`，且 Context 默认允许 string code generation，
+所以普通字符串不会进入 callback。现在 main/frame/isolated contexts 设置
+`AllowCodeGenerationFromStrings(false)`，每个 realm 在 `__obscura_init` 根据自身 CSP 的
+`script-src`/`default-src` 写入隐藏 flag；V8 callback 读取该 flag，在没有 `'unsafe-eval'` 时拒绝字符串代码生成，
+同时保留 TrustedScript 转换和 intrinsic direct-eval 语义。flag 加入 pre-hide 列表，避免环境枚举泄漏。
+
+**回归**：top CSP 测试验证 plain `eval` 和 `new Function` 返回 `EvalError`、TrustedScript 仍执行；frame
+script fixture 同样验证 `EvalError`。focused 2/2、workspace release（排除已知 shadow identity hang）
+`1702/1702 passed`，no-default、精确 release build、trace patch 和 `git diff --check` 均通过。
+
+**真实站复测**：最新 release 经 `192.168.3.57:9000` 代理请求目标时仍在 20 秒 navigation deadline 超时，
+无 challenge body/proof/complete/404；外部传输状态继续作为未决项，不加入站点特判。
+
+### Step 147 — frame CSP 完整代码生成门验证（2026-09-02，完成）
+
+**假设**：`unsafe-eval` gate 可能只覆盖普通 frame realm，而不覆盖 V8 创建的 isolated world 或新建
+frame context；任一 realm 漏洞都会让挑战看到不一致的 string-codegen 行为。
+
+**验证与修复确认**：main context、frame main world、CDP isolated world 创建时均调用
+`AllowCodeGenerationFromStrings(false)`；V8 callback 读取各自 bootstrap 写入的 CSP flag。无明确
+`'unsafe-eval'` 时 plain `eval`/`new Function` 被拒，TrustedScript 仍按 brand 转换，未替换 intrinsic
+eval，保持 direct-eval 作用域语义。flag 已加入 pre-hide 内部字段集合。
+
+**量化回归**：top Trusted Types CSP 测试与 frame script CSP fixture 均通过（2/2）；workspace release
+nextest（排除已知 shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、
+trace patch、`git diff --check` 均通过。
+
+**结论**：CSP `unsafe-eval` 在 main/frame/isolated realm 的代码生成路径已闭环，未加入域名特判。真实
+`/1.txt` 404 仍因当前代理 navigation timeout 未验收。
+
+### Step 148 — codegen 修复后的真实站复测（2026-09-02，调查中）
+
+**方法**：使用包含 V8 `unsafe-eval` callback、frame module/image CSP 修复的最新 release，stealth、
+Chrome 149 macOS UA，经 `192.168.3.57:9000` 请求目标，timeout 20s，零注入。
+
+**证据**：请求仍在 `navigation exceeded 20000ms deadline` 失败，没有 challenge body、widget、proof、
+`complete` 或 `/1.txt` 404。该结果与代码修复前的代理时序一致，无法证明目标页面执行到了 CSP 或 frame realm。
+
+**结论**：真实验收仍被外部代理/上游响应阻断；保持未完成状态，等待可返回并执行 challenge 的网络条件，
+不添加站点特判。
+
+### Step 149 — CSP 代码生成门的最终回归（2026-09-02，完成）
+
+**假设**：CSP `unsafe-eval` gate 可能通过 V8 callback 改变正常页面的 direct-eval 作用域，或在 frame
+context 创建前后出现时序窗口；需要用现有 Trusted Types 和 frame script fixture 共同验证。
+
+**结果**：main、frame main world、CDP isolated world 创建时均禁用 Context 默认 string codegen；bootstrap
+在 `__obscura_init` 根据各自 `DocumentScope.csp` 设置 hidden allow flag，V8 callback 仅在 flag 允许时放行
+普通字符串，并继续将 TrustedScript 转换为源码。plain `eval`/`new Function` 在无 `'unsafe-eval'` 时返回
+`EvalError`，无 CSP 时的 direct-eval 行为和现有脚本保持不变；flag 纳入 pre-hide，未新增可枚举引擎字段。
+
+**验证**：Trusted Types top 测试、frame CSP（含 eval/function）测试 2/2；workspace release（排除已知
+shadow identity hang）`1702/1702 passed`、5 skipped；精确 release build、no-default、trace patch、
+`git diff --check` 均通过。
+
+**结论**：CSP 代码生成机制已在所有 Obscura Window realm 覆盖，未加入域名特判。真实 `/1.txt` 404 仍受
+代理 navigation timeout 阻断。
+
+### Step 150 — `script-src-attr` inline handler CSP（2026-09-02，完成）
+
+**假设**：CSP `script-src-attr 'none'` 只限制 event-handler content attributes；如果仍通过
+`Element._resolveInlineHandler` 的 `new Function` 编译，代码生成 flag 不足以复现 Chrome 的 handler 行为。
+
+**修复**：inline handler 解析前读取当前 realm 的 CSP，按 `script-src-attr` 优先、`script-src`、`default-src`
+回退；只有存在 `'unsafe-inline'` 才编译属性 handler，`'unsafe-hashes'`/未授权属性保持阻断。该检查与
+`unsafe-eval` callback 独立，避免把 event attribute 当作普通 eval。
+
+**证据**：新增 `script_src_attr_controls_inline_event_handlers`，验证 `script-src-attr 'none'` 下
+`onclick` 不执行、改为 `'unsafe-inline'` 后执行；frame CSP fixture 也覆盖 frame realm 的 eval/function
+gate。focused 3/3、workspace release（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped，
+release/no-default/trace patch/diff check 均通过。
+
+**结论**：inline event-handler CSP 已按 realm 生效，未加入站点特判；真实 `/1.txt` 404 仍待代理恢复。
+
+### Step 151 — `script-src-attr` 修复后的真实站复测（2026-09-02，调查中）
+
+**方法**：使用包含 frame parser/dynamic/module/image CSP、V8 `unsafe-eval` 和 `script-src-attr` 修复的
+最新 release，stealth、Chrome 149 macOS UA，经 `192.168.3.57:9000` 访问目标，timeout 20s，零注入。
+
+**证据**：仍返回 `navigation exceeded 20000ms deadline`，没有 challenge body、widget、proof、complete
+或目标 `/1.txt` 404。目标直连的 curl 同时仍为 `HTTP/2 403` + `cf-mitigated: challenge`。
+
+**结论**：外部代理/上游仍未提供可执行挑战，无法对本轮 inline handler 修复做真实过盾归因；真实 404
+验收继续保持未完成，不加入站点特判。
+
+### Step 152 — external script nonce 反射与真实挑战链恢复（2026-09-02，完成）
+
+**假设**：Cloudflare challenge 的动态 `chl_page` script 使用 `a.nonce = ...`；如果 Obscura 缺少
+`HTMLScriptElement.nonce` 反射，frame-local CSP gate 会把合法 external script 误判为未授权，页面停在
+“Enable JavaScript and cookies to continue”。
+
+**证据与修复**：实际目标 HTML 的 inline script nonce 与 CSP header 一致，并明确执行
+`a.nonce = '<nonce>'; a.src = '/cdn-cgi/.../chl_page/v1?...'; head.appendChild(a)`。新增通用 `nonce` getter/setter
+（HTML element wrapper），动态 CSP gate 对 external script 同样匹配 nonce；本地 fixture 改用 `script.nonce`
+赋值并验证 external script 请求/执行恢复。未授权外部 script 仍阻断。
+
+**真实量化结果**：最新 release 直连零注入 CDP 轮在 `t=5.3s` 点击 300x65 widget，收到 `interactiveBegin`。
+Rust 日志确认 `chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200
+（约823KB）、`/pat` 401、点击后的 proof/top 3256B；页面显示 “Verification successful”。修复前同类轮次
+在动态 `chl_page` 处即被 CSP 阻断，只有“Enable JavaScript”。
+
+**当前断点**：`brunhild.challenges.cloudflare.com/cdn-cgi/.../i` 请求在 Connect 阶段失败，随后 frame `/fo`
+仍返回 200，但站点没有发放最终响应，目标未真实返回 `/1.txt` 404。该 Connect 失败与 Chrome 同轮无 response
+一致，不能继续归因 iframe CSP；等待可访问 Brunhild 的网络条件再验收。
+
+**回归**：frame CSP focused 通过；workspace release（排除已知 shadow identity hang）`1703/1703 passed`、
+5 skipped，release/no-default/trace patch/diff check 全通过。无 hostname 特判。
+
+### Step 153 — nonce 修复后的无注入真实点击证据（2026-09-02，调查中）
+
+**方法**：使用包含 `HTMLScriptElement.nonce` 反射和 external nonce CSP gate 的最新 release，直连（不经过
+失效代理）启动 CDP，执行零注入 `cdp_click_fast --deadline 40 --settle 20`，同时开启
+`RUST_LOG=obscura_js=debug` 请求日志。
+
+**证据**：页面在 `t=5.3s` 取得 300x65 widget box 并点击，随后收到 `interactiveBegin`。请求时间线中
+`chl_page` 200（约227KB）、Turnstile api.js 200（约84KB）、top `/fo` 200、frame `/fo` 200（约823KB）、
+`/pat` 401、点击后 frame proof `/fo` 200、top `/fo` 3256B 均出现；页面显示
+`Verification successful. Waiting for www.thelancet.com to respond`。这证明 nonce/CSP 修复已消除此前
+“Enable JavaScript and cookies to continue”的直接阻断。
+
+**当前断点**：challenge 随后请求
+`https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/i/...`，约1.1s 后在 Connect
+阶段失败；Chrome 同网络条件也没有该请求的 response。其后 frame 转发仍返回 200，但没有站点最终响应，
+目标未真实返回 `/1.txt` 404。
+
+**结论**：iframe CSP/nonce 环境已经把执行链推进到交互后最后的 Brunhild 网络请求；剩余失败是外部 fake-DNS/
+代理/上游可达性问题，不足以继续推断 Obscura iframe API。待该 host 可达时再进行 404 验收，不加入域名特判。
+
+### Step 154 — nonce/CSP 修复后的最终代码门禁（2026-09-02，完成）
+
+**验证范围**：在 nonce 反射、external nonce 匹配、frame script/module/image CSP、`script-src-attr` 和 V8
+`unsafe-eval` 全部落地后，重新执行精确 release build、no-default feature check 与 workspace release nextest。
+
+**结果**：workspace（排除已知 `shadow_root_identity_and_children_are_native_tree_backed` hang）
+`1703/1703 passed`、5 skipped；no-default check 通过；精确二进制晚于全部相关源码；
+`vendor/v8-trace.sh check` 为 `patched`；`git diff --check` 通过。真实目标的无注入 CDP 轮仍能在 5.3s
+点击并收到 `interactiveBegin`，但 Brunhild `/i` Connect 失败，未获得站点 404。
+
+**结论**：当前代码侧 iframe/CSP 环境修复已通过完整门禁；最终 404 仍需外部 Brunhild host/fake-DNS 可达，
+不能用站点特判或测试 fixture 代替。
+
+### Step 155 — Brunhild 请求归属与最终网络断点（2026-09-02，调查中）
+
+**方法**：从最新无注入 CDP serve 的 `RUST_LOG=obscura_js=debug` 中按时序核对 Brunhild 请求、
+后续 frame/top 转发和页面状态；同时检查 DNS 与路由，不修改请求 URL 或 Host。
+
+**证据**：`brunhild.challenges.cloudflare.com` 请求由 frame challenge 触发，日志显示
+`Origin: https://challenges.cloudflare.com`、无 Referer；约 1.1 秒后 `stealth_fetch failed ... client error (Connect)`。
+同一轮之后 frame `/fo` 仍返回 200（约127KB），页面继续显示 `Verification successful`，但没有新的站点响应。
+DNS 将 Brunhild 解析到 198.18.0.157（utun fake-DNS 路由），IPv4/IPv6 直连均 TLS syscall 失败；代理
+`192.168.3.57:9000` 当前 host down。Chrome 同条件的 Brunhild 请求也没有 response。
+
+**结论**：请求 realm、Origin 和 challenge 提交链均已正确；剩余断点是外部 fake-DNS/代理可达性，不能通过
+Obscura 的 iframe CSP 或 hostname 特判修复。真实 `/1.txt` 404 仍未取得，待 Brunhild host 可达后继续验收。
+
+### Step 156 — nonce 后真实链路与代码门禁汇总（2026-09-02，调查中）
+
+**代码状态**：`HTMLScriptElement.nonce` 反射、external nonce CSP、frame parser/dynamic/module/image CSP、
+`script-src-attr` 和 V8 `unsafe-eval` 均已落地；对应 focused fixtures 与完整 workspace 均通过。
+
+**真实状态**：直连最新 release 的无注入 CDP 轮在 5.3 秒点击并收到 `interactiveBegin`，top/frame `/fo`、
+proof、`/pat` 401 和 `Verification successful` 均可观测。唯一未完成的是 Brunhild `/i` 的 Connect/TLS；
+DNS 解析到 198.18.x fake-DNS，IPv4/IPv6 均无 response，Chrome 同条件也无 response。目标 URL 仍未真实返回
+404，故不宣称过盾成功。
+
+**门禁**：workspace release nextest（排除已知 shadow identity hang）`1703/1703 passed`、5 skipped；
+no-default check、精确 release build、trace patch 和 `git diff --check` 均通过。后续只需在 Brunhild host
+可达的网络条件下重复同一无注入点击验收，不再继续猜测已排除的 iframe CSP 根因。
+
+### Step 157 — HaHaVM-General 内存上限与 Window 常量（2026-09-02，完成）
+
+**假设**：HaHaVM-General 最新通用环境提交仍有少量可由 Chrome oracle 直接证明的公开面差异；这些差异应在
+Obscura 中按 WebIDL 语义补齐，不应与 Cloudflare 主机或质询分支绑定。
+
+**证据与修复**：本机 Chrome 152 的 `performance.memory.jsHeapSizeLimit` 和 `console.memory.jsHeapSizeLimit`
+均为 `4395630592`，Obscura 原先固定为 `4294705152`；已统一初始化、fallback 和导航重置值。Chrome 还在
+`Window` 构造器及 `Window.prototype` 上暴露不可写、可枚举、不可配置的 `TEMPORARY=0` 与 `PERSISTENT=1`，
+Obscura 原先缺失；已补齐这两组常量和 focused descriptor 回归。
+
+**验证**：`window_storage_constants_match_chrome_shape` 与
+`console_and_performance_memory_share_fresh_branded_wrappers` focused nextest 2/2 通过；精确
+trace-patched release build、no-default feature check、`vendor/v8-trace.sh check` 和 `git diff --check` 通过。
+`obscura-js` 全 crate 在既有 `shadow_root_identity_and_children_are_native_tree_backed` 挂起及宿主字体/渲染
+断言失败处中止，新增测试本身未失败。
+
+**结论**：本步完成两个通用环境差异的修复，没有改变请求或站点逻辑。代理 `192.168.3.57:9000` 当前仍
+不可达，Brunhild `/i` 无 response，目标 `/1.txt` 仍未取得真实 404。
+
+### Step 158 — frame Worker 继承 creator CSP（2026-09-02，完成）
+
+**假设**：真实 challenge 的 Brunhild `/i` 请求由 widget frame 派生的 Worker 发起；Worker 没有自己的
+Document root，若不继承创建它的 frame CSP，`op_fetch_url` 会错误地按顶层页面策略处理请求。
+
+**证据与修复**：修复前同一轮日志中 frame `/fo` 为 `root=75, csp=frame`，而 Brunhild `/i` 为
+`root=0, csp=page:none`，但 Origin 已是 `https://challenges.cloudflare.com`。新增 WorkerEnvironment 的
+creator CSP 字段和 `creator_root`/`creator_csp` op 参数；Worker 与 SharedWorker 现在将创建文档的 CSP 写入
+自身运行时，嵌套 Worker 继续沿用该策略。新增跨 frame data Worker fixture，`connect-src 'none'` 返回
+`AbortError` 且本地 HTTP 请求数为 0，证明在网络前阻断。
+
+**验证**：`frame_worker_fetch_uses_the_creator_document_csp` 及既有 frame worker 三项 focused nextest
+均通过；workspace（排除已知 shadow identity hang）`1703 passed / 2 failed`，两项失败为既有 MCP
+时序测试，单独 `--retries 2` 全部通过。精确 release build、no-default check、V8 trace patch 和 diff check
+通过。新 release 的真实轮仍稳定进入 interactiveBegin、frame/top `/fo` 和 proof/top 转发；Brunhild `/i`
+仍在 Connect/TLS 失败，目标 URL 尚未返回真实 404。
+
+**结论**：本步修复了 frame Worker CSP 传播的通用缺陷，真实请求日志中的 Worker 已从 `csp=page:none`
+迁移为有 CSP 的运行时策略；剩余 Brunhild 失败仍是外部网络可达性，未加入 hostname 特判。
+
+### Step 159 — Brunhild 真实网络路径恢复（2026-09-02，调查中）
+
+**方法**：本机 DNS 将 Brunhild 映射到 `198.18.x` fake-DNS/utun 路由，直连 TLS syscall 失败。为分离网络
+与引擎因素，使用仅作测试的本地 CONNECT 转发，将该连接送到真实 Cloudflare IP，同时保留原始 Host/SNI；
+没有修改 Obscura 请求 URL 或加入 hostname 特判。
+
+**证据**：通过该转发，Brunhild `/i` 从 Connect failure 变为真实 `204`；Obscura 仍完成 frame/top `/fo`、
+`/pat` 401 与 proof/top 转发，随后 challenge 换 ray。相同转发下 headless/headful Chrome 也停在 challenge，
+因此此前的网络失败已被独立，剩余是 challenge 判定/环境分歧。
+
+### Step 160 — 干净点击与硬件指纹 A/B（2026-09-02，调查中）
+
+**测量修正**：现有 `cdp_click_fast.py` preload 会包装 `attachShadow`，会污染函数 identity；新增固定坐标无
+preload 点击脚本，避免把探针副作用当成页面行为。动态 `Image.src` 的本地 fixture 也确认无生命周期观察时
+仍会发起 eager fetch，排除 `/ci` 缺失的 lazy-image 假设。
+
+**A/B 证据**：本机 Chrome152 同 UA 返回 `hardwareConcurrency=12`、`deviceMemory=32`，Obscura 默认 `8/8`。
+使用 `--fingerprint '{"hardwareConcurrency":12,"deviceMemory":32}'` 重跑 challenge，请求序列和结果未变：
+Brunhild `204`、`/pat` 401、proof 后换 ray，未出现真实 404。当前没有足够证据改变默认硬件策略。
+
+**结论**：iframe CSP、Worker creator CSP、图片 eager-fetch 和硬件指纹均有独立 fixture/oracle 证据；当前
+challenge 仍未返回目标真实 404，后续应继续从明文 payload/事件时序找通用差异，不添加 Cloudflare 域名分支。
+
+### Step 161 — Navigator 自有属性迁移（2026-09-02，完成）
+
+**假设**：Obscura 的 Navigator 兼容对象仍把公开 IDL 成员放在实例自身，形成 Chrome 不存在的枚举面；
+这类结构差异可能被 challenge 的全局对象探针直接读取。
+
+**证据与修复**：Chrome 152 的 `Object.getOwnPropertyNames(navigator)` 为空，`connection`、`permissions`、
+`gpu`、`geolocation`、`getBattery` 等均位于 Navigator 原型；Obscura 原先有 21 个自有成员。新增末端迁移
+层，将兼容对象的稳定值转为原型 getter、方法转为原型函数，保留对象 identity、secure-context 删除和
+`Navigator.prototype` 后续接口安装逻辑。
+
+**验证**：`navigator_has_no_own_idl_members`、fingerprint 和 StorageManager focused `3/3` 通过；workspace
+release nextest（排除已知 shadow identity hang）`1707/1707 passed`、5 skipped；精确 release build、
+no-default check、V8 trace patch 和 `git diff --check` 通过。临时真实-IP CONNECT 转发下，最新无 preload
+点击仍完成 Brunhild `204`、`/pat 401`、proof/top 转发后换 ray，目标未返回真实 404。
+
+**结论**：Navigator 枚举结构已与 Chrome 对齐，未引入站点特判；challenge 剩余分歧仍需从明文 payload 和
+事件时序继续定位。
+
+step127存档：Blob/File、UTF-8、三ray与完整门均通过，仍无真实404。
+参考HaHaVM-General的Blob分片修复继续审计公开面，Chrome151证明Obscura既有实现泄漏实例字段且把
+null/undefined分片丢弃；已迁WeakMap internal slots、补完整Blob/File接口与流读取，并修正非法UTF-8
+热路径为U+FFFD。Chrome parity focused1/1、相关6/6、obscura-js546/546与workspace1686/1686通过；
+三clean ray完整，条件点击proof/top/new-ray链完整但仍无404。step126存档：console三ray迁移与完整门均通过。
+
+Step105新增通用修复已由真实payload验证：counterclockwise arc首2x2迁移到白/191/239/48
+（Chrome白/192/244/53）；float16 context四组颜色4/4对齐；C1 Canvas文本把十宽度最大误差从
+约31px降到2.21px。49x44 Skia AA/hash、TextMetrics outline/font box、hG31项与Zok postMessage分类
+仍未决。完整门为obscura-js533/533、workspace1673/1673（4 skipped）、精确release、trace patch、
+no-default与diff check通过；deterministic 63个fixture的Obscura行为断言全过，10条checker失败
+均为Chrome151对旧参考不匹配。障碍课程未跑（本机无companion仓库）。
+
+step 104存档：**DOMParser skeleton崩溃已修，最后有效明文样本的hGgWW0有31项差异且lNCr3
+未恢复；当时迁移待测，质询仍未通过**。ZokK1最后有效payload的
+N/o/x/F/T本地分类缺口已静态覆盖，
+RTP capabilities的audio RED已从`audio/red/48000;111/111`对齐为`audio/red/48000`；
+CSSOM-only unrounded geometry已让受控inline rect从73对齐为72.9375，同时offsetWidth保持73；
+detached HTMLDocument/XMLDocument身份、owner与Document根关系已按Chrome151对齐。direct live已到
+widget proof fo 200后，但仍没有目标真实响应；
+真实payload迁移仍等待Reqable注入key刷新。ZokK1中六个已存在接口的type/native外壳已按Chrome151修复，
+本地fixture与全量门通过；真实bucket迁移待payload-2恢复。JSVMP取证已证伪frame VM和top
+secondary runProgram，并把旧ray `uA`主VM映射到新ray `nT/FX`结构；临时register probe已命中
+62/44/5 calls后删除。当前Reqable会话仍只到payload-1后600010，不能产生hG证据；按测量盲区
+应先刷新代理注入的challenge JS/key，再重复三轮payload-2。本轮已用Chrome151 oracle实现最后
+有效payload中全部34个Chrome-only N路径，并通过release CLI 34/34静态分类检查；这仍不能替代
+真实payload或过盾成功判据。后续仍按
+受控 main/frame realm oracle 拆分 parser/serializer 与其他 API。step 95 已隐藏 Error.stack 的
+Obscura/deno 内部帧；step 94 的 jdnfg5 iframe rch item 已修复（3/3）。step 95 不伪造 QqYk7，也不改变 timer 调度，
+而是在 V8 把 CallSite 交给默认或页面 formatter 前过滤内部脚本来源。thelancet 三个独立 ray
+的 payload-1 均只保留真实 `api.js`/`chl_page` URL，内部来源命中 0/3。
+`http://192.168.3.57:9000` + `https://www.thelancet.com/1.txt` 三轮均走完初始 fo、点击 proof
+和顶层 3256B 转发，随后换 ray 重开挑战，没有 `complete` 或真实 404。Chrome 149 三 payload
+按探针字段名对拍确认核心指纹面已收敛，但仍有 6 个 Chrome-only 探针、ZokK1 长尾、UA-CH
+brand、文本/canvas 与 ICE 差异；全量 V8 trace 复证 console native 绑定不可观测参数。
+B0-B7 全批次落地
+（见 step 91 与 `Challenge-fingerprint-fix-plans.md`）：UA-CH arm/26.4.0、WebGL 39 项逐项
+一致、WebGPU apple 档、SAMPLES 15 格式、N 桶 399→1137（Chrome 1164）。质询三轮提交链路
+正常（600010 回退已修）。剩余长尾：N 桶 27、o 桶 14、x/F 桶、brands 形态、sans-serif 字体
+残差、ICE srflx；障碍课程未跑（本机无 companion 仓库）。step 90 存档：step 90 用 MITM 代理注入的 `console.log("payloadJSON:…")`
+拿到 obscura 全部三轮**明文提交体**（含点击后 proof 轮），与 Chrome 三 payload 按「探针字段名」对拍
+（分片号两边错位，不能按 part 对齐）。结论：navigator 42 缺口只是冰山一角——枚举桶里 **N 桶（window
+构造器）缺 773 个、o 桶缺 49 个**；**UA-CH 高熵字段错**（x86/10.15.7 vs arm/26.4.0，brands 多一个
+"Google Chrome"）；**WebGPU adapter 报 intel gen-9**（参考 macOS Chrome 是 apple）；iframe 内
+`document.domain` 报顶层域、`compatMode` 应为 BackCompat、`innerWidth/innerHeight` 应为 0；
+WebGL 少 4 个 Apple GPU 压缩纹理扩展、limits 表多值不同；canvas 像素全 255、文本测量无亚像素；
+ICE 缺 srflx。此前 step 89 的三个缺口（默认 UA、navigator 42 API、`__obscura_click_target`）
+依然成立。step 90 补充调查确认 **`/ci/` 打点没有回归**（HEAD 多数轮次第一轮 widget 早期
+就发，~1/3 轮次推迟是 CF 端波动；iframe 修复排除），顺带发现动态 iframe about:blank
+`body=null` 的老缺陷。下一步按本 step 的影响排序表推进。
+
+step 89 存档：step 88 把 document 的 8 个内部字段改 Symbol 键后，实测
+`Object.getOwnPropertyNames(document)` 泄漏归零（主/frame realm 均 `[]`，晚快照只剩合法的
+`lang`/`dir`）。step 89 对拍 Chrome 三 payload 确认：①默认 stealth 指纹是 Windows Chrome
+145/146，参考是 macOS Chrome 149（`--user-agent` 可即时对齐）；②navigator 缺 42 个 Chrome 有的
+属性；③`__obscura_click_target` 运行时泄漏到 `globalThis`。
+
+以下为 step 67–74 的状态记录。战线从「链路走不通」转成
+「**提交载荷的内容对不上**」——`http://192.168.3.57:9000` 上的 MITM 代理把 CF 的
+提交对象以明文打了出来，第一次可以逐字段对拍（step 66）。本轮按字段修了 8 处,
+tokenB 载荷从 Chrome 的 **56% 提到 78%**（38529 → 53275 B）,
+并把 **11 处引擎内部字段泄漏清零**：
+
+| 字段 | 内容 | Chrome | 修前 | 修后 |
+|------|------|--------|------|------|
+| `YIwy3` | WebRTC SDP offer | 7277 | 2 | **7277** |
+| `EnxW1` | WebGPU 适配器 | 2293 | 8 | **2176** |
+| `fyCZH9` | 全局/文档枚举面 | 30881 | 14187 | 15047（`d.` 12→43 等） |
+| `FgjO3` 等 8 项 | WebGL 能力 | 2594 | 60（全是错误哨兵） | **2552** |
+| `DrTW4` | ICE 候选 | 1465 | 2 | **985** |
+| `ZpxzX5` | RTP 能力表 | 1273 | 7 | 本地已对齐（CF 侧未量测） |
+| `Swui9` | 键盘布局 | 596 | 2 | 本地 576（CF 侧未量测） |
+| `gqGB4` | 字体列表 | 83 | 738（三套 OS） | 已修根因（CF 侧未量测） |
+| `yQYB9` | resource timing | 366 | 缺失 | **已补齐** |
+
+**注意**：step 72 起第一次 `/fo/` 就返回 400 + `600010`,tokenB 不再下发,
+后三项只有本地量测。**原因是代理里那份被改写的 JS 的加密 key 过期**（见 step 72 的
+更正），不是引擎侧的问题,也不是 CF 对 IP 的升级。更新代理的 JS 后需重跑一轮补齐。
+最大的剩余项仍是 `fyCZH9`,根因已定位为**动态 iframe 在 Rust 帧加载器提交前拿到的是
+JS 兼容垫片**（step 68 末尾）。
+
+以下为更早的状态记录。**未通过,但断点已前移到最后一步**(2026-08-16,step 55/56)。`/pat/`(401)与
+`/ci/`(200)均已发出且状态码与 Chrome 一致,`interactiveBegin` → 点击 → **5052B 提交** →
+**3256B 回传**全链路打通;唯一没走通的是最后的判定——CF 不发 `complete`,直接换 ray 重来。
+**`fail code=600010` 现在是唯一实质阻塞**,失败码在加密响应体内。挂了六个 step 的
+「`/pat/` 从不发出」已解除:它来自 `709cb1b..HEAD` 的 parity 改进,此前被 `1f963b7` 的
+Trusted Types 回归挡住(step 49-52 定位并修复)。
+
+以下为 2026-08-15 及以前的状态记录:**未通过**。P0 五项 parity 修复（step 40）后输入链路保持打通、时间线全面提速，
+但**断点始终未移动**：`/pat/` 依旧从不发出（首要阻塞，step 39/40/44/45/46/47），
+`complete` 依旧为 0。点击被接受（Verifying…）→ 提交 5052B → 回传 3256B → 仍被判失败
+（`cf_chl_rc_ni=1`），widget 重置并换 ray 重来。机制定位已收敛（step 45/46）：`/pat/`
+**从未被 JS 构造**（网络钩子 + URL 构造器 + PAT API 三面全覆盖，零命中），`/ci/` 则
+**发出且 200**（step 45 追加修正作废了「op 吞请求」）；两者都在 **822KB→127KB 的 managed
+分流窗口**，不在点击后（step 44 的「点击后窗口」作废）。step 47（2026-08-15）修掉了
+Image 请求不记录 resource timing 这个确定缺陷（含两条回归测试），`/pat/` **仍未出现**
+——本轮 CF 在 `/ci/` 之后根本没读过 performance，该假设未被验证到。当前阻塞点：
+①**`/pat/` 从不发出**；②**frame 文档缺 navigation timing**（step 47 证据 3：CF 在两个
+widget realm 各读一次 `getEntriesByType('navigation')`，两次全空——当前唯一「已证实被
+读取且明确异常」的环境面，下一个修复目标）；③**`fail code=600010`**（step 37 起稳定）。
+**2026-08-16 回归警报（step 49/50/51）**：HEAD 相对 step 47 出现**代码回归**，已二分定位到
+唯一根因 **`1f963b7`（Trusted Types API 面按规范补齐）**。该 commit 补齐了 TT 的 API 外壳
+但没给 `eval` 接入 TT——`eval(TrustedScript)` 不执行代码（Chrome 返回 `2`，obscura 返回
+`"1+1"`）。CF 探测到 `trustedTypes` 存在就切到 TT 路径，JSVMP 静默停摆，流程从
+`realm=3/xhr=3//ci/=1` 退到 `realm=2/xhr=1//ci/=0`。**修 TT 的 eval 行为（或暂不暴露该入口）
+是当前第一优先级**，在此之前其他质询结论都跑在退化的基线上。
+
+step 48（2026-08-16）用双向被动 message 对拍**结掉一条长期未决项**：父窗口**确实回应了**
+`requestExtraParams`（widget 在自身 realm 的 41ms 收到完整 managed 配置，`food`/`meow`
+心跳 32 对双向闭环）——**断点不在 postMessage 通道，在 widget realm 内部**。同轮复现了
+`cs` 栈底的 `<obscura:bootstrap>` 两帧（step 8 未决项，CF 主动采集并传输的指纹面）。
+
+判据链：`interactiveBegin` → 点击（须在 interactiveBegin 之后 + 带 widget 外 pre-move，
+`cdp_click_fast --start 12`）→ 点击后 ~5s 的 **4976B 提交 POST** → 3256B 主页面回传 →
+`complete`+token → 站点真实 404。`interactiveEnd` 消息间歇性出现（CF 端波动，step 41），
+**不可作提交链判据**（step 43）。判成败一律看 `cf_chl_rc_ni` 是否出现。
+
+关键结论演进（被推翻的假设就地标记，详见各 step）：
+
+| step | 当时结论 | 后来 |
+|------|----------|------|
+| 22 | 分流由 IP 干净程度决定 | 被 step 33 推翻（同 IP 下 Chrome 免质询而 obscura 被拦） |
+| 29 | 怀疑预注入/观测停在主文档 realm | 被 step 30 证伪（真因是缺 `<label>` 激活行为） |
+| 34 | 「心跳停止 = 失败信号」 | 被 step 36 作废（成功路径同样停止） |
+| 36 | 断点是交互确认失败 | step 37 修事件字段后 `interactiveEnd` 首次出现 |
+| 37 | 断点 = 错误码 `600010` | 现唯一实质阻塞（排在 `/pat/` 之后） |
+
+时序约束：**检测到复选框就要立刻点**。该页 129 秒会自动换 ray（用户经验 30s+ 即可能刷新），
+刷新会作废当前 widget 的 token，迟到的点击落在死 realm 上，表现和「点了没反应」一模一样。
+
 ### Step 162 — Navigator 收尾后的真实-IP A/B（2026-09-02，调查中）
 
 **假设**：Navigator own-key 迁移后，若环境枚举是当前 challenge 的阻塞点，真实-IP CONNECT 转发下应出现
@@ -7265,6 +6958,17 @@ Element.children和Node.childNodes在插入、class mutation与detach后实时�
 
 **结论**：Navigator 枚举修复没有改变真实判定；网络可达性与 challenge proof 链已分别证明，当前仍没有
 足够证据把剩余失败归因到新的通用环境 API，也不加入 hostname 特判。最终验收继续以真实 `404` 为准。
+
+### Step 163 — scripted POST 的 Content-Type 保真（2026-09-02，完成）
+
+**假设与证据**：Chrome 152 本地 HTTP fixture 显示同源 `fetch`/XHR 的显式 `Content-Type` 会原样发送；
+Obscura 普通客户端此前对所有带 body 的 POST 无条件覆盖为 `application/x-www-form-urlencoded`，会破坏
+脚本请求头。该路径与 stealth transport 共用请求模型，属于通用网络语义缺陷。
+
+**修复与回归**：普通客户端现在只在导航 POST 且请求未提供 `Content-Type` 时补表单默认值；脚本 POST
+保留显式头部。新增 `scripted_post_preserves_explicit_content_type` 与
+`navigation_post_defaults_to_form_content_type`，obscura-net release nextest `91/91` 全部通过。
+该修复不含站点或 challenge 分支，真实 challenge 链仍按 Step162 的结果单独记录。
 
 ### Step 164 — Headers/Request/Response internal slots（2026-09-02，完成）
 
@@ -7299,17 +7003,6 @@ Chrome oracle 复核 `Response.redirect()` 返回 `type="default"`、绝对化 `
 Brunhild `/i 204`、frame/top `/fo`、`/pat 401`、proof/top 和新 ray；18 秒 settle 内页面仍为
 `Just a moment...`，没有真实 `/1.txt` `404`。该轮无 preload、无页面侧 hook，不把 challenge 文案或
 `Verification successful` 当成功；当前剩余问题仍是上游 challenge 判定，未获得足够证据继续添加通用 API。
-
-### Step 163 — scripted POST 的 Content-Type 保真（2026-09-02，完成）
-
-**假设与证据**：Chrome 152 本地 HTTP fixture 显示同源 `fetch`/XHR 的显式 `Content-Type` 会原样发送；
-Obscura 普通客户端此前对所有带 body 的 POST 无条件覆盖为 `application/x-www-form-urlencoded`，会破坏
-脚本请求头。该路径与 stealth transport 共用请求模型，属于通用网络语义缺陷。
-
-**修复与回归**：普通客户端现在只在导航 POST 且请求未提供 `Content-Type` 时补表单默认值；脚本 POST
-保留显式头部。新增 `scripted_post_preserves_explicit_content_type` 与
-`navigation_post_defaults_to_form_content_type`，obscura-net release nextest `91/91` 全部通过。
-该修复不含站点或 challenge 分支，真实 challenge 链仍按 Step162 的结果单独记录。
 
 ### Step 168 — Fetch bodyUsed 生命周期与最终回归（2026-09-02，完成）
 
@@ -8025,6 +7718,19 @@ Abort、CSP blocked和正常Response路径保持原有语义。修复提交为 `
 持续 pending，payload 的页面超时分支先完成，未进入 transport rejection。因此没有把 `fetch_error`
 强行映射成 `timeout`，也没有修改网络超时或加入域名特判。
 
+### Step 226 - XHR timeout取消底层请求（2026-09-06，代码完成）
+
+**假设**：XHR timeout 只派发了 `timeout/loadend`，没有取消内部 fetch；这会让 Brunhild 请求继续
+pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
+
+**修复与证据**：每个 XHR send 创建 AbortController，timeout 和 abort() 调用 controller.abort()，
+成功、错误和超时路径清理 controller。延迟 HTTP fixture 的 readyState/status/ontimeout 回归通过；
+与 fetch AbortSignal 回归合计 3/3。代码提交为 `14cdec8`。
+
+**验证**：完整 workspace `1755/1755 passed, 4 skipped`，精确 release 和 trace check 通过。
+指定代理无注入新轮仍为 `tQcZu4=fetch_error`；Brunhild GET 没有 completion，页面超时先结束，
+因此该修复没有把外部 pending 连接伪造成 `timeout`，目标仍未返回真实 404。
+
 ### Step 227 - Brunhild 通信归属与 timeout 分支（2026-09-06，调查中）
 
 **方法与证据**：当前 release 的全 realm `cdp_comm_probe.py` 记录 widget XHR/fetch 在 t=0.75s
@@ -8058,19 +7764,6 @@ headful click HAR 曾对 Brunhild 请求收到 `204`。这解释了当前 Chrome
 现以 Promise.race 连接 signal 与 transport op，并清理 abort listener；默认 reason 对齐为
 `This operation was aborted`。transport failure 和 abort focused 各 1/1 通过，提交为 `c24378a`。
 其workspace、release、trace check与代理复测已完成；tQcZu4仍未迁移。
-
-### Step 226 - XHR timeout取消底层请求（2026-09-06，代码完成）
-
-**假设**：XHR timeout 只派发了 `timeout/loadend`，没有取消内部 fetch；这会让 Brunhild 请求继续
-pending，并使页面自己的结果与 Chrome 的 timeout 分支不同。
-
-**修复与证据**：每个 XHR send 创建 AbortController，timeout 和 abort() 调用 controller.abort()，
-成功、错误和超时路径清理 controller。延迟 HTTP fixture 的 readyState/status/ontimeout 回归通过；
-与 fetch AbortSignal 回归合计 3/3。代码提交为 `14cdec8`。
-
-**验证**：完整 workspace `1755/1755 passed, 4 skipped`，精确 release 和 trace check 通过。
-指定代理无注入新轮仍为 `tQcZu4=fetch_error`；Brunhild GET 没有 completion，页面超时先结束，
-因此该修复没有把外部 pending 连接伪造成 `timeout`，目标仍未返回真实 404。
 
 ### Step 231 - 最新 release 代理复测（2026-09-06，调查中）
 
@@ -8116,6 +7809,14 @@ trace check 通过；真实 payload 保持 isolation 对齐，目标仍 403 chal
 最终 obstacle course 仍为 `31/33`，失败项是既有 fixture 的 IntersectionObserver `io:50` 期望和
 Win32 平台固定期望，两项在旧二进制和 Chrome oracle 中同样失败。
 
+### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
+
+最终 release 通过指定代理无注入访问并开启 CDP 条件点击。Turnstile frame owner 的
+`allow="cross-origin-isolated; fullscreen; autoplay; keyboard-map; gamepad; xr-spatial-tracking"`
+被正确传播后，frame payload 的 `crossOriginIsolated`/`SharedArrayBuffer` 差异归零，路径集合为 1647。
+点击在 `interactiveBegin` 后触发 proof `/fo` 200 和顶层新 ray；目标仍未收到真实 `/1.txt` 404。
+Brunhild `/i` 只记录 direct `op_fetch_url` 请求且无 completion，当前代理路由仍是外部阻断。
+
 ### Step 236 - isolated frame cpuPerformance（2026-09-06，代码完成）
 
 **证据**：同 UA Chrome 152 的真实 Turnstile frame 中，`navigator.cpuPerformance` 为 enumerable
@@ -8147,14 +7848,6 @@ root 外的 widget 收不到它们。
 
 **修复**：focus/blur 派发 trusted composed FocusEvent；CDP checkable input/change 设为 composed。
 现有 CDP input parity focused 8/8 通过，待全量门禁及新 binary 第三 payload 复测。
-
-### Step 235 - allow 修复后的真实 challenge 轮（2026-09-06，调查中）
-
-最终 release 通过指定代理无注入访问并开启 CDP 条件点击。Turnstile frame owner 的
-`allow="cross-origin-isolated; fullscreen; autoplay; keyboard-map; gamepad; xr-spatial-tracking"`
-被正确传播后，frame payload 的 `crossOriginIsolated`/`SharedArrayBuffer` 差异归零，路径集合为 1647。
-点击在 `interactiveBegin` 后触发 proof `/fo` 200 和顶层新 ray；目标仍未收到真实 `/1.txt` 404。
-Brunhild `/i` 只记录 direct `op_fetch_url` 请求且无 completion，当前代理路由仍是外部阻断。
 
 ### Step 239 - `gsLi5.o` Window/Navigator/Document 顺序与 named property（2026-09-07，代码完成）
 
@@ -8752,7 +8445,11 @@ Cloudflare challenge，尚未取得目标真实 404，因此这项修复是必�
 | widget `/fo/` #1 响应 | 822624 | 822648 | 同 |
 | widget `/fo/` #2（点击后的证明）响应 | 127228 | 127228 | **逐字节同长** |
 | widget `/fo/` #3 响应 | 7164 | 5160 | **分岔** |
-| 顶层 `/fo/`（收官）响应 | 3660（带 `cf_clearance`+`cf-chl-out`） | 3240（无 clearance） | **分岔 → 换 ray 重来** |
+| 顶层 `/fo/`（收官）响应 | 3660（`cf-chl-out: 177`） | 3240（`cf-chl-out: 133`） | **分岔 → 换 ray 重来** |
+
+> 更正：本表初版把收官顶层 `/fo/` 记为「3240（无 clearance）」。Step 262 按响应头实测
+> 更正：我们同样收到 `Set-Cookie: cf_clearance` 与 `cf-chl-out`，只是比参考短
+> （133 vs 153/177）。
 
 也就是说：CF 对我们前两个 `/fo/` 提交的响应与对真 Chrome **完全同长**（同一决策），分岔出现在第三个
 widget `/fo/` 与收官顶层 `/fo/`。顶层 `/fo/` 请求体我们又比参考小 ~1.2KB。
@@ -8866,7 +8563,6 @@ ov2；顶层是 `orchestrate/chl_page/v1`，其脚本文本里没有 crypto/btoa
 结论：**插桩轮只能用于「格式/早期阶段」对拍，其失败码不得当作引擎证据**；要做同上下文的值级对拍，
 需要一份**同一轮内**生成、会话值是最新的插桩脚本（或在引擎侧直接 hook 构造点）。
 
-
 ### Step 261 - 当轮新鲜（in-flight）插桩：两个 realm 都在原位打点（2026-09-16）
 
 **做法（不改挑战源码、不服务静态捕获）**：本机 mitmdump 在**当轮响应文本**里**前置**一段安装器，
@@ -8910,7 +8606,6 @@ ov2；顶层是 `orchestrate/chl_page/v1`，其脚本文本里没有 crypto/btoa
 `gR` 之上没有可挂钩的主机边界；要拿字段级明文只能**像 ov2 那样给这个程序本身插桩**
 （操作者的 `instrument_0916_11.py` 只覆盖 ov2；`chl_page` 这个程序需要同类的锚点/派发表分析，
 分析工作区 `jsvmp-engine-0916-11` 的解码器/CFG 工具目前只对 ov2 建成）。
-
 
 ### Step 262 - 判定发生在加密交换内部：我们拿到的是「更短」的 clearance（2026-09-16）
 
@@ -9032,97 +8727,16 @@ __obscura_clone_hooks
 可直接对齐 key 与值。注意先消除**插桩自身开销**带来的速率差：参考 301292 条/12.3s，我们一轮
 2902 条/5.4s + 2261 条/3.0s（每片 1 个实例），速率差主要来自两侧 tl() 落盘实现不同，不能据此下结论。
 
-## Step 265: the /fo/ responses decode without a session key, and our build is not the operator's
+### Step 265 - （已删除）"the /fo/ responses decode without a session key, and our build is not the operator's"（两个核心结论均被推翻）
 
-**Why this step.** Step 264 left one gap: the decision data is inside the `/fo/` response
-bytecode, and the only routes were "the session symmetric key" or "VM-internal
-instrumentation". The operator's `jsvmp-engine-0916-11/decode-ov1.mjs` header publishes the whole
-response transform, and its only input besides the body is the session ray. So the responses are
-decodable from our own capture, with no key handed over. This step does that, then checks whether
-the operator's build-level tooling applies to our session.
+本步曾断言 ①"our blobs are not in the operator's build encoding"、②"the challenge program
+itself is per-session（build 按会话重随机）"。两者均被 Step 266 推翻：把解码器对着 VM 的
+实际行为校验后，我们的字节码与操作者 spec 是**同一编码**、入口链自洽；按会话轮换的是
+**程序**，不是编码。原始错误来自拿一个会话的解码结果去对比另一个会话的程序文本。
+本步建立的解码管线（ray 派生 seed、逐字符串 key 的字符串表反演）本身有效，由 Step 266
+沿用；`/pat/` 401 非分岔、tracelog sink 需进 worker realm 等附属结论也已由后续 step 承载。
 
-**Decoder.** `.claude/skills/obscura-challenge-probe/scripts/ov1_decode.py` (byte for byte the
-published pipeline: `seed = 32 ^ xor(charCodeAt(ray + "_0"))`, `stage1 = atob(body)`,
-`out[i] = js_mod((255 & s1[i]) - seed - (i % 65535) + 65535, 255)`, `bytecode = atob(out)`).
-
-Validity is not asserted, it is proved twice:
-
-1. Run on the operator's own HAR it reproduces their three hard-metric artifacts exactly:
-   `a814b14a54e09ce35c3d6528d081c890` (462740 B), `1b343b06bd03b55cf01c17278884e61a` (71567 B),
-   `8ee7e511a0bda63fd54c813c4d9c7226` (4029 B).
-2. The seed is provably the server's, not merely a working guess. `out[i]` is the canonical
-   stage-2 text shifted by `(Uk_true - Uk_used) mod 255`, a per-byte constant, and the canonical
-   stage-2 is pure base64 (the VM feeds it to `atob`). Over the 65-char alphabet a shift maps the
-   alphabet onto itself only for `d = 0` (checked exhaustively), so a wrong seed cannot produce
-   the pure-base64 stage-2 that every one of our five responses produced
-   (`b64frac = 1.000`). Per-entry ray: the ray is in each `/fo/` URL
-   (`/fo/<hash>/<16 hex ray>/<token>`), which matters because our HAR holds two challenge rounds;
-   the operator's `--index all` uses one global ray and reports `[E] 最大公共前缀=0 → DIVERGENT`
-   plus 12 B / 399632 B / 64884 B artifacts on our HAR.
-
-**What our session was served** (widget level, ray `a3bf882b8bec564b`):
-
-| stage | our bytecode | reference bytecode | delta |
-|---|---|---|---|
-| 1st `/fo/` response | 462979 B | 462740 B | +239 B |
-| 2nd `/fo/` response | 71570 B | 71567 B | +3 B |
-| 3rd `/fo/` response | 2900 B | 4029 B | **-1129 B** |
-
-The reference's third program carries the widget handoff literals (`_cf_chl_opt`, `postMessage`,
-`widgetId`, `token`, `source`); ours is a different, smaller program. Page-level `/fo/` responses
-(63988 B and 1821 B) have no counterpart in the filtered reference HAR.
-
-**Our blobs are not in the operator's build encoding.** Three independent checks, all with the
-operator's own tooling run on a scratch copy of their tree (`/tmp/ov2-our`, their production tree
-untouched):
-
-1. Entry decode: at `(pc=0, key=241)` the reference blobs decode to `op=84 = cl`; ours decode to
-   `op=56`, which is absent from `spec.opToHandler`, so the entry chain dies
-   (`宽度未覆盖`, `dynamicReachable = 0`, 181 rendered instructions against the reference's 295).
-2. String table: `scripts/ov1_strprobe.py` inverts the VM's own string encoding
-   (`plaintext = Uk ^ ((b+245)&255) ^ 120`, searched over all 256 per-string keys). On the
-   reference's stage-3 blob it recovers exactly the documented literals; on all three of our blobs
-   it finds none of them, and none of `document`, `Date`, `window`, `length`, `indexOf` either.
-3. Control: the same scratch pipeline fed the reference blobs reproduces production byte for byte
-   (295 rendered instructions, `入口链自洽性 ✅`), so this is not an environment artifact.
-
-**The challenge program itself is per-session.** Two loads inside one session are 94.25% identical
-(217839 B identical block, same 235598 B size and different md5), while our program against the
-operator's `ov2-0916-11.pristine.js` (400800 B) shares 8.63% with a largest common block of 446 B
-(against `ov2-0916-11.js`, 225721 B: 7.69%, largest 691 B). A later round fetched 243573 B. So a
-saved pristine is not this session's VM, and the anchor/dispatch tables derived from it describe a
-different build. The `_cf_chl_opt` field vocabularies are identical across sessions (13-key page
-block, 26-key widget block, same names), so those names are stable and cannot be used as a build
-fingerprint.
-
-**In-flight seam that does work.** `scripts/inject-runprogram-probe.py` wraps the VM's own global
-`runProgram(text, b)` (the consumer at pristine:3406 and the source-embedded literal at
-pristine:5072) through an accessor on the global, plus `Function`, `fetch`, and
-`XMLHttpRequest.open/send`. A 30 s round produced 17889 `rp.call` records, all from
-`https://www.thelancet.com/1.txt`, all the **same** 6032-char standard-base64 program text
-(`head bdUluwUbHBYdBRNMvy6Ymoech5yRmI2J7BmHLTcbBD53…`), which is the page realm's inline program
-re-run per event. No `/fo/` text and no `new Function` argument appeared.
-
-**Where the payload builder actually runs.** The run log shows four `blob:` worker scripts, and the
-`/fo/` POSTs never pass through the page's `fetch` or `XMLHttpRequest` even though both were wrapped
-before the first page statement. The tracelog sink exists only in window realms
-(`realm.rs` sets `globalThis.__obscura_tracelog_enabled` for frames and installs `External.tracelog`;
-`env/worker/dedicated-worker.js` has no `external`). So the requested "insert
-`window.external.tracelog` into the payload builder" cannot work as written: the builder's realm has
-neither `window` nor a tracelog sink, and the addon snippet's `var W = window` throws there and is
-swallowed by its own guard.
-
-**Ruled out this round.** `GET .../pat/<ray>/...` returns `401` with a 1 byte body in the reference
-session as well, so it is not a divergence.
-
-**Status.** `https://www.thelancet.com/1.txt` still answers with the challenge; the click run is
-still 0/6. New next action: give the worker realm a sink (postMessage forwarding, or a
-`self.external.tracelog` in `dedicated-worker.js`), then log the `/fo/` fetch body and the decoded
-program text inside the worker, which is the realm that builds the payload. Instrumentation of the
-*current* session's `orchestrate/chl_page/v1` is required, because the build is re-randomized per
-session.
-
-## Step 266: a probe the challenge does not detect, the worker realm, and a correction to step 265
+### Step 266: a probe the challenge does not detect, the worker realm, and a correction to step 265
 
 **Why this step.** Step 265 concluded that our bytecode "is not in the operator's build encoding" and that
 the build is re-randomized per session. Both were wrong, and the error came from comparing a decode of one
@@ -9194,8 +8808,12 @@ real-Chrome run and carries the same probe fields):
 
 Two of those are engine defects with a clear fix: the fetch rejection text (fixed here: Chrome keeps the
 reason out of `message`, and the challenge reads that string back out of a worker) and timer quantization.
-The compute probe is the large one: the same workload takes about 22.9 s here against 2.9 s in Chrome, which
-is why the flow never reaches its final handoff inside the harness window.
+
+> Correction: this step read the compute probe's ~8x gap as the leading candidate and framed it as a
+> slow realm (the original next action was "profile the worker realm's JS throughput against the page
+> realm"). Step 267 refuted that with a realm benchmark: page realm and worker isolate both land at or
+> above a stock V8; the 8x compares two different sessions' workloads, and the real residual on that one
+> script is about 2x. What to profile is the engine's execution of `graIf9`'s script, not the realm.
 
 **What was tried and reverted.** Making a blob worker spawn its own isolate (its blob text is the
 challenge's bootstrap, and the widget CSP allows `'unsafe-eval'` with `worker-src blob:`). It makes the
@@ -9205,11 +8823,11 @@ revert restores the earlier state; `cargo nextest -p obscura-js` reports the sam
 before and after, so nothing here regressed.
 
 **Status.** `1.txt` still answers with the challenge and no `POST /1.txt` is ever issued; the objective is
-not met. Next actions, in order: the compute-probe slowdown (profile the worker realm's JS throughput
-against the page realm), the `performance.now()` clamp, and the blob-worker eval path whose own tests fail on
-this tree.
+not met. Next actions, in order: the `performance.now()` clamp, and the blob-worker eval path whose own
+tests fail on this tree. (The original first item, profiling the worker realm's throughput for the
+compute-probe slowdown, is withdrawn: Step 267 showed the gap is workload, not a slow realm.)
 
-## Step 267: the compute probe is workload, not a slow realm
+### Step 267: the compute probe is workload, not a slow realm
 
 **Why this step.** Step 266 left the compute probe as the leading candidate: our session reported
 `graIf9` = 10822 iterations in 22363 ms where the reference reported 2658 in 2904 ms, an 8x gap. The
@@ -9290,7 +8908,7 @@ across that stop, profile the engine's execution of `graIf9`'s script specifical
 worker-isolate path with its tests updated, since it is the only configuration measured to reach the
 final handoff.
 
-## Step 268: the worker-isolate path is adopted, and seven tests come with it
+### Step 268: the worker-isolate path is adopted, and seven tests come with it
 
 **Why this step.** Step 267 measured that letting a blob worker run its own bootstrap in an isolate is
 the only configuration that reached the challenge's final handoff, and left it reverted because it broke
@@ -9341,7 +8959,7 @@ engine is materially closer (worker realm faithful, seven tests recovered, fetch
 fixed) and the remaining gap is quantified: the post-second-response step, dominated by DOM-op cost and
 the compute probe's own ~23 s.
 
-## Step 269: the payload plaintext is in the console log, and the field-level diff
+### Step 269: the payload plaintext is in the console log, and the field-level diff
 
 **Why this step.** Every previous round treated the `/fo/` bodies as opaque because they are encrypted, and
 went looking for a session key. They are not opaque at the source: the challenge logs its payload object
@@ -9387,7 +9005,7 @@ the decision data is now readable in plaintext from our own runs, so the next ro
 inflated resource timings above are the most concrete candidate, since they are 5x off and land in the
 payload) instead of hunting for a key.
 
-## Step 270: resource timing is not inflated, worker timers fire, and the local proxy hop is not it
+### Step 270: resource timing is not inflated, worker timers fire, and the local proxy hop is not it
 
 **Why this step.** Step 269 left three candidates: the resource-timing entries (ours read 2932/1383 where the
 reference read 561/280), the payload counters (`uGyjw9` 4 against 508, `ZMSOw0`/`twvE0` 1181 against 466),
@@ -9423,117 +9041,19 @@ matched by shape before they can be compared at all.
 
 **Status.** Unmet: `1.txt` still returns the challenge and there is still no `POST /1.txt`.
 
-## Step 271: the stall is one statement after `new Worker`, measured in both realms
+### Step 271 - （已删除）"the stall is one statement after `new Worker`, measured in both realms"（核心观测被推翻）
 
-**Why this step.** Step 270 closed with "the step after the third response is where the reference posts its
-fourth submission, and that is the thing to instrument next". This step instruments it, with the native host-op
-stream as the primary instrument and the validated in-flight realm probe (`challenge-realm-probe.js`) only as
-the seam that names the statement. It also rules out four candidates that each had a plausible mechanism.
+本步把停滞钉在「widget 程序里 `new Worker(blob:)` 之后的那一条语句」，并据 Proxy 零属性读写
+断言「调用方不 push、不赋 `onmessage`、不 `postMessage`」。该观测被 Step 279 推翻：worker
+路径修好后五个 `graIf9` worker 结果都回来了，停点在该语句**之后更远处**。本步仍然有效的
+产出：①75s 窗口证明是「停住」而不是「太慢」；②页面 `honk` eval 等待循环（1 337 331 个前导
+空格）是挑战自己的 yield 原语，参考同样走它；③`meow`/`food` 是 keepalive 而非 handoff；
+④四个候选机制（worker 回复被空批次抛弃、V8 watchdog 切断、跨 realm `postMessage` 投递失败、
+blob worker fan-out 不可用）各自实测排除——该清单已上收至文档头部；⑤`OBSCURA_DEBUG_WORKER`
+/`OBSCURA_DEBUG_WATCHDOG` 插桩，以及「page-visible 探针扰动流程」「Proxy 改变 worker 身份」
+两条测量坑。widget 文档加载两次的现象由 Step 272 解释（Critical-CH 重试）。
 
-**The stall is not slowness.** A 75 s window (click at 10 s, read at 70 s) still ends with exactly three
-submissions: top-level `/fo/` #1, widget `/fo/` #1, widget `/fo/` #2 (the proof). Nothing after that, ever.
-So the flow is parked, not slow, and the 30 s budget is not the binding constraint.
-
-**CPU sampling says "parked", with a caveat.** `ps -o %cpu=` through one round reads 52.7 / 9.1 / 9.7 / 31.3 /
-72.6 / 86.2 / 100.4 % up to t=20 s, then 0.6 / 1.3 % from t=22 s on. The burst is real work and the tail is
-idle. Caveat: macOS `ps -o %cpu` is not an instantaneous rate, so this is corroboration only — the "parked"
-claim rests on the host-op stream going silent, not on the percentage.
-
-**The page's `honk` loop is a wait primitive, not the divergence.** The op stream's last 40 records are a loop
-of `eval` calls, one every ~0.55 s, forever. The argument is a 1 337 359-character string: **1 337 331 leading
-spaces** followed by `0, /.*honk.*/, <epoch ms>`. Its stack names the caller: `nO.nn` in
-`orchestrate/chl_page/v1` — the page realm, not the widget. The reference does the same thing (35 `globalThis.eval`
-points carrying the identical padded `honk` expression, ~175-550 ms apart over 7.7 s, stopping when the widget
-finishes). So `honk` is the challenge's own yield/wait primitive, and the page sitting in it means the page is
-waiting for the widget's handoff.
-
-**`meow`/`food` is the keepalive handshake, not the handoff.** The widget document carries the handler
-(recovered from the reference HAR at the same stage):
-`if (e.source === 'cloudflare-challenge' && e.event === 'meow' && e.widgetId === window._cf_chl_opt.EnOnL8)
-window.parent.postMessage({source:'cloudflare-challenge', widgetId:…, event:'food', seq: e.seq}, '*')`.
-Our run exchanges this pair to `seq` 31+ with both realms alive, which is why "the widget is dead" is the wrong
-reading; the widget is up and its program is not advancing.
-
-**Where the widget stops, exactly.** The widget realm's exit sequence in one round, in order:
-
-| # | event |
-|---|---|
-| 126 | `URL.revokeObjectURL` (at `TH.yU`) |
-| 127-129 | XHR `POST /fo/315550264:…/<ray>` — the proof, 91 074 bytes |
-| 131 | response 200, 127 240 characters |
-| 132-134 | `atob(127240) → 95424`; `runProgram(95424)`; `atob(95424)` |
-| 135 | `URL.createObjectURL(blob)` — a 292-byte `text/javascript` blob |
-| 136 | **`new Worker(blob:https://challenges.cloudflare.com/<uuid>)` at `TH.yg`** |
-| 137+ | nothing from this realm; only the page's `honk` loop and the `food` keepalives |
-
-Three independent instruments agree that the caller does nothing with that worker: no
-`Worker.prototype.postMessage` (probe wrapper), no `onmessage` assignment and no `addEventListener`
-(descriptor-preserving probe seams), and — decisively — **zero property `get`/`set` on the returned worker
-object** while it was wrapped in a `Proxy`. So execution stops on the statement immediately after `new Worker`,
-with no exception (the constructor wrapper's `ctor.threw` seam never fired) and no error on the page.
-
-**What the reference does there.** After the same stage's program (95 428 B) the reference constructs five
-workers ~400 µs apart and then, per the ov2 host trace, runs
-`ov2.host.call2 {method:"push", recv:"[object Array]", args:["[object Worker]"]}` →
-`ov2.host.write {obj:"[object Worker]", key:"onmessage", val:"fn:bound m0"}` →
-`ov2.host.call2 {method:"postMessage", recv:"[object Worker]", args:["var nSMXN7={…"]}`, and receives
-`MessageEvent.data.graIf9` with `OMba9` shard timings 116 ms later. So the divergence is exactly one statement
-wide: the reference pushes the worker, assigns `onmessage`, and posts the task; we do none of the three.
-
-**Ruled out this round, each with its own measurement.**
-
-1. **`op_worker_recv` empty-batch contention stranding the reply.** The JS receive loop treats an empty batch as
-   "the worker is gone" and stops polling, and the Rust op returns an empty string on transient borrow
-   contention, so a single transient hit would strand every later message. Instrumented
-   (`OBSCURA_DEBUG_WORKER`), the empty batches that occurred were all `outbox-closed` — the worker thread really
-   had exited — and no `opstate-borrowed` / `shared-state-borrowed` / `no-tokio-runtime` case was observed. The
-   hazard is real but it is not what happens here.
-2. **The V8 watchdog killing the task mid-script.** `cdp_watchdog` (5 500 ms per autonomous turn) and
-   `arm_watchdog` were both instrumented. Neither fired: `disarm_watchdog`'s
-   `"V8 watchdog fired: terminated a synchronous overrun"` warning is absent from all seven runs, and the
-   autonomous-turn counter never incremented. A silent `terminate_execution` cutoff would have matched the
-   symptom exactly; it does not occur.
-3. **Cross-realm `postMessage` delivery.** Both directions flow continuously (`meow`/`food`, `seq` to 31+), so the
-   handoff channel is healthy; what is missing is the handoff message, not its transport.
-4. **A broken blob-worker fan-out in general.** A local fixture reproducing the reference's exact sequence
-   (`new Blob` → `createObjectURL` → `new Worker` → `arr.push(w)` → `w.onmessage = fn` → `w.postMessage(task)`,
-   five shards, the same 292-byte `onmessage -> eval` bootstrap) completes 5/5 replies in the engine. So the
-   constructor, the blob store, the postMessage path and the recv loop all work for this shape; whatever breaks
-   is specific to the challenge's state at that point.
-
-**Also measured, not yet attributed.** Our session loads the turnstile widget document **twice** (two
-`rp.installed` for `challenges.cloudflare.com/…/turnstile/…` realms, at indices 17 and 189 of one run), where
-the reference HAR holds exactly one `/turnstile/f/av0/rch/…` document request. The second realm is the one that
-runs the proof step and then stops. Whether that second load is a cause or a symptom is open.
-
-**Instrumentation added (all host-side, opt-in, off by default).** `OBSCURA_DEBUG_WORKER=1` reports worker
-isolate spawn/exit and the reason a receive returned empty; `OBSCURA_DEBUG_WATCHDOG=1` reports a watchdog budget
-overrun. Both write to stderr, so neither is page-visible — which matters here, because a page-visible probe
-stops the flow before the stage under observation (see `honk` above and step 266).
-
-**Measurement pitfalls found this round.**
-
-- **A page-visible install probe perturbs the run.** Extending the `rp.installed` record with
-  `document.scripts.length`, `documentElement.outerHTML.length` and a `Math.random()`-derived realm id made the
-  page go blank (62 trace records instead of ~300, empty body). `Math.random()` shifts the PRNG the challenge
-  samples, and an early DOM serialization is itself observable. Keep the install record minimal.
-- **A `Proxy` around the worker changes identity** (`instanceof`, `String()`, descriptor reads). It is acceptable
-  for the "what does the caller touch next" question and nothing else; the answer it gave (no touch at all) was
-  cross-checked with the non-invasive postMessage/onmessage seams.
-- **The page-side `[worker] out queued` / `out deliver` logs no longer fire** since the blob-worker isolate path
-  landed (step 268), because those are logs of the document-eval stub. Worker→page traffic now has to be read at
-  the host (`OBSCURA_DEBUG_WORKER`) or inside the worker realm; reading only the page-side logs makes the worker
-  look mute.
-
-**Status.** Unmet: `https://www.thelancet.com/1.txt` still answers with the challenge, no `POST /1.txt`, and the
-click run is still 0/6. The divergence is now pinned to a single statement — the one after the widget's
-`new Worker(blob:)` in the program that answers the proof submission — and the four candidate mechanisms that
-could cut a caller off there (stranded worker reply, watchdog termination, message-transport failure, a broken
-blob-worker fan-out) are each measured and excluded. Next actions: attribute the widget program's stop at
-`TH.yg` from the program side, which needs the *current* session's program (the build is re-randomized per
-session, step 266), and settle whether the duplicated turnstile document load is causal.
-
-## Step 272: the duplicate widget document is a Critical-CH retry, and it is not the stall
+### Step 272: the duplicate widget document is a Critical-CH retry, and it is not the stall
 
 **Why this step.** Step 271 left two open questions from the objective's next action: instrument the widget
 program at the stop, and settle whether the duplicated turnstile document load is a cause or a symptom. This
@@ -9633,7 +9153,7 @@ session) with a regression test. Next: the widget program's stop at `TH.yg` stil
 current session's `orchestrate`/proof-response program, disassembled or instrumented in place — and the
 `nested_discovery` attach path needs a guard test if it is confirmed to fire.
 
-## Step 273: the caller returns — program-side measurement of the `new Worker` stop
+### Step 273: the caller returns — program-side measurement of the `new Worker` stop
 
 **Why this step.** Step 271/272 localized the stop to the statement after `new Worker` in the program that
 answers the proof submission. This step asks the program side directly: what does that program do, and how does
@@ -9667,10 +9187,16 @@ reference's post-proof window *alone* holds **9** Blobs, **58** `createObjectURL
 constructions before it does `push → onmessage → postMessage`. So the two runs are not doing the same work at
 that stage; ours leaves the fan-out after one iteration.
 
-**Answer to the asked question, as far as measurement reaches:** the caller does not execute
-`push → onmessage → postMessage` because **it returns** immediately after constructing the worker. That is a
-program-level early exit, not a blocked call, not a lost message, and not a terminated script — the three
-mechanisms that could produce the same symptom were each excluded in step 271 and are consistent with this.
+**Answer to the asked question, as far as measurement reaches（后被推翻，见更正）:** this round's
+program-side measurement read the caller as executing none of `push → onmessage → postMessage` —
+as if it **returned** immediately after constructing the worker: a program-level early exit, not a
+blocked call, not a lost message, not a terminated script (the three cut-off mechanisms of step 271
+were each excluded and consistent with it).
+
+> Correction: the "caller returns early" reading was overturned by Step 279 — with the worker path
+> fixed, all five `graIf9` worker results come back, so the stop point is further along than this
+> statement. The stage-shape comparison with the reference window (9 Blobs / 58 `createObjectURL` /
+> 5 Workers there; 5 / 5 / 7 here) stands as observation.
 
 **The native property trace cannot serve as the program-side instrument here (measured).** Two runs:
 
@@ -9719,8 +9245,13 @@ The operator's toolchain was copied to `/tmp/ov2-our` (their tree untouched) and
 own sample analysis (ov1#2 span coverage 100 %). Fed our `bc_02`, it decodes **67 695 / 71 571 bytes = 94.58 %**
 with **0 unresolved roles** and renders **17 356 instructions**; role distribution `objectInit 15379`,
 `binaryMux 460`, `methodCall 450`, `condJump 210`, `hostRead 138`, `hostWrite 116`, `hostNew 32`,
-`literalLoad 43`, `tryPush 32`, `hashJump 32`, `jump 30`. So the program is statically legible, and it is
-branch-heavy: 210 conditional jumps over 17 k instructions.
+`literalLoad 43`, `tryPush 32`, `hashJump 32`, `jump 30`. It is branch-heavy: 210 conditional jumps over 17 k
+instructions.
+
+> Correction (Step 275): the 94.58 % coverage figure is near-vacuous — at any pc, 69 of 256 keys
+> decode to a valid op, so a byte is "covered" if *some* key maps it. It is not evidence that a
+> coherent path was decoded, and this step's "the program is statically legible" was the wrong
+> conclusion; the executed branch cannot be read statically without path-derived keys.
 
 **Where the names are — scope correction for the next round.** `ov1_strprobe.py` (the VM's own string encoding,
 key searched over all 256 values) finds **none** of `Worker`, `postMessage`, `onmessage`, `createObjectURL`,
@@ -9735,12 +9266,12 @@ Disassembly: `/tmp/ov2-mine/anchor-cfg-out/ov1-2-disasm.txt` (1.1 MB) and `.json
 `/tmp/ov2-our` (a control copy) and `/tmp/ov2-mine` (our program as sample 2).
 
 **Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. Gained this round: the
-program-side statement (the caller returns after constructing the worker, with no continuation registered), the
 measured impossibility of using the native property trace at this stage, the session-dependence of the stall, and
 a working decode + disassembly pipeline for the current session's programs with the scope of the next step
-narrowed to program-plus-interpreter.
+narrowed to program-plus-interpreter. (The program-side "caller returns after constructing the worker" statement
+is withdrawn: see the correction above and Step 279.)
 
-## Step 274: the OPFS flush is a no-op, and the stall is the norm (not a proxy artefact)
+### Step 274: the OPFS flush is a no-op, and the stall is the norm (not a proxy artefact)
 
 **Why this step.** Step 273 narrowed the next action to reading the program together with the interpreter. Before
 investing in static work I removed a confound that had been muddying every conclusion, and while measuring the
@@ -9772,7 +9303,12 @@ The shape is right — `getDirectory` → `getFileHandle({create})` → `createS
 `storage_manager_and_origin_private_file_system_match_chrome_shape` passes. But `flush()` is
 `nativeMethod(SyncAccessHandle.prototype, 'flush', 0, function () { syncData(this); })` — it validates state and
 returns, and the file node is a `Uint8Array` on an in-memory tree, so nothing is ever written to or synced with a
-device. Hence 0 ms where the reference measures 10.6 ms.
+device.
+
+> Correction (Step 277): the reference's `uUOw3 = 10.6 ms` is the whole write→flush→getSize→close
+> promise chain, not the `flush()` itself; direct measurement puts Chrome's flush at ~12 µs
+> (sub-clock-resolution), which the widget reads as 0. The engine defect stands — flush never touches
+> a device — but "0 ms where the browser reads 10.6 ms" overstates the observable delta.
 
 Two notes on scope, so the finding is not over-read:
 
@@ -9829,10 +9365,10 @@ A/B under `/tmp/lancet-ab/{direct,hopped}{1,2,3}`; OPFS fixtures `/tmp/opfs/{ind
 **Status.** Unmet: `1.txt` still returns the challenge and no `POST /1.txt` is issued. Gained this round: the hop
 confound removed with n=3+3, the stall calibrated as the norm, the "handoff literals" reading refuted on both sides
 with a validated decode, the stage-by-stage size table refreshed, the static-operand limitation measured, and one
-concrete engine defect isolated — the OPFS sync access handle performs no I/O, so the challenge's storage probe
-reads 0 ms where a browser reads 10.6 ms.
+concrete engine defect isolated — the OPFS sync access handle performs no I/O (see the Step 277 correction on the
+reference's 10.6 ms reading).
 
-## Step 275: a runtime `(pc, key)` trace from our own session, and why the operator's spec cannot read our blob
+### Step 275: a runtime `(pc, key)` trace from our own session, and why the operator's spec cannot read our blob
 
 Step 274 asked for runtime states because the static route is closed. This round produced the first runtime
 `(pc, key, op)` trace of our session, and in doing so measured that the operator's spec is a *per-build* artefact
@@ -9903,7 +9439,7 @@ runtime `(pc, key, op)` trace of our session, our build's VM entry state (`key=1
 the static pass yields one state (branchy entry handler, width needs runtime state), a correction to the 94.58 %
 coverage reading, and the two harness facts above (Brotli `set_text`, worker realm has no `window`).
 
-## Step 276: the worker handoff works, the OPFS sync access handle did not (fixed), and where the flow now ends
+### Step 276: the worker handoff works, the OPFS sync access handle did not (fixed), and where the flow now ends
 
 Step 275 left the worker realm's VM copy unfound. This round found it, measured every probe the widget runs,
 and fixed the one engine defect those measurements exposed.
@@ -9937,14 +9473,21 @@ The `brunhild` failure is not an engine divergence: that URL answers **502 from 
 transport shapes, and a 502 without ACAO fails a `mode:'cors'` fetch in any browser, so the reference's own
 `catch` branch produces the same value. The OPFS probe *was* ours to fix.
 
-**Fixed: the OPFS sync access handle now does real I/O.** `flush()` was a no-op over an in-memory `Uint8Array`, so
-the widget's own timing probe read 0 ms where a browser reads milliseconds — a fingerprint difference, not a missing
-feature. `createSyncAccessHandle` is now backed by a real file under a per-process temp directory
+**Fixed: the OPFS sync access handle now does real I/O.** `flush()` was a no-op over an in-memory `Uint8Array`:
+the file node never reached a device. `createSyncAccessHandle` is now backed by a real file under a per-process
+temp directory
 (`op_opfs_sync_open/write/read/flush/truncate/size/close` in `obscura-js/src/ops.rs`), with the node's `bytes` kept
 authoritative for content and the file kept in step, so a second handle still reads what the first wrote.
 
 - Measured on the local fixture, same page as step 274: `{"writeMs":0,"flushMs":0,…}` →
-  `{"writeMs":0.09999999999999987,"flushMs":4.4,"size":64,"closed":true}` (reference: 10.6 ms).
+  `{"writeMs":0.09999999999999987,"flushMs":4.4,"size":64,"closed":true}`.
+
+> Correction (Step 277): this step framed the defect as "the widget's probe reads 0 ms where a browser
+> reads milliseconds" and made `flush()` an `fsync` (4.4 ms). Both readings were wrong: the reference's
+> 10.6 ms was a promise-chain total, real Chrome `flush()` is ~12 µs (sub-clock-resolution), and the
+> widget's probe reads **0** in Chrome — so a 4.4 ms fsync flush is a *worse* fingerprint than the 0 ms
+> it replaced. Final shape (Step 277): the real file backing stays, `flush()` is a cheap write-back
+> that stays under the clock resolution.
 - The page realm still reports `hasSync:"undefined"` — `createSyncAccessHandle` stays worker-only, as in Chrome.
 - `cargo nextest -p obscura-js --features render`: **617/620**, the three failures being the previously recorded
   unrelated ones (`link_elements_use_their_own_interface_and_resolve_urls`,
@@ -10011,11 +9554,12 @@ reference `assets/thelancet-trace/www.thelancet.com_2026_09_16_17_43_57.har`.
 
 **Status.** Unmet: no `POST /1.txt`, no 404. Gained this round: the worker handoff and its gate measured (passing),
 the full probe inventory with our values, the reference's exact success signature, **two engine fixes** — OPFS sync
-access handles now hit real storage (`flush()` 0 → 4.4 ms, obscura-js suite 617/620 with only the three documented
+access handles now hit real storage (the flush-cost direction corrected in Step 277: sub-resolution write-back,
+not fsync; obscura-js suite 617/620 with only the three documented
 pre-existing failures) and `form-action` no longer inherits `default-src` (verified with a positive and a negative
 control) — plus the divergence narrowed to the interstitial's own submit step.
 
-## Step 277: the reference's OPFS timings, a correction to step 274, and where the decision is actually made
+### Step 277: the reference's OPFS timings, a correction to step 274, and where the decision is actually made
 
 Two measurements this round change what the earlier evidence means, and one of them corrects a fix from step 276.
 
@@ -10082,7 +9626,7 @@ write 477 us, close 76 us), a correction that makes our sync access handle read 
 (and which anchors survive that), and the localization of the server's decision to our stage-2 submission. Suite:
 obscura-js 618/621, the three failures the documented pre-existing ones.
 
-## Step 278: two probe candidates cleared by direct two-engine comparison, one left
+### Step 278: two probe candidates cleared by direct two-engine comparison, one left
 
 The objective's method here is comparison, so this round compared **the same fixture in real Chrome and in Obscura**
 rather than reasoning from the reference's logs. Chrome is installed on this host
@@ -10162,7 +9706,7 @@ shorter stage-3 program (step 277), so the remaining difference is in what the p
 enumerated — the values the VM computes for itself — and reading those needs the widget instrumentation re-based on
 the rotated document using the anchors step 277 identifies.
 
-## Step 279: the widget instrumentation re-based on host surface, and a live Chrome run that stops earlier than we do
+### Step 279: the widget instrumentation re-based on host surface, and a live Chrome run that stops earlier than we do
 
 **The instrumentation no longer touches the VM's obfuscated code at all.** Step 277's rotation killed the decode
 chain anchor, so the helper now goes in at the document's own `<script nonce="…">` and wraps **host surface only**
@@ -10217,7 +9761,7 @@ alone (survives the rotation, and recovered the current probe set, two probes of
 confirmation that all five worker results now return, and the live finding that real Chrome through the same proxy
 stops earlier than Obscura does — which changes what the remaining gap can be attributed to.
 
-## Step 280: the reference payload values, and two storage fields fixed from them
+### Step 280: the reference payload values, and two storage fields fixed from them
 
 Step 279's next action was to get real Chrome to pass in the same window and capture its `payloadJSON`. Chrome still
 did not pass, but the payload does not require passing: the challenge logs it field by field, and the console calls
@@ -10266,7 +9810,7 @@ auto-attach, reference payload log, parsed reference fields, our parsed fields);
 via worker auto-attach), two storage-group divergences found by diffing them, and both fixed and verified live —
 the quota now reads the browser's 10 GiB in every realm, and `flush()` costs 0.6 ms where the reference's costs 0.54.
 
-## Step 281: payload field diff, and two prototype surfaces fixed from a two-engine enumeration
+### Step 281: payload field diff, and two prototype surfaces fixed from a two-engine enumeration
 
 Step 280's diff used the reference's *own* payload values. This round adds the complementary method — run the **same
 fixture in both engines** and compare the surfaces directly — and it found more, because the reference payload only
@@ -10316,7 +9860,7 @@ surface differences (window ordering, the eight extra `SharedStorage*` globals, 
 `HTMLCameraElement` / `HTMLMicrophoneElement`, `Document.prototype.location`'s placement, and the 1 ms-vs-548 ms
 render timing).
 
-## Step 282: cpuPerformance was gated, SharedStorage was invented, and a test caught my first fix
+### Step 282: cpuPerformance was gated, SharedStorage was invented, and a test caught my first fix
 
 Working down step 281's list, with a click flow after each change as the objective asks.
 
@@ -10354,7 +9898,7 @@ the reference fields in `/tmp/chromeref/ref_fields.json`.
 realm the reference enumerates (un-gated, not duplicated — the existing test caught the duplicate), the eight
 invented `SharedStorage*` globals are gone, and both are verified on fixtures with the suite back to 618/621.
 
-## Step 283: the environment still blocks Chrome, and screen metrics are now self-consistent
+### Step 283: the environment still blocks Chrome, and screen metrics are now self-consistent
 
 **Environment check first, as the objective asks.** Real Chrome, headful, through the specified proxy at the same
 URL, three clicks on the widget frame, 75 s: **7 top-level `/fo/` POSTs, 8 widget-document loads, zero widget `/fo/`
@@ -10393,7 +9937,7 @@ question — which stays recorded but demoted, since the evidence that the chall
 stops before any widget submission too), the reference's numeric payload fields correctly identified as a
 value-to-aliases consistency map, and the screen metrics made self-consistent (`availTop` no longer overhangs).
 
-## Step 284: `document.location` placed exactly as Chrome places it
+### Step 284: `document.location` placed exactly as Chrome places it
 
 Measured both engines on one fixture (`Object.getOwnPropertyDescriptor` on the instance and on the prototype):
 
@@ -10432,7 +9976,7 @@ fields (`NnqX6` 227 vs 9700, `tZwbF3` 1006 vs 2644).
 shape *and* its prototype's absence, with the prototype prefix identical, and the environment re-checked in the same
 window.
 
-## Step 285: two fixes from objective-directed comparison (timer delivery at DCL, macOS default font metrics)
+### Step 285: two fixes from objective-directed comparison (timer delivery at DCL, macOS default font metrics)
 
 Method per the objective: no reliance on the operator's instrumented tracelog; comparison against
 `assets/thelancet-trace` (the passing Chromium-151 fp-trace + HAR) using our own engine's instruments
@@ -10470,8 +10014,10 @@ identical, but every line box was ~17 % short because Chrome resolves this host'
 19px. After the fix, measured heights match Chrome exactly on the probe set: p2 92 = 92, p3 48 = 48,
 p4 55.938 = 55.938, p8 88 = 88, caption height 33 = 33, m1/m2 22/63 = 22/63. Still divergent: `p1`
 `transform:scale(1e32…,1.89)` reads 0x0 here vs Chrome's 6.8e+32 rect; `details` 48 vs 70; `progress` 20 vs 26;
-caption width 4 vs 39.5 (its border+margin are not applied). Those are default-widget geometry work, recorded
-for the next round.
+caption width 4 vs 39.5. Those are default-widget geometry work, recorded
+for the next round. (This step attributed the caption gap to "border+margin not applied"; Step 294
+falsified that: computed style shows border **is** counted — content 25 + 2+2 = 29 — and the gap
+tracks the shaping font, not the box tree.)
 
 **fp-trace counts comparison** (`fptrace_diff.py counts` vs `renderer-trace.log`, our `--trace-api-keyed off`
 jsonl): the MISSING builtin entries (`Date.now`, `Number.parseInt`, `Promise.*`, `Function.toString`,
@@ -10499,7 +10045,7 @@ metrics change is platform-gated to the macOS identity the fixtures do not selec
 residual attributed to VM throughput), the PingFang default-metric fix with exact height parity on the
 challenge's own layout probe, the layout-probe divergence table, and the serve+CDP loopback defect.
 
-## Step 286: offset* no longer include transforms; the atomic-only strut gap characterized
+### Step 286: offset* no longer include transforms; the atomic-only strut gap characterized
 
 **Fix: `offsetWidth`/`offsetHeight` now report the layout border box and ignore visual transforms.**
 They were `Math.round(getBoundingClientRect().width/height)`, so any transformed element answered the
@@ -10534,7 +10080,7 @@ top final response 3240 B, then a re-challenge. **No `POST /1.txt`, no 404.**
 **Suites.** obscura-js 618/621 (the three documented pre-existing). obscura-render/obscura-browser
 not re-run this round (no changes to their sources since step 285's runs).
 
-## Step 287: the line-box strut reaches atomic-only runs; p6/p7 parity
+### Step 287: the line-box strut reaches atomic-only runs; p6/p7 parity
 
 **Fix 1 (`dom.rs`):** the anonymous run wrapper's strut was gated on the run containing a *text*
 node, so an img-only or progress-only line box collapsed to the atomic height. CSS line boxes carry
@@ -10565,7 +10111,7 @@ participate in the table's shrink-to-fit width negotiation. gBCR under `scale(1e
 
 **Status.** Unmet: no `POST /1.txt`, no 404.
 
-## Step 288: summary marker parity (p5 now exact); map_rect saturation
+### Step 288: summary marker parity (p5 now exact); map_rect saturation
 
 **Fix 1 (`style.rs` + `dom.rs`): the summary disclosure marker.** Chromium's UA sheet makes
 `summary` a list-item; at the probe's zero content width the outside marker wraps onto its own
@@ -10607,7 +10153,7 @@ call).
 
 **Status.** Unmet: no `POST /1.txt`, no 404.
 
-## Step 289: instrumenting the geometry op fixed p1 — the matrix folded origin overflowed
+### Step 289: instrumenting the geometry op fixed p1 — the matrix folded origin overflowed
 
 **Instrument.** `frame_geometry_json` now dumps its inputs under `OBSCURA_GEOM_DEBUG=1` (cssom
 rect, layout rect, matrix a/d/e/f, output rect). One data:-URL probe run pointed straight at it:
@@ -10644,7 +10190,7 @@ throughput-class timing fields (PWGF4 residual, tZwbF3/uGyjw9/ZMSOw0 — semanti
 operator's updated disassembly), the caption/table width negotiation, and whatever the
 payload carries that we cannot name.
 
-## Step 290: caption-only tables join the grid, and tables shrink-to-fit
+### Step 290: caption-only tables join the grid, and tables shrink-to-fit
 
 Two layers, both verified against Chrome on the bare caption fixture
 (`<div id=cfh 0x0 fixed><table><caption>cap</caption></table>` plus the same table in normal flow):
@@ -10664,10 +10210,13 @@ still resolve against the container.
 
 **Two-engine result.** table 0/1264 → **63 (Chrome 60.313)** and identical in both containers;
 caption 4 → **37.844×29 (Chrome 39.516×33)**. The residual is ~1.7 px of glyph advance on
-'cap' plus a 4 px vertical-border inclusion detail — the same text-advance noise class as p9
+'cap' — the same text-advance noise class as p9
 (26.703 vs 27.203). In the challenge's sub-pixel probe `pc` moved from `[4, 33]` to
 `[37.844, 29, -9977.2, 337]` against Chrome `[39.516, 33, -9979.2, 335]` — structural parity,
-with only sub-glyph metrics left.
+with only sub-glyph metrics left. (The 4 px height delta was first read as a "vertical-border
+inclusion detail"; Step 294 falsified that: border is fully counted on both sides, and the delta
+is the shaping font's line metrics — bundled Liberation hhea line-height 25 vs Chrome's
+PingFang SC 29.)
 
 **Suites.** render **589/589** after the table-path change.
 
@@ -10681,7 +10230,7 @@ the payload content we cannot name. The egress verdict (the final `/fo/` answer 
 re-challenge) is unchanged by seven engine fixes this session, consistent with the server weighting
 inputs we cannot observe from here.
 
-## Step 291: doc re-check and a post-rotation flow round
+### Step 291: doc re-check and a post-rotation flow round
 
 The operator's disassembly workspace (`jsvmp-engine-0916-11`) is unchanged since Sep 16 22:31 —
 no timer/timing-family files, so `uGyjw9`/`ZMSOw0`/`tZwbF3` attribution stays blocked on the
@@ -10698,7 +10247,7 @@ round this session (steps 284-291, seven engine fixes landed), so the remaining 
 where this host cannot name it: the payload contents the VM computes, and the throughput-shaped
 timings those payloads carry.
 
-## Step 292: pacing comparison against the reference HAR
+### Step 292: pacing comparison against the reference HAR
 
 Re-checked the operator's workspace: still no timer/timing-family files
 (`uGyjw9`/`ZMSOw0`/`tZwbF3` attribution remains blocked).
@@ -10719,7 +10268,7 @@ or polling stalls (those were fixed in steps 285/289).
 VM-computed payload content and its throughput-shaped numbers; attribution needs the operator's
 next disassembly drop.
 
-## Step 293: full-trace round is flow-degrading as documented; verdict stable
+### Step 293: full-trace round is flow-degrading as documented; verdict stable
 
 Re-checked the operator's workspace once more: unchanged. Two more rounds: the full-trace config
 (`--trace-api-file --trace-api-calls`) degraded the flow exactly as documented in the measurement
@@ -10731,7 +10280,7 @@ operator's next disassembly drop.
 
 **Status.** Unmet: no `POST /1.txt`, no 404.
 
-## Step 294: the caption's vertical border was never missing — the gap is shaping-font metrics
+### Step 294: the caption's vertical border was never missing — the gap is shaping-font metrics
 
 Third consecutive check of the operator's workspace: unchanged, `uGyjw9`/`ZMSOw0`/`tZwbF3`
 attribution still blocked.
@@ -10753,7 +10302,7 @@ not a default-style tweak.
 SC on macOS), caption glyph-advance minutiae (same root), throughput-class timing attribution
 (operator docs pending).
 
-## Step 295: caption border confirmed counted; fast-path leaves carry the strut; identity shaping fonts scoped
+### Step 295: caption border confirmed counted; fast-path leaves carry the strut; identity shaping fonts scoped
 
 Fourth check of the operator's workspace: unchanged — `uGyjw9`/`ZMSOw0`/`tZwbF3` attribution stays
 blocked.
@@ -10779,7 +10328,7 @@ probe's caption numbers are unchanged this round. render suite **589/589**.
 
 **Status.** Unmet: no `POST /1.txt`, no 404.
 
-## Step 296: identity-aware PingFang loading landed — inert on this host by absence of the file
+### Step 296: identity-aware PingFang loading landed — inert on this host by absence of the file
 
 **Implemented** (`inline.rs`, `new_with_web_fonts` + `resolve_loaded_font`): the engine loads
 `/System/Library/Fonts/PingFang.ttc` at construction, registers its SC faces in the internal
@@ -10806,7 +10355,7 @@ that are absent.
 
 **Status.** Unmet: no `POST /1.txt`, no 404.
 
-## Step 297: the overdue-timer repair now re-arms deno_core's sleep — PWGF4 delivery at 5 ms
+### Step 297: the overdue-timer repair now re-arms deno_core's sleep — PWGF4 delivery at 5 ms
 
 **Root cause nailed with `obscura::timers=trace`.** A tick reported
 `next_timeout_ms=Some(0.0)` while delivering nothing (`delivered=0`), followed by hundreds of
@@ -10835,29 +10384,188 @@ round), top final not reached. **No `POST /1.txt`, no 404.**
 the remaining payload deltas are the throughput/throughput-shaped numbers and the unnamed
 contents, pending the operator's next disassembly drop.
 
-## Step 297: the overdue-timer repair now re-arms deno_core's sleep — PWGF4 delivery at 5 ms
+## 测量盲区
 
-**Root cause nailed with `obscura::timers=trace`.** A tick reported
-`next_timeout_ms=Some(0.0)` while delivering nothing (`delivered=0`), followed by hundreds of
-repair cycles that never delivered: deno_core's mutable timer sleep held a waker from a dropped
-poll future, and the yield-only `op_posted_task()` wake — the entire repair — re-pollled a sleep
-that never resolved. Delivery then piggybacked on unrelated network wakes, which is why
-`PWGF4[0].t` tracked the `/fo/` fetch (59-516 ms) instead of the 0 ms deadline.
+排查中多次因为观测手段本身失真而得出错误结论，逐条记下：
 
-**Fix (`runtime.rs`, queue_overdue_timer_wake_repair):** when a browser timer is overdue, the
-repair now also enqueues a throwaway zero-delay user timer. `queue_timer` sees the earliest
-deadline and calls `change(now)`, which replaces the stale sleep and marks it ready — the next
-poll observes it and delivers every due timer, including the real one. One extra no-op callback
-per repair.
+| 盲区 | 后果 | 正确做法 |
+|------|------|----------|
+| `querySelectorAll` 不穿透 shadow；closed 模式下 `el.shadowRoot` 为 `null` | 误判「iframe 从未插入 DOM」 | CDP `Page.addScriptToEvaluateOnNewDocument` 预注入钩子截获 `attachShadow`，保留 root 引用 |
+| frame 导航路径**不打印 URL**（只有 `op_fetch_url` 打印） | 误判「iframe 文档从未被请求」 | 看 `starting new connection` / `Cookie header for <host>`，或直接插桩 |
+| 混淆代码的字符串解码表会「返回」大量错误字符串 | 把 `unsupportedbrowser` / `invalidsitekey` 等误当作被触发的错误 | 看调用形态：`CALL Window.g(<数字>)` → `RET object:Array` → `RET string:"..."` 是查表，不是触发 |
+| trace 的脚本名列对动态脚本一律记为 `<page-eval>` | 无法区分主页面代码与 iframe 内挑战代码；`challenges.cloudflare.com` 名下 0 条不代表没执行 | 该列不可用于分辨 realm；需要 realm 内注入 |
+| Cloudflare 在**失败路径上也会下发** `cf_clearance` | 误判「过盾成功」 | 判据是 `cf_chl_rc_ni`（Not Interested）等结果码，以及复用该 cookie 能否拿到真实内容 |
+| 页面脚本会在加载时缓存原生方法引用 | `--eval` 阶段（页面脚本之后）挂的钩子无效 | 用 CDP 预注入，在页面脚本之前挂 |
+| 包装 DOM 访问器（如 `contentWindow` getter）会改变被测行为 | step 6 中 `translationInit` 与心跳一并消失，整次测量作废 | 先用可控用例验证同一机制，再决定是否需要在真实页面上挂钩 |
+| 事件处理器里的异常被 `catch(e) {}` 静默吞掉 | 整整一轮排查看不到任何错误，误以为「代码没报错」 | 先把上报补上（step 7），再采信「零错误」这个结论 |
+| stealth 模式的 fetch/XHR 走 `stealth_fetch_all`，它**没有** `op_fetch_url` 的完成日志 | 看不到响应状态与大小，无法判断载荷是否送达 | 两条路径都要有完成日志 |
+| `console.error` 可被页面覆盖，但上报路径直接调内部格式化函数 | 测试里改 `console.error` 收不到消息，误判上报没生效 | 在 `op_console_msg` 这一层挂钩 |
+| `cargo build` 的输出用 `grep -E "^error"` 过滤会漏掉真正的失败行 | 拿着**没构建成功**的旧二进制跑了一轮，结论全错 | 过滤时必须同时匹配 `Finished` / `could not compile`，确认构建真的成功 |
+| 把「改 light DOM 后截图不变」当成「绘制表面陈旧」(step 16,被 step 17 推翻) | Turnstile UI 全挂在 body 的 closed shadow root 里,light DOM 子节点本就不参与渲染,截图不变是正确行为;据此把方向带偏到「表面不随 DOM 更新」,还据此作废了 step 15 前的正确推断 | 有 shadow root 时因果测试要改 shadow 内容而非 light DOM;尽早拉真实浏览器基线(js-reverse/Chrome)逐项对照,不要只从截图反推 |
+| `Runtime.evaluate` 对某些表达式形式静默不执行，只回 `{}` | 把「探针没跑」当成「被测对象没反应」 | 一律 `JSON.stringify(...)` 包住并回读断言，确认求值真的发生 |
+| **obscura 的 `Runtime.evaluate` 对多行 `JSON.stringify((function(){...})())` 静默不返回值**（同一表达式在 Chrome 上正常） | step 29 一度读到 `box=null`、`title=''`，差点判成「obscura 没渲染出 widget」，实际 widget 一直都在 | 探针表达式一律压成**单行 IIFE**；换观测面前先用已知非空的值（如 `document.title`）自检一次 |
+| **第一次 `/fo/` 直接 400 + `600010`,tokenB 不再下发** | 所有依赖大载荷的对拍突然全部失效,看起来像「刚才那次改动把链路打断了」 | **这是代理里被改写的那份 JS 的加密 key 过期**,不是引擎侧也不是 CF 侧。看到这个形态就**直接告诉用户去更新 JS**,不要继续排查引擎 |
+| **对照实验只能排除,不能定位**：撤掉改动重跑、形态相同,只证明「不是这次改动」 | step 72 据此得出「CF 对本出口 IP 升级」——一个完全编造出来的归因。真因是代理的 JS key 过期 | 排除掉自己的改动之后,剩下的空白**就让它空着**,写「原因未知」。不要用一个听起来合理的外部故事把它填上 |
+| **`obscura fetch --eval` 不 await Promise**；CDP `Runtime.evaluate` 对**多行** async IIFE 也静默返回 `{}` | 异步探针（WebRTC / getCapabilities / fetch 链）一律读到空结果，看起来像「这个 API 什么都没返回」 | 走 CDP 且带 `awaitPromise: true`，并把表达式**压成单行**；先用 `Promise.resolve(42)` 自检一次求值路径是否真的 await |
+| **探针的预注入钩子本身会被写进指纹**（`cdp_click_fast.py` 的 PRELOAD 包 `attachShadow` 并定义 `__roots`/`__pm`/`__t0`） | step 66 第一轮里 CF 载荷的 `YIjU8` 记下了钩子函数源码、`fyCZH9` 多出 `o.__pm`/`o.__roots`/`o.__t0`——**测的是探针不是引擎**，整轮作废 | 凡是要拿载荷/指纹做对拍的轮次，用零注入探针（`/tmp/clean_click.py`）；只有需要穿透 closed shadow 定位 widget 时才用带钩子的版本，且不得用该轮数据下指纹结论 |
+| MITM 代理换机器后 **CA 也换了**（本机 `Sep 30, 2025` vs 远端 `Apr 4, 2026`） | 用旧 `SSL_CERT_FILE` 会在握手阶段就失败，症状像「代理不通」 | `curl -s http://<proxy-host>:<port>/ca` 直接取 PEM，再对 `openssl s_client -proxy` 看到的 issuer 核对 CN |
+| 探针只在**主文档** realm 预注入（`Page.addScriptToEvaluateOnNewDocument`） | step 24/25 「`addEventListener` 抓不到任何 click 绑定」被归因为 handler 用 `onclick`/缓存引用；但 handler 其实活在 widget iframe 自己的 realm 里，主文档钩子看不见 | 需要观测 frame 内行为时，确认预注入是否覆盖子 realm；不覆盖就在该 realm 内插桩 |
+| **把「有 CALL、无 COMPLETE」直接判成被拦截** | 这个特征同时也是长轮询在飞的样子；据此把 brunhild 判成被 CSP 拦截，整个 Step 61 的根因认定作废 | 让被判定的分支自己发声：在拦截处打日志（url + 生效策略 + 策略来源），再用「有没有这条日志」判定，而不是用别的日志的缺失去反推 |
+| **资源被 CSP 拒绝只表现为元素的 `error` 事件** | 与网络失败完全同形；`/ci/` 的 error 一度被当成超时 | 图片/媒体等资源路径的拦截也要打日志，否则无法与网络失败区分 |
+| **只 grep `stealth_fetch completed`，把「没有完成」当成「没有调用」** | brunhild `/i/` 被判成「JS 从未构造」，真相是它有 `op_fetch_url called`、被 CSP 提前返回，整整一个 step 的归因作废 | 请求序列一律把 `op_fetch_url called` 与 completed **按时序一起列**；只有 CALL 没有 COMPLETE 正是被拦截的特征 |
+| **`serve` 日志含 ANSI 转义，`grep` 视其为二进制**（`file` 报 `data`） | `grep -c` 直接返回 0 匹配、无任何输出，误判「这一轮没有请求日志」 | 一律 `LC_ALL=C grep -a`；先用 `wc -l` 与 `tail` 确认文件确实有内容
+| **图片请求不经过 `op_fetch_url`**（走 render 的图像管线） | `/ci/` 被判成「当前版本缺失的请求」，其实一直正常加载 | 图片是否发出用元素的 `load`/`error` 事件与 `naturalWidth` 判定，不看 fetch 日志
+| 把「日志里没有」等同于「没发生」，而不先确认该路径是否在日志覆盖内 | 同上两条的共同根因 | 每次用日志缺失作论据前，先找一个**已知发生**的同类事件验证它确实会被记录
+| **二进制比代码旧**（改完代码没重建就跑真实探测） | step 29 首轮拿 20:12 的二进制去测 21:10 的提交 | 每轮实测前 `stat` 二进制时间与 `git log -1` 对一下，并确认构建输出里有 `Finished` |
+| **导航早期（t≈1s）的 `Runtime.evaluate` 会把该 target 的文档永久清空** | step 30 的胶片探针从 t=1s 开始轮询，之后每帧都是 0 元素/0 字节截图，看着像「obscura 没渲染出页面」 | 同进程对照可复现：start=20 正常 → start=1 全空 → start=20 又正常。**探针首次求值必须延后**（脚本里 `--start`，默认 12s）。这本身是待修的真实缺陷 |
+| 监听器存在 **per-realm 的 JS 结构**（`_eventTargetListeners` WeakMap）里 | 用 isolated world 注册监听器去测「事件有没有到 frame」，恒为 0，与事实无关 | 要么在事件实际派发的 realm 内插桩，要么改用「派发前挂真监听器、看它是否被调用」的端到端测法 |
+| 注入脚本读不到 bootstrap 的 script 作用域 `const` | 探针里 `_eventTargetListeners` 恒 undefined，被静默当成「没有监听器」，得出「整条链零 listener」的错误结论 | 任何读内部变量的探针都要先打印 `typeof`，确认它真的可见 |
+| **obscura 忽略 `no_proxy`，把 `127.0.0.1` 送进 `http_proxy` 且静默失败** | step 32 的本地对照页在 obscura 里恒为空 DOM，CLI 却照打 `Page loaded`，一度以为是渲染缺陷 | 跑本地/内网目标一律 `env -u http_proxy -u https_proxy -u all_proxy`；并核对 HTTP server 的访问日志确认请求真的到达 |
+| **widget-realm 预注入钩子 + 高频（≤0.3s）Runtime.evaluate 轮询 = widget 流程稳定停滞**（step 42，3/3 复现；同一 preload 单次求值 4/4 正常） | 一度把停滞归因于钩子形态（eval/Function 替换、console.warn 等），结论全错；「大载荷进 worker」的推断也由此而来，被 Rust 探针证伪 | wrap 存在时不要轮询：单次求值；或改用 Rust 侧插桩（零页面扰动）。钩子形态层面的结论需在无轮询条件下重新验证 |
+| 页面 console 日志 target 是 **`obscura::console`** 而非 `obscura_js::ops` | `RUST_LOG=obscura_js=debug` 下 grep 不到页面 console，误以为页面没输出 | `RUST_LOG='obscura_js=debug,obscura::console=info'` |
+| **obscura 不实现 `Runtime.consoleAPICalled`** | 脚本里订阅 consoleAPICalled 收零事件，误以为钩子没触发 | obscura 侧从 serve 日志读 console（Chrome 侧才用 consoleAPICalled） |
+| Chrome 侧「过了盾就再也复现不了质询」 | 清 `clear_site_data` 不够（漏 `cloudflare.com` 域），且即便 cookie 清空到 0，受信任的 IP+指纹仍直接放行，对照实验直接落空 | 用 CDP `Network.clearBrowserCookies` 清全量；仍放行时换**全新 `--user-data-dir`**（最有效），或改用受控测试页 |
+| **`waitForDebuggerOnStart` 会暂停每一个新 target，包括 worker** | step 36：跳过 worker session 不 resume → Turnstile 的十几个 blob worker 全部挂起 → widget 永远 `Verifying...`。据此得出的「Chrome 也过不了盾」「IP 被惩罚」「overrunBegin 是真实判定」**三个结论全错** | 每个 attached target 都要 `runIfWaitingForDebugger`；worker 不发 `Page.*`，且 resume 用 fire-and-forget（worker session 可能永不回包） |
+| **把「页面没加载」当成「功能不工作」**（第二次犯） | step 38：受控页在 serve 路径下 DOM 为空、JS 未执行，据此得出「obscura 不加载图片」，复核后 4 个 png 请求全部正常 | 任何「某功能没发生」的结论，先断言页面真的加载了（`document.querySelectorAll('*').length` 或一个已知元素的文本） |
+| 过盾后页面**导航到新文档**，`window.__msgs` 随之清空 | 点击后 3 秒再 dump 就已经什么都读不到，成功样本连抓两次落空 | 让 hook 同时 `console.warn`，订阅 `Runtime.consoleAPICalled` **实时收流**，不依赖 dump 时机 |
+| 默认 feature 下整个模块不参与编译（`obscura-render` 的 `paint`） | `cargo test -p obscura-render` 全程没编译 paint.rs，17 个"失败"与改动无关，新写的测试也从未运行 | 先确认目标代码真的被编译：塞一行必然报错的语句，看构建是否失败 |
+| **端口上可能跑着会话外遗留的旧 serve 进程**（启动时静默绑定失败，日志里只有一条 bind error） | step 40 前两轮探针打在 8/14 01:15 的旧进程上，时间线全是旧代码 | 每轮实测前 `ps -o lstart -p <pid>` 对比二进制 mtime；serve 启动后立即核对 `/json/version` 的浏览器版本号 |
+| **`RUST_LOG=obscura::js=debug` 匹配不到 `op_fetch_url` 日志**（target 是模块路径 `obscura_js::ops`） | 以为「页面没发请求」，实际是日志没开对 | 请求序列用 `RUST_LOG=obscura_js=debug`（模块路径），或看 `stealth_fetch completed: <METHOD> <URL> -> <status> (bytes)` 完成日志 |
+| `cdp_click_fast.py` 从 t≈0.3s 就开始 `Runtime.evaluate` 轮询 | 踩「导航早期求值永久清空文档」坑：`box=null`、title/body 全空，误判「widget 没渲染」 | 首轮求值延迟 ≥5s 再开始轮询（`/tmp/cdp_click_fast_delayed.py`） |
+| **用不点击的探针判断提交链**（step 52-55 全部轮次） | `cdp_ci_timing_hook.py` 只导航加等待,点击之后的 5052B 提交与 3256B 回传因此永远不出现,却被当成「链路到此为止」 | 判据链凡是涉及点击之后的部分,必须用 `cdp_click_fast.py`(`--start` 要落在 `interactiveBegin` 之后);不点击的轮次只能用来看点击**之前**的阶段 |
+| **预注入 net-hook 看不到 `op_fetch_url` 直发的请求**（`has_tx=false`） | step 45/46 据此得出「`/pat/` 从未被 JS 构造」,而 `/pat/` 恰好走这条路;step 55 用 Rust 日志才看到它 | 判断「某请求是否发出」以 `RUST_LOG=obscura_js=debug` 的 `op_fetch_url called` / `stealth_fetch completed` 为准,JS 钩子只能回答「由页面脚本的哪个 API 构造」 |
+| **探针里 `delete` 之后又 `defineProperty(name,{value:undefined})`** | 属性其实还在（`name in window === true`），只是值为 undefined。据此得出「删掉 TT 仍不恢复 → 还有第二处回归」的错误结论（step 51/52） | 要真正移除就只 `delete`，并当场用 `name in globalThis` 和 `Object.getOwnPropertyNames` 复验，而不是用 `typeof` |
+| **单次测量当判据**（本页多数 A/B 结论早期只测 1-2 次） | step 52 实测同一二进制 5 轮里有 1 轮偏离（`xhr=1` vs `3`），说明判据存在 CF 端偶发波动 | 二分/对拍的每个点至少重复 3 次，报告全部轮次而不是代表值；差异要在多轮上稳定才算数 |
+| **在 HEAD 上做干预实验，却把结论安到某个中间 commit 上** | step 52 一度在 HEAD（距目标 commit 还有 22 个提交）上删 TT，用结果推断该 commit 的行为 | 干预实验必须跑在被判定的那个二进制上；要证明「某 commit 引入 X」，最强的是在它**之前**的构建上注入 X 复现 |
+| **包装 `performance.getEntries*` 的钩子只在页面主动读取时产生记录**（被动观测面） | step 47 修完 `/ci/` 的 entry 后日志里看不到它，差点误判「修复没生效」——实际是 CF 在 `/ci/` 之后再没读过 performance | 「日志里没有」只能证明**没被读**，不能证明**不存在**；条目是否真的写入必须用可控用例断言（本步落成两条回归测试），实测日志只用来判断 CF 读没读、读到什么 |
+| **出口 IP 决定拿到哪种页面，1020 硬封锁态下一切诊断无效**（step 48 证据 4） | 封锁页会加载源站的 `rocket-loader.min.js` 与 `cloudflareinsights` beacon，serve 日志看着像「正常站点资源」，一度误判为过盾；而它既不是质询也不是真实响应 | 每轮开跑探针前先看 `Page loaded` 的 title：`Just a moment...` = 质询可诊断，`Attention Required! \| Cloudflare` = 1020 封锁需换 IP，其余才可能是真实响应 |
+| **质询页 DOM 里预置了全部状态文案** | `--dump text` 出现 "Verification successful. Waiting for zencare.co to respond"，误读为已通过 | 该串是静态文案不是状态；判据仍为目标 URL 返回真实 404（`/1.txt` 本就不存在） |
+| **`fetch` 模式不转发页面 console**（step 90） | fetch 轮本地测 ICE（console.log 6 条）与质询页 payloadJSON 全部静默丢弃，一度把「fetch 轮 0 条 payloadJSON」归因成「质询没跑完」——两个原因里真正致命的是这个 | 凡要读页面 console（payloadJSON/探针 console.warn）必须起 `serve`，从 serve 日志拿 |
+| **全量 `--trace` 让质询在窗口内跑不完**（step 90） | trace 轮 90 万 CALL 把页面拖慢数倍：fetch 轮 35s 到不了提交；serve 轮页面任务直接被 `autonomous browser task exceeded its task budget` 杀掉，payloadJSON=0 | trace 轮只用于看调用形态/MISS，**不用于拿提交体**；提交体用无 trace 轮，两轮分开跑 |
+| **V8 property-lookup trace 不覆盖普通 JS 对象的属性访问**（step 90） | trace 的 MISS 仅 19 条，据此会误判「CF 没探测不存在的属性」；实际 bootstrap 的 navigator 等 JS shim 的 typeof/in 走 V8 fast path，根本不进 hook——step 89 的 42 个 navigator 缺口在 trace 里不可见 | 枚举面/缺 API 类结论只能用 `enum_realm.py`/`diff_payload_enum.py` 对拍；trace 的 MISS 只回答「window 级全局查找失败」 |
+| **`console.log` 等 native 绑定不产生 CALL 行**（postMessage 同理，step 90 复证） | 想从 trace 里读 console.log 的参数（payloadJSON），CALL/HIT 里 0 条，像「没调用过」 | payloadJSON 靠 serve 日志；trace 只见 JS→JS 与 bootstrap 实现的 API 调用 |
+| **对拍脚本不先做同侧 sanity check**（step 90） | 摊平脚本「后片覆盖前片」的 bug 把 Math 指纹 184 项**完全相同**的值误报成「144→0 缺失」，差点写进文档成为假缺口 | 任何对拍脚本先跑「自己 vs 自己」的相邻批（chrome-2 vs chrome-3、obsc-2 vs obsc-3 应≈零差）再跑跨侧对比，覆盖 bug 立刻暴露 |
+| **`diff_payload_enum.py` 只识别旧字段 `fyCZH9`**（step 92） | 当前三 payload 的枚举桶名是 `ZokK1`，脚本静默输出 `n=d=s=so=bare=0`，看起来像 CF 没读任何属性 | 先断言提取总数非零；当前 payload 直接解析数字 part 中的 `ZokK1`，按探针字段名跨 part 合并后再对拍 |
+| **Performance entry 的 Rust `recording` 日志不等于 observer 已收到**（step 93） | iframe entry 的构造日志早于 payload，容易据此误判 CF 应已采集；实际 `PerformanceObserver` 回调还在 microtask 队列里 | 同时记录 `__obscura_performance_record`、`performance.getEntries()` 和 observer 回调；区分构造、入 timeline、交付 observer 三个时刻 |
+| **按分片号（part N）对齐两边 payload**（step 90） | 同一探针在 chrome 落 part 27、obscura 落 part 20，按 part 号 diff 全是假差异；第二批提交还是**增量**的（payload-3 = payload-2 + part 40），字段集合随批增长 | 对拍一律按**探针字段名**（混淆名跨边稳定）对齐，跨 part 合并同名值；先认清「增量批」语义再解释 only-字段 |
+| **`capture_challenge.py` 的 attachShadow 注入仍在污染指纹**（step 66 证据 0 重演，step 90） | `__roots`/`__cap`/`__capHooked` 进了 ZokK1 枚举桶，包装后的 attachShadow 源码进了 payload 尾部 | 该脚本抓通信可用；凡涉及枚举面/函数源码的字段要用无注入轮次（如纯 Input domain 的导航+点击），或先给脚本去注入 |
 
-**Measured.** Repair round: `PWGF4[0].t` = **5 ms** (history: 548 → 59-516 after the DCL fix → 5).
-Follow-up rounds read 183/1009 ms; the spread is challenge-flow ordering variance (the onload
-timer now fires early; when the explicit `turnstile.render` call happens depends on the
-server-driven challenge state of that round), not delivery latency — delivery is at the deadline.
+另注：`cf_clearance` 绑定 TLS 指纹 + IP + UA，跨进程复用需固定 stealth profile
+（见 `OBSCURA_PROFILE` / `OBSCURA_ROTATE_PROFILE`）。
 
-**Suites.** obscura-js 618/621, obscura-browser 124/125 (the documented pre-existing failures).
+## 未决
 
-**Flow.** 30 s round with one click: 3 `/fo/` submissions inside the window (network slower this
-round), top final not reached. **No `POST /1.txt`, no 404.**
+按当前怀疑程度排序：
 
-**Status.** Unmet: no `POST /1.txt`, no 404.
+- **`/pat/` 从不发出**（step 39/40/44/45，现首要）：Chrome 在大载荷后 366ms 必发
+  `GET /pat/`(401) 再 `GET /ci/`；obscura 无 `/pat/`、无 `/ci/`。step 44/45 修正机制定位：
+  **执行路径完整走到 127KB 交互变体，但 `/pat/` 请求从未被构造**（step 45 trace：XHR
+  open/send 一一配对 5 次无第 5 次、页面脚本名下零 fetch）。触发机制三项假设已证伪：
+  ①`hasPrivateToken` 探测（step 39 发现 3）；②XHR/fetch `privateToken` 选项（step 44）；
+  ③**「点击后窗口」**（step 45：`/pat/` 缺失在 822KB→127KB 的 **managed 分流窗口**，
+  不在点击后——回读 step 28，浏览器 `/pat/` 在第一轮 managed 阶段）；④**PAT API 探测**
+  （step 46 补充：getter 包装下 `hasPrivateToken`/`hasRedemptionRecord`/`hasStorageAccess`
+  零读取）；⑤**`/ci/` 被吞**（step 45 追加修正：`/ci/` 发出且 200，不是缺陷）；
+  ⑥**Image 缺 resource timing**（step 47 已修，`/pat/` 仍不出现——且本轮 CF 在 `/ci/`
+  之后没读过 performance，该链路根本没被走到）。下一步见「frame 缺 navigation timing」。
+- **frame 文档缺 navigation timing**（step 47 证据 3，新增，仅次于 `/pat/`）：CF 在两个
+  widget realm 各读一次 `getEntriesByType('navigation')`，**两次都是 0 条**；主文档 realm
+  正常有条目。代码侧一致——`record_performance_response(.., "navigation", ..)` 只在
+  page.rs:3536 为顶层文档调用。这是当前唯一「已证实被 CF 读取、且读到异常值」的环境面。
+- **`interactiveEnd` 疑云已澄清**（step 41）：step 40 记的「消失」是 CF 端波动——点击
+  时机修正（等 interactiveBegin 再点）后事件链完整出现（interactiveEnd@9361 →
+  fail 600010@10056）。**不是代码回归**。
+- **`/fo/` 明文获取**（step 41）：v8 trace 不可行（TextEncoder 是 deno_core native，
+  参数捕获只对 JS 帧有效）；预注入包装 TextEncoder.encode 实测主 realm 提交阶段零调用
+  ——明文不走 TextEncoder。待确认：证明计算是否跑在 worker（预注入不覆盖 worker realm）。
+- **缺 PAT 一族 Document API**（step 39）：`hasPrivateToken`/`hasRedemptionRecord`/
+  `hasStorageAccess` 均未实现（grep 确认 0 处），HaHaVM 照 Chrome 接口补齐了这一组。
+- **`fail code=600010`**（step 37）：`interactiveEnd` 稳定后仍以此码失败，并返回
+  `cfChlOut`/`cfChlOutS` 两个加密载荷。下一步查 `600010` 在 api.js 字符串表对应的分支。
+  判据链：`interactiveEnd` ✓ → `complete`+token（仍缺）。
+- **inline script 栈帧行号偏移**（step 32，指纹面首个确凿差异）：obscura 用 script 内相对
+  行号，Chrome 用文档绝对行号，偏移 == `<script>` 标签所在行。落在 Cloudflare 明确采集的
+  `Error.stack` 面上，一行代码即可检测。修法：V8 `ScriptOrigin` 传 inline script 的起始
+  行/列偏移。（注意：本次 `cs` 的 10 帧全是外部脚本，尚未证明它就是判失败的直接原因。）
+- **label activation 剩余项**（step 30，正式实现已落地 `7521680`）：`labels`/`control`
+  IDL 补真（`htmlFor` 已有），`HTMLElement.click()` 路径的 label 转发（程序化点击仍到不了
+  input）。
+- **导航早期 `Runtime.evaluate` 清空文档**（step 30 发现）：可复现、与质询无关的真实
+  缺陷，但会持续毒化任何早期轮询的探针，值得单独修 + 回归测试。
+- **obscura 不尊重 `no_proxy`/`NO_PROXY`**（step 32 顺带发现）：设了 `no_proxy='*'` 仍会把
+  `127.0.0.1` 的请求送进 `http_proxy`，且**静默失败**——CLI 照样打印 `Page loaded`，只是
+  内容为空。只能靠 `env -u http_proxy -u https_proxy -u all_proxy` 绕开。
+- **自动点击策略**（step 28 时序约束）：一旦上一条打通，fetch 流程需要在复选框渲染的
+  **第一时间**点击，不能先等待观测——129s 会换 ray，token 作废。归属（调用方 / CLI
+  工作流 / `--solve-interactive` 之类开关）待定。
+- **obscura `Runtime.evaluate` 的多行表达式静默失败**（step 29 发现）：与质询无关，但
+  会持续毒化探针，且是真实的 CDP 一致性缺陷，值得单独修 + 回归测试。
+- **早期 timer 迟发 600–2500 ms**（step 9），与 Cloudflare 自测的 `timeTiefMs`
+  吻合。成因未定位，下一步给事件循环的 poll/park 插桩。
+- **Performance Timeline 全空**（step 10），且 `PerformanceObserver.supportedEntryTypes`
+  缺失——后者是一行即可命中的检测点。
+- 栈底仍有 2 帧 `_runAtNesting (<obscura:bootstrap>:890:9)` + `<obscura:bootstrap>:905:5`
+  （step 8 提出，step 48 复现，行号随 bootstrap 变动）。浏览器里 setTimeout 回调的栈到
+  回调那一帧就结束，下面没有引擎帧。CF 经 `{"event":"execute"}` 的 `cs` 字段主动采集并
+  传输该栈，是确定被读取、且与 Chrome 确定有差异的指纹面。
+- ~~父窗口是否回应了子窗口的 `requestExtraParams` 未证实。~~ **step 48 已证实：回应了。**
+  双向被动监听对拍显示 widget 在自身 realm 的 41ms 即收到完整 managed 配置，且 `food`/`meow`
+  心跳 32 对双向闭环。断点不在 postMessage 通道，在 widget realm 内部。
+- 跨源访问 `parent.location.origin` 返回 `undefined`，浏览器应抛 `SecurityError`。
+  可被检测的差异，未修。
+
+### 通用能力回填（路线图 P1/P2，2026-08-15）
+
+本记录中的 `labels/control`、`NO_PROXY` 和“fetch 不自动交互”观察已分别回填为通用
+实现：表单 IDL/程序化 label 激活已完成；reqwest、脚本 fetch 与 stealth/wreq 现在遵守
+`NoProxy::from_env`；输入策略通过 embedder 提供 selector/timing policy，不读取挑战文案、
+主机名或 Cloudflare 状态。真实挑战仍以 `600010` 为独立未解决项。
+
+新增的 WebSocket、WebGL、indexedDB、HTTP/2、frame layout cache 与 Debugger/host trace
+均有独立 `js-repros/` fixture。当前主机没有 Chrome/Chromium 可执行文件，故没有伪造
+Chrome 146 oracle；各 fixture README 标明了这一验证边界。
+
+### Step 298: the TS#2 "park" was the proxy's injected replay build, not the engine (2026-09-17)
+
+**假设**：带 trace/无 trace 的 30 秒轮都在 TS#2 之后停住（无 worker 突发、无 TS#3、
+CPU 0.0% 纯空闲），且页面进入探测重试循环，是引擎事件缺失。
+
+**方法**：V8 native trace（`--trace-api-file jsonl --trace-api-calls --trace-api-keyed off`）
++ `--trace-op-file` 对照 `assets/thelancet-trace` 参考；SSH 读代理进程命令行。
+
+**证据**：代理（192.168.3.57:9000）实际运行 `mitmweb -s mitm_inject_ov2_addon.py
+--set ov2_inject_enabled=true`，把 `rch/.../normal` 文档的挑战脚本替换为本地插桩
+`ov2.js`（replay build）。该 build 的流程在 payload 之后即停。通过 mitmweb options API
+（Tornado XSRF cookie + `X-Xsrftoken`，需 localhost）置 `ov2_inject_enabled=false` 后，
+同一二进制立即走完参考全部 8 步：main#1 → TS#1(822k) → pat401 → TS#2(127228B，与参考
+逐字节同长) → **TS#3(5148B) → main#2(3240B)**，随后服务端重开一轮而非放行。
+
+**结论**：此前多轮的"TS#2 后停住"是插桩 build 的形态，不能作为引擎分岔证据。
+对拍前必须先确认代理未改写挑战文档。仍未通过：判定失败发生在加密载荷内部
+（与 step 262 一致）；不点击则停在 TS#2（我们拿 interactive 变体，参考 Chrome 拿
+managed 免点击变体）。
+
+### Step 299: debugger 探针任务被静默丢弃 + 页面可见 console 探针（2026-09-17）
+
+**假设**：`Worker.postMessage` 里 `data.indexOf('debugger') !== -1` 直接 return，
+丢弃了 `eval(_p?_p.createScript("debugger"):"debugger");postMessage({yNiq8:"TWnkF5"})`
+这个往返探针（参考 trace rel 3.200 有该任务且收到回复）；2601bbc 遗留的
+`[worker] post/onmessage/out queued/out deliver/source ok/stub blob ctor`、
+`[new-url]`（按 challenges.cloudflare.com 主机名触发）、`[fetch-empty]`
+（dump `_environmentSettings()`）等 console.error 探针是页面可见的引擎噪声。
+
+**方法**：本地 fixture 复现任务往返（修复前无回复，修复后 `{"yNiq8":"TWnkF5"}`）；
+对照参考任务文本；ops trace 里数 console.error 条数。
+
+**证据**：修复前 run2 里 `[worker] post …debugger…` 已打出而回复不存在；修复后
+round-trip fixture 直接回包。console 探针从 16 条降到挑战自有的 2 条（Qssv3）。
+
+**修复**：`dedicated-worker.js` 删除 debugger 丢弃与全部 `[worker]*` 探针；
+`url.js` 删除 `[new-url]`；`fetch.js` 删除 `[fetch-empty]`。同轮验证 worker 隔离内
+timer（100/1000/3000ms 全回）、OPFS 探针（uUOw3=0.6ms）、wasm plan 基准
+（instantiate 3.9ms / loop 88.6ms，完整结果回页）、subtle.digest 200×100KB=60ms、
+PerformanceObserver buffered 交付、resource timing 字段，全部健康。
+
+**门禁**：obscura-js crate 单跑首轮 1 失败（frame_elements_report_their_own_document_geometry，
+stash 后干净树同样失败，属既有问题）；全 workspace `--no-fail-fast` **1820/1820 通过**
+（4 leaky、4 skipped）。obstacle course companion repo 仍不在工作区。真实 404 未取得。

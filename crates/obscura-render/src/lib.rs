@@ -173,11 +173,17 @@ impl CanvasTextMeasurer {
         } else {
             self.engine.measure_canvas_text(text, &style)
         };
+        let (ink_left, ink_right, ink_ascent, ink_descent) =
+            self.engine.measure_canvas_ink(text, &style);
         let (font_ascent, font_descent) = self.engine.inline_font_box_metrics(&style);
         CanvasTextMetrics {
             width,
             font_ascent,
             font_descent,
+            ink_left,
+            ink_right,
+            ink_ascent,
+            ink_descent,
         }
     }
 
@@ -193,16 +199,23 @@ impl CanvasTextMeasurer {
 
 /// What `CanvasRenderingContext2D.measureText` needs from the layout engine.
 ///
-/// Only the two font-box numbers are reported alongside the width: they come
-/// from the face's horizontal header, grid-fitted the same way inline layout
-/// fits them, which is what makes them integers in Chrome too. Ink extents
-/// (the `actualBoundingBox*` family) would need per-glyph outlines and are
-/// derived from this box by the caller instead of being invented here.
+/// The two font-box numbers come from the face's horizontal header,
+/// grid-fitted the same way inline layout fits them, which is what makes them
+/// integers in Chrome too. The `ink_*` extents are the union of the scaled
+/// glyph outlines (or of the bitmap strike's placement for color faces):
+/// fractional for vector fonts, integer for bitmap emoji, exactly the
+/// `actualBoundingBox*` family Chrome reports.
 #[cfg(feature = "paint")]
 pub struct CanvasTextMetrics {
     pub width: f32,
     pub font_ascent: f32,
     pub font_descent: f32,
+    /// Signed distance from the pen origin to the left/right ink edge.
+    pub ink_left: f32,
+    pub ink_right: f32,
+    /// Ink extents above and below the alphabetic baseline.
+    pub ink_ascent: f32,
+    pub ink_descent: f32,
 }
 
 #[cfg(feature = "paint")]

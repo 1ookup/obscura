@@ -6393,9 +6393,10 @@ fn op_canvas_measure_text(
     width
 }
 
-/// Width plus the grid-fitted font box, as `"<width>,<ascent>,<descent>"`.
+/// Width, grid-fitted font box, and glyph ink extents, as
+/// `"<width>,<ascent>,<descent>,<inkLeft>,<inkRight>,<inkAscent>,<inkDescent>"`.
 ///
-/// A flat string rather than JSON: three numbers on a path `measureText` calls
+/// A flat string rather than JSON: seven numbers on a path `measureText` calls
 /// per invocation, where the parse cost is the whole cost.
 #[cfg(feature = "render")]
 #[op2]
@@ -6406,9 +6407,18 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
         .borrow_mut()
         .canvas_text_measurer
         .measure_metrics(text, font);
+    eprintln!("[op-canvas-metrics] ink=({},{},{},{}) box=({},{})",
+        metrics.ink_left, metrics.ink_right, metrics.ink_ascent, metrics.ink_descent,
+        metrics.font_ascent, metrics.font_descent);
     format!(
-        "{},{},{}",
-        metrics.width, metrics.font_ascent, metrics.font_descent
+        "{},{},{},{},{},{},{}",
+        metrics.width,
+        metrics.font_ascent,
+        metrics.font_descent,
+        metrics.ink_left,
+        metrics.ink_right,
+        metrics.ink_ascent,
+        metrics.ink_descent
     )
 }
 

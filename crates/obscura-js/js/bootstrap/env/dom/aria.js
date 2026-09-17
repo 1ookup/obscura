@@ -28,7 +28,19 @@ function _measureTextBox(text, font) {
       const ascent = Number(parts[1]);
       const descent = Number(parts[2]);
       if (Number.isFinite(width) && Number.isFinite(ascent) && Number.isFinite(descent)) {
-        return { width, ascent, descent };
+        const inkLeft = Number(parts[3]);
+        const inkRight = Number(parts[4]);
+        const inkAscent = Number(parts[5]);
+        const inkDescent = Number(parts[6]);
+        const ink = Number.isFinite(inkLeft) && Number.isFinite(inkRight)
+          && Number.isFinite(inkAscent) && Number.isFinite(inkDescent);
+        return {
+          width, ascent, descent,
+          inkLeft: ink ? inkLeft : undefined,
+          inkRight: ink ? inkRight : undefined,
+          inkAscent: ink ? inkAscent : undefined,
+          inkDescent: ink ? inkDescent : undefined,
+        };
       }
     }
   } catch (_error) {}

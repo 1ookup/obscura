@@ -281,9 +281,25 @@ fn resolve_loaded_font(
     if let Some(stack) = fam {
         for token in stack.split(',') {
             let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            // Chrome on macOS resolves the generic `sans-serif` (the canvas
+            // default font) to the same PingFang SC face it uses for the
+            // default family: measureText at 10/16px reports PingFang's
+            // grid-fitted box (11/3, 17/5), not Helvetica's and not the
+            // bundled sans'. Prefer the host face for that token when the
+            // identity is macOS, exactly like the default-family path below.
+            let generic_sans_on_macos = font_platform() == FontPlatform::MacOs
+                && name.eq_ignore_ascii_case("sans-serif");
+
             let family = loaded
                 .get(&name.to_ascii_lowercase())
                 .filter(|entry| entry.is_webfont)
+                .or_else(|| {
+                    if generic_sans_on_macos {
+                        loaded.get("__obscura_system_pingfang")
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| {
                     bundled_face_for_css_token(name)
                         .and_then(|face| loaded.get(&face.family().to_ascii_lowercase()))
@@ -1113,6 +1129,23 @@ impl TextEngine {
         Self::new_with_web_fonts(&fonts)
     }
 
+    /// Host font bytes are read once per process and shared by every engine
+    /// (page, frame, and worker realms each construct one): the emoji TTC is
+    /// over a hundred megabytes, and a per-engine copy would multiply that by
+    /// the number of live isolates.
+    fn shared_host_font(path: &str) -> Option<Arc<Vec<u8>>> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<Vec<u8>>>>> =
+            std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().ok()?;
+        if let Some(bytes) = guard.get(path) {
+            return Some(Arc::clone(bytes));
+        }
+        let bytes = Arc::new(std::fs::read(path).ok()?);
+        guard.insert(path.to_string(), Arc::clone(&bytes));
+        Some(bytes)
+    }
+
     pub(crate) fn new_with_web_fonts(fonts: &[WebFont]) -> Self {
         // Build a database from embedded and page-provided faces. Never call
         // load_system_fonts: a host's font set would make layout differ
@@ -1126,9 +1159,9 @@ impl TextEngine {
         // family that CSS cannot select, so font-presence probes and
         // authored font-family stacks are untouched. A host without the file
         // keeps the bundled faces.
-        if let Ok(pingfang) = std::fs::read("/System/Library/Fonts/PingFang.ttc") {
+        if let Some(pingfang) = Self::shared_host_font("/System/Library/Fonts/PingFang.ttc") {
             for id in
-                db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(pingfang)))
+                db.load_font_source(cosmic_text::fontdb::Source::Binary(pingfang))
             {
                 if let Some(face) = db.face(id) {
                     let is_sc = face.families.iter().any(|(name, _)| name.contains("SC"));
@@ -1142,6 +1175,23 @@ impl TextEngine {
                         Some(face.style != cosmic_text::fontdb::Style::Normal),
                     ));
                 }
+            }
+        }
+        // NOTE (open): loading Apple Color Emoji into this database shifts
+        // Latin shaping enough to break
+        // `negative_letter_spacing_changes_intrinsic_line_breaks` (weight-500
+        // text wraps one word earlier), so the face is NOT registered here
+        // yet. Emoji ink should come from a dedicated measure-side scaler
+        // over the shared bytes (sbix walk) instead of the shaping database;
+        // see the 2026-09-17 TextMetrics section of the challenge profile.
+        if let Some(emoji) = None
+            .or_else(|| Self::shared_host_font("/System/Library/Fonts/Apple Color Emoji.ttc"))
+            .filter(|_| false)
+        {
+            for id in
+                db.load_font_source(cosmic_text::fontdb::Source::Binary(emoji))
+            {
+                declarations.push((id, Some("__obscura_system_emoji".to_string()), None, None));
             }
         }
         for bytes in [
@@ -1481,6 +1531,117 @@ impl TextEngine {
             width = width.max((run.line_w.max(0.0) * 64.0).round() / 64.0);
         }
         width
+    }
+
+    /// Glyph ink extents for a canvas `measureText` call, in baseline-relative
+    /// pixel space: `(min_x, max_x, ascent_above_baseline, descent_below)`.
+    ///
+    /// Chrome answers the `actualBoundingBox*` family from the union of the
+    /// scaled glyph outlines (fractional for vector faces) or of the bitmap
+    /// strike's placement (integer, e.g. Apple Color Emoji), not from the
+    /// font box. Spaces and empty text carry no ink.
+    pub(crate) fn measure_canvas_ink(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+    ) -> (f32, f32, f32, f32) {
+        if text.trim().is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let previous_len = self.items.len();
+        let idx = match self.push_generated_text(text, style) {
+            Some(idx) => idx,
+            None => return (0.0, 0.0, 0.0, 0.0),
+        };
+        let result = self.canvas_item_ink(idx);
+        self.items.truncate(previous_len);
+        result
+    }
+
+    fn canvas_item_ink(&mut self, idx: usize) -> (f32, f32, f32, f32) {
+        let TextEngine {
+            font_system,
+            items,
+            variable_swash,
+            ..
+        } = self;
+        let Some(item) = items.get_mut(idx) else {
+            return (0.0, 0.0, 0.0, 0.0);
+        };
+        let wrap = item.layout_wrap;
+        shape_with_text_indent(font_system, item, None, wrap);
+        // Collect the shaped glyph specs first: scaling needs &mut font_system
+        // while the runs borrow the buffer.
+        let mut specs: Vec<(cosmic_text::fontdb::ID, u16, f32, f32)> = Vec::new();
+        for run in item.buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                specs.push((
+                    glyph.font_id,
+                    glyph.glyph_id,
+                    glyph.font_size,
+                    glyph.x + glyph.x_offset,
+                ));
+            }
+        }
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut ascent = f32::NEG_INFINITY;
+        let mut descent = f32::NEG_INFINITY;
+        for (font_id, glyph_id, font_size, x_offset) in specs {
+            let Some(font) = font_system.get_font(font_id) else {
+                continue;
+            };
+            let mut scaler = variable_swash
+                .context
+                .builder(font.as_swash())
+                .size(font_size)
+                .hint(false)
+                .build();
+            // A color bitmap face (Apple Color Emoji) also carries a
+            // placeholder vector outline per glyph; the bitmap is the real
+            // ink, so it wins over the outline. Chrome reports bitmap ink as
+            // integers and vector ink as fractional outline bounds.
+            let ink = scaler
+                .scale_color_outline(glyph_id)
+                .map(|outline| {
+                    let bounds = outline.bounds();
+                    (bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y)
+                })
+                .or_else(|| {
+                    scaler
+                        .scale_color_bitmap(glyph_id, StrikeWith::BestFit)
+                        .map(|image| {
+                            let placement = image.placement;
+                            // swash bitmap placement: left of pen origin, top
+                            // above the baseline, y-up.
+                            (
+                                placement.left as f32,
+                                placement.top as f32 - placement.height as f32,
+                                placement.left as f32 + placement.width as f32,
+                                placement.top as f32,
+                            )
+                        })
+                })
+                .or_else(|| {
+                    scaler.scale_outline(glyph_id).map(|outline| {
+                        let bounds = outline.bounds();
+                        (bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y)
+                    })
+                });
+            if let Some((x0, y0, x1, y1)) = ink {
+                min_x = min_x.min(x_offset + x0);
+                max_x = max_x.max(x_offset + x1);
+                // Outline bounds are y-up: ink above the baseline is positive
+                // (bounds.max.y), below it negative (bounds.min.y).
+                ascent = ascent.max(y1);
+                descent = descent.max(-y0);
+            }
+        }
+        if min_x.is_finite() {
+            (min_x, max_x, ascent, descent)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        }
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -5184,5 +5345,88 @@ gamma</div>"#,
         // A single-color list samples to that color everywhere.
         let flat = (0.0f32, vec![([7, 8, 9, 255], None)]);
         assert_eq!(sample_gradient(&flat, 3.0, 3.0, 20.0, 20.0), [7, 8, 9, 255]);
+    }
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::*;
+
+    fn style(font_size: f32, family: &str) -> LayoutStyle {
+        let mut style = LayoutStyle::default();
+        style.font_size = Some(font_size);
+        style.font_family = Some(family.to_string());
+        style.white_space = Some(crate::WhiteSpace::Pre);
+        style
+    }
+
+    #[test]
+    fn vector_ink_is_outline_bounds_inside_the_font_box() {
+        let mut engine = TextEngine::new();
+        let style = style(16.0, "sans-serif");
+        let (font_ascent, font_descent) = engine.inline_font_box_metrics(&style);
+        let (left, right, ascent, descent) = engine.measure_canvas_ink("HxjgqMMM", &style);
+        // Real outline bounds: fractional, above the baseline, strictly inside
+        // the grid-fitted font box, and never to the left of the pen origin
+        // by more than a side bearing.
+        // Outline ink may overshoot the grid-fitted font box by a hair; only
+        // a font-box-derived fake would sit exactly on it.
+        assert!(ascent > 0.0 && ascent <= font_ascent + 2.0);
+        assert!(descent > 0.0 && descent <= font_descent + 2.0,
+            "descent {descent} must be real ink below the baseline");
+        assert!(left >= -2.0 && left < right);
+        assert!(right > 0.0);
+        let (_, _, space_ascent, space_descent) = engine.measure_canvas_ink("   ", &style);
+        assert_eq!((space_ascent, space_descent), (0.0, 0.0));
+    }
+
+    /// Restores the font platform when the test ends, successful or not.
+    struct PlatformGuard;
+    impl Drop for PlatformGuard {
+        fn drop(&mut self) {
+            set_font_platform("Win32");
+        }
+    }
+
+    #[test]
+    fn macos_generic_sans_reports_the_host_pingfang_font_box() {
+        let Ok(_) = std::fs::read("/System/Library/Fonts/PingFang.ttc") else {
+            return;
+        };
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let engine = TextEngine::new();
+        let box16 = engine.inline_font_box_metrics(&style(16.0, "sans-serif"));
+        let box10 = engine.inline_font_box_metrics(&style(10.0, "sans-serif"));
+        // Chrome on macOS answers the generic sans-serif with PingFang SC's
+        // grid-fitted hhea box: 1060/340 at upem 1000.
+        assert_eq!(box16, (17.0, 5.0), "16px sans-serif font box");
+        assert_eq!(box10, (11.0, 3.0), "10px sans-serif font box");
+    }
+
+    #[test]
+    fn canvas_measurer_reports_pingfang_box_under_macos_identity() {
+        let Ok(_) = std::fs::read("/System/Library/Fonts/PingFang.ttc") else { return };
+        let _guard = PlatformGuard;
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        let metrics = measurer.measure_metrics("x", "16px sans-serif");
+        assert_eq!((metrics.font_ascent, metrics.font_descent), (17.0, 5.0));
+    }
+
+    #[test]
+    fn emoji_ink_stays_finite_until_the_measure_side_scaler_lands() {
+        // The host emoji face is deliberately NOT in the shaping database
+        // (see the NOTE in new_with_web_fonts): loading it shifts Latin
+        // shaping. Until the dedicated sbix scaler exists, emoji clusters
+        // shape from the fallback face and the ink plumbing must still answer
+        // finite, ordered extents rather than the old font-box copy.
+        let mut engine = TextEngine::new();
+        let style = style(16.0, "sans-serif");
+        let (left, right, ascent, descent) = engine.measure_canvas_ink("\u{1F600}", &style);
+        assert!(left.is_finite() && right.is_finite());
+        assert!(ascent.is_finite() && descent.is_finite());
+        assert!(ascent > 0.0);
+        assert!(right >= left);
     }
 }

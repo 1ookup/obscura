@@ -380,18 +380,25 @@ class _Canvas2D {
     if (align === 'end') align = direction === 'rtl' ? 'left' : 'right';
     const alignmentOffset = align === 'center' ? box.width / 2
       : align === 'right' ? box.width : 0;
+    // Real ink extents from the shaped glyph outlines (or the bitmap strike
+    // for color faces): Chrome reports these signed, relative to the text
+    // alignment point -- abbLeft positive going LEFT from that point, abbRight
+    // positive going RIGHT -- with spaces contributing nothing. Without a
+    // render layer there are no outlines, and the font box remains the
+    // fallback.
+    const hasRealInk = Number.isFinite(box.inkLeft);
     return _makeTextMetrics({
       width: box.width,
-      // No per-glyph outlines are available here, so the ink extents fall back
-      // to the font box and the advance. That is a superset of the real ink
-      // rather than an invented number, and it stays consistent with the
-      // font box reported beside it.
-      actualBoundingBoxLeft: alignmentOffset,
-      actualBoundingBoxRight: (hasInk ? box.width : 0) - alignmentOffset,
+      actualBoundingBoxLeft: hasRealInk
+        ? alignmentOffset - box.inkLeft
+        : alignmentOffset,
+      actualBoundingBoxRight: hasRealInk
+        ? box.inkRight - alignmentOffset
+        : (hasInk ? box.width : 0) - alignmentOffset,
       fontBoundingBoxAscent: box.ascent,
       fontBoundingBoxDescent: box.descent,
-      actualBoundingBoxAscent: hasInk ? box.ascent : 0,
-      actualBoundingBoxDescent: hasInk ? box.descent : 0,
+      actualBoundingBoxAscent: hasRealInk ? box.inkAscent : (hasInk ? box.ascent : 0),
+      actualBoundingBoxDescent: hasRealInk ? box.inkDescent : (hasInk ? box.descent : 0),
       // Chrome puts the hanging baseline at 80% of the font ascent, the
       // alphabetic one at the origin, and the ideographic one at the font
       // descent. Checked against Chrome 146 for sans-serif, Arial, Times New
