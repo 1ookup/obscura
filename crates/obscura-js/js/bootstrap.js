@@ -188,6 +188,7 @@
 // @obscura-module env/html/svg-geometry.js
 // @obscura-module env/media/canvas-rendering-context-2d.js
 // @obscura-module env/media/canvas-element.js
+// @obscura-module env/media/support/audio-dsp.js
 // @obscura-module env/media/support/audio-context-behavior.js
 // @obscura-module env/media/audio-buffer.js
 // @obscura-module env/media/audio-context.js

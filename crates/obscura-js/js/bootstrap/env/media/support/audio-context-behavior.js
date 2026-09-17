@@ -32,16 +32,35 @@ function _audioBufferCopyToChannel(buffer, source, channel, start) {
   }
 }
 
-function _audioParam(value, min = -3.4028235e38, max = 3.4028235e38) {
+// A parameter assignment carries a time, not just a value: the renderer
+// schedules a setValueAtTime at the context's current position, and a parameter
+// with an event still ahead of the render position is processed per sample.
+function _audioParamFrame(context) {
+  if (!context) return 0;
+  if (typeof context._audioRenderFrame === 'number') return context._audioRenderFrame;
+  return Math.round((Number(context.currentTime) || 0) * (Number(context.sampleRate) || 44100));
+}
+
+function _audioParam(value, min = -3.4028235e38, max = 3.4028235e38, context = null) {
   // An AudioParam is its own interface, so a probe reading the prototype of a
   // filter's `frequency` gets `[object AudioParam]`, not a bare object.
-  return _bindInterface({
-    value,
+  let current = Number(value);
+  const param = _bindInterface({
     defaultValue: value,
     minValue: min,
     maxValue: max,
     setValueAtTime() {},
   }, 'AudioParam');
+  Object.defineProperty(param, 'value', {
+    enumerable: true,
+    configurable: true,
+    get() { return current; },
+    set(next) {
+      current = Number(next);
+      _audioDspNoteParamSet(param, _audioParamFrame(context));
+    },
+  });
+  return param;
 }
 
 // Graph plumbing for the offline renderer. Node objects stay inert stubs to
@@ -82,10 +101,26 @@ function _bindInterface(node, className) {
 function _audioNodeState(node, create) {
   let state = _audioGraph.get(node);
   if (!state && create) {
-    state = { inputs: [], started: false, buffer: null, detector: 0, phase: 0 };
+    state = {
+      inputs: [],
+      started: false,
+      buffer: null,
+      detector: 0,
+      phase: 0,
+      virtualReadIndex: 0,
+      sampleRate: 0,
+    };
     _audioGraph.set(node, state);
   }
-  return state || { inputs: [], started: false, buffer: null, detector: 0, phase: 0 };
+  return state || {
+    inputs: [],
+    started: false,
+    buffer: null,
+    detector: 0,
+    phase: 0,
+    virtualReadIndex: 0,
+    sampleRate: 0,
+  };
 }
 function _audioConnect(node, destination) {
   if (destination && typeof destination === 'object') {
@@ -136,8 +171,8 @@ function _audioContextCreateOscillator(context) {
   return _bindInterface({
     context,
     type: 'sine',
-    frequency: _audioParam(440, -22050, 22050),
-    detune: _audioParam(0, -153600, 153600),
+    frequency: _audioParam(440, -22050, 22050, context),
+    detune: _audioParam(0, -153600, 153600, context),
     connect(destination) { return _audioConnect(this, destination); },
     disconnect(destination) { _audioDisconnect(this, destination); },
     start(when) { _audioStart(this, when); },
@@ -148,11 +183,11 @@ function _audioContextCreateOscillator(context) {
 function _audioContextCreateDynamicsCompressor(context) {
   return _bindInterface({
     context,
-    threshold: _audioParam(-24, -100, 0),
-    knee: _audioParam(30, 0, 40),
-    ratio: _audioParam(12, 1, 20),
-    attack: _audioParam(0.003, 0, 1),
-    release: _audioParam(0.25, 0, 1),
+    threshold: _audioParam(-24, -100, 0, context),
+    knee: _audioParam(30, 0, 40, context),
+    ratio: _audioParam(12, 1, 20, context),
+    attack: _audioParam(0.003, 0, 1, context),
+    release: _audioParam(0.25, 0, 1, context),
     reduction: 0,
     connect(destination) { return _audioConnect(this, destination); },
     disconnect(destination) { _audioDisconnect(this, destination); },
@@ -197,7 +232,7 @@ function _audioContextCreateAnalyser(context) {
 function _audioContextCreateGain(context) {
   return _bindInterface({
     context,
-    gain: _audioParam(1),
+    gain: _audioParam(1, -3.4028235e38, 3.4028235e38, context),
     connect(destination) { return _audioConnect(this, destination); },
     disconnect(destination) { _audioDisconnect(this, destination); },
   }, 'GainNode');
@@ -206,9 +241,9 @@ function _audioContextCreateBiquadFilter(context) {
   return _bindInterface({
     context,
     type: 'lowpass',
-    frequency: _audioParam(350, 0, 22050),
-    Q: _audioParam(1, 0.0001, 1000),
-    gain: _audioParam(0, -40, 40),
+    frequency: _audioParam(350, 0, 22050, context),
+    Q: _audioParam(1, 0.0001, 1000, context),
+    gain: _audioParam(0, -40, 40, context),
     connect() {}, disconnect() {},
   }, 'BiquadFilterNode');
 }
@@ -242,109 +277,32 @@ function _audioContextClose(context) { context.state = 'closed'; return Promise.
 
 function _offlineAudioInitialize(context, channelsOrOptions, length, sampleRate) {
   if (typeof channelsOrOptions === 'object' && channelsOrOptions !== null) {
+    context.numberOfChannels = channelsOrOptions.numberOfChannels || 1;
     context.length = channelsOrOptions.length || 44100;
     context.sampleRate = channelsOrOptions.sampleRate || 44100;
   } else {
+    context.numberOfChannels = channelsOrOptions || 1;
     context.length = length || 44100;
     context.sampleRate = sampleRate || 44100;
   }
+  // An offline context is suspended until its graph is rendered, and the
+  // destination's channel count is the context's.
+  context.state = 'suspended';
+  context.destination.channelCount = context.numberOfChannels;
+  context.destination.maxChannelCount = context.numberOfChannels;
   context.oncomplete = null;
-}
-// Oscillator waveforms, Web Audio spec shapes.
-function _oscillatorSample(node, index, sampleRate) {
-  const frequency = (node.frequency && Number(node.frequency.value)) || 440;
-  const detune = (node.detune && Number(node.detune.value)) || 0;
-  const hz = frequency * Math.pow(2, detune / 1200);
-  const state = _audioNodeState(node, false);
-  state.phase = (index * hz / sampleRate) % 1;
-  const t = state.phase;
-  switch (node.type) {
-    case 'square': return t < 0.5 ? 1 : -1;
-    case 'sawtooth': return 2 * (t - Math.floor(t + 0.5));
-    case 'triangle': {
-      const x = Math.abs(2 * t - 1);
-      return 2 * x - 1;
-    }
-    case 'custom': return 0;
-    default: return Math.sin(2 * Math.PI * t);
-  }
-}
-
-// DynamicsCompressor per the Web Audio spec: peak-detector envelope in
-// linear space, soft-knee curve in dB, fixed makeup gain. The curve blends
-// slope 1 at the threshold into slope 1/ratio at the knee end:
-//   y = theta + kappa * (t + (1/rho - 1) * t^2),  t = (x - theta) / kappa
-function _compressorSample(node, input, sampleRate) {
-  const threshold = (node.threshold && Number(node.threshold.value)) || -24;
-  const knee = (node.knee && Number(node.knee.value)) || 30;
-  const ratio = (node.ratio && Number(node.ratio.value)) || 12;
-  const attack = (node.attack && Number(node.attack.value)) || 0.003;
-  const release = (node.release && Number(node.release.value)) || 0.25;
-  const state = _audioNodeState(node, true);
-  const attackCoef = Math.exp(-1 / (Math.max(attack, 1e-6) * sampleRate));
-  const releaseCoef = Math.exp(-1 / (Math.max(release, 1e-6) * sampleRate));
-  const magnitude = Math.abs(input);
-  const coef = magnitude > state.detector ? attackCoef : releaseCoef;
-  state.detector = coef * state.detector + (1 - coef) * magnitude;
-  const xDb = 20 * Math.log10(state.detector || 1e-9);
-  let yDb;
-  if (xDb <= threshold) {
-    yDb = xDb;
-  } else if (xDb >= threshold + knee) {
-    yDb = threshold + (xDb - threshold) / ratio;
-  } else {
-    const t = (xDb - threshold) / knee;
-    yDb = threshold + knee * (t + (1 / ratio - 1) * t * t);
-  }
-  const reduction = yDb - xDb;
-  node.reduction = reduction;
-  // Chrome's fixed makeup gain for the linear region's end:
-  // -(threshold + knee/2) / ratio in dB.
-  const makeupDb = -(threshold + knee / 2) / ratio;
-  const makeup = Math.pow(10, makeupDb / 20);
-  return input * Math.pow(10, reduction / 20) * makeup;
-}
-
-function _renderAudioGraphSample(node, index, sampleRate, cache) {
-  if (cache.has(node)) return cache.get(node);
-  let value = 0;
-  const state = _audioNodeState(node, false);
-  if (node.type !== undefined && node.frequency && state.started) {
-    value += _oscillatorSample(node, index, sampleRate);
-  } else if (node.buffer && state.started) {
-    const chs = node.buffer._chs || [];
-    const channel = chs[0];
-    if (channel && index < channel.length) value += channel[index];
-  }
-  for (const source of state.inputs) {
-    value += _renderAudioGraphSample(source, index, sampleRate, cache);
-  }
-  if (node.gain && node.gain.value !== undefined && state.inputs.length) {
-    value *= Number(node.gain.value);
-  }
-  if (node.threshold && node.ratio && node.attack) {
-    value = _compressorSample(node, value, sampleRate);
-  }
-  cache.set(node, value);
-  return value;
 }
 
 function _offlineAudioStartRendering(context) {
   const sampleRate = context.sampleRate || 44100;
-  const buffer = _audioContextCreateBuffer(context, 1, context.length, sampleRate);
-  const data = buffer.getChannelData(0);
-  // Render the actual connected graph: sources through gains and
-  // DynamicsCompressors into the destination. A context whose graph never
+  const buffer = _audioContextCreateBuffer(context, context.numberOfChannels || 1,
+    context.length, sampleRate);
+  context.state = 'running';
+  // Render the connected graph into the buffer. A context whose graph never
   // reaches the destination renders silence, exactly like the spec.
-  const destination = context.destination;
-  const destinationState = destination ? _audioNodeState(destination, false) : { inputs: [] };
-  if (destinationState.inputs.length) {
-    for (let index = 0; index < context.length; index++) {
-      const perSample = new Map();
-      data[index] = _renderAudioGraphSample(destination, index, sampleRate, perSample);
-    }
-  }
+  _audioDspRenderOffline(context, buffer, node => _audioNodeState(node, true));
   return Promise.resolve().then(() => {
+    context.state = 'closed';
     const event = {renderedBuffer: buffer, target: context, type: 'complete'};
     if (typeof context.oncomplete === 'function') {
       try { context.oncomplete(event); } catch (_error) {}

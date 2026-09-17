@@ -6183,6 +6183,118 @@ mod tests {
         );
     }
 
+    /// The reference chain a challenge renders and reads back: a triangle
+    /// oscillator at 9998.123456 Hz into a
+    /// DynamicsCompressor(-52, 40, 12, 0.0001, 0.25) and out to the
+    /// destination.  A rendered buffer is a fingerprint, so the band-limited
+    /// wave tables, the compressor's look-ahead delay and its soft-knee curve
+    /// all have to land on Chrome's samples: the sum of the absolute values,
+    /// the position of the first non-zero sample, the compressor's delay and
+    /// the first samples of the oscillator are asserted against a Chrome 153
+    /// render of the same graph, as are the two silent cases.
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_audio_render_matches_the_reference_dynamics_chain() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const chain = async () => {
+                        const context = new OfflineAudioContext(1, 1000, 44100);
+                        const oscillator = context.createOscillator();
+                        oscillator.type = 'triangle';
+                        oscillator.frequency.value = 9998.123456;
+                        const compressor = context.createDynamicsCompressor();
+                        compressor.threshold.value = -52;
+                        compressor.knee.value = 40;
+                        compressor.ratio.value = 12;
+                        compressor.attack.value = 0.0001;
+                        compressor.release.value = 0.25;
+                        oscillator.connect(compressor);
+                        compressor.connect(context.destination);
+                        oscillator.start(0);
+                        const rendered = await context.startRendering();
+                        return rendered.getChannelData(0);
+                    };
+                    const first = await chain();
+                    const second = await chain();
+                    let sum = 0;
+                    let firstNonzero = -1;
+                    for (let i = 0; i < first.length; i++) {
+                        sum += Math.abs(first[i]);
+                        if (firstNonzero < 0 && first[i] !== 0) firstNonzero = i;
+                    }
+                    // The oscillator alone reports its band-limited triangle,
+                    // which starts at zero and reaches its peak off the table
+                    // grid.
+                    const soloContext = new OfflineAudioContext(1, 8, 44100);
+                    const voice = soloContext.createOscillator();
+                    voice.type = 'triangle';
+                    voice.frequency.value = 9998.123456;
+                    voice.connect(soloContext.destination);
+                    voice.start(0);
+                    const solo = (await soloContext.startRendering()).getChannelData(0);
+                    // A compressor delays its input by its look-ahead, so an
+                    // impulse leaves the node 264 samples later at 44100 Hz.
+                    const delayContext = new OfflineAudioContext(1, 600, 44100);
+                    const pulse = delayContext.createBuffer(1, 600, 44100);
+                    pulse.getChannelData(0)[0] = 1;
+                    const source = delayContext.createBufferSource();
+                    source.buffer = pulse;
+                    const pedal = delayContext.createDynamicsCompressor();
+                    pedal.threshold.value = -52;
+                    pedal.knee.value = 40;
+                    pedal.ratio.value = 12;
+                    pedal.attack.value = 0.0001;
+                    pedal.release.value = 0.25;
+                    source.connect(pedal);
+                    pedal.connect(delayContext.destination);
+                    source.start(0);
+                    const delayed = (await delayContext.startRendering()).getChannelData(0);
+                    let delayFirst = -1;
+                    for (let i = 0; i < delayed.length; i++) {
+                        if (delayed[i] !== 0) { delayFirst = i; break; }
+                    }
+                    const bufferContext = new OfflineAudioContext(1, 1000, 44100);
+                    const silentSource = bufferContext.createBufferSource();
+                    silentSource.buffer = bufferContext.createBuffer(1, 1000, 44100);
+                    silentSource.connect(bufferContext.destination);
+                    silentSource.start(0);
+                    const silence = (await bufferContext.startRendering()).getChannelData(0);
+                    const empty = (await new OfflineAudioContext(1, 1000, 44100)
+                        .startRendering()).getChannelData(0);
+                    return {
+                        sum: Math.round(sum * 1e6) / 1e6,
+                        firstNonzero,
+                        deterministic: first.every((value, index) => value === second[index]),
+                        solo: Array.from(solo).map(value => Math.round(value * 1e6) / 1e6),
+                        delayFirst,
+                        bufferSourceSilent: silence.every(value => value === 0),
+                        emptyGraphSilent: empty.every(value => value === 0),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sum": 155.360909,
+                "firstNonzero": 265,
+                "deterministic": true,
+                "solo": [0, 0.802068, 0.233857, -0.733883, -0.447834, 0.603309,
+                    0.623739, -0.421447],
+                "delayFirst": 264,
+                "bufferSourceSilent": true,
+                "emptyGraphSilent": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
