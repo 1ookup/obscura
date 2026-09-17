@@ -731,13 +731,10 @@ impl StealthHttpClient {
             // subresource paths use `u=0, i` / `i`, set in fetch_with_profile).
             req = req.header("priority", "u=1, i");
         }
-        if !has_header("sec-fetch-storage-access") {
-            // Chrome attaches its storage-access state to every request it
-            // sends. This client never holds a storage access grant, so `none`
-            // is the only truthful value, and a request without the header is
-            // one a server cannot match against a browser's.
-            req = req.header("sec-fetch-storage-access", "none");
-        }
+        // Chrome omits sec-fetch-storage-access unless a storage-access grant
+        // is in play (a third-party iframe after requestStorageAccess). This
+        // client never holds one, and the reference Chrome sends no such header
+        // on scripted fetch/XHR, so adding `none` would be a tell, not parity.
         if !fingerprint.brands.is_empty() {
             if !has_header("sec-ch-ua") {
                 req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
