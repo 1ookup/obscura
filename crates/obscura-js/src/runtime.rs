@@ -5551,10 +5551,13 @@ mod tests {
                         agreesWithElement:
                             Math.abs(mono - elementWidth("72px monospace")) <= 1 / 64
                             && Math.abs(sans - elementWidth('72px "Arial", monospace')) <= 1 / 64,
-                        // The 10px probe string must land on a fractional
-                        // 1/64 boundary, not an integer pixel.
+                        // Text the identity's own face covers reports the
+                        // face's fractional advance, the way a browser does;
+                        // text the bundled stand-in shapes goes through the
+                        // 1/64 quantisation of the shaped path. Both are
+                        // sub-pixel, neither is an integer pixel.
                         subpixel: probe % 1 !== 0
-                            && Math.abs(probe * 64 - Math.round(probe * 64)) < 1e-6,
+                            && Math.abs(mono * 64 - Math.round(mono * 64)) < 1e-6,
                         positive: mono > 0 && sans > 0,
                         canvasLeavesDomUntouched: nodesAfterCanvas === nodesBefore,
                     };
@@ -27171,6 +27174,10 @@ RequestRedirect value",
     /// canvas context.
     #[test]
     fn offscreen_context_interface_owns_its_members() {
+        // The default identity is macOS, so the default font's advances come
+        // from the built-in table: PingFang SC's 'a' is 559/1000 em, 5.59 at
+        // 10px, not the bundled stand-in's 5.5625.
+        obscura_render::inline::set_font_platform("MacIntel");
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -27204,7 +27211,7 @@ RequestRedirect value",
                 "constructorName": "OffscreenCanvasRenderingContext2D",
                 "tag": "[object OffscreenCanvasRenderingContext2D]",
                 "bothHaveFillRect": true,
-                "measureWidth": 5.5625,
+                "measureWidth": 5.590000152587891,
             })
         );
     }
