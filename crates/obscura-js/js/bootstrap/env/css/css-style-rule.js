@@ -6,7 +6,8 @@ class CSSStyleRule extends CSSRule {
     const state = _cssStyleFor(declaration);
     _parseCssInto(state.props, declarations);
     state.loaded = true;
-    this._style = _styleProxy(declaration);
+    this._decl = declaration;
+    this._style = null;
   }
   get selectorText() { return this._selectorText; }
   set selectorText(value) {
@@ -15,9 +16,16 @@ class CSSStyleRule extends CSSRule {
     this._selectorText = selector;
     this._changed();
   }
-  get style() { return this._style; }
+  // The property-access Proxy is created lazily: materializing a sheet
+  // constructs hundreds of rules and paying a six-trap Proxy per rule made
+  // re-parsing a rewritten stylesheet visibly slower than Chrome's walk.
+  // cssText reads the raw declaration directly.
+  get style() {
+    if (!this._style) this._style = _styleProxy(this._decl);
+    return this._style;
+  }
   get cssText() {
-    const declarations = _normalizeStyleRuleDeclarations(this._style.cssText);
+    const declarations = _normalizeStyleRuleDeclarations(this._decl.cssText);
     return `${this._selectorText} {${declarations ? " " + declarations : ""} }`;
   }
   set cssText(_value) {}

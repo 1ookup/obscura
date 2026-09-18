@@ -2781,6 +2781,19 @@ impl Page {
                     "post-load layout pre-warm complete",
                 );
             }
+
+            // Chrome also parses stylesheets during load, so its CSSOM rule
+            // objects exist before any script walks document.styleSheets.
+            // Ours materialize lazily, which dropped both the one-time rule
+            // parse and the first cssText normalization inside whatever
+            // probe walked the sheets (measured 13 ms on the challenge
+            // page versus Chrome's 0.9 ms). Materialize once here: reading
+            // rules and cssText dispatches no events, mutates nothing, and
+            // leaves every walk after it warm.
+            let _ = js.execute_script(
+                "<cssom-prewarm>",
+                "try { for (const sh of document.styleSheets) { try { for (const r of sh.cssRules) { void r.cssText; } } catch (e) {} } } catch (e) {}",
+            );
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {

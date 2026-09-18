@@ -311,7 +311,17 @@ function _cssSplitList(value) {
 // Apply a text transformation to a value, leaving quoted strings and url()
 // payloads untouched.
 function _cssMapValueSegments(value, mapper) {
-  return _cssQuotedSegments(String(value || ""))
+  value = String(value || "");
+  // Fast path: without quotes there are no quoted segments, and without
+  // `url(` the url split cannot match, so the one segment is the whole
+  // value. Avoids the segment-array churn on the common declaration.
+  if (!value.includes('"') && !value.includes("'")) {
+    if (!/[uU][rR][lL]\(/.test(value)) return mapper(value);
+    return value.split(/(url\([^)]*\))/i)
+      .map((part, index) => (index % 2 ? part : mapper(part)))
+      .join("");
+  }
+  return _cssQuotedSegments(value)
     .map(({ quoted, text }) => quoted ? text
       : text.split(/(url\([^)]*\))/i)
         .map((part, index) => (index % 2 ? part : mapper(part)))
@@ -320,18 +330,31 @@ function _cssMapValueSegments(value, mapper) {
 }
 
 function _cssPassNumbers(value) {
+  // Every rewrite needs a digit; digit-free values ("auto", "red") skip the
+  // segment machinery entirely.
+  if (!/\d/.test(value)) return value;
   return _cssMapValueSegments(value, (part) => part.replace(
     /(?<![\w#.])[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g,
     (match) => _cssCanonicalNumberText(match)));
 }
 
 const _CSS_HEX_COLOR_RE = /(?<![\w#])#([0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?![0-9a-f])/gi;
+// `_cssNormalizeColorFunction` only rewrites rgb()/rgba()/hsl()/hsla()
+// tokens; other functions pass through unchanged, so gate the scan.
+const _CSS_COLOR_FN_PRESENT = /(?:^|[^a-zA-Z0-9-])(?:rgba?|hsla?)\(/i;
 
 function _cssPassColors(value) {
-  return _cssMapValueSegments(value, (part) => part
-    .replace(_CSS_HEX_COLOR_RE, (all, digits) => _cssHexColorFn(all, digits))
-    .replace(/[a-zA-Z][a-zA-Z0-9-]*\([^()]*\)/g, (fn) =>
-      _cssNormalizeColorFunction(fn) || fn));
+  // Hex colors need "#" and functional colors need "("; without either the
+  // pass cannot rewrite anything.
+  if (!value.includes("#") && !value.includes("(")) return value;
+  return _cssMapValueSegments(value, (part) => {
+    let out = part.replace(_CSS_HEX_COLOR_RE, (all, digits) => _cssHexColorFn(all, digits));
+    if (_CSS_COLOR_FN_PRESENT.test(out)) {
+      out = out.replace(/[a-zA-Z][a-zA-Z0-9-]*\([^()]*\)/g, (fn) =>
+        _cssNormalizeColorFunction(fn) || fn);
+    }
+    return out;
+  });
 }
 
 // Double-quote a url() payload: `url(a.png)` -> `url("a.png")`.
@@ -380,7 +403,9 @@ function _cssQuoteUrls(value) {
 }
 
 function _cssPassFunctions(value) {
-  const quoted = _cssQuoteUrls(value);
+  // url() quoting and every function rewrite match text containing "(".
+  if (!value.includes("(")) return value;
+  const quoted = /[uU][rR][lL]\(/.test(value) ? _cssQuoteUrls(value) : value;
   return _cssMapValueSegments(quoted, (part) => {
     let out = part.replace(/([a-zA-Z][a-zA-Z0-9-]*)\(([^()]*)\)/g, (match, name, args) => {
       if (/^(url|src)$/i.test(name)) return match;
@@ -408,6 +433,7 @@ function _cssPassFunctions(value) {
 }
 
 function _cssPassCommaSpace(value) {
+  if (!value.includes(",")) return value;
   return _cssMapValueSegments(value, (part) => part.replace(/\s*,\s*/g, ", "));
 }
 
@@ -416,6 +442,7 @@ function _cssPassCommaSpace(value) {
 const _CSS_STYLE_LENGTH_PROPS = /^(?:margin(?:-(?:top|right|bottom|left))?|padding(?:-(?:top|right|bottom|left))?|(?:min-|max-)?(?:width|height)|top|right|bottom|left|inset|letter-spacing|word-spacing|border|border-(?:width|spacing|radius|(?:top|right|bottom|left)-width)|outline-width|column-width|(?:column|row)-gap|gap|flex-basis|font-size|text-indent|vertical-align|background|background-position|object-position|transform-origin|perspective-origin)$/;
 
 function _cssPassZeroLength(prop, value) {
+  if (!value.includes("0")) return value;
   return _cssMapValueSegments(value, (part) => {
     let out = "", current = "", depth = 0;
     const flush = () => {
@@ -757,6 +784,9 @@ const _CSS_STYLE_VALUE_HANDLERS = {
 };
 
 function _cssValueHasVariable(value) {
+  // Every match contains the substring "var"; skip the quoted-segment scan
+  // for values without it.
+  if (!/var/i.test(value)) return false;
   return _cssQuotedSegments(String(value || "")).some(({ quoted, text }) =>
     !quoted && /[\s(]var\s*\(|^var\s*\(/i.test(text));
 }
@@ -770,7 +800,15 @@ const _CSS_PROPERTY_ALIASES = {
   "-webkit-box-shadow": "box-shadow",
 };
 
+// Declaration normalization is a pure function of (prop, value); real
+// sheets repeat the same values across rules (theme colors, transforms),
+// so memoize the pair in addition to the whole-list memo above.
+const _cssDeclPairMemo = new Map();
+
 function _cssNormalizeDeclarationText(prop, value) {
+  const key = prop + "\0" + value;
+  const cached = _cssDeclPairMemo.get(key);
+  if (cached !== undefined) return cached;
   const aliased = _CSS_PROPERTY_ALIASES[prop.toLowerCase()] || prop;
   const lower = aliased.toLowerCase();
   const handler = _CSS_STYLE_VALUE_HANDLERS[lower];
@@ -780,29 +818,51 @@ function _cssNormalizeDeclarationText(prop, value) {
   out = _cssPassFunctions(out);
   out = _cssPassCommaSpace(out);
   if (_CSS_STYLE_LENGTH_PROPS.test(lower)) out = _cssPassZeroLength(lower, out);
-  return `${aliased}: ${out}`;
+  out = `${aliased}: ${out}`;
+  if (_cssDeclPairMemo.size >= _CSS_DECL_TEXT_MEMO_MAX) _cssDeclPairMemo.clear();
+  _cssDeclPairMemo.set(key, out);
+  return out;
 }
 
 // Chrome keeps `!important` declarations after the normal ones (both in
 // authored order) and echoes declarations whose value contains `var()`
 // verbatim, because they stay pending substitution.
+//
+// Normalization is a pure text transform, and a cssRules walk re-serializes
+// every rule on each access; real sheets also repeat declaration lists
+// (utility classes, theme values). Memoize the raw declaration list ->
+// normalized text so second walks and repeated declarations cost a map hit.
+// Bounded so a sheet of unique declarations cannot grow it without limit.
+const _cssDeclTextMemo = new Map();
+const _CSS_DECL_TEXT_MEMO_MAX = 8192;
+function _memoizedText(memo, key, compute) {
+  const cached = memo.get(key);
+  if (cached !== undefined) return cached;
+  const value = compute();
+  if (memo.size >= _CSS_DECL_TEXT_MEMO_MAX) memo.clear();
+  memo.set(key, value);
+  return value;
+}
+
 function _normalizeStyleRuleDeclarations(cssText) {
-  const normal = [], important = [];
-  for (const declaration of _splitCssDeclarations(cssText)) {
-    const colon = declaration.indexOf(":");
-    if (colon <= 0) continue;
-    const prop = declaration.slice(0, colon).trim();
-    const rawValue = declaration.slice(colon + 1).trim();
-    if (!prop || !rawValue) continue;
-    const priority = _cssHasPriority(rawValue);
-    const value = priority ? _cssStripPriority(rawValue) : rawValue;
-    const text = prop.startsWith("--") || _cssValueHasVariable(value)
-      ? `${prop}: ${value}`
-      : _cssNormalizeDeclarationText(prop, value);
-    (priority ? important : normal).push(priority ? `${text} !important` : text);
-  }
-  const all = normal.concat(important);
-  return all.length ? all.join("; ") + ";" : "";
+  return _memoizedText(_cssDeclTextMemo, cssText, () => {
+    const normal = [], important = [];
+    for (const declaration of _splitCssDeclarations(cssText)) {
+      const colon = declaration.indexOf(":");
+      if (colon <= 0) continue;
+      const prop = declaration.slice(0, colon).trim();
+      const rawValue = declaration.slice(colon + 1).trim();
+      if (!prop || !rawValue) continue;
+      const priority = _cssHasPriority(rawValue);
+      const value = priority ? _cssStripPriority(rawValue) : rawValue;
+      const text = prop.startsWith("--") || _cssValueHasVariable(value)
+        ? `${prop}: ${value}`
+        : _cssNormalizeDeclarationText(prop, value);
+      (priority ? important : normal).push(priority ? `${text} !important` : text);
+    }
+    const all = normal.concat(important);
+    return all.length ? all.join("; ") + ";" : "";
+  });
 }
 
 // Chrome re-serializes keyframe declaration values from the parsed
@@ -815,6 +875,11 @@ function _normalizeStyleRuleDeclarations(cssText) {
 // arguments are joined with ", ". Named colors and `url()` payloads stay
 // verbatim. Verified against Chrome 151/153 on the challenge stylesheet.
 function _normalizeKeyframeDeclarations(cssText) {
+  return _memoizedText(_cssDeclTextMemo, cssText, () =>
+    _normalizeKeyframeDeclarationsUncached(cssText));
+}
+
+function _normalizeKeyframeDeclarationsUncached(cssText) {
   const lengthFns = /^(translate|translate3d|translatex|translatey|translatez|perspective|blur)$/i;
   const angleFns = /^(rotate|rotatex|rotatey|rotatez|skew|skewx|skewy)$/i;
   // Standard length properties re-serialize a bare zero as `0px`; SVG
@@ -865,13 +930,17 @@ class CSSKeyframeRule extends CSSRule {
     const state = _cssStyleFor(declaration);
     _parseCssInto(state.props, declarations);
     state.loaded = true;
-    this._style = _styleProxy(declaration);
+    this._decl = declaration;
+    this._style = null;
   }
   get keyText() { return this._keyText; }
   set keyText(value) { this._keyText = _normalizeKeyText(value); this._changed(); }
-  get style() { return this._style; }
+  get style() {
+    if (!this._style) this._style = _styleProxy(this._decl);
+    return this._style;
+  }
   get cssText() {
-    const declarations = _normalizeKeyframeDeclarations(this._style.cssText);
+    const declarations = _normalizeKeyframeDeclarations(this._decl.cssText);
     return `${this._keyText} {${declarations ? " " + declarations : ""} }`;
   }
   set cssText(_value) {}
