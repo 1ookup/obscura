@@ -4029,6 +4029,7 @@ async fn op_fetch_url_inner(
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let response_end = performance_started.elapsed();
+    downlink_record_sample(resp_bytes.len(), response_end);
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -4496,6 +4497,7 @@ async fn stealth_fetch_all(
         .map(|code| code.canonical_reason().unwrap_or("").to_string())
         .unwrap_or_default();
     let response_end = performance_started.elapsed();
+    downlink_record_sample(resp_bytes.len(), response_end);
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
@@ -4566,12 +4568,41 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cors_response_allows, csp_connect_allows, csp_resource_allows, glob_match,
-        initial_iframe_cross_origin_isolated, is_potentially_trustworthy, scripted_fetch_site,
-        validate_fetch_url, FetchCredentials,
+        cors_response_allows, csp_connect_allows, csp_resource_allows, downlink_estimate,
+        downlink_record_sample, glob_match, initial_iframe_cross_origin_isolated,
+        is_potentially_trustworthy, scripted_fetch_site, validate_fetch_url, FetchCredentials,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    /// Chrome's connection estimator quantizes to 25 kbps buckets inside the
+    /// reporting range and answers a default before any measurement. The
+    /// engine's estimator must obey the same three rules: the default 1.55
+    /// until a sample lands, a first-sample reading that tracks the transfer,
+    /// and clamping no matter how extreme later samples are (a pinned 10 is
+    /// the cap itself, the one value the passing session did not report).
+    #[test]
+    fn downlink_estimator_defaults_then_tracks_clamps_and_quantizes() {
+        // Fresh process: no samples yet, so the default answers.
+        assert_eq!(downlink_estimate(), 1.55);
+
+        // 4096 bytes over ~150 ms ~= 0.218 Mbps: below the default, in range.
+        downlink_record_sample(4096, std::time::Duration::from_millis(150));
+        let after = downlink_estimate();
+        assert!(after >= 0.05 && after < 10.0, "after: {after}");
+        assert!((after / 0.025).round() * 0.025 == after, "quantized: {after}");
+
+        // An extreme burst clamps to the reporting cap.
+        downlink_record_sample(1 << 30, std::time::Duration::from_millis(1));
+        assert_eq!(downlink_estimate(), 10.0);
+
+        // Starvation samples pull the EWMA down, and the answer never drops
+        // below the reporting floor.
+        for _ in 0..200 {
+            downlink_record_sample(10, std::time::Duration::from_secs(120));
+        }
+        assert_eq!(downlink_estimate(), 0.05);
+    }
 
     /// `default-src 'none'` is conventionally written first. Accepting whichever
     /// directive a single scan reached first therefore turned every later one
@@ -6696,6 +6727,68 @@ fn opfs_io(what: &str, error: std::io::Error) -> deno_error::JsErrorBox {
     deno_error::JsErrorBox::generic(format!("OPFS {what}: {error}"))
 }
 
+// --- navigator.connection.downlink estimator -------------------------------
+//
+// Chrome derives `downlink` from its network quality estimator: observed
+// transfer throughput, quantized to 25 kbps buckets, clamped to the reporting
+// range. The pinned 10 this engine used to answer is that reporting cap, and a
+// cap is exactly what the passing session did not report (1.55 Mbps). This
+// estimator feeds on the engine's completed scripted fetches -- bytes over
+// wall time, an EWMA over the recent window -- and answers the same default a
+// freshly measured Chrome answers until the first sample lands.
+
+const DOWNLINK_MIN_MBPS: f64 = 0.05;
+const DOWNLINK_MAX_MBPS: f64 = 10.0;
+const DOWNLINK_DEFAULT_MBPS: f64 = 1.55;
+const DOWNLINK_BUCKET_MBPS: f64 = 0.025;
+const DOWNLINK_EWMA_ALPHA: f64 = 0.2;
+const DOWNLINK_MAX_SAMPLES: u32 = 64;
+
+/// `(sample count, ewma mbps)`; the count only decides "has a sample landed",
+/// so it saturates instead of growing for the life of the process.
+fn downlink_estimator() -> &'static std::sync::Mutex<(u32, f64)> {
+    static ESTIMATOR: std::sync::OnceLock<std::sync::Mutex<(u32, f64)>> =
+        std::sync::OnceLock::new();
+    ESTIMATOR.get_or_init(|| std::sync::Mutex::new((0, DOWNLINK_DEFAULT_MBPS)))
+}
+
+/// Record one completed transfer. Sub-millisecond answers (cached or local)
+/// carry no usable rate information and are skipped.
+pub(crate) fn downlink_record_sample(bytes: usize, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    if bytes == 0 || secs < 0.001 {
+        return;
+    }
+    let sample = (bytes as f64) * 8.0 / 1_000_000.0 / secs;
+    let mut slot = downlink_estimator().lock().unwrap_or_else(|e| e.into_inner());
+    let (count, ewma) = *slot;
+    let next = if count == 0 {
+        sample
+    } else {
+        ewma + DOWNLINK_EWMA_ALPHA * (sample - ewma)
+    };
+    *slot = (count.saturating_add(1).min(DOWNLINK_MAX_SAMPLES), next);
+}
+
+/// The quantized estimate `navigator.connection.downlink` answers.
+fn downlink_estimate() -> f64 {
+    let slot = downlink_estimator().lock().unwrap_or_else(|e| e.into_inner());
+    let mbps = if slot.0 == 0 {
+        DOWNLINK_DEFAULT_MBPS
+    } else {
+        slot.1
+    };
+    let clamped = mbps.clamp(DOWNLINK_MIN_MBPS, DOWNLINK_MAX_MBPS);
+    (clamped / DOWNLINK_BUCKET_MBPS).round() * DOWNLINK_BUCKET_MBPS
+}
+
+#[op2(fast)]
+fn op_connection_downlink() -> f64 {
+    downlink_estimate()
+}
+
+
+
 /// Open (creating if needed) the backing file for one OPFS file handle and seed
 /// it with the bytes the in-memory node already holds. Returns a handle id.
 #[op2(fast)]
@@ -7557,6 +7650,7 @@ pub fn build_extension() -> Extension {
         op_opfs_sync_truncate(),
         op_opfs_sync_size(),
         op_opfs_sync_close(),
+        op_connection_downlink(),
         op_worker_spawn(),
         op_worker_post_message(),
         op_worker_recv(),

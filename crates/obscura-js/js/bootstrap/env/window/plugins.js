@@ -69,7 +69,11 @@ class NetworkInformation {
   // them surfaced in challenge payloads as values no real Chrome reports.
   get effectiveType() { _networkInformation(this); return '4g'; }
   get rtt() { _networkInformation(this); return 50; }
-  get downlink() { _networkInformation(this); return 10; }
+  // Chrome's estimator answers observed transfer throughput quantized to
+  // 25 kbps buckets, clamped to [0.05, 10] Mbps; the op keeps the same EWMA
+  // over the engine's completed scripted fetches. A pinned 10 is the reporting
+  // cap, and a cap is the value the passing session did not report.
+  get downlink() { _networkInformation(this); return Deno.core.ops.op_connection_downlink(); }
   get saveData() { _networkInformation(this); return false; }
 }
 const _networkInformationConstructor = Object.getOwnPropertyDescriptor(

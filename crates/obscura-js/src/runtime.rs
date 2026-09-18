@@ -29007,6 +29007,72 @@ RequestRedirect value",
         );
     }
 
+    async fn connection_downlink_follows_completed_transfers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let body = vec![b'a'; 4096];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/index.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const before = navigator.connection.downlink;
+                    await fetch("/blob");
+                    const after = navigator.connection.downlink;
+                    return {
+                        defaultBefore: before,
+                        afterIsNumber: typeof after === "number",
+                        afterInRange: after >= 0.05 && after <= 10,
+                        afterNotCap: after !== 10,
+                        afterMoved: after !== before,
+                        quantized: Math.abs(after / 0.025 - Math.round(after / 0.025)) < 1e-9,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "defaultBefore": 1.55,
+                "afterIsNumber": true,
+                "afterInRange": true,
+                "afterNotCap": true,
+                "afterMoved": true,
+                "quantized": true,
+            })
+        );
+    }
+
     #[test]
     fn performance_surface_members_live_on_the_interface_prototype() {
         let mut rt = setup_runtime("<html><body></body></html>");
