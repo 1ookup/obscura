@@ -1616,8 +1616,8 @@ impl PreparedRender {
             out.insert("width", dimension_css(style.width, "auto"));
             out.insert("height", dimension_css(style.height, "auto"));
         }
-        out.insert("min-width", dimension_css(style.min_width, "auto"));
-        out.insert("min-height", dimension_css(style.min_height, "auto"));
+        out.insert("min-width", dimension_css(style.min_width, "0px"));
+        out.insert("min-height", dimension_css(style.min_height, "0px"));
         out.insert("max-width", dimension_css(style.max_width, "none"));
         out.insert("max-height", dimension_css(style.max_height, "none"));
         out.insert(
@@ -1661,12 +1661,13 @@ impl PreparedRender {
             .to_string(),
         );
 
-        for (name, value, auto) in [
+        let margin_values = [
             ("margin-top", style.margin.top, style.margin_auto[0]),
             ("margin-right", style.margin.right, style.margin_auto[1]),
             ("margin-bottom", style.margin.bottom, style.margin_auto[2]),
             ("margin-left", style.margin.left, style.margin_auto[3]),
-        ] {
+        ];
+        for (name, value, auto) in margin_values {
             out.insert(
                 name,
                 if auto {
@@ -1676,6 +1677,10 @@ impl PreparedRender {
                 },
             );
         }
+        // Chrome serializes the `margin` shorthand from the same computed
+        // longhands, collapsing shared sides: "8px", "16px 0px",
+        // "1px 2px 3px", "1px 2px 3px 4px".
+        out.insert("margin", shorthand_sides_css(margin_values.map(|(_, v, a)| (v, a))));
         for (name, value) in [
             ("padding-top", style.padding.top),
             ("padding-right", style.padding.right),
@@ -1726,7 +1731,15 @@ impl PreparedRender {
         ] {
             out.insert(name, corner_radius_css(radius));
         }
-        out.insert("outline-width", css_px(style.outline.used_width()));
+        // Chrome decouples the computed `outline-width` from `outline-style`:
+        // the initial `medium` answers 3px even with style `none`, and an
+        // authored decimal truncates to whole pixels like a border.
+        let outline_width = if style.outline.specified_width <= 0.0 {
+            0.0
+        } else {
+            style.outline.specified_width.trunc().max(1.0)
+        };
+        out.insert("outline-width", css_px(outline_width));
         out.insert("outline-style", style.outline.style.css_name().to_string());
         out.insert(
             "outline-color",
@@ -2089,6 +2102,38 @@ fn css_number(value: f32) -> String {
 
 fn css_px(value: f32) -> String {
     format!("{}px", css_number(if value == 0.0 { 0.0 } else { value }))
+}
+
+/// Serialize a physical box shorthand (`margin`, `padding`) from its four
+/// resolved sides in top/right/bottom/left order, dropping repeated sides
+/// the way CSSOM does: `8px`, `16px 0px`, `1px 2px 3px`, `1px 2px 3px 4px`.
+/// An `auto` side keeps its keyword, so `0 0 8px auto` never collapses with
+/// a numeric side.
+fn shorthand_sides_css(sides: [(f32, bool); 4]) -> String {
+    let value = |(v, auto): (f32, bool)| {
+        if auto {
+            "auto".to_string()
+        } else {
+            css_px(v)
+        }
+    };
+    let top = value(sides[0]);
+    let right = value(sides[1]);
+    let bottom = value(sides[2]);
+    let left = value(sides[3]);
+    if right == left {
+        if top == bottom {
+            if top == right {
+                top
+            } else {
+                format!("{top} {right}")
+            }
+        } else {
+            format!("{top} {right} {bottom}")
+        }
+    } else {
+        format!("{top} {right} {bottom} {left}")
+    }
 }
 
 fn dimension_css(value: crate::Dimension, auto: &str) -> String {
@@ -13486,7 +13531,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_none_retains_width_but_does_not_change_geometry_or_computed_used_width() {
+    fn outline_none_retains_width_but_does_not_change_geometry() {
         let tree = parse_html(
             r#"<html><body style="margin:0"><div id="box" style="width:40px;height:20px;
                 outline-width:9px;outline-style:none"></div></body></html>"#,
@@ -13497,7 +13542,58 @@ mod tests {
         let rect = prepared.document_rect(id).unwrap();
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
-        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+        // Chrome decouples the computed outline-width from outline-style, so
+        // `outline-style: none` still reports the authored width.
+        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "9px");
+    }
+
+    #[test]
+    fn computed_outline_width_decouples_from_style_and_defaults_to_medium() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div id="plain" style="width:40px;height:20px"></div>
+              <div id="none-shorthand" style="width:40px;height:20px;outline:none"></div>
+              <div id="zero" style="width:40px;height:20px;outline-width:0"></div>
+              <div id="decimal" style="width:40px;height:20px;outline-width:3.9px"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (120.0, 200.0), None, &mut resources).unwrap();
+        let style = |id: &str| prepared.computed_style(tree.get_element_by_id(id).unwrap()).unwrap();
+        // Chrome answers medium (3px) for the initial width, keeps an authored
+        // zero, and truncates decimals like a border.
+        assert_eq!(style("plain")["outline-width"], "3px");
+        assert_eq!(style("plain")["outline-style"], "none");
+        assert_eq!(style("none-shorthand")["outline-width"], "3px");
+        assert_eq!(style("zero")["outline-width"], "0px");
+        assert_eq!(style("decimal")["outline-width"], "3px");
+    }
+
+    #[test]
+    fn computed_margin_shorthand_collapse_matches_chrome() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <p id="probe" style="margin:8px"></p>
+              <p id="bare"></p>
+              <div id="uneven" style="margin:1px 2px 3px 4px"></div>
+              <div id="block-pair" style="margin:16px 0"></div>
+              <div id="three" style="margin:1px 2px 3px"></div>
+              <div id="plain"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (200.0, 400.0), None, &mut resources).unwrap();
+        let style = |id: &str| prepared.computed_style(tree.get_element_by_id(id).unwrap()).unwrap();
+        assert_eq!(style("probe")["margin"], "8px");
+        assert_eq!(style("probe")["margin-top"], "8px");
+        assert_eq!(style("bare")["margin"], "16px 0px");
+        assert_eq!(style("uneven")["margin"], "1px 2px 3px 4px");
+        assert_eq!(style("block-pair")["margin"], "16px 0px");
+        assert_eq!(style("three")["margin"], "1px 2px 3px");
+        // Chrome resolves the initial `min-width`/`min-height` to 0px for a
+        // plain box, not `auto`.
+        assert_eq!(style("plain")["min-width"], "0px");
+        assert_eq!(style("plain")["min-height"], "0px");
     }
 
     #[test]

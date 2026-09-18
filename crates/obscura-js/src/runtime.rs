@@ -18977,6 +18977,99 @@ RequestRedirect value",
     }
 
     #[test]
+    fn computed_style_surface_matches_the_reference_chrome_probe() {
+        let mut rt = setup_runtime(
+            r#"<html><head></head><body><p id="probe" style="margin:8px"></p><p id="bare"></p></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (function(){
+                    const probe = getComputedStyle(document.getElementById('probe'));
+                    const bare = getComputedStyle(document.getElementById('bare'));
+                    const pick = (cs) => [
+                        cs.fontFamily, cs.caretColor, cs.columnRule, cs.columnRuleWidth,
+                        cs.webkitColumnRule, cs.webkitColumnRuleWidth, cs.minHeight, cs.minWidth,
+                        cs.outlineWidth, cs.positionAnchor, cs.transition, cs.columnRuleBreak,
+                        cs.columnRuleVisibilityItems, cs.columnRuleInset, cs.columnRuleInsetCapEnd,
+                        cs.columnRuleInsetJunctionStart, cs.flexLineCount, cs.rowRule,
+                        cs.rowRuleBreak, cs.rowRuleColor, cs.rowRuleInsetCapEnd,
+                        cs.rowRuleInsetJunctionStart, cs.rowRuleStyle, cs.rowRuleVisibilityItems,
+                        cs.rowRuleWidth, cs.rubyOverhang, cs.rule, cs.ruleBreak, cs.ruleColor,
+                        cs.ruleInset, cs.ruleOverlap, cs.ruleStyle, cs.ruleWidth,
+                        cs.ruleVisibilityItems, cs.textFit, cs.pageMarginSafety,
+                    ];
+                    return {
+                        probe: [probe.length, probe.margin, probe.marginTop, ...pick(probe)],
+                        bare: [bare.margin, bare.marginTop, bare.marginLeft, ...pick(bare)],
+                        // Numeric indices of the enumeration, exactly where the
+                        // reference Chrome capture places the names.
+                        names: [101, 102, 103, 108, 109, 110, 151, 152, 305, 306, 307,
+                                309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 382]
+                            .map((i) => probe[i]),
+                    };
+                })()
+                "#,
+            )
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        let probe = obj.get("probe").unwrap().as_array().unwrap();
+        let bare = obj.get("bare").unwrap().as_array().unwrap();
+        let names: Vec<&str> = obj
+            .get("names")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "column-rule-break", "column-rule-color", "column-rule-inset-cap-end",
+                "column-rule-visibility-items", "column-rule-width", "column-span",
+                "flex-line-count", "flex-shrink", "row-rule-break", "row-rule-color",
+                "row-rule-inset-cap-end", "row-rule-inset-junction-end",
+                "row-rule-inset-junction-start", "row-rule-style",
+                "row-rule-visibility-items", "row-rule-width", "ruby-align",
+                "ruby-overhang", "ruby-position", "rule-overlap", "rx", "text-fit",
+            ]
+        );
+        // probe: [length, margin, margin-top, then the picked values]
+        assert_eq!(probe[0], serde_json::json!(475));
+        assert_eq!(probe[1], serde_json::json!("8px"));
+        assert_eq!(probe[2], serde_json::json!("8px"));
+        let expected_probe: Vec<&str> = [
+            "\"PingFang SC\"", "rgb(0, 0, 0)", "1.5px rgb(0, 0, 0)", "1.5px",
+            "1.5px rgb(0, 0, 0)", "1.5px", "0px", "0px", "3px", "normal", "all", "normal",
+            "normal", "0px", "0px", "0px", "1", "1.5px rgb(0, 0, 0)", "normal",
+            "rgb(0, 0, 0)", "0px", "0px", "none", "normal", "1.5px", "auto",
+            "1.5px rgb(0, 0, 0)", "normal", "rgb(0, 0, 0)", "0px", "row-over-column",
+            "none", "1.5px", "normal", "none", "",
+        ]
+        .to_vec();
+        for (i, want) in expected_probe.iter().enumerate() {
+            assert_eq!(
+                probe[i + 3].as_str().unwrap(),
+                *want,
+                "probe picked value {}",
+                i
+            );
+        }
+        assert_eq!(bare[0], serde_json::json!("16px 0px"));
+        assert_eq!(bare[1], serde_json::json!("16px"));
+        assert_eq!(bare[2], serde_json::json!("0px"));
+        for i in 0..expected_probe.len() {
+            assert_eq!(
+                bare[i + 3].as_str().unwrap(),
+                expected_probe[i],
+                "bare picked value {}",
+                i
+            );
+        }
+    }
+
+    #[test]
     fn css_style_sheet_inherits_the_style_sheet_interface() {
         let mut rt = setup_runtime(
             r#"<html><head><style id="sheet">.a { color: red }</style></head><body></body></html>"#,
@@ -20071,8 +20164,8 @@ RequestRedirect value",
                     "ownCount": 748, "numericCount": 3, "namedCount": 745, "ownHas": true,
                 },
                 "computed": {
-                    "tag": "[object CSSStyleDeclaration]", "length": 456,
-                    "ownCount": 1150, "numericCount": 456, "namedCount": 694, "ownHas": true,
+                    "tag": "[object CSSStyleDeclaration]", "length": 475,
+                    "ownCount": 1211, "numericCount": 475, "namedCount": 736, "ownHas": true,
                 },
                 "prototype": ["cssText", "length", "parentRule", "cssFloat",
                     "getPropertyPriority", "getPropertyValue", "item", "removeProperty",

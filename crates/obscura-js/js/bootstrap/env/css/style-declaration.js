@@ -147,13 +147,14 @@ border-left-width border-right-color border-right-style border-right-width borde
 border-top-left-radius border-top-right-radius border-top-style border-top-width bottom box-decoration-break box-shadow box-sizing
 break-after break-before break-inside buffered-rendering caption-side caret-animation caret-color caret-shape
 clear clip clip-path clip-rule color color-interpolation color-interpolation-filters color-rendering
-color-scheme column-count column-fill column-gap column-height column-rule-color column-rule-style column-rule-width
+color-scheme column-count column-fill column-gap column-height column-rule-break column-rule-color column-rule-inset-cap-end column-rule-inset-cap-start
+column-rule-inset-junction-end column-rule-inset-junction-start column-rule-style column-rule-visibility-items column-rule-width
 column-span column-width column-wrap contain contain-intrinsic-block-size contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-size
 contain-intrinsic-width container-name container-type content content-visibility corner-bottom-left-shape corner-bottom-right-shape corner-end-end-shape
 corner-end-start-shape corner-start-end-shape corner-start-start-shape corner-top-left-shape corner-top-right-shape counter-increment counter-reset counter-set
 cursor cx cy d direction display dominant-baseline dynamic-range-limit
 empty-cells field-sizing fill fill-opacity fill-rule filter flex-basis flex-direction
-flex-grow flex-shrink flex-wrap float flood-color flood-opacity font-family font-feature-settings
+flex-grow flex-line-count flex-shrink flex-wrap float flood-color flood-opacity font-family font-feature-settings
 font-kerning font-language-override font-optical-sizing font-palette font-size font-size-adjust font-stretch font-style
 font-synthesis-small-caps font-synthesis-style font-synthesis-weight font-variant font-variant-alternates font-variant-caps font-variant-east-asian font-variant-emoji
 font-variant-ligatures font-variant-numeric font-variant-position font-variation-settings font-weight forced-color-adjust grid-auto-columns grid-auto-flow
@@ -172,7 +173,8 @@ overflow-x overflow-y overlay overscroll-behavior-block overscroll-behavior-inli
 padding-block-start padding-bottom padding-inline-end padding-inline-start padding-left padding-right padding-top paint-order
 perspective perspective-origin pointer-events position position-anchor position-area position-try-fallbacks position-try-order
 position-visibility print-color-adjust quotes r reading-flow reading-order resize right
-rotate row-gap ruby-align ruby-position rx ry scale scroll-behavior
+rotate row-gap row-rule-break row-rule-color row-rule-inset-cap-end row-rule-inset-cap-start row-rule-inset-junction-end row-rule-inset-junction-start
+row-rule-style row-rule-visibility-items row-rule-width ruby-align ruby-overhang ruby-position rule-overlap rx ry scale scroll-behavior
 scroll-initial-target scroll-margin-block-end scroll-margin-block-start scroll-margin-bottom scroll-margin-inline-end scroll-margin-inline-start scroll-margin-left scroll-margin-right
 scroll-margin-top scroll-marker-group scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left
 scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop scroll-snap-type scroll-target-group scroll-timeline-axis scroll-timeline-name
@@ -180,7 +182,7 @@ scrollbar-color scrollbar-gutter scrollbar-width shape-image-threshold shape-mar
 stop-color stop-opacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin stroke-miterlimit
 stroke-opacity stroke-width tab-size table-layout text-align text-align-last text-anchor text-autospace
 text-box-edge text-box-trim text-combine-upright text-decoration text-decoration-color text-decoration-line text-decoration-skip-ink text-decoration-style
-text-decoration-thickness text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-justify text-orientation text-overflow
+text-decoration-thickness text-emphasis-color text-emphasis-position text-emphasis-style text-fit text-indent text-justify text-orientation text-overflow
 text-rendering text-shadow text-size-adjust text-spacing-trim text-transform text-underline-offset text-underline-position text-wrap-mode
 text-wrap-style timeline-scope timeline-trigger-activation-range-end timeline-trigger-activation-range-start timeline-trigger-active-range-end timeline-trigger-active-range-start timeline-trigger-name timeline-trigger-source
 top touch-action transform transform-box transform-origin transform-style transition-behavior transition-delay
@@ -212,15 +214,16 @@ borderShape borderSpacing borderStartEndRadius borderStartStartRadius borderStyl
 borderTopRightRadius borderTopStyle borderTopWidth borderWidth bottom boxDecorationBreak boxShadow boxSizing
 breakAfter breakBefore breakInside bufferedRendering captionSide caretAnimation caretColor caretShape
 clear clip clipPath clipRule color colorInterpolation colorInterpolationFilters colorRendering
-colorScheme columnCount columnFill columnGap columnHeight columnRule columnRuleColor columnRuleStyle
-columnRuleWidth columnSpan columnWidth columnWrap columns contain containIntrinsicBlockSize containIntrinsicHeight
+colorScheme columnCount columnFill columnGap columnHeight columnRule columnRuleBreak columnRuleColor columnRuleInset columnRuleInsetCap
+columnRuleInsetCapEnd columnRuleInsetCapStart columnRuleInsetEnd columnRuleInsetJunction columnRuleInsetJunctionEnd columnRuleInsetJunctionStart
+columnRuleInsetStart columnRuleStyle columnRuleVisibilityItems columnRuleWidth columnSpan columnWidth columnWrap columns contain containIntrinsicBlockSize containIntrinsicHeight
 containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth container containerName containerType content contentVisibility
 cornerBlockEndShape cornerBlockStartShape cornerBottomLeftShape cornerBottomRightShape cornerBottomShape cornerEndEndShape cornerEndStartShape cornerInlineEndShape
 cornerInlineStartShape cornerLeftShape cornerRightShape cornerShape cornerStartEndShape cornerStartStartShape cornerTopLeftShape cornerTopRightShape
 cornerTopShape counterIncrement counterReset counterSet cursor cx cy d
 descentOverride direction display dominantBaseline dynamicRangeLimit emptyCells fallback fieldSizing
 fill fillOpacity fillRule filter flex flexBasis flexDirection flexFlow
-flexGrow flexShrink flexWrap float floodColor floodOpacity font fontDisplay
+flexGrow flexLineCount flexShrink flexWrap float floodColor floodOpacity font fontDisplay
 fontFamily fontFeatureSettings fontKerning fontLanguageOverride fontOpticalSizing fontPalette fontSize fontSizeAdjust
 fontStretch fontStyle fontSynthesis fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight fontVariant fontVariantAlternates
 fontVariantCaps fontVariantEastAsian fontVariantEmoji fontVariantLigatures fontVariantNumeric fontVariantPosition fontVariationSettings fontWeight
@@ -241,11 +244,14 @@ opacity order orphans outline outlineColor outlineOffset outlineStyle outlineWid
 overflow overflowAnchor overflowBlock overflowClipMargin overflowInline overflowWrap overflowX overflowY
 overlay overrideColors overscrollBehavior overscrollBehaviorBlock overscrollBehaviorInline overscrollBehaviorX overscrollBehaviorY pad
 padding paddingBlock paddingBlockEnd paddingBlockStart paddingBottom paddingInline paddingInlineEnd paddingInlineStart
-paddingLeft paddingRight paddingTop page pageBreakAfter pageBreakBefore pageBreakInside pageOrientation
+paddingLeft paddingRight paddingTop page pageBreakAfter pageBreakBefore pageBreakInside pageMarginSafety pageOrientation
 paintOrder perspective perspectiveOrigin placeContent placeItems placeSelf pointerEvents position
 positionAnchor positionArea positionTry positionTryFallbacks positionTryOrder positionVisibility prefix printColorAdjust
 quotes r range readingFlow readingOrder resize result right
-rotate rowGap rubyAlign rubyPosition rx ry scale scrollBehavior
+rotate rowGap rowRule rowRuleBreak rowRuleColor rowRuleInset rowRuleInsetCap rowRuleInsetCapEnd rowRuleInsetCapStart rowRuleInsetEnd
+rowRuleInsetJunction rowRuleInsetJunctionEnd rowRuleInsetJunctionStart rowRuleInsetStart rowRuleStyle rowRuleVisibilityItems rowRuleWidth rubyAlign rubyOverhang
+rubyPosition rule ruleBreak ruleColor ruleInset ruleInsetCap ruleInsetEnd ruleInsetJunction ruleInsetStart ruleOverlap ruleStyle ruleVisibilityItems ruleWidth
+rx ry scale scrollBehavior
 scrollInitialTarget scrollMargin scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom scrollMarginInline scrollMarginInlineEnd
 scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop scrollMarkerGroup scrollPadding scrollPaddingBlock scrollPaddingBlockEnd
 scrollPaddingBlockStart scrollPaddingBottom scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight scrollPaddingTop
@@ -255,7 +261,7 @@ speak speakAs src stopColor stopOpacity stroke strokeDasharray strokeDashoffset
 strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity strokeWidth suffix symbols syntax
 system tabSize tableLayout textAlign textAlignLast textAnchor textAutospace textBox
 textBoxEdge textBoxTrim textCombineUpright textDecoration textDecorationColor textDecorationLine textDecorationSkipInk textDecorationStyle
-textDecorationThickness textEmphasis textEmphasisColor textEmphasisPosition textEmphasisStyle textIndent textJustify textOrientation
+textDecorationThickness textEmphasis textEmphasisColor textEmphasisPosition textEmphasisStyle textFit textIndent textJustify textOrientation
 textOverflow textRendering textShadow textSizeAdjust textSpacingTrim textTransform textUnderlineOffset textUnderlinePosition
 textWrap textWrapMode textWrapStyle timelineScope timelineTrigger timelineTriggerActivationRange timelineTriggerActivationRangeEnd timelineTriggerActivationRangeStart
 timelineTriggerActiveRange timelineTriggerActiveRangeEnd timelineTriggerActiveRangeStart timelineTriggerName timelineTriggerSource top touchAction transform
