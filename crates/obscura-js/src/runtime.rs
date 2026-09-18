@@ -20297,6 +20297,109 @@ RequestRedirect value",
         assert_eq!(p["find"], "40%");
     }
 
+    /// CSSStyleRule.cssText must re-serialize declarations from the parsed
+    /// form like Chrome instead of echoing the authored text. The first five
+    /// rules are the Turnstile challenge pairs from the reference trace's
+    /// TextEncoder.encode payload and were verified byte-for-byte against
+    /// real Chrome 151 on macOS (the reference browser). Chrome 153 differs
+    /// from 151 in exactly two of these forms: it moves a shadow's color to
+    /// the front (`rgb(34, 139, 73) 0px 0px 0px inset`) and prints the
+    /// initial `running` play-state in the animation shorthand; the 151
+    /// reference forms below keep the authored shadow order and omit
+    /// `running`. Every other expectation was captured from headless
+    /// Chrome 153 via CDP on the same fixture.
+    #[test]
+    fn style_rule_csstext_matches_chrome_serialization() {
+        let mut rt = setup_runtime(
+            "<html><head><style>\
+             #PAdD9 { box-shadow: inset 0 0 0 #228b49; }\
+             #PAdD9 .mGPdy9 { animation: stroke .28s .41s cubic-bezier(.65, 0, .45, 1) forwards; }\
+             .agcy9 { opacity: .3; fill: none; stroke: #228b49; stroke-width: 1; }\
+             #ZvYSd8 { width: 30px; height: 30px; grid-area: 1/1; overflow: visible; }\
+             #ZvYSd8 g { transform-box: fill-box; transform-origin: center; animation: success-orbit-resolve .62s cubic-bezier(.65, 0, .45, 1) forwards; }\
+             p.num { width: +30px; height: 1.50px; opacity: 0.500; margin: 0; top: 1e3px; }\
+             p.color { color: #fff; background: #abcd; border-color: #000000ff; outline-color: #00000000; }\
+             p.color2 { color: rgb(1 2 3); fill: rgba(1,2,3,.5); stroke: rgb(50%, 20%, 10%); lighting-color: hsl(120,100%,50%); }\
+             p.grid { grid-area: 1/3/2/4; grid-column: 1/2; grid-row: 2/span 3; }\
+             p.anim { animation: foo; animation-timing-function: steps(2,end); }\
+             p.anim2 { animation: 3s linear 1s 2 reverse both paused foo; }\
+             p.webkit { -webkit-animation: foo 3s; -webkit-transition: all .3s; }\
+             p.trans { transition: margin-right .3s ease-in .5s; }\
+             p.trans2 { transition: all .3s, opacity .2s; }\
+             p.origin { transform-origin: left; transform-origin: bottom right; }\
+             p.flex { flex: 1; flex: none; flex: 2 3; }\
+             p.collapse { margin: 10px 20px 10px 20px; padding: 1px 1px 1px; overflow: auto auto; }\
+             p.shadow { box-shadow: 0 0 1px 2px red inset; }\
+             p.font { font: bold italic 12px/30px Georgia, serif; }\
+             p.bg { background: #fff url(a.png) no-repeat center/cover; }\
+             p.bg2 { background: url(a.png) 0 0 no-repeat; background-image: url(#g); }\
+             p.keep { --x: .5; margin: 0 var(--m); content: \".\"; stroke-dasharray: 1 2; }\
+             p.important { color: red !important; opacity: .5; }\
+             </style></head><body></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const rules = [...document.styleSheets[0].cssRules];
+                    return { css: rules.map(r => r.cssText) };
+                })()"#,
+            )
+            .unwrap();
+        let p: serde_json::Value = match result {
+            serde_json::Value::String(value) => serde_json::from_str(&value).unwrap(),
+            value => value,
+        };
+        let expected = [
+            // The five Turnstile challenge rules: Chrome 151 reference forms.
+            "#PAdD9 { box-shadow: inset 0px 0px 0px rgb(34, 139, 73); }",
+            "#PAdD9 .mGPdy9 { animation: 0.28s cubic-bezier(0.65, 0, 0.45, 1) 0.41s 1 normal forwards stroke; }",
+            ".agcy9 { opacity: 0.3; fill: none; stroke: rgb(34, 139, 73); stroke-width: 1; }",
+            "#ZvYSd8 { width: 30px; height: 30px; grid-area: 1 / 1; overflow: visible; }",
+            "#ZvYSd8 g { transform-box: fill-box; transform-origin: center center; animation: 0.62s cubic-bezier(0.65, 0, 0.45, 1) 0s 1 normal forwards success-orbit-resolve; }",
+            // Numbers: plus dropped, trailing zeros stripped, scientific
+            // notation expanded, bare zero lengths gain px.
+            "p.num { width: 30px; height: 1.5px; opacity: 0.5; margin: 0px; top: 1000px; }",
+            // Hex 3/4/8-digit: rgb()/rgba() with the alpha rounded to three
+            // decimals; a fully opaque 8-digit alpha collapses to rgb().
+            "p.color { color: rgb(255, 255, 255); background: rgba(170, 187, 204, 0.867); border-color: rgb(0, 0, 0); outline-color: rgba(0, 0, 0, 0); }",
+            // Functional colors: space syntax joins with commas, percentages
+            // convert to 0-255 integers, hsl converts to rgb.
+            "p.color2 { color: rgb(1, 2, 3); fill: rgba(1, 2, 3, 0.5); stroke: rgb(128, 51, 26); lighting-color: rgb(0, 255, 0); }",
+            // Grid shorthands space their slashes.
+            "p.grid { grid-area: 1 / 3 / 2 / 4; grid-column: 1 / 2; grid-row: 2 / span 3; }",
+            // Animation shorthand fills defaults (151 omits `running`) and
+            // steps drops the initial `end`; the -webkit- aliases serialize
+            // unprefixed.
+            "p.anim { animation: 0s ease 0s 1 normal none foo; animation-timing-function: steps(2); }",
+            "p.anim2 { animation: 3s linear 1s 2 reverse both paused foo; }",
+            "p.webkit { animation: 3s ease 0s 1 normal none foo; transition: 0.3s; }",
+            // Transition shorthand: property first, `all`/`ease`/`0s`
+            // initials omitted.
+            "p.trans { transition: margin-right 0.3s ease-in 0.5s; }",
+            "p.trans2 { transition: 0.3s, opacity 0.2s; }",
+            // A repeated declaration keeps only the last value.
+            "p.origin { transform-origin: right bottom; }",
+            // flex expands to grow/shrink/basis (last duplicate wins).
+            "p.flex { flex: 2 3 0%; }",
+            // Edge shorthands collapse redundant sides.
+            "p.collapse { margin: 10px 20px; padding: 1px; overflow: auto; }",
+            // Shadows keep the authored component order (the 151 form).
+            "p.shadow { box-shadow: 0px 0px 1px 2px red inset; }",
+            // font: style before weight, slash spaced, families comma-joined.
+            "p.font { font: italic bold 12px / 30px Georgia, serif; }",
+            // background: longhand order with color last, url quoted,
+            // lone position expanded.
+            "p.bg { background: url(\"a.png\") center center / cover no-repeat rgb(255, 255, 255); }",
+            "p.bg2 { background: url(\"a.png\") 0px 0px no-repeat; background-image: url(\"#g\"); }",
+            // Custom properties, var() pending substitution and string
+            // tokens stay verbatim; stroke-dasharray comma-joins.
+            "p.keep { --x: .5; margin: 0 var(--m); content: \".\"; stroke-dasharray: 1, 2; }",
+            // !important declarations sort after the normal ones.
+            "p.important { opacity: 0.5; color: red !important; }",
+        ];
+        assert_eq!(p["css"], serde_json::json!(expected));
+    }
+
     #[test]
     fn css_style_declaration_matches_chrome_named_and_computed_enumeration() {
         let mut rt = setup_runtime(

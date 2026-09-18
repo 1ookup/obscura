@@ -17,7 +17,7 @@ class CSSStyleRule extends CSSRule {
   }
   get style() { return this._style; }
   get cssText() {
-    const declarations = this._style.cssText;
+    const declarations = _normalizeStyleRuleDeclarations(this._style.cssText);
     return `${this._selectorText} {${declarations ? " " + declarations : ""} }`;
   }
   set cssText(_value) {}
