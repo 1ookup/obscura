@@ -8730,6 +8730,150 @@ RequestRedirect value",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The TextEncoder capture tees the encode() argument of every realm: the
+    /// page's, a subframe's (its own context, tagged by document root), and a
+    /// blob worker's (a separate isolate). Non-empty arguments land as
+    /// `<seq>-<realm>.txt` with byte-exact UTF-8 content, empty ones are
+    /// skipped, the encode result is unchanged, and the method's native
+    /// toString mark survives the hook.
+    #[tokio::test(flavor = "current_thread")]
+    async fn te_capture_writes_encode_arguments_from_page_frame_and_worker_realms() {
+        let dir = std::env::temp_dir().join(format!("obscura-te-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("OBSCURA_CAPTURE_TE", &dir);
+
+        // The binary-ish payload rides through String.fromCharCode so neither
+        // the page script nor the worker source needs escape sequences.
+        let binary_page = "p:\u{0}\u{1}\u{e9}\u{4e2d}\u{6587}";
+        let binary_worker = "w:\u{0}\u{1}\u{e9}\u{4e2d}\u{6587}";
+        let worker_source = "const e = new TextEncoder();\n\
+            e.encode('worker-te');\n\
+            e.encode('w:' + String.fromCharCode(0, 1, 0xE9, 0x4E2D, 0x6587));\n\
+            e.encode('');\n\
+            postMessage('done');";
+        let mut rt = setup_secure_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(
+            r#"(() => {{
+                const source = {source};
+                globalThis.__workerDone = false;
+                const worker = new Worker(URL.createObjectURL(new Blob([source], {{type: 'text/javascript'}})));
+                worker.onmessage = () => {{ globalThis.__workerDone = true; }};
+                const e = new TextEncoder();
+                e.encode('hello-te');
+                e.encode('p:' + String.fromCharCode(0, 1, 0xE9, 0x4E2D, 0x6587));
+                e.encode('');
+                globalThis.__roundtrip = Array.from(e.encode('abc')).join(',');
+            }})()"#,
+            source = serde_json::Value::String(worker_source.to_string()),
+        );
+        rt.execute_script("te-capture-page", &script).unwrap();
+
+        let frame_script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                return setupFrame('f', '<html><body></body></html>',
+                    'https://example.com/frame', null);
+            }})()"#
+        );
+        let root = rt.evaluate(&frame_script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("te-frame", 1, root, "https://example.com/frame")
+            .unwrap();
+        rt.execute_script_in_frame_realm(
+            "te-frame",
+            1,
+            "<te-frame>",
+            "const e = new TextEncoder(); e.encode('frame-te'); e.encode('');",
+        )
+        .unwrap();
+
+        pump_until(&mut rt, "String(__workerDone)", &serde_json::json!("true")).await;
+
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().to_string(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        let by_realm = |realm: &str| -> Vec<Vec<u8>> {
+            let mut bodies: Vec<Vec<u8>> = files
+                .iter()
+                .filter(|(name, _)| name.ends_with(&format!("-{realm}.txt")))
+                .map(|(_, bytes)| bytes.clone())
+                .collect();
+            bodies.sort();
+            bodies
+        };
+        // The page realm filed the two non-empty arguments plus the blob's
+        // worker source (Blob construction UTF-8-encodes its string parts) and
+        // the roundtrip probe's 'abc'; the empty encode is nowhere.
+        assert_eq!(
+            by_realm("page"),
+            vec![
+                b"abc".to_vec(),
+                worker_source.as_bytes().to_vec(),
+                b"hello-te".to_vec(),
+                binary_page.as_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(by_realm("frame"), vec![b"frame-te".to_vec()]);
+        assert_eq!(
+            by_realm("worker"),
+            vec![binary_worker.as_bytes().to_vec(), b"worker-te".to_vec()]
+        );
+        // The tee observes only: the encoded bytes are the shim's own, and the
+        // method still prints as native.
+        assert_eq!(
+            rt.evaluate("globalThis.__roundtrip").unwrap(),
+            serde_json::json!("97,98,99")
+        );
+        assert_eq!(
+            rt.evaluate("TextEncoder.prototype.encode.toString()").unwrap(),
+            serde_json::json!("function encode() { [native code] }")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no capture directory configured the tee never fires: nothing is
+    /// written, encode() answers the same bytes, and the method still prints
+    /// as native.
+    #[tokio::test(flavor = "current_thread")]
+    async fn te_capture_is_inert_without_the_flag() {
+        // The suite may be run with the flag exported; this case is the
+        // unset one.
+        std::env::remove_var("OBSCURA_CAPTURE_TE");
+        let dir = std::env::temp_dir().join(format!("obscura-te-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "te-capture-off",
+            r#"(() => {
+                const e = new TextEncoder();
+                e.encode('hello-te');
+                e.encode('');
+                globalThis.__roundtrip = Array.from(e.encode('abc')).join(',');
+            })()"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__roundtrip").unwrap(),
+            serde_json::json!("97,98,99")
+        );
+        assert_eq!(
+            rt.evaluate("TextEncoder.prototype.encode.toString()").unwrap(),
+            serde_json::json!("function encode() { [native code] }")
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Pump the event loop until `expr` evaluates to `expected`. Worker round
     /// trips cross an OS thread, so delivery needs wall-clock time.
     async fn pump_until(rt: &mut ObscuraJsRuntime, expr: &str, expected: &serde_json::Value) {

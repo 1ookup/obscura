@@ -20,6 +20,9 @@
 //! counter, so the files sort into the order the requests were made. The bytes
 //! are read from the op's own arguments and its own result: nothing is
 //! re-encoded, and neither the request nor the response is touched.
+//!
+//! The `te` module below is the sibling facility for
+//! `TextEncoder.prototype.encode` arguments, keyed on `OBSCURA_CAPTURE_TE`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -127,6 +130,76 @@ pub(crate) fn realm(root: u64, worker: bool) -> &'static str {
     }
 }
 
+/// Cross-realm capture of `TextEncoder.prototype.encode` arguments.
+///
+/// The challenge's fingerprint payload is assembled and UTF-8 encoded through
+/// `TextEncoder`, whose shim here is pure bootstrap JS: the native API tracer
+/// never sees the call, so a payload-level diff needs this tee. The bootstrap
+/// calls `op_capture_te` from inside the method body (the function object, and
+/// with it the native `toString` mark, is untouched) once per realm after
+/// `op_capture_te_enabled` answers, so with the facility off an encode() costs
+/// one cached boolean read on the JS side and no op crossing at all.
+///
+/// Enabled by `OBSCURA_CAPTURE_TE=<dir>`. Each non-empty argument, after the
+/// method's own String() coercion, is written as UTF-8 to
+/// `<dir>/<seq>-<realm>.txt`, one file per call, never truncated. Zero-length
+/// arguments are skipped (the challenge fires hundreds of empty encodes as a
+/// timing probe, none of which carry payload). `<seq>` is a process-wide
+/// counter and `<realm>` is resolved like the `/fo/` capture's: a worker owns
+/// an outbox, a frame carries its document root, everything else is the page.
+/// Writes are best-effort and the encode result is never touched.
+pub(crate) mod te {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// The capture directory. Read once per process; `None` means the
+    /// facility is off, which is what keeps the unset case free of
+    /// filesystem work.
+    fn capture_dir() -> Option<&'static str> {
+        static DIR: OnceLock<Option<String>> = OnceLock::new();
+        DIR.get_or_init(|| {
+            std::env::var("OBSCURA_CAPTURE_TE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref()
+    }
+
+    /// Whether the facility has a destination. The bootstrap resolves this
+    /// once per realm on the first encode() call and caches the answer.
+    pub(crate) fn enabled() -> bool {
+        capture_dir().is_some()
+    }
+
+    /// File one encode() argument. The JS side already skips empty strings;
+    /// the check repeats here so the op is safe for any caller. The write is
+    /// best-effort: a diagnostic that fails must not take the encode down
+    /// with it, so every error is logged and dropped.
+    pub(crate) fn record(text: &str, root: u64, worker: bool) {
+        let Some(dir) = capture_dir() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+        let path = std::path::Path::new(dir).join(format!(
+            "{}-{}.txt",
+            sequence,
+            super::realm(root, worker)
+        ));
+        if let Err(error) = std::fs::write(&path, text.as_bytes()) {
+            tracing::debug!(
+                "OBSCURA_CAPTURE_TE: could not write {}: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +226,42 @@ mod tests {
         .to_string();
         assert_eq!(response_bytes(&json), Some(vec![0, 159, 146, 150, 255]));
         assert_eq!(response_bytes(r#"{"status":200,"body":""}"#), None);
+    }
+
+    /// The TextEncoder capture files the argument as its UTF-8 bytes under
+    /// `<seq>-<realm>.txt`, skips empty arguments entirely, and keeps the
+    /// realms' files apart.
+    #[test]
+    fn te_record_writes_utf8_and_skips_empty_arguments() {
+        let dir = std::env::temp_dir().join(format!("obscura-te-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("OBSCURA_CAPTURE_TE", &dir);
+        assert!(te::enabled());
+
+        te::record("héllo — 中文", 0, false);
+        te::record("", 0, false);
+        te::record("widget", 7, false);
+        te::record("attestation", 0, true);
+
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().to_string(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert_eq!(files[0].0, "1-page.txt");
+        assert_eq!(files[0].1, "héllo — 中文".as_bytes());
+        assert_eq!(files[1].0, "2-frame.txt");
+        assert_eq!(files[1].1, b"widget");
+        assert_eq!(files[2].0, "3-worker.txt");
+        assert_eq!(files[2].1, b"attestation");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

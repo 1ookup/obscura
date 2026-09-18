@@ -297,11 +297,29 @@ globalThis.ResizeObserver = class ResizeObserver {
   }
 };
 
+// OBSCURA_CAPTURE_TE diagnostic (diag_capture.rs): resolved lazily because the
+// bootstrap is baked into the V8 snapshot, where no host op exists yet -- the
+// first encode() in each realm asks the host, and every later call costs one
+// boolean read. The tee lives inside the method body, so the function object
+// and its native toString mark are untouched.
+let _teCaptureOn;
 if (typeof TextEncoder === 'undefined') {
   globalThis.TextEncoder = class TextEncoder {
     get encoding() { return 'utf-8'; }
     encode(str) {
       str = String(str);
+      if (_teCaptureOn === undefined) {
+        try {
+          const probe = Deno.core.ops.op_capture_te_enabled;
+          // An absent op (snapshot construction) leaves this unresolved so a
+          // later realm asks again; only a real answer is cached.
+          if (typeof probe === 'function') _teCaptureOn = probe() === true;
+        } catch (_) {}
+      }
+      if (_teCaptureOn && str.length !== 0) {
+        try { Deno.core.ops.op_capture_te(str, _environmentDocumentRoot()); }
+        catch (_) {}
+      }
       const buf = [];
       for (let i = 0; i < str.length; i++) {
         let c = str.charCodeAt(i);

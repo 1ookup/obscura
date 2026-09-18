@@ -710,6 +710,32 @@ fn op_tracelog(#[string] key: &str, #[string] json: &str) {
     crate::tracelog::record(key, json);
 }
 
+/// Whether `OBSCURA_CAPTURE_TE` named a capture directory (diag_capture::te).
+/// The bootstrap resolves this once per realm on the first encode() call and
+/// caches the answer, so with the facility unset a TextEncoder.encode() costs
+/// one boolean read on the JS side and never reaches this op again.
+#[op2(fast)]
+fn op_capture_te_enabled() -> bool {
+    crate::diag_capture::te::enabled()
+}
+
+/// Diagnostic tee for `TextEncoder.prototype.encode` arguments: the bootstrap
+/// passes the argument after its String() coercion plus the calling realm's
+/// document root, and the argument is filed under `<seq>-<realm>.txt`. The op
+/// never fails and answers nothing: a diagnostic must not disturb the encode
+/// it observes, so the realm probe uses `try_borrow` rather than `borrow`.
+#[op2(fast)]
+fn op_capture_te(state: &OpState, #[string] text: &str, root: u32) {
+    let worker = {
+        let shared = state.borrow::<SharedState>().clone();
+        shared
+            .try_borrow()
+            .map(|gs| gs.worker_outbox.is_some())
+            .unwrap_or(false)
+    };
+    crate::diag_capture::te::record(text, root as u64, worker);
+}
+
 static TRACE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -7390,6 +7416,8 @@ pub fn build_extension() -> Extension {
         op_trace_push_source(),
         op_trace_pop_source(),
         op_tracelog(),
+        op_capture_te_enabled(),
+        op_capture_te(),
     ];
     #[cfg(feature = "render")]
     let mut ops = ops;
