@@ -10803,3 +10803,20 @@ postMessage/BroadcastChannel 管线走的是同一条 recv 路径），本次修
 **门禁**：obscura-js 653/653、obscura-browser 126/126、obscura-net 104/104（release、
 nextest）；release build 全量通过；no-default-features check 通过。未跑障碍课程与网络轮
 （由主控统一执行）。
+
+### Step 305: 批次 14 验证——worker 唤醒修复解开注入版停摆，时序再降（2026-09-19 05:1x）
+
+**注入轮 ver14**（TS#2 = 3-frame-req 解密，注意 capture_round.sh 曾用陈旧字母表，
+已改现拉探针）：**注入版首次走完 TS#3(94,743B)→main#2**——§10.22 的"注入版停在
+payload#2 后"之谜即 worker 管道泵间隙（689aa77 同源修复）。
+计数器：uGyjw9 287→**184**（Chrome 4，仍有余量）、ZMSOw0 729→467→**385**、
+NnqX6@TS#2 8223→**5249**（Chrome 7220，已低于参考——参考含交互等待）、
+myWtu3 4→**23**（Chrome 31）。值面全部到位：battery 99/49、downlink 7.8（动态）、
+RPKTR7=10GiB+760（宿主派生）、PlZqY9=["zh-CN"]。
+**benc 条目竞速翻回**：tQdUc5=39（worker 提速后 bench 更早完成，而 TS#2 组装仍慢）；
+压下 ZMSOw0/uGyjw9 残差即恢复 38。Vhmq4=["lang","dir"] 定案非缺陷（Step 303）。
+
+**无注入判决轮 live14**：TS#2(88,556)→TS#3(91,788)→main#2(7788/3240)→25.5s 重开。
+判决仍 fail。/ci/ 仍不发。**e14 哈希探针实弹未变**：RKUE0=sha256("0")+JRzmw6="bOHv4"
+（fixture 已修但挑战实路径仍归零——下一步用 OBSCURA_CAPTURE_TE 抓 digest 输入串定位
+是测量归零还是异步链未落地）。
