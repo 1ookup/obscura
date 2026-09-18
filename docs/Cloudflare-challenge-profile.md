@@ -10861,3 +10861,55 @@ ctl 的返回。
 （encode 之前）需要在注入层的 ov2 host digest 钩子上按槽名记录输入（mitmweb addon
 一处改动 + 新 key 一轮）即可闭合；引擎侧已排查的候选（fonts.ready/FontFace.load/rAF/
 sandboxed iframe 字体集、detached/impl-doc 测量、品牌过滤）全部与 Chrome 一致或已修。
+
+### Step 307: 批次 15B——两个活体时序残差本地闭环：空闲页 worker 回复搁浅 + 准备路径克隆churn（2026-09-19 07:xx）
+
+**方法**：全程无网络轮。worker-stage-timing fixture 扩展出相位分解（页钟
+constructor→ready→fetchTask 加 worker 钟 srcEval/entryToDispatch/dispatchToDone/
+doneToReply，两侧钟各自报告自己的时长，transit = 差额），并新增 serve/CDP 驱动
+capture-obcura.mjs 与 Chrome oracle 同一条 CDP 流程对拍（live 挑战跑在 serve 下，
+泵连续，fetch CLI 的 settle 间隙不污染测量）。decode-interpret-cost fixture 把
+ver14 真实 TS#1 响应字节（846,076 字符，ray a3d354667f8e3d84_0）喂进完整解码链
+（atob→W3 移位→atob，层 md5 b70558c1/e6c627b8/d6069811 与 python 参考一致）加
+代表性 VM 解释负载（39,014 步 switch 分发、744 次 DOM host op，宽度分布对齐
+ov1-0 反汇编平均 20.6B/条），每层 FNV 校验和与 interpretAcc 双引擎必须逐字节相等。
+
+**Target 1 修复（uGyjw9 184 vs 4）——残余相位 = 空闲页回复搁浅**。14B 修的唤醒只在
+deno_core 有被跟踪 pending work 时有效；页面 JS 纯等 worker 回复时（无 op 无 timer）
+deno_core 报告完全 idle，三个页面泵随即返回：serve 主循环把泵 disarm（
+`runtime_pump_armed = !reached_idle`，cdp/server.rs:771）、CLI settle 切片按
+100ms/50ms backoff 量化，回复滞留 outbox 直到下一个无关事件。fixture 数字：
+fetchTask 页钟 102.8ms（transit 98.6）、idle ping 102.5、后续 ping 中位 0.1——
+即每次「worker 已停、页也停」之后的第一次跳都是一次泵间隙；live14 的 Tief 窗口
+（7.85s 发任务→8.04s worker fetch 出现→184ms 读数）正是这个形状。修复：三个泵
+（autonomous turn / cooperative tick / run_event_loop_with_arrival_wake）在
+deno_core idle 且本页 worker 存活时改为停在 arrival wake 上（同一 poll 内重收集
+outbox，waker 保持注册），无 worker 页仍报 idle 正常 disarm；驻停的 future 只持
+waker 不耗 CPU。修复后（serve 形状）：fetchTask 4.9ms、transit 0.5、idlePing 0.4；
+fetch CLI 同为 ~5/0.5/0.4；Chrome oracle 5.6/0.3/0.2。boot 8.7-10.1ms 比 Chrome
+线程池 50.6ms 快，constructor 5.8 vs 0.2（一次性 isolate 开销）。回归测试
+worker_reply_wakes_a_fully_idle_page_through_the_parked_turn 钉住「一 turn 内送达」。
+**预期 live uGyjw9：4-15ms 带**（引擎面只剩 transit ~1ms + 一次性 boot ~9ms，
+其余是 worker 自己的 brunhild/pat 网络往返，Chrome 同付）。
+
+**Target 2 剖析与修复（ZMSOw0 385 vs 127）**。解码链已对齐（atob 1.1 vs 0.4、
+W3 循环 5.9 vs 6.2、digest 0.7 vs 0.3——Step 301 的 atob op 化到位后此路径无残差）；
+残差全在解释相：103ms vs Chrome 11ms，且 opMs 分解显示 110ms/119.6 集中在
+getBoundingClientRect——每次「变更后读几何」都强制一次全文档 re-prepare
+（~90 元素文档 ~1.19ms/次，Chrome 强制 layout 0.2ms/次）。sample 剖析 re-prepare：
+flatten walk（rendered_children/rendered_descendants/is_html_slot_element/
+assigned_nodes）经 DomTree::get_node 逐候选克隆整个 NodeData（字符串+属性向量），
+malloc churn 可见。修复：热路径全部改走既有的借用式 with_node，行为逐字节不变
+（校验和/accumulator/39,014 步全同）。解释相 103→81.5ms（gBCR 份额 110→75）。
+**剩余主因 = 每次准备的文本重整形**（prepare 内 build_any 的 ~70%）：
+TextEngine 每次 render pass 新建（dom.rs:4742），shaped-run 缓存必须跨 pass
+存活才能削掉它，是下一个立项点而非本批。**预期 live ZMSOw0：显著低于 385**——
+解码面已在带内、每次强制 re-prepare 便宜 ~25%、commit 1 的泵间隙修复同时吃掉
+引导程序内部 postMessage/BroadcastChannel 跳（Step 304 判定 467→385 未塌完即因
+idle 报告搁浅仍在）；精确值需下一捕获轮，若仍高于 Chrome 带宽，按本条定位直接做
+跨 pass shaped-run 缓存。
+
+**门禁**：workspace 全量 cargo nextest --release --features render 1867/1867 通过
+（含 65e227f/6f4ac63 并行批次）；no-default-features check 通过；release build
+（render+stealth）全量通过；obscura-benchmark 障碍课程不在本机（伴随库在主控侧），
+33/33 留给主控下一判决轮一并执行。
