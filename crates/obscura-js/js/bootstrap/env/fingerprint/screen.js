@@ -81,7 +81,7 @@ class Screen {
   if (d && d.get) _markNative(d.get);
   if (d && d.set) _markNative(d.set);
 });
-['addEventListener','removeEventListener','dispatchEvent'].forEach(function(k) {
+['addEventListener','removeEventListener','dispatchEvent','when'].forEach(function(k) {
   _markNative(Screen.prototype[k]);
 });
 // Chrome's Screen reaches the event methods through the EventTarget chain

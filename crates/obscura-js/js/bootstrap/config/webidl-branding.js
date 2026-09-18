@@ -1,12 +1,17 @@
 // Local tag name -> element interface identifier, for the HTML and SVG
 // namespaces. Two consumers: the per-instance [object XXX] getter, and the
 // per-interface constructor install at the end of this file.
+//
+// applet/basefont/bgsound have no window constructor in the passing Chrome
+// censuses (149) nor in the 151 renderer trace: their legacy interfaces were
+// removed, and the elements fall through to HTMLUnknownElement, so no
+// interface is built or published for them.
 const HTML_TAGS = {
   a: 'HTMLAnchorElement', abbr: 'HTMLElement', acronym: 'HTMLElement',
-  address: 'HTMLElement', applet: 'HTMLAppletElement', area: 'HTMLAreaElement',
+  address: 'HTMLElement', applet: 'HTMLUnknownElement', area: 'HTMLAreaElement',
   article: 'HTMLElement', aside: 'HTMLElement', audio: 'HTMLAudioElement',
-  b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLBaseFontElement',
-  bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLBGSoundElement',
+  b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLUnknownElement',
+  bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLUnknownElement',
   big: 'HTMLElement', blink: 'HTMLElement', blockquote: 'HTMLQuoteElement',
   body: 'HTMLBodyElement', br: 'HTMLBRElement', button: 'HTMLButtonElement',
   canvas: 'HTMLCanvasElement', caption: 'HTMLTableCaptionElement',
@@ -443,6 +448,10 @@ const SVG_TAGS = {
     return C;
   };
   const built = Object.create(null);
+  // HTMLUnknownElement must exist before the tag loop: the removed legacy
+  // interfaces (applet, basefont, bgsound) fall through to it, and every tag
+  // mapping to it has to share the exact class the global publishes.
+  built.HTMLUnknownElement = install('HTMLUnknownElement');
   const interfaceFor = (name) => {
     if (name === 'HTMLElement') return ElementCtor;
     const existing = globalThis[name];
@@ -463,7 +472,6 @@ const SVG_TAGS = {
   // ordinary HTMLElement until a CustomElementRegistry definition upgrades
   // it. HTMLUnknownElement was another Element alias, so a class is needed
   // before it can be a wrapper.
-  built.HTMLUnknownElement = install('HTMLUnknownElement');
   _elementInterfaceUnknownTag = function (localName) {
     return _isValidCustomElementName(localName)
       ? ElementCtor

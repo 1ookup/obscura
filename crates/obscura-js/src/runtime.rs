@@ -5528,13 +5528,20 @@ mod tests {
                         elementIframeMembers: Object.getOwnPropertyNames(Element.prototype)
                             .filter(name => ['sandbox', 'srcdoc', 'csp', 'contentDocument',
                                 'contentWindow'].includes(name)),
-                        featurePolicy: {
-                            tag: Object.prototype.toString.call(frame.featurePolicy),
-                            own: Object.getOwnPropertyNames(frame.featurePolicy),
-                            prototype: Object.getOwnPropertyNames(PermissionsPolicy.prototype),
-                            constructor: [PermissionsPolicy.name, PermissionsPolicy.length,
-                                Function.prototype.toString.call(PermissionsPolicy)],
-                        },
+                        featurePolicy: (() => {
+                            // window.PermissionsPolicy is gone (passing Chrome
+                            // exposes the policy objects but no constructor),
+                            // so the class is read off the instance chain.
+                            const policyProto = Object.getPrototypeOf(frame.featurePolicy);
+                            const policyClass = policyProto.constructor;
+                            return {
+                                tag: Object.prototype.toString.call(frame.featurePolicy),
+                                own: Object.getOwnPropertyNames(frame.featurePolicy),
+                                prototype: Object.getOwnPropertyNames(policyProto),
+                                constructor: [policyClass.name, policyClass.length,
+                                    Function.prototype.toString.call(policyClass)],
+                            };
+                        })(),
                         featurePolicySame: frame.featurePolicy === frame.featurePolicy,
                     };
                 })()"#,
@@ -7493,13 +7500,15 @@ mod tests {
     }
 
     /// Window-surface census facts for every name the CF challenge's
-    /// property census ships as evidence. Each row is pinned against the
-    /// local Chrome oracle (153.0.8010.37, headless, https and about:blank,
-    /// non-isolated top window) probed over CDP:
-    /// [in window, reflection, enumerable, configurable, descriptor kind,
-    ///  typeof]. `sharedStorage` is absent there until the storage-access
-    /// permission grants it, and `SharedArrayBuffer` is absent without
-    /// cross-origin isolation, so both stay absent here.
+    /// property census ships as evidence. The oracle is the passing sessions,
+    /// not the local headless Chrome: headless is exactly the shape that
+    /// fails the challenge, so where the two disagreed (Step 300) the
+    /// 149-pass census plus the real Chrome 151 renderer trace win.
+    /// Rows are [in window, reflection, enumerable, configurable, descriptor
+    /// kind, typeof]. HTMLCameraElement/HTMLMicrophoneElement and the
+    /// XSLT/Range/Policy legacy set are ABSENT in both passing oracles even
+    /// though a local 153-headless window has them; ModelContext,
+    /// WebMCPEvent and the SharedStorage family are present in both.
     #[test]
     fn window_census_surface_matches_chrome_oracle() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
@@ -7527,6 +7536,12 @@ mod tests {
                         facts('OpaqueRange'),
                         facts('PerformanceSoftNavigation'),
                         facts('PermissionsPolicy'),
+                        facts('XSLTProcessor'),
+                        facts('HTMLAppletElement'),
+                        facts('ModelContext'),
+                        facts('WebMCPEvent'),
+                        facts('SharedStorage'),
+                        facts('SharedStorageWorklet'),
                         facts('sharedStorage'),
                         facts('crossOriginIsolated'),
                     ];
@@ -7538,47 +7553,59 @@ mod tests {
             serde_json::json!([
                 [false, "absent", null, null, null, "undefined"],
                 [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
-                [true, "own", false, true, "data", "function"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
                 [true, "own", false, true, "data", "function"],
                 [true, "own", false, true, "data", "function"],
                 [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [true, "own", false, true, "data", "function"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", true, true, "data", "object"],
                 [true, "own", true, true, "accessor", "boolean"],
             ])
         );
     }
 
-    /// Constructor identity and prototype members of the two Chrome-153-era
-    /// element interfaces the census lists: illegal constructor, name,
-    /// length, prototype tag, and the member set the oracle reports.
+    /// Constructor identity of the Chrome-151-era interfaces the passing
+    /// sessions expose: the WebMCP ModelContext pair and the SharedStorage
+    /// family. Shapes follow the same WebIDL conventions the rest of the
+    /// interface table already pins (illegal constructor, @@toStringTag,
+    /// prototype chain), and navigator.modelContext answers an object whose
+    /// prototype is ModelContext.prototype, which is what the renderer trace
+    /// reports ("interface":"ModelContext").
     #[test]
-    fn camera_microphone_element_constructors_match_chrome_oracle() {
+    fn model_context_and_shared_storage_constructors_match_chrome_shape() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
                 r#"(() => {
                     const shape = (ctor) => [
-                        ctor.name, ctor.length,
+                        ctor.name,
                         String(ctor).includes('[native code]'),
                         ctor.prototype[Symbol.toStringTag],
-                        Object.getPrototypeOf(ctor.prototype)
-                            === HTMLElement.prototype,
                     ];
-                    const members = (ctor) =>
-                        Object.getOwnPropertyNames(ctor.prototype).sort().join(',');
                     const throws = (ctor) => {
                         try { new ctor(); return 'ok'; }
                         catch (e) { return e.name; }
                     };
                     return [
-                        shape(HTMLCameraElement), members(HTMLCameraElement),
-                        throws(HTMLCameraElement),
-                        shape(HTMLMicrophoneElement), members(HTMLMicrophoneElement),
-                        throws(HTMLMicrophoneElement),
+                        shape(ModelContext), throws(ModelContext),
+                        shape(WebMCPEvent), throws(WebMCPEvent),
+                        Object.getPrototypeOf(WebMCPEvent.prototype) === Event.prototype,
+                        ['SharedStorage', 'SharedStorageWorklet', 'SharedStorageAppendMethod',
+                         'SharedStorageClearMethod', 'SharedStorageDeleteMethod',
+                         'SharedStorageModifierMethod', 'SharedStorageSetMethod']
+                            .map(name => typeof window[name]),
+                        Object.prototype.toString.call(window.sharedStorage),
+                        Object.prototype.toString.call(navigator.modelContext),
+                        Object.getPrototypeOf(navigator.modelContext) === ModelContext.prototype,
                     ];
                 })()"#,
             )
@@ -7586,12 +7613,14 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                ["HTMLCameraElement", 0, true, "HTMLCameraElement", true],
-                "constructor,error,oncancel,onerror,ontrack,setConstraints,track",
-                "TypeError",
-                ["HTMLMicrophoneElement", 0, true, "HTMLMicrophoneElement", true],
-                "constructor,error,oncancel,onerror,ontrack,setConstraints,track",
-                "TypeError",
+                ["ModelContext", true, "ModelContext"], "TypeError",
+                ["WebMCPEvent", true, "WebMCPEvent"], "TypeError",
+                true,
+                ["function", "function", "function", "function", "function",
+                 "function", "function"],
+                "[object SharedStorage]",
+                "[object ModelContext]",
+                true,
             ])
         );
     }
@@ -12407,12 +12436,16 @@ RequestRedirect value",
     }
 
     #[test]
-    fn chrome149_payload_interfaces_are_present_on_secure_documents() {
-        // ModelContext/WebMCPEvent existed only behind a Chrome 153+ origin
-        // trial (the earlier capture ran a headful trial build). The UA this
-        // engine presents is stable Chrome 148, which does not expose them,
-        // and the passing baseline enumerates neither. Keep the surface free
-        // of both so the payload cannot contradict its own user agent.
+    fn chrome151_persona_interfaces_are_present_on_secure_documents() {
+        // The passing sessions expose the WebMCP model-context surface and
+        // window.sharedStorage: the Chrome 151 renderer trace reads
+        // navigator.modelContext (interface ModelContext) and
+        // window.sharedStorage (interface SharedStorage) in the top document,
+        // about:blank and the challenge frame alike, and the passing Chrome
+        // 149 census lists ModelContext, WebMCPEvent, SharedStorage and
+        // navigator.modelContext outright (Step 300). An earlier revision
+        // pinned these to absent on the strength of a headless-only capture;
+        // headless is the shape that fails the challenge, so presence wins.
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -12421,6 +12454,8 @@ RequestRedirect value",
                     modelContextTag: Object.prototype.toString.call(navigator.modelContext),
                     modelContextCtor: typeof ModelContext,
                     webMcpEvent: typeof WebMCPEvent,
+                    sharedStorage: typeof window.sharedStorage,
+                    sharedStorageTag: Object.prototype.toString.call(window.sharedStorage),
                     designMode: document.designMode,
                     navigatorOwn: Object.getOwnPropertyNames(navigator),
                 }))()"#,
@@ -12429,10 +12464,12 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!({
-                "modelContext": "undefined",
-                "modelContextTag": "[object Undefined]",
-                "modelContextCtor": "undefined",
-                "webMcpEvent": "undefined",
+                "modelContext": "object",
+                "modelContextTag": "[object ModelContext]",
+                "modelContextCtor": "function",
+                "webMcpEvent": "function",
+                "sharedStorage": "object",
+                "sharedStorageTag": "[object SharedStorage]",
                 "designMode": "off",
                 "navigatorOwn": [],
             })
@@ -28176,9 +28213,16 @@ RequestRedirect value",
                     'Node', 'Headers', 'Request', 'Response',
                     'HTMLInputElement',
                     'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
-                    'Navigator', 'Location', 'XSLTProcessor', 'HTMLUserMediaElement',
-                    'InteractionContentfulPaint', 'PerformanceSoftNavigation', 'NodeRange',
-                    'OpaqueRange',
+                    'Navigator', 'Location', 'HTMLUserMediaElement',
+                    'InteractionContentfulPaint', 'PerformanceSoftNavigation',
+                    // The Chrome 151 persona surface (Step 300): present in
+                    // the passing sessions. The XSLT/Range trio this list used
+                    // to pin is gone: both passing oracles lack it.
+                    'ModelContext', 'WebMCPEvent',
+                    'SharedStorage', 'SharedStorageWorklet',
+                    'SharedStorageAppendMethod', 'SharedStorageClearMethod',
+                    'SharedStorageDeleteMethod', 'SharedStorageModifierMethod',
+                    'SharedStorageSetMethod',
                 ];
                 const bad = [];
                 for (const n of names) {

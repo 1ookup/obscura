@@ -225,7 +225,7 @@
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
       'protectedAudience', 'storageBuckets',
     ]) _remove(globalThis.navigator, name);
-    for (const name of ['documentPictureInPicture', 'launchQueue']) {
+    for (const name of ['sharedStorage', 'documentPictureInPicture', 'launchQueue']) {
       _remove(globalThis, name);
     }
     _remove(globalThis.crypto, 'subtle');
@@ -609,7 +609,6 @@ const _chromeInterfaceTable = [
   ["HTMLBaseElement",0,0,"HTMLElement","",0],
   ["HTMLBodyElement",0,0,"HTMLElement","",0],
   ["HTMLButtonElement",0,0,"HTMLElement","",0],
-  ["HTMLCameraElement",0,0,"HTMLElement","HTMLCameraElement",0],
   ["HTMLCanvasElement",0,0,"HTMLElement","",0],
   ["HTMLCollection",0,0,"Object","",0],
   ["HTMLDListElement",0,0,"HTMLElement","",0],
@@ -647,7 +646,6 @@ const _chromeInterfaceTable = [
   ["HTMLMenuElement",0,0,"HTMLElement","",0],
   ["HTMLMetaElement",0,0,"HTMLElement","",0],
   ["HTMLMeterElement",0,0,"HTMLElement","",0],
-  ["HTMLMicrophoneElement",0,0,"HTMLElement","HTMLMicrophoneElement",0],
   ["HTMLModElement",0,0,"HTMLElement","",0],
   ["HTMLOListElement",0,0,"HTMLElement","",0],
   ["HTMLObjectElement",0,0,"HTMLElement","",0],
@@ -784,6 +782,7 @@ const _chromeInterfaceTable = [
   ["MediaStreamTrackGenerator",0,2,"MediaStreamTrack","",1],
   ["MediaStreamTrackProcessor",0,2,"Object","",1],
   ["MediaStreamTrackVideoStats",0,0,"Object","",0],
+  ["ModelContext",0,0,"EventTarget","",0],
   ["MessageChannel",0,1,"Object","MessageChannel",0],
   ["MessageEvent",0,2,"Event","",1],
   ["MessagePort",0,0,"EventTarget","",0],
@@ -811,7 +810,6 @@ const _chromeInterfaceTable = [
   ["NodeFilter",0,4,"no-proto","",0],
   ["NodeIterator",0,0,"Object","",0],
   ["NodeList",0,0,"Object","",0],
-  ["NodeRange",0,0,"AbstractRange","NodeRange",0],
   ["NotRestoredReasonDetails",0,0,"Object","",0],
   ["NotRestoredReasons",0,0,"Object","",0],
   ["Notification",0,2,"EventTarget","",1],
@@ -822,7 +820,6 @@ const _chromeInterfaceTable = [
   ["OfflineAudioCompletionEvent",0,3,"Event","",2],
   ["OfflineAudioContext",0,2,"BaseAudioContext","",1],
   ["OffscreenCanvas",0,3,"EventTarget","",2],
-  ["OpaqueRange",0,0,"AbstractRange","OpaqueRange",0],
   ["OffscreenCanvasRenderingContext2D",0,0,"Object","",0],
   ["Option",0,1,"HTMLElement","HTMLOptionElement",0],
   ["OrientationSensor",0,0,"Sensor","",0],
@@ -1035,6 +1032,13 @@ const _chromeInterfaceTable = [
   ["SVGUseElement",0,0,"SVGGraphicsElement","",0],
   ["SVGViewElement",0,0,"SVGElement","",0],
   ["Sanitizer",0,1,"Object","Sanitizer",0],
+  ["SharedStorage",0,0,"Object","",0],
+  ["SharedStorageWorklet",0,0,"Worklet","",0],
+  ["SharedStorageAppendMethod",0,0,"Object","",0],
+  ["SharedStorageClearMethod",0,0,"Object","",0],
+  ["SharedStorageDeleteMethod",0,0,"Object","",0],
+  ["SharedStorageModifierMethod",0,0,"Object","",0],
+  ["SharedStorageSetMethod",0,0,"Object","",0],
   ["Scheduler",0,0,"Object","",0],
   ["Scheduling",0,0,"Object","",0],
   ["Screen",0,0,"EventTarget","",0],
@@ -1169,6 +1173,7 @@ const _chromeInterfaceTable = [
   ["WGSLLanguageFeatures",0,0,"Object","",0],
   ["WakeLock",0,0,"Object","",0],
   ["WakeLockSentinel",0,0,"EventTarget","",0],
+  ["WebMCPEvent",0,2,"Event","",1],
   ["WaveShaperNode",0,2,"AudioNode","",1],
   ["WeakMap",0,1,"Object","WeakMap",0],
   ["WeakRef",0,4,"Object","",1],
@@ -1215,7 +1220,6 @@ const _chromeInterfaceTable = [
   ["XMLHttpRequestEventTarget",0,0,"EventTarget","",0],
   ["XMLHttpRequestUpload",0,0,"XMLHttpRequestEventTarget","",0],
   ["XMLSerializer",0,1,"Object","XMLSerializer",0],
-  ["XSLTProcessor",0,1,"Object","XSLTProcessor",0],
   ["XPathEvaluator",0,1,"Object","XPathEvaluator",0],
   ["XPathExpression",0,0,"Object","",0],
   ["XPathResult",0,0,"Object","",0],
@@ -1454,6 +1458,7 @@ const _chromeNavigatorTable = [
   ["mediaDevices", 1],
   ["mediaSession", 1],
   ["mimeTypes", 1],
+  ["modelContext", 1],
   ["permissions", 1],
   ["plugins", 1],
   ["presentation", 1],
@@ -1592,17 +1597,18 @@ const _chromeInterfaceShells = new Set();
     Object.defineProperty(globalThis, 'clientInformation',
       { get() { return globalThis.navigator; }, enumerable: true, configurable: true });
   }
-  // `sharedStorage` stays off the surface entirely: Chrome only exposes it
-  // once the storage-access permission turns it on, and the census oracle
-  // (Chrome 153, https and challenge pages alike) reports the name absent,
-  // not an empty namespace object.
+  // `sharedStorage` is present on every https window in the passing sessions
+  // (the Chrome 151 renderer trace reads window.sharedStorage in the top
+  // document, about:blank and the challenge frame alike), so the namespace
+  // object is installed here next to its enumerable-object siblings.
   for (const name of ['cookieStore', 'crashReport', 'documentPictureInPicture',
-                      'viewport', 'launchQueue']) {
+                      'sharedStorage', 'viewport', 'launchQueue']) {
     if (typeof globalThis[name] !== 'undefined') continue;
     const object = {};
     Object.defineProperty(object, Symbol.toStringTag,
       { value: { cookieStore: 'CookieStore', crashReport: 'CrashReportedDetails',
                  documentPictureInPicture: 'DocumentPictureInPicture',
+                 sharedStorage: 'SharedStorage',
                  viewport: 'Viewport',
                  launchQueue: 'LaunchQueue' }[name], configurable: true });
     Object.defineProperty(globalThis, name,
@@ -1630,30 +1636,9 @@ const _chromeInterfaceShells = new Set();
       get, set: undefined, enumerable: true, configurable: true,
     });
   };
-  if (typeof XSLTProcessor === 'function') {
-    const proto = XSLTProcessor.prototype;
-    method(proto, 'clearParameters', 0, function clearParameters() {});
-    method(proto, 'getParameter', 2, function getParameter() {});
-    method(proto, 'importStylesheet', 1, function importStylesheet() {});
-    method(proto, 'removeParameter', 2, function removeParameter() {});
-    method(proto, 'reset', 0, function reset() {});
-    method(proto, 'setParameter', 3, function setParameter() {});
-    method(proto, 'transformToDocument', 1, function transformToDocument() {});
-    method(proto, 'transformToFragment', 2, function transformToFragment() {});
-  }
   if (typeof HTMLUserMediaElement === 'function') {
     const proto = HTMLUserMediaElement.prototype;
     for (const name of ['error', 'onstream', 'oncancel', 'onerror', 'stream']) getter(proto, name);
-    method(proto, 'setConstraints', 0, function setConstraints() {});
-  }
-  if (typeof HTMLCameraElement === 'function') {
-    const proto = HTMLCameraElement.prototype;
-    for (const name of ['error', 'oncancel', 'onerror', 'ontrack', 'track']) getter(proto, name);
-    method(proto, 'setConstraints', 0, function setConstraints() {});
-  }
-  if (typeof HTMLMicrophoneElement === 'function') {
-    const proto = HTMLMicrophoneElement.prototype;
-    for (const name of ['error', 'oncancel', 'onerror', 'ontrack', 'track']) getter(proto, name);
     method(proto, 'setConstraints', 0, function setConstraints() {});
   }
   if (typeof InteractionContentfulPaint === 'function') {
@@ -1672,17 +1657,6 @@ const _chromeInterfaceShells = new Set();
       function getLargestInteractionContentfulPaint() {});
     getter(proto, 'paintTime');
     getter(proto, 'presentationTime');
-  }
-  if (typeof NodeRange === 'function') {
-    const proto = NodeRange.prototype;
-    getter(proto, 'startContainer');
-    getter(proto, 'endContainer');
-  }
-  if (typeof OpaqueRange === 'function') {
-    const proto = OpaqueRange.prototype;
-    method(proto, 'disconnect', 0, function disconnect() {});
-    method(proto, 'getBoundingClientRect', 0, function getBoundingClientRect() {});
-    method(proto, 'getClientRects', 0, function getClientRects() {});
   }
 })();
 
@@ -2441,6 +2415,7 @@ const _chromeNavigatorKeyOrder = [
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
   'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection',
+  'modelContext',
   'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
@@ -2552,9 +2527,13 @@ const _chromeNodeKeyOrder = [
 // in the reference payload order. Keep this generated table in bootstrap so
 // realm enumeration follows the same registration sequence.
 const _chromeWindowVersionExtras = new Set([
-  'FontFaceSet', 'HTMLCameraElement', 'HTMLMicrophoneElement', 'HTMLUserMediaElement',
-  'InteractionContentfulPaint', 'NodeRange',
-  'OpaqueRange', 'PerformanceSoftNavigation', 'PermissionsPolicy', 'XSLTProcessor',
+  // The 151-trace accesses every one of these (FontFaceSet 19 hits,
+  // PerformanceSoftNavigation / InteractionContentfulPaint / HTMLUserMediaElement
+  // 12 each), so they stay on the surface even though the passing census
+  // records them with the challenge's 'o.' unknown-name prefix on our side
+  // and not at all in Chrome 149's -- a known residual, not chased here.
+  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
+  'PerformanceSoftNavigation',
 ]);
 const _chromePayloadBareFunctionOrder = [
  'alert', 'atob', 'blur', 'btoa', 'cancelAnimationFrame', 'cancelIdleCallback', 'captureEvents', 'clearInterval',
@@ -2666,12 +2645,12 @@ const _chromePayloadBareFunctionOrder = [
  'EyeDropper', 'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle', 'FileSystemWritableFileStream', 'FileSystemObserver', 'FontData',
  'FragmentDirective', 'HID', 'HIDConnectionEvent', 'HIDDevice', 'HIDInputReportEvent', 'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider',
  'NavigatorLogin', 'LanguageDetector', 'LanguageModel', 'Lock', 'LockManager', 'ServiceWorker', 'ServiceWorkerContainer',
- 'NotRestoredReasonDetails', 'NotRestoredReasons', 'OTPCredential', 'PaymentAddress', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse', 'PaymentManager',
+ 'ModelContext', 'NotRestoredReasonDetails', 'NotRestoredReasons', 'OTPCredential', 'PaymentAddress', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse', 'PaymentManager',
  'PaymentMethodChangeEvent', 'Presentation', 'PresentationAvailability', 'PresentationConnection', 'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent', 'PresentationConnectionList', 'PresentationReceiver',
  'PresentationRequest', 'PressureObserver', 'PressureRecord', 'Serial', 'SerialPort', 'SpeechRecognitionPhrase', 'StorageBucket', 'StorageBucketManager',
  'Summarizer', 'Translator', 'USB', 'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice', 'USBEndpoint',
  'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket', 'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'WakeLock',
- 'WakeLockSentinel', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
+ 'WakeLockSentinel', 'WebMCPEvent', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
  'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource', 'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
  'XRJointPose', 'XRJointSpace', 'XRLightEstimate', 'XRLightProbe', 'XRPose', 'XRRay', 'XRReferenceSpace', 'XRReferenceSpaceEvent',
  'XRRenderState', 'XRRigidTransform', 'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSystem', 'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource',
@@ -2729,7 +2708,7 @@ const _chromeEnumerableWindowObjects = [
   'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
   'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
-  'cookieStore', 'caches', 'documentPictureInPicture',
+  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
   'viewport', 'launchQueue', 'speechSynthesis',
 ];
 const _chromeEnumerableWindowFunctions = [

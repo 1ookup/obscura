@@ -135,9 +135,10 @@ const _permissionsPolicyConstructorDescriptor = Object.getOwnPropertyDescriptor(
   PermissionsPolicy.prototype, 'constructor');
 delete PermissionsPolicy.prototype.constructor;
 Object.defineProperty(PermissionsPolicy.prototype, 'constructor', _permissionsPolicyConstructorDescriptor);
-Object.defineProperty(globalThis, 'PermissionsPolicy', {
-  value: PermissionsPolicy, writable: true, enumerable: false, configurable: true,
-});
+// No global binding: real Chrome (149 census, 151 trace) exposes
+// document.featurePolicy / iframe.featurePolicy objects but no
+// window.PermissionsPolicy constructor. The class stays in bootstrap scope
+// for the iframe.featurePolicy wrapper in env/dom/iframe-element.js.
 _markNative(PermissionsPolicy);
 for (const name of Object.getOwnPropertyNames(PermissionsPolicy.prototype)) {
   const descriptor = Object.getOwnPropertyDescriptor(PermissionsPolicy.prototype, name);
