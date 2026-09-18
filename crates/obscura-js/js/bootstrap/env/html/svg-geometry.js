@@ -304,6 +304,14 @@
   };
 
   function _matrixLike(m) {
+    // Chrome answers SVGMatrix here, not DOMMatrix.
+    if (typeof SVGMatrix === 'function' && SVGMatrix.prototype) {
+      try {
+        const inst = Object.create(SVGMatrix.prototype);
+        inst.a = m.a; inst.b = m.b; inst.c = m.c; inst.d = m.d; inst.e = m.e; inst.f = m.f;
+        return inst;
+      } catch (_e) {}
+    }
     if (typeof DOMMatrix === 'function') {
       try {
         const d = new DOMMatrix();
@@ -363,11 +371,11 @@
   // getBBox gains the container union and the x/y-attribute placement while
   // keeping the text measurement the previous implementation used.
   Element.prototype.getBBox = function getBBox() {
-    if (_svgUnrendered(this)) return { x: 0, y: 0, width: 0, height: 0 };
-    if (_measuringFragment) return { x: 0, y: 0, width: 0, height: 0 };
+    if (_svgUnrendered(this)) return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
+    if (_measuringFragment) return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
     _measuringFragment = true;
     try {
-      return _fragmentBBox(this);
+      return _svgRectLike(_fragmentBBox(this));
     } finally {
       _measuringFragment = false;
     }

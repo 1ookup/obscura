@@ -960,6 +960,36 @@ function _svgThrowIndexSize(index) {
   );
 }
 
+// Chrome's SVG geometry producers hand back interface instances -- getBBox
+// and getExtentOfChar answer SVGRect, getStartPositionOfChar and
+// getEndPositionOfChar answer SVGPoint -- and a probe that collects those
+// records into a filtered array (instanceof or toStringTag branding) sees an
+// empty set here, because these used to be plain {x,y,width,height} records.
+// An empty collection is what made the challenge's rect reduce read exactly 0
+// where Chrome reduced the four rects to the 150px run width. The interfaces
+// exist (illegal constructors, branded prototypes), so instances are built
+// around their prototypes.
+function _svgInterfaceInstance(name, record) {
+  const ctor = globalThis[name];
+  if (typeof ctor !== 'function' || !ctor.prototype || record == null) return record;
+  try {
+    const inst = Object.create(ctor.prototype);
+    const keys = name === 'SVGPoint' ? ['x', 'y'] : ['x', 'y', 'width', 'height'];
+    for (const key of keys) {
+      if (record[key] !== undefined) inst[key] = record[key];
+    }
+    return inst;
+  } catch (_error) { return record; }
+}
+
+function _svgRectLike(record) {
+  return _svgInterfaceInstance('SVGRect', record);
+}
+
+function _svgPointLike(record) {
+  return _svgInterfaceInstance('SVGPoint', record);
+}
+
 // First numeric value of an attribute list (SVG x/y accept per-glyph lists).
 function _svgAttrOffset(element, name) {
   try {
@@ -992,10 +1022,10 @@ function _svgRunAdvance(text, font) {
 
 Element.prototype.getBBox = function() {
   if (_svgUnrendered(this)) {
-    return { x: 0, y: 0, width: 0, height: 0 };
+    return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
   }
   const box = _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this));
-  return { x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent };
+  return _svgRectLike({ x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent });
 };
 
 Element.prototype.getComputedTextLength = function() {
@@ -1015,12 +1045,12 @@ Element.prototype.getExtentOfChar = function(ch) {
   // walking a run positioned by x=32 sees positions ascending from 32.
   const index = _svgCharacterIndex(this, ch);
   const box = _measureTextBox(text.charAt(index), font);
-  return {
+  return _svgRectLike({
     x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, index),
     y: -box.ascent,
     width: box.width,
     height: box.ascent + box.descent,
-  };
+  });
 };
 
 Element.prototype.getSubStringLength = function(ch, len) {

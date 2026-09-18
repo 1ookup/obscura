@@ -242,15 +242,16 @@ const SVG_TAGS = {
     getStartPositionOfChar(index) {
       if (_svgUnrendered(this)) _svgThrowIndexSize(index);
       // Chrome anchors the character positions on the element's x list origin
-      // (a run at x=32 starts its position list at 32), not at user-space 0.
+      // (a run at x=32 starts its position list at 32), not at user-space 0,
+      // and answers SVGPoint instances, not plain records.
       const offset = _svgAttrOffset(this, 'x');
-      return { x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 };
+      return _svgPointLike({ x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 });
     },
     getEndPositionOfChar(index) {
       if (_svgUnrendered(this)) _svgThrowIndexSize(index);
       const i = _svgCharacterIndex(this, index);
       const char = _svgTextContent(this).charAt(i);
-      return { x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 };
+      return _svgPointLike({ x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 });
     },
     getRotationOfChar(index) {
       if (_svgUnrendered(this)) _svgThrowIndexSize(index);

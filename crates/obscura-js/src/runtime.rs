@@ -7396,6 +7396,21 @@ mod tests {
                             charNum: thunk(() => t.getCharNumAtPosition({ x: 40, y: 0 })),
                             bbox: thunk(() => { const b = t.getBBox(); return b.x + "," + b.y + "," + b.width + "," + b.height; }),
                             rc: thunk(() => { const b = t.getBoundingClientRect(); return b.x + "," + b.y + "," + b.width + "," + b.height; }),
+                            bboxKind: thunk(() => t.getBBox() instanceof SVGRect ? "SVGRect" : Object.prototype.toString.call(t.getBBox())),
+                        };
+                    };
+                    const kinds = (t) => {
+                        const kind = (v) => v instanceof DOMRect ? "DOMRect"
+                            : v instanceof SVGRect ? "SVGRect"
+                            : v instanceof SVGPoint ? "SVGPoint"
+                            : v instanceof SVGMatrix ? "SVGMatrix"
+                            : Object.prototype.toString.call(v);
+                        return {
+                            bbox: kind(t.getBBox()),
+                            ext: kind(t.getExtentOfChar(0)),
+                            sp: kind(t.getStartPositionOfChar(0)),
+                            ctm: kind(t.getCTM()),
+                            gBCR: kind(t.getBoundingClientRect()),
                         };
                     };
                     // Detached in the document, never inserted.
@@ -7412,9 +7427,13 @@ mod tests {
                     out.implDoc = fam(svg.firstChild);
                     // Rendered control: same shape inserted into the document.
                     const rendered = mk(document);
-                    document.body.appendChild(rendered);
+                    const holder = document.createElementNS(ns, "svg");
+                    holder.appendChild(rendered);
+                    document.body.appendChild(holder);
                     out.rendered = fam(rendered);
                     out.renderedHasMetrics = Number(out.rendered.ctl) > 0 && Number(out.rendered.sub8) > 0;
+                    out.renderedKinds = kinds(rendered);
+                    out.detachedBBoxKind = String(Object.prototype.toString.call(mk(document).getBBox()));
                     return out;
                 })()"#,
             )
@@ -7431,12 +7450,28 @@ mod tests {
             "charNum": "-1",
             "bbox": "0,0,0,0",
             "rc": "0,0,0,0",
+            "bboxKind": "SVGRect",
         });
         assert_eq!(result["detached"], zero_family);
         assert_eq!(result["template"], zero_family);
         assert_eq!(result["implDoc"], zero_family);
         assert_eq!(result["rendered"]["noc"], serde_json::json!("64"));
         assert_eq!(result["renderedHasMetrics"], serde_json::json!(true));
+        // Chrome brands the geometry producers: SVGRect for bbox and the
+        // per-character extents, SVGPoint for positions, SVGMatrix for the
+        // CTMs, DOMRect for the CSS-box gBCR. The challenge's rect collector
+        // reduces to 0 when the records are not instances.
+        assert_eq!(
+            result["renderedKinds"],
+            serde_json::json!({
+                "bbox": "SVGRect",
+                "ext": "SVGRect",
+                "sp": "SVGPoint",
+                "ctm": "SVGMatrix",
+                "gBCR": "DOMRect",
+            })
+        );
+        assert_eq!(result["detachedBBoxKind"], serde_json::json!("[object SVGRect]"));
     }
 
     #[test]
