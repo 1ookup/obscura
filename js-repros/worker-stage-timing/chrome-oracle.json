@@ -1,0 +1,15 @@
+{
+  "workerBootMs": 40.700000047683716,
+  "workerFetchMs": 12.300000071525574,
+  "pingPongMs": 0,
+  "totalMs": 54.300000071525574,
+  "workerSelfBootMs": null,
+  "error": null,
+  "fetchBytes": 12000,
+  "marks": {
+    "start": 0,
+    "afterBoot": 40.700000047683716,
+    "afterFetch": 53.300000071525574,
+    "afterPings": 54.300000071525574
+  }
+}

@@ -1,0 +1,95 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>worker stage timing fixture</title>
+<body>
+<script>
+// Worker stage timing fixture, modelled on the Turnstile widget's blob worker
+// pipeline: the page creates a dedicated Worker from a blob URL, posts it a
+// task, the worker fetches a same-origin resource and posts the result back.
+// Three numbers come out, all milliseconds:
+//   workerBootMs   - new Worker(blobUrl) to the first message delivered
+//   workerFetchMs  - one fetch round trip measured inside the worker
+//   pingPongMs     - median message round trip through the worker
+//   totalMs        - constructor to the last reply (the uGyjw9 analogue)
+globalThis.workerFixturePromise = (async function () {
+  const result = { workerBootMs: null, workerFetchMs: null, pingPongMs: null,
+                    totalMs: null, workerSelfBootMs: null, error: null };
+  const t0 = performance.now();
+  const marks = { start: 0 };
+  try {
+    const source = `
+      self.__boot = performance.now();
+      self.onmessage = async function (e) {
+        const msg = e.data;
+        if (msg && msg.kind === 'ping') {
+          self.postMessage({ kind: 'pong', seq: msg.seq });
+          return;
+        }
+        if (msg && msg.kind === 'fetch') {
+          const t = performance.now();
+          try {
+            const resp = await fetch(msg.url);
+            const text = await resp.text();
+            self.postMessage({ kind: 'fetched', ms: performance.now() - t,
+                               bytes: text.length, status: resp.status,
+                               bootLagMs: self.__boot });
+          } catch (err) {
+            self.postMessage({ kind: 'fetched', error: String(err) });
+          }
+        }
+      };
+      self.postMessage({ kind: 'ready' });
+    `;
+    const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    const worker = new Worker(blobUrl);
+    let firstMessageMs = null;
+    const bootPromise = new Promise((resolve) => {
+      worker.onmessage = (e) => {
+        if (firstMessageMs === null) firstMessageMs = performance.now() - t0;
+        if (e.data && e.data.kind === 'ready') resolve(firstMessageMs);
+      };
+    });
+    result.workerBootMs = await bootPromise;
+    marks.afterBoot = performance.now() - t0;
+    result.workerSelfBootMs = null;
+    // One worker-side fetch round trip against the fixture server.
+    const fetchMs = await new Promise((resolve) => {
+      worker.onmessage = (e) => {
+        if (e.data && e.data.kind === 'fetched') resolve(e.data);
+      };
+      worker.postMessage({ kind: 'fetch', url: new URL('fixture-payload.txt', location.href).href });
+    });
+    marks.afterFetch = performance.now() - t0;
+    if (fetchMs.error) { result.error = fetchMs.error; }
+    else { result.workerFetchMs = fetchMs.ms; result.fetchBytes = fetchMs.bytes; }
+    // 21 message round trips; report the median.
+    const samples = [];
+    for (let seq = 0; seq < 21; seq++) {
+      const s = performance.now();
+      const pongMs = await new Promise((resolve) => {
+        worker.onmessage = (e) => {
+          if (e.data && e.data.kind === 'pong' && e.data.seq === seq) resolve(performance.now() - s);
+        };
+        worker.postMessage({ kind: 'ping', seq });
+      });
+      samples.push(pongMs);
+    }
+    marks.afterPings = performance.now() - t0;
+    samples.sort((a, b) => a - b);
+    result.pingPongMs = samples[Math.floor(samples.length / 2)];
+    result.totalMs = performance.now() - t0;
+    worker.terminate();
+  } catch (err) {
+    result.error = String(err);
+  }
+  result.marks = marks;
+  globalThis.workerFixtureResult = result;
+  const div = document.createElement('div');
+  div.id = 'worker-fixture-done';
+  div.textContent = JSON.stringify(result);
+  document.body.appendChild(div);
+  return result;
+})();
+
+</script>
+</body>
