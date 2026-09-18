@@ -29007,6 +29007,65 @@ RequestRedirect value",
         );
     }
 
+    // The challenge's storage probe (RPKTR7) hashes estimate().quota. Chrome
+    // answers a machine-derived quota: the 10 GiB floor plus a small
+    // host-accounting delta (the passing capture carried 10 GiB + 314), and
+    // usage grows with what the origin wrote. A bare 10 GiB with usage 0 is
+    // the stub shape that files the engine under emulated environment.
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_estimate_quota_and_usage_track_written_bytes() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const quotaFloor = 10 * 1024 * 1024 * 1024;
+                    const before = await navigator.storage.estimate();
+                    const before2 = await navigator.storage.estimate();
+                    const root = await navigator.storage.getDirectory();
+                    const file = await root.getFileHandle('probe.txt', { create: true });
+                    const stream = await file.createWritable();
+                    await stream.write(new Uint8Array(4096).fill(65));
+                    await stream.close();
+                    const after = await navigator.storage.estimate();
+                    return {
+                        shape: Object.keys(before),
+                        quotaAboveFloor: before.quota > quotaFloor,
+                        quotaWithinDelta: before.quota - quotaFloor < 4096,
+                        quotaNotFlat: before.quota !== quotaFloor,
+                        stable: before.quota === before2.quota && before.usage === before2.usage,
+                        usageBefore: before.usage,
+                        usageAfterGrew: after.usage >= 4096,
+                        usageIsInteger: Number.isInteger(after.usage),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "shape": ["quota", "usage", "usageDetails"],
+                "quotaAboveFloor": true,
+                "quotaWithinDelta": true,
+                "quotaNotFlat": true,
+                "stable": true,
+                "usageBefore": 0,
+                "usageAfterGrew": true,
+                "usageIsInteger": true,
+            })
+        );
+    }
+
+    // navigator.connection.downlink follows the engine's completed fetches
+    // the way Chrome's estimator follows real traffic: a default before any
+    // transfer, then a quantized, clamped reading that is not the reporting
+    // cap. A 4 KiB body served after a delay answers ~0.3 Mbps; the old pinned
+    // 10 was the cap itself, the one value the passing session did not report.
+    #[tokio::test(flavor = "current_thread")]
     async fn connection_downlink_follows_completed_transfers() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

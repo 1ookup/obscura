@@ -1104,11 +1104,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       }
       try { delete G.StorageManager.prototype.persist; } catch (e) {}
       nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
-        // The same quota the document realm answers: one origin cannot report
-        // two, and the reference capture's worker reads 10 GiB. The challenge
-        // runs its storage probe in this realm, so a flat 5 GB here was the
-        // value that actually reached the payload.
-        storageData(this); return { quota: 10737418240, usage: 0, usageDetails: {} };
+        // The same quota and usage the document realm answers: one origin
+        // cannot report two. Both come from the engine's storage op (host
+        // free-space delta over the 10 GiB floor plus the bytes this origin
+        // actually wrote through OPFS), so the challenge's storage probe in
+        // this realm sees the machine-derived numbers a browser reports.
+        storageData(this);
+        var parts = String(Deno.core.ops.op_storage_estimate()).split(',');
+        return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
       });
       nativeMethod(G.StorageManager.prototype, 'persisted', 0, async function () {
         storageData(this); return false;

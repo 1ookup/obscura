@@ -198,11 +198,16 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     clearWatch() {},
   })),
   storage: _bootstrapObject('navigator.storage', () => ({
-    // The worker realm answers this too, and one origin cannot report two
-    // quotas: both read 10 GiB, which is what the reference capture's worker
-    // reports. A per-install random band looked plausible on its own but
-    // disagreed with the worker realm's constant.
-    estimate() { return Promise.resolve({ quota: 10737418240, usage: 0 }); },
+    // Quota and usage come from the engine's storage op (host-derived quota
+    // delta over the 10 GiB floor plus the origin's real written bytes), so
+    // this realm, the document realm, and the worker realm answer with one
+    // origin's numbers instead of three flat constants.
+    estimate() {
+      const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
+      return Promise.resolve({
+        quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {},
+      });
+    },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   })),

@@ -1786,12 +1786,14 @@ const _chromeInterfaceShells = new Set();
 
   method(StorageManager.prototype, 'estimate', async function estimate() {
     requireStorage(this);
-    // Chrome grants a share of free disk under a per-origin cap; the reference
-    // capture reports 10 GiB (10737418240) from a worker realm exactly like this
-    // one, where a flat 5 GB is a value no browser produces. This realm and the
-    // document realm must answer alike: one origin reporting two quotas is its
-    // own tell, so both read the same constant.
-    return { quota: 10737418240, usage: 0, usageDetails: {} };
+    // Chrome grants a share of free disk under a per-origin cap, floored near
+    // 10 GiB with a small host-accounting delta, and usage grows with what the
+    // origin wrote. Both numbers come from the engine's storage op so this
+    // realm, navigator.storage, and the worker realm report one origin's
+    // values; a flat 10 GiB with usage 0 is the stub shape the challenge's
+    // storage probe files under emulated environment.
+    const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
+    return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
   }, 0);
   method(StorageManager.prototype, 'persisted', async function persisted() {
     requireStorage(this); return false;
@@ -1938,6 +1940,7 @@ const _chromeInterfaceShells = new Set();
         if (data.type === 'truncate') {
           const size = Math.max(0, Number(data.size) || 0);
           const next = new Uint8Array(size); next.set(state.node.bytes.subarray(0, size));
+          Deno.core.ops.op_storage_usage_add(next.length - state.node.bytes.length);
           state.node.bytes = next; return;
         }
         if (data.type === 'write') { state.position = Math.max(0, Number(data.position) || 0); data = data.data; }
@@ -1945,6 +1948,7 @@ const _chromeInterfaceShells = new Set();
       const bytes = _blobPartToBytes(data, false);
       const size = Math.max(state.node.bytes.length, state.position + bytes.length);
       const next = new Uint8Array(size); next.set(state.node.bytes); next.set(bytes, state.position);
+      Deno.core.ops.op_storage_usage_add(next.length - state.node.bytes.length);
       state.node.bytes = next; state.position += bytes.length; state.node.lastModified = Date.now();
     }, 1);
     method(FileSystemWritableFileStream.prototype, 'seek', async function seek(position) {

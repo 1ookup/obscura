@@ -6727,6 +6727,103 @@ fn opfs_io(what: &str, error: std::io::Error) -> deno_error::JsErrorBox {
     deno_error::JsErrorBox::generic(format!("OPFS {what}: {error}"))
 }
 
+/// Free bytes on the volume holding the OPFS scratch directory. Chrome derives
+/// its storage quota from the host's free disk space; the number only feeds a
+/// small delta on top of the 10 GiB floor, so a coarse answer is fine and any
+/// stat failure falls back to a constant delta rather than an error.
+fn host_free_bytes() -> u64 {
+    #[cfg(unix)]
+    {
+        let path = opfs_root().to_string_lossy().into_owned();
+        let cpath = match std::ffi::CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `fs` is a valid, zeroed statvfs owned by this call and the
+        // path outlives the syscall.
+        let ok = unsafe { libc::statvfs(cpath.as_ptr(), &mut fs) };
+        if ok == 0 {
+            (fs.f_bavail as u64).saturating_mul(fs.f_frsize as u64)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Bytes the origin actually wrote through the engine's storage shims. The
+/// OPFS backing directory is the single source of truth: the document realm,
+/// the worker realm, and `navigator.storage` all write through it, so summing
+/// the real file sizes keeps every realm's `estimate().usage` consistent
+/// without shared mutable bookkeeping. The counter covers the one shim without
+/// backing files: the document realm's in-memory writable streams report their
+/// written bytes here, and the total answers for every realm alike.
+fn storage_usage_bytes() -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(opfs_root()) {
+        for entry in entries.flatten() {
+            let size = entry
+                .metadata()
+                .map(|m| if m.is_file() { m.len() } else { 0 })
+                .unwrap_or(0);
+            total += size;
+        }
+    }
+    let js_bytes = storage_js_bytes().load(std::sync::atomic::Ordering::Relaxed);
+    total + js_bytes.max(0) as u64
+}
+
+fn storage_js_bytes() -> &'static std::sync::atomic::AtomicI64 {
+    static BYTES: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    BYTES.get_or_init(|| std::sync::atomic::AtomicI64::new(0))
+}
+
+/// Report bytes written through a storage shim without backing files. Never
+/// negative: the counter floors at zero because usage is a size, not a debt.
+#[op2(fast)]
+fn op_storage_usage_add(#[smi] delta: f64) {
+    let delta = if delta.is_finite() { delta as i64 } else { 0 };
+    let counter = storage_js_bytes();
+    loop {
+        let current = counter.load(std::sync::atomic::Ordering::Relaxed);
+        let next = current.saturating_add(delta).max(0);
+        if counter
+            .compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// `navigator.storage.estimate()` quota and usage as `"quota,usage"`.
+///
+/// Chrome's QuotaManager answers a machine-derived quota: a share of free disk
+/// space under a per-origin cap, which on ordinary desktops floors out at
+/// 10 GiB plus a small host-accounting delta (the passing capture carried
+/// 10737418554 = 10 GiB + 314; a bare 10737418240 is the flat constant a stub
+/// produces, and the challenge files it under emulated environment). The delta
+/// here comes from the host's own free-space figure and stays in the few
+/// hundred bytes Chrome reports. Usage is the origin's real written bytes.
+#[op2]
+#[string]
+fn op_storage_estimate() -> String {
+    const GIB: u64 = 1 << 30;
+    let free = host_free_bytes();
+    let delta = 200 + (free % 800);
+    let quota = 10 * GIB + delta;
+    format!("{},{}", quota, storage_usage_bytes())
+}
+
 // --- navigator.connection.downlink estimator -------------------------------
 //
 // Chrome derives `downlink` from its network quality estimator: observed
@@ -7650,10 +7747,11 @@ pub fn build_extension() -> Extension {
         op_opfs_sync_truncate(),
         op_opfs_sync_size(),
         op_opfs_sync_close(),
+        op_storage_estimate(),
+        op_storage_usage_add(),
         op_connection_downlink(),
         op_worker_spawn(),
         op_worker_post_message(),
-        op_worker_recv(),
         op_worker_terminate(),
         op_shared_worker_connect(),
         op_shared_worker_post_message(),
