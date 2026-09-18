@@ -28959,12 +28959,50 @@ RequestRedirect value",
                 "own": [],
                 "construct": "TypeError",
                 "values": ["boolean", "number", "number", "number"],
-                "desktop": [true, 0, true, 1],
+                "desktop": [true, 0, true, 0.99],
                 "events": [
                     [true, true, true, true], [true, true, true, true],
                     [true, true, true, true], [true, true, true, true],
                 ],
                 "handler": [null, "function"],
+            })
+        );
+    }
+
+    // The passing sessions' battery probe reads "99" and the boolean pair of a
+    // charging laptop; a randomized or empty level is a value no charging
+    // Chrome reports. The whole surface is pinned here: shape, values, and the
+    // event handler slots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigator_battery_answers_a_charging_laptop_shape() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const battery = await navigator.getBattery();
+                    return {
+                        charging: battery.charging,
+                        chargingTime: battery.chargingTime,
+                        dischargingTime: battery.dischargingTime === Infinity ? "Infinity" : battery.dischargingTime,
+                        level: battery.level,
+                        levelTimes100: String(battery.level * 100),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "charging": true,
+                "chargingTime": 0,
+                "dischargingTime": "Infinity",
+                "level": 0.99,
+                "levelTimes100": "99",
             })
         );
     }

@@ -621,13 +621,15 @@ function _getFp() {
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
     compKnee: 30 + (_fpRand(103) - 0.5) * 4,
     compRatio: 12 + (_fpRand(104) - 0.5) * 4,
-    // The default persona is a desktop (discrete GPU, no battery): Chrome
-    // reports a full, always-charging battery there -- level 1, charging
-    // true, chargingTime 0, dischargingTime Infinity. A randomized level in
-    // [0.5,1) never reaches 1, so the challenge's battery probe reads a
-    // level no real desktop Chrome produces.
-    batteryLevel: 1,
-    batteryCharging: true,
+    // The default persona is a charged laptop on AC: Chrome answers a full
+    // charging battery there -- level 0.99, charging true, chargingTime 0,
+    // dischargingTime Infinity. The passing capture's sessions all report
+    // 0.99 ("99" in the battery probe), never a randomized value, and a
+    // fingerprint may still pin its own batteryLevel/batteryCharging.
+    batteryLevel: Number.isFinite(fingerprint.batteryLevel)
+      ? Number(fingerprint.batteryLevel) : 0.99,
+    batteryCharging: fingerprint.batteryCharging === undefined
+      ? true : !!fingerprint.batteryCharging,
     screen: [Number(fingerprint.screen && fingerprint.screen.width) || 1920,
       Number(fingerprint.screen && fingerprint.screen.height) || 1080],
     canvasFingerprint: cfp,
