@@ -10671,3 +10671,34 @@ PerformanceSoftNavigation 在我方 census 以 'o.'（未知名）前缀出现�
 **门禁**：obscura-js 648/648、obscura-browser 126/126、obscura-net 104/104（release、
 render、nextest）；release build 全量通过；未跑障碍课程与真实网络轮（代理验证由主控
 统一执行）。
+
+### Step 302: 批次 13 验证——结构面全对齐，TS#3 从 2.9KB 变 92KB（2026-09-19 03:0x）
+
+**方法**：注入轮（ver13）+ 无注入判决轮（live13/live13c）。计数器语义按 counter-semantics.md
+（全部是毫秒时序）。注意：capture_round.sh 初版 deadline 12 < click-after 16 导致前两轮
+无点击（验证 agent 发现），已修为 deadline 21/settle 9。
+
+**注入轮 ver13（对拍通过轮）**：
+- 结构：tQdUc5 39→**38（与 Chrome 一致）**，bench 条目消失（TS#2 组装提速后 bench 不再
+  抢入——此前的"点击触发 bench"推断作废，纯时序竞争）；census 桶数 58 vs 58，目标桶
+  （44/77/1200/816、'4'、zh-CN,zh、CSS1Compat、ModelContext/SharedStorage 缺席）全部修复。
+  残差仅 5 个 o. 前缀名 + 作用域枚举的 o.crossOriginIsolated。
+- 时序：ZMSOw0/twvE0 729→**467**（atob 效果，仍 3.7x Chrome 127）；NnqX6@TS#1 831→569
+  （闭包 NnqX6−ZMSOw0=102 两侧成立）；uGyjw9 268（worker 阶段，未修，Chrome 4）；
+  TS#1→TS#2 间隔 9.35s→4.74s（Chrome ~3.1s）。
+- 未动：Vhmq4 仍 ["lang","dir"]；哈希探针仍 RKUE0=sha256("0")+JRzmw6="bOHv4"（SVG 沙箱
+  iframe 测量归零，批次 14）；/ci/ 仍不发。
+
+**无注入判决轮 live13c（16s 点击成功）**：
+```
+6.55s TS#1(4748B→822780) → 8.4s brunhild+pat401 → 11.7s TS#2(88706→127232)
+→ 22.65s TS#3(91906B→5160)  →  22.85s main#2(7788→3240)  →  25.6s 重开一轮
+```
+**TS#3 从恒 2.9KB（短失败变体）变为 91,906B**（Chrome 参考形态 93,095B）——服务端现在
+接受 TS#2 并下发第二批探针程序；点击后全流程走完。判决仍 fail（重启）。
+/ci/ 请求形态已确认：纯 image 像标 GET（sec-fetch-dest:image，无 PAT 头，响应 image/png
+3780B），URL 带会话令牌；/pat/ 401 带 4 个 PrivateToken challenge。Chrome 靠浏览器 PAT
+兑付后发 /ci/；我们停于 401。
+
+**批次 14 派发**：A) SVG 沙箱 iframe 测量归零 + Vhmq4 dir + battery/downlink/quota 值面；
+B) worker 阶段 268ms（uGyjw9）+ ZMSOw0 残差 467ms 的性能剖析。

@@ -35,5 +35,6 @@
 * [HaHaVM environment parity ledger](HaHaVM-environment-parity.md)
 * [Iframe support: design document](Iframe-support-design.md)
 * [Cloudflare challenge: diagnostic profile](Cloudflare-challenge-profile.md)
+* [Cloudflare challenge: payload construction (static solver)](Cloudflare-payload-construction.md)
 * [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 * [Testing and debugging](Testing-and-debugging.md)
