@@ -6892,6 +6892,18 @@ fn worker_environment(
             }
         },
     };
+    // The worker answers crossOriginIsolated from the creator document's
+    // scope, the same decision every realm of the page reports. Root 0 is the
+    // top document, whose flag lives on the shared state.
+    let creator_cross_origin_isolated = if creator_root > 0 {
+        gs.dom
+            .as_ref()
+            .and_then(|dom| dom.document_scope(obscura_dom::NodeId::new(creator_root)))
+            .map(|scope| scope.cross_origin_isolated)
+            .unwrap_or(gs.cross_origin_isolated)
+    } else {
+        gs.cross_origin_isolated
+    };
     crate::worker::WorkerEnvironment {
         cookie_jar: gs.cookie_jar.clone(),
         http_client: gs.http_client.clone(),
@@ -6902,6 +6914,7 @@ fn worker_environment(
         shared: shared_worker,
         origin,
         secure_context,
+        cross_origin_isolated: creator_cross_origin_isolated,
         document_csp: match worker_csp {
             Some(own) => (!own.is_empty()).then_some(own),
             None => {

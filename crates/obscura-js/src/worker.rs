@@ -47,6 +47,11 @@ pub(crate) struct WorkerEnvironment {
     /// opaque origin serializes to "null" and cannot be re-inspected for its
     /// scheme.
     pub secure_context: bool,
+    /// Whether the creator document is cross-origin isolated. A
+    /// WorkerGlobalScope answers `crossOriginIsolated` with its environment's
+    /// isolation, so a worker of an isolated page must report the same true
+    /// the window realm reports (Step 300: the challenge probes both).
+    pub cross_origin_isolated: bool,
     /// The enforced CSP of the document that created this worker. Worker
     /// fetches are governed by the creator document's `connect-src`; a frame
     /// worker must not silently fall back to the top-level page policy.
@@ -500,6 +505,7 @@ fn worker_thread_main(
             let worker_name = std::mem::take(&mut environment.name);
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
+            let worker_isolated = environment.cross_origin_isolated;
             let worker_csp = environment.document_csp.take();
             let worker_shared = environment.shared;
             let trace_label = environment.trace_label.clone();
@@ -543,6 +549,9 @@ fn worker_thread_main(
                 // URL, which describes no origin to inherit from.
                 gs.inherited_origin = Some(worker_origin.clone());
                 gs.inherited_secure_context = worker_secure;
+                // Every realm of an isolated page reports the same decision,
+                // the worker realm included.
+                gs.cross_origin_isolated = worker_isolated;
                 gs.document_csp = worker_csp;
                 gs.cookie_jar = environment.cookie_jar;
                 gs.http_client = worker_http_client;
@@ -566,6 +575,7 @@ fn worker_thread_main(
                     &worker_name,
                     &worker_origin,
                     worker_secure,
+                    environment.cross_origin_isolated,
                     worker_shared,
                     crate::tracelog::enabled(),
                 ),
@@ -710,6 +720,7 @@ fn worker_prep_script(
     name: &str,
     origin: &str,
     secure: bool,
+    isolated: bool,
     shared: bool,
     tracelog: bool,
 ) -> String {
@@ -719,6 +730,10 @@ fn worker_prep_script(
         .replace("__OBSCURA_WORKER_NAME__", &json(name))
         .replace("__OBSCURA_WORKER_ORIGIN__", &json(origin))
         .replace("__OBSCURA_WORKER_SECURE__", if secure { "true" } else { "false" })
+        .replace(
+            "__OBSCURA_WORKER_ISOLATED__",
+            if isolated { "true" } else { "false" },
+        )
         .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
         .replace("__OBSCURA_TRACELOG__", if tracelog { "true" } else { "false" })
 }
@@ -1273,7 +1288,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // file:// document is a secure context but serializes its origin to "null",
   // so the string cannot answer this.
   defGet(G, 'isSecureContext', function () { return __OBSCURA_WORKER_SECURE__; }, true);
-  defGet(G, 'crossOriginIsolated', function () { return false; }, true);
+  // The creator document's isolation decision, not a constant: a worker of a
+  // cross-origin-isolated page answers true exactly like its window does.
+  defGet(G, 'crossOriginIsolated', function () { return __OBSCURA_WORKER_ISOLATED__; }, true);
 
   // ---------------------------------------------------------------------
   // 6. Event plumbing.
@@ -1843,6 +1860,45 @@ mod tests {
             serde_json::json!(
                 r#"{"tag":"[object DedicatedWorkerGlobalScope]","ctor":"DedicatedWorkerGlobalScope","protoCtor":"DedicatedWorkerGlobalScope","isDedicated":true,"isWorkerScope":true,"isEventTarget":true,"name":"","ownName":true,"origin":"string","secure":"boolean","isolated":"boolean"}"#
             ),
+        );
+    }
+
+    /// A worker of a cross-origin-isolated page answers the same true its
+    /// window answers (Step 300: the challenge census caught the worker realm
+    /// answering false while the window answered true). A non-isolated page
+    /// keeps false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_cross_origin_isolated_follows_its_creator() {
+        let spawn_probe = |isolated: bool| {
+            let mut rt = page_runtime();
+            rt.set_cross_origin_isolated(isolated);
+            rt.execute_script(
+                "<test>",
+                r#"
+                const src = "postMessage({isolated: crossOriginIsolated," +
+                  "type: typeof crossOriginIsolated});";
+                const url = 'data:text/javascript,' + encodeURIComponent(src);
+                globalThis.__got = [];
+                new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+                "#,
+            )
+            .unwrap();
+            rt
+        };
+        let mut rt = spawn_probe(true);
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!(r#"{"isolated":true,"type":"boolean"}"#),
+        );
+
+        let mut rt = spawn_probe(false);
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!(r#"{"isolated":false,"type":"boolean"}"#),
         );
     }
 
