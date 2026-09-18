@@ -32,6 +32,8 @@ use crate::ops::{
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+    ensure_resolved_scroll_for_geometry, prepared_for_frame_root, sample_live_document_animations,
+    store_frame_prepared,
 };
 
 fn obscura_prepare_stack_trace_callback<'s>(
@@ -220,6 +222,54 @@ fn render_frame_tree_into(
 /// Render every active iframe content document of the page, deepest first,
 /// keyed by host NodeId. Requires the parent document's prepared layout for
 /// top-level frame geometry.
+/// Warm the retained layout of every committed child frame that does not
+/// already hold one. Frame documents lay out separately from the top
+/// document; without this pass the first geometry read inside a frame pays
+/// that frame's whole first layout.
+#[cfg(feature = "render")]
+fn prewarm_frame_layouts(state: &mut crate::ops::ObscuraState) {
+    let cold_frame_roots: Vec<NodeId> = match state.dom.as_ref() {
+        Some(dom) => dom
+            .iframe_hosts_in_shadow_including_subtree(dom.document())
+            .into_iter()
+            .filter_map(|host| dom.iframe_content_document(host))
+            .filter(|root| {
+                state
+                    .frame_render_states
+                    .get(root)
+                    .and_then(|frame_state| frame_state.prepared_render.as_ref())
+                    .is_none()
+            })
+            .collect(),
+        None => return,
+    };
+    if cold_frame_roots.is_empty() {
+        return;
+    }
+    let crate::ops::ObscuraState {
+        dom,
+        prepared_render,
+        render_resources,
+        frame_render_states,
+        ..
+    } = state;
+    let (Some(dom), Some(main_prepared)) = (dom.as_ref(), prepared_render.as_ref()) else {
+        return;
+    };
+    for root in cold_frame_roots {
+        if let Some(prepared) = prepared_for_frame_root(
+            dom,
+            root,
+            main_prepared,
+            render_resources,
+            frame_render_states,
+            0,
+        ) {
+            store_frame_prepared(dom, root, prepared, frame_render_states);
+        }
+    }
+}
+
 #[cfg(feature = "render")]
 fn build_frame_surfaces(
     dom: Option<&obscura_dom::DomTree>,
@@ -796,6 +846,7 @@ impl ObscuraJsRuntime {
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
             gs.resolved_scroll = None;
+            gs.layout_prewarm_generation = u64::MAX;
         }
     }
 
@@ -1254,6 +1305,45 @@ impl ObscuraJsRuntime {
             .prepared_render
             .as_ref()
             .is_some_and(|prepared| prepared.has_active_css_animations())
+    }
+
+    /// Whether a retained layout is currently cached for the main document.
+    /// Test seam for the load-time layout pre-warm: true after navigation
+    /// without any geometry read having happened.
+    #[cfg(feature = "render")]
+    pub fn has_retained_layout(&self) -> bool {
+        self.state.borrow().prepared_render.is_some()
+    }
+
+    /// One post-load layout pass so JS-forced geometry later in the page's
+    /// life reads the retained cache instead of paying the whole first
+    /// layout inside whichever script asked (measured 262 ms on a heavy
+    /// challenge page versus Chrome's ~0 because Chrome lays out during
+    /// load, before scripts query geometry). Runs the exact same animation
+    /// sample, prepare, and scroll resolution a geometry op would, so
+    /// results are identical and nothing JS-observable changes apart from
+    /// timing: no events, no network, no style differences. Once per
+    /// document generation; repeat calls only warm child frames that are
+    /// still cold, so post-load callers cannot force an animation
+    /// re-sample that rebuilds layout on animated pages.
+    #[cfg(feature = "render")]
+    pub fn prewarm_layout(&self) {
+        let mut state = self.state.borrow_mut();
+        // Same guard as the screenshot path: without it the prepare falls
+        // into the renderer's synchronous resource loader, and a page whose
+        // images/fonts are not yet seeded stalls navigation on serial
+        // network. Resources stay pending here; the navigation warmup seeds
+        // them and their completions queue the cheap retained relayout,
+        // matching Chrome's placeholder-then-relayout load behavior.
+        with_sync_render_loading_disabled(&mut state, |state| {
+            if state.layout_prewarm_generation != state.document_generation {
+                sample_live_document_animations(state);
+                if ensure_resolved_scroll_for_geometry(state).is_some() {
+                    state.layout_prewarm_generation = state.document_generation;
+                }
+            }
+            prewarm_frame_layouts(state);
+        });
     }
 
     /// Capture the live render viewport from the same prepared layout used by

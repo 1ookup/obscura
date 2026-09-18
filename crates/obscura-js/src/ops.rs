@@ -322,6 +322,12 @@ pub struct ObscuraState {
     /// coalesce framework DOM churn into one conservative local cascade.
     #[cfg(feature = "render")]
     pub pending_style_mutations: Vec<obscura_render::RetainedStyleMutation>,
+    /// Document generation that last received a load-time layout pre-warm.
+    /// The warm pass runs once per committed document; chasing every post-load
+    /// mutation would reintroduce the layout thrash the retained cache exists
+    /// to avoid. `u64::MAX` means "never".
+    #[cfg(feature = "render")]
+    pub(crate) layout_prewarm_generation: u64,
     /// Page-lifetime raw image/font bytes. A new document resets this cache;
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
@@ -472,6 +478,8 @@ impl ObscuraState {
             animation_sampled_task_generation: 0,
             #[cfg(feature = "render")]
             pending_style_mutations: Vec::new(),
+            #[cfg(feature = "render")]
+            layout_prewarm_generation: u64::MAX,
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
@@ -7832,7 +7840,7 @@ pub(crate) fn ensure_resolved_scroll(state: &mut ObscuraState) -> Option<()> {
 }
 
 #[cfg(feature = "render")]
-fn ensure_resolved_scroll_for_geometry(state: &mut ObscuraState) -> Option<()> {
+pub(crate) fn ensure_resolved_scroll_for_geometry(state: &mut ObscuraState) -> Option<()> {
     ensure_resolved_scroll_for_consumer(state, true)
 }
 
@@ -8518,7 +8526,7 @@ fn frame_content_box_from_parent(
 /// one discards the `PreparedRender` after compositing, so geometry reads could
 /// not reach frame content and reported 0x0 for every element in an iframe.
 #[cfg(feature = "render")]
-fn prepared_for_frame_root(
+pub(crate) fn prepared_for_frame_root(
     dom: &DomTree,
     frame_root: NodeId,
     main_prepared: &obscura_render::PreparedRender,
@@ -8633,7 +8641,7 @@ fn prepared_for_hidden_frame_root(
 }
 
 #[cfg(feature = "render")]
-fn store_frame_prepared(
+pub(crate) fn store_frame_prepared(
     dom: &DomTree,
     frame_root: NodeId,
     prepared: obscura_render::PreparedRender,

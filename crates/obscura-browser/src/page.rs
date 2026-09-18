@@ -2762,6 +2762,25 @@ impl Page {
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
             );
+
+            // Chrome's rendering pipeline lays out during load, before any
+            // script asks for geometry. Our first layout is lazy, so the
+            // first probe that forces a rect paid the whole-page layout
+            // (measured 262 ms on the challenge page versus Chrome's 0 ms)
+            // and its reported duration ballooned. Warm the retained layout
+            // once per document generation after the load event has fired:
+            // identical results, no extra events or network, and later
+            // forced reads hit the cache.
+            #[cfg(feature = "render")]
+            {
+                let started = std::time::Instant::now();
+                js.prewarm_layout();
+                tracing::debug!(
+                    phase = "layout-prewarm",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "post-load layout pre-warm complete",
+                );
+            }
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -4193,6 +4212,15 @@ impl Page {
             if self.process_pending_frame_navigations().await == 0 {
                 break;
             }
+        }
+
+        // Frames committed by those navigations load after the load-time
+        // pre-warm above; warm their layouts too while the main document's
+        // retained layout is still clean. The runtime skips documents that
+        // are already warm, so this is a no-op on pages without late frames.
+        #[cfg(feature = "render")]
+        if let Some(js) = &self.js {
+            js.prewarm_layout();
         }
 
         // Cross-document postMessage traffic produced by frame and page
@@ -12112,6 +12140,40 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap(),
             "/app/before.js"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_event_prewarms_retained_layout_for_forced_geometry() {
+        let mut page = frame_test_page(
+            "<html><head><style>\
+             body { margin: 0; }\
+             .box { width: 120px; height: 60px; background: #228b49; }\
+             </style></head><body><div class=\"box\"></div><p>text</p></body></html>",
+        );
+        page.init_js();
+        // Nothing has forced geometry yet: the retained layout is cold.
+        assert!(
+            !page.js.as_ref().unwrap().has_retained_layout(),
+            "layout must be lazy before the load event"
+        );
+        page.execute_scripts().await;
+        // The load-time pre-warm laid the document out, exactly like Chrome's
+        // load-phase rendering, so the first probe-scale geometry read reads
+        // the cache instead of paying the whole first layout.
+        assert!(
+            page.js.as_ref().unwrap().has_retained_layout(),
+            "load event must pre-warm the retained layout"
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.querySelector('.box').getBoundingClientRect().width")
+                .unwrap(),
+            serde_json::json!(120.0),
+            "pre-warmed geometry must match a forced layout"
         );
     }
 
