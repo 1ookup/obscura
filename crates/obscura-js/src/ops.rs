@@ -383,7 +383,7 @@ pub struct ObscuraState {
     pub(crate) shared_worker_registry: crate::worker::SharedWorkerRegistryHandle,
     pub(crate) shared_worker_host: crate::worker::SharedWorkerPageHost,
     /// Set only inside a worker's own runtime: channel back to the page,
-    /// drained by the page-side Worker recv loop (op_worker_recv).
+    /// drained by the page-side worker message drain (runtime.rs).
     pub(crate) worker_outbox: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Set only inside a worker's own runtime: the origin and secure-context
     /// flag this worker inherited from its creator. A worker's own `url` is
@@ -403,6 +403,28 @@ pub struct ObscuraState {
     /// Wakes a parked op_frame_message_recv when a MainRealm-targeted entry
     /// lands.
     pub(crate) frame_message_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the pump task of THIS runtime when a worker message
+    /// lands for it. The page-side Worker recv promise is unref'd so an idle
+    /// page with live workers still settles, which means a reply arriving at
+    /// an otherwise idle page gets no event-loop wake of its own; the permit
+    /// semantics of this Notify close that lost-wake window (same pattern as
+    /// frame_message_notify). A nested worker hands its own copy to its
+    /// children as their creator wake target.
+    /// Cross-thread wake for the pump task of the runtime that OWNS this
+    /// state (the page runtime, or a nested worker's parent worker thread).
+    /// The pump registers its task waker here on every event-loop poll; a
+    /// worker of this runtime posting a message wakes it. Without this, a
+    /// reply to an otherwise idle runtime is delivered only at the next
+    /// unrelated wake: the recv promise is unref'd so an idle page settles,
+    /// and deno_core first-polls every op with a noop waker, so a post that
+    /// lands after the runtime went idle re-registers no waiter.
+    pub(crate) worker_arrival_wake: Arc<futures_util::task::AtomicWaker>,
+    /// Set only inside a worker's own runtime: the creator runtime's
+    /// worker_arrival_wake. op_worker_post_to_page wakes it after a successful
+    /// send. A shared worker process leaves this unset: its replies route
+    /// through the shared-router thread, which wakes each connected page by
+    /// connection id.
+    pub(crate) worker_creator_arrival_wake: Option<Arc<futures_util::task::AtomicWaker>>,
 }
 
 #[cfg(feature = "render")]
@@ -513,6 +535,8 @@ impl ObscuraState {
             worker_close_requested: false,
             frame_messages: Vec::new(),
             frame_message_notify: Arc::new(tokio::sync::Notify::new()),
+            worker_arrival_wake: Arc::new(futures_util::task::AtomicWaker::new()),
+            worker_creator_arrival_wake: None,
         }
     }
 }
@@ -7012,7 +7036,7 @@ fn op_opfs_sync_close(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_
 
 // --- Dedicated Worker ops (Phase 3.11, src/worker.rs) ---
 //
-// Page-side: op_worker_spawn / op_worker_post_message / op_worker_recv /
+// Page-side: op_worker_spawn / op_worker_post_message /
 // op_worker_terminate, called by the bootstrap `Worker` class.
 // Worker-side: op_worker_post_to_page / op_worker_close, called by the worker
 // global scope installed by worker.rs (the worker runtime registers the same
@@ -7125,6 +7149,15 @@ fn worker_environment(
         trace_label: creator_from.to_string(),
         #[cfg(feature = "stealth")]
         stealth_client: gs.stealth_client.clone(),
+        creator_arrival_wake: gs.worker_arrival_wake.clone(),
+        creator_realm: if creator_root > 0 && !gs.frame_realms_ptr.is_null() {
+            // SAFETY: the pointer targets the owning runtime's realm registry,
+            // which outlives every op (set once at runtime construction).
+            let frame_realms = unsafe { &*gs.frame_realms_ptr };
+            frame_realms.realm_key_for_content_root(creator_root)
+        } else {
+            None
+        },
     }
 }
 
@@ -7297,69 +7330,39 @@ fn op_shared_worker_post_message(state: &OpState, id: u32, #[string] payload: &s
 #[op2(async)]
 #[string]
 async fn op_shared_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
-    let outbox = {
-        let state = state.borrow();
-        let shared = state.borrow::<SharedState>().clone();
-        let result = shared.borrow().shared_worker_host.outbox(id);
-        result
+    let (outbox, notify) = {
+        let st = state.borrow();
+        let shared = st.borrow::<SharedState>().clone();
+        let gs = shared.borrow();
+        (
+            gs.shared_worker_host.outbox(id),
+            gs.shared_worker_host.connection_notify(id),
+        )
     };
     let Some(outbox) = outbox else { return String::new() };
-    let mut rx = outbox.lock().await;
-    let Some(first) = rx.recv().await else { return String::new() };
-    let mut entries = vec![first];
-    while let Ok(next) = rx.try_recv() { entries.push(next); }
-    format!("[{}]", entries.join(","))
-}
-
-/// Await the worker's next outbox batch. Returns a JSON array of entries, or
-/// an empty string once the worker is terminated/gone. The bootstrap recv
-/// loop unrefs the promise so an idle page with live workers still settles.
-#[op2(async)]
-#[string]
-async fn op_worker_recv(state: Rc<RefCell<OpState>>, id: u32) -> String {
-    // Without an executor nothing can drive the worker's receive loop either,
-    // and awaiting a Tokio primitive from here panics inside a v8 callback
-    // frame, which aborts the process rather than failing one call. A caller
-    // with no runtime gets an empty batch and polls again.
-    if tokio::runtime::Handle::try_current().is_err() {
-        worker_recv_debug(id, "no-tokio-runtime");
-        return String::new();
-    }
-    // This op is called from JS while the embedder may hold the same state
-    // borrowed (a page polling a worker reply during one of its own ops, for
-    // instance). A panic here unwinds into a v8::FunctionCallback frame, which
-    // aborts the process instead of failing one call, so contention returns an
-    // empty batch and the caller polls again.
-    let outbox = {
-        let Ok(state) = state.try_borrow() else {
-            worker_recv_debug(id, "opstate-borrowed");
-            return String::new();
+    let Some(notify) = notify else { return String::new() };
+    loop {
+        // Permit-protected scan: a reply routed between the scan and the
+        // await is recorded by Notify and consumed on the next poll.
+        let notified = notify.notified();
+        let batch = {
+            let mut rx = outbox.lock().await;
+            match rx.try_recv() {
+                Err(_) => None,
+                Ok(first) => {
+                    let mut entries = vec![first];
+                    while let Ok(next) = rx.try_recv() {
+                        entries.push(next);
+                    }
+                    Some(entries)
+                }
+            }
         };
-        let shared = state.borrow::<SharedState>().clone();
-        let mut found = None;
-        let guard = shared.try_borrow();
-        if let Ok(gs) = guard {
-            found = gs.worker_host.as_ref().and_then(|host| host.outbox(id));
-        } else {
-            worker_recv_debug(id, "shared-state-borrowed");
+        if let Some(entries) = batch {
+            return format!("[{}]", entries.join(","));
         }
-        found
-    };
-    let Some(outbox) = outbox else {
-        worker_recv_debug(id, "no-outbox");
-        return String::new();
-    };
-    let mut rx = outbox.lock().await;
-    let Some(first) = rx.recv().await else {
-        worker_recv_debug(id, "outbox-closed");
-        return String::new();
-    };
-    let mut entries = vec![first];
-    while let Ok(next) = rx.try_recv() {
-        entries.push(next);
+        notified.await;
     }
-    // Entries are already JSON objects; frame the batch as a JSON array.
-    format!("[{}]", entries.join(","))
 }
 
 #[op2(fast)]
@@ -7379,8 +7382,23 @@ fn op_worker_terminate(state: &OpState, id: u32) -> bool {
 fn op_worker_post_to_page(state: &OpState, #[string] payload: &str) -> bool {
     let shared = state.borrow::<SharedState>().clone();
     let Ok(gs) = shared.try_borrow() else { return false; };
+    let creator_wake = gs.worker_creator_arrival_wake.clone();
     match gs.worker_outbox.as_ref() {
-        Some(tx) => tx.send(crate::worker::message_entry(payload)).is_ok(),
+        Some(tx) => {
+            let sent = tx.send(crate::worker::message_entry(payload)).is_ok();
+            // Wake the creator's pump so the batch drains at the next task
+            // boundary. Without this a reply to an otherwise idle creator is
+            // delivered only at the creator's next unrelated wake: nothing
+            // about the message itself can start a pump. The challenge's
+            // worker stage measured those gaps at 268 ms against Chrome's
+            // 4 ms.
+            if sent {
+                if let Some(wake) = creator_wake {
+                    wake.wake();
+                }
+            }
+            sent
+        }
         None => false,
     }
 }

@@ -617,6 +617,14 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// Upper bound on chained cross-document message rounds inside one drain
 /// (Phase 4): delivering a message can enqueue further messages, so the drain
 /// loops, and a mutually recursive postMessage pair must not spin forever.
+/// One dedicated worker's pending outbox entries plus the dispatch realm
+/// (`None` for the main realm).
+struct WorkerBatch {
+    worker_id: u32,
+    realm: Option<(String, u64)>,
+    entries_json: String,
+}
+
 const FRAME_MESSAGE_DRAIN_ROUNDS: usize = 64;
 
 impl ObscuraJsRuntime {
@@ -630,6 +638,80 @@ impl ObscuraJsRuntime {
     }
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
+    }
+
+    /// This runtime's worker-arrival wake slot. The pump futures register
+    /// their task waker here on every poll so a worker posting a message can
+    /// wake an otherwise idle runtime immediately (see op_worker_post_to_page).
+    pub(crate) fn arrival_wake_slot(&self) -> std::sync::Arc<futures_util::task::AtomicWaker> {
+        let slot = self.state.borrow().worker_arrival_wake.clone();
+        slot
+    }
+
+    /// `run_event_loop` with the parking task's waker registered into the
+    /// worker-arrival slot, so worker replies wake this runtime directly
+    /// instead of waiting for the next unrelated wake. Used by the page pumps
+    /// and by a worker runtime's own event loop (whose nested workers wake it
+    /// through the same slot).
+    ///
+    /// One wake per iteration and a microtask checkpoint after every
+    /// iteration: the wake repoll is what resolves a delivered op's promise,
+    /// so its continuation only exists after that repoll returns. The outbox
+    /// re-collect runs inside the poll right after the waker registration:
+    /// a post that slipped in before the registration would otherwise wake
+    /// an empty slot and strand the batch until the next unrelated pump.
+    pub(crate) async fn run_event_loop_with_arrival_wake(&mut self) -> Result<(), String> {
+        let wake = self.arrival_wake_slot();
+        let state = self.state.clone();
+        loop {
+            let mut waiting_for_wake = false;
+            let mut slipped = Vec::new();
+            let result = {
+                let mut pump = Box::pin(
+                    self.runtime
+                        .run_event_loop(deno_core::PollEventLoopOptions::default()),
+                );
+                std::future::poll_fn(|cx| {
+                    wake.register(cx.waker());
+                    {
+                        let mut state = state.borrow_mut();
+                        if let Some(host) = state.worker_host.as_mut() {
+                            slipped.extend(host.drain_messages().into_iter().map(
+                |(worker_id, realm, entries_json)| WorkerBatch {
+                    worker_id,
+                    realm,
+                    entries_json,
+                },
+            ));
+                        }
+                    }
+                    if !slipped.is_empty() {
+                        return std::task::Poll::Ready(None);
+                    }
+                    match std::future::Future::poll(pump.as_mut(), cx) {
+                        std::task::Poll::Ready(res) => std::task::Poll::Ready(Some(res)),
+                        std::task::Poll::Pending if waiting_for_wake => {
+                            std::task::Poll::Ready(None)
+                        }
+                        std::task::Poll::Pending => {
+                            waiting_for_wake = true;
+                            std::task::Poll::Pending
+                        }
+                    }
+                })
+                .await
+            };
+            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            self.dispatch_worker_batches(std::mem::take(&mut slipped));
+            match result {
+                Some(res) => {
+                    return res.map_err(|e| format!("Event loop error: {e}"));
+                }
+                // Woken or slipped: deliver what landed, then poll again so
+                // chained worker traffic keeps draining.
+                None => continue,
+            }
+        }
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
@@ -3318,6 +3400,7 @@ impl ObscuraJsRuntime {
         // waiting until poll_event_loop returns can reverse task order or
         // starve the message on a continuously busy page.
         self.drain_frame_messages();
+        self.drain_worker_messages();
         self.ensure_frame_message_pump();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
@@ -3326,10 +3409,8 @@ impl ObscuraJsRuntime {
         // and hydration follow-ups all rely on this boundary).
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let result = self
-            .runtime
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
-            .await
-            .map_err(|e| format!("Event loop error: {}", e));
+            .run_event_loop_with_arrival_wake()
+            .await;
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         // Cross-document messages queued by the tasks above (Phase 4). Each
         // frame-realm delivery may resolve the main realm's recv op or queue
@@ -3337,7 +3418,8 @@ impl ObscuraJsRuntime {
         // because messages can produce messages. Free for pages without
         // pending messages (one empty-queue check).
         for _ in 0..FRAME_MESSAGE_DRAIN_ROUNDS {
-            if self.drain_frame_messages() == 0 {
+            let drained = self.drain_frame_messages() + self.drain_worker_messages();
+            if drained == 0 {
                 break;
             }
             self.ensure_frame_message_pump();
@@ -3388,6 +3470,73 @@ impl ObscuraJsRuntime {
     /// (ping-pong), so the drain loops with a bound. Returns how many
     /// messages were dispatched into frame realms. Pages without pending
     /// messages pay one empty-Vec check.
+    /// Take every pending dedicated-worker outbox batch without dispatching.
+    /// Pure state access, so it is safe to call inside a poll closure (no V8
+    /// entry): the caller dispatches what it receives once the poll returns.
+    fn collect_worker_batches(&self) -> Vec<WorkerBatch> {
+        let mut state = self.state.borrow_mut();
+        match state.worker_host.as_mut() {
+            Some(host) => host
+                .drain_messages()
+                .into_iter()
+                .map(|(worker_id, realm, entries_json)| WorkerBatch {
+                    worker_id,
+                    realm,
+                    entries_json,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Hand collected batches to the bootstrap dispatcher. Must run on the
+    /// runtime thread outside a poll closure. Frame-realm batches execute in
+    /// their creating realm: frame realms re-run bootstrap, so each owns its
+    /// Worker registry. A realm that navigated away already dropped the
+    /// generation, and its batches die with it.
+    fn dispatch_worker_batches(&mut self, batches: Vec<WorkerBatch>) -> usize {
+        let mut delivered = 0;
+        for WorkerBatch {
+            worker_id,
+            realm,
+            entries_json,
+        } in batches
+        {
+            // `entries_json` is a JSON array of entry objects; both halves are
+            // engine-produced, so embedding them as source is safe.
+            let script = format!(
+                "globalThis.__obscura_worker_dispatch_batch({worker_id}, {entries_json});"
+            );
+            let outcome = match realm.as_ref() {
+                None => self
+                    .execute_script("<obscura:worker-drain>", &script)
+                    .map(|_| ()),
+                Some((frame_id, generation)) => self
+                    .execute_script_in_frame_realm(
+                        frame_id,
+                        *generation,
+                        "<obscura:worker-drain>",
+                        &script,
+                    )
+                    .map(|_| ()),
+            };
+            if let Err(error) = outcome {
+                tracing::debug!(
+                    "worker message delivery failed (worker {worker_id}): {error}"
+                );
+            } else {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+
+    /// Drain-and-dispatch helper for pump call sites outside a poll closure.
+    pub fn drain_worker_messages(&mut self) -> usize {
+        let batches = self.collect_worker_batches();
+        self.dispatch_worker_batches(batches)
+    }
+
     pub fn drain_frame_messages(&mut self) -> usize {
         use crate::ops::{FrameMessageSource, FrameMessageTarget, PendingFrameMessage};
         let mut delivered = 0;
@@ -3759,13 +3908,39 @@ impl ObscuraJsRuntime {
         // Messages queued by the previous turn precede work polled in this
         // one. This also guarantees progress when recurring page work keeps
         // deno_core's poll from reaching its return-side drain.
-        let delivered_before_poll = self.drain_frame_messages();
+        let delivered_before_poll =
+            self.drain_frame_messages() + self.drain_worker_messages();
         // Queued main-realm frame messages (Phase 4) need their recv pump
         // running before this poll so they resolve during it.
         self.ensure_frame_message_pump();
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        let arrival_wake = self.arrival_wake_slot();
+        let tick_state = self.state.clone();
+        let mut slipped = Vec::new();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            // A worker post can land while this task is parked; the arrival
+            // slot must hold this task's waker on every poll or the reply
+            // waits for the next unrelated wake.
+            arrival_wake.register(cx.waker());
+            // A post that slipped in before the registration wakes an empty
+            // slot, so re-collect the outboxes right after registering; a
+            // non-empty collect counts as tick activity.
+            {
+                let mut state = tick_state.borrow_mut();
+                if let Some(host) = state.worker_host.as_mut() {
+                    slipped.extend(host.drain_messages().into_iter().map(
+                |(worker_id, realm, entries_json)| WorkerBatch {
+                    worker_id,
+                    realm,
+                    entries_json,
+                },
+            ));
+                }
+            }
+            if !slipped.is_empty() {
+                return std::task::Poll::Ready(Ok(false));
+            }
             let tick = self
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
@@ -3796,7 +3971,9 @@ impl ObscuraJsRuntime {
             // deliveries may have enqueued main-realm messages whose recv op
             // resolves on the next tick, so callers must keep pumping.
             Ok(idle) => {
-                let delivered_after_poll = self.drain_frame_messages();
+                let delivered_after_poll =
+                    self.drain_frame_messages() + self.drain_worker_messages();
+                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 tracing::trace!(
                     target: "obscura::timers",
                     elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
@@ -3830,8 +4007,10 @@ impl ObscuraJsRuntime {
         let repair_queued = self.queue_overdue_timer_wake_repair();
         self.begin_javascript_task();
         // Preserve postMessage task ordering and make already-queued frame
-        // traffic progress before a long-lived runtime poll can park.
-        let delivered_before_poll = self.drain_frame_messages();
+        // and worker traffic progress before a long-lived runtime poll can
+        // park.
+        let delivered_before_poll =
+            self.drain_frame_messages() + self.drain_worker_messages();
         self.ensure_frame_message_pump();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
@@ -3846,8 +4025,12 @@ impl ObscuraJsRuntime {
         }
 
         let isolate_handle = self.isolate_handle();
+        let arrival_wake = self.arrival_wake_slot();
         let mut pending_polls = 0u8;
         let result = std::future::poll_fn(|cx| {
+            // The served page parks in this poll between commands; a worker
+            // post must wake it here rather than wait for the next command.
+            arrival_wake.register(cx.waker());
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -3885,7 +4068,11 @@ impl ObscuraJsRuntime {
             // Same task-boundary message drain as the cooperative tick
             // (Phase 4): a delivery means this turn was not idle.
             Ok(idle) => {
-                let delivered_after_poll = self.drain_frame_messages();
+                // Delivered ops resolved promises; run their continuations
+                // before returning so a wake always completes its delivery.
+                self.runtime.v8_isolate().perform_microtask_checkpoint();
+                let delivered_after_poll =
+                    self.drain_frame_messages() + self.drain_worker_messages();
                 Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
             }
             Err(error) => Err(error),
@@ -4071,11 +4258,11 @@ impl ObscuraJsRuntime {
 
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
-        // Default settle: just pump until idle or 5s.
+        // Default settle: just pump until idle or 5s. The arrival-wake wrap
+        // keeps worker replies flowing while this parks.
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
+            self.run_event_loop_with_arrival_wake(),
         )
         .await;
     }

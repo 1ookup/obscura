@@ -231,6 +231,19 @@ impl FrameRealmHost {
             .contains_key(&(frame_id.to_string(), generation, world_id))
     }
 
+    /// The `(frame_id, generation)` of the default-world realm whose content
+    /// document root is `root`. This is the dispatch key for a worker spawned
+    /// by that realm: frame realms re-run bootstrap, so each owns its Worker
+    /// registry. `None` when the root has no default-world realm.
+    pub(crate) fn realm_key_for_content_root(&self, root: u32) -> Option<(String, u64)> {
+        self.realms
+            .iter()
+            .find(|((_, _, world_id), realm)| {
+                *world_id == MAIN_WORLD && realm.content_root == root
+            })
+            .map(|((frame_id, generation, _), _)| (frame_id.clone(), *generation))
+    }
+
     pub fn active_count(&self) -> usize {
         self.realms.len()
     }

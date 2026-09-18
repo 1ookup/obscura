@@ -375,53 +375,44 @@ globalThis.Worker = class Worker {
     }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
     this._id = id;
+    Worker._byId.set(id, this);
     const queued = this._pending;
     this._pending = [];
     for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
-    this._recvLoop();
   }
-  async _recvLoop() {
-    const worker = this;
-    while (!worker._terminated && worker._id !== null) {
-      let batchJson;
-      try {
-        const pending = Deno.core.ops.op_worker_recv(worker._id);
-        // Unref on a page: an idle page with live workers must still settle,
-        // and the embedder pumps the loop often enough to deliver.
-        //
-        // Not inside a worker. A worker's loop has no embedder pumping it --
-        // it parks once nothing is ref'd, so an unref'd receive is never
-        // polled again and a nested worker's messages arrive only when some
-        // unrelated ref'd op (a pending timer) happens to keep the parent
-        // awake. A worker holding a live child worker is not idle.
-        if (typeof WorkerGlobalScope === 'undefined') {
-          Deno.core.unrefOpPromise(pending);
-        }
-        batchJson = await pending;
-      } catch (e) { break; }
-      if (!batchJson) break; // worker terminated or its thread exited
-      let entries = [];
-      try { entries = JSON.parse(batchJson); } catch (e) { continue; }
-      for (const entry of entries) {
-        if (worker._terminated) return;
-        if (!entry) continue;
-        if (entry.kind === 'error') { worker._dispatchError(entry.message || 'Worker error'); continue; }
-        let data;
-        try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
-        const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
-        // A worker 'out' message handler runs in the creating context: it
-        // executes under the construction-site label, not under whatever
-        // code was running when the recv loop turned.
-        if (typeof worker.onmessage === 'function') {
-          try {
-            __obscuraTraceCallWith(
-              __obscuraTraceHandlerFrom(worker, 'onmessage'), worker.onmessage, worker, [evt]);
-          } catch (e) { console.error('Worker onmessage error:', e); }
-        }
-        for (const listener of (worker._listeners['message'] || []).slice()) {
-          try { __obscuraTraceCallWith(listener.from, listener.fn, worker, [evt]); }
-          catch (e) { console.error('Worker message listener error:', e); }
-        }
+  // Delivered by the runtime's worker message drain at task boundaries (see
+  // ObscuraJsRuntime::drain_worker_messages). Batches arrive as a JSON array
+  // of {kind, data|message} entries posted by the worker thread; the same
+  // trusted-event shape the previous recv loop produced, minus the async op
+  // whose unref'd promise stranded delivery whenever the page went idle
+  // between pump phases (the challenge's worker stage measured those gaps at
+  // 268 ms against Chrome's 4 ms).
+  static _byId = new Map();
+  // Runtime entry point: ObscuraJsRuntime::drain_worker_messages executes
+  // `globalThis.__obscura_worker_dispatch_batch(<id>, <batch>)` per batch.
+  static _dispatchBatch(id, batch) {
+    const worker = Worker._byId.get(id);
+    if (!worker || worker._terminated) return;
+    // The runtime embeds `batch` as a JS array literal of entry objects.
+    for (const entry of batch) {
+      if (worker._terminated) return;
+      if (!entry) continue;
+      if (entry.kind === 'error') { worker._dispatchError(entry.message || 'Worker error'); continue; }
+      let data;
+      try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
+      const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
+      // A worker 'out' message handler runs in the creating context: it
+      // executes under the construction-site label, not under whatever
+      // code was running when the message was drained.
+      if (typeof worker.onmessage === 'function') {
+        try {
+          __obscuraTraceCallWith(
+            __obscuraTraceHandlerFrom(worker, 'onmessage'), worker.onmessage, worker, [evt]);
+        } catch (e) { console.error('Worker onmessage error:', e); }
+      }
+      for (const listener of (worker._listeners['message'] || []).slice()) {
+        try { __obscuraTraceCallWith(listener.from, listener.fn, worker, [evt]); }
+        catch (e) { console.error('Worker message listener error:', e); }
       }
     }
   }
@@ -475,6 +466,7 @@ globalThis.Worker = class Worker {
     this._terminated = true;
     this._pending.length = 0;
     if (this._id !== null) {
+      Worker._byId.delete(this._id);
       try { Deno.core.ops.op_worker_terminate(this._id); } catch (e) {}
     }
   }
@@ -610,3 +602,8 @@ function _queueIframeNavigation(hostNid) {
   Deno.core.ops.op_queue_iframe_navigation(hostNid);
 }
 
+
+globalThis.__obscura_worker_dispatch_batch = function (id, batch) {
+  Worker._dispatchBatch(id, batch);
+};
+console.error('[wsdbg-js] dispatcher installed');

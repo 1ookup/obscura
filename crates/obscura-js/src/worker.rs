@@ -43,6 +43,18 @@ pub(crate) struct WorkerEnvironment {
     /// that created it, so a `blob:`/`data:` worker still reports the page's
     /// origin rather than deriving one from its own script URL.
     pub origin: String,
+    /// The creator runtime's worker-message wake slot. After the worker posts
+    /// a reply the creator must be woken immediately: its recv promise is
+    /// unref'd (so an idle page still settles) and would otherwise only see
+    /// the reply at the next unrelated event-loop wake. For a shared worker
+    /// process the field is consumed as the connecting page's route wake
+    /// instead, because replies to pages other than the creator route through
+    /// the shared-router thread.
+    /// The creator runtime's pump-task wake slot. Registered by the creator's
+    /// event-loop poll; woken by this worker after every post to the page so
+    /// an idle creator drains the message immediately instead of at its next
+    /// unrelated event-loop wake.
+    pub creator_arrival_wake: Arc<futures_util::task::AtomicWaker>,
     /// Whether the creator was a secure context. Carried separately because an
     /// opaque origin serializes to "null" and cannot be re-inspected for its
     /// scheme.
@@ -64,6 +76,11 @@ pub(crate) struct WorkerEnvironment {
     /// the constructing context's label at `new Worker(...)`, so nested
     /// workers nest their labels.
     pub trace_label: String,
+    /// The creating realm's dispatch key: `None` for the main realm, or the
+    /// frame realm's `(frame_id, generation)`. Frame realms re-run bootstrap,
+    /// so each context owns its `Worker._byId` registry; the runtime's drain
+    /// dispatches a batch into exactly the realm that spawned the worker.
+    pub creator_realm: Option<(String, u64)>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
@@ -94,6 +111,8 @@ pub struct WorkerHost {
 }
 
 struct WorkerHandle {
+    /// The creating realm's dispatch key (see WorkerEnvironment).
+    creator_realm: Option<(String, u64)>,
     /// Page -> worker message payloads (already-serialized clone envelopes).
     to_worker: UnboundedSender<String>,
     /// Worker -> page outbox entries (JSON: {"kind":"message"|"error",..}),
@@ -153,6 +172,7 @@ impl WorkerHost {
         // host owns the worker counter, so the full label is minted here.
         let mut environment = environment;
         environment.trace_label = format!("worker({id})[{}]", environment.trace_label);
+        let creator_realm = environment.creator_realm.clone();
         let thread = std::thread::Builder::new()
             .name(format!("obscura-worker-{id}"))
             .spawn(move || {
@@ -184,6 +204,7 @@ impl WorkerHost {
         self.workers.insert(
             id,
             WorkerHandle {
+                creator_realm,
                 to_worker: msg_tx,
                 outbox_rx: Rc::new(tokio::sync::Mutex::new(out_rx)),
                 isolate_handle,
@@ -208,6 +229,29 @@ impl WorkerHost {
         id: u32,
     ) -> Option<Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>> {
         self.workers.get(&id).map(|handle| handle.outbox_rx.clone())
+    }
+
+    /// Collect every pending outbox entry as one JSON array per worker. The
+    /// owning runtime calls this at task boundaries and dispatches each batch
+    /// through `__obscura_worker_dispatch_batch` — the same synchronous drain
+    /// the frame-realm messages use — so delivery never depends on an async
+    /// op's promise resolution and its microtask checkpoint happening to run
+    /// while a pump is parked.
+    pub(crate) fn drain_messages(&mut self) -> Vec<(u32, Option<(String, u64)>, String)> {
+        let mut out = Vec::new();
+        for (id, handle) in self.workers.iter_mut() {
+            let mut entries: Vec<String> = Vec::new();
+            if let Ok(mut rx) = handle.outbox_rx.try_lock() {
+                while let Ok(entry) = rx.try_recv() {
+                    entries.push(entry);
+                }
+            }
+            if !entries.is_empty() {
+                let realm = handle.creator_realm.clone();
+                out.push((*id, realm, format!("[{}]", entries.join(","))));
+            }
+        }
+        out
     }
 
     /// Kill the worker's isolate and drop its channels. The page isolate is
@@ -250,9 +294,28 @@ pub struct SharedWorkerRegistry {
     next_worker: u32,
 }
 
+/// One connected page's route into a shared worker process. The notify is
+/// that connection's own permit slot (each parked op_shared_worker_recv
+/// awaits exactly its connection's notify, so a wake always reaches the
+/// connection the reply was routed to); the wake is the page's pump-task
+/// arrival slot, because a reply to an otherwise idle page gets no event-loop
+/// wake of its own.
+struct SharedWorkerRoute {
+    tx: UnboundedSender<String>,
+    notify: Arc<tokio::sync::Notify>,
+    wake: Arc<futures_util::task::AtomicWaker>,
+}
+
+fn wake_route(route: &SharedWorkerRoute, entry: &str) {
+    if route.tx.send(entry.to_string()).is_ok() {
+        route.notify.notify_one();
+        route.wake.wake();
+    }
+}
+
 struct SharedWorkerProcess {
     to_worker: UnboundedSender<String>,
-    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    routes: Arc<Mutex<HashMap<u64, SharedWorkerRoute>>>,
     next_connection: u64,
     isolate_handle: IsolateHandle,
     worker_join: Option<std::thread::JoinHandle<()>>,
@@ -261,8 +324,12 @@ struct SharedWorkerProcess {
 
 pub(crate) struct SharedWorkerConnection {
     to_worker: UnboundedSender<String>,
-    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    routes: Arc<Mutex<HashMap<u64, SharedWorkerRoute>>>,
     connection_id: u64,
+    /// This connection's own permit slot; a parked op_shared_worker_recv on
+    /// the owning page awaits exactly this notify, and the router fires it
+    /// with every routed reply.
+    pub(crate) notify: Arc<tokio::sync::Notify>,
     outbox_rx: Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>,
 }
 
@@ -307,6 +374,11 @@ impl SharedWorkerPageHost {
     ) -> Option<Rc<tokio::sync::Mutex<UnboundedReceiver<String>>>> {
         self.connections.get(&id).map(|connection| connection.outbox_rx.clone())
     }
+
+    /// This connection's own permit slot (see SharedWorkerConnection).
+    pub(crate) fn connection_notify(&self, id: u32) -> Option<Arc<tokio::sync::Notify>> {
+        self.connections.get(&id).map(|connection| connection.notify.clone())
+    }
 }
 
 impl SharedWorkerRegistry {
@@ -318,6 +390,12 @@ impl SharedWorkerRegistry {
         kind: String,
         environment: WorkerEnvironment,
     ) -> Result<SharedWorkerConnection, String> {
+        // Capture the connecting page's wake slot before `environment` can be
+        // moved into a new process spawn below. The permit slot is this
+        // connection's own: op_shared_worker_recv parks on it, so a routed
+        // reply always wakes exactly the connection it targets.
+        let creator_arrival_wake = environment.creator_arrival_wake.clone();
+        let connection_notify = Arc::new(tokio::sync::Notify::new());
         if !self.workers.contains_key(&key) {
             if self.workers.len() >= MAX_WORKERS {
                 return Err(format!("shared worker limit reached ({MAX_WORKERS} per context)"));
@@ -339,7 +417,14 @@ impl SharedWorkerRegistry {
             .routes
             .lock()
             .map_err(|_| "shared worker route registry poisoned".to_string())?
-            .insert(connection_id, outbox_tx);
+            .insert(
+                connection_id,
+                SharedWorkerRoute {
+                    tx: outbox_tx,
+                    notify: connection_notify.clone(),
+                    wake: creator_arrival_wake,
+                },
+            );
         if process
             .to_worker
             .send(serde_json::json!({ "connect": true, "c": connection_id }).to_string())
@@ -354,6 +439,7 @@ impl SharedWorkerRegistry {
             to_worker: process.to_worker.clone(),
             routes: Arc::clone(&process.routes),
             connection_id,
+            notify: connection_notify,
             outbox_rx: Rc::new(tokio::sync::Mutex::new(outbox_rx)),
         })
     }
@@ -409,7 +495,7 @@ fn spawn_shared_worker_process(
 
 fn route_shared_worker_outbox(
     mut outbox: UnboundedReceiver<String>,
-    routes: Arc<Mutex<HashMap<u64, UnboundedSender<String>>>>,
+    routes: Arc<Mutex<HashMap<u64, SharedWorkerRoute>>>,
 ) {
     while let Some(entry) = outbox.blocking_recv() {
         let parsed = serde_json::from_str::<serde_json::Value>(&entry).ok();
@@ -422,15 +508,15 @@ fn route_shared_worker_outbox(
         let Ok(routes) = routes.lock() else { return };
         if let Some(connection_id) = connection_id {
             if let Some(route) = routes.get(&connection_id) {
-                let _ = route.send(entry);
+                wake_route(route, &entry);
             } else if routes.len() == 1 {
                 if let Some(route) = routes.values().next() {
-                    let _ = route.send(entry);
+                    wake_route(route, &entry);
                 }
             }
         } else {
             for route in routes.values() {
-                let _ = route.send(entry.clone());
+                wake_route(route, &entry);
             }
         }
     }
@@ -558,6 +644,18 @@ fn worker_thread_main(
                 gs.callbacks = environment.callbacks;
                 gs.blocked_urls = environment.blocked_urls;
                 gs.page_in_flight = environment.page_in_flight;
+                // A dedicated worker replies through op_worker_post_to_page,
+                // which wakes the creator's pump so the message drains at the
+                // next task boundary instead of whenever the creator happens
+                // to pump its event loop. The worker's OWN arrival slot stays
+                // local, so nested workers wake it the same way. A shared
+                // worker process leaves the creator slot unset: its replies
+                // reach the router thread, which wakes each connected page by
+                // route.
+                if !worker_shared {
+                    gs.worker_creator_arrival_wake =
+                        Some(environment.creator_arrival_wake.clone());
+                }
                 #[cfg(feature = "stealth")]
                 {
                     gs.stealth_client = environment.stealth_client;
@@ -625,6 +723,29 @@ pub(crate) fn worker_debug(id: u32, message: &str) {
 /// racing the page's message channel. Biased toward messages so a burst
 /// drains before timer work; between tasks `run_event_loop` performs the
 /// microtask checkpoints.
+/// Park the worker's event loop until the next page message or a nested
+/// worker's post. The atomic arrival slot carries this task's waker while we
+/// park; the in-poll re-collect closes the slot where a post lands before
+/// registration (it would wake an empty slot and strand the batch).
+async fn park_for_worker_traffic(
+    rt: &mut ObscuraJsRuntime,
+    inbox: &mut UnboundedReceiver<String>,
+) -> Option<String> {
+    let wake = rt.arrival_wake_slot();
+    tokio::select! {
+        biased;
+        message = inbox.recv() => message,
+        _ = std::future::poll_fn(|cx| {
+            wake.register(cx.waker());
+            if rt.drain_worker_messages() > 0 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }) => None,
+    }
+}
+
 async fn worker_event_loop(
     id: u32,
     rt: &mut ObscuraJsRuntime,
@@ -640,10 +761,15 @@ async fn worker_event_loop(
             worker_debug(id, "exit: self.close() requested");
             return;
         }
+        // Nested workers of this worker deliver through the same synchronous
+        // drain the page runtime uses; cheap no-op when none exist.
+        rt.drain_worker_messages();
         let turn = tokio::select! {
             biased;
             message = inbox.recv() => Turn::Message(message),
-            pumped = rt.run_event_loop() => Turn::Idle(pumped),
+            // The worker's own arrival slot is registered inside this pump,
+            // so a nested worker's posts wake this loop directly.
+            pumped = rt.run_event_loop_with_arrival_wake() => Turn::Idle(pumped),
         };
         match turn {
             Turn::Message(Some(payload)) => {
@@ -671,8 +797,11 @@ async fn worker_event_loop(
                     return;
                 }
                 // JS fully idle (no pending timers/ops): park until the next
-                // message or channel close instead of spinning.
-                match inbox.recv().await {
+                // page message, a nested worker's post, or channel close.
+                // Parking on the channel alone would strand nested-worker
+                // replies: their wake targets the arrival slot, not the
+                // channel.
+                match park_for_worker_traffic(rt, inbox).await {
                     Some(payload) => {
                         worker_debug(id, &format!("dispatch {} bytes (parked)", payload.len()));
                         if !dispatch_message(rt, &payload, out_tx) {
@@ -681,8 +810,8 @@ async fn worker_event_loop(
                         }
                     }
                     None => {
-                        worker_debug(id, "exit: inbox closed while parked");
-                        return;
+                        // Delivered inline by the arrival drain; re-poll the
+                        // loop so chained traffic keeps moving.
                     }
                 }
             }
