@@ -20195,6 +20195,108 @@ RequestRedirect value",
         assert_eq!(p["reflectedAttribute"], "color: red; font-size: 14px;");
     }
 
+    /// CSSKeyframesRule/CSSKeyframeRule cssText must match Chrome
+    /// byte-for-byte. Chrome re-serializes keyframes in the expanded
+    /// `@keyframes name { \n  <key> { prop: value; }\n}` form regardless of
+    /// the authored spacing, normalizes the key selector list (`from`/`to`
+    /// in any case become `0%`/`100%`, `050%`/`50.0%` become `50%`, the list
+    /// is joined with ", "), and re-serializes declaration values from the
+    /// parsed representation: leading-dot numbers regain their `0`, hex
+    /// colors become `rgb()`/`rgba()`, bare zeros in length/angle transform
+    /// functions and length properties gain `px`/`deg`, and function
+    /// arguments are joined with ", ". Every expected string below was
+    /// captured from headless Chrome 151 via CDP on the same fixture; the
+    /// four Turnstile challenge keyframes (spin/scale/stroke/unspin) were
+    /// additionally verified against the reference trace's
+    /// `TextEncoder.encode` evidence payload.
+    #[test]
+    fn keyframes_rule_csstext_matches_chrome_serialization() {
+        let mut rt = setup_runtime(
+            "<html><head><style>\
+             @keyframes spin { 100% { transform: rotate(360deg); } }\
+             @keyframes scale { 0%, 100% { transform: none; } 50% { transform: scale3d(1, 1, 1); } }\
+             @keyframes stroke { 100% { stroke-dashoffset: 0; } }\
+             @keyframes unspin { 40% { stroke-width: 1px; stroke-linecap: square; stroke-dashoffset: 192; } 100% { stroke-width: 0; } }\
+             @keyframes tight{0%{opacity:0}100%{opacity:1}}\
+             @keyframes fromto { from { margin: 0px 1px; } to { margin: 2px 3px; } }\
+             @keyframes dup { 0%,100% { color: rgb(1, 2, 3); } 50% { color: #fff; } }\
+             @keyframes casekeys { FROM { opacity: 0; } To { opacity: 1; } 050% { width: 0; } 50.0% { filter: blur(0); } }\
+             @keyframes zfn { 0% { transform: translate3d(0,0,0) skew(0) rotate(0) perspective(0); } }\
+             @keyframes dots { 0% { opacity: .5; margin: -.5px 0; } 50% { content: \".\"; } }\
+             @keyframes colors { 0% { color: #FFF; background: #3080aa; border-color: #abcd; stroke: #1d1d1d; } }\
+             </style></head><body></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const rules = [...document.styleSheets[0].cssRules];
+                    return {
+                        css: rules.map(r => r.cssText),
+                        keys: rules.flatMap(r => [...r.cssRules].map(c => c.keyText)),
+                        child: rules[1].cssRules[0].cssText,
+                        find: rules[3].findRule('40%').keyText,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let p: serde_json::Value = match result {
+            serde_json::Value::String(value) => serde_json::from_str(&value).unwrap(),
+            value => value,
+        };
+        let expected = [
+            // The four Turnstile challenge keyframes: authored spacing inside
+            // values is preserved, structure is Chrome's expanded form.
+            "@keyframes spin { \n  100% { transform: rotate(360deg); }\n}",
+            "@keyframes scale { \n  0%, 100% { transform: none; }\n  50% { transform: scale3d(1, 1, 1); }\n}",
+            "@keyframes stroke { \n  100% { stroke-dashoffset: 0; }\n}",
+            "@keyframes unspin { \n  40% { stroke-width: 1px; stroke-linecap: square; stroke-dashoffset: 192; }\n  100% { stroke-width: 0; }\n}",
+            // Authored-minified input re-serializes identically.
+            "@keyframes tight { \n  0% { opacity: 0; }\n  100% { opacity: 1; }\n}",
+            // `from`/`to` become `0%`/`100%`.
+            "@keyframes fromto { \n  0% { margin: 0px 1px; }\n  100% { margin: 2px 3px; }\n}",
+            // `0%,100%` becomes `0%, 100%`; `#fff` becomes `rgb(255, 255, 255)`.
+            "@keyframes dup { \n  0%, 100% { color: rgb(1, 2, 3); }\n  50% { color: rgb(255, 255, 255); }\n}",
+            // Case-insensitive from/to, `050%`/`50.0%` -> `50%`, `width: 0` ->
+            // `0px`, `blur(0)` -> `blur(0px)`.
+            "@keyframes casekeys { \n  0% { opacity: 0; }\n  100% { opacity: 1; }\n  50% { width: 0px; }\n  50% { filter: blur(0px); }\n}",
+            // Bare zeros in transform functions take the canonical unit.
+            "@keyframes zfn { \n  0% { transform: translate3d(0px, 0px, 0px) skew(0deg) rotate(0deg) perspective(0px); }\n}",
+            // Leading-dot numbers regain `0`; `margin: -.5px 0` keeps the
+            // bare zero only where Chrome does not (SVG/number properties);
+            // string tokens are untouched.
+            "@keyframes dots { \n  0% { opacity: 0.5; margin: -0.5px 0px; }\n  50% { content: \".\"; }\n}",
+            // 6-, 4- and 3-digit hex become rgb()/rgba() with the alpha
+            // rounded to three decimals.
+            "@keyframes colors { \n  0% { color: rgb(255, 255, 255); background: rgb(48, 128, 170); border-color: rgba(170, 187, 204, 0.867); stroke: rgb(29, 29, 29); }\n}",
+        ];
+        assert_eq!(p["css"], serde_json::json!(expected));
+        let expected_keys = [
+            "100%",
+            "0%, 100%",
+            "50%",
+            "100%",
+            "40%",
+            "100%",
+            "0%",
+            "100%",
+            "0%",
+            "100%",
+            "0%, 100%",
+            "50%",
+            "0%",
+            "100%",
+            "50%",
+            "50%",
+            "0%",
+            "0%",
+            "50%",
+            "0%",
+        ];
+        assert_eq!(p["keys"], serde_json::json!(expected_keys));
+        assert_eq!(p["child"], "0%, 100% { transform: none; }");
+        assert_eq!(p["find"], "40%");
+    }
+
     #[test]
     fn css_style_declaration_matches_chrome_named_and_computed_enumeration() {
         let mut rt = setup_runtime(
