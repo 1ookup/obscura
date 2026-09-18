@@ -1792,13 +1792,18 @@ impl DomTree {
     /// Whether `node` is an HTML `<slot>` element. Slot assignment is defined
     /// only for HTML slots; same-local-name elements in other namespaces do
     /// not participate in the flattened tree.
+    ///
+    /// Borrows through `with_node`: layout calls this per node per prepare,
+    /// and a `get_node` clone of every candidate's `NodeData` (strings,
+    /// attribute vectors) dominated repeated flatten passes.
     pub fn is_html_slot_element(&self, node: NodeId) -> bool {
-        self.get_node(node).is_some_and(|node| {
+        self.with_node(node, |node| {
             node.as_element().is_some_and(|name| {
                 name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
                     && name.local.as_ref() == "slot"
             })
         })
+        .unwrap_or(false)
     }
 
     /// Return the first slot to which `node` is assigned.
@@ -1808,25 +1813,25 @@ impl DomTree {
     /// the empty/default name. The first same-name slot in shadow-tree order
     /// wins, matching the HTML slot assignment algorithm.
     pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
-        let node_ref = self.get_node(node)?;
-        let parent = node_ref.parent?;
-        let name = if node_ref.is_element() {
-            node_ref.get_attribute("slot").unwrap_or("").to_owned()
-        } else if node_ref.text_content_of_text_node().is_some() {
-            String::new()
-        } else {
-            return None;
-        };
-        drop(node_ref);
+        let (parent, name) = self.with_node(node, |node_ref| {
+            let parent = node_ref.parent?;
+            let name = if node_ref.is_element() {
+                node_ref.get_attribute("slot").unwrap_or("").to_owned()
+            } else if node_ref.text_content_of_text_node().is_some() {
+                String::new()
+            } else {
+                return None;
+            };
+            Some((parent, name))
+        })??;
 
         let root = self.shadow_root(parent)?;
         self.descendants(root).into_iter().find(|candidate| {
-            self.is_html_slot_element(*candidate)
-                && self
-                    .get_node(*candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
+            self.with_node(*candidate, |slot| {
+                self.is_html_slot_element(*candidate)
+                    && slot.get_attribute("name").map(str::to_owned).unwrap_or_default() == name
+            })
+            .unwrap_or(false)
         })
     }
 
@@ -1839,17 +1844,17 @@ impl DomTree {
         }
         let root = self.containing_shadow_root(slot)?;
         let host = self.shadow_root_info(root)?.host;
-        let name = self
-            .get_node(slot)
-            .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-            .unwrap_or_default();
+        let name = self.with_node(slot, |slot| {
+            slot.get_attribute("name").map(str::to_owned)
+        })
+        .unwrap_or_default()
+        .unwrap_or_default();
         let is_same_name_slot = |candidate: NodeId| {
-            self.is_html_slot_element(candidate)
-                && self
-                    .get_node(candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
+            self.with_node(candidate, |node| {
+                self.is_html_slot_element(candidate)
+                    && node.get_attribute("name").map(str::to_owned).unwrap_or_default() == name
+            })
+            .unwrap_or(false)
         };
         if self
             .descendants(root)
@@ -1863,17 +1868,17 @@ impl DomTree {
             self.children(host)
                 .into_iter()
                 .filter(|candidate| {
-                    let Some(node) = self.get_node(*candidate) else {
-                        return false;
-                    };
-                    let candidate_name = if node.is_element() {
-                        node.get_attribute("slot").unwrap_or("")
-                    } else if node.text_content_of_text_node().is_some() {
-                        ""
-                    } else {
-                        return false;
-                    };
-                    candidate_name == name
+                    self.with_node(*candidate, |node| {
+                        let candidate_name = if node.is_element() {
+                            node.get_attribute("slot").unwrap_or("")
+                        } else if node.text_content_of_text_node().is_some() {
+                            ""
+                        } else {
+                            return false;
+                        };
+                        candidate_name == name
+                    })
+                    .unwrap_or(false)
                 })
                 .collect(),
         )

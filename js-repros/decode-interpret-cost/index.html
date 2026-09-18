@@ -1,0 +1,222 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>decode+interpret cost fixture</title>
+<body>
+<script>
+// TS#1 decode + bootstrap-VM interpret cost, fed with the real 846,076-char
+// /fo/ TS#1 response captured in the 0919 ver14 round. The challenge
+// pipeline is: response text -> atob -> W3 bytewise unshift (key =
+// rayId + "_0") -> atob -> JSVMP bytecode -> interpret. That pipeline is
+// what the payload reports as ZMSOw0 (bootstrap program wall-ms): 385 ms
+// here against Chrome's 127 ms after the batch-13 atob op landed.
+//
+// Phases (all milliseconds, page clock):
+//   fetchRespMs   - fetch('ts1-resp.txt').text() body read
+//   atob1Ms       - atob(846076 chars) -> 634556 bytes
+//   w3Ms          - W3 unshift loop over 634556 bytes (chunked
+//                   String.fromCharCode, the challenge's accumulation shape)
+//   atob2Ms       - atob of the unshifted 634556-char string -> 475917
+//   digestMs      - 15 sha256 digests awaited sequentially (the
+//                   ov2.host.digest events in the Chrome trace)
+//   interpretMs   - switch-dispatch VM loop over the 475917-bytecode string
+//                   with a ~1500-op DOM host surface (the census shape) and
+//                   string-table reads
+//   teEncodeMs    - 200 x TextEncoder.encode(1 KiB) (shim cost probe)
+//   messageHopsMs - 5 chained setTimeout(0) + BroadcastChannel round trips
+// Every layer reports an FNV-1a checksum so engine parity is checkable
+// byte-for-byte (python reference: b70558c1..., e6c627b8..., d6069811...
+// for the md5 of the raw layers; FNV values are computed in this file).
+globalThis.decodeFixturePromise = (async function () {
+  const result = { error: null };
+  const now = () => performance.now();
+  const fnv = (s) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i) & 0xff;
+      h = (h * 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  };
+  const rayKey = 'a3d354667f8e3d84_0';
+  try {
+    // -- fetch the captured response bytes
+    let t = now();
+    const resp = await fetch('ts1-resp.txt');
+    const text = await resp.text();
+    result.fetchRespMs = now() - t;
+    result.fetchBytes = text.length;
+    result.checksumLayer0 = fnv(text);
+
+    // -- atob #1
+    t = now();
+    const shifted = atob(text);
+    result.atob1Ms = now() - t;
+    result.atob1Bytes = shifted.length;
+    result.checksumLayer1 = fnv(shifted);
+
+    // -- W3 unshift (challenge accumulation shape: chunked char codes;
+    // one apply call per 8 KiB chunk keeps V8 below its argument limit)
+    t = now();
+    let x = 32;
+    for (let i = 0; i < rayKey.length; i++) x ^= rayKey.charCodeAt(i);
+    const n = shifted.length;
+    const codes = new Array(n);
+    for (let i = 0; i < n; i++) {
+      codes[i] = (shifted.charCodeAt(i) - x - (i % 65535) + 65535) % 255;
+    }
+    let unshifted = '';
+    const CHUNK = 8192;
+    for (let i = 0; i < n; i += CHUNK) {
+      unshifted += String.fromCharCode.apply(null,
+        i + CHUNK <= n ? codes.slice(i, i + CHUNK) : codes.slice(i));
+    }
+    result.w3Ms = now() - t;
+    result.w3Bytes = unshifted.length;
+    result.checksumLayer2 = fnv(unshifted);
+
+    // -- atob #2
+    t = now();
+    const bytecode = atob(unshifted);
+    result.atob2Ms = now() - t;
+    result.bytecodeBytes = bytecode.length;
+    result.checksumLayer3 = fnv(bytecode);
+
+    // -- 15 sequential sha256 digests (the ov2.host.digest trace events)
+    t = now();
+    const encoder = new TextEncoder();
+    const digests = [];
+    for (let i = 0; i < 15; i++) {
+      const input = 'probe-' + i + '-' + result.checksumLayer1;
+      const buf = await crypto.subtle.digest('SHA-256', encoder.encode(input));
+      digests.push(new Uint8Array(buf)[0]);
+    }
+    result.digestMs = now() - t;
+    result.digestFirstByte = digests[0];
+
+    // -- interpret: switch-dispatch loop over the bytecode string with the
+    // census host surface (~1500 DOM ops over ~22k instructions).
+    const host = {
+      calls: 0,
+      dom: 0,
+      opMs: { createElement: 0, setAttribute: 0, appendChild: 0,
+              querySelectorAll: 0, classList: 0, createTextNode: 0,
+              gBCR: 0, textContent: 0 },
+      doc: document,
+      frag: null,
+      scratch: null,
+      texts: [],
+      domOp() {
+        this.dom++;
+        if (!this.scratch) this.scratch = this.doc.createElement('div');
+        if (!this.frag) this.frag = this.doc.body;
+        const t0 = performance.now();
+        switch (this.dom & 7) {
+          case 0: this.scratch = this.doc.createElement('div'); break;
+          case 1: this.scratch.setAttribute('data-k', String(this.dom)); break;
+          case 2: this.frag.appendChild(this.scratch); break;
+          case 3: this.doc.querySelectorAll('div[data-k]').length; break;
+          case 4: this.scratch.classList.toggle('tvNbU4'); break;
+          case 5: this.texts.push(this.doc.createTextNode('t' + this.dom)); break;
+          case 6: this.scratch.getBoundingClientRect(); break;
+          default: this.scratch.textContent = 'x' + this.dom; break;
+        }
+        this.opMs[['createElement', 'setAttribute', 'appendChild',
+          'querySelectorAll', 'classList', 'createTextNode', 'gBCR',
+          'textContent'][this.dom & 7]] += performance.now() - t0;
+      },
+    };
+    t = now();
+    let pc = 0;
+    let steps = 0;
+    let acc = 0;
+    const store = { lang: 1, dir: 2, ua: 3, heap: 4 };
+    const len = bytecode.length;
+    while (pc < len) {
+      const op = bytecode.charCodeAt(pc) & 0x1f;
+      steps++;
+      switch (op) {
+        case 0: { // string-table key read
+          const klen = (bytecode.charCodeAt(pc + 1) & 31) + 1;
+          let key = '';
+          for (let i = 0; i < klen; i++) {
+            key += String.fromCharCode(bytecode.charCodeAt(pc + 2 + i) & 0x7f);
+          }
+          if (store[key] !== undefined) acc ^= store[key];
+          pc += 2 + klen;
+          break;
+        }
+        case 1: { // arithmetic
+          acc = (acc + bytecode.charCodeAt(pc + 1) * 7) & 0xffffffff;
+          pc += 4;
+          break;
+        }
+        case 2: { // host call; each touches the DOM (the census's ~1500 ops
+          // across the bootstrap program compress to this rate)
+          host.calls++;
+          host.domOp();
+          pc += 6;
+          break;
+        }
+        case 3: { // string build
+          const slen = (bytecode.charCodeAt(pc + 1) & 63) + 8;
+          acc = (acc ^ slen ^ (bytecode.charCodeAt(pc + 2) & 0x7f)) & 0xffffffff;
+          pc += 2 + slen;
+          break;
+        }
+        case 4: { // jump
+          pc += (bytecode.charCodeAt(pc + 1) & 63) + 2;
+          break;
+        }
+        default: {
+          // width distribution: the disassembled ov1-0 averages ~20.6 bytes
+          // per instruction over 22,425 instructions of 462,724 bytes
+          pc += (bytecode.charCodeAt(pc) % 14) + 6;
+          break;
+        }
+      }
+    }
+    result.interpretMs = now() - t;
+    result.interpretSteps = steps;
+    result.hostCalls = host.calls;
+    result.domOps = host.dom;
+    result.interpretAcc = acc >>> 0;
+    const opMs = {};
+    for (const k in host.opMs) opMs[k] = Math.round(host.opMs[k] * 100) / 100;
+    result.opMs = opMs;
+
+    // -- TextEncoder shim probe
+    t = now();
+    const chunk = 'x'.repeat(1024);
+    let teSum = 0;
+    for (let i = 0; i < 200; i++) teSum += encoder.encode(chunk + i).length;
+    result.teEncodeMs = now() - t;
+    result.teSum = teSum;
+
+    // -- message hops: a chained setTimeout(0) burst (the bootstrap
+    // program's continuation shape). BroadcastChannel round trips were
+    // dropped here: headless Chrome does not dispatch BC message events
+    // under virtual time / CDP, so the oracle cannot run them.
+    t = now();
+    await new Promise((resolveTimers) => {
+      let seen = 0;
+      const tick = () => { if (++seen === 5) resolveTimers(); else setTimeout(tick, 0); };
+      setTimeout(tick, 0);
+    });
+    result.messageHopsMs = now() - t;
+
+    result.totalMs = result.fetchRespMs + result.atob1Ms + result.w3Ms +
+      result.atob2Ms + result.digestMs + result.interpretMs +
+      result.teEncodeMs + result.messageHopsMs;
+  } catch (err) {
+    result.error = String(err && err.stack || err);
+  }
+  globalThis.decodeFixtureResult = result;
+  const div = document.createElement('div');
+  div.id = 'decode-fixture-done';
+  div.textContent = JSON.stringify(result);
+  document.body.appendChild(div);
+  return result;
+})();
+
+</script>
+</body>

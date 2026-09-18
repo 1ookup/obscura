@@ -9298,15 +9298,16 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         return assigned_or_fallback;
     }
 
-    let Some(node) = tree.get_node(id) else {
-        return Vec::new();
-    };
-    let is_closed_html_details = node.as_element().is_some_and(|name| {
-        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-            && name.local.as_ref() == "details"
-            && node.get_attribute("open").is_none()
+    // Borrowed reads: this runs per node per layout pass, where `get_node`
+    // cloned each candidate's NodeData (strings, attribute vectors).
+    let is_closed_html_details = tree.with_node(id, |node| {
+        node.as_element().is_some_and(|name| {
+            name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && name.local.as_ref() == "details"
+                && node.get_attribute("open").is_none()
+        })
     });
-    if !is_closed_html_details {
+    if is_closed_html_details != Some(true) {
         return tree.children(id);
     }
 
@@ -9320,12 +9321,13 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     tree.children(id)
         .into_iter()
         .find(|child| {
-            tree.get_node(*child).is_some_and(|child| {
+            tree.with_node(*child, |child| {
                 child.as_element().is_some_and(|name| {
                     name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
                         && name.local.as_ref() == "summary"
                 })
             })
+            .unwrap_or(false)
         })
         .into_iter()
         .collect()
@@ -9384,30 +9386,39 @@ fn has_inline_content(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
 ) -> bool {
     rendered_children(tree, id).into_iter().any(|cid| {
-        let Some(node) = tree.get_node(cid) else {
-            return false;
-        };
-        match &node.data {
-            obscura_dom::tree::NodeData::Text { contents } => !contents.trim().is_empty(),
-            _ => styles
-                .get(&cid)
-                .map(|s| {
-                    // A display:contents wrapper is transparent: whether it
-                    // reads as inline content depends on what it splices in.
-                    if s.display_contents && s.display != crate::Display::None {
-                        has_inline_content(tree, cid, styles)
-                    } else {
-                        // Out-of-flow boxes (absolutely positioned, floated)
-                        // are not inline content: an inline that is the sole
-                        // child of a hero wrapper must not drag the wrapper
-                        // into the inline-formatting path.
-                        crate::is_inline_level_box(s)
-                            && !matches!(s.position, Some(taffy::Position::Absolute))
-                            && s.float.is_none()
-                    }
-                })
-                .unwrap_or(false),
+        // Borrowed classification: `get_node` cloned each candidate's
+        // NodeData here, and this walk runs per parent per layout pass.
+        // Text nodes answer inline; everything else falls to the style
+        // lookup exactly as the original match did.
+        let text_inline = tree
+            .with_node(cid, |node| match &node.data {
+                obscura_dom::tree::NodeData::Text { contents } => {
+                    Some(!contents.trim().is_empty())
+                }
+                _ => None,
+            })
+            .flatten();
+        if let Some(inline) = text_inline {
+            return inline;
         }
+        styles
+            .get(&cid)
+            .map(|s| {
+                // A display:contents wrapper is transparent: whether it reads
+                // as inline content depends on what it splices in.
+                if s.display_contents && s.display != crate::Display::None {
+                    has_inline_content(tree, cid, styles)
+                } else {
+                    // Out-of-flow boxes (absolutely positioned, floated) are
+                    // not inline content: an inline that is the sole child of
+                    // a hero wrapper must not drag the wrapper into the
+                    // inline-formatting path.
+                    crate::is_inline_level_box(s)
+                        && !matches!(s.position, Some(taffy::Position::Absolute))
+                        && s.float.is_none()
+                }
+            })
+            .unwrap_or(false)
     })
 }
 
