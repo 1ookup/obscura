@@ -698,7 +698,7 @@ fn macos_face_for_css_token(token: &str) -> Option<BundledFace> {
 
         "times new roman" | "times" | "georgia" | "baskerville" | "charter" | "cochin"
         | "didot" | "hoefler text" | "inaimathi" | "inaimathi bold" | "luminari"
-        | "palatino" | "apple garamond" | "bodoni 72" | "optima" | "skia" | "superclarendon" => {
+        | "palatino" | "apple garamond" | "bodoni 72" | "optima" | "superclarendon" => {
             BundledFace::Serif
         }
 
