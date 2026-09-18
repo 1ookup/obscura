@@ -225,7 +225,7 @@
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
       'protectedAudience', 'storageBuckets',
     ]) _remove(globalThis.navigator, name);
-    for (const name of ['sharedStorage', 'documentPictureInPicture', 'launchQueue']) {
+    for (const name of ['documentPictureInPicture', 'launchQueue']) {
       _remove(globalThis, name);
     }
     _remove(globalThis.crypto, 'subtle');
@@ -609,6 +609,7 @@ const _chromeInterfaceTable = [
   ["HTMLBaseElement",0,0,"HTMLElement","",0],
   ["HTMLBodyElement",0,0,"HTMLElement","",0],
   ["HTMLButtonElement",0,0,"HTMLElement","",0],
+  ["HTMLCameraElement",0,0,"HTMLElement","HTMLCameraElement",0],
   ["HTMLCanvasElement",0,0,"HTMLElement","",0],
   ["HTMLCollection",0,0,"Object","",0],
   ["HTMLDListElement",0,0,"HTMLElement","",0],
@@ -646,6 +647,7 @@ const _chromeInterfaceTable = [
   ["HTMLMenuElement",0,0,"HTMLElement","",0],
   ["HTMLMetaElement",0,0,"HTMLElement","",0],
   ["HTMLMeterElement",0,0,"HTMLElement","",0],
+  ["HTMLMicrophoneElement",0,0,"HTMLElement","HTMLMicrophoneElement",0],
   ["HTMLModElement",0,0,"HTMLElement","",0],
   ["HTMLOListElement",0,0,"HTMLElement","",0],
   ["HTMLObjectElement",0,0,"HTMLElement","",0],
@@ -1590,8 +1592,12 @@ const _chromeInterfaceShells = new Set();
     Object.defineProperty(globalThis, 'clientInformation',
       { get() { return globalThis.navigator; }, enumerable: true, configurable: true });
   }
+  // `sharedStorage` stays off the surface entirely: Chrome only exposes it
+  // once the storage-access permission turns it on, and the census oracle
+  // (Chrome 153, https and challenge pages alike) reports the name absent,
+  // not an empty namespace object.
   for (const name of ['cookieStore', 'crashReport', 'documentPictureInPicture',
-                      'sharedStorage', 'viewport', 'launchQueue']) {
+                      'viewport', 'launchQueue']) {
     if (typeof globalThis[name] !== 'undefined') continue;
     const object = {};
     Object.defineProperty(object, Symbol.toStringTag,
@@ -1638,6 +1644,16 @@ const _chromeInterfaceShells = new Set();
   if (typeof HTMLUserMediaElement === 'function') {
     const proto = HTMLUserMediaElement.prototype;
     for (const name of ['error', 'onstream', 'oncancel', 'onerror', 'stream']) getter(proto, name);
+    method(proto, 'setConstraints', 0, function setConstraints() {});
+  }
+  if (typeof HTMLCameraElement === 'function') {
+    const proto = HTMLCameraElement.prototype;
+    for (const name of ['error', 'oncancel', 'onerror', 'ontrack', 'track']) getter(proto, name);
+    method(proto, 'setConstraints', 0, function setConstraints() {});
+  }
+  if (typeof HTMLMicrophoneElement === 'function') {
+    const proto = HTMLMicrophoneElement.prototype;
+    for (const name of ['error', 'oncancel', 'onerror', 'ontrack', 'track']) getter(proto, name);
     method(proto, 'setConstraints', 0, function setConstraints() {});
   }
   if (typeof InteractionContentfulPaint === 'function') {
@@ -2536,7 +2552,8 @@ const _chromeNodeKeyOrder = [
 // in the reference payload order. Keep this generated table in bootstrap so
 // realm enumeration follows the same registration sequence.
 const _chromeWindowVersionExtras = new Set([
-  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint', 'NodeRange',
+  'FontFaceSet', 'HTMLCameraElement', 'HTMLMicrophoneElement', 'HTMLUserMediaElement',
+  'InteractionContentfulPaint', 'NodeRange',
   'OpaqueRange', 'PerformanceSoftNavigation', 'PermissionsPolicy', 'XSLTProcessor',
 ]);
 const _chromePayloadBareFunctionOrder = [
@@ -2712,7 +2729,7 @@ const _chromeEnumerableWindowObjects = [
   'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
   'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
-  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
+  'cookieStore', 'caches', 'documentPictureInPicture',
   'viewport', 'launchQueue', 'speechSynthesis',
 ];
 const _chromeEnumerableWindowFunctions = [

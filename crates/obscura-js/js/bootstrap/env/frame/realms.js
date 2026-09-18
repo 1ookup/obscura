@@ -226,7 +226,7 @@ const _chromeWindowKeyOrder = [
   'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
   'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
-  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
+  'cookieStore', 'caches', 'documentPictureInPicture',
   'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',
   'Intl', 'Atomics', 'Reflect', 'console', 'CSS', 'Temporal', 'WebAssembly',
   'GPUBufferUsage', 'GPUColorWrite', 'GPUMapMode', 'GPUShaderStage',

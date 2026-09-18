@@ -338,7 +338,8 @@ let _crossOriginIsolatedValue = false;
 // direct property access in realms that implement them; only the reflected
 // surface is gated, and isolated frames keep the complete set.
 const _nonIsolatedFrameHiddenNames = new Set([
-  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint', 'NodeRange',
+  'FontFaceSet', 'HTMLCameraElement', 'HTMLMicrophoneElement', 'HTMLUserMediaElement',
+  'InteractionContentfulPaint', 'NodeRange',
   'OpaqueRange', 'PerformanceSoftNavigation', 'PermissionsPolicy', 'XSLTProcessor',
 ]);
 // V8's code-generation callback reads this realm-local flag to enforce the

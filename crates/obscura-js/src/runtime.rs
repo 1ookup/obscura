@@ -7402,6 +7402,110 @@ mod tests {
         assert_eq!(nonisolated, serde_json::json!([false, "undefined"]));
     }
 
+    /// Window-surface census facts for every name the CF challenge's
+    /// property census ships as evidence. Each row is pinned against the
+    /// local Chrome oracle (153.0.8010.37, headless, https and about:blank,
+    /// non-isolated top window) probed over CDP:
+    /// [in window, reflection, enumerable, configurable, descriptor kind,
+    ///  typeof]. `sharedStorage` is absent there until the storage-access
+    /// permission grants it, and `SharedArrayBuffer` is absent without
+    /// cross-origin isolation, so both stay absent here.
+    #[test]
+    fn window_census_surface_matches_chrome_oracle() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const facts = (name) => {
+                        const d = Object.getOwnPropertyDescriptor(window, name);
+                        const reflected = d ? 'own'
+                            : (name in window ? 'proto' : 'absent');
+                        return [name in window, reflected,
+                            d ? d.enumerable : null,
+                            d ? d.configurable : null,
+                            d ? ('get' in d ? 'accessor' : 'data') : null,
+                            typeof window[name]];
+                    };
+                    return [
+                        facts('SharedArrayBuffer'),
+                        facts('FontFaceSet'),
+                        facts('HTMLCameraElement'),
+                        facts('HTMLMicrophoneElement'),
+                        facts('HTMLUserMediaElement'),
+                        facts('InteractionContentfulPaint'),
+                        facts('NodeRange'),
+                        facts('OpaqueRange'),
+                        facts('PerformanceSoftNavigation'),
+                        facts('PermissionsPolicy'),
+                        facts('sharedStorage'),
+                        facts('crossOriginIsolated'),
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [false, "absent", null, null, null, "undefined"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [true, "own", false, true, "data", "function"],
+                [false, "absent", null, null, null, "undefined"],
+                [true, "own", true, true, "accessor", "boolean"],
+            ])
+        );
+    }
+
+    /// Constructor identity and prototype members of the two Chrome-153-era
+    /// element interfaces the census lists: illegal constructor, name,
+    /// length, prototype tag, and the member set the oracle reports.
+    #[test]
+    fn camera_microphone_element_constructors_match_chrome_oracle() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const shape = (ctor) => [
+                        ctor.name, ctor.length,
+                        String(ctor).includes('[native code]'),
+                        ctor.prototype[Symbol.toStringTag],
+                        Object.getPrototypeOf(ctor.prototype)
+                            === HTMLElement.prototype,
+                    ];
+                    const members = (ctor) =>
+                        Object.getOwnPropertyNames(ctor.prototype).sort().join(',');
+                    const throws = (ctor) => {
+                        try { new ctor(); return 'ok'; }
+                        catch (e) { return e.name; }
+                    };
+                    return [
+                        shape(HTMLCameraElement), members(HTMLCameraElement),
+                        throws(HTMLCameraElement),
+                        shape(HTMLMicrophoneElement), members(HTMLMicrophoneElement),
+                        throws(HTMLMicrophoneElement),
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["HTMLCameraElement", 0, true, "HTMLCameraElement", true],
+                "constructor,error,oncancel,onerror,ontrack,setConstraints,track",
+                "TypeError",
+                ["HTMLMicrophoneElement", 0, true, "HTMLMicrophoneElement", true],
+                "constructor,error,oncancel,onerror,ontrack,setConstraints,track",
+                "TypeError",
+            ])
+        );
+    }
+
     /// Trusted Types shape, brand checks and sink tables. Pinned against
     /// Chrome 146 in js-repros/trusted-types/chrome-oracle.json. CSP
     /// enforcement is out of scope (no directive is parsed anywhere yet), so
