@@ -10702,3 +10702,60 @@ render、nextest）；release build 全量通过；未跑障碍课程与真实�
 
 **批次 14 派发**：A) SVG 沙箱 iframe 测量归零 + Vhmq4 dir + battery/downlink/quota 值面；
 B) worker 阶段 268ms（uGyjw9）+ ZMSOw0 残差 467ms 的性能剖析。
+
+### Step 303: 修复批次 14A 落地——哈希探针测量面 + battery/downlink/quota 值面 + dir 分岔定位（2026-09-19）
+
+**方法**：先从 ver13 的 ops.tsv 轨迹反推探针的真实形状（嵌套 about:blank 沙箱 iframe +
+template clone + 19 个 text：4 个 emoji + 15 个 64hex `font: italic 150px serif`），
+再离线复刻对拍（obscura fetch --eval 对 local headless Chrome oracle），修复只落引擎面，
+每项一个 commit 带回归测试。S2 的槽位数值闭包再进一步：我方 kRQwh3 =
+sha256("15.984000205993652") 反推成功——即 emoji #1 的 getComputedTextLength；
+由此四槽映射定型：RKUE0=hex 文本的 ctl（Chrome 4886.75，我方当时 0）、
+kRQwh3=emoji ctl（通过会话答 "0" 是那台机器无 emoji 度量的机器态差异，本地 Chrome
+同 fixture 答 19.98 非零）、oSIr8=会话相关拼接（两侧都是真摘要，预期不同）。
+
+**修复与证据**（每项一个 commit）：
+- SVG 测量（1e7008e）：整 run 的 advance 非空文本永不为 0（文本引擎无解时落回
+  每字符估算）——整 run 答 0 是唯一能产生 sha256("0") 的路径；每字符面保持诚实 0
+  （ZWJ/孤立代理项 Chrome 也答 0）。getExtentOfChar/getStartPositionOfChar/
+  getEndPositionOfChar 锚定 x 列表原点（Chrome 对 x=32 的 run 答位置 32 起，
+  我方此前从 0 起，逐字位置列表形状不同）。测试
+  challenge_svg_probe_measures_nonzero_in_hidden_sandboxed_iframe 复刻探针全形
+  （沙箱 iframe + template clone + emoji/hex 双类文本），断言 hex/emoji ctl 非零、
+  位置列表 x=32 起升序、bbox/gBCR 非退化、空文本 ctl==="0"（Chrome oracle 同页
+  验证 emptyCtl="0"）。已核实：Chrome 的 emoji 逐码元聚类（代理对两半同 x 同宽）
+  我方仍是逐码元推进，记为已知残差（进 oSIr8 类会话相关摘要）。
+- battery（efb8810）：默认人格从 level 1 改 0.99（通过会话的探针读 "99"，1 读
+  "100" 同样不是真机答），charging true/chargingTime 0/dischargingTime Infinity
+  不变；fingerprint 可覆盖 batteryLevel/batteryCharging。测试钉全表面。
+- downlink（f69db50）：删钉死 10（报告上限本身），加估测器：EWMA(α=0.2) 吃引擎
+  已完成 scripted fetch 的 bytes/秒，量化 25kbps 桶、夹 [0.05,10]、无样本答 1.55
+  （非采样 Chrome 的典型答）。测试：ops.rs 单测钉默认/量化/夹取；runtime 测试用
+  本地延迟 150ms+4KiB 的 HTTP fixture 断言 fetch 前 1.55、fetch 后在域内、≠10、
+  量化对齐。
+- storage（956a976）：删三处常数 10GiB/usage 0（navigator.js、surface-finalize.js、
+  worker.rs 模板），统一走 op_storage_estimate：quota=10GiB+200+(host 空闲字节%800)
+  （对拍通过捕获 10GiB+314 的机器派生小增量；裸 10GiB 正是被点名的 stub 形状），
+  usage=OPFS 目录真实字节数+文档 realm 内存 writable 上报的字节
+  （op_storage_usage_add），window/worker/navigator.storage 一个 origin 一个答案。
+  测试：quota 在 floor+(0,4096) 且 ≠floor、写入 4096 字节后 usage≥4096、
+  形状 {quota,usage,usageDetails:{}}。
+
+**Vhmq4 dir 分岔结论（本轮 TE 捕获为负，改为轨迹+双端 oracle 定位）**：TE 轮
+（te14a，9314 端口，OBSCURA_CAPTURE_TE，16s 点击）10 个捕获文件只含 bot-check
+字符串、TrustedTypes worker 引导与两段加密 blob——探针任务文本不经过
+TextEncoder，方法为负。改从 ops.tsv 定位：t=4.07s orchestrate（chl_page/v1）对
+顶层 documentElement（nid 2）执行 set_attribute dir=ltr（其字符串表含 "dir" 键，
+i18n 方向应用步骤，紧随"请稍候…"标题本地化），随后 api.js 读
+attribute_names(2)=["lang","dir"]——Vhmq4 即此读。本地 headless Chrome 加载真实
+挑战页：documentElement 同样变 ["lang","dir"]、dirAttr="ltr" 且全程保持；我方
+引擎同页 getAttributeNames()=["lang"]（未设前）、反射 dir getter/setter、
+computed direction、跨 realm document 路由（两极 fixture 四条路径）全部与
+Chrome 一致。结论：引擎属性面无罪；通过会话的 ["lang"] 应来自无 dir 写入的
+元素/时相（最可疑：hidden 后台标签里 i18n 应用被推迟，rIC/hidden 语义；或其
+读取 widget 文档 html——authored 仅 lang）。此为挑战语义问题，交字节码反编译
+管线确认 builder 读取的 realm/元素，不再是引擎修复项。
+
+**门禁**：obscura-js+obscura-browser+obscura-net release/render/nextest
+883/883 通过（与批次 14B 的 worker 唤醒在途改动同树并跑）；release build 全量
+通过；未跑障碍课程与判决轮（代理轮次按主控安排）。
