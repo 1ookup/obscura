@@ -1,0 +1,11 @@
+{
+  "createElementAppend10k": 1.7999999523162842,
+  "setAttribute10k": 1.600000023841858,
+  "querySelector10k": 1.399999976158142,
+  "getAttribute10k": 0.2999999523162842,
+  "getBoundingClientRect10k": 3,
+  "windowShimGets10k": 3.600000023841858,
+  "getElementById10k": 0.2999999523162842,
+  "classListToggle10k": 1.100000023841858,
+  "createNodeIterator10k": 1.2000000476837158
+}
