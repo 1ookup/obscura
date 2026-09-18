@@ -934,6 +934,32 @@ function _svgTextContent(element) {
   return text == null ? '' : String(text);
 }
 
+// Chrome answers the whole SVGTextContentElement family out of the rendering
+// tree: an SVG <text> with no layout box measures zero characters -- detached
+// nodes, template.content subtrees and implementation/DOMParser documents all
+// read getNumberOfChars()=0, getComputedTextLength()=0, zero bboxes, and
+// IndexSizeError from every per-character accessor (local Chrome oracle,
+// challenge_svg_probe_* tests). The challenge's hash probe measures both the
+// detached template original and the inserted clone, so a non-rendered run
+// carrying real metrics is a detectable divergence. Rendered = attached to a
+// document that has a window; that keeps hidden-iframe content measurable the
+// way Chrome does (an unrendered <svg> subtree stays unmeasured even when the
+// node itself reports isConnected, which template content does not).
+function _svgUnrendered(element) {
+  try {
+    if (!element || element.isConnected !== true) return true;
+    const doc = element.ownerDocument;
+    return !doc || doc.defaultView == null;
+  } catch (_error) { return true; }
+}
+
+function _svgThrowIndexSize(index) {
+  throw new DOMException(
+    'The index provided (' + index + ') is greater than the number of characters available.',
+    'IndexSizeError',
+  );
+}
+
 // First numeric value of an attribute list (SVG x/y accept per-glyph lists).
 function _svgAttrOffset(element, name) {
   try {
@@ -945,14 +971,15 @@ function _svgAttrOffset(element, name) {
   } catch (_error) { return 0; }
 }
 
-// Whole-run advance. A browser never answers 0 for the advance of a non-empty
-// run -- every measurable glyph contributes -- and the challenge's hash probe
-// digests String(getComputedTextLength()), so a zero here became the digest of
-// "0" in the beacon (the RKUE0 slot: sha256("0") where Chrome carried the real
-// 150px run width). When the text engine cannot answer, fall through to the
-// same estimate the no-op loss uses instead of reporting the one value no
-// browser produces. Per-character surfaces keep honest zeros: a zero-advance
-// code unit (ZWJ, lone surrogate) measures 0 in Chrome too.
+// Whole-run advance for a RENDERED run. A browser never answers 0 for the
+// advance of a non-empty rendered run -- every measurable glyph contributes --
+// and the challenge's hash probe digests String(getComputedTextLength()), so a
+// zero here became the digest of "0" in the beacon (the RKUE0 slot). When the
+// text engine cannot answer, fall through to the same estimate the no-op loss
+// uses instead of reporting the one value no browser produces. Unrendered runs
+// are handled by the caller (_svgUnrendered): Chrome answers 0 there, and the
+// empty run stays an honest 0. Per-character surfaces keep honest zeros: a
+// zero-advance code unit (ZWJ, lone surrogate) measures 0 in Chrome too.
 function _svgRunAdvance(text, font) {
   const box = _measureTextBox(text, font);
   if (!(box.width > 0) && text !== '') {
@@ -964,17 +991,22 @@ function _svgRunAdvance(text, font) {
 }
 
 Element.prototype.getBBox = function() {
+  if (_svgUnrendered(this)) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
   const box = _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this));
   return { x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent };
 };
 
 Element.prototype.getComputedTextLength = function() {
+  if (_svgUnrendered(this)) return 0;
   return _svgRunAdvance(_svgTextContent(this), _svgMeasurementFont(this));
 };
 
 Element.prototype.getExtentOfChar = function(ch) {
   const text = _svgTextContent(this);
   const font = _svgMeasurementFont(this);
+  if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
   // The extent is the tight box of one glyph, placed at the advance accumulated
   // over the run's prefix. Reporting a zero origin for every character (the
   // previous behaviour) makes a per-character position list collapse onto one
@@ -993,6 +1025,7 @@ Element.prototype.getExtentOfChar = function(ch) {
 
 Element.prototype.getSubStringLength = function(ch, len) {
   const text = _svgTextContent(this);
+  if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
   const start = Math.max(0, Math.trunc(Number(ch)) || 0);
   const count = len === undefined ? text.length - start : Math.max(0, Math.trunc(Number(len)) || 0);
   if (count <= 0) return 0;

@@ -323,6 +323,12 @@
   let _measuringFragment = false;
 
   Element.prototype.getBoundingClientRect = function getBoundingClientRect() {
+    // No rendering box, no fragment rect (Chrome answers the zero rect for
+    // detached/template-content/impl-document SVG subtrees).
+    if (_svgUnrendered(this)) {
+      return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0,
+        toJSON() { return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 }; } };
+    }
     const root = _svgRootOf(this);
     if (!root || root === this || _measuringFragment) {
       return _layoutGBCR.apply(this, arguments);
@@ -357,6 +363,7 @@
   // getBBox gains the container union and the x/y-attribute placement while
   // keeping the text measurement the previous implementation used.
   Element.prototype.getBBox = function getBBox() {
+    if (_svgUnrendered(this)) return { x: 0, y: 0, width: 0, height: 0 };
     if (_measuringFragment) return { x: 0, y: 0, width: 0, height: 0 };
     _measuringFragment = true;
     try {

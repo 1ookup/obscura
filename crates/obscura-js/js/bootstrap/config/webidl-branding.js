@@ -233,25 +233,34 @@ const SVG_TAGS = {
 (function _installSvgTextContentGeometry() {
   if (typeof _measureTextBox !== 'function') return;
   const geometry = {
-    getNumberOfChars() { return _svgTextContent(this).length; },
+    getNumberOfChars() {
+      // Without a rendering box Chrome reads the run as zero characters, so
+      // every count here follows the rendered check, not the text content.
+      if (_svgUnrendered(this)) return 0;
+      return _svgTextContent(this).length;
+    },
     getStartPositionOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
       // Chrome anchors the character positions on the element's x list origin
       // (a run at x=32 starts its position list at 32), not at user-space 0.
       const offset = _svgAttrOffset(this, 'x');
       return { x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 };
     },
     getEndPositionOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
       const i = _svgCharacterIndex(this, index);
       const char = _svgTextContent(this).charAt(i);
       return { x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 };
     },
     getRotationOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
       _svgCharacterIndex(this, index);
       return 0;
     },
     getCharNumAtPosition(point) {
       const x = point && Number(point.x);
       if (!Number.isFinite(x)) return -1;
+      if (_svgUnrendered(this)) return -1;
       const text = _svgTextContent(this);
       for (let i = 0; i < text.length; i++) {
         if (x < _svgAdvanceTo(this, i + 1)) return i;

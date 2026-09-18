@@ -7230,8 +7230,14 @@ mod tests {
                     const text = document.createElementNS(ns, "text");
                     text.textContent = "MMMM";
                     svg.appendChild(text);
+                    // Chrome measures an unrendered SVG run as zero characters;
+                    // the metrics appear once the tree is in the document.
+                    const detachedZero = text.getComputedTextLength() === 0
+                        && svg.getBBox().width === 0;
+                    document.body.appendChild(svg);
                     return [typeof svg.getBBox, typeof text.getComputedTextLength,
-                        svg.getBBox().width > 0, text.getComputedTextLength() > 0,
+                        detachedZero, text.getComputedTextLength() > 0,
+                        svg.getBBox().width > 0,
                         Object.prototype.hasOwnProperty.call(SVGGraphicsElement.prototype, "getBBox"),
                         Object.prototype.hasOwnProperty.call(SVGSVGElement.prototype, "getComputedTextLength")];
                 })()"#,
@@ -7245,7 +7251,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!(["function", "function", true, true, true, true])
+            serde_json::json!(["function", "function", true, true, true, true, true])
         );
     }
 
@@ -7346,6 +7352,91 @@ mod tests {
                 "subStringNonZero": true,
             })
         );
+    }
+
+    // Chrome reads an SVG text run with no rendering box as zero characters:
+    // detached nodes, template.content subtrees and implementation-created
+    // documents all answer getNumberOfChars()=0, getComputedTextLength()=0,
+    // zero bbox/gBCR, and IndexSizeError from every per-character accessor
+    // (local Chrome oracle). The challenge's hash probe measures both the
+    // template original and the inserted clone and feeds each measurement
+    // through a sha256 chain; measuring real metrics for the unrendered
+    // original was a detectable divergence and derailed two of the four
+    // digest slots (RKUE0 fell back to sha256("0"), JRzmw6 never resolved
+    // and leaked its request token). Rendered runs -- the inserted clones in
+    // the hidden sandboxed iframe -- must keep measuring.
+    #[test]
+    fn svg_text_measures_zero_for_unrendered_runs_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const ns = "http://www.w3.org/2000/svg";
+                    const hex = "dc7c811b9561739d9b75bb3e9e1715970a868834e62251b0b9ca02e74d0f42c9";
+                    const mk = (doc) => {
+                        const t = doc.createElementNS(ns, "text");
+                        t.setAttribute("x", "32");
+                        t.setAttribute("y", "32");
+                        t.setAttribute("style", "height: auto; transform: scale(1.000998); font: italic 150px serif;");
+                        t.appendChild(doc.createTextNode(hex));
+                        return t;
+                    };
+                    const fam = (t) => {
+                        const thunk = (fn) => { try { const v = fn(); return v === undefined ? "undef" : String(v); } catch (e) { return "THROW:" + e.name; } };
+                        return {
+                            noc: thunk(() => t.getNumberOfChars()),
+                            ctl: thunk(() => t.getComputedTextLength()),
+                            sub8: thunk(() => t.getSubStringLength(0, 8)),
+                            sub0: thunk(() => t.getSubStringLength(0, 0)),
+                            ext0: thunk(() => { const x = t.getExtentOfChar(0); return x.x + "," + x.width; }),
+                            sp0: thunk(() => t.getStartPositionOfChar(0).x),
+                            ep0: thunk(() => t.getEndPositionOfChar(0).x),
+                            rot0: thunk(() => t.getRotationOfChar(0)),
+                            charNum: thunk(() => t.getCharNumAtPosition({ x: 40, y: 0 })),
+                            bbox: thunk(() => { const b = t.getBBox(); return b.x + "," + b.y + "," + b.width + "," + b.height; }),
+                            rc: thunk(() => { const b = t.getBoundingClientRect(); return b.x + "," + b.y + "," + b.width + "," + b.height; }),
+                        };
+                    };
+                    // Detached in the document, never inserted.
+                    const out = { detached: fam(mk(document)) };
+                    // Template content subtree.
+                    const tpl = document.createElement("template");
+                    tpl.content.appendChild(mk(document));
+                    out.template = fam(tpl.content.firstChild);
+                    // Implementation-created document (no window).
+                    const impl = document.implementation.createHTMLDocument("probe");
+                    const svg = impl.createElementNS(ns, "svg");
+                    svg.appendChild(mk(impl));
+                    impl.body.appendChild(svg);
+                    out.implDoc = fam(svg.firstChild);
+                    // Rendered control: same shape inserted into the document.
+                    const rendered = mk(document);
+                    document.body.appendChild(rendered);
+                    out.rendered = fam(rendered);
+                    out.renderedHasMetrics = Number(out.rendered.ctl) > 0 && Number(out.rendered.sub8) > 0;
+                    return out;
+                })()"#,
+            )
+            .unwrap();
+        let zero_family = serde_json::json!({
+            "noc": "0",
+            "ctl": "0",
+            "sub8": "THROW:IndexSizeError",
+            "sub0": "THROW:IndexSizeError",
+            "ext0": "THROW:IndexSizeError",
+            "sp0": "THROW:IndexSizeError",
+            "ep0": "THROW:IndexSizeError",
+            "rot0": "THROW:IndexSizeError",
+            "charNum": "-1",
+            "bbox": "0,0,0,0",
+            "rc": "0,0,0,0",
+        });
+        assert_eq!(result["detached"], zero_family);
+        assert_eq!(result["template"], zero_family);
+        assert_eq!(result["implDoc"], zero_family);
+        assert_eq!(result["rendered"]["noc"], serde_json::json!("64"));
+        assert_eq!(result["renderedHasMetrics"], serde_json::json!(true));
     }
 
     #[test]
