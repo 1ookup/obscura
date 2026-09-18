@@ -660,13 +660,24 @@ impl ObscuraJsRuntime {
     /// re-collect runs inside the poll right after the waker registration:
     /// a post that slipped in before the registration would otherwise wake
     /// an empty slot and strand the batch until the next unrelated pump.
+    ///
+    /// When deno_core reports idle but live workers exist, this future stays
+    /// parked on the arrival slot instead of returning: worker replies are
+    /// invisible to deno_core's pending-work tracking, so returning here
+    /// would make the caller's slice boundary (settle slices, backoff caps)
+    /// the next delivery opportunity.
     pub(crate) async fn run_event_loop_with_arrival_wake(&mut self) -> Result<(), String> {
+        enum Turn {
+            Done(Result<(), String>),
+            Deliver,
+            Park,
+        }
         let wake = self.arrival_wake_slot();
         let state = self.state.clone();
         loop {
             let mut waiting_for_wake = false;
             let mut slipped = Vec::new();
-            let result = {
+            let turn = {
                 let mut pump = Box::pin(
                     self.runtime
                         .run_event_loop(deno_core::PollEventLoopOptions::default()),
@@ -686,12 +697,42 @@ impl ObscuraJsRuntime {
                         }
                     }
                     if !slipped.is_empty() {
-                        return std::task::Poll::Ready(None);
+                        return std::task::Poll::Ready(Turn::Deliver);
                     }
                     match std::future::Future::poll(pump.as_mut(), cx) {
-                        std::task::Poll::Ready(res) => std::task::Poll::Ready(Some(res)),
+                        std::task::Poll::Ready(res) => {
+                            let has_live_workers = {
+                                let mut state = state.borrow_mut();
+                                match state.worker_host.as_mut() {
+                                    Some(host) => {
+                                        let landed = host.drain_messages();
+                                        let live = host.has_live();
+                                        slipped.extend(landed.into_iter().map(|(
+                                            worker_id,
+                                            realm,
+                                            entries_json,
+                                        )| WorkerBatch {
+                                            worker_id,
+                                            realm,
+                                            entries_json,
+                                        }));
+                                        live
+                                    }
+                                    None => false,
+                                }
+                            };
+                            if !slipped.is_empty() {
+                                std::task::Poll::Ready(Turn::Deliver)
+                            } else if has_live_workers {
+                                std::task::Poll::Ready(Turn::Park)
+                            } else {
+                                std::task::Poll::Ready(Turn::Done(
+                                    res.map_err(|e| format!("Event loop error: {e}")),
+                                ))
+                            }
+                        }
                         std::task::Poll::Pending if waiting_for_wake => {
-                            std::task::Poll::Ready(None)
+                            std::task::Poll::Ready(Turn::Deliver)
                         }
                         std::task::Poll::Pending => {
                             waiting_for_wake = true;
@@ -703,13 +744,38 @@ impl ObscuraJsRuntime {
             };
             self.runtime.v8_isolate().perform_microtask_checkpoint();
             self.dispatch_worker_batches(std::mem::take(&mut slipped));
-            match result {
-                Some(res) => {
-                    return res.map_err(|e| format!("Event loop error: {e}"));
-                }
+            match turn {
+                Turn::Done(res) => return res,
                 // Woken or slipped: deliver what landed, then poll again so
                 // chained worker traffic keeps draining.
-                None => continue,
+                Turn::Deliver => continue,
+                // deno_core is idle and the pump future is exhausted; live
+                // workers may still post. Park on the arrival slot until one
+                // does (registering the waker without polling the pump).
+                Turn::Park => {
+                    std::future::poll_fn(|cx| {
+                        wake.register(cx.waker());
+                        let mut state = state.borrow_mut();
+                        if let Some(host) = state.worker_host.as_mut() {
+                            slipped.extend(host.drain_messages().into_iter().map(
+                                |(worker_id, realm, entries_json)| WorkerBatch {
+                                    worker_id,
+                                    realm,
+                                    entries_json,
+                                },
+                            ));
+                        }
+                        if slipped.is_empty() {
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(())
+                        }
+                    })
+                    .await;
+                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    self.dispatch_worker_batches(std::mem::take(&mut slipped));
+                    continue;
+                }
             }
         }
     }
@@ -3945,7 +4011,40 @@ impl ObscuraJsRuntime {
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
-                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                std::task::Poll::Ready(Ok(())) => {
+                    // deno_core has no tracked pending work, but a worker
+                    // reply is untracked: with live workers this poll holds
+                    // the only registered wake, so park here instead of
+                    // reporting idle. An idle report would end the tick while
+                    // the reply sits in the outbox, and the caller's next
+                    // slice boundary (up to a 100 ms settle slice) is what
+                    // used to deliver it.
+                    let has_live_workers = {
+                        let mut state = tick_state.borrow_mut();
+                        match state.worker_host.as_mut() {
+                            Some(host) => {
+                                let landed = host.drain_messages();
+                                let live = host.has_live();
+                                slipped.extend(landed.into_iter().map(
+                                    |(worker_id, realm, entries_json)| WorkerBatch {
+                                        worker_id,
+                                        realm,
+                                        entries_json,
+                                    },
+                                ));
+                                live
+                            }
+                            None => false,
+                        }
+                    };
+                    if !slipped.is_empty() {
+                        std::task::Poll::Ready(Ok(false))
+                    } else if has_live_workers {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(true))
+                    }
+                }
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
@@ -4026,11 +4125,32 @@ impl ObscuraJsRuntime {
 
         let isolate_handle = self.isolate_handle();
         let arrival_wake = self.arrival_wake_slot();
+        let tick_state = self.state.clone();
         let mut pending_polls = 0u8;
+        let mut slipped = Vec::new();
         let result = std::future::poll_fn(|cx| {
             // The served page parks in this poll between commands; a worker
             // post must wake it here rather than wait for the next command.
             arrival_wake.register(cx.waker());
+            // A post that slipped in before the registration wakes an empty
+            // slot, so re-collect the outboxes right after registering; a
+            // non-empty collect ends the turn so the post-poll drain
+            // dispatches it.
+            {
+                let mut state = tick_state.borrow_mut();
+                if let Some(host) = state.worker_host.as_mut() {
+                    slipped.extend(host.drain_messages().into_iter().map(
+                        |(worker_id, realm, entries_json)| WorkerBatch {
+                            worker_id,
+                            realm,
+                            entries_json,
+                        },
+                    ));
+                }
+            }
+            if !slipped.is_empty() {
+                return std::task::Poll::Ready(Ok(false));
+            }
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -4047,7 +4167,42 @@ impl ObscuraJsRuntime {
                 ));
             }
             match tick {
-                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                std::task::Poll::Ready(Ok(())) => {
+                    // deno_core has no tracked pending work, but worker
+                    // replies are untracked: with live workers this poll is
+                    // the only registered wake path, so stay parked here (the
+                    // waker stays registered) instead of reporting idle. An
+                    // idle report would disarm the served pump and strand the
+                    // next worker reply until an unrelated command arrives
+                    // (the live uGyjw9 stage measured exactly that gap).
+                    // Re-collect first: a reply may have landed between the
+                    // top-of-poll collect and deno_core going idle.
+                    let has_live_workers = {
+                        let mut state = tick_state.borrow_mut();
+                        match state.worker_host.as_mut() {
+                            Some(host) => {
+                                let landed = host.drain_messages();
+                                let live = host.has_live();
+                                slipped.extend(landed.into_iter().map(
+                                    |(worker_id, realm, entries_json)| WorkerBatch {
+                                        worker_id,
+                                        realm,
+                                        entries_json,
+                                    },
+                                ));
+                                live
+                            }
+                            None => false,
+                        }
+                    };
+                    if !slipped.is_empty() {
+                        std::task::Poll::Ready(Ok(false))
+                    } else if has_live_workers {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(true))
+                    }
+                }
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
@@ -4073,6 +4228,7 @@ impl ObscuraJsRuntime {
                 self.runtime.v8_isolate().perform_microtask_checkpoint();
                 let delivered_after_poll =
                     self.drain_frame_messages() + self.drain_worker_messages();
+                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
             }
             Err(error) => Err(error),
@@ -4300,10 +4456,13 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            // The slice parks on the worker-arrival wake too: a worker reply
+            // ends the parked slice immediately instead of the caller seeing
+            // it only at the next backoff boundary (the 50 ms cap used to
+            // quantize every worker round trip to 50-100 ms here).
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
-                self.runtime
-                    .run_event_loop(deno_core::PollEventLoopOptions::default()),
+                self.run_event_loop_with_arrival_wake(),
             )
             .await;
             // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
@@ -9398,6 +9557,55 @@ RequestRedirect value",
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("pump_until: wanted {expected}, last saw {last}");
+    }
+
+    /// A worker reply must reach a fully idle page through the parked pump
+    /// itself. deno_core tracks neither the reply nor the page's suspended
+    /// await, so the turn future has to stay parked on the worker-arrival
+    /// wake: reporting idle instead strands the reply until the caller's
+    /// next slice boundary (serve disarms its pump on idle; the CLI's
+    /// settle slices quantized every round trip to 50-100 ms).
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_reply_wakes_a_fully_idle_page_through_the_parked_turn() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-pong",
+            r#"(() => {
+                const source = 'self.onmessage = (e) => self.postMessage({pong: e.data.seq});';
+                globalThis.__pong = null;
+                const worker = new Worker(URL.createObjectURL(
+                    new Blob([source], {type: 'text/javascript'})));
+                worker.onmessage = (e) => { globalThis.__pong = e.data.pong; };
+                worker.postMessage({seq: 7});
+            })()"#,
+        )
+        .unwrap();
+        // The page has no pending ops or timers here: the only future work
+        // is the worker's reply. One autonomous turn must park on the
+        // arrival wake, receive it, and dispatch it well inside the timeout.
+        let started = std::time::Instant::now();
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rt.run_autonomous_event_loop_turn(),
+        )
+        .await
+        .expect("turn resolved while the worker booted and replied")
+        .expect("turn succeeded");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            rt.evaluate("String(globalThis.__pong)").unwrap(),
+            serde_json::json!("7")
+        );
+        // The old behavior quantized this delivery to the caller's next
+        // 100 ms settle slice; the wake delivers in single-digit ms plus
+        // worker boot.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "worker reply took {elapsed:?} to reach an idle page"
+        );
+        // The turn delivered worker traffic, so it reports not-idle and the
+        // serve loop keeps its pump armed for the next reply.
+        assert!(!idle, "a turn that delivered a worker reply is not idle");
     }
 
     /// A loopback server that answers every request with a fixed binary body.

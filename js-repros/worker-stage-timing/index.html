@@ -5,12 +5,25 @@
 <script>
 // Worker stage timing fixture, modelled on the Turnstile widget's blob worker
 // pipeline: the page creates a dedicated Worker from a blob URL, posts it a
-// task, the worker fetches a same-origin resource and posts the result back.
-// Three numbers come out, all milliseconds:
-//   workerBootMs   - new Worker(blobUrl) to the first message delivered
-//   workerFetchMs  - one fetch round trip measured inside the worker
-//   pingPongMs     - median message round trip through the worker
-//   totalMs        - constructor to the last reply (the uGyjw9 analogue)
+// task, the worker fetches two same-origin resources concurrently and posts
+// the combined result back. That stage is what the challenge payload reports
+// as `uGyjw9` (`timeTiefMs`): 184 ms on this engine against Chrome's 4 ms in
+// the 0919 captures (live14: worker brunhild/pat dispatches at 8.037/8.048 s).
+//
+// The fixture resolves to a JSON object with the original coarse numbers plus
+// a `phases` breakdown. Page-clock phases (performance.now deltas):
+//   constructorMs   - new Worker(blobUrl) sync return
+//   readyMs         - constructor to the worker's `ready` message delivered
+//   fetchTaskMs     - postMessage(task) to the worker's fetched reply
+//   idlePingMs      - one ping-pong after the worker parked >=400 ms
+// Worker-clock phases (measured inside the worker, returned in the reply):
+//   srcEvalMs       - worker source top-level start to `ready` postMessage
+//   entryToDispatchMs - onmessage entry to both fetch() calls initiated
+//   dispatchToDoneMs  - fetch dispatch to both bodies read (network)
+//   doneToReplyMs      - last body read to postMessage(replies)
+// The page->worker and worker->page message transit is whatever remains:
+//   fetchTaskMs = transitIn + entryToDispatch + dispatchToDone
+//               + doneToReply + transitOut.
 globalThis.workerFixturePromise = (async function () {
   const result = { workerBootMs: null, workerFetchMs: null, pingPongMs: null,
                     totalMs: null, workerSelfBootMs: null, error: null };
@@ -18,50 +31,123 @@ globalThis.workerFixturePromise = (async function () {
   const marks = { start: 0 };
   try {
     const source = `
+      const __srcStart = performance.now();
       self.__boot = performance.now();
       self.onmessage = async function (e) {
         const msg = e.data;
+        const entry = performance.now();
         if (msg && msg.kind === 'ping') {
-          self.postMessage({ kind: 'pong', seq: msg.seq });
+          self.postMessage({ kind: 'pong', seq: msg.seq,
+                             workerNow: performance.now() });
           return;
         }
         if (msg && msg.kind === 'fetch') {
-          const t = performance.now();
+          let dispatch, done;
           try {
-            const resp = await fetch(msg.url);
-            const text = await resp.text();
-            self.postMessage({ kind: 'fetched', ms: performance.now() - t,
-                               bytes: text.length, status: resp.status,
-                               bootLagMs: self.__boot });
+            const [a, b] = [fetch(msg.urlA), fetch(msg.urlB)];
+            dispatch = performance.now();
+            const [ra, rb] = await Promise.all([a, b]);
+            const [ta, tb] = await Promise.all([ra.text(), rb.text()]);
+            done = performance.now();
+            self.postMessage({ kind: 'fetched', ms: done - entry,
+                               bytes: ta.length + tb.length,
+                               status: ra.status,
+                               bootLagMs: self.__boot,
+                               srcStart: __srcStart,
+                               srcToEntryMs: entry - __srcStart,
+                               entryToDispatchMs: dispatch - entry,
+                               dispatchToDoneMs: done - dispatch,
+                               doneToReplyMs: performance.now() - done,
+                               workerNow: performance.now() });
           } catch (err) {
-            self.postMessage({ kind: 'fetched', error: String(err) });
+            self.postMessage({ kind: 'fetched', error: String(err),
+                               srcStart: __srcStart });
           }
         }
       };
-      self.postMessage({ kind: 'ready' });
+      self.postMessage({ kind: 'ready', srcStart: __srcStart,
+                         workerNow: performance.now() });
     `;
     const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    let constructedMs = null;
+    const workerClock = { offset: null };
+    const calibrate = (msg) => {
+      // workerNow (worker clock) vs page now (page clock) at receive time;
+      // the offset is only good to half a round trip, so the fixture never
+      // compares across clocks - each side reports its own durations.
+      if (msg.workerNow != null && workerClock.offset === null) {
+        workerClock.offset = msg.workerNow - performance.now();
+      }
+    };
+    const tC = performance.now();
     const worker = new Worker(blobUrl);
+    constructedMs = performance.now() - tC;
+    result.constructorMs = constructedMs;
     let firstMessageMs = null;
     const bootPromise = new Promise((resolve) => {
       worker.onmessage = (e) => {
         if (firstMessageMs === null) firstMessageMs = performance.now() - t0;
-        if (e.data && e.data.kind === 'ready') resolve(firstMessageMs);
+        calibrate(e.data);
+        if (e.data && e.data.kind === 'ready') {
+          resolve({ firstMessageMs, srcStart: e.data.srcStart,
+                    readyAtWorker: e.data.workerNow });
+        }
       };
     });
-    result.workerBootMs = await bootPromise;
+    const boot = await bootPromise;
+    result.workerBootMs = boot.firstMessageMs;
     marks.afterBoot = performance.now() - t0;
     result.workerSelfBootMs = null;
-    // One worker-side fetch round trip against the fixture server.
+    // One worker-side fetch round trip: two concurrent GETs against the
+    // fixture server (the brunhild+pat shape), one combined reply.
     const fetchMs = await new Promise((resolve) => {
+      const sentAt = performance.now();
       worker.onmessage = (e) => {
-        if (e.data && e.data.kind === 'fetched') resolve(e.data);
+        calibrate(e.data);
+        if (e.data && e.data.kind === 'fetched') {
+          e.data.pageSentAt = sentAt;
+          e.data.pageDeliveredMs = performance.now() - sentAt;
+          resolve(e.data);
+        }
       };
-      worker.postMessage({ kind: 'fetch', url: new URL('fixture-payload.txt', location.href).href });
+      worker.postMessage({ kind: 'fetch',
+        urlA: new URL('fixture-payload.txt', location.href).href,
+        urlB: new URL('index.html', location.href).href });
     });
     marks.afterFetch = performance.now() - t0;
     if (fetchMs.error) { result.error = fetchMs.error; }
-    else { result.workerFetchMs = fetchMs.ms; result.fetchBytes = fetchMs.bytes; }
+    else {
+      result.workerFetchMs = fetchMs.ms;
+      result.fetchBytes = fetchMs.bytes;
+      result.phases = {
+        constructorMs: Math.round(constructedMs * 1000) / 1000,
+        readyMs: Math.round(boot.firstMessageMs * 1000) / 1000,
+        srcEvalMs: Math.round(((boot.readyAtWorker - boot.srcStart)) * 1000) / 1000,
+        entryToDispatchMs: Math.round(fetchMs.entryToDispatchMs * 1000) / 1000,
+        dispatchToDoneMs: Math.round(fetchMs.dispatchToDoneMs * 1000) / 1000,
+        doneToReplyMs: Math.round(fetchMs.doneToReplyMs * 1000) / 1000,
+        fetchTaskMs: Math.round(fetchMs.pageDeliveredMs * 1000) / 1000,
+        srcToEntryMs: Math.round(fetchMs.srcToEntryMs * 1000) / 1000,
+      };
+      const transit = fetchMs.pageDeliveredMs - fetchMs.entryToDispatchMs -
+        fetchMs.dispatchToDoneMs - fetchMs.doneToReplyMs;
+      result.phases.transitBothMs = Math.round(transit * 1000) / 1000;
+    }
+    // Park the worker with no traffic for a while (the live Tief task lands
+    // on a worker that booted seconds earlier and sat idle), then measure one
+    // message round trip.
+    await new Promise((r) => setTimeout(r, 400));
+    const idleStart = performance.now();
+    await new Promise((resolve) => {
+      worker.onmessage = (e) => {
+        if (e.data && e.data.kind === 'pong' && e.data.seq === 'idle') resolve();
+      };
+      worker.postMessage({ kind: 'ping', seq: 'idle' });
+    });
+    if (result.phases) {
+      result.phases.idlePingMs =
+        Math.round((performance.now() - idleStart) * 1000) / 1000;
+    }
     // 21 message round trips; report the median.
     const samples = [];
     for (let seq = 0; seq < 21; seq++) {

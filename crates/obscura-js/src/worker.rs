@@ -223,6 +223,15 @@ impl WorkerHost {
         }
     }
 
+    /// True while at least one dedicated worker of this page is live. An idle
+    /// page with live workers must keep a pump future parked on the
+    /// worker-arrival wake: worker replies are invisible to deno_core's
+    /// pending-work tracking, so a fully-disarmed pump would strand them
+    /// until the next unrelated command or timer.
+    pub fn has_live(&self) -> bool {
+        !self.workers.is_empty()
+    }
+
     /// Shared receiver for the worker's outbox, awaited by `op_worker_recv`.
     pub fn outbox(
         &self,
