@@ -115,6 +115,7 @@ function _colorMatrix(matrix, rgb) {
   ];
 }
 function _convertCanvasColor(rgb, source, destination) {
+  if (source === destination) return rgb.slice();
   const linear = rgb.map(_colorTransferToLinear);
   const xyz = _colorMatrix(source === 'display-p3' ? _P3_TO_XYZ : _SRGB_TO_XYZ, linear);
   return _colorMatrix(destination === 'display-p3' ? _XYZ_TO_P3 : _XYZ_TO_SRGB, xyz)
@@ -129,6 +130,14 @@ function _convertCanvasFloatColor(rgb, source, destination) {
 function _canvasColorComponent(token) {
   token = String(token).trim();
   return token.endsWith('%') ? Number(token.slice(0, -1)) / 100 : Number(token);
+}
+// Float32 → unorm8 the way Skia does: the product is formed in float32 (so a
+// decimal 0.3 component becomes 76.500003), then quantized with a floor at
+// just under +0.5, which lands exact .5 ties DOWN. Oracle-verified against
+// Chrome: 0.3→77, 0.5→127, 0.25→64, 0.2→51.
+function _quantizeUnorm8(value) {
+  const clamped = Math.max(0, Math.min(1, value));
+  return Math.min(255, Math.floor(Math.fround(clamped) * 255 + 0.49999994));
 }
 const _CANVAS_AA_2X2 = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]];
 const _CANVAS_AA_4X4 = Array.from({length: 16}, (_, index) =>
@@ -223,13 +232,15 @@ class _Canvas2D {
           return [converted[0] * 255, converted[1] * 255, converted[2] * 255,
             Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 1)) * 255];
         }
-        const p3TieBias = source === 'display-p3' && this._colorSpace === 'display-p3'
-          ? Number.EPSILON * 255 : 0;
+        // Skia holds colors as float32 and quantizes with float32 multiply,
+        // so a decimal 0.3 lands on 76.500003 and rounds up to 77; the same
+        // product in float64 is 76.4999... and rounds down. Emulate the f32
+        // pipeline instead of biasing the tie.
         return [
-          Math.round(Math.max(0, Math.min(1, converted[0])) * 255 - p3TieBias),
-          Math.round(Math.max(0, Math.min(1, converted[1])) * 255 - p3TieBias),
-          Math.round(Math.max(0, Math.min(1, converted[2])) * 255 - p3TieBias),
-          Math.round(Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 1)) * 255),
+          _quantizeUnorm8(converted[0]),
+          _quantizeUnorm8(converted[1]),
+          _quantizeUnorm8(converted[2]),
+          _quantizeUnorm8(Number.isFinite(alpha) ? alpha : 1),
         ];
       }
     }

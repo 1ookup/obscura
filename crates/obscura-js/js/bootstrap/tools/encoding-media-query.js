@@ -135,6 +135,11 @@ function _mediaViewportDimension(name) {
   return name === 'width' ? 1440 : 900;
 }
 
+function _mediaDisplayIsP3() {
+  const platform = String(globalThis.navigator && globalThis.navigator.platform || '');
+  return /mac/i.test(platform);
+}
+
 function _parseMediaPx(value) {
   const match = String(value).trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px)?$/i);
   if (!match || (!match[2] && Number(match[1]) !== 0)) return null;
@@ -213,6 +218,17 @@ function _evaluateMediaFeature(raw) {
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
   if (match) return match[1] === 'no-preference';
+
+  // Chrome reports srgb for every display (it is the common denominator) and
+  // p3 only on a wide-gamut panel. Every modern Mac ships one, so the macOS
+  // identity claims p3 and rec2020 stays false, matching a real MacBook.
+  match = feature.match(/^color-gamut\s*:\s*(srgb|p3|rec2020)$/);
+  if (match) {
+    const wideGamut = _mediaDisplayIsP3();
+    return match[1] === 'srgb' || (match[1] === 'p3' && wideGamut);
+  }
+  match = feature.match(/^(video-)?dynamic-range\s*:\s*(standard|high)$/);
+  if (match) return match[2] === 'standard';
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
