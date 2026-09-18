@@ -6320,6 +6320,139 @@ fn op_text_decode(
     }
 }
 
+/// A one-byte (Latin-1) JS string. `atob`'s result is exactly this shape, and
+/// handing it to V8 through `new_from_one_byte` skips the UTF-8 expansion and
+/// the V8-side UTF-8 rescan a Rust `String` return would pay (about 4ms per
+/// megabyte measured, which is most of the gap to Chrome's native `atob`).
+struct Latin1String(Vec<u8>);
+
+impl<'a> deno_core::ToV8<'a> for Latin1String {
+    type Error = std::io::Error;
+
+    fn to_v8(
+        self,
+        scope: &mut v8::HandleScope<'a>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        v8::String::new_from_one_byte(scope, &self.0, v8::NewStringType::Normal)
+            .map(|string| string.into())
+            .ok_or_else(|| std::io::Error::other("string exceeds V8 maximum length"))
+    }
+}
+
+/// `forgiving-base64 decode` for `atob`, byte-oriented like a browser: the
+/// decoded bytes come back as a Latin-1 string (one code unit per byte).
+///
+/// The protocol is a marker prefix instead of a Result so the JS wrapper can
+/// throw the exact DOMException a browser throws ("\x00" + value on success,
+/// "\x01" for InvalidCharacterError). Semantics mirror the previous pure-JS
+/// implementation bit for bit: whitespace from the [\t\n\f\r ] class is
+/// stripped, optional padding is dropped before the length check ("QQ" and
+/// "QQ==" decode, "Q" and "QQ=" do not), any other character outside the
+/// standard alphabet is rejected, and trailing bits are not canonicalized.
+#[op2]
+#[to_v8]
+fn op_atob(#[string] data: &str) -> Latin1String {
+    // A decoder bug must not unwind into V8's FFI frame (AGENTS.md); the
+    // payload shape is page-controlled.
+    match std::panic::catch_unwind(|| forgiving_base64_decode(data)) {
+        Ok(Some(bytes)) => {
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(0);
+            out.extend_from_slice(&bytes);
+            Latin1String(out)
+        }
+        _ => Latin1String(vec![1]),
+    }
+}
+
+/// `btoa`: validate the Latin-1 range and base64-encode. "\x00" + encoded on
+/// success, "\x01" when any code unit is above 0xFF (the JS wrapper throws
+/// the same InvalidCharacterError a browser throws).
+#[op2]
+#[to_v8]
+fn op_btoa(#[string] data: &str) -> Latin1String {
+    match std::panic::catch_unwind(|| latin1_base64_encode(data)) {
+        Ok(Some(encoded)) => {
+            let mut out = Vec::with_capacity(encoded.len() + 1);
+            out.push(0);
+            out.extend_from_slice(encoded.as_bytes());
+            Latin1String(out)
+        }
+        _ => Latin1String(vec![1]),
+    }
+}
+
+/// The engine the forgiving decoder delegates to: padding is handled by hand
+/// before this runs (RequireNone), and the spec ignores leftover bits in the
+/// final quantum, unlike the default canonical check.
+fn forgiving_base64_engine() -> base64::engine::GeneralPurpose {
+    use base64::alphabet::STANDARD;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    GeneralPurpose::new(
+        &STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone)
+            .with_decode_allow_trailing_bits(true),
+    )
+}
+
+fn forgiving_base64_decode(data: &str) -> Option<Vec<u8>> {
+    let bytes = data.as_bytes();
+    // A non-ASCII byte can never be in the alphabet, and the stripped class
+    // is exactly [\t\n\f\r ]. The common payload (the challenge's ~845KB
+    // program) is pure alphabet: validate in place and decode the borrowed
+    // slice with no intermediate copy.
+    let mut whitespace = false;
+    for &byte in bytes {
+        match byte {
+            b'\t' | b'\n' | 0x0C | b'\r' | b' ' => whitespace = true,
+            0x80..=0xFF => return None,
+            _ => {}
+        }
+    }
+    let cleaned: std::borrow::Cow<[u8]> = if !whitespace {
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        let mut owned = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match byte {
+                b'\t' | b'\n' | 0x0C | b'\r' | b' ' => continue,
+                _ => owned.push(byte),
+            }
+        }
+        std::borrow::Cow::Owned(owned)
+    };
+    // Optional padding is dropped before the length check. "QQ=" keeps its
+    // '=' (len % 4 is 3 here), which then fails the alphabet check below,
+    // exactly like the previous JS implementation.
+    let mut len = cleaned.len();
+    if len % 4 == 0 {
+        if cleaned.ends_with(b"==") {
+            len -= 2;
+        } else if cleaned.ends_with(b"=") {
+            len -= 1;
+        }
+    }
+    if len % 4 == 1 {
+        return None;
+    }
+    // What reaches the engine is padding-free alphabet text of a decodable
+    // length (the %4==1 shape was rejected above).
+    forgiving_base64_engine().decode(&cleaned[..len]).ok()
+}
+
+fn latin1_base64_encode(data: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(data.len());
+    for character in data.chars() {
+        let code = character as u32;
+        if code > 0xFF {
+            return None;
+        }
+        bytes.push(code as u8);
+    }
+    Some(BASE64.encode(&bytes))
+}
+
 /// Re-encode a URL query component using a non-UTF-8 document encoding override
 /// (the WHATWG "encoding override"). `query` is the already-UTF-8-decoded query
 /// string; `label` the target charset; `special` whether the URL has a special
@@ -7401,6 +7534,8 @@ pub fn build_extension() -> Extension {
         op_add_import_map(),
         op_encoding_for_label(),
         op_text_decode(),
+        op_atob(),
+        op_btoa(),
         op_url_encode_query(),
         op_opfs_sync_open(),
         op_opfs_sync_write(),

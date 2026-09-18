@@ -77,56 +77,34 @@ registerStorageSurface();
 //   before  btoa -> "QcKAwqHDv0I="    atob -> 8 bytes [65,194,128,...]
 // and `btoa('Ā')` throws InvalidCharacterError in Chrome, which a UTF-8
 // encoder cannot do because it never sees a code unit above 0xFF.
+//
+// The hot path lives in Rust (op_atob / op_btoa). The challenge decodes its
+// ~845KB program with atob right after TS#1, and the per-char JS table walk
+// measured 65x Chrome's decode time; the op runs the same forgiving-base64
+// semantics in one pass. The op answers with a marker prefix: "\0" + value on
+// success, "\x01" for InvalidCharacterError, so the exceptions below stay the
+// exact DOMExceptions a browser throws.
 globalThis.btoa = globalThis.btoa || ((data) => {
-  const s = String(data);
-  const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let r="";
-  for(let i=0;i<s.length;i+=3){
-    const a=s.charCodeAt(i);
-    const hasB=i+1<s.length, hasC=i+2<s.length;
-    const b=hasB?s.charCodeAt(i+1):0, cc=hasC?s.charCodeAt(i+2):0;
-    if(a>0xff||b>0xff||cc>0xff){
-      throw new DOMException(
-        "Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",
-        "InvalidCharacterError");
-    }
-    r+=c[a>>2]+c[((a&3)<<4)|(b>>4)]+(hasB?c[((b&15)<<2)|(cc>>6)]:"=")+(hasC?c[cc&63]:"=");
+  const result = Deno.core.ops.op_btoa(String(data));
+  if (result.charCodeAt(0) !== 0) {
+    throw new DOMException(
+      "Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",
+      "InvalidCharacterError");
   }
-  return r;
+  return result.slice(1);
 });
 globalThis.atob = globalThis.atob || ((data) => {
-  const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let s=String(data).replace(/[\t\n\f\r ]/g,"");
-  // `forgiving-base64 decode`: the padding is optional and is dropped before
-  // the length check, so "QQ" and "QQ==" both decode and "Q" does not.
-  if(s.length%4===0){
-    if(s.endsWith("=="))s=s.slice(0,-2);
-    else if(s.endsWith("="))s=s.slice(0,-1);
-  }
-  if(s.length%4===1){
+  const result = Deno.core.ops.op_atob(String(data));
+  if (result.charCodeAt(0) !== 0) {
+    // `forgiving-base64 decode`: dropped padding before the length check
+    // ("QQ" and "QQ==" decode, "Q" does not), characters outside the table
+    // rejected.
     throw new DOMException(
       "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",
       "InvalidCharacterError");
   }
-  const r=[];
-  for(let i=0;i<s.length;i+=4){
-    const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]);
-    if(a<0||b<0||(i+2<s.length&&cc<0)||(i+3<s.length&&d<0)){
-      throw new DOMException(
-        "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",
-        "InvalidCharacterError");
-    }
-    r.push((a<<2)|(b>>4));
-    if(cc>=0)r.push(((b&15)<<4)|(cc>>2));
-    if(d>=0)r.push(((cc&3)<<6)|d);
-  }
-  // Spreading a large decoded payload into one call overflows V8's argument
-  // stack. Angular and other SSR frameworks routinely decode blobs large
-  // enough to hit that ceiling.
-  let out="";
-  const chunk=0x8000;
-  for(let i=0;i<r.length;i+=chunk) out+=String.fromCharCode(...r.slice(i,i+chunk));
-  return out;
+  // slice(1) on a large result is a sliced-string view, not a copy.
+  return result.slice(1);
 });
 
 // Functional History API. The earlier stub returned constant state and was a

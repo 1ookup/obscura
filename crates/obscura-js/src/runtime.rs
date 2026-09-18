@@ -19023,6 +19023,55 @@ RequestRedirect value",
         );
     }
 
+    /// The base64 hot path is native (op_atob / op_btoa): the challenge
+    /// decodes its ~845KB program with atob + a byte loop right after TS#1
+    /// and the old per-char JS walk measured 32ms against Chrome's 0.5ms.
+    /// Correctness on a large payload also pins the exact error surface:
+    /// every rejected input shape must still be InvalidCharacterError.
+    #[test]
+    fn atob_and_btoa_native_path_handles_large_payloads() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    // ~1MB round trip through the op path.
+                    let binary = "";
+                    for (let i = 0; i < 64; i++) binary += String.fromCharCode((i * 37 + 11) & 0xFF).repeat(1024);
+                    const encoded = btoa(binary);
+                    const decoded = atob(encoded);
+                    let identical = decoded.length === binary.length;
+                    if (identical) {
+                        for (let i = 0; i < binary.length; i += 997) {
+                            if (decoded.charCodeAt(i) !== binary.charCodeAt(i)) { identical = false; break; }
+                        }
+                    }
+                    // The whitespace strip and forgiving padding shapes.
+                    const forgiving = [
+                        atob(" QQ== "), atob("QQ"), atob("QQ==").length,
+                        atob("QQ\n=\t="),
+                    ];
+                    // Rejected shapes keep the DOMException name. "QQ=" throws
+                    // (len % 4 is 3, no padding drop, '=' is not in the table)
+                    // while "QQQ=" decodes, matching the JS it replaced.
+                    const rejected = ["Q", "QQ=", "Q===", "Q*", "\u00FF"].map((input) => {
+                        try { atob(input); return "ok"; }
+                        catch (error) { return error.name; }
+                    });
+                    return [identical, encoded.length, forgiving, rejected];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, 87384,
+                ["A", "A", 1, "A"],
+                ["InvalidCharacterError", "InvalidCharacterError", "InvalidCharacterError",
+                 "InvalidCharacterError", "InvalidCharacterError"],
+            ])
+        );
+    }
+
     /// The public-key half of `crypto.subtle` runs in Rust (`op_subtle_asym`),
     /// which is synchronous, so the round trips below are asserted directly.
     /// The shim's own parameter and usage rules sit on top of this and are
