@@ -366,10 +366,15 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() {
-    // The top document's parse mode comes from the DOM; about:blank and
-    // doctypeless documents are BackCompat.
+    // The document's OWN parse mode. A scoped frame document reads its own
+    // scope (_ScopedDocument deletes its override to keep one enumerable
+    // layer, so this inherited getter must not hardcode the top document);
+    // about:blank and doctypeless documents are BackCompat in Chrome, a
+    // parsed doctype is CSS1Compat, and DOMParser documents always answer
+    // CSS1Compat (Chrome oracle).
     try {
-      const info = _domParse("document_scope_info", 0);
+      const root = typeof this[_scopeRootSym] === 'number' ? this[_scopeRootSym] : 0;
+      const info = _domParse("document_scope_info", root);
       if (info && info.quirks !== undefined) return info.quirks ? "BackCompat" : "CSS1Compat";
     } catch (_e) {}
     return "CSS1Compat";

@@ -9569,7 +9569,9 @@ RequestRedirect value",
         const setupFrame = (hostId, html, originUrl, csp, isolated) => {
             const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));
-            if (html) op("parse_into_subtree", created.root, html);
+            // The scope is registered before the parse so the parse op can
+            // record the document's quirks flag on it, exactly like the Rust
+            // frame loader's commit does.
             op("set_document_scope", created.root, JSON.stringify({
                 url: originUrl,
                 originUrl,
@@ -9578,6 +9580,7 @@ RequestRedirect value",
                 csp: csp ?? null,
                 ...(isolated === undefined ? {} : {crossOriginIsolated: !!isolated}),
             }));
+            if (html) op("parse_into_subtree", created.root, html);
             return created.root;
         };
     "#;
@@ -17540,6 +17543,56 @@ RequestRedirect value",
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["BackCompat", true]));
+    }
+
+    #[test]
+    fn compat_mode_follows_each_document_own_parse_mode() {
+        // A parsed doctype-less document is in quirks mode: BackCompat
+        // (Chrome oracle). A parsed doctype is CSS1Compat. The getter used to
+        // hardcode the top document's scope for every document, so a nested
+        // widget document without a doctype answered CSS1Compat whenever the
+        // top page had one -- the CF challenge census caught exactly that
+        // (Step 300, bucket CSS1Compat vs BackCompat).
+        let mut rt = setup_runtime("<html><body>x</body></html>");
+        assert_eq!(
+            rt.evaluate("document.compatMode").unwrap(),
+            serde_json::json!("BackCompat")
+        );
+
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        assert_eq!(
+            rt.evaluate("document.compatMode").unwrap(),
+            serde_json::json!("CSS1Compat")
+        );
+
+        // DOMImplementation.createHTMLDocument always reports CSS1Compat.
+        assert_eq!(
+            rt.evaluate(
+                "document.implementation.createHTMLDocument('').compatMode"
+            )
+            .unwrap(),
+            serde_json::json!("CSS1Compat")
+        );
+
+        // A doctype-less frame document reports its own parse mode, not the
+        // top document's.
+        let mut rt = setup_runtime(
+            "<!DOCTYPE html><html><body><iframe id=f></iframe></body></html>",
+        );
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "http://example.com/frame");
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        let result = rt.evaluate(r#"(() => {
+            const cd = document.getElementById('f').contentDocument;
+            return [cd.compatMode, cd.doctype === null,
+                cd.documentElement.getAttributeNames().join(',')];
+        })()"#).unwrap();
+        // The parsed frame document also carries exactly its authored
+        // attributes (no synthesized dir/lang).
+        assert_eq!(result, serde_json::json!(["BackCompat", true, ""]));
     }
 
     #[tokio::test(flavor = "current_thread")]
