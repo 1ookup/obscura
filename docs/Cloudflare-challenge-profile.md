@@ -10569,3 +10569,105 @@ PerformanceObserver buffered 交付、resource timing 字段，全部健康。
 **门禁**：obscura-js crate 单跑首轮 1 失败（frame_elements_report_their_own_document_geometry，
 stash 后干净树同样失败，属既有问题）；全 workspace `--no-fail-fast` **1820/1820 通过**
 （4 leaky、4 skipped）。obstacle course companion repo 仍不在工作区。真实 404 未取得。
+
+### Step 300: 完整 payload 离线解密对拍——普查面实锤一批 + 计数器/变体分岔定位（2026-09-19）
+
+**方法**：`ov2-payload-decrypt` skill（5152e71）首次实战：注入轮（fixed key `0954fd23…`）
+`OBSCURA_CAPTURE_FO` 捕获我方 /fo/ 上行体 → 解密出完整 JSON（TS#2 109950 字符），
+与 headed Chrome 通过轮同款解密产物（远端 /tmp/ov2-dec/payload.json，0918 23:20 会话，
+Chrome 149、后台标签页）逐字段对拍。突破 8000 字符 console 截断后首次看到全部
+91 键 + 39 条目。复跑材料在 /tmp/cf0919/（ours-dec/、ref/、census-diff.txt）。
+
+**证据 1（变体分岔）**：我方 TS#2 有 39 条目（参考 38），第 26 条是 PoW/算力基准结果
+（wikEk8/wopX8/jBVrk8/hCKCP8=89.6ms，FLOW-UI-WORKER.md #1 @2.38 确认 wikEk8=计算计划）。
+参考的 TS#2 不含它——Chrome 的基准在 TS#2 之后才开始（0916 trace 4.33s Worker#5），
+结果进 TS#3（参考 TS#3 请求 93KB，我方恒 2.9KB）。我方 TS#2 在点击后 1.45s 提交，
+基准条目时间紧跟点击——**我方走 interactive（需点击）分支，参考走 managed 自动分支**。
+两个会话 TS#1 响应同尺寸（845808 vs 845784B）→ 变体是程序运行时分支，不是服务端下发。
+分支上游最大嫌疑 = TS#1 时的计数器（我方 uGyjw9=287/参考 2；NnqX6 831/229；
+ZMSOw0=twvE0=729/127——均在 TS#1 前定型，引导期产生）。
+
+**证据 2（api.js 变体排除）**：我方加载 `turnstile/v0/g/330e41bb475c/api.js?onload=khCN8`，
+0916 真实 Chrome trace 同款（5479 hits）——会话变量，不是引擎分歧。
+
+**证据 3（census 普查实锤，/tmp/cf0919/census-diff.txt）**：
+- iframe 嵌套窗口 screenX/screenY/screenLeft/screenTop/outerWidth/outerHeight 必须为 0
+  （CSSOM View 嵌套浏览上下文返回 0；Chrome oracle 实测全 0）。我方泄露顶层指纹值
+  （44/77/1200/816 进普查桶）。
+- `navigator.cpuPerformance` 我方发明（page-init.js:81）；0916 trace 与 149-pass 普查均无 → 删。
+- `navigator.languages` 应为 `["zh-CN"]`（参考普查桶 "zh-CN" 直接命中；我方多出的
+  "zh-CN,zh" 桶是数组 stringily 泄漏）。Accept-Language 头仍是 `zh-CN,zh;q=0.9`——
+  两语义需解耦（§10.13 把头的要求错误并进了属性）。
+- widget 文档（无 doctype）`document.compatMode` 应为 BackCompat（quirks）；我方 CSS1Compat。
+  Chrome oracle：createHTMLDocument 恒 CSS1Compat，解析无 doctype 文档 BackCompat。
+- 窗口表面（桶 N）：参考有 ModelContext/SharedStorage 全家（8 构造器）/WebMCPEvent/
+  navigator.modelContext；我方缺。我方多 HTMLAppletElement/HTMLBGSoundElement/
+  HTMLBaseFontElement/NodeRange/OpaqueRange/XSLTProcessor/PermissionsPolicy 及 11 个
+  'o.' 前缀名。151-trace 仲裁（hits）：SharedStorage 44✓ ModelContext 14✓ WebMCPEvent 12✓
+  SharedArrayBuffer 8✓ FontFaceSet 19✓ PerformanceSoftNavigation/InteractionContentfulPaint/
+  HTMLUserMediaElement 12✓；HTMLCameraElement/HTMLMicrophoneElement/XSLTProcessor/
+  NodeRange/OpaqueRange/Applet 系 0✗。**c67ffcd 的 camera/mic + sharedStorage 移除依据的是
+  本地 153-headless oracle——headless 正是会失败的形态，149-pass/151-trace 都反着**。
+- 桶 N 公共名顺序不同（window 自有键序指纹）。
+
+**证据 4（探针值分岔）**：HPcn5 文本度量 27.9375 vs 28.9375（差整 1px，首字形）；
+Vhmq4=["lang","dir"] vs ["lang"]；IGBuA2/oHIQ6 字体覆盖扫描多报；CYsxg7 downlink=10
+（钉死上限）vs 1.55（实测）；thhSb9/ppMls5/cHIoX8 45/55/45 vs 99/37/99；RPKTR7
+10737418240 vs 10737418554（+314）；哈希探针（RKUE0/JRzmw6/kRQwh3/oSIr8）空哈希落位
+互换 + JRzmw6 我方产出裸键名。以上语义需字节码反编译（键 pc 已定位：uGyjw9@460005、
+ZMSOw0@458630、twvE0@458705、TzZRB1@458555、WHTpH6@459929、poqG1@459888、
+Blsob5@459845、myWtu3@160944、RPKTR7@185382、thhSb9@189790、CYsxg7@230334）。
+/ci/ 请求：参考在 TS#1→TS#2 间发出（响应 2368B，进 rPXg2 资源清单第 4 条），我方全程
+未发（pat/brunhild 正常）——触发条件未知。
+
+**机器态差异（放行，不追）**：参考会话是 Chrome 149 后台标签页（visibilityState hidden、
+DPR 1、screen 1720×1260、hc 6、dm 16、tz -32）；我方模拟 151/DPR2/1512×982/hc15。
+通过会话间几何/DPR/版本互不相同 → 几何非硬门（与 Run I 结论一致）。
+
+**修复批次 13 派发**（Browser-Environment-Simulation）：普查面 7 项 + 值分岔 2 项；
+语义提取（计数器/哈希探针//ci/触发）并行走远程 jsvmp 管线。
+
+### Step 301: 修复批次 13 落地——普查面 7 项 + atob/btoa 原生化 + worker 隔离位（2026-09-19）
+
+**假设 / 方法**：按 Step 300 的 census 对拍逐项修复，另加两条加急项（atob/btoa 原生化、
+worker `crossOriginIsolated` 跟随创建文档）。仲裁规则：本地 153-headless oracle（c67ffcd
+的依据）与通过会话（149-pass census + 151 真实 renderer trace）冲突时，后者胜——headless
+正是会失败的平均形态。
+
+**修复与证据**（每项一个 commit，各带回归测试）：
+- 嵌套窗口几何：iframe realm 的 screenX/screenY/screenLeft/screenTop/outerWidth/outerHeight
+  按 CSSOM View 归零，顶层保留指纹值；普查桶 44/77/1200/816 消失。
+- 删 `navigator.cpuPerformance`（151 trace 0 hits、两份通过 census 均无）。
+- `navigator.languages` 改为逐字 authored 列表（["zh-CN"]），Accept-Language 头仍由
+  序列化器合成基语言回退（zh-CN,zh;q=0.9）；两语义解耦。
+- `document.compatMode`：_ScopedDocument 删除自己的 getter 后回落到硬编码 root 0 的
+  Document.prototype getter，widget 文档继承了顶层页的 CSS1Compat。现按各文档自己的
+  scope.quirks 应答；无 doctype→BackCompat、有 doctype→CSS1Compat、createHTMLDocument→
+  CSS1Compat（Chrome oracle）。
+- 窗口表面（桶 N/o）：增 ModelContext/WebMCPEvent/SharedStorage 全家（8 构造器）+
+  window.sharedStorage（可枚举，documentPictureInPicture 与 viewport 之间）+
+  navigator.modelContext；删 HTMLAppletElement/HTMLBGSoundElement/HTMLBaseFontElement/
+  NodeRange/OpaqueRange/XSLTProcessor/PermissionsPolicy/HTMLCameraElement/
+  HTMLMicrophoneElement（后两者即 c67ffcd 依错误 oracle 所加）；插入序按参考 payload 序。
+- `s.when`：我们的 screen.when 未标 native，被 census 的原生检查打入 typeof 桶 'f'
+  （参考在桶 N）；补 _markNative。
+- atob/btoa：Rust op 化（宽恕 base64 语义逐位保持，DOMException 在 JS 侧原样抛出），
+  结果经 one-byte-string ToV8 直传 V8。845KB 基准：atob 32.4ms→1.3-2.8ms、btoa
+  35.8ms→5.2-6.0ms（Chrome oracle 0.5/4.2）。挑战 ZMSOw0/twvE0 的 729ms 应落回
+  Chrome 的 127-129ms 量级带内。
+- worker `crossOriginIsolated`：原硬编码 false，与窗口 realm 不一致；现从创建文档 scope
+  （root 0 取页面位）透传。
+
+**Vhmq4 dir 分岔结论**：本地复现（serve + doctypeless fixture + document.write +
+srcdoc）显示解析/写入文档的 documentElement attributes 逐字等于 authored（["lang"]，
+无 dir）；引擎不在任何路径合成 dir。最可信触发 = 挑战 `?lang=auto` 的 i18n 对我们此前
+泄漏的 ["zh-CN","zh"] 语言列表的反应，随 languages 解耦一并消除；待下轮实测确认。
+
+**遗留**：SharedArrayBuffer/FontFaceSet/HTMLUserMediaElement/InteractionContentfulPaint/
+PerformanceSoftNavigation 在我方 census 以 'o.'（未知名）前缀出现、参考桶 N 全无——
+151 trace 均有真实访问（12+ hits），按指示保留为已知残差。桶 N 尾部 'o.runProgram' 位次
+与 o.eehKK5/o.__OV2FIXEDKEY__ 为挑战自身注入产物，引擎不可控。
+
+**门禁**：obscura-js 648/648、obscura-browser 126/126、obscura-net 104/104（release、
+render、nextest）；release build 全量通过；未跑障碍课程与真实网络轮（代理验证由主控
+统一执行）。
