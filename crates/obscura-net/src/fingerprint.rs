@@ -110,7 +110,7 @@ fn default_language() -> String {
 }
 
 fn default_languages() -> Vec<String> {
-    vec!["en-US".to_string(), "en".to_string()]
+    vec!["en-US".to_string()]
 }
 
 /// Overrides from `OBSCURA_FINGERPRINT_JSON`, the transport the `--fingerprint`
@@ -158,7 +158,7 @@ pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
         if !language.is_empty() {
             overrides.language = Some(language.clone());
             if std::env::var("OBSCURA_LANGUAGES").is_err() {
-                overrides.languages = Some(chrome_languages(&language));
+                overrides.languages = Some(authored_languages(&language));
             }
         }
     }
@@ -223,19 +223,14 @@ fn resolve_browser_version(token: String) -> String {
         .unwrap_or(token)
 }
 
-/// `navigator.languages` as Chrome derives it: the selected language, then its
-/// base language as a lower-priority fallback. A single `zh-CN` entry is the
-/// one thing Chrome never reports for a `zh-CN` profile, and the same list
-/// backs the `Accept-Language` header (`zh-CN,zh;q=0.9`), so both surfaces
-/// disagree with a real session when the fallback is missing.
-fn chrome_languages(language: &str) -> Vec<String> {
-    let mut languages = vec![language.to_string()];
-    if let Some((base, _)) = language.split_once('-') {
-        if !base.is_empty() && base != language {
-            languages.push(base.to_string());
-        }
-    }
-    languages
+/// `navigator.languages` is exactly the authored preference list: a `zh-CN`
+/// session reports `["zh-CN"]` (passing Chrome census, Step 300). The
+/// base-language fallback lives in the Accept-Language header only, where
+/// Chrome's serializer synthesizes it (`accept_language` below). The two
+/// surfaces used to share one expanded list, which leaked the header shape
+/// into the property.
+fn authored_languages(language: &str) -> Vec<String> {
+    vec![language.to_string()]
 }
 
 impl Default for BrowserFingerprint {
@@ -476,7 +471,7 @@ impl BrowserFingerprint {
             }).collect();
         }
         if language_overridden && !languages_overridden {
-            self.languages = chrome_languages(&self.language);
+            self.languages = authored_languages(&self.language);
         } else if languages_overridden && !language_overridden {
             if let Some(first) = self.languages.first().filter(|value| !value.is_empty()) {
                 self.language = first.clone();
@@ -486,21 +481,34 @@ impl BrowserFingerprint {
             self.language = default_language();
         }
         if self.languages.is_empty() {
-            self.languages = chrome_languages(&self.language);
+            self.languages = authored_languages(&self.language);
         }
         self
     }
 
-    /// Serialize the browser's language preference in the same order as
-    /// `navigator.languages`. The first entry is unweighted; later entries
-    /// use Chrome's conventional descending q-values.
+    /// Serialize the browser's language preference as the Accept-Language
+    /// request header. The first entry is unweighted; later entries use
+    /// Chrome's conventional descending q-values.
+    ///
+    /// Chrome's header serializer synthesizes the base language of a lone
+    /// regional variant (`zh-CN` preference -> `zh-CN,zh;q=0.9` header) while
+    /// `navigator.languages` stays the authored one-entry list. A list with
+    /// more than one authored entry serializes verbatim.
     pub fn accept_language(&self) -> String {
-        let languages = if self.languages.is_empty() {
+        let authored = if self.languages.is_empty() {
             std::slice::from_ref(&self.language)
         } else {
             &self.languages
         };
-        languages
+        let mut entries: Vec<String> = authored.to_vec();
+        if entries.len() == 1 {
+            if let Some((base, _)) = entries[0].split_once('-') {
+                if !base.is_empty() && base != entries[0] {
+                    entries.push(base.to_string());
+                }
+            }
+        }
+        entries
             .iter()
             .enumerate()
             .map(|(index, language)| {
@@ -626,7 +634,7 @@ mod tests {
     fn default_is_a_macos_chrome_149_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
         assert_eq!(fingerprint.language, "en-US");
-        assert_eq!(fingerprint.languages, vec!["en-US", "en"]);
+        assert_eq!(fingerprint.languages, vec!["en-US"]);
         assert_eq!(fingerprint.accept_language(), "en-US,en;q=0.9");
         assert_eq!(fingerprint.navigator_platform, "MacIntel");
         assert_eq!(fingerprint.ua_platform, "macOS");
@@ -715,16 +723,17 @@ mod tests {
     }
 
     #[test]
-    fn language_override_keeps_navigator_and_request_header_in_sync() {
+    fn language_property_is_the_authored_list_and_header_adds_the_fallback() {
         let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
             language: Some("zh-CN".to_string()),
             ..FingerprintOverrides::default()
         });
         assert_eq!(fingerprint.language, "zh-CN");
-        // Chrome reports the selected language and its base language as the
-        // fallback, and the same list backs Accept-Language. A bare `zh-CN`
-        // would be the one thing no zh-CN Chrome session reports.
-        assert_eq!(fingerprint.languages, vec!["zh-CN", "zh"]);
+        // navigator.languages is the authored one-entry preference (passing
+        // Chrome census hits the bare "zh-CN" bucket). The base-language
+        // fallback is a header-side synthesis only: Accept-Language still
+        // reads zh-CN,zh;q=0.9.
+        assert_eq!(fingerprint.languages, vec!["zh-CN"]);
         assert_eq!(fingerprint.accept_language(), "zh-CN,zh;q=0.9");
 
         let languages = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {

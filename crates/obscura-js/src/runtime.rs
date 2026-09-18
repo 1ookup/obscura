@@ -17476,12 +17476,13 @@ RequestRedirect value",
                 })()"#,
             )
             .unwrap();
-        // Chrome reports the selected language followed by its base language,
-        // in the main realm and in a frame realm alike. A lone `zh-CN` entry is
-        // the one list a real zh-CN session never reports.
+        // navigator.languages is the authored one-entry preference list, in
+        // the main realm and in a frame realm alike (passing Chrome census:
+        // bare "zh-CN" bucket). The Accept-Language header keeps the
+        // base-language fallback; the two surfaces are decoupled.
         assert_eq!(
             values,
-            serde_json::json!(["zh-CN", ["zh-CN", "zh"], "zh-CN", ["zh-CN", "zh"]])
+            serde_json::json!(["zh-CN", ["zh-CN"], "zh-CN", ["zh-CN"]])
         );
     }
 
