@@ -234,34 +234,49 @@ globalThis.__obscura_init = function() {
       }
     } catch (_e) {}
   }
-  // Window-level geometry every frame shares with its top window. The claim
-  // is a maximized window: outer bounds fill the working area, the window
-  // origin sits at the working area's top-left. Deterministic from the screen
-  // fingerprint, and plausible next to any screen a profile claims.
-  const availW = hasScreenOverride ? sw
-    : (Number.isFinite(Number(fingerprintScreen.availWidth)) && Number(fingerprintScreen.availWidth) > 0
-      ? Number(fingerprintScreen.availWidth) : sw);
-  const availH = hasScreenOverride ? sh
-    : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
-      ? Number(fingerprintScreen.availHeight) : sh);
-  const windowTop = Math.max(0, sh - availH);
-  // A host can provide real window metrics through ScreenFingerprint. Zero
-  // keeps the historical maximized-window fallback used by embedders that do
-  // not expose native window placement.
-  const configuredOuterW = Number(fingerprintScreen.outerWidth);
-  const configuredOuterH = Number(fingerprintScreen.outerHeight);
-  const configuredScreenX = Number(fingerprintScreen.screenX);
-  const configuredScreenY = Number(fingerprintScreen.screenY);
-  // Viewport emulation changes the CSS/screen size, but it does not erase the
-  // host window placement supplied by the fingerprint. Keep location and outer
-  // bounds independent so CDP viewport overrides do not turn a real window
-  // into the historical all-zero geometry.
-  globalThis.outerWidth = configuredOuterW > 0 ? configuredOuterW : availW;
-  globalThis.outerHeight = configuredOuterH > 0 ? configuredOuterH : availH;
-  globalThis.screenX = Number.isFinite(configuredScreenX) ? configuredScreenX : 0;
-  globalThis.screenY = Number.isFinite(configuredScreenY) ? configuredScreenY : windowTop;
-  globalThis.screenLeft = globalThis.screenX;
-  globalThis.screenTop = globalThis.screenY;
+  // Window-level geometry. A top-level window claims a maximized window:
+  // outer bounds fill the working area, the window origin sits at the working
+  // area's top-left. Deterministic from the screen fingerprint, and plausible
+  // next to any screen a profile claims.
+  //
+  // A NESTED browsing context (iframe content window) answers 0 for all six,
+  // which is what CSSOM View specifies and what a real Chrome reports from
+  // iframe contentWindow (verified oracle); only the top-level window carries
+  // the fingerprint values. The CF challenge census reads all six from the
+  // widget frame, so leaking 44/77/1200/816 there was a direct hit.
+  if (frameRootNid > 0) {
+    globalThis.outerWidth = 0;
+    globalThis.outerHeight = 0;
+    globalThis.screenX = 0;
+    globalThis.screenY = 0;
+    globalThis.screenLeft = 0;
+    globalThis.screenTop = 0;
+  } else {
+    const availW = hasScreenOverride ? sw
+      : (Number.isFinite(Number(fingerprintScreen.availWidth)) && Number(fingerprintScreen.availWidth) > 0
+        ? Number(fingerprintScreen.availWidth) : sw);
+    const availH = hasScreenOverride ? sh
+      : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
+        ? Number(fingerprintScreen.availHeight) : sh);
+    const windowTop = Math.max(0, sh - availH);
+    // A host can provide real window metrics through ScreenFingerprint. Zero
+    // keeps the historical maximized-window fallback used by embedders that do
+    // not expose native window placement.
+    const configuredOuterW = Number(fingerprintScreen.outerWidth);
+    const configuredOuterH = Number(fingerprintScreen.outerHeight);
+    const configuredScreenX = Number(fingerprintScreen.screenX);
+    const configuredScreenY = Number(fingerprintScreen.screenY);
+    // Viewport emulation changes the CSS/screen size, but it does not erase the
+    // host window placement supplied by the fingerprint. Keep location and outer
+    // bounds independent so CDP viewport overrides do not turn a real window
+    // into the historical all-zero geometry.
+    globalThis.outerWidth = configuredOuterW > 0 ? configuredOuterW : availW;
+    globalThis.outerHeight = configuredOuterH > 0 ? configuredOuterH : availH;
+    globalThis.screenX = Number.isFinite(configuredScreenX) ? configuredScreenX : 0;
+    globalThis.screenY = Number.isFinite(configuredScreenY) ? configuredScreenY : windowTop;
+    globalThis.screenLeft = globalThis.screenX;
+    globalThis.screenTop = globalThis.screenY;
+  }
 
   // The time origin is when navigation started, so it is always in the past.
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,

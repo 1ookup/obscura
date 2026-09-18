@@ -12246,6 +12246,66 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_window_geometry_reports_nested_context_zeros() {
+        // CSSOM View: a NESTED browsing context answers 0 for screenX, screenY,
+        // screenLeft, screenTop, outerWidth and outerHeight; only the top-level
+        // window carries the fingerprint placement. Chrome oracle: an iframe
+        // contentWindow reports 0 for all six. The CF challenge census reads
+        // all six from the widget frame, so leaking 44/77/1200/816 there was a
+        // direct payload hit (Step 300, census buckets 44/77/1200/816 vs 0).
+        let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 1512,
+                    height: 982,
+                    avail_width: 1512,
+                    avail_height: 944,
+                    avail_top: 38,
+                    avail_left: 0,
+                    device_scale_factor: 2.0,
+                    outer_width: 1200,
+                    outer_height: 816,
+                    screen_x: 44,
+                    screen_y: 77,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_fingerprint(&fingerprint);
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_viewport(1200.0, 700.0);
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate("[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]")
+                .unwrap(),
+            serde_json::json!([1200, 816, 44, 77, 44, 77])
+        );
+        let script = format!(r#"(() => {{
+            {FRAME_OPS_PRELUDE}
+            return setupFrame("f", '<html><body></body></html>',
+                "https://widget.example/frame", null, true);
+        }})()"#);
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            "[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop,innerWidth,devicePixelRatio]",
+            true, true, 1_000,
+        ).await.unwrap().value.unwrap();
+        // Only the six nested-window members zero out: the frame keeps its own
+        // viewport box (its iframe content box, not the top screen) and the
+        // display scale.
+        let frame_values = result.as_array().unwrap().clone();
+        assert_eq!(
+            frame_values[..6],
+            serde_json::json!([0, 0, 0, 0, 0, 0]).as_array().unwrap()[..]
+        );
+        assert!(frame_values[6].as_f64().unwrap() > 0.0, "innerWidth must stay the frame viewport");
+        assert_eq!(frame_values[7].as_f64().unwrap(), 2.0);
+    }
+
     #[test]
     fn navigator_has_no_own_idl_members() {
         let mut rt = setup_runtime("<html><body></body></html>");
