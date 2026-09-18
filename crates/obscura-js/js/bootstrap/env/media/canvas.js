@@ -934,13 +934,42 @@ function _svgTextContent(element) {
   return text == null ? '' : String(text);
 }
 
+// First numeric value of an attribute list (SVG x/y accept per-glyph lists).
+function _svgAttrOffset(element, name) {
+  try {
+    const value = element.getAttribute(name);
+    if (value == null || value === '') return 0;
+    const first = String(value).trim().split(/[\s,]+/)[0];
+    const n = Number(first);
+    return Number.isFinite(n) ? n : 0;
+  } catch (_error) { return 0; }
+}
+
+// Whole-run advance. A browser never answers 0 for the advance of a non-empty
+// run -- every measurable glyph contributes -- and the challenge's hash probe
+// digests String(getComputedTextLength()), so a zero here became the digest of
+// "0" in the beacon (the RKUE0 slot: sha256("0") where Chrome carried the real
+// 150px run width). When the text engine cannot answer, fall through to the
+// same estimate the no-op loss uses instead of reporting the one value no
+// browser produces. Per-character surfaces keep honest zeros: a zero-advance
+// code unit (ZWJ, lone surrogate) measures 0 in Chrome too.
+function _svgRunAdvance(text, font) {
+  const box = _measureTextBox(text, font);
+  if (!(box.width > 0) && text !== '') {
+    const fontSize = parseFloat(String(font)) || 10;
+    const scale = Math.max(1, Math.round(fontSize / 10));
+    box.width = String(text).length * 6 * scale;
+  }
+  return box.width;
+}
+
 Element.prototype.getBBox = function() {
   const box = _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this));
   return { x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent };
 };
 
 Element.prototype.getComputedTextLength = function() {
-  return _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this)).width;
+  return _svgRunAdvance(_svgTextContent(this), _svgMeasurementFont(this));
 };
 
 Element.prototype.getExtentOfChar = function(ch) {
@@ -949,11 +978,13 @@ Element.prototype.getExtentOfChar = function(ch) {
   // The extent is the tight box of one glyph, placed at the advance accumulated
   // over the run's prefix. Reporting a zero origin for every character (the
   // previous behaviour) makes a per-character position list collapse onto one
-  // point, and a zero width reports a glyph no font can produce.
+  // point, and a zero width reports a glyph no font can produce. Chrome places
+  // the box at the element's x list origin, not at user-space 0 -- a probe
+  // walking a run positioned by x=32 sees positions ascending from 32.
   const index = _svgCharacterIndex(this, ch);
   const box = _measureTextBox(text.charAt(index), font);
   return {
-    x: _svgAdvanceTo(this, index),
+    x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, index),
     y: -box.ascent,
     width: box.width,
     height: box.ascent + box.descent,
@@ -964,7 +995,8 @@ Element.prototype.getSubStringLength = function(ch, len) {
   const text = _svgTextContent(this);
   const start = Math.max(0, Math.trunc(Number(ch)) || 0);
   const count = len === undefined ? text.length - start : Math.max(0, Math.trunc(Number(len)) || 0);
-  return _measureTextBox(text.slice(start, start + count), _svgMeasurementFont(this)).width;
+  if (count <= 0) return 0;
+  return _svgRunAdvance(text.slice(start, start + count), _svgMeasurementFont(this));
 };
 
 // The character-position half of the same interface. Chrome exposes these on

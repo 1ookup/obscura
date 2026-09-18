@@ -6903,6 +6903,105 @@ mod tests {
         );
     }
 
+    // The challenge hash probe (RKUE0 slot) builds an SVG tree with emoji and
+    // 64-hex runs inside a hidden sandboxed about:blank iframe through a
+    // template clone, then measures from the parent realm and digests
+    // String(getComputedTextLength()). A zero advance there became the digest
+    // of "0" -- the automation-revealing residue batch 14 removes. Pins the
+    // shape of all four measurement families against the local Chrome oracle:
+    // non-empty runs advance and box non-zero, the per-char position list is
+    // ascending and anchored on the x attribute (Chrome reports 32, not 0, for
+    // x=32), and an empty element stays honestly 0.
+    #[test]
+    fn challenge_svg_probe_measures_nonzero_in_hidden_sandboxed_iframe() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    iframe.setAttribute("sandbox", "allow-same-origin allow-scripts");
+                    iframe.setAttribute("width", "100vw");
+                    iframe.setAttribute("height", "100vh");
+                    iframe.style.cssText = "position:absolute;left:-10000px;top:-10000px;visibility:hidden;";
+                    document.body.appendChild(iframe);
+                    const doc = iframe.contentDocument;
+                    if (!doc) return { haveDoc: false };
+                    const mount = doc.createElement("div");
+                    doc.body.appendChild(mount);
+                    const box = doc.createElement("div");
+                    box.setAttribute("style", "position: absolute; left: -9999px; height: auto;");
+                    const ns = "http://www.w3.org/2000/svg";
+                    const svg = doc.createElementNS(ns, "svg");
+                    svg.setAttribute("viewBox", "0 0 30 30");
+                    const g = doc.createElementNS(ns, "g");
+                    g.setAttribute("id", "orQxi0");
+                    const emoji = "\u{1F600}";
+                    const hex = "dc7c811b9561739d9b75bb3e9e1715970a868834e62251b0b9ca02e74d0f42c9";
+                    const mkText = (txt, font) => {
+                        const t = doc.createElementNS(ns, "text");
+                        t.setAttribute("x", "32");
+                        t.setAttribute("y", "32");
+                        t.setAttribute("style", "height: auto; transform: scale(1.000998);"
+                            + (font ? " font: italic 150px serif;" : ""));
+                        t.setAttribute("class", "tvNbU4");
+                        t.appendChild(doc.createTextNode(txt));
+                        return t;
+                    };
+                    g.appendChild(mkText(emoji, false));
+                    g.appendChild(mkText(hex, true));
+                    svg.appendChild(g);
+                    box.appendChild(svg);
+                    const tpl = doc.createElement("template");
+                    tpl.content.appendChild(box);
+                    const clone = tpl.content.cloneNode(true);
+                    doc.body.insertBefore(clone.firstChild, mount);
+                    const els = doc.querySelectorAll(".tvNbU4");
+                    if (els.length !== 2) return { elements: els.length };
+                    const hexCtl = String(els[1].getComputedTextLength());
+                    const emojiCtl = String(els[0].getComputedTextLength());
+                    const first = els[0].getExtentOfChar(0);
+                    const second = els[0].getExtentOfChar(1);
+                    const bb = els[1].getBBox();
+                    const rc = els[1].getBoundingClientRect();
+                    const empty = doc.createElementNS(ns, "text");
+                    g.appendChild(empty);
+                    return {
+                        haveDoc: true,
+                        connected: els[0].isConnected,
+                        hexCtlNonZero: hexCtl !== "0" && Number(hexCtl) > 0,
+                        emojiCtlNonZero: emojiCtl !== "0" && Number(emojiCtl) > 0,
+                        extentAnchoredAtX: first.x === 32,
+                        extentAscending: second.x >= first.x,
+                        extentHasHeight: first.height > 0,
+                        bboxNonZero: bb.width > 0,
+                        gBCRNonZero: rc.width > 0,
+                        emptyCtl: String(empty.getComputedTextLength()),
+                        subStringZero: String(els[1].getSubStringLength(0, 0)),
+                        subStringNonZero: String(els[1].getSubStringLength(0, 8)) !== "0",
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "haveDoc": true,
+                "connected": true,
+                "hexCtlNonZero": true,
+                "emojiCtlNonZero": true,
+                "extentAnchoredAtX": true,
+                "extentAscending": true,
+                "extentHasHeight": true,
+                "bboxNonZero": true,
+                "gBCRNonZero": true,
+                "emptyCtl": "0",
+                "subStringZero": "0",
+                "subStringNonZero": true,
+            })
+        );
+    }
+
     #[test]
     fn media_src_csp_marks_blocked_media_as_no_source() {
         let mut rt = setup_runtime("<html><body><video id='v' src='https://cdn.example/movie.mp4'></video></body></html>");

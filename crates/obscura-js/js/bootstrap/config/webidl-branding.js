@@ -235,12 +235,15 @@ const SVG_TAGS = {
   const geometry = {
     getNumberOfChars() { return _svgTextContent(this).length; },
     getStartPositionOfChar(index) {
-      return { x: _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 };
+      // Chrome anchors the character positions on the element's x list origin
+      // (a run at x=32 starts its position list at 32), not at user-space 0.
+      const offset = _svgAttrOffset(this, 'x');
+      return { x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 };
     },
     getEndPositionOfChar(index) {
       const i = _svgCharacterIndex(this, index);
       const char = _svgTextContent(this).charAt(i);
-      return { x: _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 };
+      return { x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 };
     },
     getRotationOfChar(index) {
       _svgCharacterIndex(this, index);
