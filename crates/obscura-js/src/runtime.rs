@@ -9639,7 +9639,11 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn isolated_frame_exposes_cpu_performance_projection() {
+    async fn navigator_has_no_cpu_performance_anywhere() {
+        // navigator.cpuPerformance was an invented member (Step 300): the
+        // Chrome 151 renderer trace and the passing Chrome 149 census both
+        // report zero occurrences. Pinned absent in the top document and in a
+        // cross-origin frame realm alike.
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
         let script = format!(r#"(() => {{
             {FRAME_OPS_PRELUDE}
@@ -9650,10 +9654,15 @@ RequestRedirect value",
         rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
         let result = rt.evaluate_in_frame_realm_for_cdp(
             "test-frame", 1, crate::realm::MAIN_WORLD,
-            "[typeof navigator.cpuPerformance, navigator.cpuPerformance, 'cpuPerformance' in navigator, typeof SharedArrayBuffer]",
+            "[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator, typeof SharedArrayBuffer]",
             true, true, 1_000,
         ).await.unwrap().value.unwrap();
-        assert_eq!(result, serde_json::json!(["number", 3, true, "function"]));
+        assert_eq!(result, serde_json::json!(["undefined", false, "function"]));
+        assert_eq!(
+            rt.evaluate("[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator]")
+                .unwrap(),
+            serde_json::json!(["undefined", false])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
