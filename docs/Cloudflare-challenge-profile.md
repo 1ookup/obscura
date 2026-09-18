@@ -10820,3 +10820,44 @@ RPKTR7=10GiB+760（宿主派生）、PlZqY9=["zh-CN"]。
 判决仍 fail。/ci/ 仍不发。**e14 哈希探针实弹未变**：RKUE0=sha256("0")+JRzmw6="bOHv4"
 （fixture 已修但挑战实路径仍归零——下一步用 OBSCURA_CAPTURE_TE 抓 digest 输入串定位
 是测量归零还是异步链未落地）。
+
+### Step 306: 修复批次 15A——哈希探针测量面两处 Chrome 语义差（未渲染测量 + 几何接口品牌），槽位映射证据闭环（2026-09-19）
+
+**方法**：注入轮 TE 捕获（ver15，9315 端口，`OBSCURA_CAPTURE_TE`+`OBSCURA_CAPTURE_FO`，14814 个
+编码文件）首次抓到哈希探针的 digest 输入原文，与 TS#2 解密四槽逐一 sha256 闭环：
+RKUE0=sha256("0")（TE 序 20，原文就是单字符 "0"）、kRQwh3=sha256("15.984000205993652")
+（TE 序 21 = 我方 emoji#1 的 getComputedTextLength，与本地同形 fixture 位级一致——该链在
+我方是解析成功的）、oSIr8=sha256("0.6624803331661225")（TE 序 22）、JRzmw6 **从未编码**——
+第四条异步链在 encode 之前就死了，resolve("bOHv4") 的请求令牌落进 beacon。三轮（te15/
+apitrace/ver15b）输入逐字节相同，全确定性。`--trace-api-file`（SVG 接口过滤）证明实弹
+运行里 19 个 ctl 调用全部发生且返回健康值（emoji 15.984、hex 4288-4501）——"0" 不是
+ctl 的返回。
+
+**修复与证据**（本地 headless Chrome=CDF oracle，live-shape fixture 对拍）：
+- 未渲染测量（52c5058）：Chrome 对无渲染盒的 SVG text（template.content、
+  implementation/DOMParser 文档、纯 detached）整族答零字符语义——getNumberOfChars()=0、
+  getComputedTextLength()=0、bbox/gBCR 全零、所有逐字符访问器（含 sub(0,0)）抛
+  IndexSizeError、getCTM 恒等；我方此前用字体引擎照常测量（detached 64hex 答 639.125）。
+  现按 `isConnected!==true || ownerDocument.defaultView==null` 判未渲染，渲染面（含隐藏
+  沙箱 iframe 里的 connected clone）保持实度量。测试
+  svg_text_measures_zero_for_unrendered_runs_like_chrome 钉全族答案；批次 14 的
+  connected 非零测试原样通过。
+- 几何品牌（65e227f）：Chrome 的 SVG 几何生产者答接口实例——getBBox/getExtentOfChar=
+  SVGRect、getStartPositionOfChar/getEndPositionOfChar=SVGPoint、getCTM/getScreenCTM=
+  SVGMatrix（gBCR=DOMRect、getClientRects=DOMRectList 不变）；我方此前全是 plain object
+  （`[object Object]`）。现在 SVGRect/SVGPoint/SVGMatrix 实例化（既有非法构造接口，
+  Object.create 原型 + own 属性），与 Chrome 的 instanceof/toString 逐字节一致。
+  Chrome host trace（host-surface.json call#332）显示挑战以 `array[4].reduce(jS,0)`
+  汇总 4 个 {x,y,width,height} 测量矩形，通过会话归约出 4886.75（=150px hex run 宽，
+  widthAt 闭环）；矩形收集若被品牌过滤清空，reduce 恰好答初始值 0。
+- 门禁：obscura-js+obscura-browser+obscura-net release/render/nextest 885/885；
+  no-default check 通过；release build 全量通过。
+
+**验证轮（ver15/ver15b，注入开）**：全流程照常走完（TS#2 91.7KB→TS#3→main#2），四槽
+**逐字节未变**——两处语义差虽真实且已修（都在探针测量族的对比面上），但槽位输入不随
+之翻转：slot-1 的 "0" 与 slot-3 的 "0.6624" 在修复前后确定性复现，且 apitrace 轮里
+探针只调了 ctl（19 次）而未调 getBBox/getExtentOfChar/gBCR——输入的挑选与宿主环境
+分支有关，超出 DOM op 轨迹可见面。**残留**：slot-1 的 "0" 源与 slot-4 死链的断点
+（encode 之前）需要在注入层的 ov2 host digest 钩子上按槽名记录输入（mitmweb addon
+一处改动 + 新 key 一轮）即可闭合；引擎侧已排查的候选（fonts.ready/FontFace.load/rAF/
+sandboxed iframe 字体集、detached/impl-doc 测量、品牌过滤）全部与 Chrome 一致或已修。
