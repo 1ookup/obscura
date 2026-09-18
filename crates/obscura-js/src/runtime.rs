@@ -19759,6 +19759,87 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn transfer_to_imagebitmap_carries_canvas_pixels_into_draw_image() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const canvas = new OffscreenCanvas(49, 44);
+                    const context = canvas.getContext('2d');
+                    context.fillStyle = '#f06d06';
+                    context.fillRect(0, 0, 49, 44);
+                    const paintedBefore = context.getImageData(0, 0, 49, 44).data
+                        .filter(value => value).length;
+                    const bitmap = canvas.transferToImageBitmap();
+                    const clearedAfter = context.getImageData(0, 0, 49, 44).data
+                        .filter(value => value).length;
+                    const pixel = (data, x, y) =>
+                        Array.from(data.slice((y * 49 + x) * 4, (y * 49 + x) * 4 + 4));
+                    const fresh = new OffscreenCanvas(49, 44);
+                    const freshContext = fresh.getContext('2d');
+                    freshContext.drawImage(bitmap, 0, 0);
+                    const redrawn = freshContext.getImageData(0, 0, 49, 44).data;
+                    // drawImage(canvas) keeps painting next to the bitmap branch.
+                    const peer = new OffscreenCanvas(49, 44);
+                    const peerContext = peer.getContext('2d');
+                    peerContext.fillStyle = '#00ff00';
+                    peerContext.fillRect(0, 0, 49, 44);
+                    const viaCanvas = new OffscreenCanvas(49, 44);
+                    viaCanvas.getContext('2d').drawImage(peer, 0, 0);
+                    // createImageBitmap(ImageData) preserves the sampled pixels.
+                    const bitmapFromImageData = await createImageBitmap(
+                        new ImageData(redrawn.slice(), 49, 44));
+                    const viaImageData = new OffscreenCanvas(49, 44);
+                    viaImageData.getContext('2d').drawImage(bitmapFromImageData, 0, 0);
+                    // A closed bitmap paints nothing again.
+                    const closedTarget = new OffscreenCanvas(49, 44);
+                    bitmap.close();
+                    closedTarget.getContext('2d').drawImage(bitmap, 0, 0);
+                    return {
+                        paintedBefore,
+                        clearedAfter,
+                        paintedAfter: Array.from(redrawn).filter(value => value).length,
+                        samples: [pixel(redrawn, 0, 0), pixel(redrawn, 48, 0),
+                            pixel(redrawn, 0, 43), pixel(redrawn, 48, 43),
+                            pixel(redrawn, 24, 22)],
+                        viaCanvas: pixel(viaCanvas.getContext('2d')
+                            .getImageData(0, 0, 49, 44).data, 24, 22),
+                        viaImageData: pixel(viaImageData.getContext('2d')
+                            .getImageData(0, 0, 49, 44).data, 24, 22),
+                        afterClose: Array.from(closedTarget.getContext('2d')
+                            .getImageData(0, 0, 49, 44).data)
+                            .filter(value => value).length,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        let object = value.as_object().unwrap();
+        // 49 * 44 * 4 = 8624: every channel of the opaque fill is nonzero.
+        assert_eq!(object["paintedBefore"], serde_json::json!(8624));
+        // transferToImageBitmap clears the canvas bitmap per spec...
+        assert_eq!(object["clearedAfter"], serde_json::json!(0));
+        // ...but the bitmap itself carries the pixels onto the next canvas,
+        // at the corners, edges and center alike.
+        assert_eq!(object["paintedAfter"], serde_json::json!(8624));
+        assert_eq!(
+            object["samples"],
+            serde_json::json!([
+                [240, 109, 6, 255], [240, 109, 6, 255], [240, 109, 6, 255],
+                [240, 109, 6, 255], [240, 109, 6, 255],
+            ]),
+        );
+        assert_eq!(object["viaCanvas"], serde_json::json!([0, 255, 0, 255]));
+        assert_eq!(object["viaImageData"], serde_json::json!([240, 109, 6, 255]));
+        assert_eq!(object["afterClose"], serde_json::json!(0));
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {

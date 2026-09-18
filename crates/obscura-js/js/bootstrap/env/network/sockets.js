@@ -102,13 +102,19 @@ if (typeof OffscreenCanvas === 'undefined') {
   }
 
   globalThis.ImageBitmap = class ImageBitmap {
-    constructor(key, width, height, pixels = undefined) {
+    constructor(key, width, height, pixels = undefined, colorSpace = 'srgb') {
       if (key !== _bitmapKey) throw new TypeError('Illegal constructor');
       _imageBitmapState.set(this, {width, height, pixels, closed: false});
+      // Publish the snapshot for drawImage (canvas.js module scope).
+      if (pixels) _imageBitmapPixels.set(this, {pixels, width, height, colorSpace});
     }
     get width() { const state = _imageBitmapState.get(this); return state.closed ? 0 : state.width; }
     get height() { const state = _imageBitmapState.get(this); return state.closed ? 0 : state.height; }
-    close() { const state = _imageBitmapState.get(this); state.closed = true; state.pixels = undefined; }
+    close() {
+      const state = _imageBitmapState.get(this);
+      state.closed = true; state.pixels = undefined;
+      _imageBitmapPixels.delete(this);
+    }
     get [Symbol.toStringTag]() { return 'ImageBitmap'; }
   };
 
@@ -176,6 +182,8 @@ if (typeof OffscreenCanvas === 'undefined') {
         Object.setPrototypeOf(state.context,
           globalThis.OffscreenCanvasRenderingContext2D.prototype);
         state.contextType = type;
+        // Publish the context for drawImage (canvas.js module scope).
+        _offscreenCanvasContexts.set(this, state.context);
       }
       return state.context;
     }
@@ -208,8 +216,10 @@ if (typeof OffscreenCanvas === 'undefined') {
       const pixels = context && context._buf
         ? context._buf.slice()
         : new Uint8ClampedArray(state.width * state.height * 4);
+      // _buf is the srgb unorm8 renderer buffer, whatever the canvas's own
+      // color space is, so the snapshot is tagged srgb.
       const bitmap = new globalThis.ImageBitmap(_bitmapKey, state.width, state.height,
-        pixels);
+        pixels, 'srgb');
       if (context && context._resizeFromCanvas) context._resizeFromCanvas();
       return bitmap;
     }
@@ -217,16 +227,20 @@ if (typeof OffscreenCanvas === 'undefined') {
   };
 
   globalThis.createImageBitmap = _markNative(async function createImageBitmap(source, ...crop) {
-    let width = 0, height = 0, pixels;
+    let width = 0, height = 0, pixels, colorSpace = 'srgb';
     const offscreen = _offscreenCanvasState.get(source);
     if (offscreen) {
       const context = offscreen.context || source.getContext('2d');
-      width = offscreen.width; height = offscreen.height; pixels = context._buf.slice();
+      width = offscreen.width; height = offscreen.height;
+      // _buf is the srgb unorm8 renderer buffer regardless of canvas space.
+      pixels = context && context._buf ? context._buf.slice() : undefined;
     } else if (source && source._ctx instanceof _Canvas2D) {
-      width = source._ctx._w; height = source._ctx._h; pixels = source._ctx._buf.slice();
+      width = source._ctx._w; height = source._ctx._h;
+      pixels = source._ctx._buf.slice();
     } else if (_imageDataState.has(source)) {
       const image = _imageData(source);
-      width = image.width; height = image.height;
+      width = image.width; height = image.height; colorSpace = image.colorSpace;
+      if (image.pixelFormat !== 'rgba-float16') pixels = image.data.slice();
     } else if (source instanceof Blob) {
       const bytes = new Uint8Array(await source.arrayBuffer());
       if (bytes.length >= 24 && bytes[0] === 0x89 && bytes[1] === 0x50
@@ -243,7 +257,7 @@ if (typeof OffscreenCanvas === 'undefined') {
       width = Math.abs(Math.trunc(Number(crop[2])));
       height = Math.abs(Math.trunc(Number(crop[3])));
     }
-    return new globalThis.ImageBitmap(_bitmapKey, width, height, pixels);
+    return new globalThis.ImageBitmap(_bitmapKey, width, height, pixels, colorSpace);
   });
 }
 

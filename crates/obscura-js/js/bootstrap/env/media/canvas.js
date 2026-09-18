@@ -1,4 +1,10 @@
 const _imageDataState = new WeakMap();
+// ImageBitmap pixel snapshots and OffscreenCanvas 2D contexts. The
+// OffscreenCanvas module registers what it constructs (transferToImageBitmap /
+// createImageBitmap / getContext) and drawImage consumes the entries below.
+// Shared module state, like _imageDataState above.
+const _imageBitmapPixels = new WeakMap();
+const _offscreenCanvasContexts = new WeakMap();
 const _IMAGE_DATA_COLOR_SPACES = new Set(['srgb', 'display-p3']);
 const _IMAGE_DATA_PIXEL_FORMATS = new Set(['rgba-unorm8', 'rgba-float16']);
 function _imageDataEnum(value, fallback, allowed, member) {
@@ -499,8 +505,25 @@ class _Canvas2D {
       output.colorSpace, output.pixelFormat);
   }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
+    let src = null;
     if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
+      src = img._ctx;
+    } else {
+      // An OffscreenCanvas keeps its 2D context in module state rather than an
+      // own _ctx, and an ImageBitmap carries the pixels snapshotted at
+      // construction; without these branches neither source painted at all.
+      const context = img ? _offscreenCanvasContexts.get(img) : null;
+      if (context && context._buf) {
+        src = context;
+      } else {
+        const bitmap = img ? _imageBitmapPixels.get(img) : null;
+        if (bitmap && bitmap.pixels) {
+          src = {_w: bitmap.width, _h: bitmap.height, _buf: bitmap.pixels,
+            _colorBuf: bitmap.pixels, _colorSpace: bitmap.colorSpace};
+        }
+      }
+    }
+    if (src) {
       dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
