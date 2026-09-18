@@ -10759,3 +10759,47 @@ Chrome 一致。结论：引擎属性面无罪；通过会话的 ["lang"] 应来
 **门禁**：obscura-js+obscura-browser+obscura-net release/render/nextest
 883/883 通过（与批次 14B 的 worker 唤醒在途改动同树并跑）；release build 全量
 通过；未跑障碍课程与判决轮（代理轮次按主控安排）。
+### Step 304: 批次 14B——worker 阶段 268ms 修复（消息管线）+ ZMSOw0 残差剖析（2026-09-19）
+
+**方法**：本地 fixture 对拍（无外网），Chrome headless=CDF oracle。两个新 fixture：
+`js-repros/worker-stage-timing/`（blob worker 管线：boot/worker 内 fetch/ping-pong/总时长，
+即 uGyjw9 形状）与 `js-repros/dom-op-cost/`（VM 程序的 API-touch 形状微基准，10k 次/项）。
+无代理、无挑战网络轮。
+
+**Target 1 修复（uGyjw9 268ms vs 4）**：根因不在 worker 线程而在页面侧投递。页面 recvLoop
+的 promise 是 unref 的（为让空闲页可 settle），且 deno_core 对每个 op 首次 poll 用 noop
+waker——worker 回复到达时若页面泵恰好 park，这次唤醒就丢了，回复只能等下一次无关唤醒
+（实测 ~10-100ms/跳，首次 fetch 回复 ~100ms）。修复：
+- 删 op_worker_recv 异步 op，改为运行时在任务边界同步排空各 worker outbox 并按创建
+  realm 分发（frame realm 用自己的 bootstrap 副本和 Worker 注册表，按 realm key 路由），
+  与 Phase 4 frame 消息同一形状。
+- SharedState 增加 cross-thread 到达唤醒（AtomicWaker）：各泵 future 每次 poll 注册任务
+  waker；op_worker_post_to_page 发送成功即唤醒创建方；worker 自身事件循环、嵌套 worker、
+  shared router 走同一条唤醒路径；worker 空闲 park 改为 inbox+到达槽双源。
+- 唤醒后必跑 microtask checkpoint，且 poll 内注册后重排空一次 outbox，堵住
+  "注册前到达→唤醒空槽" 的丢失窗口。
+
+本地对拍（0919 主机，loopback）：首次空闲页回复 ~100ms→~1ms；21 次 ping-pong
+310-720ms→1-2ms；fixture 总时长 319-1133ms→~113ms，其中 ~100ms 是 CLI 装载阶段间的一次
+settle 策略间隙（非消息时延；serve/CDP 下泵连续，跳时延亚毫秒）。Chrome oracle
+25-54ms（其中 worker boot 15-40ms 是线程池差异）。预期 uGyjw9：消息跳数不再叠加泵间隙，
+阶段时长回落到真实网络 fetch 底价（--stealth 下 wreq 池已热），待下一捕获轮验证。
+
+**Target 2 剖析（ZMSOw0 467 vs 127）**：按 census（~1500 次 host DOM op）+ 微基准实测，
+op 桥不可能是残差主体：
+- window shim 属性面已与 Chrome 打平（5 属性 ×10k：3.3 vs 3.7ms）。
+- DOM op 桥单项 5-18x（createElement+append 25.6 vs 1.5ms/10k、querySelector 20.1 vs
+  1.3、getBoundingClientRect 52.8 vs 3.0、classList.toggle 11.5 vs 1.1、setAttribute
+  6.9 vs 1.6；getAttribute/getNodeIterator ~2x），但 1500 次 × 2-5µs ≈ 4-8ms，
+  占 467ms 不到 2%。后续值得做（抓取吞吐收益），但解释不了 ZMSOw0。
+- 纯 JS 吞吐（W3 形状字节循环 12.2 vs 6.4ms、1M 步 switch dispatch 6.2 vs 3.9ms、
+  JSON round trip 1.0 vs 0.7ms）：1.4-1.9x，V8 tiering 正常，解释不了 3.7x。
+- setTimeout(0) 链：我们平链 ~1ms/跳，Chrome 嵌套钳位后 ~4.8ms/跳——我们更快。
+**结论**：467ms 的墙钟里含 Target 1 找到的同一批泵间隙（引导程序内部的
+postMessage/BroadcastChannel 管线走的是同一条 recv 路径），本次修复应直接压低 ZMSOw0
+与 NnqX6；剩余纯 VM 份额按纯 JS 吞吐比应在 Chrome 的 ~1.5-2x 内。下一捕获轮若仍有
+3x 以上残差，下一个剖析点是 845KB 载荷上的 GC 停顿与 atob 调用次数，而不是 DOM op。
+
+**门禁**：obscura-js 653/653、obscura-browser 126/126、obscura-net 104/104（release、
+nextest）；release build 全量通过；no-default-features check 通过。未跑障碍课程与网络轮
+（由主控统一执行）。
