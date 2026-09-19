@@ -7498,6 +7498,8 @@ mod tests {
                         wrap32: same(rectOf(() => run.getExtentOfChar(4294967296)), e0),
                         trunc: same(rectOf(() => run.getExtentOfChar(1.9)),
                             rectOf(() => run.getExtentOfChar(1))),
+                        clusterHalvesSame: same(rectOf(() => run.getExtentOfChar(2)),
+                            rectOf(() => run.getExtentOfChar(3))),
                         m1: rectOf(() => run.getExtentOfChar(-1))[1],
                         m1Message: rectOf(() => run.getExtentOfChar(-1)).slice(2).join(" "),
                         outOfRange: rectOf(() => run.getExtentOfChar(999)).slice(2).join(" "),
@@ -7524,6 +7526,7 @@ mod tests {
                 "negInf": true,
                 "wrap32": true,
                 "trunc": true,
+                "clusterHalvesSame": true,
                 "m1": "IndexSizeError",
                 "m1Message": "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The charnum provided (4294967295) is greater than the number of characters available.",
                 "outOfRange": "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The charnum provided (999) is greater than the number of characters available.",
@@ -7531,6 +7534,77 @@ mod tests {
                 "subInfCount": "0",
                 "sub999": "Failed to execute 'getSubStringLength' on 'SVGTextContentElement': The charnum provided (999) is greater than the number of characters available.",
                 "emptyEmojiThrows": "IndexSizeError",
+            })
+        );
+    }
+
+    // Chrome's geometry instances carry their fields in an internal slot
+    // behind prototype accessors: Object.keys/Object.entries on a rect are
+    // empty, the prototype's own keys are the field accessors plus
+    // constructor, and JSON.stringify of an SVGRect is "{}" (local
+    // headless-Chrome oracle). Own-property records fail that shape, and the
+    // challenge hash probe's rect collection rejects them, which is what kept
+    // the RKUE0 reduce at 0 even after the extent call itself succeeded.
+    #[test]
+    fn svg_rect_instances_carry_no_own_properties_like_chrome() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svg id="s"><text id="run" x="32" y="32">abcdef</text></svg></body></html>"#,
+        );
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const run = document.getElementById("run");
+                    const bbox = run.getBBox ? document.getElementById("s").createSVGLength === undefined : false;
+                    const g = document.querySelector("svg");
+                    const bb = (() => { try { return g.getBBox(); } catch (e) { return null; } })();
+                    const extent = run.getExtentOfChar(0);
+                    const gbcr = run.getBoundingClientRect();
+                    const fresh = new DOMRect(1, 2, 3, 4);
+                    const forIn = o => { const ks = []; for (const k in o) ks.push(k); return ks; };
+                    const proto = o => Object.getPrototypeOf(o);
+                    return {
+                        bboxInstance: bb instanceof SVGRect,
+                        bboxOwnKeys: JSON.stringify(Object.getOwnPropertyNames(bb)),
+                        bboxJson: JSON.stringify(bb),
+                        extentOwnKeys: JSON.stringify(Object.getOwnPropertyNames(extent)),
+                        extentIsRect: extent instanceof SVGRect && extent.width > 0,
+                        gbcrInstance: gbcr instanceof DOMRect,
+                        gbcrOwnKeys: JSON.stringify(Object.getOwnPropertyNames(gbcr)),
+                        gbcrJsonHasFields: JSON.stringify(gbcr).includes('"width"'),
+                        gbcrEntries: JSON.stringify(Object.entries(gbcr)),
+                        freshOwnKeys: JSON.stringify(Object.getOwnPropertyNames(fresh)),
+                        freshWidth: fresh.width,
+                        freshWrite: (fresh.width = 9, fresh.width),
+                        domRectForIn: forIn(fresh).join(","),
+                        protoXEnumerable: Object.getOwnPropertyDescriptor(proto(gbcr), "x").enumerable,
+                        protoWidthIsGetter: typeof Object.getOwnPropertyDescriptor(proto(bb), "width").get === "function",
+                        extentStillAnchored: extent.x === 32,
+                        gbcrWidthNumber: typeof gbcr.width === "number",
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bboxInstance": true,
+                "bboxOwnKeys": "[]",
+                "bboxJson": "{}",
+                "extentOwnKeys": "[]",
+                "extentIsRect": true,
+                "gbcrInstance": true,
+                "gbcrOwnKeys": "[]",
+                "gbcrJsonHasFields": true,
+                "gbcrEntries": "[]",
+                "freshOwnKeys": "[]",
+                "freshWidth": 3,
+                "freshWrite": 9,
+                "domRectForIn": "x,y,width,height,top,right,bottom,left,toJSON",
+                "protoXEnumerable": true,
+                "protoWidthIsGetter": true,
+                "extentStillAnchored": true,
+                "gbcrWidthNumber": true,
             })
         );
     }

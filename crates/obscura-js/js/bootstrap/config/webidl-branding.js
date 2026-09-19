@@ -251,15 +251,20 @@ const SVG_TAGS = {
       if (_svgUnrendered(this)) _svgThrowIndexSize('getStartPositionOfChar', index);
       // Chrome anchors the character positions on the element's x list origin
       // (a run at x=32 starts its position list at 32), not at user-space 0,
-      // and answers SVGPoint instances, not plain records.
+      // and answers SVGPoint instances, not plain records. Both halves of a
+      // surrogate pair answer the cluster's start position.
       const offset = _svgAttrOffset(this, 'x');
-      return _svgPointLike({ x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, 'getStartPositionOfChar', index)), y: 0 });
+      const i = _svgCharacterIndex(this, 'getStartPositionOfChar', index);
+      const [spanStart] = _svgCharClusterSpan(_svgTextContent(this), i);
+      return _svgPointLike({ x: offset + _svgAdvanceTo(this, spanStart), y: 0 });
     },
     getEndPositionOfChar(index) {
       if (_svgUnrendered(this)) _svgThrowIndexSize('getEndPositionOfChar', index);
       const i = _svgCharacterIndex(this, 'getEndPositionOfChar', index);
-      const char = _svgTextContent(this).charAt(i);
-      return _svgPointLike({ x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 });
+      const text = _svgTextContent(this);
+      const [spanStart, spanEnd] = _svgCharClusterSpan(text, i);
+      const char = text.slice(spanStart, spanEnd);
+      return _svgPointLike({ x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, spanStart) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 });
     },
     getRotationOfChar(index) {
       if (_svgUnrendered(this)) _svgThrowIndexSize('getRotationOfChar', index);
@@ -461,8 +466,10 @@ const SVG_TAGS = {
           clampBox(result.x), clampBox(result.y), clampBox(result.width), clampBox(result.height));
         // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
         // and skips the scroll for it. The branded value has to carry that
-        // marker, or a fixed subtree starts moving the document.
-        if (result.__obscuraViewportFixed) branded.__obscuraViewportFixed = true;
+        // marker, or a fixed subtree starts moving the document. The marker
+        // lives in a WeakSet: Chrome's rects carry no own properties, and an
+        // own flag here would hand the own-key census a name.
+        if (result.__obscuraViewportFixed) OBSCURA_VIEWPORT_FIXED_RECTS.add(branded);
         return branded;
       }),
       writable: true, enumerable: false, configurable: true,

@@ -1913,7 +1913,9 @@ class Element extends Node {
     const rect = this.getBoundingClientRect();
     // A viewport-fixed subtree is already expressed in the viewport's
     // coordinate space and cannot be brought closer by moving the document.
-    if (rect.__obscuraViewportFixed) return;
+    // The marker is tracked in the shared geometry WeakSet: the branded rect
+    // a page sees carries no own properties (Chrome rect shape).
+    if (rect.__obscuraViewportFixed || OBSCURA_VIEWPORT_FIXED_RECTS.has(rect)) return;
 
     let block = "start", inline = "nearest";
     if (arg === false) block = "end";

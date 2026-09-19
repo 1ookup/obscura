@@ -991,15 +991,52 @@ function _svgThrowIndexSize(method, index) {
 // where Chrome reduced the four rects to the 150px run width. The interfaces
 // exist (illegal constructors, branded prototypes), so instances are built
 // around their prototypes.
+// Chrome's SVGRect/SVGPoint instances carry no own properties -- the fields
+// are prototype accessors over an internal slot (local headless-Chrome
+// oracle: Object.keys(getBBox()) is empty, JSON.stringify(getBBox()) is "{}").
+// An own-property record fails that shape, and the challenge hash probe's
+// rect collection rejects it: the live reduce behind RKUE0 saw an empty set
+// while getBBox/getExtentOfChar answered branded instances (tel7 telemetry).
+// The slots share the geometry-objects module's WeakMap so neither the
+// instances nor the prototypes grow visible state.
+const OBSCURA_SVG_GEOM_FIELDS = {
+  SVGRect: ['x', 'y', 'width', 'height'],
+  SVGPoint: ['x', 'y'],
+  SVGMatrix: ['a', 'b', 'c', 'd', 'e', 'f'],
+};
+const OBSCURA_SVG_GEOM_INSTALLED = new Set();
+function _installSvgGeomAccessors(name) {
+  if (OBSCURA_SVG_GEOM_INSTALLED.has(name)) return;
+  const ctor = globalThis[name];
+  const keys = OBSCURA_SVG_GEOM_FIELDS[name];
+  if (typeof ctor !== 'function' || !ctor.prototype || !keys) return;
+  OBSCURA_SVG_GEOM_INSTALLED.add(name);
+  for (const key of keys) {
+    Object.defineProperty(ctor.prototype, key, {
+      get() {
+        const slot = OBSCURA_GEOM_SLOTS.get(this);
+        return slot ? slot[key] : undefined;
+      },
+      set(v) {
+        const slot = OBSCURA_GEOM_SLOTS.get(this);
+        if (slot) slot[key] = v;
+      },
+      configurable: true,
+      enumerable: true,
+    });
+  }
+}
 function _svgInterfaceInstance(name, record) {
   const ctor = globalThis[name];
   if (typeof ctor !== 'function' || !ctor.prototype || record == null) return record;
   try {
+    _installSvgGeomAccessors(name);
     const inst = Object.create(ctor.prototype);
-    const keys = name === 'SVGPoint' ? ['x', 'y'] : ['x', 'y', 'width', 'height'];
-    for (const key of keys) {
-      if (record[key] !== undefined) inst[key] = record[key];
+    const slot = {};
+    for (const key of OBSCURA_SVG_GEOM_FIELDS[name] || []) {
+      if (record[key] !== undefined) slot[key] = record[key];
     }
+    OBSCURA_GEOM_SLOTS.set(inst, slot);
     return inst;
   } catch (_error) { return record; }
 }
@@ -1057,6 +1094,23 @@ SVG_TEXT_CONTENT_PROTO.getComputedTextLength = function() {
   return _svgRunAdvance(_svgTextContent(this), _svgMeasurementFont(this));
 };
 
+// Chrome clusters a surrogate pair into one glyph: both UTF-16 halves answer
+// the same x and the same width (the clustered emoji glyph), so the extent
+// walk over an emoji run never sees a half-width box. Returns [start, end)
+// over the full cluster containing code unit i.
+function _svgCharClusterSpan(text, i) {
+  const hi = text.charCodeAt(i);
+  if (hi >= 0xD800 && hi <= 0xDBFF) {
+    const lo = text.charCodeAt(i + 1);
+    if (lo >= 0xDC00 && lo <= 0xDFFF) return [i, i + 2];
+  }
+  if (hi >= 0xDC00 && hi <= 0xDFFF && i > 0) {
+    const prev = text.charCodeAt(i - 1);
+    if (prev >= 0xD800 && prev <= 0xDBFF) return [i - 1, i + 1];
+  }
+  return [i, i + 1];
+}
+
 SVG_TEXT_CONTENT_PROTO.getExtentOfChar = function(ch) {
   const text = _svgTextContent(this);
   const font = _svgMeasurementFont(this);
@@ -1068,9 +1122,10 @@ SVG_TEXT_CONTENT_PROTO.getExtentOfChar = function(ch) {
   // the box at the element's x list origin, not at user-space 0 -- a probe
   // walking a run positioned by x=32 sees positions ascending from 32.
   const index = _svgCharacterIndex(this, 'getExtentOfChar', ch);
-  const box = _measureTextBox(text.charAt(index), font);
+  const [spanStart, spanEnd] = _svgCharClusterSpan(text, index);
+  const box = _measureTextBox(text.slice(spanStart, spanEnd), font);
   return _svgRectLike({
-    x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, index),
+    x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, spanStart),
     y: -box.ascent,
     width: box.width,
     height: box.ascent + box.descent,
