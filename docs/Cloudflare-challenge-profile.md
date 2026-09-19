@@ -11115,6 +11115,71 @@ cascade+taffy 重建等每趟固定成本，见 Step 308 的增量布局后续�
 收敛）；TS#3 从恒 2.9KB 失败变体转为 Chrome 形态 92KB。判决翻转的剩余路径以
 ZMSOw0 增量布局与 /ci/ PAT 为最优先。
 
+### Step 314: 修复批次 18——窗口表面函数 toString 全量原生化，四 realm 探针 1558→0（2026-09-19）
+
+**方法**：决定性全量普查器。宽度优先 `Reflect.ownKeys` 走查（自有数据/访问器、
+符号键、原型链跟进、只 stringify 不调用成员函数），同一走查器跑四个视图：主
+realm window、父 realm 经 WindowProxy 望向的帧表面、帧 realm 自身视图（eval 注入
+walker）、dedicated worker realm（walker 打进 data: worker 源）。本地 headless
+Chrome 同 fixture 过同一走查为 oracle。替换 Step 313 之前 depth≤2 的 sweep（48 项）
+为无界走查后的全量基线：主 221、frame 481、frameInner 711、worker 145，合计
+1558 个非原生函数；**Chrome oracle 四视图全 0**——无引擎正确例外，全部为真分歧。
+/ci/ 门 ODxGu4 失败标记所在的「原生函数源」探针槽（Step 313 定位）正是本泄漏，
+为本门首要嫌疑。
+
+**分歧分类（修复前 1558 项的构成）**：① 命名空间/实例对象的成员（navigation、
+caches、indexedDB、visualViewport、CSS、chrome.runtime、speechSynthesis、
+console、WebAssembly.instantiateStreaming、document.implementation 等）——旧
+finalize 只走大写开头的接口构造器；② 符号键成员（接口原型的
+[Symbol.toStringTag] getter、Window[Symbol.hasInstance]）——旧 pass 用
+getOwnPropertyNames 漏符号；③ 工厂类的原型成员（_ScopedDocument、_WebGLContext、
+UserActivation、_FragmentDirective、FeaturePolicy）——接口直系原型之外的链；
+④ init 期替换/后装的访问器（visualViewport 整体替换、innerWidth/innerHeight 帧
+度量、子框索引 0..n、window 命名属性 getter、document.location）——运行时新建
+的函数对象，快照期标记覆盖不到；⑤ 每运行时重建的 ECMAScript 内建
+（WebAssembly）——不是快照对象，快照期标记全部丢失；⑥ WindowProxy facade 与
+ancestor ref 的访问器对；⑦ worker prep 自装成员；⑧ 帧桥可达的 Deno/__bootstrap
+内部件。
+
+**修复（7 个 commit）**：webidl-branding 最终 sweep 重写：Reflect.ownKeys（符号
+键）、命名空间/实例对象走查（受控清单 + Deno/__bootstrap 载体）、接口原型链 8
+跳跟进、rename 仅限 WebIDL 槽位（命名空间对象保持 Chrome 的匿名访问器约定，如
+console.memory 的 name 为空串）、pristine 过滤（_pristineGlobalNames 之外的
+global 一律不碰——页面自有函数必须保留源码，浏览器亦然）；bootstrap 新增
+_markNativeObject（构造点逐实例标记）与 toString override 的惰性触发（首个未
+标记探针跑一次全量 sweep 后自删）；帧 realm 在 init 末 eager 跑一次（父侧探针
+先于子 realm 任何脚本）；worker prep 末追加同构 sweep（含载体）。构造点逐实例
+标记：navigation entry、IDB request/store/transaction/database/index、Cache
+对象、document.implementation、SVG 文本定位 length list、子框索引与命名属性
+getter、document.location（LegacyUnforgeable，不可配置也要标函数本身）、
+UserActivation/FeaturePolicy/PermissionsPolicy/_FragmentDirective 原型。
+realms.js 两个 WindowProxy facade 与 ancestor location 对象逐成员标记。
+runtime.rs 附带修复：debugger API 的 inspector 会话改为常驻（每次调用新建会话
+使 V8 agent 的脚本缓存在两次调用间被丢，GC 压力位移后 getScriptSource 必现
+"No script for id"）。
+
+**执行时机的机制教训（三行都实测踩过）**：sweep 同步跑在主 realm page init 内
+会翻动 image lifecycle 的 load-event 竞态（parser_image/responsive 族 9-10 个
+测试挂：localhost 响应赶在 complete getter 之前入缓存，同步刷新路径吞掉异步
+load 事件）；跑在首个脚本又断 worker spawn（data: worker 源首行的页面函数
+toString 被标成 `function shape() { [native code] }` → worker 侧 SyntaxError，
+此为 pristine 过滤 + window/self 别名守卫的由来）；快照期消费惰性钩子则运行时
+失去安全网（document 存在性作运行时判据）。最终落点：主 realm 惰性、帧 realm
+init 末 eager、worker prep 末 eager。
+
+**after（同一普查器，同一页）**：主 0、frame 0、frameInner 0、worker 0；
+Chrome oracle 0/0/0/0。toString 保真抽查 14 项中 13 项与 Chrome 逐字节相同
+（1 项为 fixture 工件：该槽 Chrome 为 value 我方为 getter，两侧 toString 均
+原生形态）。回归测试
+window_surface_functions_all_stringify_native（window + frame realm 双走查，
+断言非原生计数为 0，Chrome 对拍零例外）。
+
+**门禁**：obscura-js release/render/nextest 663/663（含新测试；此前受本批扰动
+的 parser_image/responsive/image_lifecycle/console_memory/debugger_sources/
+timing_edits 族全部复绿）；workspace 一次 1874/1875——唯一失败
+trace_source_labels 为 Step 312 已记录的既有失败，失败集与基线相同；worker
+message/pump 族 29/29；无 cargo fmt；无代理轮。
+
 ### Step 313: /ci/ PrivateToken 假说证伪，/ci/ 门的真实形状定位，HTML 接口晶格修复（2026-09-19）
 
 **方法**：针对 /ci/ 不发的问题做单向决定性实验链：mitmproxy 流量普查（全量 1016 条，
