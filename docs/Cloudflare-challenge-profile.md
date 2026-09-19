@@ -11417,3 +11417,65 @@ TS#2 POST(89KB/resp 127KB，ts=17489992) → TS#3(92KB/5KB) → main#2(7.8KB) �
 窗口（挑战会触碰每个 realm，deferred 只搬家不省钱）。ZMSOw0=560 同理未获益。
 tQdUc5=38 保持。修复批次 20 已派：水合时即标记（禁惰性扫）+ 解锁 core-surface 原型
 交换快路径（每 realm ~20ms→~1.3ms）。
+
+### Step 317: 修复批次 20——惰性深扫退役 + core-surface 原型交换快路径（2026-09-19 深夜）
+
+**回归 1 修复（uGyjw9）**：批次 18 的深扫惰性触发（首个未标记 toString 探针跑全量
+sweep）是 ver21 时序回归的载体——页面自有函数在注册表里同样「未标记」，api.js 普查
+第一次 stringify 自己的函数就把 20k 节点的深扫拉进计时窗口。三点修复：
+1. webidl-branding 的 boot 期 sweep 只在整体内联安装的 realm 跑（main context 的
+   snapshot 构建）；**实测注册表 WeakSet 的标记跨 snapshot 还原存活**
+   （还原后 `fns.has(Function.prototype.toString)` 为 true），main realm 从 boot
+   起就是预标记态。deferred frame realm 推迟到 init 完成点的单次 eager sweep
+   （原先 module 期 + init 末各一遍，现在一遍）。
+2. page-init 在每个 realm 的 init 完成点：frame realm 照旧跑全量 sweep（水合即
+   安装完成点）；main realm 只标每 context 增量（V8 每 context 新铸的
+   WebAssembly/Temporal/Float16Array 等 intrinsic + 每次 init 替换的
+   visualViewport，WeakSet add 数十次，微秒级）；**随后删除
+   `__obscura_lazy_mark_surface`**——表面安装完成的 realm 里惰性深扫从此不可达，
+   未标记函数回退为「返回自身源码」（浏览器对页面函数的行为）。
+3. worker prep 在自己的 eager sweep 后同样删钩子（worker isolate 还原的 snapshot
+   带着钩子，而 payload 独占该 scope）。
+
+新回归测试两枚：`completed_realms_premark_surface_and_drop_lazy_scan_fallback`
+（main + 水合 frame realm，直接对注册表审计全表面零未标记 + 断言钩子已删）、
+`worker_prep_drops_lazy_scan_fallback`。批次 18 的
+window_surface_functions_all_stringify_native 在无惰性网底的情况下保持绿。
+
+**回归 2 修复（ZMSOw0）**：Step 312 记录的阻塞（类 prototype 槽只读）根因是 V8 类
+语义本身。Element/Document/SVGElement 三个「大头」改经 `_swappableInterface`
+trampoline 发布：普通函数的 prototype 槽可写，core-surface-finalize 用一次
+`Object.create`（按 Reflect.ownKeys 序收集描述符，symbol 键原样携带）构建最终
+可枚举原型并一次性赋回，随后把槽重锁回类形状
+`{writable:false, enumerable:false, configurable:false}`——页面可见描述符与类语义
+逐位相同；swap 后把先于 swap 声明的子类原型链 repoint 到新原型。实测（真实原型）：
+三者 348+250+100 个成员的原地重配 14.4+6.3+1.1=21.8ms，swap 构建 1.2ms；
+Reflect.ownKeys 序 swap 前后逐字节一致（哈希对拍）；字典化捷径 23-60ms 且键序被打
+乱，delete+re-add 每键 ~40µs，均不可用——swap 是唯一既快又保序的形状。
+
+**本地基准（配对交错测量，同机静载，release 构建）**：
+- js-repros/iframe-boot-bench（8 沙箱帧，帧创建 + core boot）：修复前
+  229.7-262.2ms/总（首帧 46-55ms，后续帧 26-31ms）→ 修复后 93-101ms/总（首帧
+  ~25ms，后续帧 8-13ms），2.4x；每帧 core boot 26ms→~9ms。
+- 水合微基准（新建 deferred realm → 首个非核心 WindowProxy 陷阱全水合，冷态首
+  realm）：create+core boot 46.4-47.3ms → 24.2-24.8ms；水合段 ~95-98ms 冷态持平
+  （module 期 sweep 省下的钱被 init 末首次冷扫替代，净中性；frame realm 每realm
+  只扫一遍的差价在暖态兑现）。
+- 全触碰 frame realm（创建+水合，第 2-6 帧暖态）：修复前 97-110ms/realm（中位
+  ~103）→ 修复后 79.8-89.2ms/realm（中位 ~84）；6 realm 总 635-669ms →
+  530-572ms。每 realm 剩余成本主体是 deferred 半区模块执行 + 必要的每 context
+  全量 sweep（registry 每 context 空，无法跨 context 共享标记），压到 <15ms/realm
+  需要 per-context snapshot 级工程，另行立项。
+
+**门禁**：obscura-js release/render/nextest 666/666（含上述新测试；9f70fc3 的
+console 测试与批次 18 native-surface 门保持绿）；workspace 一次
+release/render/nextest 1877/1878——唯一失败 trace_source_labels 为既有已记录失败
+（失败集与基线相同）；AGENTS.md release 原命令构建过；
+`cargo check -p obscura-js -p obscura-cli --no-default-features` 过；无 cargo fmt；
+无代理轮（活体验证轮由 orchestrator 执行）。本机无 obscura-benchmark 检出，障碍
+课程未跑（与 Step 316 同）。
+
+**活体预期**：uGyjw9——main realm 普查窗口内已无任何深扫路径（惰性钩子在 init
+完成点删除，boot 标记跨还原存活，增量显式标记），预期回到 ver17 的 ~15 一带；
+ZMSOw0——每 realm 全触碰成本 103→84ms（-18%），按质询 ~7 个 realm 折算预期
+560 → ~460-490 一带；逼近 ~300 需上文的 per-context snapshot 立项兑付。
