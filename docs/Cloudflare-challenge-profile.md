@@ -11312,3 +11312,27 @@ final17 逐字节同量) → 23.6s 新 orchestrate 重开。**TS#2 解密未完�
 build 轮换中被擦，Step 313 ci18 同因失败，已知问题非本批引入）。ZMSOw0/uGyjw9/
 tQdUc5/NnqX6 的活体数值待探针组装管线恢复后补测；本地证据（benchmark 分相 +
 门禁全绿）支持时序残差显著收敛，精确值留待下一注入轮。
+
+### Step 315: 批次 17/18 验证——1558→0 native 泄漏关闭，探针失败标记消失（2026-09-19 22:0x）
+
+**批次 17**：17a810d deferred-surface realm boot（配对 4.9x：8 iframe 719→118-125ms，
+单帧 61-115→8-12.5ms；成本在 bootstrap 顶层执行：surface-finalize 37ms/webidl 8ms/
+webgl 9ms——现延迟到首次 WindowProxy 操作/首次脚本）；b3ed35d HTMLElement 格架
+（此前所有 HTML 元素链缺 HTMLElement 层）+ anchor/area toString；94aa122 PAT 前提
+证伪（/pat/ 是普通 fetch，Chrome JS 可见响应同为我们拿到的裸 401；1016 流无一
+PAT 重试/发行方流量；/ci/ 门=VM 阶段记录，/pat/→/ci/ 间有沙箱 iframe 检查探针，
+Chrome 打真实值、我们打 ODxGu4/Qssv3 失败标记）。
+
+**批次 18（0298505，9 commits）**：四 realm 全可达表面 toString 扫雷
+**1558→0**（top 221/frame-proxy 481/frame-inner 711/worker 145；Chrome oracle 全 0）。
+关键工程点：WebAssembly intrinsic 快照后重建使标记失效、visualViewport 每次快照后
+重装、扫描时机行为敏感（同步扫会抑制 image load 事件、无过滤扫会污染 worker 脚本
+源）——最终设计=boot 期构造器/原型 + 首次未标记 toString 探测时惰性深扫（frame/worker
+eager）。
+
+**ver20（注入）**：ODxGu4/Qssv3 失败标记归零（探针检查通过），/ci/ 仍未发，
+tQdUc5=39/38。final18/19/20 判决均 fail（重开）。**注意**：本机外部
+Virtualization VM 持续 300%+ CPU（load 9-10 六小时+），ver19/20 时序轮全部污染
+（uGyjw9 313、ZMSOw0 577——对照正午 ver17 的 15/512）；realm 修复的干净计时效果
+待负载回落后复测。判决剩余候选：ZMSOw0 安静残差、/ci/ 门其余输入、探针块解码
+（runtime-assembled，不在字节码串表）。
