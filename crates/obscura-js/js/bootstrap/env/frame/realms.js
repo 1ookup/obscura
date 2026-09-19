@@ -634,6 +634,10 @@ function _frameWindowProxyFor(hostEl) {
       enumerable: true,
     });
   }
+  // Every member of this facade is page-visible through contentWindow and
+  // must answer Function.prototype.toString natively (see the postMessage
+  // marking above for the shape).
+  _markNativeObject(frameLocation);
 
   const target = {
     // WindowProxy's own surface starts with these aliases in Chromium.
@@ -711,6 +715,10 @@ function _frameWindowProxyFor(hostEl) {
     },
   });
   _alignPropertiesOrder(target, _chromeWindowKeyOrder);
+  // The facade's accessor pairs (window/self/document/location/length/...)
+  // are page-visible through the proxy; mark them along with the data
+  // methods so the whole surface stringifies natively.
+  _markNativeObject(target);
 
   const proxy = new Proxy(target, {
     // Access checks run per property operation, not only on contentDocument:
@@ -966,6 +974,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     reload() { navigate(this.href); },
     toString() { return this.href; },
   };
+  _markNativeObject(ancestorLocation);
   const target = {
     postMessage(message, targetOrigin) {
       const to = _normalizeTargetOrigin(targetOrigin);
@@ -1022,6 +1031,9 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
   Object.defineProperty(target, "window", { get: () => ref, enumerable: true, configurable: true });
   Object.defineProperty(target, "frames", { get: () => ref, enumerable: true, configurable: true });
   _alignPropertiesOrder(target, _chromeWindowKeyOrder);
+  // Same facade marking as _frameWindowProxyFor: a nested frame reads every
+  // one of these through parent/top and stringifies them.
+  _markNativeObject(target);
   const ref = new Proxy(target, {
     get(t, key) {
       if (key === "globalThis") {
