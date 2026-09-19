@@ -10913,3 +10913,66 @@ idle 报告搁浅仍在）；精确值需下一捕获轮，若仍高于 Chrome �
 （含 65e227f/6f4ac63 并行批次）；no-default-features check 通过；release build
 （render+stealth）全量通过；obscura-benchmark 障碍课程不在本机（伴随库在主控侧），
 33/33 留给主控下一判决轮一并执行。
+
+### Step 309: 修复批次 16-SVG——`<text>` 元素接入 Chrome 的 SVG 文本接口晶格，探针形 fixture 20/20 ctl + extent 首次可达（2026-09-19）
+
+**方法**：以 strand 定位（tel4 原型链日志）+ 本地 headless Chrome oracle（`--headless=new
+--dump-dom`，接口链/原型 own-keys/常量位置逐项取证）+ runtime 探针形 fixture 三方对拍。
+修复前 bootstrap 把 SVGTextElement/SVGTextContentElement/SVGTextPositioningElement
+发布成 SVGElement 的别名（webidl-branding 自己的注释承认 "a <text> node does not
+inherit from this prototype yet"），createElementNS('text') 的包装类落在
+SVGElement——tel4 记录到的链是 `SVGElement > SVGElement > Element`；八个测量方法
+（ctl/getExtentOfChar/getSubStringLength/getNumberOfChars/getStartPositionOfChar/
+getEndPositionOfChar/getRotationOfChar/getCharNumAtPosition）全部装在
+Element.prototype 上（每个 HTML 元素都有，Chrome 无此面），另有
+SVGSVGElement.prototype 被补发整套文本方法（Chrome 的 svg 根没有 ctl）。
+
+**修复**（对拍后 Chrome 晶格，oracle 逐项核对）：
+- 真实类链：SVGTextElement/SVGTSpanElement : SVGTextPositioningElement :
+  SVGTextContentElement : SVGGraphicsElement : SVGElement : Element，
+  SVGTextPathElement 直挂 SVGTextContentElement；图形容器
+  g/a/use/image/defs/symbol/switch/foreignObject : SVGGraphicsElement（oracle：
+  Chrome 对这些 tag 一一答这些构造器）。iframe-element.js 的两条包装 ladder
+  （creation 与 hydration）按 tag 解析到新类；config/bootstrap.js 预声明表补齐
+  non-enumerable 形状；webidl-branding 品牌表补齐原型 toStringTag。
+- 方法归位：八个测量方法 + selectSubString（Chrome 的 SVG 1.1 名；不存在
+  selectSubStringLength）+ LENGTHADJUST_*.  三常量（prototype 与 constructor 双份，
+  oracle 证实）+ textLength/lengthAdjust 反射（SVGAnimatedLength/
+  SVGAnimatedEnumeration 品牌实例，每元素缓存、属性写回可见）装在
+  SVGTextContentElement.prototype；x/y/dx/dy/rotate（SVGAnimatedLengthList/
+  SVGAnimatedNumberList 形状，baseVal.numberOfItems/getItem）装在
+  SVGTextPositioningElement.prototype；getBBox/getCTM/getScreenCTM 移到
+  SVGGraphicsElement.prototype（oracle：div 上三者皆 undefined）；Element.prototype
+  与 SVGSVGElement.prototype 上的文本/几何泄漏全部移除（ranges-postlude 里一条
+  早在模块序上就失效的 Element.prototype.getBBox 引用一并清掉）。
+- 旧断言翻新：div.getCTM 从 null 改钉 undefined；SVGSVGElement 无 ctl 改钉
+  undefined 且 SVGTextContentElement 拥有 ctl。
+- 新测试三枚：svg_text_elements_use_the_chrome_interface_lattice（链
+  getPrototypeOf 走查 + instanceof + constructor.name，text/tspan/textPath/g，
+  createElementNS 与 cloneNode 同链）；svg_text_content_surface_lives_on_the_
+  text_content_interface（方法面 own-keys、常量、反射品牌与稳定身份、空文本
+  ctl="0"/getExtentOfChar(0)=IndexSizeError、div 零测量面）；
+  challenge_probe_shape_runs_twenty_ctl_calls_and_reaches_extent（隐藏沙箱 iframe
+  + svg/g/text x=32 y=32 + 2 emoji + 17 hex + 1 空文本的探针形 fixture，原型包装
+  计数：ctl 20/20、空文本 "0"、getExtentOfChar(0) 命中且答 SVGRect、x 锚在 32）。
+- 二进制级验证：release CLI 对 file:// 探针形 fixture `--eval` 读回
+  `chain=["SVGTextElement","SVGTextPositioningElement","SVGTextContentElement",
+  "SVGGraphicsElement","SVGElement","Element","Node"]、ctor="SVGTextElement"、
+  ctlCalls=20、nonZero=19、emptyCtl="0"、extentKind="[object SVGRect]"、
+  extentX=32`——与 Chrome oracle 同链同形。
+
+**预期 payload 效果**（需下一注入轮闭合精确值）：探针在 ctl 相与 extent 相之间的
+接口门禁（instanceof SVGTextContentElement / 品牌方法查账）首次在我方与 Chrome
+同形，VM 的 extent 走查得以启动——JRzmw6 不再携带异步请求令牌 "bOHv4"，改走与
+Chrome 相同的同步 digest（参考机答 "88.97507572174072" 的 rect 派生串）；RKUE0 的
+矩形收集不再空集归约出 0，离开 sha256("0")；第 20 个 ctl（空文本测 "0"）运行，
+kRQwh3 回到 Chrome 的 sha256("0") 形状（我方此前错喂 emoji ctl 的
+sha256("15.98…")）。测量值字体相关，槽位翻转以注入轮 digest 原文为准。
+
+**门禁**：obscura-js release/render nextest 652/658（6 个失败与本批无关且在 HEAD
+同样失败——并行批次的 cosmic-text/obscura-render WIP 造成的文本整形宽度 0 一族：
+canvas_text_metrics_vary、canvas_text_preparation、a_local_font_source、
+svg_fragment_geometry、frame_svg_elements、challenge_svg_probe 的 bbox 族；本批
+自身三枚新测试 + lattice 链测试 + unrendered 零族测试全绿）；browser/cdp/dom/net
+499/499；no-default-features check 通过；release build（render+stealth）全量通过；
+障碍课程不在本机（伴随库在主控侧），33/33 留给主控下一判决轮一并执行。
