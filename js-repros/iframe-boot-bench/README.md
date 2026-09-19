@@ -11,6 +11,8 @@ residual of the payload timing field `ZMSOw0`.
 ```bash
 # engine
 OBSCURA_BIN=./target/release/obscura js-repros/iframe-boot-bench/capture-obcura.mjs
+# hydration microbench (core boot then full hydrate per frame)
+OBSCURA_BIN=./target/release/obscura js-repros/iframe-boot-bench/capture-hydrate.mjs
 # Chrome oracle on the same page
 CHROME_BIN='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
   js-repros/iframe-boot-bench/capture-chrome.mjs
@@ -27,6 +29,29 @@ Both scripts print `{each: [...], total: ...}` JSON.
 | engine after Step 312 (deferred-surface realm boot, unloaded) | 8-12 | 40-55 | 100-125 |
 | engine after Step 312, under parallel build load (load avg 9-30) | 8-12.5 | 50-54 | 118-125 |
 | engine after batch 20 (prototype swap fast path, 0919 late) | 8-13 | ~25 | 93-101 |
+| engine after batch 21 (snapshot-baked frame surface template, 0920) | 3-6 | 5-7 | 32-57 |
+
+## Hydration microbench (batch 21)
+
+`hydrate.html` + `capture-hydrate.mjs` measure the challenge-relevant shape
+the table above does not cover: each frame is created (core boot) and then
+fully hydrated through a non-core WindowProxy get, because the bootstrap
+ladder touches every realm and the hydration segment is what lands in the
+payload timing field ZMSOw0. Paired, interleaved, same machine (load 10-14,
+external VM at ~300 percent), 5 runs each:
+
+| boot | hydrate per frame (ms) | 6-frame create+hydrate total (ms) |
+| --- | --- | --- |
+| batch 20 (deferred half executes at hydration) | 115-213, growing ~+20ms per hydrated realm | 1038-1064 (median 1048) |
+| batch 21 (snapshot-baked frame surface template) | 16-25, flat | 132-145 (median 133) |
+
+The growth with realm count is gone: the deferred half no longer executes
+per realm, so the live-set GC scaling that added ~20ms per hydrated realm
+disappears with it. With `OBSCURA_BOOTSTRAP_TIMING=1` at build time the
+fixture also reports per-module boundary rows; the batch-20 baseline
+attributed the hydration segment to surface-finalize (~23-25ms),
+webidl-branding and its tail (44ms first frame, growing to ~145ms),
+webgl (~9ms) and a constant ~31-37ms page init.
 
 The deferred-surface boot splits the bootstrap at
 `@obscura-deferred-surface` (js/bootstrap.js): a frame realm's first boot runs

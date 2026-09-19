@@ -11486,3 +11486,71 @@ ver22（load 5.6-6.9）：uGyjw9 526→**193**（回归修复生效；ver17 低�
 ZMSOw0 560→**460**（原型交换快路径 -18%，符合预期）；tQdUc5=39/38。
 final22 判决仍 fail（重开；30s 预算截断于第二轮）。批次 21（每上下文 snapshot 工程，
 Step 317 标记项）已派 overnight agent，含 ver23/final23 收尾轮。
+
+### Step 318: 修复批次 21——frame realm 的 snapshot 级表面模板，水合 115-213ms→16-25ms（2026-09-20 凌晨）
+
+**方法（先测量）**：新增两条 env 门控测量管线（生产关闭）：build 期
+`OBSCURA_BOOTSTRAP_TIMING=1` 让装配器在每个 bootstrap 模块边界插 Date.now 标记
+（水合 realm 经 `globalThis.__obscura_btRows` 上报每模块成本）；运行期
+`OBSCURA_REALM_TIMING=1` 输出 realm 各阶段 stderr 行。新水合微基准
+`js-repros/iframe-boot-bench/hydrate.html`：6 个沙箱 about:blank 帧（core boot）
+逐帧经非核心 WindowProxy get 全水合。
+
+**剖析（批次 20 树，同机负载 6-10）**：每帧水合 = 延迟半区模块执行 + ~0ms
+指纹应用 + 全量 `__obscura_init`（~31-37ms 恒定，含帧全量 mark sweep）。模块级
+（帧 0）：surface-finalize ~23-25ms、webgl ~9ms、navigator ~1ms、computed-style
+~1ms；webidl-branding 自身区域帧 0 为 44-46ms，且随已水合 realm 数线性增长
+约 +20ms/frame（帧 5 达 ~145ms）——模块代码恒定，增长来自每 realm 重执行类定义
+表面的 GC/live-set 缩放。6 帧全触碰总水合 ~963ms。context 创建 0.2-0.3ms、
+core boot 后续帧 8-14ms（首帧 ~26ms）。
+
+**修复（Step 317 标记的 per-context snapshot 工程）**：
+1. vendor deno_core 小补丁：`JsRuntime::add_extra_snapshot_context`，附加
+   context 在主 realm context 之前序列化（附加索引 0..n，主 realm 落在还原
+   索引 1，deno_core 还原路径本就先试 1），既有快照行为不变。
+2. build.rs 在快照期装配「frame surface template」：同一 blob 中的第二个
+   context，核心半+延迟半区内联完整执行（defer 标志不设），带占位帧身份
+   （surface-finalize 的帧形枚举路径按键）与自带 hydrate 桩（指纹应用+全量
+   init，自删）。V8 对同一 context 索引可重复反序列化（每次 Genesis 全新
+   反序列化，blob 数据只读）。跨 context 对象图会被序列化器 CHECK 拒绝
+   （Deno 对象搬运实测触发 embedder_data 断言），故模板自带 context 本地
+   shim Deno。
+3. realm.rs 两条帧 realm 路径改为还原模板（from_snapshot 索引 0）+ 每realm
+   增量（真实身份 globals、defer 标志、document_all、REALM_INIT、指纹种子、
+   core_init）；trace/tracelog 模式无快照时回退原 execute-bootstrap 路径。
+   水合触发面与语义逐字不变：未触碰的 realm 仍分文不付。
+4. 模板 realm 的注册表桥：快照序列化器拒绝共享对象，模板自带本地注册表；
+   `_markNative`/`_markNativeAs` 双写运行时共享注册表、toString override 对
+   异 realm 函数回查共享注册表（window.top 访问器被帧侧 stringify 的路径）、
+   facade 包装经隐藏的每realm入口补标目标 realm、事件状态视图逐访问转发
+   （跨 realm 事件对象，Illegal invocation 回归由此定位）、模板 realm init
+   期对运行时 Deno 面做有界标记替代全量 sweep（boot 面随快照预标记，
+   Step 317 的注册表标记跨还原存活性质）、帧指标访问器在铸造点带标。
+
+**基准（配对交错 5x5，同机负载 10-14，外部 VM ~300% CPU，中位）**：
+水合微基准每帧水合 115-213ms（随帧数线性增长）→ 16-25ms（平坦，增长消失）；
+6 帧 create+水合总 1048ms → 133ms（7.9x）。core-boot fixture（8 帧仅
+contentDocument）95ms → 34ms。Chrome 同 fixture ~16ms。
+
+**门禁**：obscura-js 666/666（含 completed_realms_premark、
+window_surface_all_stringify_native、console 保真、frame 族）；workspace
+1877/1878，唯一失败 trace_source_labels 为 stash 配对的既有基线失败；
+`cargo check -p obscura-js -p obscura-cli --no-default-features` 过；AGENTS.md
+release 原命令构建过；无 cargo fmt；无代理轮。
+
+**ver23 活体验证（注入开，03:19，负载 6.8-11）**：全流程照常——orchestrate →
+TS#1(823KB) → TS#2 POST(90KB/resp 127KB) → TS#3(93KB/resp 5.2KB) → main#2
+(7.8KB/3240B) → 新 orchestrate 重开。**TS#2 解密完成**：从代理机取当前注入态
+ov2.js 作为本轮 ov2probe.js（02:26 build），解码成功——即 cons21 以来的
+harness 缺口（capture_round.sh 未暂存 ov2probe.js）就此闭合，脚本范式不变。
+计数器：**uGyjw9=175、ZMSOw0=480、tQdUc5=38、NnqX6=5325**（ver22@load~6：
+193/460/39/6179；Chrome：4/127/38/7220）。uGyjw9 与 NnqX6 继续向 Chrome 收敛；
+ZMSOw0 480 与 ver22 的 460 在本轮负载方差内持平——本地 7.9x 的水合收益未在
+ZMSOw0 兑现，说明该字段对此段成本的敏感度低于本地微基准提示，残余主项在别处
+（/ci/ 门输入、探针块解码等 Step 315/316 列项）。
+
+**final23 判决（注入关，03:24，负载 7-8）**：流程完整同形——orchestrate →
+TS#1(846KB) → TS#2(91.7KB/127KB) → TS#3(94.9KB/5.2KB) → main#2(7.9KB/3240B)；
+~24s 处新 orchestrate 重开（ray a3daf94fefeb1706），第二轮 30s 预算截断。
+**无任何到达 www.thelancet.com/1.txt 的表单 POST/GET（无 404 终点）：fail**，
+与 final22 同形。判决剩余候选不变（Step 315/316 列项）。
