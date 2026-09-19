@@ -392,6 +392,41 @@ function _markNativeObject(obj, depth) {
   }
   return obj;
 }
+// Engine-internal trampoline for the WebIDL interfaces whose prototype the
+// core finalizer rebuilds wholesale (config/core-surface-finalize.js). A
+// class's `prototype` slot is locked by V8 class semantics, which blocked
+// the swap fast path: building the final enumerable prototype once with
+// Object.create is ~1.2ms where ~2k in-place accessor reconfigurations cost
+// ~22ms per realm boot (profile Steps 312/317). The trampoline is a plain
+// function whose prototype slot is writable, so the finalizer assigns the
+// rebuilt prototype in one write and then relocks the slot to the exact
+// descriptor a class would carry ({writable:false, enumerable:false,
+// configurable:false}). Page-visible behavior is unchanged: construction
+// forwards new.target through Reflect.construct, the [[Prototype]] chain
+// mirrors the class's parent, and name/length match the class's.
+function _swappableInterface(name, Impl, parent) {
+  const F = function (...args) {
+    return Reflect.construct(Impl, args, new.target === undefined ? F : new.target);
+  };
+  Object.defineProperty(F, 'name', { value: name, configurable: true });
+  try {
+    Object.defineProperty(F, 'length', { value: Impl.length, configurable: true });
+  } catch (_e) {}
+  F.prototype = Impl.prototype;
+  if (parent) {
+    try { Object.setPrototypeOf(F, parent); } catch (_e) {}
+  }
+  // The class prototype's `constructor` must answer the published identity:
+  // `document.createElement('div').constructor === globalThis.Element`.
+  try {
+    Object.defineProperty(Impl.prototype, 'constructor', {
+      value: F, writable: true, enumerable: false, configurable: true,
+    });
+  } catch (_e) {}
+  _markNative(F);
+  return F;
+}
+
 // DOM instance internals live under isolate-global symbols rather than own
 // string-keyed properties. `Object.getOwnPropertyNames(document)` returns
 // non-enumerable own properties too, so a non-enumerable string slot still

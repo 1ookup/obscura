@@ -6,17 +6,103 @@
 // pass covers exactly the prototypes a core document can hand out; the full
 // passes stay authoritative (webidl-branding re-installs the table-driven
 // toStringTag getters, surface-finalize re-promotes everything) and are
-// idempotent over what runs here. The main context never defers, so this
-// returns immediately there.
+// idempotent over what runs here.
 //
 // Promotion flips each non-enumerable configurable prototype member to
 // enumerable and applies the changes in one Object.defineProperties call per
 // prototype: the canvas/element/document prototypes carry hundreds of
 // members and per-member defineProperty dominates the realm boot otherwise.
+//
+// Batch 20: for the three accessor-heavy prototypes the in-place promotion
+// is most of the realm boot (Element ~14ms, Document ~6ms, SVGElement ~1ms
+// of the ~22ms total; accessor reconfiguration dominates, and a dictionary
+// fallback breaks key order), so those rebuild through the swap fast path:
+// one Object.create with the final descriptors, assigned to the trampoline's
+// writable prototype slot in one write, then relocked to the class-shaped
+// descriptor. The trampolines (_swappableInterface, config/bootstrap.js) are
+// what makes the slot writable engine-internally; the page-visible slot
+// descriptor after the relock is identical to a class's. The swap runs in
+// every realm, main context included, at the same point of the bootstrap.
 (function _coreSurfaceFinalize() {
+  const skipOnPrototype = new Set(['constructor']);
+
+  // Rebuild `name`'s prototype with enumerable members and assign it once.
+  // Descriptor collection follows Reflect.ownKeys order, so the fresh
+  // object answers [[OwnPropertyKeys]] exactly like the original; symbol
+  // keys ([Symbol.toStringTag] getters) carry over verbatim and stay
+  // non-enumerable, as WebIDL requires.
+  const swapInterfacePrototype = (name) => {
+    const F = globalThis[name];
+    if (typeof F !== 'function' || !F.prototype) return;
+    // The trampoline's slot is the only writable non-configurable one; a
+    // relocked (or plain class) slot means the swap already ran or is not
+    // applicable.
+    const slot = Object.getOwnPropertyDescriptor(F, 'prototype');
+    if (!slot || !slot.writable || slot.configurable) return;
+    const original = F.prototype;
+    let ownKeys;
+    try { ownKeys = Reflect.ownKeys(original); } catch (_error) { return; }
+    const descriptors = {};
+    let flipped = 0;
+    for (const key of ownKeys) {
+      let descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(original, key); }
+      catch (_error) { continue; }
+      if (!descriptor) continue;
+      if (typeof key === 'string' && !skipOnPrototype.has(key)
+          && !key.startsWith('_')
+          && descriptor.configurable && !descriptor.enumerable) {
+        descriptor.enumerable = true;
+        flipped++;
+      }
+      descriptors[key] = descriptor;
+    }
+    if (!flipped) return;
+    const fresh = Object.create(Object.getPrototypeOf(original), descriptors);
+    if (!Object.prototype.hasOwnProperty.call(fresh, 'constructor')) {
+      // Unreachable today (the trampoline pins it), but a rebuilt prototype
+      // without its own constructor would answer Object.prototype's.
+      try {
+        Object.defineProperty(fresh, 'constructor', {
+          value: F, writable: true, enumerable: false, configurable: true,
+        });
+      } catch (_error) { return; }
+    }
+    F.prototype = fresh;
+    try {
+      // Relock to the exact descriptor class semantics carry.
+      Object.defineProperty(F, 'prototype', { value: fresh, writable: false });
+    } catch (_error) {}
+    // Classes declared `extends <this interface>` before the swap chain the
+    // old prototype object; repoint them so they see the promoted members.
+    for (const other of Object.getOwnPropertyNames(globalThis)) {
+      let C;
+      try { C = globalThis[other]; } catch (_error) { continue; }
+      if (typeof C !== 'function' || !C.prototype || C === F) continue;
+      try {
+        if (Object.getPrototypeOf(C.prototype) === original) {
+          Object.setPrototypeOf(C.prototype, fresh);
+        }
+      } catch (_error) {}
+    }
+    // The frame's scoped document subclass (env/frame/realms.js) is
+    // realm-local rather than a global.
+    try {
+      if (typeof _ScopedDocument === 'function'
+          && Object.getPrototypeOf(_ScopedDocument.prototype) === original) {
+        Object.setPrototypeOf(_ScopedDocument.prototype, fresh);
+      }
+    } catch (_error) {}
+  };
+  // Parents before children: SVGElement's rebuilt prototype must chain the
+  // already-rebuilt Element.prototype, and the child repoint above is what
+  // puts it there before the SVG swap reads its prototype chain.
+  swapInterfacePrototype('Document');
+  swapInterfacePrototype('Element');
+  swapInterfacePrototype('SVGElement');
+
   if (!globalThis.__obscura_frame_defers_surface) return;
 
-  const skipOnPrototype = new Set(['constructor']);
   const seen = new Set();
   const promote = (proto) => {
     if (!proto || typeof proto !== 'object' || seen.has(proto)) return;

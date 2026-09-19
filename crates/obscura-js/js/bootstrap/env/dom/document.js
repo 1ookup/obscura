@@ -8,7 +8,7 @@ function _documentLegacyColor(doc, name, value) {
   return name in store ? store[name] : '';
 }
 
-class Document extends Node {
+var Document = _swappableInterface('Document', class extends Node {
   constructor(nid) {
     // Node's constructor stores the handle under _nidSym already, which keeps
     // it out of Object.getOwnPropertyNames / Object.keys / for-in without the
@@ -810,6 +810,6 @@ class Document extends Node {
   }
   hasFocus() { return true; }
   execCommand() { return false; }
-}
+}, Node);
 
 // Node supplies these members for Document as well. Keep the document

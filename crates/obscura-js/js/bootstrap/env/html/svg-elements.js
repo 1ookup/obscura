@@ -23,7 +23,7 @@ Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, {
 });
 _markNative(SVGAnimatedString);
 
-class SVGElement extends Element {}
+var SVGElement = _swappableInterface('SVGElement', class extends Element {}, Element);
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
 class SVGPathElement extends SVGGeometryElement {}

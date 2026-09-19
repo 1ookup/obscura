@@ -1,4 +1,4 @@
-class Element extends Node {
+var Element = _swappableInterface('Element', class extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
     const matchesUpgrade = entry && new.target === entry.constructor;
@@ -2033,4 +2033,4 @@ class Element extends Node {
     while ((c = this.firstChild)) this.removeChild(c);
     for (const n of converted) this.appendChild(n);
   }
-}
+}, Node);
