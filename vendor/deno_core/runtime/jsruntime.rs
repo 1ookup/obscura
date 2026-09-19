@@ -346,6 +346,12 @@ pub struct JsRuntime {
   files_loaded_from_fs_during_snapshot: Vec<&'static str>,
   // Marks if this is considered the top-level runtime. Used only by inspector.
   is_main_runtime: bool,
+  // Obscura patch (batch 21): additional contexts the embedder registered via
+  // [`JsRuntime::add_extra_snapshot_context`] while preparing a snapshot.
+  // [`JsRuntimeForSnapshot::snapshot`] serializes them BEFORE the main realm
+  // context, so the extras take restore indexes 0..n and the main realm
+  // context lands at index n, which deno_core's restore path prefers.
+  extra_snapshot_contexts: Vec<v8::Global<v8::Context>>,
 }
 
 /// The runtime type used for snapshot creation.
@@ -1150,6 +1156,7 @@ impl JsRuntime {
       allocations: isolate_allocations,
       files_loaded_from_fs_during_snapshot: vec![],
       is_main_runtime: options.is_main,
+      extra_snapshot_contexts: vec![],
     };
 
     // ...we're almost done with the setup, all that's left is to execute
@@ -1315,6 +1322,18 @@ impl JsRuntime {
   pub fn handle_scope(&mut self) -> v8::HandleScope {
     let isolate = &mut self.inner.v8_isolate;
     self.inner.main_realm.handle_scope(isolate)
+  }
+
+  /// Obscura patch (batch 21): register an additional context to serialize
+  /// into the snapshot blob. Must be called on a runtime created for
+  /// snapshotting (see [`JsRuntimeForSnapshot`]) before [`JsRuntimeForSnapshot::snapshot`]
+  /// consumes it. Extras serialize BEFORE the main realm context, so the
+  /// first extra is restore index 0 and the main realm context shifts to
+  /// index 1; deno_core's restore path (`create_context`) prefers index 1,
+  /// so the main realm keeps restoring exactly as before and the embedder
+  /// mints further contexts from the extras with `v8::Context::from_snapshot`.
+  pub fn add_extra_snapshot_context(&mut self, context: v8::Global<v8::Context>) {
+    self.extra_snapshot_contexts.push(context);
   }
 
   /// Create a synthetic module - `ext:core/ops` - that exports all ops registered
@@ -2227,11 +2246,21 @@ impl JsRuntimeForSnapshot {
       .collect();
     let realm = JsRealm::clone(&self.inner.main_realm);
 
+    // Extras first: they take the low restore indexes (0..), pushing the
+    // main realm context to index 1, which the restore path prefers.
+    // Drained before the isolate borrow below.
+    let extra_contexts = std::mem::take(&mut self.0.extra_snapshot_contexts);
+
     // Set the context to be snapshot's default context
     {
       let mut scope = realm.handle_scope(self.v8_isolate());
       let default_context = v8::Context::new(&mut scope, Default::default());
       scope.set_default_context(default_context);
+
+      for extra in extra_contexts {
+        let local_extra = v8::Local::new(&mut scope, extra);
+        scope.add_context(local_extra);
+      }
 
       let local_context = v8::Local::new(&mut scope, realm.context());
       scope.add_context(local_context);
