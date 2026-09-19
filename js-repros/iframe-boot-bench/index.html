@@ -1,0 +1,22 @@
+<!doctype html><html><body><script>
+(function(){
+  var times=[];
+  var t0=performance.now();
+  for(var i=0;i<8;i++){
+    var ts=performance.now();
+    var f=document.createElement('iframe');
+    f.sandbox='allow-same-origin';
+    f.style.cssText='position:absolute;left:-10000px;width:300px;height:100px';
+    document.body.appendChild(f);
+    // force realm materialization
+    var w=f.contentWindow;
+    var x=w.document.createElement('div');
+    w.document.body.appendChild(x);
+    times.push(+(performance.now()-ts).toFixed(1));
+  }
+  var total=+(performance.now()-t0).toFixed(1);
+  var d=document.createElement('div'); d.id='r';
+  d.textContent=JSON.stringify({each:times,total:total});
+  document.body.appendChild(d);
+})();
+</script></body></html>
