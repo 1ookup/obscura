@@ -12,12 +12,33 @@ const _eventInternalStateRegistry = Deno[_eventInternalStateRegistrySym]
     events: new WeakMap(), uiEvents: new WeakMap(),
     mouseEvents: new WeakMap(), pointerEvents: new WeakMap(),
   });
-const _trustedEvents = _eventInternalStateRegistry.trusted;
-const _eventSourceCapabilities = _eventInternalStateRegistry.sourceCapabilities;
-const _eventState = _eventInternalStateRegistry.events;
-const _uiEventState = _eventInternalStateRegistry.uiEvents;
-const _mouseEventState = _eventInternalStateRegistry.mouseEvents;
-const _pointerEventState = _eventInternalStateRegistry.pointerEvents;
+// Snapshot template realms (batch 21) evaluated the bootstrap with the
+// snapshot build's registry, while the live registry rides on the runtime's
+// rebound Deno binding. Event objects cross realms (postMessage source,
+// cross-frame dispatch, the input bridge), so these views resolve the live
+// registry at each access when it differs from the captured one. Realms that
+// share one registry (main, execute-bootstrap frames, workers) keep direct
+// references and today's fast path.
+function _liveEventRegistry() {
+  const runtime = Deno[_eventInternalStateRegistrySym];
+  return runtime && runtime !== _eventInternalStateRegistry ? runtime : null;
+}
+const _forwardEventState = (key) => {
+  const own = _eventInternalStateRegistry[key];
+  return {
+    get(k) { const r = _liveEventRegistry(); return r ? r[key].get(k) : own.get(k); },
+    set(k, v) { const r = _liveEventRegistry(); (r ? r[key] : own).set(k, v); return v; },
+    has(k) { const r = _liveEventRegistry(); return r ? r[key].has(k) : own.has(k); },
+    add(k) { const r = _liveEventRegistry(); (r ? r[key] : own).add(k); return this; },
+    delete(k) { const r = _liveEventRegistry(); return r ? r[key].delete(k) : own.delete(k); },
+  };
+};
+const _trustedEvents = _forwardEventState('trusted');
+const _eventSourceCapabilities = _forwardEventState('sourceCapabilities');
+const _eventState = _forwardEventState('events');
+const _uiEventState = _forwardEventState('uiEvents');
+const _mouseEventState = _forwardEventState('mouseEvents');
+const _pointerEventState = _forwardEventState('pointerEvents');
 
 function _eventTimeStamp() {
   try {

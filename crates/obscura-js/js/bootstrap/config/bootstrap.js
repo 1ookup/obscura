@@ -167,6 +167,7 @@ for (const name of [
     '__obscura_tracelog_enabled',
     '__obscura_objects', '__obscura_oid', '__obscura_fingerprint',
     '__obscura_set_fingerprint', '__obscura_apply_fingerprint',
+    '__obscura_mark_native_local',
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_pointer_id',
     '__obscura_registerLinkedStylesheet', '__obscura_install_window_surface',
@@ -335,10 +336,28 @@ const _nativeFns = _nativeRegistry.fns;
 // or functions whose `.name` does not match the real builtin.
 const _nativeStr = _nativeRegistry.strings;
 const _origToString = Function.prototype.toString;
+// Batch 21: snapshot template realms keep the registries their surface was
+// marked with at snapshot build, while the runtime's shared registry rides on
+// the (rebound) Deno binding. The helpers below keep both views consistent:
+// marking dual-writes into the runtime registry, and the toString override
+// consults it for functions minted in other realms. In realms that share one
+// registry the runtime lookup resolves to the same object and every added
+// check is a no-op.
+function _runtimeNativeRegistry() {
+  const runtime = Deno[_nativeRegistrySym];
+  return runtime && runtime !== _nativeRegistry ? runtime : null;
+}
 Function.prototype.toString = function toString() {
   if (_nativeStr.has(this)) { return _nativeStr.get(this); }
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
+  }
+  const runtimeRegistry = _runtimeNativeRegistry();
+  if (runtimeRegistry) {
+    if (runtimeRegistry.strings.has(this)) { return runtimeRegistry.strings.get(this); }
+    if (runtimeRegistry.fns.has(this)) {
+      return `function ${this.name || ''}() { [native code] }`;
+    }
   }
   // First unmarked probe: a page is asking a window-reachable function for
   // its source. Run the full surface sweep once, right now, so surfaces
@@ -363,9 +382,33 @@ Function.prototype.toString = function toString() {
   }
   return _origToString.call(this);
 };
-function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+function _markNative(fn) {
+  if (typeof fn === 'function') {
+    _nativeFns.add(fn);
+    const runtimeRegistry = _runtimeNativeRegistry();
+    if (runtimeRegistry) runtimeRegistry.fns.add(fn);
+  }
+  return fn;
+}
+// Cross-realm facade minting (env/frame/realms.js) marks wrappers in the
+// minting realm's registry; the target realm must see the same mark through
+// its own Function.prototype.toString override. Snapshot template realms
+// carry their own registry (batch 21), so facade minting also marks through
+// this per-realm entry point. For realms sharing one registry it is a no-op
+// re-add. Hidden from enumeration via the _preHideInternals list.
+globalThis.__obscura_mark_native_local = function (fn) {
+  if (typeof fn === 'function') _nativeFns.add(fn);
+  return fn;
+};
 // Mark a function with an exact native-code toString (used for accessors).
-function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+function _markNativeAs(fn, str) {
+  if (typeof fn === 'function') {
+    _nativeStr.set(fn, str);
+    const runtimeRegistry = _runtimeNativeRegistry();
+    if (runtimeRegistry) runtimeRegistry.strings.set(fn, str);
+  }
+  return fn;
+}
 // Mark every function-valued own member of a shim object: value functions
 // and both halves of accessor pairs. Construction sites that mint fresh
 // instances after the finalize sweeps (navigation entries, IDB requests,

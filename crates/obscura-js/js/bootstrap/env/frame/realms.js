@@ -496,6 +496,11 @@ function _frameRealmProxyMethod(realmGlobal, name, delegate) {
     wrapped = Reflect.apply(factory, realmGlobal, [delegate]);
   } catch (_error) {}
   _markNative(wrapped);
+  // The wrapper is frame-context code (built through the frame's Function),
+  // so the frame realm's own toString override must also see the mark:
+  // snapshot template realms carry their own registry (batch 21), and for
+  // shared-registry realms the extra add is a no-op.
+  try { realmGlobal.__obscura_mark_native_local?.(wrapped); } catch (_error) {}
   cache.set(name, wrapped);
   return wrapped;
 }

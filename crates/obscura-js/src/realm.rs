@@ -22,6 +22,7 @@
 //! item 1); nothing on the main path constructs either.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::v8;
@@ -251,6 +252,21 @@ impl FrameRealmHost {
 
 fn alloc_err(what: &str) -> String {
     format!("realm: {what} allocation failed")
+}
+
+/// Measurement-only phase timing (batch 21): with OBSCURA_REALM_TIMING=1 the
+/// realm-creation paths emit one stderr line per phase. Production never sets
+/// the env, and the check reads the process env once per phase print.
+fn realm_timing_enabled() -> bool {
+    std::env::var("OBSCURA_REALM_TIMING").as_deref() == Ok("1")
+}
+
+fn realm_phase_print(label: &str, elapsed: std::time::Duration) {
+    eprintln!(
+        "[realm-timing] {} {:.3}ms",
+        label,
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 fn decode_frame_module_data_url(url: &str) -> Option<String> {
@@ -805,6 +821,76 @@ impl ObscuraJsRuntime {
         Ok(v8::Global::new(scope, context))
     }
 
+    /// Restore the snapshot's frame surface template context (batch 21): a
+    /// context whose full window surface (core half and deferred half) already
+    /// executed at snapshot build, serialized at restore index 0. A frame
+    /// realm restores a fresh copy instead of re-executing the surface half at
+    /// hydration; wiring (Deno binding, security token, deno_core embedder
+    /// slots) matches [`Self::create_realm_context`]. Returns `None` when the
+    /// running isolate has no snapshot or no template index (trace-mode
+    /// runtimes skip the snapshot entirely); the caller then falls back to the
+    /// execute-bootstrap path.
+    fn create_frame_context_from_template(
+        &mut self,
+    ) -> Result<Option<v8::Global<v8::Context>>, String> {
+        const FRAME_TEMPLATE_CONTEXT_INDEX: usize = 0;
+        let main_context = self.deno_runtime_mut().main_context();
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let main_context = v8::Local::new(scope, &main_context);
+        let (deno_key, deno_val, token, context_state, module_map) = {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let main_global = main_context.global(scope);
+            let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
+            let deno_val = main_global
+                .get(scope, deno_key.into())
+                .filter(|v| v.is_object())
+                .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+            let token = main_context.get_security_token(scope);
+            let context_state = main_context.get_aligned_pointer_from_embedder_data(
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+            );
+            let module_map = main_context.get_aligned_pointer_from_embedder_data(
+                deno_core::MODULE_MAP_SLOT_INDEX,
+            );
+            (
+                v8::Global::new(scope, deno_key),
+                v8::Global::new(scope, deno_val),
+                v8::Global::new(scope, token),
+                context_state,
+                module_map,
+            )
+        };
+        let Some(context) = v8::Context::from_snapshot(
+            scope,
+            FRAME_TEMPLATE_CONTEXT_INDEX,
+            v8::ContextOptions::default(),
+        ) else {
+            return Ok(None);
+        };
+        context.set_allow_generation_from_strings(false);
+        // Same security token as the main context; see create_realm_context.
+        let token = v8::Local::new(scope, &token);
+        context.set_security_token(token);
+        unsafe {
+            context.set_aligned_pointer_in_embedder_data(
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+                context_state,
+            );
+            context.set_aligned_pointer_in_embedder_data(
+                deno_core::MODULE_MAP_SLOT_INDEX,
+                module_map,
+            );
+        }
+        {
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            let deno_key = v8::Local::new(scope, &deno_key);
+            let deno_val = v8::Local::new(scope, &deno_val);
+            global.set(scope, deno_key.into(), deno_val);
+        }
+        Ok(Some(v8::Global::new(scope, context)))
+    }
+
     /// Spike entry point (implementation order item 1); the managed layer is
     /// [`ObscuraJsRuntime::ensure_frame_realm`].
     pub fn create_secondary_realm(&mut self) -> Result<SecondaryRealm, String> {
@@ -873,8 +959,28 @@ impl ObscuraJsRuntime {
         if self.frame_realms.contains_world(frame_id, generation, world_id) {
             return Ok(false);
         }
+        let timing = realm_timing_enabled();
+        let t_total = Instant::now();
+        let t_phase = Instant::now();
 
-        let context = self.create_realm_context()?;
+        // Frame surface template (batch 21): restore the snapshot-baked
+        // context when one exists; only the execute-bootstrap fallback pays
+        // the core half inline. Either way the flags below are set on the
+        // realm global before any of its own script can run.
+        let (context, template_restored) = match self.create_frame_context_from_template()? {
+            Some(context) => (context, true),
+            None => (self.create_realm_context()?, false),
+        };
+        if timing {
+            realm_phase_print(
+                if template_restored {
+                    "create_context(template)"
+                } else {
+                    "create_context"
+                },
+                t_phase.elapsed(),
+            );
+        }
         let trace_label = self.frame_realms.mint_trace_label();
         {
             // The frame flags must exist before any realm script runs:
@@ -939,20 +1045,34 @@ impl ObscuraJsRuntime {
             // Deferred-surface boot (Step 312): same contract as the
             // synchronous op path. The flag must precede the bootstrap so the
             // assembler's tail installs __obscura_hydrate instead of running
-            // the surface half inline.
+            // the surface half inline. Template-restored realms set it too so
+            // the pre-hydration window surface matches the defer-realm shape
+            // byte for byte; their hydrate stub deletes it at hydration.
             let defer_key = v8::String::new(scope, "__obscura_frame_defers_surface")
                 .ok_or_else(|| alloc_err("key"))?;
             let defer_val = v8::Boolean::new(scope, true);
         global.set(scope, defer_key.into(), defer_val.into());
         }
-        // Bootstrap runs first, matching the main context (its bootstrap is
-        // baked into the snapshot, then `<obscura:init>` runs). REALM_INIT must
-        // come after: bootstrap's `_preHideInternals` re-declares
-        // `__obscura_objects` as undefined, so seeding it before bootstrap
-        // would be wiped and the RemoteObject stash (Phase 6.2) would be
-        // missing in the realm.
-        self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        // Template-restored realms skip the bootstrap: their surface (core
+        // half and deferred half) executed at snapshot build and traveled with
+        // the snapshot, and the assembler's inline tail already ran. The
+        // fallback path executes the core half here exactly as before.
+        if !template_restored {
+            // Bootstrap runs first, matching the main context (its bootstrap is
+            // baked into the snapshot, then `<obscura:init>` runs). REALM_INIT
+            // must come after: bootstrap's `_preHideInternals` re-declares
+            // `__obscura_objects` as undefined, so seeding it before bootstrap
+            // would be wiped and the RemoteObject stash (Phase 6.2) would be
+            // missing in the realm.
+            self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        }
+        if timing {
+            realm_phase_print("bootstrap_core", t_phase.elapsed());
+        }
         self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        if timing {
+            realm_phase_print("realm_init", t_phase.elapsed());
+        }
         // The runtime-owned fingerprint lands before `__obscura_init`, the
         // same order the main realm uses: init derives innerWidth/outer* from
         // the screen it can already see, so seeding the identity afterwards
@@ -973,6 +1093,9 @@ impl ObscuraJsRuntime {
                  globalThis.__obscura_webgl_enabled = {webgl_enabled};"
             ),
         )?;
+        if timing {
+            realm_phase_print("fingerprint_seed", t_phase.elapsed());
+        }
         // Core init for the deferred-surface boot (Step 312): binds the
         // contentDocument surface the parent can touch; the full page init
         // runs at hydration.
@@ -981,6 +1104,10 @@ impl ObscuraJsRuntime {
             "<obscura:frame-realm-core-init>",
             "globalThis.__obscura_core_init();",
         )?;
+        if timing {
+            realm_phase_print("core_init", t_phase.elapsed());
+            realm_phase_print("TOTAL_realm_boot", t_total.elapsed());
+        }
 
         // Snapshot the content root's scope for later diagnostics/routing;
         // the scope may legitimately not exist yet (about:blank pre-commit).
@@ -1856,6 +1983,9 @@ pub(crate) fn spawn_frame_realm(
     if frame_realms.contains_world(frame_id, generation, MAIN_WORLD) {
         return Ok(None);
     }
+    let timing = realm_timing_enabled();
+    let t_total = Instant::now();
+    let t_phase = Instant::now();
     // An op's scope reports the main context (Deno.core.ops is shared across
     // realms), so the current context carries the main realm's Deno binding,
     // security token and embedder slots. Read them here; the new context copies
@@ -1876,7 +2006,19 @@ pub(crate) fn spawn_frame_realm(
     let module_map =
         current.get_aligned_pointer_from_embedder_data(deno_core::MODULE_MAP_SLOT_INDEX);
 
-    let context = v8::Context::new(scope, v8::ContextOptions::default());
+    // Frame surface template (batch 21): restore the snapshot-baked context
+    // when one exists; the fallback mints a fresh context and executes the
+    // core bootstrap inline below. Either way the flags further down are set
+    // on the realm global before any of its own script can run.
+    let template_context = v8::Context::from_snapshot(
+        scope,
+        0,
+        v8::ContextOptions::default(),
+    );
+    let (context, template_restored) = match template_context {
+        Some(context) => (context, true),
+        None => (v8::Context::new(scope, v8::ContextOptions::default()), false),
+    };
     context.set_allow_generation_from_strings(false);
     context.set_security_token(token);
     unsafe {
@@ -1891,6 +2033,16 @@ pub(crate) fn spawn_frame_realm(
     }
 
     let trace_label = frame_realms.mint_trace_label();
+    if timing {
+        realm_phase_print(
+            if template_restored {
+                "sync create_context(template)"
+            } else {
+                "sync create_context"
+            },
+            t_phase.elapsed(),
+        );
+    }
     let bridge = {
         let scope = &mut v8::ContextScope::new(scope, context);
         let global = context.global(scope);
@@ -1946,8 +2098,18 @@ pub(crate) fn spawn_frame_realm(
 
         crate::document_all::install(scope, context);
 
-        run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+        // Template-restored realms skip the bootstrap (surface baked at
+        // snapshot build); the fallback executes the core half here.
+        if !template_restored {
+            run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+            if timing {
+                realm_phase_print("sync bootstrap_core", t_phase.elapsed());
+            }
+        }
         run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        if timing {
+            realm_phase_print("sync realm_init", t_phase.elapsed());
+        }
         // Fingerprint before init, matching the main realm's order (see the
         // comment in ensure_frame_world_realm). tools/script-loader's setter is
         // bootstrap core, so it runs; the deferred fingerprint applicator is
@@ -1958,6 +2120,9 @@ pub(crate) fn spawn_frame_realm(
              globalThis.__obscura_webgl_enabled = {webgl_enabled};"
         );
         run_script(scope, "<obscura:frame-fingerprint>", &fingerprint_src)?;
+        if timing {
+            realm_phase_print("sync fingerprint_seed", t_phase.elapsed());
+        }
         // Core init binds the document/top/parent surface the parent reaches
         // through contentWindow/contentDocument. The full page init runs at
         // hydration (Step 312).
@@ -1966,6 +2131,10 @@ pub(crate) fn spawn_frame_realm(
             "<obscura:frame-realm-core-init>",
             "globalThis.__obscura_core_init();",
         )?;
+        if timing {
+            realm_phase_print("sync core_init", t_phase.elapsed());
+            realm_phase_print("sync TOTAL_realm_boot", t_total.elapsed());
+        }
         let bridge_key = v8::String::new(scope, "__obscura_realm_bridge")
             .ok_or_else(|| alloc_err("key"))?;
         match global.get(scope, bridge_key.into()) {
@@ -2014,6 +2183,8 @@ pub(crate) fn hydrate_frame_realm_if_pending(
     else {
         return Ok(());
     };
+    let timing = realm_timing_enabled();
+    let t_hydrate = Instant::now();
     let Ok(hydrate) = v8::Local::<v8::Function>::try_from(hydrate) else {
         return Err("realm: hydrate value was not a function".to_string());
     };
@@ -2021,6 +2192,9 @@ pub(crate) fn hydrate_frame_realm_if_pending(
     let recv = v8::Local::new(scope, global);
     if hydrate.call(scope, recv.into(), &[]).is_none() {
         return Err(realm_error(scope, "deferred-surface hydration"));
+    }
+    if timing {
+        realm_phase_print("hydrate", t_hydrate.elapsed());
     }
     Ok(())
 }

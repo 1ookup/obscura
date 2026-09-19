@@ -286,30 +286,33 @@ globalThis.__obscura_init = function() {
       // temporarily unavailable during navigation.
       let frameWidthFallback = globalThis.innerWidth;
       let frameHeightFallback = globalThis.innerHeight;
+      // Frame realms restored from the surface template skip the init-end
+      // sweep (their boot surface travels premarked), so init-minted
+      // accessors must carry their native mark at the mint site.
       Object.defineProperty(globalThis, 'innerWidth', {
         configurable: true,
         enumerable: true,
-        get() {
+        get: _markNative(function innerWidth() {
           return frameWidthFallback = readFrameMetric('clientWidth', frameWidthFallback);
-        },
+        }),
       });
       Object.defineProperty(globalThis, 'innerHeight', {
         configurable: true,
         enumerable: true,
-        get() {
+        get: _markNative(function innerHeight() {
           return frameHeightFallback = readFrameMetric('clientHeight', frameHeightFallback);
-        },
+        }),
       });
       if (globalThis.visualViewport) {
         Object.defineProperty(globalThis.visualViewport, 'width', {
           configurable: true,
           enumerable: true,
-          get() { return globalThis.innerWidth; },
+          get: _markNative(function width() { return globalThis.innerWidth; }),
         });
         Object.defineProperty(globalThis.visualViewport, 'height', {
           configurable: true,
           enumerable: true,
-          get() { return globalThis.innerHeight; },
+          get: _markNative(function height() { return globalThis.innerHeight; }),
         });
       }
     } catch (_e) {}
@@ -523,7 +526,14 @@ globalThis.__obscura_init = function() {
   // restore, so only the per-context delta below needs marking -- a full
   // walk inside main-realm page init tips the image lifecycle's
   // load-event race the parser_image family exercises.
-  if (_callingFrameRoot()) {
+  //
+  // Batch 21: frame realms restored from the snapshot's frame surface
+  // template skip the full walk exactly like the main realm does. Their
+  // surface executed at snapshot build, where the inline boot-time pass
+  // marked it, and the same registry marks survive the restore; init-minted
+  // replacements are covered by the per-context delta and the
+  // construction-site marks.
+  if (_callingFrameRoot() && !globalThis.__obscura_frame_snapshot_surface) {
     try { globalThis.__obscura_mark_surface_native?.(); } catch (_e) {}
   } else {
     // Per-context intrinsics, minted fresh for this context by V8: mark
@@ -540,6 +550,14 @@ globalThis.__obscura_init = function() {
         }
       }
     } catch (_e) {}
+    // Batch 21: frame realms restored from the surface template skip the
+    // init-end sweep, but deno_core re-binds its op wrappers per isolate at
+    // runtime (the async ops are plain JS closures) and core_init wires frame
+    // machinery against them. Mark the runtime Deno surface -- the same walk
+    // the inline realms' init-end sweep does, bounded to the runtime binding.
+    if (globalThis.__obscura_frame_snapshot_surface) {
+      try { _markNativeObject(globalThis.Deno, 2); } catch (_e) {}
+    }
   }
   try {
     // VisualViewport is replaced with a fresh object on every page init;
