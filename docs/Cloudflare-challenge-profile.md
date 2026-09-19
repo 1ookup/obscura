@@ -11114,3 +11114,76 @@ cascade+taffy 重建等每趟固定成本，见 Step 308 的增量布局后续�
 探针损坏全部关闭（SVG 格架/ToUint32/槽位化 rect/测量归零语义/普查泄漏/时序 3-70x
 收敛）；TS#3 从恒 2.9KB 失败变体转为 Chrome 形态 92KB。判决翻转的剩余路径以
 ZMSOw0 增量布局与 /ci/ PAT 为最优先。
+
+### Step 313: /ci/ PrivateToken 假说证伪，/ci/ 门的真实形状定位，HTML 接口晶格修复（2026-09-19）
+
+**方法**：针对 /ci/ 不发的问题做单向决定性实验链：mitmproxy 流量普查（全量 1016 条，
+含 0918 Chrome 通过轮与本轮全部流量）+ 挂头 Chrome 过同一注入代理的 CDP 实验
+（Target.setAutoAttach waitForDebuggerOnStart 注入 blob worker realm，包裹
+fetch/Map/Response 记录 `__OBSFETCH__`/`__OBSMAP__` 行）+ 解密 payload 双侧对拍 +
+本地同形 fixture（401+www-authenticate PrivateToken challenge 的 same-origin
+worker fetch 链）+ 门 A/B（console.log 非原生包裹 / Fetch 层 abort /pat/）。
+
+**假说证伪（确证）**：Step 300/T3/310 的定性「/pat/ 401 后 Chrome 在网络栈做 PAT
+兑付，JS 不可见」**不成立**。实测通过轮 Chrome 的 /pat/ 抓取是 worker realm 里的
+普通 `fetch(url)`（`__OBSFETCH__ call ... pt=absent`，无 privateToken init、无任何
+PAT/Authorization/Private-Token-Client-Replay 头，sec-fetch-mode cors），JS 可见
+响应就是原始 401（`resp 401 ok=false type=basic`，头 alt-svc|cf-ray|content-length|
+content-type|date|server|www-authenticate，与我方引擎逐类一致，本地 fixture
+同页对拍全同）。全流量普查零次 /pat/ 重放、零次 issuer（pat-issuer.microsoft/
+no-reply.private-token.research.cloudflare.com）网络请求、四个 issuer 的
+PrivateToken challenge 齐全但从未被消费；`document.hasPrivateToken`/
+hasRedemptionRecord 与 fetch privateToken 选项在整条流程中不存在（字节码零字符串
++ 运行时 getter 陷阱零命中）。/ci/ 本身是无 PAT 绑定的 no-cors image GET，服务端
+只凭 URL 内的会话令牌 + cookie 即 200（image/png 7823B 过代理）。
+
+**/ci/ 门的真实形状（强）**：ov1-0 的 /pat/ 与 /ci/ URL 记录在运行时 3-6ms 内先后
+构建（两者内嵌 Date.now() 仅差 3-6ms），/ci/ 的 image 挂载由 widget realm 的
+ov1 解释器发出（initiator 栈 `normal?lang=auto:6875 <- :1222 <- :9669`，即 VM
+methodCall 处理器 cD）。门 = ov1-0 pc 47995 `params.get("private-token-client-replay").ok`，
+是 VM 内部对该阶段完成度的自持记录，不是 Response.ok（Chrome 同为 401/ok=false
+却发 /ci/）。门 A/B：Fetch 层 abort /pat/ 后 /ci/ 消失（依赖成立）；
+console.log 透明 JS 包裹（非原生 toString）后 /ci/ 照发（console 原生性不是门）。
+真正的门内容在 /pat/ 响应与 /ci/ 之间的一段沙箱 iframe 探针：两组引擎都运行它，
+Chrome 的探针输出真值（regex 源、原生函数源、锚元素、NaN、1），我方引擎同一位置
+输出失败标记 `ODxGu4`/`Qssv3`（final17/ci18 两轮一致）——探针的 2-3 项检查在我方
+引擎失败，门随之关死，流程继续走 TS#2/TS#3/main#2。探针代码在 VM 内运行期拼装
+（font-size/%c%d/正则源均不在 pristine strtab 与字节码明文/编码记录中），其检查
+项的逐项识别需要 jsvmp 反编译管线立项。
+
+**修复批次 18（commit b3ed35d，通用 Chrome 形状）**：排查中发现两处确定的真实
+引擎分歧，恰在探针检查区（探针逐字 create_element a 并 console.log 它）：
+1. HTMLElement 晶格：本引擎此前 `globalThis.HTMLElement = Element`（别名），
+   全部 HTML 元素原型链缺 HTMLElement 层（`HTMLDivElement > Element > Node`，
+   Chrome 为 `HTMLDivElement > HTMLElement > Element > Node`；SVG 侧 Step 309
+   已修、HTML 侧漏）。webidl-branding 新建真实 HTMLElement 接口（非法直接构造，
+   new.target + 接口 key 双门，页面 `new HTMLElement()` 照抛），install() 全族
+   改挂 HTMLElement，九个真实实现类（link/input/form/iframe/canvas/track/media/
+   image/object/body）prototype+static 双重 reparent，audio/video 经 media 层
+   传导；abbr/b/i 等 Chrome 直接映射 HTMLElement 的标签经内部 key 合法构造。
+2. HTMLHyperlinkElementUtils stringifier：Chrome 的 `<a>/<area>.toString()` 应答
+   IDL href（未设为空串），`String(a)` 从不给 "[object HTMLAnchorElement]"；
+   我方此前落在 Object.prototype.toString 回退。已在两接口原型装 toString
+   （writable/enumerable/configurable 全 true，length 0，走既有 href 解析）。
+   location.js 过时的「HTMLElement === Element」placement 注释同步更正。
+回归测试两枚：html_elements_use_the_chrome_interface_lattice（链走查/instanceof/
+非法构造/unknown vs 有效自定义元素名分岔/媒体族深父）、
+anchor_and_area_stringify_to_their_href_like_chrome（无 href 空串、有 href 解析
+绝对 URL、模板字面量、div 不受染、描述符形状）。obscura-js 全量
+release/render/nextest：662 中 636 过、失败 26 个与无本批的基线逐一相同（全部为
+并行在途的 surface-finalize/realm 重构族，canvas getContext 缺失等，非本批引入，
+见 working tree 未提交改动）；本批自身两枚新测试过；no-default-features check 过。
+
+**ci18 验证轮（注入开，14:00）**：全流程照常走完：orchestrate 4.2s → TS#1 5.4s →
+pat401+brunhild 12.8s → 沙箱探针 15.0s → TS#2 19.2s → TS#3 24.7s(94,220B，Chrome
+形态) → main#2 26.4s(3,240B)。/ci/ 仍未发；探针标记 ODxGu4/Qssv3 仍在（锚元素位
+的 `[object HTMLAnchorElement]` 是我方 ops 管线的参数序列化渲染，与 Chrome CDP
+显示 `a` 同为管道工件、非引擎值差）。本轮 TS#2 解密失败（build 轮换后 ov2probe.js
+钩子被擦，历史已知问题），payload 对拍缺席。**/ci/ 的诚实判决：本会话未关闭**——
+PrivateToken 假说已证伪并记录，真实门是 VM 沙箱探针的阶段资格记录，其失败检查项
+的定位是下会话的唯一低成本入口（jsvmp 反编译管线解码探针块，或以 remote patch
+v5 无源形状对探针 iframe realm 做一轮被动注入）。
+
+**更正**：Step 300/T3/310/311 中「/ci/ 网络级 PAT 兑付能力」「privateToken 选项
+被我方网络栈忽略」「兑付发生在浏览器网络栈、JS 不可见」的表述按本步证伪更正；
+counter-semantics.md S1/T3 的同源推断一并作废。
