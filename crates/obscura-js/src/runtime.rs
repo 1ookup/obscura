@@ -8361,6 +8361,101 @@ mod tests {
         );
     }
 
+    /// The challenge's native-function-source check defines a "stack" getter
+    /// returning "" on a constructed object, logs the read-back through
+    /// console.debug, and stringifies the descriptor's get (profile Step
+    /// 320, M2). The whole chain must behave identically in the probe's own
+    /// sandboxed child realm: defineProperty returns the target, the
+    /// read-back is "", the accessor is enumerable+configurable with a
+    /// callable get, the property enumerates, and a bound getter stringifies
+    /// to the anonymous-native shape the validator whitelists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_error_stack_defineproperty_chain_matches_main_realm() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        const CHAIN: &str = r#"
+            (() => {
+                const out = [];
+                const t = (label, fn) => {
+                    try { out.push(label + ' = ' + String(fn())); }
+                    catch (e) { out.push(label + ' !THROW ' + e.name + ': ' + e.message); }
+                };
+                const vmGetter = () => '';
+                let obj;
+                t('ctor', () => { obj = new Error('x'); return obj.name; });
+                t('defineProperty', () => Object.defineProperty(obj, 'stack',
+                    { get: vmGetter, configurable: true, enumerable: true }) === obj);
+                t('stack', () => JSON.stringify(obj.stack));
+                let desc;
+                t('desc', () => {
+                    desc = Object.getOwnPropertyDescriptor(obj, 'stack');
+                    return [desc.enumerable, desc.configurable,
+                        String(desc.get), String(desc.set).indexOf('[native code]') !== -1]
+                        .join('|');
+                });
+                t('keys', () => JSON.stringify(Object.keys(obj)));
+                t('getterReturn', () => JSON.stringify(desc.get()));
+                t('boundGetter', () => {
+                    const bg = vmGetter.bind(null);
+                    const o2 = {};
+                    Object.defineProperty(o2, 'stack',
+                        { get: bg, configurable: true, enumerable: true });
+                    return [String(bg), JSON.stringify(o2.stack),
+                        String(Object.getOwnPropertyDescriptor(o2, 'stack').get)].join('|');
+                });
+                return out;
+            })()
+        "#;
+        let expected: Vec<serde_json::Value> = [
+            "ctor = Error",
+            "defineProperty = true",
+            "stack = \"\"",
+            "desc = true|true|() => ''|true",
+            "keys = [\"stack\"]",
+            "getterReturn = \"\"",
+            "boundGetter = function () { [native code] }|\"\"|function () { [native code] }",
+        ]
+        .iter()
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .collect();
+        let main = rt
+            .evaluate_for_cdp(CHAIN, true, true)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            main,
+            serde_json::Value::Array(expected.clone()),
+            "main-realm stack-defineProperty chain must hold the Chrome shape"
+        );
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://challenges.example/widget', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "stack-frame",
+            1,
+            root,
+            "https://challenges.example/widget",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm("stack-frame", 1, "<stack-chain-probe>", CHAIN)
+            .unwrap();
+        assert_eq!(
+            frame,
+            serde_json::Value::Array(expected),
+            "the sandboxed child realm must run the identical chain"
+        );
+    }
+
     /// `measureText` must return a branded `TextMetrics` whose numbers live on
     /// the prototype, the way Chrome does. It used to hand back a plain object
     /// with three own properties, so `Object.prototype.toString.call(...)` read
