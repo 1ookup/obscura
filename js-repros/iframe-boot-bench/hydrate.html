@@ -1,0 +1,33 @@
+<!doctype html><html><body><script>
+// Hydration microbench (batch 21): creates 6 sandboxed about:blank iframes
+// (core boot only), then fully hydrates each one through a non-core
+// WindowProxy get (navigator). Reports per-frame create and hydrate wall
+// time plus the frame realm's per-module bootstrap boundary marks when the
+// binary was assembled with OBSCURA_BOOTSTRAP_TIMING=1. This is the
+// challenge-relevant shape: the bootstrap ladder touches every realm, so
+// hydration cost is what lands in the ZMSOw0 timing field.
+(function(){
+  var res={create:[],hydrate:[],mods:[]};
+  var t0=performance.now();
+  for(var i=0;i<6;i++){
+    var ts=performance.now();
+    var f=document.createElement('iframe');
+    f.sandbox='allow-same-origin';
+    f.style.cssText='position:absolute;left:-10000px;width:300px;height:100px';
+    document.body.appendChild(f);
+    var w=f.contentWindow;
+    var x=w.document.createElement('div');
+    w.document.body.appendChild(x);
+    res.create.push(+(performance.now()-ts).toFixed(1));
+    var th=performance.now();
+    var ok=w.navigator && typeof w.fetch==='function' && !!w.WebGLRenderingContext && !!w.XMLHttpRequest;
+    res.hydrate.push(+(performance.now()-th).toFixed(1));
+    res.mods.push(w.__obscura_btRows ? w.__obscura_btRows.slice(-8) : null);
+    if(!ok){ res.probeFail=i; }
+  }
+  res.total=+(performance.now()-t0).toFixed(1);
+  var d=document.createElement('div'); d.id='r';
+  d.textContent=JSON.stringify(res);
+  document.body.appendChild(d);
+})();
+</script></body></html>
