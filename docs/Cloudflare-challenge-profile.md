@@ -11566,3 +11566,43 @@ final24 后 mitmproxy 最近 rays 确认**无注入生产轮同样 pat 401→ci 
 残差=均匀 VM 派发成本（Step 317 dispatcher 项）。③ 两个标记检查仍在（服务器可见
 信标字段）：匿名 native 函数源槽（ODxGu4）+ %c%d NaN/Error 槽（Qssv3）——
 第六轮 jsvmp 反汇编已派（pc 51039-192011 区间）。
+
+### Step 320：标记检查修复（批次 22）——console 计数 + 绑定函数毒丸 + 子 realm 链对照（2026-09-20 06:3x）
+
+第六轮静态解码（M1-M4）指认的三类行为缺口逐一修复，本地 headless Chrome 151
+oracle（CDP consoleAPICalled + getter/描述符探针）逐值对照：
+
+① **console.count/countReset 落地**（Qssv3 阶段卫兵的第一喂入项）：per-realm
+标签表，count 经 log 通道发 `<label>: <n>`（显式 undefined→"default"，其余
+String 化），countReset 静默复位、未知标签发 `Count for 'x' does not exist`
+warning。哨兵表其余方法逐一对表后补齐 Blink 形状：零参 log/error/warn/info/
+debug/dir/dirxml/table 不发行（Blink 在 CDP 之前丢弃）、trace()/clear()/
+group()/groupEnd() 自题名行（`console.groupEnd` 即参考块尾行）、无消息 assert
+题名 `console.assert`、时间族 `t: <ms> ms` + `Timer 't' does not exist`。
+ops 行与 Chrome 捕获逐槽一致（console.js）。
+
+② **绑定函数毒丸身份**（ODxGu4 验证器读 length/name/arguments）：钉住的 V8
+把 Function.prototype 的 arguments/caller 四个视图共享为单个匿名
+%ThrowTypeError%，surface 扫描误标为最后遍历键（`function set caller`、name
+为空）——验证器读的正是这些身份字段。bootstrap 现按属性安装四个委托访问器
+（get/set arguments/caller，名与 native 串逐一对齐 Chrome），getter 委托保留
+V8 原语义（sloppy→null、运行中→活 arguments、strict/bound/native→毒丸
+TypeError，消息逐字节同 Chrome），setter 复刻 Chrome 的 sloppy 静默忽略。
+oracle 对照 39 行 38 行全等；唯一残差=毒丸 throw 自带的 `at get arguments
+(<anonymous>)` 内建帧——Chrome 的访问器是内建（有帧），本引擎按不变量隐藏
+引擎帧（与 DOM 访问器 throw 的帧形状一致）。反伪造腿期望的
+`at Object.toString (<anonymous>)` 帧两侧本就全等。
+
+③ **子 realm defineProperty("stack") 链洗清**：沙箱子 iframe 与主 realm 逐槽
+全等（defineProperty 返回目标、obj.stack 读 ""、访问器 enumerable+configurable、
+枚举含 "stack"、bound getter 串 `function () { [native code] }`）——无需引擎
+改动，仅按 realm 钉测试。**worker debugger 时序探针同轮洗清**：
+`eval("debugger")` 两引擎同为 no-op，postMessage ~10ms 先达、1500ms 回退
+后至，无挂起无抛错。
+
+同轮清障：0eb631a 遗留的 worker 启动调试行 `console.error('[wsdbg-js]
+dispatcher installed')` 每个 worker realm 都发一条参考捕获没有的 error 行，
+且在跟踪运行中先于表头落盘打乱 ops.tsv 列序（trace_source 测试红）——删除。
+
+门：obscura-js 669/669（+3 新测试：count 行与复位语义、毒丸身份与 .arguments
+throw、子 realm stack 链）、workspace 1881/1881、精确 release 构建全绿。
