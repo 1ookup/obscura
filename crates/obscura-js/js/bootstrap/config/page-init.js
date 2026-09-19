@@ -45,9 +45,12 @@ globalThis.__obscura_core_init = function() {
   }
   try {
     if (!Object.prototype.hasOwnProperty.call(globalThis.document, 'location')) {
+      // [LegacyUnforgeable] and non-configurable: the accessor functions are
+      // minted per document generation, so they carry their own native mark
+      // at install time instead of relying on the finalize sweeps.
       Object.defineProperty(globalThis.document, 'location', {
-        get() { return globalThis.location; },
-        set(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); },
+        get: _markNative(function document_location() { return globalThis.location; }),
+        set: _markNative(function document_location(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); }),
         enumerable: true,
         configurable: false,
       });
@@ -150,9 +153,12 @@ globalThis.__obscura_init = function() {
   // including frame documents created by the shared-isolate host.
   try {
     if (!Object.prototype.hasOwnProperty.call(globalThis.document, 'location')) {
+      // [LegacyUnforgeable] and non-configurable: the accessor functions are
+      // minted per document generation, so they carry their own native mark
+      // at install time instead of relying on the finalize sweeps.
       Object.defineProperty(globalThis.document, 'location', {
-        get() { return globalThis.location; },
-        set(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); },
+        get: _markNative(function document_location() { return globalThis.location; }),
+        set: _markNative(function document_location(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); }),
         enumerable: true,
         configurable: false,
       });
@@ -503,6 +509,20 @@ globalThis.__obscura_init = function() {
       _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
     }
   } catch(e) {}
+  // The native-presentation sweep. Init replaced visualViewport,
+  // re-installed viewport/child-context accessors and the named-property
+  // getters, and a fresh runtime's ECMAScript intrinsics (WebAssembly) are
+  // not the snapshot objects the bootstrap-time pass walked. Frame realms
+  // run it here eagerly: a parent probes a child's surface before the child
+  // ever runs a script of its own, so a lazy first-tostring trigger would
+  // leave the parent's probe seeing engine source. The main realm relies on
+  // the lazy trigger instead (the __obscura_lazy_mark_surface hook in
+  // config/bootstrap.js): running the scan inside main-realm page init
+  // tipped the image lifecycle's load-event race the parser_image tests
+  // exercise.
+  if (_callingFrameRoot()) {
+    try { globalThis.__obscura_mark_surface_native?.(); } catch (_e) {}
+  }
   delete globalThis.__obscura_init;
 };
 

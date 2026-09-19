@@ -182,7 +182,7 @@ for (const name of [
     // was missed here and showed up in a challenge page's window enumeration.
     '__currentScriptNid',
     // internal helpers (var-declared throughout the file)
-    '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
+    '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_markNativeObject', '_fpRand', '_fpNoise',
     '_fpCache', '_fingerprint', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -340,11 +340,58 @@ Function.prototype.toString = function toString() {
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
   }
+  // First unmarked probe: a page is asking a window-reachable function for
+  // its source. Run the full surface sweep once, right now, so surfaces
+  // installed after the bootstrap-time pass (init's visualViewport
+  // replacement, the fresh runtime's ECMAScript intrinsics, lazily
+  // installed accessors) answer natively on that very first probe. The
+  // hook is installed by config/webidl-branding.js and self-deletes, so
+  // the steady-state cost is one failed global lookup per unmarked call.
+  const lazy = globalThis.__obscura_lazy_mark_surface;
+  // Runtime only: during the snapshot build there is no document and no
+  // page, and consuming the hook there would leave the runtime realm
+  // without its lazy safety net.
+  let runtime = false;
+  try { runtime = typeof globalThis.document !== 'undefined'; } catch (_e) {}
+  if (typeof lazy === 'function' && runtime) {
+    delete globalThis.__obscura_lazy_mark_surface;
+    try { lazy(); } catch (_e) {}
+    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
+    if (_nativeFns.has(this)) {
+      return `function ${this.name || ''}() { [native code] }`;
+    }
+  }
   return _origToString.call(this);
 };
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+// Mark every function-valued own member of a shim object: value functions
+// and both halves of accessor pairs. Construction sites that mint fresh
+// instances after the finalize sweeps (navigation entries, IDB requests,
+// cache results) run this so a page-visible instance never answers
+// Function.prototype.toString with engine source. Nesting levels below
+// `depth` (sub-objects like an IDB request's implicit internals) are walked
+// with the same rule; cycles are cut by identity. Returns the input.
+function _markNativeObject(obj, depth) {
+  if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return obj;
+  const level = depth === undefined ? 1 : depth;
+  if (level < 0) return obj;
+  let keys;
+  try { keys = Reflect.ownKeys(obj); } catch (_e) { return obj; }
+  for (const key of keys) {
+    let d;
+    try { d = Object.getOwnPropertyDescriptor(obj, key); } catch (_e) { continue; }
+    if (!d) continue;
+    if (typeof d.value === 'function') _markNative(d.value);
+    if (typeof d.get === 'function') _markNative(d.get);
+    if (typeof d.set === 'function') _markNative(d.set);
+    if (level > 0 && d.value && typeof d.value === 'object') {
+      _markNativeObject(d.value, level - 1);
+    }
+  }
+  return obj;
+}
 // DOM instance internals live under isolate-global symbols rather than own
 // string-keyed properties. `Object.getOwnPropertyNames(document)` returns
 // non-enumerable own properties too, so a non-enumerable string slot still

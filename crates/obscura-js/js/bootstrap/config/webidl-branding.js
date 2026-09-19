@@ -385,15 +385,39 @@
 // Function.prototype.toString with its bootstrap source, which is what an
 // anti-tamper probe compares against a fresh realm's reference. Re-walking
 // is idempotent: the registries behind _markNative are a WeakSet/WeakMap.
-(function _markRemainingBuiltinsNative() {
+//
+// The body is a named function, not an IIFE-only pass, because the surface
+// does not stop changing when this module finishes: __obscura_init replaces
+// visualViewport, re-installs viewport and child-context accessors, and a
+// fresh runtime's ECMAScript intrinsics (WebAssembly) are not the snapshot
+// objects this module walked. It runs here once and again at the end of
+// __obscura_init (config/page-init.js), after that install work is done.
+// filterToPristine: when true, only globals present at init-end (the
+// _pristineGlobalNames census, config/page-init.js) are walked. A page's own
+// global functions -- which a browser reports with their source, not
+// "[native code]" -- must never be marked, so any pass that runs after page
+// scripts could have run must set this. The boot-time call uses false; the
+// lazy toString trigger and the frame-realm init pass use true.
+function _obscuraMarkSurfaceNative(filterToPristine) {
   if (typeof _markNative !== 'function') return;
+  const pristine = filterToPristine ? _pristineGlobalNames : null;
+  const known = (name) => !pristine || pristine.has(name);
   const seen = new Set();
   const nameOf = (fn, name) => {
     try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_e) {}
   };
-  function markMembers(owner) {
+  // The rename parameter is only true on WebIDL interface objects and the
+  // Window's own slots, where Chrome derives an accessor's visible name from
+  // its slot ("get memory" on MemoryInfo.prototype). Namespace objects play
+  // by the other convention: Chrome's console.memory accessor keeps an empty
+  // .name, so marking must not invent one there.
+  function markMembers(owner, rename) {
+    // Reflect.ownKeys, not getOwnPropertyNames: the [Symbol.toStringTag]
+    // getters on interface prototypes and Window[Symbol.hasInstance] are as
+    // page-visible as any string-keyed member, and an unmarked one answers
+    // toString with its bootstrap source.
     let keys;
-    try { keys = Object.getOwnPropertyNames(owner); } catch (_e) { return; }
+    try { keys = Reflect.ownKeys(owner); } catch (_e) { return; }
     for (const key of keys) {
       let d;
       try { d = Object.getOwnPropertyDescriptor(owner, key); } catch (_e) { continue; }
@@ -401,18 +425,35 @@
       if (typeof d.value === 'function') {
         // An anonymous function installed under a slot (URL.createObjectURL's
         // plain assignment drops the name) must carry the slot's name.
-        if (d.value.name === '') nameOf(d.value, key);
+        if (rename && typeof key === 'string' && d.value.name === '') nameOf(d.value, key);
         _markNative(d.value);
       }
       if (typeof d.get === 'function') {
-        // 'get'/'set' are shorthand-definition artifacts (`get() {}`), never
-        // the accessor's real name; Chrome reports "get <key>".
-        if (d.get.name === '' || d.get.name === 'get') nameOf(d.get, 'get ' + key);
-        if (!_nativeStr.has(d.get)) _markNativeAs(d.get, 'function get ' + key + '() { [native code] }');
+        if (typeof key === 'string') {
+          // 'get'/'set' are shorthand-definition artifacts (`get() {}`), never
+          // the accessor's real name; Chrome reports "get <key>".
+          if (rename && (d.get.name === '' || d.get.name === 'get')) nameOf(d.get, 'get ' + key);
+          if (!_nativeStr.has(d.get)) _markNativeAs(d.get, 'function get ' + key + '() { [native code] }');
+        } else {
+          // Symbol-keyed accessors: V8 renders the computed name
+          // ("get [Symbol.toStringTag]"), which _markNative reproduces
+          // verbatim; a string template would mangle it.
+          if (rename && (d.get.name === '' || d.get.name === 'get')) {
+            nameOf(d.get, 'get ' + (key.description ? '[' + key.description + ']' : ''));
+          }
+          _markNative(d.get);
+        }
       }
       if (typeof d.set === 'function') {
-        if (d.set.name === '' || d.set.name === 'set') nameOf(d.set, 'set ' + key);
-        if (!_nativeStr.has(d.set)) _markNativeAs(d.set, 'function set ' + key + '() { [native code] }');
+        if (typeof key === 'string') {
+          if (rename && (d.set.name === '' || d.set.name === 'set')) nameOf(d.set, 'set ' + key);
+          if (!_nativeStr.has(d.set)) _markNativeAs(d.set, 'function set ' + key + '() { [native code] }');
+        } else {
+          if (rename && (d.set.name === '' || d.set.name === 'set')) {
+            nameOf(d.set, 'set ' + (key.description ? '[' + key.description + ']' : ''));
+          }
+          _markNative(d.set);
+        }
       }
     }
   }
@@ -421,21 +462,156 @@
     _markNative(ctor);
     // Static interface members (URL.createObjectURL, URL.parse) are as
     // page-visible as prototype members.
-    markMembers(ctor);
+    markMembers(ctor, true);
     const proto = ctor.prototype;
     if (!proto || seen.has(proto)) return;
     seen.add(proto);
-    markMembers(proto);
+    markMembers(proto, true);
+    // Factory-built interface chains: the WebGL context class behind its
+    // public constructor, the frame _ScopedDocument under Document. Their
+    // members are as page-visible as the interface's own.
+    let parent = null;
+    try { parent = Object.getPrototypeOf(proto); } catch (_e) {}
+    for (let hop = 0; hop < 8 && parent; hop++) {
+      if (parent === Object.prototype || parent === Function.prototype) break;
+      if (seen.has(parent)) break;
+      seen.add(parent);
+      markMembers(parent, true);
+      try { parent = Object.getPrototypeOf(parent); } catch (_e) { break; }
+    }
   }
+  // Namespace and instance objects sitting on the global are as page-visible
+  // as the constructors: WebAssembly.instantiateStreaming, CSS.supports,
+  // console.error, navigation.*, caches.*, indexedDB.*, visualViewport.*,
+  // speechSynthesis.*, chrome.runtime.*, document.implementation.*, the
+  // Location accessors, screen/navigator sub-objects all used to answer
+  // toString with bootstrap source. Walk them depth- and node-bounded with
+  // cycle protection (window === window.window). Reading an accessor here
+  // descends into the object it returns; every getter on the bootstrap
+  // surface is pure, and getters that mint fresh objects mark each instance
+  // again at their construction site (_markNativeObject). Prototype chains
+  // are followed so factory-built instances (the frame _ScopedDocument, the
+  // WebGL context class behind its public interface) are covered too.
+  (function _markGlobalObjectSurfaces() {
+    // Runtime-only. Descending into window namespace objects while the
+    // snapshot is being created reads lazily-backed getters in that alien
+    // environment and perturbs the frozen heap in ways runtime behavior
+    // depends on. `document` does not exist during the snapshot build and
+    // exists in every live Window realm by the time this pass can run.
+    if (typeof globalThis.document === 'undefined') return;
+    const visited = new Set();
+    let budget = 20000;
+    const seenProtos = new Set();
+    function markProtoChain(obj) {
+      let p = obj;
+      for (let hop = 0; hop < 8 && p; hop++) {
+        if (p === Object.prototype || p === Function.prototype) break;
+        if (seenProtos.has(p)) break;
+        seenProtos.add(p);
+        markMembers(p, false);
+        try { p = Object.getPrototypeOf(p); } catch (_e) { break; }
+      }
+    }
+    function scan(obj, depth) {
+      if (!obj || budget <= 0 || depth > 4) return;
+      if (typeof obj !== 'object' && typeof obj !== 'function') return;
+      if (visited.has(obj)) return;
+      visited.add(obj);
+      budget--;
+      markMembers(obj, false);
+      markProtoChain(obj);
+      let keys;
+      try { keys = Reflect.ownKeys(obj); } catch (_e) { return; }
+      for (const key of keys) {
+        let d;
+        try { d = Object.getOwnPropertyDescriptor(obj, key); } catch (_e) { continue; }
+        if (!d) continue;
+        let v;
+        if ('value' in d) v = d.value;
+        else {
+          try { v = obj[key]; } catch (_e) { continue; }
+        }
+        if (typeof v === 'function') {
+          if (!d.get && !d.set) walkConstructor(v);
+        } else if (v && typeof v === 'object') {
+          scan(v, depth + 1);
+        }
+      }
+    }
+    // A curated list rather than a blind walk over every global getter:
+    // reading arbitrary window accessors here perturbs the resource
+    // pipeline's startup (the load-event race the image lifecycle tests
+    // exercise), and the census of namespace surfaces is stable. New
+    // namespace surfaces must be added here; their construction sites
+    // should also mark fresh instances with _markNativeObject.
+    const allSurfaces = [
+      'navigation', 'caches', 'indexedDB', 'visualViewport', 'CSS',
+      'chrome', 'speechSynthesis', 'console', 'performance', 'crypto',
+      'screen', 'history', 'scheduler', 'customElements', 'cookieStore',
+      'styleMedia', 'external', 'trustedTypes', 'localStorage',
+      'sessionStorage', 'location', 'document', 'navigator', 'Deno',
+      '__bootstrap',
+    ];
+    for (const name of allSurfaces) {
+      if (!known(name)) continue;
+      let val;
+      try { val = globalThis[name]; } catch (_e) { continue; }
+      if (val && (typeof val === 'object')) scan(val, 1);
+    }
+  })();
   const names = Object.getOwnPropertyNames(globalThis);
   for (const name of names) {
     if (!/^[A-Z]/.test(name)) continue;
+    if (!known(name)) continue;
     let val;
     try { val = globalThis[name]; } catch (_e) { continue; }
     walkConstructor(val);
   }
   // Window's own slots follow the same rules: nameless shims take the slot's
   // name (Chrome reports setTimeout.name === "setTimeout") and its accessors
-  // answer with the `get <key>` shape every other accessor uses.
-  markMembers(globalThis);
-})();
+  // answer with the `get <key>` shape every other accessor uses. Under the
+  // pristine filter, page-added globals are skipped entirely: a page
+  // function must answer toString with its source, exactly as a browser
+  // does, so only slots the engine itself installed are touched.
+  if (!filterToPristine) {
+    markMembers(globalThis, true);
+  } else {
+    // Page-added globals keep their own identity: a page function must
+    // answer toString with its source, exactly as a browser does. Only
+    // slots the engine itself installed (the pristine census) are touched.
+    const own = Object.getOwnPropertyNames(globalThis);
+    for (const name of own) {
+      if (!pristine.has(name)) continue;
+      let val;
+      try { val = globalThis[name]; } catch (_e) { continue; }
+      // window/self/frames/globalThis alias the global itself; marking it
+      // here would sweep up every page-added global function with it.
+      if (val === globalThis) continue;
+      if (val && (typeof val === 'object')) markMembers(val, true);
+    }
+  }
+}
+_obscuraMarkSurfaceNative();
+// Exported for the core-half page-init scope: this function is declared
+// inside the deferred-surface wrapper, so `__obscura_init` (which re-installs
+// visualViewport, viewport accessors and the window frame indices after this
+// module has run) cannot reach it as a lexical binding. Same pattern as
+// __obscura_install_window_surface above.
+Object.defineProperty(globalThis, '__obscura_mark_surface_native', {
+  value: () => _obscuraMarkSurfaceNative(true),
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+// Lazy trigger for the same sweep: installed for the Function.prototype
+//.toString override in config/bootstrap.js, which runs it once on the first
+// unmarked probe and then deletes it. This covers everything installed after
+// this module's own pass (init's replacements, lazy accessors, per-runtime
+// intrinsics) without paying the scan inside page init, where synchronous
+// work perturbs the image lifecycle's load-event delivery.
+Object.defineProperty(globalThis, '__obscura_lazy_mark_surface', {
+  value: () => _obscuraMarkSurfaceNative(true),
+  writable: true,
+  enumerable: false,
+  configurable: true,
+});
