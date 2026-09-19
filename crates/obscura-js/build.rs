@@ -31,12 +31,22 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
     let mut source = String::from("(function () {\n");
     let mut module_count = 0;
     let mut deferred_open = false;
+    // The console module is core-surface: every realm (main, pre-hydration
+    // frame, worker) must install it during the core boot, so its module has
+    // to stay above the @obscura-deferred-surface marker. If it slips below,
+    // frame realms boot without an op-routed console and the challenge's
+    // pre-hydration probe goes blind (Step 316); fail the build instead.
+    let mut console_module_seen = false;
 
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed == DEFERRED_MARKER {
             assert!(!deferred_open, "bootstrap manifest has two deferred markers");
             assert!(module_count > 0, "deferred marker before any core module");
+            assert!(
+                console_module_seen,
+                "tools/console.js must be listed above the deferred-surface marker"
+            );
             source.push_str("var __obscura_run_deferred_surface = function () {\n");
             deferred_open = true;
             continue;
@@ -46,6 +56,9 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
         };
         let relative_path = relative_path.trim();
         assert!(!relative_path.is_empty(), "empty bootstrap module path");
+        if relative_path == "tools/console.js" {
+            console_module_seen = true;
+        }
         let module_path = source_root.join(relative_path);
         println!("cargo:rerun-if-changed={}", module_path.display());
         let module = fs::read_to_string(&module_path).unwrap_or_else(|error| {

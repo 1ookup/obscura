@@ -8005,6 +8005,159 @@ mod tests {
         );
     }
 
+    /// A frame realm booted through the deferred-surface split (Step 312)
+    /// must carry the full, op-routed console from the core boot: the
+    /// challenge's sandbox probe calls console.* as the first thing its
+    /// script does, and the ops.tsv console rows from that realm are the
+    /// diagnostic channel for locating its failing checks (profile Steps
+    /// 313-316). The console module therefore lives in the bootstrap CORE
+    /// half, above the @obscura-deferred-surface marker, and the assembler
+    /// fails the build if it slips below. Pins, per realm: the format-string
+    /// passthrough (%s/%d/%c), the full method set, native-marked toString,
+    /// undefined returns, the console tag and memory brand, the Chrome-shaped
+    /// serialization of RegExp and node arguments, and the console.[level]
+    /// op rows the trace file is built from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_console_routes_op_rows_with_full_fidelity() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://example.com/console-frame");
+        rt.run_page_init();
+
+        const PROBE: &str = r#"
+            (() => {
+                const seen = [];
+                const op = Deno.core.ops.op_console_msg;
+                Deno.core.ops.op_console_msg = (level, msg) => { seen.push([level, msg]); };
+                try {
+                    console.log("str %s num %d", "txt", 42);
+                    console.log("%c%d", "font-size:0;color:transparent", NaN);
+                    console.error("err %s", "boom");
+                    console.warn("warn %d", 7);
+                    console.info("info");
+                    console.debug("debug");
+                    console.log(/.*.*=.*/);
+                    const a = document.createElement("a");
+                    a.setAttribute("href", "https://x.test/p");
+                    console.log(a);
+                    console.log(document);
+                    console.table(["x"]);
+                    console.dir({ q: 1 });
+                    console.trace("traceline");
+                } finally {
+                    Deno.core.ops.op_console_msg = op;
+                }
+                const methods = ["log", "error", "warn", "info", "debug", "dir",
+                    "dirxml", "table", "trace", "group", "groupCollapsed", "groupEnd",
+                    "clear", "count", "countReset", "assert", "profile", "profileEnd",
+                    "time", "timeLog", "timeEnd", "timeStamp", "context", "createTask"];
+                const nativeSource = (fn) => {
+                    try { return Function.prototype.toString.call(fn); } catch (e) { return ""; }
+                };
+                return {
+                    seen,
+                    methodsPresent: methods.every(m => typeof console[m] === "function"),
+                    nativeToString: methods.every(m =>
+                        nativeSource(console[m]) === `function ${m}() { [native code] }`),
+                    returnsUndefined:
+                        console.log("ret") === undefined && console.error("ret") === undefined,
+                    tag: Object.prototype.toString.call(console),
+                    memoryTag: Object.prototype.toString.call(console.memory),
+                };
+            })()
+        "#;
+
+        // Top realm first: the same probe shape the top-level document runs.
+        let main = rt
+            .evaluate_for_cdp(PROBE, true, true)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let main_seen: Vec<serde_json::Value> = main
+            .get("seen")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            main_seen,
+            serde_json::json!([
+                ["log", "str %s num %d txt 42"],
+                ["log", "%c%d font-size:0;color:transparent NaN"],
+                ["error", "err %s boom"],
+                ["warn", "warn %d 7"],
+                ["log", "info"],
+                ["log", "debug"],
+                ["log", "/.*.*=.*/"],
+                ["log", "a"],
+                ["log", "#document"],
+                ["log", "[object Array]"],
+                ["log", "[object Object]"],
+                ["log", "traceline"],
+            ])
+            .as_array()
+            .unwrap()
+            .as_slice(),
+            "top-realm console rows must be op-routed with Chrome-shaped values",
+        );
+
+        // Frame realm created pre-hydration (deferred-surface boot). The
+        // probe's first act is console traffic, before any other surface
+        // access, mirroring the challenge's widget-realm probe.
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://challenges.example/widget', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "console-frame",
+            1,
+            root,
+            "https://challenges.example/widget",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm("console-frame", 1, "<console-probe>", PROBE)
+            .unwrap();
+        assert_eq!(
+            frame
+                .get("seen")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .clone(),
+            main_seen,
+            "a pre-hydration frame realm must route the same console rows",
+        );
+        for realm in [(&main, "main"), (&frame, "frame")] {
+            let (value, label) = realm;
+            for key in [
+                "methodsPresent", "nativeToString", "returnsUndefined",
+            ] {
+                assert_eq!(
+                    value.get(key).and_then(serde_json::Value::as_bool),
+                    Some(true),
+                    "{label} realm console {key} must hold",
+                );
+            }
+            assert_eq!(
+                value.get("tag").and_then(serde_json::Value::as_str),
+                Some("[object console]"),
+                "{label} realm console tag must match Chrome",
+            );
+            assert_eq!(
+                value.get("memoryTag").and_then(serde_json::Value::as_str),
+                Some("[object MemoryInfo]"),
+                "{label} realm console.memory must be a core-surface MemoryInfo",
+            );
+        }
+    }
+
     /// `measureText` must return a branded `TextMetrics` whose numbers live on
     /// the prototype, the way Chrome does. It used to hand back a plain object
     /// with three own properties, so `Object.prototype.toString.call(...)` read
