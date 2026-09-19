@@ -26,7 +26,7 @@ function _idbPersist(name, state) {
 }
 function _idbKey(key) { return JSON.stringify(key === undefined ? null : key); }
 function _idbRequest(produceResult) {
-  const req = {
+  const req = _markNativeObject({
     result: undefined,
     error: null,
     source: null,
@@ -37,7 +37,7 @@ function _idbRequest(produceResult) {
     onupgradeneeded: null,
     addEventListener(type, fn) { req['on' + type] = fn; },
     removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
-  };
+  });
   Promise.resolve().then(() => {
     try {
       req.result = produceResult();
@@ -60,7 +60,7 @@ function _idbObjectStore(name, tx) {
   const data = dbState && dbState.stores[name] ? dbState.stores[name].records : {};
   const save = () => { if (tx && tx._dbName) _idbPersist(tx._dbName, tx._dbState); };
   const keys = () => Object.keys(data).map(k => { try { return JSON.parse(k); } catch (e) { return k; } });
-  return {
+  return _markNativeObject({
     name,
     keyPath: null,
     autoIncrement: false,
@@ -77,10 +77,10 @@ function _idbObjectStore(name, tx) {
     count() { return _idbRequest(() => Object.keys(data).length); },
     openCursor() { return _idbRequest(() => null); },
     openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
+    createIndex() { return _markNativeObject({ name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }); },
+    index() { return _markNativeObject({ get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }); },
     deleteIndex() {},
-  };
+  });
 }
 
 function _idbTransaction(dbState, dbName, storeNames, mode) {
@@ -88,7 +88,7 @@ function _idbTransaction(dbState, dbName, storeNames, mode) {
   const names = Array.isArray(storeNames) ? storeNames : [storeNames];
   const txState = { _dbState: dbState, _dbName: dbName };
   for (const n of names) if (dbState.stores[String(n)]) stores.set(String(n), _idbObjectStore(String(n), txState));
-  const tx = {
+  const tx = _markNativeObject({
     _dbState: dbState, _dbName: dbName,
     db: null,
     mode: mode || 'readonly',
@@ -106,7 +106,7 @@ function _idbTransaction(dbState, dbName, storeNames, mode) {
     commit() {},
     addEventListener(type, fn) { tx['on' + type] = fn; },
     removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
-  };
+  });
   Promise.resolve().then(() => {
     if (typeof tx.oncomplete === 'function') {
       try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
@@ -118,7 +118,7 @@ function _idbTransaction(dbState, dbName, storeNames, mode) {
 function _idbDatabase(name, version) {
   const state = _idbState(name);
   const objectStoreNames = { contains(n) { return Object.prototype.hasOwnProperty.call(state.stores, String(n)); }, get length() { return Object.keys(state.stores).length; }, item(i) { return Object.keys(state.stores)[i] || null; } };
-  return {
+  return _markNativeObject({
     name,
     version: state.version || version,
     objectStoreNames,
@@ -130,7 +130,7 @@ function _idbDatabase(name, version) {
     close() {},
     onversionchange: null, onabort: null, onerror: null, onclose: null,
     addEventListener() {}, removeEventListener() {},
-  };
+  });
 }
 
 function registerIndexedDbSurface() {
@@ -141,9 +141,9 @@ globalThis.indexedDB = {
     const requested = version === undefined ? 1 : Number(version);
     const state = _idbState(dbName);
     const oldVersion = state.version;
-    const req = { result: undefined, error: null, source: null, transaction: null, readyState: 'pending', onsuccess: null, onerror: null, onupgradeneeded: null,
+    const req = _markNativeObject({ result: undefined, error: null, source: null, transaction: null, readyState: 'pending', onsuccess: null, onerror: null, onupgradeneeded: null,
       addEventListener(type, fn) { req['on' + type] = fn; },
-      removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; } };
+      removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; } });
     Promise.resolve().then(() => {
       if (requested > oldVersion) {
         state.version = requested;
@@ -220,7 +220,14 @@ Object.defineProperty(globalThis, 'IDBKeyRange', {
 
 function registerCacheSurface() {
 globalThis.caches = {
-  open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
+  // Each open() hands back a fresh Cache-shaped object; its methods are own
+  // properties minted after the finalize sweeps, so mark them per instance.
+  open() { return Promise.resolve(_markNativeObject({
+    match() { return Promise.resolve(undefined); },
+    put() { return Promise.resolve(); },
+    delete() { return Promise.resolve(false); },
+    keys() { return Promise.resolve([]); },
+  })); },
   match() { return Promise.resolve(undefined); },
   has() { return Promise.resolve(false); },
   delete() { return Promise.resolve(false); },

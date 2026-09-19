@@ -28,7 +28,10 @@ function registerNavigationSurface() {
   const makeEntry = () => {
     const key = "obscura-" + serial;
     const state = history.state;
-    return {
+    // Entries are minted per navigation, long after the finalize sweeps, so
+    // each fresh instance carries its own getState/addEventListener/
+    // removeEventListener functions and must be marked at construction.
+    return _markNativeObject({
       id: key,
       key,
       index: Math.max(0, history.length - 1),
@@ -37,7 +40,7 @@ function registerNavigationSurface() {
       getState() { return state; },
       addEventListener() {},
       removeEventListener() {},
-    };
+    });
   };
   let entry = makeEntry();
   const changed = (from) => {
