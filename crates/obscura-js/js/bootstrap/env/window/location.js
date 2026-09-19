@@ -214,9 +214,9 @@ const _DOCUMENT_EVENT_HANDLERS = [
 // snapshots the assigning code's execution-source label.
 //
 // Placement note: Chrome splits these across HTMLElement.prototype and
-// SVGElement.prototype; Obscura's HTML interface layer is one Element class
-// (globalThis.HTMLElement === Element), so the HTML half lives on
-// Element.prototype and SVGElement installs its own set later (svg-elements.js).
+// SVGElement.prototype; Obscura's event-handler accessors live on
+// Element.prototype (the shared base of both interface layers) and
+// SVGElement installs its own set later (svg-elements.js).
 for (const _ev of _GLOBAL_EVENT_HANDLERS.concat(_WINDOW_EVENT_HANDLERS)) {
   const _on = "on" + _ev;
   if (!(_on in globalThis)) __obscuraTraceDefineHandler(globalThis, _on, true);

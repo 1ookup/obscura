@@ -12893,6 +12893,142 @@ RequestRedirect value",
         );
     }
 
+    // Chrome's HTML interface lattice routes every HTML element through a real
+    // HTMLElement layer: `HTMLDivElement > HTMLElement > Element > Node`. This
+    // engine used to publish HTMLElement as a bare alias of Element
+    // (env/css/supports.js), so `instanceof HTMLElement` answered true through
+    // the alias while no prototype chain contained the layer -- a shape a
+    // chain-walking inspection probe reads directly (the challenge's
+    // sandboxed-iframe console probe fails right where it creates an <a>).
+    // Local headless-Chrome oracle: chain walks, illegal-constructor
+    // TypeError, and the media family's deeper parent all match Chrome.
+    #[test]
+    fn html_elements_use_the_chrome_interface_lattice() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div><a id="a"></a></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const chainNames = (el) => {
+                    const names = [];
+                    let p = Object.getPrototypeOf(el);
+                    while (p && p.constructor && names.length < 8) {
+                        names.push(p.constructor.name);
+                        p = Object.getPrototypeOf(p);
+                    }
+                    return names;
+                };
+                const div = document.getElementById("d");
+                const anchor = document.getElementById("a");
+                const media = document.createElement("video");
+                let illegalThrows = false, illegalMessage = "";
+                try { new HTMLElement(); } catch (e) {
+                    illegalThrows = e instanceof TypeError;
+                    illegalMessage = String(e.message).slice(0, 60);
+                }
+                return {
+                    divChain: chainNames(div),
+                    anchorChain: chainNames(anchor),
+                    divIsHtmlElement: div instanceof HTMLElement,
+                    divIsElement: div instanceof Element,
+                    anchorIsHtmlElement: anchor instanceof HTMLElement,
+                    videoChain: chainNames(media),
+                    videoIsMedia: media instanceof HTMLMediaElement,
+                    videoIsHtmlElement: media instanceof HTMLElement,
+                    protoDiv: Object.getPrototypeOf(HTMLDivElement.prototype) === HTMLElement.prototype,
+                    protoMedia: Object.getPrototypeOf(HTMLMediaElement.prototype) === HTMLElement.prototype,
+                    protoAudio: Object.getPrototypeOf(HTMLAudioElement.prototype) === HTMLMediaElement.prototype,
+                    htmlElementIsNotElement: HTMLElement !== Element,
+                    htmlElementName: HTMLElement.name,
+                    protoHtmlElementParent: Object.getPrototypeOf(HTMLElement.prototype) === Element.prototype,
+                    unknownCtor: document.createElement("nosuchtag").constructor.name,
+                    customNameCtor: document.createElement("no-such-tag").constructor.name,
+                    illegalThrows,
+                    illegalMessage,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "divChain": ["HTMLDivElement", "HTMLElement", "Element", "Node", "EventTarget", "Object"],
+                "anchorChain": ["HTMLAnchorElement", "HTMLElement", "Element", "Node", "EventTarget", "Object"],
+                "divIsHtmlElement": true,
+                "divIsElement": true,
+                "anchorIsHtmlElement": true,
+                "videoChain": ["HTMLVideoElement", "HTMLMediaElement", "HTMLElement", "Element", "Node", "EventTarget", "Object"],
+                "videoIsMedia": true,
+                "videoIsHtmlElement": true,
+                "protoDiv": true,
+                "protoMedia": true,
+                "protoAudio": true,
+                "htmlElementIsNotElement": true,
+                "htmlElementName": "HTMLElement",
+                "protoHtmlElementParent": true,
+                "unknownCtor": "HTMLUnknownElement",
+                "customNameCtor": "HTMLElement",
+                "illegalThrows": true,
+                "illegalMessage": "Failed to construct 'HTMLElement': Illegal constructor",
+            })
+        );
+    }
+
+    // HTMLHyperlinkElementUtils stringifier: Chrome's <a>/<area> `toString`
+    // answers the IDL `href` (empty string when the attribute is absent), so
+    // `String(anchor)` is the resolved URL, never "[object HTMLAnchorElement]".
+    // The challenge's inspection probe stringifies a freshly created anchor;
+    // our engine used to answer the Object.prototype.toString fallback there.
+    #[test]
+    fn anchor_and_area_stringify_to_their_href_like_chrome() {
+        let mut rt = setup_runtime(r#"<html><body></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const a = document.createElement("a");
+                const area = document.createElement("area");
+                const bare = [String(a), a.toString(), `${a}`, Object.prototype.toString.call(a)];
+                a.href = "https://example.com/p?q=1#f";
+                const set = [String(a), a.toString(), `${a}`];
+                const areaSet = (() => { area.href = "https://example.net/x"; return [String(area), area.toString()]; })();
+                const plain = (() => {
+                    const d = document.createElement("div");
+                    return String(d);
+                })();
+                const desc = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, "toString");
+                return {
+                    bareEmpty: bare[0] === "" && bare[1] === "" && bare[2] === "",
+                    bareTagString: bare[3],
+                    setResolved: set,
+                    areaResolved: areaSet,
+                    plainDivStillObjectString: plain === "[object HTMLDivElement]",
+                    toStringKind: typeof desc.value,
+                    enumerable: desc.enumerable,
+                    writable: desc.writable,
+                    configurable: desc.configurable,
+                    name: desc.value.name,
+                    length: desc.value.length,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "bareEmpty": true,
+                "bareTagString": "[object HTMLAnchorElement]",
+                "setResolved": ["https://example.com/p?q=1#f", "https://example.com/p?q=1#f", "https://example.com/p?q=1#f"],
+                "areaResolved": ["https://example.net/x", "https://example.net/x"],
+                "plainDivStillObjectString": true,
+                "toStringKind": "function",
+                "enumerable": true,
+                "writable": true,
+                "configurable": true,
+                "name": "toString",
+                "length": 0,
+            })
+        );
+    }
+
     #[test]
     fn foreign_inner_html_and_contextual_fragments_keep_svg_namespace() {
         let mut rt = setup_runtime("<html><body></body></html>");

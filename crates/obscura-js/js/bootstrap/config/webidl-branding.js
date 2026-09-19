@@ -6,67 +6,6 @@
 // censuses (149) nor in the 151 renderer trace: their legacy interfaces were
 // removed, and the elements fall through to HTMLUnknownElement, so no
 // interface is built or published for them.
-const HTML_TAGS = {
-  a: 'HTMLAnchorElement', abbr: 'HTMLElement', acronym: 'HTMLElement',
-  address: 'HTMLElement', applet: 'HTMLUnknownElement', area: 'HTMLAreaElement',
-  article: 'HTMLElement', aside: 'HTMLElement', audio: 'HTMLAudioElement',
-  b: 'HTMLElement', base: 'HTMLBaseElement', basefont: 'HTMLUnknownElement',
-  bdi: 'HTMLElement', bdo: 'HTMLElement', bgsound: 'HTMLUnknownElement',
-  big: 'HTMLElement', blink: 'HTMLElement', blockquote: 'HTMLQuoteElement',
-  body: 'HTMLBodyElement', br: 'HTMLBRElement', button: 'HTMLButtonElement',
-  canvas: 'HTMLCanvasElement', caption: 'HTMLTableCaptionElement',
-  center: 'HTMLElement', cite: 'HTMLElement', code: 'HTMLElement',
-  col: 'HTMLTableColElement', colgroup: 'HTMLTableColElement',
-  data: 'HTMLDataElement', datalist: 'HTMLDataListElement',
-  dd: 'HTMLElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
-  dfn: 'HTMLElement', dialog: 'HTMLDialogElement', dir: 'HTMLDirectoryElement',
-  div: 'HTMLDivElement', dl: 'HTMLDListElement', dt: 'HTMLElement',
-  em: 'HTMLElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
-  figcaption: 'HTMLElement', figure: 'HTMLElement', font: 'HTMLFontElement',
-  footer: 'HTMLElement', form: 'HTMLFormElement', frame: 'HTMLFrameElement',
-  frameset: 'HTMLFrameSetElement', h1: 'HTMLHeadingElement',
-  h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement',
-  h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement', head: 'HTMLHeadElement',
-  header: 'HTMLElement', hgroup: 'HTMLElement', hr: 'HTMLHRElement',
-  html: 'HTMLHtmlElement', i: 'HTMLElement', iframe: 'HTMLIFrameElement',
-  img: 'HTMLImageElement', input: 'HTMLInputElement', ins: 'HTMLModElement',
-  kbd: 'HTMLElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
-  li: 'HTMLLIElement', link: 'HTMLLinkElement', main: 'HTMLElement',
-  map: 'HTMLMapElement', mark: 'HTMLElement', marquee: 'HTMLMarqueeElement',
-  menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
-  nav: 'HTMLElement', nobr: 'HTMLElement', noembed: 'HTMLElement',
-  noframes: 'HTMLElement', noscript: 'HTMLElement', object: 'HTMLObjectElement',
-  ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
-  option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
-  param: 'HTMLParamElement', picture: 'HTMLPictureElement',
-  plaintext: 'HTMLElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
-  q: 'HTMLQuoteElement', rp: 'HTMLElement', rt: 'HTMLElement',
-  ruby: 'HTMLElement', s: 'HTMLElement', samp: 'HTMLElement',
-  script: 'HTMLScriptElement', search: 'HTMLElement', section: 'HTMLElement',
-  select: 'HTMLSelectElement', slot: 'HTMLSlotElement', small: 'HTMLElement',
-  source: 'HTMLSourceElement', span: 'HTMLSpanElement', strike: 'HTMLElement',
-  strong: 'HTMLElement', style: 'HTMLStyleElement', sub: 'HTMLElement',
-  summary: 'HTMLElement', sup: 'HTMLElement', table: 'HTMLTableElement',
-  tbody: 'HTMLTableSectionElement', td: 'HTMLTableCellElement',
-  template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
-  tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement',
-  thead: 'HTMLTableSectionElement', time: 'HTMLTimeElement',
-  title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
-  tt: 'HTMLElement', u: 'HTMLElement', ul: 'HTMLUListElement',
-  var: 'HTMLElement', video: 'HTMLVideoElement', wbr: 'HTMLElement',
-  xmp: 'HTMLElement',
-};
-const SVG_TAGS = {
-  svg: 'SVGSVGElement', path: 'SVGPathElement', text: 'SVGTextElement',
-  g: 'SVGGElement', circle: 'SVGCircleElement', rect: 'SVGRectElement',
-  line: 'SVGLineElement', polyline: 'SVGPolylineElement',
-  polygon: 'SVGPolygonElement', ellipse: 'SVGEllipseElement',
-  image: 'SVGImageElement', use: 'SVGUseElement', tspan: 'SVGTSpanElement',
-  title: 'SVGTitleElement', desc: 'SVGDescElement', defs: 'SVGDefsElement',
-  symbol: 'SVGSymbolElement', marker: 'SVGMarkerElement', clipPath: 'SVGClipPathElement',
-  mask: 'SVGMaskElement', pattern: 'SVGPatternElement', linearGradient: 'SVGLinearGradientElement',
-  radialGradient: 'SVGRadialGradientElement', stop: 'SVGStopElement',
-};
 
 (function _brandWebIDLInterfaces() {
   var names = [
@@ -569,16 +508,39 @@ const SVG_TAGS = {
 // one for every other interface the tag table names, and registers
 // tag -> interface for the wrapper factory in env/dom/iframe-element.js.
 //
-// The parent of every class built here is HTMLElement, which is Element in
-// this engine, so `Object.getPrototypeOf(HTMLDivElement.prototype)` is
-// HTMLElement.prototype either way. Interfaces with a deeper parent
-// (HTMLMediaElement's subclasses) reach this point as real implementations
-// and are left alone.
+// The parent of every HTML class here is a real HTMLElement interface whose
+// prototype hangs off Element.prototype -- Chrome's HTML lattice answers
+// `HTMLDivElement > HTMLElement > Element > Node`, and a challenge-side
+// inspection probe that walks the chain (or stringifies an anchor) reads the
+// difference directly. HTMLElement itself used to be a bare alias of Element
+// (env/css/supports.js), which made every `instanceof HTMLElement` answer true
+// through the alias while no prototype chain actually contained it.
+// Interfaces with a deeper parent (HTMLMediaElement's subclasses) reach this
+// point as real implementations: their own parent is repointed onto
+// HTMLElement.prototype below, and their subclasses follow transitively.
 (function _installElementInterfaces() {
   const ElementCtor = globalThis.Element;
   if (typeof ElementCtor !== 'function' || !ElementCtor.prototype) return;
+  // The real HTMLElement interface. Direct script construction throws; the
+  // generated interfaces reach it through super(nid), and tags Chrome maps
+  // straight onto HTMLElement (b/i/abbr/...) are constructed internally with
+  // the interface key, so the guard keys on new.target plus that key.
+  const HTMLElementCtor = { HTMLElement: class extends ElementCtor {
+      constructor(nid, key) {
+        if (new.target === HTMLElementCtor
+            && (arguments.length !== 2 || key !== _elementInterfaceKey)) {
+          throw new TypeError("Failed to construct 'HTMLElement': Illegal constructor");
+        }
+        super(nid);
+      }
+      get [Symbol.toStringTag]() { return 'HTMLElement'; }
+    } }['HTMLElement'];
+  Object.defineProperty(HTMLElementCtor, 'length', { value: 0, configurable: true });
+  Object.defineProperty(globalThis, 'HTMLElement', {
+    value: _markNative(HTMLElementCtor), writable: true, enumerable: false, configurable: true,
+  });
   const install = (name) => {
-    const C = { [name]: class extends ElementCtor {
+    const C = { [name]: class extends HTMLElementCtor {
         constructor(nid, key) {
           // Internal wrappers pass the node id and env/dom/iframe-element.js's
           // construction key; page code reaches the TypeError a generated
@@ -603,10 +565,10 @@ const SVG_TAGS = {
   // mapping to it has to share the exact class the global publishes.
   built.HTMLUnknownElement = install('HTMLUnknownElement');
   const interfaceFor = (name) => {
-    if (name === 'HTMLElement') return ElementCtor;
+    if (name === 'HTMLElement') return HTMLElementCtor;
     const existing = globalThis[name];
     if (typeof existing === 'function' && existing !== ElementCtor
-        && !_chromeInterfaceShells.has(name)) {
+        && existing !== HTMLElementCtor && !_chromeInterfaceShells.has(name)) {
       // A real implementation owns this interface; only the tag binding is
       // new.
       return existing;
@@ -617,6 +579,22 @@ const SVG_TAGS = {
   for (const tag of Object.keys(HTML_TAGS)) {
     _elementInterfaceByTag[tag] = interfaceFor(HTML_TAGS[tag]);
   }
+  // Real element implementations were declared `extends Element` before the
+  // real HTMLElement existed (env/html/*, env/media/*, env/dom/iframe-element.js).
+  // Repoint their prototype and static chains onto HTMLElement so the whole
+  // lattice answers Chrome's walk; subclasses of these (HTMLAudioElement and
+  // HTMLVideoElement under HTMLMediaElement) follow transitively. The guard
+  // keeps anything already republished on HTMLElement untouched.
+  for (const name of ['HTMLLinkElement', 'HTMLInputElement', 'HTMLFormElement',
+    'HTMLIFrameElement', 'HTMLCanvasElement', 'HTMLTrackElement',
+    'HTMLMediaElement', 'HTMLImageElement', 'HTMLObjectElement', 'HTMLBodyElement']) {
+    const C = globalThis[name];
+    if (typeof C !== 'function' || !C.prototype) continue;
+    if (Object.getPrototypeOf(C.prototype) === ElementCtor.prototype) {
+      Object.setPrototypeOf(C.prototype, HTMLElementCtor.prototype);
+      if (Object.getPrototypeOf(C) === ElementCtor) Object.setPrototypeOf(C, HTMLElementCtor);
+    }
+  }
   // The wrapper for a local name no interface claims. Chrome answers
   // HTMLUnknownElement, except for a valid custom element name, which is an
   // ordinary HTMLElement until a CustomElementRegistry definition upgrades
@@ -624,9 +602,27 @@ const SVG_TAGS = {
   // before it can be a wrapper.
   _elementInterfaceUnknownTag = function (localName) {
     return _isValidCustomElementName(localName)
-      ? ElementCtor
+      ? HTMLElementCtor
       : built.HTMLUnknownElement;
   };
+  // HTMLHyperlinkElementUtils stringifier: Chrome's <a>/<area> `toString` is
+  // the IDL `href` (empty string when the attribute is absent), so
+  // `String(anchor)` never yields "[object HTMLAnchorElement]". The href
+  // accessor lives on Element.prototype here and already answers the resolved
+  // absolute URL / "" pair.
+  const hyperlinkStringifier = (name) => {
+    const C = globalThis[name];
+    if (typeof C !== 'function' || !C.prototype) return;
+    Object.defineProperty(C.prototype, 'toString', {
+      value: function toString() {
+        const h = this.href;
+        return h === undefined || h === null ? '' : String(h);
+      },
+      writable: true, enumerable: true, configurable: true,
+    });
+  };
+  hyperlinkStringifier('HTMLAnchorElement');
+  hyperlinkStringifier('HTMLAreaElement');
 })();
 
 // Final native-presentation sweep. _markBuiltinsNative (surface-finalize)
