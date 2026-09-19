@@ -2,6 +2,11 @@
 use alloc::{string::String, vec::Vec};
 use core::mem;
 
+#[cfg(not(feature = "std"))]
+use alloc::rc::Rc;
+#[cfg(feature = "std")]
+use std::rc::Rc;
+
 use crate::{
     Align, Attrs, AttrsList, Cached, FontSystem, LayoutLine, LineEnding, ShapeLine, Shaping, Wrap,
 };
@@ -13,8 +18,8 @@ pub struct BufferLine {
     ending: LineEnding,
     attrs_list: AttrsList,
     align: Option<Align>,
-    shape_opt: Cached<ShapeLine>,
-    layout_opt: Cached<Vec<LayoutLine>>,
+    shape_opt: Cached<Rc<ShapeLine>>,
+    layout_opt: Cached<Rc<Vec<LayoutLine>>>,
     shaping: Shaping,
     metadata: Option<usize>,
 }
@@ -206,26 +211,74 @@ impl BufferLine {
     #[allow(clippy::missing_panics_doc)]
     pub fn shape(&mut self, font_system: &mut FontSystem, tab_width: u16) -> &ShapeLine {
         if self.shape_opt.is_unused() {
+            #[cfg(feature = "std")]
+            let shape_start = std::time::Instant::now();
+
+            #[cfg(feature = "shape-run-cache")]
+            {
+                let key = crate::ShapeLineKey {
+                    run: crate::ShapeRunKey::new(&self.text, &self.attrs_list, 0, self.text.len()),
+                    tab_width,
+                };
+                if let Some(line) = font_system.shape_line_cache.get(&key) {
+                    self.shape_opt.set_used(line);
+                    self.layout_opt.set_unused();
+                    return self.shape_opt.get().expect("shape not found");
+                }
+            }
+
             let mut line = self
                 .shape_opt
                 .take_unused()
-                .unwrap_or_else(ShapeLine::empty);
-            line.build(
-                font_system,
-                &self.text,
-                &self.attrs_list,
-                self.shaping,
-                tab_width,
-            );
+                .unwrap_or_else(|| Rc::new(ShapeLine::empty()));
+            match Rc::get_mut(&mut line) {
+                Some(line) => line.build(
+                    font_system,
+                    &self.text,
+                    &self.attrs_list,
+                    self.shaping,
+                    tab_width,
+                ),
+                None => {
+                    let mut fresh = ShapeLine::empty();
+                    fresh.build(
+                        font_system,
+                        &self.text,
+                        &self.attrs_list,
+                        self.shaping,
+                        tab_width,
+                    );
+                    line = Rc::new(fresh);
+                }
+            }
             self.shape_opt.set_used(line);
             self.layout_opt.set_unused();
+
+            #[cfg(feature = "shape-run-cache")]
+            {
+                let key = crate::ShapeLineKey {
+                    run: crate::ShapeRunKey::new(&self.text, &self.attrs_list, 0, self.text.len()),
+                    tab_width,
+                };
+                if let Some(built) = self.shape_opt.get() {
+                    font_system
+                        .shape_line_cache
+                        .insert(key, Rc::clone(built));
+                }
+            }
+
+            #[cfg(feature = "std")]
+            crate::LINE_BUILD_NANOS.fetch_add(
+                shape_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.shape_opt.get().expect("shape not found")
     }
 
     /// Get line shaping cache
     pub fn shape_opt(&self) -> Option<&ShapeLine> {
-        self.shape_opt.get()
+        self.shape_opt.get().map(|line| &**line)
     }
 
     /// Layout line, will cache results
@@ -240,29 +293,91 @@ impl BufferLine {
         tab_width: u16,
     ) -> &[LayoutLine] {
         if self.layout_opt.is_unused() {
+            #[cfg(feature = "std")]
+            let layout_start = std::time::Instant::now();
+
+            #[cfg(feature = "shape-run-cache")]
+            {
+                let key = crate::LayoutRunKey {
+                    line: crate::ShapeRunKey::new(
+                        &self.text,
+                        &self.attrs_list,
+                        0,
+                        self.text.len(),
+                    ),
+                    font_size_bits: font_size.to_bits(),
+                    width_bits: width_opt.map(f32::to_bits),
+                    wrap,
+                    align: self.align,
+                    match_mono_bits: match_mono_width.map(f32::to_bits),
+                    tab_width,
+                };
+                if let Some(layout) = font_system.layout_run_cache.get(&key) {
+                    // `LayoutRunIter` skips any line whose shape cache is
+                    // empty, so a layout hit must still leave the line
+                    // shaped (a cheap shape-line cache clone here).
+                    let _ = self.shape(font_system, tab_width);
+                    self.layout_opt.set_used(layout);
+                    return self.layout_opt.get().expect("layout not found");
+                }
+            }
+
             let align = self.align;
             let mut layout = self
                 .layout_opt
                 .take_unused()
-                .unwrap_or_else(|| Vec::with_capacity(1));
+                .unwrap_or_else(|| Rc::new(Vec::with_capacity(1)));
+            if Rc::get_mut(&mut layout).is_none() {
+                layout = Rc::new(Vec::with_capacity(1));
+            }
             let shape = self.shape(font_system, tab_width);
+            let unique = Rc::get_mut(&mut layout).expect("layout Rc must be unique here");
             shape.layout_to_buffer(
                 &mut font_system.shape_buffer,
                 font_size,
                 width_opt,
                 wrap,
                 align,
-                &mut layout,
+                unique,
                 match_mono_width,
             );
             self.layout_opt.set_used(layout);
+
+            #[cfg(feature = "shape-run-cache")]
+            {
+                let key = crate::LayoutRunKey {
+                    line: crate::ShapeRunKey::new(
+                        &self.text,
+                        &self.attrs_list,
+                        0,
+                        self.text.len(),
+                    ),
+                    font_size_bits: font_size.to_bits(),
+                    width_bits: width_opt.map(f32::to_bits),
+                    wrap,
+                    align: self.align,
+                    match_mono_bits: match_mono_width.map(f32::to_bits),
+                    tab_width,
+                };
+                if let Some(built) = self.layout_opt.get() {
+                    font_system
+                        .layout_run_cache
+                        .insert(key, Rc::clone(built));
+                }
+            }
+
+            #[cfg(feature = "std")]
+            crate::LINE_LAYOUT_NANOS.fetch_add(
+                layout_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.layout_opt.get().expect("layout not found")
     }
 
     /// Get line layout cache
     pub fn layout_opt(&self) -> Option<&Vec<LayoutLine>> {
-        self.layout_opt.get()
+        self.layout_opt.get().map(|layout| &**layout)
     }
 
     /// Get line metadata. This will be None if [`BufferLine::set_metadata`] has not been called

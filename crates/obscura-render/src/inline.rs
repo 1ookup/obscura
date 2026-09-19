@@ -1318,6 +1318,89 @@ pub struct TextEngine {
     variable_swash: VariableSwashCache,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+    /// Web-font declaration-set identity of `font_system`'s database. When
+    /// the engine is dropped, its shaped-run cache returns to the per-thread
+    /// pool under this key so the next pass of the same document (or any
+    /// document with the same face set) starts warm. `None` only for engines
+    /// built outside `new_with_web_fonts`, which are never pooled.
+    shape_pool_key: Option<u64>,
+}
+
+/// Per-thread shaped-run cache pool, keyed by the web-font declaration set
+/// (see `new_with_web_fonts`). Small and bounded: each entry is one page's
+/// distinct shaped runs, capped both in entries and in runs per entry.
+struct PooledShapeCache {
+    key: u64,
+    shape_runs: cosmic_text::ShapeRunCache,
+    shape_lines: cosmic_text::ShapeLineCache,
+    layouts: cosmic_text::LayoutRunCache,
+}
+
+thread_local! {
+    static SHAPE_CACHE_POOL: std::cell::RefCell<Vec<PooledShapeCache>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A pool holding more than a handful of engines means documents are
+/// churning faster than caches can pay for themselves; keep the freshest.
+const SHAPE_CACHE_POOL_CAP: usize = 4;
+/// Beyond this many distinct runs, drop the cache instead of pooling it so
+/// one pathological document cannot pin memory across passes.
+const SHAPE_CACHE_POOL_MAX_RUNS: usize = 16_384;
+
+fn take_pooled_shape_cache(
+    key: u64,
+) -> Option<(
+    cosmic_text::ShapeRunCache,
+    cosmic_text::ShapeLineCache,
+    cosmic_text::LayoutRunCache,
+)> {
+    SHAPE_CACHE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let index = pool.iter().rposition(|pooled| pooled.key == key)?;
+        let pooled = pool.remove(index);
+        Some((pooled.shape_runs, pooled.shape_lines, pooled.layouts))
+    })
+}
+
+fn web_font_pool_key(fonts: &[WebFont]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fonts.len().hash(&mut hasher);
+    for font in fonts {
+        font.family.hash(&mut hasher);
+        font.weight.hash(&mut hasher);
+        font.italic.hash(&mut hasher);
+        font.data.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+impl Drop for TextEngine {
+    fn drop(&mut self) {
+        let Some(key) = self.shape_pool_key.take() else {
+            return;
+        };
+        let shape_runs = std::mem::take(&mut self.font_system.shape_run_cache);
+        let shape_lines = std::mem::take(&mut self.font_system.shape_line_cache);
+        let layouts = std::mem::take(&mut self.font_system.layout_run_cache);
+        let pooled_len = shape_runs.len().max(shape_lines.len()).max(layouts.len());
+        if pooled_len == 0 || pooled_len > SHAPE_CACHE_POOL_MAX_RUNS {
+            return;
+        }
+        SHAPE_CACHE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.push(PooledShapeCache {
+                key,
+                shape_runs,
+                shape_lines,
+                layouts,
+            });
+            if pool.len() > SHAPE_CACHE_POOL_CAP {
+                pool.remove(0);
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1693,6 +1776,83 @@ impl Default for TextEngine {
     }
 }
 
+/// Optional profiling of one shaped-run build (OBSCURA_RENDER_TIMING).
+pub struct ShapeProfGuard(Option<std::time::Instant>);
+
+fn render_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_RENDER_TIMING").is_some())
+}
+
+impl ShapeProfGuard {
+    fn new() -> Self {
+        ShapeProfGuard(render_timing_enabled().then(std::time::Instant::now))
+    }
+}
+
+impl Drop for ShapeProfGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.0.take() {
+            SHAPE_PROF.with(|cell| {
+                let mut cur = cell.get();
+                cur.0 += start.elapsed().as_nanos() as u64;
+                cur.1 += 1;
+                cell.set(cur);
+            });
+        }
+    }
+}
+
+thread_local! {
+    static SHAPE_PROF: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0u64, 0u32)) };
+    static SHAPE_PROF_COSMIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0u64) };
+}
+
+/// Accumulates milliseconds into a thread-local bucket for the timing run.
+struct SubProf;
+
+impl SubProf {
+    fn new() -> Self {
+        if render_timing_enabled() {
+            SUB_PROF_START.with(|cell| cell.set(Some(std::time::Instant::now())));
+        }
+        SubProf
+    }
+}
+
+impl Drop for SubProf {
+    fn drop(&mut self) {
+        SUB_PROF_START.with(|cell| {
+            if let Some(start) = cell.get() {
+                let nanos = start.elapsed().as_nanos() as u64;
+                SHAPE_PROF_COSMIC.with(|c| c.set(c.get() + nanos));
+                cell.set(None);
+            }
+        });
+    }
+}
+
+thread_local! {
+    static SUB_PROF_START: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// (total milliseconds, call count) of shaped-run builds since the last take.
+/// Only nonzero when OBSCURA_RENDER_TIMING is set.
+pub fn shape_prof_take() -> (f64, u32, f64) {
+    SHAPE_PROF.with(|cell| {
+        let (nanos, calls) = cell.get();
+        cell.set((0, 0));
+        let cosmic_ms = SHAPE_PROF_COSMIC.with(|c| {
+            let value = c.get();
+            c.set(0);
+            value
+        }) as f64
+            / 1_000_000.0;
+        (nanos as f64 / 1_000_000.0, calls, cosmic_ms)
+    })
+}
+
 impl TextEngine {
     pub fn new() -> Self {
         Self::new_with_fonts(&[])
@@ -1729,6 +1889,18 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts(fonts: &[WebFont]) -> Self {
+        // Shaped runs are cached on the FontSystem (cosmic-text's
+        // shape-run-cache). TextEngine is created per render pass, so without
+        // pooling, every forced layout after a DOM mutation re-shaped every
+        // text run in the document (~70 percent of a churned re-prepare; the
+        // Cloudflare census gBCR measured 84 of 86 ms in the build walk).
+        // Pool the cache per thread, keyed by the web-font declaration set:
+        // fontdb ids and glyph ids are only valid for the database they were
+        // shaped against, so caches may only be reused across engines whose
+        // face set (embedded faces + this page's @font-face resources) is
+        // identical. Successive passes of one document always match.
+        let shape_pool_key = web_font_pool_key(fonts);
+        let pooled_shape_cache = take_pooled_shape_cache(shape_pool_key);
         // Build a database from embedded and page-provided faces. Never call
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
@@ -1845,7 +2017,12 @@ impl TextEngine {
             }
         }
         db.set_sans_serif_family(FAMILY);
-        let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        if let Some((shape_runs, shape_lines, layouts)) = pooled_shape_cache {
+            font_system.shape_run_cache = shape_runs;
+            font_system.shape_line_cache = shape_lines;
+            font_system.layout_run_cache = layouts;
+        }
         TextEngine {
             font_system,
             loaded_families,
@@ -1853,6 +2030,7 @@ impl TextEngine {
             variable_swash: VariableSwashCache::new(),
             items: Vec::new(),
             replaced: Vec::new(),
+            shape_pool_key: Some(shape_pool_key),
         }
     }
 
@@ -2347,6 +2525,7 @@ impl TextEngine {
         mut owner_boxes: Vec<InlineOwnerBox>,
         mut boundary_events: Vec<InlineBoundaryEvent>,
     ) -> Option<usize> {
+        let _prof = crate::inline::ShapeProfGuard::new();
         let white_space = base.white_space.unwrap_or_default();
         let layout_wrap = if spans
             .iter()
@@ -2440,6 +2619,7 @@ impl TextEngine {
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
+        let _sub = SubProf::new();
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         // Install the used-layout mode now; intrinsic measurement temporarily
         // swaps to `min_content_wrap` below. Keeping those modes separate is
@@ -2529,6 +2709,7 @@ impl TextEngine {
                 line.set_align(Some(a));
             }
         }
+        drop(_sub);
 
         let idx = self.items.len();
         let text_indent = base.text_indent.unwrap_or(Dimension::Px(0.0));

@@ -114,6 +114,14 @@ pub struct FontSystem {
     #[cfg(feature = "shape-run-cache")]
     pub shape_run_cache: crate::ShapeRunCache,
 
+    /// Cache for fully built shape lines (word split + shaped runs)
+    #[cfg(feature = "shape-run-cache")]
+    pub shape_line_cache: crate::ShapeLineCache,
+
+    /// Cache for laid out lines
+    #[cfg(feature = "shape-run-cache")]
+    pub layout_run_cache: crate::LayoutRunCache,
+
     /// List of fallbacks
     pub(crate) dyn_fallback: Box<dyn Fallback>,
 
@@ -216,6 +224,10 @@ impl FontSystem {
             monospace_fallbacks_buffer: BTreeSet::default(),
             #[cfg(feature = "shape-run-cache")]
             shape_run_cache: crate::ShapeRunCache::default(),
+            #[cfg(feature = "shape-run-cache")]
+            shape_line_cache: crate::ShapeLineCache::default(),
+            #[cfg(feature = "shape-run-cache")]
+            layout_run_cache: crate::LayoutRunCache::default(),
             shape_buffer: ShapeBuffer::default(),
             dyn_fallback: Box::new(impl_fallback),
             fallbacks,

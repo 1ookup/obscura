@@ -110,7 +110,7 @@ pub struct LayoutLine {
 }
 
 /// Wrapping mode
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash)]
 pub enum Wrap {
     /// No wrapping
     None,
@@ -139,7 +139,7 @@ impl Display for Wrap {
 }
 
 /// Align or justify
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash)]
 pub enum Align {
     Left,
     Right,

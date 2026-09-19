@@ -495,27 +495,12 @@ fn shape_run_cached(
     end_run: usize,
     span_rtl: bool,
 ) {
-    use crate::{AttrsOwned, ShapeRunKey};
+    use crate::ShapeRunKey;
 
-    let run_range = start_run..end_run;
-    let mut key = ShapeRunKey {
-        text: line[run_range.clone()].to_string(),
-        default_attrs: AttrsOwned::new(&attrs_list.defaults()),
-        attrs_spans: Vec::new(),
-    };
-    for (attrs_range, attrs) in attrs_list.spans.overlapping(&run_range) {
-        if attrs == &key.default_attrs {
-            // Skip if attrs matches default attrs
-            continue;
-        }
-        let start = max(attrs_range.start, start_run).saturating_sub(start_run);
-        let end = min(attrs_range.end, end_run).saturating_sub(start_run);
-        if end > start {
-            let range = start..end;
-            key.attrs_spans.push((range, attrs.clone()));
-        }
-    }
+    let key = ShapeRunKey::new(line, attrs_list, start_run, end_run);
     if let Some(cache_glyphs) = font_system.shape_run_cache.get(&key) {
+        #[cfg(feature = "std")]
+        crate::SHAPE_RUN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for mut glyph in cache_glyphs.iter().cloned() {
             // Adjust glyph start and end to match run position
             glyph.start += start_run;
@@ -524,6 +509,9 @@ fn shape_run_cached(
         }
         return;
     }
+
+    #[cfg(feature = "std")]
+    crate::SHAPE_RUN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Fill in cache if not already set
     let mut cache_glyphs = Vec::new();

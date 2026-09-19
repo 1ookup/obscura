@@ -1071,8 +1071,12 @@ impl DomLayout {
         tree: &DomTree,
         viewport: (f32, f32),
     ) -> DerivedLayoutState {
+        let prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
         let viewport_fixed = self.viewport_fixed_nodes(tree);
         let geometry = self.derived_geometry_with_fixed(tree, viewport, &viewport_fixed);
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!("[timing] derived-state={:?}", prof.map(|t| t.elapsed()));
+        }
         DerivedLayoutState {
             content_size: geometry.content_size,
             viewport_fixed,
@@ -4421,9 +4425,13 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 (style.container_type != crate::ContainerType::Normal).then_some(*node)
             })
             .collect::<HashSet<_>>();
-        let connected = std::iter::once(layout_root)
-            .chain(rendered_descendants(tree, layout_root))
-            .collect::<HashSet<_>>();
+    let prof_pre = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    let connected = std::iter::once(layout_root)
+        .chain(rendered_descendants(tree, layout_root))
+        .collect::<HashSet<_>>();
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!("[timing] retained-connected={:?}", prof_pre.map(|t| t.elapsed()));
+    }
         retained.styles.retain(|node, _| connected.contains(node));
         retained
             .custom_properties
@@ -4739,7 +4747,10 @@ fn layout_dom_once(
     let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
+    let prof_engine = std::time::Instant::now();
     let mut engine = crate::inline::TextEngine::new_with_web_fonts(fonts);
+    let prof_engine = prof_engine.elapsed();
+    let mut prof_post_compute: Option<std::time::Instant> = None;
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
@@ -6241,6 +6252,7 @@ fn layout_dom_once(
         let deferred_cyclic_inline_sizes =
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
 
+        let prof_build = std::time::Instant::now();
         if let Some(taffy_root) = build(
             tree,
             root_id,
@@ -6251,6 +6263,22 @@ fn layout_dom_once(
             &mut ifc_items,
             &styles,
         ) {
+            if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                let (shape_ms, shape_calls, cosmic_ms) = crate::inline::shape_prof_take();
+                let (hits, misses) = cosmic_text::shape_run_cache_stats();
+                let (build_ms, layout_ms) = cosmic_text::line_phase_stats();
+                eprintln!(
+                    "[timing] build-walk={:?} shape-total={:.3}ms shape-cosmic={:.3}ms line-build={:.3}ms line-layout={:.3}ms shape-calls={} shape-hits={} shape-misses={}",
+                    prof_build.elapsed(),
+                    shape_ms,
+                    cosmic_ms,
+                    build_ms,
+                    layout_ms,
+                    shape_calls,
+                    hits,
+                    misses
+                );
+            }
             // Taffy has no outer display type and only gives an auto-width
             // Block root the initial-containing-block width. CSS blockifies
             // Flex/Grid roots too, so supply the equivalent used width while
@@ -6710,7 +6738,15 @@ fn layout_dom_once(
                     table_index = group_end;
                 }
 
+                let prof_compute = std::time::Instant::now();
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                    eprintln!(
+                        "[timing] engine-build={:?} compute={:?}",
+                        prof_engine, prof_compute.elapsed()
+                    );
+                }
+                prof_post_compute = Some(std::time::Instant::now());
                 if deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
@@ -7214,6 +7250,10 @@ fn layout_dom_once(
             })
         })
         .collect();
+
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!("[timing] post-compute-total={:?}", prof_post_compute.map(|t| t.elapsed()));
+    }
 
     (
         DomLayout {

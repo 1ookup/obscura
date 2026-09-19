@@ -135,6 +135,26 @@ mod shape;
 pub use self::shape_run_cache::*;
 mod shape_run_cache;
 
+pub use self::line_run_cache::*;
+mod line_run_cache;
+
+/// Diagnostic accumulators (OBSCURA_RENDER_TIMING): nanos spent building
+/// ShapeLines (word split + run shaping) and laying out lines.
+#[cfg(feature = "std")]
+pub static LINE_BUILD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "std")]
+pub static LINE_LAYOUT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (line-build ms, line-layout ms) accumulated since process start.
+#[cfg(feature = "std")]
+pub fn line_phase_stats() -> (f64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        LINE_BUILD_NANOS.load(Relaxed) as f64 / 1e6,
+        LINE_LAYOUT_NANOS.load(Relaxed) as f64 / 1e6,
+    )
+}
+
 #[cfg(feature = "swash")]
 pub use self::swash::*;
 #[cfg(feature = "swash")]

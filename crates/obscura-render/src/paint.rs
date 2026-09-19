@@ -2708,6 +2708,41 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
+    let prof_prepare =
+        std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    let result = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
+        tree,
+        layout_root,
+        viewport,
+        base_url,
+        resources,
+        dynamic_fonts,
+        stylesheet_cache,
+        retained,
+        media_type,
+        animation_sample,
+        animation_timeline,
+    );
+    if let Some(start) = prof_prepare {
+        eprintln!("[timing] prepare-total={:?}", start.elapsed());
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
+    tree: &DomTree,
+    layout_root: obscura_dom::tree::NodeId,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    resources: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    media_type: crate::CssMediaType,
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+) -> Option<PreparedRender> {
     if !viewport.0.is_finite() || !viewport.1.is_finite() || viewport.0 <= 0.0 || viewport.1 <= 0.0
     {
         return None;
@@ -2716,6 +2751,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     // CSS-sized image with no width/height attribute would otherwise be 0x0
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
+    let prof_pre = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     let (mut intrinsic, mut selected_images) =
         collect_image_intrinsics(tree, layout_root, viewport, base_url, resources);
     // Preserve the HTML source fallback separately: a remembered CSS content
@@ -2747,6 +2783,10 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     } else {
         svg_font_database()
     };
+    let prof_mid = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    if let (Some(a), Some(b)) = (prof_pre, prof_mid) {
+        eprintln!("[timing] pre-image+fonts={:?}", b.duration_since(a));
+    }
     let mut laid = match retained {
         Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
             tree,
@@ -2804,6 +2844,9 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         );
     }
     let derived = laid.derived_layout_state(tree, viewport);
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!("[timing] post-layout derived+finish={:?}", prof_mid.map(|t| t.elapsed()));
+    }
     let root_font_size = tree
         .query_selector_from(layout_root, "html")
         .ok()
