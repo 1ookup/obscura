@@ -11336,3 +11336,75 @@ Virtualization VM 持续 300%+ CPU（load 9-10 六小时+），ver19/20 时序�
 （uGyjw9 313、ZMSOw0 577——对照正午 ver17 的 15/512）；realm 修复的干净计时效果
 待负载回落后复测。判决剩余候选：ZMSOw0 安静残差、/ci/ 门其余输入、探针块解码
 （runtime-assembled，不在字节码串表）。
+
+> 更正（Step 316）：本步「ODxGu4/Qssv3 失败标记归零（探针检查通过）」不成立。
+> ver20/run/ops.tsv 存档中 ODxGu4 x2、Qssv3 x16、`[object HTMLAnchorElement]` x2、
+> `[object RegExp]` x2 全部在案；1558→0 是 toString 原生化扫雷的准确结论，但探针
+> 标记与它不是同一回事。失败标记仍在（Step 316 cons21 同证）。
+
+### Step 316: console 回归排查证伪、console 模块核心面固化 + Chrome 形序列化，cons21 槽位对拍（2026-09-19 22:2x）
+
+**背景（上一会话报告的回归）**：报称 17a810d deferred-surface 分拆后「pre-hydration
+frame realm 不再把 console.* 路由进 console op——当前二进制的质询轮 ops.tsv 中
+widget realm 零 console 行」，并担心 pre-hydration console 是最小 shim（%c/%d 格式、
+error/warn/table/dir、bind 形状、返回值与质询期望不一致）。
+
+**排查结论（回归证伪）**：
+- 事实核对：final18/19/20（21:45-21:52，当前二进制）widget realm console 行齐全
+  （每轮 83 行、其中 challenges.cloudflare.com 52 行，含探针族）；「零行」判读与
+  存档不符。上一会话 21:54 的 opstest.tsv 只有 27 行 window dom op、无脚本行，是
+  一次未跑完的 fixture，不是质询轮证据。
+- 代码核对：console 面从未在分拆标记之下——方法面在 `tools/dom-query.js`（清单
+  第 10 项，核心半），`console.memory` 在 `env/performance/memory-info.js`（核心半）。
+  且 hydration 触发面覆盖全部执行入口（脚本/eval/CDP/模块/postMessage）与全部
+  WindowProxy 观察型 trap，JS 侧不存在「水合前可执行」的路径，core 半安装的
+  console 因此对所有可达路径完整在场。
+- 真实内核：placement 是**偶然的**（寄居在 dom-query.js 里，一次清单重排就会
+  跌到标记之下，恰好复现所担心的回归形态）。
+
+**修复（本批，commit 9f70fc3）**：
+1. console 面拆为独立模块 `tools/console.js`，置于核心半首位（config/bootstrap.js
+   之后、trace-source 之前）；`build.rs` 新增装配断言：清单中 `tools/console.js`
+   必须在 @obscura-deferred-surface 标记之前，否则 build 失败——placement 由
+   命名模块 + 机械断言共同锁定。
+2. 序列化对齐 Chrome CDP 形状（使 ops.tsv console 行可与 Chrome 捕获逐槽对拍）：
+   RegExp 参数渲染为源（`/.*.*=.*/`，此前 `[object RegExp]`）；节点 wrapper 渲染
+   为 Chrome 的节点描述（元素 localName 如 `a`，document 为 `#document`，此前
+   `[object HTMLAnchorElement]`）。对象仍不走查：author getter 保持不被调用
+   （devtools 探测不变，既有测试原样通过）。
+3. 新回归测试 `frame_realm_console_routes_op_rows_with_full_fidelity`：对 top
+   realm 与 deferred-surface boot 的 frame realm 钉死——%s/%d/%c 格式透传、
+   24 方法集、toString 全 native（`function log() { [native code] }` 形）、返回
+   undefined、`[object console]` tag、`[object MemoryInfo]` memory 品牌、
+   console.[level] op 行逐条值（regex 源/`a`/`#document`/NaN）。批次 18 的
+   zero-non-native 门（window_surface_functions_all_stringify_native）保持绿。
+   obscura-js 664/664（release/render/nextest），workspace 全量见下方门禁。
+
+**cons21 注入验证轮（22:21，点击 16s）**：流程完整——orchestrate → TS#1(823KB)
+→ /pat/ worker fetch(ops.tsv ts=12461261) → 沙箱探针(ts 13182214-13341854) →
+TS#2 POST(89KB/resp 127KB，ts=17489992) → TS#3(92KB/5KB) → main#2(7.8KB) →
+23.6s 重开。注入在位（payloadJSON x3 + ov2key x3 行在案；dec 解密因 capture_round.sh
+未为 cons21 暂存 ov2probe.js 而跳过，harness 缺口非引擎问题）。
+
+**槽位对拍（widget realm，/pat/→TS#2 窗口，Chrome= ciprobe3/consol-all.txt）**：
+
+| 槽位 | Chrome | cons21（本批后） | 判定 |
+|---|---|---|---|
+| 正则源 | `/.*.*=.*/` | `/.*.*=.*/` | **一致**（本批前 `[object RegExp]`，序列化工件已消） |
+| 锚元素 | `a` | `a` | **一致**（本批前 `[object HTMLAnchorElement]`，Step 313 判为管道工件，现已同形） |
+| 原生函数源槽 | `function () { [native code] }` | `ODxGu4` | **仍分歧**：VM 自持失败标记串（探针检查未过），非 console 序列化产物 |
+| 值族（%c%d 透明探针） | `NaN` / `Error` 交错 | `Qssv3` 全族（log/error/warn 同形） | **仍分歧**：同上，VM 值本身是标记串 |
+| ` Error` 短行 | ` Error` | ` Qssv3` | 同上并入值族分歧 |
+| Chrome 捕获中的空行 | `` | 无对应行 | Chrome 侧 hook 产物可能性高，不定罪 |
+| groupEnd 行 | `console.groupEnd` | 无（静默 no-op） | hook 记录行，非输出差异 |
+
+**/ci/ 判定：仍未发**。ops.tsv 中 `/ci/` 仅命中两处 payloadJSON 注入串内文
+（ts=17404146/24816633），无任何 /ci/ 网络请求；/pat/ 后唯一的 worker fetch 即
+/pat/ 本身。与 Step 313/315 一致：门是 VM 阶段记录，剩余输入即上表「仍分歧」
+的探针检查项（原生函数源槽 + NaN/1 值族），定位途径仍是 jsvmp 探针块解码或对
+探针 iframe realm 的被动注入。
+
+**门禁**：obscura-js 664/664（含新回归测试与批次 18 门）；workspace 1875/1876
+（release/render/nextest）——唯一失败 `trace_source_labels`（首个 trace 行先于表头）
+在基线 33a1e9b detach 配对原样复现，与本批无关；release build（AGENTS.md 原命令）
+过；本机无 obscura-benchmark 检出，障碍课程未跑（下会话补）。
