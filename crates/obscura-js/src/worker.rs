@@ -1656,6 +1656,114 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       }
     } catch (e) {}
   }
+
+  // ---------------------------------------------------------------------
+  // 7. Native-presentation sweep. Last: it marks what the steps above
+  // installed.
+  //
+  // Every function reachable from the worker global must answer
+  // Function.prototype.toString with "[native code]". A dedicated worker is
+  // the one scope an anti-bot payload owns outright, and the prep's own
+  // members (postMessage, the event plumbing, the scope/location/navigator
+  // accessors) plus snapshot-carried namespace objects would otherwise hand
+  // over engine source. Mirrors the window realm's finalizer
+  // (config/webidl-branding.js) against the same shared registry, so a
+  // member marked in either realm stringifies natively in both.
+  // ---------------------------------------------------------------------
+  (function () {
+    var nativeRegistry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+    if (!nativeRegistry) return;
+    var nativeFns = nativeRegistry.fns;
+    var nativeStr = nativeRegistry.strings;
+    function mark(fn) { if (typeof fn === 'function') nativeFns.add(fn); }
+    function nameOf(fn, name) {
+      try { defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+    }
+    function markMembers(owner) {
+      var keys;
+      try { keys = Reflect.ownKeys(owner); } catch (e) { return; }
+      for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        var d;
+        try { d = Object.getOwnPropertyDescriptor(owner, key); } catch (e) { continue; }
+        if (!d) continue;
+        if (typeof d.value === 'function') {
+          if (typeof key === 'string' && d.value.name === '') nameOf(d.value, key);
+          mark(d.value);
+        }
+        if (typeof d.get === 'function') {
+          if (d.get.name === '' || d.get.name === 'get') {
+            nameOf(d.get, typeof key === 'string'
+              ? 'get ' + key : 'get [' + key.description + ']');
+          }
+          if (typeof key === 'string' && !nativeStr.has(d.get)) {
+            nativeStr.set(d.get, 'function get ' + key + '() { [native code] }');
+          } else { mark(d.get); }
+        }
+        if (typeof d.set === 'function') {
+          if (d.set.name === '' || d.set.name === 'set') {
+            nameOf(d.set, typeof key === 'string'
+              ? 'set ' + key : 'set [' + key.description + ']');
+          }
+          if (typeof key === 'string' && !nativeStr.has(d.set)) {
+            nativeStr.set(d.set, 'function set ' + key + '() { [native code] }');
+          } else { mark(d.set); }
+        }
+      }
+    }
+    var seenProtos = new Set();
+    function walkCtor(ctor) {
+      if (typeof ctor !== 'function') return;
+      mark(ctor);
+      markMembers(ctor);
+      var proto = null;
+      try { proto = ctor.prototype; } catch (e) {}
+      if (!proto || seenProtos.has(proto)) return;
+      seenProtos.add(proto);
+      markMembers(proto);
+    }
+    var visited = new Set();
+    var budget = 20000;
+    function scan(obj, depth) {
+      if (!obj || budget <= 0 || depth > 4) return;
+      if (typeof obj !== 'object' && typeof obj !== 'function') return;
+      if (visited.has(obj)) return;
+      visited.add(obj);
+      budget--;
+      markMembers(obj);
+      var keys;
+      try { keys = Reflect.ownKeys(obj); } catch (e) { return; }
+      for (var k = 0; k < keys.length; k++) {
+        var d;
+        try { d = Object.getOwnPropertyDescriptor(obj, keys[k]); } catch (e) { continue; }
+        if (!d) continue;
+        var v;
+        if ('value' in d) v = d.value;
+        else { try { v = obj[keys[k]]; } catch (e) { continue; } }
+        if (typeof v === 'function') {
+          if (!d.get && !d.set) walkCtor(v);
+        } else if (v && typeof v === 'object') {
+          scan(v, depth + 1);
+        }
+      }
+    }
+    var names = getOwnPropertyNames(G);
+    for (var n = 0; n < names.length; n++) {
+      var val;
+      try { val = G[names[n]]; } catch (e) { continue; }
+      if (typeof val === 'function') { walkCtor(val); continue; }
+      if (val && typeof val === 'object') scan(val, 1);
+    }
+    // Engine carriers the reflection filter hides from enumeration but a
+    // script can still read directly. Same rule as the window realm.
+    var carriers = ['__bootstrap', 'Deno'];
+    for (var c = 0; c < carriers.length; c++) {
+      var carrier;
+      try { carrier = G[carriers[c]]; } catch (e) { continue; }
+      if (carrier && typeof carrier === 'object') scan(carrier, 1);
+    }
+    markMembers(G);
+  })();
 })();
 "#;
 
