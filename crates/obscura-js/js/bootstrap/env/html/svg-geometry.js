@@ -855,7 +855,10 @@
     } catch (_e) { return []; }
   };
   const lengthListOf = (values) => {
-    const list = {
+    // Fresh per reflection read (the inst.baseVal/animVal assignment below
+    // runs on every access), so the getItem function must be marked at
+    // construction rather than relying on the finalize sweeps.
+    const list = _markNativeObject({
       numberOfItems: values.length,
       getItem(i) {
         if (i < 0 || i >= values.length) {
@@ -863,7 +866,7 @@
         }
         return { value: values[i] };
       },
-    };
+    });
     for (let i = 0; i < values.length; i++) list[i] = { value: values[i] };
     return list;
   };

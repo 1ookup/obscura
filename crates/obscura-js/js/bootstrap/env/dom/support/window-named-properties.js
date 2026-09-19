@@ -76,8 +76,13 @@ function _ensureWindowNamedProperty(name) {
   const holder = globalThis.Window?.prototype || Object.getPrototypeOf(globalThis);
   if (!holder || Object.prototype.hasOwnProperty.call(holder, name)) return;
   try {
+    // Installed lazily per named element at arbitrary page times, long after
+    // the finalize sweeps, so the accessor carries its own mark. Chrome
+    // renders the WebIDL accessor as "function get <name>() { [native code] }".
     Object.defineProperty(holder, name, {
-      get() { return _windowNamedValue(name); }, configurable: true, enumerable: false,
+      get: _markNativeAs(function () { return _windowNamedValue(name); },
+        'function get ' + name + '() { [native code] }'),
+      configurable: true, enumerable: false,
     });
     _windowNamedPropertyNames.add(name);
   } catch (_error) {}

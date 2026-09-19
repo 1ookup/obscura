@@ -393,7 +393,10 @@ function _syncWindowFrameIndices() {
   for (let i = 0; i < count; i++) {
     if (Object.getOwnPropertyDescriptor(globalThis, i)) continue;
     Object.defineProperty(globalThis, i, {
-      get() { return _childBrowsingContexts()[i]?.contentWindow; },
+      // Resynchronised at connect/disconnect time, outside the finalize
+      // sweeps, so the accessor carries its own mark.
+      get: _markNativeAs(function () { return _childBrowsingContexts()[i]?.contentWindow; },
+        'function get ' + i + '() { [native code] }'),
       configurable: true,
       // Chrome's indexed window properties show up in for-in.
       enumerable: true
