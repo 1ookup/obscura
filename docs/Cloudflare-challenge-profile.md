@@ -10976,3 +10976,56 @@ svg_fragment_geometry、frame_svg_elements、challenge_svg_probe 的 bbox 族；
 自身三枚新测试 + lattice 链测试 + unrendered 零族测试全绿）；browser/cdp/dom/net
 499/499；no-default-features check 通过；release build（render+stealth）全量通过；
 障碍课程不在本机（伴随库在主控侧），33/33 留给主控下一判决轮一并执行。
+
+### Step 308: 修复批次 16-性能——强制 re-prepare 的文本重整形跨 pass 缓存，churn 后单次 gBCR 118→23ms（2026-09-19）
+
+**方法**：全程无网络轮。新 fixture `js-repros/forced-layout-cost/`：census 形
+wrapper + ~100 元素，再加 `?site=N` 的站点页体块（默认 6 → 1931 元素、670 个
+shaped run），节点增删/class 切换/style 改写把 layout 弄脏后计时单次
+getBoundingClientRect，Chrome headless 同页对拍。live 的 census 文档是完整站点页
+（interstitial 覆盖其上），所以用站点页体块缩放到 live 成本带。
+
+**剖析**（OBSCURA_RENDER_TIMING，新增 prepare-total / build-walk / shape-total /
+compute / derived-state 分相）：site=6 单次 churn 后 prepare ≈ 118ms 中
+build-walk 占 86-92ms，其中 push_shaped_item 的文本整形 84ms（670 run，~125µs/
+个）——Step 307 指认的 "~70% 文本重整形" 实测 84/86=98% 的 build-walk、71% 的
+整次 prepare。cosmic-text 0.14.2 自带 shape-run-cache（vendored 版已内置，feature
+未开），但 TextEngine 每 render pass 重建，FontSystem 及其一切缓存随引擎陪葬。
+
+**修复**（三个 commit：fixture / 引擎 / 文档）：
+- 开 `shape-run-cache` feature；vendored cosmic-text 增 `ShapeLineCache`（整行
+  词切分+run 整形，key = ShapeRunKey + tab_width）与 `LayoutRunCache`（key =
+  行 key + font_size/width/wrap/align/monospace/tab 位型），挂 FontSystem，
+  BufferLine::shape/layout 命中即返回。shape 产物按 em 归一（layout 时才乘
+  font_size），attrs 携带 family/weight/metrics/letter-spacing/font_id，键完整。
+- TextEngine 增 per-thread `SHAPE_CACHE_POOL`（cap 4，>16k run 丢弃），按
+  web-font 声明集哈希（含字节哈希）为键换入换出三份缓存：fontdb ID 只在同
+  一 face 集内有效，键相同即 ID 相同，杜绝跨页污染。TextEngine::drop 归还。
+- `LayoutRunIter::next` 以 `line.shape_opt()?` 静默跳过未 shape 的行——layout
+  缓存命中必须先 `self.shape()` 填充 shape_opt，否则 layout_runs 吐零宽
+  （字体可用性探针两次 measure 一侧得 0，恰好把 mac/Windows 家族表翻转，
+  a_local_font_source_fails 抓住；首次实现踩中，已修并有 63/63 fixture 兜底）。
+- inline.rs 增 OBSCURA_RENDER_TIMING 的 shape 分相计数（OnceLock 化，关闭时
+  每 run 一次原子开销）；dom.rs/paint.rs 增 prepare 分相计时。
+
+**数字**（release、file:// 本地、同机同参数）：
+- forced-layout site=6：churn 后单次 gBCR **114-118 → 22.6-24.0ms**（4.7x），
+  10 轮 mutate→read 1100-1150 → 210-218ms；未脏读 0.1ms 不变；Chrome 0.1ms。
+  分相：build-walk 86-92 → 5.5-6.0ms（shape-total 84 → 3.4）；prepare-total
+  ~47 → 19-20ms；line-build/line-layout 每 pass 增量 16/19ms → ~0.2ms。
+  剩余为保留式级联（1.3ms）、taffy 重建+compute（~5ms）、derived scroll/fixed
+  状态（2.2ms）、rect 写回+合成（~4ms）等 O(n) 固定项，属增量布局（option b）
+  范畴，按指示 time-box 未动。
+- decode-interpret-cost（fixture 文本每次 churn 均为新串，跨 pass 命中有限）：
+  interpret 103 → 81.5 → **66.9ms**，gBCR 份额 110 → 75 → **61ms**；四层
+  checksum + interpretAcc + 39014 步 + 744 host op 与 Chrome 逐字节相等。
+- 行为门禁：render-repros 63/63 fixture 截图与改动前二进制**逐字节相等**
+  （pixel diff 0）；obscura 全量 nextest 1870 中 1869 过（timing_edits 一例在
+  与本批 fixture 并行压机时超时，隔离复跑 3/3 过，无回归）；no-default-features
+  check、release build（render+stealth）全量通过。
+
+**预期 live uGyjw9**：census 的 Ha 项单次 gBCR 在统一 prepare 成本内，整形份
+（live 文档更重、CJK 占比更高，份额应高于 70%）塌缩为缓存命中，残余为保留式
+级联 + taffy 重建 + derived/scroll 固定项；按 site=6 的换算，timeTiefMs 预期落
+**10-30ms 带**（census 对象本身的 10-15ms 大半在外），Chrome 4ms 仍留少量
+差距，差距项即增量布局，另行立项。
