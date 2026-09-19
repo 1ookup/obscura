@@ -936,6 +936,14 @@ impl ObscuraJsRuntime {
             // its own; the bootstrap below installs it on this realm's
             // Document.prototype.
             crate::document_all::install(scope, context);
+            // Deferred-surface boot (Step 312): same contract as the
+            // synchronous op path. The flag must precede the bootstrap so the
+            // assembler's tail installs __obscura_hydrate instead of running
+            // the surface half inline.
+            let defer_key = v8::String::new(scope, "__obscura_frame_defers_surface")
+                .ok_or_else(|| alloc_err("key"))?;
+            let defer_val = v8::Boolean::new(scope, true);
+        global.set(scope, defer_key.into(), defer_val.into());
         }
         // Bootstrap runs first, matching the main context (its bootstrap is
         // baked into the snapshot, then `<obscura:init>` runs). REALM_INIT must
@@ -965,10 +973,13 @@ impl ObscuraJsRuntime {
                  globalThis.__obscura_webgl_enabled = {webgl_enabled};"
             ),
         )?;
+        // Core init for the deferred-surface boot (Step 312): binds the
+        // contentDocument surface the parent can touch; the full page init
+        // runs at hydration.
         self.execute_in_context(
             &context,
-            "<obscura:frame-realm-page-init>",
-            "globalThis.__obscura_init();",
+            "<obscura:frame-realm-core-init>",
+            "globalThis.__obscura_core_init();",
         )?;
 
         // Snapshot the content root's scope for later diagnostics/routing;
@@ -1292,6 +1303,7 @@ impl ObscuraJsRuntime {
         } else {
             let scope = &mut self.deno_runtime_mut().handle_scope();
             let context = v8::Local::new(scope, context);
+            hydrate_frame_realm_if_pending(scope, context)?;
             let scope = &mut v8::ContextScope::new(scope, context);
             let module = v8::Local::new(scope, &root);
             if module.get_status() == v8::ModuleStatus::Evaluated {
@@ -1733,6 +1745,9 @@ impl ObscuraJsRuntime {
     ) -> Result<serde_json::Value, String> {
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let context = v8::Local::new(scope, context);
+        // Deferred-surface frame realms hydrate before their first script
+        // (Step 312); a no-op for the main context and hydrated realms.
+        hydrate_frame_realm_if_pending(scope, context)?;
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let source =
@@ -1841,7 +1856,6 @@ pub(crate) fn spawn_frame_realm(
     if frame_realms.contains_world(frame_id, generation, MAIN_WORLD) {
         return Ok(None);
     }
-
     // An op's scope reports the main context (Deno.core.ops is shared across
     // realms), so the current context carries the main realm's Deno binding,
     // security token and embedder slots. Read them here; the new context copies
@@ -1920,25 +1934,38 @@ pub(crate) fn spawn_frame_realm(
             let flag_val = v8::Boolean::new(scope, true);
             global.set(scope, flag_key.into(), flag_val.into());
         }
+        // Deferred-surface boot (Step 312): the flag must exist before the
+        // bootstrap runs because the assembler's tail reads it to decide
+        // between running the deferred surface inline and installing
+        // __obscura_hydrate. The bootstrap core (document/element machinery,
+        // proxy facades) runs now; the surface half hydrates on first touch.
+        let defer_key = v8::String::new(scope, "__obscura_frame_defers_surface")
+            .ok_or_else(|| alloc_err("key"))?;
+        let defer_val = v8::Boolean::new(scope, true);
+            global.set(scope, defer_key.into(), defer_val.into());
 
         crate::document_all::install(scope, context);
 
         run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
         run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
         // Fingerprint before init, matching the main realm's order (see the
-        // comment in ensure_frame_world_realm).
+        // comment in ensure_frame_world_realm). tools/script-loader's setter is
+        // bootstrap core, so it runs; the deferred fingerprint applicator is
+        // caught up by __obscura_hydrate.
         let fingerprint_src = format!(
             "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
              globalThis.__obscura_stealth = {stealth}; \
              globalThis.__obscura_webgl_enabled = {webgl_enabled};"
         );
         run_script(scope, "<obscura:frame-fingerprint>", &fingerprint_src)?;
+        // Core init binds the document/top/parent surface the parent reaches
+        // through contentWindow/contentDocument. The full page init runs at
+        // hydration (Step 312).
         run_script(
             scope,
-            "<obscura:frame-realm-page-init>",
-            "globalThis.__obscura_init();",
+            "<obscura:frame-realm-core-init>",
+            "globalThis.__obscura_core_init();",
         )?;
-
         let bridge_key = v8::String::new(scope, "__obscura_realm_bridge")
             .ok_or_else(|| alloc_err("key"))?;
         match global.get(scope, bridge_key.into()) {
@@ -1964,6 +1991,38 @@ pub(crate) fn spawn_frame_realm(
         },
     );
     Ok(bridge)
+}
+
+/// Run a context's pending deferred-surface hydration (Step 312). Frame
+/// realms booted with `__obscura_frame_defers_surface` carry a
+/// `__obscura_hydrate` function on their global; the first execution routed
+/// into the realm (script, module, eval, message dispatch) runs it so the
+/// realm's full window surface exists before author code observes anything.
+/// The hydrate function deletes itself, so this is a cheap property miss for
+/// the main context and every already-hydrated realm.
+pub(crate) fn hydrate_frame_realm_if_pending(
+    scope: &mut v8::HandleScope,
+    context: v8::Local<v8::Context>,
+) -> Result<(), String> {
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "__obscura_hydrate")
+        .ok_or_else(|| alloc_err("key"))?;
+    let Some(hydrate) = global
+        .get(scope, key.into())
+        .filter(|value| value.is_function())
+    else {
+        return Ok(());
+    };
+    let Ok(hydrate) = v8::Local::<v8::Function>::try_from(hydrate) else {
+        return Err("realm: hydrate value was not a function".to_string());
+    };
+    let scope = &mut v8::TryCatch::new(scope);
+    let recv = v8::Local::new(scope, global);
+    if hydrate.call(scope, recv.into(), &[]).is_none() {
+        return Err(realm_error(scope, "deferred-surface hydration"));
+    }
+    Ok(())
 }
 
 fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String {

@@ -1,3 +1,84 @@
+// Creation-time init for deferred-surface frame realms (Step 312). The Rust
+// realm host runs this instead of __obscura_init when the realm was created
+// with __obscura_frame_defers_surface: the realm binds its document, top and
+// parent, and installs the pieces the parent can reach through contentDocument
+// before any full-surface hydration. Everything that only matters once the
+// realm's own surface is observable (screen/viewport, named window tree,
+// performance origin, pristine-name census, platform order) stays in
+// __obscura_init, which the deferred-surface hydration runs. Only prefix
+// bootstrap bindings may be referenced here: the deferred modules have not
+// run yet when this executes.
+globalThis.__obscura_core_init = function() {
+  // Secure-context gating lives in surface-finalize (deferred); the optional
+  // call is a no-op now and re-runs with the full init at hydration.
+  try { _applySecureContextGating?.(); } catch (_e) {}
+  globalThis.__virtualUrl = null;
+  _installWasmStreamingFallback();
+  _installDocumentAll();
+
+  const documentNid = +_dom("document_node_id");
+  const frameRootNid = globalThis.__obscura_frame_document_nid;
+  if (typeof frameRootNid === "number" && frameRootNid > 0) {
+    // _scopedDocumentFor caches the wrapper in _cache as the canonical
+    // Document object for the content root, so the later full
+    // __obscura_init rebind at hydration returns this same object.
+    globalThis.document = _scopedDocumentFor(frameRootNid);
+    globalThis.document[_defaultViewProxySym] = globalThis;
+    const container = _domParse("frame_container_info", frameRootNid) || {};
+    const parentRoot =
+      typeof container.parentRoot === "number" && container.parentRoot > 0
+        ? container.parentRoot : 0;
+    const topRef = _ancestorWindowRef(frameRootNid, 0, true);
+    globalThis.top = topRef;
+    globalThis.parent =
+      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef;
+    globalThis.frameElement = null;
+    try {
+      if (typeof container.host === "number" && container.host > 0
+          && _dom("iframe_scopes_same_origin", frameRootNid, parentRoot) === "true") {
+        globalThis.frameElement = _wrapEl(container.host);
+      }
+    } catch (e) {}
+  } else {
+    globalThis.document = new Document(documentNid);
+    _cache.set(documentNid, globalThis.document);
+  }
+  try {
+    if (!Object.prototype.hasOwnProperty.call(globalThis.document, 'location')) {
+      Object.defineProperty(globalThis.document, 'location', {
+        get() { return globalThis.location; },
+        set(value) { _navigateCurrentContext(_resolveUrl(String(value)), 'GET', ''); },
+        enumerable: true,
+        configurable: false,
+      });
+    }
+  } catch (_error) {}
+  try {
+    const registryState = _customElementRegistryData(globalThis.customElements);
+    registryState.roots.clear();
+    registryState.roots.add(globalThis.document);
+  } catch (_e) {}
+  try { _applyCrossOriginIsolation?.(frameRootNid || 0); } catch (_e) {}
+  try {
+    const scopeInfo = _domParse('document_scope_info', frameRootNid || 0) || {};
+    const header = String(scopeInfo.csp || '');
+    let scriptSources = null;
+    let defaultSources = null;
+    for (const directive of header.split(';')) {
+      const tokens = directive.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) continue;
+      const name = tokens.shift().toLowerCase();
+      if (name === 'script-src' && scriptSources === null) scriptSources = tokens;
+      if (name === 'default-src' && defaultSources === null) defaultSources = tokens;
+    }
+    const sources = scriptSources || defaultSources;
+    globalThis.__obscura_csp_allows_unsafe_eval =
+      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+  } catch (_e) {
+    globalThis.__obscura_csp_allows_unsafe_eval = true;
+  }
+};
+
 globalThis.__obscura_init = function() {
   // First: the document URL is known now, and the gating below removes APIs
   // that later init steps would otherwise hand out on an insecure origin.
@@ -14,10 +95,18 @@ globalThis.__obscura_init = function() {
   // provided by the pinned V8 IC/runtime hooks.
 
   // Frame wrappers belong to the replaced document; the Rust loader creates
-  // fresh content roots for the new page.
-  _scopedDocs.clear();
-  _frameWindowProxies.clear();
-  _iframeContentDocsSeen = false;
+  // fresh content roots for the new page. A frame realm's caches must survive
+  // its own deferred-surface hydration (Step 312): the realm created its
+  // canonical document wrapper at __obscura_core_init time and the parent may
+  // already hold it, so clearing here would rebind contentDocument identity.
+  // A frame realm lives and dies with one document generation, so its caches
+  // never go stale the way a navigating main context's do.
+  if (typeof globalThis.__obscura_frame_document_nid !== "number"
+      || globalThis.__obscura_frame_document_nid <= 0) {
+    _scopedDocs.clear();
+    _frameWindowProxies.clear();
+    _iframeContentDocsSeen = false;
+  }
 
   const documentNid = +_dom("document_node_id");
   // Frame realm hook (Phase 3.7): the Rust realm host defines this nid on a
@@ -368,6 +457,11 @@ globalThis.__obscura_init = function() {
   // a fresh frame has none.
   try {
     _extendChromeWindowFunctionOrder();
+    // The else branch references config/window-surface and config/
+    // surface-finalize bindings that live behind the deferred-surface marker
+    // (Step 312). Both always define __obscura_install_platform_surfaces, so
+    // the branch is dead in every realm that ran the deferred surface; the
+    // guard and the try/catch keep a broken surface install from throwing.
     if (typeof globalThis.__obscura_install_platform_surfaces === 'function') {
       globalThis.__obscura_install_platform_surfaces(globalThis);
     } else {

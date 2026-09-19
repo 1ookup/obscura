@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const BOOTSTRAP_MARKER: &str = "// @obscura-module ";
+const DEFERRED_MARKER: &str = "// @obscura-deferred-surface";
 
 fn load_bootstrap_source(manifest_path: &Path) -> String {
     let manifest = fs::read_to_string(manifest_path).unwrap_or_else(|error| {
@@ -18,11 +19,29 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
     // belongs to the assembler rather than any module, so every source file is
     // independently parseable while shared private bindings remain shared in
     // the snapshot and in secondary realms.
+    //
+    // Modules below the @obscura-deferred-surface marker are wrapped in
+    // __obscura_run_deferred_surface (Step 312). A frame realm created with
+    // __obscura_frame_defers_surface skips the call and receives a hydrate
+    // function instead; the main context and every non-deferring realm run it
+    // inline exactly as before. The wrapper keeps one lexical scope for the
+    // deferred half, so cross-module bindings inside it are unchanged, and
+    // prefix code that was pulled above the marker still sees bindings from
+    // the core half through the outer scope.
     let mut source = String::from("(function () {\n");
     let mut module_count = 0;
+    let mut deferred_open = false;
 
     for line in manifest.lines() {
-        let Some(relative_path) = line.strip_prefix(BOOTSTRAP_MARKER) else {
+        let trimmed = line.trim();
+        if trimmed == DEFERRED_MARKER {
+            assert!(!deferred_open, "bootstrap manifest has two deferred markers");
+            assert!(module_count > 0, "deferred marker before any core module");
+            source.push_str("var __obscura_run_deferred_surface = function () {\n");
+            deferred_open = true;
+            continue;
+        }
+        let Some(relative_path) = trimmed.strip_prefix(BOOTSTRAP_MARKER) else {
             continue;
         };
         let relative_path = relative_path.trim();
@@ -40,6 +59,26 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
     }
 
     assert!(module_count > 0, "bootstrap manifest has no modules");
+    if deferred_open {
+        source.push_str(
+            "\n};\n\
+             if (!globalThis.__obscura_frame_defers_surface) {\n\
+             \x20 __obscura_run_deferred_surface();\n\
+             } else {\n\
+             \x20 globalThis.__obscura_hydrate = function () {\n\
+             \x20   delete globalThis.__obscura_hydrate;\n\
+             \x20   delete globalThis.__obscura_frame_defers_surface;\n\
+             \x20   __obscura_run_deferred_surface();\n\
+             \x20   __obscura_run_deferred_surface = null;\n\
+             \x20   // The fingerprint was stored by tools/script-loader's setter at\n\
+             \x20   // realm creation; the deferred fingerprint modules define the\n\
+             \x20   // applicator, so catch up now, then run the full page init.\n\
+             \x20   try { globalThis.__obscura_apply_fingerprint && globalThis.__obscura_apply_fingerprint(); } catch (_e) {}\n\
+             \x20   try { globalThis.__obscura_init(); } finally { delete globalThis.__obscura_init; }\n\
+             \x20 };\n\
+             }\n",
+        );
+    }
     source.push_str("\n})();\n");
     source
 }

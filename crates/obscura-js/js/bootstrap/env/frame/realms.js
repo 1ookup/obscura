@@ -270,6 +270,178 @@ function _orderedWindowNames(names) {
   named.sort((a, b) => (rank.get(a) ?? 10_000) - (rank.get(b) ?? 10_000));
   return indices.concat(named);
 }
+
+const _chromeWindowVersionExtras = new Set([
+  // The 151-trace accesses every one of these (FontFaceSet 19 hits,
+  // PerformanceSoftNavigation / InteractionContentfulPaint / HTMLUserMediaElement
+  // 12 each), so they stay on the surface even though the passing census
+  // records them with the challenge's 'o.' unknown-name prefix on our side
+  // and not at all in Chrome 149's -- a known residual, not chased here.
+  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
+  'PerformanceSoftNavigation',
+]);
+
+const _chromePayloadBareFunctionOrder = [
+ 'alert', 'atob', 'blur', 'btoa', 'cancelAnimationFrame', 'cancelIdleCallback', 'captureEvents', 'clearInterval',
+ 'clearTimeout', 'close', 'confirm', 'createImageBitmap', 'fetch', 'find', 'focus', 'getComputedStyle',
+ 'getSelection', 'matchMedia', 'moveBy', 'moveTo', 'open', 'postMessage', 'print', 'prompt',
+ 'queueMicrotask', 'releaseEvents', 'reportError', 'requestAnimationFrame', 'requestIdleCallback', 'resizeBy', 'resizeTo', 'scroll',
+ 'scrollBy', 'scrollTo', 'setInterval', 'setTimeout', 'stop', 'structuredClone', 'webkitCancelAnimationFrame', 'webkitRequestAnimationFrame',
+ 'fetchLater', 'getScreenDetails', 'queryLocalFonts', 'showDirectoryPicker', 'showOpenFilePicker', 'showSaveFilePicker', 'webkitRequestFileSystem', 'webkitResolveLocalFileSystemURL',
+ 'addEventListener', 'dispatchEvent', 'removeEventListener', 'when', 'Object', 'Function', 'Number', 'parseFloat',
+ 'parseInt', 'Boolean', 'String', 'Symbol', 'Date', 'Promise', 'RegExp', 'Error',
+ 'AggregateError', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'ArrayBuffer',
+ 'Uint8Array', 'Int8Array', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'BigUint64Array', 'BigInt64Array',
+ 'Uint8ClampedArray', 'Float32Array', 'Float64Array', 'DataView', 'Map', 'BigInt', 'Set', 'Iterator',
+ 'WeakMap', 'WeakSet', 'Proxy', 'FinalizationRegistry', 'WeakRef', 'decodeURI', 'decodeURIComponent', 'encodeURI',
+ 'encodeURIComponent', 'escape', 'unescape', 'eval', 'isFinite', 'isNaN', 'Option', 'Image',
+ 'Audio', 'webkitURL', 'webkitRTCPeerConnection', 'webkitMediaStream', 'WebKitMutationObserver', 'WebKitCSSMatrix', 'XPathResult', 'XPathExpression',
+ 'XPathEvaluator', 'XMLSerializer', 'XMLHttpRequestUpload', 'XMLHttpRequestEventTarget', 'XMLHttpRequest', 'XMLDocument', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController',
+ 'WritableStream', 'Worker', 'WindowControlsOverlayGeometryChangeEvent', 'WindowControlsOverlay', 'Window', 'WheelEvent', 'WebSocket', 'WebGLVertexArrayObject',
+ 'WebGLUniformLocation', 'WebGLTransformFeedback', 'WebGLTexture', 'WebGLSync', 'WebGLShaderPrecisionFormat', 'WebGLShader', 'WebGLSampler', 'WebGLRenderingContext',
+ 'WebGLRenderbuffer', 'WebGLQuery', 'WebGLProgram', 'WebGLObject', 'WebGLFramebuffer', 'WebGLContextEvent', 'WebGLBuffer', 'WebGLActiveInfo',
+ 'WebGL2RenderingContext', 'WaveShaperNode', 'VisualViewport', 'VisibilityStateEntry', 'VirtualKeyboardGeometryChangeEvent', 'ViewTransitionTypeSet', 'ViewTransition', 'ViewTimeline',
+ 'VideoPlaybackQuality', 'VideoFrame', 'VideoColorSpace', 'ValidityState', 'VTTCue', 'UserActivation', 'URLSearchParams', 'URLPattern',
+ 'URL', 'UIEvent', 'TrustedTypePolicyFactory', 'TrustedTypePolicy', 'TrustedScriptURL', 'TrustedScript', 'TrustedHTML', 'TreeWalker',
+ 'TransitionEvent', 'TransformStreamDefaultController', 'TransformStream', 'TrackEvent', 'TouchList', 'TouchEvent', 'Touch', 'ToggleEvent',
+ 'TimeRanges', 'TextUpdateEvent', 'TextTrackList', 'TextTrackCueList', 'TextTrackCue', 'TextTrack', 'TextMetrics', 'TextFormatUpdateEvent',
+ 'TextFormat', 'TextEvent', 'TextEncoderStream', 'TextEncoder', 'TextDecoderStream', 'TextDecoder', 'Text', 'TaskSignal',
+ 'TaskPriorityChangeEvent', 'TaskController', 'TaskAttributionTiming', 'SyncManager', 'Subscriber', 'SubmitEvent', 'StyleSheetList', 'StyleSheet',
+ 'StylePropertyMapReadOnly', 'StylePropertyMap', 'StorageEvent', 'Storage', 'StereoPannerNode', 'StaticRange', 'SourceBufferList', 'SourceBuffer',
+ 'ShadowRoot', 'Selection', 'SecurityPolicyViolationEvent', 'ScrollTimeline', 'ScriptProcessorNode', 'ScreenOrientation', 'Screen', 'Scheduling',
+ 'Scheduler', 'SVGViewElement', 'SVGUseElement', 'SVGUnitTypes', 'SVGTransformList', 'SVGTransform', 'SVGTitleElement', 'SVGTextPositioningElement',
+ 'SVGTextPathElement', 'SVGTextElement', 'SVGTextContentElement', 'SVGTSpanElement', 'SVGSymbolElement', 'SVGSwitchElement', 'SVGStyleElement', 'SVGStringList',
+ 'SVGStopElement', 'SVGSetElement', 'SVGScriptElement', 'SVGSVGElement', 'SVGRectElement', 'SVGRect', 'SVGRadialGradientElement', 'SVGPreserveAspectRatio',
+ 'SVGPolylineElement', 'SVGPolygonElement', 'SVGPointList', 'SVGPoint', 'SVGPatternElement', 'SVGPathElement', 'SVGNumberList', 'SVGNumber',
+ 'SVGMetadataElement', 'SVGMatrix', 'SVGMaskElement', 'SVGMarkerElement', 'SVGMPathElement', 'SVGLinearGradientElement', 'SVGLineElement', 'SVGLengthList',
+ 'SVGLength', 'SVGImageElement', 'SVGGraphicsElement', 'SVGGradientElement', 'SVGGeometryElement', 'SVGGElement', 'SVGForeignObjectElement', 'SVGFilterElement',
+ 'SVGFETurbulenceElement', 'SVGFETileElement', 'SVGFESpotLightElement', 'SVGFESpecularLightingElement', 'SVGFEPointLightElement', 'SVGFEOffsetElement', 'SVGFEMorphologyElement', 'SVGFEMergeNodeElement',
+ 'SVGFEMergeElement', 'SVGFEImageElement', 'SVGFEGaussianBlurElement', 'SVGFEFuncRElement', 'SVGFEFuncGElement', 'SVGFEFuncBElement', 'SVGFEFuncAElement', 'SVGFEFloodElement',
+ 'SVGFEDropShadowElement', 'SVGFEDistantLightElement', 'SVGFEDisplacementMapElement', 'SVGFEDiffuseLightingElement', 'SVGFEConvolveMatrixElement', 'SVGFECompositeElement', 'SVGFEComponentTransferElement', 'SVGFEColorMatrixElement',
+ 'SVGFEBlendElement', 'SVGEllipseElement', 'SVGElement', 'SVGDescElement', 'SVGDefsElement', 'SVGComponentTransferFunctionElement', 'SVGClipPathElement', 'SVGCircleElement',
+ 'SVGAnimationElement', 'SVGAnimatedTransformList', 'SVGAnimatedString', 'SVGAnimatedRect', 'SVGAnimatedPreserveAspectRatio', 'SVGAnimatedNumberList', 'SVGAnimatedNumber', 'SVGAnimatedLengthList',
+ 'SVGAnimatedLength', 'SVGAnimatedInteger', 'SVGAnimatedEnumeration', 'SVGAnimatedBoolean', 'SVGAnimatedAngle', 'SVGAnimateTransformElement', 'SVGAnimateMotionElement', 'SVGAnimateElement',
+ 'SVGAngle', 'SVGAElement', 'Response', 'ResizeObserverSize', 'ResizeObserverEntry', 'ResizeObserver', 'Request', 'ReportingObserver',
+ 'ReportBody', 'ReadableStreamDefaultReader', 'ReadableStreamDefaultController', 'ReadableStreamBYOBRequest', 'ReadableStreamBYOBReader', 'ReadableStream', 'ReadableByteStreamController', 'Range',
+ 'RadioNodeList', 'RTCTrackEvent', 'RTCStatsReport', 'RTCSessionDescription', 'RTCSctpTransport', 'RTCRtpTransceiver', 'RTCRtpSender', 'RTCRtpReceiver',
+ 'RTCPeerConnectionIceEvent', 'RTCPeerConnectionIceErrorEvent', 'RTCPeerConnection', 'RTCIceTransport', 'RTCIceCandidate', 'RTCErrorEvent', 'RTCError', 'RTCEncodedVideoFrame',
+ 'RTCEncodedAudioFrame', 'RTCDtlsTransport', 'RTCDataChannelEvent', 'RTCDTMFToneChangeEvent', 'RTCDTMFSender', 'RTCCertificate', 'PromiseRejectionEvent', 'ProgressEvent',
+ 'ProcessingInstruction', 'PopStateEvent', 'PointerEvent', 'PluginArray', 'Plugin', 'PictureInPictureWindow', 'PictureInPictureEvent', 'Permissions',
+ 'PermissionStatus', 'PeriodicWave', 'PerformanceTiming', 'PerformanceServerTiming', 'PerformanceScriptTiming', 'PerformanceResourceTiming', 'PerformancePaintTiming', 'PerformanceObserverEntryList',
+ 'PerformanceObserver', 'PerformanceNavigationTiming', 'PerformanceNavigation', 'PerformanceMeasure', 'PerformanceMark', 'PerformanceLongTaskTiming', 'PerformanceLongAnimationFrameTiming', 'PerformanceEventTiming',
+ 'PerformanceEntry', 'PerformanceElementTiming', 'Performance', 'Path2D', 'PannerNode', 'PageTransitionEvent', 'OverconstrainedError', 'OscillatorNode',
+ 'OffscreenCanvasRenderingContext2D', 'OffscreenCanvas', 'OfflineAudioContext', 'OfflineAudioCompletionEvent', 'Observable', 'NodeList', 'NodeIterator', 'NodeFilter',
+ 'Node', 'NetworkInformation', 'NavigatorUAData', 'Navigator', 'NavigationTransition', 'NavigationPrecommitController', 'NavigationHistoryEntry', 'NavigationDestination',
+ 'NavigationCurrentEntryChangeEvent', 'NavigationActivation', 'Navigation', 'NavigateEvent', 'NamedNodeMap', 'MutationRecord', 'MutationObserver', 'MouseEvent',
+ 'MimeTypeArray', 'MimeType', 'MessagePort', 'MessageEvent', 'MessageChannel', 'MediaStreamTrackVideoStats', 'MediaStreamTrackProcessor', 'MediaStreamTrackGenerator',
+ 'MediaStreamTrackEvent', 'MediaStreamTrackAudioStats', 'MediaStreamTrack', 'MediaStreamEvent', 'MediaStreamAudioSourceNode', 'MediaStreamAudioDestinationNode', 'MediaStream', 'MediaSourceHandle',
+ 'MediaSource', 'MediaRecorder', 'MediaQueryListEvent', 'MediaQueryList', 'MediaList', 'MediaError', 'MediaEncryptedEvent', 'MediaElementAudioSourceNode',
+ 'MediaCapabilities', 'MathMLElement', 'Location', 'LayoutShiftAttribution', 'LayoutShift', 'LargestContentfulPaint', 'KeyframeEffect', 'KeyboardEvent',
+ 'IntersectionObserverEntry', 'IntersectionObserver', 'InterestEvent', 'InputEvent', 'InputDeviceInfo', 'InputDeviceCapabilities', 'Ink', 'ImageData',
+ 'ImageBitmapRenderingContext', 'ImageBitmap', 'IdleDeadline', 'IIRFilterNode', 'IDBVersionChangeEvent', 'IDBTransaction', 'IDBRequest', 'IDBRecord',
+ 'IDBOpenDBRequest', 'IDBObjectStore', 'IDBKeyRange', 'IDBIndex', 'IDBFactory', 'IDBDatabase', 'IDBCursorWithValue', 'IDBCursor',
+ 'History', 'HighlightRegistry', 'Highlight', 'Headers', 'HashChangeEvent', 'HTMLVideoElement', 'HTMLUnknownElement', 'HTMLUListElement',
+ 'HTMLTrackElement', 'HTMLTitleElement', 'HTMLTimeElement', 'HTMLTextAreaElement', 'HTMLTemplateElement', 'HTMLTableSectionElement', 'HTMLTableRowElement', 'HTMLTableElement',
+ 'HTMLTableColElement', 'HTMLTableCellElement', 'HTMLTableCaptionElement', 'HTMLStyleElement', 'HTMLSpanElement', 'HTMLSourceElement', 'HTMLSlotElement', 'HTMLSelectedContentElement',
+ 'HTMLSelectElement', 'HTMLScriptElement', 'HTMLQuoteElement', 'HTMLProgressElement', 'HTMLPreElement', 'HTMLPictureElement', 'HTMLParamElement', 'HTMLParagraphElement',
+ 'HTMLOutputElement', 'HTMLOptionsCollection', 'HTMLOptionElement', 'HTMLOptGroupElement', 'HTMLObjectElement', 'HTMLOListElement', 'HTMLModElement', 'HTMLMeterElement',
+ 'HTMLMetaElement', 'HTMLMenuElement', 'HTMLMediaElement', 'HTMLMarqueeElement', 'HTMLMapElement', 'HTMLLinkElement', 'HTMLLegendElement', 'HTMLLabelElement',
+ 'HTMLLIElement', 'HTMLInputElement', 'HTMLImageElement', 'HTMLIFrameElement', 'HTMLHtmlElement', 'HTMLHeadingElement', 'HTMLHeadElement', 'HTMLHRElement',
+ 'HTMLFrameSetElement', 'HTMLFrameElement', 'HTMLFormElement', 'HTMLFormControlsCollection', 'HTMLFontElement', 'HTMLFieldSetElement', 'HTMLEmbedElement', 'HTMLElement',
+ 'HTMLDocument', 'HTMLDivElement', 'HTMLDirectoryElement', 'HTMLDialogElement', 'HTMLDetailsElement', 'HTMLDataListElement', 'HTMLDataElement', 'HTMLDListElement',
+ 'HTMLCollection', 'HTMLCanvasElement', 'HTMLButtonElement', 'HTMLBodyElement', 'HTMLBaseElement', 'HTMLBRElement', 'HTMLAudioElement', 'HTMLAreaElement',
+ 'HTMLAnchorElement', 'HTMLAllCollection', 'GeolocationPositionError', 'GeolocationPosition', 'GeolocationCoordinates', 'Geolocation', 'GamepadHapticActuator', 'GamepadEvent',
+ 'GamepadButton', 'Gamepad', 'GainNode', 'FormDataEvent', 'FormData', 'FontFaceSetLoadEvent', 'FontFace', 'FocusEvent',
+ 'FileReader', 'FileList', 'File', 'FeaturePolicy', 'External', 'EventTarget', 'EventSource', 'EventCounts',
+ 'Event', 'ErrorEvent', 'EncodedVideoChunk', 'EncodedAudioChunk', 'ElementInternals', 'Element', 'EditContext', 'DynamicsCompressorNode',
+ 'DragEvent', 'DocumentType', 'DocumentTimeline', 'DocumentFragment', 'Document', 'DelegatedInkTrailPresenter', 'DelayNode', 'DecompressionStream',
+ 'DataTransferItemList', 'DataTransferItem', 'DataTransfer', 'DOMTokenList', 'DOMStringMap', 'DOMStringList', 'DOMRectReadOnly', 'DOMRectList',
+ 'DOMRect', 'DOMQuad', 'DOMPointReadOnly', 'DOMPoint', 'DOMParser', 'DOMMatrixReadOnly', 'DOMMatrix', 'DOMImplementation',
+ 'DOMException', 'DOMError', 'CustomStateSet', 'CustomEvent', 'CustomElementRegistry', 'Crypto', 'CountQueuingStrategy', 'ConvolverNode',
+ 'ContentVisibilityAutoStateChangeEvent', 'ConstantSourceNode', 'CompressionStream', 'CompositionEvent', 'Comment', 'CommandEvent', 'CloseWatcher', 'CloseEvent',
+ 'ClipboardEvent', 'CharacterData', 'CharacterBoundsUpdateEvent', 'ChannelSplitterNode', 'ChannelMergerNode', 'CaretPosition', 'CanvasRenderingContext2D', 'CanvasPattern',
+ 'CanvasGradient', 'CanvasCaptureMediaStreamTrack', 'CSSViewTransitionRule', 'CSSVariableReferenceValue', 'CSSUnparsedValue', 'CSSUnitValue', 'CSSTranslate', 'CSSTransition',
+ 'CSSTransformValue', 'CSSTransformComponent', 'CSSSupportsRule', 'CSSStyleValue', 'CSSStyleSheet', 'CSSStyleRule', 'CSSStyleDeclaration', 'CSSStartingStyleRule',
+ 'CSSSkewY', 'CSSSkewX', 'CSSSkew', 'CSSScopeRule', 'CSSScale', 'CSSRuleList', 'CSSRule', 'CSSRotate',
+ 'CSSPropertyRule', 'CSSPositionValue', 'CSSPositionTryRule', 'CSSPositionTryDescriptors', 'CSSPerspective', 'CSSPageRule', 'CSSNumericValue', 'CSSNumericArray',
+ 'CSSNestedDeclarations', 'CSSNamespaceRule', 'CSSMediaRule', 'CSSMatrixComponent', 'CSSMathValue', 'CSSMathSum', 'CSSMathProduct', 'CSSMathNegate',
+ 'CSSMathMin', 'CSSMathMax', 'CSSMathInvert', 'CSSMathClamp', 'CSSMarginRule', 'CSSLayerStatementRule', 'CSSLayerBlockRule', 'CSSKeywordValue',
+ 'CSSKeyframesRule', 'CSSKeyframeRule', 'CSSImportRule', 'CSSImageValue', 'CSSGroupingRule', 'CSSFontPaletteValuesRule', 'CSSFontFaceRule', 'CSSCounterStyleRule',
+ 'CSSContainerRule', 'CSSConditionRule', 'CSSAnimation', 'CSPViolationReportBody', 'CDATASection', 'ByteLengthQueuingStrategy', 'BrowserCaptureMediaStreamTrack', 'BroadcastChannel',
+ 'BlobEvent', 'Blob', 'BiquadFilterNode', 'BeforeUnloadEvent', 'BeforeInstallPromptEvent', 'BaseAudioContext', 'BarProp', 'AudioWorkletNode',
+ 'AudioSinkInfo', 'AudioScheduledSourceNode', 'AudioProcessingEvent', 'AudioParamMap', 'AudioParam', 'AudioNode', 'AudioListener', 'AudioDestinationNode',
+ 'AudioData', 'AudioContext', 'AudioBufferSourceNode', 'AudioBuffer', 'Attr', 'AnimationTimeline', 'AnimationPlaybackEvent', 'AnimationEvent',
+ 'AnimationEffect', 'Animation', 'AnalyserNode', 'AbstractRange', 'AbortSignal', 'AbortController', 'SuppressedError', 'DisposableStack',
+ 'AsyncDisposableStack', 'Float16Array', 'AbsoluteOrientationSensor', 'Accelerometer', 'AudioDecoder', 'AudioEncoder', 'AudioWorklet', 'BatteryManager',
+ 'Cache', 'CacheStorage', 'Clipboard', 'ClipboardChangeEvent', 'ClipboardItem', 'CookieChangeEvent', 'CookieStore', 'CookieStoreManager',
+ 'CreateMonitor', 'Credential', 'CredentialsContainer', 'CryptoKey', 'DeviceMotionEvent', 'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate', 'DeviceOrientationEvent',
+ 'FederatedCredential', 'GPU', 'GPUAdapter', 'GPUAdapterInfo', 'GPUBindGroup', 'GPUBindGroupLayout', 'GPUBuffer', 'GPUCanvasContext',
+ 'GPUCommandBuffer', 'GPUCommandEncoder', 'GPUCompilationInfo', 'GPUCompilationMessage', 'GPUComputePassEncoder', 'GPUComputePipeline', 'GPUDevice', 'GPUDeviceLostInfo',
+ 'GPUError', 'GPUExternalTexture', 'GPUInternalError', 'GPUOutOfMemoryError', 'GPUPipelineError', 'GPUPipelineLayout', 'GPUQuerySet', 'GPUQueue',
+ 'GPURenderBundle', 'GPURenderBundleEncoder', 'GPURenderPassEncoder', 'GPURenderPipeline', 'GPUSampler', 'GPUShaderModule', 'GPUSupportedFeatures', 'GPUSupportedLimits',
+ 'GPUTexture', 'GPUTextureView', 'GPUUncapturedErrorEvent', 'GPUValidationError', 'GravitySensor', 'Gyroscope', 'IdleDetector', 'ImageCapture',
+ 'ImageDecoder', 'ImageTrack', 'ImageTrackList', 'Keyboard', 'KeyboardLayoutMap', 'LinearAccelerationSensor', 'MIDIAccess', 'MIDIConnectionEvent',
+ 'MIDIInput', 'MIDIInputMap', 'MIDIMessageEvent', 'MIDIOutput', 'MIDIOutputMap', 'MIDIPort', 'MediaDeviceInfo', 'MediaDevices',
+ 'MediaKeyMessageEvent', 'MediaKeySession', 'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys', 'NavigationPreloadManager', 'NavigatorManagedData', 'OrientationSensor',
+ 'PasswordCredential', 'ProtectedAudience', 'RelativeOrientationSensor', 'ScreenDetailed', 'ScreenDetails', 'Sensor', 'SensorErrorEvent', 'ServiceWorkerRegistration',
+ 'StorageManager', 'SubtleCrypto', 'VideoDecoder', 'VideoEncoder', 'VirtualKeyboard', 'WGSLLanguageFeatures', 'WebTransport', 'WebTransportBidirectionalStream',
+ 'WebTransportDatagramDuplexStream', 'WebTransportError', 'Worklet', 'XRDOMOverlayState', 'XRLayer', 'XRWebGLBinding', 'AudioPlaybackStats', 'AuthenticatorAssertionResponse',
+ 'AuthenticatorAttestationResponse', 'AuthenticatorResponse', 'PublicKeyCredential', 'BarcodeDetector', 'Bluetooth', 'BluetoothCharacteristicProperties', 'BluetoothDevice', 'BluetoothRemoteGATTCharacteristic',
+ 'BluetoothRemoteGATTDescriptor', 'BluetoothRemoteGATTServer', 'BluetoothRemoteGATTService', 'CaptureController', 'CrashReportContext', 'DevicePosture', 'DigitalCredential', 'DocumentPictureInPicture',
+ 'EyeDropper', 'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle', 'FileSystemWritableFileStream', 'FileSystemObserver', 'FontData',
+ 'FragmentDirective', 'HID', 'HIDConnectionEvent', 'HIDDevice', 'HIDInputReportEvent', 'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider',
+ 'NavigatorLogin', 'LanguageDetector', 'LanguageModel', 'Lock', 'LockManager', 'ServiceWorker', 'ServiceWorkerContainer',
+ 'ModelContext', 'NotRestoredReasonDetails', 'NotRestoredReasons', 'OTPCredential', 'PaymentAddress', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse', 'PaymentManager',
+ 'PaymentMethodChangeEvent', 'Presentation', 'PresentationAvailability', 'PresentationConnection', 'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent', 'PresentationConnectionList', 'PresentationReceiver',
+ 'PresentationRequest', 'PressureObserver', 'PressureRecord', 'Serial', 'SerialPort', 'SpeechRecognitionPhrase', 'StorageBucket', 'StorageBucketManager',
+ 'Summarizer', 'Translator', 'USB', 'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice', 'USBEndpoint',
+ 'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket', 'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'WakeLock',
+ 'WakeLockSentinel', 'WebMCPEvent', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRDepthInformation',
+ 'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource', 'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
+ 'XRJointPose', 'XRJointSpace', 'XRLightEstimate', 'XRLightProbe', 'XRPose', 'XRRay', 'XRReferenceSpace', 'XRReferenceSpaceEvent',
+ 'XRRenderState', 'XRRigidTransform', 'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSystem', 'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource',
+ 'XRView', 'XRViewerPose', 'XRViewport', 'XRWebGLDepthInformation', 'XRWebGLLayer', 'XRCompositionLayer', 'XRProjectionLayer', 'XRCubeLayer',
+ 'XRCylinderLayer', 'XREquirectLayer', 'XRLayerEvent', 'XRQuadLayer', 'XRSubImage', 'XRWebGLSubImage', 'XRPlane', 'XRPlaneSet',
+ 'XRVisibilityMaskChangeEvent', 'AnimationTrigger', 'BackgroundFetchManager', 'BackgroundFetchRecord', 'BackgroundFetchRegistration', 'BluetoothUUID', 'CSSFontFeatureValuesRule', 'CSSFunctionDeclarations',
+ 'CSSFunctionDescriptors', 'CSSFunctionRule', 'CSSPseudoElement', 'ChapterInformation', 'CropTarget', 'DocumentPictureInPictureEvent', 'Fence', 'FencedFrameConfig',
+ 'HTMLFencedFrameElement', 'HTMLGeolocationElement', 'IntegrityViolationReportBody', 'LaunchParams', 'LaunchQueue', 'MediaMetadata', 'MediaSession', 'Notification',
+ 'Origin', 'PageRevealEvent', 'PageSwapEvent', 'PerformanceTimingConfidence', 'PeriodicSyncManager', 'Profiler', 'PushManager', 'PushSubscription',
+ 'PushSubscriptionOptions', 'QuotaExceededError', 'RTCDataChannel', 'RTCRtpScriptTransform', 'RemotePlayback', 'RestrictionTarget', 'Sanitizer', 'SharedStorage',
+ 'SharedStorageWorklet', 'SharedStorageAppendMethod', 'SharedStorageClearMethod', 'SharedStorageDeleteMethod', 'SharedStorageModifierMethod', 'SharedStorageSetMethod', 'SharedWorker', 'SnapEvent',
+ 'SpeechGrammar', 'SpeechGrammarList', 'SpeechRecognition', 'SpeechRecognitionErrorEvent', 'SpeechRecognitionEvent', 'SpeechSynthesis', 'SpeechSynthesisErrorEvent', 'SpeechSynthesisEvent',
+ 'SpeechSynthesisUtterance', 'SpeechSynthesisVoice', 'TimelineTrigger', 'TimelineTriggerRange', 'TimelineTriggerRangeList', 'Viewport', 'WebSocketError', 'WebSocketStream',
+ 'webkitSpeechGrammar', 'webkitSpeechGrammarList', 'webkitSpeechRecognition', 'webkitSpeechRecognitionError', 'webkitSpeechRecognitionEvent'
+];
+
+function _extendChromeWindowFunctionOrder() {
+  const ordered = _chromePayloadBareFunctionOrder;
+  const seen = new Set(_chromeWindowKeyOrder);
+  for (const name of ordered) {
+    if (!seen.has(name)) { seen.add(name); _chromeWindowKeyOrder.push(name); }
+  }
+  for (const name of _chromeWindowVersionExtras) {
+    if (!seen.has(name)) { seen.add(name); _chromeWindowKeyOrder.push(name); }
+  }
+}
+
+function _alignPropertiesOrder(target, keyOrder) {
+  if (keyOrder === _chromeWindowKeyOrder
+      && typeof globalThis.__obscura_install_window_surface === 'function') {
+    globalThis.__obscura_install_window_surface(target, keyOrder);
+    return;
+  }
+  if (!target) return;
+  for (const key of keyOrder) {
+    if (target === globalThis && _ecmaScriptGlobals.has(key)) continue;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(target, key);
+      if (desc && desc.configurable) {
+        delete target[key];
+        Object.defineProperty(target, key, desc);
+      }
+    } catch (_error) {}
+  }
+}
 function _isWindowIndexKey(key) {
   if (typeof key !== 'string' || !/^(?:0|[1-9]\d*)$/.test(key)) return false;
   const value = Number(key);
@@ -572,7 +744,10 @@ function _frameWindowProxyFor(hostEl) {
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      if (realmGlobal) return Reflect.get(realmGlobal, key, realmGlobal);
+      if (realmGlobal) {
+        _hydrateFrameRealmSurface(realmGlobal);
+        return Reflect.get(realmGlobal, key, realmGlobal);
+      }
       if (key === "globalThis") return proxy;
       return _blankFrameSurfaceHas(key) ? _iframeRealmGlobal(t, key) : undefined;
     },
@@ -582,6 +757,7 @@ function _frameWindowProxyFor(hostEl) {
       }
       if (Reflect.has(t, key)) return Reflect.set(t, key, value);
       const realmGlobal = sameOrigin() ? _frameRealmGlobalFor(contentRoot()) : null;
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.set(realmGlobal, key, value, realmGlobal)
         : Reflect.set(t, key, value);
@@ -596,12 +772,16 @@ function _frameWindowProxyFor(hostEl) {
       if (Reflect.has(t, key)) return true;
       if (typeof key === "string" && !sameOrigin()) return false;
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
-      if (realmGlobal) return Reflect.has(realmGlobal, key);
+      if (realmGlobal) {
+        _hydrateFrameRealmSurface(realmGlobal);
+        return Reflect.has(realmGlobal, key);
+      }
       return key === "globalThis" || _blankFrameSurfaceHas(key);
     },
     ownKeys(t) {
       if (!sameOrigin()) return Reflect.ownKeys(t);
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      _hydrateFrameRealmSurface(realmGlobal);
       const source = realmGlobal
         ? _frameRealmOwnKeys(realmGlobal) : _pristineGlobalNames;
       const keys = [];
@@ -626,6 +806,7 @@ function _frameWindowProxyFor(hostEl) {
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
       let descriptor;
       if (realmGlobal) {
+        _hydrateFrameRealmSurface(realmGlobal);
         descriptor = _frameRealmOwnDescriptor(realmGlobal, key);
       } else if (key === "globalThis") {
         descriptor = { value: proxy, writable: true, enumerable: false };
@@ -644,6 +825,7 @@ function _frameWindowProxyFor(hostEl) {
     defineProperty(t, key, descriptor) {
       if (!sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.defineProperty(realmGlobal, key, descriptor)
         : Reflect.defineProperty(t, key, descriptor);
@@ -651,6 +833,7 @@ function _frameWindowProxyFor(hostEl) {
     deleteProperty(t, key) {
       if (!sameOrigin()) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.deleteProperty(realmGlobal, key)
         : Reflect.deleteProperty(t, key);
@@ -658,11 +841,25 @@ function _frameWindowProxyFor(hostEl) {
     getPrototypeOf(t) {
       if (!sameOrigin()) return Reflect.getPrototypeOf(t);
       const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal ? Reflect.getPrototypeOf(realmGlobal) : Reflect.getPrototypeOf(t);
     },
   });
   _frameWindowProxies.set(hostNid, proxy);
   return proxy;
+}
+
+// Step 312: a frame realm booted with __obscura_frame_defers_surface carries
+// only the core surface (its document, the proxy facades, DOM classes) until
+// first touch. Every parent-side proxy operation that would observe the
+// realm's window surface hydrates it first; `document` and the WindowProxy
+// aliases are core and stay hydrate-free so reading contentDocument stays at
+// core cost. The hydrate function deletes itself when it runs, so this is a
+// single property miss once the realm is whole.
+function _hydrateFrameRealmSurface(realmGlobal) {
+  if (realmGlobal && realmGlobal.__obscura_hydrate) {
+    try { realmGlobal.__obscura_hydrate(); } catch (_e) {}
+  }
 }
 // The Rust-built frame-message delivery script and the main realm's recv
 // loop resolve these by name from separate scripts; export them explicitly
@@ -839,6 +1036,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       if (Reflect.has(t, key)) return Reflect.get(t, key);
       if (typeof key === "string" && !sameOrigin()) throw securityError();
       const realmGlobal = targetGlobal();
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal ? Reflect.get(realmGlobal, key, realmGlobal) : undefined;
     },
     set(t, key, value) {
@@ -861,6 +1059,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       if (Reflect.has(t, key)) return true;
       if (typeof key === "string" && !sameOrigin()) return false;
       const realmGlobal = targetGlobal();
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return !!realmGlobal && Reflect.has(realmGlobal, key);
     },
     ownKeys(t) {
@@ -868,6 +1067,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       if (!sameOrigin()) return keys;
       const realmGlobal = targetGlobal();
       if (!realmGlobal) return keys;
+      _hydrateFrameRealmSurface(realmGlobal);
       const seen = new Set(keys);
       for (const key of _frameRealmOwnKeys(realmGlobal)) {
         if (key === "constructor") continue;
@@ -884,6 +1084,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
         return { value: ref, writable: true, enumerable: false, configurable: true };
       }
       const realmGlobal = targetGlobal();
+      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       const descriptor = realmGlobal
         ? _frameRealmOwnDescriptor(realmGlobal, key) : undefined;
       if (!descriptor) return undefined;

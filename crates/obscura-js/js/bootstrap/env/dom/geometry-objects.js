@@ -15,6 +15,28 @@ const OBSCURA_GEOM_SLOTS = new WeakMap();
 // DOMRect a page receives stays own-key-less like Chrome's (the marker used
 // to be an own property).
 const OBSCURA_VIEWPORT_FIXED_RECTS = new WeakSet();
+// SVG geometry result interfaces (Chrome: non-constructible, own toStringTag,
+// no prototype members beyond the field accessors the SVG producers install).
+// They live in the bootstrap core so a deferred-surface frame realm answers
+// branded records from getBBox/getExtentOfChar before hydration, where
+// surface-finalize's interface table has not run; the table skips names that
+// already exist, so hydration is a no-op for them.
+function OBSCURA_INSTALL_SVG_GEOM_INTERFACE(name) {
+  if (typeof globalThis[name] !== 'undefined') return;
+  const ctor = { [name]: class {
+      constructor() {
+        throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+      }
+    } }[name];
+  Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag,
+    { value: name, configurable: true });
+  Object.defineProperty(globalThis, name,
+    { value: _markNative(ctor), writable: true, enumerable: false, configurable: true });
+}
+OBSCURA_INSTALL_SVG_GEOM_INTERFACE('SVGRect');
+OBSCURA_INSTALL_SVG_GEOM_INTERFACE('SVGPoint');
+OBSCURA_INSTALL_SVG_GEOM_INTERFACE('SVGMatrix');
 function OBSCURA_GEOM_ACCESSORS(proto, keys) {
   for (const key of keys) {
     Object.defineProperty(proto, key, {

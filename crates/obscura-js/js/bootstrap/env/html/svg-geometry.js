@@ -680,3 +680,253 @@
     writable: true, enumerable: false, configurable: true,
   });
 })();
+
+// SVGTextContentElement's character-position API. Chrome exposes it on the
+// interface; Obscura had none of it, so a probe that walks a text run one
+// character at a time -- which is how the challenge builds its ascending
+// per-character position list -- collected an empty list instead of the
+// advances a browser reports. This runs here rather than next to the
+// measurement methods in env/media/canvas.js because the reflection accessors
+// below want the final interface objects; env/html/svg-elements.js has
+// already defined SVGTextContentElement as a real class, and <text>/<tspan>/
+// <textPath> inherit it through the interface lattice.
+(function _installSvgTextContentGeometry() {
+  if (typeof _measureTextBox !== 'function') return;
+  const owner = globalThis.SVGTextContentElement && globalThis.SVGTextContentElement.prototype;
+  if (!owner || owner === Element.prototype) return;
+  const geometry = {
+    getNumberOfChars() {
+      // Without a rendering box Chrome reads the run as zero characters, so
+      // every count here follows the rendered check, not the text content.
+      if (_svgUnrendered(this)) return 0;
+      return _svgTextContent(this).length;
+    },
+    getStartPositionOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getStartPositionOfChar', index);
+      // Chrome anchors the character positions on the element's x list origin
+      // (a run at x=32 starts its position list at 32), not at user-space 0,
+      // and answers SVGPoint instances, not plain records. Both halves of a
+      // surrogate pair answer the cluster's start position.
+      const offset = _svgAttrOffset(this, 'x');
+      const i = _svgCharacterIndex(this, 'getStartPositionOfChar', index);
+      const [spanStart] = _svgCharClusterSpan(_svgTextContent(this), i);
+      return _svgPointLike({ x: offset + _svgAdvanceTo(this, spanStart), y: 0 });
+    },
+    getEndPositionOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getEndPositionOfChar', index);
+      const i = _svgCharacterIndex(this, 'getEndPositionOfChar', index);
+      const text = _svgTextContent(this);
+      const [spanStart, spanEnd] = _svgCharClusterSpan(text, i);
+      const char = text.slice(spanStart, spanEnd);
+      return _svgPointLike({ x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, spanStart) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 });
+    },
+    getRotationOfChar(index) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getRotationOfChar', index);
+      _svgCharacterIndex(this, 'getRotationOfChar', index);
+      return 0;
+    },
+    getCharNumAtPosition(point) {
+      const x = point && Number(point.x);
+      if (!Number.isFinite(x)) return -1;
+      if (_svgUnrendered(this)) return -1;
+      const text = _svgTextContent(this);
+      for (let i = 0; i < text.length; i++) {
+        if (x < _svgAdvanceTo(this, i + 1)) return i;
+      }
+      return -1;
+    },
+    // Chrome's SVG 1.1 name (selectSubStringLength does not exist there --
+    // local headless-Chrome oracle). Selection itself needs layout hit-testing
+    // this engine does not model for SVG runs; validating the index the way
+    // Chrome does and returning cleanly is the observable behaviour for an
+    // empty selection surface.
+    selectSubString(index, count) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize('selectSubString', index);
+      _svgCharacterIndex(this, 'selectSubString', index);
+      if (count !== undefined && count < 0) {
+        throw new DOMException(
+          'The number provided (' + count + ') is negative.',
+          'IndexSizeError',
+        );
+      }
+    },
+  };
+  for (const name of Object.keys(geometry)) {
+    Object.defineProperty(owner, name, {
+      value: geometry[name], writable: true, enumerable: false, configurable: true,
+    });
+  }
+  // WebIDL constants live on the interface prototype object for the SVG 1.1
+  // interfaces, and Chrome mirrors them on the constructor (local Chrome
+  // oracle: own keys on both).
+  const constants = [['LENGTHADJUST_UNKNOWN', 0],
+                     ['LENGTHADJUST_SPACING', 1],
+                     ['LENGTHADJUST_SPACINGANDGLYPHS', 2]];
+  for (const [name, value] of constants) {
+    Object.defineProperty(owner, name, {
+      value, writable: true, enumerable: true, configurable: false,
+    });
+    const ctor = globalThis.SVGTextContentElement;
+    if (ctor && !Object.prototype.hasOwnProperty.call(ctor, name)) {
+      Object.defineProperty(ctor, name, {
+        value, writable: true, enumerable: true, configurable: false,
+      });
+    }
+  }
+  // Reflected attributes. Chrome caches the reflection objects per element
+  // (text.textLength === text.textLength) and keeps them in sync with the
+  // attribute, so the getters memoize the wrapper per slot in a WeakMap and
+  // refresh the value on each read. Instances are branded from the shells.
+  const reflectionCache = new WeakMap();
+  const slotOf = (el, slot, brand, initial) => {
+    let slots = reflectionCache.get(el);
+    if (slots === undefined) { slots = {}; reflectionCache.set(el, slots); }
+    let inst = slots[slot];
+    if (inst === undefined) {
+      inst = Object.create(brandedOf(brand));
+      inst.baseVal = initial;
+      inst.animVal = initial;
+      slots[slot] = inst;
+    }
+    return inst;
+  };
+  const brandedOf = (name) => {
+    const ctor = globalThis[name];
+    return (ctor && typeof ctor === 'function' && ctor.prototype)
+      ? ctor.prototype : Object.prototype;
+  };
+  const attrNumber = (el, attr, fallback) => {
+    try {
+      const v = el.getAttribute(attr);
+      if (v == null || v === '') return fallback;
+      const n = Number(String(v).trim().split(/[\s,]+/)[0]);
+      return Number.isFinite(n) ? n : fallback;
+    } catch (_e) { return fallback; }
+  };
+  const attrEnum = (el, attr) => {
+    try {
+      const v = el.getAttribute(attr);
+      if (v === 'spacingAndGlyphs') return 2;
+      if (v === 'spacing') return 1;
+      return 1; // spec initial value: lengthAdjust="spacing"
+    } catch (_e) { return 1; }
+  };
+  Object.defineProperty(owner, 'textLength', {
+    get() {
+      const n = attrNumber(this, 'textLength', 0);
+      const len = { value: n };
+      const inst = slotOf(this, 'textLength', 'SVGAnimatedLength', len);
+      inst.baseVal = len;
+      inst.animVal = len;
+      return inst;
+    }, configurable: true, enumerable: true,
+  });
+  Object.defineProperty(owner, 'lengthAdjust', {
+    get() {
+      const n = attrEnum(this, 'lengthAdjust');
+      const inst = slotOf(this, 'lengthAdjust', 'SVGAnimatedEnumeration', 1);
+      inst.baseVal = n;
+      inst.animVal = n;
+      return inst;
+    }, configurable: true, enumerable: true,
+  });
+})();
+
+// SVGTextPositioningElement's x/y/dx/dy/rotate reflection. Chrome answers
+// SVGAnimatedLengthList instances (SVGAnimatedNumberList for rotate) whose
+// baseVal supports numberOfItems/getItem; the challenge sets x/y as
+// attributes and reads positions back through the measurement API, but a
+// census probe reading text.x.baseVal.numberOfItems must not see undefined.
+(function _installSvgTextPositioningReflection() {
+  const owner = globalThis.SVGTextPositioningElement
+    && globalThis.SVGTextPositioningElement.prototype;
+  if (!owner || owner === Element.prototype) return;
+  const reflectionCache = new WeakMap();
+  const brandedOf = (name) => {
+    const ctor = globalThis[name];
+    return (ctor && typeof ctor === 'function' && ctor.prototype)
+      ? ctor.prototype : Object.prototype;
+  };
+  const parseList = (el, attr) => {
+    try {
+      const raw = el.getAttribute(attr);
+      if (raw == null || raw === '') return [];
+      return String(raw).trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+    } catch (_e) { return []; }
+  };
+  const lengthListOf = (values) => {
+    const list = {
+      numberOfItems: values.length,
+      getItem(i) {
+        if (i < 0 || i >= values.length) {
+          throw new DOMException('Index out of range', 'IndexSizeError');
+        }
+        return { value: values[i] };
+      },
+    };
+    for (let i = 0; i < values.length; i++) list[i] = { value: values[i] };
+    return list;
+  };
+  const animatedListOf = (el, attr, kind) => {
+    // Chrome keeps one reflection object per element/attribute
+    // (text.x === text.x); the underlying list refreshes on each read so
+    // attribute writes stay visible.
+    let perEl = reflectionCache.get(el);
+    if (perEl === undefined) { perEl = {}; reflectionCache.set(el, perEl); }
+    let inst = perEl[attr];
+    if (inst === undefined) {
+      inst = Object.create(brandedOf(kind));
+      perEl[attr] = inst;
+    }
+    const values = parseList(el, attr);
+    inst.baseVal = lengthListOf(values);
+    inst.animVal = lengthListOf(values);
+    return inst;
+  };  for (const attr of ['x', 'y', 'dx', 'dy']) {
+    Object.defineProperty(owner, attr, {
+      get() { return animatedListOf(this, attr, 'SVGAnimatedLengthList'); },
+      configurable: true, enumerable: true,
+    });
+  }
+  Object.defineProperty(owner, 'rotate', {
+    get() { return animatedListOf(this, 'rotate', 'SVGAnimatedNumberList'); },
+    configurable: true, enumerable: true,
+  });
+})();
+
+// Geometry producers hand back plain records, so `Object.prototype.toString`
+// on a rect reads `[object Object]` where a browser reads `[object DOMRect]`,
+// and `rect instanceof DOMRect` is false. The tag alone does not help: the
+// value has to actually be an instance. Re-wrap the producer instead of
+// rewriting the layout path.
+(function _brandGeometryResults() {
+  if (typeof DOMRect !== 'function' || typeof _markNative !== 'function') return;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    Element.prototype, 'getBoundingClientRect');
+  if (!descriptor || typeof descriptor.value !== 'function') return;
+  const call = descriptor.value;
+  try {
+    Object.defineProperty(Element.prototype, 'getBoundingClientRect', {
+      value: _markNative(function () {
+        const result = call.apply(this, arguments);
+        if (result == null || typeof result.x !== 'number'
+            || typeof result.width !== 'number') return result;
+        if (result instanceof DOMRect) return result;
+        // Chrome's layout engine clamps every box at LayoutUnit's maximum;
+        // a magnitude no browser can produce (an overflowing authored width
+        // that reached layout) is a renderer fingerprint.
+        const clampBox = (v) => (!Number.isFinite(v) || Math.abs(v) > 33554430) ? 33554430 : v;
+        const branded = new DOMRect(
+          clampBox(result.x), clampBox(result.y), clampBox(result.width), clampBox(result.height));
+        // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
+        // and skips the scroll for it. The branded value has to carry that
+        // marker, or a fixed subtree starts moving the document. The marker
+        // lives in a WeakSet: Chrome's rects carry no own properties, and an
+        // own flag here would hand the own-key census a name.
+        if (result.__obscuraViewportFixed) OBSCURA_VIEWPORT_FIXED_RECTS.add(branded);
+        return branded;
+      }),
+      writable: true, enumerable: false, configurable: true,
+    });
+  } catch (e) {}
+})();
