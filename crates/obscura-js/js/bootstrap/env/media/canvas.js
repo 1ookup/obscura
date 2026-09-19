@@ -1020,20 +1020,22 @@ function _svgRunAdvance(text, font) {
   return box.width;
 }
 
-Element.prototype.getBBox = function() {
-  if (_svgUnrendered(this)) {
-    return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
-  }
-  const box = _measureTextBox(_svgTextContent(this), _svgMeasurementFont(this));
-  return _svgRectLike({ x: 0, y: -box.ascent, width: box.width, height: box.ascent + box.descent });
-};
+// The text-content methods belong on SVGTextContentElement.prototype (Chrome's
+// IDL owner, reachable from <text>/<tspan>/<textPath> through the interface
+// lattice). They sat on Element.prototype while the text interfaces were
+// aliases, which leaked ctl/getExtentOfChar onto every HTML element -- a
+// surface no browser has. SVGTextContentElement is a real class by now
+// (env/html/svg-elements.js, earlier in the manifest); the Element fallback
+// only guards a module order surprise.
+const SVG_TEXT_CONTENT_PROTO = (globalThis.SVGTextContentElement
+  && globalThis.SVGTextContentElement.prototype) || Element.prototype;
 
-Element.prototype.getComputedTextLength = function() {
+SVG_TEXT_CONTENT_PROTO.getComputedTextLength = function() {
   if (_svgUnrendered(this)) return 0;
   return _svgRunAdvance(_svgTextContent(this), _svgMeasurementFont(this));
 };
 
-Element.prototype.getExtentOfChar = function(ch) {
+SVG_TEXT_CONTENT_PROTO.getExtentOfChar = function(ch) {
   const text = _svgTextContent(this);
   const font = _svgMeasurementFont(this);
   if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
@@ -1053,7 +1055,7 @@ Element.prototype.getExtentOfChar = function(ch) {
   });
 };
 
-Element.prototype.getSubStringLength = function(ch, len) {
+SVG_TEXT_CONTENT_PROTO.getSubStringLength = function(ch, len) {
   const text = _svgTextContent(this);
   if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
   const start = Math.max(0, Math.trunc(Number(ch)) || 0);
@@ -1082,9 +1084,6 @@ function _svgCharacterIndex(element, index) {
 function _svgAdvanceTo(element, count) {
   return _measureTextBox(_svgTextContent(element).slice(0, count), _svgMeasurementFont(element)).width;
 }
-
-// The interface itself is installed by the last manifest module, so the
-// methods above are attached from there (config/webidl-branding.js).
 
 Element.prototype.attachShadow = function attachShadow(opts) {
   var _mode = opts == null ? undefined : opts.mode;

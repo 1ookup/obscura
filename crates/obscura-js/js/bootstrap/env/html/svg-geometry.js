@@ -280,14 +280,21 @@
   }
 
   // --- installed API ------------------------------------------------------
-  Element.prototype.getCTM = function getCTM() {
+  // getBBox/getCTM/getScreenCTM are SVGGraphicsElement members in Chrome's
+  // IDL (an HTML div has none of them), so they install on the graphics
+  // prototype directly; every SVG element that Chrome answers them for
+  // inherits it through the interface lattice.
+  const GRAPHICS_PROTO = (globalThis.SVGGraphicsElement
+    && globalThis.SVGGraphicsElement.prototype) || Element.prototype;
+
+  GRAPHICS_PROTO.getCTM = function getCTM() {
     const root = _svgRootOf(this);
     if (!root) return null;
     if (root === this) return _matrixLike(_ident());
     return _matrixLike(_viewportCTM(this) || _ident());
   };
 
-  Element.prototype.getScreenCTM = function getScreenCTM() {
+  GRAPHICS_PROTO.getScreenCTM = function getScreenCTM() {
     const root = _svgRootOf(this);
     if (!root) return null;
     const origin = _layoutGBCR.call(root);
@@ -370,7 +377,7 @@
 
   // getBBox gains the container union and the x/y-attribute placement while
   // keeping the text measurement the previous implementation used.
-  Element.prototype.getBBox = function getBBox() {
+  GRAPHICS_PROTO.getBBox = function getBBox() {
     if (_svgUnrendered(this)) return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
     if (_measuringFragment) return _svgRectLike({ x: 0, y: 0, width: 0, height: 0 });
     _measuringFragment = true;
@@ -626,11 +633,13 @@
     return pts[pts.length - 1].slice();
   }
 
-  // Keep the generic Element fallback for compatibility, but publish the
-  // geometry methods on their owning SVG interfaces as Chrome does. Besides
+  // Publish the one method that stays an Element member in Chrome
+  // (getClientRects) onto the graphics prototype as well, so an SVG element's
+  // fragment-aware override shadows it at the interface level. Besides
   // matching the IDL surface, this preserves the receiver interface in the
-  // native call trace (SVGGraphicsElement.getBBox and
-  // SVGSVGElement.getComputedTextLength), which challenge scripts inspect.
+  // native call trace (SVGGraphicsElement.getClientRects), which challenge
+  // scripts inspect. getBBox/getCTM/getScreenCTM are defined on the graphics
+  // prototype above.
   function _publishSvgMethod(proto, name) {
     if (!proto || proto === Element.prototype
         || Object.prototype.hasOwnProperty.call(proto, name)) return;
@@ -641,15 +650,14 @@
     });
   }
   const graphicsProto = globalThis.SVGGraphicsElement && globalThis.SVGGraphicsElement.prototype;
-  for (const name of ['getBBox', 'getCTM', 'getScreenCTM', 'getClientRects']) {
+  for (const name of ['getClientRects']) {
     _publishSvgMethod(graphicsProto, name);
   }
-  const svgProto = globalThis.SVGSVGElement && globalThis.SVGSVGElement.prototype;
-  for (const name of ['getComputedTextLength', 'getSubStringLength', 'getExtentOfChar',
-                      'getStartPositionOfChar', 'getEndPositionOfChar',
-                      'getRotationOfChar', 'getCharNumAtPosition', 'getNumberOfChars']) {
-    _publishSvgMethod(svgProto, name);
-  }
+  // Chrome does NOT carry the text-content methods on SVGSVGElement (an svg
+  // root is an SVGGraphicsElement, not an SVGTextContentElement; local
+  // headless-Chrome oracle: typeof SVGSVGElement.prototype.getComputedTextLength
+  // === "undefined"). The old republish here was a divergence, dropped with
+  // the text methods' move onto SVGTextContentElement.prototype.
 
   const GEOMETRY_PROTO = (globalThis.SVGGeometryElement && globalThis.SVGGeometryElement.prototype) || Element.prototype;
   Object.defineProperty(GEOMETRY_PROTO, 'getTotalLength', {

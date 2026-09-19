@@ -91,6 +91,10 @@ const SVG_TAGS = {
     'HTMLVideoElement', 'HTMLAudioElement', 'HTMLObjectElement', 'HTMLTrackElement',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement', 'SVGAnimatedString',
+    'SVGTextContentElement', 'SVGTextPositioningElement', 'SVGTextElement',
+    'SVGTSpanElement', 'SVGTextPathElement',
+    'SVGAElement', 'SVGDefsElement', 'SVGForeignObjectElement', 'SVGGElement',
+    'SVGImageElement', 'SVGSwitchElement', 'SVGSymbolElement', 'SVGUseElement',
     // Text tracks
     'TextTrack', 'TextTrackList', 'TextTrackCue', 'TextTrackCueList', 'VTTCue',
     // CSSOM
@@ -228,10 +232,14 @@ const SVG_TAGS = {
 // character at a time -- which is how the challenge builds its ascending
 // per-character position list -- collected an empty list instead of the
 // advances a browser reports. This runs here rather than next to the
-// measurement methods in env/media/canvas.js because the SVG interfaces are
-// installed by this, the last, manifest module.
+// measurement methods in env/media/canvas.js because the reflection accessors
+// below want the final interface objects; env/html/svg-elements.js has
+// already defined SVGTextContentElement as a real class, and <text>/<tspan>/
+// <textPath> inherit it through the interface lattice.
 (function _installSvgTextContentGeometry() {
   if (typeof _measureTextBox !== 'function') return;
+  const owner = globalThis.SVGTextContentElement && globalThis.SVGTextContentElement.prototype;
+  if (!owner || owner === Element.prototype) return;
   const geometry = {
     getNumberOfChars() {
       // Without a rendering box Chrome reads the run as zero characters, so
@@ -268,41 +276,163 @@ const SVG_TAGS = {
       }
       return -1;
     },
+    // Chrome's SVG 1.1 name (selectSubStringLength does not exist there --
+    // local headless-Chrome oracle). Selection itself needs layout hit-testing
+    // this engine does not model for SVG runs; validating the index the way
+    // Chrome does and returning cleanly is the observable behaviour for an
+    // empty selection surface.
+    selectSubString(index, count) {
+      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
+      _svgCharacterIndex(this, index);
+      if (count !== undefined && count < 0) {
+        throw new DOMException(
+          'The number provided (' + count + ') is negative.',
+          'IndexSizeError',
+        );
+      }
+    },
   };
-  // Where they belong. `SVGTextElement` and its siblings are still published
-  // as aliases of SVGElement here, so a <text> node does not inherit from this
-  // prototype yet -- the install below Element.prototype is what makes them
-  // reachable on the element the challenge actually measures.
-  const owner = globalThis.SVGTextContentElement && globalThis.SVGTextContentElement.prototype;
-  if (owner) {
-    for (const name of Object.keys(geometry)) {
-      Object.defineProperty(owner, name, {
-        value: geometry[name], writable: true, enumerable: false, configurable: true,
-      });
-    }
-  }
   for (const name of Object.keys(geometry)) {
-    Object.defineProperty(Element.prototype, name, {
+    Object.defineProperty(owner, name, {
       value: geometry[name], writable: true, enumerable: false, configurable: true,
     });
   }
+  // WebIDL constants live on the interface prototype object for the SVG 1.1
+  // interfaces, and Chrome mirrors them on the constructor (local Chrome
+  // oracle: own keys on both).
+  const constants = [['LENGTHADJUST_UNKNOWN', 0],
+                     ['LENGTHADJUST_SPACING', 1],
+                     ['LENGTHADJUST_SPACINGANDGLYPHS', 2]];
+  for (const [name, value] of constants) {
+    Object.defineProperty(owner, name, {
+      value, writable: true, enumerable: true, configurable: false,
+    });
+    const ctor = globalThis.SVGTextContentElement;
+    if (ctor && !Object.prototype.hasOwnProperty.call(ctor, name)) {
+      Object.defineProperty(ctor, name, {
+        value, writable: true, enumerable: true, configurable: false,
+      });
+    }
+  }
+  // Reflected attributes. Chrome caches the reflection objects per element
+  // (text.textLength === text.textLength) and keeps them in sync with the
+  // attribute, so the getters memoize the wrapper per slot in a WeakMap and
+  // refresh the value on each read. Instances are branded from the shells.
+  const reflectionCache = new WeakMap();
+  const slotOf = (el, slot, brand, initial) => {
+    let slots = reflectionCache.get(el);
+    if (slots === undefined) { slots = {}; reflectionCache.set(el, slots); }
+    let inst = slots[slot];
+    if (inst === undefined) {
+      inst = Object.create(brandedOf(brand));
+      inst.baseVal = initial;
+      inst.animVal = initial;
+      slots[slot] = inst;
+    }
+    return inst;
+  };
+  const brandedOf = (name) => {
+    const ctor = globalThis[name];
+    return (ctor && typeof ctor === 'function' && ctor.prototype)
+      ? ctor.prototype : Object.prototype;
+  };
+  const attrNumber = (el, attr, fallback) => {
+    try {
+      const v = el.getAttribute(attr);
+      if (v == null || v === '') return fallback;
+      const n = Number(String(v).trim().split(/[\s,]+/)[0]);
+      return Number.isFinite(n) ? n : fallback;
+    } catch (_e) { return fallback; }
+  };
+  const attrEnum = (el, attr) => {
+    try {
+      const v = el.getAttribute(attr);
+      if (v === 'spacingAndGlyphs') return 2;
+      if (v === 'spacing') return 1;
+      return 1; // spec initial value: lengthAdjust="spacing"
+    } catch (_e) { return 1; }
+  };
+  Object.defineProperty(owner, 'textLength', {
+    get() {
+      const n = attrNumber(this, 'textLength', 0);
+      const len = { value: n };
+      const inst = slotOf(this, 'textLength', 'SVGAnimatedLength', len);
+      inst.baseVal = len;
+      inst.animVal = len;
+      return inst;
+    }, configurable: true, enumerable: true,
+  });
+  Object.defineProperty(owner, 'lengthAdjust', {
+    get() {
+      const n = attrEnum(this, 'lengthAdjust');
+      const inst = slotOf(this, 'lengthAdjust', 'SVGAnimatedEnumeration', 1);
+      inst.baseVal = n;
+      inst.animVal = n;
+      return inst;
+    }, configurable: true, enumerable: true,
+  });
 })();
 
-// The SVG classes are finalized after the media module installs the generic
-// text helpers. Re-publish the root SVG text methods at this final stage so a
-// frame-created <svg> resolves them through SVGSVGElement's own interface.
-(function _finalizeSvgRootMethods() {
-  const owner = globalThis.SVGSVGElement && globalThis.SVGSVGElement.prototype;
+// SVGTextPositioningElement's x/y/dx/dy/rotate reflection. Chrome answers
+// SVGAnimatedLengthList instances (SVGAnimatedNumberList for rotate) whose
+// baseVal supports numberOfItems/getItem; the challenge sets x/y as
+// attributes and reads positions back through the measurement API, but a
+// census probe reading text.x.baseVal.numberOfItems must not see undefined.
+(function _installSvgTextPositioningReflection() {
+  const owner = globalThis.SVGTextPositioningElement
+    && globalThis.SVGTextPositioningElement.prototype;
   if (!owner || owner === Element.prototype) return;
-  for (const name of ['getComputedTextLength', 'getSubStringLength', 'getExtentOfChar',
-                      'getStartPositionOfChar', 'getEndPositionOfChar',
-                      'getRotationOfChar', 'getCharNumAtPosition', 'getNumberOfChars']) {
-    const fn = Element.prototype[name];
-    if (typeof fn !== 'function') continue;
-    Object.defineProperty(owner, name, {
-      value: fn, writable: true, enumerable: false, configurable: true,
+  const reflectionCache = new WeakMap();
+  const brandedOf = (name) => {
+    const ctor = globalThis[name];
+    return (ctor && typeof ctor === 'function' && ctor.prototype)
+      ? ctor.prototype : Object.prototype;
+  };
+  const parseList = (el, attr) => {
+    try {
+      const raw = el.getAttribute(attr);
+      if (raw == null || raw === '') return [];
+      return String(raw).trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+    } catch (_e) { return []; }
+  };
+  const lengthListOf = (values) => {
+    const list = {
+      numberOfItems: values.length,
+      getItem(i) {
+        if (i < 0 || i >= values.length) {
+          throw new DOMException('Index out of range', 'IndexSizeError');
+        }
+        return { value: values[i] };
+      },
+    };
+    for (let i = 0; i < values.length; i++) list[i] = { value: values[i] };
+    return list;
+  };
+  const animatedListOf = (el, attr, kind) => {
+    // Chrome keeps one reflection object per element/attribute
+    // (text.x === text.x); the underlying list refreshes on each read so
+    // attribute writes stay visible.
+    let perEl = reflectionCache.get(el);
+    if (perEl === undefined) { perEl = {}; reflectionCache.set(el, perEl); }
+    let inst = perEl[attr];
+    if (inst === undefined) {
+      inst = Object.create(brandedOf(kind));
+      perEl[attr] = inst;
+    }
+    const values = parseList(el, attr);
+    inst.baseVal = lengthListOf(values);
+    inst.animVal = lengthListOf(values);
+    return inst;
+  };  for (const attr of ['x', 'y', 'dx', 'dy']) {
+    Object.defineProperty(owner, attr, {
+      get() { return animatedListOf(this, attr, 'SVGAnimatedLengthList'); },
+      configurable: true, enumerable: true,
     });
   }
+  Object.defineProperty(owner, 'rotate', {
+    get() { return animatedListOf(this, 'rotate', 'SVGAnimatedNumberList'); },
+    configurable: true, enumerable: true,
+  });
 })();
 
 // Geometry producers hand back plain records, so `Object.prototype.toString`

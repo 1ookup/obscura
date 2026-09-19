@@ -153,6 +153,10 @@ for (const name of [
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'SVGTextContentElement', 'SVGTextPositioningElement', 'SVGTextElement',
+    'SVGTSpanElement', 'SVGTextPathElement',
+    'SVGAElement', 'SVGDefsElement', 'SVGForeignObjectElement', 'SVGGElement',
+    'SVGImageElement', 'SVGSwitchElement', 'SVGSymbolElement', 'SVGUseElement',
   ];
   // Preserve whatever is already there. Most of these names do not exist yet
   // at this point, but some do (`Deno`), and redefining those with

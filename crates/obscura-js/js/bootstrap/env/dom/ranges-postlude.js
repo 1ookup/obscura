@@ -32,7 +32,6 @@
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,
   Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
-  Element.prototype.getBBox,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
   Node.prototype.contains, Node.prototype.hasChildNodes, Node.prototype.cloneNode,

@@ -4949,7 +4949,10 @@ mod tests {
                         pointAtLengthExact: p.x === 50 && p.y === 0,
                         clientRectsSingleFragment: list.length === 1
                             && Math.abs(list.item(0).x - rect.x) < 1e-6,
-                        htmlOutsideSvgHasNoCtm: div.getCTM() === null && div.getScreenCTM() === null,
+                        // Chrome has no getCTM/getScreenCTM outside the SVG
+                        // graphics interfaces (a div answers undefined).
+                        htmlOutsideSvgHasNoCtm: typeof div.getCTM === "undefined"
+                            && typeof div.getScreenCTM === "undefined",
                         textIsNotGeometry: typeof $("t1").getTotalLength === "undefined",
                         circleIsGeometry: $("c1") instanceof SVGGeometryElement,
                         rectShapeIsGeometry: $("r3") instanceof SVGGeometryElement,
@@ -7239,7 +7242,11 @@ mod tests {
                         detachedZero, text.getComputedTextLength() > 0,
                         svg.getBBox().width > 0,
                         Object.prototype.hasOwnProperty.call(SVGGraphicsElement.prototype, "getBBox"),
-                        Object.prototype.hasOwnProperty.call(SVGSVGElement.prototype, "getComputedTextLength")];
+                        // Chrome carries the text methods on
+                        // SVGTextContentElement, not on the svg root
+                        // (SVGSVGElement is an SVGGraphicsElement there).
+                        Object.prototype.hasOwnProperty.call(SVGTextContentElement.prototype, "getComputedTextLength"),
+                        typeof svg.getComputedTextLength === "undefined"];
                 })()"#,
                 true,
                 true,
@@ -7251,7 +7258,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!(["function", "function", true, true, true, true, true])
+            serde_json::json!(["function", "function", true, true, true, true, true, true])
         );
     }
 
@@ -7350,6 +7357,213 @@ mod tests {
                 "emptyCtl": "0",
                 "subStringZero": "0",
                 "subStringNonZero": true,
+            })
+        );
+    }
+
+    // The measurement surface lives on SVGTextContentElement.prototype, where
+    // Chrome's IDL owns it (local headless-Chrome oracle: the prototype's own
+    // keys are the eight measurement methods, selectSubString, the three
+    // LENGTHADJUST_* constants, textLength/lengthAdjust, constructor). The
+    // methods used to sit on Element.prototype while the text interfaces were
+    // aliases, which handed every HTML element a measurement surface no
+    // browser has.
+    #[test]
+    fn svg_text_content_surface_lives_on_the_text_content_interface() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svg id="s"><text id="run" x="32" y="32">abcdef</text><text id="empty"></text></svg></body></html>"#,
+        );
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const $ = id => document.getElementById(id);
+                    const div = document.createElement("div");
+                    const own = Object.getOwnPropertyNames(SVGTextContentElement.prototype).sort();
+                    const run = $("run");
+                    const extent = run.getExtentOfChar(0);
+                    const outOfRange = () => { try { run.getExtentOfChar(99); return "no-throw"; } catch (e) { return e.name; } };
+                    const emptyExtent = () => { try { $("empty").getExtentOfChar(0); return "no-throw"; } catch (e) { return e.name; } };
+                    return {
+                        ownsCtl: own.includes("getComputedTextLength"),
+                        ownsExtent: own.includes("getExtentOfChar"),
+                        ownsSub: own.includes("getSubStringLength"),
+                        ownsPositions: own.includes("getStartPositionOfChar")
+                            && own.includes("getEndPositionOfChar"),
+                        ownsRotation: own.includes("getRotationOfChar"),
+                        ownsCharNum: own.includes("getCharNumAtPosition"),
+                        ownsCount: own.includes("getNumberOfChars"),
+                        ownsSelect: own.includes("selectSubString"),
+                        noSelectSubStringLength: !own.includes("selectSubStringLength"),
+                        constants: [SVGTextContentElement.LENGTHADJUST_UNKNOWN,
+                            SVGTextContentElement.LENGTHADJUST_SPACING,
+                            SVGTextContentElement.LENGTHADJUST_SPACINGANDGLYPHS],
+                        constantKeys: own.filter(k => k.startsWith("LENGTHADJUST_")).length,
+                        divHasNoMeasure: typeof div.getComputedTextLength === "undefined"
+                            && typeof div.getExtentOfChar === "undefined"
+                            && typeof div.getSubStringLength === "undefined"
+                            && typeof div.getNumberOfChars === "undefined",
+                        divHasNoBBox: typeof div.getBBox === "undefined",
+                        extentBranded: extent instanceof SVGRect,
+                        extentAnchoredAtX: extent.x === 32,
+                        emptyCtl: String($("empty").getComputedTextLength()),
+                        emptyNoc: String($("empty").getNumberOfChars()),
+                        emptyExtentThrows: emptyExtent(),
+                        outOfRangeThrows: outOfRange(),
+                        textLengthBranded: Object.prototype.toString.call(run.textLength),
+                        textLengthValue: run.textLength.baseVal.value,
+                        textLengthStable: run.textLength === run.textLength,
+                        lengthAdjustDefault: run.lengthAdjust.baseVal === 1,
+                        xListItems: run.x.baseVal.numberOfItems,
+                        xFirstItem: run.x.baseVal.getItem(0).value,
+                        xStable: run.x === run.x,
+                        gBCRStillElementLevel: typeof div.getBoundingClientRect === "function",
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "ownsCtl": true,
+                "ownsExtent": true,
+                "ownsSub": true,
+                "ownsPositions": true,
+                "ownsRotation": true,
+                "ownsCharNum": true,
+                "ownsCount": true,
+                "ownsSelect": true,
+                "noSelectSubStringLength": true,
+                "constants": [0, 1, 2],
+                "constantKeys": 3,
+                "divHasNoMeasure": true,
+                "divHasNoBBox": true,
+                "extentBranded": true,
+                "extentAnchoredAtX": true,
+                "emptyCtl": "0",
+                "emptyNoc": "0",
+                "emptyExtentThrows": "IndexSizeError",
+                "outOfRangeThrows": "IndexSizeError",
+                "textLengthBranded": "[object SVGAnimatedLength]",
+                "textLengthValue": 0,
+                "textLengthStable": true,
+                "lengthAdjustDefault": true,
+                "xListItems": 1,
+                "xFirstItem": 32,
+                "xStable": true,
+                "gBCRStillElementLevel": true,
+            })
+        );
+    }
+
+    // Probe-shape fixture for the live strand: the challenge measures 20 text
+    // elements in a hidden sandboxed iframe (emoji runs, 64-hex runs and one
+    // EMPTY text) and then walks extents. In the live capture our engine only
+    // ever issued 19 ctl calls -- the empty element's measurement never ran --
+    // and getExtentOfChar was never reached, so the JRzmw6 chain fell back to
+    // its async request token and the beacon leaked "bOHv4" where a digest
+    // belongs. Chrome's sequence (strand telemetry, /tmp/cf0919/chr1): 20 ctl
+    // calls ending with the empty text answering "0", then getExtentOfChar
+    // returning an SVGRect. Values below are font-dependent on purpose; the
+    // call counts and shapes are the pinned contract.
+    #[test]
+    fn challenge_probe_shape_runs_twenty_ctl_calls_and_reaches_extent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    iframe.setAttribute("sandbox", "allow-same-origin allow-scripts");
+                    iframe.setAttribute("width", "100vw");
+                    iframe.setAttribute("height", "100vh");
+                    iframe.style.cssText = "position:absolute;left:-10000px;top:-10000px;visibility:hidden;";
+                    document.body.appendChild(iframe);
+                    const doc = iframe.contentDocument;
+                    if (!doc) return { haveDoc: false };
+                    const ns = "http://www.w3.org/2000/svg";
+                    const box = doc.createElement("div");
+                    box.setAttribute("style", "position: absolute; left: -9999px; height: auto;");
+                    const svg = doc.createElementNS(ns, "svg");
+                    const g = doc.createElementNS(ns, "g");
+                    svg.appendChild(g);
+                    const mkText = (txt, emoji) => {
+                        const t = doc.createElementNS(ns, "text");
+                        t.setAttribute("x", "32");
+                        t.setAttribute("y", "32");
+                        t.setAttribute("style", "height: auto; transform: scale(1.000998);"
+                            + (emoji ? " font: italic 150px serif;" : ""));
+                        t.setAttribute("class", "tvNbU4");
+                        if (txt !== null) t.appendChild(doc.createTextNode(txt));
+                        return t;
+                    };
+                    // 2 emoji + 17 hex + 1 empty = the probe's 20 measured runs.
+                    const els = [];
+                    for (let i = 0; i < 2; i++) els.push(mkText("\u{1F600}", true));
+                    for (let i = 0; i < 17; i++) {
+                        els.push(mkText("dc7c811b9561739d9b75bb3e9e1715970a868834e62251b0b9ca02e74d0f4" + String(i).padStart(2, "0"), false));
+                    }
+                    els.push(mkText(null, false));
+                    for (const t of els) g.appendChild(t);
+                    box.appendChild(svg);
+                    doc.body.appendChild(box);
+                    // Count the ctl calls the way the telemetry pass did.
+                    // The iframe content realm owns the elements (its own
+                    // bootstrap globals), so resolve the owning prototype
+                    // from an element instead of this realm's constructor.
+                    let proto = Object.getPrototypeOf(els[0]);
+                    while (proto && !Object.prototype.hasOwnProperty.call(proto, "getComputedTextLength")) {
+                        proto = Object.getPrototypeOf(proto);
+                    }
+                    let ctlCalls = 0;
+                    const orig = proto.getComputedTextLength;
+                    proto.getComputedTextLength = function () {
+                        ctlCalls++;
+                        return orig.apply(this, arguments);
+                    };
+                    const values = els.map(t => String(t.getComputedTextLength()));
+                    proto.getComputedTextLength = orig;
+                    const nonZero = values.filter(v => Number(v) > 0).length;
+                    const empty = els[els.length - 1];
+                    const extent = els[0].getExtentOfChar(0);
+                    return {
+                        haveDoc: true,
+                        elements: els.length,
+                        // Realm-agnostic identity walk: the element realm owns
+                        // the classes, so check the chain, not this realm's
+                        // instanceof.
+                        allTextInterface: els.every(t => {
+                            let p = Object.getPrototypeOf(t);
+                            while (p) {
+                                if (p.constructor && p.constructor.name === "SVGTextContentElement") return true;
+                                p = Object.getPrototypeOf(p);
+                            }
+                            return false;
+                        }),
+                        ctlCalls,
+                        nonZeroCtl: nonZero,
+                        emptyCtl: values[values.length - 1],
+                        emptyNoc: empty.getNumberOfChars(),
+                        extentReached: true,
+                        extentBranded: Object.prototype.toString.call(extent) === "[object SVGRect]",
+                        extentAnchoredAtX: extent.x === 32,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "haveDoc": true,
+                "elements": 20,
+                "allTextInterface": true,
+                "ctlCalls": 20,
+                "nonZeroCtl": 19,
+                "emptyCtl": "0",
+                "emptyNoc": 0,
+                "extentReached": true,
+                "extentBranded": true,
+                "extentAnchoredAtX": true,
             })
         );
     }
@@ -12435,6 +12649,94 @@ RequestRedirect value",
                 "path",
                 "undefined"
             ])
+        );
+    }
+
+    // The Cloudflare hash probe resolves its text-element methods through the
+    // SVG text interface chain, and the live strand showed our <text> elements
+    // answering `SVGElement > SVGElement > Element` (the bootstrap published
+    // SVGTextElement/SVGTextContentElement as aliases of SVGElement), a shape
+    // no browser produces. Local headless-Chrome oracle: the chain is
+    // SVGTextElement > SVGTextPositioningElement > SVGTextContentElement >
+    // SVGGraphicsElement > SVGElement > Element, tspan sits beside text on the
+    // positioning layer, textPath branches off the content interface directly,
+    // and the graphics containers (g/a/use/image/defs/symbol/switch/
+    // foreignObject) are SVGGraphicsElement subclasses.
+    #[test]
+    fn svg_text_elements_use_the_chrome_interface_lattice() {
+        let mut rt = setup_runtime(
+            r##"<html><body><svg><g id="container"><text id="run" x="32" y="32">abcd</text><tspan id="span">x</tspan><textPath id="tp" href="#p">y</textPath></g></svg></body></html>"##,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const ns = "http://www.w3.org/2000/svg";
+                const $ = id => document.getElementById(id);
+                const chainNames = (el) => {
+                    const names = [];
+                    let p = Object.getPrototypeOf(el);
+                    while (p && p.constructor && names.length < 7) {
+                        names.push(p.constructor.name);
+                        p = Object.getPrototypeOf(p);
+                    }
+                    return names;
+                };
+                const created = document.createElementNS(ns, "text");
+                const clone = $("run").cloneNode(true);
+                const textOwn = Object.getOwnPropertyNames(SVGTextElement.prototype);
+                return {
+                    parsedCtor: $("run").constructor.name,
+                    createdCtor: created.constructor.name,
+                    cloneCtor: clone.constructor.name,
+                    chain: chainNames($("run")),
+                    createdChain: chainNames(created),
+                    textIsContent: $("run") instanceof SVGTextContentElement,
+                    textIsPositioning: $("run") instanceof SVGTextPositioningElement,
+                    textIsGraphics: $("run") instanceof SVGGraphicsElement,
+                    tspanCtor: $("span").constructor.name,
+                    tspanIsPositioning: $("span") instanceof SVGTextPositioningElement,
+                    textPathCtor: $("tp").constructor.name,
+                    textPathIsContent: $("tp") instanceof SVGTextContentElement,
+                    textPathNotPositioning: !($("tp") instanceof SVGTextPositioningElement),
+                    protoText: Object.getPrototypeOf(SVGTextElement.prototype) === SVGTextPositioningElement.prototype,
+                    protoPositioning: Object.getPrototypeOf(SVGTextPositioningElement.prototype) === SVGTextContentElement.prototype,
+                    protoContent: Object.getPrototypeOf(SVGTextContentElement.prototype) === SVGGraphicsElement.prototype,
+                    protoGraphics: Object.getPrototypeOf(SVGGraphicsElement.prototype) === SVGElement.prototype,
+                    gCtor: $("container").constructor.name,
+                    gIsGraphics: $("container") instanceof SVGGraphicsElement,
+                    gOwnProto: Object.getPrototypeOf(SVGGElement.prototype) === SVGGraphicsElement.prototype,
+                    textOwnBeyondCtor: textOwn.filter(k => k !== "constructor").length,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "parsedCtor": "SVGTextElement",
+                "createdCtor": "SVGTextElement",
+                "cloneCtor": "SVGTextElement",
+                "chain": ["SVGTextElement", "SVGTextPositioningElement", "SVGTextContentElement",
+                          "SVGGraphicsElement", "SVGElement", "Element", "Node"],
+                "createdChain": ["SVGTextElement", "SVGTextPositioningElement", "SVGTextContentElement",
+                                 "SVGGraphicsElement", "SVGElement", "Element", "Node"],
+                "textIsContent": true,
+                "textIsPositioning": true,
+                "textIsGraphics": true,
+                "tspanCtor": "SVGTSpanElement",
+                "tspanIsPositioning": true,
+                "textPathCtor": "SVGTextPathElement",
+                "textPathIsContent": true,
+                "textPathNotPositioning": true,
+                "protoText": true,
+                "protoPositioning": true,
+                "protoContent": true,
+                "protoGraphics": true,
+                "gCtor": "SVGGElement",
+                "gIsGraphics": true,
+                "gOwnProto": true,
+                "textOwnBeyondCtor": 0,
+            })
         );
     }
 

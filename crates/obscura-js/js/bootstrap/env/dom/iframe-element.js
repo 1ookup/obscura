@@ -160,6 +160,29 @@ let _elementInterfaceUnknownTag = null;
 // without it.
 const _elementInterfaceKey = Symbol('element interface construction');
 
+// SVG local names Chrome answers with a dedicated text/graphics interface
+// (local headless-Chrome oracle). Values are global constructor names,
+// resolved at call time because env/html/svg-elements.js defines the classes
+// later in the manifest. path/svg and the basic shapes keep their explicit
+// branches in the ladders below (the shapes share SVGGeometryElement).
+const _svgInterfaceByLocalName = {
+  text: 'SVGTextElement',
+  tspan: 'SVGTSpanElement',
+  textPath: 'SVGTextPathElement',
+  g: 'SVGGElement',
+  a: 'SVGAElement',
+  use: 'SVGUseElement',
+  image: 'SVGImageElement',
+  defs: 'SVGDefsElement',
+  symbol: 'SVGSymbolElement',
+  switch: 'SVGSwitchElement',
+  foreignObject: 'SVGForeignObjectElement',
+};
+function _svgInterfaceFor(localName) {
+  const name = _svgInterfaceByLocalName[localName];
+  return (name && globalThis[name]) || null;
+}
+
 // One place where a wrapper class is constructed, so every interface that
 // needs an internal argument beyond the node id is listed once.
 function _wrapElementNode(C, nid) {
@@ -187,6 +210,8 @@ function _elementClassFor(nid) {
       tag === "circle" || tag === "ellipse" || tag === "line"
       || tag === "polygon" || tag === "polyline" || tag === "rect"
     )) return globalThis.SVGGeometryElement;
+    const svgIface = _svgInterfaceFor(tag);
+    if (svgIface) return svgIface;
     if (globalThis.SVGElement) return globalThis.SVGElement;
     return Element;
   }
@@ -230,6 +255,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
       localName === "circle" || localName === "ellipse" || localName === "line"
       || localName === "polygon" || localName === "polyline" || localName === "rect"
     )) return globalThis.SVGGeometryElement;
+    const svgIface = _svgInterfaceFor(localName);
+    if (svgIface) return svgIface;
     if (globalThis.SVGElement) return globalThis.SVGElement;
     return Element;
   }
