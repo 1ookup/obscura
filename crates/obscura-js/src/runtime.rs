@@ -460,6 +460,15 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Persistent local inspector session for the debugger API. V8's
+    /// inspector agent retains its parsed-script cache only while at least
+    /// one Debugger-enabled session exists; a session-per-call let the agent
+    /// drop that cache between two debugger calls, and a script nothing on
+    /// the page references any more (an eval()'d snippet) then became
+    /// uncollectable-by-id: scripts() reported it, getScriptSource answered
+    /// "No script for id". One long-lived session keeps scripts readable for
+    /// the runtime's lifetime once the debugger has been used.
+    debugger_session: Option<deno_core::LocalInspectorSession>,
     /// Per-frame Window realm registry (Phase 3.7, src/realm.rs). Empty on
     /// pages without iframes; the main-context path never touches it. Boxed so
     /// a raw pointer to it can be shared into `ObscuraState` and used from ops
@@ -890,6 +899,7 @@ impl ObscuraJsRuntime {
             frame_module_maps: HashMap::new(),
             frame_message_pump_started: false,
             trace_ambient_label: std::cell::RefCell::new("window".to_string()),
+            debugger_session: None,
         };
         {
             // Share a stable pointer to the realm registry into the op-visible
@@ -3278,23 +3288,41 @@ impl ObscuraJsRuntime {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
+        Self::inspector_post_message_session(&mut self.runtime, session, method, params).await
+    }
+
+    /// Session-taking variant for callers that hold a session out of `self`
+    /// (the persistent debugger session): borrows the two fields disjointly
+    /// instead of going through `&mut self`.
+    async fn inspector_post_message_session(
+        runtime: &mut JsRuntime,
+        session: &mut deno_core::LocalInspectorSession,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         let request = Box::pin(session.post_message(method, params));
-        self.runtime
+        runtime
             .with_event_loop_future(request, deno_core::PollEventLoopOptions::default())
             .await
             .map_err(|error| format!("inspector {method} failed: {error}"))
     }
 
-    fn local_inspector_session(&mut self) -> deno_core::LocalInspectorSession {
+    /// The long-lived debugger session, created on first use. See the
+    /// `debugger_session` field note for why it must outlive a single call.
+    fn ensure_debugger_session(&mut self) {
         self.runtime.maybe_init_inspector();
-        self.runtime
-            .inspector()
-            .borrow()
-            .create_local_session(deno_core::InspectorSessionOptions {
-                kind: deno_core::InspectorSessionKind::NonBlocking {
-                    wait_for_disconnect: false,
-                },
-            })
+        if self.debugger_session.is_none() {
+            self.debugger_session = Some(
+                self.runtime
+                    .inspector()
+                    .borrow()
+                    .create_local_session(deno_core::InspectorSessionOptions {
+                        kind: deno_core::InspectorSessionKind::NonBlocking {
+                            wait_for_disconnect: false,
+                        },
+                    }),
+            );
+        }
     }
 
     pub fn enable_debugger(&mut self) {
@@ -3305,9 +3333,10 @@ impl ObscuraJsRuntime {
     /// includes scripts compiled through page `eval()`/`Function`, which do not
     /// pass through the embedder's classic-script execution methods.
     pub async fn debugger_scripts(&mut self) -> Result<Vec<DebuggerScript>, String> {
-        let mut session = self.local_inspector_session();
+        self.ensure_debugger_session();
+        let session = self.debugger_session.as_mut().unwrap();
         let mut notifications = session.take_notification_rx();
-        self.inspector_post_message(&mut session, "Debugger.enable", None)
+        Self::inspector_post_message_session(&mut self.runtime, session, "Debugger.enable", None)
             .await?;
 
         let mut scripts = Vec::new();
@@ -3335,16 +3364,17 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn debugger_script_source(&mut self, script_id: &str) -> Result<String, String> {
-        let mut session = self.local_inspector_session();
-        self.inspector_post_message(&mut session, "Debugger.enable", None)
+        self.ensure_debugger_session();
+        let session = self.debugger_session.as_mut().unwrap();
+        Self::inspector_post_message_session(&mut self.runtime, session, "Debugger.enable", None)
             .await?;
-        let result = self
-            .inspector_post_message(
-                &mut session,
-                "Debugger.getScriptSource",
-                Some(serde_json::json!({"scriptId": script_id})),
-            )
-            .await?;
+        let result = Self::inspector_post_message_session(
+            &mut self.runtime,
+            session,
+            "Debugger.getScriptSource",
+            Some(serde_json::json!({"scriptId": script_id})),
+        )
+        .await?;
         result
             .get("scriptSource")
             .and_then(serde_json::Value::as_str)
@@ -8508,6 +8538,146 @@ mod tests {
                 [true, "own", true, true, "data", "object"],
                 [true, "own", true, true, "accessor", "boolean"],
             ])
+        );
+    }
+
+    /// Every function reachable from the window surface -- own slots,
+    /// namespace objects (WebAssembly, console, CSS, navigation, caches,
+    /// indexedDB, chrome, speechSynthesis, ...), interface statics and
+    /// prototypes including their [Symbol.toStringTag] accessors -- must
+    /// answer Function.prototype.toString with "[native code]". The
+    /// Cloudflare challenge stringifies functions during telemetry, and one
+    /// /ci/ probe deterministically emits failure markers in the slot where
+    /// a passing Chrome logs a native function source (profile Steps 313
+    /// and 314). Local headless Chrome is the oracle: the same breadth-first
+    /// walk over the window and a same-origin frame realm reports zero
+    /// non-native functions there, so zero is the gate here. Page-created
+    /// globals are excluded from the walk, because a browser reports their
+    /// source too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_surface_functions_all_stringify_native() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://example.com/native-sweep");
+        rt.run_page_init();
+
+        const WALKER: &str = r#"
+            (() => {
+                const native = (fn) => {
+                    let s;
+                    try { s = Function.prototype.toString.call(fn); }
+                    catch (e) { return true; }
+                    return s.indexOf('[native code]') !== -1;
+                };
+                const walk = (root, rootName) => {
+                    const bad = [];
+                    const seen = new Set([root]);
+                    const queue = [[root, rootName]];
+                    let scanned = 0;
+                    while (queue.length && scanned < 20000 && bad.length <= 200) {
+                        const entry = queue.shift();
+                        const obj = entry[0];
+                        const base = entry[1];
+                        scanned++;
+                        let keys;
+                        try { keys = Reflect.ownKeys(obj); } catch (e) { continue; }
+                        for (const key of keys) {
+                            let d;
+                            try {
+                                d = Object.getOwnPropertyDescriptor(obj, key);
+                            } catch (e) { continue; }
+                            if (!d) continue;
+                            const label = base + '.' +
+                                (typeof key === 'symbol' ? key.toString() : key);
+                            let v;
+                            if ('value' in d) {
+                                v = d.value;
+                            } else {
+                                if (typeof d.get === 'function' && !native(d.get)) {
+                                    bad.push(label + ':get');
+                                }
+                                if (typeof d.set === 'function' && !native(d.set)) {
+                                    bad.push(label + ':set');
+                                }
+                                try { v = obj[key]; } catch (e) { continue; }
+                            }
+                            if (typeof v === 'function') {
+                                if (!native(v)) bad.push(label);
+                                let proto = null;
+                                try { proto = v.prototype; } catch (e) {}
+                                if (proto && typeof proto === 'object') {
+                                    queue.push([proto, label + '.$proto']);
+                                }
+                            } else if (v && typeof v === 'object') {
+                                queue.push([v, label]);
+                            }
+                        }
+                    }
+                    return { scanned, bad, total: bad.length };
+                };
+                // Page globals (nothing has run yet, but be explicit) and the
+                // walker itself are not engine surface.
+                const skip = new Set(['__obscuraNativeSweepDone']);
+                const root = {};
+                for (const name of Object.getOwnPropertyNames(window)) {
+                    if (!/^[A-Z]/.test(name) && skip.has(name)) continue;
+                    let v;
+                    try { v = window[name]; } catch (e) { continue; }
+                    if (v && (typeof v === 'object' || typeof v === 'function')) {
+                        root[name] = v;
+                    }
+                }
+                return walk(root, 'window');
+            })()
+        "#;
+
+        let main = rt
+            .evaluate_for_cdp(WALKER, true, true)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            main.get("total").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "window surface must stringify natively; offenders: {:?}",
+            main.get("bad")
+        );
+
+        // Frame realm: the parent probes a child's surface before the child
+        // runs any script of its own, so its whole reachable surface must be
+        // native as well.
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://example.com/native-sweep-frame', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "native-sweep-frame",
+            1,
+            root,
+            "https://example.com/native-sweep-frame",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm(
+                "native-sweep-frame",
+                1,
+                "<native-sweep>",
+                WALKER,
+            )
+            .unwrap();
+        assert_eq!(
+            frame.get("total").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "frame realm surface must stringify natively; offenders: {:?}",
+            frame.get("bad")
         );
     }
 
