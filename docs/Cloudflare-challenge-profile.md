@@ -11096,3 +11096,21 @@ svg_rect_instances_carry_no_own_properties_like_chrome 两枚）；五 crate
 release/render nextest 1158/1159（timing_edits 并行压机超时一例，隔离复跑过，
 Step 308 已知 flake）；no-default-features check 通过；release build
 （render+stealth）全量通过；障碍课程不在本机，33/33 留给主控。
+
+### Step 311: 批次 16 全量验证——哈希探针实弹关闭，判决仍 fail（2026-09-19 12:0x）
+
+**ver17（注入，解密 TS#2）**：e20 四槽全部真实摘要——RKUE0=30182874…、
+**JRzmw6=27da8f30…（"bOHv4" 令牌泄漏终结）**、kRQwh3/oSIr8 不变；uGyjw9=15
+（Chrome 4，带内）、tQdUc5=38（对齐）、NnqX6=7609（参考 7220 带内）、myWtu3=26
+（参考 31）。仅 ZMSOw0=512 偏高（epoch 波动带 385-512，Chrome 127；剩余为
+cascade+taffy 重建等每趟固定成本，见 Step 308 的增量布局后续）。
+
+**final17（无注入判决轮）**：完整流程 TS#1→pat/brunhild→TS#2→TS#3→main#2→
+26.9s 重开一轮。/1.txt 404 未取得。剩余已知分歧：① ZMSOw0 时序（增量布局工程）；
+② /ci/ 网络级 PAT 兑付能力（Step 310/遥测确认：无 JS 门，纯网络栈能力）；
+③ 小计数器 TzZRB1/WHTpH6 19 vs 11/12；④ census o. 前缀 5 项残差。
+
+**本轮累计（0919 会话）**：批次 13/14/15/16 共 26 个修复 commit；payload 可见
+探针损坏全部关闭（SVG 格架/ToUint32/槽位化 rect/测量归零语义/普查泄漏/时序 3-70x
+收敛）；TS#3 从恒 2.9KB 失败变体转为 Chrome 形态 92KB。判决翻转的剩余路径以
+ZMSOw0 增量布局与 /ci/ PAT 为最优先。
