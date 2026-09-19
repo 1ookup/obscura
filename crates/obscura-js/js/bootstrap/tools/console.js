@@ -10,7 +10,10 @@
 // every realm at all times, and the challenge's sandbox probe logs through it
 // before touching any other surface, so the method set, the native-marked
 // toString, the undefined return values, and the op routing are all part of
-// the observable contract here.
+// the observable contract here. The sentinel table also reads the
+// count/countReset side effect ("<label>: <n>" rows, Chrome's per-realm
+// label map) and the self-titled bare-call rows (trace/clear/group family),
+// so those shapes are contract too (profile Step 320).
 //
 // Message serialization mirrors what a CDP console consumer sees from Chrome,
 // because the ops.tsv console rows are the diagnostic channel the Cloudflare
@@ -85,15 +88,84 @@ function _makeConsoleMethod(name, length, implementation) {
   _markNativeAs(method, `function ${name}() { [native code] }`);
   return method;
 }
+// Chrome keeps one label -> n map per realm for count/countReset (and one
+// for the time family), and this module is evaluated once per realm boot,
+// so a module closure is the realm's map. The challenge's console-method
+// sentinel table runs count/countReset and reads the "<label>: <n>" side
+// effect (profile Step 320); missing output is a legitimate fail signal.
+const _consoleCounts = new Map();
+const _consoleTimes = new Map();
+// count/countReset/time/timeLog/timeEnd take (label = "default"); an
+// explicit undefined is the default label too, and anything else is
+// stringified (console.count({}) prints "[object Object]: 1"). A Symbol
+// label cannot be stringified: Chrome silently drops the call.
+const _consoleLabel = (args) => {
+  try {
+    return args.length === 0 || args[0] === undefined
+      ? 'default' : String(args[0]);
+  } catch (_e) { return undefined; }
+};
+// Milliseconds with Chrome's fractional shape ("t: 0.005859375 ms"). The
+// op is the same monotonic clock performance.now() is built on; wrapped in
+// try so a console call can never break the op-routed console contract.
+const _consoleMs = () => {
+  try { return Deno.core.ops.op_monotonic_ms(); } catch (_e) { return 0; }
+};
 function _consoleOutput(name, args) {
   if (name === 'assert') {
-    if (!args[0]) _consoleFn('error', ['Assertion failed:', ...Array.from(args).slice(1)]);
+    if (!args[0]) {
+      // Chrome titles a message-less assert with the method name and does
+      // not prepend "Assertion failed:" to a message it carries.
+      if (args.length > 1) _consoleFn('error', Array.from(args).slice(1));
+      else _consoleFn('error', ['console.assert']);
+    }
     return;
   }
+  if (name === 'count') {
+    const label = _consoleLabel(args);
+    if (label === undefined) return;
+    const n = (_consoleCounts.get(label) || 0) + 1;
+    _consoleCounts.set(label, n);
+    return _consoleFn('log', [`${label}: ${n}`]);
+  }
+  if (name === 'countReset') {
+    const label = _consoleLabel(args);
+    if (label === undefined) return;
+    if (_consoleCounts.has(label)) {
+      _consoleCounts.set(label, 0);
+      return;
+    }
+    return _consoleFn('warn', [`Count for '${label}' does not exist`]);
+  }
+  if (name === 'time') {
+    const label = _consoleLabel(args);
+    if (label !== undefined) _consoleTimes.set(label, _consoleMs());
+    return;
+  }
+  if (name === 'timeLog' || name === 'timeEnd') {
+    const label = _consoleLabel(args);
+    if (label === undefined) return;
+    const start = _consoleTimes.get(label);
+    if (start === undefined) {
+      return _consoleFn('warn', [`Timer '${label}' does not exist`]);
+    }
+    if (name === 'timeEnd') _consoleTimes.delete(label);
+    return _consoleFn('log', [`${label}: ${_consoleMs() - start} ms`]);
+  }
+  // Blink gives a bare call a default title only on the self-titled methods
+  // (trace/clear/group/groupEnd) and drops every other zero-arg call
+  // entirely -- no consoleAPICalled row reaches CDP, so an empty row where
+  // Chrome emits none is a visible ops-diff row.
+  if (name === 'groupEnd') return _consoleFn('log', ['console.groupEnd']);
+  if (name === 'clear') return _consoleFn('log', ['console.clear']);
+  if (name === 'trace' || name === 'group' || name === 'groupCollapsed') {
+    if (args.length === 0) return _consoleFn('log', [`console.${name}`]);
+    return _consoleFn('log', Array.from(args));
+  }
+  if (args.length === 0) return;
   if (name === 'error' || name === 'warn') return _consoleFn(name, Array.from(args));
   if (name === 'debug' || name === 'info' || name === 'log'
-      || name === 'dir' || name === 'dirxml' || name === 'table'
-      || name === 'trace') {
+      || name === 'dir' || name === 'dirxml' || name === 'table') {
     return _consoleFn('log', Array.from(args));
   }
 }

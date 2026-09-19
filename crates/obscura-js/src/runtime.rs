@@ -8158,6 +8158,125 @@ mod tests {
         }
     }
 
+    /// The probe's console-method sentinel table reads the count/countReset
+    /// side effect (profile Step 320: the reference capture's " : 1" row is
+    /// a count call, and the missing output was a legitimate fail signal),
+    /// so count must keep Chrome's per-realm label map and emit
+    /// "<label>: <n>" through the log channel, countReset must reset
+    /// silently (warning only for an unknown label), and the remaining
+    /// sentinel shapes must hold: a bare trace/clear/group call carries its
+    /// self title, a message-less assert is titled too, a zero-arg
+    /// log/error/warn emits no row at all (Blink drops it), and the time
+    /// family logs "t: <ms> ms" with the Timer warning for unknown labels.
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_count_countreset_and_bare_call_rows_match_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const seen = [];
+                    const op = Deno.core.ops.op_console_msg;
+                    Deno.core.ops.op_console_msg = (level, msg) => { seen.push([level, msg]); };
+                    try {
+                        console.count();
+                        console.count();
+                        console.count('x');
+                        console.count('x');
+                        console.count('');
+                        console.count(undefined);
+                        console.countReset();
+                        console.count();
+                        console.countReset('x');
+                        console.count('x');
+                        console.countReset('zz');
+                        console.count({a: 1});
+                        const rc = console.count('retCheck');
+                        const rr = console.countReset('retCheck');
+                        console.trace();
+                        console.trace('trc');
+                        console.groupEnd();
+                        console.clear();
+                        console.log();
+                        console.warn();
+                        console.assert(false);
+                        console.assert(false, 'A');
+                        console.time('t');
+                        console.timeEnd('t');
+                        console.timeEnd('t');
+                        console.timeLog('nope');
+                        console.countReset('x');
+                        console.count('x');
+                        console.count('x');
+                        return { seen, rc, rr };
+                    } finally { Deno.core.ops.op_console_msg = op; }
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let seen: Vec<serde_json::Value> = result
+            .get("seen")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .clone();
+        assert!(result.get("rc").is_none(), "count must return undefined");
+        assert!(result.get("rr").is_none(), "countReset must return undefined");
+        let timed_rows: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|row| {
+                row.get(1).and_then(serde_json::Value::as_str)
+                    .map_or(false, |m| m.starts_with("t: ") && m.ends_with(" ms"))
+            })
+            .collect();
+        assert_eq!(timed_rows.len(), 1, "timeEnd must log exactly one timed row");
+        let text_rows: Vec<String> = seen
+            .iter()
+            .map(|row| {
+                format!(
+                    "{},{}",
+                    row.get(0).and_then(serde_json::Value::as_str).unwrap(),
+                    row.get(1).and_then(serde_json::Value::as_str).unwrap()
+                )
+            })
+            .collect();
+        for (level, msg) in [
+            ("log", "default: 1"),
+            ("log", "default: 2"),
+            ("log", "x: 1"),
+            ("log", "x: 2"),
+            ("log", ": 1"),
+            ("log", "default: 3"),
+            ("log", "default: 1"),
+            ("log", "x: 1"),
+            ("warn", "Count for 'zz' does not exist"),
+            ("log", "[object Object]: 1"),
+            ("log", "console.trace"),
+            ("log", "trc"),
+            ("log", "console.groupEnd"),
+            ("log", "console.clear"),
+            ("error", "console.assert"),
+            ("error", "A"),
+            ("warn", "Timer 't' does not exist"),
+            ("warn", "Timer 'nope' does not exist"),
+            ("log", "x: 1"),
+            ("log", "x: 2"),
+        ] {
+            let row = format!("{level},{msg}");
+            assert!(
+                text_rows.iter().any(|r| r == &row),
+                "expected console row {row:?} in {text_rows:?}"
+            );
+        }
+        assert_eq!(
+            text_rows.iter().filter(|r| r.starts_with("log,x:")).count(),
+            5,
+            "count('x') must see 1, 2, then 1 after a reset, then 1, 2 after another"
+        );
+    }
+
     /// `measureText` must return a branded `TextMetrics` whose numbers live on
     /// the prototype, the way Chrome does. It used to hand back a plain object
     /// with three own properties, so `Object.prototype.toString.call(...)` read
