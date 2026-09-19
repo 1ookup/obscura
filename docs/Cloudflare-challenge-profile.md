@@ -11554,3 +11554,15 @@ TS#1(846KB) → TS#2(91.7KB/127KB) → TS#3(94.9KB/5.2KB) → main#2(7.9KB/3240B
 ~24s 处新 orchestrate 重开（ray a3daf94fefeb1706），第二轮 30s 预算截断。
 **无任何到达 www.thelancet.com/1.txt 的表单 POST/GET（无 404 终点）：fail**，
 与 final22 同形。判决剩余候选不变（Step 315/316 列项）。
+
+### Step 319：探针块解码（第五轮）+ /ci/ 生产解锁（2026-09-20 04:5x）
+
+**第五轮遥测**（eval/Function 假设证伪：探针是纯 ov1-0 字节码，无 JS 组装）：
+① **/ci/ 首次实弹触发**——probe22/23 注入轮 200 image/png（/pat/ 后 +5ms），
+走 `<link rel=preload as=image>`+隐藏 `<img>`（资源加载路径，故 ops fetch 不可见）；
+final24 后 mitmproxy 最近 rays 确认**无注入生产轮同样 pat 401→ci 200**。
+门关闭于探针阶段完成度（活跃性）而非检查结果——批次 17/20/21 realm 工作解锁。
+② ZMSOw0 洗清：探针单次 1.7ms 无重试循环，ZMSOw0 在 TS#1 已定型（探针 9.3s 才跑）；
+残差=均匀 VM 派发成本（Step 317 dispatcher 项）。③ 两个标记检查仍在（服务器可见
+信标字段）：匿名 native 函数源槽（ODxGu4）+ %c%d NaN/Error 槽（Qssv3）——
+第六轮 jsvmp 反汇编已派（pc 51039-192011 区间）。
