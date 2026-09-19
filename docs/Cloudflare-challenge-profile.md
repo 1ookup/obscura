@@ -11187,3 +11187,63 @@ v5 无源形状对探针 iframe realm 做一轮被动注入）。
 **更正**：Step 300/T3/310/311 中「/ci/ 网络级 PAT 兑付能力」「privateToken 选项
 被我方网络栈忽略」「兑付发生在浏览器网络栈、JS 不可见」的表述按本步证伪更正；
 counter-semantics.md S1/T3 的同源推断一并作废。
+
+### Step 312: 修复批次 17-性能——deferred-surface frame realm boot，空 about:blank 帧启动 62ms→7ms（2026-09-19）
+
+**方法**：无网络轮。新 fixture `js-repros/iframe-boot-bench/`（8 个沙箱 about:blank
+iframe 背靠背创建并触摸 contentDocument，页内计时）。基线剖析（realm 创建分相，
+OBSCURA_REALM_TIMING）：V8 context 创建 0.2-0.3ms、bootstrap 编译 1.6ms（V8
+compilation cache 生效）——贵的是执行：bootstrap 顶层语句 58-62ms（分模块计时：
+surface-finalize 37ms、webgl 指纹 9ms、webidl-branding 8ms、computed-style 2ms、
+location 3ms）+ `__obscura_init` 15ms + 后置清理。即：解析与 context 都不贵，
+贵的是每个空帧都完整执行一遍 1.7MB 的窗口表面安装。
+
+**修复（deferred-surface split）**：
+- bootstrap 清单新增 `@obscura-deferred-surface` 标记（env/fingerprint/navigator.js
+  起）。装配器把标记之后的模块包进 `__obscura_run_deferred_surface`；主 context 与
+  未打标 realm 原样内联执行（主路径字节不变），frame realm 则设置
+  `__obscura_frame_defers_surface` 跳过内联执行、改为安装 `__obscura_hydrate`。
+  水合重入同一词法作用域执行延迟半区，再补跑指纹应用与完整 `__obscura_init`。
+- core 半保留父进程可经 contentDocument 触达的文档图：bootstrap 胶水、tools、
+  events、dom、realms、iframe/location、style-declaration，以及拉入前缀的类定义
+  模块（canvas/svg/媒体/css-rule 族/dedicated-worker/自定义元素/geometry 等）。
+  `page-init` 新增 `__obscura_core_init`（文档绑定、top/parent、location 访问器、
+  customElements 锚、CSP eval 标志），并给帧 realm 关闭会在水合时重绑文档身份的
+  `_scopedDocs/_frameWindowProxies` 清理。窗口序 helpers（_alignPropertiesOrder
+  等）与 HTML_TAGS/SVG_TAGS 表移入常驻前缀；SVG 文本测量 API（Step 309）与
+  SVGRect/SVGPoint/SVGMatrix 接口移入核心，保证父侧持有的 SVG 几何在水合前即有
+  品牌实例。
+- 水合触发面：WindowProxy 全部观察型 trap（get/has/ownKeys/gOPD/set/
+  defineProperty/deleteProperty/getPrototypeOf，帧代理与 ancestor facade 两侧）；
+  Rust 侧 `execute_in_context_at` 与帧模块求值统一先行水合（脚本/eval/CDP/模块/
+  postMessage 投递全覆盖）。`contentDocument` 与 WindowProxy 别名成员不触发水合。
+- `config/core-surface-finalize.js`（新前缀模块）为核心文档图做预水合表面对齐：
+  WebIDL 可枚举性提升（按原型批量 Object.defineProperties）+ 过渡版
+  Document/Element toStringTag getter；完整 pass 在水合时保持权威并幂等覆盖。
+  页面可空手 for..in contentDocument 而不经过任何会水合的 trap，此对齐是行为
+  等价的关键。
+
+**剖析补记（为何最终放弃 prototype 替换快路径）**：Object.create 单发构建
+替换原型本可将 promotion 压到 1.3ms，但本引擎类构造器的 prototype 槽为只读
+（赋值与 value-only defineProperty 均被拒），且不可靠的半完成状态比慢更危险，
+故保留批量原地 defineProperties（~20ms，为当前剩余主成本，后续立项方向）。
+
+**基准（js-repros/iframe-boot-bench，同树配对测量）**：未拆分（仅禁用标记）
+586-668ms/8 帧（首帧 61-115ms）→ 拆分后 232-247ms（首帧 47-54ms，每帧 8-12ms）
+——当天下午并行压机（load 9-30）下 4.9x； unloaded 基线 719ms（晨间）对应拆分
+后 ~120ms。剩余每帧成本：核心半执行 ~7ms（core-finalize ~20ms 大头在
+Element/Document 原型，见上）+ context 0.3ms + core-init 0.3ms。
+
+**门禁**：obscura-js+browser 788/788（含 a_connected_iframe、challenge SVG 探针、
+census 族）；workspace 1873/1874——唯一失败 trace_source_labels 在本批之前的
+b3ed35d 基线即复现（首个 trace 事件次序被晶格提交改变，行先于表头），与本批
+无关且有 stash 配对复现证据；no-default-features check 过；无 cargo fmt；
+op 均不 unwind（新路径全 try/catch 或 Result）。
+
+**ver18 活体验证（注入开，16:54）**：流程完整——orchestrate → TS#1(846KB) →
+TS#2 POST(91KB/resp 127KB) → TS#3 POST(94KB/resp 5KB) → main#2(3,240B，与
+final17 逐字节同量) → 23.6s 新 orchestrate 重开。**TS#2 解密未完成**：build 轮换
+后 base64 表随 ov2.js 轮换，ver18 页面响应不含注入探针（ov2probe.js 组装钩子在
+build 轮换中被擦，Step 313 ci18 同因失败，已知问题非本批引入）。ZMSOw0/uGyjw9/
+tQdUc5/NnqX6 的活体数值待探针组装管线恢复后补测；本地证据（benchmark 分相 +
+门禁全绿）支持时序残差显著收敛，精确值留待下一注入轮。
