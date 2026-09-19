@@ -707,7 +707,9 @@ class Document extends Node {
   get scrollingElement() { return this.documentElement; }
   get implementation() {
     const ownerDoc = this;
-    return {
+    // Fresh per read, so its methods are marked at construction rather than
+    // relying on the finalize sweeps.
+    return _markNativeObject({
       // Spec: createHTMLDocument returns a NEW detached Document. jQuery
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
       // the result — when we returned `globalThis.document`, the real
@@ -754,7 +756,7 @@ class Document extends Node {
         return dt;
       },
       hasFeature() { return true; },
-    };
+    });
   }
   get styleSheets() {
     if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);

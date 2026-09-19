@@ -60,6 +60,10 @@ class UserActivation {
 Object.defineProperty(UserActivation.prototype, Symbol.toStringTag, {
   value: 'UserActivation', configurable: true,
 });
+// Instances are minted fresh on every userActivation read, long after the
+// finalize sweeps, so the prototype members (constructor, activation
+// getters) carry the native presentation the instances expose.
+_markNativeObject(UserActivation.prototype);
 if (typeof Navigator !== 'undefined' && Navigator.prototype) {
   Object.defineProperty(Navigator.prototype, 'userActivation', {
     configurable: true, enumerable: true,

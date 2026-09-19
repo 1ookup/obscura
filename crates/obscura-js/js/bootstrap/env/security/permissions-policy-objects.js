@@ -97,6 +97,9 @@ class FeaturePolicy {
   get [Symbol.toStringTag]() { return 'FeaturePolicy'; }
 }
 globalThis.FeaturePolicy = FeaturePolicy;
+// document.featurePolicy / iframe.featurePolicy mint fresh instances on
+// every read, so the prototype carries the native presentation.
+_markNativeObject(FeaturePolicy.prototype);
 
 const _permissionsPolicyKey = Symbol('PermissionsPolicy');
 const _permissionsPolicyDocuments = new WeakMap();
@@ -140,9 +143,6 @@ Object.defineProperty(PermissionsPolicy.prototype, 'constructor', _permissionsPo
 // window.PermissionsPolicy constructor. The class stays in bootstrap scope
 // for the iframe.featurePolicy wrapper in env/dom/iframe-element.js.
 _markNative(PermissionsPolicy);
-for (const name of Object.getOwnPropertyNames(PermissionsPolicy.prototype)) {
-  const descriptor = Object.getOwnPropertyDescriptor(PermissionsPolicy.prototype, name);
-  if (descriptor?.get) _markNative(descriptor.get);
-  if (descriptor?.set) _markNative(descriptor.set);
-  if (descriptor?.value) _markNative(descriptor.value);
-}
+// Reflect.ownKeys-based, so the symbol-keyed toStringTag getter is covered
+// alongside the string-keyed members.
+_markNativeObject(PermissionsPolicy.prototype);

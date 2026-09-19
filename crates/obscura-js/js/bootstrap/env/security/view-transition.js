@@ -3,6 +3,9 @@
 class _FragmentDirective {
   get [Symbol.toStringTag]() { return 'FragmentDirective'; }
 }
+// document.fragmentDirective mints a fresh instance per document, so the
+// prototype (constructor, toStringTag getter) carries the native marks.
+_markNativeObject(_FragmentDirective.prototype);
 const _documentFeaturePolicies = new WeakMap();
 const _documentFragmentDirectives = new WeakMap();
 
