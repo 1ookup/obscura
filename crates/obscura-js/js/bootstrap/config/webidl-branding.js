@@ -248,22 +248,22 @@ const SVG_TAGS = {
       return _svgTextContent(this).length;
     },
     getStartPositionOfChar(index) {
-      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getStartPositionOfChar', index);
       // Chrome anchors the character positions on the element's x list origin
       // (a run at x=32 starts its position list at 32), not at user-space 0,
       // and answers SVGPoint instances, not plain records.
       const offset = _svgAttrOffset(this, 'x');
-      return _svgPointLike({ x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, index)), y: 0 });
+      return _svgPointLike({ x: offset + _svgAdvanceTo(this, _svgCharacterIndex(this, 'getStartPositionOfChar', index)), y: 0 });
     },
     getEndPositionOfChar(index) {
-      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
-      const i = _svgCharacterIndex(this, index);
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getEndPositionOfChar', index);
+      const i = _svgCharacterIndex(this, 'getEndPositionOfChar', index);
       const char = _svgTextContent(this).charAt(i);
       return _svgPointLike({ x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, i) + _measureTextBox(char, _svgMeasurementFont(this)).width, y: 0 });
     },
     getRotationOfChar(index) {
-      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
-      _svgCharacterIndex(this, index);
+      if (_svgUnrendered(this)) _svgThrowIndexSize('getRotationOfChar', index);
+      _svgCharacterIndex(this, 'getRotationOfChar', index);
       return 0;
     },
     getCharNumAtPosition(point) {
@@ -282,8 +282,8 @@ const SVG_TAGS = {
     // Chrome does and returning cleanly is the observable behaviour for an
     // empty selection surface.
     selectSubString(index, count) {
-      if (_svgUnrendered(this)) _svgThrowIndexSize(index);
-      _svgCharacterIndex(this, index);
+      if (_svgUnrendered(this)) _svgThrowIndexSize('selectSubString', index);
+      _svgCharacterIndex(this, 'selectSubString', index);
       if (count !== undefined && count < 0) {
         throw new DOMException(
           'The number provided (' + count + ') is negative.',

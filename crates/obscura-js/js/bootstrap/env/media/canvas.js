@@ -953,9 +953,31 @@ function _svgUnrendered(element) {
   } catch (_error) { return true; }
 }
 
-function _svgThrowIndexSize(index) {
+// WebIDL `unsigned long` conversion (ECMA-262 ToUint32 of ToNumber): NaN and
+// both infinities collapse to +0, finite values truncate then wrap mod 2^32.
+// The challenge's extent walk calls getExtentOfChar with the emoji STRING it
+// is measuring; ToNumber of that string is NaN and Chrome answers the index-0
+// glyph box. A numeric-coercion throw here is the live gate between the ctl
+// phase and the extent phase: the rect reduce behind RKUE0 collapses to 0 and
+// the JRzmw6 chain diverts to its async request token. Verified against the
+// local headless-Chrome oracle: getExtentOfChar(emoji string), NaN, Infinity,
+// -Infinity, 1.9 and 2^32 all answer like a valid index; -1 wraps out of
+// range and throws.
+function _svgToUnsignedLong(index) {
+  const n = Number(index);
+  if (Number.isNaN(n) || n === Infinity || n === -Infinity) return 0;
+  let i = Math.trunc(n) % 4294967296;
+  if (i < 0) i += 4294967296;
+  return i;
+}
+
+// Chrome's message carries the converting method name and the WRAPPED value
+// ("The charnum provided (4294967295) ..." for getExtentOfChar(-1)).
+function _svgThrowIndexSize(method, index) {
   throw new DOMException(
-    'The index provided (' + index + ') is greater than the number of characters available.',
+    'Failed to execute \'' + method + '\' on \'SVGTextContentElement\': '
+    + 'The charnum provided (' + _svgToUnsignedLong(index)
+    + ') is greater than the number of characters available.',
     'IndexSizeError',
   );
 }
@@ -1038,14 +1060,14 @@ SVG_TEXT_CONTENT_PROTO.getComputedTextLength = function() {
 SVG_TEXT_CONTENT_PROTO.getExtentOfChar = function(ch) {
   const text = _svgTextContent(this);
   const font = _svgMeasurementFont(this);
-  if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
+  if (_svgUnrendered(this)) _svgThrowIndexSize('getExtentOfChar', ch);
   // The extent is the tight box of one glyph, placed at the advance accumulated
   // over the run's prefix. Reporting a zero origin for every character (the
   // previous behaviour) makes a per-character position list collapse onto one
   // point, and a zero width reports a glyph no font can produce. Chrome places
   // the box at the element's x list origin, not at user-space 0 -- a probe
   // walking a run positioned by x=32 sees positions ascending from 32.
-  const index = _svgCharacterIndex(this, ch);
+  const index = _svgCharacterIndex(this, 'getExtentOfChar', ch);
   const box = _measureTextBox(text.charAt(index), font);
   return _svgRectLike({
     x: _svgAttrOffset(this, 'x') + _svgAdvanceTo(this, index),
@@ -1057,9 +1079,12 @@ SVG_TEXT_CONTENT_PROTO.getExtentOfChar = function(ch) {
 
 SVG_TEXT_CONTENT_PROTO.getSubStringLength = function(ch, len) {
   const text = _svgTextContent(this);
-  if (_svgUnrendered(this)) _svgThrowIndexSize(ch);
-  const start = Math.max(0, Math.trunc(Number(ch)) || 0);
-  const count = len === undefined ? text.length - start : Math.max(0, Math.trunc(Number(len)) || 0);
+  if (_svgUnrendered(this)) _svgThrowIndexSize('getSubStringLength', ch);
+  const start = _svgToUnsignedLong(ch);
+  if (start >= text.length) _svgThrowIndexSize('getSubStringLength', start);
+  // count is an unsigned long too: NaN and both infinities convert to 0, so
+  // getSubStringLength(0, Infinity) answers 0 (Chrome oracle).
+  const count = len === undefined ? text.length - start : _svgToUnsignedLong(len);
   if (count <= 0) return 0;
   return _svgRunAdvance(text.slice(start, start + count), _svgMeasurementFont(this));
 };
@@ -1069,12 +1094,13 @@ SVG_TEXT_CONTENT_PROTO.getSubStringLength = function(ch, len) {
 // text run one character at a time -- which is how the challenge builds its
 // ascending per-character position list -- collected nothing at all. Advances
 // come from the same engine, accumulated over the prefix of the run.
-function _svgCharacterIndex(element, index) {
+function _svgCharacterIndex(element, method, index) {
   const text = _svgTextContent(element);
-  const i = Math.trunc(Number(index));
-  if (!Number.isFinite(i) || i < 0 || i >= text.length) {
+  const i = _svgToUnsignedLong(index);
+  if (i >= text.length) {
     throw new DOMException(
-      'The index provided (' + index + ') is greater than the number of characters available.',
+      'Failed to execute \'' + method + '\' on \'SVGTextContentElement\': '
+      + 'The charnum provided (' + i + ') is greater than the number of characters available.',
       'IndexSizeError',
     );
   }

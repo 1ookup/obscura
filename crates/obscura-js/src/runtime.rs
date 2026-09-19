@@ -7456,6 +7456,85 @@ mod tests {
         );
     }
 
+    // The challenge's extent walk calls getExtentOfChar with the emoji STRING
+    // it is measuring (tel6 live telemetry: `getExtentOfChar("\u{1F600}")`).
+    // WebIDL's unsigned long conversion maps NaN to 0, so Chrome answers the
+    // index-0 glyph box; a numeric-coercion throw there was the live gate
+    // between the ctl phase and the extent phase (RKUE0's rect reduce
+    // collapsed to 0, JRzmw6 diverted to its async request token). Conversion
+    // table pinned against the local headless-Chrome oracle: NaN, both
+    // infinities and 2^32 behave like valid indices, -1 wraps out of range
+    // and throws, 1.9 truncates to 1, and the throw message carries the
+    // converting method name plus the WRAPPED value.
+    #[test]
+    fn svg_char_index_follows_the_webidl_unsigned_long_conversion() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svg id="s">
+                <text id="run" x="32" y="32">AB&#128512;CD</text>
+                <text id="empty"></text>
+            </svg></body></html>"#,
+        );
+        rt.set_url("https://challenges.example/challenge");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const run = document.getElementById("run");
+                    const rectOf = f => {
+                        try { const r = f(); return r instanceof SVGRect ? ["rect", r.x, r.width] : ["no-rect", String(r)]; }
+                        catch (e) { return ["throw", e.name, String(e.message)]; }
+                    };
+                    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+                    const e0 = rectOf(() => run.getExtentOfChar(0));
+                    const p0 = rectOf(() => run.getStartPositionOfChar(0));
+                    const sub0 = String(run.getSubStringLength(0, 1));
+                    return {
+                        nchars: run.getNumberOfChars(),
+                        emojiString: same(rectOf(() => run.getExtentOfChar("\u{1F600}")), e0),
+                        nan: same(rectOf(() => run.getExtentOfChar(NaN)), e0),
+                        posEmoji: same(rectOf(() => run.getStartPositionOfChar("\u{1F600}")), p0),
+                        posNan: same(rectOf(() => run.getStartPositionOfChar(NaN)), p0),
+                        inf: same(rectOf(() => run.getExtentOfChar(Infinity)), e0),
+                        negInf: same(rectOf(() => run.getExtentOfChar(-Infinity)), e0),
+                        wrap32: same(rectOf(() => run.getExtentOfChar(4294967296)), e0),
+                        trunc: same(rectOf(() => run.getExtentOfChar(1.9)),
+                            rectOf(() => run.getExtentOfChar(1))),
+                        m1: rectOf(() => run.getExtentOfChar(-1))[1],
+                        m1Message: rectOf(() => run.getExtentOfChar(-1)).slice(2).join(" "),
+                        outOfRange: rectOf(() => run.getExtentOfChar(999)).slice(2).join(" "),
+                        subEmoji: String(run.getSubStringLength("\u{1F600}", 1)) === sub0,
+                        subInfCount: String(run.getSubStringLength(0, Infinity)),
+                        sub999: rectOf(() => run.getSubStringLength(999, 1)).slice(2).join(" "),
+                        emptyEmojiThrows: (() => {
+                            try { document.getElementById("empty").getExtentOfChar("\u{1F600}"); return "no-throw"; }
+                            catch (e) { return e.name; }
+                        })(),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "nchars": 6,
+                "emojiString": true,
+                "nan": true,
+                "posEmoji": true,
+                "posNan": true,
+                "inf": true,
+                "negInf": true,
+                "wrap32": true,
+                "trunc": true,
+                "m1": "IndexSizeError",
+                "m1Message": "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The charnum provided (4294967295) is greater than the number of characters available.",
+                "outOfRange": "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The charnum provided (999) is greater than the number of characters available.",
+                "subEmoji": true,
+                "subInfCount": "0",
+                "sub999": "Failed to execute 'getSubStringLength' on 'SVGTextContentElement': The charnum provided (999) is greater than the number of characters available.",
+                "emptyEmojiThrows": "IndexSizeError",
+            })
+        );
+    }
+
     // Probe-shape fixture for the live strand: the challenge measures 20 text
     // elements in a hidden sandboxed iframe (emoji runs, 64-hex runs and one
     // EMPTY text) and then walks extents. In the live capture our engine only
