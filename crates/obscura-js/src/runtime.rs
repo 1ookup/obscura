@@ -8277,6 +8277,90 @@ mod tests {
         );
     }
 
+    /// The bound-function exotic checks: Chrome installs four distinct,
+    /// named poison-pill accessors on Function.prototype whose native forms
+    /// are "function get|set arguments() ... [native code]" and "function
+    /// get|set caller() ..."; reading .arguments/.caller on a bound,
+    /// strict, or native function throws the poison TypeError, a sloppy
+    /// function answers null, and a sloppy store is silently ignored. The
+    /// pinned V8 exposed one anonymous pill for all four views, which the
+    /// surface sweep mis-marked with the last key it walked; the bootstrap
+    /// now installs per-property delegating accessors (profile Step 320).
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_poison_pill_accessors_match_chrome_identity() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const S = Function.prototype.toString;
+                    const poison = "'caller', 'callee', and 'arguments' properties " +
+                      "may not be accessed on strict mode functions or the arguments " +
+                      "objects for calls to them";
+                    const da = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments');
+                    const dc = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
+                    const bound = (function f(a, b, c) {}).bind(null, 1, 2);
+                    const throwOf = (fn) => {
+                        try { fn(); return null; } catch (e) {
+                            return [e.name, e.message];
+                        }
+                    };
+                    let sloppyStore;
+                    try { (function sm() { return 1; }).arguments = 5; sloppyStore = 'silent'; }
+                    catch (e) { sloppyStore = e.name; }
+                    return {
+                        desc: [da.enumerable, da.configurable, da.get.length],
+                        names: [da.get.name, da.set.name, dc.get.name, dc.set.name],
+                        sources: [S.call(da.get), S.call(da.set), S.call(dc.get), S.call(dc.set)],
+                        distinct: [da.get !== da.set, da.get !== dc.get, da.set !== dc.set],
+                        bound: {
+                            name: bound.name,
+                            length: bound.length,
+                            source: S.call(bound),
+                            arguments: throwOf(() => bound.arguments),
+                            caller: throwOf(() => bound.caller),
+                        },
+                        nativeArguments: throwOf(() => Math.max.arguments),
+                        strictArguments: throwOf(
+                            () => (function () { 'use strict'; return 1; }).arguments),
+                        sloppyArguments: (function () { return 1; }).arguments,
+                        sloppyStore,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let poison = "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them";
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "desc": [false, true, 0],
+                "names": ["get arguments", "set arguments", "get caller", "set caller"],
+                "sources": [
+                    "function get arguments() { [native code] }",
+                    "function set arguments() { [native code] }",
+                    "function get caller() { [native code] }",
+                    "function set caller() { [native code] }",
+                ],
+                "distinct": [true, true, true],
+                "bound": {
+                    "name": "bound f",
+                    "length": 1,
+                    "source": "function () { [native code] }",
+                    "arguments": ["TypeError", poison],
+                    "caller": ["TypeError", poison],
+                },
+                "nativeArguments": ["TypeError", poison],
+                "strictArguments": ["TypeError", poison],
+                "sloppyArguments": null,
+                "sloppyStore": "silent",
+            })
+        );
+    }
+
     /// `measureText` must return a branded `TextMetrics` whose numbers live on
     /// the prototype, the way Chrome does. It used to hand back a plain object
     /// with three own properties, so `Object.prototype.toString.call(...)` read

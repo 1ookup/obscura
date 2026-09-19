@@ -435,6 +435,59 @@ function _markNativeObject(obj, depth) {
   }
   return obj;
 }
+// The Function.prototype "arguments"/"caller" restricted properties. Recent
+// Chrome installs four distinct, named accessors ("get arguments",
+// "set arguments", "get caller", "set caller"), each answering
+// Function.prototype.toString with its own "function get|set <key>() ...
+// [native code]" and .name with the accessor label. The V8 this engine pins
+// exposes a single anonymous %ThrowTypeError% for all four views, which the
+// native-presentation sweep then mis-marks with whichever key it walked last
+// ("function set caller", .name "") -- and the challenge's bound-function
+// validator reads exactly these identity fields (profile Step 320). Replace
+// both properties with per-property accessors that delegate to the captured
+// V8 pair: the getter keeps V8's exact semantics (null for a sloppy
+// function, its live arguments while it runs, the poison TypeError for
+// strict, bound, class, and native receivers), and the setter reproduces
+// Chrome's sloppy silent-ignore -- a direct call into the pinned V8's pill
+// throws where Chrome's setter returns quietly. The throw carries Chrome's
+// message and leaves a "at get arguments" frame above the caller, matching
+// the stack shape the reference capture records.
+(function _installPoisonPillAccessors() {
+  const poisonMessage = "'caller', 'callee', and 'arguments' properties may " +
+    'not be accessed on strict mode functions or the arguments objects for ' +
+    'calls to them';
+  for (const key of ['arguments', 'caller']) {
+    let captured;
+    try { captured = Object.getOwnPropertyDescriptor(Function.prototype, key); }
+    catch (_e) { continue; }
+    if (!captured || typeof captured.get !== 'function') continue;
+    const nativeGet = captured.get;
+    const nativeSet = captured.set;
+    const getter = _markNativeAs(function () { return nativeGet.call(this); },
+      `function get ${key}() { [native code] }`);
+    Object.defineProperty(getter, 'name', {
+      value: `get ${key}`, configurable: true,
+    });
+    const setter = _markNativeAs(function (value) {
+      // The captured V8 getter is the sloppiness discriminator: it returns
+      // (null or a live arguments object) for a sloppy function and throws
+      // for everything Chrome's setter rejects too.
+      let sloppy = false;
+      try { nativeGet.call(this); sloppy = true; } catch (_e) { sloppy = false; }
+      if (sloppy) return;
+      if (typeof nativeSet === 'function') { nativeSet.call(this, value); return; }
+      throw new TypeError(poisonMessage);
+    }, `function set ${key}() { [native code] }`);
+    Object.defineProperty(setter, 'name', {
+      value: `set ${key}`, configurable: true,
+    });
+    try {
+      Object.defineProperty(Function.prototype, key, {
+        get: getter, set: setter, enumerable: false, configurable: true,
+      });
+    } catch (_e) {}
+  }
+})();
 // Engine-internal trampoline for the WebIDL interfaces whose prototype the
 // core finalizer rebuilds wholesale (config/core-surface-finalize.js). A
 // class's `prototype` slot is locked by V8 class semantics, which blocked
