@@ -606,4 +606,3 @@ function _queueIframeNavigation(hostNid) {
 globalThis.__obscura_worker_dispatch_batch = function (id, batch) {
   Worker._dispatchBatch(id, batch);
 };
-console.error('[wsdbg-js] dispatcher installed');
