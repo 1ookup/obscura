@@ -11408,3 +11408,12 @@ TS#2 POST(89KB/resp 127KB，ts=17489992) → TS#3(92KB/5KB) → main#2(7.8KB) �
 （release/render/nextest）——唯一失败 `trace_source_labels`（首个 trace 行先于表头）
 在基线 33a1e9b detach 配对原样复现，与本批无关；release build（AGENTS.md 原命令）
 过；本机无 obscura-benchmark 检出，障碍课程未跑（下会话补）。
+
+### Step 317 前置记录：ver21 揭示批次 17/18 的时序回归（2026-09-19 23:1x）
+
+**ver21**（load 6-7，比 ver19/20 的 9-10 低）：uGyjw9=**526**（ver17 正午为 15；ver19/20
+负载 10 下 295/313）——非负载线性，是回归：① 批次 18 native 扫雷的**惰性深扫**被挑战
+自身的 toString 探测触发，落进计时窗口；② 批次 17 延迟水合把表面安装成本挪进引导程序
+窗口（挑战会触碰每个 realm，deferred 只搬家不省钱）。ZMSOw0=560 同理未获益。
+tQdUc5=38 保持。修复批次 20 已派：水合时即标记（禁惰性扫）+ 解锁 core-surface 原型
+交换快路径（每 realm ~20ms→~1.3ms）。
