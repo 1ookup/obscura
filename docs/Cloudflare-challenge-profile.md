@@ -11029,3 +11029,70 @@ build-walk 占 86-92ms，其中 push_shaped_item 的文本整形 84ms（670 run�
 级联 + taffy 重建 + derived/scroll 固定项；按 site=6 的换算，timeTiefMs 预期落
 **10-30ms 带**（census 对象本身的 10-15ms 大半在外），Chrome 4ms 仍留少量
 差距，差距项即增量布局，另行立项。
+
+### Step 310: 修复批次 17——哈希探针活体两道叠门（WebIDL 索引转换 + 几何对象内部槽），extent 首次在实弹应答 SVGRect；判决轮仍重启（2026-09-19）
+
+**方法**：注入轮 tel5（v3 遥测：window 接口全局读探针 + @@hasInstance 陷阱 +
+createElementNS/cloneNode/DOMParser/Worker 包裹 + 子 realm 采纳）暴露一条
+instrumentation 纪律：把 window.SVGTextContentElement 等从数据属性换成 accessor
+本身就会被挑战的环境分类识别，探针被整段跳过、payload 提前提交（tel5 流程形状
+失真）。tel6 改用 tel4 已验证的无源形状（仅原型方法数据属性包裹 + 创建/克隆
+日志 + digest/te/token 陷阱）拿到干净的活体探针序列；tel7 在第一批修复落地后
+复跑，定位第二道门；final16 为无注入判决轮。注入开三轮 + 判决一轮，预算用满。
+
+**tel6/tel7 实弹探针序列（与 Chrome strand 逐调用同形，19 text 全部落在新晶格
+ctor=SVGTextElement 链上）**：getBBox(g)=SVGRect → 每元素 [gBCR x6 + ctl]
+（emoji 15.984 x4 + hex 4288-4501 x15）→ 12 次 emoji gBCR → **getExtentOfChar("😀")**
+→ 摘要。两道门依次定位：
+
+1. **tel6（26b01f9 修复前）**：extent 调用传入的是被测 emoji **字符串**，
+   WebIDL unsigned long 转换把 ToNumber 的 NaN 映射为 0，Chrome 答第 0 个
+   glyph 盒；我方 `Number.isFinite(trunc)` 检查直接抛 IndexSizeError。该异常
+   就是 strand 定位里"ctl 相与 extent 相之间的门"：RKUE0 的矩形归约塌缩成空集
+   "0"，JRzmw6 链转入异步请求令牌路径。修复：`_svgToUnsignedLong` 按
+   ToUint32 语义转换（NaN/±∞ → 0、截断后 mod 2^32），越界抛错带 Chrome 的
+   方法名前缀与**换算后**的值（"charnum provided (4294967295)"），家族五个
+   取索引方法与 getSubStringLength 起点范围检查一并对齐。
+2. **tel7（23f74b6 修复前）**：extent 已应答 `[object SVGRect]`，归约仍为 "0"。
+   对拍（本地 headless Chrome oracle，rect-shape fixture）实锤：Chrome 的
+   SVGRect/DOMRect 实例**自身零 own 属性**（字段是原型上的 enumerable
+   getter，`JSON.stringify(getBBox()) === "{}"`，Object.entries 为空），我方是
+   own enumerable 数据属性记录——探针的矩形收集按"原生几何对象"形状验收，
+   两种 branded 实例全数被拒，归约恒空集。修复：DOMRectReadOnly/DOMRect 字段
+   移入模块 WeakMap 内部槽 + 原型 enumerable accessor（top/right/bottom/left
+   派生、DOMRect 可写字段、toJSON 保留并 enumerable，与 Chrome for-in 逐键
+   一致），SVG 几何生产者（getBBox/getExtentOfChar/getStartPositionOfChar/
+   getEndPositionOfChar）改产槽式 SVGRect/SVGPoint；viewport-fixed 标记从 own
+   属性移入共享 WeakSet。extent 走查同时按 Chrome 聚类代理对：emoji 两个
+   UTF-16 半元同 x 同整字形宽。二进制级对拍：修复后 rect-shape fixture 十七项
+   形状断言与 Chrome 逐字节同形。
+
+**tel6/tel7 槽位**：tel7（修复 1 已落地、修复 2 在途）解密 TS#2/TS#3 四槽仍为
+RKUE0=sha256("0")、JRzmw6="bOHv4"、kRQwh3=sha256("15.984…")、oSIr8=
+sha256("0.6624…")——与门 2 未修一致。**修复 2 落地后的实弹槽位翻转未及注入轮
+验证（4 轮预算用满）**，本地证据：oracle 十七项形状全同形 + extent 应答整字形
+branded SVGRect。
+
+**无注入判决轮 final16（真实 key，注入关）**：
+```
+4.1s orchestrate(a3d5b21c) → 5.0s TS#1 → 6.9s TS#2 → 9.1s pat401+brunhild
+→ 12.6s TS#3 → 24.1s 第4次 widget POST → 24.3s main#2(3240B)
+→ 26.7s 新 orchestrate(a3d5b2aa) 重开一轮 —— 判决仍 fail
+```
+/ci/ 仍不发（PAT 兑付在浏览器网络栈，Step 300/T3 定性不变）；main#2 之后未出现
+指向 www.thelancet.com/1.txt 的表单提交，而是换 ray 重开挑战。与 live13c/live14
+相比流程完整性与时序继续收敛（TS#2 提前到 6.9s、main#2 24.3s），**残余分歧 =
+main#2 之后服务端仍下发新挑战**：候选为哈希探针四槽（修复 2 的实弹效果待
+验证轮确认）与 /ci/ PAT 兑付两族，前者是下一步唯一低成本验证项（一注入轮）。
+
+**遥测脚本沉淀**：`chanllenge/ov2/patch_ov2_telemetry3.py`（v3，window 访问器
+陷阱版——会毒化流程，仅静态诊断用）、`patch_ov2_telemetry5.py`（v5，无源安全
+形状，tel6/tel7 采用），备份 ov2.js.bak-pre-v3-*；KC copy-site 钩子因 build 轮
+换后锚点改名未再插入，计数器闭环由 pass-3 结论维持。
+
+**门禁**：obscura-js 10/10 SVG 族（含新增
+svg_char_index_follows_the_webidl_unsigned_long_conversion、
+svg_rect_instances_carry_no_own_properties_like_chrome 两枚）；五 crate
+release/render nextest 1158/1159（timing_edits 并行压机超时一例，隔离复跑过，
+Step 308 已知 flake）；no-default-features check 通过；release build
+（render+stealth）全量通过；障碍课程不在本机，33/33 留给主控。
