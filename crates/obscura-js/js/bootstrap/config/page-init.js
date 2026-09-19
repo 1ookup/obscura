@@ -509,20 +509,54 @@ globalThis.__obscura_init = function() {
       _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
     }
   } catch(e) {}
-  // The native-presentation sweep. Init replaced visualViewport,
-  // re-installed viewport/child-context accessors and the named-property
-  // getters, and a fresh runtime's ECMAScript intrinsics (WebAssembly) are
-  // not the snapshot objects the bootstrap-time pass walked. Frame realms
-  // run it here eagerly: a parent probes a child's surface before the child
-  // ever runs a script of its own, so a lazy first-tostring trigger would
-  // leave the parent's probe seeing engine source. The main realm relies on
-  // the lazy trigger instead (the __obscura_lazy_mark_surface hook in
-  // config/bootstrap.js): running the scan inside main-realm page init
-  // tipped the image lifecycle's load-event race the parser_image tests
-  // exercise.
+  // Native presentation (batch 20). Init replaced visualViewport, the
+  // frame-metric accessors and the named-property getters, and a fresh
+  // context mints its own ECMAScript intrinsics (WebAssembly, Temporal and
+  // friends are not the snapshot objects the boot-time pass marked).
+  //
+  // Deferred-surface frame realms run the full sweep here eagerly: their
+  // surface installs at hydration, a parent probes a child before the child
+  // runs any script of its own, and this init IS the realm's
+  // surface-install completion point. The main realm does not re-walk here:
+  // its boot-time pass (config/webidl-branding.js, snapshot build) already
+  // marked the whole surface and the registry's marks survive the snapshot
+  // restore, so only the per-context delta below needs marking -- a full
+  // walk inside main-realm page init tips the image lifecycle's
+  // load-event race the parser_image family exercises.
   if (_callingFrameRoot()) {
     try { globalThis.__obscura_mark_surface_native?.(); } catch (_e) {}
+  } else {
+    // Per-context intrinsics, minted fresh for this context by V8: mark
+    // their members directly. Idempotent and cheap (WeakSet adds on a few
+    // dozen functions), so it runs on every page init.
+    try {
+      for (const intrinsic of ['WebAssembly', 'Temporal', 'Iterator',
+        'Float16Array', 'DisposableStack', 'AsyncDisposableStack',
+        'AggregateError', 'SuppressedError']) {
+        const holder = globalThis[intrinsic];
+        if (holder && (typeof holder === 'object' || typeof holder === 'function')) {
+          _markNative(holder);
+          _markNativeObject(holder, 2);
+        }
+      }
+    } catch (_e) {}
   }
+  try {
+    // VisualViewport is replaced with a fresh object on every page init;
+    // mark it at its construction site like every post-sweep surface.
+    if (globalThis.visualViewport
+        && typeof globalThis.visualViewport.addEventListener === 'function') {
+      _markNative(globalThis.visualViewport.addEventListener);
+      _markNative(globalThis.visualViewport.removeEventListener);
+    }
+  } catch (_e) {}
+  // Surface install is complete: remove the lazy deep-scan fallback so it is
+  // unreachable from this realm for the rest of its life. Functions minted
+  // after this point mark themselves at their construction sites
+  // (_markNativeObject), which is the shape the finalize sweeps' registries
+  // expect; an unmarked function must answer toString with its source, the
+  // way a page function does in a browser, rather than tip the scan.
+  try { delete globalThis.__obscura_lazy_mark_surface; } catch (_e) {}
   delete globalThis.__obscura_init;
 };
 

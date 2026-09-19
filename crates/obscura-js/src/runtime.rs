@@ -8834,6 +8834,153 @@ mod tests {
         );
     }
 
+    /// A realm that completed its surface install (the main realm after
+    /// run_page_init, a frame realm after hydration) must have every
+    /// reachable engine function already in the native registry -- checked
+    /// against the registry itself, not through Function.prototype.toString,
+    /// whose override used to mask exactly this gap by firing the full deep
+    /// scan on the first unmarked probe. The lazy fallback hook must be gone
+    /// from every such realm, so no page-observable execution can ever pay
+    /// the scan inside its own timed window (profile Step 317, ver21:
+    /// uGyjw9 15 -> 295-526). Page globals are excluded from the walk: a
+    /// browser reports their source too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_realms_premark_surface_and_drop_lazy_scan_fallback() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://example.com/premark");
+        rt.run_page_init();
+
+        const AUDIT: &str = r#"
+            (() => {
+                const registry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+                // Genuine V8 intrinsics (Intl, Temporal, ...) answer toString
+                // natively without a registry entry; the audit's offenders are
+                // functions that are neither marked nor intrinsics -- engine
+                // bootstrap closures leaking source.
+                const native = (fn) => {
+                    let s;
+                    try { s = Function.prototype.toString.call(fn); }
+                    catch (e) { return true; }
+                    return s.indexOf('[native code]') !== -1;
+                };
+                const marked = (fn) => registry.fns.has(fn) || registry.strings.has(fn) || native(fn);
+                const walk = (root) => {
+                    let scanned = 0, unmarked = 0, first = '';
+                    const seen = new Set([root]);
+                    const queue = [root];
+                    while (queue.length && scanned < 20000) {
+                        const obj = queue.shift();
+                        scanned++;
+                        let keys;
+                        try { keys = Reflect.ownKeys(obj); } catch (e) { continue; }
+                        for (const key of keys) {
+                            let d;
+                            try {
+                                d = Object.getOwnPropertyDescriptor(obj, key);
+                            } catch (e) { continue; }
+                            if (!d) continue;
+                            if (typeof d.get === 'function' && !marked(d.get)) {
+                                unmarked++;
+                                if (!first) first = String(d.get.name || key);
+                            }
+                            if (typeof d.set === 'function' && !marked(d.set)) {
+                                unmarked++;
+                                if (!first) first = String(d.set.name || key);
+                            }
+                            let v;
+                            if ('value' in d) {
+                                v = d.value;
+                                if (typeof v === 'function' && !marked(v)) {
+                                    unmarked++;
+                                    if (!first) first = String(v.name || key);
+                                }
+                            } else {
+                                try { v = obj[key]; } catch (e) { continue; }
+                            }
+                            if (v && (typeof v === 'object' || typeof v === 'function')
+                                && !seen.has(v)) {
+                                seen.add(v);
+                                queue.push(v);
+                            }
+                        }
+                    }
+                    return { scanned, unmarked, first };
+                };
+                const root = {};
+                for (const name of Object.getOwnPropertyNames(globalThis)) {
+                    let v;
+                    try { v = globalThis[name]; } catch (e) { continue; }
+                    if (v && (typeof v === 'object' || typeof v === 'function')) {
+                        root[name] = v;
+                    }
+                }
+                return {
+                    audit: walk(root),
+                    lazyHook: typeof globalThis.__obscura_lazy_mark_surface,
+                };
+            })()
+        "#;
+
+        let main = rt
+            .evaluate_for_cdp(AUDIT, true, true)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            main.get("lazyHook").and_then(serde_json::Value::as_str),
+            Some("undefined"),
+            "main realm completed surface install: lazy scan fallback must be unreachable"
+        );
+        assert_eq!(
+            main.get("audit")
+                .and_then(|a| a.get("unmarked"))
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "main realm surface must be premarked at init completion; first offender: {:?}",
+            main.get("audit").and_then(|a| a.get("first"))
+        );
+
+        // Frame realm: hydration is its surface-install completion point, so
+        // the same two facts must hold before any script of its own runs.
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://example.com/premark-frame', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "premark-frame",
+            1,
+            root,
+            "https://example.com/premark-frame",
+        )
+        .unwrap();
+        let frame = rt
+            .execute_script_in_frame_realm("premark-frame", 1, "<premark>", AUDIT)
+            .unwrap();
+        assert_eq!(
+            frame.get("lazyHook").and_then(serde_json::Value::as_str),
+            Some("undefined"),
+            "hydrated frame realm: lazy scan fallback must be unreachable"
+        );
+        assert_eq!(
+            frame
+                .get("audit")
+                .and_then(|a| a.get("unmarked"))
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "hydrated frame realm surface must be premarked; first offender: {:?}",
+            frame.get("audit").and_then(|a| a.get("first"))
+        );
+    }
+
     /// Constructor identity of the Chrome-151-era interfaces the passing
     /// sessions expose: the WebMCP ModelContext pair and the SharedStorage
     /// family. Shapes follow the same WebIDL conventions the rest of the

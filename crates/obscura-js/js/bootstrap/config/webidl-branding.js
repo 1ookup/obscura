@@ -591,7 +591,12 @@ function _obscuraMarkSurfaceNative(filterToPristine) {
     }
   }
 }
-_obscuraMarkSurfaceNative();
+// The boot-time pass runs only where the whole surface installs inline (the
+// main context at snapshot build, non-deferring realms); its registry marks
+// survive the snapshot restore, so the main realm is premarked from boot. A
+// deferred-surface frame realm defers the sweep to its single eager pass at
+// init completion (config/page-init.js): one pass per realm instead of two.
+if (!globalThis.__obscura_frame_defers_surface) _obscuraMarkSurfaceNative();
 // Exported for the core-half page-init scope: this function is declared
 // inside the deferred-surface wrapper, so `__obscura_init` (which re-installs
 // visualViewport, viewport accessors and the window frame indices after this
@@ -604,11 +609,13 @@ Object.defineProperty(globalThis, '__obscura_mark_surface_native', {
   configurable: false,
 });
 // Lazy trigger for the same sweep: installed for the Function.prototype
-//.toString override in config/bootstrap.js, which runs it once on the first
-// unmarked probe and then deletes it. This covers everything installed after
-// this module's own pass (init's replacements, lazy accessors, per-runtime
-// intrinsics) without paying the scan inside page init, where synchronous
-// work perturbs the image lifecycle's load-event delivery.
+//.toString override in config/bootstrap.js. This is the pre-boot safety net
+// only -- a restored context carries it until its first __obscura_init (or
+// the worker prep), which marks the surface eagerly and then deletes the
+// hook, so a realm with a complete surface can never fire the deep scan from
+// inside page execution (batch 20: the challenge census stringifies page
+// functions, and the first unmarked probe used to run the full sweep inside
+// its own timed window; profile Step 317, uGyjw9 15 -> 295-526).
 Object.defineProperty(globalThis, '__obscura_lazy_mark_surface', {
   value: () => _obscuraMarkSurfaceNative(true),
   writable: true,

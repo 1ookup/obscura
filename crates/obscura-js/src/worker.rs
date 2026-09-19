@@ -1764,6 +1764,18 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
     markMembers(G);
   })();
+
+  // 8. Remove the lazy deep-scan fallback. The snapshot the worker isolate
+  // restored carries __obscura_lazy_mark_surface (config/webidl-branding.js
+  // installs it at snapshot build), and the sweep above just marked the
+  // whole prep surface eagerly -- so this is the worker's surface-install
+  // completion point, exactly as __obscura_init is for the window realms
+  // (config/page-init.js). An anti-bot payload owns this scope outright and
+  // stringifies page functions during its census; the first unmarked probe
+  // must answer with the function's own source, the way a browser does, and
+  // must never fire the full sweep inside the payload's timed windows
+  // (batch 20, uGyjw9).
+  try { delete G.__obscura_lazy_mark_surface; } catch (e) {}
 })();
 "#;
 
@@ -1824,6 +1836,34 @@ mod tests {
             &serde_json::json!(
                 r#"[{"echo":"hi"},{"echo":{"n":1,"arr":[1,2],"nested":{"s":"x"}}}]"#
             ),
+        )
+        .await;
+    }
+
+    /// The worker prep is the worker's surface-install completion point: the
+    /// native-presentation sweep runs eagerly there, and the lazy deep-scan
+    /// fallback the snapshot carried must be gone afterwards (batch 20, same
+    /// rule as the window realms' init completion). A payload that owns the
+    /// scope stringifies its own functions; the first unmarked probe must
+    /// never fire the full sweep inside the payload's timed windows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_prep_drops_lazy_scan_fallback() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "onmessage = function (e) { postMessage(typeof __obscura_lazy_mark_surface); };";
+            const w = new Worker('data:text/javascript,' + encodeURIComponent(src));
+            globalThis.__hookKind = 'pending';
+            w.onmessage = (e) => { globalThis.__hookKind = e.data; };
+            w.postMessage('hi');
+            "#,
+        )
+        .unwrap();
+        pump_until(
+            &mut rt,
+            "globalThis.__hookKind",
+            &serde_json::json!("undefined"),
         )
         .await;
     }
