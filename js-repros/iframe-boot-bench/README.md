@@ -26,6 +26,7 @@ Both scripts print `{each: [...], total: ...}` JSON.
 | engine 0919 morning (Step 311 base, unsplit) | 78-93 | 142 | 719 |
 | engine after Step 312 (deferred-surface realm boot, unloaded) | 8-12 | 40-55 | 100-125 |
 | engine after Step 312, under parallel build load (load avg 9-30) | 8-12.5 | 50-54 | 118-125 |
+| engine after batch 20 (prototype swap fast path, 0919 late) | 8-13 | ~25 | 93-101 |
 
 The deferred-surface boot splits the bootstrap at
 `@obscura-deferred-surface` (js/bootstrap.js): a frame realm's first boot runs
