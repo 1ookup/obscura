@@ -1,0 +1,152 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>forced-layout cost fixture</title>
+<style>
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; }
+  .wrap { padding: 8px; border: 1px solid #ccc; }
+  .row { padding: 2px 6px; margin: 1px 0; }
+  .lbl { color: #333; }
+  .val { color: #06c; }
+  #census-target { position: relative; }
+</style>
+<body>
+<script>
+// One forced-layout getBoundingClientRect on a churned document, the shape
+// the api.js extra-params census pays in the parent realm (payload field
+// uGyjw9 / timeTiefMs). Live telemetry: 179-244 ms cold (document churned by
+// widget style/iframe injections since load), <3 ms warm, Chrome 4 ms total.
+//
+// Phases (all milliseconds, page clock):
+//   buildMs       - construct a ~100-element text document (interstitial shape)
+//   warmReadMs    - first gBCR right after build (layout pre-warmed by load
+//                   settle; both engines should be near-free)
+//   churnMs       - widget-churn shape: create/remove nodes, toggle classes,
+//                   rewrite styles and text (layout stays dirty, no reads)
+//   churnedReadMs - THE number: one gBCR on the churned document; this pays a
+//                   full re-prepare on our engine. Success bar: <15 ms
+//   churnedRead2Ms - second gBCR without intervening mutation (must be free)
+//   churnAndRead10Ms - 10 mutate->read cycles (the census's repeated probes)
+// Every read returns its rect width checksum so behavior parity is visible.
+globalThis.forcedLayoutPromise = (async function () {
+  const result = { error: null };
+  const now = () => performance.now();
+  try {
+    const body = document.body;
+    const t0 = now();
+
+    // -- build a modest interstitial-shaped document (~100 elements)
+    const frag = document.createDocumentFragment();
+    const wrapper = document.createElement('div');
+    wrapper.id = 'census-target';
+    wrapper.className = 'wrap';
+    for (let i = 0; i < 30; i++) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = 'field ' + i + ' label text';
+      const val = document.createElement('span');
+      val.className = 'val';
+      val.textContent = 'value-' + i + '-with-some-length';
+      row.appendChild(lbl);
+      row.appendChild(val);
+      wrapper.appendChild(row);
+    }
+    // plus ~40 more small nodes with text (spinner/notice shape)
+    for (let i = 0; i < 40; i++) {
+      const d = document.createElement('div');
+      d.className = i % 2 ? 'row' : 'lbl';
+      d.textContent = 'note ' + i;
+      wrapper.appendChild(d);
+    }
+    frag.appendChild(wrapper);
+    body.appendChild(frag);
+    result.buildMs = now() - t0;
+    result.elements = wrapper.querySelectorAll('*').length + 1;
+
+    // -- site-page block: the live census document is a full site page
+    // (interstitial overlays it), so add a site-page-sized block of text
+    // nodes. Scale factor via ?site=N (default 6 -> ~1900 nodes, the shape
+    // that reproduces the live 100-250 ms cold gBCR on this engine).
+    const siteBlocks = Number(new URLSearchParams(location.search).get('site') || 6);
+    const site = document.createElement('div');
+    site.id = 'site-block';
+    const siteFrag = document.createDocumentFragment();
+    for (let i = 0; i < siteBlocks * 100; i++) {
+      const p = document.createElement('p');
+      p.className = 'row site';
+      const s1 = document.createElement('span');
+      s1.textContent = 'Section ' + i + ': shaping dominates the retained layout rebuild cost';
+      const s2 = document.createElement('span');
+      s2.className = 'val';
+      s2.textContent = 'read more about item ' + i + ' here';
+      p.appendChild(s1);
+      p.appendChild(s2);
+      siteFrag.appendChild(p);
+    }
+    site.appendChild(siteFrag);
+    body.appendChild(site);
+    result.siteElements = site.querySelectorAll('*').length;
+    result.totalElements = result.elements + result.siteElements;
+
+    // -- warm read: layout is already prepared by the load settle
+    let t = now();
+    const warm = wrapper.getBoundingClientRect();
+    result.warmReadMs = now() - t;
+    result.warmWidth = warm.width;
+
+    // -- churn without reads (widget injections: styles, nodes, text)
+    const churn = () => {
+      const t0 = now();
+      for (let i = 0; i < 5; i++) {
+        const d = document.createElement('div');
+        d.className = 'row';
+        d.style.color = i % 2 ? 'red' : 'green';
+        d.textContent = 'churn ' + i;
+        wrapper.appendChild(d);
+        wrapper.removeChild(wrapper.lastElementChild);
+      }
+      wrapper.className = 'wrap w' + (churnN++ % 2);
+      wrapper.querySelector('.val').style.letterSpacing = '1px';
+      // one site-page style touch keeps the whole-document style graph dirty
+      site.className = 'siteblock s' + (churnN % 2);
+      return now() - t0;
+    };
+    var churnN = 0;
+    let churnMs = 0;
+    for (let i = 0; i < 3; i++) churnMs += churn();
+    result.churnMs = churnMs;
+
+    // -- THE number: one forced-layout read on the churned document
+    t = now();
+    const churned = wrapper.getBoundingClientRect();
+    result.churnedReadMs = now() - t;
+    result.churnedWidth = churned.width;
+
+    // -- second read with no intervening mutation (must reuse layout)
+    t = now();
+    wrapper.getBoundingClientRect();
+    result.churnedRead2Ms = now() - t;
+
+    // -- 10 mutate->read cycles (the census probes geometry repeatedly)
+    t = now();
+    let cycleSum = 0;
+    for (let i = 0; i < 10; i++) {
+      const d = wrapper.lastElementChild;
+      d.style.color = i % 2 ? 'blue' : 'black';
+      cycleSum += wrapper.getBoundingClientRect().width;
+    }
+    result.churnAndRead10Ms = now() - t;
+    result.cycleSum = cycleSum;
+  } catch (err) {
+    result.error = String(err && err.stack || err);
+  }
+  globalThis.forcedLayoutResult = result;
+  const div = document.createElement('div');
+  div.id = 'forced-layout-fixture-done';
+  div.textContent = JSON.stringify(result);
+  document.body.appendChild(div);
+  return result;
+})();
+</script>
+</body>
