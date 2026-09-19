@@ -11479,3 +11479,10 @@ release/render/nextest 1877/1878——唯一失败 trace_source_labels 为既有
 完成点删除，boot 标记跨还原存活，增量显式标记），预期回到 ver17 的 ~15 一带；
 ZMSOw0——每 realm 全触碰成本 103→84ms（-18%），按质询 ~7 个 realm 折算预期
 560 → ~460-490 一带；逼近 ~300 需上文的 per-context snapshot 立项兑付。
+
+### Step 318 前置：批次 20 验证 + final22（2026-09-20 01:2x）
+
+ver22（load 5.6-6.9）：uGyjw9 526→**193**（回归修复生效；ver17 低负载基线 15）、
+ZMSOw0 560→**460**（原型交换快路径 -18%，符合预期）；tQdUc5=39/38。
+final22 判决仍 fail（重开；30s 预算截断于第二轮）。批次 21（每上下文 snapshot 工程，
+Step 317 标记项）已派 overnight agent，含 ver23/final23 收尾轮。
