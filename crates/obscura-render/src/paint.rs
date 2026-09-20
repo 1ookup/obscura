@@ -2645,10 +2645,22 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
             .collect::<Vec<_>>();
         animation_mutations.as_slice()
     };
-    let retained = RetainedStyleMaps {
+    let mut retained = RetainedStyleMaps {
         styles: std::mem::take(&mut previous.layout.styles),
         custom_properties: std::mem::take(&mut previous.layout.custom_properties),
+        taffy: previous.layout.taffy.take(),
     };
+    // Hand the previous layout's shaped-text engine to the retained taffy
+    // state: the incremental path reuses engine item indices in place.
+    if let Some(state) = retained.taffy.as_mut() {
+        #[cfg(feature = "paint")]
+        {
+            state.engine = Some(std::mem::replace(
+                &mut previous.layout.text_engine,
+                crate::inline::TextEngine::placeholder(),
+            ));
+        }
+    }
     let previous_census = previous.discovery.take();
     drop(previous);
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(

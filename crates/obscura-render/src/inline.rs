@@ -1901,6 +1901,27 @@ impl TextEngine {
         // identical. Successive passes of one document always match.
         let shape_pool_key = web_font_pool_key(fonts);
         let pooled_shape_cache = take_pooled_shape_cache(shape_pool_key);
+        Self::build_with_web_fonts(fonts, Some(shape_pool_key), pooled_shape_cache)
+    }
+
+    /// A throwaway engine that never touches the shape-cache pool, neither
+    /// when created nor when dropped. Used as the placeholder filling a
+    /// layout's engine slot while ownership moves to a retained engine: a
+    /// pooled placeholder would steal the very cache the next build needs
+    /// and turn every full rebuild into a cold reshape.
+    pub(crate) fn placeholder() -> Self {
+        Self::build_with_web_fonts(&[], None, None)
+    }
+
+    fn build_with_web_fonts(
+        fonts: &[WebFont],
+        shape_pool_key: Option<u64>,
+        pooled_shape_cache: Option<(
+            cosmic_text::ShapeRunCache,
+            cosmic_text::ShapeLineCache,
+            cosmic_text::LayoutRunCache,
+        )>,
+    ) -> Self {
         // Build a database from embedded and page-provided faces. Never call
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
@@ -2030,7 +2051,7 @@ impl TextEngine {
             variable_swash: VariableSwashCache::new(),
             items: Vec::new(),
             replaced: Vec::new(),
-            shape_pool_key: Some(shape_pool_key),
+            shape_pool_key,
         }
     }
 

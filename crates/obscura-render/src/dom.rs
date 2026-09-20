@@ -365,6 +365,9 @@ pub struct DomLayout {
     /// no DOM node of their own, but unlike the legacy text-only fast path
     /// they participate in layout with their pseudo style's real box model.
     pub(crate) generated_boxes: Vec<GeneratedBox>,
+    /// Taffy bookkeeping retained for the next incremental rebuild. Empty on
+    /// layouts built by callers that never reuse them (one-shot measures).
+    pub(crate) taffy: Option<RetainedTaffy>,
 }
 
 /// One connected element attribute mutation eligible for conservative
@@ -588,6 +591,33 @@ impl From<TreeStyleMutation> for RetainedStyleMutation {
 pub(crate) struct RetainedStyleMaps {
     pub styles: HashMap<NodeId, crate::LayoutStyle>,
     pub custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+    /// Taffy bookkeeping from the previous build, when the layout is eligible
+    /// for incremental (dirty-subtree) updates instead of a full rebuild.
+    pub(crate) taffy: Option<RetainedTaffy>,
+}
+
+/// Retained taffy state from one build: the tree itself, its DOM mapping,
+/// the shaped-text registries, and the text engine holding every item index.
+/// An incremental prepare applies style updates to this state in place;
+/// taffy's per-node caches then confine recomputation to the dirty subtrees.
+pub(crate) struct RetainedTaffy {
+    pub(crate) tree: TaffyTree<usize>,
+    pub(crate) id_map: HashMap<taffy::NodeId, NodeId>,
+    pub(crate) reverse: HashMap<NodeId, taffy::NodeId>,
+    pub(crate) words: HashMap<taffy::NodeId, (NodeId, String)>,
+    pub(crate) ifc_items: IfcRegistry,
+    pub(crate) text_runs: HashMap<NodeId, Vec<(Rect, String)>>,
+    /// Per-node text-shaping inputs as of the node's last (re)build.
+    pub(crate) text_inputs: HashMap<NodeId, TextShapingInputs>,
+    /// Nodes whose final taffy style equals the pure per-node recomputation
+    /// (`to_taffy_style` of their computed style): no build-loop override, no
+    /// post-compute fixup touched their taffy style. Only these may take
+    /// `set_style` updates; any other dirty node forces a full rebuild.
+    pub(crate) self_describing: HashSet<NodeId>,
+    /// Text engine adopted from the previous layout on the transfer into an
+    /// incremental prepare; `None` once the engine lives in the new layout.
+    #[cfg(feature = "paint")]
+    pub(crate) engine: Option<crate::inline::TextEngine>,
 }
 
 /// Dense identifier for one scrolling area in a prepared render. Index zero
@@ -2196,8 +2226,8 @@ fn sync_positioned_pseudo_percentage_padding(
 /// container's own DOM id, `runs` holds anonymous inline-run leaves keyed by
 /// the parent block's DOM id (those leaves have no DOM node, so their final
 /// rects are captured separately; see `compute_absolute_rects`).
-#[derive(Default)]
-struct IfcRegistry {
+#[derive(Default, Clone)]
+pub(crate) struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     /// For each node surfaced by `flatten_boxless_inline_children`, the
     /// chain of flattened boxless-inline ancestors that were removed above
@@ -2247,6 +2277,7 @@ struct FixedTableColumn {
     specified: bool,
 }
 
+#[derive(Clone)]
 struct MulticolBuild {
     columns: Vec<taffy::NodeId>,
     children: Vec<taffy::NodeId>,
@@ -4708,6 +4739,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             &shadow_sheets,
             None,
             retained,
+            mutations,
             prewalked,
             animation_sample,
             animation_timeline,
@@ -4799,6 +4831,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 &shadow_sheets,
                 Some(&snapshot),
                 None,
+                mutations,
                 prewalked,
                 animation_sample,
                 animation_timeline,
@@ -4859,6 +4892,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 &shadow_sheets,
                 None,
                 None,
+                mutations,
                 prewalked,
                 animation_sample,
                 animation_timeline,
@@ -4888,6 +4922,240 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     )
 }
 
+/// Engine slot that defers its construction until the incremental
+/// eligibility decision has settled. Creating a `TextEngine` takes the
+/// warmed shape caches out of the pool; if that happened before the
+/// decision, a fallback full rebuild would run with a cold cache while the
+/// warm one sat inside the not-yet-dropped retained state.
+struct DeferredEngine {
+    inner: Option<crate::inline::TextEngine>,
+    fonts: Vec<crate::inline::WebFont>,
+}
+
+impl DeferredEngine {
+    fn new(fonts: &[crate::inline::WebFont]) -> Self {
+        Self {
+            inner: None,
+            fonts: fonts.to_vec(),
+        }
+    }
+
+    fn adopt(&mut self, engine: crate::inline::TextEngine) {
+        self.inner = Some(engine);
+    }
+
+    fn into_engine(mut self) -> crate::inline::TextEngine {
+        self.inner
+            .take()
+            .unwrap_or_else(|| crate::inline::TextEngine::new_with_web_fonts(&self.fonts))
+    }
+
+    fn materialize_now(&mut self) {
+        self.inner
+            .get_or_insert_with(|| crate::inline::TextEngine::new_with_web_fonts(&self.fonts));
+    }
+
+    fn into_inner(mut self) -> crate::inline::TextEngine {
+        self.inner
+            .take()
+            .expect("engine materialized before layout finishes")
+    }
+}
+
+impl std::ops::Deref for DeferredEngine {
+    type Target = crate::inline::TextEngine;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("engine materialized")
+    }
+}
+
+impl std::ops::DerefMut for DeferredEngine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .get_or_insert_with(|| crate::inline::TextEngine::new_with_web_fonts(&self.fonts))
+    }
+}
+
+/// The text-shaping inputs a text leaf's metrics depend on (font size,
+/// family, weight, letter spacing, line height, white space, transform).
+/// Word leaves and shaped engine items bake these in at build time, so any
+/// change inside a text-bearing subtree needs build()'s re-shaping pass.
+#[derive(Clone, PartialEq, Default)]
+struct TextShapingInputs {
+    font_size: Option<f32>,
+    font_weight: u16,
+    font_family: Option<String>,
+    letter_spacing: Option<f32>,
+    line_height: f32,
+    white_space: Option<crate::WhiteSpace>,
+    text_transform: Option<crate::TextTransform>,
+    italic: bool,
+}
+
+fn text_shaping_inputs(style: &crate::LayoutStyle) -> TextShapingInputs {
+    TextShapingInputs {
+        font_size: style.font_size,
+        font_weight: crate::style::used_font_weight(style),
+        font_family: style.font_family.clone(),
+        letter_spacing: style.letter_spacing,
+        line_height: crate::inline::used_line_height(style),
+        white_space: style.white_space,
+        text_transform: style.text_transform,
+        italic: style.font_style_italic.unwrap_or(false),
+    }
+}
+
+/// Structural identity of a taffy box: the fields that decide what structure
+/// build() would create around the node. Any change here means the update
+/// needs build()'s structural machinery, not a `set_style`.
+fn taffy_shape_key(style: &taffy::Style) -> (taffy::style::Display, bool, bool, bool) {
+    (
+        style.display,
+        style.position == taffy::Position::Absolute,
+        !style.grid_template_columns.is_empty(),
+        !style.grid_template_rows.is_empty(),
+    )
+}
+
+/// Does the taffy subtree rooted at `root` contain any text-bearing leaf
+/// (per-word leaves, shaped items, or generated-content text)? Bounded by
+/// the live-node bound inside taffy's own child lists.
+fn taffy_subtree_has_text(
+    state: &RetainedTaffy,
+    root: taffy::NodeId,
+    budget: &mut usize,
+) -> bool {
+    if *budget == 0 {
+        return true; // conservative: treat exhaustion as text-bearing
+    }
+    *budget -= 1;
+    if state.words.contains_key(&root) {
+        return true;
+    }
+    if let Some(&dom) = state.id_map.get(&root) {
+        if state.ifc_items.whole.contains_key(&dom)
+            || state.ifc_items.runs.contains_key(&dom)
+            || state.ifc_items.word_items.contains_key(&dom)
+        {
+            return true;
+        }
+    }
+    for child in state.tree.children(root).unwrap_or_default() {
+        if taffy_subtree_has_text(state, child, budget) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply the recascaded styles of `fresh` nodes to the retained taffy state
+/// in place, so taffy's per-node caches confine recomputation to dirty
+/// subtrees. Returns false when any dirty node is not provably a plain,
+/// self-describing box (its update needs build()'s structural machinery) and
+/// the caller must fall back to a full rebuild.
+///
+/// Per dirty node, in order:
+/// - no computed style: skip;
+/// - text-shaping inputs unchanged: the taffy base style decides. Equal
+///   base is a no-op; a different base on a self-describing box of the same
+///   structural shape is an in-place `set_style`;
+/// - text-shaping inputs changed: safe only when the node's whole taffy
+///   subtree is text-free;
+/// - a rendered element with no taffy box (anonymous-run member, flattened
+///   inline chain) always forces a full rebuild, as does a non
+///   self-describing box or a structural shape change.
+fn try_incremental_style_updates(
+    state: &mut RetainedTaffy,
+    _tree: &DomTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    fresh: &HashSet<NodeId>,
+) -> bool {
+    for &node in fresh {
+        let Some(style) = styles.get(&node) else {
+            continue;
+        };
+        // Boxed-ness transitions (display:none / display:contents entering
+        // or leaving) change the tree shape itself; only build() can do
+        // that. Same-state unboxed nodes have nothing to update.
+        let was_boxed = state.reverse.contains_key(&node);
+        let now_boxed = style.display != crate::Display::None && !style.display_contents;
+        if was_boxed != now_boxed {
+            return false;
+        }
+        if !now_boxed {
+            continue;
+        }
+        let new_inputs = text_shaping_inputs(style);
+        let inputs_changed = state
+            .text_inputs
+            .get(&node)
+            .map(|old| *old != new_inputs)
+            .unwrap_or(true);
+        let Some(&taffy_id) = state.reverse.get(&node) else {
+            // Renders without a taffy box: anonymous-run membership or a
+            // flattened inline chain, which only build() restructures.
+            return false;
+        };
+        if !state.self_describing.contains(&node) {
+            return false;
+        }
+        let new_base = to_taffy_style(style);
+        let unchanged_base = state
+            .tree
+            .style(taffy_id)
+            .map(|current| *current == new_base)
+            .unwrap_or(true);
+        if !inputs_changed {
+            if unchanged_base {
+                continue;
+            }
+            let shape_matches = state
+                .tree
+                .style(taffy_id)
+                .map(|current| taffy_shape_key(current) == taffy_shape_key(&new_base))
+                .unwrap_or(false);
+            if !shape_matches {
+                return false;
+            }
+            // set_style marks the node and its ancestors dirty; taffy's
+            // caches then recompute exactly the damaged subtrees.
+            let _ = state.tree.set_style(taffy_id, new_base);
+            continue;
+        }
+        // Text inputs changed: only safe when nothing under this box
+        // carries text shaped at build time.
+        let mut budget = fresh.len().saturating_mul(64) + 4096;
+        if taffy_subtree_has_text(state, taffy_id, &mut budget) {
+            return false;
+        }
+        if unchanged_base {
+            state.text_inputs.insert(node, new_inputs);
+            continue;
+        }
+        let shape_matches = state
+            .tree
+            .style(taffy_id)
+            .map(|current| taffy_shape_key(current) == taffy_shape_key(&new_base))
+            .unwrap_or(false);
+        if !shape_matches {
+            return false;
+        }
+        let _ = state.tree.set_style(taffy_id, new_base);
+    }
+    true
+}
+
+/// Record the per-node text-shaping inputs for one node (build and
+/// incremental update paths).
+fn record_text_inputs(state: &mut RetainedTaffy, styles: &HashMap<NodeId, crate::LayoutStyle>) {
+    for (&dom, _) in &state.reverse {
+        if let Some(style) = styles.get(&dom) {
+            state.text_inputs.insert(dom, text_shaping_inputs(style));
+        }
+    }
+}
+
 fn layout_dom_once(
     tree: &DomTree,
     layout_root: NodeId,
@@ -4898,6 +5166,7 @@ fn layout_dom_once(
     shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     snapshot: Option<&crate::css::ContainerSnapshot>,
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
+    mutations: &[crate::dom::RetainedStyleMutation],
     prewalked: (bool, Option<NodeId>),
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
@@ -4910,9 +5179,17 @@ fn layout_dom_once(
     let (quirks_mode, root_element) = prewalked;
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
-    let (mut styles, mut custom_properties, fresh_styles) = match retained {
-        Some((retained, fresh)) => (retained.styles, retained.custom_properties, Some(fresh)),
-        None => (HashMap::new(), HashMap::new(), None),
+    let (mut styles, mut custom_properties, fresh_styles, mut retained_taffy) = match retained {
+        Some((mut retained, fresh)) => {
+            let taffy_state = retained.taffy.take();
+            (
+                retained.styles,
+                retained.custom_properties,
+                Some(fresh),
+                taffy_state,
+            )
+        }
+        None => (HashMap::new(), HashMap::new(), None, None),
     };
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
@@ -4973,9 +5250,11 @@ fn layout_dom_once(
     let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
-    let prof_engine = std::time::Instant::now();
-    let mut engine = crate::inline::TextEngine::new_with_web_fonts(fonts);
-    let prof_engine = prof_engine.elapsed();
+    // The engine is created at the build site: adopting the retained
+    // engine (or taking its warmed shape caches from the pool) must happen
+    // AFTER the eligibility decision, which may drop the retained engine
+    // back into the pool.
+    let mut engine = DeferredEngine::new(fonts);
     let mut prof_post_compute: Option<std::time::Instant> = None;
     let mut ifc_items = IfcRegistry::default();
 
@@ -4988,6 +5267,13 @@ fn layout_dom_once(
     let mut cssom_rects = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
+    // Incremental-rebuild bookkeeping (filled by the full build, or adopted
+    // from the retained state on the in-place update path).
+    let mut reverse: HashMap<NodeId, taffy::NodeId> = HashMap::new();
+    let mut text_inputs: HashMap<NodeId, TextShapingInputs> = HashMap::new();
+    let mut self_describing: HashSet<NodeId> = HashSet::new();
+    let mut tree_reusable = false;
+    let mut incremental_applied = false;
     // Final absolute rects of anonymous inline-run leaves, keyed by the
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
@@ -6476,17 +6762,120 @@ fn layout_dom_once(
         let deferred_cyclic_inline_sizes =
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
 
+        // Incremental (dirty-subtree) rebuild: when the retained taffy state
+        // is present and every recascaded dirty node is provably a plain,
+        // self-describing box, update styles in place instead of rebuilding
+        // the taffy tree. taffy's per-node caches then recompute exactly the
+        // damaged subtrees. Anything the checks cannot prove falls back to
+        // the full build below.
+        incremental_applied = false;
+        let mut incremental_root: Option<taffy::NodeId> = None;
+        if let (Some(state), Some(fresh)) = (retained_taffy.as_mut(), fresh_styles.as_ref()) {
+            // Resource damage (image/font bytes) changes what the shaped
+            // engine items must contain, and tree damage (insert/remove/
+            // text) changes which word leaves exist. Only build() re-shapes
+            // and re-splices; attribute and animation restyles are the
+            // incremental path's whole mandate.
+            let needs_rebuild = mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    RetainedStyleMutation::Resource | RetainedStyleMutation::Tree(_)
+                )
+            });
+            if !needs_rebuild
+                && state.reverse.contains_key(&root_id)
+                && try_incremental_style_updates(state, tree, &styles, fresh)
+            {
+                if let Some(state) = retained_taffy.take() {
+                    let RetainedTaffy {
+                        tree: retained_tree,
+                        id_map: retained_id_map,
+                        reverse: retained_reverse,
+                        words: retained_words,
+                        ifc_items: retained_ifc,
+                        text_runs: retained_text_runs,
+                        text_inputs: retained_text_inputs,
+                        self_describing: retained_self_describing,
+                        engine: mut retained_engine,
+                    } = state;
+                    taffy_tree = retained_tree;
+                    id_map = retained_id_map;
+                    reverse = retained_reverse;
+                    words = retained_words;
+                    text_inputs = retained_text_inputs;
+                    self_describing = retained_self_describing;
+                    ifc_items = retained_ifc;
+                    text_runs = retained_text_runs;
+                    #[cfg(feature = "paint")]
+                    {
+                        engine.adopt(retained_engine.take().unwrap_or_else(|| {
+                            crate::inline::TextEngine::new_with_web_fonts(fonts)
+                        }));
+                    }
+                    #[cfg(not(feature = "paint"))]
+                    {
+                        let _ = retained_engine;
+                    }
+                    incremental_root = reverse.get(&root_id).copied();
+                    incremental_applied = incremental_root.is_some();
+                }
+            } else {
+                // Failed eligibility: drop the state NOW so the adopted
+                // engine's shape caches return to the pool before the full
+                // build below takes them again; dropping it later would
+                // leave the build with a cold cache and a full reshape.
+                drop(retained_taffy.take());
+            }
+        }
+        // First real engine acquisition: on the fallback path the retained
+        // state was already dropped above, so its shape caches are back in
+        // the pool and this construction reuses them warm. On the adopted
+        // path this is the retained engine itself.
+        let prof_engine = std::time::Instant::now();
+        engine.materialize_now();
+        let prof_engine = prof_engine.elapsed();
         let prof_build = std::time::Instant::now();
-        if let Some(taffy_root) = build(
-            tree,
-            root_id,
-            &mut taffy_tree,
-            &mut id_map,
-            &mut words,
-            &mut engine,
-            &mut ifc_items,
-            &styles,
-        ) {
+        tree_reusable = false;
+        let taffy_root_holder = if incremental_applied {
+            if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                let (hits, misses) = cosmic_text::shape_run_cache_stats();
+                eprintln!(
+                    "[timing] build-walk=incremental fresh={} shape-hits={} shape-misses={}",
+                    fresh_styles.as_ref().map_or(0, |fresh| fresh.len()),
+                    hits,
+                    misses,
+                );
+            }
+            tree_reusable = true;
+            incremental_root
+        } else {
+            build(
+                tree,
+                root_id,
+                &mut taffy_tree,
+                &mut id_map,
+                &mut words,
+                &mut engine,
+                &mut ifc_items,
+                &styles,
+            )
+            .map(|taffy_root| {
+                // Fresh bookkeeping for the next incremental prepare.
+                reverse = id_map
+                    .iter()
+                    .map(|(&taffy_id, &dom)| (dom, taffy_id))
+                    .collect();
+                text_inputs = HashMap::new();
+                for (&dom, _) in &reverse {
+                    if let Some(style) = styles.get(&dom) {
+                        text_inputs.insert(dom, text_shaping_inputs(style));
+                    }
+                }
+                taffy_root
+            })
+        };
+        if let Some(taffy_root) = taffy_root_holder {
+            tree_reusable = true;
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                 let (shape_ms, shape_calls, cosmic_ms) = crate::inline::shape_prof_take();
                 let (hits, misses) = cosmic_text::shape_run_cache_stats();
@@ -7479,6 +7868,67 @@ fn layout_dom_once(
         eprintln!("[timing] post-compute-total={:?}", prof_post_compute.map(|t| t.elapsed()));
     }
 
+    // Capture the incremental-rebuild bookkeeping now that every taffy style
+    // mutation has settled (post-compute fixups included). Self-describing
+    // flags are re-derived for touched nodes: a node whose final taffy style
+    // still equals the pure per-node recomputation may take in-place style
+    // updates next time; anything the fixups retuned may not.
+    let taffy_state = if tree_reusable {
+        if incremental_applied {
+            if let Some(fresh) = fresh_styles.as_ref() {
+                for &node in fresh {
+                    match (reverse.get(&node), styles.get(&node)) {
+                        (Some(&t), Some(style)) => {
+                            let pure = to_taffy_style(style);
+                            let clean = taffy_tree
+                                .style(t)
+                                .map(|current| *current == pure)
+                                .unwrap_or(false);
+                            if clean {
+                                self_describing.insert(node);
+                            } else {
+                                self_describing.remove(&node);
+                            }
+                            text_inputs.insert(node, text_shaping_inputs(style));
+                        }
+                        _ => {
+                            self_describing.remove(&node);
+                            text_inputs.remove(&node);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (&dom, &t) in &reverse {
+                if let Some(style) = styles.get(&dom) {
+                    text_inputs.insert(dom, text_shaping_inputs(style));
+                    let pure = to_taffy_style(style);
+                    let clean = taffy_tree
+                        .style(t)
+                        .map(|current| *current == pure)
+                        .unwrap_or(false);
+                    if clean {
+                        self_describing.insert(dom);
+                    }
+                }
+            }
+        }
+        Some(RetainedTaffy {
+            tree: taffy_tree,
+            id_map,
+            reverse,
+            words,
+            ifc_items: ifc_items.clone(),
+            text_runs: text_runs.clone(),
+            text_inputs,
+            self_describing,
+            #[cfg(feature = "paint")]
+            engine: None,
+        })
+    } else {
+        None
+    };
+
     (
         DomLayout {
             root: layout_root,
@@ -7492,7 +7942,7 @@ fn layout_dom_once(
             transforms,
             text_runs,
             #[cfg(feature = "paint")]
-            text_engine: engine,
+            text_engine: engine.into_inner(),
             #[cfg(feature = "paint")]
             ifc_items: ifc_items.whole,
             #[cfg(feature = "paint")]
@@ -7500,6 +7950,7 @@ fn layout_dom_once(
             #[cfg(feature = "paint")]
             word_ifc_items: ifc_items.word_items,
             generated_boxes,
+            taffy: taffy_state,
         },
         signature,
         query_stats,
@@ -16898,6 +17349,7 @@ mod tests {
             .into(),
         ];
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17019,6 +17471,7 @@ mod tests {
             &mut timeline,
         );
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17103,6 +17556,7 @@ mod tests {
         tree.append_child(popup, first);
         tree.append_child(popup, second);
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17173,6 +17627,7 @@ mod tests {
             node.set_attribute("autocomplete", "off".into())
         });
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17229,6 +17684,7 @@ mod tests {
             node.set_attribute("autocomplete", "off".into())
         });
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17332,6 +17788,7 @@ mod tests {
             node.set_attribute(case.attribute, case.new_value.into())
         });
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17652,6 +18109,7 @@ mod tests {
             node.set_attribute("autocomplete", "off".into())
         });
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -17707,6 +18165,7 @@ mod tests {
         expectation: RetainedDifferentialExpectation,
     ) -> DomLayout {
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -18462,6 +18921,7 @@ mod tests {
         );
         tree.append_child(host, signal);
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -18511,6 +18971,7 @@ mod tests {
         );
         tree.append_child(list, insert);
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
@@ -18566,6 +19027,7 @@ mod tests {
         );
         tree.insert_before(stable, watcher);
         let retained = RetainedStyleMaps {
+            taffy: None,
             styles: std::mem::take(&mut initial.styles),
             custom_properties: std::mem::take(&mut initial.custom_properties),
         };
