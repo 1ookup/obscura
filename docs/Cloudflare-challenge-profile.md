@@ -11957,3 +11957,113 @@ derived-state 融合（<25ms 目标未达，当前 ~38ms）。
 实弹：ver34 ZMSOw0=523/uGyjw9=195/tQdUc5=39（带内）。final30/31/32 判决 fail
 同形态；brunhild 窗口持续关闭（Chrome 对照 502），Qssv3 守卫翻转仍在；
 final31 起 ODxGu4×0。
+
+### Step 326：修复批次 27——Step 323 后续项②③落地：derived-state 六趟并两趟 + clean-subtree 几何复用 + 全文档扫描闩锁，decode gBCR 份额 39.2→28.3ms（2026-09-20 20:0x）
+
+**方法**：按 Step 324 后续项①（本批改编号为②③）执行。先扩展
+OBSCURA_RENDER_TIMING 探针把 prepare 尾段拆到子趟（incremental-attempt /
+pre-compute-fixups / fixup-recomputes / abs-rects / unrounded-rects /
+cssom-advance / fragments / clips / finalize / retained-derive /
+finish-scan），在 decode-interpret-cost fixture 上把一次 churned prepare
+的每趟成本列成表再动手。注意：探针本身有成本（~25 行 eprintln ≈
+250-300µs/prepare），插桩后的分相数字只看相对量级；绝对数字一律以
+无插桩配对交错实测为准。
+
+**剖析（5447dae 插桩态，decode fixture，churned prepare 均值）**：
+derived-state ~105µs（viewport-fixed 20 + content-size 9 + scroll-tree 25
++ sticky 28，4 次独立全树 rendered_descendants + 2 层递归，每节点一次
+rendered_parent）；post-compute ~118µs（abs-rects 12.5 + clips 13.9 +
+fragments 15.8 + finalize 4.6 + padding 0.2 + fixup-recomputes 29 +
+repaint 前置的 reparent/表宽扫描 ~19）；另有 css-sources 预走查 ~10、
+post-cascade-fixups 的 counter 全样式扫描 ~12。
+
+**修复一（acef5d4，derived-state 融合）**：viewport_fixed_nodes /
+scrolling_content_size_with_fixed / scroll_tree / sticky_layout_with_geometry
+四趟各走全树（4 次 rendered_descendants 收集 + 2 层递归）并为一次递归
+（自顶向下携带 fixed/scroll 上下文，自底向上聚合滚动溢出，FusedScrollWalk）
++ sticky 一次递归先序（父指针下传，去 rendered_parent 每节点查询）。
+逐节点公式与并集操作数不变（min/max 精确交换），输出值恒等。
+rendered-walks 计数 6→2。derived-state 插桩均值 105→36µs。
+
+**修复二（672cf40，clean-subtree 几何复用）**：上一轮布局的
+rects/cssom_rects/inline_fragments/text_runs/clip_rects/translates/
+transforms 在移交点（prepare_dom_with_retained_styles_with_animation_state）
+移入保留态，给下一次 incremental prepare 做种子。写回趟为每个 taffy 节点
+计算 LayoutKey（unrounded+rounded 的 location/size）：key 与保留值相等且
+子树不含本 prepare 的 taffy 损伤种子（try_incremental_style_updates 的
+set_style 节点、resync 的 set_children 父及其子树与祖先链）⇒ 整子树剪枝，
+保留表项即逐字节等于重写值（taffy 每节点缓存保证 cache-hit 子树的布局值
+不变）。changed 集驱动 cssom advance 修正、普通 inline 片段、行几何、
+engine.finalize（whole/runs/word_items 三路）与 clip 写回全部按需执行；
+resync 摘除的 DOM 子树从保留表剪除（pruned_dom 只在 detached 块收——
+retained move 的 Remove 突变也进 removed_dom，剪了会丢活节点的表项，
+element_scroll_offsets 跟进测试抓出过）。clip 走查以「父输出相对保留值
+未变 ⇒ 子树继承不变」递归剪枝；styles_touched（fresh 链 + 各样式写入点
+登记）与 root font/viewport 变化使其保守失效。
+
+**伴生修复（同提交，全文档扫描闩锁）**：FixupFlags
+（percent_padding / fit_content / grid / flex / table_cell / positioned /
+counters）在重建 prepare 精确扫描一次，incremental prepare 只对 fresh
+样式做「只置位不清零」的闩锁更新；sync_resolved_percentage_padding、
+apply_fit_content_widths、apply_full_span_column_subgrids、
+repair_intrinsic_column_flex_negative_margins、
+apply_table_cell_block_alignment、reparent_inset_positioned_nodes、
+post_cascade_fixups 的 counter 全样式扫描，以及表宽趟的 id_map 过滤
+全部按闩锁早退——文档无该类候选时这些扫描是可证明的 no-op。css 预走查
+（style 文本 + quirks + root 元素）在突变不可能触碰样式块/doctype/根
+元素时整段复用（sources 走 Rc，style 文本/祖先链检查防 <style>
+textContent 翻新，stylesheet_index_cache 测试抓出过）。
+
+**数字（配对交错，同 release 二进制族，基线 = 542fe29 构建，负载 ~7-9）**：
+
+| 指标 | 542fe29 | 本批 | Chrome |
+|---|---|---|---|
+| decode gBCR 份额 | 37.1-42.6（中位 39.2） | 27.3-30.9（中位 28.3） | 12.9 |
+| decode 单次树损强制读 | ~0.42ms | ~0.31ms | ~0.14 |
+| decode interpretAcc | 522541 | 522541（逐字节同） | 同 |
+| forced-layout churnAndRead10 | 112.4-118.5 | 45.4-45.8 | ~0 |
+| forced-layout churnedRead | 20.8-21.2 | 18.1-19.3 | ~0.1 |
+| forced-layout warmRead | 58.9-68.8 | 57.6-58.7 | 10 |
+
+插桩分相（churned prepare 均值，含探针开销）：post-compute 117.6→81.4
+（abs-rects 12.5→3.3、clips 13.9→1.3、finalize 4.6→2.8、fragments 被门
+控掉出榜单）；derived-state 105→36；rendered-walks 6→2；css-sources
+10→0.3。<25ms 目标未达：per-read 0.31ms 里 prepare 尾段的 O(document)
+全趟已不再是主体，残差集中在突变再级联本体（cascade ~30µs +
+incremental-attempt ~28µs，其中 resync 期望子列表重建随受影响父的子节点
+数线性增长）与每次 gBCR 的 op 桥接常数（warm gBCR 外部实测 ~12µs，
+decode 规模）。
+
+**门禁**：render-repros 63/63 fixture 截图与基线二进制逐字节相等；
+obscura-render 608/608、obscura-js 670/670（含 element_scroll_offsets
+跟进测试抓出的 retained-move 剪除回归与 stylesheet_index_cache 抓出的
+style 文本门漏点，均已修；timing_edits/worker_source 各偶发一次，隔离
+复测过且 HEAD 同样偶发）；workspace 1888/1889（worker_source 偶发，隔离
+3/3 过）；`cargo check -p obscura-js -p obscura-cli --no-default-features`
+过；AGENTS.md 精确 release 构建过；无 cargo fmt。
+
+**活体（注入开，19:48-20:00）**：ov2 build 于 18:27 再轮换（md5
+703b4db7…），ver35 首解报表缺失，从代理机取回当班 patched ov2.js
+作 alphabet 后解密成功（工具侧 BUILDS 注册表未登记，仅 --key-hex 路径）。
+四轮（3-frame TS#2）：ver35 ZMSOw0=234/uGyjw9=634/tQdUc5=38/NnqX6=7137；
+ver35b 907/242/39/16767；ver35c 793/19/0/896（tQdUc5=0，轮无效弃样）；
+ver35d 510/285/0/614（同弃）；ver35e 537/354/40/16485。有效轮中位
+ZMSOw0≈537（带内 384-589，最优样本 234 深低于带，方向与 decode 树损
+份额收敛一致）、uGyjw9≈354（骑带顶 323，ver35 的 634 单点离带，重站点
+census 走的是全量重建路径本批不受益，且宿主外 VM ~300% 负载持续）。
+轮间方差大（同二进制 Z 234↔907），无单调回归信号。
+
+**final33 判决（注入关，20:05，注入态已复原 True 并经 options API 读回
+实证）**：流程完整同形——orchestrate(api.js 536 → fo POST → TS#2 →
+pat401+brunhild → 第二轮 orchestrate 616 hits) = **fail，与 final22-32
+同形**；无任何到达 www.thelancet.com/1.txt 的表单 POST/GET（1.txt 命中
+均为顶层文档自身）；console 行 **Qssv3×4**（brunhild 阶段护卫翻转）。
+brunhild 路由窗口对 Chrome 对照同样 502——窗口对所有客户端未开，Qssv3
+为 brunhild 护卫标记。
+
+**后续项（另行立项）**：① gBCR op 桥接常数——warm gBCR ~12µs（JSON
+往返 + scroll 快照消费），census 形态可仿 ResizeObserver 批量 op 一次
+取全；② resync 期望子列表随受影响父子节点数线性增长（body 挂 100+ 子时
+每 churn 重排全列），可做增量期望列表；③ 重站点 churn 后单次 census
+读（uGyjw9）仍走全量重建路径，resync 回退门（关系选择器/表/匿名 run）
+是 decode 外站点的下一块收益。20:1x。
