@@ -19,6 +19,8 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
+use wreq::IntoEmulation;
+#[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, ReferrerPolicy, RequestInfo, RequestMode,
     ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
@@ -227,13 +229,28 @@ impl StealthHttpClient {
         } else {
             wreq_util::Platform::Linux
         };
-        let emulation_opts = wreq_util::Emulation::builder()
+        let mut emulation = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome148)
             .platform(platform)
-            .build();
-
+            .build()
+            .into_emulation();
+        // Real Chrome 151 leads the signature_algorithms extension with the
+        // three RSA-PSS-PSS algorithms -- captured 11 entries
+        // (0904,0905,0906, then the profile's 8). The btls-sys BoringSSL
+        // snapshot only knows them once vendor/btls-sys-pss-pss.patch is
+        // applied (vendor/btls-sys-setup.sh); under the stock crate this
+        // string fails to parse and the client refuses to build, which keeps
+        // the two halves of the fix from silently diverging.
+        if let Some(tls) = emulation.tls_options.as_mut() {
+            tls.sigalgs_list = Some(std::borrow::Cow::Borrowed(
+                "rsa_pss_pss_sha256:rsa_pss_pss_sha384:rsa_pss_pss_sha512:\
+                 ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
+                 ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
+                 rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
+            ));
+        }
         let mut builder = wreq::Client::builder()
-            .emulation(emulation_opts)
+            .emulation(emulation)
             // Keep emulation's TLS/HTTP2 fingerprint, but generate request
             // headers in this module so default and explicit Client-Hints
             // can never be serialized twice by the transport layer.

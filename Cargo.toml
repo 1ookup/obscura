@@ -73,6 +73,11 @@ taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and
 # rasterization until the upstream API exposes them.
 cosmic-text = { path = "vendor/cosmic-text" }
+# Adds the rsa_pss_pss_* signature algorithms (0x0904-0x0906) to the vendored
+# BoringSSL snapshot so the stealth client's ClientHello can advertise the
+# 11-entry list real Chrome 151 sends (see vendor/btls-sys/patches/
+# boringssl-pss-pss.patch and crates/obscura-net/src/wreq_client.rs).
+btls-sys = { path = "vendor/btls-sys" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return

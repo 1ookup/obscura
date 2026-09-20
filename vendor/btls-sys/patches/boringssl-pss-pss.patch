@@ -1,0 +1,44 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index ff68ba6..a0df4b1 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1138,6 +1138,9 @@ OPENSSL_EXPORT int SSL_set_ocsp_response(SSL *ssl, const uint8_t *response,
+ #define SSL_SIGN_RSA_PSS_RSAE_SHA256 0x0804
+ #define SSL_SIGN_RSA_PSS_RSAE_SHA384 0x0805
+ #define SSL_SIGN_RSA_PSS_RSAE_SHA512 0x0806
++#define SSL_SIGN_RSA_PSS_PSS_SHA256 0x0904
++#define SSL_SIGN_RSA_PSS_PSS_SHA384 0x0905
++#define SSL_SIGN_RSA_PSS_PSS_SHA512 0x0906
+ #define SSL_SIGN_ED25519 0x0807
+ 
+ // SSL_SIGN_RSA_PKCS1_SHA256_LEGACY is a backport of RSASSA-PKCS1-v1_5 with
+diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
+index 2346aa4..f863995 100644
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -81,6 +81,15 @@ static const SSL_SIGNATURE_ALGORITHM kSignatureAlgorithms[] = {
+     {SSL_SIGN_RSA_PSS_RSAE_SHA512, EVP_PKEY_RSA, NID_undef, &EVP_sha512,
+      /*is_rsa_pss=*/true, /*tls12_ok=*/true, /*tls13_ok=*/true,
+      /*client_only=*/false},
++    {SSL_SIGN_RSA_PSS_PSS_SHA256, EVP_PKEY_RSA_PSS, NID_undef, &EVP_sha256,
++     /*is_rsa_pss=*/true, /*tls12_ok=*/true, /*tls13_ok=*/true,
++     /*client_only=*/false},
++    {SSL_SIGN_RSA_PSS_PSS_SHA384, EVP_PKEY_RSA_PSS, NID_undef, &EVP_sha384,
++     /*is_rsa_pss=*/true, /*tls12_ok=*/true, /*tls13_ok=*/true,
++     /*client_only=*/false},
++    {SSL_SIGN_RSA_PSS_PSS_SHA512, EVP_PKEY_RSA_PSS, NID_undef, &EVP_sha512,
++     /*is_rsa_pss=*/true, /*tls12_ok=*/true, /*tls13_ok=*/true,
++     /*client_only=*/false},
+ 
+     {SSL_SIGN_ECDSA_SHA1, EVP_PKEY_EC, NID_undef, &EVP_sha1,
+      /*is_rsa_pss=*/false, /*tls12_ok=*/true, /*tls13_ok=*/false,
+@@ -479,6 +488,9 @@ static const SignatureAlgorithmName kSignatureAlgorithmNames[] = {
+     {SSL_SIGN_RSA_PSS_RSAE_SHA256, "rsa_pss_rsae_sha256"},
+     {SSL_SIGN_RSA_PSS_RSAE_SHA384, "rsa_pss_rsae_sha384"},
+     {SSL_SIGN_RSA_PSS_RSAE_SHA512, "rsa_pss_rsae_sha512"},
++    {SSL_SIGN_RSA_PSS_PSS_SHA256, "rsa_pss_pss_sha256"},
++    {SSL_SIGN_RSA_PSS_PSS_SHA384, "rsa_pss_pss_sha384"},
++    {SSL_SIGN_RSA_PSS_PSS_SHA512, "rsa_pss_pss_sha512"},
+     {SSL_SIGN_ED25519, "ed25519"},
+ };
+ 
