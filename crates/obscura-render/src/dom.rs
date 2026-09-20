@@ -1114,25 +1114,123 @@ impl DomLayout {
         viewport: (f32, f32),
     ) -> DerivedLayoutState {
         let prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-        let prof_fixed = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-        let viewport_fixed = self.viewport_fixed_nodes(tree);
-        let prof_fixed = prof_fixed.map(|t| t.elapsed());
-        let prof_content =
-            std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-        let geometry = self.derived_geometry_with_fixed(tree, viewport, &viewport_fixed);
+        let state = self.fused_derived_layout_state(tree, viewport);
         if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
             eprintln!(
-                "[timing] derived-state={:?} viewport-fixed={:?} content+scroll+sticky={:?}",
+                "[timing] derived-state={:?} (fused: fixed+content+scroll in one walk, sticky second)",
                 prof.map(|t| t.elapsed()),
-                prof_fixed.unwrap_or_default(),
-                prof_content.map(|t| t.elapsed()).unwrap_or_default(),
+            );
+        }
+        state
+    }
+
+    /// Fused derivation of the same values as `derived_layout_state`:
+    /// viewport-fixed ownership, root scrolling overflow, element scroll
+    /// topology, and sticky constraints, in two tree walks instead of the
+    /// six separate full traversals (four `rendered_descendants` collections
+    /// plus two recursions) the stage-by-stage composition performs. The
+    /// first walk threads the parent's fixed/scroll context down and
+    /// aggregates scrolling overflow up; the second is the sticky preorder.
+    /// Every per-node formula and union operand set is the same as the
+    /// stage-by-stage version, so the outputs are value-identical.
+    pub(crate) fn fused_derived_layout_state(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+    ) -> DerivedLayoutState {
+        let prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+        let capacity = tree.len();
+        let mut viewport_fixed: HashSet<NodeId> = HashSet::new();
+        let mut containers = vec![ScrollContainer {
+            node: None,
+            parent: None,
+            client_size: viewport,
+            // The root viewport's scrolling area is only known once the walk
+            // has aggregated root overflow; filled in right after it.
+            content_size: viewport,
+            max_offset: (0.0, 0.0),
+        }];
+        let mut node_container = vec![None; capacity];
+        let mut movement_owner = vec![None; capacity];
+        let mut node_content_size = vec![None; capacity];
+        let mut content_right = viewport.0.max(0.0);
+        let mut content_bottom = viewport.1.max(0.0);
+
+        // The layout root is the first element descendant, exactly as in
+        // `scroll_tree` and `scrolling_content_size_with_fixed`.
+        let root = tree
+            .descendants(self.root)
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()));
+
+        if let Some(root) = root {
+            let mut walk = FusedScrollWalk {
+                laid: self,
+                tree,
+                viewport_fixed: &mut viewport_fixed,
+                containers: &mut containers,
+                node_container: &mut node_container,
+                movement_owner: &mut movement_owner,
+                node_content_size: &mut node_content_size,
+                content_right: &mut content_right,
+                content_bottom: &mut content_bottom,
+            };
+            walk.node(
+                root,
+                // The root element's rendered parent is the document node;
+                // neither fixed nor a scroll owner, matching the separate
+                // stages' view of it.
+                false,
+                false,
+                Some(ScrollId::ROOT),
+                None,
+            );
+        }
+
+        let content_size = (content_right.ceil(), content_bottom.ceil());
+        containers[0].content_size = content_size;
+        containers[0].max_offset = (
+            crate::quantized_scroll_range(content_size.0, viewport.0, 1.0),
+            crate::quantized_scroll_range(content_size.1, viewport.1, 1.0),
+        );
+        for container in containers.iter_mut().skip(1) {
+            container.content_size = container
+                .node
+                .and_then(|node| node_content_size.get(node.index()).copied().flatten())
+                .unwrap_or(container.client_size);
+            container.max_offset = (
+                crate::quantized_scroll_range(
+                    container.content_size.0,
+                    container.client_size.0,
+                    1.0,
+                ),
+                crate::quantized_scroll_range(
+                    container.content_size.1,
+                    container.client_size.1,
+                    1.0,
+                ),
+            );
+        }
+
+        let scroll_tree = ScrollTree {
+            containers,
+            node_container,
+            node_content_size,
+            movement_owner,
+        };
+
+        let sticky = self.fused_sticky_layout(tree, viewport, content_size, &scroll_tree);
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!(
+                "[timing] derived-state={:?} fused fixed+content+scroll+sticky",
+                prof.map(|t| t.elapsed()),
             );
         }
         DerivedLayoutState {
-            content_size: geometry.content_size,
+            content_size,
             viewport_fixed,
-            sticky: geometry.sticky,
-            scroll_tree: geometry.scroll_tree,
+            sticky,
+            scroll_tree,
         }
     }
 
@@ -1852,6 +1950,516 @@ impl DomLayout {
         }
 
         layout
+    }
+
+    /// Sticky constraint collection in one recursive preorder over the
+    /// rendered tree, threading the rendered parent down instead of asking
+    /// `rendered_parent` per node. Per-node decisions, map inserts, and
+    /// frame values are exactly `sticky_layout_with_geometry`'s.
+    fn fused_sticky_layout(
+        &self,
+        tree: &DomTree,
+        viewport: (f32, f32),
+        content: (f32, f32),
+        scroll_tree: &ScrollTree,
+    ) -> StickyLayout {
+        let root_containing = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: content.0,
+            height: content.1,
+        };
+        let mut layout = StickyLayout::default();
+        let mut nearest_sticky: HashMap<NodeId, Option<NodeId>> = HashMap::new();
+        let mut inherited_clip_sticky: HashMap<NodeId, Option<NodeId>> = HashMap::new();
+        let mut nearest_scrollport = vec![None; scroll_tree.movement_owner.len()];
+        let root_font_size = tree
+            .query_selector("html")
+            .ok()
+            .flatten()
+            .and_then(|root| self.styles.get(&root).and_then(|style| style.font_size))
+            .unwrap_or(16.0);
+
+        // The recursive worker. `parent` is the rendered parent exactly as
+        // `rendered_parent` would report it.
+        fn visit(
+            laid: &DomLayout,
+            tree: &DomTree,
+            viewport: (f32, f32),
+            scroll_tree: &ScrollTree,
+            root_containing: Rect,
+            root_font_size: f32,
+            layout: &mut StickyLayout,
+            nearest_sticky: &mut HashMap<NodeId, Option<NodeId>>,
+            inherited_clip_sticky: &mut HashMap<NodeId, Option<NodeId>>,
+            nearest_scrollport: &mut [Option<(NodeId, bool)>],
+            id: NodeId,
+            parent: Option<NodeId>,
+        ) {
+            let inherited_scrollport = parent
+                .and_then(|parent| nearest_scrollport.get(parent.index()).copied())
+                .flatten();
+            let style = laid.styles.get(&id);
+            let establishes_authored_scrollport = style.is_some_and(|style| {
+                style.overflow_scroll_container
+                    && !is_viewport_overflow_source(id, &laid.styles)
+                    && !style.display_contents
+            }) && laid.rects.contains_key(&id);
+            let descendants_scrollport = if establishes_authored_scrollport {
+                Some((
+                    id,
+                    scroll_tree
+                        .node_container
+                        .get(id.index())
+                        .copied()
+                        .flatten()
+                        .is_some(),
+                ))
+            } else {
+                inherited_scrollport
+            };
+            if let Some(slot) = nearest_scrollport.get_mut(id.index()) {
+                *slot = descendants_scrollport;
+            }
+            let parent_sticky = parent
+                .and_then(|parent| nearest_sticky.get(&parent).copied())
+                .flatten();
+            let inherited_clip = parent.and_then(|parent| {
+                let parent_style = laid.styles.get(&parent);
+                if parent_style.is_some_and(|style| style.overflow_hidden) {
+                    nearest_sticky.get(&parent).copied().flatten()
+                } else {
+                    inherited_clip_sticky.get(&parent).copied().flatten()
+                }
+            });
+            if let Some(owner) = inherited_clip {
+                layout.clip_owners.insert(id, owner);
+            }
+            inherited_clip_sticky.insert(id, inherited_clip);
+
+            let scroll_owner = scroll_tree
+                .movement_owner
+                .get(id.index())
+                .copied()
+                .flatten();
+            let Some(scroll_owner) = scroll_owner else {
+                nearest_sticky.insert(id, None);
+                for child in rendered_children(tree, id) {
+                    visit(
+                        laid, tree, viewport, scroll_tree, root_containing, root_font_size,
+                        layout, nearest_sticky, inherited_clip_sticky, nearest_scrollport,
+                        child, Some(id),
+                    );
+                }
+                return;
+            };
+            let container = scroll_tree.containers[scroll_owner.index()];
+            let scrollport_node = container.node;
+            let supported_scroll_owner = match inherited_scrollport {
+                Some((authored, true)) => scrollport_node == Some(authored),
+                Some((_authored, false)) => false,
+                None => scrollport_node.is_none(),
+            };
+            let supported_coordinate_space = parent
+                .and_then(|parent| laid.transforms.get(&parent))
+                .is_none_or(|transform| transform.is_translation());
+
+            let is_sticky = style.is_some_and(|style| {
+                style.position_sticky
+                    && style.inset.iter().any(Option::is_some)
+                    && supported_scroll_owner
+                    && supported_coordinate_space
+            });
+            if !is_sticky {
+                nearest_sticky.insert(id, parent_sticky);
+                if let Some(owner) = parent_sticky {
+                    layout.owners.insert(id, owner);
+                }
+                for child in rendered_children(tree, id) {
+                    visit(
+                        laid, tree, viewport, scroll_tree, root_containing, root_font_size,
+                        layout, nearest_sticky, inherited_clip_sticky, nearest_scrollport,
+                        child, Some(id),
+                    );
+                }
+                return;
+            }
+            let (Some(style), Some(rect)) = (style, laid.rects.get(&id).copied()) else {
+                nearest_sticky.insert(id, parent_sticky);
+                for child in rendered_children(tree, id) {
+                    visit(
+                        laid, tree, viewport, scroll_tree, root_containing, root_font_size,
+                        layout, nearest_sticky, inherited_clip_sticky, nearest_scrollport,
+                        child, Some(id),
+                    );
+                }
+                return;
+            };
+            let (tx, ty) = laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+            let (own_tx, own_ty) = resolved_own_translate(style, &rect, 16.0, viewport);
+            let normal = Rect {
+                x: rect.x + tx - own_tx,
+                y: rect.y + ty - own_ty,
+                ..rect
+            };
+
+            let mut containing = None;
+            let mut containing_node = None;
+            let mut ancestor = parent;
+            while let Some(candidate) = ancestor {
+                if let (Some(candidate_style), Some(candidate_rect)) = (
+                    laid.styles.get(&candidate),
+                    laid.rects.get(&candidate).copied(),
+                ) {
+                    if candidate_style.display != crate::Display::Inline
+                        && !candidate_style.display_contents
+                    {
+                        let (ctx, cty) = laid
+                            .translates
+                            .get(&candidate)
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
+                        containing = Some(Rect {
+                            x: candidate_rect.x
+                                + ctx
+                                + candidate_style.border.left
+                                + candidate_style.padding.left,
+                            y: candidate_rect.y
+                                + cty
+                                + candidate_style.border.top
+                                + candidate_style.padding.top,
+                            width: (candidate_rect.width
+                                - candidate_style.border.left
+                                - candidate_style.border.right
+                                - candidate_style.padding.left
+                                - candidate_style.padding.right)
+                                .max(0.0),
+                            height: (candidate_rect.height
+                                - candidate_style.border.top
+                                - candidate_style.border.bottom
+                                - candidate_style.padding.top
+                                - candidate_style.padding.bottom)
+                                .max(0.0),
+                        });
+                        containing_node = Some(candidate);
+                        break;
+                    }
+                }
+                ancestor = rendered_parent(tree, candidate);
+            }
+
+            let scrollport = scrollport_node
+                .and_then(|node| {
+                    let style = laid.styles.get(&node)?;
+                    let rect = laid.rects.get(&node).copied()?;
+                    let (tx, ty) = laid.translates.get(&node).copied().unwrap_or((0.0, 0.0));
+                    Some(Rect {
+                        x: rect.x + tx + style.border.left + style.padding.left,
+                        y: rect.y + ty + style.border.top + style.padding.top,
+                        width: (rect.width
+                            - style.border.left
+                            - style.border.right
+                            - style.padding.left
+                            - style.padding.right)
+                            .max(0.0),
+                        height: (rect.height
+                            - style.border.top
+                            - style.border.bottom
+                            - style.padding.top
+                            - style.padding.bottom)
+                            .max(0.0),
+                    })
+                })
+                .unwrap_or(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport.0,
+                    height: viewport.1,
+                });
+            layout.frames.push(StickyFrame {
+                id,
+                parent_sticky,
+                scroll_owner,
+                scrollport_node,
+                scrollport,
+                normal,
+                containing: containing.unwrap_or(root_containing),
+                containing_is_scrollport: containing_node == scrollport_node,
+                margin: style.margin,
+                inset: style.inset,
+                inset_expressions: style.inset_expressions.clone(),
+                font_size: style.font_size.unwrap_or(16.0),
+                root_font_size,
+                rtl_inline: style.direction == Some(taffy::Direction::Rtl),
+            });
+            layout.owners.insert(id, id);
+            nearest_sticky.insert(id, Some(id));
+            for child in rendered_children(tree, id) {
+                visit(
+                    laid, tree, viewport, scroll_tree, root_containing, root_font_size,
+                    layout, nearest_sticky, inherited_clip_sticky, nearest_scrollport,
+                    child, Some(id),
+                );
+            }
+        }
+
+        for child in rendered_children(tree, self.root) {
+            visit(
+                self,
+                tree,
+                viewport,
+                scroll_tree,
+                root_containing,
+                root_font_size,
+                &mut layout,
+                &mut nearest_sticky,
+                &mut inherited_clip_sticky,
+                &mut nearest_scrollport,
+                child,
+                Some(self.root),
+            );
+        }
+
+        layout
+    }
+}
+
+/// One recursive descent computing what `viewport_fixed_nodes`,
+/// `scrolling_content_size_with_fixed`, and `scroll_tree` each computed with
+/// their own full traversal: the viewport-fixed set, root scrolling
+/// overflow, per-node scroll ownership and containers, and per-node
+/// scrolling overflow. Per-node formulas and union operands are the same as
+/// the separate stages; only the traversal is shared.
+struct FusedScrollWalk<'a> {
+    laid: &'a DomLayout,
+    tree: &'a DomTree,
+    viewport_fixed: &'a mut HashSet<NodeId>,
+    containers: &'a mut Vec<ScrollContainer>,
+    node_container: &'a mut Vec<Option<ScrollId>>,
+    movement_owner: &'a mut Vec<Option<ScrollId>>,
+    node_content_size: &'a mut Vec<Option<(f32, f32)>>,
+    content_right: &'a mut f32,
+    content_bottom: &'a mut f32,
+}
+
+impl FusedScrollWalk<'_> {
+    /// Visit one node; returns its visual scrolling-overflow rect (the
+    /// `overflow_bounds` entry the reverse pass stored), or `None` for a box
+    /// without a layout rect.
+    fn node(
+        &mut self,
+        id: NodeId,
+        parent_is_fixed: bool,
+        inherited_has_fixed_cb: bool,
+        inherited_owner: Option<ScrollId>,
+        inherited_content_clip: Option<OverflowClip>,
+    ) -> Option<Rect> {
+        let tree = self.tree;
+        let style = self.laid.styles.get(&id);
+        let rect = self.laid.rects.get(&id).copied();
+
+        // Viewport-fixed classification (viewport_fixed_nodes).
+        let starts_viewport_fixed =
+            style.is_some_and(|style| style.position_fixed && !inherited_has_fixed_cb);
+        let is_fixed = parent_is_fixed || starts_viewport_fixed;
+        if is_fixed {
+            self.viewport_fixed.insert(id);
+        }
+        let establishes_fixed_cb = style.is_some_and(|style| style.containing_block_triggers != 0);
+        let ancestor_has_fixed_cb = inherited_has_fixed_cb || establishes_fixed_cb;
+
+        // Scroll ownership (scroll_tree's `assign`).
+        let owner = if is_fixed && !parent_is_fixed {
+            None
+        } else {
+            inherited_owner
+        };
+        if let Some(slot) = self.movement_owner.get_mut(id.index()) {
+            *slot = owner;
+        }
+        let establishes = style.is_some_and(|style| {
+            style.overflow_scroll_container
+                && !style.overflow_propagated_to_viewport
+                && !style.display_contents
+        }) && rect.is_some()
+            && !self
+                .laid
+                .transforms
+                .get(&id)
+                .is_some_and(|transform| !transform.is_translation());
+        let child_owner = if establishes {
+            let style = style.expect("scroll container style");
+            let rect = rect.expect("scroll container rect");
+            let client = (
+                (rect.width - style.border.left - style.border.right).max(0.0),
+                (rect.height - style.border.top - style.border.bottom).max(0.0),
+            );
+            let sid = ScrollId(self.containers.len() as u32);
+            self.containers.push(ScrollContainer {
+                node: Some(id),
+                parent: owner,
+                client_size: client,
+                content_size: client,
+                max_offset: (0.0, 0.0),
+            });
+            if let Some(slot) = self.node_container.get_mut(id.index()) {
+                *slot = Some(sid);
+            }
+            Some(sid)
+        } else {
+            owner
+        };
+
+        // Root scrolling overflow contribution
+        // (accumulate_scrolling_overflow). Viewport-fixed subtrees neither
+        // contribute nor propagate the content clip.
+        let mut content_child_clip = None;
+        if !is_fixed {
+            if let Some(rect) = rect {
+                let translated = self
+                    .laid
+                    .transforms
+                    .get(&id)
+                    .copied()
+                    .map(|transform| transform.map_rect(rect))
+                    .unwrap_or(rect);
+                let visible = if let Some(ref clip) = inherited_content_clip {
+                    clip.intersect_rect(&translated)
+                } else {
+                    Some(translated)
+                };
+                if let Some(overflow) = visible {
+                    *self.content_right = self.content_right.max(overflow.x + overflow.width);
+                    *self.content_bottom = self.content_bottom.max(overflow.y + overflow.height);
+                }
+            }
+            if let (Some(style), Some(rect)) = (style, rect) {
+                if style.overflow_hidden
+                    && !is_viewport_overflow_source(id, &self.laid.styles)
+                {
+                    let (tx, ty) = self.laid.translates.get(&id).copied().unwrap_or((0.0, 0.0));
+                    let own = OverflowClip::for_box(&rect, style, tx, ty);
+                    content_child_clip = Some(match inherited_content_clip {
+                        Some(clip) => clip.intersect(own),
+                        None => own,
+                    });
+                } else {
+                    content_child_clip = inherited_content_clip;
+                }
+            }
+        }
+
+        // Local scrolling overflow (the reverse pass), children first.
+        let Some(rect) = rect else {
+            for child in rendered_children(tree, id) {
+                self.node(
+                    child,
+                    is_fixed,
+                    ancestor_has_fixed_cb,
+                    child_owner,
+                    content_child_clip.clone(),
+                );
+            }
+            return None;
+        };
+        let padding_rect = style.map_or(rect, |style| Rect {
+            x: rect.x + style.border.left,
+            y: rect.y + style.border.top,
+            width: (rect.width - style.border.left - style.border.right).max(0.0),
+            height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+        });
+        let visual_padding = self
+            .laid
+            .transforms
+            .get(&id)
+            .copied()
+            .map(|transform| transform.map_rect(padding_rect))
+            .unwrap_or(padding_rect);
+        let mut local = visual_padding;
+        for child in rendered_children(tree, id) {
+            let Some(child_overflow) = self.node(
+                child,
+                is_fixed,
+                ancestor_has_fixed_cb,
+                child_owner,
+                content_child_clip.clone(),
+            ) else {
+                continue;
+            };
+            let contribution =
+                if let Some(style) = self.laid.styles.get(&child).filter(|style| {
+                    style.overflow_hidden && !style.overflow_propagated_to_viewport
+                }) {
+                    let border_box = self
+                        .laid
+                        .rects
+                        .get(&child)
+                        .copied()
+                        .map(|rect| {
+                            self.laid
+                                .transforms
+                                .get(&child)
+                                .copied()
+                                .map(|transform| transform.map_rect(rect))
+                                .unwrap_or(rect)
+                        })
+                        .unwrap_or(child_overflow);
+                    let x0 = if style.clips_overflow_x() {
+                        border_box.x
+                    } else {
+                        child_overflow.x
+                    };
+                    let x1 = if style.clips_overflow_x() {
+                        border_box.x + border_box.width
+                    } else {
+                        child_overflow.x + child_overflow.width
+                    };
+                    let y0 = if style.clips_overflow_y() {
+                        border_box.y
+                    } else {
+                        child_overflow.y
+                    };
+                    let y1 = if style.clips_overflow_y() {
+                        border_box.y + border_box.height
+                    } else {
+                        child_overflow.y + child_overflow.height
+                    };
+                    Rect {
+                        x: x0,
+                        y: y0,
+                        width: (x1 - x0).max(0.0),
+                        height: (y1 - y0).max(0.0),
+                    }
+                } else {
+                    child_overflow
+                };
+            local = local.union(&contribution);
+        }
+        let mut content = (
+            (local.x + local.width - visual_padding.x).max(visual_padding.width),
+            (local.y + local.height - visual_padding.y).max(visual_padding.height),
+        );
+        // Scroll containers include trailing end padding in their scrolling
+        // area. Visible/clip boxes expose descendant overflow but, matching
+        // Chromium, do not append that trailing padding.
+        if let Some(style) = style.filter(|style| style.overflow_scroll_container) {
+            if content.0 > visual_padding.width {
+                content.0 += style.padding.right;
+            }
+            if content.1 > visual_padding.height {
+                content.1 += style.padding.bottom;
+            }
+        }
+        if let Some(slot) = self.node_content_size.get_mut(id.index()) {
+            *slot = Some(
+                if style.is_some_and(|style| style.ignores_used_box_sizes()) {
+                    (0.0, 0.0)
+                } else {
+                    content
+                },
+            );
+        }
+        Some(local)
     }
 }
 
