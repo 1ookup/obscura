@@ -3707,11 +3707,22 @@ fn cascade_walk(
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
     fresh_styles: Option<&HashSet<NodeId>>,
+    fresh_chain: Option<&HashSet<NodeId>>,
 ) {
     let Some(node) = tree.get_node(id) else {
         return;
     };
     let is_element = node.is_element();
+    // Retained-prepare pruning: a node off the fresh chain has no fresh
+    // descendant, so its whole subtree reuses retained styles and the walk
+    // would only re-read maps there. Skip the subtree entirely; the fresh set
+    // (not the chain) still decides which visited node recomputes.
+    if fresh_styles.is_some()
+        && !fresh_chain.is_some_and(|chain| chain.contains(&id))
+        && styles.contains_key(&id)
+    {
+        return;
+    }
     // The custom-property map in force for this node's subtree: the parent's,
     // unless this element declares its own `--x` (then a richer map).
     let mut this_props = parent_props.clone();
@@ -3993,6 +4004,7 @@ fn cascade_walk(
             descendant_cell_padding,
             descendant_color_scheme_dark,
             fresh_styles,
+            fresh_chain,
         );
     }
     if let Some(assigned_nodes) = tree.assigned_nodes(id) {
@@ -4028,6 +4040,7 @@ fn cascade_walk(
                 descendant_cell_padding,
                 descendant_color_scheme_dark,
                 fresh_styles,
+                fresh_chain,
             );
         }
     }
@@ -4057,6 +4070,7 @@ fn cascade_walk(
                     None,
                     descendant_color_scheme_dark,
                     fresh_styles,
+                    fresh_chain,
                 );
             }
         }
@@ -6911,6 +6925,7 @@ fn layout_dom_once(
         None,
         false,
         fresh_styles.as_ref(),
+        fresh_styles.as_ref().map(|_| &fresh_chain),
     );
     let cascade_prof = cascade_prof.map(|t| t.elapsed());
     let fixups_prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
