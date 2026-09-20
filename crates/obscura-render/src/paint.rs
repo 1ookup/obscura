@@ -3051,20 +3051,25 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
         .and_then(|root| laid.styles.get(&root))
         .and_then(|style| style.font_size)
         .unwrap_or(16.0);
+    let prof_finish = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    let active_animation_impact = laid
+        .styles
+        .values()
+        .filter(|style| css_animation_is_active(style))
+        .map(|style| style.animation_effect_impact)
+        .chain(std::iter::once(
+            animation_timeline.active_waapi_effect_impact(animation_sample.time),
+        ))
+        .max()
+        .unwrap_or_default();
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!("[timing] finish-scan={:?}", prof_finish.map(|t| t.elapsed()));
+    }
     Some(PreparedRender {
         viewport,
         animation_sample,
         has_active_waapi_animations: animation_timeline.has_active_waapi(animation_sample.time),
-        active_animation_impact: laid
-            .styles
-            .values()
-            .filter(|style| css_animation_is_active(style))
-            .map(|style| style.animation_effect_impact)
-            .chain(std::iter::once(
-                animation_timeline.active_waapi_effect_impact(animation_sample.time),
-            ))
-            .max()
-            .unwrap_or_default(),
+        active_animation_impact,
         root_font_size,
         base_url: base_url.map(str::to_string),
         has_dynamic_fonts: !dynamic_fonts.is_empty(),

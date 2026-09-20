@@ -5883,6 +5883,8 @@ fn layout_dom_once(
     // back into the pool.
     let mut engine = DeferredEngine::new(fonts);
     let mut prof_post_compute: Option<std::time::Instant> = None;
+    #[allow(unused_assignments)]
+    let mut prof_recompute: Option<std::time::Instant> = None;
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
@@ -7422,6 +7424,7 @@ fn layout_dom_once(
         incremental_applied = false;
         structural_resync = false;
         let mut incremental_root: Option<taffy::NodeId> = None;
+        let prof_incremental = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
         if let (Some(state), Some(fresh)) = (retained_taffy.as_mut(), fresh_styles.as_ref()) {
             // Resource damage (image/font bytes) changes what the shaped
             // engine items must contain; resource arrival keeps its full
@@ -7563,6 +7566,9 @@ fn layout_dom_once(
         // state was already dropped above, so its shape caches are back in
         // the pool and this construction reuses them warm. On the adopted
         // path this is the retained engine itself.
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!("[timing] incremental-attempt={:?}", prof_incremental.map(|t| t.elapsed()));
+        }
         let prof_engine = std::time::Instant::now();
         engine.materialize_now();
         let prof_engine = prof_engine.elapsed();
@@ -7658,6 +7664,7 @@ fn layout_dom_once(
                     }
                 }
             }
+            let prof_precompute = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             let static_position_candidates = reparent_inset_positioned_nodes(
                 tree,
                 layout_root,
@@ -8087,7 +8094,11 @@ fn layout_dom_once(
                 }
 
                 let prof_compute = std::time::Instant::now();
+                if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                    eprintln!("[timing] pre-compute-fixups={:?}", prof_precompute.map(|t| t.elapsed()));
+                }
                 let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                prof_recompute = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
                 if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                     eprintln!(
                         "[timing] engine-build={:?} compute={:?}",
@@ -8236,6 +8247,7 @@ fn layout_dom_once(
             #[cfg(not(feature = "paint"))]
             {
                 let _ = taffy_tree.compute_layout(taffy_root, available);
+                prof_recompute = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
                 if deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
@@ -8349,6 +8361,10 @@ fn layout_dom_once(
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
             }
+            let prof_padding = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+            if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                eprintln!("[timing] post-compute-fixup-recomputes={:?}", prof_recompute.map(|t| t.elapsed()));
+            }
             sync_resolved_percentage_padding(
                 &taffy_tree,
                 taffy_root,
@@ -8357,6 +8373,8 @@ fn layout_dom_once(
                 &ifc_items.generated,
                 &mut styles,
             );
+            let prof_padding = prof_padding.map(|t| t.elapsed());
+            let prof_abs_rects = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             let generated_nodes: HashMap<taffy::NodeId, usize> = ifc_items
                 .generated
                 .iter()
@@ -8377,6 +8395,8 @@ fn layout_dom_once(
                 &generated_nodes,
                 &mut generated_rects,
             );
+            let prof_abs_rects = prof_abs_rects.map(|t| t.elapsed());
+            let prof_unrounded = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             compute_absolute_unrounded_rects(
                 &taffy_tree,
                 taffy_root,
@@ -8385,6 +8405,8 @@ fn layout_dom_once(
                 &id_map,
                 &mut cssom_rects,
             );
+            let prof_unrounded = prof_unrounded.map(|t| t.elapsed());
+            let prof_cssom_advance = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             // Taffy intentionally keeps the engine's established rounded
             // intrinsic sizing for reflow and paint. CSSOM View, however,
             // exposes the shaped 26.6 advance for auto-sized inline formatting
@@ -8406,8 +8428,21 @@ fn layout_dom_once(
                     rect.width = advance + edges;
                 }
             }
+            let prof_cssom_advance = prof_cssom_advance.map(|t| t.elapsed());
+            let prof_fragments = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
             synthesize_row_rects(tree, layout_root, &mut rects);
+            let prof_fragments = prof_fragments.map(|t| t.elapsed());
+            if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+                eprintln!(
+                    "[timing] post-compute-parts padding={:?} abs-rects={:?} unrounded-rects={:?} cssom-advance={:?} fragments={:?}",
+                    prof_padding.unwrap_or_default(),
+                    prof_abs_rects.unwrap_or_default(),
+                    prof_unrounded.unwrap_or_default(),
+                    prof_cssom_advance.unwrap_or_default(),
+                    prof_fragments.unwrap_or_default(),
+                );
+            }
         }
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
@@ -8415,6 +8450,7 @@ fn layout_dom_once(
     let mut clip_rects = HashMap::new();
     let mut translates = HashMap::new();
     let mut transforms = HashMap::new();
+    let prof_clips = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     if let Some(root_id) = root {
         let root_font_size = styles
             .get(&root_id)
@@ -8436,6 +8472,8 @@ fn layout_dom_once(
             viewport,
         );
     }
+    let prof_clips = prof_clips.map(|t| t.elapsed());
+    let prof_finalize = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
 
     // Pin each shaped inline context to its final content-box origin/width now
     // that layout is done, so paint draws the same line breaks it was sized for.
@@ -8599,6 +8637,16 @@ fn layout_dom_once(
         })
         .collect();
 
+    let prof_finalize = prof_finalize.map(|t| t.elapsed());
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!(
+            "[timing] post-compute-parts clips={:?} finalize={:?} rects={}",
+            prof_clips.unwrap_or_default(),
+            prof_finalize.unwrap_or_default(),
+            rects.len(),
+        );
+    }
+
     if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
         eprintln!("[timing] post-compute-total={:?}", prof_post_compute.map(|t| t.elapsed()));
     }
@@ -8608,6 +8656,7 @@ fn layout_dom_once(
     // flags are re-derived for touched nodes: a node whose final taffy style
     // still equals the pure per-node recomputation may take in-place style
     // updates next time; anything the fixups retuned may not.
+    let prof_retained = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     let taffy_state = if tree_reusable {
         if incremental_applied {
             if let Some(fresh) = fresh_styles.as_ref() {
@@ -8664,6 +8713,9 @@ fn layout_dom_once(
     } else {
         None
     };
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!("[timing] retained-derive={:?}", prof_retained.map(|t| t.elapsed()));
+    }
 
     (
         DomLayout {
