@@ -22,6 +22,37 @@
 // as Chrome's node description (an element's local name, `#document`), and
 // every other object keeps the Object.prototype.toString brand. None of these
 // paths walk an argument: author-defined getters stay uninvoked.
+// The error description behind the branch above: walk own properties along
+// the prototype chain (the brand test already proved the Error internal
+// slot, so the walk starts at the object and stops at a small depth) and
+// take the first DATA descriptor whose value is not undefined. An accessor
+// is skipped the same way V8 skips it when building the description (a
+// TypeError with an accessor "name" still reports "TypeError", oracle
+// pinned), and author getters are never invoked.
+function _errorDataProperty(obj, key) {
+  let cursor = obj;
+  for (let depth = 0; depth < 8 && cursor !== null && cursor !== undefined; depth++) {
+    let desc;
+    try { desc = Object.getOwnPropertyDescriptor(cursor, key); } catch (_e) { return undefined; }
+    if (desc !== undefined && 'value' in desc && desc.value !== undefined) return desc.value;
+    try { cursor = Object.getPrototypeOf(cursor); } catch (_e) { return undefined; }
+  }
+  return undefined;
+}
+function _errorDescription(a) {
+  let name = 'Error';
+  let message;
+  const n = _errorDataProperty(a, 'name');
+  if (n !== undefined && n !== null) {
+    try { name = String(n); } catch (_e) { name = 'Error'; }
+  }
+  const m = _errorDataProperty(a, 'message');
+  if (m !== undefined && m !== null) {
+    try { message = String(m); } catch (_e) { message = undefined; }
+  }
+  return message === undefined || message === '' ? name : name + ': ' + message;
+}
+
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
@@ -34,11 +65,17 @@ const _consoleFn = (level, args) => {
     // it by setting Symbol.toStringTag, which the devtools probe this guards
     // against does not do (it would have tripped the same check).
     if (a instanceof Error || Object.prototype.toString.call(a) === '[object Error]') {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
+      // Chrome's consoleAPICalled description for an Error is its name and
+      // message read as DATA properties -- never .stack. With devtools closed
+      // nothing reads the arguments at all, and a shadowed "stack" accessor is
+      // exactly the devtools-detection tripwire the challenge plants: reading
+      // it here answered "devtools is open" and flipped the console battery's
+      // outcome tokens wholesale (profile Step 329, oracle headless Chrome
+      // 0/0/0 getter fires on the shadowed-stack fixture vs 0/2/1 before this
+      // fix). An accessor shadowing name/message is ignored the same way V8
+      // ignores it for the description ("Error" default), verified against
+      // the same oracle.
+      return _errorDescription(a);
     }
     if (typeof a === "object") {
       // Chrome formats a RegExp as its source, not the brand.

@@ -8115,15 +8115,39 @@ mod tests {
                         enumerable: true, configurable: true,
                     });
                     console.log(element);
-                    // An Error argument must still report its stack: that path
-                    // reads no author property and diagnostics depend on it.
+                    // An Error argument renders Chrome's consoleAPICalled
+                    // description (name and message read as DATA properties,
+                    // never .stack). A shadowed "stack" accessor is the
+                    // devtools-detection tripwire the challenge plants: with
+                    // devtools closed Chrome fires no argument getter at all
+                    // (oracle: headless Chrome 0/0/0 on the same fixture,
+                    // profile Step 329), and the description ignores an
+                    // accessor shadowing name/message the same way V8 does.
                     let reportedError = false;
                     const seen = [];
                     const op = Deno.core.ops.op_console_msg;
                     Deno.core.ops.op_console_msg = (level, msg) => { seen.push(msg); };
                     try {
-                        console.error(new TypeError("boom-probe"));
-                        reportedError = seen.some(m => m.includes("boom-probe"));
+                        let stackHits = 0;
+                        const err = new TypeError("boom-probe");
+                        Object.defineProperty(err, "stack", {
+                            get() { stackHits++; return "shadow"; },
+                            enumerable: true, configurable: true,
+                        });
+                        let nameHits = 0;
+                        Object.defineProperty(err, "name", {
+                            get() { nameHits++; return "Trap"; },
+                            enumerable: true, configurable: true,
+                        });
+                        console.error(err);
+                        reportedError = seen.some(m => m.includes("boom-probe"))
+                            && seen.some(m => m.includes("TypeError: boom-probe"));
+                        const custom = new Error("AecW7");
+                        custom.name = "PhWMD5";
+                        console.log(custom);
+                        reportedError = reportedError
+                            && seen.some(m => m.includes("PhWMD5: AecW7"))
+                            && stackHits === 0 && nameHits === 0;
                     } finally {
                         Deno.core.ops.op_console_msg = op;
                     }
