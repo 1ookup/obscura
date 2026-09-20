@@ -3002,17 +3002,28 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
     // content: its metadata then enters the same intrinsic-size map as `src`.
-    if collect_content_image_intrinsics(
-        tree,
-        &laid.styles,
-        base_url,
-        resources,
-        &mut intrinsic,
-        &mut selected_images,
-        &source_intrinsic,
-        &source_selected_images,
-        &seeded_content_images,
-    ) {
+    // The collect pass clones every node under a computed style while
+    // looking for `content:url()` images. Documents without any
+    // `content_image` style and nothing remembered from an earlier one -
+    // the overwhelming majority - skip it via one allocation-free scan over
+    // the style values alone. Remembered nodes keep their restore path.
+    let content_images_possible = !resources.content_image_intrinsics.is_empty()
+        || laid
+            .styles
+            .values()
+            .any(|style| style.content_image.is_some());
+    if content_images_possible
+        && collect_content_image_intrinsics(
+            tree,
+            &laid.styles,
+            base_url,
+            resources,
+            &mut intrinsic,
+            &mut selected_images,
+            &source_intrinsic,
+            &source_selected_images,
+            &seeded_content_images,
+        ) {
         #[cfg(test)]
         {
             resources.content_image_layout_retries += 1;
@@ -3033,10 +3044,10 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
     if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
         eprintln!("[timing] post-layout derived+finish={:?}", prof_mid.map(|t| t.elapsed()));
     }
-    let root_font_size = tree
-        .query_selector_from(layout_root, "html")
-        .ok()
-        .flatten()
+    // `query_selector_from(layout_root, "html")` costs a full matcher walk
+    // per prepare. The root element is the first `html` element in document
+    // order by construction; a bounded walk finds it without the matcher.
+    let root_font_size = first_html_element(tree, layout_root)
         .and_then(|root| laid.styles.get(&root))
         .and_then(|style| style.font_size)
         .unwrap_or(16.0);
@@ -3066,6 +3077,30 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
         layout: laid,
         discovery: previous_census,
     })
+}
+
+/// The first `html` element in document order under `root`, or `None`.
+/// Equivalent to `query_selector_from(root, "html")` for the root font size
+/// read, without building a matcher.
+fn first_html_element(
+    tree: &DomTree,
+    root: obscura_dom::tree::NodeId,
+) -> Option<obscura_dom::tree::NodeId> {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let Some(node) = tree.get_node(id) {
+            if node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "html")
+            {
+                return Some(id);
+            }
+            for child in tree.children(id).into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 fn css_animation_is_active(style: &crate::LayoutStyle) -> bool {
