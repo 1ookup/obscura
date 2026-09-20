@@ -660,7 +660,240 @@ pub(crate) struct RetainedTaffy {
     /// The previous prepare's css-prewalk inputs when the document's style
     /// blocks, doctype, and root element cannot have changed.
     pub(crate) css_state: Option<CssPrewalkInputs>,
+    /// Per-parent expected taffy child lists from the last structural resync.
+    /// A single-child mutation splices its entry (insert/remove/replace at the
+    /// changed child) instead of re-deriving every child's roots from the DOM
+    /// child list, which made one append O(parent children). Entries are
+    /// dropped whenever their box is pruned, a full rebuild replaces the state,
+    /// or a fresh node outside the spliced subtrees sits under the parent.
+    pub(crate) expected_children: HashMap<taffy::NodeId, ExpectedChildren>,
 }
+
+/// The retained-state memo of one parent's expected taffy child list: the DOM
+/// children in expected order, how many taffy roots each contributes, and the
+/// concatenated root list `set_children` received.
+#[derive(Default, Clone)]
+pub(crate) struct ExpectedChildren {
+    /// DOM children in expected order (boxed elements, text nodes, and
+    /// flattened subtrees' members all appear per contributing child).
+    pub(crate) children: Vec<NodeId>,
+    /// Root count per entry of `children`, parallel to it.
+    pub(crate) spans: Vec<u32>,
+    /// Whether the child's roots are a projection of its subtree
+    /// (display:contents or flattenable inline) rather than its own single
+    /// box. A recascade inside such a subtree can move the parent's root list,
+    /// so the memo validation treats it as unverifiable.
+    pub(crate) flags: Vec<bool>,
+    /// Concatenated expected taffy roots in child order.
+    pub(crate) roots: Vec<taffy::NodeId>,
+}
+
+impl ExpectedChildren {
+    fn offset_of(&self, position: usize) -> usize {
+        self.spans[..position].iter().map(|&span| span as usize).sum()
+    }
+
+    fn position_of(&self, child: NodeId) -> Option<usize> {
+        self.children.iter().position(|&entry| entry == child)
+    }
+
+    fn insert_child(
+        &mut self,
+        position: usize,
+        child: NodeId,
+        follows_subtree: bool,
+        roots: Vec<taffy::NodeId>,
+    ) {
+        let start = self.offset_of(position);
+        let span = roots.len() as u32;
+        self.roots.splice(start..start, roots);
+        self.children.insert(position, child);
+        self.spans.insert(position, span);
+        self.flags.insert(position, follows_subtree);
+    }
+
+    fn remove_child(&mut self, position: usize) {
+        let start = self.offset_of(position);
+        let span = self.spans[position] as usize;
+        self.roots.drain(start..start + span);
+        self.children.remove(position);
+        self.spans.remove(position);
+        self.flags.remove(position);
+    }
+
+    fn replace_roots_at(&mut self, position: usize, roots: Vec<taffy::NodeId>) {
+        let start = self.offset_of(position);
+        let old_span = self.spans[position] as usize;
+        let new_span = roots.len() as u32;
+        self.roots.splice(start..start + old_span, roots);
+        self.spans[position] = new_span;
+    }
+}
+
+/// One queued child-list operation against a parent's expected-children memo.
+#[derive(Clone, Copy)]
+enum ParentOpKind {
+    Insert,
+    Remove,
+    Text,
+}
+
+#[derive(Clone, Copy)]
+struct ParentOp {
+    kind: ParentOpKind,
+    node: NodeId,
+    /// The mutation's DOM parent is the boxed owner itself, so the memo's
+    /// children list can address the node directly.
+    direct: bool,
+}
+
+/// True when the child's expected roots are derived from its subtree
+/// (display:contents or a flattenable inline) instead of being its own box.
+fn child_roots_follow_subtree(
+    tree: &DomTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    child: NodeId,
+) -> bool {
+    match styles.get(&child) {
+        Some(style) => {
+            (style.display_contents && style.display != crate::Display::None)
+                || is_flattenable_inline(tree, child, styles)
+        }
+        None => false,
+    }
+}
+
+/// Is the memo entry still trustworthy for `parent`? Every fresh node under
+/// the parent that this resync does not splice must be provably unable to move
+/// the root list: the parent itself (its shaping-input change would already
+/// have rejected the resync), or a boxed non-flattened direct child (its
+/// contribution is exactly its own box). Flattened direct children track their
+/// subtree and force a recompute.
+fn memo_valid_for_parent(
+    tree: &DomTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    parent: NodeId,
+    entry: &ExpectedChildren,
+    fresh: &HashSet<NodeId>,
+    spliced: &HashSet<NodeId>,
+) -> bool {
+    for &f in fresh {
+        if f == parent || spliced.contains(&f) {
+            continue;
+        }
+        // Is f a strict DOM descendant of the parent?
+        let mut inside = false;
+        let mut cursor = tree.get_node(f).and_then(|node| node.parent);
+        let mut hops = 0usize;
+        while let Some(current) = cursor {
+            if current == parent {
+                inside = true;
+                break;
+            }
+            cursor = tree.get_node(current).and_then(|node| node.parent);
+            hops += 1;
+            if hops > 65536 {
+                return false;
+            }
+        }
+        if !inside {
+            continue;
+        }
+        // Find f's direct-child ancestor under the parent.
+        let mut direct = f;
+        loop {
+            match tree.get_node(direct).and_then(|node| node.parent) {
+                Some(current) if current != parent => direct = current,
+                Some(_) => break,
+                None => return false,
+            }
+        }
+        let Some(position) = entry.position_of(direct) else {
+            return false;
+        };
+        if entry.flags[position] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply one child-list operation to the memo. Err means the memo could not
+/// represent the operation and the caller must recompute.
+fn apply_parent_op(
+    state: &mut RetainedTaffy,
+    tree: &DomTree,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    entry: &mut ExpectedChildren,
+    op: &ParentOp,
+    engine: &mut crate::inline::TextEngine,
+    text_rebuilds: &mut Vec<NodeId>,
+    budget: &mut usize,
+) -> Result<(), ()> {
+    match op.kind {
+        ParentOpKind::Insert => {
+            if entry.position_of(op.node).is_some() {
+                return Err(());
+            }
+            let Some(roots) =
+                expected_box_roots(state, tree, styles, op.node, engine, text_rebuilds, budget)
+            else {
+                return Err(());
+            };
+            let position = expected_insert_position(tree, entry, op.node);
+            let follows =
+                child_roots_follow_subtree(tree, styles, op.node);
+            entry.insert_child(position, op.node, follows, roots);
+        }
+        ParentOpKind::Remove => {
+            let Some(position) = entry.position_of(op.node) else {
+                return Err(());
+            };
+            entry.remove_child(position);
+        }
+        ParentOpKind::Text => {
+            let Some(position) = entry.position_of(op.node) else {
+                return Err(());
+            };
+            if !text_rebuilds.contains(&op.node) {
+                text_rebuilds.push(op.node);
+            }
+            let Some(roots) =
+                expected_box_roots(state, tree, styles, op.node, engine, text_rebuilds, budget)
+            else {
+                return Err(());
+            };
+            entry.replace_roots_at(position, roots);
+        }
+    }
+    Ok(())
+}
+
+/// The memo position a newly inserted child splices into: the number of memo
+/// children preceding it in DOM order. Walking previous siblings, the first
+/// memo member encountered bounds the insertion point (nodes between it and
+/// the child are neither memo members nor spliced-in by earlier ops yet).
+fn expected_insert_position(
+    tree: &DomTree,
+    entry: &ExpectedChildren,
+    node: NodeId,
+) -> usize {
+    let mut cursor = tree.get_node(node).and_then(|node| node.prev_sibling);
+    let mut hops = 0usize;
+    while let Some(previous) = cursor {
+        if let Some(position) = entry.position_of(previous) {
+            return position + 1;
+        }
+        cursor = tree.get_node(previous).and_then(|node| node.prev_sibling);
+        hops += 1;
+        if hops > 65536 {
+            break;
+        }
+    }
+    0
+}
+
+
 
 impl FixupFlags {
     fn note_style(&mut self, style: &crate::LayoutStyle) {
@@ -6426,6 +6659,7 @@ fn try_incremental_tree_updates(
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     mutations: &[crate::dom::RetainedStyleMutation],
+    fresh: &HashSet<NodeId>,
     engine: &mut crate::inline::TextEngine,
     taffy_damage_seeds: &mut Vec<taffy::NodeId>,
 ) -> bool {
@@ -6441,10 +6675,17 @@ fn try_incremental_tree_updates(
     let mut removed_roots: Vec<NodeId> = Vec::new();
     let mut affected_parents: Vec<NodeId> = Vec::new();
     let mut text_rebuilds: Vec<NodeId> = Vec::new();
+    // Per-owner child-list operations, in mutation order. `direct` marks ops
+    // whose DOM parent is the boxed owner itself, which is what the
+    // expected-children memo splices; ops under flattened wrappers always take
+    // the recompute path.
+    let mut parent_ops: HashMap<NodeId, Vec<ParentOp>> = HashMap::new();
     for mutation in mutations {
         match mutation {
             Tree(TreeStyleMutation::Insert {
-                node, new_parent, ..
+                node,
+                old_parent,
+                new_parent,
             }) => {
                 if !inserted_roots.contains(node) {
                     inserted_roots.push(*node);
@@ -6459,6 +6700,34 @@ fn try_incremental_tree_updates(
                 if !affected_parents.contains(&owner) {
                     affected_parents.push(owner);
                 }
+                parent_ops.entry(owner).or_default().push(ParentOp {
+                    kind: ParentOpKind::Insert,
+                    node: *node,
+                    direct: *new_parent == owner,
+                });
+                // A retained move leaves the old owner's memo listing the
+                // moved child even though taffy's set_children already
+                // scrubbed it; without a reconciliation there a later splice
+                // of the old owner would resurrect the box.
+                if let Some(old) = old_parent {
+                    if *old != *new_parent {
+                        if let Some(owner_old) = box_owning_ancestor(state, tree, styles, *old) {
+                            if owner_old != owner {
+                                if !affected_parents.contains(&owner_old) {
+                                    affected_parents.push(owner_old);
+                                }
+                                parent_ops
+                                    .entry(owner_old)
+                                    .or_default()
+                                    .push(ParentOp {
+                                        kind: ParentOpKind::Remove,
+                                        node: *node,
+                                        direct: *old == owner_old,
+                                    });
+                            }
+                        }
+                    }
+                }
             }
             Tree(TreeStyleMutation::Remove { node, old_parent }) => {
                 if !removed_roots.contains(node) {
@@ -6470,6 +6739,11 @@ fn try_incremental_tree_updates(
                 if !affected_parents.contains(&owner) {
                     affected_parents.push(owner);
                 }
+                parent_ops.entry(owner).or_default().push(ParentOp {
+                    kind: ParentOpKind::Remove,
+                    node: *node,
+                    direct: *old_parent == owner,
+                });
             }
             Tree(TreeStyleMutation::Text { node, parent }) => {
                 if !text_rebuilds.contains(node) {
@@ -6484,6 +6758,11 @@ fn try_incremental_tree_updates(
                         if !affected_parents.contains(&owner) {
                             affected_parents.push(owner);
                         }
+                        parent_ops.entry(owner).or_default().push(ParentOp {
+                            kind: ParentOpKind::Text,
+                            node: *node,
+                            direct: *parent == owner,
+                        });
                     }
                     // A detached text node has no rendered leaves to rebuild;
                     // appending it later goes through the insert path.
@@ -6541,9 +6820,18 @@ fn try_incremental_tree_updates(
 
     // Compute the expected child list for every affected parent. Any failure
     // (unknown structure, missing box, exhausted budget) aborts the resync.
+    // A parent whose memo entry is still valid splices the queued child-list
+    // operations into it; everything else re-derives the list from the DOM
+    // child list and refreshes the memo.
     let mut expected: Vec<(taffy::NodeId, Vec<taffy::NodeId>)> = Vec::new();
     {
         let mut budget: usize = tree.len().saturating_add(1024);
+        let spliced: HashSet<NodeId> = inserted_roots
+            .iter()
+            .chain(removed_roots.iter())
+            .copied()
+            .flat_map(|root| std::iter::once(root).chain(tree.descendants(root)))
+            .collect();
         for &parent in &affected_parents {
             if !resyncable_parent_box(state, parent) {
                 return resync_reject("parent-box-reserved", parent);
@@ -6551,21 +6839,85 @@ fn try_incremental_tree_updates(
             let Some(&box_id) = state.reverse.get(&parent) else {
                 return resync_reject("parent-box-missing", parent);
             };
-            let mut roots = Vec::new();
-            for child in rendered_children(tree, parent) {
-                match expected_box_roots(
-                    state,
-                    tree,
-                    styles,
-                    child,
-                    engine,
-                    &mut text_rebuilds,
-                    &mut budget,
-                ) {
-                    Some(child_roots) => roots.extend(child_roots),
-                    None => return resync_reject("child-structure-inexpressible", parent),
+            let ops = parent_ops.get(&parent);
+            let mut spliced_entry: Option<ExpectedChildren> = None;
+            if let Some(ops) = ops {
+                if ops.iter().all(|op| op.direct) {
+                    if let Some(entry) = state.expected_children.get(&box_id) {
+                        let mut entry = entry.clone();
+                        if memo_valid_for_parent(tree, styles, parent, &entry, fresh, &spliced) {
+                            let mut ok = true;
+                            for op in ops {
+                                if apply_parent_op(
+                                    state,
+                                    tree,
+                                    styles,
+                                    &mut entry,
+                                    op,
+                                    engine,
+                                    &mut text_rebuilds,
+                                    &mut budget,
+                                )
+                                .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            // The memo's child list must equal the DOM's
+                            // rendered child list after the splice; any drift
+                            // (an op that landed at the wrong position) falls
+                            // back to the exact recompute.
+                            if ok && entry.children == rendered_children(tree, parent) {
+                                spliced_entry = Some(entry);
+                            }
+                        }
+                    }
                 }
             }
+            let entry = match spliced_entry {
+                Some(entry) => entry,
+                None => {
+                    // Recompute from the DOM child list (previous behavior),
+                    // then refresh the memo so later resyncs can splice.
+                    let mut children = Vec::new();
+                    let mut spans = Vec::new();
+                    let mut flags = Vec::new();
+                    let mut roots = Vec::new();
+                    for child in rendered_children(tree, parent) {
+                        match expected_box_roots(
+                            state,
+                            tree,
+                            styles,
+                            child,
+                            engine,
+                            &mut text_rebuilds,
+                            &mut budget,
+                        ) {
+                            Some(child_roots) => {
+                                spans.push(child_roots.len() as u32);
+                                flags.push(child_roots_follow_subtree(tree, styles, child));
+                                children.push(child);
+                                roots.extend(child_roots);
+                            }
+                            None => {
+                                return resync_reject("child-structure-inexpressible", parent)
+                            }
+                        }
+                    }
+                    let entry = ExpectedChildren {
+                        children,
+                        spans,
+                        flags,
+                        roots: roots.clone(),
+                    };
+                    state.expected_children.insert(box_id, entry);
+                    expected.push((box_id, roots));
+                    continue;
+                }
+            };
+            let roots = entry.roots.clone();
+            state.expected_children.insert(box_id, entry);
             expected.push((box_id, roots));
         }
     }
@@ -6684,6 +7036,11 @@ fn try_incremental_tree_updates(
             .retain(|dom| !removed_dom.contains(dom));
         styles.retain(|dom, _| !removed_dom.contains(dom));
         custom_properties.retain(|dom, _| !removed_dom.contains(dom));
+        // Memos keyed by pruned boxes must go: taffy can hand those ids out
+        // again, and a stale memo would splice the wrong child list.
+        state
+            .expected_children
+            .retain(|box_id, _| !removed_leaf_ids.contains(box_id));
         // Geometry bookkeeping for the next prepare: only the DOM subtrees
         // whose boxes were actually orphaned leave the reused geometry maps.
         // A retained move keeps its boxes and must not be pruned, even
@@ -7005,6 +7362,9 @@ fn layout_dom_once(
     let mut reverse: HashMap<NodeId, taffy::NodeId> = HashMap::new();
     let mut text_inputs: HashMap<NodeId, TextShapingInputs> = HashMap::new();
     let mut self_describing: HashSet<NodeId> = HashSet::new();
+    // Per-parent expected-children memos carried across incremental prepares;
+    // seeded by each resync and revalidated against the next fresh set.
+    let mut expected_children: HashMap<taffy::NodeId, ExpectedChildren> = HashMap::new();
     let mut tree_reusable = false;
     let mut incremental_applied = false;
     let mut structural_resync = false;
@@ -8613,6 +8973,7 @@ fn layout_dom_once(
                         &mut styles,
                         &mut custom_properties,
                         mutations,
+                        fresh,
                         &mut engine,
                         &mut taffy_damage_seeds,
                     );
@@ -8655,7 +9016,12 @@ fn layout_dom_once(
                             pruned_dom: _,
                             fixup_flags: _,
                             css_state: _,
+                            expected_children: retained_expected_children,
                         } = state;
+                        // The per-parent expected-children memo outlives the
+                        // prepare: each resync revalidates it against the
+                        // fresh set before splicing.
+                        expected_children = retained_expected_children;
                         taffy_tree = retained_tree;
                         id_map = retained_id_map;
                         reverse = retained_reverse;
@@ -10098,6 +10464,7 @@ fn layout_dom_once(
             pruned_dom: Vec::new(),
             fixup_flags,
             css_state,
+            expected_children,
         })
     } else {
         None
