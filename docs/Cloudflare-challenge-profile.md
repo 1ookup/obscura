@@ -12445,3 +12445,82 @@ b32_loop.txt}，obdiag 临检已全部还原（工作树仅 bootstrap.js 卫兵 
 88407/88553/88635 的分类语义（b31-w2 曾记录我方 29 事件 vs Chrome 13，当时
 排除过早）；③ 新表面缺口：JSON.stringify(元素) 我方枚举出引擎内部自有属性
 （`{"_style":{...}}` vs Chrome `{"id":"mfiL4"}`），own property 形状需对齐。
+
+### Step 332：修复批次 33——wrapper 内部槽全面非枚举化（435 处 `_hset`）+ 事件 init 槽/NodeList/location 形状对齐：ver42 判决首轮 POST /1.txt 404（历史首次过线），复验两轮 GET 403；判决判定为间歇，未稳定翻转（2026-09-21 凌晨）
+
+**方法**：先本地 headless Chrome 153 oracle（CDP 直评）建「元素类 JSON/自有键形状」全表
+（div/id/attrs/a+href/style/script/img/input/iframe/text/document/event/CustomEvent/
+collection/NodeList/navigator/location/window/自定义元素），同表跑我方二进制取 before；
+再全 bootstrap 扫描内部自有属性写点，统一转 `_hset`；改反射过滤规则为「`_` 前缀且
+**非枚举**」；最后 ver42 注入轮 + 判决三轮。
+
+**oracle 表（Chrome 153 实测 vs 我方 before/after）**：
+| 探针 | Chrome | 我方 before | 我方 after |
+|---|---|---|---|
+| `JSON.stringify(createElement('div'))`（含 id/attrs/读 style/tagName 后） | `{}` | `{"_style":{600+CSS 属性},"_tagName":"DIV","_lname":"div","_ns":...,"_nullNamespaceAttrs":...,"_treeDetachedExact":...,"_treeConnected...}` | `{}` |
+| a+href / script+src / text node / Range | `{}` / keys `[]` | 同上泄内部槽 | `{}` / `[]` |
+| 元素带**自有可枚举 id 访问器**（挑战 fold 实形，TBNgK7 臂） | `{"id":"mfiL4"}` | `{"_style":{...},...}` | `{"id":"mfiL4"}` |
+| 元素带自有**非枚举** id | `{}` | （同泄） | `{}` |
+| 自定义元素用户字段 `_own=5,pub=6` | keys `["_own","pub"]`、JSON `{"_own":5,"pub":6}` | keys 被前缀过滤成 `["pub"]`（反向失真） | `["_own","pub"]` / `{"_own":5,"pub":6}` |
+| `el.hasOwnProperty('_style')` / gOPD('_style') | false / undefined | true / enum-true | false / undefined |
+| document 自有键 | `["location"]` | `["location"]`（本就同） | `["location"]` |
+| Event / CustomEvent | keys `["isTrusted","foo"]`、JSON `{"isTrusted":false,"foo":1}` / `{"isTrusted":false}` | Event 同；CustomEvent 泄 `detail` | 同 Chrome |
+| NodeList / HTMLCollection（非空） | keys `["0"]`、JSON `{"0":{}}`、无 `"length"` | NodeList 泄自有 `length`（空表 `{"length":0}`） | `["0"]` / `{"0":{}}` |
+| location 自有键序 | ancestorOrigins,href…hash,assign,reload,replace,toString | 无 ancestorOrigins、port 在 hash 后、toString 最前 | 同 Chrome（含 ancestorOrigins，DOMStringList 走原型） |
+
+残余三项（本批不处理，均既有）：`'_style' in el` 为 true（`in` 运算符 JS 层不可拦，
+发现面已被 keys/gOPN/JSON 关死，只能猜名）；for-in 原型链 394 vs 347 条（原型面枚举
+总数差，另一批）；CSSStyleDeclaration 键数 746 vs 739（CSS 属性表粒度，另一批）。
+
+**修复（787c04e + 383a6b6）**：
+1. `_hset`（config/bootstrap.js 顶部）：首写 `defineProperty` 成非枚举槽，之后走
+   `hasOwnProperty` 命中即普通赋值的快路。全 bootstrap 435 处内部字段写点（`this._x`、
+   跨对象 `rule._parentStyleSheet` 等、`__customUpgraded`、`_selected`、`_imageRequest++`
+   两处手工）机械转换；脚本三轮修 bug 后定点收敛（多段目标截断、prototype 接收者、
+   修 span 覆盖）；59 文件全部 node --check 过。
+2. 反射过滤改规则：gOPN/Reflect.ownKeys/gOPDs 只隐藏「`_` 前缀且非枚举」的自有属性
+   （页面自建的 `_own` 可枚举照出，=Chrome）；`Object.keys` 撤销 DOM-wrapper 前缀过滤
+   （枚举性已真实）；新增 gOPD 单数与 `Object.prototype.hasOwnProperty` 覆盖
+   （`_` 名才走慢路；引擎侧 `_hop` 于覆盖前捕获，审计 35 处调用全为普通对象，无影响）。
+3. 审计面：CustomEvent.detail、MessageEvent.data/origin/lastEventId/source/ports、
+   ErrorEvent 五槽由自有枚举字段改为 realm 共享注册表背后的**原型访问器**
+   （`_eventInitSlots`，构造器赋值语句不变）；NodeList 改 HTMLCollection 同型
+   （WeakMap+共享 trap proxy，键 `["0"]` 无 `"length"`，`new NodeList()` 非法构造）；
+   location 增 ancestorOrigins（原型 DOMStringList，帧 realm 沿 frame_container_info
+   逐级填祖先 origin，顶层空）并按 Chrome 序重排自有键。
+
+**fold NaN 路径（目标 2a 解码）**：远端工具链不可用——jsvmp-engine-0916-11 的
+macOS 共享目录本机未挂载，解码机 192.168.3.206 SSH 不通；按 2b 走实证路线。ver42
+（注入开，字母表取代理主机 mitmweb `ov2_js_path` 指向的当轮 patched ov2.js，
+417593 字节，新表 `FewrALiy…5q`；`/tmp/ov2.js` 已是 0918 旧件不可用）：TS#3 帧
+89378 字节解密成功（payload 结构换代：顶层改数字键 `/28/SbVZ3`，ver41 旧件不可比）。
+**SbVZ3 仍 14 条 vs ref 91**：Qssv3=2（=ref）、ODxGu4=1（=ref）、TKyxg5/mfiL4/21/
+wguL7 尾段逐项全等；rFmgn2/lzDF4×2/TBNgK7×2 与 72 条方法块仍缺席。fold 第三参
+（NaN×3+Error×4）**不在 beacon payload 内出现**（两 payload 全无 NaN/错误对象数组，
+`/1/gsLi5/x` 是探测路径表）——该形状只有 obdiag 临检轮可见；final41b/c 的 serve.log
+仍见 `%c%d … Error` 行，fold 未翻。结论：JSON 修复未翻转 SbVZ3 闸门，与「闸门是
+值条件（worker 回包/计数类旗）而非元素串化」的定位一致；0x164e3 解码仍开放。
+（payload 内 gsLi5 探测分组顺序 ref 与 ver42 不同，属 build 轮换的表内容差异，
+非引擎枚举序分歧。）
+
+**判决（诚实汇报）**：final41（注入关，click-after 16）：mitmproxy
+`POST www.thelancet.com/1.txt → 404`，其后 `GET /favicon.ico → 200`（放行态）——
+**33 批以来判决线首次过线**。按协议复验：final41b、final41c（同参）均 **FAIL**
+（`GET /1.txt → 403`，无 POST；orchestrate 新 ray 照走全程）。三轮 1/3：POST 404
+出现在紧随 ver42 注入轮的首个判决轮，随后两轮不再复现——判定为**间歇过线**，
+未稳定翻转；注入已复原 true（options API 复核 value=True）。边界证据：三轮 ops.tsv
+规模同量（10.5 万行）、worker/fetch 全程在跑，b/c 的 GET 403 为页面自查路径。
+
+**测试门**：obscura-js 674/674（新增
+wrapper_own_key_shapes_match_chrome_oracle：div/a/script/text/range/NodeList/
+HTMLCollection/event/CustomEvent/自定义元素/id 访问器/非枚举 id/document/location
+键序/嵌套序列化全钉；修正 NodeList 断言前重取非空集合 oracle——Chrome 非空列表
+keys 是 `["0"]` 且 JSON 含索引，唯一枚举的是缺 `"length"`）；workspace
+1905/1905 全过（含 timing 用例）；no-default-features check 过；精确 release 构建
+（--features render）过；无 cargo fmt。产物存 /tmp/cf0919/{b33_jsonshape_oracle.py,
+b33_battery.js,b33_battery_run.py,b33_convert_hset.py,b33-chrome-before-clean.json,
+b33-obscura-before-clean.json,b33-obscura-after-clean.json,ver42/*,final41*/}。
+下一批入口：① 0x164e3 catch 块与 worker 回包子 88407/88553/88635 的解码（解码机
+恢复后优先；fold 仍全 Error 是 72 条缺席同根）；② for-in 原型链 394 vs 347 的
+原型面枚举总数差；③ CSS 属性表 746 vs 739 粒度对齐；④ 判决间歇性复现条件
+（POST 404 仅出现在注入诊断轮之后的判决轮，相关性与因果待查）。
