@@ -8323,10 +8323,6 @@ mod tests {
         }
     }
 
-    /// The probe's console-method sentinel table reads the count/countReset
-    /// side effect (profile Step 320: the reference capture's " : 1" row is
-    /// a count call, and the missing output was a legitimate fail signal),
-    /// so count must keep Chrome's per-realm label map and emit
     /// The challenge's cross-realm console-identity check reads a child
     /// realm's console methods through the PARENT realm's
     /// Function.prototype.toString (the validator's indexOf("[native code]")
@@ -8417,6 +8413,81 @@ mod tests {
                 "ownNamesUnchanged": true,
             }),
             "frame console methods must stringify native through the parent realm",
+        );
+    }
+
+    /// The cross-registry consult must not re-enter itself. The bridged
+    /// frame override reached through `cross` resolves the probed function
+    /// against its own baked registries; on a miss its runtime view shares
+    /// this same `cross` list, so without the busy guard an unmarked page
+    /// function recursed override -> consult -> override until the stack
+    /// overflowed -- one full overflow cycle per toString probe of a page
+    /// function (profile Step 331). A spy override in the cross list pins
+    /// the consult to exactly one invocation per probe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_tostring_consult_does_not_reenter_itself() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://example.com/cross-no-reenter");
+        rt.run_page_init();
+
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://example.com/widget', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "cross-no-reenter",
+            1,
+            root,
+            "https://example.com/widget",
+        )
+        .unwrap();
+
+        let probe = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const reg = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+                    if (!reg || !reg.cross || !reg.cross.length) {
+                        return { bridged: false };
+                    }
+                    let spyCalls = 0;
+                    const spy = function () { spyCalls += 1; return null; };
+                    reg.cross.push(spy);
+                    let src;
+                    try {
+                        function pageFn() { return 42; }
+                        src = Function.prototype.toString.call(pageFn);
+                    } finally {
+                        reg.cross.pop();
+                    }
+                    return {
+                        bridged: true,
+                        spyCalls,
+                        pageSourceOk: src === "function pageFn() { return 42; }",
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "bridged": true,
+                "spyCalls": 1,
+                "pageSourceOk": true,
+            }),
+            "a page function probe must consult cross exactly once and answer its own source",
         );
     }
 

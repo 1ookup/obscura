@@ -367,12 +367,23 @@ Function.prototype.toString = function toString() {
   // contract for the template surface without re-walking it per realm. A
   // miss here (page functions answer their source, functions minted after
   // the template bake) yields no verdict and falls through.
+  //
+  // The consult is guarded with a busy flag ON the shared list: a frame
+  // override reached through it resolves functions against its own baked
+  // registries and then skips this loop, because its runtime view shares
+  // this same list -- without the guard an unmarked function recurses
+  // override -> consult -> override until the stack overflows (batch 32).
   {
     const cross = (runtimeRegistry && runtimeRegistry.cross) || _nativeRegistry.cross || [];
-    for (let i = 0; i < cross.length; i++) {
-      let s;
-      try { s = cross[i].call(this); } catch (_e) { continue; }
-      if (typeof s === 'string' && s.indexOf('[native code]') !== -1) return s;
+    if (cross.length && !cross.busy) {
+      cross.busy = true;
+      try {
+        for (let i = 0; i < cross.length; i++) {
+          let s;
+          try { s = cross[i].call(this); } catch (_e) { continue; }
+          if (typeof s === 'string' && s.indexOf('[native code]') !== -1) return s;
+        }
+      } finally { cross.busy = false; }
     }
   }
   // First unmarked probe: a page is asking a window-reachable function for
