@@ -12304,3 +12304,68 @@ console_log_does_not_invoke_getters_on_its_arguments：钉 shadowed stack
 createTask 无接收者调用我方不抛，Chrome 抛，不入哨兵表，另批处理）。
 下一批入口：fold 的 NaN 路径 + child-realm console 身份 + rFmgn2/lzDF4 探针
 （pc 88993/89464/89519）解码。
+
+### Step 330：修复批次 31——跨 realm console 原生串化修复：活体电池 ODxGu4 探针槽翻成 Chrome 形（原生函数源），判决仍 fail（2026-09-21 凌晨）
+
+**方法**：先走查信标静态面（远端 jsvmp 工具链 + 新写 lin11-14 线性/CFG 走读器：
+补 cx=c4+N、cP=4+N、m2 宽度；以 ENV-DETECT 的 (pc,key) 字符串命中为锚点），再本地
+fixture + headless Chrome 151 oracle 对拍，最后 ver40 注入轮 + final39 判决轮。
+
+**信标静态面（确证）**：
+1. SbVZ3 三条缺席项全是子 realm 探针臂的结果标记：rFmgn2 @88993、lzDF4
+   @89464/@89519（toString 下毒探针臂，条件 !h[86]）、TBNgK7 @89615/@89671
+   （锚元素 id-getter 探针臂，条件 !h[80]），另有 pUXPt5 @89735/@89787 双推
+   （两侧 payload 都没有，推入受 tryPush 类卫兵）。各臂共享子程序 sub 88882
+   （0x15b32），由尾段 0x016475 二次调用，即电池跑两轮、每轮推一轮。
+2. 每方法 72 条来自 90598-91013 的方法表循环：11 方法表（count→nGUI2 …
+   warn→HIFR9），循环体 cd tryPush 包 try-catch，count/dir/其余三分支读
+   **三个不同 console 对象**（cl "console" ×3 @90638/90649/90660），发射后
+   折叠值进帧槽累加器，下轮 %c%d 第三参即它。catch 吃掉的异常就是折叠值：
+   Chrome 折叠 Number(undefined)=NaN、error 族为探针自身 Error（NaN×6+Error×2
+   对拍 ciprobe3 每槽）；我方首个 slot 就进 catch，全程持 Error。72 条收割在
+   try 体内，catch 即整块缺席。第三参分歧与 72 条缺席同根。
+3. worker debugger 探针（sub 88472：blob worker eval
+   `_p?_p.createScript("debugger"):"debugger"` + 1500ms 兜底 postMessage）经
+   fixture 对拍（b31-w2/b31-fixture）：两条引擎的令牌回传/兜底时序形状全同
+   （Chrome 13/324ms，我方 29/313ms），排除。
+
+**引擎缺口（oracle 实证）**：父 realm `Function.prototype.toString.call
+(childRealm.console.log)` 返回引擎闭包源（`function() { return
+implementation.apply(this, arguments); }`），Chrome 恒答
+`function log() { [native code] }`。根因：模板恢复的 frame realm 的原生标记
+在快照烘焙注册表里（烘焙 override 的闭包），序列化器不能跨上下文共享该对象，
+而 realm.rs 恢复后把全局 Deno 换成主 realm 绑定，父 realm 的 override 查的是
+活体共享注册表，查不到。第七轮 M2 的「String(f) 双 realm 已对平」恰被自身
+override 的本地视图遮蔽。方法串行的三条臂卫兵 (!h[86]/!h[87]) 与折叠 catch
+都由这条跨 realm 校验喂旗。
+
+**修复**：realm 创建（模板恢复两处路径）把烘焙 override 本体注册进共享注册表
+的 `cross` 列表（上限 16），bootstrap.js 的 toString override 在本地与 runtime
+注册表均 miss 后征询 cross 条目，答 `[native code]` 即采信。页面函数两侧仍答
+自身源码（双向 fixture 验证），own property 列表不变，逐 frame 全量重扫（曾试
+page-init 全量 sweep）会翻 timing 套件，弃。
+
+**ver40（注入开，字母表取自代理主机当轮 ov2.js，rotated 0921-02）**：
+SbVZ3 14 条 vs ref 91：Qssv3 2、ODxGu4 1（数组内计数 =ref，全 payload 4/2 同
+=ref）、TKyxg5/wguL7 尾段逐项全等；活体电池 fn 探针槽发射值由 ODxGu4 标记串
+**翻成 `function () { [native code] }`（=ref）**，电池两轮结构与 Chrome 相同。
+残余：TBNgK7×2 本轮反缺席（ver39 有），三臂标记与 72 条仍缺，%c%d 第三参仍
+全 Error（ref NaN/Error 交错），count 槽我方空行 vs ref ` : 1`。
+
+**判决（诚实汇报）**：final39 与 final39b（注入关，click-after 16）均
+**FAIL**：mitmproxy `GET www.thelancet.com/1.txt → 403`，新 ray
+a3e33a3b4c8de0a4 / a3e33c47ec84354b→a3e33cd32f15354b 重开。注入已复原 true。
+
+**测试门**：obscura-js 672/672（新增
+frame_console_answers_native_to_string_from_parent_realm：父 realm 经
+contentWindow 对子 console 全 24 方法 Function.prototype.toString 必答原生，
+并钉 bridge 注册与 own property 形状）；workspace 1902/1903（唯 fail
+timing_edits_preserve_identity_and_pause_holds_then_resumes 为并行负载抖动：
+isolated 5/5 过、净树上全量亦翻不同 timing 用例）；no-default-features check
+过；精确 release 构建过；无 cargo fmt。fixture 与走读器存
+/tmp/cf0919/{b31-fixture.html,b31-challenge.html,b31-probe.html,b31-fnstr.html,
+b31-pagefn.html,b31_oracle.py,lin11-14.mjs}（远端同步 lin11/12/14）。
+下一批入口：折叠 catch 的剩余抛点（三个 console 对象读取/方法分派中仍有一处
+我方抛 Chrome 不抛）；count 槽空行 vs ` : 1` 的取值路径；TBNgK7 臂 !h[80] 翻
+转的旗源（h[86]/h[87]/h[80] 的写入点仍在 worker 回包子 88407/88553/88635 与
+eOWlr6 setter 区）。
