@@ -12067,3 +12067,117 @@ brunhild 路由窗口对 Chrome 对照同样 502——窗口对所有客户端�
 每 churn 重排全列），可做增量期望列表；③ 重站点 churn 后单次 census
 读（uGyjw9）仍走全量重建路径，resync 回退门（关系选择器/表/匿名 run）
 是 decode 外站点的下一块收益。20:1x。
+
+### Step 327：修复批次 28——Step 326 后续项①②落地：gBCR op 桥接砍到微秒级 + cascade fresh 链剪枝 + resync 期望子列表 memo 拼接，decode gBCR 份额 28.3→26.0ms（配对，负载期）（2026-09-20 21:5x）
+
+**方法**：按 Step 326 后续项①（op 桥接）与②（期望子列表）执行。先对 warm
+gBCR 做分相微基准（页面内 performance.now 外部计时，5000 次均值）：小页面
+（2 节点）full 5.2µs / op 本体 3.7µs / JSON.parse 0.7µs；1940 节点站点页面
+full ~99µs / op 本体 ~93µs。即桥接常数随文档规模线性增长，主体不在
+serde/参数封送，而是 op 本体内的每读重复劳动。
+
+**剖析（桥接本体，d724ae2）**：`op_layout_geometry` 每次
+`ensure_prepared_geometry` 都调 `document_base_url`：`url::Url::parse` 一
+次 + `query_selector("base[href]")` 一次。JS 侧 `document.querySelector`
+实测 84µs（1940 节点文档），即 op 本体的 ~90%。其余：serde_json::json!
+Value 树 + to_string（~1µs 级）、`String(nid)` 参数封送、返回串构造。
+
+**修复一（7f1e515，op 桥接）**：
+- base URL memo：`document_base_url_cached`，键 = (页面 URL,
+  base_url_generation)。generation 只在**可能改动 base 解析的连接突变**
+  时递增（新增/删除/移动含 `<base>` 的子树、`<base>` 上的属性写、
+  innerHTML/textContent 整表替换），判定函数
+  `mutation_touches_base_element` 在突变落盘前走受影响子树（remove 场景
+  旧子树仍可走查）。census 的 append/attr/text churn 完全不碰键。set_dom
+  （同 URL 重导航）也递增，防旧文档 memo 泄漏。runtime.rs 的 bump 点与
+  ops.rs 的判定点都 render 门控，`--no-default-features` 编译过。
+- 参数改 `#[smi] i32`（去掉 JS 侧 `String(nid)` 与 Rust 侧 parse），
+  bootstrap 三处调用点直传 int。
+- `frame_geometry_json` 从 json! Value 树改 `#[derive(Serialize)]` 结构体
+  一次成形（字段名/数值格式不变，f32 显式转 f64 与原 json! 语义一致）。
+- 微基准（1940 节点，修复后）：op 本体 93 → **1.0µs**，full warm gBCR
+  ~99 → **2.6µs**（目标 <5µs 达成；Chrome ~1µs 级）。小页面 full
+  5.2 → 2.3µs。
+
+**修复二（0d8527c，cascade 剪枝）**：retained prepare 的 cascade_walk 一直
+全文档走查（fresh 只决定哪些节点重算，不决定是否访问）。新增 fresh_chain
+参数（fresh ∪ 祖先链，layout_dom_once 已有），walk 开头判定：fresh 存在且
+节点不在链上且 styles 已有条目 ⇒ 整子树返回。链外节点本就走 reuse 路径
+（零写入），剪除无行为差异；full rebuild（fresh=None）不受影响。插桩均值
+cascade-walk 27 → 16µs（探针开销内）。
+
+**修复三（f1e9a5e，期望子列表 memo 拼接）**：`try_incremental_tree_updates`
+对每个受影响父按 rendered_children 全量重推 expected_box_roots（每子一次
+哈希查找 + 文本叶 Vec 克隆），body 挂 ~180 子时每 churn ~15µs。新增
+`expected_children` memo（随 RetainedTaffy 跨 prepare 转移）：children/
+spans/flags/roots 四表。命中时按突变序拼接（Insert 按前驱兄弟定位插点，
+Remove/Text 按子定位替换），未命中（首次、扁平化 wrapper 间接命中、非
+direct 突变）走原重推路径并回填 memo。正确性闸门：
+- memo 有效性按 fresh 走查：fresh 节点在父子树内且不被本次拼接覆盖时，仅
+  当其「直接子祖先」是盒化非扁平子（根贡献恒为自身盒）才可忽略；扁平子
+  （display:contents/可扁平 inline）flag 为真即回退重推。父自身 fresh 且
+  shaping 输入变化会先被 try_incremental_style_updates 整体拒绝，故安全。
+- 拼接后 `entry.children == rendered_children(parent)` 逐项校验，不等即
+  回退重推——插点算错不可能静默落盘。
+- retained move 的旧 owner 显式进受影响集（taffy set_children 会摘链，但
+  memo 不摘会被下次拼接复活）。
+- 摘除盒的 memo 按 taffy 节点 id 清除（id 复用防串）。
+- 回归门 `base_url_cache_survives_churn_and_drops_on_base_mutations`
+  （440c94c，base URL memo 的 churn 保持 + base 移除失效）。
+- decode fixture 93/93 次 churned prepare 全走 resync，resync fallback 0，
+  拼接路径 0 回退。
+
+**数字（配对交错，同 release 二进制族 d724ae2 vs 本批，系统负载 13-20
+偏高期，记录在案）**：
+
+| 指标 | d724ae2 | 本批 | 备注 |
+|---|---|---|---|
+| decode gBCR 份额 | 28.2（26.9-29.2） | 26.0（24.5-29.8） | 93 读，per-read ~0.28ms |
+| decode gBCR 份额（静载复测） | - | 25.4（23.1-26.0） | 本批二进制单侧 |
+| decode interpretMs | 36.1 | 34.4 | |
+| decode interpretAcc | 522541 | 522541（逐字节同） | 4 层 checksum 同 |
+| forced-layout warmRead | 64.4 | 57.6 | base memo 直接受益 |
+| forced-layout churnedRead | 19.0 | 19.5 | 噪声内持平 |
+| forced-layout churnedRead2 | 0.1 | 0 | 保持免费 |
+| forced-layout churnAndRead10 | 46.8 | 40.0 | |
+| warm gBCR op 本体（1940 节点） | ~93µs | ~1.0µs | 页内 5000 次均值 |
+
+<20ms 目标未达：桥接与 recascade scope 落地后，per-read 残差主体已是
+prepare 尾段 O(document) 走查（插桩 "post-layout derived+finish" ~600µs，
+含 ~250-300µs 探针自开销；基线同相 ~660µs，非本批回归）。Phase 326 后续
+③（重站点全量重建路径）与该尾段是下一块正面范围。
+
+**门禁**：render-repros 63/63 fixture 截图与 d724ae2 基线二进制逐字节相等
+（cmp 全量）；obscura-render 608/608、obscura-js 670/670 + 新增 1、
+focused 1278/1278、workspace 1889/1889（render/release/nextest
+--no-fail-fast）；AGENTS.md 精确 release 构建过（本批提交完成后复验通过，
+期间窗口的构建失败为并行批次在 obscura-net 的未提交中间态所致，与本批
+无关）；`cargo check -p obscura-js -p obscura-cli --no-default-features`
+过；无 cargo fmt。
+
+**活体（注入开，21:21-21:25）**：ov2 build 20:27 再轮换（md5
+db962593…），ver36 首解失败后从代理机取回当班 patched ov2.js
+（~/macOSShare/cf5s/chanllenge/ov2/ov2.js）作 alphabet 解密成功（BUILDS
+注册表仍未登记，仅 --key-hex 路径）。ver36（3-frame TS#2，负载 15-49）：
+ZMSOw0=415（带内 384-589）、uGyjw9=1185（离带，负载混淆嫌疑）、
+tQdUc5=38、NnqX6=6675；ver36b 复测（静载 ~7）：**ZMSOw0=485、uGyjw9=381
+（回带）、tQdUc5=39、NnqX6=7403**——四值全带内，无回归信号。
+
+**brunhild**：Chrome 对照经代理 dump-dom 仍 502（connection closed）——
+路由窗口对所有客户端未开。
+
+**final34 判决（注入关，21:25，注入态已复原 true 并经 options API 读回
+value=True）**：流程完整同形——双 interstitial（1-page/6-page，113768/
+113760 字节）+ TS#2 3-frame + Qssv3×4（2 ERROR + 2 WARN，brunhild 阶段
+护卫翻转）= **fail，与 final22-33 同形**；ops.tsv 中 1.txt 446 行均为顶层
+文档 document_url/document_scope_info 读，无任何到达
+www.thelancet.com/1.txt 的表单 POST/GET；**ODxGu4 0 次**。
+
+**后续项（另行立项）**：① prepare 尾段 O(document) 走查
+（derived+finish 相，styles 表多次全表 filter/for 与几何写回走查的
+latch 化）；② 重站点 churn 后单次 census 读的全量重建回退门
+（关系选择器/表/匿名 run，Step 324 后续③）；③ decode 残差里
+fixup-recomputes 相的四个非门控走查
+（resolve_atomic_percentage_heights / resolve_deferred_flex_inline_sizes /
+apply_float_continuations / apply_table_row_geometry）按 FixupFlags 扩位
+latch。21:5x。
