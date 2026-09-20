@@ -12243,3 +12243,64 @@ FAIL：mitmproxy 线上 `GET www.thelancet.com/1.txt -> 403`（仍是挑战页�
 obscura-js 671/671；全仓 1902/1902。obstacle course 33/33 门：本机未找到
 obscura-benchmark 伴随仓库（常见位置均无 `obstacle-course/`），网络面
 行为由上述注入/判定轮直接覆盖，伴随仓库就位后补跑。22:4x。
+
+### Step 329：修复批次 30——console 指纹电池解码与 shadowed-stack 修复：信标 Qssv3 20→2（Chrome 精确值），判决仍 fail（2026-09-21 凌晨）
+
+**方法**：先做双侧解密 payload 的槽位级对拍（ref=/tmp/cf0919/ref/payload.json 的
+`/26/SbVZ3` 数组 vs 我方 ver37d 的 `/10/SbVZ3`），再按第六轮已验证的 jsvmp 工具链
+（远程 /tmp/edges3.json + flow2 + 新写的 lin10 线性走读器；修正 m6 为变长
+`1+varint+1`、cI arity ^66@pc+4、cD arity ^174@pc+3）走读 pc 87800-91100，最后用
+本地 headless Chrome 151 oracle（CDP）对 shadowed-stack fixture 定位根因。
+
+**对拍实锤（修正此前所有轮的定性）**：
+1. 通过参考轮 payload 里 ODxGu4=1、Qssv3=2 是**正常 Chrome 形状**（Step 328 的
+   「参考 ODxGu4=0」系误读）。「失败标记」的真正含义：每个探针的 harvest 记
+   `(值, 方法哨兵)` 对，值无效时才替换为 Qssv3。
+2. pc 90057 的「Qssv3 写入」**不是阶段卫兵**：89950-90112 是静态 spec 表构建
+   `[{name→PhWMD5},{message→AecW7},{stack→Qssv3}]`（stack 槽两侧都记 Qssv3，
+   即 Chrome 的两个合法 Qssv3 之一）；90169-90598 是 11 方法哨兵表构建；两者
+   之前根本没有「整表替换」分支。第六轮 M3 的「stage guard」定性作废。
+3. 我方与 ref 的真实差异四处：idx0 记 `lPqZ4`（ref `TKyxg5`，defineProperty
+   "stack" 探针的 frame[121] 结果标记）；缺 `rFmgn2, lzDF4, lzDF4` 三条；
+   每方法 ref 有两轮 `(PhWMD5, 哨兵, AecW7, 哨兵)`（72 条）而我方一轮
+   `(Qssv3, 哨兵, Qssv3, 哨兵)`（36 条）；wguL7 尾段两侧全等（含 Chrome 的
+   第二个合法 Qssv3）。
+
+**根因（oracle 实证）**：console op 序列化的 Error 分支读 `a.stack`
+（tools/console.js 旧 39 行）。挑战在探针对象上布 shadowed "stack" 访问器，
+访问即写 frame 标记（vmGetter = m1 bind 产物，sub 87819：加载 lPqZ4 → 写
+frame[121] → 返回 ""）——这是 devtools 探测线：Chrome（devtools 关闭）对
+console 参数零读取，我方为渲染 ops 行读了 stack，等于回答「devtools 开着」，
+电池 outcome 全面翻转。fixture（对象/普通 Error/自定义 Error 各带 shadowed
+stack，经 console.debug/log/error/warn/count 触发）：Chrome 0/0/0 次触发，
+修复前我方 0/2/1，修复后 0/0/0。
+
+**修复（2d3fe19）**：Error 参数按 Chrome consoleAPICalled description 渲染——
+沿原型链取第一个**数据**描述符（访问器与 data-undefined 按同型 oracle 跳过：
+TypeError 带访问器 name 仍报 "TypeError"，oracle 钉死），`name: message` 形，
+永不读 stack。（288a093 补充：function 参数改走
+`Function.prototype.toString.call`，同样绕过自有 toString 覆盖——挑战给
+validator 结果函数下毒，Chrome 行显示真源码，我方行此前显示毒串。）
+
+**ver38（注入开）**：TS#2 解密成功。SbVZ3：Qssv3 **20→2（Chrome 精确值）**、
+ODxGu4 1（=ref）、idx0 `TKyxg5`（=ref）、wguL7 尾段 6 条逐项全等；
+ver39 诊断轮（临时 console.__obdiag op 行，JS 面零变化）钉出剩余分歧的形状：
+9 方法 family 排放的第三参我方是**普通 Error 对象**（ref 为 NaN×3+Error×4），
+且 beacon 的每方法 72 条 + rFmgn2/lzDF4 三条仍缺席（缺席而非失败标记）——
+fold 管线在 VM/host 侧仍有一步按 Chrome 走 NaN 的路径在我方走 Error，
+定位需要下一批（child-iframe realm 的 console 身份/跨 realm 子检查为主嫌，
+pass-5 P5 已记录电池实际跑在沙箱 iframe 的独立 console 上）。
+
+**判决（诚实汇报）**：final38 与 final38b（注入关，click-after 16）两轮均
+**FAIL**：mitmproxy `GET www.thelancet.com/1.txt → 403`（新 ray orchestrate
+重启，a3e28c90→a3e28d27 / a3e29373→a3e293f8）。信标虽达 Qssv3/ODxGu4 的
+Chrome 计数，但 SbVZ3 仍 16 条 vs ref 91 条（每方法块 + trio 缺席），边缘
+裁决仍拒绝。测试门：obscura-js 671/671（含改写后的
+console_log_does_not_invoke_getters_on_its_arguments：钉 shadowed stack
+零触发 + 数据属性描述两例）、全仓见下方补记、no-default-features check 过、
+精确 release 构建过；无 cargo fmt。console 面对拍脚本与 fixture 存
+/tmp/cf0919/{stackgetter-fixture*.html,console-surface-diff.py,fn-fixture.html}
+（console 面全量 24 方法 name/length/source/接收者行为对拍：唯一残差
+createTask 无接收者调用我方不抛，Chrome 抛，不入哨兵表，另批处理）。
+下一批入口：fold 的 NaN 路径 + child-realm console 身份 + rFmgn2/lzDF4 探针
+（pc 88993/89464/89519）解码。
