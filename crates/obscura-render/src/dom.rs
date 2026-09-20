@@ -617,6 +617,10 @@ pub(crate) struct RetainedTaffy {
     pub(crate) text_leaves: HashMap<NodeId, Vec<taffy::NodeId>>,
     /// Per-node text-shaping inputs as of the node's last (re)build.
     pub(crate) text_inputs: HashMap<NodeId, TextShapingInputs>,
+    /// Nodes whose computed height is definite, as of the last inheritance
+    /// walk. Retained so the walk can skip subtrees without fresh nodes
+    /// while the percentage-height post-pass stays complete.
+    pub(crate) definite_heights: HashSet<NodeId>,
     /// Nodes whose final taffy style equals the pure per-node recomputation
     /// (`to_taffy_style` of their computed style): no build-loop override, no
     /// post-compute fixup touched their taffy style. Only these may take
@@ -5794,6 +5798,25 @@ fn layout_dom_once(
         }
         None => (HashMap::new(), HashMap::new(), None, None),
     };
+    // Topmost relevance chain for the inheritance walk: every fresh node plus
+    // its ancestors. Reused nodes outside this chain have no fresh descendant,
+    // so their retained styles are already final and their subtree can be
+    // skipped entirely.
+    let fresh_chain: HashSet<NodeId> = {
+        let mut chain = HashSet::new();
+        if let Some(fresh) = fresh_styles.as_ref() {
+            for &node in fresh {
+                let mut cursor = Some(node);
+                while let Some(current) = cursor {
+                    if !chain.insert(current) {
+                        break;
+                    }
+                    cursor = rendered_parent(tree, current);
+                }
+            }
+        }
+        chain
+    };
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
         snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
@@ -5883,6 +5906,22 @@ fn layout_dom_once(
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
+    // Computed-definite-height node set (see the inheritance walk below).
+    // Incremental prepares seed it from the retained set: skipped reused
+    // subtrees keep their retained definiteness, while fresh nodes are
+    // dropped so the walk recomputes them exactly.
+    let mut definite_height_nodes = retained_taffy
+        .as_ref()
+        .map(|state| {
+            let mut seeded = state.definite_heights.clone();
+            if let Some(fresh) = fresh_styles.as_ref() {
+                for node in fresh {
+                    seeded.remove(node);
+                }
+            }
+            seeded
+        })
+        .unwrap_or_default();
     if let Some(root_id) = root {
         // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
         // `scrollbar-gutter:stable` reserves it even when the scrollbar track
@@ -6032,7 +6071,6 @@ fn layout_dom_once(
         // containing-block chain. Merely retaining `height:Percent` is not
         // sufficient: under an auto-height containing block it computes to
         // auto and must never become a post-layout percentage basis.
-        let mut definite_height_nodes = HashSet::new();
         let mut queue = vec![(root_id, root_inh)];
         while let Some((id, mut inh)) = queue.pop() {
             // Default the child containing-block width to this element's own
@@ -6179,6 +6217,14 @@ fn layout_dom_once(
                 }
                 inh.cb_width = child_cb_width;
                 inh.cb_height_definite = child_cb_height_definite;
+                // No fresh node below a reused node means every descendant
+                // keeps a retained style computed under this same inherited
+                // context; the whole subtree is already final. Only safe when
+                // the definite-height set travelled with the retained state,
+                // so the percentage-height post-pass stays complete.
+                if retained_taffy.is_some() && !fresh_chain.contains(&id) {
+                    continue;
+                }
                 for child in style_children(tree, id).into_iter().rev() {
                     queue.push((child, inh.clone()));
                 }
@@ -7460,6 +7506,9 @@ fn layout_dom_once(
                             text_leaves: retained_text_leaves,
                             text_inputs: retained_text_inputs,
                             self_describing: retained_self_describing,
+                            // Already seeded into the walk's definite-height
+                            // set before the adoption point above.
+                            definite_heights: _,
                             engine: mut retained_engine,
                         } = state;
                         taffy_tree = retained_tree;
@@ -8608,6 +8657,7 @@ fn layout_dom_once(
             text_leaves,
             text_inputs,
             self_describing,
+            definite_heights: definite_height_nodes,
             #[cfg(feature = "paint")]
             engine: None,
         })
