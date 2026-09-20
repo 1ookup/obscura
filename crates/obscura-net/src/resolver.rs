@@ -48,8 +48,10 @@ const DEFAULT_DOH_ENDPOINTS: &[&str] = &[
 /// Whole-probe budget: the DoH race must never turn a working network into
 /// a slow one. Both record-type races run concurrently, so this bounds the
 /// gate's total added latency; a probe that misses the budget allows the
-/// request and the transport behaves exactly as before.
-const DOH_PROBE_BUDGET: Duration = Duration::from_millis(500);
+/// request and the transport behaves exactly as before. On a jittery tunnel
+/// this is what bounds the worst case; the common case answers in one
+/// round trip.
+const DOH_PROBE_BUDGET: Duration = Duration::from_millis(700);
 
 /// How long a gate decision is reused. DNS TTLs are not tracked per record;
 /// this bounds both staleness and DoH traffic.
@@ -210,8 +212,12 @@ fn doh_client() -> &'static reqwest::Client {
             // The DoH probe reports on the direct network; sending it through
             // the user's proxy would make the probe answer about the wrong
             // path and could loop a proxy-side failure back into resolution.
+            // The per-request timeout must sit at or above the race budget:
+            // a tighter request timeout would fail both endpoints whenever a
+            // single round trip is slow, and the budget exists to bound the
+            // wait, not to disqualify slow-but-alive resolvers.
             .no_proxy()
-            .timeout(Duration::from_millis(350))
+            .timeout(DOH_PROBE_BUDGET)
             .build()
             .expect("failed to build DoH probe client")
     })
