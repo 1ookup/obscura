@@ -11840,3 +11840,105 @@ createElement/appendChild churn；② clean-tree 几何复用——零 set_style
 prepare 直接继承上一轮 rects/片段/derived（再砍 post-compute 5.5ms 与
 derived 2.2ms）；③ derived-state 趟融合（viewport-fixed/scroll/sticky 共享
 一次先序 + 父索引）。13:44。
+
+### Step 324：修复批次 26——树损结构化 resync：树突变原位拼接保留 taffy 树，decode gBCR 份额 61.2→38.5ms（2026-09-20 16:5x）
+
+**方法**：按 Step 323 后续项 ① 执行。先插桩：decode-interpret-cost fixture 在
+5447dae 上 94 次 build-walk 全部为全量重建（93 次 gBCR 强制读 + 1 次首渲染），
+incremental 路径 0 次命中；单次 churned prepare 分相（census 复用前）：
+build-walk ~158µs（含整形）、compute ~31µs、post-compute ~92µs、
+prepare-total 均值 673µs、rendered-walks=8。churn 形状确认：元素 textContent
+在 bootstrap 里走 remove_child + create_text_node + append_child，挑战实际
+churn 只产生 Insert（div→body、text→div）+ Attribute，无整轮 prepare 丢弃。
+
+**实现（8cf550d，结构化 resync）**：DomLayout 保留态新增每文本节点的词叶表
+（`text_leaves`，由全量 build 末一次按 taffy 子序 DFS 导出、resync 增量维护）。
+树损不再是整体回退：每个受影响父节点先解析到**持盒祖先**（穿过
+display:contents/可扁平内联；解析不到即回退），按 build_any 顶层拼接规则从
+**突变后 DOM** 重算期望 taffy 子列表（插入子树先经 build_any 原机建盒并入
+id_map/reverse/words/ifc），然后每父一次 `set_children` 同时完成摘除、插接、
+换位；摘下的盒自底向上 `remove` 并逐注册表剪枝（id_map/reverse/words/
+text_leaves/ifc 各表/styles/custom_properties）。期望子列表重算不了的任何
+结构一律整体回退全量重建（先丢弃半改状态再重建，整形缓存纪律与批 25 相同）。
+
+**回退门清单（counted，OBSCURA_RENDER_TIMING `resync fallback reason=`）**：
+style-element/关系型选择器（planner 层 Full）；Resource 损伤；父盒被专用结构
+占用（whole 整叶 IFC、匿名 inline run、表、multicol、float continuation、
+generated content）；实际子列表含期望模型表达不了的未认领盒（匿名 flex/grid
+run 项、inline-flex 外壳）；脏节点 boxedness 翻转；词叶居于匿名 wrapper 内的
+文本突变；插入根未重算级联。**挑战 churn 形状（简单叶元素 append + 文本节点
+append + 属性）93/93 次 prepare 全走 resync，回退 0 次。**
+
+**伴生修复**：① census 复用扩展到 census-inert 树损（按插入/移除子树扫描，
+上限 4096 节点；Text 突变按 svg 祖先链判定），发现走查 93/93 全跳；
+② 分离子树插入（old_parent=None）不再触发全树 connectivity 走查；
+③ 重算级联后 base 逐字节相同且整形输入未变的非 self-describing 盒
+（树损防御性祖先链的常态）安全跳过，不再一票回退；
+④ 保留态不再收编上一轮 `text_runs`（post-compute 每轮从 taffy 走查整体重推
+导）——收编会在词叶页每轮翻倍词矩形并在绘制时二次混色，批 25 的隐性缺陷，
+本轮补回归门 `retained_attr_churn_text_runs_do_not_duplicate`；
+⑤ DeferredEngine 增 is_materialized 守卫，resync 成功路径不再被二次 adopt
+换成空引擎（此前会让保留 item 索引全部悬空）。
+
+**修复二（cf3e6d0，继承走查 clean-subtree 剪枝）**：retained prepare 的
+自顶向下继承走查只需访问 fresh 链（fresh 节点及其祖先）；链外 reused 节点的
+子树样式已终态，整子树跳过。走查唯一外溢副作用 definite-height 集合改随
+保留态携带（reused 保留、fresh 剔除后由走查重算），百分比高度后处理保持完整。
+
+**修复三（a877e9d，prepare finish 快路径）**：content-image collect 的
+逐样式 get_node 克隆扫描加门（无 content_image 样式且无 remembered 节点时
+一次纯样式值扫描替代；remembered 节点的 HTML 回退复原路径保留，补
+`repeated_content_image_prepare` 回归）；根字号查询
+`query_selector_from(layout_root, "html")` 换成有界文档序走查（每 prepare
+一次完整 matcher 建树 + 走查省去）。
+
+**数字（配对交错，同 release 二进制族，负载 ~7-9）**：
+
+| 指标 | 5447dae | 本批 | Chrome |
+|---|---|---|---|
+| decode interpretMs | 65.6-69.6 | 45.8-48.0 | 15.7 |
+| decode gBCR 份额 | 58.6-61.2 | 37.6-39.6 | 12.9 |
+| decode 单次树损强制读 | ~0.63ms | ~0.41ms | ~0.14 |
+| decode interpretAcc | 522541 | 522541（逐字节同） | 同 |
+| forced-layout churnedRead | 21.3-23.5 | 20.6-21.8 | ~0.1 |
+| forced-layout churnAndRead10 | 120-131 | 108.5-115.3 | ~0 |
+| forced-layout warmRead | 61-68 | 58.5-61.5 | 10 |
+
+resync 内部分相（decode，插桩下）：build-walk 158µs → **6.5µs**、
+census-reuse 93/93、connectivity skipped 93/93、cascade ~17µs、
+compute ~7µs、post-compute ~13µs、derived-state ~26µs、
+prepare-total 673 → **~275µs**。gBCR 份额未达 <25ms 目标：残差主体已是
+O(document) 的后段（post-compute 矩形/片段/clip 写回、derived-state、
+finalize/clip 走查，合计 ~85µs）加 dom-op 桥接常量，即 Step 323 后续项
+②③ 的正面范围，本批不越界。
+
+**门禁**：render-repros 63/63 fixture 截图与本批前二进制逐字节相等（修复三
+后二进制复验）；obscura-render 608/608、obscura-js 670/670（含新增
+resync 判定矩阵 8 项：append/remove/move/文本插入/词叶文本突变回退/
+whole-IFC 文本突变回退/匿名 run 回退/text_runs 去重门）；workspace
+1889/1889（render/release/nextest，--no-fail-fast，两次：一次
+timing_edits、一次 worker_source 偶发，隔离复测 5/5 过且 HEAD 同样偶发，
+非本批回归）；`cargo check -p obscura-js -p obscura-cli
+--no-default-features` 过；AGENTS.md 精确 release 构建过；无 cargo fmt。
+
+**活体（注入开，16:36）**：ov2 build 16:22 前又轮换一次（ver33 的 13:41
+表解密 ver34 载荷报「字符 '+' 不在表中」，从代理机重取 16:37 build
+md5 794dbce3… 解密成功；注入链路.ov2_inject_enabled 实证 true）。ver34
+（3-frame TS#2）：**ZMSOw0=523（回带内 384-589；ver33 的 589 为带顶，
+方向与 decode 树损份额一致，resync 后回落）、uGyjw9=195（带内 175-323）、
+tQdUc5=39（期待 38）、NnqX6=5928**（ver33: 7828；Chrome 7220 量级）。
+2/4/7-frame 同轮复测：523/195/39-40 一致（NnqX6 625/16156 为帧间方差）。
+
+**final31 判决（注入关，16:38，注入态已复原 true 并 API 读回 True）**：
+流程完整同形——双 orchestrate（ray a3df837c…、a3df8414…，第二轮重开）=
+**fail，与 final22-30 同形**；无任何到达 www.thelancet.com/1.txt 的表单
+POST/GET（ops.tsv 中 1.txt 100 条均为顶层文档自身）；console 行
+**Qssv3×4**（08:38:29，2 ERROR + 2 WARN，brunhild 阶段护卫翻转，Step 321
+路由窗口残差），**ODxGu4 0 次**。brunhild 路由窗口对所有客户端仍未开。
+
+**后续项（另行立项）**：① clean-tree 几何复用——零 set_style 的 prepare
+直接继承上一轮 rects/片段/derived（残差大头：post-compute + derived 合计
+~85µs/次，decode 规模可再向 Chrome 收敛一倍）；② derived-state 趟融合
+（viewport-fixed/scroll/sticky 共享一次先序 + 父索引）；③ resync 覆盖
+匿名 run wrapper 内词叶（需在期望模型中重建 build_mixed_block 分段，
+收益存疑，先记门不补）。16:58。
