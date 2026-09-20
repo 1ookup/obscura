@@ -1612,7 +1612,7 @@ var Element = _swappableInterface('Element', class extends Node {
   _renderClientMetrics() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this[_nidSym] | 0));
+      const raw = Deno.core.ops.op_layout_geometry(this[_nidSym] | 0);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -1637,7 +1637,7 @@ var Element = _swappableInterface('Element', class extends Node {
   _renderBoxGeometry() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this[_nidSym] | 0));
+      const raw = Deno.core.ops.op_layout_geometry(this[_nidSym] | 0);
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       // Consumers validate the fields they use: getBoundingClientRect() needs

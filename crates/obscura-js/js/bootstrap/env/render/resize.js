@@ -96,7 +96,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?.[_nidSym] != null) {
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(target[_nidSym] | 0));
+      const raw = Deno.core.ops.op_layout_geometry(target[_nidSym] | 0);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }

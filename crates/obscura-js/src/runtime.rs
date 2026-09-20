@@ -982,6 +982,12 @@ impl ObscuraJsRuntime {
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
+        #[cfg(feature = "render")]
+        {
+            // A new document resolves its base URL independently of the
+            // previous one, even at the same page URL (reload, SPA re-commit).
+            gs.base_url_generation = gs.base_url_generation.wrapping_add(1);
+        }
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.

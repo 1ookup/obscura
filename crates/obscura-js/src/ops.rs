@@ -322,6 +322,15 @@ pub struct ObscuraState {
     /// coalesce framework DOM churn into one conservative local cascade.
     #[cfg(feature = "render")]
     pub pending_style_mutations: Vec<obscura_render::RetainedStyleMutation>,
+    /// Memoized document base URL, valid while the page URL and the
+    /// base-element generation are unchanged. See `document_base_url_cached`.
+    #[cfg(feature = "render")]
+    pub(crate) base_url_cache: Option<(String, u64, std::rc::Rc<str>)>,
+    /// Bumped when a connected mutation can change which `<base>` element
+    /// resolves the document base URL. Ordinary DOM churn leaves it alone so
+    /// the geometry hot path keeps hitting `base_url_cache`.
+    #[cfg(feature = "render")]
+    pub(crate) base_url_generation: u64,
     /// Document generation that last received a load-time layout pre-warm.
     /// The warm pass runs once per committed document; chasing every post-load
     /// mutation would reintroduce the layout thrash the retained cache exists
@@ -500,6 +509,10 @@ impl ObscuraState {
             animation_sampled_task_generation: 0,
             #[cfg(feature = "render")]
             pending_style_mutations: Vec::new(),
+            #[cfg(feature = "render")]
+            base_url_cache: None,
+            #[cfg(feature = "render")]
+            base_url_generation: 0,
             #[cfg(feature = "render")]
             layout_prewarm_generation: u64::MAX,
             #[cfg(feature = "render")]
@@ -1352,6 +1365,53 @@ fn op_dom(
     result
 }
 
+/// Can this connected mutation change which `<base>` element resolves the
+/// document base URL? The HTML base is the first base element in tree order
+/// carrying an href, so only subtree membership changes and href writes on a
+/// base can move it; ordinary element/attribute/text churn cannot. Runs before
+/// the mutation is applied, so removed subtrees are still walkable. Detached
+/// mutations never get here (`invalidate` is already false for them).
+#[cfg(feature = "render")]
+fn mutation_touches_base_element(dom: &DomTree, cmd: &str, arg1: &str, arg2: &str) -> bool {
+    let is_base = |id: NodeId| {
+        dom.get_node(id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "base")
+        })
+    };
+    let subtree_has_base = |root: NodeId| -> bool {
+        if is_base(root) {
+            return true;
+        }
+        dom.descendants(root).into_iter().any(is_base)
+    };
+    let parse_node = |arg: &str| arg.parse::<u32>().ok().map(NodeId::new);
+    match cmd {
+        // arg1 = node: attribute writes only matter on the base itself. The
+        // attribute name is irrelevant here; local-name identity is the cheap
+        // and conservative test.
+        "set_attribute" | "remove_attribute" | "set_attribute_ns" | "remove_attribute_ns"
+        | "set_live_checked" => parse_node(arg1).is_some_and(is_base),
+        // arg2 = appended child / arg1 = inserted node or removed child: a
+        // base anywhere in the moved subtree can precede or succeed the
+        // current one in tree order.
+        "append_child" => parse_node(arg2).is_some_and(subtree_has_base),
+        "insert_before" | "remove_child" => parse_node(arg1).is_some_and(subtree_has_base),
+        // Child lists are replaced wholesale; stay conservative rather than
+        // walking the replacement markup.
+        "set_inner_html" | "set_inner_html_context" => true,
+        // Element textContent drops its children: a base among the old
+        // children disappears. Text-node targets have no children and cannot
+        // carry a base, so they stay cache-friendly.
+        "set_text_content" => parse_node(arg1).is_some_and(|node| {
+            dom.children(node)
+                .into_iter()
+                .any(subtree_has_base)
+        }),
+        _ => false,
+    }
+}
+
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
     let shared = state.borrow::<SharedState>().clone();
     {
@@ -1428,6 +1488,18 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             for frame_state in state.frame_render_states.values_mut() {
                 frame_state.prepared_render = None;
             }
+        }
+        #[cfg(feature = "render")]
+        if invalidate
+            && state
+                .dom
+                .as_ref()
+                .is_some_and(|dom| mutation_touches_base_element(dom, &cmd, &arg1, &arg2))
+        {
+            // Only a base-relevant connected mutation moves the document base
+            // URL, so only those bust the memoized value used by the geometry
+            // hot path.
+            state.base_url_generation = state.base_url_generation.wrapping_add(1);
         }
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
@@ -7999,11 +8071,36 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     }
 }
 
+/// Cached `document_base_url` for the geometry hot path. A hit requires the
+/// page URL and the base-element generation to be unchanged since the value
+/// was computed. The generation only moves when a connected mutation can
+/// change which `<base>` resolves (insert/remove/move of a subtree containing
+/// a base element, an attribute write on a base, or a wholesale child-list
+/// replacement), so ordinary DOM churn - the census append/attribute/text
+/// shape - keeps hitting the cache. Without it each warm CSSOM geometry op
+/// paid a full URL parse plus a `base[href]` document scan (~84us at census
+/// scale), which dominated the op bridge.
+#[cfg(feature = "render")]
+pub(crate) fn document_base_url_cached(state: &mut ObscuraState) -> Option<std::rc::Rc<str>> {
+    if let Some((url, generation, base)) = &state.base_url_cache {
+        if *generation == state.base_url_generation && *url == state.url {
+            return Some(std::rc::Rc::clone(base));
+        }
+    }
+    let computed = document_base_url(state)?;
+    state.base_url_cache = Some((
+        state.url.clone(),
+        state.base_url_generation,
+        std::rc::Rc::from(computed.as_str()),
+    ));
+    Some(std::rc::Rc::from(computed.as_str()))
+}
+
 #[cfg(feature = "render")]
 pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    let base_url = document_base_url_cached(state);
     let csp_origin = state
         .top_origin
         .as_ref()
@@ -8114,7 +8211,7 @@ pub(crate) fn ensure_prepared_render(
 fn ensure_prepared_geometry(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    let base_url = document_base_url_cached(state);
     let reusable = state.pending_style_mutations.is_empty()
         && !state.animation_timeline.has_pending_start_candidates()
         && state.prepared_render.as_ref().is_some_and(|prepared| {
@@ -9018,6 +9115,40 @@ pub(crate) fn store_frame_prepared(
 /// the JSON shape `op_layout_geometry` returns. Shared by the top-document and
 /// frame paths so a frame's rect is byte-identical in structure to the main
 /// document's.
+/// Wire format for `op_layout_geometry`. Serialized structurally instead of
+/// through a `serde_json::Value` tree: the CSSOM geometry op runs once per
+/// `getBoundingClientRect()` and census-shaped callers issue hundreds of
+/// reads, where the intermediate map/vec allocations showed up in profiles.
+#[cfg(feature = "render")]
+#[derive(serde::Serialize)]
+struct ClientRectJson {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(feature = "render")]
+#[derive(serde::Serialize)]
+struct LayoutGeometryJson {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    #[serde(rename = "layoutWidth")]
+    layout_width: Option<f64>,
+    #[serde(rename = "layoutHeight")]
+    layout_height: Option<f64>,
+    #[serde(rename = "clientWidth")]
+    client_width: f64,
+    #[serde(rename = "clientHeight")]
+    client_height: f64,
+    #[serde(rename = "clientRects")]
+    client_rects: Vec<ClientRectJson>,
+    #[serde(rename = "viewportFixed")]
+    viewport_fixed: bool,
+}
+
 #[cfg(feature = "render")]
 fn frame_geometry_json(
     prepared: &obscura_render::PreparedRender,
@@ -9061,13 +9192,11 @@ fn frame_geometry_json(
     };
     let client_rects = client_rects
         .into_iter()
-        .map(|rect| {
-            serde_json::json!({
-                "x": rect.x,
-                "y": rect.y,
-                "width": rect.width,
-                "height": rect.height,
-            })
+        .map(|rect| ClientRectJson {
+            x: rect.x as f64,
+            y: rect.y as f64,
+            width: rect.width as f64,
+            height: rect.height as f64,
         })
         .collect::<Vec<_>>();
     let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
@@ -9080,29 +9209,28 @@ fn frame_geometry_json(
         .layout()
         .rects
         .get(&nid)
-        .map(|rect| (rect.width, rect.height));
-    serde_json::json!({
-        "x": rect.x,
-        "y": rect.y,
-        "width": rect.width,
-        "height": rect.height,
-        "layoutWidth": layout_size.map(|(width, _)| width),
-        "layoutHeight": layout_size.map(|(_, height)| height),
-        "clientWidth": client_width,
-        "clientHeight": client_height,
-        "clientRects": client_rects,
-        "viewportFixed": viewport_fixed,
-    })
-    .to_string()
+        .map(|rect| (rect.width as f64, rect.height as f64));
+    let payload = LayoutGeometryJson {
+        x: rect.x as f64,
+        y: rect.y as f64,
+        width: rect.width as f64,
+        height: rect.height as f64,
+        layout_width: layout_size.map(|(width, _)| width),
+        layout_height: layout_size.map(|(_, height)| height),
+        client_width: client_width as f64,
+        client_height: client_height as f64,
+        client_rects,
+        viewport_fixed,
+    };
+    serde_json::to_string(&payload).unwrap_or_default()
 }
 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
+fn op_layout_geometry(state: &OpState, #[smi] nid_smi: i32) -> String {
     let shared = state.borrow::<SharedState>().clone();
-    let nid: u32 = nid_str.parse().unwrap_or(0);
-    let nid = obscura_dom::tree::NodeId::new(nid);
+    let nid = obscura_dom::tree::NodeId::new(nid_smi.max(0) as u32);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_some() {
