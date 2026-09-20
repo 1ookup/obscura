@@ -12181,3 +12181,65 @@ fixup-recomputes 相的四个非门控走查
 （resolve_atomic_percentage_heights / resolve_deferred_flex_inline_sizes /
 apply_float_continuations / apply_table_row_geometry）按 FixupFlags 扩位
 latch。21:5x。
+
+### Step 328：修复批次 29——网络面：AAAA-only 域名在无全局 IPv6 的机器上即时失败（family gate），替代慢速连接死亡（2026-09-20 22:4x）
+
+**实验结论（本次批次的判定实验）**：真 Chrome 以 `--host-resolver-rules`
+把 brunhild.challenges.cloudflare.com 置为即刻 DNS 失败（brunhild 是
+AAAA-only 域名，无 A 记录，经 DoH 复核），挑战全程跑完并 PASS，表单提交
+落到 `www.thelancet.com/1.txt` 返回 404。即：**快速、干净的失败被挑战
+容忍**；我们的引擎在同一测试网络（Clash/mihomo fake-IP DNS 对一切域名
+撒谎返回 198.18.x）上走 CONNECT/隧道、完成握手后被边缘掐断，
+1.63s（最长 5.7s，ver35e ops 间隔）才浮出 `TypeError: Failed to fetch`。
+慢速失败-悬挂正是翻转阶段护卫（Qssv3 标记入服务端可见信标）的形态。
+
+**归因**：本仓库 fetch 路径审计无任何连接失败重试循环（两个传输层与
+JS 桥均在首次 send 错误即返回，新增回归测试钉死该不变量）；1.6s 来自
+网络真实路径——直连时 curl 对照同为 1.21s（隧道 RTT + 边缘掐断），代理
+时为 mitmproxy 上游（curl 经代理 1.68s，其中 TLS 相 1.56s）。客户端
+唯一能砍掉的：在拨号之前就知道"该名字对本机不可达"。
+
+**修复（59e83b0 + 后续两个 commit）**：新增
+`obscura-net::resolver` family gate，在两个传输层的 send 位点与传输
+并发地跑（`start_family_gate` 返回 `FamilyGate::Watch`，`select!` 令
+deny 落地即取消在途请求，pass/丢探针则放行；缓存命中同步短路）：
+
+- 系统解析有可拨号 IPv4 → 原样放行（普通网络零额外流量）；
+- 系统答案为 fake-IP 区间（198.18.0.0/15，RFC 2544 基准段，公网 DNS
+  不会用作答案）或为空 → DoH 并发查 A+AAAA（1.1.1.1 与 dns.google
+  两路竞速，预算 1.1s，探针与传输并发故不增加任何延迟）；
+- 仅当 NOERROR 且无 A 记录、有 AAAA 记录、且本机任何接口无全局 IPv6
+  （2000::/3，getifaddrs 判定，ULA/link-local 不算）→ 立即拒绝；
+  NXDOMAIN（VPN split-horizon 域名）、DoH 不可达、有真实 A 一律放行；
+- 判定按 host 缓存 300s；`OBSCURA_FAMILY_GATE=0` 整体关闭；
+  `OBSCURA_DOH_ENDPOINTS` 可换桩。代理路径同样被门控：等待一个只能
+  经由同族死路的 CONNECT 正是要移除的延迟。
+
+**延迟（brunhild 失败浮现）**：修复前直连 ~1.2-1.5s、代理挑战路径
+1.6s（判定实验）至 5.7s（ver35e 间隔）；修复后 CLI 直连 0.19-0.33s
+墙钟（含 ~0.2s 进程启动，网络相 50-150ms），代理 8/8 次拒绝、247-479ms
+墙钟；注入轮 ver37d 引擎日志明证：`stealth_fetch failed: GET
+https://brunhild... after 770.9ms: DNS: 'brunhild...' has no A record
+(IPv6-only name) and this host has no global IPv6 route`（负载拥塞下
+探针落地即取消，771ms，仍远快于旧路径）。中间态（门控先于拨号、
+700ms 预算）在挑战负载下 3 轮中 2 轮探针超时退回旧路径（ver37 判定
+失败），故改为并发竞速形态。
+
+**信标标记（注入轮解密，key 0954fd238920cb4e832366d227b62cf3）**：
+ver35e/ver37/ver37d 的 TS#2 payload 均 ODxGu4=1、Qssv3=20；
+ZMSOw0/uGyjw9/tQdUc5/NnqX6 各 1。通过参考轮（0916）payload 为
+ODxGu4=1、Qssv3=2。即 Qssv3 计数与 brunhild 延迟无关（771ms 快速
+拒绝后仍为 20），属 console 指纹面（`%c%d font-size:0;color:transparent`
+样式探针，我们 20 计 vs Chrome 2 计）——另一批次的工作，网络面已尽。
+
+**判定（诚实汇报）**：final35/36/37 三轮（注入关，click-after 16）均
+FAIL：mitmproxy 线上 `GET www.thelancet.com/1.txt -> 403`（仍是挑战页，
+非 404 放行），随后新 ray orchestrate 重启。关闭结构（/1.txt 重载）
+已能触达、brunhild 失败已快速干净，但边缘裁决仍依据其余遥测拒绝。
+下一步方向：console 指纹面（Qssv3 20 vs 2）。
+
+**测试**：obscura-net 116/116（新增：close-after-ClientHello 两个快失败
+回归 + family 判定/DoH JSON 解析/fake-IP 段单测 + 桩 DoH 端点端到端）；
+obscura-js 671/671；全仓 1902/1902。obstacle course 33/33 门：本机未找到
+obscura-benchmark 伴随仓库（常见位置均无 `obstacle-course/`），网络面
+行为由上述注入/判定轮直接覆盖，伴随仓库就位后补跑。22:4x。
