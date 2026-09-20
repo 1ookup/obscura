@@ -12524,3 +12524,19 @@ b33-obscura-before-clean.json,b33-obscura-after-clean.json,ver42/*,final41*/}。
 恢复后优先；fold 仍全 Error 是 72 条缺席同根）；② for-in 原型链 394 vs 347 的
 原型面枚举总数差；③ CSS 属性表 746 vs 739 粒度对齐；④ 判决间歇性复现条件
 （POST 404 仅出现在注入诊断轮之后的判决轮，相关性与因果待查）。
+
+### Step 333：里程碑——final41 首次通过（POST /1.txt → 404），通过率 1/6（2026-09-21 06:4x）
+
+**批次 33**（787c04e/383a6b6）：DOM 包装器内部槽不可枚举化（435 个写点、59 个文件
+→ `_hset`），JSON.stringify(元素) 与 Chrome 逐字节一致（挑战 fold 形态
+`{"id":"mfiL4"}` 命中）；Event/NodeList/location 形状审计（MessageEvent 5 字段、
+CustomEvent.detail、ancestorOrigins 等）。
+
+**final41（注入关，16s 点击）：`POST www.thelancet.com/1.txt → 404` + favicon 200——
+33 个批次以来首次通过**（mitmproxy 全历史唯一一条 POST 404，证据确凿）。
+后续 b/c/final42/final43 均 403 → **当前通过率 1/6，间歇性**。
+
+**稳定性路径（下一批）**：ver42 的 SbVZ3 仍 14 vs 参考 91——72 条逐方法块、
+rFmgn2/lzDF4/TBNgK7 三元组、fold 第三参 NaN×3+Error×4（我们全 Error）仍未翻转；
+静态解码指向 worker-return 分类族（subs 88407/88553/88635，解码宿主 192.168.3.206
+当时宕机）。判据已达成，稳定性收敛以此为最优先。
