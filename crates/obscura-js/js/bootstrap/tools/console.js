@@ -77,6 +77,15 @@ const _consoleFn = (level, args) => {
       // the same oracle.
       return _errorDescription(a);
     }
+    if (typeof a === "function") {
+      // Chrome's consoleAPICalled description for a function comes from V8's
+      // internal %FunctionToString, which bypasses an own "toString" override
+      // (oracle: a function with a poisoned own toString renders its real
+      // source, not the override's return). String(a) would dispatch to the
+      // override and leak the poison into the op rows.
+      try { return Function.prototype.toString.call(a); } catch (_e) {}
+      return String(a);
+    }
     if (typeof a === "object") {
       // Chrome formats a RegExp as its source, not the brand.
       if (Object.prototype.toString.call(a) === '[object RegExp]') {
