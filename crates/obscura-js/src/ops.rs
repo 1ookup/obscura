@@ -3836,6 +3836,18 @@ async fn op_fetch_url_inner(
         }
     }
 
+    // Family gate: an IPv6-only name on a machine without global IPv6 must
+    // reject the fetch at the resolution stage (Chrome semantics), before
+    // the transport dials anything. Runs for both the stealth and reqwest
+    // transports; redirects re-run it per hop below. Cached per host.
+    if let Ok(parsed) = url::Url::parse(&url) {
+        if let Some(host) = parsed.host_str() {
+            obscura_net::ensure_host_reachable(host)
+                .await
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        }
+    }
+
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
@@ -4041,6 +4053,14 @@ async fn op_fetch_url_inner(
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
             .to_string());
+        }
+        // Family gate on the redirect target too: a hop to an IPv6-only
+        // name fails here rather than as a transport error (cached per
+        // host; see obscura-net::resolver).
+        if let Some(host) = next_url.host_str() {
+            if let Err(error) = obscura_net::ensure_host_reachable(host).await {
+                return Err(deno_error::JsErrorBox::generic(error.to_string()));
+            }
         }
         if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
             return Ok(serde_json::json!({

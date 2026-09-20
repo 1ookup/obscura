@@ -20,6 +20,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# getifaddrs for the family gate's global-IPv6 check (already in the tree as
+# a transitive dependency of the HTTP stacks; this only names it).
+libc = "0.2"
 async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"

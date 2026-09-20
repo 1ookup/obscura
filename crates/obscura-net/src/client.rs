@@ -1848,6 +1848,14 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..max_redirects {
             validate_request_mode(&request, &current_url)?;
+            // Family gate: an IPv6-only name on a machine without global
+            // IPv6 must fail here, at the name-resolution stage Chrome uses,
+            // instead of as a slow transport death later (also covers the
+            // proxied shape, where only the CONNECT would otherwise observe
+            // the unreachable family). Cached per host; see resolver.rs.
+            if let Some(host) = current_url.host_str() {
+                crate::resolver::ensure_host_reachable(host).await?;
+            }
             let mut callback_headers = self.extra_headers.read().await.clone();
             callback_headers.extend(request.headers.clone());
             let request_info = RequestInfo {

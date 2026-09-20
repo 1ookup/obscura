@@ -419,6 +419,13 @@ impl StealthHttpClient {
 
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
+            // Family gate: fail an IPv6-only name on a machine without
+            // global IPv6 at the resolution stage, before the CONNECT, so a
+            // proxy's slow upstream death never replaces Chrome's instant
+            // name-resolution error. Cached per host; see resolver.rs.
+            if let Some(host) = current_url.host_str() {
+                crate::resolver::ensure_host_reachable(host).await?;
+            }
             // The emulation profile carries Chrome's own default headers.
             // RequestBuilder::header appends, so leaving those defaults on
             // would serialize duplicate sec-ch-ua fields. Keep emulation's
@@ -714,6 +721,11 @@ impl StealthHttpClient {
         let req_method = method
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
+        // Family gate for scripted fetch()/XHR: same resolution-stage
+        // rejection the navigation path applies (see fetch_with_profile).
+        if let Some(host) = url.host_str() {
+            crate::resolver::ensure_host_reachable(host).await?;
+        }
         // See fetch_with_profile: emulation defaults are transport metadata,
         // not a second source of request headers.
         let mut req = self
@@ -932,7 +944,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::ReferrerPolicy;
+    use super::{ReferrerPolicy, STEALTH_USER_AGENT};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
 
@@ -1273,5 +1285,87 @@ mod tests {
         let request = request.await.unwrap().to_ascii_lowercase();
         assert!(request.contains("\r\nsec-fetch-dest: iframe\r\n"), "{request}");
         assert!(!request.contains("\r\nsec-fetch-user:"), "{request}");
+    }
+
+    /// Chrome never retries a fetch() whose connection dies; the error must
+    /// surface on the first failure. A peer that accepts the TCP connection,
+    /// reads the ClientHello, and closes must therefore produce a network
+    /// error in round-trip time, not after a retry or timeout cycle. This is
+    /// the invariant the managed-challenge stage guard cares about: a fast
+    /// clean failure reads as a normal offline network, a slow one does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stealth_fetch_rejects_quickly_when_connection_closes_after_client_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // Accept, drain whatever the client sends, close.
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    drop(stream);
+                });
+            }
+        });
+
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("https://{address}/")).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = client.fetch(&url).await;
+        let elapsed = started.elapsed();
+        let error = result.expect_err("a closed connection must fail the fetch");
+        assert!(
+            error.to_string().contains("https://"),
+            "error must name the request: {error}",
+        );
+        // Generous CI-safe bound for the "no retry, no hang" property; the
+        // observed failure mode is single-digit milliseconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "connection death must reject in round-trip time, took {elapsed:?}"
+        );
+    }
+
+    /// Same invariant for the scripted fetch()/XHR path (`send_single`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stealth_send_single_rejects_quickly_when_connection_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    drop(stream);
+                });
+            }
+        });
+
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("https://{address}/beacon")).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = client
+            .send_single("GET", &url, &HashMap::new(), "", false, false)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "a closed connection must fail the fetch");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "connection death must reject in round-trip time, took {elapsed:?}"
+        );
     }
 }
