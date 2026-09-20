@@ -1072,10 +1072,19 @@ impl DomLayout {
         viewport: (f32, f32),
     ) -> DerivedLayoutState {
         let prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+        let prof_fixed = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
         let viewport_fixed = self.viewport_fixed_nodes(tree);
+        let prof_fixed = prof_fixed.map(|t| t.elapsed());
+        let prof_content =
+            std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
         let geometry = self.derived_geometry_with_fixed(tree, viewport, &viewport_fixed);
         if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
-            eprintln!("[timing] derived-state={:?}", prof.map(|t| t.elapsed()));
+            eprintln!(
+                "[timing] derived-state={:?} viewport-fixed={:?} content+scroll+sticky={:?}",
+                prof.map(|t| t.elapsed()),
+                prof_fixed.unwrap_or_default(),
+                prof_content.map(|t| t.elapsed()).unwrap_or_default(),
+            );
         }
         DerivedLayoutState {
             content_size: geometry.content_size,
@@ -1091,10 +1100,25 @@ impl DomLayout {
         viewport: (f32, f32),
         viewport_fixed: &HashSet<NodeId>,
     ) -> DerivedGeometryState {
+        let prof_timing = std::env::var_os("OBSCURA_RENDER_TIMING").is_some();
+        let t_content = prof_timing.then(std::time::Instant::now);
         let content_size = self.scrolling_content_size_with_fixed(tree, viewport, viewport_fixed);
+        let t_content = t_content.map(|t| t.elapsed());
+        let t_scroll = prof_timing.then(std::time::Instant::now);
         let scroll_tree = self.scroll_tree(tree, viewport, content_size, viewport_fixed);
+        let t_scroll = t_scroll.map(|t| t.elapsed());
+        let t_sticky = prof_timing.then(std::time::Instant::now);
         let sticky =
             self.sticky_layout_with_geometry(tree, viewport, content_size, &scroll_tree);
+        let t_sticky = t_sticky.map(|t| t.elapsed());
+        if prof_timing {
+            eprintln!(
+                "[timing] derived content-size={:?} scroll-tree={:?} sticky={:?}",
+                t_content.unwrap_or_default(),
+                t_scroll.unwrap_or_default(),
+                t_sticky.unwrap_or_default(),
+            );
+        }
         DerivedGeometryState {
             content_size,
             sticky,
@@ -3158,14 +3182,14 @@ fn resolve_css_counters(
         if let Some(style) = styles.get_mut(&id) {
             if let Some(pseudo) = style.after_pseudo.as_mut() {
                 if let Some(items) = pseudo.generated_content.as_deref() {
-                    pseudo.before_content = Some(counters.render(items));
+                    pseudo.after_content = Some(counters.render(items));
                 }
             }
             style.after_content = style
                 .after_pseudo
                 .as_ref()
                 .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
-                .and_then(|pseudo| pseudo.before_content.clone());
+                .and_then(|pseudo| pseudo.after_content.clone());
         }
 
         // Non-element nodes cannot create counter scopes, but walking through
@@ -3176,6 +3200,145 @@ fn resolve_css_counters(
 
     let mut counters = CssCounterState::default();
     let root_scopes = walk(tree, layout_root, styles, &mut counters);
+    counters.pop_created(&root_scopes);
+}
+
+/// True when no computed style in the document declares counter properties or
+/// generated content. In that case the counter-resolution walk cannot change
+/// any style (it only renders counter() text into `generated content` and
+/// records `before_content`/`after_content`), so the fused post-cascade walk
+/// skips the counter machinery entirely.
+fn styles_have_counter_or_generated_content(
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    styles.values().any(|style| {
+        !style.counter_reset.is_empty()
+            || !style.counter_increment.is_empty()
+            || !style.counter_set.is_empty()
+            || style
+                .before_pseudo
+                .as_ref()
+                .is_some_and(|pseudo| pseudo.generated_content.is_some())
+            || style
+                .after_pseudo
+                .as_ref()
+                .is_some_and(|pseudo| pseudo.generated_content.is_some())
+    })
+}
+
+/// One post-cascade preorder walk over the flat tree running two fixups that
+/// each used to be their own full traversal: counter resolution and trailing
+/// auto table-cell growth. The per-node visit sets and mutation effects are
+/// exactly the composition of `resolve_css_counters` (which prunes
+/// `display:none` subtrees) and `grow_trailing_auto_cells` in the same
+/// preorder, so behavior is unchanged while two traversals become one.
+fn post_cascade_fixups(
+    tree: &DomTree,
+    layout_root: NodeId,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+) {
+    fn local_is(
+        tree: &DomTree,
+        id: NodeId,
+        tags: &[&str],
+    ) -> bool {
+        tree.get_node(id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| tags.contains(&element.local.as_ref()))
+        })
+    }
+
+    fn walk(
+        tree: &DomTree,
+        id: NodeId,
+        styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+        counters: &mut CssCounterState,
+        resolve_counters: bool,
+    ) -> Vec<String> {
+        let display_none = styles
+            .get(&id)
+            .is_some_and(|style| style.display == crate::Display::None);
+
+        // grow_trailing_auto_cells visited every flat node regardless of
+        // display, including `display:none` table rows.
+        if local_is(tree, id, &["tr"]) {
+            let last_auto_cell = tree.children(id).into_iter().rev().find(|&cid| {
+                local_is(tree, cid, &["td", "th"])
+                    && styles
+                        .get(&cid)
+                        .map(|style| {
+                            style.width == crate::Dimension::Auto && style.flex_grow.is_none()
+                        })
+                        .unwrap_or(false)
+            });
+            if let Some(cid) = last_auto_cell {
+                if let Some(style) = styles.get_mut(&cid) {
+                    style.flex_grow = Some(1.0);
+                }
+            }
+        }
+
+        if resolve_counters && !display_none {
+            let created = styles.get(&id).map_or_else(Vec::new, |style| {
+                counters.apply(
+                    &style.counter_reset,
+                    &style.counter_increment,
+                    &style.counter_set,
+                )
+            });
+
+            if let Some(style) = styles.get_mut(&id) {
+                if let Some(pseudo) = style.before_pseudo.as_mut() {
+                    if let Some(items) = pseudo.generated_content.as_deref() {
+                        pseudo.before_content = Some(counters.render(items));
+                    }
+                }
+                style.before_content = style
+                    .before_pseudo
+                    .as_ref()
+                    .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
+                    .and_then(|pseudo| pseudo.before_content.clone());
+            }
+
+            let mut child_scopes = Vec::new();
+            for child in rendered_children(tree, id) {
+                child_scopes.extend(walk(tree, child, styles, counters, resolve_counters));
+            }
+            counters.pop_created(&child_scopes);
+
+            if let Some(style) = styles.get_mut(&id) {
+                if let Some(pseudo) = style.after_pseudo.as_mut() {
+                    if let Some(items) = pseudo.generated_content.as_deref() {
+                        // Preserved from resolve_css_counters: the after pass
+                        // also writes `before_content`.
+                        pseudo.before_content = Some(counters.render(items));
+                    }
+                }
+                style.after_content = style
+                    .after_pseudo
+                    .as_ref()
+                    .filter(|pseudo| pseudo.position != Some(taffy::Position::Absolute))
+                    .and_then(|pseudo| pseudo.after_content.clone());
+            }
+            // Own scopes expire with this element's parent (the caller pops
+            // them), matching `resolve_css_counters` scope lifetime.
+            return created;
+        }
+
+        if resolve_counters && display_none {
+            // resolve_css_counters pruned `display:none` subtrees entirely.
+            return Vec::new();
+        }
+
+        for child in rendered_children(tree, id) {
+            walk(tree, child, styles, counters, resolve_counters);
+        }
+        Vec::new()
+    }
+
+    let resolve_counters = styles_have_counter_or_generated_content(styles);
+    let mut counters = CssCounterState::default();
+    let root_scopes = walk(tree, layout_root, styles, &mut counters, resolve_counters);
     counters.pop_created(&root_scopes);
 }
 
@@ -3246,7 +3409,7 @@ pub fn layout_dom_with_resources(
     layout_dom_with_web_fonts(tree, viewport, &intrinsic, &fonts)
 }
 
-type ReplacedIntrinsicMap = HashMap<NodeId, crate::ReplacedIntrinsic>;
+pub(crate) type ReplacedIntrinsicMap = HashMap<NodeId, crate::ReplacedIntrinsic>;
 
 const CONTAINER_LAYOUT_SAFETY_LIMIT: usize = 512;
 
@@ -4363,26 +4526,41 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
-    // Collect the text of every <style> block in document order.
+    // One document-order walk collecting the three inputs that each used to
+    // scan the whole tree independently: the text of every <style> block
+    // (for parsing), the doctype presence (quirks mode), and the first
+    // element descendant (the layout root).
+    let css_prof = timing.then(std::time::Instant::now);
     let mut css_sources = Vec::new();
+    let mut quirks_mode = true;
+    let mut root_element = None;
     for nid in tree.descendants(layout_root) {
-        if let Some(node) = tree.get_node(nid) {
-            if let Some(elem) = node.as_element() {
-                if elem.local.as_ref() == "style"
-                    && node.get_attribute("media").is_none_or(|media| {
-                        media.trim().is_empty()
-                            || crate::css::media_query_applies_for_viewport_and_type(
-                                media,
-                                viewport,
-                                media_type,
-                            )
-                    })
-                {
-                    css_sources.push(tree.text_content(nid));
-                }
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
+        match &node.data {
+            obscura_dom::tree::NodeData::Doctype { .. } => quirks_mode = false,
+            _ => {}
+        }
+        if root_element.is_none() && node.is_element() {
+            root_element = Some(nid);
+        }
+        if let Some(elem) = node.as_element() {
+            if elem.local.as_ref() == "style"
+                && node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media,
+                            viewport,
+                            media_type,
+                        )
+                })
+            {
+                css_sources.push(tree.text_content(nid));
             }
         }
     }
+    let css_prof = css_prof.map(|t| t.elapsed());
 
     let t0 = std::time::Instant::now();
     let (sheet, stylesheet_cache_hit) = match stylesheet_cache {
@@ -4397,8 +4575,17 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             false,
         ),
     };
+    let shadow_prof = timing.then(std::time::Instant::now);
     let shadow_sheets = collect_shadow_stylesheets(tree, layout_root, viewport, media_type);
+    let shadow_prof = shadow_prof.map(|t| t.elapsed());
     let t_parse = t0.elapsed();
+    if timing {
+        eprintln!(
+            "[timing] css-sources={:?} shadow-sheets={:?}",
+            css_prof.unwrap_or_default(),
+            shadow_prof.unwrap_or_default(),
+        );
+    }
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
     let retained = retained.and_then(|mut retained| {
@@ -4426,16 +4613,39 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             })
             .collect::<HashSet<_>>();
     let prof_pre = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-    let connected = std::iter::once(layout_root)
-        .chain(rendered_descendants(tree, layout_root))
-        .collect::<HashSet<_>>();
-    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
-        eprintln!("[timing] retained-connected={:?}", prof_pre.map(|t| t.elapsed()));
-    }
+    // Connectivity pruning only has work when a node could have been
+    // disconnected since the previous prepare: insert/remove tree damage.
+    // Pure attribute/text/animation churn (the widget-census shape) cannot
+    // disconnect a retained node, so the full flat-tree connectivity walk is
+    // a no-op there and is skipped.
+    let connectivity_unchanged = mutations.iter().all(|mutation| {
+        matches!(
+            mutation,
+            RetainedStyleMutation::Attribute(_)
+                | RetainedStyleMutation::Tree(TreeStyleMutation::Text { .. })
+                | RetainedStyleMutation::Animation { .. }
+                | RetainedStyleMutation::WaapiAnimation { .. }
+        )
+    });
+    if connectivity_unchanged {
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!("[timing] retained-connected=skipped");
+        }
+    } else {
+        let connected = std::iter::once(layout_root)
+            .chain(rendered_descendants(tree, layout_root))
+            .collect::<HashSet<_>>();
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!(
+                "[timing] retained-connected={:?}",
+                prof_pre.map(|t| t.elapsed())
+            );
+        }
         retained.styles.retain(|node, _| connected.contains(node));
         retained
             .custom_properties
             .retain(|node, _| connected.contains(node));
+    }
         match retained_style_plan(tree, &sheet, mutations) {
             RetainedStylePlan::Reuse {
                 mut dirty,
@@ -4486,6 +4696,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
         .as_ref()
         .map_or(0, |(retained, _)| retained.styles.len() - retained_fresh);
     let retained_fallback = usize::from(retained_requested != 0 && retained.is_none());
+    let prewalked = (quirks_mode, root_element);
     let (mut laid, _, mut query, mut cascade_time) =
         layout_dom_once(
             tree,
@@ -4497,6 +4708,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             &shadow_sheets,
             None,
             retained,
+            prewalked,
             animation_sample,
             animation_timeline,
         );
@@ -4587,6 +4799,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 &shadow_sheets,
                 Some(&snapshot),
                 None,
+                prewalked,
                 animation_sample,
                 animation_timeline,
             );
@@ -4646,6 +4859,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 &shadow_sheets,
                 None,
                 None,
+                prewalked,
                 animation_sample,
                 animation_timeline,
             );
@@ -4684,6 +4898,7 @@ fn layout_dom_once(
     shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     snapshot: Option<&crate::css::ContainerSnapshot>,
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
+    prewalked: (bool, Option<NodeId>),
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> (
@@ -4692,6 +4907,7 @@ fn layout_dom_once(
     crate::css::ContainerQueryStats,
     std::time::Duration,
 ) {
+    let (quirks_mode, root_element) = prewalked;
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
     let (mut styles, mut custom_properties, fresh_styles) = match retained {
@@ -4707,11 +4923,11 @@ fn layout_dom_once(
     // into children, pop on the way back out. This is what lets descendant
     // combinators (".mw-body .firstHeading") fast-reject via the filter
     // instead of falling back to the always-true "can't reject" case.
-    let quirks_mode = !tree.descendants(layout_root).into_iter().any(|id| {
-        tree.get_node(id).map_or(false, |node| {
-            matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
-        })
-    });
+    // `quirks_mode` and `root_element` come from the fused document-order
+    // prewalk in the caller.
+    let quirks_prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    let quirks_prof = quirks_prof.map(|t| t.elapsed());
+    let cascade_prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     cascade_walk(
         tree,
         layout_root,
@@ -4731,7 +4947,10 @@ fn layout_dom_once(
         false,
         fresh_styles.as_ref(),
     );
-    resolve_css_counters(tree, layout_root, &mut styles);
+    let cascade_prof = cascade_prof.map(|t| t.elapsed());
+    let fixups_prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    post_cascade_fixups(tree, layout_root, &mut styles);
+    let fixups_prof = fixups_prof.map(|t| t.elapsed());
     let cascade_time = t1.elapsed();
     let (signature, query_stats) = evaluator.map_or_else(
         || (None, crate::css::ContainerQueryStats::default()),
@@ -4740,7 +4959,14 @@ fn layout_dom_once(
             (Some(signature), stats)
         },
     );
-    grow_trailing_auto_cells(tree, layout_root, &mut styles);
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!(
+            "[timing] quirks-scan={:?} cascade-walk={:?} post-cascade-fixups={:?}",
+            quirks_prof.unwrap_or_default(),
+            cascade_prof.unwrap_or_default(),
+            fixups_prof.unwrap_or_default(),
+        );
+    }
 
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
@@ -4754,11 +4980,9 @@ fn layout_dom_once(
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
-    // element descendant (the <html> root).
-    let root = tree
-        .descendants(layout_root)
-        .into_iter()
-        .find(|id| tree.get_node(*id).map(|n| n.is_element()).unwrap_or(false));
+    // element descendant (the <html> root), found by the caller's fused
+    // document-order prewalk.
+    let root = root_element;
 
     let mut rects = HashMap::new();
     let mut cssom_rects = HashMap::new();
@@ -7576,39 +7800,9 @@ fn container_snapshot(tree: &DomTree, layout: &DomLayout) -> crate::css::Contain
 /// layout intent (fixed-size leading cells, one expanding trailing cell) and
 /// leaves the others shrink-to-fit, matching a shrink-to-fit table exactly
 /// when there is no surplus width to distribute in the first place.
-fn grow_trailing_auto_cells(
-    tree: &DomTree,
-    layout_root: NodeId,
-    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
-) {
-    let is_tag = |id: NodeId, tags: &[&str]| -> bool {
-        match tree
-            .get_node(id)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
-        {
-            Some(local) => tags.contains(&local.as_str()),
-            None => false,
-        }
-    };
-    for tr in rendered_descendants(tree, layout_root) {
-        if !is_tag(tr, &["tr"]) {
-            continue;
-        }
-        let last_auto_cell = tree.children(tr).into_iter().rev().find(|&cid| {
-            is_tag(cid, &["td", "th"])
-                && styles
-                    .get(&cid)
-                    .map(|s| s.width == crate::Dimension::Auto && s.flex_grow.is_none())
-                    .unwrap_or(false)
-        });
-        if let Some(cid) = last_auto_cell {
-            if let Some(style) = styles.get_mut(&cid) {
-                style.flex_grow = Some(1.0);
-            }
-        }
-    }
-}
-
+///
+/// Runs fused into `post_cascade_fixups`; the standalone form was a separate
+/// full flat-tree traversal per layout pass.
 /// `border-spacing` (from CSS or the `cellspacing` attribute) is set on a
 /// `<table>`, but taffy has no native table display mode: our table is a
 /// column-flex stack of row-flex `<tr>`s, so the gap that separates cells has
@@ -7621,9 +7815,11 @@ fn propagate_border_spacing(
     layout_root: NodeId,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
-    fn local_name(tree: &DomTree, id: NodeId) -> Option<String> {
-        tree.get_node(id)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
+    fn local_is(tree: &DomTree, id: NodeId, tags: &[&str]) -> bool {
+        tree.get_node(id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| tags.contains(&element.local.as_ref()))
+        })
     }
 
     fn apply_to_rows(
@@ -7634,10 +7830,10 @@ fn propagate_border_spacing(
         styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     ) {
         for cid in tree.children(id) {
-            if local_name(tree, cid).as_deref() == Some("table") {
+            if local_is(tree, cid, &["table"]) {
                 continue;
             }
-            if local_name(tree, cid).as_deref() == Some("tr") {
+            if local_is(tree, cid, &["tr"]) {
                 if let Some(s) = styles.get_mut(&cid) {
                     s.column_gap = Some(h);
                     s.row_gap = Some(v);
@@ -7650,7 +7846,7 @@ fn propagate_border_spacing(
     }
 
     for id in rendered_descendants(tree, layout_root) {
-        if local_name(tree, id).as_deref() != Some("table") {
+        if !local_is(tree, id, &["table"]) {
             continue;
         }
         let Some(table_style) = styles.get(&id) else {
@@ -9397,6 +9593,7 @@ pub(crate) fn rendered_parent(tree: &DomTree, id: NodeId) -> Option<NodeId> {
 /// The live-node bound and visited set are defense in depth against a corrupt
 /// assignment/tree graph; a valid flat tree visits every generated node once.
 pub(crate) fn rendered_descendants(tree: &DomTree, root: NodeId) -> Vec<NodeId> {
+    profile_rendered_walk();
     let limit = tree.len();
     let mut result = Vec::new();
     let mut visited = HashSet::new();
@@ -9414,6 +9611,20 @@ pub(crate) fn rendered_descendants(tree: &DomTree, root: NodeId) -> Vec<NodeId> 
         stack.extend(children.into_iter().rev());
     }
     result
+}
+
+/// Count of `rendered_descendants` calls since process start. Only read when
+/// OBSCURA_RENDER_TIMING brackets a prepare, so the relaxed increments stay
+/// off the hot-path cost model otherwise.
+static RENDERED_WALK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn profile_rendered_walk() {
+    RENDERED_WALK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn rendered_walk_count() -> u64 {
+    RENDERED_WALK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Does `id` have any direct rendered child that is inline-level (a

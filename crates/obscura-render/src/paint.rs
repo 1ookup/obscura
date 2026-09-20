@@ -920,6 +920,7 @@ pub struct PreparedRender {
     selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     svg_fonts: Arc<usvg::fontdb::Database>,
     layout: crate::DomLayout,
+    discovery: Option<DiscoveryCensus>,
 }
 
 impl PreparedRender {
@@ -2491,6 +2492,7 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animat
         dynamic_fonts,
         stylesheet_cache,
         None,
+        None,
         media_type,
         animation_sample,
         animation_timeline,
@@ -2647,6 +2649,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         styles: std::mem::take(&mut previous.layout.styles),
         custom_properties: std::mem::take(&mut previous.layout.custom_properties),
     };
+    let previous_census = previous.discovery.take();
     drop(previous);
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
@@ -2657,6 +2660,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         dynamic_fonts,
         stylesheet_cache,
         Some((retained, mutations)),
+        previous_census,
         crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
@@ -2695,6 +2699,38 @@ fn retained_animation_restyle_mutations(
     mutations
 }
 
+/// Resource discovery results retained across prepares. When the queued
+/// mutation list cannot change the image / web-font / SVG-text census, the
+/// next prepare reuses these instead of re-walking the whole document. Font
+/// bytes are shared via `Rc`: re-decoding them per prepare would dominate the
+/// discovery cost the census exists to avoid.
+#[derive(Clone)]
+pub(crate) struct DiscoveryCensus {
+    intrinsic: crate::dom::ReplacedIntrinsicMap,
+    selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    fonts: std::rc::Rc<Vec<crate::inline::WebFont>>,
+    has_svg_text: bool,
+}
+
+/// True when no queued mutation can change the resource census. Tree changes
+/// can add or remove images, style blocks, or SVG text; `Resource` marks new
+/// image/font bytes whose intrinsics or availability may differ; the listed
+/// attributes feed image candidate selection directly. Attribute churn on
+/// other names (style, class, id, aria, ...) and animation restyles leave the
+/// census untouched.
+pub(crate) fn census_preserving(mutations: &[crate::dom::RetainedStyleMutation]) -> bool {
+    mutations.iter().all(|mutation| match mutation {
+        crate::dom::RetainedStyleMutation::Tree(_)
+        | crate::dom::RetainedStyleMutation::Resource => false,
+        crate::dom::RetainedStyleMutation::Attribute(attribute) => !matches!(
+            attribute.name.to_ascii_lowercase().as_str(),
+            "src" | "srcset" | "sizes" | "poster"
+        ),
+        crate::dom::RetainedStyleMutation::Animation { .. }
+        | crate::dom::RetainedStyleMutation::WaapiAnimation { .. } => true,
+    })
+}
+
 fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     tree: &DomTree,
     layout_root: obscura_dom::tree::NodeId,
@@ -2704,12 +2740,14 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    previous_census: Option<DiscoveryCensus>,
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
 ) -> Option<PreparedRender> {
     let prof_prepare =
         std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+    let prof_prepare_walks0 = crate::dom::rendered_walk_count();
     let result = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
         tree,
         layout_root,
@@ -2719,12 +2757,17 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         dynamic_fonts,
         stylesheet_cache,
         retained,
+        previous_census,
         media_type,
         animation_sample,
         animation_timeline,
     );
     if let Some(start) = prof_prepare {
-        eprintln!("[timing] prepare-total={:?}", start.elapsed());
+        eprintln!(
+            "[timing] prepare-total={:?} rendered-walks={}",
+            start.elapsed(),
+            crate::dom::rendered_walk_count().saturating_sub(prof_prepare_walks0),
+        );
     }
     result
 }
@@ -2739,6 +2782,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    previous_census: Option<DiscoveryCensus>,
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
@@ -2747,13 +2791,72 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
     {
         return None;
     }
-    // Fetch <img> bytes up front to learn intrinsic sizes for layout (a
-    // CSS-sized image with no width/height attribute would otherwise be 0x0
-    // and never paint). This seeds the same cache the paint pass reads, so
-    // each URL is still fetched at most once.
+    // Resource discovery (image intrinsics, web fonts, SVG-text presence) is
+    // a full flat-tree walk. When the previous prepare's census is available
+    // and the queued mutations provably cannot change it (no tree damage, no
+    // resource arrival, no image-candidate attribute), reuse it instead of
+    // re-walking the document.
     let prof_pre = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-    let (mut intrinsic, mut selected_images) =
-        collect_image_intrinsics(tree, layout_root, viewport, base_url, resources);
+    let prof_walks0 = crate::dom::rendered_walk_count();
+    let census_reusable = retained
+        .as_ref()
+        .is_some_and(|(_, mutations)| census_preserving(mutations));
+    let mut previous_census = previous_census.filter(|_| census_reusable);
+    let fonts: std::rc::Rc<Vec<crate::inline::WebFont>>;
+    let (mut intrinsic, mut selected_images, has_svg_text) = if let Some(census) =
+        previous_census.take()
+    {
+        let DiscoveryCensus {
+            intrinsic,
+            selected_images,
+            fonts: reused_fonts,
+            has_svg_text,
+        } = census;
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!(
+                "[timing] census-reuse fonts={} intrinsics={} selected={} svg-text={} walks=0",
+                reused_fonts.len(),
+                intrinsic.len(),
+                selected_images.len(),
+                has_svg_text,
+            );
+        }
+        fonts = reused_fonts;
+        (intrinsic, selected_images, has_svg_text)
+    } else {
+        let prof_t = prof_pre.map(|_| std::time::Instant::now());
+        let DiscoveryOutcome {
+            intrinsic,
+            selected,
+            fonts: discovered_fonts,
+            has_svg_text,
+        } = discover_resources(tree, layout_root, viewport, base_url, resources, dynamic_fonts);
+        let prof_t = prof_t.map(|t| t.elapsed());
+        fonts = std::rc::Rc::new(discovered_fonts);
+        if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+            eprintln!(
+                "[timing] discover-walk={:?} fonts={} intrinsics={} selected={} svg-text={} walks={}",
+                prof_t.unwrap_or_default(),
+                fonts.len(),
+                intrinsic.len(),
+                selected.len(),
+                has_svg_text,
+                crate::dom::rendered_walk_count().saturating_sub(prof_walks0),
+            );
+        }
+        (intrinsic, selected, has_svg_text)
+    };
+    // Carry the census forward for the next prepare: the maps cloned here are
+    // the pre-seed discovery state, and content-image seeding/retry re-applies
+    // deterministically on top (its remembered state lives in the resource
+    // cache), so reuse starts from exactly this shape.
+    debug_assert!(previous_census.is_none());
+    previous_census = Some(DiscoveryCensus {
+        intrinsic: intrinsic.clone(),
+        selected_images: selected_images.clone(),
+        fonts: std::rc::Rc::clone(&fonts),
+        has_svg_text,
+    });
     // Preserve the HTML source fallback separately: a remembered CSS content
     // image temporarily overrides it, but a changed/removed/failed content
     // selection must restore the source before the correction layout.
@@ -2772,20 +2875,31 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
         .iter()
         .filter_map(|nid| selected_images.get(nid).cloned().map(|value| (*nid, value)))
         .collect::<HashMap<_, _>>();
+    let prof_t_seed = std::env::var_os("OBSCURA_RENDER_TIMING")
+        .map(|_| std::time::Instant::now());
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, layout_root, base_url, resources, dynamic_fonts);
+    let prof_t_seed = prof_t_seed.map(|t| t.elapsed());
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
-    let svg_fonts = if has_inline_svg_text(tree, layout_root) {
+    let prof_t_svgfonts = std::env::var_os("OBSCURA_RENDER_TIMING")
+        .map(|_| std::time::Instant::now());
+    let svg_fonts = if has_svg_text {
         svg_font_database_with_web_fonts(&fonts)
     } else {
         svg_font_database()
     };
+    let prof_t_svgfonts = prof_t_svgfonts.map(|t| t.elapsed());
     let prof_mid = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     if let (Some(a), Some(b)) = (prof_pre, prof_mid) {
-        eprintln!("[timing] pre-image+fonts={:?}", b.duration_since(a));
+        eprintln!(
+            "[timing] pre-image+fonts={:?} seed={:?} svg-font-db={:?} walks={}",
+            b.duration_since(a),
+            prof_t_seed.unwrap_or_default(),
+            prof_t_svgfonts.unwrap_or_default(),
+            crate::dom::rendered_walk_count().saturating_sub(prof_walks0),
+        );
     }
     let mut laid = match retained {
         Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
@@ -2878,6 +2992,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
         selected_images,
         svg_fonts,
         layout: laid,
+        discovery: previous_census,
     })
 }
 
@@ -3079,6 +3194,7 @@ pub fn prepare_frame_document(
         resources,
         &[],
         stylesheet_cache,
+        None,
         None,
         crate::CssMediaType::Screen,
         animation_sample,
@@ -7335,138 +7451,6 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fetch the Latin/ASCII face from each authored `@font-face` rule and decode
-/// WOFF/WOFF2 into the sfnt bytes consumed by fontdb/cosmic-text. Unicode-range
-/// filtering is load-bearing for performance: generated font packages commonly
-/// emit six or seven script subsets per face, while an English page needs only
-/// the subset containing ASCII.
-fn collect_web_fonts(
-    tree: &DomTree,
-    layout_root: obscura_dom::tree::NodeId,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-    dynamic_fonts: &[DynamicFontFace],
-) -> Vec<crate::inline::WebFont> {
-    let mut seen = std::collections::HashSet::new();
-    let mut fonts = Vec::new();
-    let mut rules = Vec::new();
-
-    for nid in crate::dom::rendered_descendants(tree, layout_root) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "style")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
-            if !font_face_covers_ascii(face) {
-                continue;
-            }
-            let Some(src) = font_face_urls(face).into_iter().next() else {
-                continue;
-            };
-            rules.push((
-                font_resource_key(&src, base_url),
-                src,
-                font_face_family(face),
-                font_face_weight(face),
-                font_face_italic(face),
-            ));
-        }
-    }
-    for face in dynamic_fonts {
-        let descriptor_block = format!(
-            "src:{};font-weight:{};font-style:{};unicode-range:{}",
-            face.source, face.weight, face.style, face.unicode_range
-        );
-        if !font_face_covers_ascii(&descriptor_block) {
-            continue;
-        }
-        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
-            continue;
-        };
-        rules.push((
-            font_resource_key(&src, base_url),
-            src,
-            (!face.family.is_empty()).then(|| face.family.clone()),
-            font_face_weight(&descriptor_block),
-            font_face_italic(&descriptor_block),
-        ));
-    }
-
-    // Critical web fonts are normally preloaded from the document with a URL
-    // already resolved relative to the HTML. Fetch those first, while retaining
-    // the matching @font-face descriptors needed for CSS family/weight lookup.
-    let mut preloads = Vec::new();
-    for nid in crate::dom::rendered_descendants(tree, layout_root) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "link")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let rel = node.get_attribute("rel").unwrap_or("");
-        let as_value = node.get_attribute("as").unwrap_or("");
-        if rel
-            .split_ascii_whitespace()
-            .any(|token| token.eq_ignore_ascii_case("preload"))
-            && as_value.eq_ignore_ascii_case("font")
-        {
-            if let Some(href) = node.get_attribute("href") {
-                preloads.push(href.to_string());
-            }
-        }
-    }
-    for src in preloads.iter().take(16) {
-        let key = font_resource_key(src, base_url);
-        if !cache.font_src_allows(&key) {
-            continue;
-        }
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
-            let metadata = rules.iter().find(|rule| rule.0 == key);
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family: metadata.and_then(|rule| rule.2.clone()),
-                weight: metadata.and_then(|rule| rule.3),
-                italic: metadata.and_then(|rule| rule.4),
-            });
-        }
-    }
-
-    for (key, src, family, weight, italic) in rules {
-        if fonts.len() >= 16 {
-            break;
-        }
-        if !seen.insert(key) {
-            continue;
-        }
-        if !cache.font_src_allows(&font_resource_key(&src, base_url)) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family,
-                weight,
-                italic,
-            });
-        }
-    }
-    fonts
-}
-
 fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
     url::Url::parse(src)
         .ok()
@@ -9423,24 +9407,38 @@ fn paint_positioned_pseudo(
     }
 }
 
-/// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
-/// intrinsic (width, height) so layout can size replaced elements that have no
-/// explicit dimensions. Video posters are image resources too: before a
-/// decoded frame exists, their intrinsic dimensions and pixels are the
-/// replaced content Chromium paints for `<video>`. Keyed by the element's
-/// NodeId.
-fn collect_image_intrinsics(
+/// Discover every resource the layout needs in ONE flat-tree walk, then
+/// process the findings in the same order the three former traversals used:
+/// image bytes first, then dynamic font faces, font preloads, and finally
+/// @font-face rules. Collecting images (with intrinsic bytes), web-font
+/// declarations, font preloads, and inline-SVG-text presence separately cost
+/// four full-document walks per prepare; the per-collection outputs and the
+/// relative fetch order are unchanged.
+///
+/// `discover` collects candidates only; all network/cache fetches happen in
+/// the ordered post-walk phases so request order matches the previous
+/// multi-pass behavior exactly.
+fn discover_resources(
     tree: &DomTree,
     layout_root: obscura_dom::tree::NodeId,
     viewport: (f32, f32),
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> (
-    HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
-    HashMap<obscura_dom::tree::NodeId, SelectedImage>,
-) {
-    let mut out = std::collections::HashMap::new();
-    let mut selected = HashMap::new();
+    dynamic_fonts: &[DynamicFontFace],
+) -> DiscoveryOutcome {
+    struct ImageCandidate {
+        nid: obscura_dom::tree::NodeId,
+        url: String,
+        density: f32,
+        profile: ImageRequestProfile,
+    }
+
+    let mut image_candidates: Vec<ImageCandidate> = Vec::new();
+    let mut font_rules: Vec<(String, String, Option<String>, Option<(u16, u16)>, Option<bool>)> =
+        Vec::new();
+    let mut font_preloads: Vec<String> = Vec::new();
+    let mut has_svg_text = false;
+
     for nid in crate::dom::rendered_descendants(tree, layout_root) {
         let Some(node) = tree.get_node(nid) else {
             continue;
@@ -9448,47 +9446,174 @@ fn collect_image_intrinsics(
         let Some(element) = node.as_element() else {
             continue;
         };
-        let (url, density) = match element.local.as_ref() {
-            "img" => {
-                let Some(candidate) = resolve_img_url(tree, nid, viewport) else {
-                    continue;
+        match element.local.as_ref() {
+            "img" | "video" => {
+                let (url, density) = match element.local.as_ref() {
+                    "img" => {
+                        let Some(candidate) = resolve_img_url(tree, nid, viewport) else {
+                            continue;
+                        };
+                        candidate
+                    }
+                    _ => {
+                        let Some(poster) = node.get_attribute("poster") else {
+                            continue;
+                        };
+                        let poster = poster.trim();
+                        if poster.is_empty() {
+                            continue;
+                        }
+                        (poster.to_string(), 1.0)
+                    }
                 };
-                candidate
+                image_candidates.push(ImageCandidate {
+                    nid,
+                    url,
+                    density,
+                    profile: image_request_profile(tree, nid),
+                });
             }
-            "video" => {
-                let Some(poster) = node.get_attribute("poster") else {
-                    continue;
-                };
-                let poster = poster.trim();
-                if poster.is_empty() {
-                    continue;
+            "style" => {
+                let css = tree.text_content(nid);
+                for face in font_face_blocks(&css) {
+                    if !font_face_covers_ascii(face) {
+                        continue;
+                    }
+                    let Some(src) = font_face_urls(face).into_iter().next() else {
+                        continue;
+                    };
+                    font_rules.push((
+                        font_resource_key(&src, base_url),
+                        src,
+                        font_face_family(face),
+                        font_face_weight(face),
+                        font_face_italic(face),
+                    ));
                 }
-                (poster.to_string(), 1.0)
             }
-            _ => continue,
-        };
-        let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
-        let profile = image_request_profile(tree, nid);
-        selected.insert(
-            nid,
-            SelectedImage {
-                resolved_url: resolved_url.clone(),
-                density,
-                profile,
-            },
-        );
-        let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, profile) else {
-            continue;
-        };
-        if let Some(mut intrinsic) = image_intrinsic_metadata(&bytes) {
-            // A 2x (or w-descriptor) candidate's raw pixels are density times
-            // its CSS size. A ratio is dimensionless and remains unchanged.
-            intrinsic.width = intrinsic.width.map(|width| width / density);
-            intrinsic.height = intrinsic.height.map(|height| height / density);
-            out.insert(nid, intrinsic);
+            "link" => {
+                let rel = node.get_attribute("rel").unwrap_or("");
+                let as_value = node.get_attribute("as").unwrap_or("");
+                if rel
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("preload"))
+                    && as_value.eq_ignore_ascii_case("font")
+                {
+                    if let Some(href) = node.get_attribute("href") {
+                        font_preloads.push(href.to_string());
+                    }
+                }
+            }
+            "text" | "tspan" | "textPath" => has_svg_text = true,
+            _ => {}
         }
     }
-    (out, selected)
+
+    // -- image bytes and intrinsic sizes (former collect_image_intrinsics)
+    let mut intrinsic = std::collections::HashMap::new();
+    let mut selected = HashMap::new();
+    for candidate in image_candidates {
+        let resolved_url = resolve_resource_url(&candidate.url, base_url).unwrap_or(candidate.url);
+        selected.insert(
+            candidate.nid,
+            SelectedImage {
+                resolved_url: resolved_url.clone(),
+                density: candidate.density,
+                profile: candidate.profile,
+            },
+        );
+        let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, candidate.profile)
+        else {
+            continue;
+        };
+        if let Some(mut intrinsic_size) = image_intrinsic_metadata(&bytes) {
+            // A 2x (or w-descriptor) candidate's raw pixels are density times
+            // its CSS size. A ratio is dimensionless and remains unchanged.
+            intrinsic_size.width = intrinsic_size.width.map(|width| width / candidate.density);
+            intrinsic_size.height = intrinsic_size.height.map(|height| height / candidate.density);
+            intrinsic.insert(candidate.nid, intrinsic_size);
+        }
+    }
+
+    // -- web fonts (former collect_web_fonts: dynamic faces, preloads, rules)
+    let mut seen = std::collections::HashSet::new();
+    let mut fonts = Vec::new();
+
+    for face in dynamic_fonts {
+        let descriptor_block = format!(
+            "src:{};font-weight:{};font-style:{};unicode-range:{}",
+            face.source, face.weight, face.style, face.unicode_range
+        );
+        if !font_face_covers_ascii(&descriptor_block) {
+            continue;
+        }
+        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
+            continue;
+        };
+        font_rules.push((
+            font_resource_key(&src, base_url),
+            src,
+            (!face.family.is_empty()).then(|| face.family.clone()),
+            font_face_weight(&descriptor_block),
+            font_face_italic(&descriptor_block),
+        ));
+    }
+
+    // Critical web fonts are normally preloaded from the document with a URL
+    // already resolved relative to the HTML. Fetch those first, while retaining
+    // the matching @font-face descriptors needed for CSS family/weight lookup.
+    for src in font_preloads.iter().take(16) {
+        let key = font_resource_key(src, base_url);
+        if !cache.font_src_allows(&key) {
+            continue;
+        }
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
+            let metadata = font_rules.iter().find(|rule| rule.0 == key);
+            fonts.push(crate::inline::WebFont {
+                data: decoded,
+                family: metadata.and_then(|rule| rule.2.clone()),
+                weight: metadata.and_then(|rule| rule.3),
+                italic: metadata.and_then(|rule| rule.4),
+            });
+        }
+    }
+
+    for (key, src, family, weight, italic) in font_rules {
+        if fonts.len() >= 16 {
+            break;
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        if !cache.font_src_allows(&font_resource_key(&src, base_url)) {
+            continue;
+        }
+        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
+            fonts.push(crate::inline::WebFont {
+                data: decoded,
+                family,
+                weight,
+                italic,
+            });
+        }
+    }
+
+    DiscoveryOutcome {
+        intrinsic,
+        selected,
+        fonts,
+        has_svg_text,
+    }
+}
+
+struct DiscoveryOutcome {
+    intrinsic: std::collections::HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
+    selected: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
+    fonts: Vec<crate::inline::WebFont>,
+    has_svg_text: bool,
 }
 
 /// Add intrinsic metadata for CSS `content:url(...)` images after the first
@@ -10682,17 +10807,6 @@ fn svg_font_database_with_web_fonts(
         database.load_font_data(font.data.clone());
     }
     std::sync::Arc::new(database)
-}
-
-fn has_inline_svg_text(tree: &DomTree, layout_root: obscura_dom::tree::NodeId) -> bool {
-    crate::dom::rendered_descendants(tree, layout_root)
-        .into_iter()
-        .any(|nid| {
-        tree.get_node(nid).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|name| matches!(name.local.as_ref(), "text" | "tspan" | "textPath"))
-        })
-        })
 }
 
 /// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
