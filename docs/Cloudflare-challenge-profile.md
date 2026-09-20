@@ -11606,3 +11606,65 @@ dispatcher installed')` 每个 worker realm 都发一条参考捕获没有的 er
 
 门：obscura-js 669/669（+3 新测试：count 行与复位语义、毒丸身份与 .arguments
 throw、子 realm stack 链）、workspace 1881/1881、精确 release 构建全绿。
+
+### Step 321：brunhild 传输缺口——ClientHello 对齐 Chrome 151 + 路由残差（2026-09-20 08-10）
+
+**第七轮"brunhild 拒绝非浏览器 TLS"结论修正为先测后判**。本步把断点定位、
+字节级差异、可落地修复与不可落地残差一次性钉死。
+
+**① 断点定位（哪里死）**：本机与代理机（Clash Verge/mihomo fake-ip，utun0
+198.18.0.0/15）上 brunhild 一律 TCP 连上、ClientHello 发出后、ServerHello
+之前被切。wreq=Connect SYSCALL(5)；curl(LibreSSL)=SSL_connect SYSCALL；
+Chrome netlog：SOCKET 发出 1942-2038B ClientHello 后 read=0，SSL 握手
+net_error=-100（ERR_CONNECTION_CLOSED）。mihomo API（unix socket）证实出口
+（KR 节点）把 brunhild 解析为真实 CF IPv6 2606:4700::6812:1192，切连接发生
+在该边缘。代理 flow 库：09-18 以来 brunhild **0/84 完成**（含 /i/test 与每轮
+widget fetch）——mitm 的 Python TLS 从未通过 brunhild。
+
+**② "Chrome 能过"是时变路由态**：第七轮晨间直连 Chrome 完整往返；本次复测
+（08:0x-08:3x）Chrome 153 与 Chrome for Testing 151.0.7922.138 直连同样
+ERR_CONNECTION_CLOSED——过期 token、2 分钟内新鲜 token、IPv4/IPv6 fake-ip
+两条路径、三处出口（mihomo KR / DIRECT / ClashX 7890）、两台 Mac 全部被切，
+同时刻 challenges.cloudflare.com 全程正常。结论：brunhild 当前被路由/边缘
+状态性封切，非本引擎单方指纹问题；晨间可过窗口未再出现。
+
+**③ ClientHello 字节级对照**（本地 127.0.0.1:4443 捕获中继，SNI 修正为
+brunhild）vs CfT 151.0.7922.138：ciphers 16 条含 grease、supported_groups
+（grease,X25519MLKEM768,X25519,P-256,P-384）、key_share（grease 1B + MLKEM
+1216B + X25519 32B）、ALPN h2,http/1.1、ECH grease(0xfe0d)、ALPS 新码点
+(17613)、compress_certificate brotli、psk_exchange_modes、扩展乱序——全部
+一致。**差异两条**：
+1. signature_algorithms：Chrome 151 发 11 条
+   `[0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601]`
+   （rsa_pss_pss_* 三条领跑）；wreq Chrome148 档只发后 8 条。
+2. Chrome 151 另发两个空标记扩展 0x12e0(0000) 与 0xCA34(0000；153 同槽位
+   已长成 186B trust-tag 载荷)。
+H2 层三方（151/153/本引擎）逐字节相等：SETTINGS
+65536/0/6291456/262144、连接级 WINDOW_UPDATE 15663105、HEADERS flags=37。
+
+**④ 修复（通用，非主机名特化）**：
+- vendor/btls-sys（crates.io 0.5.6 原样入库，与 cosmic-text/taffy 同模式）
+  + `patches/boringssl-pss-pss.patch`：补 SSL_SIGN_RSA_PSS_PSS_SHA256/384/512
+  定义、kSignatureAlgorithms 表项与解析器名——仅"可宣告"回移植，不触签名
+  路径（引擎不出客户端证书）；build/main.rs 在 boringssl.patch 之后追加应用。
+  根 Cargo.toml [patch.crates-io] 接线，全部构建形态一致生效。
+- wreq_client.rs 构建后覆写 `tls.sigalgs_list` 为实测 Chrome 151 顺序的
+  11 项。原 crate 下该串无法解析、客户端拒绝构建——两半修复不会静默漂移。
+- 复捕获验证：发出侧 signature_algorithms 与 Chrome 151 逐字节一致，
+  其余字段无回归。
+- 残差：0x12e0/0xCA34 空标记扩展——BoringSSL kExtensions 编译期定死、wreq
+  无自定义扩展 API，不可表达，记录在案。
+
+**⑤ final26 判决（注入关，09:24）**：流程完整——orchestrate → TS#1 →
+widget → /pat/ 401 → brunhild /i/（09:24:11，connection closed，代理自身
+Python TLS 被切，与历史 84/84 同因）→ /ci/ 200 → TS#2/TS#3 →
+**www.thelancet.com/1.txt GET 403 + 09:24:26 新 orchestrate 重开 = FAIL**
+（无 404 终点，与 final22-25 同形）。ops.tsv 探针块照发：ODxGu4 x2 +
+Qssv3 x20——brunhild 探针阶段卫兵仍翻转，标记为该失败的下游（第七轮链路
+不变量再次成立）。诚实回答：**/1.txt 未到 404，本轮 fail**；brunhild 5/5
+直连与 5/5 代理复放全部被切（同时刻 Chrome 对照同切），终局验证被路由残差
+阻塞，待晨间式可过窗口或非 fake-ip 网络复测。
+
+门：obscura-net 104/104（stealth）、workspace 1881/1881、
+`cargo check -p obscura-js -p obscura-cli --no-default-features` 过、
+精确 release 构建（v8-source config）全绿、无 cargo fmt。
