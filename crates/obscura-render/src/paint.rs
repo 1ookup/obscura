@@ -2730,10 +2730,38 @@ pub(crate) struct DiscoveryCensus {
 /// attributes feed image candidate selection directly. Attribute churn on
 /// other names (style, class, id, aria, ...) and animation restyles leave the
 /// census untouched.
-pub(crate) fn census_preserving(mutations: &[crate::dom::RetainedStyleMutation]) -> bool {
+pub(crate) fn census_preserving(
+    tree: &DomTree,
+    mutations: &[crate::dom::RetainedStyleMutation],
+) -> bool {
     mutations.iter().all(|mutation| match mutation {
-        crate::dom::RetainedStyleMutation::Tree(_)
-        | crate::dom::RetainedStyleMutation::Resource => false,
+        crate::dom::RetainedStyleMutation::Resource => false,
+        crate::dom::RetainedStyleMutation::Tree(tree_mutation) => match tree_mutation {
+            crate::dom::TreeStyleMutation::Insert { node, .. } => {
+                subtree_census_inert(tree, *node)
+            }
+            // A removed node is already detached at prepare time; its subtree
+            // is still reachable through the stable node id.
+            crate::dom::TreeStyleMutation::Remove { node, .. } => {
+                subtree_census_inert(tree, *node)
+            }
+            // A text content change can only move the SVG-text census flag
+            // when the text lives inside an <svg> subtree.
+            crate::dom::TreeStyleMutation::Text { parent, .. } => match parent {
+                Some(parent) => !tree
+                    .ancestors(*parent)
+                    .into_iter()
+                    .any(|ancestor| {
+                        tree.with_node(ancestor, |node| {
+                            node.as_element().is_some_and(|element| {
+                                element.local.as_ref() == "svg"
+                            })
+                        })
+                        .unwrap_or(false)
+                    }),
+                None => true,
+            },
+        },
         crate::dom::RetainedStyleMutation::Attribute(attribute) => !matches!(
             attribute.name.to_ascii_lowercase().as_str(),
             "src" | "srcset" | "sizes" | "poster"
@@ -2741,6 +2769,38 @@ pub(crate) fn census_preserving(mutations: &[crate::dom::RetainedStyleMutation])
         crate::dom::RetainedStyleMutation::Animation { .. }
         | crate::dom::RetainedStyleMutation::WaapiAnimation { .. } => true,
     })
+}
+
+/// True when the subtree rooted at `root` (itself included) holds nothing the
+/// resource discovery walk could observe: no image candidates, no style
+/// sources, no font preloads, no SVG text elements. Style and link subtrees
+/// are also planner-level full-rebuild damage, but keeping them here makes
+/// the census gate independently sound. The scan is bounded by the subtree
+/// size, which replaces a full document walk only when the churned fragment
+/// is small; huge fragments pay the discovery walk instead.
+fn subtree_census_inert(tree: &DomTree, root: obscura_dom::tree::NodeId) -> bool {
+    const CENSUS_SCAN_BOUND: usize = 4096;
+    let mut scanned = 0usize;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        scanned += 1;
+        if scanned > CENSUS_SCAN_BOUND {
+            return false;
+        }
+        let Some(node_data) = tree.get_node(node) else {
+            continue;
+        };
+        if let Some(element) = node_data.as_element() {
+            match element.local.as_ref() {
+                "img" | "video" | "style" | "link" | "text" | "tspan" | "textPath" => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        stack.extend(tree.children(node));
+    }
+    true
 }
 
 fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
@@ -2812,7 +2872,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal_inner(
     let prof_walks0 = crate::dom::rendered_walk_count();
     let census_reusable = retained
         .as_ref()
-        .is_some_and(|(_, mutations)| census_preserving(mutations));
+        .is_some_and(|(_, mutations)| census_preserving(tree, mutations));
     let mut previous_census = previous_census.filter(|_| census_reusable);
     let fonts: std::rc::Rc<Vec<crate::inline::WebFont>>;
     let (mut intrinsic, mut selected_images, has_svg_text) = if let Some(census) =

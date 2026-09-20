@@ -368,6 +368,10 @@ pub struct DomLayout {
     /// Taffy bookkeeping retained for the next incremental rebuild. Empty on
     /// layouts built by callers that never reuse them (one-shot measures).
     pub(crate) taffy: Option<RetainedTaffy>,
+    /// Whether this layout's taffy tree came from a structural resync (tree
+    /// mutations spliced into the retained tree) rather than a full rebuild.
+    /// Diagnostics and tests only; geometry is identical by construction.
+    pub structural_resync: bool,
 }
 
 /// One connected element attribute mutation eligible for conservative
@@ -606,7 +610,11 @@ pub(crate) struct RetainedTaffy {
     pub(crate) reverse: HashMap<NodeId, taffy::NodeId>,
     pub(crate) words: HashMap<taffy::NodeId, (NodeId, String)>,
     pub(crate) ifc_items: IfcRegistry,
-    pub(crate) text_runs: HashMap<NodeId, Vec<(Rect, String)>>,
+    /// Word leaves per real text node, in taffy child order. Pseudo-content
+    /// leaves are keyed by their host element and deliberately absent: a
+    /// structural resync splices these lists when text content or sibling
+    /// structure changes.
+    pub(crate) text_leaves: HashMap<NodeId, Vec<taffy::NodeId>>,
     /// Per-node text-shaping inputs as of the node's last (re)build.
     pub(crate) text_inputs: HashMap<NodeId, TextShapingInputs>,
     /// Nodes whose final taffy style equals the pure per-node recomputation
@@ -4648,12 +4656,18 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     // disconnected since the previous prepare: insert/remove tree damage.
     // Pure attribute/text/animation churn (the widget-census shape) cannot
     // disconnect a retained node, so the full flat-tree connectivity walk is
-    // a no-op there and is skipped.
+    // a no-op there and is skipped. A detached-subtree insert (old_parent
+    // None) only ADDS connected nodes; the resync's reconciliation prunes
+    // removed subtrees itself.
     let connectivity_unchanged = mutations.iter().all(|mutation| {
         matches!(
             mutation,
             RetainedStyleMutation::Attribute(_)
                 | RetainedStyleMutation::Tree(TreeStyleMutation::Text { .. })
+                | RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                    old_parent: None,
+                    ..
+                })
                 | RetainedStyleMutation::Animation { .. }
                 | RetainedStyleMutation::WaapiAnimation { .. }
         )
@@ -4955,6 +4969,10 @@ impl DeferredEngine {
             .get_or_insert_with(|| crate::inline::TextEngine::new_with_web_fonts(&self.fonts));
     }
 
+    fn is_materialized(&self) -> bool {
+        self.inner.is_some()
+    }
+
     fn into_inner(mut self) -> crate::inline::TextEngine {
         self.inner
             .take()
@@ -5050,12 +5068,13 @@ fn taffy_subtree_has_text(
 }
 
 /// Apply the recascaded styles of `fresh` nodes to the retained taffy state
-/// in place, so taffy's per-node caches confine recomputation to dirty
+/// in place, so taffy's per-node caches confine recomputation to the dirty
 /// subtrees. Returns false when any dirty node is not provably a plain,
 /// self-describing box (its update needs build()'s structural machinery) and
 /// the caller must fall back to a full rebuild.
 ///
 /// Per dirty node, in order:
+/// - in `skip` (nodes the structural resync builds or prunes itself): skip;
 /// - no computed style: skip;
 /// - text-shaping inputs unchanged: the taffy base style decides. Equal
 ///   base is a no-op; a different base on a self-describing box of the same
@@ -5065,13 +5084,30 @@ fn taffy_subtree_has_text(
 /// - a rendered element with no taffy box (anonymous-run member, flattened
 ///   inline chain) always forces a full rebuild, as does a non
 ///   self-describing box or a structural shape change.
+/// Report one structural-resync rejection and return false (the caller falls
+/// back to a full rebuild). Reasons are only printed under
+/// OBSCURA_RENDER_TIMING.
+fn resync_reject(reason: &str, node: NodeId) -> bool {
+    if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
+        eprintln!(
+            "[timing] resync fallback reason={reason} node={}",
+            node.index()
+        );
+    }
+    false
+}
+
 fn try_incremental_style_updates(
     state: &mut RetainedTaffy,
     _tree: &DomTree,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     fresh: &HashSet<NodeId>,
+    skip: &HashSet<NodeId>,
 ) -> bool {
     for &node in fresh {
+        if skip.contains(&node) {
+            continue;
+        }
         let Some(style) = styles.get(&node) else {
             continue;
         };
@@ -5081,7 +5117,7 @@ fn try_incremental_style_updates(
         let was_boxed = state.reverse.contains_key(&node);
         let now_boxed = style.display != crate::Display::None && !style.display_contents;
         if was_boxed != now_boxed {
-            return false;
+            return resync_reject("boxedness-transition", node);
         }
         if !now_boxed {
             continue;
@@ -5095,17 +5131,26 @@ fn try_incremental_style_updates(
         let Some(&taffy_id) = state.reverse.get(&node) else {
             // Renders without a taffy box: anonymous-run membership or a
             // flattened inline chain, which only build() restructures.
-            return false;
+            return resync_reject("unboxed-dirty-node", node);
         };
-        if !state.self_describing.contains(&node) {
-            return false;
-        }
         let new_base = to_taffy_style(style);
         let unchanged_base = state
             .tree
             .style(taffy_id)
             .map(|current| *current == new_base)
             .unwrap_or(true);
+        if !state.self_describing.contains(&node) {
+            // A box that build() or post-compute retuned cannot take
+            // set_style updates. A recascade that produced an identical base
+            // and identical shaping inputs (the common defensive
+            // ancestor-chain case: tree damage puts every ancestor of the
+            // mutation in the dirty set even though none of their geometry
+            // inputs moved) still skips safely.
+            if unchanged_base && !inputs_changed {
+                continue;
+            }
+            return resync_reject("non-self-describing", node);
+        }
         if !inputs_changed {
             if unchanged_base {
                 continue;
@@ -5116,7 +5161,7 @@ fn try_incremental_style_updates(
                 .map(|current| taffy_shape_key(current) == taffy_shape_key(&new_base))
                 .unwrap_or(false);
             if !shape_matches {
-                return false;
+                return resync_reject("shape-change", node);
             }
             // set_style marks the node and its ancestors dirty; taffy's
             // caches then recompute exactly the damaged subtrees.
@@ -5127,7 +5172,7 @@ fn try_incremental_style_updates(
         // carries text shaped at build time.
         let mut budget = fresh.len().saturating_mul(64) + 4096;
         if taffy_subtree_has_text(state, taffy_id, &mut budget) {
-            return false;
+            return resync_reject("text-bearing-inputs-changed", node);
         }
         if unchanged_base {
             state.text_inputs.insert(node, new_inputs);
@@ -5139,7 +5184,7 @@ fn try_incremental_style_updates(
             .map(|current| taffy_shape_key(current) == taffy_shape_key(&new_base))
             .unwrap_or(false);
         if !shape_matches {
-            return false;
+            return resync_reject("shape-change-text", node);
         }
         let _ = state.tree.set_style(taffy_id, new_base);
     }
@@ -5154,6 +5199,564 @@ fn record_text_inputs(state: &mut RetainedTaffy, styles: &HashMap<NodeId, crate:
             state.text_inputs.insert(dom, text_shaping_inputs(style));
         }
     }
+}
+
+/// Collect the per-text-node word-leaf lists from a freshly built taffy tree.
+///
+/// `words` keys leaves by (leaf id -> source DOM id, word). A source that has
+/// its own box (`id_map` hit) is a `::before`/`::after` host, not a text node;
+/// only real text nodes land in the returned map. Walking the taffy tree in
+/// child-list order keeps each list in document order, which is what the
+/// structural resync's expected-child computation replays.
+fn derive_text_leaves(
+    taffy_tree: &TaffyTree<usize>,
+    root: taffy::NodeId,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    words: &HashMap<taffy::NodeId, (NodeId, String)>,
+) -> HashMap<NodeId, Vec<taffy::NodeId>> {
+    let mut text_leaves: HashMap<NodeId, Vec<taffy::NodeId>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(&(source, _)) = words.get(&node) {
+            if !id_map.contains_key(&node) {
+                text_leaves.entry(source).or_default().push(node);
+            }
+        }
+        // Pushing children reversed keeps the pop order equal to the child
+        // list order, so per-source leaf vectors come out in document order.
+        if let Ok(children) = taffy_tree.children(node) {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    text_leaves
+}
+
+/// The taffy child list a full `build_any` walk would produce for `id` under
+/// the current DOM and styles, expressed in retained-state terms.
+///
+/// This mirrors `build_any`'s top-level splicing rules (display:contents and
+/// flattenable-inline wrappers contribute their children's roots, display:none
+/// contributes nothing, text nodes contribute their recorded word leaves) and
+/// deliberately does NOT attempt to model build()'s anonymous-run folding:
+/// any structure the retained state cannot express here simply fails, and the
+/// caller falls back to a full rebuild.
+fn expected_box_roots(
+    state: &mut RetainedTaffy,
+    tree: &DomTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    id: NodeId,
+    engine: &mut crate::inline::TextEngine,
+    text_rebuilds: &mut Vec<NodeId>,
+    budget: &mut usize,
+) -> Option<Vec<taffy::NodeId>> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let is_text = tree
+        .get_node(id)
+        .map(|node| matches!(node.data, obscura_dom::tree::NodeData::Text { .. }))
+        .unwrap_or(false);
+    if is_text {
+        if text_rebuilds.contains(&id) {
+            // Text content changed: re-shape now so the expected list carries
+            // the new word leaves. The caller's set_children swaps out the
+            // old leaves in the same splice.
+            let leaves = crate::dom::build_text_words_for_resync(
+                tree,
+                id,
+                &mut state.tree,
+                styles,
+                &mut state.words,
+                engine,
+                &mut state.ifc_items,
+            );
+            state.text_leaves.insert(id, leaves.clone());
+            text_rebuilds.retain(|pending| *pending != id);
+            return Some(leaves);
+        }
+        return Some(state.text_leaves.get(&id).cloned().unwrap_or_default());
+    }
+    let Some(style) = styles.get(&id) else {
+        return None;
+    };
+    if style.display == crate::Display::None {
+        return Some(Vec::new());
+    }
+    if (style.display_contents && style.display != crate::Display::None)
+        || is_flattenable_inline(tree, id, styles)
+    {
+        let mut roots = Vec::new();
+        for child in rendered_children(tree, id) {
+            roots.extend(expected_box_roots(
+                state, tree, styles, child, engine, text_rebuilds, budget,
+            )?);
+        }
+        return Some(roots);
+    }
+    state.reverse.get(&id).copied().map(|taffy_id| vec![taffy_id])
+}
+
+/// True when the retained state can splice children into `parent`'s taffy box
+/// without ambiguity: the box exists and none of build()'s re-structuring
+/// machinery (shaped whole-IFC leaf, anonymous runs, tables, multicol, floats,
+/// generated content) owns its child list.
+fn resyncable_parent_box(state: &RetainedTaffy, parent: NodeId) -> bool {
+    let Some(&box_id) = state.reverse.get(&parent) else {
+        return false;
+    };
+    if state.ifc_items.whole.contains_key(&parent)
+        || state.ifc_items.runs.contains_key(&parent)
+        || state.ifc_items.float_aware_blocks.contains(&parent)
+        || state.ifc_items.table_cols.contains_key(&box_id)
+        || state
+            .ifc_items
+            .fixed_table_cols
+            .contains_key(&box_id)
+        || state.ifc_items.table_rows.contains_key(&box_id)
+        || state
+            .ifc_items
+            .multicol
+            .iter()
+            .any(|build| build.columns.contains(&box_id) || build.children.contains(&box_id))
+        || state
+            .ifc_items
+            .float_continuations
+            .iter()
+            .any(|entry| {
+                entry.owner == parent || entry.float == box_id || entry.flow == box_id
+            })
+        || state
+            .ifc_items
+            .generated
+            .iter()
+            .any(|generated| generated.host == parent)
+    {
+        return false;
+    }
+    true
+}
+
+/// The nearest ancestor (or `node` itself) that owns the taffy box the
+/// mutation's structural damage lands in. Flattened wrappers
+/// (display:contents, flattenable inlines) have no box of their own; their
+/// children splice into the nearest boxed ancestor's child list, which is
+/// exactly what the expected-child recursion replays.
+fn box_owning_ancestor(
+    state: &RetainedTaffy,
+    tree: &DomTree,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    node: NodeId,
+) -> Option<NodeId> {
+    let mut current = node;
+    let mut budget = tree.len().saturating_add(8);
+    loop {
+        if budget == 0 {
+            return None;
+        }
+        budget -= 1;
+        if state.reverse.contains_key(&current) {
+            return resyncable_parent_box(state, current).then_some(current);
+        }
+        let parent = rendered_parent(tree, current)?;
+        if styles.get(&parent).is_none() {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+/// Structural resync: translate queued tree mutations into taffy tree edits
+/// against the retained state, so insert/remove/move/text churn avoids the
+/// full rebuild. Everything runs against the DOM's post-mutation state, and
+/// each affected parent is reconciled as a whole child list, so mutation
+/// order and intermediate sibling indices never matter.
+///
+/// Returns false when any step cannot be expressed (the caller drops the
+/// retained state and runs the full rebuild). A false return may leave the
+/// state and engine partially mutated; both are discarded wholesale on the
+/// fallback path.
+fn try_incremental_tree_updates(
+    state: &mut RetainedTaffy,
+    tree: &DomTree,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+    mutations: &[crate::dom::RetainedStyleMutation],
+    engine: &mut crate::inline::TextEngine,
+) -> bool {
+    use RetainedStyleMutation::Tree;
+
+    // Inserted detached subtrees need boxes before the affected parents'
+    // expected child lists can be computed. Moved nodes keep their boxes when
+    // they have them; a move out of a display:none (or otherwise unboxed)
+    // context has none and is built like a fresh insert. Every affected
+    // parent resolves to the boxed ancestor whose child list actually
+    // changes.
+    let mut inserted_roots: Vec<NodeId> = Vec::new();
+    let mut removed_roots: Vec<NodeId> = Vec::new();
+    let mut affected_parents: Vec<NodeId> = Vec::new();
+    let mut text_rebuilds: Vec<NodeId> = Vec::new();
+    for mutation in mutations {
+        match mutation {
+            Tree(TreeStyleMutation::Insert {
+                node, new_parent, ..
+            }) => {
+                if !inserted_roots.contains(node) {
+                    inserted_roots.push(*node);
+                }
+                // Every mutation parent is connected, so a missing resyncable
+                // owner (the parent's box is reserved by build()'s structural
+                // machinery, e.g. a shaped whole-IFC leaf) must abort; a
+                // silent skip would engage the resync without doing the work.
+                let Some(owner) = box_owning_ancestor(state, tree, styles, *new_parent) else {
+                    return resync_reject("no-resyncable-parent-box", *new_parent);
+                };
+                if !affected_parents.contains(&owner) {
+                    affected_parents.push(owner);
+                }
+            }
+            Tree(TreeStyleMutation::Remove { node, old_parent }) => {
+                if !removed_roots.contains(node) {
+                    removed_roots.push(*node);
+                }
+                let Some(owner) = box_owning_ancestor(state, tree, styles, *old_parent) else {
+                    return resync_reject("no-resyncable-parent-box", *old_parent);
+                };
+                if !affected_parents.contains(&owner) {
+                    affected_parents.push(owner);
+                }
+            }
+            Tree(TreeStyleMutation::Text { node, parent }) => {
+                if !text_rebuilds.contains(node) {
+                    text_rebuilds.push(*node);
+                }
+                match parent {
+                    Some(parent) => {
+                        let Some(owner) = box_owning_ancestor(state, tree, styles, *parent)
+                        else {
+                            return resync_reject("no-resyncable-parent-box", *parent);
+                        };
+                        if !affected_parents.contains(&owner) {
+                            affected_parents.push(owner);
+                        }
+                    }
+                    // A detached text node has no rendered leaves to rebuild;
+                    // appending it later goes through the insert path.
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    // A text rebuild whose owning box was not resolved above would never be
+    // spliced; without its box in the reconciliation set the stale leaves
+    // would survive. Abort instead.
+    for &text_node in &text_rebuilds {
+        let old_leaves = state
+            .text_leaves
+            .get(&text_node)
+            .cloned()
+            .unwrap_or_default();
+        if old_leaves.is_empty() {
+            continue;
+        }
+        let Some(&leaf) = old_leaves.first() else {
+            continue;
+        };
+        let Some(leaf_box) = state.tree.parent(leaf) else {
+            continue;
+        };
+        let boxed = affected_parents
+            .iter()
+            .any(|parent| state.reverse.get(parent) == Some(&leaf_box));
+        if !boxed {
+            return resync_reject("text-leaves-outside-resyncable-box", text_node);
+        }
+    }
+
+    // Build boxes for every inserted detached subtree. build_any appends the
+    // new nodes and registries exactly as the full build would; the produced
+    // roots attach to their parent in the reconciliation pass below.
+    for &root in &inserted_roots {
+        if state.reverse.contains_key(&root) {
+            // Already has boxes: a retained move or a re-attach of a node the
+            // previous prepare still rendered. Reuse instead of rebuilding.
+            continue;
+        }
+        let root_is_text = tree
+            .get_node(root)
+            .is_some_and(|node| matches!(node.data, obscura_dom::tree::NodeData::Text { .. }));
+        // Text nodes carry no computed style of their own; build_text_words
+        // reads the parent's. Only element roots need a recascaded style.
+        if !root_is_text && styles.get(&root).is_none() {
+            return resync_reject("inserted-root-uncascaded", root);
+        }
+        build_any_for_resync(tree, root, state, styles, engine);
+    }
+
+    // Compute the expected child list for every affected parent. Any failure
+    // (unknown structure, missing box, exhausted budget) aborts the resync.
+    let mut expected: Vec<(taffy::NodeId, Vec<taffy::NodeId>)> = Vec::new();
+    {
+        let mut budget: usize = tree.len().saturating_add(1024);
+        for &parent in &affected_parents {
+            if !resyncable_parent_box(state, parent) {
+                return resync_reject("parent-box-reserved", parent);
+            }
+            let Some(&box_id) = state.reverse.get(&parent) else {
+                return resync_reject("parent-box-missing", parent);
+            };
+            let mut roots = Vec::new();
+            for child in rendered_children(tree, parent) {
+                match expected_box_roots(
+                    state,
+                    tree,
+                    styles,
+                    child,
+                    engine,
+                    &mut text_rebuilds,
+                    &mut budget,
+                ) {
+                    Some(child_roots) => roots.extend(child_roots),
+                    None => return resync_reject("child-structure-inexpressible", parent),
+                }
+            }
+            expected.push((box_id, roots));
+        }
+    }
+
+    // Removed-DOM membership, needed to classify unclaimed boxes below.
+    let mut removed_dom: HashSet<NodeId> = HashSet::new();
+    for &root in &removed_roots {
+        for dom in tree.descendants(root) {
+            removed_dom.insert(dom);
+        }
+        removed_dom.insert(root);
+    }
+    let replaced_leaves: HashSet<taffy::NodeId> = text_rebuilds
+        .iter()
+        .filter_map(|text| state.text_leaves.get(text))
+        .flatten()
+        .copied()
+        .collect();
+
+    // Detached boxes: children each actual list has that no expected list
+    // claims. Every unclaimed box must be provably prunable - it belongs to a
+    // removed DOM subtree or is an old word leaf of a rebuilt text node. Any
+    // other unclaimed box is retained structure the expected-list model
+    // cannot express (an anonymous flex/grid run, an outer inline wrapper);
+    // splicing over it would silently delete real boxes, so fall back.
+    let claimed: HashSet<taffy::NodeId> = expected
+        .iter()
+        .flat_map(|(_, roots)| roots.iter().copied())
+        .collect();
+    let mut detached: Vec<taffy::NodeId> = Vec::new();
+    for (index, &parent) in affected_parents.iter().enumerate() {
+        let Some(&box_id) = state.reverse.get(&parent) else {
+            continue;
+        };
+        let actual = state.tree.children(box_id).unwrap_or_default();
+        for child in actual {
+            if expected[index].1.contains(&child) || claimed.contains(&child) {
+                continue;
+            }
+            let removable = replaced_leaves.contains(&child)
+                || state
+                    .id_map
+                    .get(&child)
+                    .is_some_and(|dom| removed_dom.contains(dom));
+            if !removable {
+                return resync_reject("unclaimed-anonymous-box", parent);
+            }
+            detached.push(child);
+        }
+    }
+
+    // Splice every affected parent to its expected list. set_children detaches
+    // removed leaves, adopts inserted roots, and fixes move order in one call;
+    // it marks the parent dirty so taffy recomputes exactly these subtrees.
+    for (box_id, roots) in &expected {
+        if state.tree.set_children(*box_id, roots).is_err() {
+            let host = state
+                .id_map
+                .get(box_id)
+                .copied()
+                .unwrap_or_else(|| NodeId::new(0));
+            return resync_reject("set-children-failed", host);
+        }
+    }
+
+    // Prune everything the splice orphaned: taffy nodes bottom-up, then the
+    // per-DOM registries over each removed DOM subtree.
+    if !detached.is_empty() {
+        let mut removed_leaf_ids: HashSet<taffy::NodeId> = HashSet::new();
+        let mut removal_order: Vec<taffy::NodeId> = Vec::new();
+        let mut stack = detached.clone();
+        while let Some(node) = stack.pop() {
+            removal_order.push(node);
+            removed_leaf_ids.insert(node);
+            if let Some(&dom) = state.id_map.get(&node) {
+                removed_dom.insert(dom);
+            }
+            if let Ok(children) = state.tree.children(node) {
+                stack.extend(children);
+            }
+        }
+        for node in removal_order.into_iter().rev() {
+            state.id_map.remove(&node);
+            let _ = state.tree.remove(node);
+        }
+        let text_leaves_pruned: Vec<NodeId> = state
+            .text_leaves
+            .keys()
+            .copied()
+            .filter(|text| removed_dom.contains(text))
+            .collect();
+        for text in text_leaves_pruned {
+            state.text_leaves.remove(&text);
+        }
+        state
+            .words
+            .retain(|leaf, (_, _)| !removed_leaf_ids.contains(leaf));
+        state.ifc_items.whole.retain(|dom, _| !removed_dom.contains(dom));
+        state.ifc_items.runs.retain(|dom, _| !removed_dom.contains(dom));
+        state
+            .ifc_items
+            .word_items
+            .retain(|dom, _| !removed_dom.contains(dom));
+        state
+            .ifc_items
+            .flattened_owner_chains
+            .retain(|dom, _| !removed_dom.contains(dom));
+        state
+            .ifc_items
+            .generated
+            .retain(|generated| !removed_dom.contains(&generated.host));
+        state.text_inputs.retain(|dom, _| !removed_dom.contains(dom));
+        state
+            .self_describing
+            .retain(|dom| !removed_dom.contains(dom));
+        styles.retain(|dom, _| !removed_dom.contains(dom));
+        custom_properties.retain(|dom, _| !removed_dom.contains(dom));
+    }
+
+    true
+}
+
+/// Register a freshly built inserted subtree in the retained bookkeeping
+/// (text-shaping inputs and self-describing flags are (re)derived by the
+/// caller's end-of-prepare pass; build_any already maintains id_map, words,
+/// and the IfcRegistry).
+fn build_any_for_resync(
+    tree: &DomTree,
+    id: NodeId,
+    state: &mut RetainedTaffy,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    engine: &mut crate::inline::TextEngine,
+) -> Vec<taffy::NodeId> {
+    let is_text = tree
+        .get_node(id)
+        .map(|node| matches!(node.data, obscura_dom::tree::NodeData::Text { .. }))
+        .unwrap_or(false);
+    if is_text {
+        let leaves = crate::dom::build_text_words_for_resync(
+            tree,
+            id,
+            &mut state.tree,
+            styles,
+            &mut state.words,
+            engine,
+            &mut state.ifc_items,
+        );
+        state.text_leaves.insert(id, leaves.clone());
+        return leaves;
+    }
+    let Some(style) = styles.get(&id) else {
+        return Vec::new();
+    };
+    if style.display == crate::Display::None {
+        return Vec::new();
+    }
+    if (style.display_contents && style.display != crate::Display::None)
+        || is_flattenable_inline(tree, id, styles)
+    {
+        let mut roots = Vec::new();
+        for child in rendered_children(tree, id) {
+            roots.extend(build_any_for_resync(tree, child, state, styles, engine));
+        }
+        return roots;
+    }
+    let roots = build_any(
+        tree,
+        id,
+        &mut state.tree,
+        &mut state.id_map,
+        &mut state.words,
+        engine,
+        &mut state.ifc_items,
+        styles,
+    );
+    // build() fills id_map (and `words` for any word leaves it produced) for
+    // the whole built subtree; mirror the new entries into the resync's
+    // reverse map and per-text-node leaf lists so the expected-child
+    // computation sees the same retained state a full build would.
+    for (&taffy_id, &dom) in state.id_map.iter() {
+        state.reverse.entry(dom).or_insert(taffy_id);
+    }
+    for &root_box in &roots {
+        derive_text_leaves_into(
+            &state.tree,
+            root_box,
+            &state.id_map,
+            &state.words,
+            &mut state.text_leaves,
+        );
+    }
+    roots
+}
+
+/// `derive_text_leaves` for one already-attached subtree, merging into an
+/// existing map. Word leaves keep taffy child order.
+fn derive_text_leaves_into(
+    taffy_tree: &TaffyTree<usize>,
+    root: taffy::NodeId,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    words: &HashMap<taffy::NodeId, (NodeId, String)>,
+    text_leaves: &mut HashMap<NodeId, Vec<taffy::NodeId>>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(&(source, _)) = words.get(&node) {
+            if !id_map.contains_key(&node) {
+                text_leaves.entry(source).or_default().push(node);
+            }
+        }
+        if let Ok(children) = taffy_tree.children(node) {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Rebuild one text node's word leaves into the retained state. Mirrors
+/// `build_text_words` but clears the node's stale registries first so shaped
+/// item lists and word maps never double-register.
+fn build_text_words_for_resync(
+    tree: &DomTree,
+    id: NodeId,
+    taffy_tree: &mut TaffyTree<usize>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
+    ifc_items: &mut IfcRegistry,
+) -> Vec<taffy::NodeId> {
+    // Stale entries from the previous content would double-register item
+    // indices and word rects.
+    ifc_items.word_items.remove(&id);
+    crate::dom::build_text_words(tree, id, taffy_tree, styles, words, engine, ifc_items)
 }
 
 fn layout_dom_once(
@@ -5250,6 +5853,7 @@ fn layout_dom_once(
     let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
+    let mut text_leaves: HashMap<NodeId, Vec<taffy::NodeId>> = HashMap::new();
     // The engine is created at the build site: adopting the retained
     // engine (or taking its warmed shape caches from the pool) must happen
     // AFTER the eligibility decision, which may drop the retained engine
@@ -5274,6 +5878,7 @@ fn layout_dom_once(
     let mut self_describing: HashSet<NodeId> = HashSet::new();
     let mut tree_reusable = false;
     let mut incremental_applied = false;
+    let mut structural_resync = false;
     // Final absolute rects of anonymous inline-run leaves, keyed by the
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
@@ -6763,61 +7368,139 @@ fn layout_dom_once(
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
 
         // Incremental (dirty-subtree) rebuild: when the retained taffy state
-        // is present and every recascaded dirty node is provably a plain,
-        // self-describing box, update styles in place instead of rebuilding
-        // the taffy tree. taffy's per-node caches then recompute exactly the
-        // damaged subtrees. Anything the checks cannot prove falls back to
-        // the full build below.
+        // is present, first update recascaded styles in place, then translate
+        // queued tree mutations into taffy tree edits (structural resync).
+        // taffy's per-node caches then recompute exactly the damaged
+        // subtrees. Anything the checks cannot prove falls back to the full
+        // build below.
         incremental_applied = false;
+        structural_resync = false;
         let mut incremental_root: Option<taffy::NodeId> = None;
         if let (Some(state), Some(fresh)) = (retained_taffy.as_mut(), fresh_styles.as_ref()) {
             // Resource damage (image/font bytes) changes what the shaped
-            // engine items must contain, and tree damage (insert/remove/
-            // text) changes which word leaves exist. Only build() re-shapes
-            // and re-splices; attribute and animation restyles are the
-            // incremental path's whole mandate.
-            let needs_rebuild = mutations.iter().any(|mutation| {
-                matches!(
-                    mutation,
-                    RetainedStyleMutation::Resource | RetainedStyleMutation::Tree(_)
-                )
-            });
-            if !needs_rebuild
-                && state.reverse.contains_key(&root_id)
-                && try_incremental_style_updates(state, tree, &styles, fresh)
-            {
-                if let Some(state) = retained_taffy.take() {
-                    let RetainedTaffy {
-                        tree: retained_tree,
-                        id_map: retained_id_map,
-                        reverse: retained_reverse,
-                        words: retained_words,
-                        ifc_items: retained_ifc,
-                        text_runs: retained_text_runs,
-                        text_inputs: retained_text_inputs,
-                        self_describing: retained_self_describing,
-                        engine: mut retained_engine,
-                    } = state;
-                    taffy_tree = retained_tree;
-                    id_map = retained_id_map;
-                    reverse = retained_reverse;
-                    words = retained_words;
-                    text_inputs = retained_text_inputs;
-                    self_describing = retained_self_describing;
-                    ifc_items = retained_ifc;
-                    text_runs = retained_text_runs;
+            // engine items must contain; resource arrival keeps its full
+            // rebuild. Attribute, animation, and tree damage take the
+            // incremental paths below.
+            let has_resource = mutations
+                .iter()
+                .any(|mutation| matches!(mutation, RetainedStyleMutation::Resource));
+            let has_tree_damage = mutations
+                .iter()
+                .any(|mutation| matches!(mutation, RetainedStyleMutation::Tree(_)));
+            if !has_resource && state.reverse.contains_key(&root_id) {
+                // Nodes the structural resync builds or prunes itself never
+                // take the per-node style-update path: freshly inserted
+                // subtrees have no boxes yet (they would wrongly fail
+                // eligibility), and removed subtrees must not fail for theirs.
+                let mut style_skip: HashSet<NodeId> = HashSet::new();
+                if has_tree_damage {
+                    for mutation in mutations {
+                        let (inserted, removed) = match mutation {
+                            RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                                node, ..
+                            }) => (Some(*node), None),
+                            RetainedStyleMutation::Tree(TreeStyleMutation::Remove {
+                                node, ..
+                            }) => (None, Some(*node)),
+                            _ => (None, None),
+                        };
+                        // A node that already has boxes (a retained move)
+                        // still needs its recascaded style applied in place.
+                        if let Some(root) =
+                            inserted.filter(|root| !state.reverse.contains_key(root))
+                        {
+                            style_skip.insert(root);
+                            for dom in tree.descendants(root) {
+                                style_skip.insert(dom);
+                            }
+                        }
+                        if let Some(root) = removed {
+                            style_skip.insert(root);
+                            for dom in tree.descendants(root) {
+                                style_skip.insert(dom);
+                            }
+                        }
+                    }
+                }
+                let mut style_updates_ok =
+                    try_incremental_style_updates(state, tree, &styles, fresh, &style_skip);
+                let mut resync_ok = style_updates_ok;
+                if style_updates_ok && has_tree_damage {
+                    // The resync shapes new text into the retained engine so
+                    // engine item indices stay valid for every unchanged
+                    // subtree.
                     #[cfg(feature = "paint")]
-                    {
-                        engine.adopt(retained_engine.take().unwrap_or_else(|| {
-                            crate::inline::TextEngine::new_with_web_fonts(fonts)
-                        }));
+                    engine.adopt(state.engine.take().unwrap_or_else(|| {
+                        crate::inline::TextEngine::new_with_web_fonts(fonts)
+                    }));
+                    resync_ok = try_incremental_tree_updates(
+                        state,
+                        tree,
+                        &mut styles,
+                        &mut custom_properties,
+                        mutations,
+                        &mut engine,
+                    );
+                    if !resync_ok {
+                        // Discard the half-mutated engine so its shape caches
+                        // return to the pool before the full rebuild
+                        // materializes a fresh one.
+                        engine = DeferredEngine::new(fonts);
+                        style_updates_ok = false;
                     }
-                    #[cfg(not(feature = "paint"))]
-                    {
-                        let _ = retained_engine;
+                }
+                if resync_ok {
+                    if let Some(state) = retained_taffy.take() {
+                        let RetainedTaffy {
+                            tree: retained_tree,
+                            id_map: retained_id_map,
+                            reverse: retained_reverse,
+                            words: retained_words,
+                            ifc_items: retained_ifc,
+                            text_leaves: retained_text_leaves,
+                            text_inputs: retained_text_inputs,
+                            self_describing: retained_self_describing,
+                            engine: mut retained_engine,
+                        } = state;
+                        taffy_tree = retained_tree;
+                        id_map = retained_id_map;
+                        reverse = retained_reverse;
+                        words = retained_words;
+                        text_inputs = retained_text_inputs;
+                        self_describing = retained_self_describing;
+                        text_leaves = retained_text_leaves;
+                        ifc_items = retained_ifc;
+                        #[cfg(feature = "paint")]
+                        {
+                            // The resync path already adopted the retained
+                            // engine to shape new text; re-adopting here
+                            // would replace it with an empty engine while
+                            // every retained item index points at the old
+                            // one. Only the attr path still needs the
+                            // transfer.
+                            if !engine.is_materialized() {
+                                engine.adopt(retained_engine.take().unwrap_or_else(|| {
+                                    crate::inline::TextEngine::new_with_web_fonts(fonts)
+                                }));
+                            } else {
+                                let _ = retained_engine;
+                            }
+                        }
+                        #[cfg(not(feature = "paint"))]
+                        {
+                            let _ = retained_engine;
+                        }
+                        incremental_root = reverse.get(&root_id).copied();
+                        incremental_applied = incremental_root.is_some();
+                        structural_resync = incremental_applied && has_tree_damage;
                     }
-                    incremental_root = reverse.get(&root_id).copied();
-                    incremental_applied = incremental_root.is_some();
+                } else {
+                    let _ = style_updates_ok;
+                    // Failed eligibility: drop the state NOW so the adopted
+                    // engine's shape caches return to the pool before the full
+                    // build below takes them again; dropping it later would
+                    // leave the build with a cold cache and a full reshape.
+                    drop(retained_taffy.take());
                 }
             } else {
                 // Failed eligibility: drop the state NOW so the adopted
@@ -6839,8 +7522,10 @@ fn layout_dom_once(
         let taffy_root_holder = if incremental_applied {
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                 let (hits, misses) = cosmic_text::shape_run_cache_stats();
+                let kind = if structural_resync { "resync" } else { "incremental" };
                 eprintln!(
-                    "[timing] build-walk=incremental fresh={} shape-hits={} shape-misses={}",
+                    "[timing] build-walk={} fresh={} shape-hits={} shape-misses={}",
+                    kind,
                     fresh_styles.as_ref().map_or(0, |fresh| fresh.len()),
                     hits,
                     misses,
@@ -6871,6 +7556,7 @@ fn layout_dom_once(
                         text_inputs.insert(dom, text_shaping_inputs(style));
                     }
                 }
+                text_leaves = derive_text_leaves(&taffy_tree, taffy_root, &id_map, &words);
                 taffy_root
             })
         };
@@ -7919,7 +8605,7 @@ fn layout_dom_once(
             reverse,
             words,
             ifc_items: ifc_items.clone(),
-            text_runs: text_runs.clone(),
+            text_leaves,
             text_inputs,
             self_describing,
             #[cfg(feature = "paint")]
@@ -7951,6 +8637,7 @@ fn layout_dom_once(
             word_ifc_items: ifc_items.word_items,
             generated_boxes,
             taffy: taffy_state,
+            structural_resync,
         },
         signature,
         query_stats,
@@ -15504,8 +16191,10 @@ fn build_children_with_float_zone(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use obscura_dom::tree::NodeData;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+    use obscura_dom::tree_sink::parse_into_subtree;
 
     fn attach_programmatic_shadow(tree: &DomTree, host: NodeId, source: NodeId) -> NodeId {
         let root = tree
@@ -21339,5 +22028,372 @@ mod tests {
         let width = |id| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
 
         assert!(width("keep") > width("normal"));
+    }
+
+    /// Retained-layout oracle for tree churn: build once, mutate the DOM,
+    /// then compare the structurally-resynced layout against a forced full
+    /// rebuild of the same tree. Every observable surface (computed styles,
+    /// border boxes, word runs, inline fragments) must match exactly.
+    fn run_tree_resync_case(
+        name: &str,
+        html: &str,
+        mutate: impl FnOnce(&DomTree) -> Vec<RetainedStyleMutation>,
+        expect_resync: bool,
+    ) {
+        let tree = parse_html(html);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (640.0, 480.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        let mutations = mutate(&tree);
+        // Mirror the retained-prepare wrapper: the shaped-text engine moves
+        // with the retained taffy state, leaving a placeholder in the dead
+        // layout.
+        let mut retained_taffy = initial.taffy.take();
+        #[cfg(feature = "paint")]
+        if let Some(state) = retained_taffy.as_mut() {
+            state.engine = Some(std::mem::replace(
+                &mut initial.text_engine,
+                crate::inline::TextEngine::placeholder(),
+            ));
+        }
+        let retained = RetainedStyleMaps {
+            taffy: retained_taffy,
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (mut incremental, _telemetry) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (640.0, 480.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &mutations,
+        );
+        let full = layout_dom(&tree, (640.0, 480.0));
+
+        assert_eq!(
+            incremental.structural_resync, expect_resync,
+            "{name}: structural resync engagement"
+        );
+        assert_computed_styles_match(name, &incremental, &full);
+        assert_eq!(incremental.rects, full.rects, "{name}: border boxes");
+        assert_eq!(
+            incremental.inline_fragments, full.inline_fragments,
+            "{name}: inline fragments"
+        );
+        assert_eq!(incremental.text_runs, full.text_runs, "{name}: text runs");
+        assert_eq!(
+            incremental.custom_properties, full.custom_properties,
+            "{name}: custom properties"
+        );
+        // The resynced state must itself be retained in a consistent shape:
+        // a clean read on top (fresh damage, no extra mutation) must keep
+        // reproducing the full rebuild's geometry.
+        if expect_resync {
+            let mut chained_taffy = incremental.taffy.take();
+            #[cfg(feature = "paint")]
+            if let Some(state) = chained_taffy.as_mut() {
+                state.engine = Some(std::mem::replace(
+                    &mut incremental.text_engine,
+                    crate::inline::TextEngine::placeholder(),
+                ));
+            }
+            let retained = RetainedStyleMaps {
+                taffy: chained_taffy,
+                styles: incremental.styles.clone(),
+                custom_properties: incremental.custom_properties.clone(),
+            };
+            let (chained, _) = layout_dom_with_web_fonts_pass_limit(
+                &tree,
+                (640.0, 480.0),
+                &HashMap::new(),
+                &[],
+                None,
+                Some(&mut cache),
+                Some(retained),
+                &[],
+            );
+            assert_eq!(chained.rects, full.rects, "{name}: chained clean read");
+        }
+    }
+
+    fn body_of(tree: &DomTree) -> NodeId {
+        tree.children(tree.children(tree.document())[0])
+            .into_iter()
+            .find(|child| {
+                tree.with_node(*child, |node| {
+                    node.as_element()
+                        .is_some_and(|element| element.local.as_ref() == "body")
+                })
+                .unwrap_or(false)
+            })
+            .expect("body element")
+    }
+
+    /// A detached element subtree with an id, built by parsing into a
+    /// detached holder document node (obscura-render does not depend on
+    /// html5ever, so nodes cannot be hand-constructed here).
+    fn detached_element_with_id(tree: &DomTree, id: &str) -> NodeId {
+        let holder = tree.new_node(NodeData::Document);
+        parse_into_subtree(
+            tree,
+            holder,
+            &format!("<div id=\"{id}\" class=\"item\">{id} text words</div>"),
+        );
+        tree.children(holder)[0]
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_insert_appends_match_forced_full() {
+        run_tree_resync_case(
+            "append element",
+            r#"<html><head><style>
+                html,body{margin:0} .item{width:40px;height:11px}
+            </style></head><body>
+                <div id="a" class="item">alpha beta</div>
+                <div id="b" class="item">gamma delta</div>
+            </body></html>"#,
+            |tree| {
+                let body = body_of(tree);
+                let inserted = detached_element_with_id(tree, "c");
+                tree.append_child(body, inserted);
+                vec![RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                    node: inserted,
+                    old_parent: None,
+                    new_parent: body,
+                })]
+            },
+            true,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_text_mutation_inside_anonymous_wrapper_falls_back() {
+        // A mixed block wraps its run atoms in an anonymous flex wrapper; the
+        // per-word leaves live inside that wrapper, which the retained child
+        // list cannot see through. Text churn there takes the full rebuild
+        // and must still match its geometry exactly.
+        run_tree_resync_case(
+            "text mutation inside anonymous wrapper",
+            r#"<html><head><style>
+                html,body{margin:0}
+            </style></head><body>
+                <div id="host">one two <b style="display:inline-block">x</b></div>
+            </body></html>"#,
+            |tree| {
+                let host = tree.get_element_by_id("host").expect("host");
+                let text_child = tree
+                    .children(host)
+                    .into_iter()
+                    .find(|child| {
+                        tree.with_node(*child, |node| {
+                            matches!(node.data, NodeData::Text { .. })
+                        })
+                        .unwrap_or(false)
+                    })
+                    .expect("text child");
+                // nodeValue-style content change on the existing text node...
+                tree.with_node_mut(text_child, |node| match &mut node.data {
+                    NodeData::Text { contents } => *contents = "NINE eight seven".into(),
+                    _ => {}
+                });
+                // ...plus a textContent-style append of a fresh text node.
+                let appended = tree.new_node(NodeData::Text {
+                    contents: "tail words".into(),
+                });
+                tree.append_child(host, appended);
+                vec![
+                    RetainedStyleMutation::Tree(TreeStyleMutation::Text {
+                        node: text_child,
+                        parent: Some(host),
+                    }),
+                    RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                        node: appended,
+                        old_parent: None,
+                        new_parent: host,
+                    }),
+                ]
+            },
+            false,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_text_change_on_shaped_ifc_falls_back() {
+        // A container whose whole content is one shaped IFC leaf registers
+        // that leaf under the whole-IFC registry; re-shaping its text needs
+        // build()'s engine work, so the mutation takes the full rebuild and
+        // must still match its geometry exactly.
+        run_tree_resync_case(
+            "text change on shaped IFC",
+            r#"<html><head><style>
+                html,body{margin:0}
+            </style></head><body>
+                <div id="host">one two</div>
+            </body></html>"#,
+            |tree| {
+                let host = tree.get_element_by_id("host").expect("host");
+                let text_child = tree.children(host)[0];
+                tree.with_node_mut(text_child, |node| match &mut node.data {
+                    NodeData::Text { contents } => *contents = "NINE eight seven".into(),
+                    _ => {}
+                });
+                vec![RetainedStyleMutation::Tree(TreeStyleMutation::Text {
+                    node: text_child,
+                    parent: Some(host),
+                })]
+            },
+            false,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_remove_matches_forced_full() {
+        run_tree_resync_case(
+            "remove element",
+            r#"<html><head><style>
+                html,body{margin:0} .item{width:40px;height:11px}
+            </style></head><body>
+                <div id="a" class="item">alpha beta</div>
+                <div id="b" class="item">gamma delta</div>
+            </body></html>"#,
+            |tree| {
+                let body = body_of(tree);
+                let removed = tree.get_element_by_id("b").expect("b");
+                tree.remove_child(removed);
+                vec![RetainedStyleMutation::Tree(TreeStyleMutation::Remove {
+                    node: removed,
+                    old_parent: body,
+                })]
+            },
+            true,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_move_matches_forced_full() {
+        run_tree_resync_case(
+            "reorder siblings",
+            r#"<html><head><style>
+                html,body{margin:0} .item{width:40px;height:11px}
+            </style></head><body>
+                <div id="a" class="item">alpha beta</div>
+                <div id="b" class="item">gamma delta</div>
+                <div id="c" class="item">epsilon zeta</div>
+            </body></html>"#,
+            |tree| {
+                let body = body_of(tree);
+                let mover = tree.get_element_by_id("c").expect("c");
+                let reference = tree.get_element_by_id("a").expect("a");
+                tree.insert_before(mover, reference);
+                vec![RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                    node: mover,
+                    old_parent: Some(body),
+                    new_parent: body,
+                })]
+            },
+            true,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_tree_insert_inside_anonymous_run_falls_back() {
+        // A mixed block folds its inline run into ONE anonymous shaped leaf;
+        // the retained child list cannot express a splice there, so the
+        // mutation must take the full rebuild and still match its geometry.
+        run_tree_resync_case(
+            "mixed block anonymous run",
+            r#"<html><head><style>
+                html,body{margin:0}
+            </style></head><body>
+                <div id="row">loose text
+                    <span id="s">inner</span>
+                </div>
+            </body></html>"#,
+            |tree| {
+                let row = tree.get_element_by_id("row").expect("row");
+                let inserted = detached_element_with_id(tree, "x");
+                tree.append_child(row, inserted);
+                vec![RetainedStyleMutation::Tree(TreeStyleMutation::Insert {
+                    node: inserted,
+                    old_parent: None,
+                    new_parent: row,
+                })]
+            },
+            false,
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn retained_attr_churn_text_runs_do_not_duplicate() {
+        // The incremental path re-derives text runs from the taffy walk each
+        // prepare; adopting the previous map would double every word (and
+        // double-blend them at paint time).
+        let tree = parse_html(
+            r#"<html><head><style>html,body{margin:0}</style></head><body>
+                <div id="subject">word one <b style="display:inline-block">two</b> three</div>
+            </body></html>"#,
+        );
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            (640.0, 480.0),
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        assert!(
+            !initial.text_runs.is_empty(),
+            "fixture must produce word runs"
+        );
+        let subject = tree.get_element_by_id("subject").expect("subject");
+        tree.with_node_mut(subject, |node| {
+            node.set_attribute("data-state", "on".into())
+        });
+        let mut retained_taffy = initial.taffy.take();
+        #[cfg(feature = "paint")]
+        if let Some(state) = retained_taffy.as_mut() {
+            state.engine = Some(std::mem::replace(
+                &mut initial.text_engine,
+                crate::inline::TextEngine::placeholder(),
+            ));
+        }
+        let retained = RetainedStyleMaps {
+            taffy: retained_taffy,
+            styles: std::mem::take(&mut initial.styles),
+            custom_properties: std::mem::take(&mut initial.custom_properties),
+        };
+        let (incremental, _) = layout_dom_with_web_fonts_pass_limit(
+            &tree,
+            (640.0, 480.0),
+            &HashMap::new(),
+            &[],
+            None,
+            Some(&mut cache),
+            Some(retained),
+            &[AttributeStyleMutation {
+                node: subject,
+                name: "data-state".into(),
+                old_value: None,
+                new_value: Some("on".into()),
+            }
+            .into()],
+        );
+        let full = layout_dom(&tree, (640.0, 480.0));
+        assert_eq!(incremental.text_runs, full.text_runs);
     }
 }
