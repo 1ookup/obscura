@@ -6363,6 +6363,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn performance_now_throws_illegal_invocation_on_unbranded_receivers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const attempt = (label, call) => {
+                        try {
+                            const value = call();
+                            return [label, "no-throw", typeof value === "number"];
+                        } catch (error) {
+                            return [label, error.constructor.name, error.message];
+                        }
+                    };
+                    const results = [
+                        attempt("bound", () => performance.now()),
+                        attempt("detached", () => { const now = performance.now; return now(); }),
+                        attempt("plainReceiver", () => performance.now.call({})),
+                        attempt("prototypeReceiver", () => {
+                            const standIn = Object.create(Performance.prototype);
+                            return performance.now.call(standIn);
+                        }),
+                        attempt("undefinedReceiver", () => performance.now.call(undefined)),
+                        attempt("singletonReceiver", () => performance.now.call(performance)),
+                    ];
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        Performance.prototype, "now");
+                    return {
+                        results,
+                        descriptor: {
+                            name: descriptor.value.name,
+                            length: descriptor.value.length,
+                            text: Function.prototype.toString.call(descriptor.value),
+                            writable: descriptor.writable,
+                            enumerable: descriptor.enumerable,
+                            configurable: descriptor.configurable,
+                            hasGetter: descriptor.get === undefined,
+                        },
+                        perfInstanceOf: performance instanceof Performance,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "results": [
+                    ["bound", "no-throw", true],
+                    ["detached", "TypeError", "Illegal invocation"],
+                    ["plainReceiver", "TypeError", "Illegal invocation"],
+                    ["prototypeReceiver", "TypeError", "Illegal invocation"],
+                    ["undefinedReceiver", "TypeError", "Illegal invocation"],
+                    ["singletonReceiver", "no-throw", true],
+                ],
+                "descriptor": {
+                    "name": "now",
+                    "length": 0,
+                    "text": "function now() { [native code] }",
+                    "writable": true,
+                    "enumerable": true,
+                    "configurable": true,
+                    "hasGetter": true,
+                },
+                "perfInstanceOf": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn console_methods_context_and_tasks_match_chrome_shape() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt

@@ -19,22 +19,32 @@ globalThis.__obscura_rebasePerformanceOrigin = function(timeOrigin) {
   _perfOriginMono = _monoMs() - (elapsed > 0 ? elapsed : 0);
 };
 
+// Chrome brands performance.now with the receiver's internal slot: bound
+// calls answer the clock, but a detached call (or any receiver without the
+// slot, including an Object.create(Performance.prototype) stand-in) throws
+// "Illegal invocation". The WeakSet survives snapshot restore like the other
+// registry marks, so restored realms stay branded.
+var _performanceBrand = new WeakSet();
+var _performanceNowImpl = (function() {
+  // Monotonically non-decreasing. Equal readings are allowed; avoiding a
+  // synthetic per-call increment keeps tight loops from advancing the clock.
+  var _last = 0;
+  return function() {
+    var mono = _monoMs();
+    if (_perfOriginMono === null) _perfOriginMono = mono;
+    var ms = mono - _perfOriginMono;
+    if (!(ms > 0)) ms = 0;
+    ms = Math.floor(ms / _PERF_CLAMP_MS) * _PERF_CLAMP_MS;
+    if (ms < _last) return _last;
+    _last = ms;
+    return _last;
+  };
+})();
 globalThis.performance = globalThis.performance || {
-  now: (function() {
-    // Monotonically non-decreasing. Equal readings are allowed; avoiding a
-    // synthetic per-call increment keeps tight loops from advancing the clock.
-    var _last = 0;
-    return function() {
-      var mono = _monoMs();
-      if (_perfOriginMono === null) _perfOriginMono = mono;
-      var ms = mono - _perfOriginMono;
-      if (!(ms > 0)) ms = 0;
-      ms = Math.floor(ms / _PERF_CLAMP_MS) * _PERF_CLAMP_MS;
-      if (ms < _last) return _last;
-      _last = ms;
-      return _last;
-    };
-  })(),
+  now: function now() {
+    if (!_performanceBrand.has(this)) throw new TypeError('Illegal invocation');
+    return _performanceNowImpl();
+  },
   // A worker never runs __obscura_init, so this default has to be usable as
   // it stands: an origin of 0 made now() report Unix epoch milliseconds.
   timeOrigin: Date.now(),
@@ -46,3 +56,5 @@ globalThis.performance = globalThis.performance || {
     usedJSHeapSize: 16781520,
   },
 };
+_performanceBrand.add(globalThis.performance);
+_markNative(globalThis.performance.now);
