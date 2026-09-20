@@ -26,7 +26,7 @@ class PerformanceScriptTiming {
 
 class PerformanceLongAnimationFrameTiming {
   constructor(detail) {
-    this._detail = detail;
+    _hset(this, "_detail", detail);
   }
   get name() { return 'long-animation-frame'; }
   get entryType() { return 'long-animation-frame'; }
@@ -51,7 +51,7 @@ class PerformanceLongAnimationFrameTiming {
 
 class VisibilityStateEntry {
   constructor(detail) {
-    this._detail = detail;
+    _hset(this, "_detail", detail);
   }
   get name() { return this._detail.name; }
   get entryType() { return 'visibility-state'; }

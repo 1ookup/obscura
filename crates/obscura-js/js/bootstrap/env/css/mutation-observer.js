@@ -1,21 +1,21 @@
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
-    this._callback = callback;
-    this._targets = [];
-    this._records = [];
+    _hset(this, "_callback", callback);
+    _hset(this, "_targets", []);
+    _hset(this, "_records", []);
   }
   observe(target, options) {
     this._targets.push({ target, options: options || {} });
     globalThis.__mutationObservers.push(this);
   }
   disconnect() {
-    this._targets = [];
+    _hset(this, "_targets", []);
     const idx = globalThis.__mutationObservers.indexOf(this);
     if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
   }
   takeRecords() {
     const r = this._records.slice();
-    this._records = [];
+    _hset(this, "_records", []);
     return r;
   }
   _notify(records) {

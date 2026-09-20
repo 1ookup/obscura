@@ -66,7 +66,7 @@ globalThis.SharedWorker = class SharedWorker {
         "Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
     }
     this.onerror = null;
-    this._listeners = {};
+    _hset(this, "_listeners", {});
     const href = String(url);
     // The second argument is a name shorthand or a SharedWorkerOptions.
     const name = options == null ? ''
@@ -120,11 +120,11 @@ globalThis.SharedWorker = class SharedWorker {
       _sharedWorkerEntries.set(key, entry);
     }
     entry.workers.push(this);
-    this._entry = entry;
+    _hset(this, "_entry", entry);
 
     // Each construction is its own connection, even to a reused worker.
     const connectionId = entry.nextConnection++;
-    this._connectionId = connectionId;
+    _hset(this, "_connectionId", connectionId);
     const channel = new MessageChannel();
     this.port = channel.port1;
     const bridge = channel.port2;

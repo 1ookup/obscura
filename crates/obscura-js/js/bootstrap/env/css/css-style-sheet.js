@@ -2,19 +2,19 @@ class CSSStyleSheet extends StyleSheet {
   constructor(_options) {
     super(_styleSheetConstructionKey);
     this.ownerRule = null;
-    this._disabled = false;
-    this._ownerNode = null;
-    this._sourceNode = null;
-    this._sourceText = "";
-    this._sourceTextRead = null;
-    this._sourceEpochDom = -1;
-    this._sourceEpochNative = null;
-    this._href = null;
-    this._media = null;
-    this._originClean = true;
-    this._rules = [];
-    this._cssRules = new CSSRuleList(this);
-    this._adopters = new Set();
+    _hset(this, "_disabled", false);
+    _hset(this, "_ownerNode", null);
+    _hset(this, "_sourceNode", null);
+    _hset(this, "_sourceText", "");
+    _hset(this, "_sourceTextRead", null);
+    _hset(this, "_sourceEpochDom", -1);
+    _hset(this, "_sourceEpochNative", null);
+    _hset(this, "_href", null);
+    _hset(this, "_media", null);
+    _hset(this, "_originClean", true);
+    _hset(this, "_rules", []);
+    _hset(this, "_cssRules", new CSSRuleList(this));
+    _hset(this, "_adopters", new Set());
   }
   get cssRules() {
     this._assertOriginClean();
@@ -23,23 +23,23 @@ class CSSStyleSheet extends StyleSheet {
   }
   get rules() { return this.cssRules; }
   _bindOwner(ownerNode, sourceNode = ownerNode) {
-    this._ownerNode = ownerNode;
-    this._sourceNode = sourceNode;
-    this._sourceText = null;
-    this._sourceTextRead = null;
+    _hset(this, "_ownerNode", ownerNode);
+    _hset(this, "_sourceNode", sourceNode);
+    _hset(this, "_sourceText", null);
+    _hset(this, "_sourceTextRead", null);
     this._refreshFromOwner();
   }
   _bindLinkedOwner(ownerNode, sourceNode, href, originClean) {
-    this._ownerNode = ownerNode;
-    this._sourceNode = sourceNode;
-    this._sourceText = null;
-    this._sourceTextRead = null;
-    this._href = href || null;
-    this._originClean = originClean !== false;
+    _hset(this, "_ownerNode", ownerNode);
+    _hset(this, "_sourceNode", sourceNode);
+    _hset(this, "_sourceText", null);
+    _hset(this, "_sourceTextRead", null);
+    _hset(this, "_href", href || null);
+    _hset(this, "_originClean", originClean !== false);
     if (this._originClean) this._refreshFromOwner();
     else {
       this._setRules([]);
-      this._sourceText = sourceNode?.textContent || "";
+      _hset(this, "_sourceText", sourceNode?.textContent || "");
     }
   }
   _assertOriginClean() {
@@ -65,9 +65,9 @@ class CSSStyleSheet extends StyleSheet {
       && this._sourceEpochNative === nativeEpoch) {
       return this._sourceTextRead;
     }
-    this._sourceTextRead = this._sourceNode.textContent || "";
-    this._sourceEpochDom = domEpoch;
-    this._sourceEpochNative = nativeEpoch;
+    _hset(this, "_sourceTextRead", this._sourceNode.textContent || "");
+    _hset(this, "_sourceEpochDom", domEpoch);
+    _hset(this, "_sourceEpochNative", nativeEpoch);
     return this._sourceTextRead;
   }
   _refreshFromOwner() {
@@ -86,27 +86,27 @@ class CSSStyleSheet extends StyleSheet {
       const added = _splitTopLevelCssRules(text.slice(this._sourceText.length));
       if (added.valid) {
         for (const rule of added.rules.map(_cssRuleFromText).filter(Boolean)) {
-          rule._parentStyleSheet = this;
+          _hset(rule, "_parentStyleSheet", this);
           this._rules.push(rule);
         }
-        this._sourceText = text;
+        _hset(this, "_sourceText", text);
         return;
       }
     }
     const parsed = _splitTopLevelCssRules(text);
     const rules = parsed.rules.map(_cssRuleFromText).filter(Boolean);
     this._setRules(rules);
-    this._sourceText = text;
+    _hset(this, "_sourceText", text);
   }
   _setRules(rules) {
-    for (const rule of this._rules) rule._parentStyleSheet = null;
+    for (const rule of this._rules) _hset(rule, "_parentStyleSheet", null);
     this._rules.splice(0, this._rules.length, ...rules);
-    for (const rule of this._rules) rule._parentStyleSheet = this;
+    for (const rule of this._rules) _hset(rule, "_parentStyleSheet", this);
   }
   _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
   _ruleChanged() {
     const text = this._serializeText();
-    this._sourceText = text;
+    _hset(this, "_sourceText", text);
     // DOM text is the renderer bridge for this bounded CSSOM implementation:
     // its ordinary style-element mutation path invalidates cascade/layout.
     // Avoiding the observable text rewrite requires a future native effective-
@@ -116,11 +116,11 @@ class CSSStyleSheet extends StyleSheet {
     // `text`; seed the raw cache with that value so the next refresh does not
     // re-serialize the subtree just to discover nothing changed.
     if (this._sourceNode) {
-      this._sourceTextRead = text;
-      this._sourceEpochDom = _domMutationEpoch;
-      this._sourceEpochNative = Deno.core.ops.op_layout_metrics_epoch
+      _hset(this, "_sourceTextRead", text);
+      _hset(this, "_sourceEpochDom", _domMutationEpoch);
+      _hset(this, "_sourceEpochNative", Deno.core.ops.op_layout_metrics_epoch
         ? Deno.core.ops.op_layout_metrics_epoch()
-        : null;
+        : null);
     }
     _syncAdoptedStyleSheet(this);
   }
@@ -136,7 +136,7 @@ class CSSStyleSheet extends StyleSheet {
     }
     const cssRule = _cssRuleFromText(parsed.rules[0]);
     if (!cssRule) throw new DOMException("The rule could not be parsed", "SyntaxError");
-    cssRule._parentStyleSheet = this;
+    _hset(cssRule, "_parentStyleSheet", this);
     this._rules.splice(idx, 0, cssRule);
     this._ruleChanged();
     return idx;
@@ -148,7 +148,7 @@ class CSSStyleSheet extends StyleSheet {
     const idx = Number(index) >>> 0;
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
     const [removed] = this._rules.splice(idx, 1);
-    if (removed) removed._parentStyleSheet = null;
+    if (removed) _hset(removed, "_parentStyleSheet", null);
     this._ruleChanged();
   }
   addRule(selector, style, index) {

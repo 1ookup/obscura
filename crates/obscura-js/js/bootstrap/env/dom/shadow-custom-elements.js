@@ -23,7 +23,7 @@ function _customElementRegistryData(value) {
 }
 function _customElementUpgrade(registry, el, cls) {
   if (el.__customUpgraded) return;
-  el.__customUpgraded = true;
+  _hset(el, "__customUpgraded", true);
   try {
     const constructionEntry = { element: el, constructor: cls, constructed: false };
     _customElementConstructionStack.push(constructionEntry);
@@ -41,7 +41,7 @@ function _customElementUpgrade(registry, el, cls) {
       try { el.connectedCallback(); } catch (_error) {}
     }
   } catch (_error) {
-    el.__customUpgradeFailed = true;
+    _hset(el, "__customUpgradeFailed", true);
   }
 }
 function _customElementUpgradeRoot(registry, root) {

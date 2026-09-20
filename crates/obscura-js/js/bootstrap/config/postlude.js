@@ -1,6 +1,6 @@
 if (typeof URLPattern === 'undefined') {
   globalThis.URLPattern = class URLPattern {
-    constructor(pattern){this._pattern=pattern||{};} test(){return false;} exec(){return null;}
+    constructor(pattern){_hset(this, "_pattern",pattern||{});} test(){return false;} exec(){return null;}
   };
 }
 

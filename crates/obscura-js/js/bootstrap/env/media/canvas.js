@@ -150,13 +150,13 @@ class _Canvas2D {
   constructor(canvas, attrs = undefined) {
     this.canvas = canvas;
     attrs = attrs == null ? {} : Object(attrs);
-    this._colorSpace = _imageDataEnum(attrs.colorSpace, 'srgb',
-      _IMAGE_DATA_COLOR_SPACES, 'colorSpace');
-    this._colorType = attrs.colorType === 'float16' ? 'float16' : 'unorm8';
-    this._alpha = attrs.alpha !== false;
-    this._desynchronized = !!attrs.desynchronized;
-    this._willReadFrequently = !!attrs.willReadFrequently;
-    this._damageQueued = false;
+    _hset(this, "_colorSpace", _imageDataEnum(attrs.colorSpace, 'srgb',
+      _IMAGE_DATA_COLOR_SPACES, 'colorSpace'));
+    _hset(this, "_colorType", attrs.colorType === 'float16' ? 'float16' : 'unorm8');
+    _hset(this, "_alpha", attrs.alpha !== false);
+    _hset(this, "_desynchronized", !!attrs.desynchronized);
+    _hset(this, "_willReadFrequently", !!attrs.willReadFrequently);
+    _hset(this, "_damageQueued", false);
     this._resizeFromCanvas();
   }
   _canvasDimension(name, fallback) {
@@ -175,9 +175,9 @@ class _Canvas2D {
     this.direction = 'inherit';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
-    this._stateStack = [];
-    this._transform = [1, 0, 0, 1, 0, 0];
-    this._path = [];
+    _hset(this, "_stateStack", []);
+    _hset(this, "_transform", [1, 0, 0, 1, 0, 0]);
+    _hset(this, "_path", []);
   }
   _resizeFromCanvas() {
     const requestedWidth = this._canvasDimension('width', 300);
@@ -185,13 +185,13 @@ class _Canvas2D {
     const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
       && requestedHeight <= _MAX_CANVAS_DIMENSION
       && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
-    this._w = valid ? requestedWidth : 0;
-    this._h = valid ? requestedHeight : 0;
-    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
-    this._floatBuf = this._colorType === 'float16'
-      ? new Float32Array(this._buf.length) : null;
-    this._colorBuf = this._colorSpace === 'srgb' && !this._floatBuf
-      ? this._buf : new Uint8ClampedArray(this._buf.length);
+    _hset(this, "_w", valid ? requestedWidth : 0);
+    _hset(this, "_h", valid ? requestedHeight : 0);
+    _hset(this, "_buf", new Uint8ClampedArray(this._w * this._h * 4));
+    _hset(this, "_floatBuf", this._colorType === 'float16'
+      ? new Float32Array(this._buf.length) : null);
+    _hset(this, "_colorBuf", this._colorSpace === 'srgb' && !this._floatBuf
+      ? this._buf : new Uint8ClampedArray(this._buf.length));
     this._resetDrawingState();
     const register = Deno.core.ops.op_canvas_register_surface;
     if (typeof register === 'function' && this.canvas[_nidSym] != null) {
@@ -210,9 +210,9 @@ class _Canvas2D {
   _markPaintDamage() {
     if (this.canvas[_nidSym] == null) return;
     if (this._damageQueued) return;
-    this._damageQueued = true;
+    _hset(this, "_damageQueued", true);
     queueMicrotask(() => {
-      this._damageQueued = false;
+      _hset(this, "_damageQueued", false);
       const damage = Deno.core.ops.op_canvas_paint_damage;
       if (typeof damage === 'function') damage(this.canvas[_nidSym]);
     });
@@ -297,11 +297,11 @@ class _Canvas2D {
     if (!identity || (this.fillStyle && this.fillStyle._stops)) {
       const currentPath = this._path;
       try {
-        this._path = [];
+        _hset(this, "_path", []);
         this.rect(x, y, w, h);
         this.fill();
       } finally {
-        this._path = currentPath;
+        _hset(this, "_path", currentPath);
       }
       return;
     }
@@ -553,7 +553,7 @@ class _Canvas2D {
     }
     this._markPaintDamage();
   }
-  beginPath() { this._path = []; }
+  beginPath() { _hset(this, "_path", []); }
   closePath() { if (this._path) this._path.push({t:'Z'}); }
   moveTo(x, y) {
     if (this._path) {
@@ -839,15 +839,15 @@ class _Canvas2D {
       globalCompositeOperation: this.globalCompositeOperation,
       _transform: this._transform.slice()});
   }
-  restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); this._transform = t; } }
+  restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); _hset(this, "_transform", t); } }
   translate(x, y) { this.transform(1, 0, 0, 1, +x, +y); }
   rotate(angle) {
     const c = Math.cos(+angle), s = Math.sin(+angle);
     this.transform(c, s, -s, c, 0, 0);
   }
   scale(x, y) { this.transform(+x, 0, 0, y === undefined ? +x : +y, 0, 0); }
-  setTransform(a, b, c, d, e, f) { this._transform = [+a, +b, +c, +d, +e || 0, +f || 0]; }
-  resetTransform() { this._transform = [1, 0, 0, 1, 0, 0]; }
+  setTransform(a, b, c, d, e, f) { _hset(this, "_transform", [+a, +b, +c, +d, +e || 0, +f || 0]); }
+  resetTransform() { _hset(this, "_transform", [1, 0, 0, 1, 0, 0]); }
   getTransform() {
     const [a, b, c, d, e, f] = this._transform;
     return {a, b, c, d, e, f, is2D: true, isIdentity: a === 1 && b === 0 && c === 0
@@ -858,11 +858,11 @@ class _Canvas2D {
   }
   transform(a, b, c, d, e, f) {
     const [a0, b0, c0, d0, e0, f0] = this._transform;
-    this._transform = [
+    _hset(this, "_transform", [
       a0 * +a + c0 * +b, b0 * +a + d0 * +b,
       a0 * +c + c0 * +d, b0 * +c + d0 * +d,
       a0 * (+e || 0) + c0 * (+f || 0) + e0,
-      b0 * (+e || 0) + d0 * (+f || 0) + f0];
+      b0 * (+e || 0) + d0 * (+f || 0) + f0]);
   }
   createLinearGradient(x0, y0, x1, y1) {
     return this._makeGradient('linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
@@ -1184,11 +1184,11 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
-  shadow._treeDetachedExact = false;
+  _hset(shadow, "_treeDetachedExact", false);
   shadow[_treeParentSym] = null;
   shadow[_treeParentEpochSym] = _treeMutationEpoch;
-  shadow._treeConnected = this.isConnected;
-  shadow._treeConnectedEpoch = _treeMutationEpoch;
+  _hset(shadow, "_treeConnected", this.isConnected);
+  _hset(shadow, "_treeConnectedEpoch", _treeMutationEpoch);
   _cache.set(rootNid, shadow);
   try {
     const registry = shadow.customElementRegistry;

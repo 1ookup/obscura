@@ -1,5 +1,24 @@
 "use strict";
 
+// Engine-internal wrapper fields are underscore-prefixed own properties. They
+// must be NON-enumerable: JSON.stringify, for-in and Object.keys on a wrapper
+// have to answer Chrome's own-key shape (oracle: a div serializes as `{}` even
+// with id set), and V8's JSON/for-in walk the property table directly, so the
+// reflection-API filters below cannot cover them. Every internal-field write
+// in the bootstrap goes through _hset: the first write defines the slot
+// non-enumerable, later writes take the plain-assignment fast path on the
+// existing slot.
+var _hop = Object.prototype.hasOwnProperty;
+function _hset(o, name, v) {
+  if (_hop.call(o, name)) { o[name] = v; return v; }
+  try {
+    Object.defineProperty(o, name, { value: v, writable: true, enumerable: false, configurable: true });
+  } catch (_e) {
+    try { o[name] = v; } catch (_e2) {}
+  }
+  return v;
+}
+
 // Everything the JavaScript engine put on the global before this file runs.
 // Their prototypes follow ECMAScript rules (members non-enumerable) and must
 // not be touched by the WebIDL enumerability pass at the bottom of this file;
@@ -689,7 +708,21 @@ _markNative(globalThis.dispatchEvent);
     if (typeof name !== 'string' || name.length < 4) { return false; }
     return name.indexOf('obscura') !== -1 || name.indexOf('Obscura') !== -1 || name === 'Deno';
   }
-  function _filter(t, names) {
+  // DOM wrapper implementation slots are all underscore-prefixed. They are
+  // intentionally ordinary JS fields for fast internal access, but Chrome's
+  // WebIDL objects do not expose them through own-property reflection. Since
+  // every internal write goes through _hset the slots are own
+  // NON-enumerable properties, so hide exactly those here: reflection APIs
+  // that include non-enumerables (getOwnPropertyNames, Reflect.ownKeys) must
+  // not list them, while an underscore-prefixed field a PAGE created stays
+  // enumerable and visible, matching Chrome, which has no underscore slots.
+  function _isEngineSlot(t, name) {
+    if (typeof name !== 'string' || name.length === 0 || name.charAt(0) !== '_') { return false; }
+    if (!_isDomWrapper(t)) { return false; }
+    var d = _oGOPD(t, name);
+    return !!d && !d.enumerable;
+  }
+  function _filter(t, names, skipDomSlots) {
     var out = names;
     if (_isGlobal(t)) {
       var set = _set();
@@ -703,24 +736,33 @@ _markNative(globalThis.dispatchEvent);
         });
       }
     }
-    // DOM wrapper implementation slots are all underscore-prefixed. They are
-    // intentionally ordinary JS fields for fast internal access, but Chrome's
-    // WebIDL objects do not expose them through own-property reflection.
-    if (_isDomWrapper(t)) {
-      out = out.filter(function(name) { return typeof name !== 'string' || name.charAt(0) !== '_'; });
+    if (!skipDomSlots) {
+      out = out.filter(function(name) { return !_isEngineSlot(t, name); });
     }
     return out;
   }
   var _oGOPN = Object.getOwnPropertyNames;
   var _oOwnKeys = Reflect.ownKeys;
   var _oKeys = Object.keys;
+  var _oGOPD = Object.getOwnPropertyDescriptor;
   var _oGOPDs = Object.getOwnPropertyDescriptors;
   function define(obj, prop, impl) {
     try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
   define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
   define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
-  define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  // Object.keys only reports enumerable properties, and every engine slot is
+  // non-enumerable now, so the DOM-wrapper filter would only hide fields a
+  // page itself created (Chrome shows those). The global/frame hiding stays.
+  define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t), true); });
+  define(Object, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, name) {
+    if (typeof name === 'string' && name.charAt(0) === '_') {
+      var d0 = _oGOPD(t, name);
+      if (d0 && !d0.enumerable && _isDomWrapper(t)) { return undefined; }
+      return d0;
+    }
+    return _oGOPD(t, name);
+  });
   define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
@@ -739,10 +781,19 @@ _markNative(globalThis.dispatchEvent);
     if (_isDomWrapper(t)) {
       var domKeys = _oGOPN(all);
       for (var j = 0; j < domKeys.length; j++) {
-        if (typeof domKeys[j] === 'string' && domKeys[j].charAt(0) === '_') delete all[domKeys[j]];
+        if (_isEngineSlot(t, domKeys[j])) { delete all[domKeys[j]]; }
       }
     }
     return all;
+  });
+  // Same rule for hasOwnProperty: `'_style' in el` cannot be intercepted (the
+  // operator reads the property table directly), but the method form can, and
+  // Chrome answers false for every underscore name a probe can guess because
+  // it has no such slots at all. Engine internals capture the raw method at
+  // boot (see _hop above) and are unaffected.
+  define(Object.prototype, 'hasOwnProperty', function hasOwnProperty(name) {
+    if (typeof name === 'string' && name.charAt(0) === '_' && _isEngineSlot(this, name)) { return false; }
+    return _hop.call(this, name);
   });
   // Engine globals created after the snapshot-time hide list was captured --
   // the interaction strategy flags, the embedder's input policy, the measure

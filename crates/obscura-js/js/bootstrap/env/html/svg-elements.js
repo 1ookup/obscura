@@ -1,9 +1,9 @@
 // SVG object shapes and the SVGAnimatedString reflection helper used by
 // Element.className/href.
 function SVGAnimatedString(el, attr, fallbackAttr) {
-  this._el = el;
-  this._attr = attr;
-  this._fallback = fallbackAttr || null;
+  _hset(this, "_el", el);
+  _hset(this, "_attr", attr);
+  _hset(this, "_fallback", fallbackAttr || null);
 }
 SVGAnimatedString.prototype._read = function() {
   let value = this._el.getAttribute(this._attr);

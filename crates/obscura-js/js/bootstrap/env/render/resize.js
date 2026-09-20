@@ -222,14 +222,14 @@ globalThis.ResizeObserver = class ResizeObserver {
     if (typeof callback !== "function") {
       throw new TypeError("ResizeObserver callback must be a function");
     }
-    this._callback = callback;
-    this._targets = new Map();
-    this._active = [];
-    this._skipped = false;
+    _hset(this, "_callback", callback);
+    _hset(this, "_targets", new Map());
+    _hset(this, "_active", []);
+    _hset(this, "_skipped", false);
   }
   _gather(measurements, depth) {
-    this._active = [];
-    this._skipped = false;
+    _hset(this, "_active", []);
+    _hset(this, "_skipped", false);
     let shallowest = Infinity;
     for (const [target, observation] of this._targets) {
       let measurement = measurements.get(target);
@@ -247,7 +247,7 @@ globalThis.ResizeObserver = class ResizeObserver {
       // does not require a persistent frame timer; already-reported targets
       // still obey the loop-depth guard.
       if (targetDepth <= depth && last) {
-        this._skipped = true;
+        _hset(this, "_skipped", true);
         continue;
       }
       shallowest = Math.min(shallowest, targetDepth);
@@ -267,7 +267,7 @@ globalThis.ResizeObserver = class ResizeObserver {
       observation.last = size.slice();
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
-    this._active = [];
+    _hset(this, "_active", []);
     try { this._callback(entries, this); } catch (_error) {}
   }
   observe(target, options = {}) {
@@ -291,8 +291,8 @@ globalThis.ResizeObserver = class ResizeObserver {
   }
   disconnect() {
     this._targets.clear();
-    this._active = [];
-    this._skipped = false;
+    _hset(this, "_active", []);
+    _hset(this, "_skipped", false);
     _unregisterResizeObserver(this);
   }
 };

@@ -15,10 +15,10 @@
   }
   function fire(signal, reason) {
     if (signal._aborted) return;
-    signal._aborted = true;
-    signal._reason = reason !== undefined
+    _hset(signal, "_aborted", true);
+    _hset(signal, "_reason", reason !== undefined
       ? reason
-      : new DOMException("This operation was aborted", "AbortError");
+      : new DOMException("This operation was aborted", "AbortError"));
     const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
     try { if (evt instanceof Event) _eventSetEndpoints(evt, signal, signal); } catch (_) {}
     emit(signal, evt);
@@ -28,9 +28,9 @@
       if (brand !== BRAND) {
         throw new TypeError("Failed to construct 'AbortSignal': Illegal constructor");
       }
-      this._aborted = false;
-      this._reason = undefined;
-      this._listeners = [];
+      _hset(this, "_aborted", false);
+      _hset(this, "_reason", undefined);
+      _hset(this, "_listeners", []);
       this.onabort = null;
     }
     get aborted() { return this._aborted; }
@@ -50,10 +50,10 @@
     }
     static abort(reason) {
       const s = new AbortSignal(BRAND);
-      s._aborted = true;
-      s._reason = reason !== undefined
+      _hset(s, "_aborted", true);
+      _hset(s, "_reason", reason !== undefined
         ? reason
-        : new DOMException("This operation was aborted", "AbortError");
+        : new DOMException("This operation was aborted", "AbortError"));
       return s;
     }
     static timeout(ms) {
@@ -65,7 +65,7 @@
       const s = new AbortSignal(BRAND);
       const list = Array.from(signals || []);
       for (const sig of list) {
-        if (sig && sig.aborted) { s._aborted = true; s._reason = sig.reason; return s; }
+        if (sig && sig.aborted) { _hset(s, "_aborted", true); _hset(s, "_reason", sig.reason); return s; }
       }
       for (const sig of list) {
         if (sig && typeof sig.addEventListener === "function") {

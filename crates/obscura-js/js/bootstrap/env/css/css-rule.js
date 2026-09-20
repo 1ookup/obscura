@@ -12,10 +12,10 @@ class CSSRule {
   static SUPPORTS_RULE = 12;
 
   constructor(cssText, type = 0) {
-    this._cssText = String(cssText || "").trim();
-    this._type = type;
-    this._parentStyleSheet = null;
-    this._parentRule = null;
+    _hset(this, "_cssText", String(cssText || "").trim());
+    _hset(this, "_type", type);
+    _hset(this, "_parentStyleSheet", null);
+    _hset(this, "_parentRule", null);
   }
   get type() { return this._type; }
   get cssText() { return this._cssText; }
@@ -925,18 +925,18 @@ function _normalizeKeyframeDeclarationsUncached(cssText) {
 class CSSKeyframeRule extends CSSRule {
   constructor(keyText, declarations) {
     super("", CSSRule.KEYFRAME_RULE);
-    this._keyText = _normalizeKeyText(keyText);
+    _hset(this, "_keyText", _normalizeKeyText(keyText));
     const declaration = new CSSStyleDeclaration(null, () => this._changed(), this);
     const state = _cssStyleFor(declaration);
     _parseCssInto(state.props, declarations);
     state.loaded = true;
-    this._decl = declaration;
-    this._style = null;
+    _hset(this, "_decl", declaration);
+    _hset(this, "_style", null);
   }
   get keyText() { return this._keyText; }
-  set keyText(value) { this._keyText = _normalizeKeyText(value); this._changed(); }
+  set keyText(value) { _hset(this, "_keyText", _normalizeKeyText(value)); this._changed(); }
   get style() {
-    if (!this._style) this._style = _styleProxy(this._decl);
+    if (!this._style) _hset(this, "_style", _styleProxy(this._decl));
     return this._style;
   }
   get cssText() {
@@ -954,13 +954,13 @@ class CSSKeyframeRule extends CSSRule {
 class CSSKeyframesRule extends CSSRule {
   constructor(name, bodyText) {
     super("", CSSRule.KEYFRAMES_RULE);
-    this._name = String(name || "");
-    this._keyRules = [];
+    _hset(this, "_name", String(name || ""));
+    _hset(this, "_keyRules", []);
     this._parseBody(String(bodyText || ""));
-    this._dirty = false;
+    _hset(this, "_dirty", false);
   }
   _parseBody(body) {
-    this._keyRules = [];
+    _hset(this, "_keyRules", []);
     let position = 0;
     const text = body;
     while (position < text.length) {
@@ -976,14 +976,14 @@ class CSSKeyframesRule extends CSSRule {
       }
       const declarations = text.slice(open + 1, close - 1);
       const rule = new CSSKeyframeRule(keyText, declarations);
-      rule._parentRule = this;
+      _hset(rule, "_parentRule", this);
       this._keyRules.push(rule);
       position = close;
       while (position < text.length && /\s/.test(text[position])) position++;
     }
   }
   get name() { return this._name; }
-  set name(value) { this._name = String(value || ""); this._changed(); }
+  set name(value) { _hset(this, "_name", String(value || "")); this._changed(); }
   get cssRules() { return this._keyRules; }
   get cssText() {
     const body = this._keyRules.map(rule => "  " + rule.cssText).join("\n");
@@ -996,7 +996,7 @@ class CSSKeyframesRule extends CSSRule {
     const rule = new CSSKeyframeRule(
       String(ruleText).slice(0, open).trim(),
       String(ruleText).slice(open + 1, String(ruleText).lastIndexOf("}")));
-    rule._parentRule = this;
+    _hset(rule, "_parentRule", this);
     this._keyRules.push(rule);
     this._changed();
   }

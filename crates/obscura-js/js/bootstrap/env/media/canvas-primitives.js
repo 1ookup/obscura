@@ -36,7 +36,7 @@ function _encodePNG(w, h, rgba) {
   if (!_encodePNG._t) {
     var t = new Uint32Array(256);
     for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
-    _encodePNG._t = t;
+    _hset(_encodePNG, "_t", t);
   }
   var T = _encodePNG._t;
   function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }

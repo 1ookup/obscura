@@ -5,7 +5,7 @@ if (typeof FileReader === 'undefined') {
       this.result = null; this.error = null; this.readyState = 0;
       this.onloadstart = null; this.onprogress = null; this.onload = null;
       this.onabort = null; this.onerror = null; this.onloadend = null;
-      this._listeners = {};
+      _hset(this, "_listeners", {});
     }
     get [Symbol.toStringTag]() { return 'FileReader'; }
     _read(blob, kind, encoding) {

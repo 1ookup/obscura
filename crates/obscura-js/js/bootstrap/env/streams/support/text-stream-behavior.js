@@ -24,5 +24,5 @@ function _textDecoderStreamInitialize(stream, label, options) {
   });
   stream.readable = transform.readable;
   stream.writable = transform.writable;
-  stream._decoder = decoder;
+  _hset(stream, "_decoder", decoder);
 }

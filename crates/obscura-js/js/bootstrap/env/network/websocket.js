@@ -21,9 +21,9 @@ if (typeof WebSocket === 'undefined') {
       this.onmessage = null;
       this.onerror = null;
       this.onclose = null;
-      this._id = null;
-      this._closedByUser = false;
-      this._closeDispatched = false;
+      _hset(this, "_id", null);
+      _hset(this, "_closedByUser", false);
+      _hset(this, "_closeDispatched", false);
       _makeListenerBox(this);
       const open = Deno.core.ops.op_websocket_open?.(this.url, this.protocol);
       Promise.resolve(open).then((id) => {
@@ -32,7 +32,7 @@ if (typeof WebSocket === 'undefined') {
           this._dispatchClose(1000, '', true);
           return;
         }
-        this._id = Number(id);
+        _hset(this, "_id", Number(id));
         this.readyState = 1;
         const event = new Event('open');
         if (typeof this.onopen === 'function') {
@@ -53,7 +53,7 @@ if (typeof WebSocket === 'undefined') {
     }
     _dispatchClose(code, reason, wasClean) {
       if (this._closeDispatched) return;
-      this._closeDispatched = true;
+      _hset(this, "_closeDispatched", true);
       this.readyState = 3;
       const close = new Event('close');
       close.code = code || 1000;
@@ -108,7 +108,7 @@ if (typeof WebSocket === 'undefined') {
     }
     close(code, reason) {
       if (this.readyState >= 2) return;
-      this._closedByUser = true;
+      _hset(this, "_closedByUser", true);
       this.readyState = 2;
       if (this._id != null) Deno.core.ops.op_websocket_close?.(this._id, code || 1000, reason || '');
       this._dispatchClose(code || 1000, reason || '', true);

@@ -365,8 +365,8 @@ class Node extends EventTarget {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
     const connected = _dom("is_connected", this[_nidSym]) === "true";
-    this._treeConnected = connected;
-    this._treeConnectedEpoch = _treeMutationEpoch;
+    _hset(this, "_treeConnected", connected);
+    _hset(this, "_treeConnectedEpoch", _treeMutationEpoch);
     return connected;
   }
   normalize() {

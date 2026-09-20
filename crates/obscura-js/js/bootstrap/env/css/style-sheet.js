@@ -15,7 +15,7 @@ class StyleSheet {
   get title() { return this._ownerNode?.getAttribute?.('title') || ''; }
   get media() { return this._media || null; }
   get disabled() { return !!this._disabled; }
-  set disabled(value) { this._disabled = !!value; }
+  set disabled(value) { _hset(this, "_disabled", !!value); }
   get [Symbol.toStringTag]() { return 'StyleSheet'; }
 }
 globalThis.StyleSheet = StyleSheet;

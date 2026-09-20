@@ -1,6 +1,6 @@
 class StyleSheetList {
   constructor(root) {
-    this._root = root;
+    _hset(this, "_root", root);
     return new Proxy(this, {
       get(target, property, receiver) {
         if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {

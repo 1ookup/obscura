@@ -1,5 +1,5 @@
 class ProcessingInstruction extends CharacterData {
-  constructor(nid, target) { super(nid); this._target = target; }
+  constructor(nid, target) { super(nid); _hset(this, "_target", target); }
   get target() { return this._target; }
   get nodeName() { return this._target; }
   get nodeType() { return 7; }

@@ -203,13 +203,13 @@ if (typeof Performance === 'function') {
       }
       // Preserve the container's private listener storage when linking its
       // prototype to EventTarget below.
-      this._listeners = Object.create(null);
-      this._handlers = Object.create(null);
+      _hset(this, "_listeners", Object.create(null));
+      _hset(this, "_handlers", Object.create(null));
       // The spec's [[ready promise]] resolves only once an active
       // registration exists for this client. There is never one, so it stays
       // pending for the document's lifetime, which is exactly what Chrome
       // does on a page that has not registered a worker.
-      this._ready = new Promise(function () {});
+      _hset(this, "_ready", new Promise(function () {}));
     }
 
     get controller() { return null; }

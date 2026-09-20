@@ -2,8 +2,8 @@ class KeyframeEffect {
   constructor(target, keyframes, options) {
     if (!(target instanceof Element)) throw new TypeError('KeyframeEffect target must be an Element');
     this.target = target;
-    this._keyframes = _normalizeWaapiKeyframes(keyframes);
-    this._timing = _normalizeWaapiTiming(options);
+    _hset(this, "_keyframes", _normalizeWaapiKeyframes(keyframes));
+    _hset(this, "_timing", _normalizeWaapiTiming(options));
   }
   getKeyframes() { return this._keyframes.map(frame => ({ ...frame, computedOffset: frame.offset, easing: 'linear', composite: 'auto' })); }
   getTiming() {

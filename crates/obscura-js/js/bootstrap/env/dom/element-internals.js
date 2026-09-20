@@ -1,13 +1,13 @@
 // ElementInternals: form-associated custom element internals. Validity/state
 // are JS-observable; ARIA reflection that needs the accessibility tree is not.
 globalThis.ElementInternals = class ElementInternals {
-  constructor(el) { this._el = el; this._valid = true; this._flags = {}; this._message = ''; this._value = null; this._states = new Set(); }
-  setFormValue(value, state) { this._value = value; }
+  constructor(el) { _hset(this, "_el", el); _hset(this, "_valid", true); _hset(this, "_flags", {}); _hset(this, "_message", ''); _hset(this, "_value", null); _hset(this, "_states", new Set()); }
+  setFormValue(value, state) { _hset(this, "_value", value); }
   setValidity(flags, message, anchor) {
     flags = flags || {};
     const bad = Object.keys(flags).some((k) => k !== 'valid' && flags[k]);
     if (bad && (message == null || message === '')) throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The second argument should not be empty if one or more flags in the first argument are true.");
-    this._flags = flags; this._valid = !bad; this._message = bad ? String(message) : '';
+    _hset(this, "_flags", flags); _hset(this, "_valid", !bad); _hset(this, "_message", bad ? String(message) : '');
   }
   checkValidity() { return this._valid; }
   reportValidity() { return this._valid; }

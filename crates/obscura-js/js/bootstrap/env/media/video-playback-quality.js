@@ -1,7 +1,7 @@
 class VideoPlaybackQuality {
   constructor(key) {
     if (key !== _timeRangesKey) throw new TypeError('Illegal constructor');
-    this._creationTime = _performanceNowSafe();
+    _hset(this, "_creationTime", _performanceNowSafe());
   }
   get creationTime() { return this._creationTime; }
   get droppedVideoFrames() { return 0; }

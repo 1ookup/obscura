@@ -16,7 +16,7 @@ var Element = _swappableInterface('Element', class extends Node {
       Object.setPrototypeOf(upgrading, new.target.prototype);
       return upgrading;
     }
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
+    _hset(this, "_style", _styleProxy(new CSSStyleDeclaration(this)));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -27,7 +27,7 @@ var Element = _swappableInterface('Element', class extends Node {
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
     // for every comparison adds thousands of calls on modern component trees.
     if (this._tagName !== undefined) return this._tagName;
-    this._tagName = _domParse("tag_name", this[_nidSym]) || "";
+    _hset(this, "_tagName", _domParse("tag_name", this[_nidSym]) || "");
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
@@ -39,7 +39,7 @@ var Element = _swappableInterface('Element', class extends Node {
     if (this._lname !== undefined) return this._lname;
     const ln = _domParse("local_name", this[_nidSym])
       || (this.tagName || "").toLowerCase();
-    if (ln) this._lname = ln;
+    if (ln) _hset(this, "_lname", ln);
     return ln;
   }
   get id() { return this.getAttribute("id") || ""; }
@@ -322,7 +322,7 @@ var Element = _swappableInterface('Element', class extends Node {
     return Number.isFinite(zoom) ? zoom : 1;
   }
   get part() {
-    if (!this._partList) this._partList = new DOMTokenList(this, "part");
+    if (!this._partList) _hset(this, "_partList", new DOMTokenList(this, "part"));
     return this._partList;
   }
   get prefix() { return null; }
@@ -379,7 +379,7 @@ var Element = _swappableInterface('Element', class extends Node {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
     if (this.namespaceURI === "http://www.w3.org/2000/svg") {
-      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(this, "class");
+      if (!this._svgClassName) _hset(this, "_svgClassName", new SVGAnimatedString(this, "class"));
       return this._svgClassName;
     }
     return this.getAttribute("class") || "";
@@ -400,7 +400,7 @@ var Element = _swappableInterface('Element', class extends Node {
     let ns = _domParse("namespace_uri", this[_nidSym]) || "";
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
-    this._nsCache = ns;
+    _hset(this, "_nsCache", ns);
     return ns;
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
@@ -492,12 +492,12 @@ var Element = _swappableInterface('Element', class extends Node {
         // frameworks stash the fragment and compare it later.
         if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
         const content = _cache.get(nid);
-        content._fragmentContext = 'template';
+        _hset(content, "_fragmentContext", 'template');
         return content;
       }
       if (!this._templateContent) {
-        this._templateContent = document.createDocumentFragment();
-        this._templateContent._fragmentContext = 'template';
+        _hset(this, "_templateContent", document.createDocumentFragment());
+        _hset(this._templateContent, "_fragmentContext", 'template');
       }
       return this._templateContent;
     }
@@ -515,7 +515,7 @@ var Element = _swappableInterface('Element', class extends Node {
   get nextElementSibling() { let s = this.nextSibling; while(s && s.nodeType !== 1) s = s.nextSibling; return s; }
   get previousElementSibling() { let s = this.previousSibling; while(s && s.nodeType !== 1) s = s.previousSibling; return s; }
   get classList() {
-    if (!this._classList) this._classList = new DOMTokenList(this, "class");
+    if (!this._classList) _hset(this, "_classList", new DOMTokenList(this, "class"));
     return this._classList;
   }
   get relList() {
@@ -527,24 +527,24 @@ var Element = _swappableInterface('Element', class extends Node {
     // rather than throwing. Vite's modulepreload polyfill runs
     // link.relList.supports('modulepreload') at the top of every bundle; a
     // throw there aborts the whole module and the SPA renders blank.
-    if (!this._relList) this._relList = new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]);
+    if (!this._relList) _hset(this, "_relList", new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]));
     return this._relList;
   }
   get sandbox() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
-    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
+    if (!this._sandboxList) _hset(this, "_sandboxList", new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]));
     return this._sandboxList;
   }
   get sizes() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
-    if (!this._sizesList) this._sizesList = new DOMTokenList(this, "sizes");
+    if (!this._sizesList) _hset(this, "_sizesList", new DOMTokenList(this, "sizes"));
     return this._sizesList;
   }
   get htmlFor() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
     const ln = this.localName;
     if (ln === "output") {
-      if (!this._htmlForList) this._htmlForList = new DOMTokenList(this, "for");
+      if (!this._htmlForList) _hset(this, "_htmlForList", new DOMTokenList(this, "for"));
       return this._htmlForList;
     }
     if (ln === "label") return this.getAttribute("for") || "";
@@ -638,7 +638,7 @@ var Element = _swappableInterface('Element', class extends Node {
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
-    this._nullNamespaceAttrs = null;
+    _hset(this, "_nullNamespaceAttrs", null);
     if (ns === "" && n === "style") _cssStyleReplaceFromAttribute(this._style, value);
   }
   removeAttribute(n) {
@@ -675,14 +675,14 @@ var Element = _swappableInterface('Element', class extends Node {
     ns = String(ns == null ? "" : ns);
     n = String(n);
     _dom("remove_attribute_ns", this[_nidSym], ns + "\0" + n);
-    this._nullNamespaceAttrs = null;
+    _hset(this, "_nullNamespaceAttrs", null);
     if (ns === "" && n === "style") _cssStyleReplaceFromAttribute(this._style, "");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
   getAttributeNames() { return _domParse("attribute_names", this[_nidSym]) || []; }
   get attributes() {
-    if (!this._attributes) this._attributes = new NamedNodeMap(this);
+    if (!this._attributes) _hset(this, "_attributes", new NamedNodeMap(this));
     return this._attributes;
   }
   getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this[_nidSym], String(ns == null ? "" : ns) + "\0" + String(n)); }
@@ -807,7 +807,7 @@ var Element = _swappableInterface('Element', class extends Node {
   _resolveInlineHandler(name) {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
     // as a function body on first read and cache it on the instance.
-    const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
+    const cache = this.__inlineHandlerCache || (_hset(this, "__inlineHandlerCache", {}));
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
     if (!src) { cache[name] = null; return null; }
@@ -969,14 +969,14 @@ var Element = _swappableInterface('Element', class extends Node {
     if (!this.dispatchEvent(beforeEvent)) return;
     // The beforetoggle handler may have changed our type or shown us; re-check.
     if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
-    this._popoverState = "showing";
+    _hset(this, "_popoverState", "showing");
     const target = this;
     setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   hidePopover() {
     if (!this._checkPopoverValidity(/*expectedToBeShowing*/true)) return;
     this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-    this._popoverState = "hidden";
+    _hset(this, "_popoverState", "hidden");
     const target = this;
     setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
   }
@@ -1001,7 +1001,7 @@ var Element = _swappableInterface('Element', class extends Node {
       // popover attribute, which may now be removed (No Popover), and would
       // throw NotSupportedError. This mirrors the spec hide with throw=false.
       this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-      this._popoverState = "hidden";
+      _hset(this, "_popoverState", "hidden");
       const target = this;
       setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     }
@@ -1011,13 +1011,13 @@ var Element = _swappableInterface('Element', class extends Node {
   // is layout (out of scope); the open state, returnValue, and beforetoggle/
   // toggle/close/cancel events are JS-observable and implemented here.
   get open() { return this.hasAttribute('open'); }
-  set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
+  set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); _hset(this, "_dialogModal", false); } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
-  set returnValue(v) { this._returnValue = String(v); }
+  set returnValue(v) { _hset(this, "_returnValue", String(v)); }
   get oncancel() { return this._oncancel || null; }
-  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
+  set oncancel(f) { _hset(this, "_oncancel", typeof f === 'function' ? f : null); }
   get onclose() { return this._onclose || null; }
-  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  set onclose(f) { _hset(this, "_onclose", typeof f === 'function' ? f : null); }
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
@@ -1025,7 +1025,7 @@ var Element = _swappableInterface('Element', class extends Node {
     const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
     if (!this.dispatchEvent(before)) return;
     if (this.hasAttribute('open')) return;
-    this.setAttribute('open', ''); this._dialogModal = false;
+    this.setAttribute('open', ''); _hset(this, "_dialogModal", false);
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   showModal() {
@@ -1034,14 +1034,14 @@ var Element = _swappableInterface('Element', class extends Node {
     const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
     if (!this.dispatchEvent(before)) return;
     if (this.hasAttribute('open')) return;
-    this.setAttribute('open', ''); this._dialogModal = true;
+    this.setAttribute('open', ''); _hset(this, "_dialogModal", true);
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   _dialogClose(result, fireClose) {
     if (!this.hasAttribute('open')) return;
     this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-    this.removeAttribute('open'); this._dialogModal = false;
-    if (result !== undefined) this._returnValue = String(result);
+    this.removeAttribute('open'); _hset(this, "_dialogModal", false);
+    if (result !== undefined) _hset(this, "_returnValue", String(result));
     const self = this;
     setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     if (fireClose) setTimeout(() => { try { self.dispatchEvent(new Event('close', { bubbles: false, cancelable: false })); } catch (e) {} }, 0);
@@ -1050,10 +1050,10 @@ var Element = _swappableInterface('Element', class extends Node {
   requestClose(result) {
     if (!this.hasAttribute('open')) return;
     if (this._dialogCancelFiring) return; // no re-entrant cancel
-    this._dialogCancelFiring = true;
+    _hset(this, "_dialogCancelFiring", true);
     let canceled = false;
     try { const ev = new Event('cancel', { bubbles: false, cancelable: true }); this.dispatchEvent(ev); canceled = ev.defaultPrevented; }
-    finally { this._dialogCancelFiring = false; }
+    finally { _hset(this, "_dialogCancelFiring", false); }
     if (canceled) return;
     this._dialogClose(result, true);
   }
@@ -1062,7 +1062,7 @@ var Element = _swappableInterface('Element', class extends Node {
     if (!registry || !registry.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
     if (this.getAttribute('is')) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
     if (this._internalsAttached) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': ElementInternals for the specified element was already attached.", "NotSupportedError");
-    this._internalsAttached = true;
+    _hset(this, "_internalsAttached", true);
     return new ElementInternals(this);
   }
   get value() {
@@ -1234,7 +1234,7 @@ var Element = _swappableInterface('Element', class extends Node {
     return this.hasAttribute("selected");
   }
   set selected(v) {
-    this._selected = !!v;
+    _hset(this, "_selected", !!v);
     // Keep the native DOM tree in sync so layout/paint observes live form
     // state after scripts construct or change an option.
     if (this.localName === 'option') {
@@ -1290,7 +1290,7 @@ var Element = _swappableInterface('Element', class extends Node {
         (ln === 'a' || ln === 'image' || ln === 'use' || ln === 'script' ||
          ln === 'pattern' || ln === 'filter' || ln === 'textPath' || ln === 'mpath' ||
          ln === 'linearGradient' || ln === 'radialGradient' || ln === 'feImage' || ln === 'tref')) {
-      if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
+      if (!this._svgHref) _hset(this, "_svgHref", new SVGAnimatedString(this, "href", "xlink:href"));
       return this._svgHref;
     }
     if (ln === 'a' || ln === 'area') {
@@ -1446,7 +1446,7 @@ var Element = _swappableInterface('Element', class extends Node {
   set selectedIndex(v) {
     const opts = this.options;
     for (let i = 0; i < opts.length; i++) {
-      opts[i]._selected = (i === v);
+      _hset(opts[i], "_selected", (i === v));
     }
   }
   // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
@@ -1537,7 +1537,7 @@ var Element = _swappableInterface('Element', class extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
+    _hset(this, "_dataset", new Proxy({}, {
       get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
       set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
       has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
@@ -1549,7 +1549,7 @@ var Element = _swappableInterface('Element', class extends Node {
         }
         return undefined;
       },
-    });
+    }));
     return this._dataset;
   }
   get offsetWidth() {
@@ -1775,7 +1775,7 @@ var Element = _swappableInterface('Element', class extends Node {
       }
     }
     const changed = actual !== old;
-    this._scrollTop = actual;
+    _hset(this, "_scrollTop", actual);
     if (changed && !this._scrollSuppress) this._fireScroll();
     if (changed &&
         typeof globalThis.__obscura_recompute_intersections === "function") {
@@ -1811,7 +1811,7 @@ var Element = _swappableInterface('Element', class extends Node {
       }
     }
     const changed = actual !== old;
-    this._scrollLeft = actual;
+    _hset(this, "_scrollLeft", actual);
     if (changed && !this._scrollSuppress) this._fireScroll();
     if (changed &&
         typeof globalThis.__obscura_recompute_intersections === "function") {
@@ -1978,8 +1978,8 @@ var Element = _swappableInterface('Element', class extends Node {
     if (native) {
       const actualLeft = updated ? (updated.x || 0) : oldLeft;
       const actualTop = updated ? (updated.y || 0) : oldTop;
-      this._scrollLeft = actualLeft;
-      this._scrollTop = actualTop;
+      _hset(this, "_scrollLeft", actualLeft);
+      _hset(this, "_scrollTop", actualTop);
       if (actualLeft !== oldLeft || actualTop !== oldTop) {
         if (typeof globalThis.__obscura_recompute_intersections === "function") {
           globalThis.__obscura_recompute_intersections();
@@ -1988,10 +1988,10 @@ var Element = _swappableInterface('Element', class extends Node {
       }
       return;
     }
-    this._scrollSuppress = true;
+    _hset(this, "_scrollSuppress", true);
     if (left !== undefined) this.scrollLeft = +left || 0;
     if (top !== undefined) this.scrollTop = +top || 0;
-    this._scrollSuppress = false;
+    _hset(this, "_scrollSuppress", false);
     if (this.scrollLeft !== oldLeft || this.scrollTop !== oldTop) this._fireScroll();
   }
   scroll(x, y) { this.scrollTo(x, y); }
@@ -2006,10 +2006,10 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   _fireScroll() {
     if (this._scrollEventPending) return;
-    this._scrollEventPending = true;
+    _hset(this, "_scrollEventPending", true);
     const self = this;
     setTimeout(() => {
-      self._scrollEventPending = false;
+      _hset(self, "_scrollEventPending", false);
       try { self.dispatchEvent(new Event('scroll', { bubbles: false })); } catch (e) {}
     }, 0);
   }

@@ -393,10 +393,10 @@ function _webglCompressedTextureAstc() {
 
 class _WebGLContext {
   constructor(canvas, isWebGL2, attrs) {
-    this.canvas = canvas; this._isWebGL2 = !!isWebGL2; this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
-    this._lost = false; this._extensions = new Map(); this._error = 0;
+    this.canvas = canvas; _hset(this, "_isWebGL2", !!isWebGL2); this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
+    _hset(this, "_lost", false); _hset(this, "_extensions", new Map()); _hset(this, "_error", 0);
     // Chrome echoes back the attributes the caller passed, filling defaults.
-    this._attrs = (attrs && typeof attrs === 'object') ? attrs : {};
+    _hset(this, "_attrs", (attrs && typeof attrs === 'object') ? attrs : {});
   }
   get drawingBufferColorSpace() { return 'srgb'; }
   get unpackColorSpace() { return 'srgb'; }
@@ -420,14 +420,14 @@ class _WebGLContext {
     const key = +name;
     if (key === 0x8B8B && !this._isWebGL2) {
       if (this._extensions.has('OES_standard_derivatives')) return 0x1100;
-      if (!this._error) this._error = 0x0500;
+      if (!this._error) _hset(this, "_error", 0x0500);
       return null;
     }
     if (key === 0x8FBB) {
       const extension = this._isWebGL2
         ? 'EXT_disjoint_timer_query_webgl2' : 'EXT_disjoint_timer_query';
       if (this._extensions.has(extension)) return false;
-      if (!this._error) this._error = 0x0500;
+      if (!this._error) _hset(this, "_error", 0x0500);
       return null;
     }
     // The adapter strings sit behind WEBGL_debug_renderer_info, never here.
@@ -484,8 +484,8 @@ class _WebGLContext {
     } else if (key === 'WEBGL_lose_context') {
       const context = this;
       value = {
-        loseContext() { context._lost = true; },
-        restoreContext() { context._lost = false; },
+        loseContext() { _hset(context, "_lost", true); },
+        restoreContext() { _hset(context, "_lost", false); },
       };
     } else if (key === 'OES_vertex_array_object') {
       value = {
@@ -547,7 +547,7 @@ class _WebGLContext {
   // have returned.
   getError() {
     const error = this._error;
-    this._error = 0;
+    _hset(this, "_error", 0);
     return error;
   }
   isEnabled(capability) { return +capability === 0x0BD0; }  // DITHER is on by default
@@ -557,7 +557,7 @@ class _WebGLContext {
     // answers; the sample counts themselves are the profile's (Apple GPUs
     // top out at 4x MSAA, D3D11 FL11 reports 8/4/2/1).
     if (+pname !== 0x80A9) {
-      if (!this._error) this._error = 0x0500;
+      if (!this._error) _hset(this, "_error", 0x0500);
       return null;
     }
     const key = +internalformat;
@@ -567,7 +567,7 @@ class _WebGLContext {
         && this._extensions.has('EXT_color_buffer_float')) {
       return new Int32Array(counts);
     }
-    if (!this._error) this._error = 0x0500;
+    if (!this._error) _hset(this, "_error", 0x0500);
     return null;
   }
   getIndexedParameter() { return null; }

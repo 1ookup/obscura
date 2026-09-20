@@ -1,10 +1,10 @@
 // The canvas half of the WebGPU surface: enough for a probe that configures
 // a context and reads the configuration back. No texture contents exist.
 globalThis.GPUCanvasContext = class GPUCanvasContext {
-  constructor(canvas) { this.canvas = canvas; this._configuration = null; }
+  constructor(canvas) { this.canvas = canvas; _hset(this, "_configuration", null); }
   configure(configuration) {
     const config = configuration || {};
-    this._configuration = {
+    _hset(this, "_configuration", {
       device: config.device,
       format: config.format || 'bgra8unorm',
       usage: typeof config.usage === 'number' ? config.usage : 0x10,
@@ -12,9 +12,9 @@ globalThis.GPUCanvasContext = class GPUCanvasContext {
       colorSpace: 'srgb',
       toneMapping: { mode: 'standard' },
       viewFormats: Array.isArray(config.viewFormats) ? config.viewFormats.slice() : [],
-    };
+    });
   }
-  unconfigure() { this._configuration = null; }
+  unconfigure() { _hset(this, "_configuration", null); }
   getConfiguration() {
     if (!this._configuration) return null;
     const config = this._configuration;

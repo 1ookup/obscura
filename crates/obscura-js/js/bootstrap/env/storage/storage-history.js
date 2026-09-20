@@ -154,7 +154,7 @@ function registerHistorySurface() {
     set scrollRestoration(value) {
       const normalized = String(value);
       if (normalized === "auto" || normalized === "manual") {
-        this._scrollRestoration = normalized;
+        _hset(this, "_scrollRestoration", normalized);
       }
     }
     pushState(state, _title, url) {

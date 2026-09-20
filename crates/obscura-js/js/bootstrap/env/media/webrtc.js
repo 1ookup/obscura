@@ -258,10 +258,10 @@ function _rtcRandomUint(digits) {
 // per interface for the lifetime of the page.
 function _rtcMdnsHosts() {
   if (!_rtcMdnsHosts._cache) {
-    _rtcMdnsHosts._cache = [0, 1].map(() => {
+    _hset(_rtcMdnsHosts, "_cache", [0, 1].map(() => {
       const hex = _rtcRandomHex(16).join('').toLowerCase();
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}.local`;
-    });
+    }));
   }
   return _rtcMdnsHosts._cache;
 }

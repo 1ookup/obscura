@@ -5,20 +5,20 @@
 class HTMLImageElement extends Element {
   constructor(nid) {
     super(nid);
-    this._imageRequest = 0;
-    this._imageQueued = false;
-    this._imageInitialized = false;
-    this._imageCompletionDeferred = false;
-    this._imageComplete = typeof Deno.core.ops.op_image_metadata === "function"
+    _hset(this, "_imageRequest", 0);
+    _hset(this, "_imageQueued", false);
+    _hset(this, "_imageInitialized", false);
+    _hset(this, "_imageCompletionDeferred", false);
+    _hset(this, "_imageComplete", typeof Deno.core.ops.op_image_metadata === "function"
       ? true
-      : !this.getAttribute("src");
-    this._imageDecoded = false;
-    this._imageNaturalWidth = 0;
-    this._imageNaturalHeight = 0;
-    this._imageCurrentSrc = "";
-    this._imageDecodeWaiters = [];
+      : !this.getAttribute("src"));
+    _hset(this, "_imageDecoded", false);
+    _hset(this, "_imageNaturalWidth", 0);
+    _hset(this, "_imageNaturalHeight", 0);
+    _hset(this, "_imageCurrentSrc", "");
+    _hset(this, "_imageDecodeWaiters", []);
     this._refreshImageFromCache();
-    this._imageInitialized = true;
+    _hset(this, "_imageInitialized", true);
     // Parser images stay lazy until script observes their lifecycle or paint
     // asks for the same cache entry. Inline handlers are observers too.
     if (!this._imageComplete
@@ -57,7 +57,7 @@ class HTMLImageElement extends Element {
   }
   get onload() { return this._imageOnload || null; }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
+    _hset(this, "_imageOnload", typeof value === "function" ? value : null);
     __obscuraTraceRecordHandler(this, 'onload');
     if (this._imageOnload) {
       this._refreshImageFromCache();
@@ -66,7 +66,7 @@ class HTMLImageElement extends Element {
   }
   get onerror() { return this._imageOnerror || null; }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
+    _hset(this, "_imageOnerror", typeof value === "function" ? value : null);
     __obscuraTraceRecordHandler(this, 'onerror');
     if (this._imageOnerror) {
       this._refreshImageFromCache();
@@ -140,31 +140,31 @@ class HTMLImageElement extends Element {
     // not hang while rendering is disabled.
     const hasMetadataLoader = typeof Deno.core.ops.op_load_image_metadata === "function";
     this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
-    this._imageCompletionDeferred = true;
+    _hset(this, "_imageCompletionDeferred", true);
     this._refreshImageFromCache(true);
     if (!this._imageComplete) this._queueImageRequest();
   }
 
   _adoptImageCandidate(currentSrc) {
     this._rejectImageDecodes();
-    this._imageRequest++;
-    this._imageQueued = false;
-    this._imageNaturalWidth = 0;
-    this._imageNaturalHeight = 0;
-    this._imageDecoded = false;
-    this._imageCurrentSrc = currentSrc ? String(currentSrc) : "";
-    this._imageComplete = !this._imageCurrentSrc;
+    _hset(this, "_imageRequest", this._imageRequest + 1);
+    _hset(this, "_imageQueued", false);
+    _hset(this, "_imageNaturalWidth", 0);
+    _hset(this, "_imageNaturalHeight", 0);
+    _hset(this, "_imageDecoded", false);
+    _hset(this, "_imageCurrentSrc", currentSrc ? String(currentSrc) : "");
+    _hset(this, "_imageComplete", !this._imageCurrentSrc);
   }
 
   _queueImageRequest() {
     if (this._imageQueued || this._imageComplete) return;
-    this._imageQueued = true;
+    _hset(this, "_imageQueued", true);
     const request = this._imageRequest;
     setTimeout(() => {
       if (request === this._imageRequest && !this._imageComplete) {
         this._runImageRequest(request);
       } else if (request === this._imageRequest) {
-        this._imageQueued = false;
+        _hset(this, "_imageQueued", false);
       }
     }, 1);
   }
@@ -172,7 +172,7 @@ class HTMLImageElement extends Element {
   _runImageRequest(request) {
     const finish = (metadata) => {
       if (request !== this._imageRequest) return;
-      this._imageQueued = false;
+      _hset(this, "_imageQueued", false);
       if (metadata && metadata.state === "stale") {
         this._refreshImageFromCache(true);
         this._queueImageRequest();
@@ -223,7 +223,7 @@ class HTMLImageElement extends Element {
         // the candidate bytes. A cache-only getter must not synchronously
         // complete it and swallow the later load/error event.
         if (this._imageInitialized && selected) {
-          this._imageCompletionDeferred = true;
+          _hset(this, "_imageCompletionDeferred", true);
         }
       }
       if (metadata.state === "pending") {
@@ -233,10 +233,10 @@ class HTMLImageElement extends Element {
         return;
       }
       if ((deferCompletion || this._imageCompletionDeferred) && selected) {
-        this._imageComplete = false;
-        this._imageDecoded = false;
-        this._imageNaturalWidth = 0;
-        this._imageNaturalHeight = 0;
+        _hset(this, "_imageComplete", false);
+        _hset(this, "_imageDecoded", false);
+        _hset(this, "_imageNaturalWidth", 0);
+        _hset(this, "_imageNaturalHeight", 0);
         return;
       }
       this._applyImageMetadata(metadata, this._imageRequest, false);
@@ -259,26 +259,26 @@ class HTMLImageElement extends Element {
       this._adoptImageCandidate(selected);
       request = this._imageRequest;
     }
-    this._imageCompletionDeferred = false;
-    this._imageComplete = true;
-    this._imageCurrentSrc = selected || this.src;
+    _hset(this, "_imageCompletionDeferred", false);
+    _hset(this, "_imageComplete", true);
+    _hset(this, "_imageCurrentSrc", selected || this.src);
     const width = Number(metadata && metadata.width);
     const height = Number(metadata && metadata.height);
     const loaded = !!(metadata && metadata.ok)
       && (typeof Deno.core.ops.op_image_metadata !== "function"
         || (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0));
     if (loaded) {
-      this._imageDecoded = true;
-      this._imageNaturalWidth = Number.isFinite(width) && width > 0 ? Math.round(width) : 0;
-      this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
+      _hset(this, "_imageDecoded", true);
+      _hset(this, "_imageNaturalWidth", Number.isFinite(width) && width > 0 ? Math.round(width) : 0);
+      _hset(this, "_imageNaturalHeight", Number.isFinite(height) && height > 0 ? Math.round(height) : 0);
       this._resolveImageDecodes(request);
       if (dispatchEvent) {
         try { this.dispatchEvent(new Event("load")); } catch (_error) {}
       }
     } else {
-      this._imageDecoded = false;
-      this._imageNaturalWidth = 0;
-      this._imageNaturalHeight = 0;
+      _hset(this, "_imageDecoded", false);
+      _hset(this, "_imageNaturalWidth", 0);
+      _hset(this, "_imageNaturalHeight", 0);
       this._rejectImageDecodes(request);
       if (dispatchEvent) {
         try { this.dispatchEvent(new Event("error")); } catch (_error) {}
@@ -304,7 +304,7 @@ class HTMLImageElement extends Element {
       if (waiter.request === request) waiter.resolve();
       else remaining.push(waiter);
     }
-    this._imageDecodeWaiters = remaining;
+    _hset(this, "_imageDecodeWaiters", remaining);
   }
 
   _rejectImageDecodes(request) {
@@ -316,7 +316,7 @@ class HTMLImageElement extends Element {
         remaining.push(waiter);
       }
     }
-    this._imageDecodeWaiters = remaining;
+    _hset(this, "_imageDecodeWaiters", remaining);
   }
 
   addEventListener(type, callback, options) {

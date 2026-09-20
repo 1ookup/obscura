@@ -148,27 +148,27 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     if (typeof callback !== "function") {
       throw new TypeError("IntersectionObserver callback must be a function");
     }
-    this._callback = callback;
-    this._options = options || {};
-    this._root = this._options.root == null ? null : this._options.root;
+    _hset(this, "_callback", callback);
+    _hset(this, "_options", options || {});
+    _hset(this, "_root", this._options.root == null ? null : this._options.root);
     if (this._root !== null && !(this._root instanceof Element) &&
         this._root?.nodeType !== 9) {
       throw new TypeError("IntersectionObserver root must be an Element or Document");
     }
-    this._margins = _ioMargins(this._options.rootMargin || "0px");
+    _hset(this, "_margins", _ioMargins(this._options.rootMargin || "0px"));
     if (!this._margins) throw new SyntaxError("Invalid IntersectionObserver rootMargin");
     const raw = this._options.threshold == null
       ? [0]
       : (Array.isArray(this._options.threshold) ? this._options.threshold : [this._options.threshold]);
-    this._thresholds = [...new Set(raw.map(Number))].sort((a, b) => a - b);
-    if (!this._thresholds.length) this._thresholds = [0];
+    _hset(this, "_thresholds", [...new Set(raw.map(Number))].sort((a, b) => a - b));
+    if (!this._thresholds.length) _hset(this, "_thresholds", [0]);
     if (this._thresholds.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
       throw new RangeError("IntersectionObserver threshold must be between 0 and 1");
     }
-    this._targets = new Set();
-    this._previous = new Map();
-    this._records = [];
-    this._connected = true;
+    _hset(this, "_targets", new Set());
+    _hset(this, "_previous", new Map());
+    _hset(this, "_records", []);
+    _hset(this, "_connected", true);
     globalThis.__intersectionObservers.push(this);
   }
   _rootBounds(measurements) {
@@ -299,7 +299,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     // Re-register lazily so dormant observers do not stay in the global
     // geometry recomputation list forever.
     if (!this._connected) {
-      this._connected = true;
+      _hset(this, "_connected", true);
       if (!globalThis.__intersectionObservers.includes(this)) {
         globalThis.__intersectionObservers.push(this);
       }
@@ -313,7 +313,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._previous.delete(el);
   }
   disconnect() {
-    this._connected = false;
+    _hset(this, "_connected", false);
     this._targets.clear();
     this._previous.clear();
     this._records.length = 0;

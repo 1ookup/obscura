@@ -18,8 +18,8 @@ class HTMLVideoElement extends HTMLMediaElement {
         "Failed to execute 'requestVideoFrameCallback' on 'HTMLVideoElement': " +
         'parameter 1 is not of type \'Function\'.');
     }
-    this._videoFrameCallbacks = this._videoFrameCallbacks || new Map();
-    const handle = (this._videoFrameHandle = (this._videoFrameHandle || 0) + 1);
+    _hset(this, "_videoFrameCallbacks", this._videoFrameCallbacks || new Map());
+    const handle = (_hset(this, "_videoFrameHandle", (this._videoFrameHandle || 0) + 1));
     this._videoFrameCallbacks.set(handle, callback);
     return handle;
   }

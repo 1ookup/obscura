@@ -5,7 +5,7 @@ globalThis.StaticRange = class StaticRange {
     const sc = init.startContainer, ec = init.endContainer;
     if (sc.nodeType === 10 || ec.nodeType === 10 || sc.nodeType === 7 || ec.nodeType === 7)
       throw new DOMException("StaticRange endpoints cannot be DocumentType or ProcessingInstruction", "InvalidNodeTypeError");
-    this._sc = sc; this._so = init.startOffset >>> 0; this._ec = ec; this._eo = init.endOffset >>> 0;
+    _hset(this, "_sc", sc); _hset(this, "_so", init.startOffset >>> 0); _hset(this, "_ec", ec); _hset(this, "_eo", init.endOffset >>> 0);
   }
   get startContainer() { return this._sc; }
   get startOffset() { return this._so; }

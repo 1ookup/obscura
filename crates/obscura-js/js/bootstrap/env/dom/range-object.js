@@ -1,7 +1,7 @@
 globalThis.Range = class Range {
   constructor() {
     const d = globalThis.document || null;
-    this._sc = d; this._so = 0; this._ec = d; this._eo = 0;
+    _hset(this, "_sc", d); _hset(this, "_so", 0); _hset(this, "_ec", d); _hset(this, "_eo", 0);
   }
   get startContainer() { return this._sc; }
   get startOffset() { return this._so; }
@@ -15,15 +15,15 @@ globalThis.Range = class Range {
     while (c) { if (setA.has(c[_nidSym])) return c; c = c.parentNode; }
     return null;
   }
-  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)[_nidSym] !== _rngRoot(this._ec)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
-  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
+  setStart(n, o) { _rngCheckOffset(n, o); _hset(this, "_sc", n); _hset(this, "_so", o); if (_rngRoot(n)[_nidSym] !== _rngRoot(this._ec)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { _hset(this, "_ec", n); _hset(this, "_eo", o); } }
+  setEnd(n, o) { _rngCheckOffset(n, o); _hset(this, "_ec", n); _hset(this, "_eo", o); if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym] || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { _hset(this, "_sc", n); _hset(this, "_so", o); } }
   setStartBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n)); }
   setStartAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n) + 1); }
   setEndBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n)); }
   setEndAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n) + 1); }
-  collapse(toStart) { if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; } }
-  selectNode(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); const i = _rngNodeIndex(n); this._sc = p; this._so = i; this._ec = p; this._eo = i + 1; }
-  selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
+  collapse(toStart) { if (toStart) { _hset(this, "_ec", this._sc); _hset(this, "_eo", this._so); } else { _hset(this, "_sc", this._ec); _hset(this, "_so", this._eo); } }
+  selectNode(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); const i = _rngNodeIndex(n); _hset(this, "_sc", p); _hset(this, "_so", i); _hset(this, "_ec", p); _hset(this, "_eo", i + 1); }
+  selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); _hset(this, "_sc", n); _hset(this, "_so", 0); _hset(this, "_ec", n); _hset(this, "_eo", len); }
   comparePoint(n, o) {
     o = o >>> 0; // offset is a WebIDL unsigned long: -1 -> 4294967295 -> IndexSizeError
     if (_rngRoot(n)[_nidSym] !== _rngRoot(this._sc)[_nidSym]) throw new DOMException("nodes are in different trees", "WrongDocumentError");
@@ -69,7 +69,7 @@ globalThis.Range = class Range {
     const o = _rngNodeIndex(n);
     return _rngCmp(p, o, this._ec, this._eo) < 0 && _rngCmp(p, o + 1, this._sc, this._so) > 0;
   }
-  cloneRange() { const r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; }
+  cloneRange() { const r = new Range(); _hset(r, "_sc", this._sc); _hset(r, "_so", this._so); _hset(r, "_ec", this._ec); _hset(r, "_eo", this._eo); return r; }
   createContextualFragment(html) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'createContextualFragment' on 'Range': 1 argument required, but only 0 present.");
     const node = this._sc;

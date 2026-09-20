@@ -16,7 +16,7 @@ class HTMLTrackElement extends Element {
   get readyState() { return HTMLTrackElement.LOADED; }
   get track() {
     if (!this._textTrack) {
-      this._textTrack = new TextTrack(this, this.kind, this.label, this.srclang);
+      _hset(this, "_textTrack", new TextTrack(this, this.kind, this.label, this.srclang));
     }
     return this._textTrack;
   }

@@ -1,9 +1,9 @@
 class DocumentType extends Node {
   constructor(nid, name, publicId, systemId) {
     super(nid);
-    this._name = name;
-    this._publicId = publicId;
-    this._systemId = systemId;
+    _hset(this, "_name", name);
+    _hset(this, "_publicId", publicId);
+    _hset(this, "_systemId", systemId);
   }
   get nodeType() { return 10; }
   get nodeName() { return this._name; }

@@ -3,7 +3,7 @@
 // class is defined below, after Range. _selectionFor is hoisted.
 function _selectionFor(doc) {
   if (!doc) return null;
-  if (!doc._selection) doc._selection = new Selection(doc);
+  if (!doc._selection) _hset(doc, "_selection", new Selection(doc));
   return doc._selection;
 }
 globalThis.getSelection = _markNative(function getSelection() {
@@ -121,8 +121,8 @@ function _sheetForStyleElement(style) {
 function _detachStyleSheet(style) {
   const sheet = _styleElementSheets.get(style);
   if (!sheet) return;
-  sheet._ownerNode = null;
-  sheet._sourceNode = null;
+  _hset(sheet, "_ownerNode", null);
+  _hset(sheet, "_sourceNode", null);
   _styleElementSheets.delete(style);
 }
 function _linkElementHasCssSheet(link) {
@@ -146,8 +146,8 @@ function _sheetForLinkElement(link) {
 function _detachLinkedStyleSheet(link) {
   const sheet = _linkElementSheets.get(link);
   if (!sheet) return;
-  sheet._ownerNode = null;
-  sheet._sourceNode = null;
+  _hset(sheet, "_ownerNode", null);
+  _hset(sheet, "_sourceNode", null);
   _linkElementSheets.delete(link);
 }
 // Called wherever a subtree stops being connected. Two things are keyed on
@@ -174,7 +174,7 @@ function _syncAdoptedStyleSheet(sheet) {
 
 function _reconcileAdoptedStyleSheetAdopters(root, sheets) {
   const previous = root._registeredAdoptedStyleSheets
-    || (root._registeredAdoptedStyleSheets = new Set());
+    || (_hset(root, "_registeredAdoptedStyleSheets", new Set()));
   const current = new Set(Array.from(sheets || []).filter(sheet => sheet instanceof CSSStyleSheet));
   for (const sheet of previous) {
     if (!current.has(sheet)) sheet._adopters?.delete(root);
@@ -182,7 +182,7 @@ function _reconcileAdoptedStyleSheetAdopters(root, sheets) {
   for (const sheet of current) {
     if (!previous.has(sheet)) sheet._adopters.add(root);
   }
-  root._registeredAdoptedStyleSheets = current;
+  _hset(root, "_registeredAdoptedStyleSheets", current);
 }
 
 function _adoptedStyleTarget(root) {

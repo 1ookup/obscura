@@ -124,7 +124,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
     } catch (_error) { bytes = new Uint8Array(0); }
     return new File([bytes], spec.name || '', { type: spec.type || '' });
   });
-  el._files = _makeFileList(files);
+  _hset(el, "_files", _makeFileList(files));
   try {
     el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', { bubbles: true })));
   } catch (_error) {}

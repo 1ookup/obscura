@@ -85,7 +85,7 @@ class HTMLLinkElement extends Element {
     if (String(this.as).toLowerCase() !== 'image') return;
     const href = this.href;
     if (!href || this._preloadedHref === href) return;
-    this._preloadedHref = href;
+    _hset(this, "_preloadedHref", href);
     try {
       const image = new Image();
       image.src = href;

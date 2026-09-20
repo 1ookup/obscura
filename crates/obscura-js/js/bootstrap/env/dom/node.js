@@ -202,19 +202,19 @@ function __prepareInsertedSubtree(root) {
 }
 
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
+  _hset(node, "_treeDetachedExact", true);
   node[_treeParentSym] = null;
   node[_treeParentEpochSym] = _treeMutationEpoch;
-  node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hset(node, "_treeConnected", false);
+  _hset(node, "_treeConnectedEpoch", _treeMutationEpoch);
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
+  _hset(node, "_treeDetachedExact", false);
   node[_treeParentSym] = parent;
   node[_treeParentEpochSym] = _treeMutationEpoch;
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hset(node, "_treeConnected", !!connected);
+  _hset(node, "_treeConnectedEpoch", _treeMutationEpoch);
   // Insertion adopts the node into the parent's document. Restamp only the
   // moved root; descendants re-resolve lazily (weak consistency, see
   // Node#ownerDocument). Free while no iframe content document exists.
@@ -228,6 +228,6 @@ function _seedInsertedTreeState(node, parent, connected) {
 }
 
 function _seedUnchangedConnection(node, connected) {
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hset(node, "_treeConnected", !!connected);
+  _hset(node, "_treeConnectedEpoch", _treeMutationEpoch);
 }

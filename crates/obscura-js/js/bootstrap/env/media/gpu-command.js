@@ -181,7 +181,7 @@ globalThis.GPUTexture = class GPUTexture {
   createView(descriptor) {
     const source = descriptor && typeof descriptor === 'object' ? descriptor : {};
     const view = new globalThis.GPUTextureView(_gpuKey, source.label);
-    view._texture = this;
+    _hset(view, "_texture", this);
     return view;
   }
   destroy() {

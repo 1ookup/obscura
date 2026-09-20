@@ -73,7 +73,7 @@ function _audioDspDiscreteTimeConstant(timeConstant, sampleRate) {
 
 // Twiddle factors for the in-place radix-2 transform, one table per size.
 function _audioDspTwiddles(size) {
-  if (!_audioDspTwiddles._cache) _audioDspTwiddles._cache = new Map();
+  if (!_audioDspTwiddles._cache) _hset(_audioDspTwiddles, "_cache", new Map());
   let table = _audioDspTwiddles._cache.get(size);
   if (!table) {
     const half = size >> 1;
@@ -192,7 +192,7 @@ function _audioDspBuildTable(wave, rangeIndex) {
 }
 
 function _audioDspWaveTables(type, sampleRate) {
-  if (!_audioDspWaveTables._cache) _audioDspWaveTables._cache = new Map();
+  if (!_audioDspWaveTables._cache) _hset(_audioDspWaveTables, "_cache", new Map());
   const key = type + '@' + sampleRate;
   const cached = _audioDspWaveTables._cache.get(key);
   if (cached) return cached;
@@ -770,13 +770,13 @@ function _audioDspRenderOffline(context, buffer, stateOf) {
     const quantum = { start, frames: Math.min(128, frames - start), token: ++token, sampleRate };
     // Parameter assignments are timed against the render position, so the
     // context has to know where it is while the graph is being pulled.
-    context._audioRenderFrame = start;
+    _hset(context, "_audioRenderFrame", start);
     const rendered = _audioDspRenderInputs(destinationState, quantum, stateOf);
     const mixed = _audioDspMixToChannels(rendered, channelCount, quantum.frames);
     for (let channel = 0; channel < channelCount; channel++) {
       if (mixed[channel]) data[channel].set(mixed[channel], start);
     }
   }
-  context._audioRenderFrame = frames;
+  _hset(context, "_audioRenderFrame", frames);
   return buffer;
 }

@@ -164,7 +164,7 @@ function _deliverWorkerOutMessage(worker, message) {
   // already registered stalled the widget.
   const listeners = (worker._listeners['message'] || []).slice();
   if (typeof worker.onmessage !== 'function' && !listeners.length) {
-    worker._listener = message;
+    _hset(worker, "_listener", message);
     return;
   }
   const evt = globalThis.__obscura_markTrusted
@@ -235,7 +235,7 @@ globalThis.Worker = class Worker {
     // navigator probe result never reached the page and Turnstile chose PAT.
     if (this._listener !== undefined && this._listener !== null) {
       const pending = this._listener;
-      this._listener = undefined;
+      _hset(this, "_listener", undefined);
       _deliverWorkerOutMessage(this, pending);
     }
   }
@@ -250,16 +250,16 @@ globalThis.Worker = class Worker {
     __obscuraTraceRecordHandler(this, 'onerror');
   }
   constructor(url, options) {
-    this._handlers = { message: null, messageerror: null, error: null };
-    this._listeners = {};
-    this._terminated = false;
-    this._id = null;
-    this._pending = [];
+    _hset(this, "_handlers", { message: null, messageerror: null, error: null });
+    _hset(this, "_listeners", {});
+    _hset(this, "_terminated", false);
+    _hset(this, "_id", null);
+    _hset(this, "_pending", []);
     // Execution-source label of the code constructing this worker. The
     // worker's own trace label is worker(M)[this], and 'out' message
     // callbacks on the page side restore it: a handler runs in the creating
     // context, not in whichever turn delivered the message.
-    this._traceFrom = __obscuraTraceCurrent();
+    _hset(this, "_traceFrom", __obscuraTraceCurrent());
     const worker = this;
     const href = String(url);
     const workerType = options && options.type !== undefined
@@ -288,7 +288,7 @@ globalThis.Worker = class Worker {
     }
     // Surfaces as `self.name` in the worker; "" when none was supplied, which
     // is what a browser reports -- an absent binding is not the same value.
-    this._name = options && options.name !== undefined ? String(options.name) : '';
+    _hset(this, "_name", options && options.name !== undefined ? String(options.name) : '');
     const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
     // A blob worker's script is the blob's own text, and the challenge builds
     // one that evals the tasks posted to it (`onmessage -> eval`). Running that
@@ -298,7 +298,7 @@ globalThis.Worker = class Worker {
     // document does not have. The widget CSP allows it (`script-src 'nonce-…'
     // 'unsafe-eval'` with `worker-src blob:`).
     if (typeof blobSource === 'string' && blobSource.length) {
-      this._scriptUrl = resolved;
+      _hset(this, "_scriptUrl", resolved);
       this._spawn(blobSource, resolved, workerType, '');
       return;
     }
@@ -308,7 +308,7 @@ globalThis.Worker = class Worker {
     // isolate made fetch("") a PAT request (no Origin) and the widget failed
     // 600010. Large classic http(s) workers still spawn.
     if (resolved.startsWith('blob:') || href.startsWith('blob:')) {
-      this._inlineEvalWorker = true;
+      _hset(this, "_inlineEvalWorker", true);
       return;
     }
     if (resolved.startsWith('data:')) {
@@ -374,10 +374,10 @@ globalThis.Worker = class Worker {
       );
     }
     catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
-    this._id = id;
+    _hset(this, "_id", id);
     Worker._byId.set(id, this);
     const queued = this._pending;
-    this._pending = [];
+    _hset(this, "_pending", []);
     for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
   }
   // Delivered by the runtime's worker message drain at task boundaries (see
@@ -463,7 +463,7 @@ globalThis.Worker = class Worker {
   }
   terminate() {
     if (this._terminated) return;
-    this._terminated = true;
+    _hset(this, "_terminated", true);
     this._pending.length = 0;
     if (this._id !== null) {
       Worker._byId.delete(this._id);

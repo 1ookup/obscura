@@ -56,7 +56,7 @@ function _installWasmStreamingFallback() {
     }
     return WebAssembly.instantiate(response, imports);
   };
-  fallback.__obscuraFallback = true;
+  _hset(fallback, "__obscuraFallback", true);
   WebAssembly.instantiateStreaming = fallback;
 }
 _installWasmStreamingFallback();

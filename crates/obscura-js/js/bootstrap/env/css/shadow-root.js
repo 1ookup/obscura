@@ -1,12 +1,12 @@
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   constructor(nid, host, options) {
     super(nid);
-    this._host = host;
-    this._mode = options.mode;
-    this._delegatesFocus = !!options.delegatesFocus;
-    this._slotAssignment = options.slotAssignment === 'manual' ? 'manual' : 'named';
-    this._clonable = !!options.clonable;
-    this._serializable = !!options.serializable;
+    _hset(this, "_host", host);
+    _hset(this, "_mode", options.mode);
+    _hset(this, "_delegatesFocus", !!options.delegatesFocus);
+    _hset(this, "_slotAssignment", options.slotAssignment === 'manual' ? 'manual' : 'named');
+    _hset(this, "_clonable", !!options.clonable);
+    _hset(this, "_serializable", !!options.serializable);
     const registry = options.customElementRegistry;
     _shadowCustomElementRegistries.set(
       this,

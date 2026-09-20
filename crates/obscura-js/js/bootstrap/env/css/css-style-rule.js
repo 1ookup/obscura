@@ -1,19 +1,19 @@
 class CSSStyleRule extends CSSRule {
   constructor(selectorText, declarations) {
     super("", CSSRule.STYLE_RULE);
-    this._selectorText = String(selectorText || "").trim();
+    _hset(this, "_selectorText", String(selectorText || "").trim());
     const declaration = new CSSStyleDeclaration(null, () => this._changed(), this);
     const state = _cssStyleFor(declaration);
     _parseCssInto(state.props, declarations);
     state.loaded = true;
-    this._decl = declaration;
-    this._style = null;
+    _hset(this, "_decl", declaration);
+    _hset(this, "_style", null);
   }
   get selectorText() { return this._selectorText; }
   set selectorText(value) {
     const selector = String(value || "").trim();
     if (!selector || /[{}]/.test(selector)) return;
-    this._selectorText = selector;
+    _hset(this, "_selectorText", selector);
     this._changed();
   }
   // The property-access Proxy is created lazily: materializing a sheet
@@ -21,7 +21,7 @@ class CSSStyleRule extends CSSRule {
   // re-parsing a rewritten stylesheet visibly slower than Chrome's walk.
   // cssText reads the raw declaration directly.
   get style() {
-    if (!this._style) this._style = _styleProxy(this._decl);
+    if (!this._style) _hset(this, "_style", _styleProxy(this._decl));
     return this._style;
   }
   get cssText() {

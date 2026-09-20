@@ -17,7 +17,7 @@ var Document = _swappableInterface('Document', class extends Node {
   }
   get timeline() {
     if (!this._timeline) {
-      this._timeline = new DocumentTimeline();
+      _hset(this, "_timeline", new DocumentTimeline());
     }
     return this._timeline;
   }
@@ -103,9 +103,9 @@ var Document = _swappableInterface('Document', class extends Node {
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
-      this._doctype = new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      _hset(this, "_doctype", new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || ""));
     } else {
-      this._doctype = null;
+      _hset(this, "_doctype", null);
     }
     return this._doctype;
   }
@@ -166,7 +166,7 @@ var Document = _swappableInterface('Document', class extends Node {
     // weakening iframe/fetch/storage origin checks; those must be wired to a
     // future browsing-context principal model before domain relaxation can
     // grant cross-document access.
-    this._effectiveDomain = candidate;
+    _hset(this, "_effectiveDomain", candidate);
   }
   get referrer() {
     if (typeof this[_scopeRootSym] === 'number') {
@@ -531,10 +531,10 @@ var Document = _swappableInterface('Document', class extends Node {
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
-    el._tagName = localName.toUpperCase();
-    el._lname = localName;
-    el._ns = "http://www.w3.org/1999/xhtml";
-    el._nullNamespaceAttrs = new Map();
+    _hset(el, "_tagName", localName.toUpperCase());
+    _hset(el, "_lname", localName);
+    _hset(el, "_ns", "http://www.w3.org/1999/xhtml");
+    _hset(el, "_nullNamespaceAttrs", new Map());
     _seedDetachedTreeState(el);
     // Creation knows its scope: stamp the owner-document root (scoped
     // documents carry _scopeRoot, the main document its own nid).
@@ -542,8 +542,8 @@ var Document = _swappableInterface('Document', class extends Node {
     _stampDetachedDocumentNode(this, el);
     _cache.set(nid, el);
     if (el && localName === 'template') {
-      el._templateContent = this.createDocumentFragment();
-      el._templateContent._fragmentContext = 'template';
+      _hset(el, "_templateContent", this.createDocumentFragment());
+      _hset(el._templateContent, "_fragmentContext", 'template');
     }
     const registry = this.customElementRegistry || globalThis.customElements;
     const definition = registry?.get(localName);
@@ -556,7 +556,7 @@ var Document = _swappableInterface('Document', class extends Node {
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
     if (namespace === "http://www.w3.org/1999/xhtml") {
       const el = this.createElement(qualified);
-      if (el) el._ns = namespace;
+      if (el) _hset(el, "_ns", namespace);
       return el;
     }
     const nid = +_dom(
@@ -569,10 +569,10 @@ var Document = _swappableInterface('Document', class extends Node {
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
-    el._tagName = qualified;
-    el._lname = localName;
-    el._ns = effectiveNamespace;
-    el._nullNamespaceAttrs = new Map();
+    _hset(el, "_tagName", qualified);
+    _hset(el, "_lname", localName);
+    _hset(el, "_ns", effectiveNamespace);
+    _hset(el, "_nullNamespaceAttrs", new Map());
     _seedDetachedTreeState(el);
     el[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     _stampDetachedDocumentNode(this, el);
@@ -734,7 +734,7 @@ var Document = _swappableInterface('Document', class extends Node {
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
         const html = qualifiedName ? `<${safe}></${safe}>` : "";
         const doc = new DOMParser().parseFromString(html, "application/xml");
-        if (_doctype) doc._docType = _doctype;
+        if (_doctype) _hset(doc, "_docType", _doctype);
         return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
@@ -752,7 +752,7 @@ var Document = _swappableInterface('Document', class extends Node {
           publicId === undefined ? "" : String(publicId),
           systemId === undefined ? "" : String(systemId)
         );
-        dt._ownerDocument = ownerDoc;
+        _hset(dt, "_ownerDocument", ownerDoc);
         return dt;
       },
       hasFeature() { return true; },

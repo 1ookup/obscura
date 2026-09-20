@@ -20,13 +20,13 @@ class HTMLIFrameElement extends Element {
   set name(value) { this.setAttribute('name', value); }
   get sandbox() {
     if (!this._sandboxList) {
-      this._sandboxList = new DOMTokenList(this, 'sandbox', [
+      _hset(this, "_sandboxList", new DOMTokenList(this, 'sandbox', [
         'allow-downloads', 'allow-forms', 'allow-modals', 'allow-orientation-lock',
         'allow-pointer-lock', 'allow-popups', 'allow-popups-to-escape-sandbox',
         'allow-presentation', 'allow-same-origin', 'allow-scripts',
         'allow-top-navigation', 'allow-top-navigation-by-user-activation',
         'allow-top-navigation-to-custom-protocols',
-      ]);
+      ]));
     }
     return this._sandboxList;
   }

@@ -8491,6 +8491,146 @@ mod tests {
         );
     }
 
+    /// JSON.stringify, Object.keys, for-in, getOwnPropertyNames,
+    /// hasOwnProperty and getOwnPropertyDescriptor on DOM wrappers must
+    /// answer Chrome's own-key shape. Headless-Chrome oracle (153): a div
+    /// serializes as `{}` even with id set and carries no own string-keyed
+    /// properties at all; an element with an own ENUMERABLE `id` accessor
+    /// serializes as `{"id":...}` (the challenge's fold does exactly this on
+    /// an anchor -- profile Steps 331/332); document's only own key is
+    /// `location`; CustomEvent.detail is a prototype accessor so
+    /// JSON.stringify(event) is `{"isTrusted":false}`; NodeList and
+    /// HTMLCollection list their indexes ("0") but not "length" (oracle:
+    /// keys ["0"], JSON {"0":{}}) while `list[0]` keeps working. Engine
+    /// internal slots used to be enumerable own fields, so the fold saw
+    /// `{"_style":{...}}` where Chrome answers `{}`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapper_own_key_shapes_match_chrome_oracle() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            "<html><body><div id=a></div><p>x</p></body></html>",
+        ));
+        rt.set_url("https://example.com/wrapper-shape");
+        rt.run_page_init();
+        let shape = rt
+            .evaluate(
+                r#"(() => {
+                    const forInOwn = (o) => {
+                        const a = [];
+                        for (const k in o) a.push(k);
+                        return a.filter(k => k.charAt(0) === '_');
+                    };
+                    const div = document.createElement('div');
+                    div.id = 'mfiL4';
+                    div.setAttribute('data-x', '1');
+                    void div.tagName; void div.localName; void div.style;
+                    const a = document.createElement('a');
+                    a.href = 'https://example.com/x';
+                    const script = document.createElement('script');
+                    script.src = 'https://x/y.js';
+                    const text = document.createTextNode('hi');
+                    const range = document.createRange();
+                    const list = document.querySelectorAll('div');
+                    const ev = new Event('click'); ev.foo = 1;
+                    const custom = new CustomEvent('c', { detail: { x: 1 } });
+                    class X extends HTMLElement {
+                        constructor() { super(); this._own = 5; this.pub = 6; }
+                    }
+                    customElements.define('x-shape', X);
+                    const ce = document.createElement('x-shape');
+                    const withAccessor = document.createElement('span');
+                    Object.defineProperty(withAccessor, 'id', {
+                        get() { return 'mfiL4'; }, enumerable: true,
+                    });
+                    const nonEnum = document.createElement('span');
+                    Object.defineProperty(nonEnum, 'id', {
+                        get() { return 'z'; }, enumerable: false,
+                    });
+                    return {
+                        divJson: JSON.stringify(div),
+                        divKeys: Object.keys(div),
+                        divGopn: Object.getOwnPropertyNames(div),
+                        divForInOwn: forInOwn(div),
+                        divHasStyle: div.hasOwnProperty('_style'),
+                        divStyleDescMissing:
+                            Object.getOwnPropertyDescriptor(div, '_style') === undefined,
+                        aJson: JSON.stringify(a),
+                        scriptJson: JSON.stringify(script),
+                        textJson: JSON.stringify(text),
+                        rangeJson: JSON.stringify(range),
+                        rangeKeys: Object.keys(range),
+                        listJson: JSON.stringify(list),
+                        listKeys: Object.keys(list),
+                        listItem0: (list[0] || null) !== null,
+                        listLength: list.length,
+                        listHasLengthKey: Object.keys(list).indexOf('length') !== -1,
+                        colKeys: Object.keys(document.getElementsByTagName('div')),
+                        evKeys: Object.keys(ev),
+                        evJson: JSON.stringify(ev),
+                        customJson: JSON.stringify(custom),
+                        ceJson: JSON.stringify(ce),
+                        ceKeys: Object.keys(ce),
+                        accessorJson: JSON.stringify(withAccessor),
+                        accessorKeys: Object.keys(withAccessor),
+                        nonEnumJson: JSON.stringify(nonEnum),
+                        docKeys: Object.keys(document),
+                        locationKeys: Object.keys(location),
+                        nested: JSON.stringify({ el: div, n: 1 }),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let get = |key: &str| shape.get(key).cloned().unwrap_or_default();
+        assert_eq!(get("divJson"), serde_json::json!("{}"));
+        assert_eq!(get("divKeys"), serde_json::json!([]));
+        assert_eq!(get("divGopn"), serde_json::json!([]));
+        assert_eq!(get("divForInOwn"), serde_json::json!([]));
+        assert_eq!(get("divHasStyle"), serde_json::json!(false));
+        assert_eq!(get("divStyleDescMissing"), serde_json::json!(true));
+        assert_eq!(get("aJson"), serde_json::json!("{}"));
+        assert_eq!(get("scriptJson"), serde_json::json!("{}"));
+        assert_eq!(get("textJson"), serde_json::json!("{}"));
+        assert_eq!(get("rangeJson"), serde_json::json!("{}"));
+        assert_eq!(get("rangeKeys"), serde_json::json!([]));
+        assert_eq!(get("listJson"), serde_json::json!("{\"0\":{}}"));
+        assert_eq!(get("listKeys"), serde_json::json!(["0"]));
+        assert_eq!(get("listItem0"), serde_json::json!(true));
+        assert_eq!(
+            get("listLength"),
+            serde_json::json!(1),
+            "NodeList length/bracket access must survive the proxy shape",
+        );
+        assert_eq!(
+            get("listHasLengthKey"),
+            serde_json::json!(false),
+            "length must not be an own enumerable key (Chrome answers keys [\"0\"])",
+        );
+        assert_eq!(get("colKeys"), serde_json::json!(["0"]));
+        assert_eq!(get("evKeys"), serde_json::json!(["isTrusted", "foo"]));
+        assert_eq!(get("evJson"), serde_json::json!("{\"isTrusted\":false,\"foo\":1}"));
+        assert_eq!(get("customJson"), serde_json::json!("{\"isTrusted\":false}"));
+        assert_eq!(get("ceJson"), serde_json::json!("{\"_own\":5,\"pub\":6}"));
+        assert_eq!(
+            get("ceKeys"),
+            serde_json::json!(["_own", "pub"]),
+            "a page's own underscore field must stay visible (Chrome shows it)",
+        );
+        assert_eq!(get("accessorJson"), serde_json::json!("{\"id\":\"mfiL4\"}"));
+        assert_eq!(get("accessorKeys"), serde_json::json!(["id"]));
+        assert_eq!(get("nonEnumJson"), serde_json::json!("{}"));
+        assert_eq!(get("docKeys"), serde_json::json!(["location"]));
+        assert_eq!(
+            get("locationKeys"),
+            serde_json::json!([
+                "ancestorOrigins", "href", "origin", "protocol", "host",
+                "hostname", "port", "pathname", "search", "hash",
+                "assign", "reload", "replace", "toString",
+            ]),
+            "location's own-key order must match Chrome's LegacyUnforgeable order",
+        );
+        assert_eq!(get("nested"), serde_json::json!("{\"el\":{},\"n\":1}"));
+    }
+
     /// "<label>: <n>" through the log channel, countReset must reset
     /// silently (warning only for an unknown label), and the remaining
     /// sentinel shapes must hold: a bare trace/clear/group call carries its

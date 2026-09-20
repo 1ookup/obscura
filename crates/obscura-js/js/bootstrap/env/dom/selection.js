@@ -2,8 +2,8 @@
 // instance per document. Everything except modify() (needs visual line/word
 // layout) is layout-free, built on the Range boundary-point helpers above.
 globalThis.Selection = class Selection {
-  constructor(doc) { this._doc = doc; this._range = null; this._direction = 'none'; }
-  _setRange(r, dir) { this._range = r; this._direction = dir; }
+  constructor(doc) { _hset(this, "_doc", doc); _hset(this, "_range", null); _hset(this, "_direction", 'none'); }
+  _setRange(r, dir) { _hset(this, "_range", r); _hset(this, "_direction", dir); }
   _inDoc(node) { return !!(node && this._doc && this._doc.contains && this._doc.contains(node)); }
   get rangeCount() { return this._range ? 1 : 0; }
   get isCollapsed() { return !this._range || this._range.collapsed; }

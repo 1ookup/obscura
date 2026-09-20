@@ -5,20 +5,20 @@ class Animation {
     this.timeline = timeline;
     this.onfinish = null;
     this.oncancel = null;
-    this._nativeId = _waapiNextId++;
-    this._registered = false;
-    this._playState = 'idle';
-    this._holdTime = 0;
-    this._startTime = null;
-    this._finishTimer = null;
+    _hset(this, "_nativeId", _waapiNextId++);
+    _hset(this, "_registered", false);
+    _hset(this, "_playState", 'idle');
+    _hset(this, "_holdTime", 0);
+    _hset(this, "_startTime", null);
+    _hset(this, "_finishTimer", null);
     this.ready = Promise.resolve(this);
     this._resetFinishedPromise();
-    if (effect) effect._animation = this;
+    if (effect) _hset(effect, "_animation", this);
   }
   _resetFinishedPromise() {
     this.finished = new Promise((resolve, reject) => {
-      this._resolveFinished = resolve;
-      this._rejectFinished = reject;
+      _hset(this, "_resolveFinished", resolve);
+      _hset(this, "_rejectFinished", reject);
     });
     // Browser code commonly ignores the rejected cancel promise.
     this.finished.catch(() => {});
@@ -45,8 +45,8 @@ class Animation {
         : this.effect._timing.iterations,
       iterationsInfinite: this.effect._timing.iterations === Infinity,
     };
-    try { this._registered = !!Deno.core.ops.op_waapi_create?.(JSON.stringify(input)); }
-    catch (_) { this._registered = false; }
+    try { _hset(this, "_registered", !!Deno.core.ops.op_waapi_create?.(JSON.stringify(input))); }
+    catch (_) { _hset(this, "_registered", false); }
     if (this._registered) {
       _waapiAnimations.add(this);
       _domMutationEpoch++;
@@ -58,12 +58,12 @@ class Animation {
     if (this._playState !== 'running' || !this.effect) return;
     const timing = this.effect._timing;
     if (timing.iterations === Infinity) {
-      this._finishTimer = null;
+      _hset(this, "_finishTimer", null);
       return;
     }
     const end = Math.max(0, timing.delay + timing.duration * timing.iterations);
     const remaining = Math.max(0, end - this.currentTime);
-    this._finishTimer = setTimeout(() => this.finish(), remaining);
+    _hset(this, "_finishTimer", setTimeout(() => this.finish(), remaining));
   }
   get playState() { return this._playState; }
   get currentTime() {
@@ -72,38 +72,38 @@ class Animation {
   }
   set currentTime(value) {
     const time = Math.max(0, Number(value) || 0);
-    this._holdTime = time;
-    if (this._playState === 'running') this._startTime = performance.now() - time;
+    _hset(this, "_holdTime", time);
+    if (this._playState === 'running') _hset(this, "_startTime", performance.now() - time);
     this._native('currentTime', time);
     this._scheduleFinish();
   }
   get startTime() { return this._startTime; }
   set startTime(value) {
-    if (value == null) { this._startTime = null; return; }
+    if (value == null) { _hset(this, "_startTime", null); return; }
     const start = Number(value);
     if (!Number.isFinite(start)) throw new TypeError('Invalid startTime');
-    this._startTime = start;
-    this._holdTime = Math.max(0, performance.now() - start);
+    _hset(this, "_startTime", start);
+    _hset(this, "_holdTime", Math.max(0, performance.now() - start));
     this._native('currentTime', this._holdTime);
     this._scheduleFinish();
   }
   play() {
     if (!this.effect) return;
     if (this._playState === 'finished' || this._playState === 'idle') {
-      this._holdTime = 0;
+      _hset(this, "_holdTime", 0);
       if (this._playState === 'finished') this._resetFinishedPromise();
     }
     this._register();
-    this._startTime = performance.now() - this._holdTime;
-    this._playState = 'running';
+    _hset(this, "_startTime", performance.now() - this._holdTime);
+    _hset(this, "_playState", 'running');
     this._native('play');
     this.ready = Promise.resolve(this);
     this._scheduleFinish();
   }
   pause() {
     if (this._playState === 'idle') this._register();
-    this._holdTime = this.currentTime;
-    this._playState = 'paused';
+    _hset(this, "_holdTime", this.currentTime);
+    _hset(this, "_playState", 'paused');
     this._native('currentTime', this._holdTime);
     this._native('pause');
     if (this._finishTimer != null) clearTimeout(this._finishTimer);
@@ -112,8 +112,8 @@ class Animation {
     if (!this.effect) return;
     this._register();
     const timing = this.effect._timing;
-    this._holdTime = Math.max(0, timing.delay + timing.duration * timing.iterations);
-    this._playState = 'finished';
+    _hset(this, "_holdTime", Math.max(0, timing.delay + timing.duration * timing.iterations));
+    _hset(this, "_playState", 'finished');
     this._native('finish');
     if (this._finishTimer != null) clearTimeout(this._finishTimer);
     this._resolveFinished(this);
@@ -124,10 +124,10 @@ class Animation {
   cancel() {
     if (this._finishTimer != null) clearTimeout(this._finishTimer);
     this._native('cancel');
-    this._registered = false;
-    this._playState = 'idle';
-    this._holdTime = 0;
-    this._startTime = null;
+    _hset(this, "_registered", false);
+    _hset(this, "_playState", 'idle');
+    _hset(this, "_holdTime", 0);
+    _hset(this, "_startTime", null);
     _waapiAnimations.delete(this);
     this._rejectFinished(new DOMException('The animation was canceled', 'AbortError'));
     const event = new Event('cancel');

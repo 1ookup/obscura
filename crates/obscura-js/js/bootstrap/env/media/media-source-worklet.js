@@ -5,7 +5,7 @@ if (typeof globalThis.MediaSource === 'undefined') {
   const MediaSource = class MediaSource extends EventTarget {
     constructor() {
       super();
-      this._readyState = 'closed';
+      _hset(this, "_readyState", 'closed');
       this.sourceBuffers = [];
       this.activeSourceBuffers = [];
       this.duration = NaN;

@@ -7,7 +7,7 @@ function _audioBufferInitialize(buffer, options) {
   buffer.length = opts.length || 0;
   buffer.sampleRate = opts.sampleRate || 44100;
   buffer.duration = buffer.length / (buffer.sampleRate || 44100);
-  buffer._chs = [];
+  _hset(buffer, "_chs", []);
   for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
     buffer._chs.push(new Float32Array(buffer.length));
   }
@@ -156,7 +156,7 @@ function _audioContextInitialize(context) {
     numberOfOutputs: 0,
     channelCount: 2,
   }, 'AudioDestinationNode');
-  context._listeners = {};
+  _hset(context, "_listeners", {});
 }
 function _audioContextAddEventListener(context, type, callback) {
   if (!context._listeners[type]) context._listeners[type] = [];

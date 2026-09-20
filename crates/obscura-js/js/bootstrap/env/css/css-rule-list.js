@@ -1,6 +1,6 @@
 class CSSRuleList {
   constructor(sheet) {
-    this._sheet = sheet;
+    _hset(this, "_sheet", sheet);
     return new Proxy(this, {
       get(target, property, receiver) {
         if (typeof property === "string" && /^(?:0|[1-9]\d*)$/.test(property)) {

@@ -221,7 +221,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
     err.name = 'AbortError';
-    err.__aborted = true;
+    _hset(err, "__aborted", true);
     throw err;
   }
   if (parsed.corsBlocked) {

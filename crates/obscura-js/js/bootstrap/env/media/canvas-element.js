@@ -41,9 +41,9 @@ HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
     if (this._contextKind) {
       return this._contextKind === '2d' ? this._ctx : null;
     }
-    try { this._ctx = new _Canvas2D(this, attrs); }
+    try { _hset(this, "_ctx", new _Canvas2D(this, attrs)); }
     catch (_error) { return null; }
-    this._contextKind = '2d';
+    _hset(this, "_contextKind", '2d');
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
@@ -71,17 +71,17 @@ HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
     if (this._contextKind) {
       return this._contextKind === family ? this._ctx : null;
     }
-    this._ctx = family === 'webgl2'
+    _hset(this, "_ctx", family === 'webgl2'
       ? new globalThis.WebGL2RenderingContext(this, true, attrs)
-      : new globalThis.WebGLRenderingContext(this, false, attrs);
-    this._contextKind = family;
+      : new globalThis.WebGLRenderingContext(this, false, attrs));
+    _hset(this, "_contextKind", family);
     return this._ctx;
   }
   if (type === 'webgpu') {
     if (!globalThis.__obscura_webgl_enabled || !globalThis.GPUCanvasContext) return null;
     if (this._contextKind && this._contextKind !== 'webgpu') return null;
-    this._contextKind = 'webgpu';
-    if (!this._webgpuCtx) this._webgpuCtx = new globalThis.GPUCanvasContext(this);
+    _hset(this, "_contextKind", 'webgpu');
+    if (!this._webgpuCtx) _hset(this, "_webgpuCtx", new globalThis.GPUCanvasContext(this));
     return this._webgpuCtx;
   }
   return null;
