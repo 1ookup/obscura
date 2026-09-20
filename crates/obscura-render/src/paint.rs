@@ -2660,6 +2660,20 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
                 crate::inline::TextEngine::placeholder(),
             ));
         }
+        // Carry the previous layout's geometry maps so the next incremental
+        // prepare can reuse unchanged subtrees instead of rewriting them.
+        state.geometry = Some(crate::dom::RetainedGeometry {
+            rects: std::mem::take(&mut previous.layout.rects),
+            cssom_rects: std::mem::take(&mut previous.layout.cssom_rects),
+            inline_fragments: std::mem::take(&mut previous.layout.inline_fragments),
+            text_runs: std::mem::take(&mut previous.layout.text_runs),
+            clip_rects: std::mem::take(&mut previous.layout.clip_rects),
+            translates: std::mem::take(&mut previous.layout.translates),
+            transforms: std::mem::take(&mut previous.layout.transforms),
+            generated_rects: std::mem::take(&mut state.generated_rects),
+            viewport: previous.viewport,
+            root_font_size: previous.root_font_size,
+        });
     }
     let previous_census = previous.discovery.take();
     drop(previous);

@@ -630,6 +630,220 @@ pub(crate) struct RetainedTaffy {
     /// incremental prepare; `None` once the engine lives in the new layout.
     #[cfg(feature = "paint")]
     pub(crate) engine: Option<crate::inline::TextEngine>,
+    /// Final taffy layout values per node from the last walk that wrote
+    /// geometry: unrounded and rounded location/size. A node whose key equals
+    /// the freshly computed values produced byte-identical rect writes last
+    /// prepare, so its whole subtree can be reused instead of rewritten.
+    pub(crate) layout_keys: HashMap<taffy::NodeId, LayoutKey>,
+    /// The generated-content build list the generated rect slots belong to.
+    /// Slots are positional, so any change realigns them and forces a full
+    /// generated-rect rewrite.
+    pub(crate) generated_signature: Vec<(taffy::NodeId, NodeId)>,
+    /// Whether the current build has any taffy table boxes; gates the DOM
+    /// row-geometry pass.
+    pub(crate) has_table_boxes: bool,
+    /// Generated-content rect slots aligned with `generated_signature`,
+    /// retained because the slot values only change when a generated box is
+    /// rewritten.
+    pub(crate) generated_rects: Vec<Option<Rect>>,
+    /// Post-compute geometry maps moved out of the previous layout at the
+    /// transfer into this prepare; `None` once consumed by a reuse walk.
+    pub(crate) geometry: Option<RetainedGeometry>,
+    /// DOM nodes the structural resync pruned since the last prepare: their
+    /// geometry entries must be dropped from the reused maps.
+    pub(crate) pruned_dom: Vec<NodeId>,
+    /// Document-shape latches for the fixed-scan post-compute passes. An
+    /// exact scan runs once per full rebuild; incremental prepares only set
+    /// latches (a fresh style that introduces a candidate), never clear
+    /// them, so a latch is always a sound superset of the document.
+    pub(crate) fixup_flags: FixupFlags,
+    /// The previous prepare's css-prewalk inputs when the document's style
+    /// blocks, doctype, and root element cannot have changed.
+    pub(crate) css_state: Option<CssPrewalkInputs>,
+}
+
+impl FixupFlags {
+    fn note_style(&mut self, style: &crate::LayoutStyle) {
+        self.percent_padding |= style.padding_percent.iter().any(Option::is_some)
+            || style
+                .before_pseudo
+                .as_deref()
+                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some))
+            || style
+                .after_pseudo
+                .as_deref()
+                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some));
+        self.fit_content |= style.width_fit_content;
+        self.grid |= style.display == crate::Display::Grid;
+        self.flex |= style.display == crate::Display::Flex;
+        self.table_cell |= style.is_table_cell_box;
+        self.positioned |= style.position.is_some() || style.containing_block_triggers != 0;
+        self.counters |= !style.counter_reset.is_empty()
+            || !style.counter_increment.is_empty()
+            || !style.counter_set.is_empty()
+            || style
+                .before_pseudo
+                .as_ref()
+                .is_some_and(|pseudo| pseudo.generated_content.is_some())
+            || style
+                .after_pseudo
+                .as_ref()
+                .is_some_and(|pseudo| pseudo.generated_content.is_some());
+    }
+}
+
+/// Latches gating the whole-document style scans in the post-compute fixup
+/// passes. `false` means no node in the document can match the scan, so the
+/// scan is a proven no-op.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FixupFlags {
+    /// Any style with percentage padding (sync_resolved_percentage_padding).
+    pub percent_padding: bool,
+    /// Any `width: fit-content` element (apply_fit_content_widths).
+    pub fit_content: bool,
+    /// Any grid container (apply_full_span_column_subgrids).
+    pub grid: bool,
+    /// Any flex container (repair_intrinsic_column_flex_negative_margins).
+    pub flex: bool,
+    /// Any table cell box (apply_table_cell_block_alignment).
+    pub table_cell: bool,
+    /// Any positioned or containing-block-establishing element
+    /// (reparent_inset_positioned_nodes).
+    pub positioned: bool,
+    /// Any counter or generated content (post_cascade_fixups' resolver).
+    pub counters: bool,
+}
+
+/// The document-order prewalk inputs of one prepare: `<style>` block text,
+/// quirks mode, and the layout root element. Sources are reference-counted
+/// because an unchanged document reuses the same allocation across prepares.
+pub(crate) struct CssPrewalkInputs {
+    pub sources: std::rc::Rc<Vec<String>>,
+    pub quirks_mode: bool,
+    pub root_element: Option<NodeId>,
+    pub viewport: (f32, f32),
+}
+
+/// True when the queued mutations cannot change the css-prewalk inputs: no
+/// `<style>` block, doctype, or first element can have been added or removed
+/// and no `<style>` attribute can have changed. Style-element mutations are
+/// the planner's Full damage anyway; this keeps the gate independently sound.
+pub(crate) fn css_inputs_preserving(
+    tree: &DomTree,
+    mutations: &[crate::dom::RetainedStyleMutation],
+) -> bool {
+    mutations.iter().all(|mutation| match mutation {
+        crate::dom::RetainedStyleMutation::Resource => false,
+        crate::dom::RetainedStyleMutation::Animation { .. }
+        | crate::dom::RetainedStyleMutation::WaapiAnimation { .. } => true,
+        crate::dom::RetainedStyleMutation::Attribute(attribute) => {
+            let is_style = tree.with_node(attribute.node, |node| {
+                node.as_element()
+                    .is_some_and(|element| element.local.as_ref() == "style")
+            });
+            !is_style.unwrap_or(false)
+        }
+        crate::dom::RetainedStyleMutation::Tree(tree_mutation) => match tree_mutation {
+            crate::dom::TreeStyleMutation::Insert { node, .. }
+            | crate::dom::TreeStyleMutation::Remove { node, .. } => {
+                subtree_style_inert(tree, *node)
+                    && !has_style_ancestor(tree, *node)
+            }
+            // Style text IS a text node under the <style> element: a text
+            // mutation there rewrites the sources.
+            crate::dom::TreeStyleMutation::Text { parent, .. } => match parent {
+                Some(parent) => !has_style_ancestor(tree, *parent),
+                None => true,
+            },
+        },
+    })
+}
+
+/// True when `node` or any of its ancestors is a `<style>` element.
+fn has_style_ancestor(tree: &DomTree, node: NodeId) -> bool {
+    let own = tree.with_node(node, |node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "style")
+    });
+    own.unwrap_or(false)
+        || tree
+            .ancestors(node)
+            .into_iter()
+            .any(|ancestor| {
+                tree.with_node(ancestor, |node| {
+                    node.as_element()
+                        .is_some_and(|element| element.local.as_ref() == "style")
+                })
+                .unwrap_or(false)
+            })
+}
+
+/// True when the subtree rooted at `root` holds no `<style>` element and no
+/// doctype, bounded like the census scan.
+fn subtree_style_inert(tree: &DomTree, root: NodeId) -> bool {
+    const CSS_SCAN_BOUND: usize = 4096;
+    let mut scanned = 0usize;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        scanned += 1;
+        if scanned > CSS_SCAN_BOUND {
+            return false;
+        }
+        let inert = tree.with_node(node, |node| {
+            node.as_element()
+                .is_none_or(|element| element.local.as_ref() != "style")
+                && !matches!(&node.data, obscura_dom::tree::NodeData::Doctype { .. })
+        });
+        if !inert.unwrap_or(false) {
+            return false;
+        }
+        stack.extend(tree.children(node));
+    }
+    true
+}
+
+/// The geometry maps of one prepare, retained for the next incremental
+/// prepare so unchanged subtrees reuse their entries instead of being
+/// rewritten. Assembled at the transfer from the outgoing layout.
+pub(crate) struct RetainedGeometry {
+    pub rects: HashMap<NodeId, Rect>,
+    pub cssom_rects: HashMap<NodeId, Rect>,
+    pub inline_fragments: HashMap<NodeId, Vec<Rect>>,
+    pub text_runs: HashMap<NodeId, Vec<(Rect, String)>>,
+    pub clip_rects: HashMap<NodeId, Option<OverflowClip>>,
+    pub translates: HashMap<NodeId, (f32, f32)>,
+    pub transforms: HashMap<NodeId, crate::Affine2>,
+    pub generated_rects: Vec<Option<Rect>>,
+    pub viewport: (f32, f32),
+    pub root_font_size: f32,
+}
+
+/// The taffy layout values the rect write-backs derive a node's entry from.
+/// Equal keys imply equal writes (the accumulation from the parent is equal
+/// because the parent's key is equal too), which is what makes subtree
+/// reuse byte-identical to rewriting.
+#[derive(Clone, Copy)]
+pub(crate) struct LayoutKey {
+    pub unrounded: (taffy::Point<f32>, taffy::Size<f32>),
+    pub rounded: (taffy::Point<f32>, taffy::Size<f32>),
+}
+
+impl LayoutKey {
+    fn of(tree: &TaffyTree<usize>, node: taffy::NodeId) -> Option<Self> {
+        let rounded = tree.layout(node).ok()?;
+        let unrounded = tree.unrounded_layout(node);
+        Some(Self {
+            unrounded: (unrounded.location, unrounded.size),
+            rounded: (rounded.location, rounded.size),
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.unrounded.0 == other.unrounded.0
+            && self.unrounded.1 == other.unrounded.1
+            && self.rounded.0 == other.rounded.0
+            && self.rounded.1 == other.rounded.1
+    }
 }
 
 /// Dense identifier for one scrolling area in a prepared render. Index zero
@@ -2542,6 +2756,7 @@ fn mark_viewport_overflow_source(
     tree: &DomTree,
     root: NodeId,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    styles_touched: &mut HashSet<NodeId>,
 ) {
     let root_is_html = tree.get_node(root).is_some_and(|node| {
         node.as_element()
@@ -2553,6 +2768,7 @@ fn mark_viewport_overflow_source(
     let root_owns_overflow = styles.get(&root).is_some_and(|style| style.overflow_hidden);
     if let Some(style) = styles.get_mut(&root) {
         style.overflow_propagated_to_viewport = true;
+        styles_touched.insert(root);
     }
     if root_owns_overflow {
         return;
@@ -2596,6 +2812,7 @@ fn sync_resolved_percentage_padding(
     id_map: &HashMap<taffy::NodeId, NodeId>,
     generated: &[GeneratedBoxBuild],
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    styles_touched: &mut HashSet<NodeId>,
 ) {
     let has_percentage_padding = styles.values().any(|style| {
         style.padding_percent.iter().any(Option::is_some)
@@ -2634,16 +2851,19 @@ fn sync_resolved_percentage_padding(
         id_map: &HashMap<taffy::NodeId, NodeId>,
         generated: &HashMap<taffy::NodeId, (NodeId, GeneratedBoxKind)>,
         styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+        styles_touched: &mut HashSet<NodeId>,
     ) {
         let Ok(layout) = taffy_tree.layout(node) else {
             return;
         };
         if let Some(dom_id) = id_map.get(&node) {
             if let Some(style) = styles.get_mut(dom_id) {
+                styles_touched.insert(*dom_id);
                 sync(style, containing_block_width);
             }
         } else if let Some((host, kind)) = generated.get(&node) {
             if let Some(host_style) = styles.get_mut(host) {
+                styles_touched.insert(*host);
                 let pseudo = match kind {
                     GeneratedBoxKind::Before => host_style.before_pseudo.as_deref_mut(),
                     GeneratedBoxKind::After => host_style.after_pseudo.as_deref_mut(),
@@ -2664,6 +2884,7 @@ fn sync_resolved_percentage_padding(
                     id_map,
                     generated,
                     styles,
+                    styles_touched,
                 );
             }
         }
@@ -2680,6 +2901,7 @@ fn sync_resolved_percentage_padding(
         id_map,
         &generated,
         styles,
+        styles_touched,
     );
 }
 
@@ -2794,6 +3016,7 @@ fn resolve_atomic_percentage_heights(
 fn sync_positioned_pseudo_percentage_padding(
     rects: &HashMap<NodeId, Rect>,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    styles_touched: &mut HashSet<NodeId>,
 ) {
     let has_positioned_percentage_padding = styles.values().any(|style| {
         [
@@ -2838,6 +3061,7 @@ fn sync_positioned_pseudo_percentage_padding(
         if let Some(pseudo) = style.after_pseudo.as_deref_mut() {
             sync(pseudo, containing_block_width);
         }
+        styles_touched.insert(*host);
     }
 }
 
@@ -2992,6 +3216,161 @@ fn resolve_clip_rects(
             transforms,
             root_font_size,
             viewport,
+        );
+    }
+}
+
+/// Clip/translate/transform write-back for an incremental prepare whose
+/// retained maps are already populated from the previous prepare. A subtree
+/// is skipped whole when the node's own rect and style are unchanged and the
+/// inherited clip/translate/transform equals the retained entry: the outputs
+/// are a pure function of those inputs, so the retained entries are exactly
+/// what a full rewrite would produce. `changed_dom` carries every node whose
+/// rect was rewritten this prepare plus the ancestors of those nodes, and a
+/// parent only descends when its own outputs moved away from the retained
+/// values, so a skipped node can never hide a changed descendant.
+#[allow(clippy::too_many_arguments)]
+fn resolve_clip_rects_reusing(
+    tree: &DomTree,
+    id: NodeId,
+    inherited: Option<OverflowClip>,
+    tx: f32,
+    ty: f32,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
+    translates: &mut HashMap<NodeId, (f32, f32)>,
+    parent_transform: crate::Affine2,
+    transforms: &mut HashMap<NodeId, crate::Affine2>,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    changed_dom: &HashSet<NodeId>,
+    styles_touched: &HashSet<NodeId>,
+    affected_dom: &HashSet<NodeId>,
+    clip_touched: &mut HashSet<NodeId>,
+) {
+    resolve_clip_rects_reusing_visit(
+        tree,
+        id,
+        inherited,
+        tx,
+        ty,
+        rects,
+        styles,
+        clip_rects,
+        translates,
+        parent_transform,
+        transforms,
+        root_font_size,
+        viewport,
+        changed_dom,
+        styles_touched,
+        affected_dom,
+        clip_touched,
+        // The root's inherited inputs are constants; only its own inputs
+        // decide whether it must recompute.
+        false,
+    );
+}
+
+/// `must_recompute` is set for children of a node whose outputs moved away
+/// from the retained values: their inherited inputs changed, so their own
+/// unchanged inputs cannot save them from recomputation.
+#[allow(clippy::too_many_arguments)]
+fn resolve_clip_rects_reusing_visit(
+    tree: &DomTree,
+    id: NodeId,
+    inherited: Option<OverflowClip>,
+    tx: f32,
+    ty: f32,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
+    translates: &mut HashMap<NodeId, (f32, f32)>,
+    parent_transform: crate::Affine2,
+    transforms: &mut HashMap<NodeId, crate::Affine2>,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    changed_dom: &HashSet<NodeId>,
+    styles_touched: &HashSet<NodeId>,
+    affected_dom: &HashSet<NodeId>,
+    clip_touched: &mut HashSet<NodeId>,
+    must_recompute: bool,
+) {
+    if !must_recompute
+        && !affected_dom.contains(&id)
+        && !styles_touched.contains(&id)
+        && !changed_dom.contains(&id)
+    {
+        // Retained entries stand; the inherited inputs are unchanged.
+        return;
+    }
+    let previous_entry = clip_rects.get(&id).cloned();
+    let previous_translate = translates.get(&id).copied();
+    let previous_transform = transforms.get(&id).copied();
+
+    clip_rects.insert(id, inherited.clone());
+    // This node's own translate joins the accumulation for its box and its
+    // whole subtree (percentages resolve against its own border box).
+    let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
+        let rect = rects.get(&id).copied().unwrap_or_default();
+        resolved_own_translate(style, &rect, root_font_size, viewport)
+    });
+    let (tx, ty) = (tx + own_tx, ty + own_ty);
+    if tx != 0.0 || ty != 0.0 {
+        translates.insert(id, (tx, ty));
+    }
+    let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
+        let rect = rects.get(&id).copied().unwrap_or_default();
+        resolved_transform_matrix(style, &rect, root_font_size, viewport)
+    });
+    let transform = parent_transform.then(own_transform);
+    if !transform.is_identity() {
+        transforms.insert(id, transform);
+    }
+    clip_touched.insert(id);
+
+    // The children's inherited inputs changed iff this node's outputs moved
+    // away from the retained values.
+    let outputs_changed = previous_entry.as_ref() != Some(&inherited)
+        || previous_translate != translates.get(&id).copied()
+        || previous_transform != transforms.get(&id).copied();
+    let next = match (styles.get(&id), rects.get(&id)) {
+        (Some(style), Some(rect))
+            if style.overflow_hidden && !is_viewport_overflow_source(id, styles) =>
+        {
+            let own = OverflowClip::for_box(rect, style, tx, ty);
+            Some(match inherited {
+                Some(clip) => clip.intersect(own),
+                None => own,
+            })
+        }
+        _ => inherited,
+    };
+    if !outputs_changed {
+        // The whole subtree's entries already hold the right values.
+        return;
+    }
+    for cid in rendered_children(tree, id) {
+        resolve_clip_rects_reusing_visit(
+            tree,
+            cid,
+            next.clone(),
+            tx,
+            ty,
+            rects,
+            styles,
+            clip_rects,
+            translates,
+            transform,
+            transforms,
+            root_font_size,
+            viewport,
+            changed_dom,
+            styles_touched,
+            affected_dom,
+            clip_touched,
+            true,
         );
     }
 }
@@ -3887,6 +4266,8 @@ fn post_cascade_fixups(
     tree: &DomTree,
     layout_root: NodeId,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    styles_touched: &mut HashSet<NodeId>,
+    counters_possible: bool,
 ) {
     fn local_is(
         tree: &DomTree,
@@ -3905,6 +4286,7 @@ fn post_cascade_fixups(
         styles: &mut HashMap<NodeId, crate::LayoutStyle>,
         counters: &mut CssCounterState,
         resolve_counters: bool,
+        styles_touched: &mut HashSet<NodeId>,
     ) -> Vec<String> {
         let display_none = styles
             .get(&id)
@@ -3924,6 +4306,7 @@ fn post_cascade_fixups(
             });
             if let Some(cid) = last_auto_cell {
                 if let Some(style) = styles.get_mut(&cid) {
+                    styles_touched.insert(cid);
                     style.flex_grow = Some(1.0);
                 }
             }
@@ -3939,6 +4322,7 @@ fn post_cascade_fixups(
             });
 
             if let Some(style) = styles.get_mut(&id) {
+                styles_touched.insert(id);
                 if let Some(pseudo) = style.before_pseudo.as_mut() {
                     if let Some(items) = pseudo.generated_content.as_deref() {
                         pseudo.before_content = Some(counters.render(items));
@@ -3953,11 +4337,12 @@ fn post_cascade_fixups(
 
             let mut child_scopes = Vec::new();
             for child in rendered_children(tree, id) {
-                child_scopes.extend(walk(tree, child, styles, counters, resolve_counters));
+                child_scopes.extend(walk(tree, child, styles, counters, resolve_counters, styles_touched));
             }
             counters.pop_created(&child_scopes);
 
             if let Some(style) = styles.get_mut(&id) {
+                styles_touched.insert(id);
                 if let Some(pseudo) = style.after_pseudo.as_mut() {
                     if let Some(items) = pseudo.generated_content.as_deref() {
                         // Preserved from resolve_css_counters: the after pass
@@ -3982,14 +4367,15 @@ fn post_cascade_fixups(
         }
 
         for child in rendered_children(tree, id) {
-            walk(tree, child, styles, counters, resolve_counters);
+            walk(tree, child, styles, counters, resolve_counters, styles_touched);
         }
         Vec::new()
     }
 
-    let resolve_counters = styles_have_counter_or_generated_content(styles);
+    let resolve_counters = counters_possible
+        && styles_have_counter_or_generated_content(styles);
     let mut counters = CssCounterState::default();
-    let root_scopes = walk(tree, layout_root, styles, &mut counters, resolve_counters);
+    let root_scopes = walk(tree, layout_root, styles, &mut counters, resolve_counters, styles_touched);
     counters.pop_created(&root_scopes);
 }
 
@@ -5083,7 +5469,7 @@ fn layout_dom_with_web_fonts_pass_limit(
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
-    retained: Option<RetainedStyleMaps>,
+    mut retained: Option<RetainedStyleMaps>,
     mutations: &[RetainedStyleMutation],
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let mut animation_timeline = crate::AnimationTimelineState::default();
@@ -5169,7 +5555,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
     stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
-    retained: Option<RetainedStyleMaps>,
+    mut retained: Option<RetainedStyleMaps>,
     mutations: &[RetainedStyleMutation],
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
@@ -5182,34 +5568,61 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     // (for parsing), the doctype presence (quirks mode), and the first
     // element descendant (the layout root).
     let css_prof = timing.then(std::time::Instant::now);
-    let mut css_sources = Vec::new();
-    let mut quirks_mode = true;
-    let mut root_element = None;
-    for nid in tree.descendants(layout_root) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        match &node.data {
-            obscura_dom::tree::NodeData::Doctype { .. } => quirks_mode = false,
-            _ => {}
-        }
-        if root_element.is_none() && node.is_element() {
-            root_element = Some(nid);
-        }
-        if let Some(elem) = node.as_element() {
-            if elem.local.as_ref() == "style"
-                && node.get_attribute("media").is_none_or(|media| {
-                    media.trim().is_empty()
-                        || crate::css::media_query_applies_for_viewport_and_type(
-                            media,
-                            viewport,
-                            media_type,
-                        )
-                })
-            {
-                css_sources.push(tree.text_content(nid));
+    // The prewalk inputs (<style> text, quirks mode, root element) are pure
+    // document shape. When the queued mutations cannot touch that shape and
+    // the viewport is unchanged, reuse the retained inputs instead of
+    // walking the whole document.
+    let reused_css_inputs = retained
+        .as_mut()
+        .and_then(|retained| retained.taffy.as_mut())
+        .and_then(|state| state.css_state.take())
+        .filter(|css| css.viewport == viewport && css_inputs_preserving(tree, mutations));
+    let (css_sources, quirks_mode, root_element) = if let Some(css) = reused_css_inputs {
+        (css.sources, css.quirks_mode, css.root_element)
+    } else {
+        let mut css_sources = Vec::new();
+        let mut quirks_mode = true;
+        let mut root_element = None;
+        for nid in tree.descendants(layout_root) {
+            let Some(node) = tree.get_node(nid) else {
+                continue;
+            };
+            match &node.data {
+                obscura_dom::tree::NodeData::Doctype { .. } => quirks_mode = false,
+                _ => {}
+            }
+            if root_element.is_none() && node.is_element() {
+                root_element = Some(nid);
+            }
+            if let Some(elem) = node.as_element() {
+                if elem.local.as_ref() == "style"
+                    && node.get_attribute("media").is_none_or(|media| {
+                        media.trim().is_empty()
+                            || crate::css::media_query_applies_for_viewport_and_type(
+                                media,
+                                viewport,
+                                media_type,
+                            )
+                    })
+                {
+                    css_sources.push(tree.text_content(nid));
+                }
             }
         }
+        let css_sources = std::rc::Rc::new(css_sources);
+        (css_sources, quirks_mode, root_element)
+    };
+    // Store this prepare's inputs for the next one.
+    if let Some(state) = retained
+        .as_mut()
+        .and_then(|retained| retained.taffy.as_mut())
+    {
+        state.css_state = Some(CssPrewalkInputs {
+            sources: std::rc::Rc::clone(&css_sources),
+            quirks_mode,
+            root_element,
+            viewport,
+        });
     }
     let css_prof = css_prof.map(|t| t.elapsed());
 
@@ -5715,6 +6128,7 @@ fn try_incremental_style_updates(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     fresh: &HashSet<NodeId>,
     skip: &HashSet<NodeId>,
+    taffy_damage_seeds: &mut Vec<taffy::NodeId>,
 ) -> bool {
     for &node in fresh {
         if skip.contains(&node) {
@@ -5778,6 +6192,7 @@ fn try_incremental_style_updates(
             // set_style marks the node and its ancestors dirty; taffy's
             // caches then recompute exactly the damaged subtrees.
             let _ = state.tree.set_style(taffy_id, new_base);
+            taffy_damage_seeds.push(taffy_id);
             continue;
         }
         // Text inputs changed: only safe when nothing under this box
@@ -5799,6 +6214,7 @@ fn try_incremental_style_updates(
             return resync_reject("shape-change-text", node);
         }
         let _ = state.tree.set_style(taffy_id, new_base);
+        taffy_damage_seeds.push(taffy_id);
     }
     true
 }
@@ -5997,6 +6413,7 @@ fn try_incremental_tree_updates(
     custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     mutations: &[crate::dom::RetainedStyleMutation],
     engine: &mut crate::inline::TextEngine,
+    taffy_damage_seeds: &mut Vec<taffy::NodeId>,
 ) -> bool {
     use RetainedStyleMutation::Tree;
 
@@ -6198,6 +6615,7 @@ fn try_incremental_tree_updates(
                 .unwrap_or_else(|| NodeId::new(0));
             return resync_reject("set-children-failed", host);
         }
+        taffy_damage_seeds.push(*box_id);
     }
 
     // Prune everything the splice orphaned: taffy nodes bottom-up, then the
@@ -6252,6 +6670,11 @@ fn try_incremental_tree_updates(
             .retain(|dom| !removed_dom.contains(dom));
         styles.retain(|dom, _| !removed_dom.contains(dom));
         custom_properties.retain(|dom, _| !removed_dom.contains(dom));
+        // Geometry bookkeeping for the next prepare: only the DOM subtrees
+        // whose boxes were actually orphaned leave the reused geometry maps.
+        // A retained move keeps its boxes and must not be pruned, even
+        // though its Remove mutation put it in `removed_dom` above.
+        state.pruned_dom = removed_dom.drain().collect();
     }
 
     true
@@ -6406,6 +6829,33 @@ fn layout_dom_once(
         }
         None => (HashMap::new(), HashMap::new(), None, None),
     };
+    // Geometry-reuse bookkeeping from the previous prepare. Taken up front so
+    // the end-of-prepare RetainedTaffy construction can rebuild both fields
+    // from this prepare's outputs.
+    let mut pruned_dom = retained_taffy
+        .as_mut()
+        .map(|state| std::mem::take(&mut state.pruned_dom))
+        .unwrap_or_default();
+    let mut fixup_flags = retained_taffy
+        .as_ref()
+        .map(|state| state.fixup_flags)
+        .unwrap_or_default();
+    let mut css_state = retained_taffy
+        .as_mut()
+        .map(|state| state.css_state.take())
+        .unwrap_or(None);
+    let mut layout_keys: HashMap<taffy::NodeId, LayoutKey> = retained_taffy
+        .as_mut()
+        .map(|state| std::mem::take(&mut state.layout_keys))
+        .unwrap_or_default();
+    let mut generated_signature = retained_taffy
+        .as_mut()
+        .map(|state| std::mem::take(&mut state.generated_signature))
+        .unwrap_or_default();
+    let mut retained_geometry = retained_taffy
+        .as_mut()
+        .map(|state| state.geometry.take())
+        .unwrap_or(None);
     // Topmost relevance chain for the inheritance walk: every fresh node plus
     // its ancestors. Reused nodes outside this chain have no fresh descendant,
     // so their retained styles are already final and their subtree can be
@@ -6425,6 +6875,10 @@ fn layout_dom_once(
         }
         chain
     };
+    // Nodes whose computed style may have been rewritten this prepare: the
+    // fresh chain plus every node the post-cascade style writers touch. The
+    // reuse clip walk treats these as always-recompute.
+    let mut styles_touched: HashSet<NodeId> = fresh_chain.clone();
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
         snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
@@ -6460,7 +6914,31 @@ fn layout_dom_once(
     );
     let cascade_prof = cascade_prof.map(|t| t.elapsed());
     let fixups_prof = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-    post_cascade_fixups(tree, layout_root, &mut styles);
+    // Latch the fixup flags from this prepare's fresh styles before the
+    // gated passes read them; on a full rebuild rescan exactly (the cascade
+    // is final here, and the fixups below only resolve counter values).
+    match fresh_styles.as_ref() {
+        Some(fresh) => {
+            for node in fresh {
+                if let Some(style) = styles.get(node) {
+                    fixup_flags.note_style(style);
+                }
+            }
+        }
+        None => {
+            fixup_flags = FixupFlags::default();
+            for style in styles.values() {
+                fixup_flags.note_style(style);
+            }
+        }
+    }
+    post_cascade_fixups(
+        tree,
+        layout_root,
+        &mut styles,
+        &mut styles_touched,
+        fixup_flags.counters,
+    );
     let fixups_prof = fixups_prof.map(|t| t.elapsed());
     let cascade_time = t1.elapsed();
     let (signature, query_stats) = evaluator.map_or_else(
@@ -6504,6 +6982,9 @@ fn layout_dom_once(
     let mut cssom_rects = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
+    let mut clip_rects = HashMap::new();
+    let mut translates = HashMap::new();
+    let mut transforms = HashMap::new();
     // Incremental-rebuild bookkeeping (filled by the full build, or adopted
     // from the retained state on the in-place update path).
     let mut reverse: HashMap<NodeId, taffy::NodeId> = HashMap::new();
@@ -6515,7 +6996,28 @@ fn layout_dom_once(
     // Final absolute rects of anonymous inline-run leaves, keyed by the
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
-    let mut generated_rects: Vec<Option<Rect>> = Vec::new();
+    let mut generated_rects: Vec<Option<Rect>> = retained_taffy
+        .as_mut()
+        .map(|state| std::mem::take(&mut state.generated_rects))
+        .unwrap_or_default();
+    // Clean-subtree geometry reuse: on an incremental prepare whose taffy
+    // tree carried a full geometry snapshot, the maps start from the
+    // retained values and only the rewritten subtrees are walked.
+    let mut geometry_reuse = false;
+    let (mut reuse_viewport, mut reuse_root_font_size) = (viewport, 16.0f32);
+    // Taffy nodes the incremental paths restyled or respliced this prepare,
+    // plus the static-position reparenting; the reuse walk always visits
+    // these and their ancestors.
+    let mut taffy_damage_seeds: Vec<taffy::NodeId> = Vec::new();
+    // Set when a post-compute taffy fixup actually rewrote styles: its
+    // effects are not covered by the tracked seeds, so reuse is disabled for
+    // this prepare.
+    let mut fixups_touched_taffy = false;
+    // DOM nodes whose geometry entries the write-back rewrote this prepare
+    // (plus text nodes whose word lists were re-collected), and the
+    // anonymous engine items whose rects were rewritten.
+    let mut changed_dom: HashSet<NodeId> = HashSet::new();
+    let mut changed_anon: HashSet<usize> = HashSet::new();
     // Computed-definite-height node set (see the inheritance walk below).
     // Incremental prepares seed it from the retained set: skipped reused
     // subtrees keep their retained definiteness, while fresh nodes are
@@ -7626,7 +8128,7 @@ fn layout_dom_once(
 
         // Root/body overflow propagated to the viewport leaves the source
         // element itself overflow-visible for Taffy and BFC decisions.
-        mark_viewport_overflow_source(tree, root_id, &mut styles);
+        mark_viewport_overflow_source(tree, root_id, &mut styles, &mut styles_touched);
 
         // Border-collapse is inherited, so only distribute a table's
         // effective spacing to the legacy flex fallback after the computed
@@ -8080,7 +8582,7 @@ fn layout_dom_once(
                     }
                 }
                 let mut style_updates_ok =
-                    try_incremental_style_updates(state, tree, &styles, fresh, &style_skip);
+                    try_incremental_style_updates(state, tree, &styles, fresh, &style_skip, &mut taffy_damage_seeds);
                 let mut resync_ok = style_updates_ok;
                 if style_updates_ok && has_tree_damage {
                     // The resync shapes new text into the retained engine so
@@ -8097,7 +8599,13 @@ fn layout_dom_once(
                         &mut custom_properties,
                         mutations,
                         &mut engine,
+                        &mut taffy_damage_seeds,
                     );
+                    if resync_ok {
+                        if let Some(state) = retained_taffy.as_mut() {
+                            pruned_dom = std::mem::take(&mut state.pruned_dom);
+                        }
+                    }
                     if !resync_ok {
                         // Discard the half-mutated engine so its shape caches
                         // return to the pool before the full rebuild
@@ -8121,6 +8629,17 @@ fn layout_dom_once(
                             // set before the adoption point above.
                             definite_heights: _,
                             engine: mut retained_engine,
+                            // Seeded into the local reuse bookkeeping before
+                            // the build section; the adoption point never
+                            // sees it.
+                            layout_keys: _,
+                            generated_signature: _,
+                            generated_rects: _,
+                            has_table_boxes: _,
+                            geometry: _,
+                            pruned_dom: _,
+                            fixup_flags: _,
+                            css_state: _,
                         } = state;
                         taffy_tree = retained_tree;
                         id_map = retained_id_map;
@@ -8225,6 +8744,69 @@ fn layout_dom_once(
         };
         if let Some(taffy_root) = taffy_root_holder {
             tree_reusable = true;
+            // Clean-subtree geometry reuse: seed the output maps from the
+            // retained geometry. Only the subtrees whose taffy layout values
+            // changed this prepare (plus the ancestors of the taffy nodes the
+            // incremental path mutated) are walked and rewritten below; the
+            // rest of the document keeps the retained entries, which are
+            // byte-identical to what a full rewrite would produce.
+            let mut reuse_affected: HashSet<taffy::NodeId> = HashSet::new();
+            if incremental_applied {
+                if let Some(geo) = retained_geometry.take() {
+                    geometry_reuse = true;
+                    rects = geo.rects;
+                    cssom_rects = geo.cssom_rects;
+                    inline_fragments = geo.inline_fragments;
+                    text_runs = geo.text_runs;
+                    clip_rects = geo.clip_rects;
+                    translates = geo.translates;
+                    transforms = geo.transforms;
+                    reuse_viewport = geo.viewport;
+                    reuse_root_font_size = geo.root_font_size;
+                    for dom in pruned_dom.drain(..) {
+                        rects.remove(&dom);
+                        cssom_rects.remove(&dom);
+                        inline_fragments.remove(&dom);
+                        text_runs.remove(&dom);
+                        clip_rects.remove(&dom);
+                        translates.remove(&dom);
+                        transforms.remove(&dom);
+                    }
+                    for &seed in &taffy_damage_seeds {
+                        // Everything inside a seed's subtree can have been
+                        // recomputed (a container whose own values end
+                        // unchanged can still absorb child changes), and
+                        // every ancestor's accumulated position can move.
+                        if !reuse_affected.insert(seed) {
+                            continue;
+                        }
+                        let mut stack = taffy_tree.children(seed).unwrap_or_default();
+                        while let Some(descendant) = stack.pop() {
+                            if reuse_affected.insert(descendant) {
+                                if let Ok(children) = taffy_tree.children(descendant) {
+                                    stack.extend(children);
+                                }
+                            }
+                        }
+                        let mut cursor = taffy_tree.parent(seed);
+                        while let Some(ancestor) = cursor {
+                            if !reuse_affected.insert(ancestor) {
+                                break;
+                            }
+                            cursor = taffy_tree.parent(ancestor);
+                        }
+                    }
+                }
+            }
+            if !geometry_reuse {
+                // The maps start empty on a full rebuild, so the previous
+                // prepare's keys describe a different tree and must not be
+                // offered to the next reuse walk as current values.
+                layout_keys.clear();
+                generated_signature.clear();
+                taffy_damage_seeds.clear();
+                pruned_dom.clear();
+            }
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                 let (shape_ms, shape_calls, cosmic_ms) = crate::inline::shape_prof_take();
                 let (hits, misses) = cosmic_text::shape_run_cache_stats();
@@ -8269,10 +8851,25 @@ fn layout_dom_once(
                         };
                         adjusted.size.width = taffy::Dimension::length(declared);
                         let _ = taffy_tree.set_style(taffy_root, adjusted);
+                        taffy_damage_seeds.push(taffy_root);
                     }
                 }
             }
+            // The table used-width pass below re-styles table boxes from the
+            // whole id_map; its writes are not tracked as seeds.
+            if !ifc_items.table_rows.is_empty() {
+                fixups_touched_taffy = true;
+            }
             let prof_precompute = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
+            // A post-compute taffy fixup that did work invalidates the
+            // tracked-seed coverage of the geometry reuse walk.
+            macro_rules! note_fixup {
+                ($did:expr) => {{
+                    let did = $did;
+                    fixups_touched_taffy |= did;
+                    did
+                }};
+            }
             let static_position_candidates = reparent_inset_positioned_nodes(
                 tree,
                 layout_root,
@@ -8305,11 +8902,18 @@ fn layout_dom_once(
                 // wide cell, e.g. a fixed-width image row in an infobox, makes the
                 // table grow rather than overflow), at most the available width,
                 // preferring the author's specified width when there is one.
-                let mut tables: Vec<(taffy::NodeId, NodeId, usize)> = id_map
-                    .iter()
-                    .filter(|(taffy, _)| ifc_items.table_rows.contains_key(taffy))
-                    .map(|(t, d)| (*t, *d, table_ancestor_depth(tree, *d, &styles)))
-                    .collect();
+                let mut tables: Vec<(taffy::NodeId, NodeId, usize)> = if ifc_items
+                    .table_rows
+                    .is_empty()
+                {
+                    Vec::new()
+                } else {
+                    id_map
+                        .iter()
+                        .filter(|(taffy, _)| ifc_items.table_rows.contains_key(taffy))
+                        .map(|(t, d)| (*t, *d, table_ancestor_depth(tree, *d, &styles)))
+                        .collect()
+                };
                 // Outer tables consume their nested tables' intrinsic sizes.
                 // Only after an outer depth is fixed can a root layout expose
                 // the real cell width available to the next nested depth.
@@ -8714,7 +9318,8 @@ fn layout_dom_once(
                     );
                 }
                 prof_post_compute = Some(std::time::Instant::now());
-                if deferred_cyclic_inline_sizes.is_empty()
+                if note_fixup!(fixup_flags.fit_content
+                    && deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
                         &id_map,
@@ -8732,27 +9337,28 @@ fn layout_dom_once(
                             .ok()?;
                             tree.layout(node).ok().map(|layout| layout.size.width)
                         },
-                    )
+                    ))
                 {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if resolve_atomic_percentage_heights(
+                if note_fixup!(resolve_atomic_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
                     &id_map,
                     &styles,
                     &definite_height_nodes,
-                ) {
+                )) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
+                if note_fixup!(fixup_flags.flex && repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles))
                 {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
+                fixups_touched_taffy |= !deferred_cyclic_inline_sizes.is_empty();
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
                     &mut taffy_tree,
@@ -8771,7 +9377,8 @@ fn layout_dom_once(
                             );
                         }
                         DeferredFlexReflowPhase::FitContent => {
-                            if apply_fit_content_widths(
+                            if note_fixup!(fixup_flags.fit_content
+                                && apply_fit_content_widths(
                                 tree,
                                 &id_map,
                                 resolved_styles,
@@ -8788,7 +9395,7 @@ fn layout_dom_once(
                                     .ok()?;
                                     tree.layout(node).ok().map(|layout| layout.size.width)
                                 },
-                            ) {
+                            )) {
                                 let _ = tree.compute_layout_with_measure(
                                     taffy_root,
                                     available,
@@ -8798,19 +9405,19 @@ fn layout_dom_once(
                         }
                     }
                 );
-                if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
+                if note_fixup!(apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol)) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items) {
+                if note_fixup!(apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items)) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items) {
+                if note_fixup!(apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items)) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if apply_full_span_column_subgrids(
+                if note_fixup!(fixup_flags.grid && apply_full_span_column_subgrids(
                     tree,
                     &mut taffy_tree,
                     &id_map,
@@ -8827,11 +9434,11 @@ fn layout_dom_once(
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
                     },
-                ) {
+                )) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles) {
+                if note_fixup!(fixup_flags.table_cell && apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles)) {
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
@@ -8844,6 +9451,7 @@ fn layout_dom_once(
                 // candidates before changing any parent, preserving nested
                 // static-position candidates.
                 if !static_position_candidates.is_empty() {
+                    fixups_touched_taffy = true;
                     resolve_static_positions_and_reparent(
                         &mut taffy_tree,
                         &static_position_candidates,
@@ -8856,7 +9464,8 @@ fn layout_dom_once(
             {
                 let _ = taffy_tree.compute_layout(taffy_root, available);
                 prof_recompute = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-                if deferred_cyclic_inline_sizes.is_empty()
+                if note_fixup!(fixup_flags.fit_content
+                    && deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
                         &id_map,
@@ -8873,24 +9482,25 @@ fn layout_dom_once(
                             .ok()?;
                             tree.layout(node).ok().map(|layout| layout.size.width)
                         },
-                    )
+                    ))
                 {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if resolve_atomic_percentage_heights(
+                if note_fixup!(resolve_atomic_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
                     &id_map,
                     &styles,
                     &definite_height_nodes,
-                ) {
+                )) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
+                if note_fixup!(fixup_flags.flex && repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles))
                 {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
+                fixups_touched_taffy |= !deferred_cyclic_inline_sizes.is_empty();
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
                     &mut taffy_tree,
@@ -8905,7 +9515,8 @@ fn layout_dom_once(
                             let _ = tree.compute_layout(taffy_root, available);
                         }
                         DeferredFlexReflowPhase::FitContent => {
-                            if apply_fit_content_widths(
+                            if note_fixup!(fixup_flags.fit_content
+                                && apply_fit_content_widths(
                                 tree,
                                 &id_map,
                                 resolved_styles,
@@ -8921,22 +9532,22 @@ fn layout_dom_once(
                                     .ok()?;
                                     tree.layout(node).ok().map(|layout| layout.size.width)
                                 },
-                            ) {
+                            )) {
                                 let _ = tree.compute_layout(taffy_root, available);
                             }
                         }
                     }
                 );
-                if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
+                if note_fixup!(apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol)) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items) {
+                if note_fixup!(apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items)) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items) {
+                if note_fixup!(apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items)) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if apply_full_span_column_subgrids(
+                if note_fixup!(fixup_flags.grid && apply_full_span_column_subgrids(
                     tree,
                     &mut taffy_tree,
                     &id_map,
@@ -8952,16 +9563,17 @@ fn layout_dom_once(
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
                     },
-                ) {
+                )) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles) {
+                if note_fixup!(fixup_flags.table_cell && apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles)) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
                 // Keep the no-paint geometry path in the same final-position
                 // contract as screenshots: static coordinates are resolved
                 // after every pass that can move in-flow placeholders.
                 if !static_position_candidates.is_empty() {
+                    fixups_touched_taffy = true;
                     resolve_static_positions_and_reparent(
                         &mut taffy_tree,
                         &static_position_candidates,
@@ -8973,14 +9585,17 @@ fn layout_dom_once(
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                 eprintln!("[timing] post-compute-fixup-recomputes={:?}", prof_recompute.map(|t| t.elapsed()));
             }
-            sync_resolved_percentage_padding(
-                &taffy_tree,
-                taffy_root,
-                initial_cb_width,
-                &id_map,
-                &ifc_items.generated,
-                &mut styles,
-            );
+            if fixup_flags.percent_padding {
+                sync_resolved_percentage_padding(
+                    &taffy_tree,
+                    taffy_root,
+                    initial_cb_width,
+                    &id_map,
+                    &ifc_items.generated,
+                    &mut styles,
+                    &mut styles_touched,
+                );
+            }
             let prof_padding = prof_padding.map(|t| t.elapsed());
             let prof_abs_rects = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             let generated_nodes: HashMap<taffy::NodeId, usize> = ifc_items
@@ -8989,37 +9604,94 @@ fn layout_dom_once(
                 .enumerate()
                 .map(|(index, generated)| (generated.node, index))
                 .collect();
-            generated_rects.resize(ifc_items.generated.len(), None);
-            compute_absolute_rects(
-                &taffy_tree,
-                taffy_root,
-                initial_cb_x,
-                0.0,
-                &id_map,
-                &words,
-                &mut rects,
-                &mut text_runs,
-                &mut anon_rects,
-                &generated_nodes,
-                &mut generated_rects,
-            );
+            // Generated rect slots are positional: when the generated build
+            // list changed shape this prepare, the retained slot values no
+            // longer align and every generated box is rewritten.
+            let mut generated_realigned = true;
+            if geometry_reuse {
+                generated_realigned = generated_signature
+                    == ifc_items
+                        .generated
+                        .iter()
+                        .map(|generated| (generated.node, generated.host))
+                        .collect::<Vec<_>>();
+                if generated_realigned {
+                    generated_rects.resize(ifc_items.generated.len(), None);
+                } else {
+                    generated_rects.clear();
+                    generated_rects.resize(ifc_items.generated.len(), None);
+                }
+            } else {
+                generated_rects.clear();
+                generated_rects.resize(ifc_items.generated.len(), None);
+            }
+            generated_signature = ifc_items
+                .generated
+                .iter()
+                .map(|generated| (generated.node, generated.host))
+                .collect();
+            let mut touched_text_nodes: HashSet<NodeId> = HashSet::new();
+            if geometry_reuse && !fixups_touched_taffy {
+                let reuse_force_visit: HashSet<taffy::NodeId> = if generated_realigned {
+                    HashSet::new()
+                } else {
+                    generated_nodes.keys().copied().collect()
+                };
+                compute_absolute_rects_reusing(
+                    &taffy_tree,
+                    taffy_root,
+                    initial_cb_x,
+                    0.0,
+                    &id_map,
+                    &words,
+                    &mut rects,
+                    &mut text_runs,
+                    &mut anon_rects,
+                    &generated_nodes,
+                    &mut generated_rects,
+                    &mut cssom_rects,
+                    &mut layout_keys,
+                    &mut touched_text_nodes,
+                    &mut changed_dom,
+                    &mut changed_anon,
+                    &reuse_affected,
+                    &reuse_force_visit,
+                );
+            } else {
+                compute_absolute_rects(
+                    &taffy_tree,
+                    taffy_root,
+                    initial_cb_x,
+                    0.0,
+                    &id_map,
+                    &words,
+                    &mut rects,
+                    &mut text_runs,
+                    &mut anon_rects,
+                    &generated_nodes,
+                    &mut generated_rects,
+                );
+                compute_absolute_unrounded_rects(
+                    &taffy_tree,
+                    taffy_root,
+                    initial_cb_x,
+                    0.0,
+                    &id_map,
+                    &mut cssom_rects,
+                );
+            }
             let prof_abs_rects = prof_abs_rects.map(|t| t.elapsed());
-            let prof_unrounded = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-            compute_absolute_unrounded_rects(
-                &taffy_tree,
-                taffy_root,
-                initial_cb_x,
-                0.0,
-                &id_map,
-                &mut cssom_rects,
-            );
-            let prof_unrounded = prof_unrounded.map(|t| t.elapsed());
             let prof_cssom_advance = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
             // Taffy intentionally keeps the engine's established rounded
             // intrinsic sizing for reflow and paint. CSSOM View, however,
             // exposes the shaped 26.6 advance for auto-sized inline formatting
             // contexts. Replace only the matching rounded text width.
+            // Unchanged IFC owners keep their retained entry, which already
+            // encodes the same resolution from the same inputs.
             for (&nid, &idx) in &ifc_items.whole {
+                if geometry_reuse && !changed_dom.contains(&nid) {
+                    continue;
+                }
                 let Some(rect) = cssom_rects.get_mut(&nid) else {
                     continue;
                 };
@@ -9038,47 +9710,114 @@ fn layout_dom_once(
             }
             let prof_cssom_advance = prof_cssom_advance.map(|t| t.elapsed());
             let prof_fragments = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
-            inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
-            synthesize_row_rects(tree, layout_root, &mut rects);
+            if geometry_reuse {
+                // Only rewritten rects can change ordinary-inline fragments:
+                // a fragment is a pure function of the element's flow rect,
+                // its style, and the selected face metrics.
+                for &dom in &changed_dom {
+                    let Some(style) = styles.get(&dom) else {
+                        continue;
+                    };
+                    if !style.ignores_used_box_sizes() {
+                        continue;
+                    }
+                    let Some(flow_rect) = rects.get(&dom).copied() else {
+                        continue;
+                    };
+                    let fragment = inline_fragment_rect(style, &flow_rect, &engine);
+                    rects.insert(dom, fragment);
+                    inline_fragments.insert(dom, vec![fragment]);
+                }
+            } else {
+                inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
+            }
+            // The row-geometry pass only writes for DOM table elements whose
+            // boxes are table cells/rows; without taffy table boxes every
+            // write is a no-op.
+            if !geometry_reuse || !ifc_items.table_rows.is_empty() {
+                synthesize_row_rects(tree, layout_root, &mut rects);
+            }
             let prof_fragments = prof_fragments.map(|t| t.elapsed());
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
                 eprintln!(
-                    "[timing] post-compute-parts padding={:?} abs-rects={:?} unrounded-rects={:?} cssom-advance={:?} fragments={:?}",
+                    "[timing] post-compute-parts padding={:?} abs-rects={:?} cssom-advance={:?} fragments={:?}",
                     prof_padding.unwrap_or_default(),
                     prof_abs_rects.unwrap_or_default(),
-                    prof_unrounded.unwrap_or_default(),
                     prof_cssom_advance.unwrap_or_default(),
                     prof_fragments.unwrap_or_default(),
                 );
             }
         }
     }
-    sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
+    sync_positioned_pseudo_percentage_padding(&rects, &mut styles, &mut styles_touched);
 
-    let mut clip_rects = HashMap::new();
-    let mut translates = HashMap::new();
-    let mut transforms = HashMap::new();
+    let mut clip_touched: HashSet<NodeId> = HashSet::new();
     let prof_clips = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
     if let Some(root_id) = root {
         let root_font_size = styles
             .get(&root_id)
             .and_then(|style| style.font_size)
             .unwrap_or(16.0);
-        resolve_clip_rects(
-            tree,
-            root_id,
-            None,
-            0.0,
-            0.0,
-            &rects,
-            &styles,
-            &mut clip_rects,
-            &mut translates,
-            crate::Affine2::IDENTITY,
-            &mut transforms,
-            root_font_size,
-            viewport,
-        );
+        // Clip outputs are pure functions of the inherited clip/translate/
+        // transform, the node's own rect and style, the root font size, and
+        // the viewport. When everything except the inherited inputs is
+        // unchanged AND the inherited inputs are unchanged, the retained
+        // entry is already the answer. Reuse is disabled when a tracked
+        // style writer or the deferred-flex path may have touched styles.
+        let clip_reuse = geometry_reuse
+            && reuse_viewport == viewport
+            && reuse_root_font_size == root_font_size
+            && !fixups_touched_taffy;
+        if clip_reuse {
+            let affected_dom = {
+                let mut affected: HashSet<NodeId> = HashSet::new();
+                let mut queue: Vec<NodeId> = changed_dom.iter().copied().collect();
+                while let Some(node) = queue.pop() {
+                    if !affected.insert(node) {
+                        continue;
+                    }
+                    if let Some(parent) = rendered_parent(tree, node) {
+                        queue.push(parent);
+                    }
+                }
+                affected
+            };
+            resolve_clip_rects_reusing(
+                tree,
+                root_id,
+                None,
+                0.0,
+                0.0,
+                &rects,
+                &styles,
+                &mut clip_rects,
+                &mut translates,
+                crate::Affine2::IDENTITY,
+                &mut transforms,
+                root_font_size,
+                viewport,
+                &changed_dom,
+                &styles_touched,
+                &affected_dom,
+                &mut clip_touched,
+            );
+        } else {
+            resolve_clip_rects(
+                tree,
+                root_id,
+                None,
+                0.0,
+                0.0,
+                &rects,
+                &styles,
+                &mut clip_rects,
+                &mut translates,
+                crate::Affine2::IDENTITY,
+                &mut transforms,
+                root_font_size,
+                viewport,
+            );
+        }
     }
     let prof_clips = prof_clips.map(|t| t.elapsed());
     let prof_finalize = std::env::var_os("OBSCURA_RENDER_TIMING").map(|_| std::time::Instant::now());
@@ -9087,6 +9826,11 @@ fn layout_dom_once(
     // that layout is done, so paint draws the same line breaks it was sized for.
     #[cfg(feature = "paint")]
     for (nid, &idx) in &ifc_items.whole {
+        // Unchanged owners keep the engine's already-finalized state, which
+        // encodes the same origin/width/clip the rewrite would produce.
+        if geometry_reuse && !changed_dom.contains(nid) && !clip_touched.contains(nid) {
+            continue;
+        }
         if let (Some(rect), Some(style)) = (rects.get(nid), styles.get(nid)) {
             let mut origin = crate::inline::content_origin(rect, style);
             let cw = crate::inline::content_width(rect, style);
@@ -9136,6 +9880,13 @@ fn layout_dom_once(
     // block (its inherited chain, plus its own overflow like any child).
     #[cfg(feature = "paint")]
     for (parent, items) in &ifc_items.runs {
+        if geometry_reuse
+            && !changed_dom.contains(parent)
+            && !clip_touched.contains(parent)
+            && items.iter().all(|idx| !changed_anon.contains(idx))
+        {
+            continue;
+        }
         let inherited = clip_rects.get(parent).cloned().flatten();
         let clip = match (styles.get(parent), rects.get(parent)) {
             (Some(style), Some(prect)) if style.overflow_hidden => {
@@ -9161,6 +9912,13 @@ fn layout_dom_once(
     // node while each item is pinned to its anonymous leaf.
     #[cfg(feature = "paint")]
     for (text_node, items) in &ifc_items.word_items {
+        if geometry_reuse
+            && !changed_dom.contains(text_node)
+            && !clip_touched.contains(text_node)
+            && items.iter().all(|idx| !changed_anon.contains(idx))
+        {
+            continue;
+        }
         let clip = clip_rects
             .get(text_node)
             .cloned()
@@ -9179,7 +9937,7 @@ fn layout_dom_once(
     // The common paragraph with no nested inline owner skips both this work and
     // the second clip-tree walk.
     #[cfg(feature = "paint")]
-    if engine.has_inline_owners() {
+    if engine.has_inline_owners() && (!geometry_reuse || !changed_dom.is_empty()) {
         let canonical = synthesize_shaped_inline_fragments(tree, &mut rects, &styles, &engine);
         if !canonical.is_empty() {
             let relative_offsets = canonical
@@ -9235,9 +9993,9 @@ fn layout_dom_once(
     let generated_boxes = ifc_items
         .generated
         .iter()
-        .zip(generated_rects)
+        .zip(generated_rects.iter())
         .filter_map(|(generated, rect)| {
-            rect.map(|rect| GeneratedBox {
+            (*rect).map(|rect| GeneratedBox {
                 host: generated.host,
                 kind: generated.kind,
                 rect,
@@ -9317,6 +10075,14 @@ fn layout_dom_once(
             definite_heights: definite_height_nodes,
             #[cfg(feature = "paint")]
             engine: None,
+            layout_keys,
+            generated_signature,
+            generated_rects,
+            has_table_boxes: !ifc_items.table_rows.is_empty(),
+            geometry: None,
+            pruned_dom: Vec::new(),
+            fixup_flags,
+            css_state,
         })
     } else {
         None
@@ -10455,6 +11221,164 @@ fn compute_absolute_rects(
                 );
             }
         }
+    }
+}
+
+/// Geometry write-back for an incremental prepare whose retained maps are
+/// already populated from the previous prepare: identical to running
+/// `compute_absolute_rects` and `compute_absolute_unrounded_rects` over the
+/// whole tree, except that a subtree whose taffy layout key equals the
+/// retained one, and which contains no taffy damage seed, is skipped whole.
+/// Taffy's per-node caches guarantee a cache-hit subtree's layout values are
+/// identical, so the skipped writes would have produced the retained values
+/// byte for byte.
+#[allow(clippy::too_many_arguments)]
+fn compute_absolute_rects_reusing(
+    taffy_tree: &TaffyTree<usize>,
+    taffy_id: taffy::NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    words: &HashMap<taffy::NodeId, (NodeId, String)>,
+    rects: &mut HashMap<NodeId, Rect>,
+    text_runs: &mut HashMap<NodeId, Vec<(Rect, String)>>,
+    anon_rects: &mut HashMap<usize, Rect>,
+    generated_nodes: &HashMap<taffy::NodeId, usize>,
+    generated_rects: &mut [Option<Rect>],
+    cssom_rects: &mut HashMap<NodeId, Rect>,
+    layout_keys: &mut HashMap<taffy::NodeId, LayoutKey>,
+    touched_text_nodes: &mut HashSet<NodeId>,
+    changed_dom: &mut HashSet<NodeId>,
+    changed_anon: &mut HashSet<usize>,
+    reuse_affected: &HashSet<taffy::NodeId>,
+    force_visit: &HashSet<taffy::NodeId>,
+) {
+    let key = LayoutKey::of(taffy_tree, taffy_id);
+    let Some(key) = key else {
+        // The original walks skip a node whose rounded layout cannot be
+        // read; a stale key must not survive that case.
+        layout_keys.remove(&taffy_id);
+        return;
+    };
+    let clean = !force_visit.contains(&taffy_id)
+        && !reuse_affected.contains(&taffy_id)
+        && layout_keys
+            .get(&taffy_id)
+            .is_some_and(|previous| previous.matches(&key));
+    if clean {
+        // The subtree's layout values are identical; its map entries and
+        // its key stand.
+        return;
+    }
+    layout_keys.insert(taffy_id, key);
+
+    // Rounded write-back (compute_absolute_rects).
+    let layout = taffy_tree
+        .layout(taffy_id)
+        .expect("layout key above proves the rounded layout is readable");
+    let x = abs_x + layout.location.x;
+    let y = abs_y + layout.location.y;
+    let rect = Rect {
+        x,
+        y,
+        width: layout.size.width,
+        height: layout.size.height,
+    };
+    if let Some(dom_id) = id_map.get(&taffy_id) {
+        rects.insert(*dom_id, rect);
+        changed_dom.insert(*dom_id);
+    } else if let Some(&item) = taffy_tree.get_node_context(taffy_id) {
+        anon_rects.insert(item, rect);
+        changed_anon.insert(item);
+    }
+    if let Some(index) = generated_nodes.get(&taffy_id) {
+        generated_rects[*index] = Some(rect);
+    }
+    if let Some((text_dom_id, word)) = words.get(&taffy_id) {
+        // A text node's word leaves all live under one parent box, so a
+        // visited box re-collects the node's whole list; restart it once.
+        if touched_text_nodes.insert(*text_dom_id) {
+            text_runs.remove(text_dom_id);
+        }
+        text_runs
+            .entry(*text_dom_id)
+            .or_default()
+            .push((rect, word.clone()));
+        changed_dom.insert(*text_dom_id);
+    }
+
+    // Unrounded, layout-unit-snapped CSSOM write-back
+    // (compute_absolute_unrounded_rects).
+    let unrounded = taffy_tree.unrounded_layout(taffy_id);
+    let left = abs_x + unrounded.location.x;
+    let top = abs_y + unrounded.location.y;
+    let ux = snap_to_layout_unit(left);
+    let uy = snap_to_layout_unit(top);
+    let uright = snap_to_layout_unit(left + unrounded.size.width);
+    let ubottom = snap_to_layout_unit(top + unrounded.size.height);
+    if let Some(dom_id) = id_map.get(&taffy_id) {
+        cssom_rects.insert(
+            *dom_id,
+            Rect {
+                x: ux,
+                y: uy,
+                width: uright - ux,
+                height: ubottom - uy,
+            },
+        );
+    }
+
+    if let Ok(children) = taffy_tree.children(taffy_id) {
+        for child_id in children {
+            compute_absolute_rects_reusing(
+                taffy_tree,
+                child_id,
+                x,
+                y,
+                id_map,
+                words,
+                rects,
+                text_runs,
+                anon_rects,
+                generated_nodes,
+                generated_rects,
+                cssom_rects,
+                layout_keys,
+                touched_text_nodes,
+                changed_dom,
+                changed_anon,
+                reuse_affected,
+                force_visit,
+            );
+        }
+    }
+}
+
+/// Fragment box of an ordinary non-replaced inline element from its flow
+/// rect. Shared by the full fragment pass and the reuse-path per-node
+/// update so both compute the identical value.
+fn inline_fragment_rect(
+    style: &crate::LayoutStyle,
+    flow_rect: &Rect,
+    engine: &crate::inline::TextEngine,
+) -> Rect {
+    let font_height = engine.inline_font_box_height(style).max(0.0);
+    let line_height = engine.selected_line_height(style).max(0.0);
+    // Taffy's surrogate may be taller than this element's own strut when
+    // a nested inline enlarges the line. Center the element's logical
+    // line-height inside that allocation before removing its leading.
+    let logical_top = flow_rect.y + (flow_rect.height - line_height) / 2.0;
+    Rect {
+        x: flow_rect.x,
+        y: logical_top + (line_height - font_height) / 2.0
+            - style.padding.top
+            - style.border.top,
+        width: flow_rect.width,
+        height: font_height
+            + style.padding.top
+            + style.padding.bottom
+            + style.border.top
+            + style.border.bottom,
     }
 }
 
