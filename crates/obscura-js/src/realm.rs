@@ -44,6 +44,24 @@ const BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 const REALM_INIT_SRC: &str =
     "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;";
 
+/// Runs in a template-restored frame context right after its global `Deno`
+/// has been swapped for the live runtime's binding: registers this realm's
+/// baked Function.prototype.toString override with the shared native
+/// registry so other realms resolve the snapshot-baked surface marks
+/// (bootstrap.js `cross` consult). The cap bounds the list under frame
+/// churn; stale entries only cost a dead-call fallback on a miss.
+const CROSS_REGISTRY_BRIDGE: &str = r#"
+(function () {
+  try {
+    var reg = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+    if (!reg) return;
+    if (!reg.cross) reg.cross = [];
+    var fto = Function.prototype.toString;
+    if (reg.cross.length < 16 && reg.cross.indexOf(fto) === -1) reg.cross.push(fto);
+  } catch (e) {}
+})();
+"#;
+
 /// A secondary context in the runtime's isolate. Dropping the handle releases
 /// the context to GC; the main context is unaffected.
 pub struct SecondaryRealm {
@@ -886,7 +904,20 @@ impl ObscuraJsRuntime {
             let global = context.global(scope);
             let deno_key = v8::Local::new(scope, &deno_key);
             let deno_val = v8::Local::new(scope, &deno_val);
-            global.set(scope, deno_key.into(), deno_val);
+            global.set(scope, deno_key.into(), deno_val.into());
+        }
+        // The snapshot-baked surface marks live in the context-baked registry
+        // the baked Function.prototype.toString override closes over; the
+        // serializer cannot share that object with the live runtime's shared
+        // registry. Hand the shared registry the baked override itself: its
+        // toString consult (bootstrap.js `cross`) then resolves the template
+        // surface's marks for every other realm, keeping Chrome's
+        // "native answers native from any realm" contract (profile Step 330:
+        // the challenge's cross-realm console-identity validator read raw
+        // engine source here and flipped its probe outcomes).
+        {
+            let scope = &mut v8::ContextScope::new(scope, context);
+            run_script(scope, "<obscura:frame-cross-registry>", CROSS_REGISTRY_BRIDGE)?;
         }
         Ok(Some(v8::Global::new(scope, context)))
     }
@@ -2049,6 +2080,11 @@ pub(crate) fn spawn_frame_realm(
         let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
         let deno_local = v8::Local::new(scope, &deno_val);
         global.set(scope, deno_key.into(), deno_local.into());
+        if template_restored {
+            // Register the baked toString override with the shared registry
+            // (see create_frame_context_from_template for the rationale).
+            run_script(scope, "<obscura:frame-cross-registry>", CROSS_REGISTRY_BRIDGE)?;
+        }
 
         let nid_key = v8::String::new(scope, "__obscura_frame_document_nid")
             .ok_or_else(|| alloc_err("key"))?;

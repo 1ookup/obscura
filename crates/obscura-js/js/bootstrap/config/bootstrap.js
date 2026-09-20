@@ -329,7 +329,7 @@ function _identityObject(_label, source) { return source; }
 
 const _nativeRegistrySym = Symbol.for('obscura.nativeFunctionRegistry');
 const _nativeRegistry = Deno[_nativeRegistrySym] ||
-  (Deno[_nativeRegistrySym] = { fns: new WeakSet(), strings: new WeakMap() });
+  (Deno[_nativeRegistrySym] = { fns: new WeakSet(), strings: new WeakMap(), cross: [] });
 const _nativeFns = _nativeRegistry.fns;
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
@@ -357,6 +357,22 @@ Function.prototype.toString = function toString() {
     if (runtimeRegistry.strings.has(this)) { return runtimeRegistry.strings.get(this); }
     if (runtimeRegistry.fns.has(this)) {
       return `function ${this.name || ''}() { [native code] }`;
+    }
+  }
+  // Snapshot template realms mark their surface into a context-baked
+  // registry their own baked override closes over; the serializer cannot
+  // share that registry with this realm, so realm creation (realm.rs) hands
+  // the shared registry the baked override instead. Consulting it keeps
+  // Chrome's "a native function answers [native code] from every realm"
+  // contract for the template surface without re-walking it per realm. A
+  // miss here (page functions answer their source, functions minted after
+  // the template bake) yields no verdict and falls through.
+  {
+    const cross = (runtimeRegistry && runtimeRegistry.cross) || _nativeRegistry.cross || [];
+    for (let i = 0; i < cross.length; i++) {
+      let s;
+      try { s = cross[i].call(this); } catch (_e) { continue; }
+      if (typeof s === 'string' && s.indexOf('[native code]') !== -1) return s;
     }
   }
   // First unmarked probe: a page is asking a window-reachable function for

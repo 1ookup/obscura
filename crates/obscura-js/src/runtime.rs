@@ -8327,6 +8327,99 @@ mod tests {
     /// side effect (profile Step 320: the reference capture's " : 1" row is
     /// a count call, and the missing output was a legitimate fail signal),
     /// so count must keep Chrome's per-realm label map and emit
+    /// The challenge's cross-realm console-identity check reads a child
+    /// realm's console methods through the PARENT realm's
+    /// Function.prototype.toString (the validator's indexOf("[native code]")
+    /// anti-spoof leg, profile Step 330). A template-restored frame realm
+    /// used to carry its native marks only in the snapshot-baked registry
+    /// its own baked toString override closes over, so the parent's probe
+    /// saw raw engine source (`function() { return implementation.apply(...)`)
+    /// where Chrome answers `[native code]` from every realm, flipping the
+    /// battery's probe outcomes wholesale. The init-completion sweep must
+    /// run in every frame realm so its _runtimeNativeRegistry dual-write
+    /// lands each mark in the shared runtime registry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_console_answers_native_to_string_from_parent_realm() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://example.com/console-cross-realm");
+        rt.run_page_init();
+
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://example.com/widget', null);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm(
+            "console-cross-realm",
+            1,
+            root,
+            "https://example.com/widget",
+        )
+        .unwrap();
+        // Warm the frame console from the frame side, mirroring the
+        // challenge's child-realm probe traffic.
+        rt.execute_script_in_frame_realm(
+            "console-cross-realm",
+            1,
+            "<warm>",
+            "void console.log('warm'); void console.count('warm');",
+        )
+        .unwrap();
+
+        // The parent reads the child console through the same-origin
+        // WindowProxy and stringifies the methods with ITS OWN
+        // Function.prototype.toString -- the exact shape the challenge's
+        // sandbox validator uses.
+        let probe = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const cw = document.getElementById('f').contentWindow;
+                    const fam = ["log", "error", "warn", "info", "debug", "dir",
+                        "dirxml", "table", "trace", "count", "countReset",
+                        "group", "groupCollapsed", "groupEnd", "clear", "assert",
+                        "time", "timeLog", "timeEnd", "timeStamp", "profile",
+                        "profileEnd", "context", "createTask"];
+                    const native = (fn) => {
+                        try {
+                            return Function.prototype.toString.call(fn)
+                                === `function ${fn.name}() { [native code] }`;
+                        } catch (e) { return false; }
+                    };
+                    const reg = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+                    return {
+                        methodsPresent: fam.every(m => typeof cw.console[m] === "function"),
+                        allNativeFromParent: fam.every(m => native(cw.console[m])),
+                        childOverrideBridgedToSharedRegistry: !!(reg && reg.cross && reg.cross.length),
+                        ownNamesUnchanged:
+                            Object.getOwnPropertyNames(cw.console.log).sort().join(",") === "length,name,prototype",
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "methodsPresent": true,
+                "allNativeFromParent": true,
+                "childOverrideBridgedToSharedRegistry": true,
+                "ownNamesUnchanged": true,
+            }),
+            "frame console methods must stringify native through the parent realm",
+        );
+    }
+
     /// "<label>: <n>" through the log channel, countReset must reset
     /// silently (warning only for an unknown label), and the remaining
     /// sentinel shapes must hold: a bare trace/clear/group call carries its
