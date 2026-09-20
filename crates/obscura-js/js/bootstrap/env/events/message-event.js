@@ -11,3 +11,6 @@ globalThis.MessageEvent = class MessageEvent extends Event {
     this.ports = Object.freeze(Array.isArray(o.ports) ? o.ports.slice() : []);
   }
 };
+_eventInitSlots(globalThis.MessageEvent, [
+  ['data', null], ['origin', ''], ['lastEventId', ''], ['source', null], ['ports', () => []],
+]);

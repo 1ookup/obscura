@@ -57,6 +57,10 @@ const _htmlCollectionProxy = {
     if (typeof key !== 'string') return Reflect.getOwnPropertyDescriptor(t, key);
     const values = _htmlCollectionData(t);
     if (/^(?:0|[1-9]\d*)$/.test(key) && Number(key) < values.length) {
+      // Chrome's platform indexed properties are enumerable own properties
+      // (oracle, Chrome 153, non-empty collection: Object.keys -> ["0"],
+      // JSON.stringify -> {"0":{}}), unlike length/item/namedItem which stay
+      // off the instance.
       return { value: values[Number(key)], writable: false, enumerable: true, configurable: true };
     }
     const named = t.namedItem(key);
@@ -82,11 +86,54 @@ function _isHTMLEl(element) {
 }
 
 // NodeList is static and has no named access; this factory avoids allocating
-// an Array subclass for every querySelectorAll/childNodes call.
+// an Array subclass for every querySelectorAll/childNodes call. Like
+// HTMLCollection the elements live in a WeakMap behind a shared-trap proxy so
+// `list[0]` keeps working while the instance carries no own enumerable
+// properties: Chrome answers {} for JSON.stringify(list) and [] for
+// Object.keys(list) (oracle), not the index/length own props a JS array
+// subclass would expose.
+const _nodeListKey = Symbol('NodeList');
+const _nodeListValues = new WeakMap();
+function _nodeListData(value) {
+  const held = _nodeListValues.get(value);
+  if (!held) throw new TypeError('Illegal invocation');
+  return held;
+}
+const _nodeListProxy = {
+  get(t, key, receiver) {
+    if (typeof key === 'string' && /^(?:0|[1-9]\d*)$/.test(key)) {
+      const v = _nodeListData(receiver)[Number(key)];
+      return v != null ? v : null;
+    }
+    return Reflect.get(t, key, receiver);
+  },
+  has(t, key) {
+    if (Reflect.has(t, key)) return true;
+    return typeof key === 'string' && /^(?:0|[1-9]\d*)$/.test(key)
+      && Number(key) < _nodeListData(t).length;
+  },
+  ownKeys(t) {
+    return _nodeListData(t).map((_value, index) => String(index));
+  },
+  getOwnPropertyDescriptor(t, key) {
+    if (typeof key !== 'string') return Reflect.getOwnPropertyDescriptor(t, key);
+    const values = _nodeListData(t);
+    if (/^(?:0|[1-9]\d*)$/.test(key) && Number(key) < values.length) {
+      // Chrome's platform indexed properties are enumerable own properties
+      // (oracle, Chrome 153, non-empty list: Object.keys -> ["0"],
+      // JSON.stringify -> {"0":{}}); length is NOT an own key, which is what
+      // distinguishes this shape from the old own-field implementation.
+      return { value: values[Number(key)], writable: false, enumerable: true, configurable: true };
+    }
+    return Reflect.getOwnPropertyDescriptor(t, key);
+  },
+};
+
 function _nodeList(elements) {
-  const list = new NodeList();
-  for (let i = 0; i < elements.length; i++) list[i] = elements[i];
-  list.length = elements.length;
+  const values = Array.from(elements || []).filter(Boolean);
+  const target = new NodeList(_nodeListKey, values);
+  const list = new Proxy(target, _nodeListProxy);
+  _nodeListValues.set(list, values);
   return list;
 }
 

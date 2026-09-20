@@ -8,3 +8,4 @@ globalThis.CustomEvent = class CustomEvent extends Event {
     this.detail = detail;
   }
 };
+_eventInitSlots(globalThis.CustomEvent, [['detail', null]]);

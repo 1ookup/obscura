@@ -11,6 +11,7 @@ const _eventInternalStateRegistry = Deno[_eventInternalStateRegistrySym]
     trusted: new WeakSet(), sourceCapabilities: new WeakMap(),
     events: new WeakMap(), uiEvents: new WeakMap(),
     mouseEvents: new WeakMap(), pointerEvents: new WeakMap(),
+    inits: new WeakMap(),
   });
 // Snapshot template realms (batch 21) evaluated the bootstrap with the
 // snapshot build's registry, while the live registry rides on the runtime's
@@ -39,6 +40,33 @@ const _eventState = _forwardEventState('events');
 const _uiEventState = _forwardEventState('uiEvents');
 const _mouseEventState = _forwardEventState('mouseEvents');
 const _pointerEventState = _forwardEventState('pointerEvents');
+const _eventInitState = _forwardEventState('inits');
+
+// Chrome keeps the per-interface init members (CustomEvent.detail,
+// MessageEvent.data, ErrorEvent.message, ...) as enumerable accessors on the
+// interface prototype; instances carry no own properties, so
+// JSON.stringify(event) answers {"isTrusted":false} and Object.keys lists
+// nothing beyond page-added fields (oracle). Own fields here were a
+// fingerprint surface. _eventInitSlots installs the Chrome-shaped prototype
+// accessors; constructor code keeps assigning through `this.<name> =`, which
+// the setter routes into the realm-shared registry.
+function _eventInitSlots(impl, props) {
+  for (const [name, fallback] of props) {
+    Object.defineProperty(impl.prototype, name, {
+      get() {
+        const v = _eventInitState.get(this);
+        if (v && v.has(name)) { return v.get(name); }
+        return typeof fallback === 'function' ? fallback() : fallback;
+      },
+      set(v) {
+        let m = _eventInitState.get(this);
+        if (!m) { m = new Map(); _eventInitState.set(this, m); }
+        m.set(name, v);
+      },
+      enumerable: true, configurable: true,
+    });
+  }
+}
 
 function _eventTimeStamp() {
   try {

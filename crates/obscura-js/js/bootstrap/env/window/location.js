@@ -103,23 +103,65 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _environmentSettings().url;
 }
+// Chrome exposes Location.ancestorOrigins as a DOMStringList whose members
+// live on the prototype (JSON {}, Object.keys []), listing the origins of
+// every ancestor browsing context nearest first; a top-level page's list is
+// empty. The own-key enumeration of `location` itself lists ancestorOrigins
+// first, then the URL components, then the navigation methods, with toString
+// last (oracle, Chrome 153).
+function _ancestorOriginsList() {
+  const origins = [];
+  try {
+    let root = Number(globalThis.__obscura_frame_document_nid) || 0;
+    for (let depth = 0; depth < 8 && root > 0; depth++) {
+      const container = _domParse('frame_container_info', root) || {};
+      const parentRoot = Number(container.parentRoot) || 0;
+      if (parentRoot <= 0) break;
+      const info = _domParse('document_scope_info', parentRoot) || {};
+      const origin = typeof info.origin === 'string' && info.origin ? info.origin : null;
+      if (origin && origins[origins.length - 1] !== origin) origins.push(origin);
+      root = parentRoot;
+    }
+  } catch (_e) {}
+  const proto = {
+    get length() { return origins.length; },
+    item(i) {
+      i = Number(i);
+      return Number.isInteger(i) && i >= 0 && i < origins.length ? origins[i] : null;
+    },
+    contains(s) { return origins.indexOf(String(s)) !== -1; },
+  };
+  const list = Object.create(proto);
+  try {
+    Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMStringList', configurable: true });
+  } catch (_e2) {}
+  return list;
+}
 let _locationObj;
+const _ancestorOriginsCache = new WeakMap();
 function registerLocationSurface() {
 globalThis.location = _bootstrapObject('location', () => ({
+  // [SameObject]: every read returns the same list instance; the WeakMap
+  // keeps the cache invisible to own-property reflection.
+  get ancestorOrigins() {
+    let v = _ancestorOriginsCache.get(this);
+    if (!v) { v = _ancestorOriginsList(); _ancestorOriginsCache.set(this, v); }
+    return v;
+  },
   get href() { return __currentUrl(); },
   set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
   get hostname() { try { return new URL(this.href).hostname; } catch { return ""; } },
+  get port() { try { return new URL(this.href).port; } catch { return ""; } },
   get pathname() { try { return new URL(this.href).pathname; } catch { return "/"; } },
   get search() { try { return new URL(this.href).search; } catch { return ""; } },
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
-  get port() { try { return new URL(this.href).port; } catch { return ""; } },
-  toString() { return this.href; },
   assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
   replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
+  toString() { return this.href; },
 }));
 _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {

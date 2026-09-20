@@ -8,6 +8,9 @@ globalThis.ErrorEvent = class ErrorEvent extends Event {
     this.error = o.error !== undefined ? o.error : null;
   }
 };
+_eventInitSlots(globalThis.ErrorEvent, [
+  ['message', ''], ['filename', ''], ['lineno', 0], ['colno', 0], ['error', null],
+]);
 
 // HTML's "report the exception": fire an `error` event at the global object and
 // give `window.onerror` first refusal, so a page's own collector sees the
