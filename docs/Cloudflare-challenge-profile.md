@@ -12369,3 +12369,79 @@ b31-pagefn.html,b31_oracle.py,lin11-14.mjs}（远端同步 lin11/12/14）。
 我方抛 Chrome 不抛）；count 槽空行 vs ` : 1` 的取值路径；TBNgK7 臂 !h[80] 翻
 转的旗源（h[86]/h[87]/h[80] 的写入点仍在 worker 回包子 88407/88553/88635 与
 eOWlr6 setter 区）。
+
+### Step 331：修复批次 32——跨 realm toString cross 表自递归修复（每探针一次栈溢出周期），count 行实为挑战轮换回归，fold NaN 路径与 TBNgK7 旗源仍开放；判决三连 fail（2026-09-21 凌晨）
+
+**方法**：先走读 loop 区静态面（远端 lin14 走读：pc 90169 key=86 哨兵表构建、
+90598 key=6 方法表循环、三臂 0x0162e8/0x01630f/0x016339、catch target 探测），
+再本地 fixture + headless Chrome 151 oracle 对拍（b32-fixture 六视角折叠环、
+b32-consoleprops、b32-throwscan、b32-idgetter），最后 obdiag32 注入轮（diag32）
++ A/B 无卫兵轮（diag32b）+ ver41 + 判决三轮。
+
+**loop 区静态面（确证）**：
+1. 方法表 11 项：count→nGUI2、countReset→CqhOS8、debug→FpVt9、dir→QLaZp6、
+   dirxml→YVlHf2 … warn→HIFR9。循环体三臂读同一个 `h[113]["console"]`
+   （cl "console" ×3 只是三份字符串常量，不是三个 console 对象——Step 330 的
+   「三个不同 console 对象」定性作废）：count 臂 `count("\u0000", <fold>)` +
+   `countReset("\u0000", <fold>)`（cI arity 2），dir 臂 `dir("", <fold>)`，rest
+   臂 `m("%c%d", style, fold)` + 一次哨兵收集调用。ref 信标的 per-method 块
+   （PhWMD5,哨兵,AecW7,哨兵）×2 轮里没有 nGUI2/CqhOS8：count 系迭代不发
+   %c%d、不推哨兵，产出就是 count 行本身（ref 的 ` : 1`）。
+2. catch 块目标（tryPush key=104）候选 0x164e3，不构成 loop 局部；m4/m6 帧
+   槽与 fold 槽（loop 头 `h[40]=h[21]+h[53]` 型加法）的数据流未闭合，本批未
+   定 catch 块语义。
+3. TBNgK7 臂实为「collector 方法调用」形状：`h[20]="TBNgK7"; cI 调用` 是以
+   token 名为键的方法调用，SbVZ3 = 收集到的 token 名数组；pUXPt5 同。
+
+**引擎侧实证（oracle）**：11 方法 × 全分支形状（styled/NaN/Error 参、
+"\u0000" 参、receiver 换 undefined/window）在 headless Chrome 151 全部
+ok:undefined、零抛；我方同形。b32-fixture 六视角（parent→parent/child、
+child→parent/own/top/frames[0]）两侧逐项全等（唯一双方一致的 throw 是
+child frames[0] 无 console）。console.log(带自有 id accessor 的锚元素) 两侧
+getter 均零触发（afterLog=0）——我方 console 不读 id，TBNgK7 翻转不是
+console 串化回归。
+
+**引擎缺口（修复 1）**：批次 31 的 cross 表征询会自递归——被征询的 frame
+baked override 在自身 registry miss 后经 `_runtimeNativeRegistry()` 拿到的
+正是共享 registry，再次进入同一条 cross 列表（含它自己）：对任何未标记
+（页面）函数的 toString 探针 = override→征询→override 直到栈溢出的完整
+周期，RangeError 被内层 catch 吞掉后答案仍对，但每次探针付一次溢出代价。
+修复：busy 旗钉在共享列表本体上，重入时 frame override 跳过征询直接落
+_origToString。回归测试 cross_tostring_consult_does_not_reenter_itself 用
+spy override 钉征询次数=1（无卫兵时数千，测试在 stash 卫兵后实测翻红）。
+
+**obdiag32 轮（diag32，带临检）实锤**：challenge 真实电池里
+`count("\u0000", <fold对象>)`/`countReset`/`dir` 全部到达我方 console 方法、
+**零 THREW**——ver39/330 的「首个 slot 进 catch、loop 在我方抛」定性在当前
+build 上不再成立；count 行 `"\x00: 1"` 当场发出（grep 因 NUL 字节漏计，
+逐字节扫 ops.tsv 实证）。fold 仍全 Error（ref NaN×3+Error×4）：count 系迭代
+后 fold 未被 Number(pop) 清成 NaN，误差在 VM 值栈/fold 槽数据流，不在
+console 表面。
+
+**count 行归因（A/B 实证）**：diag32b（同 build、stash 卫兵的无卫兵二进制）
+count 行同样在场——ver40 的 count 行缺席是 **ov2 build 轮换的产物**
+（0921-02 build 缺席；04:10/04:28 build 均在场，两 build 字节数 444111/
+441005 vs 420699），不是批次 31 的回归，也不归功本批修复。
+
+**ver41（注入开，字母表 04:28 build 441005）**：SbVZ3 14 条 vs ref 91 不变：
+Qssv3=2（=ref）、ODxGu4=1（=ref）、mfiL4/21/TKyxg5/wguL7 尾段全等；
+count 行 4 条在场（信号达成）；72 条块、rFmgn2/lzDF4、TBNgK7 仍缺席；
+%c%d 第三参仍全 Error（24 条，ref 为 NaN×3+Error×4 交错）。
+
+**判决（诚实汇报）**：final40 / final40b / final40c（注入关，click-after 16）
+三轮均 **FAIL**：mitmproxy `GET www.thelancet.com/1.txt → 403`。注入已复原
+true（options API 复核 value=True）。
+
+**测试门**：obscura-js 673（新增
+cross_tostring_consult_does_not_reenter_itself；672 过 + worker_source
+并行抖动 isolated 过）；workspace 1903/1904（唯 fail 同一 timing 用例，
+isolated 3/3 过）；no-default-features check 过；精确 release 构建过（含
+diag32b 的无卫兵 A/B 二进制，判后已换回卫兵版）；无 cargo fmt。fixture 与
+走读器存 /tmp/cf0919/{b32-fixture.html,b32-consoleprops.html,
+b32-throwscan.html,b32-idgetter.html,b32_run.py,b32_ci*.mjs,b32_pre.txt,
+b32_loop.txt}，obdiag 临检已全部还原（工作树仅 bootstrap.js 卫兵 + 测试）。
+下一批入口：① fold 槽的 VM 值流（pop 后为何不清 NaN，需 jsvmp replay 单
+子程序插桩，catch 块 0x164e3 语义）；② TBNgK7/trio 旗源 worker 回包子
+88407/88553/88635 的分类语义（b31-w2 曾记录我方 29 事件 vs Chrome 13，当时
+排除过早）；③ 新表面缺口：JSON.stringify(元素) 我方枚举出引擎内部自有属性
+（`{"_style":{...}}` vs Chrome `{"id":"mfiL4"}`），own property 形状需对齐。
