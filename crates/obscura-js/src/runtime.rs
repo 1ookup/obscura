@@ -4889,6 +4889,68 @@ mod tests {
         rt
     }
 
+    /// The geometry hot path memoizes the document base URL. The memo must
+    /// survive ordinary DOM churn (the census append/attribute/text shape) and
+    /// must drop the moment a mutation can change which `<base>` resolves:
+    /// keying it on every connected change made it useless for churned pages,
+    /// keying it on none of them let a removed `<base>` keep resolving.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "render")]
+    async fn base_url_cache_survives_churn_and_drops_on_base_mutations() {
+        let mut rt = setup_runtime(
+            r#"<html><head><base id="b" href="/docs/"></head><body><div id="host"></div></body></html>"#,
+        );
+        rt.set_url("http://example.com/start/page");
+        // The base href resolves against the page URL and lands in the memo.
+        let generation_at_seed;
+        {
+            let mut state = rt.state.borrow_mut();
+            let base = crate::ops::document_base_url_cached(&mut state).unwrap();
+            assert_eq!(base.as_ref(), "http://example.com/docs/");
+            generation_at_seed = state.base_url_generation;
+        }
+        // Ordinary churn: append a div, then give it text. The memo must
+        // still hold (same generation, same resolution).
+        rt.evaluate(
+            r##"(function() {
+                const op = (c, a, b) => Deno.core.ops.op_dom(c, String(a ?? ""), String(b ?? ""));
+                const host = Number(op("query_selector", "#host"));
+                const div = Number(op("create_element", "div", ""));
+                op("append_child", String(host), String(div));
+                const text = Number(op("create_text_node", "x1", ""));
+                op("append_child", String(div), String(text));
+                return true;
+            })()"##,
+        )
+        .unwrap();
+        {
+            let mut state = rt.state.borrow_mut();
+            let base = crate::ops::document_base_url_cached(&mut state).unwrap();
+            assert_eq!(base.as_ref(), "http://example.com/docs/");
+            assert_eq!(
+                state.base_url_generation, generation_at_seed,
+                "churn must not bust the memo"
+            );
+        }
+        // Removing the <base> element changes the resolution: the next read
+        // must recompute against the page URL.
+        rt.evaluate(
+            r##"(function() {
+                const op = (c, a, b) => Deno.core.ops.op_dom(c, String(a ?? ""), String(b ?? ""));
+                const base = Number(op("query_selector", "#b"));
+                op("remove_child", String(base), "");
+                return true;
+            })()"##,
+        )
+        .unwrap();
+        {
+            let mut state = rt.state.borrow_mut();
+            let base = crate::ops::document_base_url_cached(&mut state).unwrap();
+            assert_eq!(base.as_ref(), "http://example.com/start/page");
+            assert_eq!(state.base_url_generation, generation_at_seed + 1);
+        }
+    }
+
     /// `setup_runtime` on an origin that is a secure context. Chrome exposes
     /// serviceWorker, crypto.subtle, caches, storage, clipboard, wakeLock,
     /// credentials, locks and mediaDevices *only* there, so a test that
