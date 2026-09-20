@@ -11678,3 +11678,59 @@ final26/27（批次 23 二进制，注入关）：全流程 + /ci/ 200，brunhil
 修复（8111633）真实且泛化：vendored btls-sys + PSS-PSS 广告回移植，重捕获与
 Chrome 151 逐字节一致（H2 层本已一致）。端到端验证阻塞至 brunhild 窗口重开；
 期间 VM 派发时序（ZMSOw0/uGyjw9）为剩余引擎侧主项。
+
+### Step 322：批次 24——"解释器派发 6-7x"假设证伪：V8 面全对齐，残差钉在强制 re-prepare 面（2026-09-20 11:0x）
+
+**方法（按 cheapest-first 顺序取证）**。① 构建形态核查：`target/release/gn_out/
+args.gn`（is_debug=false）+ v8_base ninja defines 实测——`NDEBUG`、无
+DCHECK_ALWAYS_ON/slow_dchecks，`V8_ENABLE_SPARKPLUG/MAGLEV/TURBOFAN/
+LEAPTIERING` 全开；librusty_v8.a（09-15 构）晚于 args.gn，args 未漂移。运行旗标
+仅 `--enable-sharedarraybuffer-per-context`（v8_flags.rs）。结论：**我们的 V8 是
+fast 变体，"dcheck/慢构建"假设（批次 24 假设 1/2）不成立**。② 派发隔离：decode-
+interpret-cost fixture 去 DOM 变体（同 475917B 程序、39,014 步、interpretAcc
+逐字节相等）：本引擎 1.5ms vs Chrome 1.2ms——**纯 switch 派发对齐**。③ 巨型
+megamorphic 派发台（462KB 伪字节码、24 帧×40 属性状态对象、200 locals、300
+字符串表、46,215 步/轮，warm 10 轮中位）：本引擎 1.06ms vs Chrome 0.61ms，
+局部变量对照组 0.60 vs 0.375——均匀 1.3-2x，无派发形状悬崖。④ 运行期旗标 A/B
+（OBSCURA_V8_FLAGS）：semi-space 16/32、--no-maglev、--no-turbofan 全部在噪声带
+（interpret 69.2-72.2 vs 基线 70.8）——GC/分层不敏感。⑤
+`performance.now.call(performance)` 之外——侧获：Chrome 对解绑调用
+`const n=performance.now; n()` 抛 "Illegal invocation"（品牌检查，连
+`Object.create(Performance.prototype)` 接收者都抛），本引擎此前照答数字。
+
+**fixture 分解（真 462KB 程序，注入轮外本地对拍）**：interpret 相 70.8（66.9-81.5
+带）vs Chrome 15.7ms；其中 gBCR 93 次强制读 62.8 vs 12.9ms（0.68 vs 0.14ms/次，
+4.9x）、其余 DOM op 6.4 vs 1.1、纯派发 1.5 vs 1.2。**"每步 6-7x"是 gBCR 成本摊进
+步数的会计假象**。94 次 prepare 合计 63.3ms：pre-image+fonts 5.2（图片/web 字体/
+svg 文本三次全树发现走查，本文档三者皆无）、build-walk 14.3（shape 8.3——Step 308
+shaped-run 缓存工作正常，miss 2-3/次=新 append 的文本）、derived-state 7.6、
+cascade 4.2（rules=0 仍走全树）、engine-build+compute 4.9、parse 0.5，另有 ~25ms
+未计入的多趟全树步（quirks 扫描/根查找/ratio 收集/defer 循环/counter/grow 单元/
+derived 几何等 ~8 趟小走查）。live 规模换算：forced-layout fixture（site=6，
+~1931 节点）Step 308 后单次 churned gBCR 仍 ~20-25ms vs Chrome ~0.1ms——
+**live ZMSOw0 残差 = 变更后几何读的强制全文档 re-prepare 面 × census 规模**，
+收敛路径是把 ~15 趟全树遍历合并/增量化（独立立项），非 V8 侧可修。
+
+**顺带修复（3c411f6）**：performance.now 接收者品牌检查——WeakSet 品牌（跨
+snapshot 还原存活，同注册表标记性质）+ 内建钟 impl；解绑/普通对象/原型替身
+接收者抛 TypeError "Illegal invocation"，单例接收者照答；包装函数 _markNative
+（worker realm 的 toString 也回到 native 串）。Chrome oracle 12 槽位逐一对表后
+全等（before：6 槽照答数字）。回归测试
+performance_now_throws_illegal_invocation_on_unbranded_receivers。
+
+门：obscura-js 670/670、workspace 1882/1882（render/release/nextest，
+--no-fail-fast）、`cargo check -p obscura-js -p obscura-cli
+--no-default-features` 过、AGENTS.md 精确 release 构建过；decode fixture
+interpret 70.1-75.0ms、interpretAcc=522541 逐字节不变（无回归）。
+
+**活体（注入开，11:07-11:09，负载 5.2-9.9）**：ver30 解密 7-frame（retry 形）：
+ZMSOw0=722、uGyjw9=323、tQdUc5=0、NnqX6=824——722/0 为离带离群（round 内重试
+流程 + 5 分钟负载 9.9）；ver31 复测（3-frame 常规形）：**ZMSOw0=485、uGyjw9=323、
+tQdUc5=38、NnqX6=6210**——ZMSOw0 回 384-487 带、tQdUc5 回 38，本批无回归。
+**final29 判决（注入关，11:10）**：流程完整——TS#1(822KB) → TS#2(90KB/127KB) →
+TS#3(93KB/5.2KB) → main#2(7.8KB/3240B) → 11:10:36 新 orchestrate（第二次
+TS#1 822KB）= **fail，与 final22-26 同形**：无任何到达
+www.thelancet.com/1.txt 的表单 POST/GET（无 404/403 终点）；console 行
+Qssv3×4/轮 = brunhild 阶段护卫翻转（Step 321 路由窗口残差，非本批回归）。
+`MutationObserver is not defined` 页任务报错经查 ver22/24/26/final26 同在
+（1-3 次/轮），既有残差非新引入。注入态已复原 true。
