@@ -11668,3 +11668,13 @@ Qssv3 x20——brunhild 探针阶段卫兵仍翻转，标记为该失败的下�
 门：obscura-net 104/104（stealth）、workspace 1881/1881、
 `cargo check -p obscura-js -p obscura-cli --no-default-features` 过、
 精确 release 构建（v8-source config）全绿、无 cargo fmt。
+
+### Step 321 补充：final26/27 判决 + brunhild 路由窗口（2026-09-20 10:0x）
+
+final26/27（批次 23 二进制，注入关）：全流程 + /ci/ 200，brunhild 仍被切（阶段护卫
+翻转 → ODxGu4×2+Qssv3×20 → 重开）。**关键更正**：brunhild 当前对所有人不可达——
+真 Chrome 153 与 CfT 151 同样 ERR_CONNECTION_CLOSED（直连/代理/双栈/三出口），
+代理侧 09-18 起 0/84。"Chrome 能过 brunhild"是时变路由窗口。批次 23 的 sigalgs
+修复（8111633）真实且泛化：vendored btls-sys + PSS-PSS 广告回移植，重捕获与
+Chrome 151 逐字节一致（H2 层本已一致）。端到端验证阻塞至 brunhild 窗口重开；
+期间 VM 派发时序（ZMSOw0/uGyjw9）为剩余引擎侧主项。
