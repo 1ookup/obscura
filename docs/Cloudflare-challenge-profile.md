@@ -11942,3 +11942,18 @@ POST/GET（ops.tsv 中 1.txt 100 条均为顶层文档自身）；console 行
 （viewport-fixed/scroll/sticky 共享一次先序 + 父索引）；③ resync 覆盖
 匿名 run wrapper 内词叶（需在期望模型中重建 build_mixed_block 分段，
 收益存疑，先记门不补）。16:58。
+
+### Step 325：批次 24-26 验证汇总（2026-09-20 17:1x）
+
+批次 24（3c411f6）：V8 派发平价证明（同程序 39k 步 1.5 vs 1.2ms；构建为 fast 变体
+全部优化层开启）；"6-7x 解释器差距"实为 gBCR 强制读摊入步数。附带修复
+performance.now 未品牌接收者 Illegal invocation。
+批次 25（7a89070/7edf96a）：pass 融合 + attr-churn 增量 taffy 重建（每次准备全树
+遍历 15→6；截图 63/63 逐字节不变）。
+批次 26（8cf550d/cf3e6d0/a877e9d）：**结构性 tree-churn 重同步**——挑战形态
+93/93 就地更新零回退，gBCR 份额 61.2→37.6-39.6ms，prepare 673→275µs；
+interpretAcc 逐字节一致。剩余（Step 323 后续②③）：clean-tree 几何复用 +
+derived-state 融合（<25ms 目标未达，当前 ~38ms）。
+实弹：ver34 ZMSOw0=523/uGyjw9=195/tQdUc5=39（带内）。final30/31/32 判决 fail
+同形态；brunhild 窗口持续关闭（Chrome 对照 502），Qssv3 守卫翻转仍在；
+final31 起 ODxGu4×0。
