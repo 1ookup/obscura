@@ -1848,14 +1848,8 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..max_redirects {
             validate_request_mode(&request, &current_url)?;
-            // Family gate: an IPv6-only name on a machine without global
-            // IPv6 must fail here, at the name-resolution stage Chrome uses,
-            // instead of as a slow transport death later (also covers the
-            // proxied shape, where only the CONNECT would otherwise observe
-            // the unreachable family). Cached per host; see resolver.rs.
-            if let Some(host) = current_url.host_str() {
-                crate::resolver::ensure_host_reachable(host).await?;
-            }
+            // Note: the family gate races the transport at the send site
+            // below (see resolver.rs), covering every redirect hop.
             let mut callback_headers = self.extra_headers.read().await.clone();
             callback_headers.extend(request.headers.clone());
             let request_info = RequestInfo {
@@ -2052,9 +2046,31 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
-            })?;
+            // Family gate racing the transport: a background probe cancels
+            // the request on denial (IPv6-only name, no global IPv6),
+            // reproducing Chrome's instant resolution-stage failure. Cached
+            // per host; see resolver.rs.
+            let mut gate = match current_url.host_str() {
+                Some(host) => crate::resolver::start_family_gate(host)?,
+                None => crate::resolver::FamilyGate::Settled,
+            };
+            let mut send_fut = std::pin::pin!(req_builder.send());
+            let resp = match &mut gate {
+                crate::resolver::FamilyGate::Settled => send_fut.await.map_err(|e| {
+                    ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                })?,
+                crate::resolver::FamilyGate::Watch(rx) => tokio::select! {
+                    resp = &mut send_fut => resp.map_err(|e| {
+                        ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                    })?,
+                    outcome = rx => match outcome {
+                        Ok(Err(deny)) => return Err(deny),
+                        _ => send_fut.await.map_err(|e| {
+                            ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                        })?,
+                    },
+                },
+            };
             let response_start = fetch_started.elapsed();
 
             let status = resp.status();

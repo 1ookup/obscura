@@ -3836,18 +3836,6 @@ async fn op_fetch_url_inner(
         }
     }
 
-    // Family gate: an IPv6-only name on a machine without global IPv6 must
-    // reject the fetch at the resolution stage (Chrome semantics), before
-    // the transport dials anything. Runs for both the stealth and reqwest
-    // transports; redirects re-run it per hop below. Cached per host.
-    if let Ok(parsed) = url::Url::parse(&url) {
-        if let Some(host) = parsed.host_str() {
-            obscura_net::ensure_host_reachable(host)
-                .await
-                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
-        }
-    }
-
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
@@ -3964,12 +3952,49 @@ async fn op_fetch_url_inner(
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let resp = req.send().await.map_err(|e| {
-            if let Some(ref counter) = in_flight {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            deno_error::JsErrorBox::generic(e.to_string())
-        })?;
+        // Family gate racing the transport: a background probe cancels the
+        // request on denial (IPv6-only name, no global IPv6), reproducing
+        // Chrome's instant resolution-stage failure. Covers every redirect
+        // hop; cached per host (obscura_net::resolver).
+        let mut gate = match url::Url::parse(&current_url) {
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => obscura_net::start_family_gate(host)
+                    .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?,
+                None => obscura_net::FamilyGate::Settled,
+            },
+            Err(_) => obscura_net::FamilyGate::Settled,
+        };
+        let mut send_fut = std::pin::pin!(req.send());
+        let resp = match &mut gate {
+            obscura_net::FamilyGate::Settled => send_fut.await.map_err(|e| {
+                if let Some(ref counter) = in_flight {
+                    counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                deno_error::JsErrorBox::generic(e.to_string())
+            })?,
+            obscura_net::FamilyGate::Watch(rx) => tokio::select! {
+                resp = &mut send_fut => resp.map_err(|e| {
+                    if let Some(ref counter) = in_flight {
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    deno_error::JsErrorBox::generic(e.to_string())
+                })?,
+                outcome = rx => match outcome {
+                    Ok(Err(deny)) => {
+                        if let Some(ref counter) = in_flight {
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Err(deno_error::JsErrorBox::generic(deny.to_string()));
+                    }
+                    _ => send_fut.await.map_err(|e| {
+                        if let Some(ref counter) = in_flight {
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        deno_error::JsErrorBox::generic(e.to_string())
+                    })?,
+                },
+            },
+        };
         let current_response_start = performance_started.elapsed();
 
         if let Some(ref counter) = in_flight {
@@ -4053,14 +4078,6 @@ async fn op_fetch_url_inner(
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
             .to_string());
-        }
-        // Family gate on the redirect target too: a hop to an IPv6-only
-        // name fails here rather than as a transport error (cached per
-        // host; see obscura-net::resolver).
-        if let Some(host) = next_url.host_str() {
-            if let Err(error) = obscura_net::ensure_host_reachable(host).await {
-                return Err(deno_error::JsErrorBox::generic(error.to_string()));
-            }
         }
         if !csp_connect_allows(request_csp.as_deref(), next_url.as_str(), &page_origin) {
             return Ok(serde_json::json!({

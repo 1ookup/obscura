@@ -16,8 +16,8 @@ pub use client::{
     SsrfGuardResolver, referrer_value,
 };
 pub use resolver::{
-    decide_family, ensure_host_reachable, is_fake_range_v4, is_global_ipv6, DohAnswer,
-    FamilyDecision, SystemAddrs,
+    decide_family, ensure_host_reachable, is_fake_range_v4, is_global_ipv6, start_family_gate,
+    DohAnswer, FamilyDecision, FamilyGate, SystemAddrs,
 };
 // The HTTP method type accepted by `ObscuraHttpClient::fetch_with_method`,
 // re-exported so navigation callers do not need a direct reqwest dependency.

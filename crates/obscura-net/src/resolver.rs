@@ -45,13 +45,12 @@ const DEFAULT_DOH_ENDPOINTS: &[&str] = &[
     "https://dns.google/resolve?name={name}&type={type}",
 ];
 
-/// Whole-probe budget: the DoH race must never turn a working network into
-/// a slow one. Both record-type races run concurrently, so this bounds the
-/// gate's total added latency; a probe that misses the budget allows the
-/// request and the transport behaves exactly as before. On a jittery tunnel
-/// this is what bounds the worst case; the common case answers in one
-/// round trip.
-const DOH_PROBE_BUDGET: Duration = Duration::from_millis(700);
+/// Whole-probe budget: bounds how long the background probe works on one
+/// answer. The probe runs concurrently with the transport (see
+/// `start_family_gate`), so this never adds latency to a fetch; it only
+/// decides how long a deny can still overtake a transport that is hanging
+/// on an unreachable family.
+const DOH_PROBE_BUDGET: Duration = Duration::from_millis(1100);
 
 /// How long a gate decision is reused. DNS TTLs are not tracked per record;
 /// this bounds both staleness and DoH traffic.
@@ -414,6 +413,44 @@ fn finish(decision: FamilyDecision, host: &str) -> Result<(), ObscuraNetError> {
             "DNS: '{host}' has no A record (IPv6-only name) and this host has no global IPv6 route"
         ))),
     }
+}
+
+/// The per-fetch gate handle `start_family_gate` returns.
+pub enum FamilyGate {
+    /// Resolution already settled: either a usable family is known from
+    /// cache (dial now) or the host never reaches DNS (IP literal). Nothing
+    /// to watch.
+    Settled,
+    /// A probe is running in the background. Await it alongside the
+    /// transport: a denial cancels the request the moment it lands, while a
+    /// pass (or a dropped channel) just leaves the transport running. The
+    /// probe never blocks the request, so the gate adds no latency to any
+    /// host that connects normally.
+    Watch(tokio::sync::oneshot::Receiver<Result<(), ObscuraNetError>>),
+}
+
+/// Start the family gate for a fetch to `host`. Cheap: a cached decision
+/// resolves without any I/O. When the decision is not cached, the probe runs
+/// on a background task (it stores the decision for later fetches even if
+/// this request finishes first) and the caller watches it next to the
+/// transport send.
+pub fn start_family_gate(host: &str) -> Result<FamilyGate, ObscuraNetError> {
+    if family_gate_disabled() {
+        return Ok(FamilyGate::Settled);
+    }
+    if host.is_empty() || !host.contains('.') || host.parse::<IpAddr>().is_ok() {
+        return Ok(FamilyGate::Settled);
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(cached) = cached_decision(&host) {
+        return finish(cached, &host).map(|_| FamilyGate::Settled);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let outcome = ensure_host_reachable(&host).await;
+        let _ = tx.send(outcome);
+    });
+    Ok(FamilyGate::Watch(rx))
 }
 
 fn cached_decision(host: &str) -> Option<FamilyDecision> {
