@@ -12892,3 +12892,127 @@ EvalError 的 realm 若再现，用已验证的 `__OBCSP__` 记录一轮即可�
 （记录代码在 338 批已移除，恢复是三行改动）；③ Worker.prototype
 收敛到 Chrome 5 项（_spawn/_dispatchError 走符号或内部载体）；
 ④ Function.prototype.own 与 RTCPeerConnection 的枚举顺序对齐。
+
+### Step 339：批次 38——a7533ef6 工具链重推（新 VM 常量 + 112 连发活体验证），键链断裂主因系多实例交错，抛点图谱更新（164/164/155），epoch 判决 0/5（2026-09-21 午后）
+
+**方法**：对 served ov2（md5 a7533ef6，422391B，beautified 新混淆）离线重推
+字符串表与 VM 结构；两轮被动插桩（ob38a/ob38c 经代理 ov2_js_path 注入，
+console.warn 落 serve.log；ob38b 一轮 flow 早期塌缩无数据）做活体
+(pc,op,key) 锚点与抛点键值采集；判决轮 final65..68 分散跑（注入 false，
+每轮前查 ov2 md5）。
+
+**① 附带发现：served ov2.js 非 pristine**。文件内残留 b37 的
+`console.log("ov2key:", ...)` 十六进制键打印 IIFE（1 处）。注入关闭的
+判决轮不受影响（原始 CF 响应直通），但任何注入轮/对拍都多一行 console
+输出（质询数 console 调用）。本批插桩副本已剔除该行；live 文件未动
+（保持 a7533ef6 指纹），后续批次应决定是否原地清除。
+
+**② 字符串表（交付）**：javascript-obfuscator 单表，纯字符串无 RC4。
+G() 为反引号大字面量按 `;` 切分（2037 项），访问器 `a(n)=G()[n-372]`，
+旋转校验目标 443517，实测 **320 次旋转收敛**。抽查全对：
+Q(667)="document"、Q(1957)="length"、Q(417)="prototype"、
+Q(919)="run"、Q(479)="runProgram"、Q(1252)="pop"、Q(1646)="splice"。
+全表已落 /tmp/b38/strtab.tsv。
+
+**③ VM 引擎结构（交付）**：类 GE（engine 里 `GE.prototype.run`），
+构造：h=Array(256).fill(0) 槽，i=(1+random*254)|0 随机实例键，
+**l=161^i（PC 槽）、j=147^i（键寄存器槽）、m=68^i（字节码槽）、
+o=124^i（帧栈槽）**；slot[3]=M（(0,eval) 产物）、slot[68^i]=E(base64
+字节码)（E=atob+Uint8Array 缓存）。启动：`A.runProgram = I =>
+new GE(I).run(0, 143, [])`——**初始键 143**。run 双循环：slot[222]
+try 注册表空时走 helper 化循环，非空走 inline 循环（同 case 表，后者
+带 try/catch，catch 弹 [pc,key,frame,extra] 恢复）。fetch 公式（活体
+锚点核对通过）：
+
+    op = key ^ ((bc[pc] + 66) & 255)          # 老 build 常量 40 → 66
+    LCG: key' = ((key + op) * 38077 + 29118) & 255   # 老 16542/45691 → 38077/29118
+
+case 表 68 个 op → 47 个 handler（G3/N/Y/X/g/G0/J/c/.../D×8/T×6，D/T
+带即时常数第二参）。已解码样例（静态读码，未逐一活体对拍）：
+op228=G3 三字节跳转（24 位目标 + 键重同步）；op168=e NEWOBJ
+（slot[op1^键]={}）；op144=f NEWARRAY（slot[op1^键^211]=[]）；
+op177=c THROW（throw slot[adj(op1)^57]，57.44）；**op92=GL 哈希校验
+字符串驻留**（见 ④）。
+字节码提取沿用 b36 传输层公式（body b64 → 逐字节减
+(seed + i%65535) mod 255 → 再 b64），seed 单字节可暴力（final65=29、
+ob38a=27），prog 462-476KB/轮。
+
+**④ 头条：fetch/LCG 长链活体成立（最长 112 连发）；链断裂主因是多
+实例交错，handler 级数据驱动改键仍存疑**。ob38a 4000 条 (pc,op,key)
+活体轨迹核对：fetch/LCG 公式在程序开头两处锚点精确成立（pc0
+key143→op0、pc10 key81→op0），但 LCG 键链在后续大量断裂。两个候选
+解释：a) handler 数据驱动改键——op92 GL 的形态支持：1 字节字符串槽
+id（^111）+ 4 字节目标 hash32 + 3 字节跳转/键基值 + 1 字节键重同步，
+运行时对字符串算两遍 FNV 变体（init 3701420497；乘子 55135/41508 与
+31655/36681，int32 语义），**跳转目标与下一键从 hash 派生**
+（mini-switch 序 "2|1|3|4|0"：hash2 → Iv^=h>>>8 → keyreg=(h&255)^Id
+→ pc=Iv）；b) 轨迹污染——__OB38 缓冲是全局的，多 GE 实例（主程序 +
+子程序并发）交错写入，跨实例相邻三元组本就无键链关系。按
+`kb_{i+1} = nk_i`（纯 LCG 延续）分链判别：出现 **70-112 连发的长链**
+（≥5 连发的链 150 条、覆盖 2984/4000）——实例内 LCG 是干净延续的，
+fetch+LCG 在最长 112 连发指令上活体成立，远强于两点锚；断裂主因是
+b) 多实例交错。剩余未分辨：G3 跳转模型的 130 处对拍全不中（handler
+键重同步或实例切换，需给 __OB38 加实例 id 再验，hook 处 this 即 GE
+实例）；GL 手解 hash 与两处候选站（toString/RangeError @op92）未对
+上，模型仍为草稿——若 GL 确在个别点数据驱动改键，b36 式 walker 在
+那些点仍需字符串模拟。
+
+**⑤ 抛点图谱更新（新 build，活体键值已采）**：三连循环不变
+（caller → toString → Cyclic 每循环三抛，ob38a/ob38c 两轮计数完全
+一致）：
+
+| 抛点（ob38c 轮） | 次数 | 活体键 k | ob38a 轮 pc |
+|---|---|---|---|
+| 'caller','callee','arguments' strict TypeError | 155 | k240 @pc48625 | 185814 |
+| Function.prototype.toString requires 'this' be Function | 164 | k163 @pc49641 | 186830 |
+| Cyclic __proto__ value | 164 | k240 @pc47959 | 185148 |
+
+caller 计数比另两族少 9（两轮一致）：循环以 caller 抛开场，9 个子尝试
+从 toString 起步（多页尝试轮换的截断效应），非语义分歧。一次性抛点
+延续：RangeError Invalid code point -1（ob38c @pc97593 k101 一轮
+一次）、EvalError Code generation from strings disallowed（每轮一次，
+**b37 eval 门决策表全 allow 后仍现**，realm 仍未锁定）、裸 Error 11 次
+（LEB 守卫族，pcs 205-215K 群聚）。b37 两项静态保真修复
+（Function.prototype 匿名、console own-props）后三连计数形状未变——
+修复没有减少抛点（预期内：探针操作数仍非 Chrome 形），fold 仍每轮
+重入 160+ 组。
+
+**⑥ epoch 判决映射（ov2 md5 → tally）**：本批 5 轮全部未过
+（每轮仅 GET /1.txt 403 质询页，无完成 POST）：
+
+| 轮 | 时刻 | ov2 md5 | 备注 | 结果 |
+|---|---|---|---|---|
+| final65 | 15:29 | a7533ef6 | build 后 ~1h | FAIL |
+| final66 | 15:46 | a7533ef6 | 距上 17min | FAIL |
+| final67 | 15:53 | a7533ef6 | 距上 ~7min（间距不足） | FAIL |
+| final68 | 16:02 | a7533ef6 | 距上 ~9min | FAIL |
+| final69 | 16:17 | a7533ef6 | 距上 15min | FAIL |
+
+（镜像文件 /tmp/b38/epoch_map.tsv，临时性。）
+
+诚实评估：a7533ef6 上线后累计 **0/16**（b37 final60-64 0/5 + 本批
+0/5 + 穿插 ver46/塌缩轮）。5/5 窗口仅在 10:28 build（17c5a7df）出现
+过；当前 build 未在任何 epoch 放行过一次。epoch 随机性假说下，16 连
+败的概率取决于单轮过线率 p：若 p 与旧 build 同（5/5 暗示 p 不低），
+16 连败 p^16 已很难成立——**当前 build 大概率是确定性不过**（缺
+beacon 块或新 VM 期望形状变化），继续在同一 build 上刷判决轮收益低；
+突破口应在 ④/⑤ 的操作数形状对平，或等待下一次 ov2 轮换后立即复测
+5/5 是否复现。
+
+**产物**：/tmp/b38/（strtab.tsv、strtab_b38.mjs、prog_b38.mjs、
+prog_ob38a|c.bin、verify_b38.mjs、handlers.json、handlers_b38.mjs、
+patch_ov2_b38.py、patch_ov2_b38b.py、ov2_b38.js、ov2_b38b.js、
+epoch_map.tsv）/tmp/cf0919/ob38a|ob38b|ob38c（fo + serve.log +
+ops.tsv）、final65..68（fo + dec）。远端 /tmp/ov2_b38.js、
+/tmp/ov2_b38b.js；代理 ov2_js_path 已复原 live ov2.js。
+
+**下一批入口**：① 给 __OB38 轨迹钩子加 GE 实例 id（hook 处 this 即
+实例），按实例分链重验 LCG 断裂，分辨"数据驱动键调度"与"多实例交错"；
+② GL 字符串驻留模型对拍：插桩 dump GL 入口槽值（slot[Ih^键] 的字符串
+与算出的 h1/h2）一轮即可钉死 hash 表；③ 在 walker 里并置字符串模拟后
+重推三连抛点操作数（sentinel 槽号与填充点），对照 NIsa2 心跳；
+④ EvalError realm：每轮一次照旧，用 338 已验证的
+`__OBCSP__` 三行恢复即可定位；⑤ 决定 served ov2.js 的 ov2key 残留
+是否原地清除（会改 md5 指纹，需与轮换窗口协调）；⑥ ov2 轮换监控：
+轮换后立即 3 连判决，检验 5/5 是否复现，定位"friendly epoch"是否
+实为"friendly build"。
