@@ -13106,3 +13106,95 @@ own 多出 `when`（Chrome 无）；④ SharedWorker.prototype（Chrome own=
 constructor,onerror,port）未对拍；⑤ EvalError realm 照旧未锁定
 （每轮一次，b39c/d 的自适应窗口 hook 可复用）；⑥ 下一轮 ov2 周转后
 立即 3 连判决（周转后首小时是 5/5 复测窗口）。
+
+### Step 341：批次 40——ver48 完成 beacon 解密成功，完成轮字段级对拍全谱（38 组一一对应，SbVZ3 91 vs 14 仍是最大缺口），四处已证面修复落盘（Worker/SharedWorker 实例零 own、when 移除、键盘布局 48 项），TS#1 400/600010 短路新失败面（注入件过期即被切，A/B 实证非本批回归），判决 0/5（2026-09-21 深夜）
+
+**方法**：ver48 的完成 POST（4-frame-req 91895 B）用 ov2-payload-decrypt
+skill + 代理主机 live patched ov2.js（51237f8a）作 alphabet 解密成功
+（112045 B JSON、roundtrip 逐字节自证）；同轮 3-frame-req（TS#2）一并解出。
+参考面四件：ref（0918 通过会话 TS#2，91 键）、child26 dec4（0920 build 我方
+TS#3）+ dec7（通过 warm 载荷的 TS#1 形 telemetry，47 键）、final44-48 判决轮
+body 不可解（注入关 ⇒ ot 随机，数学上不可解，勿再试）。153-headless oracle
+（本机 Chrome 已升 153）实测四面对拍；151 证据按仓库仲裁规则优先。
+
+**① 完成轮分类（确证）**：ver48 4-frame-req 是 TS#3 阶段完成 beacon：
+94 顶层键 = ref 91 + `aQgx8`（我方 1，ref 缺席；warm TS#1 里为 0，语义未解）
++ `nEJhr9`（空串，TS#3 独有）+ 编号组 `39`（tQdUc5 38→39，TS#3 程序自加的
+第 39 组，child26 TS#3 同构；非此前"多余空组"）。`mKiXm6` 0→38、`maNnU6`
+40→47、`dJYZ1` []→["mc_acc_p"]、EBwu9/wuMCA2 换新签（TS#3 重发）均随阶段
+推进，与 child26 跨 build 一致。
+
+**② 逐组对拍（交付，钱面）**：38 个编号组与 ref 一一bijective（按子键集
+内容匹配，组号随 build 洗牌），**每组子键集合完全一致**；分歧全在组内值：
+
+| 面 | ref（通过 Chrome） | 我方 ver48 TS#3 | 定性 |
+|---|---|---|---|
+| SbVZ3（console 电池） | 91 条 | 14 条 | 头 8 条（TKyxg5/PhWMD5/AecW7/Qssv3/cnrU5/ODxGu4/mfiL4/21）+ wguL7 尾 6 条（含第二个合法 Qssv3）逐项全等；**缺 fold 三元 rFmgn2×1+lzDF4×2+TBNgK7×2（5 条）与 72 条方法块（9 方法×2 轮×4）**；Qssv3=2 已是 Chrome 形（329 批修复兑现） |
+| IeOS2（键盘布局） | 48 项，Chrome 内部哈希序，含 IntlBackslash→§ | 47 项几何序，缺 IntlBackslash | **本批修复** |
+| uHNG9（WebRTC ICE） | 9 候选 | 6 候选 | 环境性（mDNS 收集窗口），形状同 |
+| IGBuA2/oHIQ6 | [159,163] / [] | 11 项 / 233 项 | 字体覆盖扫描多报（Step 300 已记账，未动） |
+| Pdbt7（资源时间线） | 9 条含 link 项（/ci/ 图标预载） | 6 条 | 我方资源记录缺 link 项（/ci/ 未入 rPXg2/Pdbt7） |
+| Vhmq4 | ["lang"] | ["lang","dir"] | Step 303 已判非缺陷（orchestrator i18n 写 dir，本地 Chrome 同形） |
+| gIBpo1 | 全 0 | 4 事件 | 受控点击所致（managed 交互式），ref 会话无点击 |
+| 计时器 | ZMSOw0 127 / tZwbF3 8155 等 | ZMSOw0 538 / tZwbF3 1315 等 | uGyjw9=15 已带内；ZMSOw0 残 4.2x（317 批派发快路径项） |
+
+**③ 落盘修复（4 commit，各带回归钉）**：
+1. `fix: Worker instances own no properties, state moves to a WeakMap`：
+   实例 7 个 _* 内部件（_handlers/_listeners/_terminated/_id/_pending/
+   _traceFrom/_name + 条件 _scriptUrl/_inlineEvalWorker/_listener）全部移入
+   模块 WeakMap；oracle 实证 Chrome 实例 getOwnPropertyNames 为空。
+2. `fix: SharedWorker converges to Chrome shape`：prototype 收敛为
+   **{port, constructor, onerror} 且恰此序**（oracle：port 是 prototype
+   accessor，实例连 port 都不 own；340 批④的"own=constructor,onerror,port"
+   记载系层级误读，本轮 oracle 修正）；listener 三人组继承
+   EventTarget.prototype 共享注册表，_dispatchError 改模块函数；
+   新钉 `sharedworker_shape_matches_chrome`、
+   `worker_instances_own_no_properties_like_chrome`。
+3. `fix: drop when from EventTarget, Screen, ScreenOrientation and window`
+   ：151 无 EventTarget.prototype.when（340 批③ oracle；Observable/when
+   属后续版本——本机 153 已有，仲裁取 151）；Screen/ScreenOrientation/
+   Window prototype 的自有 when 同删（任何 Chrome 版本均无此 own）；
+   全局 Observable 保留。153 oracle 顺带实证 Location.prototype 无 when。
+   测试改钉 151 形（when 全链缺席 + Observable 形状保留）。
+4. `fix: keyboard layout map matches the reference session membership and
+   order`：_KEYBOARD_LAYOUT_US 按通过会话 /34/IeOS2 逐项重排（48 项含
+   IntlBackslash→§，Chrome 哈希序非几何序）——迭代序即快照序列化序。
+
+门禁：obscura-js 681/681；workspace release nextest 1912/1912；
+no-default-features check 过；精确 release 构建过；无 cargo fmt。
+
+**④ TS#1 400/600010 短路（本批最重要新事实）**：ver50 注入轮（20:17，
+51237f8a 时代）流程形态剧变：TS#1 小 POST → **121 B `{"d":…}` 加密错误**
+（widget 解出 `QJDyx5:400 / qcMvE9:600010`）→ main#2 → 重 orchestrate，
+四尝试同型，**无 TS#2/TS#3**——完成 beacon 本轮无物可验。A/B 钉死：
+用 ed36229 pre-fix 二进制（worktree 不可行，vendor 未跟踪；改为
+`git checkout ed36229 -- crates/` 原树重建）跑 ver50b，**同样 400 短路**——
+非本批回归。机理解读：注入轮跑的是代理暂存的 51237f8a（16:28 时代件），
+而 CF 侧 build 已周转 18:28→20:28 两代（20:28 起线上件 fddfbf79，
+425420 B）；**过期注入件的 TS#1 被 server 识破并 400 切断**（17:43 ver48
+时 51237f8a 尚是当轮件故全流程放行）。注入链纪律升级：**每次 ov2 周转后
+注入轮必须先重取 live ov2.js**，否则注定短路。注入轮预算 2/2 用毕
+（ver50 + ver50b A/B）。
+
+**⑤ 判决**：注入关（CF 原生 20:28 新 build）、新二进制，final75..79 五轮
+**全流程完整**（TS#1 4.7KB→845KB 程序→TS#2 90KB→TS#3 93KB→main#2 7.8KB
+→重开），但 /1.txt 仅 GET 403 双连、无 POST 404——**0/5**。ov2 md5 per
+round：ver50/ver50b=51237f8a 时代（served 件），final75..79=fddfbf79
+（20:28 周转后原生件，注入关）。注入已恢复 true（options 复核 value=True）。
+
+**产物**：/tmp/cf0919/ver48/{dec2,dec3,dec4}、ver50|ver50b（fo+run+dec）、
+final75..79、obscura-prefix|obscura-newfix（A/B 二进制 md5
+159a70f2/742917c1）、headed-a/ts3-dec-*（0918 件表不匹配，不可解记录）、
+child26/dec4|dec7、/tmp/cf0919/vflows4.sh（mitmweb flows API 按
+pretty_host+path 过滤的判决提取，替代 capture_round 内联查询）、
+/tmp/cf0919/oracle341.html（153 oracle 探针）。
+
+**下一批入口**：① SbVZ3 的 77 条缺口（fold 全 Error 根因）仍是 beacon
+侧最大客户可见分歧：需对 fddfbf79 新 build 重推工具链（字符串表/fetch/LCG
+常量照 b38/b39 法）后做一次电池旗标活体 dump（340 批⑤的自适应窗口 hook
+形状可直接复用），锁定 h[80]/h[86]/h[87] 在电池处的活体值；② 注入轮前置
+检查：代理 ov2.js md5 与 CF 当轮 build 比对，过期即短路（④）；③ uHNG9
+ICE 候选 9 vs 6：查我方 RTCPeerConnection 候选收集的接口枚举；④ Pdbt7/
+rPXg2 缺 /ci/ link 项：确认 /ci/ 在新 build 时代是否仍发、资源记录为何
+不收；⑤ aQgx8/nEJhr9 语义（引擎 builder 常量字段，TS#3 出现）留待字节码
+管线；⑥ 周转后首小时 3 连判决复测窗口（340 批⑥）继续有效。
