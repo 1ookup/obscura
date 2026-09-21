@@ -162,7 +162,7 @@ function _deliverWorkerOutMessage(worker, message) {
   // onmessage assignment replays it. Dropping it made the widget lose the
   // navigator probe and choose PAT / 600010; queuing while a listener was
   // already registered stalled the widget.
-  const listeners = (worker._listeners['message'] || []).slice();
+  const listeners = _eventTargetListenersFor(worker, 'message');
   if (typeof worker.onmessage !== 'function' && !listeners.length) {
     _hset(worker, "_listener", message);
     return;
@@ -177,7 +177,7 @@ function _deliverWorkerOutMessage(worker, message) {
     } catch (e) { console.error('Worker onmessage error:', e); }
   }
   for (const entry of listeners) {
-    try { __obscuraTraceCallWith(entry.from, entry.fn, worker, [evt]); }
+    try { __obscuraTraceCallWith(entry.from, entry.callback, worker, [evt]); }
     catch (e) { console.error('Worker message listener error:', e); }
   }
 }
@@ -219,6 +219,94 @@ function _runPostedWorkerSource(worker, data, type) {
   try { delete globalThis.__obscuraWorkerThis; } catch (e) { globalThis.__obscuraWorkerThis = undefined; }
 }
 
+// Chrome 151 Worker.prototype owns exactly {constructor, onerror, onmessage,
+// postMessage, terminate}, in that enumeration order, and chains directly to
+// EventTarget.prototype: the listener trio is the shared EventTarget registry,
+// so nothing worker-specific is published as an own prototype property.
+const _workerById = new Map();
+function _workerSpawn(self, source, finalUrl, workerType = 'classic', workerCsp = '') {
+  if (self._terminated) return;
+  let id;
+  // The creator's URL, read from this realm's own `location`. A worker
+  // inherits the origin of the document that constructed it, so a worker
+  // built inside a cross-origin frame must not be handed the top-level
+  // page's origin -- frame realms each have their own `location`.
+  const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
+  try {
+    id = Deno.core.ops.op_worker_spawn(
+      String(source),
+      String(finalUrl),
+      String(workerType),
+      String(self._name || ''),
+      creatorUrl,
+      JSON.stringify(_fingerprint()),
+      String(_environmentDocumentRoot()),
+      _environmentDocumentCsp(),
+      String(self._traceFrom || 'window'),
+      String(workerCsp || ''),
+    );
+  }
+  catch (e) { _workerDispatchError(self, e && e.message ? e.message : String(e)); return; }
+  _hset(self, "_id", id);
+  _workerById.set(id, self);
+  const queued = self._pending;
+  _hset(self, "_pending", []);
+  for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
+}
+// Delivered by the runtime's worker message drain at task boundaries (see
+// ObscuraJsRuntime::drain_worker_messages). Batches arrive as a JSON array
+// of {kind, data|message} entries posted by the worker thread; the same
+// trusted-event shape the previous recv loop produced, minus the async op
+// whose unref'd promise stranded delivery whenever the page went idle
+// between pump phases (the challenge's worker stage measured those gaps at
+// 268 ms against Chrome's 4 ms).
+function _workerDispatchBatch(id, batch) {
+  const worker = _workerById.get(id);
+  if (!worker || worker._terminated) return;
+  // The runtime embeds `batch` as a JS array literal of entry objects.
+  for (const entry of batch) {
+    if (worker._terminated) return;
+    if (!entry) continue;
+    if (entry.kind === 'error') { _workerDispatchError(worker, entry.message || 'Worker error'); continue; }
+    let data;
+    try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
+    const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
+    // A worker 'out' message handler runs in the creating context: it
+    // executes under the construction-site label, not under whatever
+    // code was running when the message was drained.
+    if (typeof worker.onmessage === 'function') {
+      try {
+        __obscuraTraceCallWith(
+          __obscuraTraceHandlerFrom(worker, 'onmessage'), worker.onmessage, worker, [evt]);
+      } catch (e) { console.error('Worker onmessage error:', e); }
+    }
+      for (const entry of _eventTargetListenersFor(worker, 'message')) {
+        try { __obscuraTraceCallWith(entry.from, entry.callback, worker, [evt]); }
+        catch (e) { console.error('Worker message listener error:', e); }
+      }
+  }
+}
+function _workerDispatchError(self, message) {
+  const worker = self;
+  // Deliver asynchronously so `new Worker(...)` callers can attach onerror.
+  setTimeout(() => {
+    if (worker._terminated) return;
+    const evt = { type: 'error', message: String(message), target: worker };
+    const handlers = _eventTargetListenersFor(worker, 'error');
+    if (typeof worker.onerror === 'function') {
+      try {
+        __obscuraTraceCallWith(
+          __obscuraTraceHandlerFrom(worker, 'onerror'), worker.onerror, worker, [evt]);
+      } catch (e) {}
+    } else if (!handlers.length) {
+      console.error('Worker error:', String(message));
+    }
+    for (const entry of handlers) {
+      try { __obscuraTraceCallWith(entry.from, entry.callback, worker, [evt]); } catch (e) {}
+    }
+  }, 0);
+}
+
 globalThis.Worker = class Worker {
   // IDL event-handler attributes live on the prototype, like Chrome's
   // Worker.prototype. An own data property per instance would show up in
@@ -226,6 +314,12 @@ globalThis.Worker = class Worker {
   // created by a challenge script is exactly the sort of place gets read.
   // The setters also snapshot the assigning code's execution-source label,
   // so callbacks fire attributed to their assigner (trace runs only).
+  // Declaration order matches Chrome's enumeration: onerror before onmessage.
+  get onerror() { return this._handlers.error; }
+  set onerror(fn) {
+    this._handlers.error = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+    __obscuraTraceRecordHandler(this, 'onerror');
+  }
   get onmessage() { return this._handlers.message; }
   set onmessage(fn) {
     this._handlers.message = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
@@ -238,16 +332,6 @@ globalThis.Worker = class Worker {
       _hset(this, "_listener", undefined);
       _deliverWorkerOutMessage(this, pending);
     }
-  }
-  get onmessageerror() { return this._handlers.messageerror; }
-  set onmessageerror(fn) {
-    this._handlers.messageerror = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
-    __obscuraTraceRecordHandler(this, 'onmessageerror');
-  }
-  get onerror() { return this._handlers.error; }
-  set onerror(fn) {
-    this._handlers.error = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
-    __obscuraTraceRecordHandler(this, 'onerror');
   }
   constructor(url, options) {
     _hset(this, "_handlers", { message: null, messageerror: null, error: null });
@@ -299,7 +383,7 @@ globalThis.Worker = class Worker {
     // 'unsafe-eval'` with `worker-src blob:`).
     if (typeof blobSource === 'string' && blobSource.length) {
       _hset(this, "_scriptUrl", resolved);
-      this._spawn(blobSource, resolved, workerType, '');
+      _workerSpawn(this, blobSource, resolved, workerType, '');
       return;
     }
     // No text for this blob. HaHaVM's Worker is a stub for blob: URLs:
@@ -312,7 +396,7 @@ globalThis.Worker = class Worker {
       return;
     }
     if (resolved.startsWith('data:')) {
-      this._spawn(_workerScriptFromDataUrl(resolved), resolved, workerType, '');
+      _workerSpawn(this, _workerScriptFromDataUrl(resolved), resolved, workerType, '');
       return;
     }
     if (resolved.startsWith('http:') || resolved.startsWith('https:')) {
@@ -344,98 +428,16 @@ globalThis.Worker = class Worker {
           // creating document's (local-scheme workers inherit; handled in
           // the host from the script URL scheme).
           const workerCsp = resp.headers?.get?.('content-security-policy') || '';
-          if (!worker._terminated) worker._spawn(source, resp.url || resolved, workerType, workerCsp);
-        } catch (e) { worker._dispatchError(e && e.message ? e.message : String(e)); }
+          if (!worker._terminated) _workerSpawn(worker, source, resp.url || resolved, workerType, workerCsp);
+        } catch (e) { _workerDispatchError(worker, e && e.message ? e.message : String(e)); }
       })();
       return;
     }
     throw new DOMException("Failed to construct 'Worker': unsupported script URL scheme.", 'SecurityError');
   }
-  _spawn(source, finalUrl, workerType = 'classic', workerCsp = '') {
-    if (this._terminated) return;
-    let id;
-    // The creator's URL, read from this realm's own `location`. A worker
-    // inherits the origin of the document that constructed it, so a worker
-    // built inside a cross-origin frame must not be handed the top-level
-    // page's origin -- frame realms each have their own `location`.
-    const creatorUrl = String((globalThis.location && globalThis.location.href) || '');
-    try {
-      id = Deno.core.ops.op_worker_spawn(
-        String(source),
-        String(finalUrl),
-        String(workerType),
-        String(this._name || ''),
-        creatorUrl,
-        JSON.stringify(_fingerprint()),
-        String(_environmentDocumentRoot()),
-        _environmentDocumentCsp(),
-        String(this._traceFrom || 'window'),
-        String(workerCsp || ''),
-      );
-    }
-    catch (e) { this._dispatchError(e && e.message ? e.message : String(e)); return; }
-    _hset(this, "_id", id);
-    Worker._byId.set(id, this);
-    const queued = this._pending;
-    _hset(this, "_pending", []);
-    for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
-  }
-  // Delivered by the runtime's worker message drain at task boundaries (see
-  // ObscuraJsRuntime::drain_worker_messages). Batches arrive as a JSON array
-  // of {kind, data|message} entries posted by the worker thread; the same
-  // trusted-event shape the previous recv loop produced, minus the async op
-  // whose unref'd promise stranded delivery whenever the page went idle
-  // between pump phases (the challenge's worker stage measured those gaps at
-  // 268 ms against Chrome's 4 ms).
-  static _byId = new Map();
-  // Runtime entry point: ObscuraJsRuntime::drain_worker_messages executes
-  // `globalThis.__obscura_worker_dispatch_batch(<id>, <batch>)` per batch.
-  static _dispatchBatch(id, batch) {
-    const worker = Worker._byId.get(id);
-    if (!worker || worker._terminated) return;
-    // The runtime embeds `batch` as a JS array literal of entry objects.
-    for (const entry of batch) {
-      if (worker._terminated) return;
-      if (!entry) continue;
-      if (entry.kind === 'error') { worker._dispatchError(entry.message || 'Worker error'); continue; }
-      let data;
-      try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
-      const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
-      // A worker 'out' message handler runs in the creating context: it
-      // executes under the construction-site label, not under whatever
-      // code was running when the message was drained.
-      if (typeof worker.onmessage === 'function') {
-        try {
-          __obscuraTraceCallWith(
-            __obscuraTraceHandlerFrom(worker, 'onmessage'), worker.onmessage, worker, [evt]);
-        } catch (e) { console.error('Worker onmessage error:', e); }
-      }
-      for (const listener of (worker._listeners['message'] || []).slice()) {
-        try { __obscuraTraceCallWith(listener.from, listener.fn, worker, [evt]); }
-        catch (e) { console.error('Worker message listener error:', e); }
-      }
-    }
-  }
-  _dispatchError(message) {
-    const worker = this;
-    // Deliver asynchronously so `new Worker(...)` callers can attach onerror.
-    setTimeout(() => {
-      if (worker._terminated) return;
-      const evt = { type: 'error', message: String(message), target: worker };
-      const handlers = (worker._listeners['error'] || []).slice();
-      if (typeof worker.onerror === 'function') {
-        try {
-          __obscuraTraceCallWith(
-            __obscuraTraceHandlerFrom(worker, 'onerror'), worker.onerror, worker, [evt]);
-        } catch (e) {}
-      } else if (!handlers.length) {
-        console.error('Worker error:', String(message));
-      }
-      for (const listener of handlers) {
-        try { __obscuraTraceCallWith(listener.from, listener.fn, worker, [evt]); } catch (e) {}
-      }
-    }, 0);
-  }
+  // _spawn moved off the prototype: Chrome 151 Worker.prototype owns exactly
+  // {constructor, onerror, onmessage, postMessage, terminate}. The spawn path
+  // lives in the module-scope _workerSpawn.
   postMessage(data, type) {
     if (this._terminated) return;
     // HaHaVM Worker_postMessage: a string that itself contains postMessage
@@ -466,32 +468,18 @@ globalThis.Worker = class Worker {
     _hset(this, "_terminated", true);
     this._pending.length = 0;
     if (this._id !== null) {
-      Worker._byId.delete(this._id);
+      _workerById.delete(this._id);
       try { Deno.core.ops.op_worker_terminate(this._id); } catch (e) {}
     }
   }
-  addEventListener(type, fn) {
-    if (typeof fn !== 'function') return;
-    const ls = this._listeners[type] || (this._listeners[type] = []);
-    if (ls.some(entry => entry.fn === fn)) return;
-    // Registration-time snapshot, matching the shared listener registry.
-    ls.push({ fn, from: globalThis.__obscura_trace_from_enabled ? __obscuraTraceCurrent() : null });
-  }
-  removeEventListener(type, fn) {
-    const ls = this._listeners[type];
-    if (ls) {
-      const i = ls.findIndex(entry => entry.fn === fn);
-      if (i >= 0) ls.splice(i, 1);
-    }
-  }
-  dispatchEvent(evt) {
-    const handlers = (this._listeners[(evt && evt.type) || ''] || []).slice();
-    for (const listener of handlers) {
-      try { __obscuraTraceCallWith(listener.from, listener.fn, this, [evt]); } catch (e) {}
-    }
-    return true;
-  }
 };
+// The listener trio is inherited, not own: Chrome 151 Worker.prototype owns
+// exactly {constructor, onerror, onmessage, postMessage, terminate} and chains
+// directly to EventTarget.prototype, whose shared listener registry the
+// delivery paths above read.
+if (globalThis.EventTarget && globalThis.EventTarget.prototype) {
+  Object.setPrototypeOf(Worker.prototype, globalThis.EventTarget.prototype);
+}
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 globalThis.__blobBytesStore = globalThis.__blobBytesStore || {};
@@ -604,5 +592,5 @@ function _queueIframeNavigation(hostNid) {
 
 
 globalThis.__obscura_worker_dispatch_batch = function (id, batch) {
-  Worker._dispatchBatch(id, batch);
+  _workerDispatchBatch(id, batch);
 };

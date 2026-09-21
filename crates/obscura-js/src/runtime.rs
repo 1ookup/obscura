@@ -11363,6 +11363,45 @@ RequestRedirect value",
         panic!("pump_until: wanted {expected}, last saw {last}");
     }
 
+    /// Chrome 151 Worker.prototype owns exactly {constructor, onerror,
+    /// onmessage, postMessage, terminate}, in that order, and chains to
+    /// EventTarget.prototype (oracle headless Chrome 151). The bootstrap class
+    /// used to publish _spawn, _dispatchError, onmessageerror and the listener
+    /// trio as own prototype properties, and Worker carried _byId and
+    /// _dispatchBatch as own statics; every one of those is page-visible via
+    /// getOwnPropertyNames and none exists in Chrome.
+    #[test]
+    fn worker_prototype_own_properties_match_chrome_151() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let probe = rt
+            .evaluate(r#"(() => {
+                const own = Object.getOwnPropertyNames(Worker.prototype);
+                return {
+                    own: own.join(","),
+                    chainedToEventTarget:
+                        Object.getPrototypeOf(Worker.prototype) === EventTarget.prototype,
+                    listenerTrioInherited:
+                        typeof Worker.prototype.addEventListener === 'function'
+                        && typeof Worker.prototype.removeEventListener === 'function'
+                        && typeof Worker.prototype.dispatchEvent === 'function',
+                    noInternalLeaks: ["_spawn", "_dispatchError", "onmessageerror", "_byId", "_dispatchBatch"]
+                        .every(name => !own.includes(name)),
+                    staticsClean: Object.getOwnPropertyNames(Worker).sort().join(","),
+                };
+            })()"#)
+            .unwrap();
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "own": "constructor,onerror,onmessage,postMessage,terminate",
+                "chainedToEventTarget": true,
+                "listenerTrioInherited": true,
+                "noInternalLeaks": true,
+                "staticsClean": "length,name,prototype",
+            })
+        );
+    }
+
     /// A worker reply must reach a fully idle page through the parked pump
     /// itself. deno_core tracks neither the reply nor the page's suspended
     /// await, so the turn future has to stay parked on the worker-arrival

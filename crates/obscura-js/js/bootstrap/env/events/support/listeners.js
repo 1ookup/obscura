@@ -42,6 +42,14 @@ function _eventTargetAdd(target, type, callback, options) {
     signal.addEventListener('abort', entry.abortHandler, { once: true });
   }
 }
+// Snapshot of the listeners registered for one type on one target. Workers
+// have no _listeners bag of their own (Chrome 151 instances own nothing), so
+// their message/error delivery reads this registry instead.
+function _eventTargetListenersFor(target, type) {
+  const byType = _eventTargetListeners.get(target);
+  if (!byType) return [];
+  return (byType.get(String(type)) || []).slice();
+}
 function _eventTargetRemove(target, type, callback, options) {
   const byType = _eventTargetListeners.get(target);
   if (!byType) return;
