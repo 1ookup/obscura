@@ -8222,6 +8222,94 @@ mod tests {
         );
     }
 
+    /// %-format substitution converts its argument position, once, with
+    /// Chrome's exact reach.
+    ///
+    /// Oracle (headless Chrome 153, devtools closed): a leading format string
+    /// makes Chrome run ToNumber on %d/%i/%f positions and ToString on %s
+    /// positions -- firing the argument's own toString getter once per call --
+    /// while %c/%o/%O stay raw and a bare `console.log(probe)` fires nothing.
+    /// The challenge's console battery plants its state-recording closure on
+    /// `toString` and passes it as the %d substitution of
+    /// `console.log("%c%d", "font-size:0;color:transparent", probe)`, so the
+    /// missing conversion left the battery's frame flags unwritten and gated
+    /// off the fold trio and the per-method block (77 missing beacon rows,
+    /// profile Steps 336/341/342). Named getters (id/name/length/...) stay
+    /// unconsulted in every position: ToPrimitive only reaches valueOf and
+    /// toString.
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_format_args_preconvert_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const seen = [];
+                    const op = Deno.core.ops.op_console_msg;
+                    Deno.core.ops.op_console_msg = (level, msg) => { seen.push(msg); };
+                    try {
+                        let toStringHits = 0;
+                        const probe = {};
+                        Object.defineProperty(probe, "toString", {
+                            value() { toStringHits++; return "T"; },
+                            enumerable: true, configurable: true,
+                        });
+                        console.log("%c%d", "font-size:0;color:transparent", probe);
+                        const onceHits = toStringHits;
+                        console.log("%s", probe);
+                        console.log(probe);
+                        console.log("%c %o", "s", probe);
+                        // Named getters stay unconsulted even in a %d position.
+                        const named = {};
+                        const namedHits = [];
+                        for (const key of ["id", "name", "length"]) {
+                            Object.defineProperty(named, key, {
+                                get() { namedHits.push(key); return "x"; },
+                                enumerable: true, configurable: true,
+                            });
+                        }
+                        console.log("%d", named);
+                        console.log("%d", 3.7);
+                        // A bare call with no format string fires nothing.
+                        const plainHits = [];
+                        const plain = {};
+                        Object.defineProperty(plain, "toString", {
+                            value() { plainHits.push(1); return "T"; },
+                            enumerable: true, configurable: true,
+                        });
+                        console.log(plain);
+                        return { seen, onceHits, toStringHits, namedHits,
+                            plainFired: plainHits.length > 0 };
+                    } finally {
+                        Deno.core.ops.op_console_msg = op;
+                    }
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "seen": [
+                    "%c%d font-size:0;color:transparent NaN",
+                    "%s T",
+                    "[object Object]",
+                    "%c %o s [object Object]",
+                    "%d NaN",
+                    "%d 3",
+                    "[object Object]",
+                ],
+                "onceHits": 1,
+                "toStringHits": 2,
+                "namedHits": [],
+                "plainFired": false,
+            }),
+        );
+    }
+
     /// A frame realm booted through the deferred-surface split (Step 312)
     /// must carry the full, op-routed console from the core boot: the
     /// challenge's sandbox probe calls console.* as the first thing its

@@ -53,8 +53,54 @@ function _errorDescription(a) {
   return message === undefined || message === '' ? name : name + ': ' + message;
 }
 
+// With devtools closed Chrome still pre-converts the arguments that line up
+// with printf-style specifiers in a leading format string: %d/%i/%f run
+// ToNumber and %s runs ToString on the argument at that position, while %c,
+// %o and %O keep it raw and the format string itself stays literal in the
+// row. The conversions are observable through user getters -- the challenge
+// plants its state-recording closure on `toString` and passes it as the %d
+// substitution of `console.log("%c%d", style, probe)`, so Chrome fires that
+// closure once per call even with devtools closed, and the closure's side
+// effects gate the console battery's second emission block (profile Steps
+// 336/342). A bare `console.log(probe)` with no format string fires nothing.
+// Oracle: headless Chrome 153, getter-fire census per console method.
+function _consoleFormatConversions(args) {
+  if (typeof args[0] !== "string" || args.length < 2) return null;
+  const fmt = args[0];
+  if (fmt.indexOf("%") === -1) return null;
+  const specs = [];
+  for (let i = 0; i + 1 < fmt.length; i++) {
+    if (fmt[i] !== "%") continue;
+    const c = fmt[i + 1];
+    if (c === "%") { i++; continue; }
+    if (c === "d" || c === "i" || c === "f" || c === "s" || c === "c" || c === "o" || c === "O") {
+      specs.push(c);
+      i++;
+    }
+  }
+  if (specs.length === 0) return null;
+  const out = [];
+  for (let k = 1; k < args.length && k - 1 < specs.length; k++) {
+    const t = specs[k - 1];
+    try {
+      if (t === "d" || t === "i") {
+        const n = Number(args[k]);
+        out[k] = Number.isNaN(n) ? "NaN" : String(Math.trunc(n));
+      } else if (t === "f") {
+        out[k] = String(Number(args[k]));
+      } else if (t === "s") {
+        out[k] = String(args[k]);
+      }
+    } catch (_e) { /* a throwing getter leaves the argument raw */ }
+  }
+  return out;
+}
+
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
+  try {
+    const conv = _consoleFormatConversions(args);
+    Deno.core.ops.op_console_msg(level, args.map((a, idx) => {
+      if (conv && conv[idx] !== undefined) return conv[idx];
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     // `instanceof` misses an Error that came from another realm -- a frame
@@ -105,13 +151,14 @@ const _consoleFn = (level, args) => {
       // Do not walk the object. Chrome keeps a reference and formats lazily
       // when devtools is closed, so author-defined getters are never invoked
       // by a bare console.log -- and that asymmetry is exactly what
-      // devtools-detection code tests for. Cloudflare's challenge runs it on
-      // every log line as
-      //   console.log("%c%d", "font-size:0;color:transparent", probeObject)
-      // where `probeObject` carries accessors that record being read.
-      // JSON.stringify walks every enumerable property and calls toJSON, so
-      // it answered "devtools is open" unconditionally; reading `.message` to
-      // salvage `{}` did the same for one more property.
+      // devtools-detection code tests for. The one exception is the %-format
+      // substitution handled above (_consoleFormatConversions): a format
+      // specifier in the leading string makes Chrome convert that argument
+      // position (%d via ToNumber, %s via ToString), which does fire the
+      // probe's own toString once per call. JSON.stringify walks every
+      // enumerable property and calls toJSON, so it answered "devtools is
+      // open" unconditionally; reading `.message` to salvage `{}` did the
+      // same for one more property.
       // Object.prototype.toString only consults Symbol.toStringTag, which the
       // detection above does not use, and matches how Chrome labels a value
       // it has not expanded.
