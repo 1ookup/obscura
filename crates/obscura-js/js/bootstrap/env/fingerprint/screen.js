@@ -18,9 +18,6 @@ class ScreenOrientation {
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
-  when(type, options = undefined) {
-    return _eventTargetWhen.call(this, type, options, arguments.length);
-  }
   get [Symbol.toStringTag]() { return 'ScreenOrientation'; }
 }
 globalThis.ScreenOrientation = _markNative(ScreenOrientation);
@@ -70,9 +67,6 @@ class Screen {
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
-  when(type, options = undefined) {
-    return _eventTargetWhen.call(this, type, options, arguments.length);
-  }
   get [Symbol.toStringTag]() { return 'Screen'; }
 }
 ['width','height','availWidth','availHeight','availTop','availLeft','colorDepth',

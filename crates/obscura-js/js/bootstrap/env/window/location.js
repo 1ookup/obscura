@@ -398,16 +398,10 @@ if (!Object.getOwnPropertyDescriptor(Navigator.prototype,
       value: false, writable: true, enumerable: true, configurable: true,
     });
 }
-const _windowEventPrototype = Object.getPrototypeOf(globalThis);
-if (_windowEventPrototype && !Object.getOwnPropertyDescriptor(_windowEventPrototype, 'when')) {
-  const when = ({ when(type, options = undefined) {
-    return _eventTargetWhen.call(this, type, options, arguments.length);
-  } }).when;
-  _markNative(when);
-  Object.defineProperty(_windowEventPrototype, 'when', {
-    value: when, writable: true, enumerable: true, configurable: true,
-  });
-}
+// No `window.when`: the Window prototype inherits from EventTarget.prototype,
+// and Chrome 151 (the claimed identity; Step 340 oracle) publishes no `when`
+// anywhere on that chain. An own `when` here was a page-visible own property
+// on the window surface enumeration that no real 151 has.
 
 
 // The child browsing contexts, exposed as `window.length` and `window[i]`.
