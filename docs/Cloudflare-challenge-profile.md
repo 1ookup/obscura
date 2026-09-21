@@ -12540,3 +12540,91 @@ CustomEvent.detail、ancestorOrigins 等）。
 rFmgn2/lzDF4/TBNgK7 三元组、fold 第三参 NaN×3+Error×4（我们全 Error）仍未翻转；
 静态解码指向 worker-return 分类族（subs 88407/88553/88635，解码宿主 192.168.3.206
 当时宕机）。判据已达成，稳定性收敛以此为最优先。
+
+### Step 334：修复批次 34——unhandled rejection 引擎面修复：worker 回包分类族解码完成，判决轮 5/5 全过（final44-48 连续 POST /1.txt → 404），通过率 1/6 → 5/5（2026-09-21 上午）
+
+**方法**：解码机 192.168.3.57 的 jsvmp 工具链恢复可用（macOSShare 经 ssh 挂载路径
+`/Users/l9h8/macOSShare/cf5s/cf-ov2-replay/jsvmp-engine-0916-11/`，本机未挂载该子目录）。
+先用 edges3.json + lin10/12/14 走读器解码 worker 回包分类族与 fold/catch 区，再本地
+fixture（/tmp/cf0919/b34-fixture.html）+ headless Chrome 151 oracle 对拍 worker 回包
+时序与 fold 机制，最后 ver43 注入轮 + final44-48 判决五连轮。
+
+**worker 回包分类族解码（确证）**：
+1. TWnkF5 worker 探针全流程（region 88297-88882）：launcher 把主源串
+   `eval(_p?_p.createScript("debugger"):"debugger");postMessage({ yNiq8:"<A>",
+   TWnkF5:"<B>" });` postMessage 进 blob worker，随后第二条消息
+   `setTimeout(function(){self.postMessage({ pvIO8:"1"})},1500)` 作 1500ms 兜底。
+   主线程三个 handler：sub 88297（读 `data.yNiq8`，真则记 `!h[87]` 旗）、
+   sub 88379（onerror，记 null）、sub 88407（读 `data.pvIO8 === "1"`，真则
+   **h[117]=true**，否则 **h[213]=false**）。关键：正常 Chrome（无 devtools 的
+   `_p` 钩子）里主源 eval **必抛 ReferenceError**（`_p` 未定义），`{yNiq8,TWnkF5}`
+   回包根本不发；正常回包序列是 **[evalErr 型回包, 1500ms 后 {pvIO8:"1"}]**。
+2. 电池子 sub 88882（循环尾 0x016475 与臂区 89139 各调一次）：早退卫兵 → 读
+   `!h[80]`/`!h[87]` → 条件 terminate() → `h[158]=h[8]*h[198]`（乘法，undefined
+   入算即 NaN，即 Chrome fold 的 NaN 源）→ 臂链 rFmgn2 → lzDF4（第二发条件
+   **!h[86]**，探针=console.log(带毒 toString 对象)）→ TBNgK7（第二发条件
+   **!h[80]**，探针=createElement("a") + Object.defineProperty(el,"id",{get,
+   configurable/enumerable=!h[88]}) + console.log(el)）→ pUXPt5（同形）。ref 的
+   trio 计数（rFmgn2×1、lzDF4×2、TBNgK7×2）⇒ Chrome 的 h[86]/h[80] 为假。
+3. fold：逐方法循环（90756 头）每轮 `h[21]=h[104].pop()`、循环头
+   `h[40]=h[21]+h[53]`（加法）；空栈 pop=undefined + 数 ⇒ NaN（Chrome 形）。
+   catch 块 0x164e3（tryPush key=104）：`h[76]=h[1]==h[225]` 松等 + cP 调用 +
+   条件跳转；catch 吃掉的异常会成为后续迭代的 fold 值（ref 的 Error×4 即此，
+   属 Chrome 正常行为）。循环尾 0x16453-0x16485：条件启动 worker launcher
+   （sub 88472）与电池子（sub 88882），fold 经 frame[120] 传入。
+
+**引擎缺口（oracle 实证，两轮对拍全等）**：b34-fixture 在 Chrome 151 与我方
+引擎的 worker 回包序列（order=["evalErr","pvIO8"]、replyCount=2、
+pvIO8eq1=true、yniq8 假分支）与 fold（全 NaN、零 THREW）**逐项全等**——worker
+回包/fold 机制在我方 JS 面本就正确，Step 331 的 ②号嫌疑排除。真正的缺口在
+**unhandled rejection 引擎面**：真实判决轮 serve.log 反复出现
+`autonomous page task failed: Event loop error: Uncaught (in promise)
+ReferenceError: MutationObserver is not defined`。Turnstile/挑战的 worker 域
+promise 引用 MutationObserver（worker 正确无此绑定，Chrome 同抛同记），但
+deno_core 把未处理 rejection 变成 realm 派发异常令下一轮 event loop 报错；
+serve 泵连续 3 次报错即解除武装（server.rs `runtime_pump_error_streak <= 3`），
+页面后续异步阶段全冻结。final41 轮恰好 3 条、final43 轮 4-5 条——final41 的
+「间歇过线」即与泵死亡赛跑的产物。
+
+**修复（本批 commit）**：新增 `crates/obscura-js/js/bootstrap/tools/
+rejection-reporting.js`（bootstrap.js 清单注册，各 realm 通用）：注册 deno_core
+`setUnhandledPromiseRejectionHandler`——派发 Chrome 形 `unhandledrejection`
+（PromiseRejectionEvent，promise+reason，可 preventDefault），未拦截则
+console.error(reason)，**消费该 rejection**（返回 true）使 event loop 不再报错；
+消费的 reason 记入 `__obscura_consumedRejections`（上限 32），drive_module_eval
+据此恢复模块体 top-level throw 的报错路径（inline_module_evaluation_error_
+propagates 钉死）。不劫持 setReportExceptionCallback（模块求值依赖默认派发）。
+window.onerror/onunhandledrejection 槽保持 null（=浏览器原形）。回归测试 3 条：
+unhandled_rejection_reports_and_leaves_the_event_loop_alive、
+unhandled_rejection_preventdefault_hushes_the_console_report、
+worker_scope_unhandled_rejection_does_not_fail_the_page_turn（stash 卫兵实测
+翻红后恢复）。worker 面 MutationObserver 缺失维持不变（=Chrome worker 形）。
+
+**ver43（注入开，字母表取代理主机当轮 patched ov2.js 409099 字节，TS#3 帧
+90871 字节解密成功）**：SbVZ3 仍 **14 条 vs ref 91**（/21/SbVZ3；Qssv3=2、
+ODxGu4=1、TKyxg5/mfiL4/21/wguL7 尾段逐项全等；rFmgn2/lzDF4×2/TBNgK7×2 与
+72 条方法块仍缺席；fold 第三参仍全 Error）——beacon 侧分歧原样，即修复不直接
+翻转 SbVZ3 闸门。但 serve.log 实证 `Event loop error` 与
+`autonomous page task failed` **双清零**（修复前每轮 3-5 条），MutationObserver
+行转为 Chrome 形纯 console 报告，Turnstile widget 流程跑通
+（"Cannot find Widget" 清理提示首现）。
+
+**判决（诚实汇报）**：final44 / final45 / final46 / final47 / final48（注入关，
+click-after 16，间隔约 10s，负载 3.8-5.1）**五轮全部 PASS**：mitmproxy 每轮
+`POST www.thelancet.com/1.txt → 404`（favicon 200 放行态随行）。**本批通过率
+5/5；累计口径 1/6 → 6/11**。ops.tsv 每轮 5.9-9.7 万行全程在跑；泵零报错。
+注入已复原 true（options API 复核 value=True）。
+
+**测试门**：obscura-js 677/677（含 3 条新回归）；workspace 1908/1908 全过；
+no-default-features check 过；精确 release 构建（--features render）过；无
+cargo fmt。fixture 与对拍产物存 /tmp/cf0919/{b34-fixture.html,b34_run.py,
+b34-mo-probe.html,b34-worker-reject.html,b34probe/}，走读器输出存远端
+/tmp/b34_*.txt。
+
+**稳定性评估（诚实）**：5/5 是小样本（5 轮、单机、负载 3.8-5.1、同一 ov2
+build 周期内），且 SbVZ3 的 trio/72 条/fold 形状分歧仍未闭合——风险分显达
+阈值线之上的证据是「流程完整性」（泵冻结会饿死判决链后段），而非 beacon
+计数追平。下一步应：① 复跑跨 build 轮换与高负载场景验证 5/5 稳健性；② 继续
+0x164e3 catch 数据流与 collect 调用（哨兵收集器）的解码，闭合 SbVZ3 的
+77 条缺口；③ MutationObserver 引擎实现（当前全平台仅 worker 缺失，主/子
+realm 已有功能版）。
