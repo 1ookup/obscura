@@ -128,8 +128,13 @@ const _consoleMethodNames = [
   'timeStamp', 'context', 'createTask',
 ];
 function _makeConsoleMethod(name, length, implementation) {
-  const method = function() { return implementation.apply(this, arguments); };
-  Object.defineProperty(method, 'name', { value: name, configurable: true });
+  // Method shorthand, not a function expression: Chrome's console.log owns
+  // exactly "length,name" (oracle headless Chrome 151), and an ordinary
+  // closure carries a non-configurable "prototype" own property the oracle
+  // does not have. The shorthand has no [[Construct]] and no prototype while
+  // staying a strict function, so `.caller`/`.arguments` still throw the
+  // same TypeError Chrome throws for its native console methods.
+  const method = { [name](...args) { return implementation.apply(this, args); } }[name];
   Object.defineProperty(method, 'length', { value: length, configurable: true });
   _markNativeAs(method, `function ${name}() { [native code] }`);
   return method;

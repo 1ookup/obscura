@@ -7141,6 +7141,57 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, "EvalError", "EvalError", "<i>ok</i>", 2]));
     }
 
+    // Step 337 follow-up: one live EvalError ("Code generation from strings
+    // disallowed") fired in a realm no local fixture could reproduce, so the
+    // per-realm gate decision now reports itself (__OBCSP__ rows, page-init).
+    // The ver46 round captured the exact header text every live realm parsed
+    // -- top document and the rch challenge frame, nonce per load -- and all
+    // 28 decisions computed allow. These tests pin the gate on those exact
+    // live texts: the parser must keep seeing 'unsafe-eval' through the
+    // nonce, the trusted-types and sandbox directives that follow it, and
+    // must never flip the V8 code-generation gate off for them.
+    fn eval_gate_with_live_csp(csp: &str) {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://www.thelancet.com/1.txt");
+        rt.set_content_security_policy(Some(csp));
+        rt.run_page_init();
+        let result = rt
+            .evaluate(r#"(() => {
+                let direct = 'allowed', indirect = 'allowed', ctor = 'allowed';
+                try { direct = eval('1 + 1'); } catch (e) { direct = e.name; }
+                try { indirect = window.eval('2 + 2'); } catch (e) { indirect = e.name; }
+                try { ctor = new Function('return 3 + 3')(); } catch (e) { ctor = e.name; }
+                let policy = 'allowed';
+                try { trustedTypes.createPolicy('FHMZS9', {createScript: x => x}); }
+                catch (e) { policy = e.name; }
+                return [
+                    globalThis.__obscura_csp_allows_unsafe_eval,
+                    direct, indirect, ctor, policy,
+                ];
+            })()"#)
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, 2, 4, 6, "allowed"]),
+            "eval gate must allow for live challenge CSP: {csp}"
+        );
+    }
+
+    #[test]
+    fn live_top_document_csp_keeps_eval_allowed() {
+        eval_gate_with_live_csp(
+            "default-src 'none'; script-src 'nonce-jUzQDMmp1f37ipMnsEw7KQ' 'unsafe-eval' https://challenges.cloudflare.com; script-src-attr 'none'; style-src 'unsafe-inline'; img-src 'self' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com blob:; child-src 'self' https://challenges.cloudflare.com blob:; worker-src blob:; form-action http: https:; base-uri 'self'",
+        );
+    }
+
+    #[test]
+    fn live_rch_frame_csp_keeps_eval_allowed() {
+        eval_gate_with_live_csp(
+            "default-src 'none'; script-src 'nonce-89lTtr1oonGHggnUaFcOiI' 'unsafe-eval'; script-src-attr 'none'; worker-src blob:; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self' https://hagen.challenges.cloudflare.com https://brunhild.challenges.cloudflare.com; frame-src 'self' blob:; child-src 'self' blob:; form-action 'none'; base-uri 'self'; trusted-types FHMZS9 default; require-trusted-types-for 'script'; sandbox allow-same-origin allow-scripts allow-popups allow-forms",
+        );
+    }
+
     #[test]
     fn script_src_attr_controls_inline_event_handlers() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -8413,7 +8464,11 @@ mod tests {
                         allNativeFromParent: fam.every(m => native(cw.console[m])),
                         childOverrideBridgedToSharedRegistry: !!(reg && reg.cross && reg.cross.length),
                         ownNamesUnchanged:
-                            Object.getOwnPropertyNames(cw.console.log).sort().join(",") === "length,name,prototype",
+                            // Chrome owns exactly length,name on a console
+                            // method (oracle headless Chrome 151); the
+                            // bootstrap closure's non-configurable
+                            // "prototype" own property was a visible extra.
+                            Object.getOwnPropertyNames(cw.console.log).sort().join(",") === "length,name",
                     };
                 })()"#,
                 true,
