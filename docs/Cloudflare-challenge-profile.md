@@ -12628,3 +12628,17 @@ build 周期内），且 SbVZ3 的 trio/72 条/fold 形状分歧仍未闭合—�
 0x164e3 catch 数据流与 collect 调用（哨兵收集器）的解码，闭合 SbVZ3 的
 77 条缺口；③ MutationObserver 引擎实现（当前全平台仅 worker 缺失，主/子
 realm 已有功能版）。
+
+### Step 335：批次 34 复核——5/5 真实但限旧 build；轮换后 0/3 为 epoch 评分（2026-09-21 11:2x）
+
+**批次 34**（1fe3ef4）：间歇性真因=**serve 泵在 3 次连续 event-loop 错误后解除武装**
+（每轮失败的 MutationObserver 未处理拒绝恰好 3 次杀泵；final41 的通过是泵死亡前
+的竞态）。修复=rejection-reporting.js（全 realm Chrome 形态 unhandledrejection：派发、
+console 报告、消费拒绝——Chrome 里未处理拒绝从不杀页面）。final44-48 **5/5 全过**
+（POST /1.txt 404）。
+**复核**：ov2 build 10:28 轮换（md5 17c5a7df）后 final49-51 **0/3**，但流程形态完整、
+泵健康（0 event-loop 错误）、注入诊断轮标记全对齐（Qssv3=2=ref、ODxGu4=1=ref、
+uGyjw9=176 带内、tQdUc5=38）——**轮换后失败是服务端 epoch 评分变化，非我们侧回归**。
+SbVZ3 键在本 build 改名（77 条逐方法块缺口仍在，为最大剩余客户可见差异）。
+下一批：h[80]/h[86]/h[87] 旗标写点解码（决定 rFmgn2/lzDF4/TBNgK7 双发射与
+72 条块）+ 跨 epoch 复测。
