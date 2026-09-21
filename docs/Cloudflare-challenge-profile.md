@@ -13350,3 +13350,71 @@ ov2.js.bak-b42-pre-clean、/tmp/ov2-b42-restaged.js、
 值即哨兵令牌——collector 推 `carrier.stack` 的分支是 dir 块错形直接原因，
 字节码定位后反推 Chrome 侧为何不进该分支；③ epoch 判决继续 0/5，beacon
 78 与放行闸关系维持两道闸结论；④ 8587b07f 首小时 3 连判决窗口照旧。
+
+### Step 344：批次 43——8587b07f 全套工具链重推（strtab 2015 项旋转 342、Wz 寄存器 XOR、双取指模 +115/+141、LCG ×31843+31841），载体调度全解（臂进 throw→catch 帧恢复→臂体→T 返回载体；catch 帧随工作队列、T=RET），我方 vs Chrome VM 层逐项对称无分歧面，干净 ver53 beacon 78，判决 0/5（2026-09-22 凌晨）
+
+**① 工具链（交付，沙盒活体）**：served ov2（md5 8587b07f，00:29 代，408501 B，
+固定键窗在、ov2key 0 次）先离线重推全套。字符串表 W() 2015 项、访问器
+i(n)=W()[n-175]、旋转 342 次收敛、校验目标 986113（12 项 /1../12 公式，wP 索引
+1222/1921/1109/1212/1063/182/921/1270/177/435/2096/1406）。VM 类 Wz：i 随机
+1..254、l=i^217（PC）、j=i^48（键）、m=i^25（字节码）、o=i^40（帧栈）、
+47^i=globalThis（k=(0,eval)("this")）、21^i=工作队列 U、253^i=深度注册表、
+29^i=载荷字节汇；runProgram = new Wz(传输件).run(0, 112, [])。**双取指模**：
+主循环（队列空）op = key^((bc[pc]+115)&255)，子循环（队列非空、带 try/catch）
+op = key^((bc[pc]+141)&255)；LCG key' = ((key+op)*31843+31841)&255（mod 256 即
+×3+97，双射）；**全部操作数字节 (b+115)&255 后再 XOR 当前键寄存器**（取指 LCG
+先行，操作数用后键）。case 表 69 op → 48 handler 抽出（/tmp/b43/handlers），
+48 个语义核心逐一解出（b/l/n/q/Wf/Ws/WC/WG/WO 等帧族、Wi/WE/W5/W9/WW/Ww/WU/
+Wc 调用族、W1 立即数 5 模、T=RET、M=THROW、WY/Wy 守卫哈希、Wp 载荷字节写、
+e[X]=String.fromCharCode 名字拼装族：I^7/j^172/Wi^149/WE^225/W1^158）。
+
+**② 程序传输（每会话重扰）**：2-frame-resp → 剥离 → s1 → (s1[i]-seed-
+i%65535) mod 255 → b64 → 字节码，种子 4096 前缀单解。**程序按会话重 scram**：
+00:52 会话 462710 B（seed 77）vs 01:41 会话 462919 B（seed 65），头前缀
+7141c478 一致、396k 字节差——同一程序族每会话全量重混淆，静态解码必须配对
+本会话的 2-frame-resp。
+
+**③ 载体调度全解（ob43a，本会话程序+追踪对齐）**：插桩补丁
+patch_ov2_b43.py（run 入口 E 事件带初始 (pc,key)、双取指点 (pc,op) 追踪、双
+halt 槽+帧 dump（X）、catch 事件（C）；console.warn 通道；Error 实参仅
+Object.prototype.toString.call，绝不触 stack/name/message——343⑤ 纪律）。
+本会话 164 个电池臂（入口 pc 114680，key 182）：**臂序言在 pc+40 处 THROW
+载体**（C i=75 pc=114720 k=98 exc=[object Error]，164/164 臂），run 循环
+catch 弹队列帧 [pc,key,frames,depth] 恢复寄存器、异常写入 97^K、
+registry.splice(depth)；随后臂体 = typeof 门 → W1 载 undefined fold → W1 载
+方法名 → g 分配实参数组 → W5 调 collector；臂经 T（op18：槽值复制进 82^K、
+queue.length=registry.pop()、pc=NaN）停机，**返回值即载体**（X
+ret=[object Error]，164 次）。载体全生命周期：一次构造、常驻 82^K/97^K、每
+臂 throw→catch 恢复→臂体→T 返回。collector（入口 114786）读帧格（WC/WG
+fold 累加）、每半程 4 次 Wi 调用、经 Wp 写载荷行（29^K 字节汇）、Wf 帧比较门
+控发射；dir collector 停机槽 12=[object Error]（即引擎 dir() 收到的 fold）、
+82/97=载体。第二回合 9 臂（pc 132xxx-133xxx）跳过第三级 catch（C@115397）：
+我方 155/164、Chrome 164/173——**delta-9 形状两侧相同**。
+
+**④ 引擎 vs Chrome VM 层对拍（无分歧面，诚实汇报）**：ob43a（obscura，插桩
+注入轮）vs ob43b/ob43c（headless Chrome 153 同插桩件经代理）：首流分叉系每
+会话程序重扰伪差（同角色不同 pc/键链，非行为差）；结构性计数全对称——臂进
+throw 数（164 vs 173=会话时长差）、第三级 catch 缺 9 形状、X ret=Error 数、
+canvas 探针槽形（12=Error 两侧皆）、count 臂 typeof 门流一致。dir fold 载体
+写入点在 collector 闭包内部状态（挑战侧），VM 调度层无可观察引擎差；342④
+console 面普查维持等号。**按纪律不落投机修复**。
+
+**⑤ ver53 + 判决**：ver53（干净 staged 8587b07f，注入开）全流程完整，
+4-frame-req 解密 roundtrip 自证，**SbVZ3 = 78**（78/91 持平，残差=trio 5 +
+dir 块）。判决 final90..94（注入关）每轮仅 GET /1.txt 403 双连、无 POST
+404，**0/5**。全程 served 件 md5 8587b07f（02:29 轮换未及发生，5 轮同代）。
+
+**产物**：/tmp/b43/（strtab.tsv、case_b43.json、handlers/ 48+resolved、
+harness.mjs、walker2.mjs 单步执行器、probe_ops.mjs、patch_ov2_b43.py、
+ov2_b43.js、prog_b43/prog_ob43a、ob43a_events.json、ob43b_events.json、
+ob43c_console.txt、解码器 decodecount/decodedir/decodecol2）、
+/tmp/cf0919/{ob43a,ob43b,ver53,final90..94}。远端 ov2.js 已还原 8587b07f
+（.bak-b43-pre 为注入前备份），注入 true。
+
+**下一批入口**：① 每会话程序重扰 = 静态解码必须先抓当会话 2-frame-resp；
+Chrome 侧 playwright response.body 抓不到 822KB 程序件，需注入关时代理侧
+dump（flows API 存 body）。② dir collector 槽 12 的写入指令：下一插桩轮加
+「槽 12 写点侦测」（X 事件已带标签槽号，需 per-dispatch 槽写钩），锁 fold 源
+头指令后反推 Chrome 侧为何同槽为 NaN。③ 沙盒单步执行器（walker2 + 真实
+handler）已可与追踪逐指令对齐（本次 off-by-one：next = pc+len+1，跳转写绝对
+pc），可预解 Wf/Ws/WG 门控槽位再做定向插桩。
