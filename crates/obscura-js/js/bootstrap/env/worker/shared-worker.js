@@ -3,6 +3,20 @@
 // the same origin/name/script tuple across pages.
 const _sharedWorkerEntries = new Map();
 
+// Instance internals live in this WeakMap, not on the object: a real Chrome
+// SharedWorker instance owns no properties at all -- `port` is a prototype
+// accessor (oracle headless Chrome: SharedWorker.prototype owns exactly
+// {port, constructor, onerror}, and getOwnPropertyNames(instance) is empty).
+const _sharedWorkerState = new WeakMap();
+function _sharedWorkerStateOf(worker) {
+  let state = _sharedWorkerState.get(worker);
+  if (!state) {
+    state = { entry: null, connectionId: 0, port: null, onerror: null };
+    _sharedWorkerState.set(worker, state);
+  }
+  return state;
+}
+
 // Worker -> page: {"kind":"message","data":"{\"v\":...,\"c\":<connection>}"}.
 async function _sharedWorkerReceive(entry) {
   while (entry.id !== null) {
@@ -30,7 +44,25 @@ async function _sharedWorkerReceive(entry) {
 
 function _sharedWorkerError(entry, message) {
   entry.failed = true;
-  for (const worker of entry.workers.slice()) worker._dispatchError(message);
+  for (const worker of entry.workers.slice()) _sharedWorkerDispatchError(worker, message);
+}
+
+// _sharedWorkerDispatchError lives off the prototype: the listener trio is
+// inherited from EventTarget.prototype (shared registry), matching the
+// Worker.prototype convergence.
+function _sharedWorkerDispatchError(worker, message) {
+  setTimeout(() => {
+    const evt = { type: 'error', message: String(message), target: worker };
+    const handlers = _eventTargetListenersFor(worker, 'error');
+    if (typeof worker.onerror === 'function') {
+      try { worker.onerror(evt); } catch (e) {}
+    } else if (!handlers.length) {
+      console.error('SharedWorker error:', String(message));
+    }
+    for (const handler of handlers) {
+      try { handler.call(worker, evt); } catch (e) {}
+    }
+  }, 0);
 }
 
 function _sharedWorkerSpawned(entry, source, finalUrl, workerType, creatorFrom, workerCsp = '') {
@@ -59,14 +91,21 @@ function _sharedWorkerSend(entry, payload) {
   Deno.core.ops.op_shared_worker_post_message(entry.id, payload);
 }
 
-globalThis.SharedWorker = class SharedWorker {
-  constructor(url, options) {
-    if (arguments.length < 1) {
-      throw new TypeError(
-        "Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
-    }
-    this.onerror = null;
-    _hset(this, "_listeners", {});
+// A plain constructor function rather than class syntax: the own set below
+// must start with `port` (Chrome's enumeration order), and a class body
+// always lists `constructor` first -- its prototype object is also
+// non-configurable, so it cannot be swapped afterwards.
+function SharedWorker(url, options) {
+  if (new.target === undefined) {
+    throw new TypeError(
+      "Failed to construct 'SharedWorker': Please use the 'new' operator, "
+        + "this DOM object constructor cannot be called as a function.");
+  }
+  if (arguments.length < 1) {
+    throw new TypeError(
+      "Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+  }
+  const state = _sharedWorkerStateOf(this);
     const href = String(url);
     // The second argument is a name shorthand or a SharedWorkerOptions.
     const name = options == null ? ''
@@ -120,13 +159,13 @@ globalThis.SharedWorker = class SharedWorker {
       _sharedWorkerEntries.set(key, entry);
     }
     entry.workers.push(this);
-    _hset(this, "_entry", entry);
+    state.entry = entry;
 
     // Each construction is its own connection, even to a reused worker.
     const connectionId = entry.nextConnection++;
-    _hset(this, "_connectionId", connectionId);
+    state.connectionId = connectionId;
     const channel = new MessageChannel();
-    this.port = channel.port1;
+    state.port = channel.port1;
     const bridge = channel.port2;
     entry.connections.set(connectionId, bridge);
     bridge.onmessage = event => {
@@ -167,41 +206,33 @@ globalThis.SharedWorker = class SharedWorker {
       })();
       return;
     }
-  }
-  _dispatchError(message) {
-    const worker = this;
-    setTimeout(() => {
-      const evt = { type: 'error', message: String(message), target: worker };
-      const handlers = (worker._listeners['error'] || []).slice();
-      if (typeof worker.onerror === 'function') {
-        try { worker.onerror(evt); } catch (e) {}
-      } else if (!handlers.length) {
-        console.error('SharedWorker error:', String(message));
-      }
-      for (const handler of handlers) {
-        try { handler.call(worker, evt); } catch (e) {}
-      }
-    }, 0);
-  }
-  addEventListener(type, fn) {
-    if (typeof fn !== 'function') return;
-    const ls = this._listeners[type] || (this._listeners[type] = []);
-    if (ls.indexOf(fn) < 0) ls.push(fn);
-  }
-  removeEventListener(type, fn) {
-    const ls = this._listeners[type];
-    if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); }
-  }
-  dispatchEvent(evt) {
-    for (const handler of (this._listeners[(evt && evt.type) || ''] || []).slice()) {
-      try { handler.call(this, evt); } catch (e) {}
-    }
-    return true;
-  }
-  get [Symbol.toStringTag]() { return 'SharedWorker'; }
-};
-_markNative(globalThis.SharedWorker);
-// Preserve the worker's event implementation while sharing the EventTarget chain.
-try {
-  Object.setPrototypeOf(globalThis.SharedWorker.prototype, EventTarget.prototype);
-} catch (e) {}
+}
+_markNative(SharedWorker);
+globalThis.SharedWorker = SharedWorker;
+
+// Chrome 151 SharedWorker.prototype owns exactly {port, constructor, onerror},
+// in that order, with `port` a prototype accessor over per-instance state and
+// the listener trio inherited from EventTarget.prototype (oracle headless
+// Chrome: getOwnPropertyNames(instance) is empty -- not even `port`).
+const _sharedWorkerProto = Object.create(
+  globalThis.EventTarget && globalThis.EventTarget.prototype
+    ? globalThis.EventTarget.prototype : Object.prototype);
+Object.defineProperty(_sharedWorkerProto, 'port', {
+  get() { return _sharedWorkerStateOf(this).port; },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(_sharedWorkerProto, 'constructor', {
+  value: SharedWorker,
+  writable: true, configurable: true, enumerable: false,
+});
+Object.defineProperty(_sharedWorkerProto, 'onerror', {
+  get() { return _sharedWorkerStateOf(this).onerror; },
+  set(fn) {
+    _sharedWorkerStateOf(this).onerror = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+  },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(SharedWorker, 'prototype', {
+  value: _sharedWorkerProto,
+  writable: false, enumerable: false, configurable: false,
+});

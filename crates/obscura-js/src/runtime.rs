@@ -5341,7 +5341,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn event_target_when_and_observable_match_chrome_shape_and_delivery() {
+    async fn observable_matches_chrome_shape_and_when_stays_off_the_prototypes() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
@@ -5380,21 +5380,6 @@ mod tests {
                     run.first = await values.first();
                     run.last = await values.last();
                     run.reduce = await values.reduce((sum, value) => sum + value, 0);
-                    const eventResults = [];
-                    const observable = document.when('oracle-event');
-                    const subscribeReturn = observable.subscribe(event =>
-                        eventResults.push([event.type, event.target === document]));
-                    document.dispatchEvent(new Event('oracle-event'));
-                    const controller = new AbortController();
-                    let abortedDeliveries = 0;
-                    document.when('abort-event').subscribe(() => abortedDeliveries++,
-                        { signal: controller.signal });
-                    controller.abort();
-                    document.dispatchEvent(new Event('abort-event'));
-                    const outcome = callback => {
-                        try { callback(); return null; }
-                        catch (error) { return [error.name, error.message]; }
-                    };
                     return {
                         constructors: {
                             observable: [Observable.name, Observable.length,
@@ -5406,20 +5391,20 @@ mod tests {
                         observableKeys: Object.getOwnPropertyNames(Observable.prototype).sort(),
                         subscriberKeys: Object.getOwnPropertyNames(Subscriber.prototype).sort(),
                         run,
-                        event: {
-                            tag: Object.prototype.toString.call(observable),
-                            subscribeReturn: typeof subscribeReturn,
-                            eventResults, abortedDeliveries,
-                            paths: [typeof globalThis.when, typeof document.when,
+                        when: {
+                            // Chrome 151 (the identity the fingerprint claims;
+                            // Step 340 oracle) publishes no `when` anywhere on
+                            // the EventTarget chain, and no Screen/Window
+                            // prototype carries it as an own property either.
+                            eventTargetProtoOwn:
+                                Object.getOwnPropertyNames(EventTarget.prototype).join(","),
+                            inherited: [typeof globalThis.when, typeof document.when,
                                 typeof screen.when, typeof screen.orientation.when],
-                            own: [Object.prototype.hasOwnProperty.call(globalThis, 'when'),
-                                Object.prototype.hasOwnProperty.call(document, 'when'),
-                                Object.prototype.hasOwnProperty.call(screen, 'when'),
-                                Object.prototype.hasOwnProperty.call(screen.orientation, 'when')],
-                            shape: [document.when.name, document.when.length,
-                                Function.prototype.toString.call(document.when)],
-                            missing: outcome(() => document.when()),
-                            badReceiver: outcome(() => Node.prototype.when.call({}, 'x')),
+                            own: [Object.prototype.hasOwnProperty.call(EventTarget.prototype, 'when'),
+                                Object.prototype.hasOwnProperty.call(Screen.prototype, 'when'),
+                                Object.prototype.hasOwnProperty.call(ScreenOrientation.prototype, 'when'),
+                                Object.prototype.hasOwnProperty.call(Object.getPrototypeOf(globalThis), 'when')],
+                            observableGlobal: typeof Observable,
                         },
                     };
                 })()"#,
@@ -5465,15 +5450,12 @@ mod tests {
                     "subscribeReturn": "undefined", "toArray": [1, 2, 3],
                     "mapFilterTake": [4], "first": 1, "last": 3, "reduce": 6,
                 },
-                "event": {
-                    "tag": "[object Observable]", "subscribeReturn": "undefined",
-                    "eventResults": [["oracle-event", true]], "abortedDeliveries": 0,
-                    "paths": ["function", "function", "function", "function"],
+                "when": {
+                    "eventTargetProtoOwn":
+                        "constructor,addEventListener,dispatchEvent,removeEventListener",
+                    "inherited": ["undefined", "undefined", "undefined", "undefined"],
                     "own": [false, false, false, false],
-                    "shape": ["when", 1, "function when() { [native code] }"],
-                    "missing": ["TypeError",
-                        "Failed to execute 'when' on 'EventTarget': 1 argument required, but only 0 present."],
-                    "badReceiver": ["TypeError", "Illegal invocation"],
+                    "observableGlobal": "function",
                 },
             })
         );
@@ -11402,6 +11384,94 @@ RequestRedirect value",
         );
     }
 
+    /// Chrome 151 (oracle) owns nothing on a Worker instance:
+    /// getOwnPropertyNames(worker) is empty. The bootstrap constructor used to
+    /// publish seven underscore internals (_handlers/_listeners/_terminated/
+    /// _id/_pending/_traceFrom/_name) per instance; a challenge script reads
+    /// own-property lists on the worker objects it constructs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_instances_own_no_properties_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let probe = rt
+            .evaluate(
+                r#"(() => {
+                    const worker = new Worker(URL.createObjectURL(
+                        new Blob(['onmessage=e=>{}'], {type: 'text/javascript'})));
+                    const own = o => Object.getOwnPropertyNames(o).join(",");
+                    return {
+                        workerOwn: own(worker),
+                        workerEnum: Object.keys(worker).join(","),
+                        onmessageRoundTrip: (worker.onmessage = null) === null
+                            && worker.onmessage === null,
+                        noInternalLeaks: ["_handlers", "_listeners", "_terminated", "_id",
+                            "_pending", "_traceFrom", "_name", "_listener",
+                            "_inlineEvalWorker", "_scriptUrl"].every(name =>
+                                !(name in worker)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "workerOwn": "",
+                "workerEnum": "",
+                "onmessageRoundTrip": true,
+                "noInternalLeaks": true,
+            })
+        );
+    }
+
+    /// Chrome 151 (oracle) owns nothing on a SharedWorker instance either:
+    /// `port` is a prototype accessor, and SharedWorker.prototype enumerates
+    /// exactly {port, constructor, onerror} in that order with the listener
+    /// trio inherited from EventTarget.prototype. The bootstrap used to
+    /// publish own `port`/`onerror`/`_listeners`/`_entry`/`_connectionId` per
+    /// instance plus `_dispatchError`/listener trio on the prototype.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedworker_shape_matches_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let probe = rt
+            .evaluate(
+                r#"(() => {
+                    const shared = new SharedWorker(URL.createObjectURL(
+                        new Blob(['onconnect=e=>{}'], {type: 'text/javascript'})));
+                    const own = o => Object.getOwnPropertyNames(o).join(",");
+                    const proto = Object.getPrototypeOf(shared);
+                    return {
+                        sharedOwn: own(shared),
+                        sharedEnum: Object.keys(shared).join(","),
+                        sharedProtoOwn: own(proto),
+                        sharedChained: Object.getPrototypeOf(proto) === EventTarget.prototype,
+                        sharedPort: shared.port instanceof MessagePort,
+                        sharedPortSame: shared.port === shared.port,
+                        sharedOnErrorCoerced: (shared.onerror = 7, shared.onerror),
+                        listenerTrioInherited: ["addEventListener", "removeEventListener",
+                            "dispatchEvent"].every(name => typeof shared[name] === "function"),
+                        noInternalLeaks: ["_handlers", "_listeners", "_terminated", "_id",
+                            "_pending", "_traceFrom", "_name", "_entry",
+                            "_connectionId", "_dispatchError"].every(name =>
+                                !(name in shared)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "sharedOwn": "",
+                "sharedEnum": "",
+                "sharedProtoOwn": "port,constructor,onerror",
+                "sharedChained": true,
+                "sharedPort": true,
+                "sharedPortSame": true,
+                "sharedOnErrorCoerced": null,
+                "listenerTrioInherited": true,
+                "noInternalLeaks": true,
+            })
+        );
+    }
+
     /// A worker reply must reach a fully idle page through the parked pump
     /// itself. deno_core tracks neither the reply nor the page's suspended
     /// await, so the turn future has to stay parked on the worker-arrival
@@ -15165,7 +15235,7 @@ RequestRedirect value",
             result,
             serde_json::json!([
                 "type", "angle", "onchange", "lock", "unlock",
-                "addEventListener", "dispatchEvent", "removeEventListener", "when",
+                "addEventListener", "dispatchEvent", "removeEventListener",
             ])
         );
     }
@@ -27550,7 +27620,7 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_keyboard_layout_map_describes_a_physical_ansi_board() {
+    async fn the_keyboard_layout_map_matches_the_reference_session_order() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .call_function_on_for_cdp(
@@ -27563,10 +27633,13 @@ RequestRedirect value",
                         brand: String(map),
                         letters: [map.get('KeyA'), map.get('KeyZ')],
                         backslash: map.get('Backslash'),
-                        // The extra key an ISO board has and an ANSI one does
-                        // not; claiming it under a US layout is a mismatch.
-                        noIsoKey: map.has('IntlBackslash') === false,
+                        // The reference session's real Chrome on this machine
+                        // reports the ISO key with its layout glyph.
+                        intlBackslash: map.get('IntlBackslash'),
                         iterates: [...map].length,
+                        // Chrome's internal hash order, not alphabetical:
+                        // the snapshot serializes in iteration order.
+                        firstFive: [...map.keys()].slice(0, 5).join(','),
                     };
                 }"#,
                 None,
@@ -27579,13 +27652,14 @@ RequestRedirect value",
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!({
-                "size": 47,
+                "size": 48,
                 "readOnly": true,
                 "brand": "[object KeyboardLayoutMap]",
                 "letters": ["a", "z"],
                 "backslash": "\\",
-                "noIsoKey": true,
-                "iterates": 47,
+                "intlBackslash": "§",
+                "iterates": 48,
+                "firstFive": "KeyK,KeyG,Digit2,Digit0,KeyV",
             })
         );
     }
