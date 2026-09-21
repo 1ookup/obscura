@@ -13198,3 +13198,83 @@ ICE 候选 9 vs 6：查我方 RTCPeerConnection 候选收集的接口枚举；�
 rPXg2 缺 /ci/ link 项：确认 /ci/ 在新 build 时代是否仍发、资源记录为何
 不收；⑤ aQgx8/nEJhr9 语义（引擎 builder 常量字段，TS#3 出现）留待字节码
 管线；⑥ 周转后首小时 3 连判决复测窗口（340 批⑥）继续有效。
+
+### Step 342：批次 41——fddfbf79 工具链全套重推（取指/LCG 活体 8/8 链验证），电池卫兵块解码（互反 NOT 旗标 + worker 状态帧读），根因落定：Chrome 对 %c%d 格式替换会触发探针 toString 而我方从不触碰，修复后 beacon 14 → 78（块 8/9 方法到位，trio 5 条与第 9 方法 8 条仍缺），判决 0/5（2026-09-21 深夜）
+
+**方法**：served ov2（md5 fddfbf79，425420 B，20:28 轮换，与 341 批同代）先离线
+重推全套工具链，再以两轮被动插桩（ob41a 全量 dump + 指令流、ob41b 深帧格
+dump）加一轮 headless Chrome 153 代理侧 oracle 对拍；修复落盘后 ver51 注入轮
+解出 TS#3 完成 beacon；判决 final80..84。
+
+**① 工具链（交付，活体验证）**：字符串表 S() 2089 项、访问器
+A(n)=S()[n-245]、旋转 380 次收敛、校验目标 721238（/tmp/b41/strtab.tsv）。
+VM 类 AP：h=Array(256)、i 随机实例键、l=i^237（PC）、j=99^i（键）、m=i^114
+（字节码）、o=i^189（帧栈）、slot[166^i]=globalThis（(0,eval)("this")）、
+3^i try 注册表；runProgram = new AP(prog).run(0, 221, [])（初始键 221）。
+取指 op = key ^ ((bc[pc]+168)&255)，LCG key' = ((key+op)*45710+6379)&255
+（ob41a 活体 (pc,op) 链 8/8 全对，种子 67）。case 表 69 op → 48 handler：
+Sl 18 变二元、SO 5 变一元、Ss(1) MOV(dst^76/src^151)、Sd(100) RET（dst
+lab^241，置 pc=NaN 走 halt 出口）、Sc_1(159) 立即数、SV(131) 双目标 IFEQ、
+Su_1(76) 24 位跳（键重同步 ^92）、A8(14) fold 累加、A2(110)/A6(107) 帧读写
+（子码 lab^228：142 写/176 读/235 分配）、SB(235) 逐字符拼名 GETPROP（SQ 表
+^14）、SX(194) 拼名 CALL（名 ^238、arity lab^203、dst lab^11）、Sp(203) 槽名
+CALL、SN(252)/Sv_1(113) payload 字典写入。传输层种子对 2-frame-resp 暴力
+（4096 前缀单解）；guard 块解码用「每指令键 = op 反推」法绕开 handler 字长
+模型（341 批遗留的插桩 op==pc 行由此可解）。
+
+**② 电池旗标写点全解（交付）**：本 build 电池入口子 = TKyxg5 子（E@48868，
+runProgram 键 221），卫兵序：读帧格 119/115/117/116（worker 状态通道，等价
+旧 build 116/117/213）→ **互反 NOT 写**：s64 = !s66、s66 = !s64（s64/s66 =
+新 build 的 h[80]/h[86]/h[87] 等价物，槽号随 build 洗牌，label = slot ^ i）
+→ 后续臂区以 !旗标门控 trio 与方法块发射。帧格 92/93/95 为伴随读。**两引擎
+在该子出口的帧值一致**（Chrome 153 oracle vs 我方 ob41b：worker 格
+106/115/116/117/119 全 undefined、三处 false 格一致、frame[119] 同
+undefined）——卫兵输入不是分歧点；分歧在探针闭包的**运行次数**：出口帧栈
+我方 n124 vs Chrome n122（多一次闭包调用 = 多 2 帧）。
+
+**③ 根因（oracle 实锤 + 修复）**：headless Chrome 153（devtools 关）逐方法
+getter 触发普查：**带 % 格式符的 console 调用会按位置预转换实参**——%d/%i/%f
+走 ToNumber、%s 走 ToString，从而**每次调用触发一次探针自 toString**；%c/%o
+/%O 保持原样、格式串本身在行内保持字面、无格式串的裸调用零触发。
+`console.log("%c%d", style, probe)` 正是电池的每次探针调用——Chrome 每调用
+跑一次闭包（读写帧槽、推进臂区状态），我方 console 从不触碰实参，闭包一次
+不跑，臂区旗标永不就位。修复（commit f12dee4，console.js
+_consoleFormatConversions + runtime.rs 回归钉
+console_format_args_preconvert_like_chrome）：前导字符串含 % 时按说明符位置
+预转换（%d/%i 取整、%f Number、%s String、%c/%o/%O 原样、%% 消耗无参、转换
+抛错保持原样），行文本对 primitive 实参不变，命名 getter（id/name/length）
+在任何位置仍不触发（b329 不变量保持）。既有三处行 pin 全部不变。
+
+**④ ver51（注入轮，新二进制）**：全流程完整，TS#3 完成 beacon 解出
+（4-frame-req 92311 B → 113563 B JSON，roundtrip 自证）。**SbVZ3 14 → 78**：
+head 8（TKyxg5/PhWMD5/AecW7/Qssv3/cnrU5/ODxGu4/mfiL4/21）+ 方法块 64（8 方法
+token FpVt9/YVlHf2/QqPF4/FFeiZ6/wnNg0/NThit5/ZlKFS2/HIFR9 × 8 行）+ 尾 6
+（wguL7 双 AecW7/Qssv3 形状与 ref 一致）。ref 91 = 8 + 5 trio + 72（9 方法 ×
+8）+ 6；**残差 13 = trio 5（rFmgn2×1+lzDF4×2+TBNgK7×2）+ 第 9 方法块 8**。
+trio 令牌在我方 payload 全程零出现，第 9 方法的探针未产出 token——两者的
+触发机制与 %c%d 闭包面不同，未定位，不落投机修复。
+
+**⑤ 判决**：注入关，final80..84 全部仅 GET /1.txt 403 双连、无 POST 404，
+**0/5**。ov2 md5 per round：final80..83 = fddfbf79，final84 = 0f547cc6
+（22:28 轮换后首测，仍 403）。fddfbf79 时代累计 0/5（本轮）+ ver51 注入轮
+完整流程未放行。341 批 A/B 结论维持：beacon 分数与 epoch 放行是两道闸，
+beacon 78/91 仍不过第二道。
+
+**⑥ 附带发现**：b39 批原地清除的 ov2key console.log IIFE 随 20:28 轮换
+**又被轮换自动化带回了 served ov2.js**（pristine 425165 → served 425420 的
+255 B 差值 = fixed-key 补丁 + ov2key 残留）；本批插桩副本与 ver51 均在打补
+丁时剔除。轮换自动化的补丁模板需要同步删掉这条残留，否则每个注入轮多一次
+console.log（质询数 console 调用）。
+
+**产物**：/tmp/b41/（strtab.tsv、case_b41.json、handlers/ 48 个、
+patch_ov2_b41.py、patch_ov2_b41b.py、ov2_b41*.js、prog_final75.bin、
+prog_ob41a.bin、ob41a_events.json、chrome_oracle_tkyxg5.txt、getter/fmt
+oracle 脚本）、/tmp/cf0919/ob41a|ob41b|ver51|final80..84（fo + serve.log +
+dec4）。代理 ov2_js_path 已复原 live ov2.js（0f547cc6），注入 true。
+
+**下一批入口**：① trio 5 条的发射条件：rFmgn2/lzDF4/TBNgK7 令牌在 0f547cc6
+新 build 上重推工具链后沿 341 批⑤自适应窗口 hook 形状做一次闭包侧追踪（本批
+SX/Sp handler 模型可复用），锁 fold 臂的精确门控；② 第 9 方法 token 缺失：
+对 9 个电池方法逐个 census 我方 vs Chrome 的探针返回形状（341 批①方法级
+对拍表可复用），定位失败方法；③ 轮换自动化补丁模板清除 ov2key 残留（⑥）；
+④ epoch 放行闸与 beacon 分数的关系继续证伪：0f547cc6 首小时 3 连判决窗口。
