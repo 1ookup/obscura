@@ -12732,3 +12732,95 @@ Reqable 监听，mitmweb 在 8080，两者链路关系待查；verdict 以 8081 
 解码（h[86]/h[87] 写点最可能藏身处）；③ sentinel collector 构造与 token
 推入在 VM 侧的抛点（fold 全 Error 同根）；④ Reqable(9000)→mitmweb(8080)
 链路确认。
+
+### Step 337：批次 36——电池派发实锤（SU/Sp/Q0）+ 抛点图谱（三连探针 + eval 拒绝），b35 零命中系日志级别假象；无修复落盘，判决维持 0/3（2026-09-21 午后）
+
+**方法**：远端工具链（192.168.3.57）对当前 build 的 ov2.js（10:28 轮换
+md5 17c5a7df）先离线解码引擎字符串表，再对 VM 五个 call 族 handler +
+run 循环 catch 做被动挂钩（patch /tmp/patch_ov2_b36.py 与 b36c 版：
+普查行 + 异常行 + 一次性旗标槽 dump，状态全部挂 VM 实例），经代理
+ov2_js_path 注入跑 ob36a/ob36b/ob36c 三轮插桩（预算 3/3 用满）；随后
+离线解码本轮 ov1 主程序（ray a3e679477d235503，prog0.bin 475867 B），
+用活体 (pc,key) 锚点核对取指公式；本地 fixture（同源/跨源 iframe、
+blob worker、blob iframe、真实 rch 文档复刻）隔离 eval 拒绝路径。
+
+**头条：b35「四钩子零命中」是日志级别假象。** 本引擎 console.log/info
+经 ops.rs 3147-3149 落 tracing::info，serve 默认过滤器不显示；b35 的
+`__OBC__`/`__OBTERM__` 普查行全部用 console.log，故一行都不进 serve.log。
+改用 console.warn 后钩子全部命中。旗值「未读到」类结论（含本表
+h[80]/h[86]/h[87] 行）凡以 console.log 行缺失为据者均需重估。
+
+**① 电池真派发（交付）**：引擎字符串表为 javascript-obfuscator 单表：
+Q(n)=S()[n-428]（S 1861 项，旋转 220 次收敛校验 329716）。"console"
+(1031)/"log"（不在表中）等电池方法名不走 sa 静态解码，而是 call handler
+内用 SB 256 单字符表（String.fromCharCode(Sc) 逐字符）按 key 派生字节串
+现场拼出，故任何静态索引搜索天生不可见。VM 结构：Qr 类
+（h=Array(256) 槽，i=随机 key，j=35^i 键寄存器，l=137^i PC，m=61^i 字节码，
+o=189^i 帧栈；try=87^i 等），run 为巨型 switch，每 handler 独立函数按
+case 经 Sl/HX.call(this,...) 绑定。取指公式（活体锚点三处核对通过）：
+op = key ^ ((bc[pc]+40)&255)；key 演化 LCG：key' = ((key+op)*16542+45691)&255
+（fetch 内先演化再派发，handler 用新 key）。电池实走：
+- console 方法（13 方法两遍）：SU（方法名内联拼串、收者取值槽）与
+  Sp（收者与方法名都取值槽）两族；本 build 每方法 ×2。
+- terminate()：Q0（帧槽 .u 收者=Worker 对象）一次 + SU/Sp 形态 15 次，
+  共 16 次 worker.terminate。
+- 心跳：window.NIsa2(code) → window.eval(result)（SU/Sp 交替，约 600ms）。
+  NIsa2 在 rch 文档内联定义：identity 回退与 p.createScript（TrustedTypes
+  策略 FHMZS9）双版本，本机实测返回真 TrustedScript 对象。
+
+**② 抛点图谱（交付，fold 全 Error 同根拆解）**：本引擎 fold 根每轮抛
+三连（150 行 cap 截断前约 130+ 组，帧深 288；Chrome 参考 7 轮仅 4 错）：
+1. `TypeError: Cyclic __proto__ value` @pc131082(k181)——handler SP 经
+   gbfUR 助手调 Object.setPrototypeOf(x,y)，收者/参数取帧槽 .u；
+2. `TypeError: 'caller','callee','arguments'...` @pc131759(k115)——
+   handler SK 内直接读函数 caller/arguments（探针本体）；
+3. `TypeError: Function.prototype.toString requires that 'this' be a
+   Function` @pc132775(k243)——SU 解析 toString 后 .call 收到非函数。
+三条消息均为 V8 原生文本（Chrome 同源），故分歧在探针收到的操作数
+（sentinel 值），不在抛出机制本身。另有一次性：RangeError Invalid code
+point -1（SU 内 String.fromCodePoint，pc96902）；`EvalError: Code
+generation from strings disallowed for this context`（Proxy.eval 经 SU，
+pc207951，一次）；Sp LEB 守卫裸 Error（pc134593）。
+
+**EvalError 拒绝路径（未定位到 realm，未落修复）**：vendor/rusty_v8
+binding.cc ObscuraModifyCodeGeneration 对字符串 eval 在 realm 全局
+`__obscura_csp_allows_unsafe_eval===false` 时拒绝；flag 由 page-init 从
+document_scope_info 的 csp 解析（script-src/default-src 是否含
+'unsafe-eval'）。本轮所有文档（top 1.txt 头+meta、rch 头+meta）CSP 均含
+unsafe-eval；本地 fixture 四种拓扑（同源/跨源端口 iframe、blob worker、
+blob iframe）与真实 rch 文档本地复刻全部 flag=true、eval 放行、
+createPolicy('FHMZS9') 成功。活体拒绝的 realm 仍未锁定（未测差异仅剩
+orchestrator 动态建帧全链路）。按仓库纪律不落投机修复：拒绝本身
+Chrome 语义一致，错在 flag 计算，盲改 gate 风险大于收益。
+
+**附带发现（通用分歧，未动）**：本引擎 console 对象
+Object.prototype.toString 判为 `[object console]`（小写），Chrome 为
+`[object Console]`；一次性旗标 dump 钩子正是以 `[object Console]` 为
+触发条件而全部错过，本批活体旗值仍未读到。webidl-branding 应补
+console 的 toStringTag。
+
+**③ m6 key 派生 dst**：当前 build 的 m6 族 handler 本体已逐字提取：
+Q6（frameWrite：`cell[Ib].u = slots[IC ^ key]`，IC 由 key 连 XOR
+adj 字节常量 216/40 累积、LEB 续读守卫 throw Error()）、Sj（frameRead
++调用）、Sl（五单目 op，同族寻址）。0916-11 旧扫描 b35_m6.mjs 无可达性
+过滤（4 槽 5210 个裸候选）不可用作写点结论。下一批把已证实的
+取指+LCG 演化与本批 handler 字节模型接入 batch-30 线性 walker，即可对
+当前 build 做可达 m6 写点全枚举（活体 k 值锚点已留）。
+
+**判决**：无修复落盘，ver45 未触发；未消费 injected/verdict 轮。
+Step 336 判决维持（0/3，GET /1.txt 403）。代理 ov2_js_path 已复原
+原 ov2.js、注入 true。产物：/tmp/patch_ov2_b36.py、/tmp/patch_ov2_b36c.py、
+/tmp/ov2_b36.js、/tmp/ov2_b36c.js、/tmp/b36/strtab.tsv、
+/tmp/b36/decode_b36.mjs、/tmp/b36/prog0.bin(.b64)、/tmp/b36/walk_b36.mjs、
+/tmp/b36/fixt/*（eval 拓扑 fixture + cdp_probe.py）、
+/tmp/cf0919/ob36a|ob36b|ob36c（fo 抓包 + serve.log + ops.tsv）。
+
+**下一批入口**：① 以本批 SU/Sp 普查 + catch 钩子（console.warn 版）
+重跑一轮即可读旗：把一次性 dump 触发条件改为 `__tg==='console'`（小写）
+或直接在首个 `SU|log` 行后 dump 全 256 槽；② 三连探针的操作数解密：
+从 (pc,key) 锚点前向按 handler 字节模型解码循环体（fetch/LCG 已证），
+锁定 sentinel 槽号与填充点，对照 NIsa2 心跳 eval 的返回（活体 EvalError
+一次性 vs 心跳多次的矛盾说明首次与后续路径不同）；③ EvalError 拒绝
+realm：给 page-init flag 计算加一行临时 console.warn（csp+ nid）即可
+一轮定位，或审查 orchestrator 动态 iframe 的 scope.csp 继承；④ console
+toStringTag 大写修正（独立小修复，可先行）；⑤ m6 可达枚举（见上）。
