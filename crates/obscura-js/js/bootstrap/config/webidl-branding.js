@@ -424,8 +424,14 @@ function _obscuraMarkSurfaceNative(filterToPristine) {
       if (!d) continue;
       if (typeof d.value === 'function') {
         // An anonymous function installed under a slot (URL.createObjectURL's
-        // plain assignment drops the name) must carry the slot's name.
-        if (rename && typeof key === 'string' && d.value.name === '') nameOf(d.value, key);
+        // plain assignment drops the name) must carry the slot's name. The
+        // ECMAScript intrinsics keep their spec names regardless of the slot
+        // they sit in: Function walked above renamed Function.prototype to
+        // "prototype" (its key), which leaked "function prototype() ..." as
+        // the intrinsic's toString where Chrome answers the anonymous
+        // "function () { [native code] }" (oracle headless Chrome 151).
+        if (rename && typeof key === 'string' && d.value.name === ''
+            && d.value !== Function.prototype) nameOf(d.value, key);
         _markNative(d.value);
       }
       if (typeof d.get === 'function') {
@@ -590,6 +596,18 @@ function _obscuraMarkSurfaceNative(filterToPristine) {
       if (val && (typeof val === 'object')) markMembers(val, true);
     }
   }
+  // Chrome keeps Function.prototype anonymous: name "" (configurable) and
+  // toString "function () { [native code] }" (oracle headless Chrome 151).
+  // Restore that shape on every pass -- an earlier snapshot-time pass marked
+  // the renamed form, and the snapshot registry marks survive the restore.
+  try {
+    if (Function.prototype.name !== '') {
+      Object.defineProperty(Function.prototype, 'name', {
+        value: '', writable: false, enumerable: false, configurable: true,
+      });
+    }
+  } catch (_e) {}
+  try { _markNativeAs(Function.prototype, 'function () { [native code] }'); } catch (_e) {}
 }
 // The boot-time pass runs only where the whole surface installs inline (the
 // main context at snapshot build, non-deferring realms); its registry marks

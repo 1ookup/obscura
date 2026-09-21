@@ -366,7 +366,13 @@ function _runtimeNativeRegistry() {
   const runtime = Deno[_nativeRegistrySym];
   return runtime && runtime !== _nativeRegistry ? runtime : null;
 }
-Function.prototype.toString = function toString() {
+// Method shorthand, not a function expression: Chrome's Function.prototype
+// .toString owns exactly "length,name" (oracle headless Chrome 151), and an
+// ordinary closure carries a non-configurable "prototype" own property the
+// intrinsic does not have. Strictness carries over, so `.caller` still
+// throws the same TypeError Chrome throws for the intrinsic.
+Function.prototype.toString = {
+  toString() {
   if (_nativeStr.has(this)) { return _nativeStr.get(this); }
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
@@ -427,7 +433,8 @@ Function.prototype.toString = function toString() {
     }
   }
   return _origToString.call(this);
-};
+  }
+}.toString;
 function _markNative(fn) {
   if (typeof fn === 'function') {
     _nativeFns.add(fn);
