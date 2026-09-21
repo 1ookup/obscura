@@ -156,7 +156,8 @@ function _blobLooksLikeEvalMessageWorker(source) {
 }
 
 function _deliverWorkerOutMessage(worker, message) {
-  if (worker._terminated) return;
+  const state = _workerStateOf(worker);
+  if (state.terminated) return;
   // HaHaVM Worker_postMessage('out'): deliver to onmessage when assigned,
   // else to registered message listeners, else queue in `listener` until an
   // onmessage assignment replays it. Dropping it made the widget lose the
@@ -164,7 +165,7 @@ function _deliverWorkerOutMessage(worker, message) {
   // already registered stalled the widget.
   const listeners = _eventTargetListenersFor(worker, 'message');
   if (typeof worker.onmessage !== 'function' && !listeners.length) {
-    _hset(worker, "_listener", message);
+    state.listener = message;
     return;
   }
   const evt = globalThis.__obscura_markTrusted
@@ -223,9 +224,29 @@ function _runPostedWorkerSource(worker, data, type) {
 // postMessage, terminate}, in that enumeration order, and chains directly to
 // EventTarget.prototype: the listener trio is the shared EventTarget registry,
 // so nothing worker-specific is published as an own prototype property.
+// Worker instance internals live in this WeakMap, not on the object: a real
+// Chrome Worker instance owns no properties at all (oracle headless Chrome:
+// getOwnPropertyNames(worker) is empty), and the challenge reads own-property
+// lists on the workers it constructs. Same discipline as the EventTarget
+// listener registry below.
+const _workerState = new WeakMap();
+function _workerStateOf(worker) {
+  let state = _workerState.get(worker);
+  if (!state) {
+    state = {
+      handlers: { message: null, messageerror: null, error: null },
+      terminated: false, id: null, pending: [], traceFrom: 'window',
+      name: '', listener: undefined, scriptUrl: '', inlineEval: false,
+    };
+    _workerState.set(worker, state);
+  }
+  return state;
+}
+
 const _workerById = new Map();
 function _workerSpawn(self, source, finalUrl, workerType = 'classic', workerCsp = '') {
-  if (self._terminated) return;
+  const state = _workerStateOf(self);
+  if (state.terminated) return;
   let id;
   // The creator's URL, read from this realm's own `location`. A worker
   // inherits the origin of the document that constructed it, so a worker
@@ -237,20 +258,20 @@ function _workerSpawn(self, source, finalUrl, workerType = 'classic', workerCsp 
       String(source),
       String(finalUrl),
       String(workerType),
-      String(self._name || ''),
+      String(state.name || ''),
       creatorUrl,
       JSON.stringify(_fingerprint()),
       String(_environmentDocumentRoot()),
       _environmentDocumentCsp(),
-      String(self._traceFrom || 'window'),
+      String(state.traceFrom || 'window'),
       String(workerCsp || ''),
     );
   }
   catch (e) { _workerDispatchError(self, e && e.message ? e.message : String(e)); return; }
-  _hset(self, "_id", id);
+  state.id = id;
   _workerById.set(id, self);
-  const queued = self._pending;
-  _hset(self, "_pending", []);
+  const queued = state.pending;
+  state.pending = [];
   for (const payload of queued) Deno.core.ops.op_worker_post_message(id, payload);
 }
 // Delivered by the runtime's worker message drain at task boundaries (see
@@ -262,10 +283,12 @@ function _workerSpawn(self, source, finalUrl, workerType = 'classic', workerCsp 
 // 268 ms against Chrome's 4 ms).
 function _workerDispatchBatch(id, batch) {
   const worker = _workerById.get(id);
-  if (!worker || worker._terminated) return;
+  if (!worker) return;
+  const state = _workerStateOf(worker);
+  if (state.terminated) return;
   // The runtime embeds `batch` as a JS array literal of entry objects.
   for (const entry of batch) {
-    if (worker._terminated) return;
+    if (state.terminated) return;
     if (!entry) continue;
     if (entry.kind === 'error') { _workerDispatchError(worker, entry.message || 'Worker error'); continue; }
     let data;
@@ -288,9 +311,10 @@ function _workerDispatchBatch(id, batch) {
 }
 function _workerDispatchError(self, message) {
   const worker = self;
+  const state = _workerStateOf(worker);
   // Deliver asynchronously so `new Worker(...)` callers can attach onerror.
   setTimeout(() => {
-    if (worker._terminated) return;
+    if (state.terminated) return;
     const evt = { type: 'error', message: String(message), target: worker };
     const handlers = _eventTargetListenersFor(worker, 'error');
     if (typeof worker.onerror === 'function') {
@@ -309,41 +333,34 @@ function _workerDispatchError(self, message) {
 
 globalThis.Worker = class Worker {
   // IDL event-handler attributes live on the prototype, like Chrome's
-  // Worker.prototype. An own data property per instance would show up in
-  // Object.keys(worker) and in the own-property descriptor, which a Worker
-  // created by a challenge script is exactly the sort of place gets read.
-  // The setters also snapshot the assigning code's execution-source label,
-  // so callbacks fire attributed to their assigner (trace runs only).
-  // Declaration order matches Chrome's enumeration: onerror before onmessage.
-  get onerror() { return this._handlers.error; }
+  // Worker.prototype. Instances carry no own state at all (Chrome owns
+  // nothing on a Worker instance): the internals this class needs live in
+  // the _workerState WeakMap. The setters also snapshot the assigning code's
+  // execution-source label, so callbacks fire attributed to their assigner
+  // (trace runs only). Declaration order matches Chrome's enumeration:
+  // onerror before onmessage.
+  get onerror() { return _workerStateOf(this).handlers.error; }
   set onerror(fn) {
-    this._handlers.error = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+    _workerStateOf(this).handlers.error = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
     __obscuraTraceRecordHandler(this, 'onerror');
   }
-  get onmessage() { return this._handlers.message; }
+  get onmessage() { return _workerStateOf(this).handlers.message; }
   set onmessage(fn) {
-    this._handlers.message = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
+    const state = _workerStateOf(this);
+    state.handlers.message = (typeof fn === 'function' || (fn && typeof fn === 'object')) ? fn : null;
     __obscuraTraceRecordHandler(this, 'onmessage');
     // HaHaVM Worker_onmessage_set: an out message that arrived before the
     // handler was assigned is replayed now. Without it the widget's first
     // navigator probe result never reached the page and Turnstile chose PAT.
-    if (this._listener !== undefined && this._listener !== null) {
-      const pending = this._listener;
-      _hset(this, "_listener", undefined);
+    if (state.listener !== undefined && state.listener !== null) {
+      const pending = state.listener;
+      state.listener = undefined;
       _deliverWorkerOutMessage(this, pending);
     }
   }
   constructor(url, options) {
-    _hset(this, "_handlers", { message: null, messageerror: null, error: null });
-    _hset(this, "_listeners", {});
-    _hset(this, "_terminated", false);
-    _hset(this, "_id", null);
-    _hset(this, "_pending", []);
-    // Execution-source label of the code constructing this worker. The
-    // worker's own trace label is worker(M)[this], and 'out' message
-    // callbacks on the page side restore it: a handler runs in the creating
-    // context, not in whichever turn delivered the message.
-    _hset(this, "_traceFrom", __obscuraTraceCurrent());
+    const state = _workerStateOf(this);
+    state.traceFrom = __obscuraTraceCurrent();
     const worker = this;
     const href = String(url);
     const workerType = options && options.type !== undefined
@@ -372,7 +389,7 @@ globalThis.Worker = class Worker {
     }
     // Surfaces as `self.name` in the worker; "" when none was supplied, which
     // is what a browser reports -- an absent binding is not the same value.
-    _hset(this, "_name", options && options.name !== undefined ? String(options.name) : '');
+    state.name = options && options.name !== undefined ? String(options.name) : '';
     const blobSource = globalThis.__blobStore?.[href] ?? globalThis.__blobStore?.[resolved];
     // A blob worker's script is the blob's own text, and the challenge builds
     // one that evals the tasks posted to it (`onmessage -> eval`). Running that
@@ -382,7 +399,7 @@ globalThis.Worker = class Worker {
     // document does not have. The widget CSP allows it (`script-src 'nonce-…'
     // 'unsafe-eval'` with `worker-src blob:`).
     if (typeof blobSource === 'string' && blobSource.length) {
-      _hset(this, "_scriptUrl", resolved);
+      state.scriptUrl = resolved;
       _workerSpawn(this, blobSource, resolved, workerType, '');
       return;
     }
@@ -392,7 +409,7 @@ globalThis.Worker = class Worker {
     // isolate made fetch("") a PAT request (no Origin) and the widget failed
     // 600010. Large classic http(s) workers still spawn.
     if (resolved.startsWith('blob:') || href.startsWith('blob:')) {
-      _hset(this, "_inlineEvalWorker", true);
+      state.inlineEval = true;
       return;
     }
     if (resolved.startsWith('data:')) {
@@ -439,7 +456,8 @@ globalThis.Worker = class Worker {
   // {constructor, onerror, onmessage, postMessage, terminate}. The spawn path
   // lives in the module-scope _workerSpawn.
   postMessage(data, type) {
-    if (this._terminated) return;
+    const state = _workerStateOf(this);
+    if (state.terminated) return;
     // HaHaVM Worker_postMessage: a string that itself contains postMessage
     // is classic-script source, Function()'d in the creating document. The
     // rewritten source then calls this method again with type "out" to
@@ -449,7 +467,7 @@ globalThis.Worker = class Worker {
       // With an isolate behind this worker every post is a message for it: the
       // blob's own bootstrap evals the task inside the worker scope. The
       // document-eval path is only for a worker that has none.
-      if (this._id === null && data.indexOf('hahavm_this') === -1
+      if (state.id === null && data.indexOf('hahavm_this') === -1
           && data.indexOf('postMessage') !== -1) {
         _runPostedWorkerSource(this, data, type);
         return;
@@ -460,16 +478,17 @@ globalThis.Worker = class Worker {
       return;
     }
     const payload = _workerSerializeMessage(data);
-    if (this._id === null) { this._pending.push(payload); return; }
-    Deno.core.ops.op_worker_post_message(this._id, payload);
+    if (state.id === null) { state.pending.push(payload); return; }
+    Deno.core.ops.op_worker_post_message(state.id, payload);
   }
   terminate() {
-    if (this._terminated) return;
-    _hset(this, "_terminated", true);
-    this._pending.length = 0;
-    if (this._id !== null) {
-      _workerById.delete(this._id);
-      try { Deno.core.ops.op_worker_terminate(this._id); } catch (e) {}
+    const state = _workerStateOf(this);
+    if (state.terminated) return;
+    state.terminated = true;
+    state.pending.length = 0;
+    if (state.id !== null) {
+      _workerById.delete(state.id);
+      try { Deno.core.ops.op_worker_terminate(state.id); } catch (e) {}
     }
   }
 };
