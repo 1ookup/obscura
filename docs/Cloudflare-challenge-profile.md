@@ -13016,3 +13016,93 @@ ops.tsv）、final65..68（fo + dec）。远端 /tmp/ov2_b38.js、
 是否原地清除（会改 md5 指纹，需与轮换窗口协调）；⑥ ov2 轮换监控：
 轮换后立即 3 连判决，检验 5/5 是否复现，定位"friendly epoch"是否
 实为"friendly build"。
+
+### Step 340：批次 39——三连抛点操作数全解（setPrototypeOf(X,X) / fn['arguments'] / X.toString.call(X)，探针语义与 Chrome 一致），ov2 周转 58800b74 全套工具链重推，G3 跳转+二次 LCG 黑盒钉死，Worker.prototype 11→5 收敛，判决 0/5（2026-09-21 夜）
+
+**方法**：批 38 落幕后 served ov2.js 再次周转（16:28，md5 58800b74，
+402597B，页端工具链全量重推）；三连抛点操作数用"插桩轮 + 同轮程序重提取
++ 窗口指令流解码"三步闭环拿到；Chrome 151 headless 逐条对拍。
+
+**① ov2key 残留清除（交付）**：b37 残留的 `console.log("ov2key:",...)`
+IIFE 已从 served ov2.js 原地剔除（清除后 51237f8a；插桩轮走的是剔除后副本）。
+**注意**：该残留自 b37 起随每次注入/直通轮多打一行 console（质询数 console
+调用），a7533ef6 的 0/16 与它的时间窗重叠，不能排除是贡献因子之一。
+
+**② 58800b74 工具链重推（交付）**：字符串表 1883 项、旋转 164 次收敛
+341273、访问器偏移 E(n)=J()[n-132]（/tmp/b38/b39/strtab_new.tsv）；
+VM 类 ES：**初始键 176**，fetch `op=((bc[pc]+235)&255)^key`，
+**新 LCG 为二次式 key'=(4230*(key+op)^2+6443*(key+op)+5860)&255**（活体
+2000 三元组 73/73 锚点核对）；槽位 l=157^i、j=65^i、m=114^i、o=124^i，
+slots[120^i]=M、92^i/220^i 注册表；case 表 69 op→48 handler（69 个 Jx(n)
+即时常数族为旧 D 族）；传输层种子仍是 document.title 折叠单字节
+（每轮程序随 attempt 漂移：同轮 trace 链约束约 73-81% 命中，跨轮不可复用）。
+**G3 类跳转（JM，op108）黑盒钉死**：目标=((k^adj(b1))<<16)|((k^adj(b2))<<8)
+|(k^adj(b3))，键重同步=k^adj(b4)^213，5 字节绝对跳——用微型程序直接驱动
+真引擎逐一字节验证（b38 的"130 处全不中"系多实例交错污染，模型本身没错）。
+GL 类哈希驻留（Eu？）本轮未再验：抛点解码不经过它，不阻塞。
+
+**③ 三连抛点操作数全解（交付，ver48/ob39b/ob39c/ob39d 四轮插桩闭环）**：
+插桩 hook（catch 时 dump 全 256 槽 + 自适应窗口指令流采样，ob39d 命中
+20000 条）+ 同轮 2-frame-resp 按窗口约束重提取（seed 暴力 15849/19564），
+三站指令与操作数：
+
+| 抛点（ob39d 轮，inst 462026） | handler | 操作数（活体键） | 语义 |
+|---|---|---|---|
+| Cyclic @83828 | Jv(op231) CALL2-via-frame, kb252 | frame[103].u(slots[17], slots[17]) | setPrototypeOf(X, X)，X 同槽两次 |
+| 'caller' @84497 | JC(op214) GET-by-built-string, kb179 | slots[16] = slots[52]['arguments']，名长 9 | 严格函数毒属性读 |
+| toString @85525 | JV(op253) CALL-by-built-string, kb179→188 | slots[18] = slots[16]['toString'].call(slots[16])，名长 8，arity 0 | Function.prototype.toString.call(非函数) |
+
+ver48 轮同构复验（程序不同、槽位不同：cyclic 双参同槽 17、'arguments'
+名长 9、'toString' 8+arity0 完全一致）——**这是挑战电池的固定三连型探针，
+对每个被枚举的方法/字符串跑一遍**。slot 17 的值＝
+`"function arc() { [native code] }"`（String(fn) 的结果，ver48 dump
+slot 216/244 实证）：电池在探测**字符串化后的方法**。
+
+**④ 探针语义逐条对拍 Chrome 151（交付）**：本机 --eval 与 headless Chrome
+逐条同输入对拍，全部一致，无引擎分歧：
+`Object.setPrototypeOf('abc','abc')` 双方均抛
+"Object prototype may only be an Object or null"（注意 proto 类型检查
+先于 cyclic 检查——活体抛 Cyclic 说明当时的实参已是对象形态，系电池自身
+包装，非引擎差异）；`Object.setPrototypeOf(o,o)` 双方均抛
+"Cyclic __proto__ value"；`fn['arguments']` 双方均抛 strict TypeError；
+`{}` 无此路径；`Object.create(Function.prototype).toString.call(同)` 双方均抛
+"Function.prototype.toString requires…"。**结论：三连抛点是电池的预期
+探测（try/catch 包裹、计数入载荷），不是引擎分歧**；b38"探针操作数仍非
+Chrome 形"的假设被推翻，fold 三连计数本身不是判决失败的直接原因。
+
+**⑤ 落盘修复：Worker.prototype 收敛 Chrome 151（commit 06335e9）**：
+oracle 实证 Chrome 151 Worker.prototype own 恰为
+`{constructor,onerror,onmessage,postMessage,terminate}` 且直链
+EventTarget.prototype；本引擎旧类发布 11 个 own（多 _spawn/_dispatchError/
+onmessageerror/addEventListener/removeEventListener/dispatchEvent），另有
+Worker 静态 _byId/_dispatchBatch。修复：_spawn/_dispatchError 改模块函数，
+onmessageerror 移除（151 无此 accessor），listener 三人组改继承
+EventTarget.prototype（新增 listeners.js `_eventTargetListenersFor`
+读取共享 WeakMap 注册表，worker 消息/错误投递改走该注册表），
+statics 收敛为 length,name,prototype。新增回归钉
+`worker_prototype_own_properties_match_chrome_151`。
+
+**⑥ 判决**：新 build 58800b74 首次判决（注入 false、ov2.js 已剔除
+ov2key）：final70..74 每轮仅 GET /1.txt 403 双连，无 POST、无真实 404，
+**0/5**。58800b74 上线后累计 0/5。ver48/ob39b/ob39c/ob39d 四轮插桩轮
+同样无 POST。**注**：5/5 窗口只出现在 10:28 的 17c5a7df build；此后
+17c5a7df→a7533ef6→58800b74 三连周转全部 0/16+0/5——"friendly epoch"
+更像"friendly build"，周转后的首个 3 连判决（339 批入口⑥）依然全红，
+指向 58800b74 时代质询对新面（本批未定位）或 fingerprint 的要求更高。
+
+**产物**：/tmp/b38/b39/（strtab_new.tsv、case_new.json、handlers_new.json、
+deob_new.mjs、patch_ov2_b39*.py、ov2_b39*.js、probe_g3*.mjs、
+harness/probe/smoke、ver48_excs.json、ob39d_trace.json、ob39d_excs.json、
+prog_ob39d.bin、prog_ver48.bin）/tmp/cf0919/ver48|ob39b|ob39c|ob39d|
+final70..74。远端：ov2.js=51237f8a（已剔除 ov2key 的干净件），
+注入已恢复 true。
+
+**下一批入口**：① 判决失败的观察面转向"电池完成之后"：ver48 的
+payload POST（3-frame-req 89-93KB）内容可解（ov2_payload_codec 需补
+--ov2js 参数即可跑），对照 Chrome 完成轮的载荷差异，定位被卡的具体
+beacon；② Worker 实例 own props（本引擎 7 个 _* 内部件 vs Chrome []）
+是下一处已证差异，用 WeakMap 私有仓改造即可；③ EventTarget.prototype
+own 多出 `when`（Chrome 无）；④ SharedWorker.prototype（Chrome own=
+constructor,onerror,port）未对拍；⑤ EvalError realm 照旧未锁定
+（每轮一次，b39c/d 的自适应窗口 hook 可复用）；⑥ 下一轮 ov2 周转后
+立即 3 连判决（周转后首小时是 5/5 复测窗口）。
