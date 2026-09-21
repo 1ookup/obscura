@@ -12642,3 +12642,93 @@ uGyjw9=176 带内、tQdUc5=38）——**轮换后失败是服务端 epoch 评分
 SbVZ3 键在本 build 改名（77 条逐方法块缺口仍在，为最大剩余客户可见差异）。
 下一批：h[80]/h[86]/h[87] 旗标写点解码（决定 rFmgn2/lzDF4/TBNgK7 双发射与
 72 条块）+ 跨 epoch 复测。
+
+### Step 336：批次 35——旗标写点解码半程：电池卫兵/探针闭包/worker 回包帧槽通道解码完成，worker eval 形状本机实锤对平；当前 build 引擎内四处 methodCall 派发钩子全不命中，活体旗值未读到；判决 0/3 维持（2026-09-21 午后）
+
+**方法**：远端工具链（192.168.3.57，macOSShare jsvmp-engine-0916-11）先用
+edges3/lin14 + 本批新写的全程序扫描器（/tmp/b35_scanwrites.mjs 可达 BFS、
+/tmp/b35_chain.mjs 链式验证写点扫描、/tmp/b35_subs.mjs 全量 m1 子程序入口枚举、
+/tmp/b35_m6.mjs m6 key 派生 dst 扫描）走读旗标区；再对当前 build 的 ov2.js
+（10:28 轮换 md5 17c5a7df）做四处 methodCall 派发点的被动钩子（patch
+/tmp/patch_ov2_b35.py + patch_ov2_b35b.py：terminate 触发全 256 值槽+帧槽 dump、
+console 电池 13 方法普查行），跑 ob35/ob35b/ob35c 三轮注入诊断；最后
+final52-54 三轮判决。
+
+**0916-11 静态面（确证）**：
+1. 旗标消费点：电池 sub 88882（k=153）卫兵序 = m6 读帧槽→真则直接 halt 早退
+   → `!h[80]`/`!h[87]`（ce）→ m4 写 frame[119] → 再 m6 读 → 条件 terminate()
+   （cS arity=0）。臂区第二发射条件 lzDF4=`!h[86]`、TBNgK7/pUXPt5=`!h[80]`，
+   均在各自 console.log 探针**之前**求值。
+2. 探针闭包（m1 帧调用，捕获创建时帧栈——闭包与臂共享 fs，帧槽即跨闭包通信
+   通道）：0x157f3=decoy（返回 undefined）、0x15802=obj.toString（读 `!h[86]`/
+   `!h[87]`、写 frame[97]、返回 "ODxGu4"）、0x15823=id getter（同读、写
+   frame[98]、返回 "mfiL4"）。Chrome 的 console.log 不串化参数→闭包不跑→
+   帧槽保持 falsy→下一轮检查通过→第二发射。ref trio 计数（rFmgn2×1、
+   lzDF4×2、TBNgK7×2）⇒ **Chrome 在电池处 h[80]=h[86]=h[87]=falsy**。
+3. worker 回包→帧槽通道：sub 88297（yNiq8，devtools 开时才会发）写
+   frame[116]=truthy；sub 88379（evalErr）写 frame[116]=null；sub 88407
+   （pvIO8 1500ms 兜底）写 h[117]=true / 否则 h[213]=false。电池卫兵早退读的
+   就是 worker 状态帧槽。
+4. 旗标写点：链式验证扫描（8 链）全程序仅两组真写——收获大子程序 0x14fc8
+   `h[80] = (h[71] === h[166])`（上下文是按 token 键读 QiCj2/Gamg7/iYEgs4/
+   qnAv3/NPxL4/RBfY7 等探针结果的 harvest 级联）与 0x15504 `h[80] = h[6]`
+   （随后 ERdgw3(4 参) 调用 + `.message` 读取分支）。h[86]/h[87] 的写点不在
+   任何链式可达区——嫌疑集中在 m6（dst 由 key 派生，渲染层显示 h[?]，静态
+   不可见）与 cj（throw/slotClear 家族）。
+5. 系统槽全表（spec-0916-11）：PC=75、KEY=140、FRAME=70、VSTACK=103、TRY=104、
+   EXC=231、RET=197、BC=12、GLOBAL=113、WBUF=254；入口 `run(0,241,[])`；
+   m1 七元组 [targetPc,newKey,帧栈,args,flags]，argpass 槽
+   [30,187,97,202,60,201,0,92]；h[80]=h[30]（主驱动子 0x67a25 开头，=VM 实例，
+   恒真）随后被收获子覆盖。fold 的 h[104].pop() 即 try 栈弹出：**fold 值=当轮
+   被捕获的异常（无则 undefined）**——ref NaN×3+Error×4 = 3 轮无异常 + 4 轮有；
+   我方全 Error = 每个 try 区都抛——抛点在 VM 自身代码（host console 调用
+   本身零抛，b32 已证），首嫌是 sentinel collector 调用（token 名键的方法调用，
+   pUXPt5 区 `h[26]=h[113][h[13]]` + cT hostNew 构造，h[13]=h[244]=h[50].pop()）。
+
+**引擎侧实证（本批新对拍）**：/tmp/cf0919/b35-worker-p2.html 以挑战原形
+`eval(_p ? _p.createScript("debugger") : "debugger");postMessage({yNiq8,TWnkF5})`
+直打 blob worker：我方引擎回 `evalErr: "ReferenceError: _p is not defined"`、
+yNiq8 不发——**worker 回包形状与 Chrome 逐字节对平**（b34 fixture 结论复证，
+且排除了「我方 worker 域多出 _p」假设；此前 b35-worker-p.html 的假阳性系
+fixture 自带 `var _p` 声明污染）。console JS 面不再触碰 args（console.js
+对象分支只走 Object.prototype.toString，无属性遍历），排除渲染侧误触闭包。
+
+**活体旗读（诚实汇报：未达成）**：当前 build 的 ov2.js 引擎内共 4 处
+method-call 派发形状（slot 接收者版 232100、帧槽接收者版 330688、slot 对版
+372601、perm-switch 版 253977）全部挂钩（terminate 触发 slot+帧槽全量 dump、
+13 个 console 方法名普查行，无 window 全局、状态挂在 VM 实例 `__c`），语法
+JSC 过。ob35c 轮电池确实跑了两遍（serve.log 03:45:30/03:45:53 两组 %c%d）、
+TS#2 解密成功（uGyjw9=15、tQdUc5=0、无大信标数组——早期载荷形态），但
+**四钩子零命中**：电池的 cI/cS 调用走的派发实现仍未定位（本 build 每条
+handler 是独立函数、字符串表经 sa(idx) 解码，"bind"/"terminate" 的表索引只在
+字节码数据里，静态不可达）。插桩预算超支（ob35 钩子实参 bug、ob35b 挂错
+派发点），代理 ov2_js_path 已复原原文件、注入复原 true。
+
+**判决（诚实汇报）**：final52 / final53 / final54（注入关，click-after 16）
+三轮全 **FAIL**：mitmproxy 全部 `GET /1.txt → 403`，无 POST 404——**跨 epoch
+复测维持 0/3**（Step 335 结论不变，当前 10:28 build 的 epoch 评分仍未放行）。
+mitmweb flows 由 8081 UI 查询（注意：capture_round.sh 的 --proxy 9000 是
+Reqable 监听，mitmweb 在 8080，两者链路关系待查；verdict 以 8081 flows 的
+`/1.txt` 记录为准）。
+
+**测试门**：无引擎代码改动（根因未验证，不落投机修复）；工作树仅 docs。
+产物：走读器与扫描器 /tmp/b35_*.mjs（远端）、钩子补丁 /tmp/patch_ov2_b35*.py
+（远端）、fixture /tmp/cf0919/b35-worker-p2.html、CDP 直评驱动
+/tmp/cf0919/b35_fixture_run.py、判定流提取 /tmp/b35_vflows2.py+
+/tmp/b35_sample2.py（远端）。
+
+**旗标真值表（当前认知）**：
+| 槽 | 消费点 | Chrome | 我方 |
+|---|---|---|---|
+| h[87] | 电池卫兵 `!h[87]`；88297 收获 `!h[87]` | falsy | 未读到（写点未定位） |
+| h[80] | 电池卫兵、TBNgK7/pUXPt5 第二发射 `!h[80]` | falsy | 未读到；已知写点：收获子 `=(h[71]===h[166])`、ERdgw3 探针子 `=h[6]`、主驱动序 `=h[30]`(恒真,后被覆盖) |
+| h[86] | lzDF4 第二发射 `!h[86]`；两闭包读 | falsy | 未读到（写点疑在 m6 key 派生 dst） |
+| 帧 116 | 电池早退卫兵 | null（evalErr 路径） | null（worker 对平，b35-worker-p2 实证） |
+| fold | try 栈 pop + 加法 | NaN×3+Error×4 | 全 Error（VM try 区每轮抛，抛点未定位） |
+
+下一批入口：① 定位当前 build 引擎里电池 cI/cS 真正走的 method-call 派发
+（建议：字符串表 sa/解码器处单点挂钩记录 "log"/"terminate" 索引的读取方，
+或对运行循环的 op→函数映射表做一次性 dump）；② m6 key 派生 dst 的精确
+解码（h[86]/h[87] 写点最可能藏身处）；③ sentinel collector 构造与 token
+推入在 VM 侧的抛点（fold 全 Error 同根）；④ Reqable(9000)→mitmweb(8080)
+链路确认。
