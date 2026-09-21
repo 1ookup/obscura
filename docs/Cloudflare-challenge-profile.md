@@ -13278,3 +13278,75 @@ SX/Sp handler 模型可复用），锁 fold 臂的精确门控；② 第 9 方�
 对 9 个电池方法逐个 census 我方 vs Chrome 的探针返回形状（341 批①方法级
 对拍表可复用），定位失败方法；③ 轮换自动化补丁模板清除 ov2key 残留（⑥）；
 ④ epoch 放行闸与 beacon 分数的关系继续证伪：0f547cc6 首小时 3 连判决窗口。
+
+### Step 343：批次 42——轮换模板 ov2key 残留清除（patch_fixed_key 新增 none sink 设为默认 + served 件强制重打 055f45dc），残差 13 条解码：第 9 方法=console.dir（QLaZp6），dir fold 被挑战载体 Error（stack=Qssv3、name/message 毒 getter）占用；console 面触发数与 Chrome 153 逐项对平无引擎面可修，干净 ver52 beacon 78，判决 0/5（2026-09-22 凌晨）
+
+**① 轮换模板清除（交付）**：192.168.3.57
+`chanllenge/ov2/patch_fixed_key.py` 的 `--key-sink` 新增 `none` 并设为默认：
+`KEY_TAIL_NONE=""`（hex 汇总 IIFE 照构造、零 IO），`KEY_SEG_RE` 尾组改可空，
+`parse_key_segment` 按 sink 分支期望尾；node 行为自测拆 `_HARNESS_KEY_BODY +
+LOUD/NONE_ASSERTS + TAIL`，NONE 断言=捕获通道零输出+零全局+片段值 undefined
+（console 捕获安装复用，片段若说话即抓）。`extract_ov2_js.py` choices/default
+同步 none。selftest+verify 全过（远端 node 在 `~/.nvm/versions/node/v24.15.0/
+bin`，非交互 ssh 需补 PATH）。负控：console 件按 none 校验报 sink 不符；
+console/tracelog 路径回归全过。原模板备份 `.bak-b42`。served 件强制重打：
+`ov2-0921-22.pristine.js` → `ov2.js` md5 `055f45dc`（409758 B，ov2key 出现
+0 次，固定键窗 7a139c41e258bd06f4 9 周期不变，verify 全过）；addon 每请求
+`read_text`，免重启即生效。本批全程 served 件=055f45dc。
+
+**② 残差 13 条解码（交付）**：ref SbVZ3 91 = 头 8 + trio 5（rFmgn2×1,
+lzDF4×2, TBNgK7×2）+ 9 方法块 ×8 行 + wguL7 尾 6；每方法块=[PhWMD5, M,
+AecW7, M]×2 轮。9 方法=debug→FpVt9、**dir→QLaZp6**、dirxml→YVlHf2、
+error→QqPF4、info→FFeiZ6、log→wnNg0、table→NThit5、trace→ZlKFS2、
+warn→HIFR9（第 9 方法=console.dir 实锤）。当前代调用形全同构：每方法 2 次
+`M("%c%d", style, fold)`，collector 每调用推 4 条；仅 dir 走 `dir("", fold)`
+（无 %c%d）。Chrome oracle 侧 trio 事件 lzDF4×2/TBNgK7×2（rFmgn2 该次会话
+未发，为会话条件令牌）；oracle 自带 payloadJSON 的 SbVZ3=90 条（缺
+rFmgn2、其余与 ref 全同）。
+
+**③ dir fold 载体（新事实）**：ob42a/ob42b 两轮插桩（console.js 临时诊断：
+ops 行内方法名 tag + Error 的 stack/OWN/MSG/NAME dump；ops 通道引擎内部、
+页面不可见）电池行序=regex 对、function 对、anchor 对、count 对（NUL 标签
+行显空）、9 方法对、groupEnd；dir 的 2 次调用第二参=挑战自制载体 Error
+（own=[stack,name,message]，stack=数据属性且值即令牌 "Qssv3"，name/message
+为访问器 getter=毒闭包通道），其余 8 方法 fold=NaN。collector 推载体
+`stack`（Qssv3）替代缺省哨兵 → 我方 dir 块错形。载体入 fold 的入口在挑战
+VM 内部（count 臂 catch 推栈/弹栈调度），当前代字节码走读才可锁 pc。
+
+**④ 引擎面对拍（无面可修，诚实汇报）**：本机 headless Chrome 153 vs 我方
+逐项全等——count(errObj)/countReset(errObj) 的 name/message getter 触发数
+（11/11）、`String(errObj)`（11，"X: Y"）、NUL 标签 count 行、console 全
+方法 `length=0`、`dirXml` 双侧缺席、`memory` 双侧 object、error 描述跳过
+访问器（b329 不变量保持）。dir fold 分歧不在任何可从 JS 面观察的引擎行为，
+按纪律不落投机修复；关闸=342 批入口①的当前代闭包侧追踪。
+
+**⑤ 插桩干扰教训（重要）**：诊断 `_errorDescription` 读 `a.stack` 本身触发
+载体 stack 状态通道——ob42a/b beacon 82 条（dir 块半发射 [Qssv3,QLaZp6]×2、
+头名 lPqZ4）系插桩污染测量，不可作 beacon 依据；干净 ver52=78（头名
+TKyxg5）。载体的 stack/name/message 均为载荷状态通道，后续插桩严禁触碰
+挑战 Error 实参的任何属性。头名组按 attempt 轮换（同一 served 文件两见
+lPqZ4/TKyxg5），与 beacon 计数无关。
+
+**⑥ ver52 + 判决**：ver52（干净二进制=22e78d0 原码重建 + 干净 served 件
+055f45dc，注入开）全流程完整，4-frame-req 解密 roundtrip 自证，SbVZ3=78
+（与 ver51 持平：ov2key 残留不计入挑战 VM 状态，清除属可见面卫生而非
+beacon 计数项）。判决 final85..89（注入关）每轮仅 GET /1.txt 403 双连、
+无 POST 404，**0/5**。全程 served 件 md5 055f45dc。
+
+**产物**：/tmp/cf0919/{ob42a,ob42b,ver52,final85..89}（fo+run+dec）、
+/tmp/b42/（模板改件本地副本、Chrome 对拍 probe）；远端
+patch_fixed_key.py.bak-b42、extract_ov2_js.py.bak-b42、
+ov2.js.bak-b42-pre-clean、/tmp/ov2-b42-restaged.js、
+/tmp/b42-ov2-console.js。注入已复原 true（options 复核 value=True）。
+
+**⑦ 轮换端到端核验（交付）**：00:29 轮换为首个走新模板的产物——
+`ov2-0922-00.pristine.js`（408270 B）→ served `ov2.js` md5 `8587b07f`
+（408501 B，+231=纯固定键插入），ov2key 出现 0 次。模板修复在真实轮换上
+闭环，后续注入轮须重取 8587b07f（341 批④纪律）。
+
+**下一批入口**：① 当前代字节码走读：沿 342 批 SX/Sp/SN 模型重推
+最新代工具链，锁 count 臂 catch 推栈/弹栈调度（载体入 dir fold 的
+精确 pc）与 trio 臂门控槽位（s64/s66 等价槽）；② dir fold 载体的 stack
+值即哨兵令牌——collector 推 `carrier.stack` 的分支是 dir 块错形直接原因，
+字节码定位后反推 Chrome 侧为何不进该分支；③ epoch 判决继续 0/5，beacon
+78 与放行闸关系维持两道闸结论；④ 8587b07f 首小时 3 连判决窗口照旧。
