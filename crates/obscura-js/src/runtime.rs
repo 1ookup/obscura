@@ -3097,6 +3097,9 @@ impl ObscuraJsRuntime {
     ) -> Result<(), String> {
         self.begin_javascript_task();
         let budget = tokio::time::Duration::from_millis(budget_ms);
+        // Reset the rejection reporter's consumed-record channel so only this
+        // module's rejections are attributed to the load below.
+        let _ = self.evaluate("globalThis.__obscura_consumedRejections = [];");
         let result = self.runtime.mod_evaluate(module_id);
         tokio::pin!(result);
 
@@ -3114,7 +3117,23 @@ impl ObscuraJsRuntime {
         .await;
 
         match outcome {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                // The bootstrap's unhandled-rejection reporter consumes a
+                // module body's top-level throw before the event loop can
+                // turn it into an eval error (a module rejection is
+                // indistinguishable from a page rejection at the hook).
+                // The reporter records each consumed reason; surface the
+                // first one here so module loads still fail loudly.
+                let consumed = self
+                    .evaluate("String((globalThis.__obscura_consumedRejections || [])[0] || '')")
+                    .unwrap_or(serde_json::json!(""));
+                if let Some(first) = consumed.as_str() {
+                    if !first.is_empty() {
+                        return Err(format!("{} eval error: {}", what, first));
+                    }
+                }
+                Ok(())
+            }
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
                 "{} evaluation timed out after {}ms",
@@ -25216,6 +25235,170 @@ RequestRedirect value",
             .await
             .unwrap_err();
         assert!(err.contains("boom"));
+    }
+
+    /// Chrome reports an unhandled rejection through the console and the
+    /// unhandledrejection event while the page keeps running. deno_core's
+    /// default parks the reason as the realm's dispatched exception, which
+    /// errors the next event-loop turn; on live challenge pages three of
+    /// those in a row disarmed the autonomous pump and froze the beacon's
+    /// late stages (profile Step 334). The rejection must be consumed in the
+    /// realm that produced it, the follow-up timer must still run, and
+    /// window.onunhandledrejection stays null (the slot is not the event).
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejection_reports_and_leaves_the_event_loop_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "rejection-probe",
+            r#"(() => {
+                const rows = [];
+                const op = Deno.core.ops.op_console_msg;
+                Deno.core.ops.op_console_msg = (level, msg) => {
+                    rows.push(level + ":" + msg);
+                };
+                globalThis.__rejRows = rows;
+                globalThis.__restoreConsoleOp = () => {
+                    Deno.core.ops.op_console_msg = op;
+                };
+                new Promise((_, reject) => { reject(new TypeError("late-boom")); });
+                globalThis.__evts = [];
+                globalThis.addEventListener("unhandledrejection", (e) => {
+                    globalThis.__evts.push({
+                        msg: e.reason && e.reason.message,
+                        isPromise: e.promise instanceof Promise,
+                    });
+                });
+                setTimeout(() => { globalThis.__afterRejection = "alive"; }, 20);
+            })()"#,
+        )
+        .unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                "new Promise(resolve => setTimeout(() => {
+                     globalThis.__restoreConsoleOp();
+                     resolve(globalThis.__afterRejection);
+                 }, 80))",
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap().as_str(),
+            Some("alive"),
+            "a timer after an unhandled rejection must still run"
+        );
+        let evts = rt.evaluate("JSON.stringify(globalThis.__evts)").unwrap();
+        let evts = evts.as_str().unwrap();
+        assert!(
+            evts.contains("late-boom") && evts.contains("\"isPromise\":true"),
+            "unhandledrejection event must carry reason and promise, got: {evts}"
+        );
+        let rows = rt.evaluate("JSON.stringify(globalThis.__rejRows)").unwrap();
+        let rows = rows.as_str().unwrap();
+        assert!(
+            rows.contains("TypeError: late-boom"),
+            "console must report the rejection reason Chrome-shaped, got: {rows}"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.onunhandledrejection").unwrap(),
+            serde_json::json!(null),
+            "engine reporting must not occupy the page-visible handler slot"
+        );
+    }
+
+    /// preventDefault() on unhandledrejection hushes the console report
+    /// exactly as Chrome does, and the event loop still survives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejection_preventdefault_hushes_the_console_report() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "hushed-probe",
+            r#"(() => {
+                const rows = [];
+                const op = Deno.core.ops.op_console_msg;
+                Deno.core.ops.op_console_msg = (level, msg) => {
+                    rows.push(level + ":" + msg);
+                };
+                globalThis.__rejRows = rows;
+                globalThis.addEventListener("unhandledrejection", (e) => {
+                    globalThis.__hushSaw = true;
+                    e.preventDefault();
+                });
+                new Promise((_, reject) => { reject(new Error("hushed-boom")); });
+                setTimeout(() => { globalThis.__afterHush = "alive"; }, 20);
+            })()"#,
+        )
+        .unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                "new Promise(resolve => setTimeout(() => resolve(globalThis.__afterHush), 80))",
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap().as_str(), Some("alive"));
+        assert_eq!(
+            rt.evaluate("JSON.stringify(globalThis.__rejRows.includes('hushed-boom'))")
+                .unwrap(),
+            serde_json::json!("false"),
+            "preventDefault must suppress the console report"
+        );
+        assert_eq!(
+            rt.evaluate("String(globalThis.__hushSaw)").unwrap(),
+            serde_json::json!("true"),
+            "the listener itself must still fire"
+        );
+    }
+
+    /// The challenge shape that froze real rounds: a worker realm rejects
+    /// inside a promise (a worker-scope probe touching MutationObserver,
+    /// which workers correctly lack). Chrome logs the rejection in the
+    /// worker and moves on; pre-fix the rejection surfaced on the page as a
+    /// worker error event ("Worker error: Event loop error: Uncaught
+    /// (in promise) ..."), and on the serve pump three of those in a row
+    /// disarmed the autonomous task with the beacon's late stages queued
+    /// (profile Step 334). The page must see no worker error and its own
+    /// timer must still run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_unhandled_rejection_does_not_fail_the_page_turn() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(() => {
+                    const source =
+                        "Promise.resolve().then(() => { void MutationObserver; });" +
+                        "self.onmessage = (e) => self.postMessage({pong: e.data.seq});";
+                    const worker = new Worker(URL.createObjectURL(
+                        new Blob([source], {type: "text/javascript"})));
+                    globalThis.__workerErrors = [];
+                    worker.onerror = (e) => {
+                        globalThis.__workerErrors.push(String(e.message || e));
+                    };
+                    worker.onmessage = (e) => { globalThis.__pong = e.data.pong; };
+                    worker.postMessage({seq: 7});
+                    setTimeout(() => { globalThis.__afterWorkerRejection = "alive"; }, 20);
+                    return new Promise((resolve) => setTimeout(() => resolve({
+                        pong: String(globalThis.__pong),
+                        timer: String(globalThis.__afterWorkerRejection),
+                        workerErrors: globalThis.__workerErrors,
+                    }), 250));
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "pong": "7",
+                "timer": "alive",
+                "workerErrors": [],
+            }),
+            "worker rejection must stay in the worker realm: no error event on the page"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
