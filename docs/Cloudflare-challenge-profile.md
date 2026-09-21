@@ -12824,3 +12824,71 @@ Step 336 判决维持（0/3，GET /1.txt 403）。代理 ov2_js_path 已复原
 realm：给 page-init flag 计算加一行临时 console.warn（csp+ nid）即可
 一轮定位，或审查 orchestrator 动态 iframe 的 scope.csp 继承；④ console
 toStringTag 大写修正（独立小修复，可先行）；⑤ m6 可达枚举（见上）。
+
+### Step 338：批次 37——eval 门决策表全 allow（ver46 一轮定位），b36 引擎当轮被替换（ov2 周转 a7533ef6），Chrome 实测推翻两项嫌疑、落两处静态保真修复，判决 0/5（2026-09-21 夜）
+
+**方法**：page-init 两条 eval 门路径各加一行 `__OBCSP__` console.warn
+决策记录（nid/url/srcdoc/allow/解析出的 script-src 与 default-src/原文），
+console.warn 走 ops.tsv 与 serve.log 双通道；ver46 注入轮（老 build
+ov2_cur.js=17c5a7df 打 SU/SK/SP 操作数 dump + EXC37 catch 记录后经代理
+ov2_js_path 注入）；三个抛面（setPrototypeOf 循环、.caller、
+Function.prototype.toString）先以 prog0.bin 静态解码，再以本机 headless
+Chrome 151 做 oracle 对拍。
+
+**① eval 门（交付：决策表 + 回归钉）**：ver46 一轮捕获 28 行决策，
+覆盖 4 次页面尝试 × 每次尝试的全部 realm：top(nid 0)、api.js 的
+about:blank(nid 62)×2、rch 质询帧(nid 75)×2、widget 的
+about:blank(nid 193)×2，全部 `allow=true`。原文（nonce 每次尝试轮换）：
+top 与 rch 的 script-src 均含 `'unsafe-eval'`（rch 另带
+`trusted-types FHMZS9 default; require-trusted-types-for 'script';
+sandbox allow-same-origin ...`），page-init 解析器对 nonce/TT/sandbox
+指令全部正确放行。b36 那次一次性 EvalError 的拒绝 realm 未复现、未锁定；
+按纪律不落投机修复，仅把两条活体 CSP 原文钉进 runtime 测试
+（`live_top_document_csp_keeps_eval_allowed` / `live_rch_frame_csp_keeps_eval_allowed`，
+parser 若再误判即红）。决策记录本身已从 bootstrap 移除：质询会数 console
+调用，常驻 7 行/加载的额外 warn 是可见面差异。
+
+**② b36 图谱当轮失效**：本轮 live ov2 已周转（share 件 md5
+a7533ef6，422391B，14:28 更新，正文为美化后新混淆；旧 build 无 LCG
+16542/45691 指纹，VM 结构重排）。ver46 注入的旧 build 引擎跑完了
+心跳（每尝试一次 `SU|toString|function|Function|eval` 成功）但电池/抛点
+全程零命中、无 payload POST、页面 4 次重载——新 orchestrator 配旧引擎
+即自旋。三连抛点图（pc131082/131759/132775）与 fold 形状核对需对新
+build 重推（fetch/LCG 公式不可复用）。旧 build 静态解码仍确认了
+SU 抛点形状：`slot[10] = slot[19]['toString'].call(slot[19])`（arity 0，
+methodCall 内联名，LEB 名长 8='toString'）。
+
+**③ Chrome oracle 对拍（修正 337 两项、落两修）**：headless Chrome 151
+实测——`console.log.caller`/`.arguments`、`eval.caller`、
+`setTimeout.caller` 全部**同样抛** strict TypeError（现代 V8 对原生函数
+不再回 null），本引擎原本就一致，SK 抛点不是引擎分歧；
+`Object.prototype.toString.call(console)` Chrome 本就是小写
+`[object console]`，337 附带发现④"大写修正"是反向修复，撤销不动。
+真正对不上的两处已修：
+- `String(Function.prototype)` 本引擎答 "function prototype() ..."——
+  标记扫描 walkConstructor(Function) 对 rename=true 的空名值按槽键改名，
+  Function.prototype 恰在 Function 自己的 'prototype' 槽下被改名；
+  现跳过并每遍恢复 name=''/匿名 toString（oracle 串）。
+- 每个 console 方法多一个不可配置 own `prototype`（Chrome own 集恰为
+  length,name 且 `console.log.prototype===undefined`）；改为对象字面量
+  method shorthand（无 [[Construct]]/prototype，严格性保留，
+  `.caller` 仍抛同文）。跨 realm console 测试同步改钉 Chrome 集合。
+同轮 oracle 还记账两处未动：`Worker.prototype.own` 多出
+`_spawn/_dispatchError/onmessageerror/addEventListener/...`
+（Chrome 恰 5 项）；`Function.prototype.own` 与 RTCPeerConnection
+accessor 的枚举顺序差。留待后续批次。
+
+**④ 判决**：verdict 轮 final60..64（注入 false、ov2_js_path 复原
+live 件）全部未过——每轮 `/1.txt` 仅 GET 403（质询页），无完成后的
+POST/真实 404，tally **0/5**；单轮墙钟 32-34s，serve 进程全程存活。
+ver46（注入轮）同样因 build 错配未到 POST。33 阶 obstacle course 在
+本机无 companion 仓库可跑（obscura-benchmark 不在此环境）；workspace
+release nextest **1910/1910**（cargo v8-test），obscura-js **679/679**、
+obscura-browser **126/126**，oracle 对拍 fixture 见 /tmp/b37/oracle2.html。
+
+**下一批入口**：① 对 a7533ef6 新 build 重取字符串表 + 重推 VM fetch
+公式（老 LCG 常量已不在），重建三连抛点锚与 m6 枚举；② 一次性
+EvalError 的 realm 若再现，用已验证的 `__OBCSP__` 记录一轮即可锁定
+（记录代码在 338 批已移除，恢复是三行改动）；③ Worker.prototype
+收敛到 Chrome 5 项（_spawn/_dispatchError 走符号或内部载体）；
+④ Function.prototype.own 与 RTCPeerConnection 的枚举顺序对齐。
