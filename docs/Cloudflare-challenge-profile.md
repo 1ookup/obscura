@@ -13440,3 +13440,61 @@ ImageData 只读 `.buffer/.join` 走快速路径，**零逐像素 length 读**�
 "像素墙"的机制级真身，判决主嫌疑。修复方向：挑战字体清单（local() 族 + 二进制
 Apple Symbols）下 canvas fillText 的渲染空白定位与修复；判据=新插桩轮循环数 1,920→~15
 + 判决轮。
+
+### Step 346：fillText 空白根因落定——textBaseline 缺失，修复上线（2026-09-23 凌晨）
+
+**扫描画布真身（trace 还原）**：扫描的 7,680 字节 ImageData 来自一个 80×24 的
+OffscreenCanvas 探针：`fillStyle #ffffff` 白底 → `fillStyle #000000` → `font
+'16px Arial'` → **`textBaseline 'top'`** → `fillText(text, 2, 0)` → `getImageData(0,
+0, 80, 24)` → 逐元素找非 255。obH 轮扫描圈内每圈 `Uint8ClampedArray.length`=7680 +
+1 个元素读，元素值全 255；参考轮同位读 `length`=1024 的数组 0/1/2 号元素即见内容
+（240/109/6），圈数个位数。challenge 还注册自定义族 `aanotafontaa`
+（`27.77777777777778px aanotafontaa`，48×48 渐变+shadow 探针用）并读写 `filter`。
+
+**根因**：`fillText` 把 y 当 alphabetic 基线、完全无视 `textBaseline`。'top' + y=0
+时点阵 em 盒全部画在 y-7*scale..y-1 行（scale=2 即 -14..-1 行），整体在画布外，
+画布保持白底全 255。次因：2D context 无 `filter` 属性，读回 undefined，Chrome 答
+'none'（参考轮 filter 读 4 次 vs 我们 1 次、globalCompositeOperation 5 vs 3 的分支差
+与之相伴）。本地 fixture 一比一复现：同探针 non255=0；y=18 默认基线 non255=1128（点阵
+正常），坐落机制。
+
+**修复（e596740，generic Chrome-shaped）**：fillText/strokeText 按 `textBaseline`
+放 em 盒（top=首行墨在 y；alphabetic=墨在 y 上方；bottom/ideographic=降部线在 y
+（-0.3 盒高）；hanging/middle 居间），`textAlign` 按墨宽偏移（left/start/right/end
+经 direction 解析、center 居中）；2D context 新增 `filter` 属性，默认 'none'，赋值
+回读，save/restore 覆盖。默认基线绘制逐字节不变；52c5058 的 unrendered SVG 零测量
+语义不受影响（svg 套件 10/10 绿）。
+
+**空白矩阵 vs 本地 headless-Chromium oracle**（80×24、白底、黑字 "Cloudflare"、
+16px Arial；n=非 255 字节数，rows=墨行带）：
+
+| 探针 | Chrome n / 首字节 / rows | 我们 n / 首字节 / rows |
+|---|---|---|
+| top y=0（挑战形） | 1569 / 16 / 0-12 | 1272 / 24 / 0-13 |
+| alphabetic y=0 | 48 / 28 / 0-0 | 0（干净裁剪） |
+| alphabetic y=18 | 1587 / 1628 / 5-18 | 1272 / 1304 / 4-17 |
+| top y=18 | 639 / 5468 / 17-23 | 588 / 5784 / 18-23 |
+| middle y=18 | 1587 / 2908 / 9-22 | 1272 / 2904 / 9-22 |
+| bottom y=18 | 1587 / 348 / 1-14 | 1272 / 24 / 0-13 |
+| hanging y=18 | 774 / 5148 / 16-23 | 858 / 4824 / 15-23 |
+| center x=40 | 行 5 起 | 行 4 起 |
+| `16px "Apple Symbols", sans-serif` | 1035 非空白 | 1272 非空白 |
+| `27.78px aanotafontaa` | 1998 / 行 0-18 | 1755 / 行 0-17 |
+| filter 默认 / 赋值回读+save-restore | 'none' / blur(2px)\|blur(2px) | 同 |
+
+判据（非空白 + 合理覆盖 + 行带对齐）全过：挑战形扫描从满 1,920 圈变为首非 255 在
+元素 6（byte 24，Chrome 元素 4）即退出。字节级逐像素一致仍属 Step 10.13 像素墙，非
+本次判据。
+
+**现场验证（ver54）受挫于服务端换臂**：23:46 起 CF 把该出口 IP 切到降级臂——
+challenges.cloudflare.com 的 `fo`/`eb` POST 400、www 侧 `fo` POST 只回 121 字节
+`{"d":...}` 信封（obH 22:42 同形请求回 822,968 字节整包），主程序（bc_len 462917）
+不再下发，四轮 ver54（23:46/23:49/23:51/23:56）都只跑 gate（bc_len 5208，~9.6k 条
+记录）。gate 阶段 host 读对拍（obH pre-main vs ver54）无任何 canvas/fingerprint 读
+差 → 循环圈数的现场对拍在主程序恢复下发前不可观测；像素级证据以 oracle 矩阵为
+准。fix 提交只触 canvas 2D 与测试，网络/gate 代码零改动。
+
+**判决轮（final95-99，injection OFF，ov2 部署件 md5 5f53e8f8 未变）**：0/5——五轮
+均困在降级臂循环（/1.txt 全 GET 403，无通过 beacon POST），与 obH/ver53 时代同款
+0/5 相同，非本修复引入（gate 无 canvas 读差佐证）。注：插桩 ov2 部署件保持
+5f53e8f8（108 键 stage4v3），injection 已恢复 true。
