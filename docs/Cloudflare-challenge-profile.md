@@ -13498,3 +13498,13 @@ challenges.cloudflare.com 的 `fo`/`eb` POST 400、www 侧 `fo` POST 只回 121 
 均困在降级臂循环（/1.txt 全 GET 403，无通过 beacon POST），与 obH/ver53 时代同款
 0/5 相同，非本修复引入（gate 无 canvas 读差佐证）。注：插桩 ov2 部署件保持
 5f53e8f8（108 键 stage4v3），injection 已恢复 true。
+
+### Step 347：textBaseline 修复实弹确认——扫描循环塌缩 67 倍（2026-09-23 00:1x）
+
+CF 降级臂 00:08:57 恢复（rch 449KB），看守器自动开火：**ver55（插桩轮，新二进制）：
+ov2.h.fc = 248（修复前 16,774），pc 循环区域 = 0（修复前 54,478）**——1,920 圈空白
+画布扫描循环已在实弹中消失（与 Step 346 的 ImageData 级 oracle 预测一致）。
+final100-103（4 轮判决）：均 fail（流程完整：main#1→TS#1→pat/brunhild→TS#2→TS#3→
+main#2→GET /1.txt 403）。canvas 指纹面已修，判决剩余分岔：信标残留 13 条（载体
+信道）、canvas 逐字节 parity（点阵近似）、及其余未见面。下一批入口：用同一套
+指令级对拍方法在恢复臂上重跑差分，找下一个最大计数异常。
