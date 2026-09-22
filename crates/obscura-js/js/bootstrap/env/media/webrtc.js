@@ -292,12 +292,11 @@ function _rtcStunServer(configuration) {
 const _RTC_SRFLX_PRIORITY = 1677729535;
 const _RTC_STUN_TIMEOUT_MS = 1000;
 
-function _rtcSrflxCandidate(slots, base, mapped) {
+function _rtcSrflxCandidate(slots, base, mapped, foundation) {
   const space = String(mapped).trim().indexOf(' ');
   if (space <= 0) return null;
   const address = String(mapped).slice(0, space).trim();
   if (!address) return null;
-  const foundation = _rtcRandomUint(10);
   const tail = `typ srflx raddr 0.0.0.0 rport 0 generation 0`;
   return {
     candidate: `candidate:${foundation} 1 udp ${_RTC_SRFLX_PRIORITY} ${address} ${base.port} ${tail} ufrag ${slots.ufrag} network-cost 999`,
@@ -334,15 +333,22 @@ function _rtcKinds(slots) {
 // views of one connection cannot disagree. The lines follow Chrome's shape:
 // one `typ host` candidate per interface per section, an mDNS name instead of
 // a local address, and no `ufrag` (the media-level `a=ice-ufrag:` covers it).
+// The foundation names the interface, not the section: Chrome repeats one
+// foundation across every m-line an interface reaches into, while each
+// section's candidate carries its own locally allocated port (Chrome 153
+// oracle: three sections answered one foundation and three ports per
+// interface). Randomizing the foundation per section -- the earlier shape --
+// read as twice as many interfaces as the machine has.
 function _rtcCandidatePlan(slots) {
   const kinds = _rtcKinds(slots);
   const key = kinds.join(',');
   if (slots.candidatePlan && slots.candidatePlanKey === key) return slots.candidatePlan;
   const hosts = _rtcMdnsHosts();
+  const foundations = hosts.map(() => _rtcRandomUint(10));
   const plan = [];
   kinds.forEach((_kind, index) => {
     hosts.forEach((host, hostIndex) => {
-      const foundation = _rtcRandomUint(10);
+      const foundation = foundations[hostIndex];
       // The two type-preference/local-preference pairs Chrome emits for its
       // first two interfaces.
       const priority = hostIndex === 0 ? 2113937151 : 2113942271;
@@ -477,34 +483,46 @@ function _rtcGatherCandidates(connection, slots) {
     deliver('icegatheringstatechange', new Event('icegatheringstatechange'));
     deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', { candidate: null }));
   };
-  // The srflx candidate follows the host candidates, as it does in Chrome, and
-  // it is the answer to a real binding request: the page named the server, so
-  // the address is the one the server reported.
+  // The srflx candidates follow the host candidates, as they do in Chrome,
+  // and they are the answer to a real binding request: the page named the
+  // server, so the address is the one the server reported. One binding, one
+  // learned mapping: the same address trickles into every m-line section
+  // under one foundation. Chrome trickles a srflx per section (Chrome 153
+  // oracle), and the passing session read one srflx identity once per
+  // m-line; a per-section random foundation read as that many distinct
+  // server answers.
   const askStun = () => {
     if (!slots.stunServer || slots.srflxAttempted) {
       complete();
       return;
     }
     slots.srflxAttempted = true;
-    const base = queue.find(item => item.sdpMLineIndex === 0) || queue[0];
+    const foundation = _rtcRandomUint(10);
     _rtcStunLookup(slots.stunServer).then(mapped => {
       if (slots.closed) return;
-      const item = mapped ? _rtcSrflxCandidate(slots, base, mapped) : null;
-      if (!item) {
+      if (!mapped) {
         complete();
         return;
       }
-      deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', {
-        candidate: new RTCIceCandidate({
-          candidate: item.candidate,
-          sdpMid: item.sdpMid,
-          sdpMLineIndex: item.sdpMLineIndex,
-          usernameFragment: slots.ufrag,
-        }),
-      }));
-      applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
-      item.gathered = true;
-      slots.candidatePlan.push(item);
+      for (let index = 0; index < kinds.length; index++) {
+        const base = queue.find(item => item.sdpMLineIndex === index) || queue[0];
+        const item = _rtcSrflxCandidate(slots, base, mapped, foundation);
+        if (!item) {
+          complete();
+          return;
+        }
+        deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', {
+          candidate: new RTCIceCandidate({
+            candidate: item.candidate,
+            sdpMid: item.sdpMid,
+            sdpMLineIndex: item.sdpMLineIndex,
+            usernameFragment: slots.ufrag,
+          }),
+        }));
+        applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
+        item.gathered = true;
+        slots.candidatePlan.push(item);
+      }
       complete();
     });
   };

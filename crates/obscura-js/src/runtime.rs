@@ -28062,6 +28062,109 @@ RequestRedirect value",
         assert_eq!(value["state"], "complete");
     }
 
+    /// One candidate identity per interface, repeated across the m-line
+    /// sections: Chrome names one foundation per interface and repeats it in
+    /// every section that reaches the interface (Chrome 153 oracle: three
+    /// sections answered one foundation and one mDNS name per interface,
+    /// each section with its own port), and it trickles a srflx candidate
+    /// per section under one foundation. Randomizing the foundation per
+    /// (section, interface) -- the earlier shape -- read as ~6 distinct
+    /// interfaces where Chrome shows 2, and a per-section srflx foundation
+    /// read as one server answer per section; the passing session read 3
+    /// unique candidate identities, once per m-line each.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_candidate_plan_names_one_foundation_per_interface() {
+        // The stub is on loopback, which the private-network policy allows
+        // only through the same switch the fetch path reads.
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (stun_url, _stub) = spawn_stun_stub([203, 0, 113, 9], 5557);
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        const pc = new RTCPeerConnection(
+                            {{ iceServers: [{{ urls: '{stun_url}' }}] }});
+                        pc.createDataChannel('probe');
+                        const offer = await pc.createOffer(
+                            {{offerToReceiveAudio: true, offerToReceiveVideo: true}});
+                        const events = [];
+                        const gathered = new Promise(resolve => {{
+                            pc.onicecandidate = event => {{
+                                events.push(event.candidate ? {{
+                                    mid: event.candidate.sdpMid,
+                                    mli: event.candidate.sdpMLineIndex,
+                                    line: event.candidate.candidate,
+                                }} : null);
+                                if (!event.candidate) resolve();
+                            }};
+                        }});
+                        await pc.setLocalDescription(offer);
+                        await gathered;
+                        const hosts = events.filter(Boolean)
+                            .filter(entry => entry.line.includes(' typ host '));
+                        const srflx = events.filter(Boolean)
+                            .filter(entry => entry.line.includes(' typ srflx '));
+                        const foundation = entry => entry.line.split(' ')[0];
+                        const port = entry => entry.line.split(' ')[5];
+                        return {{
+                            sections: offer.sdp.split('\r\n')
+                                .filter(line => line.startsWith('m=')).length,
+                            hostCount: hosts.length,
+                            srflxCount: srflx.length,
+                            // interface 0 reaches sections 0,1,2 first in each
+                            // pair, interface 1 second.
+                            interface0SharesFoundation:
+                                foundation(hosts[0]) === foundation(hosts[2])
+                                && foundation(hosts[2]) === foundation(hosts[4]),
+                            interface1SharesFoundation:
+                                foundation(hosts[1]) === foundation(hosts[3])
+                                && foundation(hosts[3]) === foundation(hosts[5]),
+                            interfacesDiffer:
+                                foundation(hosts[0]) !== foundation(hosts[1]),
+                            hostUniqueLines: new Set(hosts.map(entry => entry.line)).size,
+                            srflxPerSection: srflx.map(entry => String(entry.mli)),
+                            // One learned answer, one port per section: the
+                            // srflx reuses its section's base host port, so
+                            // the lines differ while the foundation and the
+                            // reported address stay one mapping's.
+                            srflxUniqueLines: new Set(srflx.map(entry => entry.line)).size,
+                            srflxOneFoundation:
+                                foundation(srflx[0]) === foundation(srflx[1])
+                                && foundation(srflx[1]) === foundation(srflx[2]),
+                            srflxAddress: srflx[0].line.split(' ')[4],
+                            trailingNull: events[events.length - 1] === null,
+                        }};
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "sections": 3,
+                "hostCount": 6,
+                "srflxCount": 3,
+                "interface0SharesFoundation": true,
+                "interface1SharesFoundation": true,
+                "interfacesDiffer": true,
+                // Chrome 153: one foundation per interface, one port per
+                // (section, interface), so six distinct lines.
+                "hostUniqueLines": 6,
+                "srflxPerSection": ["0", "1", "2"],
+                "srflxUniqueLines": 3,
+                "srflxOneFoundation": true,
+                "srflxAddress": "203.0.113.9",
+                "trailingNull": true,
+            })
+        );
+    }
+
     /// The events a connection trickles are the interface instances Chrome
     /// delivers: an 'icecandidate' event stringifies
     /// '[object RTCPeerConnectionIceEvent]' and is trusted, the
