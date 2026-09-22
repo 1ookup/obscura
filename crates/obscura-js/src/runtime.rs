@@ -13879,6 +13879,41 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn document_prototype_stringifies_like_chrome() {
+        // Chrome stamps the interface prototype object with the plain
+        // interface tag: Document.prototype answers '[object Document]'
+        // while an HTML document instance answers '[object HTMLDocument]'.
+        // The dynamic tag getter used to answer from the live document even
+        // on the prototype, so a probe walking the document's proto chain
+        // (the challenge gate reads querySelector off
+        // Object.getPrototypeOf(document)) saw '[object HTMLDocument]'.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const detached = document.implementation.createHTMLDocument('d');
+                    return {
+                        protoToString: Object.prototype.toString.call(Document.prototype),
+                        instanceToString: Object.prototype.toString.call(document),
+                        detachedToString: Object.prototype.toString.call(detached),
+                        documentProtoIsDocument:
+                            Object.getPrototypeOf(document) === Document.prototype,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "protoToString": "[object Document]",
+                "instanceToString": "[object HTMLDocument]",
+                "detachedToString": "[object HTMLDocument]",
+                "documentProtoIsDocument": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn debugger_reads_sources_compiled_through_eval() {
         let mut rt = setup_runtime("<html><body></body></html>");

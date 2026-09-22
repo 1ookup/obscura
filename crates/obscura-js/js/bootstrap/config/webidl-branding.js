@@ -158,6 +158,9 @@
     Object.defineProperty(Document.prototype, Symbol.toStringTag, {
       get() {
         try {
+          // The prototype itself answers the plain interface tag; only a
+          // document instance carries the HTMLDocument brand.
+          if (this === Document.prototype) return 'Document';
           const root = this.documentElement;
           return root && root.localName === 'html' ? 'HTMLDocument' : 'Document';
         } catch (e) { return 'Document'; }

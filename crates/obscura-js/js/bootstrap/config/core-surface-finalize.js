@@ -150,6 +150,12 @@
       Object.defineProperty(Document.prototype, Symbol.toStringTag, {
         get() {
           try {
+            // Chrome stamps the interface prototype object itself with the
+            // plain interface tag: Document.prototype stringifies
+            // '[object Document]' while an HTML document instance answers
+            // '[object HTMLDocument]'. The instance check keeps the live
+            // document's root from leaking into the prototype's answer.
+            if (this === Document.prototype) return 'Document';
             const root = this.documentElement;
             const name = root && (root.localName
               || String(root.tagName || '').toLowerCase());
