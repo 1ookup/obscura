@@ -13662,3 +13662,59 @@ CF 臂方差 vs candidate 事件面评价路径；② 第三 traced 预算花在
 在现网新代件下的归属阶段待定位（retry 后 or 移除）；④ dir fold 载体信道仍等
 Reqable 注入工具链重建；⑤ 工作区 gate 台账回填（cargo v8-test +
 no-default-features 检查）。
+
+### Step 350：批次 47——retry 环 A/B 归因（8b7381c 无罪，CF 臂方差），TextMetrics 数值与 Chrome 153 位形全对齐，判决 0/6 仍全 retry（2026-09-23 凌晨）
+
+**① A/B 双二进制**：A = HEAD 8d482cc（含 8b7381c）；B = 同树
+`git revert --no-commit 8b7381c`（webrtc.js + runtime.rs，-141/+20，不落 commit），
+release（render + v8-source）各出一枚：/tmp/cf0919/obscuraA、obscuraB，sha 互异。
+建毕即还原：revert 弃置、树干净、无历史改写，target/release 重新落回 A 形。
+预算用量 2 次构建 + 6 轮（上限 8 轮未用满）。
+
+**② 交错判决 6 轮**（capture_round 同模板改显式二进制参数 /tmp/cf0919/ab_round.sh：
+click-after 16、deadline 21 + settle 9 = 30s 预算、轮间 12-15s、无注入态、
+port 9313 + proxy 9000）：
+
+| 轮 | 时刻 | 二进制 | click | api.js 供件 | 新ray 5-page | cycle2 api.js | ops 20-32s | 判决 |
+|----|------|--------|-------|-------------|--------------|---------------|------------|------|
+| R1 | 02:21:10 | A | 16.0s | 822812 @8s | 7788 @23s | 822620 @29s | 37436 | retry 环 |
+| R2 | 02:25:34 | B | 16.0s | 845980 @7s | 7799 @23s | 822844 @29s | 49767 | retry 环 |
+| R3 | 02:26:37 | A | 16.0s | 822984 @8s | 7724 @23s | 823020 @29s | 59569 | retry 环 |
+| R4 | 02:27:27 | B | 18.0s（迟） | 822892 @24s（供件迟） | 无 | 无 | 58236 | 慢轮（预算内停在 challenge） |
+| R5 | 02:28:33 | A | 16.0s | 822856 @7s | 7746 @23s | 845948 @29s | 37678 | retry 环 |
+| R6 | 02:29:21 | B | 16.0s | 846012 @8s | 7788 @23s | 845932 @29s | 46255 | retry 环 |
+
+**③ 判决：同形分布，8b7381c 无罪，retry 环属 CF 臂侧**。A 3/3 retry 环，
+B 2/3 retry 环 + 1 供件迟缓慢轮（B 从未走得更远，反而在 api.js 交付上卡早，
+click 18s、预算耗尽仍在 challenge，与 candidate 评价面无关）。六轮零 main#2、
+零 /1.txt 复取：无 404 过，也无 403 拒绝，final104-108 的拒绝形在本窗口未再现。
+同轮内 api.js 供件 822KB/846KB 两代随机出现，与二进制无相关（A、B 各见两代），
+印证 Step 349 的"供件同代"观察不构成分组变量。candidate 群体 9+1 形（8b7381c）
+不改变 payload 评价路径，无需 forward 修复。换代后判决累计 0/17
+（0/5 拒绝形 + 0/12 retry 环）。
+
+**④ 信道注记**：Reqable web API（8081）已无监听（远端 /tmp/flows.json 停在
+Sep 22 22:19 即批次 45，现连 000），/1.txt 无法按 flow 查状态；本轮判决改用
+产物侧签名：click verdict 行（六轮均"请稍候…"）、serve.log NaN console 双循环
+（8s/29s 各一）、ops.tsv 20-32s 第二波（3.7 万至 6 万行）、fo 序列（5-page
+7.7KB 新 ray + 7-frame 822/846KB）。Step 349 入口④的 Reqable 工具链重建需把
+8081 API 一并恢复。
+
+**⑤ Target 2 TextMetrics 数值形（ver57 apitrace result 字段 vs Chrome 153
+同机 oracle obJ/ref.json）**：apitrace 278 行全部携带 result，TextMetrics getter
+读数逐值提取：fontBoundingBoxAscent 17 / fontBoundingBoxDescent 5、
+hangingBaseline 13.600000381469727、alphabeticBaseline 0、
+ideographicBaseline -2.2400054931640625，五值与 Chrome 153 oracle **逐位一致**；
+emHeightAscent/Descent 我方 undefined、Chrome 153 亦 undef（一致）；
+actualBoundingBoxLeft -0.671875 对 -0.672000（栅格化尾差，同形）；
+width/actualBoundingBoxRight 量级交叠（oracle 40-65、我方 45-58，串不同）。
+**零 value 形分歧**，读数计数同 Step 349（ascent/descent/width ×30，
+left/right/font/hanging/alphabetic/ideographic ×20，emHeight ×10）。注：参考
+tracelog 已轮转无 TextMetrics 记录（trace.jsonl 现 0 字节、.old 为 5 月代 0 条），
+obJ/ref.json 为现役数值 oracle。
+
+**下一批入口**：① retry 环若破形（CF 换臂），第一时间补 A/B 复测（二进制仍在
+/tmp/cf0919，零构建成本）核对拒绝形是否双侧同现；② 第三 traced 预算仍留给 TS
+widget 窗口 `--trace-api-calls`（TextMetrics 调用实参 + measureText 字符串清单，
+349 ② 未动）；③ 富配置区计数归属阶段（349 ③）仍待 retry 破或换代；④ Reqable
+8081 API + 注入工具链重建（349 ④ 扩围）；⑤ 工作区 gate 台账回填（349 ⑤）。
