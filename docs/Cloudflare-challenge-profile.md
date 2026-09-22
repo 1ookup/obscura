@@ -13576,3 +13576,89 @@ oracle.html,oracle2.html,cdp_click_net.py,verdict_round.sh,sbvz3.py}。
 别名（连 DOMParser identity 钉一起翻）；④ dir fold 载体信道的观测面随 stage4v3
 件消失，须等注入工具链在 Reqable 侧重建；⑤ 工作区 gate 台账回填（cargo v8-test +
 no-default-features 检查）。
+
+### Step 349：批次 46——candidate 群体按 Chrome 153 对拍定形（foundation 按接口共用、srflx 逐 section）、HTMLDocument 静态链翻正；canvas 富配置区在换代件下仍未观测（www 主程序零 canvas 读、TS widget 侧 TextMetrics 探针已实名运行），判决 0/6 全为 retry 环（2026-09-23 凌晨）
+
+**① Target 3 HTMLDocument 别名查证（Chrome 153.0.8010.48 本地 oracle 逐字段）**：
+`HTMLDocument === Document` 为 **false**——Chrome 153 把 HTMLDocument 还原成真接口：
+自有构造名 "HTMLDocument"（`function HTMLDocument() { [native code] }`）、自有
+prototype（tag [object HTMLDocument]，ownKeys 仅 ['constructor']）、静态链挂
+Document（`Object.getPrototypeOf(HTMLDocument) === Document`，与
+HTMLAnchorElement→HTMLElement、RTCPeerConnectionIceEvent→Event 同款 lattice）；
+document 实例的直接原型是 HTMLDocument.prototype、instanceof 双真。旧参考（5 月
+Chromium）是别名时代，两者在该面已分叉；按 oracle 定形。我方全部 tag/name/描述符
+本来就对（shell 的 [object HTMLDocument] prototype、name、[true,false,true] 窗口
+描述符、detached 文档 instanceof 真），唯一缺口是静态链仍挂
+Function.prototype——全 lattice 里唯一漏静态链的接口对。修复（3b280f5）：
+surface-finalize 表安装后补 `setPrototypeOf(HTMLDocument, Document)`。
+document 实例的原型**不动**：runtime.rs 的钉与 Step 348 的 trace 证据一致——gate
+从 Object.getPrototypeOf(document) 读 querySelector 且通过轮答 [object Document]
+（升 document 原型到 HTMLDocument.prototype 会把该读打回 [object HTMLDocument]，
+直接回退 894598c）。`document instanceof HTMLDocument` 保持 false（对 153 的已知
+残差，零页面读证据）。DOMParser identity 钉不动（别名未做）。回归钉
+htmldocument_is_a_distinct_constructor_with_the_chrome_shape（11 字段全锁）。
+
+**② Target 2 candidate 群体（同机 oracle + 截断参考对拍）**：oracle3.html 三
+section（audio+video+datachannel+stun）实测 Chrome 153：**foundation/mDNS 名/
+priority/ufrag 按接口跨 section 共用，port 逐 (section,接口) 各配**（接口 0 三
+section 三 port：58579/52589/52184，同一 foundation 4092233735），srflx 逐
+section 派发、同接口一 foundation。参考（ov2 val 截断 48 字符）的 "3 唯一串×6
+读" 实为 identity 桶口径：2 host 桶 + 1 srflx 桶，每桶 = 3 m-line × 2 串读；
+27 次 ev.candidate 读 ÷3/事件 = 9 非空事件 + 1 null，即 3 section × (2 host +
+1 srflx)。我方旧形 foundation 逐 (m-line,接口) 随机 = 6 串身份 + srflx 仅
+m-line 0 一次（7 事件）。修复（8b7381c）：`_rtcCandidatePlan` foundation 按
+接口生成一次跨 section 共用（port 保持逐 section 各配，oracle 原样）；
+`_rtcSrflxCandidate` 改收外部 foundation；askStun 一次真实 binding 的同一答案
+逐 section 派发（同 foundation 同地址，port 沿用各 section 的 base host port），
+事件数 7+1 → **9+1，与参考读数结构对齐**。回归钉
+a_candidate_plan_names_one_foundation_per_interface（6 host、3 srflx、接口级
+foundation 共用双真、接口间不同、hostUniqueLines 6、srflxPerSection [0,1,2]）；
+srflx 单 section、offer/trickle、ice_events 形状诸钉全绿。
+
+**③ Target 1 canvas 富配置区（ver56 按批注 filter + ver57 加宽 filter，两轮
+api-trace）**：ver56 指定 filter（CanvasRenderingContext2D,fillStyle,shadowBlur,
+shadowColor,gCO,filter,fillText,strokeText,getImageData,createRadialGradient）
+**0 条**——但该轮流程在 TS fo POST 后停滞、pat/brunhild 未达。ver57 加宽
+（+FontFace/fonts/measureText/TextMetrics/OffscreenCanvas/createLinearGradient）
+**278 条**，全部来自 challenges.cloudflare.com 的 **TS widget 侧**：
+TextMetrics.actualBoundingBoxAscent/Descent ×30、width ×30、
+fontBoundingBox/hanging/alphabetic/ideographic 基线 ×20、emHeight ×10、
+CanvasRenderingContext2D.prototype ×12、Canvas2D.filter ×2（答 'none'）、
+fillText/strokeText/getImageData/createRadialGradient 的 .prototype/.name 函数
+自省各 ×1。**www 主程序侧两轮均零 canvas/font 读**：主程序 3.65s 下发、4.5s 即
+POST fo（运行 ~1s），旧代（ov2 5f53e8f8 件）里 ~10s 全电池主程序（fillStyle
+~25/shadowBlur ~12/1920 圈扫描）在现网新代件下不可见——富配置区要么随换代移到
+retry 之后的阶段（本轮流程从未到达），要么已从 www 主程序移除。判定：Step 348
+入口①的"region NOW runs?"答案为 **否，且非我方 canvas 面回归**（TS 侧探针在我
+方引擎实名运行、读数正常：filter 'none'、TextMetrics 数值齐全——fillText/
+textBaseline 修复在其下游可见）。通道注记：native trace 对 2D context 读以实现
+类名记账（Canvas2D.fillStyle 形），方法调用经 remembered-name 记
+CanvasRenderingContext2D.*，数据属性写不记账（仅 accessor 形）——老考 counts
+口径对拍时须按成员名过滤而非接口名。
+
+**④ 判决（final109-114，capture_round 45s×2 + 75s×4，注入态=现网原样）**：
+**0/6**。六轮同一模板：main#1(orchestrate GET @3.5s)→TS#1 api.js@3.9s→www fo
+POST@4.4s→TS fo@6.6s→pat/brunhild@8.7s→TS fo@12.3s→（16s 点击）TS fo@22.4s→
+www fo#2@22.7s→**新 ray orchestrate@25s（retry 环）**→cycle2（api.js、www fo、
+TS fo、pat/brunhild@30s）→空闲至截止。六轮全部零 /1.txt fetch：无 404 beacon
+（无过），也无 403 拒绝导航——**retry 环形**，与 final104-108 的
+main#2→GET /1.txt 403 拒绝形不同。供件字节同代（7-frame-resp 845.8-846.1KB、
+2-frame-resp 822.8KB，final108 同代），排除断供轮换；差异源两说：CF 臂侧
+session 方差，或本批 candidate 事件面变化（gate 正面读取它）改变了 payload 评价
+路径。SbVZ3 解不可运行（Reqable 无 ov2probe，decrypt 步按预期失败）。
+
+**产物**：/tmp/cf0919/{ver56,ver57,final109..114}（fo + serve.log + ops.tsv +
+api-trace）、/tmp/cf0919/{ver56_round.sh,ver57_round.sh,capture_round75.sh}、
+/tmp/cf0919/obJ/{oracle3.html,oracle4.html,oracle5.html,chrome_oracle3.py}。
+
+**测试**：obscura-js 全套 688：687 过 + timing_edits 1 败 = 台账在案的并行负载
+flake（隔离过、stash 干净树复跑同样过）；工作区 gate 按台账继续 deferred。发布
+形构建（--features render + v8-source.toml）完成后实弹。
+
+**下一批入口**：① A/B 归因 retry 环：8b7381c^ 二进制单轮判决（同模板），区分
+CF 臂方差 vs candidate 事件面评价路径；② 第三 traced 预算花在 TS widget 窗口
+`--trace-api-calls`（TextMetrics 探针的调用实参 + measureText 字符串清单）与
+若 retry 环打破后 main#2 的 canvas 面复查；③ 富配置区计数（fillStyle ~25 等）
+在现网新代件下的归属阶段待定位（retry 后 or 移除）；④ dir fold 载体信道仍等
+Reqable 注入工具链重建；⑤ 工作区 gate 台账回填（cargo v8-test +
+no-default-features 检查）。
