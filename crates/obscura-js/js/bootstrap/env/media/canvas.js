@@ -175,6 +175,7 @@ class _Canvas2D {
     this.direction = 'inherit';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
+    this.filter = 'none';
     _hset(this, "_stateStack", []);
     _hset(this, "_transform", [1, 0, 0, 1, 0, 0]);
     _hset(this, "_path", []);
@@ -341,6 +342,40 @@ class _Canvas2D {
     }
     this._markPaintDamage();
   }
+  // Chrome positions the text run through textBaseline/textAlign. The dot box
+  // stands in for the glyph em box: 7*scale rows above the alphabetic line
+  // plus a proportional descender band below it, so each baseline value lands
+  // the ink where Chrome puts it -- 'top' puts the first ink row at y,
+  // 'alphabetic' keeps it above y, 'bottom'/'ideographic' put the descender
+  // line at y. A probe that draws at y=0 with 'top' (the common canvas
+  // fingerprint shape) paints rows 0..7*scale-1; treating y as the alphabetic
+  // baseline there pushed every dot off-canvas and answered a blank canvas.
+  _textBaselineOffset(scale) {
+    const ascent = 7 * scale;
+    const descent = Math.round(2.1 * scale);
+    switch (this.textBaseline) {
+      case 'top': return ascent;
+      case 'hanging': return Math.round(0.8 * ascent);
+      case 'middle': return Math.round((ascent - descent) / 2);
+      case 'bottom':
+      case 'ideographic': return -descent;
+      default: return 0; // alphabetic, and anything unrecognised
+    }
+  }
+  // Alignment shifts the run horizontally so the ink box (not the origin)
+  // meets x: centered runs put their midpoint at x, right/end runs their
+  // right edge. 'start'/'end' resolve through the canvas direction.
+  _textAlignOffset(str, scale) {
+    if (!str.length) return 0;
+    const runWidth = str.length * 6 * scale - scale;
+    const rtl = this.direction === 'rtl';
+    let align = this.textAlign;
+    if (align === 'start') align = rtl ? 'right' : 'left';
+    if (align === 'end') align = rtl ? 'left' : 'right';
+    if (align === 'center') return Math.round(runWidth / 2);
+    if (align === 'right') return runWidth;
+    return 0;
+  }
   fillText(text, x, y) {
     // A gradient fill under text uses the gradient's first stop; per-glyph
     // gradient evaluation stays out of the dot-matrix rasterizer.
@@ -351,7 +386,8 @@ class _Canvas2D {
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = _prepareCanvasText(text);
     const [tx, ty] = this._applyTransform(+x || 0, +y || 0);
-    let cx = Math.round(tx);
+    const baseY = Math.round(ty) + this._textBaselineOffset(scale);
+    let cx = Math.round(tx) - this._textAlignOffset(str, scale);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
       for (let row = 0; row < 7; row++) {
@@ -362,7 +398,7 @@ class _Canvas2D {
           if (on) {
             for (let sy = 0; sy < scale; sy++) {
               for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(ty) - 7*scale + row*scale + sy, r, g, b, a);
+                this._setPixel(cx + col*scale + sx, baseY - 7*scale + row*scale + sy, r, g, b, a);
               }
             }
           }
@@ -836,7 +872,7 @@ class _Canvas2D {
     this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle,
       globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth,
       textAlign: this.textAlign, textBaseline: this.textBaseline, direction: this.direction,
-      globalCompositeOperation: this.globalCompositeOperation,
+      globalCompositeOperation: this.globalCompositeOperation, filter: this.filter,
       _transform: this._transform.slice()});
   }
   restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); _hset(this, "_transform", t); } }

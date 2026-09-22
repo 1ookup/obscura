@@ -22708,6 +22708,94 @@ RequestRedirect value",
     }
 
     #[test]
+    fn canvas_filltext_honors_baseline_alignment_and_filter_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const draw = (setup, x, y) => {
+                        const canvas = new OffscreenCanvas(80, 24);
+                        const context = canvas.getContext('2d');
+                        context.fillStyle = '#ffffff';
+                        context.fillRect(0, 0, 80, 24);
+                        context.fillStyle = '#000000';
+                        context.font = '16px Arial';
+                        setup(context);
+                        context.fillText('Cloudflare', x, y);
+                        const data = context.getImageData(0, 0, 80, 24).data;
+                        let non255 = 0, firstRow = -1, lastRow = -1;
+                        for (let i = 0; i < data.length; i++) {
+                            if (data[i] !== 255) {
+                                non255++;
+                                const row = Math.floor((i / 4) / 80);
+                                if (firstRow < 0) firstRow = row;
+                                lastRow = row;
+                            }
+                        }
+                        return { non255, firstRow, lastRow };
+                    };
+                    const id = () => {};
+                    // The canvas fingerprint probe shape: white fill, black
+                    // text at y=0 with textBaseline 'top'. An engine that
+                    // treats y as the alphabetic baseline paints every dot
+                    // above the canvas and answers an all-255 ImageData.
+                    const topY0 = draw(c => { c.textBaseline = 'top'; }, 2, 0);
+                    const alphY0 = draw(id, 2, 0);
+                    const topY18 = draw(c => { c.textBaseline = 'top'; }, 2, 18);
+                    const alphY18 = draw(id, 2, 18);
+                    const middleY18 = draw(c => { c.textBaseline = 'middle'; }, 2, 18);
+                    const bottomY18 = draw(c => { c.textBaseline = 'bottom'; }, 2, 18);
+                    const center = draw(c => { c.textAlign = 'center'; }, 40, 18);
+                    const right = draw(c => { c.textAlign = 'right'; }, 78, 18);
+                    const left = draw(c => { c.textAlign = 'left'; }, 2, 18);
+                    const filterContext = new OffscreenCanvas(4, 4).getContext('2d');
+                    const filterDefault = String(filterContext.filter);
+                    filterContext.filter = 'blur(2px)';
+                    const saved = String(filterContext.filter);
+                    filterContext.save();
+                    filterContext.filter = 'none';
+                    filterContext.restore();
+                    return {
+                        topY0, alphY0, topY18, alphY18, middleY18, bottomY18,
+                        center, right, left,
+                        filterDefault,
+                        filterRestored: [saved, String(filterContext.filter)],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let non255 = |case: &str| result[case]["non255"].clone();
+        let first_row = |case: &str| result[case]["firstRow"].as_i64().unwrap();
+        let last_row = |case: &str| result[case]["lastRow"].as_i64().unwrap();
+        // Chrome oracle (local headless Chromium, same probe): topY0 answers
+        // 1569 non-white bytes with ink rows 0-12, first at byte 16; a blank
+        // canvas here is the Cloudflare 1,920-scan divergence.
+        assert!(non255("topY0").as_i64().unwrap() > 0);
+        assert_eq!(first_row("topY0"), 0);
+        assert!(last_row("topY0") < 16);
+        // Alphabetic at y=0 keeps the whole run above the canvas (Chrome's
+        // antialiasing leaves a one-row sliver; the dot box clips cleanly).
+        assert_eq!(non255("alphY0"), serde_json::json!(0));
+        // Baselines order the run top-to-bottom the way Chrome places the em
+        // box: bottom ink highest, then alphabetic, middle, top.
+        assert!(first_row("bottomY18") < first_row("alphY18"));
+        assert!(first_row("alphY18") < first_row("middleY18"));
+        assert!(first_row("middleY18") < first_row("topY18"));
+        assert_eq!(first_row("topY18"), 18);
+        assert!(last_row("topY18") >= 23);
+        // Alignment: centered/right runs start at or right of the left run.
+        assert!(first_row("center") >= first_row("left"));
+        assert!(first_row("right") >= first_row("left"));
+        // Chrome defaults filter to 'none' and round-trips assigned values
+        // through save/restore; an undefined answer is a detectable miss.
+        assert_eq!(result["filterDefault"], serde_json::json!("none"));
+        assert_eq!(
+            result["filterRestored"],
+            serde_json::json!(["blur(2px)", "blur(2px)"])
+        );
+    }
+
+    #[test]
     fn inline_rects_keep_chromes_subpixel_width_while_offset_width_rounds() {
         let mut rt = setup_runtime(
             r#"<html><body style="margin:0"><span id="probe"
