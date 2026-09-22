@@ -13418,3 +13418,25 @@ dump（flows API 存 body）。② dir collector 槽 12 的写入指令：下一
 头指令后反推 Chrome 侧为何同槽为 NaN。③ 沙盒单步执行器（walker2 + 真实
 handler）已可与追踪逐指令对齐（本次 off-by-one：next = pc+len+1，跳转写绝对
 pc），可预解 Wf/Ws/WG 门控槽位再做定向插桩。
+
+### Step 345：全量插桩对拍——1,920 圈空白画布扫描循环定位（2026-09-22 深夜）
+
+**方法**：代理侧 stage4v3 全量插桩（108 键：48 handler/dispatch/sub-op/host 读写/boot/
+net）+ 我方引擎原生 `--tracelog-file` 通道。obH 轮 447,066 条记录 vs 参考（通过轮，
+自定义 Chromium，219,141 条）。分程序对齐（gate 5208 / main ~463-476k / battery 71567）。
+
+**异常点**：主程序 pc 202643-202802 的循环，我们 1,920 圈 vs 参考 ~15 圈（占我们主程序
+全部指令 35%）。循环体每圈：fl→fx→ft→**fc×4（host 读）**→ft(140)→fo→ft(141)→fN(130)…
+
+**循环真身**：host 读直方图实锤——`Uint8ClampedArray`（length=7680，即 1920 像素×RGBA
+的 ImageData）逐像素读取 9,621 次，元素值**全 255（空白）**；通过的参考对同一
+ImageData 只读 `.buffer/.join` 走快速路径，**零逐像素 length 读**（搜索 ~15 圈即退出）。
+
+**上游链**：~60 个 `local()` FontFace 构造（字体枚举）+ 一个 **Uint8Array 二进制字体源**
+的 FontFace("Apple Symbols", bytes) → canvas `fillText`（-5.9ms）→ `getImageData`（T=0）
+→ 像素扫描。**我们的 fillText 把画画成了全白**——文本未渲染。
+
+**结论**：canvas 文本渲染空白 = 搜索循环满扫 + canvas 指纹值错误。这是 Step 10.13
+"像素墙"的机制级真身，判决主嫌疑。修复方向：挑战字体清单（local() 族 + 二进制
+Apple Symbols）下 canvas fillText 的渲染空白定位与修复；判据=新插桩轮循环数 1,920→~15
++ 判决轮。
