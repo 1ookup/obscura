@@ -13914,6 +13914,59 @@ RequestRedirect value",
         );
     }
 
+    #[test]
+    fn htmldocument_is_a_distinct_constructor_with_the_chrome_shape() {
+        // Chrome 153 oracle: HTMLDocument is not a Document alias. It answers
+        // to its own name, carries a distinct prototype tagged
+        // '[object HTMLDocument]' (the brand document instances stringify
+        // with), and its static chain sits on Document like every other
+        // interface pair. The shell used to leave the static chain on
+        // Function.prototype -- the one interface whose constructor walk
+        // missed Chrome's lattice. The live document's own prototype stays
+        // Document.prototype: the gate reads querySelector off it and the
+        // passing reference saw '[object Document]' there, so the instance
+        // chain is not repointed onto HTMLDocument.prototype.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const detached = document.implementation.createHTMLDocument('d');
+                    return {
+                        alias: HTMLDocument === Document,
+                        name: HTMLDocument.name,
+                        string: String(HTMLDocument),
+                        protoDistinct: HTMLDocument.prototype !== Document.prototype,
+                        protoTag: Object.prototype.toString.call(HTMLDocument.prototype),
+                        staticChain: Object.getPrototypeOf(HTMLDocument) === Document,
+                        documentProtoIsDocument:
+                            Object.getPrototypeOf(document) === Document.prototype,
+                        protoTagRead:
+                            Object.prototype.toString.call(Object.getPrototypeOf(document)),
+                        documentTag: Object.prototype.toString.call(document),
+                        detachedInstanceOfHd: detached instanceof HTMLDocument,
+                        detachedTag: Object.prototype.toString.call(detached),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "alias": false,
+                "name": "HTMLDocument",
+                "string": "function HTMLDocument() { [native code] }",
+                "protoDistinct": true,
+                "protoTag": "[object HTMLDocument]",
+                "staticChain": true,
+                "documentProtoIsDocument": true,
+                "protoTagRead": "[object Document]",
+                "documentTag": "[object HTMLDocument]",
+                "detachedInstanceOfHd": true,
+                "detachedTag": "[object HTMLDocument]",
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn debugger_reads_sources_compiled_through_eval() {
         let mut rt = setup_runtime("<html><body></body></html>");

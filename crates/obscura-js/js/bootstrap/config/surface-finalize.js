@@ -1592,6 +1592,19 @@ const _chromeInterfaceShells = new Set();
       }
     }
   }
+  // Chrome 153 makes HTMLDocument a real interface again, not a Document
+  // alias: its own constructor (name "HTMLDocument", distinct prototype
+  // tagged [object HTMLDocument]) whose static chain sits on Document,
+  // measured alongside every other interface pair. The shell above left the
+  // static chain on Function.prototype -- the one interface pair in the
+  // lattice that missed Chrome's constructor walk.
+  try {
+    const htmlDocument = globalThis.HTMLDocument, documentCtor = globalThis.Document;
+    if (typeof htmlDocument === 'function' && typeof documentCtor === 'function'
+        && Object.getPrototypeOf(htmlDocument) !== documentCtor) {
+      Object.setPrototypeOf(htmlDocument, documentCtor);
+    }
+  } catch (_e) {}
   // Namespace/accessor objects the table's own kinds cannot express.
   if (typeof globalThis.clientInformation === 'undefined') {
     Object.defineProperty(globalThis, 'clientInformation',
