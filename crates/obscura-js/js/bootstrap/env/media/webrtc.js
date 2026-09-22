@@ -418,6 +418,17 @@ function _rtcGatherCandidates(connection, slots) {
       try { listener.call(connection, event); } catch (error) { console.error(error); }
     }
   };
+  // Chrome delivers these through the event system: an 'icecandidate' event
+  // is an RTCPeerConnectionIceEvent instance, the gathering-state event a
+  // plain Event, the endpoints are the connection, and isTrusted is true.
+  // The direct handler call here bypasses dispatchEvent, so the endpoints
+  // are set the way a dispatch would leave them (Chrome 153 oracle: the
+  // event's own enumerable keys answer ['isTrusted']).
+  const deliver = (type, event) => {
+    _eventSetEndpoints(event, connection, connection);
+    globalThis.__obscura_markTrusted(event);
+    emit(type, event);
+  };
   // Chrome folds each gathered candidate into the current local
   // description's SDP as it trickles out, so `pc.localDescription.sdp` at
   // gathering-complete carries an `a=candidate:` line per gathered
@@ -463,8 +474,8 @@ function _rtcGatherCandidates(connection, slots) {
   // srflx candidate the STUN server answered with, then the null candidate.
   const complete = () => {
     slots.iceGatheringState = 'complete';
-    emit('icegatheringstatechange', { type: 'icegatheringstatechange', target: connection });
-    emit('icecandidate', { type: 'icecandidate', candidate: null, target: connection });
+    deliver('icegatheringstatechange', new Event('icegatheringstatechange'));
+    deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', { candidate: null }));
   };
   // The srflx candidate follows the host candidates, as it does in Chrome, and
   // it is the answer to a real binding request: the page named the server, so
@@ -483,16 +494,14 @@ function _rtcGatherCandidates(connection, slots) {
         complete();
         return;
       }
-      emit('icecandidate', {
-        type: 'icecandidate',
+      deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', {
         candidate: new RTCIceCandidate({
           candidate: item.candidate,
           sdpMid: item.sdpMid,
           sdpMLineIndex: item.sdpMLineIndex,
           usernameFragment: slots.ufrag,
         }),
-        target: connection,
-      });
+      }));
       applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
       item.gathered = true;
       slots.candidatePlan.push(item);
@@ -511,7 +520,7 @@ function _rtcGatherCandidates(connection, slots) {
         sdpMLineIndex: item.sdpMLineIndex,
         usernameFragment: slots.ufrag,
       });
-      emit('icecandidate', { type: 'icecandidate', candidate, target: connection });
+      deliver('icecandidate', new RTCPeerConnectionIceEvent('icecandidate', { candidate }));
       applyCandidateToLocal(item.sdpMLineIndex, item.sdpLine);
       item.gathered = true;
       _scheduleAfter(1, step);

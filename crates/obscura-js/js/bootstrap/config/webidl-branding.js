@@ -16,6 +16,7 @@
     'HashChangeEvent', 'MessageEvent', 'ProgressEvent', 'ClipboardEvent',
     'SubmitEvent', 'ToggleEvent', 'PromiseRejectionEvent', 'StorageEvent',
     'SecurityPolicyViolationEvent',
+    'RTCPeerConnectionIceEvent',
     'EventSource',
     // Core DOM interfaces own distinct prototypes.
     'Node', 'EventTarget', 'Element', 'Document', 'XMLDocument', 'DocumentFragment',

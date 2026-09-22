@@ -28027,6 +28027,92 @@ RequestRedirect value",
         assert_eq!(value["state"], "complete");
     }
 
+    /// The events a connection trickles are the interface instances Chrome
+    /// delivers: an 'icecandidate' event stringifies
+    /// '[object RTCPeerConnectionIceEvent]' and is trusted, the
+    /// gathering-state event a plain Event, and the connection is both
+    /// endpoints. Plain object literals answered '[object Object]' with no
+    /// isTrusted -- a shape a probe reads straight off the trickle (the
+    /// reference session reads event.candidate off
+    /// [object RTCPeerConnectionIceEvent]; we read it off [object Object]).
+    /// Oracle: Chrome 153, iceServers [] -- the event's own enumerable keys
+    /// answer ['isTrusted'] and the interface carries no url attribute.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ice_events_carry_the_chrome_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const ice = [];
+                    const gather = [];
+                    pc.onicecandidate = event => ice.push({
+                        toString: Object.prototype.toString.call(event),
+                        ctor: event.constructor.name,
+                        isIceEvent: event instanceof RTCPeerConnectionIceEvent,
+                        isEvent: event instanceof Event,
+                        isTrusted: event.isTrusted,
+                        type: event.type,
+                        targetIsPc: event.target === pc,
+                        currentTargetIsPc: event.currentTarget === pc,
+                        candidateKind: event.candidate === null ? 'null'
+                            : Object.prototype.toString.call(event.candidate),
+                        ownKeys: Object.keys(event).join(','),
+                        url: event.url,
+                    });
+                    pc.onicegatheringstatechange = event => gather.push({
+                        toString: Object.prototype.toString.call(event),
+                        isTrusted: event.isTrusted,
+                        targetIsPc: event.target === pc,
+                        type: event.type,
+                    });
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    await pc.setLocalDescription(offer);
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    return { ice, gather };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        let ice = value["ice"].as_array().unwrap();
+        assert!(ice.len() >= 2, "host candidates plus the null: {ice:?}");
+        for event in ice {
+            assert_eq!(event["toString"], "[object RTCPeerConnectionIceEvent]");
+            assert_eq!(event["ctor"], "RTCPeerConnectionIceEvent");
+            assert_eq!(event["isIceEvent"], true);
+            assert_eq!(event["isEvent"], true);
+            assert_eq!(event["isTrusted"], true);
+            assert_eq!(event["type"], "icecandidate");
+            assert_eq!(event["targetIsPc"], true);
+            assert_eq!(event["currentTargetIsPc"], true);
+            assert_eq!(event["ownKeys"], "isTrusted");
+            assert_eq!(event["url"], serde_json::Value::Null);
+        }
+        let last = ice.last().unwrap();
+        assert_eq!(last["candidateKind"], "null", "the trickle ends on null");
+        assert!(
+            ice[..ice.len() - 1]
+                .iter()
+                .all(|event| event["candidateKind"] == "[object RTCIceCandidate]"),
+            "every real candidate is an RTCIceCandidate: {ice:?}"
+        );
+        let gather = value["gather"].as_array().unwrap();
+        assert!(!gather.is_empty(), "the gathering state changed");
+        for event in gather {
+            assert_eq!(event["toString"], "[object Event]");
+            assert_eq!(event["isTrusted"], true);
+            assert_eq!(event["targetIsPc"], true);
+            assert_eq!(event["type"], "icegatheringstatechange");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
         let mut rt = setup_runtime("<html><body></body></html>");

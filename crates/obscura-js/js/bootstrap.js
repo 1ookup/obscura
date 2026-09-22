@@ -213,6 +213,7 @@
 // @obscura-module env/media/rtc-rtp-receiver.js
 // @obscura-module env/media/rtc-session-description.js
 // @obscura-module env/media/rtc-ice-candidate.js
+// @obscura-module env/media/rtc-peer-connection-ice-event.js
 // @obscura-module env/storage/indexeddb-cache.js
 // @obscura-module env/input/support/media-capabilities-behavior.js
 // @obscura-module env/input/capabilities.js
