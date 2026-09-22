@@ -13508,3 +13508,71 @@ final100-103（4 轮判决）：均 fail（流程完整：main#1→TS#1→pat/br
 main#2→GET /1.txt 403）。canvas 指纹面已修，判决剩余分岔：信标残留 13 条（载体
 信道）、canvas 逐字节 parity（点阵近似）、及其余未见面。下一批入口：用同一套
 指令级对拍方法在恢复臂上重跑差分，找下一个最大计数异常。
+
+### Step 348：批次 45——指令级差分循环再开即遭遇 serve 侧换代（stage4v3 件轮换消失、mitmproxy 被 Reqable 接管），gate 级对拍仍锁出两处引擎面分歧并修复（RTC icecandidate 事件对象、Document.prototype toStringTag），判决期主程序恢复下发，SbVZ3 78 持平，判决 0/5（2026-09-23 凌晨）
+
+**① R1 插桩轮与 fresh 异常排名**：obJ 轮（b9ef38c 二进制，--tracelog-file + ops）
+7,246 条记录，只收到 gate（bc_len 5208 ×3：g162 11.5s / g234 11.2s / g166 截断）；
+参考（通过轮 trace.jsonl，326,188 行 = gate→main 462,994→battery 71,564→post 4,071）。
+ver55 复盘：其 3 程序亦全为 gate——Step 347 的 fc 16,774→248 对拍实为主程序对比
+gate 轮，非同程序。gate 对 gate（按 SHAPE，比值×量）排名：
+1. **RTC 事件对象形状**：参考读 `event.candidate` 的 receiver 是
+   [object RTCPeerConnectionIceEvent] ×27/gate，我方 ×0；我方从 [object Object]
+   读 ×21/gate，参考 ×0——我方 onicecandidate 派发的是裸字面量。
+2. **candidate 群体**：参考每会话 3 个唯一 candidate 串各读 6 次；我方每 gate
+   ~6.5 个唯一串各读 2 次——_rtcCandidatePlan 的 foundation/port 逐 (m-line,接口)
+   随机，而 Chrome 同接口跨 m-line 共用（未修，下一批入口）。
+3. **Document 原型 tag**：参考从 [object Document]（即 Document.prototype）读
+   querySelector/querySelectorAll 各 ×2/gate，我方同读落在 [object HTMLDocument]
+   （getPrototypeOf(document) 的动态 tag 被 documentElement 兜底泄漏污染）。
+4. Date 读 23 vs 18/gate（会话条件探针，不修）。gate handler/disp 计数全在会话
+   方差内（fb 111 vs 113、fc 82 vs 63 等）。
+
+**② 换代**：R2 轮起 served ov2 轮换——新件 419,330 B 内联，stage4v3 的 108 键
+（ov2.h.*/ov2.disp/host）零残留，仅剩 fixed-key 窗口补丁（__OV2FIXEDKEY__ ×1）；
+代理侧 9000 端口易主 Reqable，mitmweb 8081 消失——set_inject.sh 与 flows API 失效，
+判决轮的注入开关不再可操作（served 件即现网所发）。R2 以 --trace-api-file 原生
+通道顶上：canvas 富配置区（fillStyle/shadowBlur/… 读）在 gate-only 期不可观测
+（canvas 探针在主程序内，未下发），但 chl_page 自身的 RTC 探针
+（RTCPeerConnection GET ×2→createDataChannel→addEventListener→createOffer→
+setLocalDescription→close）与 Window.Document ×10 均在 native trace 实名出现，
+与 R1 排名互证。
+
+**③ 修复两处（generic Chrome-shaped，Chrome 153.0.8010.48 本地 oracle 逐字段）**：
+- **f07489d**：新 interface `RTCPeerConnectionIceEvent`（extends Event，
+  _eventInitSlots 挂 candidate，无 url 属性——Chrome 153 读它答 undefined），
+  webidl-branding 名单补 tag；webrtc.js 的三处 icecandidate 与
+  icegatheringstatechange 派发改走真实 Event 实例 + _eventSetEndpoints
+  （target=currentTarget=连接）+ __obscura_markTrusted。oracle 形状：toString
+  [object RTCPeerConnectionIceEvent]、instanceof 双真、isTrusted true、
+  ownKeys=['isTrusted']、null candidate 收尾；gather 事件为 [object Event]。
+  回归钉 ice_events_carry_the_chrome_interface_shape。
+- **894598c**：Document.prototype 的动态 toStringTag getter 加
+  `this === Document.prototype → 'Document'` 卫（core-surface-finalize 与
+  webidl-branding 两处安装点），原型自身答 [object Document]、实例保持
+  [object HTMLDocument]。回归钉 document_prototype_stringifies_like_chrome。
+  未做 HTMLDocument=Document 别名（本轮零页面读证据；runtime.rs 的 DOMParser
+  identity 钉 "HTMLDocument" 需随之翻面，列为下一批）。
+- obscura-js 全套 686：685 过 + timing_edits 1 败=清理树同样存在的并行负载 flake
+  （隔离 3/3 过）。工作区 gate 按台账 deferred。R3 实弹：native trace 里
+  `RTCPeerConnectionIceEvent candidate` GET ×3 实名出现（修复前这些读无接口名）。
+
+**④ 判决（final104-108，注入态=现网原样，Reqable 供件）**：**0/5**。但流程面
+恢复：final104 起 2-frame-resp 重回 822,968 B 整包（gate-only 降级臂结束），
+main#1→TS#1→TS#2→TS#3→main#2→GET /1.txt 403 完整；TS 信标逐轮可解
+（fixed-key 0954fd23… 仍在新件窗口内），**SbVZ3 = 78 三轮全平**（残差 13 = trio 5
++ dir 块 8，与本批两修无交——console 电池不计 RTC/Document 面）。rch 探针
+438,597-438,618 B、marker ×1 每轮。canvas 富配置区仍未观测（本轮无 api-trace
+预算；主程序恢复后为下一批首轮必查）。
+
+**产物**：/tmp/cf0919/{obJ,obJ2,obJ3,final104..108}（fo + serve.log + api-trace +
+dec/）、/tmp/cf0919/obJ/{analyze.py,perinst_ours.json,ref.json,chrome_oracle.py,
+oracle.html,oracle2.html,cdp_click_net.py,verdict_round.sh,sbvz3.py}。
+
+**下一批入口**：① 主程序恢复下发，首轮即用 --trace-api-file 查 canvas 富配置区
+（fillStyle ~25 / shadowBlur ~12 / shadowColor ~5 / gCO ~5 / filter ~4 的读数对
+拍）与 1920 圈扫描是否仍塌缩；② candidate 群体：foundation/port 按接口跨 m-line
+共用 + 事件串去重（Chrome 对拍），或按挑战真实建连参数定形；③ HTMLDocument=Document
+别名（连 DOMParser identity 钉一起翻）；④ dir fold 载体信道的观测面随 stage4v3
+件消失，须等注入工具链在 Reqable 侧重建；⑤ 工作区 gate 台账回填（cargo v8-test +
+no-default-features 检查）。

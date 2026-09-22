@@ -7,7 +7,14 @@ run covers are then removed.
 
 ## Pending
 
-(none)
+- 2026-09-23: commits `f07489d` (rtc: icecandidate events are
+  RTCPeerConnectionIceEvent instances) + `894598c` (dom: Document.prototype
+  stringifies [object Document]). Scoped suite ran instead:
+  `cargo nextest run --release --features render -p obscura-js --config
+  vendor/v8-source.toml`, 686 tests, 685 pass + 1 pre-existing load flake
+  (`timing_edits_preserve_identity_and_pause_holds_then_resumes`, fails on the
+  clean tree at b9ef38c under parallel load, passes standalone). Bootstrap-only
+  change plus tests; exact release build ran before the verdict rounds.
 
 ## Backfilled
 
