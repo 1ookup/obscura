@@ -569,6 +569,15 @@ streaming `Page.startScreencast` protocol.
 
 - **[Hermes agent plugin](https://github.com/SGavrl/hermes-plugin-obscura)**: run [Hermes](https://github.com/NousResearch/hermes-agent) agent browser tasks on Obscura. The plugin spawns `obscura serve` per session (or connects to an already running server) and drives it over CDP, with optional `--stealth`.
 
+## Development
+
+See [AGENTS.md](AGENTS.md) for build/test conventions. Iterating on a fix? Run
+the scoped `cargo nextest` suites for the crates you touch and defer the full
+workspace gate by logging it in
+[docs/test-gate-ledger.md](docs/test-gate-ledger.md); backfill with one
+consolidated `cargo v8-test` before pushing. The full gate stays mandatory
+before pushes, releases, and obstacle-course runs.
+
 ## License
 
 Apache 2.0

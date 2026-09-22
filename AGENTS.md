@@ -91,6 +91,25 @@ obscura-js and obscura-browser are compiled and exercised. Add
 single V8 isolate per process, so the runtime tests fail under it. `nextest`
 runs each test in its own process, which is the only supported way.
 
+### Scoped-first test gating (defer the full workspace run)
+
+The full workspace release run above costs 10-30 minutes. During iterative fix
+batches, do NOT run it per batch. The policy:
+
+1. During a batch, run only the SCOPED suites for the crates you touched
+   (`cargo nextest run --release --features render -p <crate> --config
+   vendor/v8-source.toml`). These catch the breakage where it happens.
+2. DEFER the full workspace run and record it in `docs/test-gate-ledger.md`
+   (one line: commit range, date, what scoped suites ran instead). The exact
+   release build itself is cheap and stays mandatory before any live round.
+3. Backfill = one consolidated `cargo v8-test` (plus `cargo check -p
+   obscura-js -p obscura-cli --no-default-features --config
+   vendor/v8-source.toml`) when the ledger holds a batch of entries, before a
+   push, or before an obstacle-course run. Clear the ledger entries it covers.
+4. The full gate is MANDATORY (never deferred) before: pushing, tagging,
+   obstacle-course runs, and any change to feature gates, build config, or
+   unsafe/FFI boundaries. Deferred-gate commits must not touch those areas.
+
 The authoritative behavioral gate is the **obstacle course** in the companion
 repo `obscura-benchmark` (33 capability + speed stages, must stay 33/33):
 
