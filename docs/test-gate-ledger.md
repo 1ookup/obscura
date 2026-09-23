@@ -18,6 +18,9 @@ run covers are then removed.
 
 ## Backfilled
 
+- 2026-09-23: backfill executed 13:58, `cargo nextest run --release
+  --features render --no-fail-fast --config vendor/v8-source.toml` =
+  **1925/1925 passed** (1 leaky, 4 skipped) at HEAD d4a5352. Ledger clear.
 - 2026-09-22: baseline. All code commits through `280cf2b` carried full
   workspace gates inside their batches (latest: 1914/1914 at the batch-41
   fix `f12dee4`; `6ac3488`/`280cf2b` are docs-only). Ledger starts empty.
