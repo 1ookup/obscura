@@ -5022,6 +5022,111 @@ mod tests {
         }
     }
 
+    /// `document.body` and `document.head` are fixed addresses in the tree
+    /// (a particular child of the root `html` element), so the engine answers
+    /// them from the node structure rather than a selector walk over every
+    /// descendant. The walk made the ordinary `document.body.appendChild(node)`
+    /// loop quadratic in the page size: 20k appends took 2.9 s against
+    /// Chrome's 4.6 ms, and the per-append cost grew with the document.
+    #[test]
+    fn document_body_and_head_resolve_from_the_tree_shape() {
+        let mut rt = setup_runtime(
+            r#"<html><head><title>t</title></head><body><div id="host"></div></body></html>"#,
+        );
+        // The op names the same nodes the scoped selector does.
+        assert_eq!(
+            rt.evaluate(
+                r#"(function () {
+                    const op = (c, a, b) => Deno.core.ops.op_dom(c, String(a ?? ""), String(b ?? ""));
+                    const html = Number(op("document_element"));
+                    const head = Number(op("document_section_element", 0, "head"));
+                    const body = Number(op("document_section_element", 0, "body"));
+                    return JSON.stringify([
+                        html > 0,
+                        head === Number(op("query_selector_scoped", String(html), "head")),
+                        body === Number(op("query_selector_scoped", String(html), "body")),
+                    ]);
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!("[true,true,true]"),
+        );
+        // A root that is not a document answers none, so the bootstrap keeps
+        // its selector fallback instead of reporting a body that does not exist.
+        assert_eq!(
+            rt.evaluate(r#"Deno.core.ops.op_dom("document_section_element", "987654", "body")"#)
+                .unwrap(),
+            serde_json::json!("-1"),
+        );
+        // Both getters follow the live tree through mutation and re-parse.
+        assert_eq!(
+            rt.evaluate("document.body === document.getElementById('host').parentNode")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            rt.evaluate("document.head === document.querySelector('head')")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        rt.evaluate("document.body.innerHTML = '<span id=\"s\">x</span>'")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("document.body === document.getElementById('s').parentNode")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    /// Connecting or disconnecting a subtree only moves Window's indexed frame
+    /// properties when the subtree actually carries a browsing context. The
+    /// resync is a whole-document iframe query, and running it for every plain
+    /// element made mutation on a site-sized page ~30x slower than Chrome.
+    #[test]
+    fn window_frame_indices_follow_iframe_subtrees_only() {
+        let mut rt = setup_runtime(r#"<html><body><div id="host"></div></body></html>"#);
+        // A plain element never becomes a child browsing context.
+        rt.evaluate(
+            r##"(function () {
+                const host = document.getElementById("host");
+                for (let i = 0; i < 4; i++) host.appendChild(document.createElement("div"));
+                return document.querySelectorAll("iframe").length;
+            })()"##,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("window.length").unwrap().as_f64(),
+            Some(0.0),
+            "plain divs must not register a child browsing context",
+        );
+        // An iframe subtree does, and window[i] tracks it across removal.
+        rt.evaluate(
+            r##"(function () {
+                const host = document.getElementById("host");
+                const wrap = document.createElement("div");
+                wrap.id = "wrap";
+                wrap.appendChild(document.createElement("iframe"));
+                host.appendChild(wrap);
+                return true;
+            })()"##,
+        )
+        .unwrap();
+        assert_eq!(rt.evaluate("window.length").unwrap().as_f64(), Some(1.0));
+        assert_eq!(
+            rt.evaluate("typeof window[0]").unwrap(),
+            serde_json::json!("object"),
+        );
+        rt.evaluate("document.getElementById('wrap').remove()")
+            .unwrap();
+        assert_eq!(rt.evaluate("window.length").unwrap().as_f64(), Some(0.0));
+        assert_eq!(
+            rt.evaluate("Object.getOwnPropertyDescriptor(window, '0') === undefined")
+                .unwrap(),
+            serde_json::json!(true),
+            "a removed frame must also drop its indexed window property",
+        );
+    }
+
     /// `setup_runtime` on an origin that is a secure context. Chrome exposes
     /// serviceWorker, crypto.subtle, caches, storage, clipboard, wakeLock,
     /// credentials, locks and mediaDevices *only* there, so a test that

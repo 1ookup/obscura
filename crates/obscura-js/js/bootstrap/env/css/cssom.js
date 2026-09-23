@@ -155,13 +155,21 @@ function _detachLinkedStyleSheet(link) {
 // with it leaves window[i].
 function _subtreeDisconnected(root) {
   if (!root) return;
-  _syncWindowFrameIndices();
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
   if (!root.querySelectorAll) return;
-  for (const style of _internalQuerySelectorAll(root, "style")) _detachStyleSheet(style);
-  for (const link of _internalQuerySelectorAll(root, 'link[rel~="stylesheet"]')) {
-    _detachLinkedStyleSheet(link);
+  // `_syncWindowFrameIndices` answers Window's indexed frame properties with a
+  // whole-document iframe query. That is ~60us on a 3.6k-node page, and it was
+  // paid by every disconnected node. Only a subtree that actually carries a
+  // browsing-context host can move the count, so scan the subtree (shadow
+  // roots included, matching the connect-side scan) and keep the indices exact
+  // for the case that matters.
+  const iframeIds = _domParse("iframe_hosts_including_shadow", root[_nidSym], "") || [];
+  if (iframeIds.length !== 0) _syncWindowFrameIndices();
+  // One scoped query for both stylesheet kinds instead of two.
+  for (const node of _internalQuerySelectorAll(root, 'style,link[rel~="stylesheet"]')) {
+    if (node.localName === "style") _detachStyleSheet(node);
+    else _detachLinkedStyleSheet(node);
   }
 }
 

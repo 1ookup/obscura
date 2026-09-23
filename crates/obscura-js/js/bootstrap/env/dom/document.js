@@ -8,6 +8,16 @@ function _documentLegacyColor(doc, name, value) {
   return name in store ? store[name] : '';
 }
 
+// `document.head` / `document.body` resolved from the tree shape (see
+// Document.prototype's getters). Returns null when the document does not have
+// the conforming root/child layout, so the caller can fall back to a selector.
+function _documentSectionElement(doc, which) {
+  const scopeRoot = doc && doc[_scopeRootSym];
+  const root = typeof scopeRoot === 'number' ? scopeRoot : 0;
+  const id = +_dom("document_section_element", root, which);
+  return id > 0 ? _wrapEl(id) : null;
+}
+
 var Document = _swappableInterface('Document', class extends Node {
   constructor(nid) {
     // Node's constructor stores the handle under _nidSym already, which keeps
@@ -43,8 +53,21 @@ var Document = _swappableInterface('Document', class extends Node {
   // Native Document getters query the tree internally. Calling the public
   // querySelector method here lets a page's monkey-patch observe engine
   // bookkeeping (and pollutes the challenge's selector trace).
-  get head() { return _internalQuerySelector(this, "head"); }
-  get body() { return _internalQuerySelector(this, "body"); }
+  //
+  // Both addresses are fixed by the spec to a particular child of the root
+  // `html` element, so the engine resolves them from the tree shape. The
+  // selector query they used to run walked every descendant of the document,
+  // which made the ordinary `document.body.appendChild(node)` loop quadratic
+  // in the page size. A document without the conforming shape (unparsed,
+  // fragment-built) answers none and keeps the selector fallback.
+  get head() {
+    const section = _documentSectionElement(this, "head");
+    return section !== null ? section : _internalQuerySelector(this, "head");
+  }
+  get body() {
+    const section = _documentSectionElement(this, "body");
+    return section !== null ? section : _internalQuerySelector(this, "body");
+  }
   get customElementRegistry() { return globalThis.customElements; }
   get designMode() { return 'off'; }
   set designMode(value) { String(value); }

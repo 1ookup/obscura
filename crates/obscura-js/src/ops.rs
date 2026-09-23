@@ -1693,6 +1693,49 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             }
             "-1".into()
         }
+        // `document.body` / `document.head` answered from the tree shape rather
+        // than a document-wide selector query. The spec fixes both addresses:
+        // each is a particular child of the root `html` element (body also
+        // matches `frameset`), so a conforming document resolves them in a
+        // handful of node reads. The bootstrap used to run
+        // `querySelectorAll("body")` on every access, which is O(document) --
+        // `document.body.appendChild(...)` in a loop was quadratic. Documents
+        // that do not have the conforming shape return -1 and the bootstrap
+        // keeps its selector fallback.
+        "document_section_element" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let html = if dom
+                .get_node(root)
+                .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "html"))
+                .unwrap_or(false)
+            {
+                Some(root)
+            } else {
+                dom.children(root).into_iter().find(|cid| {
+                    dom.get_node(*cid)
+                        .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "html"))
+                        .unwrap_or(false)
+                })
+            };
+            let Some(html) = html else { return "-1".into() };
+            let wanted = |local: &str| -> bool {
+                match arg2.as_str() {
+                    "head" => local == "head",
+                    // A frameset document's `body` is its frameset element.
+                    _ => local == "body" || local == "frameset",
+                }
+            };
+            for cid in dom.children(html) {
+                if dom
+                    .get_node(cid)
+                    .and_then(|n| n.as_element().map(|e| wanted(e.local.as_ref())))
+                    .unwrap_or(false)
+                {
+                    return cid.index().to_string();
+                }
+            }
+            "-1".into()
+        }
         "document_doctype" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {

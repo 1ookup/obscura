@@ -184,7 +184,13 @@ function __prepareInsertedSubtree(root) {
     _dom("create_blank_iframe_document", +nid);
     _queueIframeNavigation(+nid);
   }
-  _syncWindowFrameIndices();
+  // `_syncWindowFrameIndices` answers Window's indexed frame properties by
+  // querying the whole document for iframes. Connecting a subtree that holds
+  // no browsing context cannot move that count, so skip the walk: on a site
+  // page it is the dominant per-mutation cost (a 3.6k-node document pays a
+  // ~60us iframe query for every appended div). Every path that does change
+  // the count still reaches the sync, so the indices stay exact.
+  if (iframeIds.length !== 0) _syncWindowFrameIndices();
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
