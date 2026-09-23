@@ -317,49 +317,49 @@ globalThis.__obscura_init = function() {
       }
     } catch (_e) {}
   }
-  // Window-level geometry. A top-level window claims a maximized window:
-  // outer bounds fill the working area, the window origin sits at the working
-  // area's top-left. Deterministic from the screen fingerprint, and plausible
-  // next to any screen a profile claims.
+  // Window-level geometry. A window claims a maximized window: outer bounds
+  // fill the working area, the window origin sits at the working area's
+  // top-left. Deterministic from the screen fingerprint, and plausible next to
+  // any screen a profile claims.
   //
-  // A NESTED browsing context (iframe content window) answers 0 for all six,
-  // which is what CSSOM View specifies and what a real Chrome reports from
-  // iframe contentWindow (verified oracle); only the top-level window carries
-  // the fingerprint values. The CF challenge census reads all six from the
-  // widget frame, so leaking 44/77/1200/816 there was a direct hit.
-  if (frameRootNid > 0) {
-    globalThis.outerWidth = 0;
-    globalThis.outerHeight = 0;
-    globalThis.screenX = 0;
-    globalThis.screenY = 0;
-    globalThis.screenLeft = 0;
-    globalThis.screenTop = 0;
-  } else {
-    const availW = hasScreenOverride ? sw
-      : (Number.isFinite(Number(fingerprintScreen.availWidth)) && Number(fingerprintScreen.availWidth) > 0
-        ? Number(fingerprintScreen.availWidth) : sw);
-    const availH = hasScreenOverride ? sh
-      : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
-        ? Number(fingerprintScreen.availHeight) : sh);
-    const windowTop = Math.max(0, sh - availH);
-    // A host can provide real window metrics through ScreenFingerprint. Zero
-    // keeps the historical maximized-window fallback used by embedders that do
-    // not expose native window placement.
-    const configuredOuterW = Number(fingerprintScreen.outerWidth);
-    const configuredOuterH = Number(fingerprintScreen.outerHeight);
-    const configuredScreenX = Number(fingerprintScreen.screenX);
-    const configuredScreenY = Number(fingerprintScreen.screenY);
-    // Viewport emulation changes the CSS/screen size, but it does not erase the
-    // host window placement supplied by the fingerprint. Keep location and outer
-    // bounds independent so CDP viewport overrides do not turn a real window
-    // into the historical all-zero geometry.
-    globalThis.outerWidth = configuredOuterW > 0 ? configuredOuterW : availW;
-    globalThis.outerHeight = configuredOuterH > 0 ? configuredOuterH : availH;
-    globalThis.screenX = Number.isFinite(configuredScreenX) ? configuredScreenX : 0;
-    globalThis.screenY = Number.isFinite(configuredScreenY) ? configuredScreenY : windowTop;
-    globalThis.screenLeft = globalThis.screenX;
-    globalThis.screenTop = globalThis.screenY;
-  }
+  // The six members describe the OS window, and every realm of a document tree
+  // shares that one window, so a NESTED browsing context reports the same six
+  // values as its top-level ancestor. Measured on Chrome 153 (windowed,
+  // 3440x1440 DPR 1, outer 1440x900 at 22,52): an attached iframe, a srcdoc
+  // iframe and `frames[i]` all answer 1440/900/22/52 for
+  // outerWidth/outerHeight/screenX/screenY. Only innerWidth/innerHeight are
+  // frame-local (the iframe content box). An earlier build zeroed all six in
+  // nested realms on the belief that CSSOM View required it; that belief is
+  // wrong, and `outerWidth: 0` is a headless tell the CF census reads from the
+  // widget frame.
+  //
+  // A zero-configuration ScreenFingerprint still falls back to the derived
+  // maximized window, which is what embedders that expose no native window
+  // placement have always observed.
+  const availW = hasScreenOverride ? sw
+    : (Number.isFinite(Number(fingerprintScreen.availWidth)) && Number(fingerprintScreen.availWidth) > 0
+      ? Number(fingerprintScreen.availWidth) : sw);
+  const availH = hasScreenOverride ? sh
+    : (Number.isFinite(Number(fingerprintScreen.availHeight)) && Number(fingerprintScreen.availHeight) > 0
+      ? Number(fingerprintScreen.availHeight) : sh);
+  const windowTop = Math.max(0, sh - availH);
+  // A host can provide real window metrics through ScreenFingerprint. Zero
+  // keeps the historical maximized-window fallback used by embedders that do
+  // not expose native window placement.
+  const configuredOuterW = Number(fingerprintScreen.outerWidth);
+  const configuredOuterH = Number(fingerprintScreen.outerHeight);
+  const configuredScreenX = Number(fingerprintScreen.screenX);
+  const configuredScreenY = Number(fingerprintScreen.screenY);
+  // Viewport emulation changes the CSS/screen size, but it does not erase the
+  // host window placement supplied by the fingerprint. Keep location and outer
+  // bounds independent so CDP viewport overrides do not turn a real window
+  // into the historical all-zero geometry.
+  globalThis.outerWidth = configuredOuterW > 0 ? configuredOuterW : availW;
+  globalThis.outerHeight = configuredOuterH > 0 ? configuredOuterH : availH;
+  globalThis.screenX = Number.isFinite(configuredScreenX) ? configuredScreenX : 0;
+  globalThis.screenY = Number.isFinite(configuredScreenY) ? configuredScreenY : windowTop;
+  globalThis.screenLeft = globalThis.screenX;
+  globalThis.screenTop = globalThis.screenY;
 
   // The time origin is when navigation started, so it is always in the past.
   // Jittering it forward put `performance.timeOrigin` after `Date.now()`,

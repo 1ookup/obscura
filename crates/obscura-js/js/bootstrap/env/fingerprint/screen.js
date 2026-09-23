@@ -26,18 +26,29 @@ globalThis.ScreenOrientation = _markNative(ScreenOrientation);
 // running `for..in`, so a non-enumerable `_w` is still one
 // `Object.getOwnPropertyNames(screen)` away from being visible. A browser's
 // screen object has no own string-keyed properties at all.
-// Chromium answers the display's real bit depth rather than a constant, and
-// the answer follows the platform: 30 on macOS, 24 on Windows and Linux. A
-// macOS identity that answered 24 contradicted its own platform on the first
-// screen probe, whether or not an embedder supplied screen metrics.
-var _screenDepthPlatform = null;
+// Chromium answers the attached display's real bit depth rather than a
+// constant: 24 for an ordinary 8-bit panel, 30 for a 10-bit one, and the
+// 10-bit panels are the Retina ones. Measured on Chrome 153, macOS 15,
+// 3440x1440 DPR 1: `screen.colorDepth` 24 both windowed and headless, and 24
+// even with `--force-device-scale-factor=2` -- the device scale override does
+// not move the bit depth, the physical panel does. Platform alone is therefore
+// not enough (a DPR 1 macOS identity that answered 30 contradicted its own
+// display on the first screen probe), so the answer follows the claimed
+// deviceScaleFactor, which is the only display attribute a fingerprint has:
+// a macOS identity at DPR >= 2 means a Retina-class panel, hence 30. Windows
+// and Linux stay 24 at every scale (Windows at 200% scaling is 24, not 30),
+// and so does a macOS identity at DPR 1, which is the measured answer for an
+// external non-Retina display.
+var _screenDepthKey = null;
 var _screenDepthValue = 24;
 function _screenColorDepth() {
   const fingerprint = _fingerprint();
   const platform = String(fingerprint.uaPlatform || fingerprint.navigatorPlatform || '');
-  if (platform !== _screenDepthPlatform) {
-    _screenDepthPlatform = platform;
-    _screenDepthValue = /^mac/i.test(platform) ? 30 : 24;
+  const scale = Number(globalThis.devicePixelRatio);
+  const key = platform + '|' + (Number.isFinite(scale) && scale > 0 ? scale : 1);
+  if (key !== _screenDepthKey) {
+    _screenDepthKey = key;
+    _screenDepthValue = /^mac/i.test(platform) && scale >= 2 ? 30 : 24;
   }
   return _screenDepthValue;
 }

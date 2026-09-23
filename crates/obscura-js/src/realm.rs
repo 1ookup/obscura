@@ -1100,10 +1100,6 @@ impl ObscuraJsRuntime {
         if timing {
             realm_phase_print("bootstrap_core", t_phase.elapsed());
         }
-        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
-        if timing {
-            realm_phase_print("realm_init", t_phase.elapsed());
-        }
         // The runtime-owned fingerprint lands before `__obscura_init`, the
         // same order the main realm uses: init derives innerWidth/outer* from
         // the screen it can already see, so seeding the identity afterwards
@@ -1111,11 +1107,20 @@ impl ObscuraJsRuntime {
         // to a correctly re-seeded screen. The stealth and GPU-profile flags
         // travel with it: a frame that got the identity but not the flags
         // reported a different machine from its own parent.
+        //
+        // The seeding must also precede `<obscura:frame-realm-init>`: every
+        // `execute_in_context` hydrates a deferred-surface realm first, so that
+        // call is what runs the realm's `<obscura:init>` (page init). Seeding
+        // after it ran page init against the *fallback* fingerprint -- a frame
+        // created by the async loader (every navigated iframe) reported
+        // outerWidth 1920 / screenX 0 next to a correctly re-seeded screen,
+        // while the synchronously materialized about:blank realm, whose
+        // hydrate runs on the first facade read, reported the real window.
         let fingerprint_json = serde_json::to_string(&self.fingerprint)
             .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
         let stealth = self.stealth;
         let webgl_enabled = self.gpu_profile_enabled();
-        self.execute_in_context(
+        self.run_in_realm_before_hydration(
             &context,
             "<obscura:frame-fingerprint>",
             &format!(
@@ -1126,6 +1131,10 @@ impl ObscuraJsRuntime {
         )?;
         if timing {
             realm_phase_print("fingerprint_seed", t_phase.elapsed());
+        }
+        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        if timing {
+            realm_phase_print("realm_init", t_phase.elapsed());
         }
         // Core init for the deferred-surface boot (Step 312): binds the
         // contentDocument surface the parent can touch; the full page init
@@ -1894,6 +1903,26 @@ impl ObscuraJsRuntime {
         self.execute_in_context_at(context, name, source, 0)
     }
 
+    /// Run a boot script in a realm without triggering its deferred-surface
+    /// hydration. `execute_in_context` hydrates before the script body runs,
+    /// which is wrong for the one seeding that must land *ahead* of a realm's
+    /// `<obscura:init>`: for a template-restored frame realm hydration fires
+    /// on the first execute of any kind, so a seeding routed through
+    /// `execute_in_context` ran after the page init it was supposed to
+    /// precede, and the realm derived its window geometry from the fallback
+    /// identity instead of the runtime fingerprint.
+    fn run_in_realm_before_hydration(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        name: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        run_script(scope, name, source)
+    }
+
     pub(crate) fn execute_in_context_at(
         &mut self,
         context: &v8::Global<v8::Context>,
@@ -2146,10 +2175,13 @@ pub(crate) fn spawn_frame_realm(
         if timing {
             realm_phase_print("sync realm_init", t_phase.elapsed());
         }
-        // Fingerprint before init, matching the main realm's order (see the
-        // comment in ensure_frame_world_realm). tools/script-loader's setter is
-        // bootstrap core, so it runs; the deferred fingerprint applicator is
-        // caught up by __obscura_hydrate.
+        // Fingerprint before the realm's page init (see the ordering note in
+        // ensure_frame_world_realm). This path runs every script through
+        // `run_script`, which never triggers hydration, so page init runs at
+        // the realm's first execution or facade read -- after the identity is
+        // installed either way. tools/script-loader's setter is bootstrap core,
+        // so it runs; the deferred fingerprint applicator is caught up by
+        // __obscura_hydrate.
         let fingerprint_src = format!(
             "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
              globalThis.__obscura_stealth = {stealth}; \
