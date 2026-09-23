@@ -1,3 +1,78 @@
+// Range contents extraction (DOM Standard 5.3.4 clone/extract/delete). The
+// engine's innerHTML parser, mutation plumbing and node identity are all real
+// on both sides of the boundary, so the challenge's readback shape
+// (selectNodeContents + extractContents + innerHTML of the destination) gets
+// the same answer Chrome gives instead of an empty fragment. Whole nodes MOVE
+// under extract so identity survives like Chrome; partial character-data
+// edges split like Chrome.
+function _rngContentsFragment(range, clone) {
+  const sc = range._sc, ec = range._ec, so = range._so, eo = range._eo;
+  const ownerDoc = (sc && sc.ownerDocument) || globalThis.document || document;
+  const frag = ownerDoc.createDocumentFragment();
+  if (!sc || !ec || range.collapsed) return frag;
+  const textLike = (n) => n.nodeType === 3 || n.nodeType === 4;
+  const adoptAll = (nodes) => {
+    for (let i = 0; i < nodes.length; i++) {
+      frag.appendChild(clone ? nodes[i].cloneNode(true) : nodes[i]);
+    }
+  };
+  if (_rngSame(sc, ec)) {
+    if (textLike(sc)) {
+      if (clone) {
+        frag.appendChild(ownerDoc.createTextNode(sc.data.slice(so, eo)));
+      } else if (typeof sc.splitText === 'function') {
+        const tail = so < eo ? sc.splitText(eo) : null;
+        const mid = so > 0 ? (tail ? sc.splitText(so) : null) : sc;
+        frag.appendChild(mid !== null && mid !== undefined ? mid : sc);
+      } else {
+        frag.appendChild(ownerDoc.createTextNode(sc.data.slice(so, eo)));
+      }
+      return frag;
+    }
+    adoptAll(Array.prototype.slice.call(sc.childNodes, so, eo));
+    return frag;
+  }
+  // Different containers: partial start side, fully covered middle children
+  // of the common ancestor, partial end side.
+  const endAncestors = _rngAncestors(ec);
+  let common = null;
+  for (let a = sc; a; a = a.parentNode) {
+    if (endAncestors.indexOf(a) >= 0) { common = a; break; }
+  }
+  if (!common) return frag;
+  let startChild = sc;
+  while (startChild && startChild.parentNode !== common) startChild = startChild.parentNode;
+  let endChild = ec;
+  while (endChild && endChild.parentNode !== common) endChild = endChild.parentNode;
+  if (!startChild || !endChild) return frag;
+  // Start side.
+  if (textLike(sc)) {
+    if (clone) frag.appendChild(ownerDoc.createTextNode(sc.data.slice(so)));
+    else if (sc.nodeType === 3 && typeof sc.splitText === 'function' && so > 0) {
+      frag.appendChild(sc.splitText(so));
+    } else frag.appendChild(sc);
+  } else if (startChild !== sc) {
+    adoptAll(Array.prototype.slice.call(sc.childNodes, so));
+  }
+  // Middle: children of common strictly between the boundary children.
+  const commonKids = Array.prototype.slice.call(common.childNodes);
+  const si = commonKids.indexOf(startChild);
+  const ei = commonKids.indexOf(endChild);
+  if (si >= 0 && ei > si) adoptAll(commonKids.slice(si + 1, ei));
+  // End side.
+  if (textLike(ec)) {
+    if (clone) frag.appendChild(ownerDoc.createTextNode(ec.data.slice(0, eo)));
+    else if (ec.nodeType === 3 && typeof ec.splitText === 'function' && eo < _rngNodeLength(ec)) {
+      // ec keeps [0, eo); the tail stays behind, ec itself moves.
+      ec.splitText(eo);
+      frag.appendChild(ec);
+    } else frag.appendChild(ec);
+  } else if (endChild !== ec) {
+    adoptAll(Array.prototype.slice.call(ec.childNodes, 0, eo));
+  }
+  return frag;
+}
+
 globalThis.Range = class Range {
   constructor() {
     const d = globalThis.document || null;
@@ -108,9 +183,9 @@ globalThis.Range = class Range {
     if (!_rngSame(sc, ec) && (ec.nodeType === 3 || ec.nodeType === 4)) s += (ec.data || "").slice(0, this._eo);
     return s;
   }
-  cloneContents() { return (globalThis.document || document).createDocumentFragment(); }
-  extractContents() { return (globalThis.document || document).createDocumentFragment(); }
-  deleteContents() {}
+  cloneContents() { return _rngContentsFragment(this, true); }
+  extractContents() { return _rngContentsFragment(this, false); }
+  deleteContents() { _rngContentsFragment(this, false); }
   insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
   surroundContents(node) { this.insertNode(node); }
   detach() {}
