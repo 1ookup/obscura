@@ -232,8 +232,21 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
+// Text children serialized literally instead of entity-escaped. This is the
+// HTML fragment-serialization "do not escape" list -- style, script, xmp,
+// iframe, noembed, noframes, plaintext, plus noscript (the document is
+// scripting-enabled) -- NOT the tokenizer's raw-text/RCDATA set. textarea and
+// title are RCDATA when PARSED, so their text is escaped when serialized;
+// listing and pre are ordinary elements on both sides. Chrome 153 answers the
+// escaped form for textarea/title and the literal form for the other six, and
+// the challenge's round-trip probe stores the markup only when the readback
+// equals the input.
 fn is_raw_text_element(tag: &str) -> bool {
-    matches!(tag, "script" | "style" | "textarea" | "title")
+    matches!(
+        tag,
+        "script" | "style" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext"
+            | "noscript"
+    )
 }
 
 #[cfg(test)]
@@ -380,6 +393,83 @@ mod tests {
                 inner_html_round_trip(input),
                 expected,
                 "innerHTML round trip diverged from Chrome 153 for {input:?}",
+            );
+        }
+    }
+
+    /// `el.innerHTML = x; el.innerHTML` for the containers whose text children
+    /// are serialized literally instead of escaped. Expectations are verbatim
+    /// Chrome 153 reads (local headless oracle, same build as the payload).
+    ///
+    /// Serialization escapes textarea and title (both are RCDATA when parsed)
+    /// and emits script, style, xmp, iframe, noembed, noframes, plaintext and
+    /// noscript literally. The distinction is invisible for markup that
+    /// round-trips exactly, which is why it survived until the challenge's
+    /// round-trip probe: that probe stores the markup only when the readback
+    /// equals the input, so the six raw containers it uses go empty for us.
+    #[test]
+    fn raw_text_containers_serialize_like_chrome_153() {
+        let p_seq = "<p>EnIF0</p><p>ikyR0</p>";
+        let attr = r#"<div data-foo="&quot;"></div>"#;
+        let cases: [(&str, &str, &str); 22] = [
+            // Ordinary containers: markup round-trips identically.
+            ("div", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("div", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("template", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("pre", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            // Serialized literally.
+            ("script", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("style", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("xmp", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("xmp", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("iframe", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("iframe", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("noembed", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("noembed", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("noframes", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("noframes", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("plaintext", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("plaintext", attr, r#"<div data-foo="&quot;"></div>"#),
+            ("noscript", p_seq, "<p>EnIF0</p><p>ikyR0</p>"),
+            ("noscript", attr, r#"<div data-foo="&quot;"></div>"#),
+            // RCDATA when parsed: the decoded text is escaped on the way out.
+            (
+                "textarea",
+                p_seq,
+                "&lt;p&gt;EnIF0&lt;/p&gt;&lt;p&gt;ikyR0&lt;/p&gt;",
+            ),
+            (
+                "title",
+                p_seq,
+                "&lt;p&gt;EnIF0&lt;/p&gt;&lt;p&gt;ikyR0&lt;/p&gt;",
+            ),
+            (
+                "textarea",
+                attr,
+                r#"&lt;div data-foo="""&gt;&lt;/div&gt;"#,
+            ),
+            (
+                "title",
+                attr,
+                r#"&lt;div data-foo="""&gt;&lt;/div&gt;"#,
+            ),
+        ];
+
+        for (tag, input, expected) in cases {
+            let tree = parse_html("<body></body>");
+            let host = tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(tag)),
+                attrs: Vec::new(),
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            });
+            let context = QualName::new(None, ns!(html), LocalName::from(tag));
+            let fragment = parse_fragment_with_context(input, context);
+            tree.import_children_from(host, &fragment, fragment.fragment_root());
+            assert_eq!(
+                tree.inner_html(host),
+                expected,
+                "innerHTML readback diverged from Chrome 153 for {tag} <- {input:?}",
             );
         }
     }
