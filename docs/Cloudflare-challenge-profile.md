@@ -14568,3 +14568,15 @@ script | style | xmp | iframe | noembed | noframes | plaintext | noscript
 **残余保真缺口（未修）**：preload 驱动的条目我们报 `initiatorType: "img"`，Chrome 报 `"link"`（fixture 实证）。
 
 **流程事故（我的失误，已修复）**：我用不带路径的 `git commit`（`76cf924`）把另一个 agent **预先 staged 的 7 个源文件**一起提交了，而定义 `_armPreloadImageLinks` 的 `link.js` 当时未 staged ⇒ **HEAD 的 bootstrap 会抛 `ReferenceError`**（任何 `element.innerHTML =` 都失败，全新 checkout 大面积失效）。已用 `06adea9` 补齐定义与调用点，HEAD 恢复自洽。**纪律更正：任何提交必须显式带上路径（`git commit -- <paths>`），绝不用裸 `git commit`。**
+
+#### 354.29 媒体/WebGL 面：`OYbs6` 识别、`XqEQ3`/`xkNI3` 修复、worker canvas 全缺
+
+**`OYbs6` 是什么（不再是猜测）**：把 wrapper 注入真实 Chrome（拦截所有 target 的 `Debugger.scriptParsed` + `Page.addScriptToEvaluateOnNewDocument` + `waitForDebuggerOnStart`），记录挑战期间**每一次 WebGL/GPU/media 调用的实参与返回值**，再逐格对上。结论：CF 在 **`new OffscreenCanvas(1,1).getContext('webgl')`（WebGL1，未传 attributes）** 上跑探针，35 个元素是一条扁平 dump——下标 5-13 是 `getContextAttributes()` 的 9 字段（布尔转数字）、0-2 与 16-32 是 `getParameter` 各枚举、14/15 是 `ALIASED_POINT_SIZE_RANGE`/`ALIASED_LINE_WIDTH_RANGE`、33/34 是 `drawingBufferColorSpace`/`unpackColorSpace`。
+
+**`OYbs6[10]` 的机制（值得记住）**：那次 context **没传任何 attributes**，Chrome 仍回 `"low-power"`。同一进程内对照：**顶层 frame 回显正确**（`default`/显式 `high-performance` 各自正确），而**任何跨站 iframe（OOPIF）渲染进程一律回 `low-power`**（CF 挑战 iframe 与一个中立的 iana.org iframe 都是）。⇒ 这是 **Chromium 按渲染进程的行为，不是 API 语义、也不按源**。未修：复刻它需要「realm 相对顶层是否**跨站**」这一信号，Chrome 的边界是 **site(eTLD+1)** 而非 origin，用现成的 `iframe_scopes_same_origin`（origin 比较）会在同站不同子域上答错；且 `realms.js` 正被大改。建议路径：Rust 侧暴露 per-realm 的 "cross-site to top" 布尔。
+
+**`XqEQ3` 修复**：四个元素依次是 `MediaSource.isTypeSupported`×8(audio) / ×10(video)、`mediaCapabilities.decodingInfo`×8 / `encodingInfo`×10。两处根因（`media-capabilities-behavior.js`）：① `powerEfficient` 恒 `false`（Chrome 按平台解码器答：Apple/Metal 下 H.264/HEVC/VP9 与全部音频 `true`，AV1/VP8 `false`）⇒ 第三数组 `3` vs `7`；② **完全没有字典校验**，`encodingInfo({type:'file'})` 会 resolve（Chrome 抛 `TypeError`，CF 因此写 `null`）⇒ 第四元素 `[3,3,…]` vs `null`。顺带补齐 `MediaDecodingType`/`MediaEncodingType` 与必填成员规则。
+
+**`xkNI3`/`KnOhl5` 修复**：video 编解码清单缺第 16/17 位两条 H.264 `profile-level-id=64001f`（来自 `RTCRtpSender.getCapabilities('video')`，由 `webrtc.js` 的 SDP 派生）。补进 SDP 后 audio 8/8、video **23/23 与 `xkNI3` 逐元素一致（含顺序）**。
+
+**新发现，优先级高（已派修）**：**worker 作用域里 `OffscreenCanvas` 的 WebGL 是空的**——`new Worker(blob)` 内 `new OffscreenCanvas(1,1).getContext('webgl2', {powerPreference:'low-power'})` 我们返回 **`null`**（Chrome 正常返回 context）。这**不只是某个字段值不同，而是一整块 API 缺失**，会改变 VM 走的代码路径（CF 调用栈里 `Worker.constructor` 17 次、`OffscreenCanvas` 12 次）。另一条同族：`OffscreenCanvas.getContext('experimental-webgl')` Chrome 抛 `TypeError`、我们返回 context。
