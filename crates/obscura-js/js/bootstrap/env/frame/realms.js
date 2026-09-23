@@ -216,15 +216,27 @@ function _materializeFrameRealm(hostNid) {
   }
 }
 const _chromeWindowKeyOrder = [
-  // WindowProxy exposes opener before the event-handler block. The boolean
-  // and secure-context globals follow the same native registration order.
-  'opener', 'closed', 'crossOriginIsolated', 'credentialless',
-  'isSecureContext', 'originAgentCluster', 'offscreenBuffering',
+  // The boolean and secure-context globals follow the native registration
+  // order. Chrome 153 places closed between status and frames, and opener
+  // between top and parent; the observable own-key order of those four is
+  // pinned by window_legacy_attributes_and_event_target_shape_match_chrome.
+  'crossOriginIsolated', 'credentialless',
+  'isSecureContext', 'originAgentCluster',
   'window', 'self', 'document', 'location', 'customElements', 'history',
   'navigation', 'locationbar', 'menubar', 'personalbar', 'scrollbars',
-  'statusbar', 'toolbar', 'frames', 'top', 'parent', 'frameElement',
-  'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
-  'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
+  'statusbar', 'toolbar', 'status', 'closed', 'frames', 'length', 'top',
+  'opener', 'parent', 'frameElement',
+  'navigator', 'origin', 'external', 'screen',
+  // Chrome 153 enumerates the geometry cluster between `screen` and
+  // `styleMedia` in exactly this sequence, with the visual viewport object
+  // after pageYOffset and devicePixelRatio after outerHeight. Measured with
+  // getOwnPropertyNames on a fresh local Chrome 153 window; a live passing
+  // payload's census bucket carries the same relative order.
+  'innerWidth', 'innerHeight', 'scrollX', 'pageXOffset', 'scrollY',
+  'pageYOffset', 'visualViewport', 'screenX', 'screenY', 'outerWidth',
+  'outerHeight', 'devicePixelRatio', 'clientInformation',
+  'offscreenBuffering', 'screenLeft', 'screenTop', 'styleMedia',
+  'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
   'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
   'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',

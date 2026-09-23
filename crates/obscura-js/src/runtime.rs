@@ -14903,6 +14903,48 @@ RequestRedirect value",
         );
     }
 
+    /// Chrome 153 enumerates the window geometry cluster between `screen` and
+    /// `styleMedia` in one stable sequence, with `length` after `frames` and
+    /// the scroll functions behind the cluster. A passing challenge payload's
+    /// window census bucket carries the same relative order, so the engine's
+    /// own-property order must match it exactly.
+    #[test]
+    fn window_geometry_cluster_enumerates_in_chrome_153_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = Object.getOwnPropertyNames(window);
+                    const at = name => names.indexOf(name);
+                    const cluster = ["screen", "innerWidth", "innerHeight",
+                        "scrollX", "pageXOffset", "scrollY", "pageYOffset",
+                        "visualViewport", "screenX", "screenY", "outerWidth",
+                        "outerHeight", "devicePixelRatio", "clientInformation",
+                        "offscreenBuffering", "screenLeft", "screenTop",
+                        "styleMedia"];
+                    const ranks = cluster.map(at);
+                    const clusterSorted = ranks.every((rank, index) =>
+                        rank >= 0 && (index === 0 || rank > ranks[index - 1]));
+                    return {
+                        clusterSorted,
+                        lengthBeforeScreen: at("length") < at("screen"),
+                        framesBeforeLength: at("frames") < at("length"),
+                        scrollBehindCluster: at("screenTop") < at("scroll"),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "clusterSorted": true,
+                "lengthBeforeScreen": true,
+                "framesBeforeLength": true,
+                "scrollBehindCluster": true,
+            })
+        );
+    }
+
     #[test]
     fn window_webidl_constructors_are_not_enumerable() {
         let mut rt = setup_runtime("<html><body></body></html>");
