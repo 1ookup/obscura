@@ -14684,3 +14684,22 @@ g/BODY/challenges.cloudflare.com   '0|'
 **集合基本相同，顺序几乎完全不同**。另有两处集合差：我方 fetch 多 `priority`（Chrome 的 h1 fetch 无、h2 有），Chrome h1 有 `Connection` 我方无——属 h1/h2 差异，需按 h2 基准判定。
 
 **为什么这可能重要**：HTTP 头的**顺序**是已知的客户端指纹向量，CF 的 **JA4H** 就包含它。此前 §10.13 只核过头的**取值**，从未核过顺序。已派修（要求先搭出可信的 **h2** 观测手段——因为经代理打 CF 走的是 h2，h1 的回显不能直接当基准——再按 Chrome 的 h2 行为对齐，且不得为排序引入每请求分配）。
+
+#### 354.35 `OjmeV1` 空串**结案**（第五次尝试命中）：Trusted Types 跨 realm brand + 解析重入 sink
+
+前一版的「detached 旧 body」假设**被证伪**——该 agent 把真实现场的 op 级 trace 挖出来（`ours/rt3/run/ops.tsv`，57k 行），探针真身是：
+
+```
+create_element html → set_inner_html 241 arg2='' → create head/body → 读 inner_html(body) → ''
+```
+
+即 **`document.implementation.createHTMLDocument()` 造空文档 → `documentElement.innerHTML = <TrustedHTML>` → 回读 `body.innerHTML`**。失败条件是 **realm 进入 Trusted Types 强制**（rch 页 CSP 里就有 `require-trusted-types-for 'script'`）。两个真缺陷：
+
+1. `DOMParser.parseFromString` 是 **JS 实现**，内部用 `root.innerHTML = html` 走**公开 sink**；TT 强制下该赋值抛错并被 `catch` 吞掉 ⇒ 解析结果为空文档。Chrome 的解析在引擎内部，**只有 `parseFromString` 的实参是 sink**。
+2. **Trusted Types brand 注册表是每 realm 一个 WeakMap，而 Chrome 的 brand 是 per-agent**（同一 renderer 内跨 realm 通用）⇒ 跨 realm 传来的 TrustedHTML 在 sink 上被判未授权而抛错 ⇒ 写入不落地。这正是 `createHTMLDocument()` 回读为空的机理。
+
+修复：拆出 `_parseMarkupFromString()`（引擎内部解析，不走 sink）；brand 注册表搬到 `Deno[Symbol.for('obscura.trustedTypesRegistry')]`（沿用 `eventStateRegistry`/`nativeFunctionRegistry` 的既有跨 realm 模式），按 **kind 字符串**判定而非每 realm 的构造器身份；同族的 `template.innerHTML` 与 `document.open()` 一并修。3 条新测试均验证过「关掉修复即失败」（用仓库外备份 + 就地开关，未用任何 git 写命令）。`obscura-js` **711/711**。
+
+**实弹兑现**（轮次 t1，二进制 `3e14b849`）：`OjmeV1` 的 **`[85]/[86]/[103]/[104]` 四个空串全部消失**。剩余 `[75]`（已确认噪声）、`[79]`、`[82]`（同一探针的"回读不等"布尔，**未随之翻转**，说明另有原因）、`[118]`（Chrome 数字 `611` / 我方 `[object Object]`，仍未定）。
+
+**方法论**：这是该项的**第五次**解释尝试，也是第一次**既有机制、又在实弹 payload 上兑现**的一次。前四次的教训一致：**先用仪器在注入链路里读出探针的真实 op 序列，再谈根因**。
