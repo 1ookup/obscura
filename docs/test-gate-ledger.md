@@ -7,6 +7,30 @@ run covers are then removed.
 
 ## Pending
 
+- 2026-09-24: commit `b4a1bf5` (js: gate the font-platform call in the
+  offscreen context test). Feature-gate adjacent: the guard restores the
+  `--no-default-features` shape. Verified instead of the full gate:
+  `cargo check -p obscura-js -p obscura-cli --no-default-features --config
+  vendor/v8-source.toml` (passes) and `cargo check --tests -p obscura-js
+  --no-default-features` (now compiles; failed with E0433 before). The
+  render-shape suites were green at `bfbf226`. Full gate still mandatory
+  before push.
+
+- 2026-09-24: commit `bfbf226` (js: cross-realm ops, worker canvas, media
+  capabilities, geometry branding). The geometry-branding hunks in that commit
+  -- getClientRects() entries are real DOMRect instances, DOMRectList /
+  DOMPoint / DOMQuad adopt Chrome's interface shape, visualViewport is a
+  VisualViewport instance -- ran scoped suites instead:
+  `cargo nextest run --release --features render --no-fail-fast -p
+  obscura-js -p obscura-browser -p obscura-cdp -p obscura-render --config
+  vendor/v8-source.toml` = **1627 run, 0 failed, 4 skipped**, plus
+  `-p obscura-dom` (no render feature) at 93/93; exact release build current
+  at `ac5b04146391768c`. Two obscura-js failures seen under parallel load are
+  pre-existing flakes (`timing_edits_preserve_identity_...`, already recorded
+  below, and `worker_canvas_subsystem_follows_the_creator_gpu_profile`); both
+  pass standalone and the suite re-ran 708/708. Deferred full gate plus the
+  obstacle course remain mandatory before any push or verdict claim.
+
 - 2026-09-24: commits `6b2acdc` (dom: attribute and text escaping match
   Chrome 153) + `a98a5ef` (js: every realm reports the browser window
   geometry) + `64f6e5a` (browser: frame isolation, storage quota, connection
