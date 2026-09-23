@@ -14384,3 +14384,17 @@ C4 = function (Y, …) { console.log("payloadJSON:", JSON.stringify(Y)); … }
 **未断言**：这条扇出**尚未证明**就是那些引导期常量的测量对象。已派修（缓存 + 失效键走一个只读 op，语义保真要求：动态增删/改 `<base href>` 后 `baseURI`/`location.href`/相对 URL 解析必须立即反映）。
 
 **另一条独立确定性值差**：条目 `[BMnw0+Ozfs8+UYbIv2+bzNje2+knVv1+xWWV8]` 中 Chrome **四轮一致** `UYbIv2 == Ozfs8 == "UGOeP6"`、`knVv1=7`（`hCfV6` 143），我方 `Ozfs8="WoUrS0"`、`knVv1=5`（`hCfV6` 1170）。同条目 `UYbIv2` 我们**与 Chrome 相同**，所以是"同一值的两个槽位有一个算错"，可能比计数器更容易定位。
+
+**批次 52 补充线索：`SbVZ3` 是结构性差（缺项，非值差）**
+
+`SbVZ3` 是一条按 token 平铺的报告（Chrome 90 项 / 我方 78 项），Chrome 稳定多出：
+
+| token | Chrome | 我方 |
+|---|---|---|
+| `lzDF4` | 2 | **0** |
+| `TBNgK7` | 2 | **0** |
+| `QLaZp6` | 4 | **0**（我方同位置是 `QqPF4`） |
+| `PhWMD5` | 20 | **18** |
+| `AecW7` | 20 | **18** |
+
+其余全部逐项一致（含开头 `TKyxg5/PhWMD5/AecW7/Qssv3/cnrU5/ODxGu4/mfiL4/21`）。⇒ 我方在这条报告里**少了 2 组记录**，且有一组用了不同的键名。形态是"少记了 2 次某类事件"，不是"某值算错"——与 §354.20 的 `aQgx8` 同属**结构/路径差**类，优先级应高于纯值差（结构差更容易被判为"客户端行为不同"）。
