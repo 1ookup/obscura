@@ -147,13 +147,29 @@ if (typeof OffscreenCanvas === 'undefined') {
     }
     getContext(type, attrs = undefined) {
       const state = _offscreenCanvasState.get(this);
-      type = String(type).toLowerCase();
-      if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-        // Chrome's OffscreenCanvas runs the same WebGL families as a canvas
-        // element: the context is cached per surface, the families are
-        // mutually exclusive, and the attributes of the first call are what
-        // getContextAttributes keeps reporting.
-        if (!globalThis.__obscura_webgl_enabled) return null;
+      // The argument is an OffscreenRenderingContextType enum, not the
+      // free-form string HTMLCanvasElement.getContext takes. WebIDL matches
+      // enum members case-sensitively, so `'WebGL'` and the legacy
+      // `'experimental-webgl'` alias the element still honours both raise a
+      // TypeError here instead of the null an unknown element context id
+      // gets. An absent argument is required-argument arity, which fails
+      // before the enum is read.
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'getContext' on 'OffscreenCanvas': "
+          + '1 argument required, but only 0 present.');
+      }
+      type = String(type);
+      if (type !== '2d' && type !== 'bitmaprenderer' && type !== 'webgl'
+          && type !== 'webgl2' && type !== 'webgpu') {
+        throw new TypeError(
+          'Failed to execute \'getContext\' on \'OffscreenCanvas\': The provided value \''
+          + type + '\' is not a valid enum value of type OffscreenRenderingContextType.');
+      }
+      if (type === 'webgl' || type === 'webgl2') {
+        // The context-creation dictionary is converted before the method body
+        // runs, so an invalid powerPreference rejects even a surface whose
+        // request would otherwise answer null. Chrome's OffscreenCanvas names
+        // the shared mixin, not the element's WebGLContextAttributes.
         const powerPreference = attrs && typeof attrs === 'object'
           ? attrs.powerPreference : undefined;
         if (powerPreference !== undefined && powerPreference !== 'default'
@@ -161,21 +177,39 @@ if (typeof OffscreenCanvas === 'undefined') {
             && powerPreference !== 'high-performance') {
           throw new TypeError(
             'Failed to execute \'getContext\' on \'OffscreenCanvas\': Failed to read '
-            + 'the \'powerPreference\' property from \'WebGLContextAttributes\': The '
+            + 'the \'powerPreference\' property from \'CanvasContextCreationAttributesModule\': The '
             + 'provided value \'' + powerPreference + '\' is not a valid enum value '
             + 'of type CanvasPowerPreference.');
         }
-        const family = type === 'webgl2' ? 'webgl2' : 'webgl';
-        if (state.contextType !== null && state.contextType !== family) return null;
+        // Chrome's OffscreenCanvas runs the same WebGL families as a canvas
+        // element: the context is cached per surface, the families are
+        // mutually exclusive, and the attributes of the first call are what
+        // getContextAttributes keeps reporting.
+        if (state.contextType !== null && state.contextType !== type) return null;
+        if (!globalThis.__obscura_webgl_enabled) return null;
         if (!state.context) {
-          state.context = family === 'webgl2'
+          state.context = type === 'webgl2'
             ? new globalThis.WebGL2RenderingContext(this, true, attrs)
             : new globalThis.WebGLRenderingContext(this, false, attrs);
-          state.contextType = family;
+          state.contextType = type;
+        }
+        return state.context;
+      }
+      if (type === 'webgpu') {
+        // navigator.gpu is [Exposed=(Window,Worker)], and the offscreen
+        // canvas offers the WebGPU family in a worker exactly as the element
+        // does in a document.
+        if (state.contextType !== null && state.contextType !== type) return null;
+        if (!globalThis.__obscura_webgl_enabled || !globalThis.GPUCanvasContext) return null;
+        if (!state.context) {
+          state.context = new globalThis.GPUCanvasContext(this);
+          state.contextType = type;
         }
         return state.context;
       }
       if (state.contextType !== null && state.contextType !== type) return null;
+      // `bitmaprenderer` is a recognised member this layer does not
+      // implement, so it answers the null a rejected family gets.
       if (type !== '2d') return null;
       if (!state.context) {
         state.context = new _Canvas2D(this, attrs);
@@ -189,15 +223,17 @@ if (typeof OffscreenCanvas === 'undefined') {
     }
     convertToBlob() {
       const state = _offscreenCanvasState.get(this);
-      if (!state.context) {
-        return Promise.reject(new DOMException(
-          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': 'OffscreenCanvas' has no rendering context.",
-          'InvalidStateError'));
-      }
+      // Chrome validates the size before the rendering context, so a
+      // zero-sized surface reports IndexSizeError even when it has none.
       if (state.width === 0 || state.height === 0) {
         return Promise.reject(new DOMException(
-          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The canvas has no pixels.",
+          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The size of the OffscreenCanvas is zero.",
           'IndexSizeError'));
+      }
+      if (!state.context) {
+        return Promise.reject(new DOMException(
+          "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The OffscreenCanvas has no rendering context.",
+          'InvalidStateError'));
       }
       if (!state.context._buf) {
         // A WebGL surface has no CPU-side 2D buffer to encode here; Chrome
@@ -210,6 +246,14 @@ if (typeof OffscreenCanvas === 'undefined') {
     }
     transferToImageBitmap() {
       const state = _offscreenCanvasState.get(this);
+      // A surface with no rendering context has no bitmap to hand over;
+      // Chrome raises InvalidStateError rather than minting a blank one.
+      if (!state.context) {
+        throw new DOMException(
+          "Failed to execute 'transferToImageBitmap' on 'OffscreenCanvas': "
+          + 'Cannot transfer an ImageBitmap from an OffscreenCanvas with no context',
+          'InvalidStateError');
+      }
       const context = state.context && state.context._buf
         ? state.context
         : this.getContext('2d');
@@ -298,7 +342,7 @@ if (typeof Range === 'undefined') {
     setStart(n,o){this.startContainer=n;this.startOffset=o;} setEnd(n,o){this.endContainer=n;this.endOffset=o;}
     collapse(){} selectNode(){} selectNodeContents(){} cloneContents(){return document?.createDocumentFragment();}
     deleteContents(){} insertNode(){} getBoundingClientRect(){return new DOMRect();}
-    getClientRects(){return new DOMRectList([]);} cloneRange(){return new Range();} toString(){return '';}
+    getClientRects(){return OBSCURA_DOM_RECT_LIST([]);} cloneRange(){return new Range();} toString(){return '';}
   };
 }
 

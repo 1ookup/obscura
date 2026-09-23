@@ -1375,25 +1375,6 @@ fn op_dom(
     result
 }
 
-/// The first `base[href]` element below `root` in tree order, which is the one
-/// the document base URL resolves against.
-///
-/// `query_selector_from` answers the same question but parses the selector and
-/// builds a matching context first, and `base[href]` is only a type selector
-/// plus an attribute presence test: the selector carries no namespace
-/// declaration, so it matches a `base` local name in any namespace, exactly
-/// like the walk here. `document.baseURI` is read on every relative URL
-/// resolution, so that saving is on the hot path.
-fn first_base_href(dom: &DomTree, root: NodeId) -> Option<NodeId> {
-    dom.descendants(root).into_iter().find(|id| {
-        dom.get_node(*id).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "base")
-                && node.get_attribute("href").is_some()
-        })
-    })
-}
-
 /// Can this connected mutation change which `<base>` element resolves the
 /// document base URL? The HTML base is the first base element in tree order
 /// carrying an href, so only subtree membership changes and href writes on a
@@ -1815,7 +1796,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     None => (String::new(), String::new()),
                 }
             };
-            let base = first_base_href(dom, NodeId::new(root))
+            let base = dom
+                .query_selector_from(NodeId::new(root), "base[href]")
+                .ok()
+                .flatten()
                 .and_then(|id| {
                     dom.get_node(id)
                         .and_then(|node| node.get_attribute("href").map(str::to_string))
@@ -7410,6 +7394,9 @@ fn worker_environment(
         origin,
         secure_context,
         cross_origin_isolated: creator_cross_origin_isolated,
+        // The GPU consistency profile is the creator realm's decision, the
+        // same one its own canvas and navigator.gpu answer from.
+        webgl_enabled: gs.webgl_enabled,
         document_csp: match worker_csp {
             Some(own) => (!own.is_empty()).then_some(own),
             None => {

@@ -5,7 +5,10 @@ globalThis.screenX = 0;
 globalThis.screenY = 0;
 globalThis.screenLeft = 0;
 globalThis.screenTop = 0;
-globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, [Symbol.toStringTag]: 'VisualViewport', addEventListener(){}, removeEventListener(){} }));
+// A real VisualViewport instance (env/dom/geometry-objects.js owns the
+// interface), not the plain object the boot surface used to publish: the
+// fields are prototype accessors and the value's own keys are empty.
+globalThis.visualViewport = OBSCURA_VISUAL_VIEWPORT_NEW();
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920;
 globalThis.innerHeight = 1000;

@@ -57,6 +57,16 @@ function _applyDocQueryEncoding(u) {
 // This realm's document, not the top-level one: `document_url` is the Rust
 // side's page URL, so links inside a frame resolved against the embedder.
 function _anchorBase() {
+  // The document base URL, which is what the HTML hyperlink and form-action
+  // members resolve against. A `<base href>` inserted or rewritten after
+  // parse moves them, and the document URL does not. Chrome 153 resolves
+  // <a href="sub/x"> to https://cdn.example/assets/sub/x once that base is
+  // in the head; reading `document_url` (the Rust side's page URL) or
+  // `location.href` (this realm's own URL) answered the page URL instead.
+  try {
+    const base = globalThis.document && globalThis.document.baseURI;
+    if (base) return base;
+  } catch (_e) {}
   return globalThis.location?.href || _domParse("document_url") || "about:blank";
 }
 function _elemHrefURL(el) {

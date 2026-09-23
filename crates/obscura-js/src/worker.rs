@@ -64,6 +64,13 @@ pub(crate) struct WorkerEnvironment {
     /// isolation, so a worker of an isolated page must report the same true
     /// the window realm reports (Step 300: the challenge probes both).
     pub cross_origin_isolated: bool,
+    /// Whether the creator realm runs the GPU consistency profile. WebGL and
+    /// WebGPU are context-level capabilities, not document-level ones: a
+    /// challenge that builds its probe inside a worker reads the same adapter
+    /// the page reads, so the worker realm has to answer the creator's
+    /// decision rather than re-deriving it (the worker runtime carries no
+    /// stealth flag of its own, and re-deriving would answer "no GPU").
+    pub webgl_enabled: bool,
     /// The enforced CSP of the document that created this worker. Worker
     /// fetches are governed by the creator document's `connect-src`; a frame
     /// worker must not silently fall back to the top-level page policy.
@@ -601,6 +608,7 @@ fn worker_thread_main(
             let worker_origin = std::mem::take(&mut environment.origin);
             let worker_secure = environment.secure_context;
             let worker_isolated = environment.cross_origin_isolated;
+            let worker_webgl = environment.webgl_enabled;
             let worker_csp = environment.document_csp.take();
             let worker_shared = environment.shared;
             let trace_label = environment.trace_label.clone();
@@ -647,6 +655,9 @@ fn worker_thread_main(
                 // Every realm of an isolated page reports the same decision,
                 // the worker realm included.
                 gs.cross_origin_isolated = worker_isolated;
+                // A nested worker inherits this runtime's state, so the profile
+                // decision has to live here too, not only in the prep script.
+                gs.webgl_enabled = worker_webgl;
                 gs.document_csp = worker_csp;
                 gs.cookie_jar = environment.cookie_jar;
                 gs.http_client = worker_http_client;
@@ -682,7 +693,8 @@ fn worker_thread_main(
                     &worker_name,
                     &worker_origin,
                     worker_secure,
-                    environment.cross_origin_isolated,
+                    worker_isolated,
+                    worker_webgl,
                     worker_shared,
                     crate::tracelog::enabled(),
                 ),
@@ -859,6 +871,7 @@ fn worker_prep_script(
     origin: &str,
     secure: bool,
     isolated: bool,
+    webgl_enabled: bool,
     shared: bool,
     tracelog: bool,
 ) -> String {
@@ -871,6 +884,10 @@ fn worker_prep_script(
         .replace(
             "__OBSCURA_WORKER_ISOLATED__",
             if isolated { "true" } else { "false" },
+        )
+        .replace(
+            "__OBSCURA_WEBGL_ENABLED__",
+            if webgl_enabled { "true" } else { "false" },
         )
         .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
         .replace("__OBSCURA_TRACELOG__", if tracelog { "true" } else { "false" })
@@ -897,6 +914,15 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       value: true, writable: false, enumerable: false, configurable: false,
     });
   } catch (e) { G.__obscuraIsWorker = true; }
+  // The GPU consistency profile is a browser-context capability, not a
+  // document one: the page's `navigator.gpu` and its canvas WebGL families
+  // answer from it, and a worker of that page answers the same machine. The
+  // worker runtime is seeded from the page snapshot and carries no stealth
+  // flag of its own, so the creator's decision is re-applied here. Without
+  // it OffscreenCanvas.getContext('webgl2') answers null in every worker
+  // while the page proves the GPU exists -- a tell no browser produces, and
+  // the one the challenge's worker-side probe reads.
+  try { G.__obscura_webgl_enabled = __OBSCURA_WEBGL_ENABLED__; } catch (e) {}
   var getOwnPropertyNames = Object.getOwnPropertyNames;
   // A worker's performance clock counts from the worker's own creation, like
   // Chrome's worker time origin. The startup snapshot otherwise leaves the
@@ -976,6 +1002,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     // Observers scoped to layout/DOM
     'MutationObserver', 'MutationRecord', 'IntersectionObserver',
     'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry',
+    // CanvasRenderingContext2D is [Exposed=Window]; a worker's canvas context
+    // is the offscreen interface, and `typeof CanvasRenderingContext2D` alone
+    // separates the two scopes in every browser.
+    'CanvasRenderingContext2D',
     // CSSOM
     'CSS', 'CSSStyleDeclaration', 'CSSStyleSheet', 'CSSRule', 'CSSRuleList',
     'StyleSheet', 'StyleSheetList', 'MediaQueryList', 'getComputedStyle',
@@ -1162,14 +1192,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     // NavigatorLanguage, NavigatorOnLine, NavigatorConcurrentHardware,
     // NavigatorDeviceMemory, NavigatorStorage, NavigatorLocks,
     // NavigatorPermissions, NavigatorBeacon, plus userAgentData/connection/
-    // serviceWorker/mediaCapabilities.
+    // serviceWorker/mediaCapabilities/gpu.
     var NAV_ALLOW = [
       'appCodeName', 'appName', 'appVersion', 'platform', 'product',
       'productSub', 'userAgent', 'vendor', 'vendorSub',
       'language', 'languages', 'onLine',
       'hardwareConcurrency', 'deviceMemory',
       'userAgentData', 'connection', 'locks', 'permissions',
-      'mediaCapabilities', 'serviceWorker', 'sendBeacon',
+      'mediaCapabilities', 'serviceWorker', 'sendBeacon', 'gpu',
     ];
     for (var n = 0; n < NAV_ALLOW.length; n++) {
       var prop = NAV_ALLOW[n];
@@ -1793,6 +1823,17 @@ mod tests {
         rt
     }
 
+    /// A secure-context page runtime. `navigator.gpu` is [SecureContext] in a
+    /// browser, so a probe that reads it has to be served from an https origin
+    /// to mean anything.
+    fn secure_page_runtime() -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/app/index.html");
+        rt.run_page_init();
+        rt
+    }
+
     /// Pump the page event loop until `expr` evaluates to `expected`. Worker
     /// round trips cross a real OS thread, so delivery needs wall-clock time;
     /// each pump drains resolved worker-recv ops and their microtasks.
@@ -2188,6 +2229,183 @@ mod tests {
         assert_eq!(
             got,
             serde_json::json!(r#"{"isolated":false,"type":"boolean"}"#),
+        );
+    }
+
+    /// The canvas subsystem is a browser-context capability, not a document
+    /// one. A worker of a page that runs the GPU consistency profile answers
+    /// the same machine the page answers: OffscreenCanvas.getContext('webgl2')
+    /// returns a usable WebGL2 context, navigator.gpu reaches an adapter, and
+    /// the context attributes are the ones the page reports. Before the
+    /// creator's decision was carried across, every worker answered null for
+    /// both while the page answered a context -- a cross-realm contradiction
+    /// no browser produces, and the probe the challenge runs inside its
+    /// worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_canvas_subsystem_follows_the_creator_gpu_profile() {
+        let mut rt = secure_page_runtime();
+        rt.set_stealth(true);
+        rt.execute_script(
+            "<test>",
+            r#"
+            function probe() {
+              const out = {};
+              // [Exposed=Window]; the worker's canvas context is the offscreen
+              // interface, so this is undefined on the other side.
+              out.canvasCtor = typeof CanvasRenderingContext2D;
+              out.offscreenTag = Object.prototype.toString.call(new OffscreenCanvas(1, 1));
+              out.gpuAdapter = typeof (navigator.gpu && navigator.gpu.requestAdapter);
+              const canvas = new OffscreenCanvas(4, 4);
+              const gl = canvas.getContext('webgl2', { powerPreference: 'low-power' });
+              out.isWebGL2 = gl instanceof WebGL2RenderingContext;
+              out.attrs = gl.getContextAttributes();
+              out.version = gl.getParameter(0x1F02);
+              out.renderer = (function () {
+                const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null;
+              })();
+              out.program = (function () {
+                const shader = gl.createShader(0x8B31);
+                gl.shaderSource(shader, 'void main(){}');
+                gl.compileShader(shader);
+                const program = gl.createProgram();
+                gl.attachShader(program, shader);
+                gl.linkProgram(program);
+                return gl.getProgramParameter(program, 0x8B82);
+              })();
+              out.familyExclusive = canvas.getContext('2d') === null;
+              const pixels = new Uint8Array(16);
+              gl.readPixels(0, 0, 2, 2, 0x1908, 0x1401, pixels);
+              out.readback = [pixels.length, pixels[3]];
+              const twoD = new OffscreenCanvas(8, 8);
+              const context = twoD.getContext('2d');
+              context.fillStyle = '#3366ff';
+              context.fillRect(2, 2, 3, 3);
+              out.painted = Array.from(context.getImageData(3, 3, 1, 1).data);
+              // OffscreenCanvas.getContext is the OffscreenRenderingContextType
+              // enum, which the legacy element-only alias is not a member of.
+              let legacyAlias = null;
+              try { new OffscreenCanvas(1, 1).getContext('experimental-webgl'); }
+              catch (error) { legacyAlias = error.name; }
+              out.legacyAlias = legacyAlias;
+              return out;
+            }
+            const src = 'postMessage((' + probe.toString() + ')());';
+            const url = URL.createObjectURL(new Blob([src], {type: 'text/javascript'}));
+            globalThis.__got = [];
+            globalThis.__page = (function () {
+              const gl = new OffscreenCanvas(4, 4)
+                .getContext('webgl2', { powerPreference: 'low-power' });
+              const ext = gl.getExtension('WEBGL_debug_renderer_info');
+              return {
+                attrs: gl.getContextAttributes(),
+                version: gl.getParameter(0x1F02),
+                renderer: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null,
+              };
+            })();
+            const worker = new Worker(url);
+            worker.onmessage = (event) => { globalThis.__got.push(event.data); };
+            // A worker whose probe throws (a null context dereference, the
+            // shape this test exists to catch) has to be reported as a value
+            // the assertions below can read, not as a silent timeout.
+            worker.onerror = (event) => {
+              globalThis.__got.push({ workerError: String(event.message || event) });
+            };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("__got[0].canvasCtor").unwrap(),
+            serde_json::json!("undefined"),
+        );
+        assert_eq!(
+            rt.evaluate("__got[0].offscreenTag").unwrap(),
+            serde_json::json!("[object OffscreenCanvas]"),
+        );
+        assert_eq!(
+            rt.evaluate("__got[0].gpuAdapter").unwrap(),
+            serde_json::json!("function"),
+        );
+        assert_eq!(rt.evaluate("__got[0].isWebGL2").unwrap(), serde_json::json!(true));
+        assert_eq!(
+            rt.evaluate("__got[0].familyExclusive").unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(rt.evaluate("__got[0].program").unwrap(), serde_json::json!(true));
+        // A real render-to-read-back loop, not just a non-null handle: the 2D
+        // surface rasterizes fillRect and reads the pixel back, and the WebGL
+        // surface hands back a full pixel buffer.
+        assert_eq!(
+            rt.evaluate("__got[0].painted").unwrap(),
+            serde_json::json!([0x33, 0x66, 0xff, 0xff]),
+        );
+        assert_eq!(
+            rt.evaluate("__got[0].readback").unwrap(),
+            serde_json::json!([16, 255]),
+        );
+        assert_eq!(
+            rt.evaluate("__got[0].legacyAlias").unwrap(),
+            serde_json::json!("TypeError"),
+        );
+        // One browser context cannot describe two machines: every field here
+        // is read from the same decision on both sides of the realm boundary.
+        assert_eq!(
+            rt.evaluate(
+                "JSON.stringify(__got[0].attrs) === JSON.stringify(__page.attrs)"
+            )
+            .unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            rt.evaluate("__got[0].attrs.powerPreference").unwrap(),
+            serde_json::json!("low-power"),
+        );
+        assert_eq!(
+            rt.evaluate("[__got[0].version, __got[0].renderer]").unwrap(),
+            rt.evaluate("[__page.version, __page.renderer]").unwrap(),
+        );
+    }
+
+    /// The other direction: with no GPU profile the worker stays truthful --
+    /// no context, no adapter -- exactly like its own page. Carrying the
+    /// creator's decision must not turn into "always say yes".
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_without_the_gpu_profile_answers_null_like_its_page() {
+        let mut rt = secure_page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "postMessage({" +
+              "flag: globalThis.__obscura_webgl_enabled," +
+              "webgl: new OffscreenCanvas(1, 1).getContext('webgl') === null," +
+              "webgl2: new OffscreenCanvas(1, 1).getContext('webgl2') === null," +
+              "gpu: typeof navigator.gpu });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (event) => { globalThis.__got.push(event.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(
+                r#"{"flag":false,"webgl":true,"webgl2":true,"gpu":"object"}"#
+            ),
+        );
+        // Both realms agree on what the browser has: no context, no adapter.
+        assert_eq!(
+            rt.evaluate("typeof navigator.gpu").unwrap(),
+            rt.evaluate("__got[0].gpu").unwrap(),
+        );
+        assert_eq!(
+            rt.evaluate("__obscura_webgl_enabled").unwrap(),
+            serde_json::json!(false),
+        );
+        assert_eq!(
+            rt.evaluate("new OffscreenCanvas(1, 1).getContext('webgl')").unwrap(),
+            serde_json::json!(null),
         );
     }
 

@@ -1399,8 +1399,11 @@ var Element = _swappableInterface('Element', class extends Node {
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
     // A native content document gets the stable WindowProxy regardless of
-    // origin; per-property access checks live on the proxy itself.
-    if (_frameContentState(this[_nidSym]).root >= 0) {
+    // origin; per-property access checks live on the proxy itself. Only the
+    // root is needed here -- the same-origin verdict costs an origin compare
+    // in the engine and every read of a *property* on the result re-checks it
+    // through the proxy trap -- so this stays on the root-only op.
+    if (+_dom("iframe_content_document_root", this[_nidSym]) >= 0) {
       return _frameWindowProxyFor(this);
     }
     return null;
@@ -1874,19 +1877,19 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   getClientRects() {
     const geometry = this._renderBoxGeometry();
-    if (geometry === null) return new DOMRectList([]);
+    if (geometry === null) return OBSCURA_DOM_RECT_LIST([]);
     if (geometry !== undefined) {
       if (Array.isArray(geometry.clientRects)) {
-        return new DOMRectList(geometry.clientRects.map(
+        return OBSCURA_DOM_RECT_LIST(geometry.clientRects.map(
           rect => this._rectFromRenderGeometry({
             ...rect,
             viewportFixed: geometry.viewportFixed,
           })
         ));
       }
-      return new DOMRectList([this._rectFromRenderGeometry(geometry)]);
+      return OBSCURA_DOM_RECT_LIST([this._rectFromRenderGeometry(geometry)]);
     }
-    return new DOMRectList([this.getBoundingClientRect()]);
+    return OBSCURA_DOM_RECT_LIST([this.getBoundingClientRect()]);
   }
   // No layout engine: a stub that always returns true unblocks Playwright's
   // actionability polling. With a real layout we'd check display, visibility,

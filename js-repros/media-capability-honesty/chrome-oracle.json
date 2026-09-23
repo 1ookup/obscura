@@ -86,7 +86,7 @@
   "decodingInfo": {
     "supported": true,
     "smooth": true,
-    "powerEfficient": false
+    "powerEfficient": true
   },
   "mediaSource": "function",
   "msSupported": true

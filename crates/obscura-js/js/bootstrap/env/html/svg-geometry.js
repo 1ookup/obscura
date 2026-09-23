@@ -372,7 +372,7 @@
     const root = _svgRootOf(this);
     if (!root || root === this) return _layoutGCRs.apply(this, arguments);
     const r = this.getBoundingClientRect();
-    return new DOMRectList([new DOMRect(r.x, r.y, r.width, r.height)]);
+    return OBSCURA_DOM_RECT_LIST([new DOMRect(r.x, r.y, r.width, r.height)]);
   };
 
   // getBBox gains the container union and the x/y-attribute placement while
@@ -900,36 +900,91 @@
 // Geometry producers hand back plain records, so `Object.prototype.toString`
 // on a rect reads `[object Object]` where a browser reads `[object DOMRect]`,
 // and `rect instanceof DOMRect` is false. The tag alone does not help: the
-// value has to actually be an instance. Re-wrap the producer instead of
+// value has to actually be an instance. Re-wrap the producers instead of
 // rewriting the layout path.
+//
+// getClientRects() needs the same treatment as getBoundingClientRect(): it
+// hands back a branded DOMRectList whose *entries* are the raw layout records,
+// so `el.getClientRects()[0]` -- and the identical `item(0)` -- read as plain
+// objects with nine own enumerable keys where Chrome answers an empty DOMRect.
+// Both methods are wrapped here because this is the one place that already
+// owns the viewport-fixed marker transfer.
 (function _brandGeometryResults() {
   if (typeof DOMRect !== 'function' || typeof _markNative !== 'function') return;
-  const descriptor = Object.getOwnPropertyDescriptor(
+  // Chrome's layout engine clamps every box at LayoutUnit's maximum; a
+  // magnitude no browser can produce (an overflowing authored width that
+  // reached layout) is a renderer fingerprint.
+  const clampBox = (v) => (!Number.isFinite(v) || Math.abs(v) > 33554430) ? 33554430 : v;
+  const brandRect = (result) => {
+    if (result == null || typeof result.x !== 'number'
+        || typeof result.width !== 'number') return result;
+    if (result instanceof DOMRect) return result;
+    const branded = new DOMRect(
+      clampBox(result.x), clampBox(result.y), clampBox(result.width), clampBox(result.height));
+    // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
+    // and skips the scroll for it. The branded value has to carry that
+    // marker, or a fixed subtree starts moving the document. The marker
+    // lives in a WeakSet: Chrome's rects carry no own properties, and an
+    // own flag here would hand the own-key census a name.
+    if (result.__obscuraViewportFixed) OBSCURA_VIEWPORT_FIXED_RECTS.add(branded);
+    return branded;
+  };
+  // Chrome's DOMRectList indexed properties are not writable, so a list whose
+  // entries need branding has to be rebuilt rather than patched in place. A
+  // list that is already branded (Range.getClientRects, the SVG fragment
+  // producer) is returned unchanged.
+  const brandRectList = (list) => {
+    if (list == null || typeof list.length !== 'number') return list;
+    const count = list.length | 0;
+    let rebuilt = null;
+    for (let i = 0; i < count; i++) {
+      const entry = brandRect(list[i]);
+      if (rebuilt) rebuilt.push(entry);
+      else if (entry !== list[i]) {
+        rebuilt = [];
+        for (let j = 0; j < i; j++) rebuilt.push(list[j]);
+        rebuilt.push(entry);
+      }
+    }
+    return rebuilt ? OBSCURA_DOM_RECT_LIST(rebuilt) : list;
+  };
+  // Method shorthand, not a function expression: Chrome's DOM methods own
+  // exactly "length,name" (no "prototype"), and the sweep that renames
+  // anonymous slots is not reached in every realm.
+  const geometryWrappers = {
+    getBoundingClientRect() { return brandRect(callGBCR.apply(this, arguments)); },
+    getClientRects() { return brandRectList(callGCR.apply(this, arguments)); },
+  };
+  const gbcrDescriptor = Object.getOwnPropertyDescriptor(
     Element.prototype, 'getBoundingClientRect');
-  if (!descriptor || typeof descriptor.value !== 'function') return;
-  const call = descriptor.value;
-  try {
-    Object.defineProperty(Element.prototype, 'getBoundingClientRect', {
-      value: _markNative(function () {
-        const result = call.apply(this, arguments);
-        if (result == null || typeof result.x !== 'number'
-            || typeof result.width !== 'number') return result;
-        if (result instanceof DOMRect) return result;
-        // Chrome's layout engine clamps every box at LayoutUnit's maximum;
-        // a magnitude no browser can produce (an overflowing authored width
-        // that reached layout) is a renderer fingerprint.
-        const clampBox = (v) => (!Number.isFinite(v) || Math.abs(v) > 33554430) ? 33554430 : v;
-        const branded = new DOMRect(
-          clampBox(result.x), clampBox(result.y), clampBox(result.width), clampBox(result.height));
-        // `scrollIntoView` marks a viewport-fixed box on the rect it reads back
-        // and skips the scroll for it. The branded value has to carry that
-        // marker, or a fixed subtree starts moving the document. The marker
-        // lives in a WeakSet: Chrome's rects carry no own properties, and an
-        // own flag here would hand the own-key census a name.
-        if (result.__obscuraViewportFixed) OBSCURA_VIEWPORT_FIXED_RECTS.add(branded);
-        return branded;
-      }),
-      writable: true, enumerable: false, configurable: true,
-    });
-  } catch (e) {}
+  const gcrDescriptor = Object.getOwnPropertyDescriptor(
+    Element.prototype, 'getClientRects');
+  const callGBCR = gbcrDescriptor && typeof gbcrDescriptor.value === 'function'
+    ? gbcrDescriptor.value : null;
+  const callGCR = gcrDescriptor && typeof gcrDescriptor.value === 'function'
+    ? gcrDescriptor.value : null;
+  for (const name of ['getBoundingClientRect', 'getClientRects']) {
+    const call = name === 'getBoundingClientRect' ? callGBCR : callGCR;
+    if (!call) continue;
+    try {
+      Object.defineProperty(Element.prototype, name, {
+        value: _markNative(geometryWrappers[name]),
+        writable: true, enumerable: false, configurable: true,
+      });
+    } catch (e) {}
+  }
+  // The SVG fragment override is published onto SVGGraphicsElement.prototype
+  // as an own method (see _publishSvgMethod above), which means it holds the
+  // pre-wrap function object: without this re-point an SVG element's
+  // getClientRects bypasses the wrapper entirely.
+  const graphicsProto = globalThis.SVGGraphicsElement && globalThis.SVGGraphicsElement.prototype;
+  if (graphicsProto
+      && Object.prototype.hasOwnProperty.call(graphicsProto, 'getClientRects')) {
+    try {
+      Object.defineProperty(graphicsProto, 'getClientRects', {
+        value: Element.prototype.getClientRects,
+        writable: true, enumerable: false, configurable: true,
+      });
+    } catch (e) {}
+  }
 })();

@@ -3,6 +3,22 @@
 Obscura decodes no audio or video, and still does not. What this fixture covers
 is what it *declares*, which was both wrong and self-contradictory:
 
+> **`powerEfficient` depends on the GPU, not on the engine.** Both answers below
+> are real Chrome 153 on the same machine; only `--disable-gpu` separates them.
+> The baseline is the GPU-enabled one, because that is the Chrome the
+> Cloudflare challenge is compared against.
+>
+> | capture | H.264 / HEVC / VP9, all audio | AV1, VP8 |
+> |---|---|---|
+> | `--disable-gpu` (what the old fixture recorded) | `false` | `false` |
+> | GPU enabled (the baseline, what `chrome-oracle.json` now records) | `true` | `false` |
+>
+> `capture-chrome.mjs` spawns Chrome with `--disable-gpu`, which is what
+> produced the old `false` for H.264. Drop that flag to reproduce the recorded
+> answer. Obscura follows the declared GPU profile: the Apple/Metal identity
+> (the macOS default, and the Cloudflare fingerprint) reports hardware
+> decoding, the D3D11 identity reports software.
+
 - `canPlayType` answered `""` for every type, including `video/mp4`. No Chrome
   build produces that, and it pushes sites into their "your browser cannot play
   video" path.
@@ -40,8 +56,12 @@ Declared (now matching Chrome):
 - `canPlayType`: `maybe` for a known container, `probably` when the codecs are
   also known, `""` otherwise — including `video/ogg; codecs="theora"` and
   `video/quicktime`, which Chrome also refuses.
-- `decodingInfo` / `encodingInfo`: use MediaCapabilities format rules and keep
-  `powerEfficient` false because Obscura has no hardware decoder.
+- `decodingInfo` / `encodingInfo`: use MediaCapabilities format rules, and
+  reject a configuration Chrome cannot read with the same `TypeError` Chrome
+  raises (a bad `type`, a missing required member such as `bitrate`, or a
+  dictionary naming neither `video` nor `audio`). `powerEfficient` follows the
+  declared GPU profile: the Apple/Metal identity hardware-decodes everything
+  supported except AV1 and VP8, the D3D11 identity reports software.
 - `MediaSource.isTypeSupported`: uses MediaSource's stricter container/codec
   combinations. Chrome itself intentionally disagrees with `canPlayType` for
   formats such as Ogg, so sharing one table would be incorrect.

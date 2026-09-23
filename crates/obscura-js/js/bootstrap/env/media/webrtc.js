@@ -39,7 +39,7 @@ const _RTC_SDP_SECTIONS = {
   },
   video: {
     head: [
-      "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 35 36 37 38 103 104 107 108 109 114 115 116 117 118 39 40 41 42 43 44 45 46 47 48 49 50 51 52 119 120 121 53",
+      "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 35 36 37 38 103 104 107 108 109 114 115 116 117 118 39 40 41 42 43 44 45 46 47 48 122 123 124 125 49 50 51 52 119 120 121 53",
       "c=IN IP4 0.0.0.0",
       "a=rtcp:9 IN IP4 0.0.0.0",
     ],
@@ -193,6 +193,28 @@ const _RTC_SDP_SECTIONS = {
       "a=fmtp:47 level-idx=5;profile=1;tier=0",
       "a=rtpmap:48 rtx/90000",
       "a=fmtp:48 apt=47",
+      // High profile (64001f) H264. Chrome offers it after AV1 and before
+      // H265, and RTCRtpSender.getCapabilities('video') lists the two
+      // packetization modes in the same place. Without them the capability
+      // view is two codecs short of a real Chrome.
+      "a=rtpmap:122 H264/90000",
+      "a=rtcp-fb:122 goog-remb",
+      "a=rtcp-fb:122 transport-cc",
+      "a=rtcp-fb:122 ccm fir",
+      "a=rtcp-fb:122 nack",
+      "a=rtcp-fb:122 nack pli",
+      "a=fmtp:122 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f",
+      "a=rtpmap:123 rtx/90000",
+      "a=fmtp:123 apt=122",
+      "a=rtpmap:124 H264/90000",
+      "a=rtcp-fb:124 goog-remb",
+      "a=rtcp-fb:124 transport-cc",
+      "a=rtcp-fb:124 ccm fir",
+      "a=rtcp-fb:124 nack",
+      "a=rtcp-fb:124 nack pli",
+      "a=fmtp:124 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=64001f",
+      "a=rtpmap:125 rtx/90000",
+      "a=fmtp:125 apt=124",
       "a=rtpmap:49 H265/90000",
       "a=rtcp-fb:49 goog-remb",
       "a=rtcp-fb:49 transport-cc",

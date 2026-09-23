@@ -200,8 +200,8 @@ globalThis.Range = class Range {
     return new DOMRect();
   }
   getClientRects() {
-    if (this.collapsed) return new DOMRectList([]);
-    return new DOMRectList([this.getBoundingClientRect()]);
+    if (this.collapsed) return OBSCURA_DOM_RECT_LIST([]);
+    return OBSCURA_DOM_RECT_LIST([this.getBoundingClientRect()]);
   }
   static get START_TO_START() { return 0; }
   static get START_TO_END() { return 1; }

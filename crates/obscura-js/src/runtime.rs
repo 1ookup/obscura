@@ -1311,13 +1311,13 @@ impl ObscuraJsRuntime {
         let _ = self.runtime.execute_script(
             "<set-viewport>",
             format!(
+                // visualViewport.width/height derive from innerWidth/innerHeight
+                // through their prototype accessors, so the window metrics
+                // below are the whole update; assigning to them would be a
+                // silent no-op (Chrome's IDL has no setter either).
                 "globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
-                 if(globalThis.visualViewport){{\
-                   globalThis.visualViewport.width={width};\
-                   globalThis.visualViewport.height={height};\
-                 }}\
                  if(typeof globalThis.__obscura_recompute_intersections==='function'){{\
                    globalThis.__obscura_recompute_intersections();\
                  }}\
@@ -6320,7 +6320,7 @@ mod tests {
                 "frameCallbackHandle": "number",
                 "decodingSupported": true,
                 "decodingSmooth": true,
-                "decodingPowerEfficient": false,
+                "decodingPowerEfficient": true,
                 "decodingBogus": false,
                 "decodingOgg": true,
                 "decodingKeys": [
@@ -7052,7 +7052,13 @@ mod tests {
                     try { new OffscreenCanvas(4, 4).getContext('webgl', {powerPreference: 'banana'}); }
                     catch (error) { invalidEnum = error.name; }
                     const aliased = new OffscreenCanvas(4, 4);
-                    const webgl = aliased.getContext('experimental-webgl', {powerPreference: 'low-power'});
+                    // The element's free-form string takes the legacy alias;
+                    // the offscreen enum does not (Chrome 153 raises TypeError
+                    // for the same call on an OffscreenCanvas).
+                    let legacyAlias = null;
+                    try { aliased.getContext('experimental-webgl'); }
+                    catch (error) { legacyAlias = error.name; }
+                    const webgl = aliased.getContext('webgl', {powerPreference: 'low-power'});
                     const aliasedAgain = aliased.getContext('webgl');
                     return [
                         gl1 instanceof WebGL2RenderingContext,
@@ -7060,6 +7066,7 @@ mod tests {
                         wrongFamily === null,
                         attrs.powerPreference,
                         invalidEnum,
+                        legacyAlias,
                         webgl instanceof WebGLRenderingContext,
                         webgl === aliasedAgain,
                         aliasedAgain.getContextAttributes().powerPreference,
@@ -7070,7 +7077,130 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                true, true, true, "low-power", "TypeError", true, true, "low-power"
+                true, true, true, "low-power", "TypeError", "TypeError",
+                true, true, "low-power"
+            ])
+        );
+    }
+
+    /// `OffscreenCanvas.getContext` takes an OffscreenRenderingContextType
+    /// enum, which the free-form `HTMLCanvasElement` string is not: the
+    /// members match case-sensitively, an absent argument is required-argument
+    /// arity, and the legacy `experimental-webgl` alias -- which the element
+    /// still honours -- is not a member at all. All three were Chrome 153
+    /// readings taken against the offscreen interface in a document and in a
+    /// worker, where the answers are identical.
+    #[test]
+    fn offscreen_canvas_get_context_takes_the_rendering_context_type_enum() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const read = (fn) => {
+                        try {
+                            const value = fn();
+                            if (value === null) return 'null';
+                            return Object.prototype.toString.call(value);
+                        } catch (error) { return error.name; }
+                    };
+                    const element = (id) => read(() =>
+                        document.createElement('canvas').getContext(id));
+                    const offscreen = (id) => read(() =>
+                        new OffscreenCanvas(2, 2).getContext(id));
+                    return {
+                        noArgument: read(() => new OffscreenCanvas(2, 2).getContext()),
+                        undefinedArgument: offscreen(undefined),
+                        nullArgument: offscreen(null),
+                        upperCaseWebgl: offscreen('WebGL'),
+                        upperCaseWebgl2: offscreen('WebGL2'),
+                        experimental: offscreen('experimental-webgl'),
+                        unknown: offscreen('3d'),
+                        empty: offscreen(''),
+                        numeric: offscreen(2),
+                        elementExperimental: element('experimental-webgl'),
+                        elementUpperCase: element('WEBGL'),
+                        elementUnknown: element('3d'),
+                        valid: ['2d', 'webgl', 'webgl2', 'webgpu']
+                            .map((id) => offscreen(id)),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "noArgument": "TypeError",
+                "undefinedArgument": "TypeError",
+                "nullArgument": "TypeError",
+                "upperCaseWebgl": "TypeError",
+                "upperCaseWebgl2": "TypeError",
+                "experimental": "TypeError",
+                "unknown": "TypeError",
+                "empty": "TypeError",
+                "numeric": "TypeError",
+                // The element's own string behaviour is unchanged: it lowercases
+                // and answers null for ids it does not know.
+                "elementExperimental": "[object WebGLRenderingContext]",
+                "elementUpperCase": "null",
+                "elementUnknown": "null",
+                "valid": [
+                    "[object OffscreenCanvasRenderingContext2D]",
+                    "[object WebGLRenderingContext]",
+                    "[object WebGL2RenderingContext]",
+                    "[object GPUCanvasContext]",
+                ],
+            })
+        );
+    }
+
+    /// The export pair validates the same way Chrome does: the size is checked
+    /// before the rendering context, transferToImageBitmap refuses a surface
+    /// that has no context rather than minting a blank bitmap, and both
+    /// messages name the interface the way Chrome 153 does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn offscreen_canvas_export_errors_name_the_offscreen_interface() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const sync = (fn) => {
+                        try { fn(); return 'no throw'; }
+                        catch (error) { return error.name + ': ' + error.message; }
+                    };
+                    const read = async (promise) => {
+                        try { await promise; return 'no throw'; }
+                        catch (error) { return error.name + ': ' + error.message; }
+                    };
+                    const zero = new OffscreenCanvas(0, 0);
+                    zero.getContext('2d');
+                    const painted = new OffscreenCanvas(4, 4);
+                    painted.getContext('2d');
+                    return [
+                        sync(() => new OffscreenCanvas(2, 2).transferToImageBitmap()),
+                        sync(() => painted.transferToImageBitmap()),
+                        await read(new OffscreenCanvas(4, 4).convertToBlob()),
+                        await read(zero.convertToBlob()),
+                        // Chrome validates the size before the context.
+                        await read(new OffscreenCanvas(0, 0).convertToBlob()),
+                    ];
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                "InvalidStateError: Failed to execute 'transferToImageBitmap' on 'OffscreenCanvas': Cannot transfer an ImageBitmap from an OffscreenCanvas with no context",
+                "no throw",
+                "InvalidStateError: Failed to execute 'convertToBlob' on 'OffscreenCanvas': The OffscreenCanvas has no rendering context.",
+                "IndexSizeError: Failed to execute 'convertToBlob' on 'OffscreenCanvas': The size of the OffscreenCanvas is zero.",
+                "IndexSizeError: Failed to execute 'convertToBlob' on 'OffscreenCanvas': The size of the OffscreenCanvas is zero.",
             ])
         );
     }
@@ -8184,6 +8314,149 @@ mod tests {
         rt.set_content_security_policy(Some("default-src 'none'; base-uri 'self'"));
         let result = rt.evaluate("document.baseURI").unwrap();
         assert_eq!(result, serde_json::json!("https://app.example/index.html"));
+    }
+
+    /// The four dynamic `<base>` transitions, in the order a page performs
+    /// them, read through every author-visible surface that resolves against
+    /// the document base URL.
+    ///
+    /// `document.baseURI` now reaches the engine through one read-only
+    /// `document_base_info` call instead of `document_scope_info` plus
+    /// `query_selector_scoped` and `get_attribute`. A cache keyed on anything
+    /// weaker than "which `base[href]` is first in tree order and what its
+    /// href says" passes the first assertion and fails the rest, so this is
+    /// the test that keeps the single call a live read.
+    const DYNAMIC_BASE_SEQUENCE: &str = r#"(() => {
+        const link = document.createElement('a');
+        link.setAttribute('href', 'sub/x');
+        document.body.appendChild(link);
+        const read = () => [document.baseURI, link.baseURI, link.href,
+                            new URL('sub/x', document.baseURI).href, location.href];
+        const out = { initial: read() };
+        const base = document.createElement('base');
+        document.head.appendChild(base);
+        out.hrefLess = read();
+        base.setAttribute('href', 'https://cdn.example/assets/');
+        out.added = read();
+        base.setAttribute('href', 'https://cdn2.example/lib/');
+        out.changed = read();
+        base.removeAttribute('href');
+        out.hrefRemoved = read();
+        base.setAttribute('href', 'https://cdn2.example/lib/');
+        const first = document.createElement('base');
+        first.setAttribute('href', 'https://first.example/');
+        document.head.insertBefore(first, base);
+        out.reinserted = read();
+        document.head.removeChild(first);
+        out.firstRemoved = read();
+        document.head.removeChild(base);
+        out.allRemoved = read();
+        return out;
+    })()"#;
+
+    /// Build the `{phase: [baseURI, elementBaseURI, anchorHref, URL-resolved, locationHref]}`
+    /// map the sequence returns. `docUrl` is the document URL the realm starts
+    /// on and `phaseBase` the base in effect for that phase; every `<base>`
+    /// value used below ends in "/", so `phaseBase + "sub/x"` is the WHATWG
+    /// resolution of `sub/x` against it.
+    fn dynamic_base_expectations(docUrl: &str, phaseBase: &str, phaseResolved: &str) -> serde_json::Value {
+        let at = |base: &str, resolved: &str| {
+            serde_json::json!([base, base, resolved, resolved, docUrl])
+        };
+        serde_json::json!({
+            "initial": at(phaseBase, phaseResolved),
+            "hrefLess": at(phaseBase, phaseResolved),
+            "added": at("https://cdn.example/assets/", "https://cdn.example/assets/sub/x"),
+            "changed": at("https://cdn2.example/lib/", "https://cdn2.example/lib/sub/x"),
+            "hrefRemoved": at(phaseBase, phaseResolved),
+            "reinserted": at("https://first.example/", "https://first.example/sub/x"),
+            "firstRemoved": at("https://cdn2.example/lib/", "https://cdn2.example/lib/sub/x"),
+            "allRemoved": at(phaseBase, phaseResolved),
+        })
+    }
+
+    /// Chrome 153 resolves `<a href="sub/x">` to the *new* base the moment a
+    /// `<base href>` lands in the head, and back to the page URL the moment
+    /// it leaves. Verified against headless Chrome on this exact fixture:
+    /// all seven phases, all five fields, identical.
+    #[test]
+    fn base_uri_tracks_a_dynamic_base_element_in_the_top_document() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body><div id=d><span id=s>x</span></div></body></html>",
+        );
+        let result = rt.evaluate(DYNAMIC_BASE_SEQUENCE).unwrap();
+        assert_eq!(
+            result,
+            dynamic_base_expectations("http://example.com/test", "http://example.com/test", "http://example.com/sub/x")
+        );
+    }
+
+    /// The same transitions inside an iframe content document, read from the
+    /// frame's own realm and from the embedder.
+    ///
+    /// A frame document resolves through the `_scopeRootSym` path of
+    /// `Node.prototype.baseURI` rather than the ownerDocument path, and the
+    /// frame's `document_url` is the embedder's page URL -- the regression
+    /// this guards is a frame answering the top document's base.
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_uri_tracks_a_dynamic_base_element_in_a_subframe() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                return setupFrame("f",
+                    '<html><head></head><body><div id="inner">x</div></body></html>',
+                    "http://example.com/frame");
+            }})()"#
+        );
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "http://example.com/frame")
+            .unwrap();
+        let result = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                DYNAMIC_BASE_SEQUENCE,
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            dynamic_base_expectations(
+                "http://example.com/frame",
+                "http://example.com/frame",
+                "http://example.com/sub/x",
+            )
+        );
+        // The embedder reads the frame's base through the same content root.
+        let observed = rt
+            .evaluate(
+                r#"(() => {
+                    const doc = document.getElementById("f").contentDocument;
+                    const before = doc.baseURI;
+                    const base = doc.createElement("base");
+                    base.setAttribute("href", "https://cdn.example/assets/");
+                    doc.head.appendChild(base);
+                    const after = doc.baseURI;
+                    doc.head.removeChild(base);
+                    return [before, after, doc.baseURI];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!([
+                "http://example.com/frame",
+                "https://cdn.example/assets/",
+                "http://example.com/frame",
+            ])
+        );
     }
 
     /// `console.log` must not walk the objects handed to it.
@@ -10402,6 +10675,117 @@ provided documentURL ('https://other.example') does not match the current origin
             &[],
         )
         .await;
+    }
+
+    /// MediaCapabilities validation and the powerEfficient answer, cell by
+    /// cell against the Chrome 153 oracle. Chrome rejects a configuration it
+    /// cannot read instead of resolving `supported: false`, and the two enums
+    /// disagree: decodingInfo still accepts 'media-source' while encodingInfo
+    /// accepts only 'webrtc'. powerEfficient follows the declared GPU profile,
+    /// so the Apple/Metal identity hardware-decodes H.264, HEVC, VP9 and the
+    /// audio codecs but not AV1 or VP8.
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capabilities_reject_like_chrome_and_follow_the_declared_gpu() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const video = {contentType: 'video/mp4; codecs="avc1.42E01E"',
+                                   width: 1920, height: 1080, bitrate: 2646242, framerate: '25'};
+                    const settle = async (method, configuration) => {
+                        try {
+                            const r = await navigator.mediaCapabilities[method](configuration);
+                            return {solved: [r.supported, r.smooth, r.powerEfficient]};
+                        } catch (error) { return {name: error.name, message: error.message}; }
+                    };
+                    const power = async contentType =>
+                        (await navigator.mediaCapabilities.decodingInfo(
+                            {type: 'file', video: {contentType, width: 1920, height: 1080,
+                                                   bitrate: 2646242, framerate: '25'}}))
+                            .powerEfficient;
+                    return {
+                        encodingFile: await settle('encodingInfo', {type: 'file', video}),
+                        encodingRecord: await settle('encodingInfo', {type: 'record', video}),
+                        decodingNull: await settle('decodingInfo', null),
+                        decodingNoMedia: await settle('decodingInfo', {type: 'file'}),
+                        decodingBadType: await settle('decodingInfo', {type: 'bogus', video}),
+                        decodingMissingBitrate: await settle('decodingInfo',
+                            {type: 'file', video: {contentType: video.contentType,
+                                                   width: 1920, height: 1080, framerate: '25'}}),
+                        // Only contentType is required in AudioConfiguration.
+                        audioWithoutExtras: await settle('decodingInfo',
+                            {type: 'file', audio: {contentType: 'audio/mpeg'}}),
+                        decodingWebrtcVideo: await settle('decodingInfo',
+                            {type: 'webrtc', video: {contentType: 'video/VP8', width: 1920,
+                                                     height: 1080, bitrate: 2646242, framerate: 25}}),
+                        decodingWebrtcAudio: await settle('decodingInfo',
+                            {type: 'webrtc', audio: {contentType: 'audio/opus', channels: '2',
+                                                     bitrate: 128000, samplerate: 48000}}),
+                        decodingWebrtcAv1: await settle('decodingInfo',
+                            {type: 'webrtc', video: {contentType: 'video/AV1', width: 1920,
+                                                     height: 1080, bitrate: 2646242, framerate: 25}}),
+                        // rtx is in the capability list but is not a media
+                        // codec, and Chrome answers unsupported for it.
+                        decodingWebrtcRtx: await settle('decodingInfo',
+                            {type: 'webrtc', video: {contentType: 'video/rtx', width: 1920,
+                                                     height: 1080, bitrate: 2646242, framerate: 25}}),
+                        avc: await power('video/mp4; codecs="avc1.42E01E"'),
+                        hevc: await power('video/mp4; codecs="hev1.1.6.L93.B0"'),
+                        vp9: await power('video/webm; codecs="vp09.00.10.08"'),
+                        av1: await power('video/mp4; codecs="av01.0.01M.08"'),
+                        vp8: await power('video/webm; codecs="vp8"'),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "encodingFile": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'encodingInfo' on 'MediaCapabilities': Failed to read the 'type' property from 'MediaEncodingConfiguration': The provided value 'file' is not a valid enum value of type MediaEncodingType.",
+                },
+                // 'record' is still in Chrome's MediaEncodingType IDL enum,
+                // so it fails the behavioral check with the shorter message
+                // rather than the WebIDL reading error.
+                "encodingRecord": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'encodingInfo' on 'MediaCapabilities': The provided value 'record' is not a valid enum value of type MediaEncodingType.",
+                },
+                "decodingNull": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'decodingInfo' on 'MediaCapabilities': The provided value is not of type 'MediaDecodingConfiguration'.",
+                },
+                "decodingNoMedia": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'decodingInfo' on 'MediaCapabilities': The configuration dictionary has neither |video| nor |audio| specified and needs at least one of them.",
+                },
+                "decodingBadType": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'decodingInfo' on 'MediaCapabilities': Failed to read the 'type' property from 'MediaDecodingConfiguration': The provided value 'bogus' is not a valid enum value of type MediaDecodingType.",
+                },
+                "decodingMissingBitrate": {
+                    "name": "TypeError",
+                    "message": "Failed to execute 'decodingInfo' on 'MediaCapabilities': Failed to read the 'video' property from 'MediaConfiguration': Failed to read the 'bitrate' property from 'VideoConfiguration': Required member is undefined.",
+                },
+                "audioWithoutExtras": {"solved": [true, true, true]},
+                "decodingWebrtcVideo": {"solved": [true, true, false]},
+                "decodingWebrtcAudio": {"solved": [true, true, true]},
+                "decodingWebrtcAv1": {"solved": [true, true, false]},
+                "decodingWebrtcRtx": {"solved": [false, false, false]},
+                // The default fingerprint is the macOS Apple/Metal identity.
+                "avc": true,
+                "hevc": true,
+                "vp9": true,
+                "av1": false,
+                "vp8": false,
+            })
+        );
     }
 
     /// The media capability capture, read in full rather than sampled.
@@ -18804,6 +19188,243 @@ RequestRedirect value",
         assert_eq!(result, serde_json::json!([[100, 20, 1], [100, 20, 1]]));
     }
 
+    /// Chrome's CSSOM View geometry surface is made of branded interface
+    /// instances, and the own-key census is one of the first things an
+    /// anti-bot probe reads. `getBoundingClientRect()` was branded, but the
+    /// entries of the DOMRectList `getClientRects()` returns were the raw
+    /// layout records: `[0]` and `item(0)` answered `[object Object]` with
+    /// nine own enumerable keys where Chrome answers an empty DOMRect, and
+    /// `instanceof DOMRect` was false. The list itself carried own `length`
+    /// and a legal constructor where Chrome keeps `length` on the prototype
+    /// and throws from `new DOMRectList()`.
+    #[test]
+    fn cssom_rect_geometry_is_branded() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="box" style="width:611px;height:100px"></div></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const box = document.getElementById("box");
+                const list = box.getClientRects();
+                const sample = value => ({
+                    tag: Object.prototype.toString.call(value),
+                    ctor: value.constructor.name,
+                    keys: Object.keys(value),
+                    own: Object.getOwnPropertyNames(value),
+                    isRect: value instanceof DOMRect,
+                    isReadOnly: value instanceof DOMRectReadOnly,
+                });
+                return {
+                    rect: sample(box.getBoundingClientRect()),
+                    first: sample(list[0]),
+                    item: sample(list.item(0)),
+                    sameEntry: list[0] === list.item(0),
+                    listTag: Object.prototype.toString.call(list),
+                    listCtor: list.constructor.name,
+                    listOwn: Object.getOwnPropertyNames(list),
+                    listLength: list.length,
+                    listItemOutOfRange: list.item(9),
+                    listConstructorThrows: (() => {
+                        try { new DOMRectList(); return "no-throw"; }
+                        catch (error) { return error.constructor.name; }
+                    })(),
+                    rectProto: Object.getOwnPropertyNames(DOMRect.prototype),
+                    readOnlyProto: Object.getOwnPropertyNames(DOMRectReadOnly.prototype),
+                    listProto: Object.getOwnPropertyNames(DOMRectList.prototype),
+                    pointProto: Object.getOwnPropertyNames(DOMPoint.prototype),
+                    pointKeys: Object.getOwnPropertyNames(new DOMPoint(1, 2, 3, 4)),
+                    pointIsReadOnly: new DOMPoint(1, 2, 3, 4) instanceof DOMPointReadOnly,
+                    quadProto: Object.getOwnPropertyNames(DOMQuad.prototype),
+                    quadJson: JSON.stringify(new DOMQuad({x: 1, y: 2})),
+                    forIn: (() => {
+                        const keys = [];
+                        for (const key in box.getBoundingClientRect()) keys.push(key);
+                        return keys;
+                    })(),
+                    json: JSON.stringify(box.getBoundingClientRect()),
+                };
+                "#,
+            )
+            .unwrap();
+
+        let empty_own = serde_json::json!([]);
+        for name in ["rect", "first", "item"] {
+            let sample = &result[name];
+            assert_eq!(
+                sample["tag"],
+                serde_json::json!("[object DOMRect]"),
+                "{name} must stringify as a DOMRect"
+            );
+            assert_eq!(sample["ctor"], serde_json::json!("DOMRect"), "{name} constructor.name");
+            assert_eq!(sample["keys"], empty_own, "{name} must have no own enumerable keys");
+            assert_eq!(
+                sample["own"],
+                empty_own,
+                "{name} must carry its fields as prototype accessors, not own properties"
+            );
+            assert_eq!(sample["isRect"], serde_json::json!(true), "{name} instanceof DOMRect");
+            assert_eq!(sample["isReadOnly"], serde_json::json!(true), "{name} instanceof DOMRectReadOnly");
+        }
+        assert_eq!(result["sameEntry"], serde_json::json!(true), "index 0 and item(0) are one object");
+        assert_eq!(result["listTag"], serde_json::json!("[object DOMRectList]"));
+        assert_eq!(result["listCtor"], serde_json::json!("DOMRectList"));
+        // Chrome's indexed properties are the list's only own keys; `length`
+        // lives on the prototype.
+        assert_eq!(result["listOwn"], serde_json::json!(["0"]));
+        assert_eq!(result["listLength"], serde_json::json!(1));
+        assert_eq!(result["listItemOutOfRange"], serde_json::Value::Null);
+        assert_eq!(
+            result["listConstructorThrows"],
+            serde_json::json!("TypeError"),
+            "DOMRectList has no public constructor"
+        );
+
+        // Interface prototypes: the declared members first, `constructor`
+        // last, exactly as WebIDL emits them.
+        assert_eq!(
+            result["rectProto"],
+            serde_json::json!(["x", "y", "width", "height", "constructor"])
+        );
+        assert_eq!(
+            result["readOnlyProto"],
+            serde_json::json!(
+                ["x", "y", "width", "height", "top", "right", "bottom", "left", "toJSON", "constructor"]
+            )
+        );
+        assert_eq!(
+            result["listProto"],
+            serde_json::json!(["length", "item", "constructor"])
+        );
+        assert_eq!(
+            result["pointProto"],
+            serde_json::json!(["x", "y", "z", "w", "constructor"])
+        );
+        assert_eq!(result["pointKeys"], empty_own);
+        assert_eq!(
+            result["pointIsReadOnly"],
+            serde_json::json!(true),
+            "DOMPoint extends DOMPointReadOnly"
+        );
+        assert_eq!(
+            result["quadProto"],
+            serde_json::json!(["p1", "p2", "p3", "p4", "getBounds", "toJSON", "constructor"])
+        );
+        assert_eq!(
+            result["quadJson"],
+            serde_json::json!(
+                "{\"p1\":{\"x\":1,\"y\":2,\"z\":0,\"w\":1},\"p2\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"p3\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"p4\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1}}"
+            )
+        );
+        assert_eq!(
+            result["forIn"],
+            serde_json::json!(
+                ["x", "y", "width", "height", "top", "right", "bottom", "left", "toJSON"]
+            ),
+            "for-in reaches the prototype accessors"
+        );
+    }
+
+    /// `visualViewport` was a plain object literal: its seven fields plus two
+    /// listener stubs were own enumerable keys, `instanceof VisualViewport`
+    /// was false and its prototype chain stopped at `Object.prototype`. Chrome
+    /// publishes a VisualViewport > EventTarget interface whose fields are
+    /// prototype accessors -- the own-key census on it is empty.
+    #[test]
+    fn visual_viewport_is_a_branded_interface() {
+        let mut rt = setup_runtime(r#"<html><body><div id="spacer" style="height:5000px"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const vv = visualViewport;
+                const chain = [];
+                for (let proto = Object.getPrototypeOf(vv); proto; proto = Object.getPrototypeOf(proto)) {
+                    chain.push(proto.constructor ? proto.constructor.name : String(proto));
+                }
+                return {
+                    tag: Object.prototype.toString.call(vv),
+                    ctor: vv.constructor.name,
+                    keys: Object.keys(vv),
+                    own: Object.getOwnPropertyNames(vv),
+                    isVisualViewport: vv instanceof VisualViewport,
+                    isEventTarget: vv instanceof EventTarget,
+                    chain,
+                    protoOwn: Object.getOwnPropertyNames(VisualViewport.prototype),
+                    protoParent: Object.getPrototypeOf(VisualViewport.prototype) === EventTarget.prototype,
+                    renderProtoOwn: Object.getOwnPropertyNames(Object.getPrototypeOf(vv)),
+                    matchesWindow: vv.width === innerWidth && vv.height === innerHeight,
+                    offsetLeft: vv.offsetLeft,
+                    offsetTop: vv.offsetTop,
+                    scale: vv.scale,
+                    pageMatchesScroll: vv.pageLeft === scrollX && vv.pageTop === scrollY,
+                    onresize: vv.onresize,
+                    onscroll: vv.onscroll,
+                    onscrollend: vv.onscrollend,
+                    handlerRoundTrip: (() => {
+                        const fn = () => {};
+                        vv.onresize = fn;
+                        const readBack = vv.onresize === fn;
+                        vv.onresize = null;
+                        return [readBack, vv.onresize === null];
+                    })(),
+                    widthReadOnly: (() => {
+                        const before = vv.width;
+                        vv.width = 12345;
+                        return vv.width === before && vv.width === innerWidth;
+                    })(),
+                    constructorThrows: (() => {
+                        try { new VisualViewport(); return "no-throw"; }
+                        catch (error) { return error.constructor.name; }
+                    })(),
+                };
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(result["tag"], serde_json::json!("[object VisualViewport]"));
+        assert_eq!(result["ctor"], serde_json::json!("VisualViewport"));
+        assert_eq!(result["keys"], serde_json::json!([]));
+        assert_eq!(result["own"], serde_json::json!([]));
+        assert_eq!(result["isVisualViewport"], serde_json::json!(true));
+        assert_eq!(result["isEventTarget"], serde_json::json!(true));
+        assert_eq!(
+            result["chain"],
+            serde_json::json!(["VisualViewport", "EventTarget", "Object"])
+        );
+        assert_eq!(
+            result["protoOwn"],
+            serde_json::json!([
+                "offsetLeft", "offsetTop", "pageLeft", "pageTop", "width", "height",
+                "scale", "onresize", "onscroll", "onscrollend", "constructor"
+            ])
+        );
+        assert_eq!(result["protoParent"], serde_json::json!(true));
+        assert_eq!(
+            result["renderProtoOwn"],
+            result["protoOwn"],
+            "the instance's prototype is the interface's, not a per-page object"
+        );
+        assert_eq!(result["matchesWindow"], serde_json::json!(true));
+        assert_eq!(result["offsetLeft"], serde_json::json!(0));
+        assert_eq!(result["offsetTop"], serde_json::json!(0));
+        assert_eq!(result["scale"], serde_json::json!(1));
+        assert_eq!(result["pageMatchesScroll"], serde_json::json!(true));
+        assert_eq!(result["onresize"], serde_json::Value::Null);
+        assert_eq!(result["onscroll"], serde_json::Value::Null);
+        assert_eq!(result["onscrollend"], serde_json::Value::Null);
+        assert_eq!(
+            result["handlerRoundTrip"],
+            serde_json::json!([true, true]),
+            "an on* handler reads back the assigned function and clears on null"
+        );
+        assert_eq!(
+            result["widthReadOnly"],
+            serde_json::json!(true),
+            "Chrome's visualViewport.width has no setter"
+        );
+        assert_eq!(result["constructorThrows"], serde_json::json!("TypeError"));
+    }
+
     /// Chromium 150 reference (800x513 CSS-pixel viewport):
     /// top=[60,20,20,-267], bottom=[448,448,231,31,-496] at the sampled
     /// root scroll offsets. This keeps sticky distinct from fixed positioning,
@@ -24714,6 +25335,80 @@ RequestRedirect value",
         );
     }
 
+    /// Turnstile preloads its `/ci/` image with a `<link rel=preload as=image>`
+    /// and depends on the GET a browser starts for it. A parsed link never
+    /// calls HTMLLinkElement's setters, so arming the preload only from there
+    /// left the fetch to the later `Image.src` assignment -- a round trip late,
+    /// and gone entirely when the challenge only ever built the preload link.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_inserted_preload_image_link_starts_the_fetch() {
+        for setup in [
+            // insertAdjacentHTML -> appendChild/insertBefore
+            "document.head.insertAdjacentHTML('beforeend', \
+             '<link rel=\"preload\" as=\"image\" href=\"preload.png\">');",
+            // innerHTML -> the native fragment parser
+            "document.head.innerHTML = \
+             '<link rel=\"preload\" as=\"image\" href=\"preload.png\">';",
+            // <template> + cloneNode + appendChild
+            "const template = document.createElement('template'); \
+             template.innerHTML = '<link rel=\"preload\" as=\"image\" href=\"preload.png\">'; \
+             document.head.appendChild(template.content.firstChild.cloneNode(true));",
+        ] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let loader_calls = calls.clone();
+            let png = two_by_three_png();
+            let mut rt = parser_image_runtime(
+                "<html><head></head><body></body></html>",
+                move |_url: &str| {
+                    loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(png.clone())
+                },
+            );
+            rt.execute_script("parser-preload-link", setup).unwrap();
+            rt.run_event_loop_bounded(100).await.unwrap();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "a parsed <link rel=preload as=image> must start its fetch: {setup}",
+            );
+        }
+    }
+
+    /// The same link built through the JS setters already armed the preload,
+    /// and arming it a second time must not issue a second GET.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_built_preload_image_link_fetches_once() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<html><head></head><body></body></html>",
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script(
+            "script-preload-link",
+            r#"
+                const link = document.createElement('link');
+                link.rel = 'preload';
+                link.as = 'image';
+                link.href = 'preload.png';
+                document.head.appendChild(link);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the setter path and the insertion sweep must agree on one request",
+        );
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn parser_image_lifecycle_uses_shared_render_resource() {
@@ -28340,6 +29035,19 @@ RequestRedirect value",
                         rtxOnce: video.codecs.filter(c => c.mimeType === 'video/rtx').length,
                         videoCount: video.codecs.length,
                         h264Profiles: video.codecs.filter(c => c.mimeType === 'video/H264').length,
+                        // Chrome lists the High-profile pair between AV1 and
+                        // H265; the challenge's codec probe compares the whole
+                        // ordered list, not just its length.
+                        highProfile: video.codecs
+                            .map(codec => codec.sdpFmtpLine || '')
+                            .filter(line => line.includes('profile-level-id=64001f')),
+                        highProfileAfterAv1: (() => {
+                            const list = video.codecs.map(name);
+                            return list.findIndex(e => e.includes('64001f'))
+                                > list.findIndex(e => e === 'video/AV1;level-idx=5;profile=1;tier=0')
+                                && list.findIndex(e => e.includes('64001f'))
+                                < list.findIndex(e => e.startsWith('video/H265'));
+                        })(),
                         firstVideo: name(video.codecs[0]),
                         redHasFmtp: 'sdpFmtpLine' in red,
                         redFmtp: red.sdpFmtpLine ?? null,
@@ -28360,8 +29068,16 @@ RequestRedirect value",
                     "audio/PCMU/8000", "audio/PCMA/8000", "audio/CN/8000",
                     "audio/telephone-event/48000", "audio/telephone-event/8000"],
                 "rtxOnce": 1,
-                "videoCount": 21,
-                "h264Profiles": 8,
+                // Chrome 153 offers 23 video codecs: the 21 below plus the two
+                // High-profile H264 packetization modes the challenge capture
+                // showed us missing.
+                "videoCount": 23,
+                "h264Profiles": 10,
+                "highProfile": [
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f",
+                    "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=64001f",
+                ],
+                "highProfileAfterAv1": true,
                 "firstVideo": "video/VP8",
                 "redHasFmtp": false,
                 "redFmtp": null,

@@ -223,7 +223,12 @@ globalThis.__obscura_init = function() {
     hasScreenOverride ? undefined : Number(fingerprintScreen.availTop),
     hasScreenOverride ? undefined : Number(fingerprintScreen.availLeft),
   );
-  globalThis.visualViewport = _bootstrapObject('visualViewport', () => ({ width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, [Symbol.toStringTag]: 'VisualViewport', addEventListener(){}, removeEventListener(){} }));
+  // A real VisualViewport instance: prototype accessors, empty own keys, and
+  // the VisualViewport > EventTarget chain (env/dom/geometry-objects.js owns
+  // the interface). The old placeholder was a plain object whose seven fields
+  // were own enumerable keys, and every field derives from the window metrics
+  // set just below.
+  globalThis.visualViewport = OBSCURA_VISUAL_VIEWPORT_NEW();
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -276,10 +281,6 @@ globalThis.__obscura_init = function() {
         if (zeroViewport || (Number.isFinite(parsed.clientWidth) && parsed.clientWidth >= 0)) {
           globalThis.innerWidth = zeroViewport ? 0 : parsed.clientWidth;
           globalThis.innerHeight = zeroViewport ? 0 : parsed.clientHeight;
-          if (globalThis.visualViewport) {
-            globalThis.visualViewport.width = globalThis.innerWidth;
-            globalThis.visualViewport.height = globalThis.innerHeight;
-          }
         }
       }
       // A frame viewport can change without recreating its realm (responsive
@@ -306,18 +307,11 @@ globalThis.__obscura_init = function() {
           return frameHeightFallback = readFrameMetric('clientHeight', frameHeightFallback);
         }),
       });
-      if (globalThis.visualViewport) {
-        Object.defineProperty(globalThis.visualViewport, 'width', {
-          configurable: true,
-          enumerable: true,
-          get: _markNative(function width() { return globalThis.innerWidth; }),
-        });
-        Object.defineProperty(globalThis.visualViewport, 'height', {
-          configurable: true,
-          enumerable: true,
-          get: _markNative(function height() { return globalThis.innerHeight; }),
-        });
-      }
+      // visualViewport needs no per-realm re-install here: its width/height
+      // and pageLeft/pageTop accessors already read these live metrics (and
+      // globalThis.scrollX/scrollY) on every access, so the frame's viewport
+      // stays live without the own accessors an earlier shape installed --
+      // Chrome's visualViewport has no own properties at all.
     } catch (_e) {}
   }
   // Window-level geometry. A window claims a maximized window: outer bounds

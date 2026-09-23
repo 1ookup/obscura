@@ -57,7 +57,9 @@ class HTMLIFrameElement extends Element {
     return null;
   }
   get contentWindow() {
-    if (_frameContentState(this[_nidSym]).root >= 0) {
+    // Root only: the same-origin verdict is the proxy trap's job (see
+    // _frameContentState), and this getter is a null test.
+    if (+_dom('iframe_content_document_root', this[_nidSym]) >= 0) {
       return _frameWindowProxyFor(this);
     }
     return null;

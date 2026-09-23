@@ -775,10 +775,15 @@ function _frameWindowProxyFor(hostEl) {
   const proxy = new Proxy(target, {
     // Access checks run per property operation, not only on contentDocument:
     // cross-origin callers get the HTML allowlist; anything else throws.
+    // The state is resolved on first use, not at entry. window, self, document,
+    // location, frames, top, parent, closed and opener are all answered
+    // straight off the target, and a browser resolves none of them through the
+    // engine, so an eager read would put a bridge call on what used to be a
+    // pure property read.
     get(t, key) {
-      const st = frameState();
+      let st;
       if (key === "globalThis") {
-        if (!st.same) throw securityError();
+        if (!(st ??= frameState()).same) throw securityError();
         return proxy;
       }
       // `constructor` is inherited off the target's Object.prototype, which
@@ -786,12 +791,12 @@ function _frameWindowProxyFor(hostEl) {
       // own Window, so route it through the frame realm like every other
       // Window member instead of the target's prototype chain.
       if (key === "constructor") {
-        if (!st.same) throw securityError();
+        if (!(st ??= frameState()).same) throw securityError();
         const realmGlobal = _frameRealmGlobalFor(st.root);
         return realmGlobal ? Reflect.get(realmGlobal, "constructor", realmGlobal) : Object;
       }
       if ((key === "postMessage" || key === "blur" || key === "focus" || key === "close")
-          && st.same) {
+          && (st ??= frameState()).same) {
         const realmGlobal = _frameRealmGlobalFor(st.root);
         if (realmGlobal) {
           if (key === "postMessage") {
@@ -803,7 +808,7 @@ function _frameWindowProxyFor(hostEl) {
         }
       }
       if (Reflect.has(t, key)) return Reflect.get(t, key);
-      if (typeof key === "string" && !st.same) throw securityError();
+      if (typeof key === "string" && !(st ??= frameState()).same) throw securityError();
       const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) {
         _hydrateFrameRealmSurface(realmGlobal);
@@ -813,27 +818,29 @@ function _frameWindowProxyFor(hostEl) {
       return _blankFrameSurfaceHas(key) ? _iframeRealmGlobal(t, key) : undefined;
     },
     set(t, key, value) {
-      const st = frameState();
-      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !st.same) {
+      let st;
+      if (typeof key === "string" && !_crossOriginWindowProps.has(key)
+          && !(st ??= frameState()).same) {
         throw securityError();
       }
       if (Reflect.has(t, key)) return Reflect.set(t, key, value);
-      const realmGlobal = st.same ? _frameRealmGlobalFor(st.root) : null;
-      if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
-      return realmGlobal
-        ? Reflect.set(realmGlobal, key, value, realmGlobal)
-        : Reflect.set(t, key, value);
+      if ((st ??= frameState()).same) {
+        const realmGlobal = _frameRealmGlobalFor(st.root);
+        if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
+        return Reflect.set(realmGlobal, key, value, realmGlobal);
+      }
+      return Reflect.set(t, key, value);
     },
     has(t, key) {
-      const st = frameState();
-      if (key === "globalThis") return st.same;
+      let st;
+      if (key === "globalThis") return (st ??= frameState()).same;
       if (key === "constructor") {
-        if (!st.same) return false;
+        if (!(st ??= frameState()).same) return false;
         const realmGlobal = _frameRealmGlobalFor(st.root);
         return realmGlobal ? Reflect.has(realmGlobal, "constructor") : true;
       }
       if (Reflect.has(t, key)) return true;
-      if (typeof key === "string" && !st.same) return false;
+      if (typeof key === "string" && !(st ??= frameState()).same) return false;
       const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) {
         _hydrateFrameRealmSurface(realmGlobal);
