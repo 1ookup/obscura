@@ -1375,6 +1375,25 @@ fn op_dom(
     result
 }
 
+/// The first `base[href]` element below `root` in tree order, which is the one
+/// the document base URL resolves against.
+///
+/// `query_selector_from` answers the same question but parses the selector and
+/// builds a matching context first, and `base[href]` is only a type selector
+/// plus an attribute presence test: the selector carries no namespace
+/// declaration, so it matches a `base` local name in any namespace, exactly
+/// like the walk here. `document.baseURI` is read on every relative URL
+/// resolution, so that saving is on the hot path.
+fn first_base_href(dom: &DomTree, root: NodeId) -> Option<NodeId> {
+    dom.descendants(root).into_iter().find(|id| {
+        dom.get_node(*id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| element.local.as_ref() == "base")
+                && node.get_attribute("href").is_some()
+        })
+    })
+}
+
 /// Can this connected mutation change which `<base>` element resolves the
 /// document base URL? The HTML base is the first base element in tree order
 /// carrying an href, so only subtree membership changes and href writes on a
@@ -1759,6 +1778,82 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        // Read-only. Everything an author-facing base URL needs in one bridge
+        // call: the document's own URL, the URL a relative reference resolves
+        // against, then the element that resolves its `base href` as
+        // "<nid>|<href>" ("0" when the document has none).
+        //
+        // Newline-separated. The two URLs differ only for a srcdoc/about:blank
+        // frame, where the scope keeps its creator's URL as the base so
+        // relative references resolve like the parent's while `document.URL`
+        // still reads about:srcdoc. At the top level both are the page URL.
+        //
+        // Resolving a relative URL used to reach this through
+        // `document_scope_info` plus `query_selector_scoped` and
+        // `get_attribute` -- three round trips for two facts. `location.href`,
+        // `document.baseURI` and every `a.href` / fetch / script URL paid it,
+        // and in a frame realm the first of the three was the full
+        // document-scope payload.
+        //
+        // The URL is composed on the JS side: the CSP base-uri check and the
+        // relative resolution both live there.
+        "document_base_info" => {
+            let root = arg1.parse::<u32>().unwrap_or(0);
+            let (doc_url, scope_url) = if root == 0 {
+                (gs.url.clone(), gs.url.clone())
+            } else {
+                match dom.document_scope(NodeId::new(root)) {
+                    Some(scope) => {
+                        let scope_url = scope.url.clone();
+                        let doc_url = if scope.base_url.is_empty() {
+                            scope_url.clone()
+                        } else {
+                            scope.base_url.clone()
+                        };
+                        (doc_url, scope_url)
+                    }
+                    None => (String::new(), String::new()),
+                }
+            };
+            let base = first_base_href(dom, NodeId::new(root))
+                .and_then(|id| {
+                    dom.get_node(id)
+                        .and_then(|node| node.get_attribute("href").map(str::to_string))
+                        .map(|href| format!("{}|{href}", id.index()))
+                })
+                .unwrap_or_else(|| "0".to_string());
+            format!("{doc_url}\n{scope_url}\n{base}")
+        }
+        // Read-only. The three URL facts `_environmentSettings`, the frame
+        // Location facade and a scoped `Document.URL` read out of
+        // `document_scope_info`, without the rest of that object. The full
+        // payload is ~15 fields of JSON and `location.href` in a frame realm
+        // parsed two of them per read.
+        //
+        // Newline-separated origin, url and baseUrl. An empty field keeps its
+        // falsy meaning on the JS side: no origin serializes as "null", and no
+        // base URL falls back to the document URL.
+        "document_scope_urls" => {
+            let root = arg1.parse::<u32>().unwrap_or(0);
+            if root == 0 {
+                let origin = gs
+                    .top_origin
+                    .as_ref()
+                    .map(|origin| origin.serialize())
+                    .unwrap_or_default();
+                format!("{origin}\n{}\n", gs.url)
+            } else {
+                match dom.document_scope(NodeId::new(root)) {
+                    Some(scope) => format!(
+                        "{}\n{}\n{}",
+                        scope.origin.serialize(),
+                        scope.url,
+                        scope.base_url
+                    ),
+                    None => "\n\n".into(),
+                }
+            }
+        }
         // Same as "query_selector_scoped", but the walk also enters hosted
         // (including closed) shadow trees. A page query cannot cross that
         // boundary, yet the engine may need to reach a widget control rendered
@@ -1810,6 +1905,39 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             dom.matches_selector(nid, &arg2)
                 .unwrap_or(false)
                 .to_string()
+        }
+        // Read-only. The active content-document root of an iframe host and
+        // whether the calling realm is same-origin with it, as
+        // "<root>|<sameOrigin>" ("-1|false" for a host with no browsing
+        // context).
+        //
+        // Every WindowProxy property operation needs both halves, and until
+        // this existed each paid two bridge calls: `iframe_content_document_root`
+        // followed by `iframe_scopes_same_origin`. On pages that poll a frame's
+        // window -- a challenge reading `contentWindow.document.cookie` in a
+        // loop -- that pair was the single largest source of op traffic.
+        "iframe_content_document_state" => {
+            let host = arg1.parse::<u32>().unwrap_or(0);
+            let caller = arg2.parse::<u32>().unwrap_or(0);
+            match dom.iframe_content_document(NodeId::new(host)) {
+                Some(root) => {
+                    let origin_of = |raw: u32| -> Option<obscura_dom::Origin> {
+                        if raw == 0 {
+                            Some(gs.top_origin.clone().unwrap_or_else(|| {
+                                obscura_dom::Origin::from_url(&gs.url)
+                            }))
+                        } else {
+                            dom.document_scope(NodeId::new(raw)).map(|scope| scope.origin)
+                        }
+                    };
+                    let same = match (origin_of(caller), origin_of(root.index() as u32)) {
+                        (Some(a), Some(b)) => a.same_origin(&b),
+                        _ => false,
+                    };
+                    format!("{}|{same}", root.index())
+                }
+                None => "-1|false".into(),
+            }
         }
         // Create a fresh content-document root for an <iframe> host, replacing
         // (and reporting) any previously active root so navigation can retire

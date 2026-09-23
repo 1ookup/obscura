@@ -28,7 +28,7 @@ function _environmentSettings() {
   }
   const root = _callingFrameRoot();
   if (root > 0) {
-    const info = _domParse("document_scope_info", root) || {};
+    const info = _documentScopeUrls(root);
     const rawUrl = info.url || globalThis.__obscura_frame_base_url || "about:blank";
     let url = rawUrl;
     // The deliberate answer below applies only to frames whose document
@@ -62,11 +62,40 @@ function _environmentSettings() {
     const cookieUrl = /^(?:https?|wss?):/i.test(url) ? url : baseUrl;
     return { root, url, baseUrl, cookieUrl, origin: info.origin || "null" };
   }
-  const url = _domParse("document_url") || "about:blank";
-  let origin = "null";
-  try { origin = new URL(url).origin; } catch (e) {}
+  // Page URL and top origin in one bridge call. Deriving the origin through
+  // `new URL(url)` instead re-serialized the whole component set (about 3us)
+  // on every `location.href`, every relative URL resolution and every fetch.
+  const scope = _documentScopeUrls(0);
+  const url = scope.url || "about:blank";
+  let origin = scope.origin;
+  if (!origin) {
+    origin = "null";
+    try { origin = new URL(url).origin; } catch (e) {}
+  }
   const baseUrl = (globalThis.document && globalThis.document.baseURI) || url;
   return { root: 0, url, baseUrl, cookieUrl: url, origin };
+}
+// One bridge call for the two document URLs and the `base href` element:
+// `"<docUrl>\n<url>\n<nid>|<href>"`, with a trailing "0" when the document has
+// no `<base href>`. `docUrl` is what a relative reference resolves against
+// (the scope's base URL, which a srcdoc frame inherits from its creator);
+// `url` is `document.URL`. An empty href keeps its falsy meaning (null), so
+// callers still fall back to the document URL for `<base href="">`.
+function _documentBaseInfo(rootNid) {
+  try {
+    const raw = _dom("document_base_info", rootNid);
+    if (!raw) return { docUrl: "", url: "", base: null };
+    const first = raw.indexOf("\n");
+    if (first < 0) return { docUrl: raw, url: raw, base: null };
+    const second = raw.indexOf("\n", first + 1);
+    if (second < 0) return { docUrl: raw.slice(0, first), url: raw.slice(0, first), base: null };
+    const sig = raw.slice(second + 1);
+    const docUrl = raw.slice(0, first);
+    const url = raw.slice(first + 1, second);
+    if (!sig || sig === "0") return { docUrl, url, base: null };
+    const bar = sig.indexOf("|");
+    return { docUrl, url, base: bar >= 0 ? (sig.slice(bar + 1) || null) : null };
+  } catch (_) { return { docUrl: "", url: "", base: null }; }
 }
 // Internal base lookup used by the engine's own URL resolution. Calling the
 // author-facing querySelector here leaks an implementation detail into the
@@ -74,10 +103,26 @@ function _environmentSettings() {
 function _internalBaseHref(doc) {
   try {
     if (!doc || typeof doc[_nidSym] !== 'number') return null;
-    const nid = Number(_dom("query_selector_scoped", doc[_nidSym], "base[href]"));
-    if (!Number.isFinite(nid) || nid < 0) return null;
-    return _domParse("get_attribute", nid, "href") || null;
+    return _documentBaseInfo(doc[_nidSym]).base;
   } catch (_) { return null; }
+}
+// The three URL facts of a document scope, without the rest of
+// `document_scope_info`. Same falsy shape: an absent origin reads as "null"
+// and an absent base URL falls back to the document URL at the call site.
+function _documentScopeUrls(rootNid) {
+  try {
+    const raw = _dom("document_scope_urls", rootNid);
+    if (!raw) return { origin: "", url: "", baseUrl: "" };
+    const a = raw.indexOf("\n");
+    const b = a < 0 ? -1 : raw.indexOf("\n", a + 1);
+    if (b < 0) return { origin: "", url: "", baseUrl: "" };
+    return { origin: raw.slice(0, a), url: raw.slice(a + 1, b), baseUrl: raw.slice(b + 1) };
+  } catch (_) { return { origin: "", url: "", baseUrl: "" }; }
+}
+// `new URL(href, base).href` through the cheap resolve op, which shares the
+// Rust parser with the URL constructor. Null where the constructor threw.
+function _resolveBaseHref(href, base) {
+  return base ? _urlResolveOp(href, base) : href;
 }
 
 function _resolveUrl(url) {

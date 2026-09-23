@@ -58,11 +58,11 @@ class Node extends EventTarget {
   get baseURI() {
     try {
       if (typeof this[_scopeRootSym] === 'number') {
-        const info = _domParse('document_scope_info', this[_scopeRootSym]) || {};
-        const docUrl = info.baseUrl || info.url || 'about:blank';
-        const href = _internalBaseHref(this);
-        if (href) {
-          const resolved = new URL(href, docUrl).href;
+        const info = _documentBaseInfo(this[_scopeRootSym]);
+        const docUrl = info.docUrl || 'about:blank';
+        if (info.base) {
+          const resolved = _resolveBaseHref(info.base, docUrl);
+          if (!resolved) return "";
           if (_cspBaseUriAllows(resolved)) return resolved;
         }
         return docUrl;
@@ -71,13 +71,13 @@ class Node extends EventTarget {
       // ownerDocument lookup is cached and skipped entirely on pages without
       // iframe content documents.
       const doc = (_iframeContentDocsSeen && this.ownerDocument) || globalThis.document;
-      const docUrl = (doc && doc.URL) || "";
-      const href = _internalBaseHref(doc);
-      if (href) {
-        if (href) {
-          const resolved = docUrl ? new URL(href, docUrl).href : href;
-          if (_cspBaseUriAllows(resolved)) return resolved;
-        }
+      if (!doc || typeof doc[_nidSym] !== 'number') return "";
+      const info = _documentBaseInfo(doc[_nidSym]);
+      const docUrl = info.url || "";
+      if (info.base) {
+        const resolved = _resolveBaseHref(info.base, docUrl);
+        if (!resolved) return "";
+        if (_cspBaseUriAllows(resolved)) return resolved;
       }
       return docUrl;
     } catch (e) {

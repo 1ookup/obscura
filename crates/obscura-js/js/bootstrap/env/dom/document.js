@@ -134,8 +134,7 @@ var Document = _swappableInterface('Document', class extends Node {
   }
   get URL() {
     if (typeof this[_scopeRootSym] === 'number') {
-      const info = _domParse('document_scope_info', this[_scopeRootSym]);
-      return (info && info.url) || 'about:blank';
+      return _documentScopeUrls(this[_scopeRootSym]).url || 'about:blank';
     }
     return _domParse("document_url") ?? "";
   }

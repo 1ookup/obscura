@@ -14492,3 +14492,21 @@ Chrome 的 `/ci/` 真实响应（三份 HAR 全查，均为 `image/png`）：
 同批复核一致：`Sec-Ch-Ua-Mobile: ?0`、`Sec-Ch-Ua-Platform: "macOS"`、`Accept-Language: zh-CN,zh;q=0.9`、`Accept-Encoding: gzip, deflate, br, zstd`、导航 `Priority: u=0, i` / fetch `u=1, i`。
 
 **另一条待核**：`Accept` 在导航上下文我们发 `text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7`（Chrome 导航同为该串），fetch 上下文两边都是 `*/*`——已列入顺带核对表，暂未发现差异。
+
+#### 354.25 原始文本元素序列化修复（`OjmeV1` 空串的根因）+ 一次工作区事故
+
+**修复**（`a7576a7`）：`is_raw_text_element` 由 `script|style|textarea|title` 改为
+
+```
+script | style | xmp | iframe | noembed | noframes | plaintext | noscript
+```
+
+即 **HTML 片段序列化的 "do not escape" 名单**，而不是分词器的 raw-text/RCDATA 集合：`textarea`/`title` 在**解析**时是 RCDATA，所以**序列化**时要转义；`listing`/`pre` 两侧都是普通元素。Chrome 153 oracle 对 `textarea`/`title` 答转义形态、对其余六个答字面形态。
+
+**这解释了 §354.5 的 `OjmeV1[85]/[86]/[103]/[104]` 四个空串**：挑战的 **round-trip 探针**把标记写进容器、**只在回读等于输入时才保留**；我们那六个原始容器回读不等，于是变空。⇒ §354.10(E) 与 §354.16 对这几项"根因未定"的状态**结案**（不是 srcdoc 解析，也不是 CDP await 提交时序——那是另一个真缺陷）。带 22 用例的 `raw_text_containers_serialize_like_chrome_153` 测试钉住全表；`obscura-dom` 93/93 通过。
+
+**工作区事故（过程教训，务必记住）**：某 agent 为了验证"没有修复时新测试会失败"，在**多 agent 共享工作区**里跑了 `git stash` → **六个 agent 的全部未提交工作被一起卷进 `stash@{0}`**，工作区被清空；随后它的 `git stash pop` **中止**（未合并任何东西，stash 保留），未造成额外损失。各 agent 察觉后自行写回，我从 stash 补回了当时仍未回写的 `serialize.rs`（即上面那条修复）。
+
+- **无工作永久丢失**：stash 已做两份独立备份（`/tmp/agent-stash-backup.patch`、`/tmp/cf-parity/wsbackup/stash0-030210.patch`），14 个文件已逐个核对全部回到工作区。
+- **纪律（对后续所有并行 agent 生效）**：共享工作区内**禁止**任何改动工作区/历史的 git 命令——`stash`/`pop`/`apply`/`drop`/`clear`、`reset`、`checkout -- <path>`、`restore`、`clean`、`commit`、`add -A`、`rebase`、`merge`、`switch`、`branch -D`；只读的 `status`/`diff`/`log`/`stash list`/`stash show` 可用。
+- **"验证没有修复会失败"的正确做法**：写成可开关的形式、在仓库外副本上验证，或用隔离 worktree —— **绝不能用 `git stash`**。

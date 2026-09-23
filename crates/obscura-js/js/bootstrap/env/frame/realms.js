@@ -21,6 +21,19 @@ function _frameSameOrigin(rootNid) {
   return _dom("iframe_scopes_same_origin", _callingFrameRoot(), rootNid) === "true";
 }
 
+// The active content root of an iframe host together with the calling realm's
+// same-origin verdict, from one bridge call: "<root>|<sameOrigin>", with -1
+// for a host that has no browsing context. Every frame access check needs both
+// halves, and asking for them separately cost two round trips per property
+// operation on a WindowProxy.
+function _frameContentState(hostNid) {
+  const raw = _dom("iframe_content_document_state", hostNid, _callingFrameRoot());
+  const cut = raw.indexOf("|");
+  if (cut < 0) return { root: -1, same: false };
+  const root = Number(raw.slice(0, cut));
+  return { root, same: root >= 0 && raw.slice(cut + 1) === "true" };
+}
+
 // Cross-document postMessage (Phase 4). Structured cloning reuses the Worker
 // JSON envelope (_workerSerializeMessage, a hoisted top-level declaration);
 // transfer lists are not supported yet (TODO). The typed-origin targetOrigin
@@ -97,19 +110,13 @@ class _ScopedDocument extends Document {
     // are scoped here.
     Object.getOwnPropertyDescriptor(Document.prototype, "title").set.call(this, v);
   }
-  get URL() { const info = this._scopeInfo(); return (info && info.url) || "about:blank"; }
+  get URL() { return _documentScopeUrls(this[_scopeRootSym]).url || "about:blank"; }
   get baseURI() {
-    const info = this._scopeInfo();
-    const docUrl = (info && (info.baseUrl || info.url)) || "about:blank";
-    const base = _internalQuerySelector(this, "base[href]");
-    if (base) {
-      const href = base.getAttribute("href");
-      if (href) {
-        try {
-          const resolved = new URL(href, docUrl).href;
-          if (_cspBaseUriAllows(resolved)) return resolved;
-        } catch (e) {}
-      }
+    const info = _documentBaseInfo(this[_scopeRootSym]);
+    const docUrl = info.docUrl || "about:blank";
+    if (info.base) {
+      const resolved = _resolveBaseHref(info.base, docUrl);
+      if (resolved && _cspBaseUriAllows(resolved)) return resolved;
     }
     return docUrl;
   }
@@ -222,9 +229,12 @@ function _frameRealmGlobalFor(rootNid) {
 // they consult _frameRealmGlobalFor. Only the initial about:blank document
 // (empty frameId) needs this: a document the async loader committed already has
 // a frameId and will get its realm from ensure_frame_realm on the event loop.
-function _materializeFrameRealm(hostNid) {
-  const root = +_dom("iframe_content_document_root", hostNid);
-  if (root < 0 || !_frameSameOrigin(root) || _frameRealmGlobalFor(root)) return;
+function _materializeFrameRealm(hostNid, knownState) {
+  // Callers that already resolved the host's state pass it in, so the steady
+  // state (a frame whose realm is built) costs no bridge call at all.
+  const st = knownState || _frameContentState(hostNid);
+  const root = st.root;
+  if (root < 0 || !st.same || _frameRealmGlobalFor(root)) return;
   const info = _domParse("document_scope_info", root);
   if (info && info.frameId) return;
   const bridge = Deno.core.ops.op_ensure_frame_realm(hostNid);
@@ -622,11 +632,13 @@ function _frameWindowProxyFor(hostEl) {
   // fallback reads as tampered.
   _materializeFrameRealm(hostNid);
 
-  const contentRoot = () => +_dom("iframe_content_document_root", hostNid);
-  const sameOrigin = () => {
-    const root = contentRoot();
-    return root >= 0 && _frameSameOrigin(root);
-  };
+  // Every property operation below resolves the host's frame state once, at
+  // entry: a frame cannot navigate inside a synchronous JS call, so the value
+  // holds for the whole trap, and the previous shape paid two bridge calls
+  // per property read plus one more for each repeat.
+  const frameState = () => _frameContentState(hostNid);
+  const contentRoot = () => frameState().root;
+  const sameOrigin = () => frameState().same;
   const securityError = () => new DOMException(
     'Blocked a frame with origin "'
       + (globalThis.location ? globalThis.location.origin : "null")
@@ -643,18 +655,16 @@ function _frameWindowProxyFor(hostEl) {
   // enqueue a navigation through the Rust frame controller.
   const frameLocation = {
     get href() {
-      const root = contentRoot();
-      if (root < 0 || !_frameSameOrigin(root)) throw securityError();
-      const info = _domParse("document_scope_info", root);
-      return (info && info.url) || "about:blank";
+      const st = frameState();
+      if (!st.same) throw securityError();
+      return _documentScopeUrls(st.root).url || "about:blank";
     },
     set href(v) { navigate(v); },
     assign(v) { navigate(v); },
     replace(v) { navigate(v); },
     reload() {
-      const root = contentRoot();
-      const info = root >= 0 ? _domParse("document_scope_info", root) : null;
-      navigate((info && info.url) || "about:blank");
+      const st = frameState();
+      navigate(st.root >= 0 ? (_documentScopeUrls(st.root).url || "about:blank") : "about:blank");
     },
     toString() { return this.href; },
   };
@@ -682,33 +692,33 @@ function _frameWindowProxyFor(hostEl) {
     get window() { return proxy; },
     get self() { return proxy; },
     get document() {
-      const root = contentRoot();
-      if (root < 0) return null;
-      if (!_frameSameOrigin(root)) throw securityError();
-      const realmGlobal = _frameRealmGlobalFor(root);
+      const st = frameState();
+      if (st.root < 0) return null;
+      if (!st.same) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal && realmGlobal.document) {
         realmGlobal.document[_defaultViewProxySym] = proxy;
         return realmGlobal.document;
       }
-      const doc = _scopedDocumentFor(root);
+      const doc = _scopedDocumentFor(st.root);
       doc[_defaultViewProxySym] = proxy;
       return doc;
     },
     get location() {
-      const root = contentRoot();
-      if (root >= 0 && _frameSameOrigin(root)) {
-        const realmGlobal = _frameRealmGlobalFor(root);
+      const st = frameState();
+      if (st.same) {
+        const realmGlobal = _frameRealmGlobalFor(st.root);
         if (realmGlobal && realmGlobal.location) return realmGlobal.location;
       }
       return frameLocation;
     },
     set location(v) { navigate(v); },
     get name() {
-      if (!sameOrigin()) throw securityError();
+      if (!frameState().same) throw securityError();
       return _frameContextName(hostNid);
     },
     set name(v) {
-      if (!sameOrigin()) throw securityError();
+      if (!frameState().same) throw securityError();
       // window.name assignment renames the browsing context and, unlike the
       // iframe attribute, persists across navigations.
       _dom("frame_context_name_set", hostNid, String(v == null ? "" : v));
@@ -717,9 +727,9 @@ function _frameWindowProxyFor(hostEl) {
     // parent window are the main global. The full ancestor WindowProxy chain
     // for nested frames arrives with per-frame realms (Phase 3.7).
     get length() {
-      const root = contentRoot();
-      if (root < 0) return 0;
-      return (_domParse("query_selector_all_scoped", root, "iframe") || []).length;
+      const st = frameState();
+      if (st.root < 0) return 0;
+      return (_domParse("query_selector_all_scoped", st.root, "iframe") || []).length;
     },
     get closed() { return false; },
     get opener() { return null; },
@@ -751,7 +761,7 @@ function _frameWindowProxyFor(hostEl) {
     top: { get: () => globalThis, enumerable: true, configurable: true },
     parent: { get: () => globalThis, enumerable: true, configurable: true },
     frameElement: {
-      get: () => { if (!sameOrigin()) throw securityError(); return hostEl; },
+      get: () => { if (!frameState().same) throw securityError(); return hostEl; },
       enumerable: true,
       configurable: true,
     },
@@ -766,8 +776,9 @@ function _frameWindowProxyFor(hostEl) {
     // Access checks run per property operation, not only on contentDocument:
     // cross-origin callers get the HTML allowlist; anything else throws.
     get(t, key) {
+      const st = frameState();
       if (key === "globalThis") {
-        if (!sameOrigin()) throw securityError();
+        if (!st.same) throw securityError();
         return proxy;
       }
       // `constructor` is inherited off the target's Object.prototype, which
@@ -775,13 +786,13 @@ function _frameWindowProxyFor(hostEl) {
       // own Window, so route it through the frame realm like every other
       // Window member instead of the target's prototype chain.
       if (key === "constructor") {
-        if (!sameOrigin()) throw securityError();
-        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+        if (!st.same) throw securityError();
+        const realmGlobal = _frameRealmGlobalFor(st.root);
         return realmGlobal ? Reflect.get(realmGlobal, "constructor", realmGlobal) : Object;
       }
       if ((key === "postMessage" || key === "blur" || key === "focus" || key === "close")
-          && sameOrigin()) {
-        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+          && st.same) {
+        const realmGlobal = _frameRealmGlobalFor(st.root);
         if (realmGlobal) {
           if (key === "postMessage") {
             return _frameRealmProxyMethod(realmGlobal, key, Reflect.get(t, key));
@@ -792,8 +803,8 @@ function _frameWindowProxyFor(hostEl) {
         }
       }
       if (Reflect.has(t, key)) return Reflect.get(t, key);
-      if (typeof key === "string" && !sameOrigin()) throw securityError();
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (typeof key === "string" && !st.same) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) {
         _hydrateFrameRealmSurface(realmGlobal);
         return Reflect.get(realmGlobal, key, realmGlobal);
@@ -802,26 +813,28 @@ function _frameWindowProxyFor(hostEl) {
       return _blankFrameSurfaceHas(key) ? _iframeRealmGlobal(t, key) : undefined;
     },
     set(t, key, value) {
-      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
+      const st = frameState();
+      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !st.same) {
         throw securityError();
       }
       if (Reflect.has(t, key)) return Reflect.set(t, key, value);
-      const realmGlobal = sameOrigin() ? _frameRealmGlobalFor(contentRoot()) : null;
+      const realmGlobal = st.same ? _frameRealmGlobalFor(st.root) : null;
       if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.set(realmGlobal, key, value, realmGlobal)
         : Reflect.set(t, key, value);
     },
     has(t, key) {
-      if (key === "globalThis") return sameOrigin();
+      const st = frameState();
+      if (key === "globalThis") return st.same;
       if (key === "constructor") {
-        if (!sameOrigin()) return false;
-        const realmGlobal = _frameRealmGlobalFor(contentRoot());
+        if (!st.same) return false;
+        const realmGlobal = _frameRealmGlobalFor(st.root);
         return realmGlobal ? Reflect.has(realmGlobal, "constructor") : true;
       }
       if (Reflect.has(t, key)) return true;
-      if (typeof key === "string" && !sameOrigin()) return false;
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      if (typeof key === "string" && !st.same) return false;
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) {
         _hydrateFrameRealmSurface(realmGlobal);
         return Reflect.has(realmGlobal, key);
@@ -829,8 +842,9 @@ function _frameWindowProxyFor(hostEl) {
       return key === "globalThis" || _blankFrameSurfaceHas(key);
     },
     ownKeys(t) {
-      if (!sameOrigin()) return Reflect.ownKeys(t);
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const st = frameState();
+      if (!st.same) return Reflect.ownKeys(t);
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       _hydrateFrameRealmSurface(realmGlobal);
       const source = realmGlobal
         ? _frameRealmOwnKeys(realmGlobal) : _pristineGlobalNames;
@@ -848,12 +862,13 @@ function _frameWindowProxyFor(hostEl) {
     getOwnPropertyDescriptor(t, key) {
       const own = Reflect.getOwnPropertyDescriptor(t, key);
       if (own) return own;
-      if (typeof key === "string" && !sameOrigin()) return undefined;
+      const st = frameState();
+      if (typeof key === "string" && !st.same) return undefined;
       if (key === "constructor") return undefined;
       if (key === "globalThis") {
         return { value: proxy, writable: true, enumerable: false, configurable: true };
       }
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       let descriptor;
       if (realmGlobal) {
         _hydrateFrameRealmSurface(realmGlobal);
@@ -873,24 +888,27 @@ function _frameWindowProxyFor(hostEl) {
       return descriptor;
     },
     defineProperty(t, key, descriptor) {
-      if (!sameOrigin()) throw securityError();
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const st = frameState();
+      if (!st.same) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.defineProperty(realmGlobal, key, descriptor)
         : Reflect.defineProperty(t, key, descriptor);
     },
     deleteProperty(t, key) {
-      if (!sameOrigin()) throw securityError();
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const st = frameState();
+      if (!st.same) throw securityError();
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal
         ? Reflect.deleteProperty(realmGlobal, key)
         : Reflect.deleteProperty(t, key);
     },
     getPrototypeOf(t) {
-      if (!sameOrigin()) return Reflect.getPrototypeOf(t);
-      const realmGlobal = _frameRealmGlobalFor(contentRoot());
+      const st = frameState();
+      if (!st.same) return Reflect.getPrototypeOf(t);
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal) _hydrateFrameRealmSurface(realmGlobal);
       return realmGlobal ? Reflect.getPrototypeOf(realmGlobal) : Reflect.getPrototypeOf(t);
     },
@@ -1005,8 +1023,7 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
     get href() {
       if (!sameOrigin()) throw securityError();
       if (targetRoot > 0) {
-        const info = _domParse("document_scope_info", targetRoot);
-        return (info && info.url) || "about:blank";
+        return _documentScopeUrls(targetRoot).url || "about:blank";
       }
       return _domParse("document_url") || "about:blank";
     },

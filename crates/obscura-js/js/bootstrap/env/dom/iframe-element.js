@@ -41,23 +41,23 @@ class HTMLIFrameElement extends Element {
   get height() { return this.getAttribute('height') || ''; }
   set height(value) { this.setAttribute('height', value); }
   get contentDocument() {
-    const nativeRoot = +_dom('iframe_content_document_root', this[_nidSym]);
-    if (nativeRoot >= 0) {
-      if (!_frameSameOrigin(nativeRoot)) return null;
-      _materializeFrameRealm(this[_nidSym]);
-      const realmGlobal = _frameRealmGlobalFor(nativeRoot);
+    const st = _frameContentState(this[_nidSym]);
+    if (st.root >= 0) {
+      if (!st.same) return null;
+      _materializeFrameRealm(this[_nidSym], st);
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal && realmGlobal.document) {
         realmGlobal.document[_defaultViewProxySym] = _frameWindowProxyFor(this);
         return realmGlobal.document;
       }
-      const doc = _scopedDocumentFor(nativeRoot);
+      const doc = _scopedDocumentFor(st.root);
       doc[_defaultViewProxySym] = _frameWindowProxyFor(this);
       return doc;
     }
     return null;
   }
   get contentWindow() {
-    if (+_dom('iframe_content_document_root', this[_nidSym]) >= 0) {
+    if (_frameContentState(this[_nidSym]).root >= 0) {
       return _frameWindowProxyFor(this);
     }
     return null;

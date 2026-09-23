@@ -433,6 +433,9 @@ var Element = _swappableInterface('Element', class extends Node {
     // setAttribute path. Register those elements for Window named access
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
+    // Same reason: a parsed <link rel=preload as=image> never reaches
+    // HTMLLinkElement's setters, so its fetch has to be armed here.
+    _armPreloadImageLinks(this);
     _reconcileWindowNamedProperties(previousWindowNames);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this[_nidSym]) || [];
@@ -1372,19 +1375,19 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
-    const nativeRoot = +_dom("iframe_content_document_root", this[_nidSym]);
-    if (nativeRoot >= 0) {
+    const st = _frameContentState(this[_nidSym]);
+    if (st.root >= 0) {
       // Native content document committed by the Rust frame loader. The
       // same-origin gate compares typed DocumentScope origins in Rust, never
       // serialized origin strings; cross-origin content reads as null.
-      if (!_frameSameOrigin(nativeRoot)) return null;
-      _materializeFrameRealm(this[_nidSym]);
-      const realmGlobal = _frameRealmGlobalFor(nativeRoot);
+      if (!st.same) return null;
+      _materializeFrameRealm(this[_nidSym], st);
+      const realmGlobal = _frameRealmGlobalFor(st.root);
       if (realmGlobal && realmGlobal.document) {
         realmGlobal.document[_defaultViewProxySym] = _frameWindowProxyFor(this);
         return realmGlobal.document;
       }
-      const doc = _scopedDocumentFor(nativeRoot);
+      const doc = _scopedDocumentFor(st.root);
       doc[_defaultViewProxySym] = _frameWindowProxyFor(this);
       return doc;
     }
@@ -1397,7 +1400,7 @@ var Element = _swappableInterface('Element', class extends Node {
     if (this.localName !== 'iframe') return undefined;
     // A native content document gets the stable WindowProxy regardless of
     // origin; per-property access checks live on the proxy itself.
-    if (+_dom("iframe_content_document_root", this[_nidSym]) >= 0) {
+    if (_frameContentState(this[_nidSym]).root >= 0) {
       return _frameWindowProxyFor(this);
     }
     return null;
