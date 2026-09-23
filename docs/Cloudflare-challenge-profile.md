@@ -14580,3 +14580,25 @@ script | style | xmp | iframe | noembed | noframes | plaintext | noscript
 **`xkNI3`/`KnOhl5` 修复**：video 编解码清单缺第 16/17 位两条 H.264 `profile-level-id=64001f`（来自 `RTCRtpSender.getCapabilities('video')`，由 `webrtc.js` 的 SDP 派生）。补进 SDP 后 audio 8/8、video **23/23 与 `xkNI3` 逐元素一致（含顺序）**。
 
 **新发现，优先级高（已派修）**：**worker 作用域里 `OffscreenCanvas` 的 WebGL 是空的**——`new Worker(blob)` 内 `new OffscreenCanvas(1,1).getContext('webgl2', {powerPreference:'low-power'})` 我们返回 **`null`**（Chrome 正常返回 context）。这**不只是某个字段值不同，而是一整块 API 缺失**，会改变 VM 走的代码路径（CF 调用栈里 `Worker.constructor` 17 次、`OffscreenCanvas` 12 次）。另一条同族：`OffscreenCanvas.getContext('experimental-webgl')` Chrome 抛 `TypeError`、我们返回 context。
+
+#### 354.30 请求头面收口：`Cache-Control` 过度发送已修
+
+**Chrome 的真实规则（读线上头测的，不是读回显）**：用 `Network.requestWillBeSentExtraInfo`（**必须用它**——reload 时 `requestWillBeSent` 报 `Cache-Control: None`，线上其实是 `max-age=0`），测了 11 种导航：
+
+| 导航种类 | 线上 `Cache-Control` |
+|---|---|
+| 全新 URL 的 `Page.navigate` | **无** |
+| 同一 URL 的 `Page.reload` | **`max-age=0`** |
+| 重访已访问过的 URL | 无 |
+| 地址栏式新 URL 导航 | 无 |
+| JS `document.location = location.href`（同 URL） | **无**（这条最关键：它确实发网络请求，但仍不带） |
+| `history.back()` / `forward()` | 无请求（BFCache） |
+| 跨源往返后的 `Page.reload` | `max-age=0` |
+
+⇒ **只有显式 reload 带它**。两个独立 oracle 实例复现一致，reload 行另经 httpbin 回显三方确认。
+
+**Obscura 无 reload 语义**：`RequestMode` 只有 `Navigate | NoCors | Cors | SameOrigin`，`RequestMode::Navigate` 同时被首次导航与 reload 使用 ⇒ 无法区分。故**直接去掉发射**，并在注释里写明「reload 语义未接线，故一律不发；接线后按上表只为 reload 恢复」。旧的注释理由（"没有它的导航不是浏览器会发的"）与 oracle 相反，已更正。**fetch/XHR 路径未动**（Chrome 那边本就不带）。
+
+改动 2 文件（`wreq_client.rs` 隐身路径 + `client.rs` 明文路径，两条独立代码路径各自覆盖），新增 2 条回归测试，`obscura-net` **120/120**。端到端 httpbin 双引擎对照：导航与 fetch 两种上下文 **0 DIFF**。
+
+**纠正我先前的一条观察**：我报告的「两条 baseURI 测试正在失败」是**快速变动的树里的瞬时状态**，并不可复现；该批工作**不是**该 agent 写的（它只动了 `obscura-net`）。当前 `-p obscura-js` 为 708 项、唯一失败是台账已记录的既有负载 flake（`timing_edits_preserve_identity_and_pause_holds_then_resumes`，单独跑通过）。
