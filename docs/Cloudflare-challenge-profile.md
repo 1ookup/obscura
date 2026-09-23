@@ -14793,3 +14793,28 @@ obscura fetch "https://www.thelancet.com/cdn-cgi/challenge-platform/h/b/orchestr
 **对 Obscura 的直接含义**：我们用**固定 14s** 点击，实测落在 TS#2 响应**之后约 +4.2s**——**比任何已知通过的 Chrome 轮都晚**，而这个位置从未被测过。已派实验：先在 Chrome 上二分出通过窗口的**两端**（`fo-click-delay` 0.5/1.0/2.6/4.0/6.0/9.0/12.0，关键档 ≥3 轮、每轮全新 profile），再给 Obscura 做一个**同样锚定**的点击器（靠 preload 在 widget realm 计数 `/fo/` 响应并经 `postMessage` 中继到顶层，CDP 轮询后点击），在同一组档位上跑，并带空注入对照。
 
 **两处方法学坑（该 agent 记录）**：① `Fetch.enable` 打在 OOPIF 会话上**会返回 ok 但静默不拦截**，除非 `Target.setAutoAttach` 用 `waitForDebuggerOnStart: true` + `Runtime.runIfWaitingForDebugger`——否则 `challenges.cloudflare.com` 的 `/fo/` POST 全部逃逸，延迟只打到了 `thelancet.com` 的两条；② **复用的 `--user-data-dir` 会把 clearance 带过去、下一轮 GET 直接 404 而根本没走挑战**，每轮必须全新 profile（早期有一轮 `base` 因此作废）。
+
+#### 354.40 探针耗时的真因是**两个量级级别的 DOM 缺陷**（`3f70892`）
+
+耗时压缩 agent 自己复算了 `hCfV6`（按签名配对，不按下标），确认 §354.36 的表，并把根因挖到了宿主 op 层——**不是"探针本身慢"，而是 DOM 变更路径本身是坏的**：
+
+- **每次 DOM 变更都跑一次全文档 iframe 查询**：`_syncWindowFrameIndices`（`env/dom/node.js:187` 经 `__prepareInsertedSubtree`、`env/css/cssom.js:158` 经 `_subtreeDisconnected`）用 `querySelectorAll('iframe')` **从 document** 回答 Window 的索引帧属性。3.6k 节点的页面上每次变更约 **62µs**，且成本**随文档增长**。
+- **`document.body` / `document.head` 是整个文档的选择器查询**（`env/dom/document.js:46-47`）⇒ `document.body.appendChild(x)` 每次都是 O(文档)，**整个循环是二次的**（op trace：500 次 append 发出 **501 次 `query_selector_all_scoped 0 body`**）。
+
+**修复**：帧索引重同步只在**被连接的子树真的含 browsing context** 时才跑（该扫描 `__prepareInsertedSubtree` 里已经算过）；样式表侧改为扫描**自身子树**而非整个文档并合并两条选择器查询；`body`/`head` 改由**树形**在 O(1) 内解析（规范口径：root `html` 的子元素，`body` 兼匹配 `frameset`），对不合规文档回退到选择器。
+
+**实测（同 fixture，min of 3）**：
+
+| 形状 | 改前 | 改后 | Chrome |
+|---|---|---|---|
+| `appendChild` ×300（3.6k 节点） | 20.4ms | **2.5ms** | 0.0 |
+| 经 `document.body` create+append ×20k | 2916ms | **282ms** | 4.6 |
+| 预建后 append ×20k | 5270ms | **148ms** | 3.3 |
+| `remove` ×20k | 2695ms | **97ms** | 3.0 |
+| 5×2000 分批 append | 60→266（**增长**） | **27（持平）** | 0.4 持平 |
+
+**诚实声明**：该 agent **没有达成**我给的 `hCfV6` 目标（`gsLi5 ≤50ms` 等），并明确说"不能诚实地声称在这些数字上有进展"——因为普查的残余是**另一个独立问题**：帧 realm 的 `innerWidth`/`innerHeight` 是访问器，会调 `op_layout_metrics` → `ensure_prepared_geometry` → **整个顶层文档的全量 re-prepare**；实测同一形状改前改后都是 31ms vs Chrome 1.2ms（26x，与线上的 24x 吻合）。**这是 `gsLi5` 的下一个、也是最有价值的线索**，属 profile 已记的独立工程（多趟全树遍历合并/增量化）。
+
+**判决轮 p1/p2（`1cd84403`）**：仍失败（时序假设既已证伪，这项从"判据候选"降级为纯性能改进，但它是**真缺陷**、值得留）。
+
+**同批记录的其他发现**（未修）：`querySelectorAll('*')` 比 Chrome 慢 26x、`querySelectorAll('iframe')` 慢 8.7x（节点 id 列表的急切 JSON 序列化 + 遍历）；**500 层嵌套会让进程 Rust 栈溢出**（改前即可复现，未查）。
