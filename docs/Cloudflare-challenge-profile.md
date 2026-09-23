@@ -14732,3 +14732,23 @@ create_element html → set_inner_html 241 arg2='' → create head/body → 读 
 **注意**：`gsLi5` 这一项在 §10.21 被追过一次（文档记 "census 探针 794ms vs 21ms"，批次 12 做了布局预热）。本轮实测仍是 **670ms vs 28ms**——即**当时并未收敛**，只是从 794 降到 670。已派专项压缩探针阶段耗时（目标：`gsLi5` ≤50ms、`SbVZ3` ≤90ms，并给出改动前后同 fixture 的 min-of-3 对照）。
 
 **若这条成立**，此前所有 payload 级"优化"（包括已修的那些真实缺陷）对本判据**天然无效**——这正好解释了 `everything`（34 条规则全上、分岔压到 5）仍然失败的实验结果。
+
+#### 354.37 页面层 payload 缺口：表能取到，但 payload 不可解（缺口实际不可闭合）
+
+**表是可取的**：用我方引擎经代理抓页面层脚本即可——
+
+```bash
+RAY=$(grep -ao 'ray=[a-f0-9]*' /tmp/cf-parity/ours/<run>/run/ops.tsv | head -1 | cut -d= -f2)
+obscura fetch "https://www.thelancet.com/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=$RAY" \
+  --proxy http://192.168.3.57:9000 --stealth --user-agent '<干净 153 UA>' --dump original > page_layer.js
+```
+
+实测拿到 **236,838 字节**，其中含 65 字符表 `r$Y248tALRGxb6kmw7aeOSj0-XCT9dN1EFfUZIQJyi5hVcnK3qvpoPs+MHuDWgzBl`。
+
+**但 payload 不可解**：两件事同时成立——
+1. 该表**随 build 轮换**（用它解 01:43 的参考臂 body 直接报「字符 'l' 不在表中」）；
+2. 更根本的是：**页面层走的是未打补丁的真 CF 脚本，加密 key 不可控**（注入只在 `/turnstile/…/rch/` 生效）。所以页面层上行**对谁都无法解密**（我方与 Chrome 皆然），替换值的来源不存在。
+
+⇒ §354.32 的缺口 ③ **实际不可闭合**。唯一可能的迂回是在**不解密**的前提下做形状匹配与置换（钩子能拿到活的 JS 对象、也能知道字段名——页面层字段名可从这份 236KB 脚本的字符串表里提），但**替换成什么值**无从得知（`1-page-req` 两引擎恒为 2370 字节，说明结构同形、内容不可比）。
+
+**结论**：payload 侧的可对拍空间**到此为止**。剩余候选只有请求/传输层（头顺序，正在修）与探针阶段耗时（正在修）。
