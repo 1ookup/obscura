@@ -1,20 +1,35 @@
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
+    // The argument is a Trusted Types sink in Chrome: under
+    // `require-trusted-types-for 'script'` a plain string raises
+    // "Failed to execute 'parseFromString' on 'DOMParser': This document
+    // requires 'TrustedHTML' assignment." The parse itself is not a sink.
+    const trusted = globalThis.__obscura_tt_enforce(
+      'TrustedHTML', source, 'DOMParser parseFromString');
+    return _parseMarkupFromString(trusted, mimeType);
+  }
+};
+// Engine-internal parse. Callers that are not the public parseFromString
+// (implementation.createHTMLDocument, createDocument, cloneNode) pass the
+// markup directly: Chrome's sinks are the APIs, not the parser underneath.
+function _parseMarkupFromString(source, mimeType) {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
     // innerHTML parses children via html5ever fragment-parsing rules. Most
     // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
     // fragment parser strips the outer `<html>` and emits its head+body
-    // children, which is what callers want.
-    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    // children, which is what callers want. `_setElementInnerHTML` is the
+    // setter without its Trusted Types sink check, which must not apply to an
+    // internal parse.
+    try { _setElementInnerHTML(root, html); } catch (e) { /* leave empty on parse error */ }
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
     // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
     if (isXml && !_xmlWellFormed(html)) {
       try {
-        root.innerHTML = '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>';
+        _setElementInnerHTML(root, '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>');
       } catch (e) { /* ignore */ }
     }
 
@@ -169,7 +184,7 @@ globalThis.DOMParser = class DOMParser {
       _docType: null,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
-        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+        return _parseMarkupFromString(root.outerHTML, mimeType);
       },
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
@@ -207,5 +222,7 @@ globalThis.DOMParser = class DOMParser {
     _detachedNodeOwners.set(root, exposedDocument);
     _detachedRootOwners.set(root[_nidSym], exposedDocument);
     return exposedDocument;
-  }
-};
+}
+// Publish the sink-free parse to the core half, where
+// implementation.createHTMLDocument and createDocument live.
+_internalMarkupParse = _parseMarkupFromString;

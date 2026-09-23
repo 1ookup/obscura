@@ -408,39 +408,7 @@ var Element = _swappableInterface('Element', class extends Node {
   get innerHTML() { return _domParse("inner_html", this[_nidSym]) ?? ""; }
   set innerHTML(v) {
     v = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
-    if (this.localName === 'template') {
-      this.content.innerHTML = v;
-      return;
-    }
-    // Capture the children that are about to be replaced so we can deliver
-    // them as `removedNodes` in the MutationObserver record. Without this,
-    // libraries that mutate via `innerHTML =` (jQuery's `.html(s)`, React
-    // `dangerouslySetInnerHTML`, vue-style content swaps) silently bypass
-    // every MutationObserver subscriber and downstream hydration / polling
-    // logic stalls.
-    const previousWindowNames = _windowNamedNamesInTree(this);
-    // Native fragment replacement bypasses Node.removeChild. Disassociate
-    // descendant style sheets before the backing nodes leave the document so
-    // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
-    for (const style of _internalQuerySelectorAll(this, "style")) _detachStyleSheet(style);
-    let oldChildren = [];
-    let newChildren = [];
-    if (globalThis.__mutationObservers?.length) {
-      oldChildren = _domParse("child_nodes", this[_nidSym]) || [];
-    }
-    _dom("set_inner_html", this[_nidSym], String(v ?? ""));
-    // HTML fragment parsing can introduce IDs without calling the JS
-    // setAttribute path. Register those elements for Window named access
-    // before script can synchronously read `window.someId`.
-    _registerWindowNamedTree(this);
-    // Same reason: a parsed <link rel=preload as=image> never reaches
-    // HTMLLinkElement's setters, so its fetch has to be armed here.
-    _armPreloadImageLinks(this);
-    _reconcileWindowNamedProperties(previousWindowNames);
-    if (globalThis.__mutationObservers?.length) {
-      newChildren = _domParse("child_nodes", this[_nidSym]) || [];
-      globalThis.__notifyMutation('childList', this[_nidSym], newChildren, oldChildren);
-    }
+    _setElementInnerHTML(this, v);
   }
   get outerHTML() { return _domParse("outer_html", this[_nidSym]) ?? ""; }
   // Assigning outerHTML replaces the element with the parsed markup. There was
@@ -2040,3 +2008,59 @@ var Element = _swappableInterface('Element', class extends Node {
     for (const n of converted) this.appendChild(n);
   }
 }, Node);
+
+// Engine-internal markup parses (implementation.createHTMLDocument /
+// createDocument) go through the parser without the Trusted Types argument
+// check that belongs to the public DOMParser.parseFromString. The parser
+// itself lives in the deferred half, so the holder is declared here in the core
+// half where those Document methods live: the deferred scope reads the outer
+// one, not the other way round. A deferred-surface frame realm has no parser
+// until it hydrates, which is also when it gets its DOMParser global.
+var _internalMarkupParse = null;
+
+// The body of the innerHTML setter, without the Trusted Types sink check.
+// Engine-internal parsers (DOMParser, implementation.createHTMLDocument,
+// document.open) must use this: Chrome's parser is not a script sink, so a
+// parse there neither requires nor consumes a TrustedHTML. Routing an internal
+// parse through the public setter made DOMParser.parseFromString return an
+// empty document in every `require-trusted-types-for 'script'` realm -- the
+// rch frame of a Cloudflare challenge is one.
+function _setElementInnerHTML(element, v) {
+  if (element.localName === 'template') {
+    // The contents live in a separate fragment, whose innerHTML setter is a
+    // sink of its own: writing through it re-entered enforcement with a value
+    // that had already been branded, so `template.innerHTML = trustedHTML`
+    // threw whenever a realm enforced Trusted Types.
+    _setFragmentInnerHTMLRaw(element.content, String(v ?? ""));
+    return;
+  }
+  // Capture the children that are about to be replaced so we can deliver
+  // them as `removedNodes` in the MutationObserver record. Without this,
+  // libraries that mutate via `innerHTML =` (jQuery's `.html(s)`, React
+  // `dangerouslySetInnerHTML`, vue-style content swaps) silently bypass
+  // every MutationObserver subscriber and downstream hydration / polling
+  // logic stalls.
+  const previousWindowNames = _windowNamedNamesInTree(element);
+  // Native fragment replacement bypasses Node.removeChild. Disassociate
+  // descendant style sheets before the backing nodes leave the document so
+  // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
+  for (const style of _internalQuerySelectorAll(element, "style")) _detachStyleSheet(style);
+  let oldChildren = [];
+  let newChildren = [];
+  if (globalThis.__mutationObservers?.length) {
+    oldChildren = _domParse("child_nodes", element[_nidSym]) || [];
+  }
+  _dom("set_inner_html", element[_nidSym], String(v ?? ""));
+  // HTML fragment parsing can introduce IDs without calling the JS
+  // setAttribute path. Register those elements for Window named access
+  // before script can synchronously read `window.someId`.
+  _registerWindowNamedTree(element);
+  // Same reason: a parsed <link rel=preload as=image> never reaches
+  // HTMLLinkElement's setters, so its fetch has to be armed here.
+  _armPreloadImageLinks(element);
+  _reconcileWindowNamedProperties(previousWindowNames);
+  if (globalThis.__mutationObservers?.length) {
+    newChildren = _domParse("child_nodes", element[_nidSym]) || [];
+    globalThis.__notifyMutation('childList', element[_nidSym], newChildren, oldChildren);
+  }
+}

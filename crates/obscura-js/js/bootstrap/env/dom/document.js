@@ -716,7 +716,10 @@ var Document = _swappableInterface('Document', class extends Node {
       // jQuery 3.x with it. DOMParser now builds the complete detached
       // document skeleton, so only the optional title needs adding here.
       createHTMLDocument(title) {
-        const doc = new DOMParser().parseFromString("", "text/html");
+        // Engine-internal parse: Chrome's createHTMLDocument takes no markup
+        // and is not a Trusted Types sink, so it must not route through
+        // parseFromString's argument check.
+        const doc = _internalMarkupParse("", "text/html");
         if (arguments.length > 0) {
           const titleEl = document.createElement("title");
           titleEl.textContent = String(title);
@@ -732,7 +735,7 @@ var Document = _swappableInterface('Document', class extends Node {
         const name = (qualifiedName && String(qualifiedName)) || "root";
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
         const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
+        const doc = _internalMarkupParse(html, "application/xml");
         if (_doctype) _hset(doc, "_docType", _doctype);
         return doc;
       },
@@ -801,7 +804,11 @@ var Document = _swappableInterface('Document', class extends Node {
   }
   open() {
     var body = this.body;
-    if (body) body.innerHTML = '';
+    // Clearing the body is the engine's own write, not a page assignment:
+    // Chrome's document.open() is not a Trusted Types sink and never throws
+    // under require-trusted-types-for, so this must not go through the public
+    // setter's sink check.
+    if (body) _setElementInnerHTML(body, '');
     return this;
   }
   close() {

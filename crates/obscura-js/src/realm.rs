@@ -2798,6 +2798,56 @@ mod tests {
         assert_eq!(realm.scope_origin.as_deref(), Some("http://example.com"));
     }
 
+    /// Chrome's Trusted Types brand is per-agent, not per-realm: a value minted
+    /// in one realm answers `isHTML` in another and is accepted at a sink
+    /// there. Each obscura realm evaluates the bootstrap, so a realm-local
+    /// brand registry dropped the brand at every frame boundary and the sink
+    /// threw where Chrome writes. The challenge's parser probe hands a branded
+    /// value across realms and reads the body back, so the write has to land.
+    #[test]
+    fn trusted_types_brand_crosses_realm_boundaries() {
+        let mut rt = setup_runtime("<html><body><iframe id=host></iframe></body></html>");
+        let root = setup_frame(&mut rt, "host", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        rt.frame_realm_expose_main_global("frame-test", 1, "__main").unwrap();
+        assert_eq!(
+            rt.execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<mint>",
+                r#"(() => {
+                    const policy = trustedTypes.createPolicy('cross', {createHTML: value => value});
+                    __main.__crossTrusted = policy.createHTML('<b>cross</b>');
+                    return typeof __main.__crossTrusted;
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!("object")
+        );
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const cross = globalThis.__crossTrusted;
+                const recognised = trustedTypes.isHTML(cross);
+                const body = document.body;
+                body.innerHTML = cross;
+                let plain = 'accepted';
+                try { body.innerHTML = '<i>plain</i>'; }
+                catch (error) { plain = error.name; }
+                return [recognised, body.innerHTML, plain];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, "<b>cross</b>", "TypeError"])
+        );
+    }
+
     #[test]
     fn frame_scoped_query_sees_incremental_fragment_insertions() {
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");

@@ -13,7 +13,27 @@
   //
   // Brand membership, not prototype identity: `Object.create(
   // TrustedHTML.prototype)` must fail `isHTML`, and in Chrome it does.
-  const _trustedValue = new WeakMap();
+  //
+  // The brand is per-agent, not per-realm. Chrome answers true for a
+  // TrustedHTML minted in another realm (`iframe.contentWindow.trustedTypes
+  // .isHTML(topValue)`) and accepts it at a sink there, because every realm in
+  // one renderer shares the brand. Obscura's realms each evaluate this module,
+  // so a realm-local WeakMap lost the brand the moment a value crossed a frame
+  // boundary: the sink threw and the write never landed. The registry rides on
+  // the Deno binding, which every realm of one runtime shares, exactly like
+  // the event-state registry. Kind strings, never the per-realm constructor
+  // identity, are what is compared, so a foreign value answers for its own
+  // realm's interface too.
+  const _registrySym = Symbol.for('obscura.trustedTypesRegistry');
+  const _registry = Deno[_registrySym] ||
+    (Deno[_registrySym] = { values: new WeakMap(), kinds: new WeakMap() });
+  // Snapshot template realms kept the registry captured at snapshot build time
+  // while the runtime's lives on the rebound Deno binding; resolve the live one
+  // at each access, as the event-state registry does.
+  function _brandRegistry() {
+    const live = Deno[_registrySym];
+    return live && live !== _registry ? live : _registry;
+  }
 
   function _defineHidden(target, name, value) {
     Object.defineProperty(target, name, {
@@ -30,7 +50,7 @@
       value: name, configurable: true,
     });
     const read = function (self) {
-      const held = _trustedValue.get(self);
+      const held = _brandRegistry().values.get(self);
       if (held === undefined) throw new TypeError('Illegal invocation');
       return held;
     };
@@ -47,15 +67,19 @@
   const TrustedScript = _trustedTypeInterface('TrustedScript');
   const TrustedScriptURL = _trustedTypeInterface('TrustedScriptURL');
 
-  const _trustedKind = new WeakMap();
+  const _kindOfCtor = new WeakMap();
+  _kindOfCtor.set(TrustedHTML, 'html');
+  _kindOfCtor.set(TrustedScript, 'script');
+  _kindOfCtor.set(TrustedScriptURL, 'scripturl');
   function _mint(ctor, text) {
     const object = Object.create(ctor.prototype);
-    _trustedValue.set(object, String(text));
-    _trustedKind.set(object, ctor);
+    const registry = _brandRegistry();
+    registry.values.set(object, String(text));
+    registry.kinds.set(object, _kindOfCtor.get(ctor));
     return object;
   }
-  const _isKind = (ctor, value) =>
-    value != null && _trustedValue.has(value) && _trustedKind.get(value) === ctor;
+  const _isKind = (kind, value) =>
+    value != null && _brandRegistry().kinds.get(value) === kind;
 
   const _policyName = new WeakMap();
   const _policyRules = new WeakMap();
@@ -164,8 +188,8 @@
   // covering and cannot tell them apart from the value alone.
   function _enforceSink(kind, value, sink) {
     if (!_requiredScriptSink()) return String(value == null ? '' : value);
-    if (_isKind(kind === 'TrustedHTML' ? TrustedHTML
-      : kind === 'TrustedScript' ? TrustedScript : TrustedScriptURL, value)) {
+    if (_isKind(kind === 'TrustedHTML' ? 'html'
+      : kind === 'TrustedScript' ? 'script' : 'scripturl', value)) {
       return String(value);
     }
     if (_defaultPolicy) {
@@ -231,11 +255,11 @@
   }));
 
   _defineHidden(_factoryProto, 'isHTML',
-    _markNative(function isHTML(value) { return _isKind(TrustedHTML, value); }));
+    _markNative(function isHTML(value) { return _isKind('html', value); }));
   _defineHidden(_factoryProto, 'isScript',
-    _markNative(function isScript(value) { return _isKind(TrustedScript, value); }));
+    _markNative(function isScript(value) { return _isKind('script', value); }));
   _defineHidden(_factoryProto, 'isScriptURL',
-    _markNative(function isScriptURL(value) { return _isKind(TrustedScriptURL, value); }));
+    _markNative(function isScriptURL(value) { return _isKind('scripturl', value); }));
 
   _defineHidden(_factoryProto, 'getAttributeType', _markNative(function getAttributeType(tagName, attribute) {
     if (arguments.length < 2) {

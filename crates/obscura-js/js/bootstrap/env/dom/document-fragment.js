@@ -1,3 +1,14 @@
+// The fragment write without the Trusted Types sink check, for engine-internal
+// parses (a <template>'s contents fragment is written by the template's own
+// innerHTML setter once enforcement has already run).
+function _setFragmentInnerHTMLRaw(fragment, html) {
+  if (fragment._fragmentContext) {
+    _dom("set_inner_html_context", fragment[_nidSym], _fragmentContextPayload(fragment._fragmentContext, html));
+  } else {
+    _dom("set_inner_html", fragment[_nidSym], html);
+  }
+}
+
 class DocumentFragment extends Node {
   constructor(nid) {
     const created = nid === undefined;
@@ -9,11 +20,7 @@ class DocumentFragment extends Node {
   get innerHTML() { return _domParse("inner_html", this[_nidSym]) ?? ""; }
   set innerHTML(v) {
     const html = globalThis.__obscura_tt_enforce('TrustedHTML', v, 'Element innerHTML');
-    if (this._fragmentContext) {
-      _dom("set_inner_html_context", this[_nidSym], _fragmentContextPayload(this._fragmentContext, html));
-    } else {
-      _dom("set_inner_html", this[_nidSym], html);
-    }
+    _setFragmentInnerHTMLRaw(this, html);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this[_nidSym], s)); }
   querySelectorAll(s) {

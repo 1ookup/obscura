@@ -7425,6 +7425,86 @@ mod tests {
         );
     }
 
+    /// `DOMParser.parseFromString` parses internally: only its *argument* is a
+    /// Trusted Types sink. Implementing it as `root.innerHTML = html` put the
+    /// engine's own parse through the public sink, so under
+    /// `require-trusted-types-for 'script'` the assignment threw, the shim's
+    /// catch swallowed it, and every parse in a Trusted Types realm returned an
+    /// empty body -- whatever the caller had branded. The rch frame of a
+    /// Cloudflare challenge probes the parser exactly this way, so the check
+    /// reports the engine as a fake DOM. Chrome 153 (local oracle): branded
+    /// input parses, a plain string raises TypeError, and createHTMLDocument
+    /// (no markup argument) keeps working.
+    #[test]
+    fn dom_parser_parses_trusted_input_and_rejects_plain_strings_under_trusted_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://challenges.example/rch.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types probe default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const policy = trustedTypes.createPolicy('probe', {createHTML: value => value});
+                const out = {};
+                out.trusted = new DOMParser().parseFromString(
+                    policy.createHTML('<p>one</div><p>two</p>'), 'text/html').body.innerHTML;
+                out.entity = new DOMParser().parseFromString(
+                    policy.createHTML('<div data-foo="&#34;"></div>'), 'text/html').body.innerHTML;
+                try {
+                    new DOMParser().parseFromString('<p>x</p>', 'text/html');
+                    out.plain = 'accepted';
+                } catch (error) { out.plain = error.name; }
+                out.implDoc = document.implementation.createHTMLDocument('t')
+                    .documentElement.childNodes.length;
+                out.implDocBody = document.implementation.createHTMLDocument().body.innerHTML;
+                return out;
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "trusted": "<p>one</p><p>two</p>",
+                "entity": "<div data-foo=\"&quot;\"></div>",
+                "plain": "TypeError",
+                "implDoc": 2,
+                "implDocBody": "",
+            })
+        );
+    }
+
+    /// A <template>'s contents fragment has an innerHTML setter of its own,
+    /// which is also a Trusted Types sink. The template setter forwarded the
+    /// already-enforced value into it, so `template.innerHTML = trustedHTML`
+    /// re-entered enforcement with a plain string and threw. Chrome accepts the
+    /// branded value at the template sink.
+    #[test]
+    fn template_inner_html_accepts_trusted_html_under_trusted_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://challenges.example/rch.html");
+        rt.set_content_security_policy(Some(
+            "default-src 'none'; trusted-types probe default; require-trusted-types-for 'script'",
+        ));
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const policy = trustedTypes.createPolicy('probe', {createHTML: value => value});
+                const markup = '<tr><td>cell</td></tr>';
+                const template = document.createElement('template');
+                template.innerHTML = policy.createHTML(markup);
+                const table = document.createElement('table');
+                table.innerHTML = policy.createHTML(markup);
+                return [template.innerHTML, table.innerHTML];
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["<tr><td>cell</td></tr>", "<tbody><tr><td>cell</td></tr></tbody>"])
+        );
+    }
+
     /// Chrome hands the default policy three arguments: the value, the expected
     /// type, and the name of the sink being covered. A policy is allowed to
     /// branch on the sink, and cannot tell them apart from the value alone.
