@@ -218,6 +218,23 @@ function _evaluateMediaFeature(raw) {
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
   if (match) return match[1] === 'no-preference';
+  match = feature.match(/^prefers-reduced-transparency\s*:\s*(reduce|no-preference)$/);
+  if (match) return match[1] === 'no-preference';
+  // Chrome 153 default-variant answers (headed + headless oracle agree);
+  // inverted-colors is a retired feature and answers false to every value,
+  // which the fallthrough below already produces.
+  match = feature.match(/^prefers-contrast\s*:\s*(no-preference|more|less|custom)$/);
+  if (match) return match[1] === 'no-preference';
+  match = feature.match(/^forced-colors\s*:\s*(none|active)$/);
+  if (match) return match[1] === 'none';
+  match = feature.match(/^display-mode\s*:\s*(browser|fullscreen|standalone|minimal-ui|window-controls-overlay)$/);
+  if (match) return match[1] === 'browser';
+  match = feature.match(/^update\s*:\s*(fast|slow|none)$/);
+  if (match) return match[1] === 'fast';
+  match = feature.match(/^scripting\s*:\s*(enabled|initial-only|none)$/);
+  if (match) return match[1] === 'enabled';
+  match = feature.match(/^monochrome\s*:\s*(\d+)$/);
+  if (match) return Number(match[1]) === 0;
 
   // Chrome reports srgb for every display (it is the common denominator) and
   // p3 only on a wide-gamut panel. Every modern Mac ships one, so the macOS
