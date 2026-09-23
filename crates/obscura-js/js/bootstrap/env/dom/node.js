@@ -170,7 +170,6 @@ function __prepareInsertedSubtree(root) {
   // every script in the subtree in tree order.
   if (!root || !root.isConnected) return;
   if (root.nodeType === 1 && root.localName === 'iframe') {
-    __frameFreezeContextName(root);
     _dom("create_blank_iframe_document", root[_nidSym]);
     _queueIframeNavigation(root[_nidSym]);
   }
@@ -181,8 +180,6 @@ function __prepareInsertedSubtree(root) {
   // having no frame yet. Nothing re-queued it, so the frame stayed empty.
   const iframeIds = _domParse("iframe_hosts_including_shadow", root[_nidSym], "") || [];
   for (const nid of iframeIds) {
-    const host = _wrapEl(+nid);
-    if (host) __frameFreezeContextName(host);
     _dom("create_blank_iframe_document", +nid);
     _queueIframeNavigation(+nid);
   }

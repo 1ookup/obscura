@@ -13885,3 +13885,100 @@ innerHTML 臂与 OjmeV1[79]/[118]、XCvwf5.ryJGE4、dsKPy6、kPEvW6、
 IGBuA2/oHIQ6 扫描基准：全押字节码反编译管线（per-probe 键非明文, 字符串表
 法已到顶）; ③ aQgx8/nEJhr9 语义维持 351 ①（Reqable 注入工具链）; ④ retry
 环形分布续记; ⑤ 工作区 gate 台账回填（350 ⑤）。
+
+### Step 353：批次 50——gPOK0 帧游走续攻：CDP 全程对拍推翻 boot 计数差假说，实锤帧名自视图缺陷并引擎侧落锤（frame_context_names），实弹编号进入 21/22 带但组成仍未及参考，native trace 仪器轮读出 aQgx8 为 orchestrate 侧 beacon 组装 GET，判决 0/5（5 retry 环，臂型不变）（2026-09-23 傍晚）
+
+**方法**：先 oracle 后动刀，本次 oracle 是活体全程。本机 Chrome 153.0.8010.48 经
+同一代理打真实 thelancet.com/1.txt，`Target.setAutoAttach` 逐上下文采样
+（window.name/title/window.length/history.length + Page.getFrameTree +
+`Page.addScriptToEvaluateOnNewDocument` boot 记录器），另以本地 shadow fixture
+（top+widget+light/open-shadow/closed-shadow 子帧，srcdoc 子代自报 window.name）
+同页对拍我方 release。判决轮 5 发（final131..135，capture_round 45s click 16），
+仪器轮 1 发（final130，`--trace-api-file` native property trace，634,766 条
+136MB）。
+
+**oracle 实锤（推翻 Step 352 的 boot 上下文计数差假说）**：
+- 活体 Chrome 的 widget（rch）帧：`window.name=""`（空，不是 root）、
+  `window.length=0`、`history.length=2` 与 top 相同。top 页
+  `window.frames` 全程为 0 而帧树里 widget 有约 7 个瞬时子帧 attach
+  （6.9-9.4s 密集，多数随即 detach）⇒ 21/20 这类编号不是任何 JS 可见的
+  boot 上下文计数（活体只有 2），而是挑战自建的命名序号；joint session
+  history 假说同样被 hist=2 证伪。
+- shadow fixture 对拍：Chrome 的 open/closed shadow 子 iframe **不进**
+  `window.frames`、`querySelectorAll('iframe')` 也不命中，但子代浏览上下文
+  真实存在（自报 window.name=VMQLo22/23）；我方这两个面本来就一致。
+  插入后改 name 属性、上下文名保持空：两边一致（352 修复保持）。
+- **真正的引擎面缺陷**：子帧文档里自己的 `window.name` 自视图。Chrome 答
+  出生态冻结的属性名（childA 自视图 VMQLo20，shadow 内同），我方答空串；
+  即 352 只修了 parent 侧 WindowProxy，child realm 的 legacy accessor 仍是
+  realm 局部变量。walk 里恒多的一个 root 段与编号错位由此而来。
+
+**引擎面修复（engine-side store，一处 commit）**：`ObscuraState.
+frame_context_names: HashMap<u32,String>` 按宿主 nid 存浏览上下文名；
+`create_iframe_content_document`（首建）与 `create_blank_iframe_document`
+（插入步同步建）在诞生时刻快照 name 属性（空也存，防回退活属性；导航
+previous=Some 不重快照）；新 op `frame_context_name`/`frame_context_name_set`
+读写该 store，读侧保留属性懒回退兜解析期帧；realms.js 的 WindowProxy
+name getter/setter 与 surface-finalize.js 的 child-realm legacy accessor
+（`_callingFrameRoot`+`frame_container_info` 定位宿主）全部改走 op store。
+realm 局部 `_frameBrowsingContextNames` 删除（跨 realm 本就无法共享）。
+钉 `frame_realm_own_window_name_is_the_browsing_context_name`（自视图出生
+名、帧内改名对父可见、属性不动、双视图跨导航存活）。shadow fixture 对拍
+修复后 childA/C/D 自视图逐位同 Chrome。srcdoc 子帧 location.href 答
+embedder URL 与 Chrome（about:srcdoc）不同属 9-17 已测的 deliberate
+answer（PAT 分支），不动。
+
+**仪器化轮（final130，native trace）**：全程 634,766 条 property 记录中
+`aQgx8` 恰 1 条：`HIT Object aQgx8 <orchestrate chl_page> 3:57736 GET`，
+栈 `jf:3:57736 <- OEkcY:2:19628 <- jI:2:21288 <- i:2:127170`；`nEJhr9`、
+`IGBuA2` 零记录（本轮未走完）。结论：aQgx8 累积器对象在 orchestrate
+（chl_page）侧，TS#1 明文初值与 beacon 组装读同源；本运行无任何按名 SET，
+TS#2 的 0→1 翻转发生在 widget VM 侧（跨 isolate，page isolate trace 看不到
+写点）或本轮未达的路径。trace 写盘开销致本轮超预算未出 TS#2（仪器轮代价，
+不计臂型）。
+
+**判决 final131-135（capture_round 45s, click 16; 每轮同窗 rch probe 解密
+TS#2 全成；负载 4.4-5.4，无静窗；机载 load 7.7-9.4）**：
+
+| 轮 | 负载带 | gPOK0 分段 | TS#2 | ov2 md5 | 判决 |
+|----|------|------|------|------|------|
+| final131 | NnqX6=10118/uGyjw9=396 | VMQLo21·VMQLo21·VMQLo20·root·root | 38 无 bench | 37808015 | retry 环 |
+| final132 | NnqX6=10494/uGyjw9=761 | VMQLo20·root·VMQLo20·VMQLo22·root | 39 bench@25 | c4f092cf | retry 环 |
+| final133 | NnqX6=9446/uGyjw9=304 | VMQLo20·root·VMQLo21·root·root | 38 无 bench | 6ca15450 | retry 环 |
+| final134 | NnqX6=10834/uGyjw9=251 | root·VMQLo21·root·root·VMQLo20 | 38 无 bench | 86e0087a | retry 环 |
+| final135 | NnqX6=10714/uGyjw9=215 | root·root·root·VMQLo21·VMQLo20 | 39 bench@37 | a15a89ae | retry 环 |
+
+**0/5**（形分布 5 retry 环，全流程+cycle2，2 ray；final109 以来臂型不变）。
+gPOK0 实弹变化：首个非 root 编号 3/5 轮读 21、2/5 轮读 20（352 的恒 20
+不再成立），**VMQLo22 首次在任何轮出现**（编号确为挑战自建序号，非固定
+{20,21} 常量）；组成仍差参考（参考恒 1 root+4 named，我方 2-3 root+2-3
+named）⇒ widget 内瞬时子帧的命名/churn 序列仍有残余差，属 VM 侧，需字节
+码管线（dispatcher store 位点）或逐帧 oracle 巡检。新 op 上活：orchestrate
+脚本本身在 live 轮走 `frame_context_name` 读（final131 ops.tsv 34 次）。
+
+**仪器化路径答复（352 入口③）**：路径存在且已用掉。代理机
+192.168.3.57 上 `mitmdump -s mitm_inject_ov2_addon.py
+--set ov2_inject_enabled=true`（pid 92968/92969，当日 11:17 起）活着，
+就是现行 ov2 服务链：按请求重读本地 ov2.js（317KB，13:08 更新）整段替换
+/rch/ 内联脚本，改文件即生效、无需重启；另有 `ov2_trace_snippet_enabled`
+（Phase 17）可前置任意 JS（需改 mitmdump 选项重启）。当前 ov2.js 无
+_vmpTrace 钩子、仅一条 Turnstile 过期 console.warn；dispatcher 的 store
+opcode 不匹配简单寄存器形状 grep，console.warn 级写点探针仍需 dispatcher
+store 位点分析（=字节码管线）。故本批仪器轮改用我方 native property
+trace（`--trace-api-file`，源构建直出 SET/GET 记录含运行时键与调用栈），
+不动共享代理链，读出 aQgx8 侧别如上。
+
+**产物**：/tmp/cf0919/b50/{frameside.py,fsample.py,hframeside.py,chrec.py,
+chr*/samples.jsonl+attaches.json+recs.jsonl,fix/{top.html,widget.html,
+drive*.py,collect.log},rec/}，/tmp/cf0919/round50.sh,
+/tmp/cf0919/round50_instrumented.sh，/tmp/cf0919/final130（trace-api.tsv
+136MB）/final131..135。
+
+**下一批入口**：① gPOK0 残余：widget 内瞬时子帧命名/churn 序列对拍
+（活体 Chrome frameAttached/Detached 时序 vs 我方 ops.tsv，编号 21/22 分
+配规则），字节码管线定位 walk 的命名读点；② aQgx8：orchestrate 侧累积器
+GET 位点已定（chl_page jf/OEkcY/jI/i 栈），写点在 widget VM 跨 isolate，
+需 worker isolate trace 或 dispatcher store 位点；③ nEJhr9/IGBuA2 本轮
+零记录，需走完全流程的仪器轮（trace 开销需过滤方案，`--trace-api-filter`
+只控静态名，计算键探针不过滤，考虑分轮抽样）；④ retry 环臂型续记
+（final109-135 恒 retry 环）；⑤ 工作区 gate 台账回填（350 ⑤）。

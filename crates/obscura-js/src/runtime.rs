@@ -12203,6 +12203,78 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_own_window_name_is_the_browsing_context_name() {
+        // Chrome 153 oracle (batch 50 shadow fixture): the frame's OWN global
+        // window.name answers with the browsing-context name the frame was
+        // born with, an assignment inside the frame renames the context for
+        // the parent too, and both views survive a navigation. The store is
+        // engine-side because parent and frame run in separate realms.
+        let mut rt = setup_runtime("<html><body><iframe id=f name=\"PerA\"></iframe></body></html>");
+        let script = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                return setupFrame("f", '<html><body></body></html>',
+                    "http://example.com/frame");
+            }})()"#
+        );
+        let root = rt.evaluate(&script).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, "http://example.com/frame")
+            .unwrap();
+        let inside = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame", 1, crate::realm::MAIN_WORLD,
+                "window.name", true, true, 1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(inside, serde_json::json!("PerA"));
+        // An assignment inside the frame renames the context for the parent.
+        rt.evaluate_in_frame_realm_for_cdp(
+            "test-frame", 1, crate::realm::MAIN_WORLD,
+            "window.name = \"Renamed\"", true, true, 1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const f = document.getElementById("f");
+                    return [f.contentWindow.name, f.getAttribute("name")];
+                })()"#
+            )
+            .unwrap(),
+            serde_json::json!(["Renamed", "PerA"])
+        );
+        // Both views survive a navigation of the same context: a second
+        // commit reuses the browsing context, so the name is not re-frozen
+        // from the (still unchanged) attribute.
+        let script2 = format!(
+            r#"(() => {{
+                {FRAME_OPS_PRELUDE}
+                return setupFrame("f", '<html><body><p>second</p></body></html>',
+                    "http://example.com/frame2");
+            }})()"#
+        );
+        rt.evaluate(&script2).unwrap();
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').contentWindow.name").unwrap(),
+            serde_json::json!("Renamed")
+        );
+        let inside2 = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame", 1, crate::realm::MAIN_WORLD,
+                "window.name", true, true, 1_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(inside2, serde_json::json!("Renamed"));
+    }
+
     #[test]
     fn native_iframe_same_origin_content_document_is_scoped() {
         let mut rt = setup_runtime(

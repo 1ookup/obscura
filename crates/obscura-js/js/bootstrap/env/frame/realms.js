@@ -196,22 +196,15 @@ const _frameWindowProxies = new Map();
 // (local Chrome 153 oracle: attribute-after-insert stays "", a name set
 // before insertion or assigned through contentWindow keeps its value after
 // loading a real document).
-const _frameBrowsingContextNames = new Map();
-function _frameContextName(hostNid, hostEl) {
-  let name = _frameBrowsingContextNames.get(hostNid);
-  if (name === undefined) {
-    name = (hostEl && hostEl.getAttribute && hostEl.getAttribute("name")) || "";
-    _frameBrowsingContextNames.set(hostNid, name);
-  }
-  return name;
-}
-// Insertion steps hook: freezes the name the browsing context is born with.
-// Called from __prepareInsertedSubtree for every connected iframe.
-function __frameFreezeContextName(hostEl) {
-  if (!hostEl) return;
-  const nid = hostEl[_nidSym];
-  if (nid === undefined || _frameBrowsingContextNames.has(nid)) return;
-  _frameBrowsingContextNames.set(nid, hostEl.getAttribute("name") || "");
+//
+// The store is engine-side (`frame_context_names` on the shared state, frozen
+// by the content-document creation ops) rather than a realm-local map: the
+// parent and the frame run in separate realms, and a name assigned inside the
+// frame must be visible to the parent and vice versa. The freeze is the Rust
+// creation op's job; this lazy read only answers for parse-time iframes whose
+// creation never went through it.
+function _frameContextName(hostNid) {
+  return String(_dom("frame_context_name", hostNid) ?? "");
 }
 
 // Rust rebuilds this context-local registry whenever a managed frame realm is
@@ -712,13 +705,13 @@ function _frameWindowProxyFor(hostEl) {
     set location(v) { navigate(v); },
     get name() {
       if (!sameOrigin()) throw securityError();
-      return _frameContextName(hostNid, hostEl);
+      return _frameContextName(hostNid);
     },
     set name(v) {
       if (!sameOrigin()) throw securityError();
       // window.name assignment renames the browsing context and, unlike the
       // iframe attribute, persists across navigations.
-      _frameBrowsingContextNames.set(hostNid, String(v == null ? "" : v));
+      _dom("frame_context_name_set", hostNid, String(v == null ? "" : v));
     },
     // Single-realm: the top and (for frames embedded by the top document)
     // parent window are the main global. The full ancestor WindowProxy chain

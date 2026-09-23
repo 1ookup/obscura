@@ -2394,8 +2394,31 @@ const _navigatorMemberLengths = {
     }
     Object.defineProperty(globalThis, name, descriptor);
   };
-  accessor('name', function() { return windowName; }, function(value) {
+  // A frame realm's window.name is the browsing-context name: born from the
+  // iframe's name attribute (frozen engine-side at content-document creation),
+  // shared with the parent's WindowProxy view, and an assignment from inside
+  // the frame renames the context for the parent too and survives navigations.
+  // Reads/writes route through the engine-side store so both realms agree;
+  // the top realm (no frame root) keeps the plain realm-local value.
+  function _ownContextHostNid() {
+    const root = _callingFrameRoot();
+    if (!root) return 0;
+    try {
+      const container = _domParse('frame_container_info', root);
+      const host = container && Number(container.host);
+      return Number.isFinite(host) && host > 0 ? host : 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+  accessor('name', function() {
+    const host = _ownContextHostNid();
+    if (host) return String(_dom('frame_context_name', host) ?? '');
+    return windowName;
+  }, function(value) {
     windowName = String(value);
+    const host = _ownContextHostNid();
+    if (host) _dom('frame_context_name_set', host, windowName);
   });
   accessor('status', function() { return windowStatus; }, function(value) {
     windowStatus = String(value);

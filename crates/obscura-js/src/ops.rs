@@ -221,6 +221,15 @@ pub struct ObscuraState {
     /// navigations set it to the source document URL.
     pub referrer: String,
     pub blocked_urls: Vec<String>,
+    /// Browsing-context names of nested frames, keyed by the iframe host nid.
+    /// Chrome reads the iframe's name attribute once, when the nested browsing
+    /// context is created; the snapshot lands here at that moment and every
+    /// window.name view (the parent's WindowProxy and the frame realm's own
+    /// global) reads and mutates this store. Engine-side, because the parent
+    /// and the frame run in separate realms whose bootstrap state is distinct:
+    /// a name assigned inside the frame must be visible to the parent and
+    /// survive navigations, exactly as a browsing-context name does.
+    pub frame_context_names: HashMap<u32, String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
@@ -463,6 +472,7 @@ impl ObscuraState {
             title: String::new(),
             referrer: String::new(),
             blocked_urls: Vec::new(),
+            frame_context_names: HashMap::new(),
             cookie_jar: None,
             http_client: None,
             callbacks: None,
@@ -1813,18 +1823,41 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             };
             match dom.create_iframe_content_document(NodeId::new(host)) {
                 Ok((root, previous)) => {
+                    // Chrome reads the iframe's name attribute once, when the
+                    // nested browsing context is created. Snapshot it here, at
+                    // exactly that moment: later attribute changes do not
+                    // rename the live context, while a window.name assignment
+                    // (through the parent's WindowProxy or from inside the
+                    // frame) goes through frame_context_name_set and does.
+                    // Navigations reuse the context, so a `previous` root must
+                    // not re-snapshot. The empty attribute must be stored too,
+                    // or a later read would fall back to the live attribute.
+                    let name_snapshot = if previous.is_none() {
+                        Some(
+                            dom.get_node(NodeId::new(host))
+                                .and_then(|node| node.get_attribute("name").map(str::to_string))
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        None
+                    };
+                    let previous_index = previous.map(|id| id.index());
                     // A navigation gives the iframe a new document timeline.
                     // Retained wrappers may still expose the detached old DOM,
                     // but its stylesheet/animation state must not remain in the
                     // active renderer map indefinitely.
+                    drop(gs);
+                    let mut shared_mut = shared.borrow_mut();
                     #[cfg(feature = "render")]
                     if let Some(previous) = previous {
-                        drop(gs);
-                        shared.borrow_mut().frame_render_states.remove(&previous);
+                        shared_mut.frame_render_states.remove(&previous);
+                    }
+                    if let Some(name) = name_snapshot {
+                        shared_mut.frame_context_names.insert(host, name);
                     }
                     serde_json::json!({
                         "root": root.index(),
-                        "previous": previous.map(|id| id.index()),
+                        "previous": previous_index,
                     })
                     .to_string()
                 }
@@ -1836,6 +1869,29 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             dom.iframe_content_document(NodeId::new(host))
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
+        }
+        // The browsing-context name of a nested frame, keyed by host nid.
+        // Frozen at content-document creation from the name attribute; a
+        // missing entry lazily answers with the attribute so parse-time
+        // iframes that never hit the creation op still follow the same rule.
+        "frame_context_name" => {
+            let host = arg1.parse::<u32>().unwrap_or(0);
+            if let Some(name) = gs.frame_context_names.get(&host) {
+                return name.clone();
+            }
+            dom.get_node(NodeId::new(host))
+                .and_then(|node| node.get_attribute("name").map(str::to_string))
+                .unwrap_or_default()
+        }
+        "frame_context_name_set" => {
+            let host = match arg1.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => return "0".into(),
+            };
+            let name = arg2.replace('\0', "");
+            drop(gs);
+            shared.borrow_mut().frame_context_names.insert(host, name);
+            "1".into()
         }
         // The initial about:blank document, committed synchronously when the
         // <iframe> is connected.
@@ -1940,6 +1996,21 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let Ok((root, _previous)) = dom.create_iframe_content_document(host) else {
                 return "-1".into();
             };
+            // First creation: this is the browsing-context birth moment, so
+            // freeze the name attribute exactly once (same rule as the
+            // create_iframe_content_document op; the early return above makes
+            // every arrival here a first creation). The empty attribute must
+            // be stored too, or a later read would fall back to the live
+            // attribute. The insert waits until the dom borrow is done.
+            let name_snapshot = if gs.frame_context_names.contains_key(&(host.index() as u32)) {
+                None
+            } else {
+                Some(
+                    dom.get_node(host)
+                        .and_then(|node| node.get_attribute("name").map(str::to_string))
+                        .unwrap_or_default(),
+                )
+            };
             // An empty body is not what about:blank is: it has a documentElement,
             // a head and a body, and scripts read all three.
             obscura_dom::parse_into_subtree(
@@ -1973,6 +2044,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     cross_origin_isolated: initial_cross_origin_isolated,
                 },
             );
+            if let Some(name) = name_snapshot {
+                drop(gs);
+                shared.borrow_mut().frame_context_names.insert(host.index() as u32, name);
+            }
             root.index().to_string()
         }
         // Parse a complete HTML document and graft it under a content root.
