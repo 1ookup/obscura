@@ -601,6 +601,8 @@ fn android_model(user_agent: &str) -> String {
 fn chromium_brands(major: u32, google_chrome: bool, full: bool, full_version: &str) -> Vec<BrandVersion> {
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VERSION: [&str; 3] = ["8", "99", "24"];
+    // The `orders` table of GetRandomOrder, indexed by `major % 6`. These are
+    // destinations, not source indices; see `shuffle_brands`.
     const PERMUTATIONS: [[usize; 3]; 6] = [
         [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
     ];
@@ -616,14 +618,33 @@ fn chromium_brands(major: u32, google_chrome: bool, full: bool, full_version: &s
     let version = if full { full_version.to_string() } else { major.to_string() };
     let chromium = BrandVersion { brand: "Chromium".to_string(), version: version.clone() };
     if !google_chrome {
-        return vec![chromium, grease];
+        // An unbranded Chromium build drops the product brand, leaving the
+        // grease pair and Chromium. Its two-entry branch of GetRandomOrder is
+        // `{seed % 2, (seed + 1) % 2}`, so even majors keep the grease brand
+        // first and odd majors put Chromium first.
+        let seed = major as usize;
+        return shuffle_brands([grease, chromium], [seed % 2, (seed + 1) % 2]);
     }
     let chrome = BrandVersion { brand: "Google Chrome".to_string(), version };
-    let values = [grease, chromium, chrome];
-    PERMUTATIONS[major as usize % PERMUTATIONS.len()]
-        .iter()
-        .map(|index| values[*index].clone())
-        .collect()
+    shuffle_brands(
+        [grease, chromium, chrome],
+        PERMUTATIONS[major as usize % PERMUTATIONS.len()],
+    )
+}
+
+/// Chromium's `ShuffleBrandList` applies its permutation as a scatter,
+/// `shuffled[order[i]] = list[i]` (components/embedder_support/user_agent_utils.cc),
+/// so `order` holds each source entry's destination index. Reading the same row
+/// as a gather is what used to send `[Chromium, Google Chrome, Not_A Brand]`
+/// for a major of 153, where Chrome sends `[Google Chrome, Not_A Brand,
+/// Chromium]`. Only the rows that are not their own inverse (3-cycles, i.e.
+/// majors 3 and 4 mod 6) differ between the two readings.
+fn shuffle_brands<const N: usize>(values: [BrandVersion; N], order: [usize; N]) -> Vec<BrandVersion> {
+    let mut shuffled = values.clone();
+    for (index, value) in values.into_iter().enumerate() {
+        shuffled[order[index]] = value;
+    }
+    shuffled.to_vec()
 }
 
 #[cfg(test)]
@@ -645,6 +666,66 @@ mod tests {
         assert!(fingerprint.gpu.renderer.contains("ANGLE Metal Renderer"));
         assert_eq!(fingerprint.sec_ch_ua_platform(), "\"macOS\"");
         assert_eq!(fingerprint.sec_ch_ua_mobile(), "?0");
+    }
+
+    /// Chrome seeds a stable permutation of the brand list with the major
+    /// version (`GetRandomOrder` + `ShuffleBrandList`, and the `orders` table
+    /// for three-entry lists, in
+    /// components/embedder_support/user_agent_utils.cc). Only the rows that are
+    /// not their own inverse move any entry: majors 3 and 4 mod 6 are the
+    /// 3-cycles, and those are exactly the ones a gather reading gets wrong.
+    ///
+    /// 153 is oracle-measured: Chrome 153.0.8010.48 on macOS echoing
+    /// https://httpbin.org/headers sends
+    /// `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"`.
+    /// The other rows are the remaining `orders` entries applied by the same
+    /// source rule; they are pinned here so a future edit cannot drift them
+    /// silently. To re-measure a new milestone, run that Chrome version
+    /// headless and read the `Sec-Ch-Ua` field of the echoed headers, in both a
+    /// navigation and a `fetch()` context.
+    #[test]
+    fn brand_order_follows_chromiums_major_version_seeded_shuffle() {
+        let brands = |major: u32| -> Vec<String> {
+            chromium_brands(major, true, false, "")
+                .into_iter()
+                .map(|brand| format!("{}={}", brand.brand, brand.version))
+                .collect()
+        };
+        // major % 6 == 0, 150: row [0, 1, 2]
+        assert_eq!(brands(150), ["Not;A=Brand=8", "Chromium=150", "Google Chrome=150"]);
+        // major % 6 == 1, 151: row [0, 2, 1]
+        assert_eq!(brands(151), ["Not=A?Brand=99", "Google Chrome=151", "Chromium=151"]);
+        // major % 6 == 2, 152: row [1, 0, 2]
+        assert_eq!(brands(152), ["Chromium=152", "Not?A_Brand=24", "Google Chrome=152"]);
+        // major % 6 == 3, 153: row [1, 2, 0] -- the oracle row
+        assert_eq!(brands(153), ["Google Chrome=153", "Not_A Brand=8", "Chromium=153"]);
+        // major % 6 == 4, 154: row [2, 0, 1]
+        assert_eq!(brands(154), ["Chromium=154", "Google Chrome=154", "Not A(Brand=99"]);
+        // major % 6 == 5, 155: row [2, 1, 0]
+        assert_eq!(brands(155), ["Google Chrome=155", "Chromium=155", "Not(A:Brand=24"]);
+
+        // The serialized header for the oracle row, verbatim.
+        assert_eq!(
+            BrowserFingerprint::from_user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
+                .sec_ch_ua(),
+            "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"");
+    }
+
+    /// The unbranded build drops the product brand and takes the two-entry
+    /// branch of GetRandomOrder, `{seed % 2, (seed + 1) % 2}`. Oracle:
+    /// Chrome for Testing 154.0.8037.57, an unbranded Chromium build, sends
+    /// `"Not A(Brand";v="99", "Chromium";v="154"` from the same echo endpoint.
+    #[test]
+    fn unbranded_chromium_orders_the_grease_brand_by_major_parity() {
+        let brands = |major: u32| -> Vec<String> {
+            chromium_brands(major, false, false, "")
+                .into_iter()
+                .map(|brand| brand.brand)
+                .collect()
+        };
+        assert_eq!(brands(154), ["Not A(Brand", "Chromium"]);
+        assert_eq!(brands(155), ["Chromium", "Not(A:Brand"]);
     }
 
     #[test]
