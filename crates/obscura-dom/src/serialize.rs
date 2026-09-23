@@ -176,22 +176,49 @@ impl DomTree {
     }
 }
 
+// Text-node escaping. Chrome 153 emits &amp;, &lt;, &gt; and &nbsp; (U+00A0)
+// and leaves everything else, including ", verbatim -- measured with the same
+// oracle probe as escape_attr. A non-breaking space is invisible in the
+// serialized bytes but not to a byte-exact diff, so it is escaped here for the
+// same reason it is in an attribute value.
 fn escape_text(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
             '<' => buf.push_str("&lt;"),
             '>' => buf.push_str("&gt;"),
+            '\u{00a0}' => buf.push_str("&nbsp;"),
             _ => buf.push(c),
         }
     }
 }
 
+// Attribute-value escaping, as Chrome 153 actually serializes (measured with
+// getAttribute/setAttribute round trips through innerHTML and outerHTML on a
+// local headless build; the same table comes back from a full parse of each
+// entity form, so it is the serializer's rule and not a parse artifact):
+//
+//   &      -> &amp;
+//   "      -> &quot;
+//   U+00A0 -> &nbsp;
+//   <      -> &lt;
+//   >      -> &gt;
+//
+// Everything else is emitted verbatim, including ' (values are always
+// double-quoted) and tab/newline (Chrome does not switch to a quoted form for
+// them the way the HTML spec's attribute serialization allows). The spec's
+// "escaping a string" list is only &, U+00A0 and "; Chrome also escapes the
+// two markup-significant angle brackets, and an oracle diff of the Cloudflare
+// challenge payload is what pinned that. Escaping all five is re-parse
+// stable: each entity decodes back to the character that produced it.
 fn escape_attr(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
             '"' => buf.push_str("&quot;"),
+            '<' => buf.push_str("&lt;"),
+            '>' => buf.push_str("&gt;"),
+            '\u{00a0}' => buf.push_str("&nbsp;"),
             _ => buf.push(c),
         }
     }
@@ -214,7 +241,19 @@ mod tests {
     use html5ever::{LocalName, QualName};
 
     use crate::tree::{NodeData, ShadowRootMode};
-    use crate::tree_sink::parse_html;
+    use crate::tree_sink::{parse_fragment_with_context, parse_html};
+
+    // Fragment parse + serialize, the shape `div.innerHTML = x; div.innerHTML`
+    // takes in the engine: the receiver element is the fragment context and
+    // the result is its serialized children.
+    fn inner_html_round_trip(input: &str) -> String {
+        let tree = parse_html(r#"<div id="host"></div>"#);
+        let host = tree.get_element_by_id("host").unwrap();
+        let context = QualName::new(None, ns!(html), LocalName::from("div"));
+        let fragment = parse_fragment_with_context(input, context);
+        tree.import_children_from(host, &fragment, fragment.fragment_root());
+        tree.inner_html(host)
+    }
 
     #[test]
     fn test_outer_html() {
@@ -302,6 +341,97 @@ mod tests {
                 "comment data still contains a raw '>': {serialized}"
             );
         }
+    }
+
+    /// The Chrome 153 escaping oracle for the Cloudflare challenge payload.
+    /// Every expected string below is a verbatim read of Chrome 153
+    /// (`div.innerHTML = input; div.innerHTML`) on a local headless build. The
+    /// rows are the ones the CF payload produced: the entities Chrome re-escapes
+    /// (`<`, `>`, NBSP) sit next to the ones it does not (`'`, tab, newline), so
+    /// a serializer that escapes too much fails here as loudly as one that
+    /// escapes too little.
+    #[test]
+    fn inner_html_escaping_matches_the_chrome_153_oracle() {
+        let cases = [
+            ("<p>EnIF0</p><p>ikyR0</p>", "<p>EnIF0</p><p>ikyR0</p>"),
+            (r#"<div data-foo="&quot;"></div>"#, r#"<div data-foo="&quot;"></div>"#),
+            (r#"<div data-foo="x"></div>"#, r#"<div data-foo="x"></div>"#),
+            (
+                r#"<div data-foo="a&quot;b"></div>"#,
+                r#"<div data-foo="a&quot;b"></div>"#,
+            ),
+            // Both spellings of a double quote parse to one character and
+            // serialize back as &quot;.
+            (r#"<div data-foo="&#34;"></div>"#, r#"<div data-foo="&quot;"></div>"#),
+            ("<div data-foo='\"'></div>", r#"<div data-foo="&quot;"></div>"#),
+            (r#"<div data-foo="&amp;"></div>"#, r#"<div data-foo="&amp;"></div>"#),
+            (r#"<div data-foo="&lt;"></div>"#, r#"<div data-foo="&lt;"></div>"#),
+            (r#"<div data-foo="&gt;"></div>"#, r#"<div data-foo="&gt;"></div>"#),
+            (
+                r#"<div data-foo="&nbsp;"></div>"#,
+                r#"<div data-foo="&nbsp;"></div>"#,
+            ),
+            (r#"<img alt="&quot;">"#, r#"<img alt="&quot;">"#),
+            (r#"<a href="?a=&quot;b">z</a>"#, r#"<a href="?a=&quot;b">z</a>"#),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                inner_html_round_trip(input),
+                expected,
+                "innerHTML round trip diverged from Chrome 153 for {input:?}",
+            );
+        }
+    }
+
+    /// The characters Chrome 153 escapes in an attribute value versus the ones
+    /// it emits raw, for every character the CF payload carries. A value is
+    /// always double-quoted, so `'` stays literal, and the ASCII whitespace a
+    /// quoted value may contain is not rewritten.
+    #[test]
+    fn attribute_values_escape_exactly_the_chrome_153_set() {
+        let tree = parse_html(r#"<div id="host"></div>"#);
+        let cases = [
+            ("<", "&lt;"),
+            (">", "&gt;"),
+            ("&", "&amp;"),
+            ("\"", "&quot;"),
+            ("'", "'"),
+            ("\u{00a0}", "&nbsp;"),
+            ("\t\n", "\t\n"),
+            ("=", "="),
+            ("\u{0300}", "\u{0300}"),
+        ];
+
+        for (value, escaped) in cases {
+            let el = tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from("div")),
+                attrs: vec![crate::tree::Attribute {
+                    name: QualName::new(None, ns!(), LocalName::from("a")),
+                    value: value.to_string(),
+                }],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            });
+            assert_eq!(
+                tree.outer_html(el),
+                format!(r#"<div a="{escaped}"></div>"#),
+                "attribute value {value:?} serialized differently from Chrome 153",
+            );
+        }
+    }
+
+    /// Text nodes follow the same escape set: Chrome re-escapes NBSP there too,
+    /// and leaves `"` alone.
+    #[test]
+    fn text_nodes_escape_amp_angles_and_nbsp() {
+        let tree = parse_html(r#"<div id="host"></div>"#);
+        let host = tree.get_element_by_id("host").unwrap();
+        let text = tree.new_node(NodeData::Text {
+            contents: "<>&\"\u{00a0}".to_string(),
+        });
+        tree.append_child(host, text);
+        assert_eq!(tree.inner_html(host), "&lt;&gt;&amp;\"&nbsp;");
     }
 
     #[test]
