@@ -14354,3 +14354,33 @@ C4 = function (Y, …) { console.log("payloadJSON:", JSON.stringify(Y)); … }
 - G5：`OYbs6`/`XqEQ3`/`xkNI3`/`HPcn5`/`lgWCE7`（媒体与度量）
 
 落盘位置建议：`js-repros/` 下新增 `cf-field-swap/`（探针 + 驱动脚本），产物写 `/tmp/cf-parity/swap/`。
+
+#### 354.20 计数器族定性更正 + 跨 realm op 扇出（批次 52 线索）
+
+**定性更正（推翻 §10.20/§10.21 的读法）**：`uGyjw9`/`TzZRB1`/`WHTpH6`/`ZMSOw0`/`twvE0`/`eaaP6`/`tZwbF3`/`wOvYJ5`/`Blsob5` 在**同一轮的 payload#1/#2/#3 中逐字节相同**（我方与 Chrome 都是）⇒ 它们是**引导期一次性定型的常量**，不是运行中的计数器。只有 `NnqX6` 随条目数增长（尺寸代理）。
+
+⇒ **§10.20/§10.21 的「`uGyjw9` = worker 进度消息洪泛」与 §10.22 的「不随时长收敛 ⇒ 真实事件量差」都应改写为：引导阶段的内部工作量代理**。引导期根本没有 worker 流量，所以那两类归因都不适用。各字段倍率差异极大（1.2x ↔ 155x）⇒ **不是单一 API 造成**，而是按各引导阶段内部工作量的比例放大。
+
+**H2（事件重复投递）证伪**（双引擎本机 fixture）：`setTimeout(0)`×200、`Promise.then`×500、`MessageChannel`×200、`Worker.postMessage`×300 —— 两引擎**均零重复、零乱序**。另排除：frame realm 启动慢（8 个 srcdoc 帧 42.7ms vs 48.6ms）、digest 更快（100ms 预算 Chrome 57,610 次 > 我方 45,203 次，**我们更慢**）、worker 往返延迟量级不符。
+
+**H3（`aQgx8` 结构差）成立**：顶层键集精确差一项——`ours#2 = ref#2 ∪ {aQgx8}`、`ours#3 = ref#3 ∪ {aQgx8}`；键数 `ref = 47/53/54` vs `ours = 47/54/55`。Chrome 的 `aQgx8` 是**一次性引导标志**：#1 写 `0`，#2/#3 **整个不写**；我方 #2/#3 写 `1`。
+
+**H1（API 异常触发重试）未有直接证据**，但找到**唯一量化到该量级的引擎侧差异：跨 realm 属性读的 op 扇出**。
+
+`--trace-op-file` 复算（118,370 op）：`iframe_content_document_root` 60,485、`iframe_scopes_same_origin` 30,818、`document_scope_info` 2,698、`query_selector_scoped(…,'base[href]')` 1,033-1,454，全部来自 `challenges.cloudflare.com/.../rch/...` 两个 realm；集中在四个爆段，每 20ms 437 op、op 间距 17-22μs，**合计约 2.1s**。对照 Chrome 同挑战 trace：`contentWindow` 读 8 次、`contentDocument` 7 次、`baseURI` 1 次。
+
+双引擎单次读成本（非顶层 realm）：
+
+| API | Chrome | Obscura | 倍率 |
+|---|---|---|---|
+| `document.baseURI` | 0.033μs | **3.97μs** | **120x** |
+| `element.baseURI` | 0.067μs | 4.13μs | 62x |
+| `location.href` | 0.20μs | **7.70μs** | 38x |
+| `parent.document.URL` | 0.23μs | 4.53μs | 19x |
+| `iframe.contentWindow.document.URL` | 0.27μs | 5.90μs | 22x |
+
+根因：`env/window/location.js:74 _internalBaseHref()` 每次读都跑 `query_selector_scoped(doc,'base[href]')` + `get_attribute`，而同文件 `:7` 的 `_environmentSettings()` 依赖 `document.baseURI` ⇒ 每次 `location.href`/fetch/URL 解析都付这笔钱；`env/dom/node-object.js:58 Node.prototype.baseURI` 再叠一次 `document_scope_info`；`env/frame/realms.js:612 _frameWindowProxyFor()` 的 `contentRoot()`/`sameOrigin()` 每访问一次 frame WindowProxy 属性各跑一次。
+
+**未断言**：这条扇出**尚未证明**就是那些引导期常量的测量对象。已派修（缓存 + 失效键走一个只读 op，语义保真要求：动态增删/改 `<base href>` 后 `baseURI`/`location.href`/相对 URL 解析必须立即反映）。
+
+**另一条独立确定性值差**：条目 `[BMnw0+Ozfs8+UYbIv2+bzNje2+knVv1+xWWV8]` 中 Chrome **四轮一致** `UYbIv2 == Ozfs8 == "UGOeP6"`、`knVv1=7`（`hCfV6` 143），我方 `Ozfs8="WoUrS0"`、`knVv1=5`（`hCfV6` 1170）。同条目 `UYbIv2` 我们**与 Chrome 相同**，所以是"同一值的两个槽位有一个算错"，可能比计数器更容易定位。
