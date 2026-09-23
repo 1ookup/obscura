@@ -188,6 +188,32 @@ const _crossOriginWindowProps = new Set([
 // frame's navigations; every access re-reads the active content root.
 const _frameWindowProxies = new Map();
 
+// Browsing context name, keyed by host nid. Chrome reads the iframe's name
+// attribute once, when the nested browsing context is created (insertion);
+// a later attribute change does not rename the live context, while a
+// `window.name` assignment (from the parent through the WindowProxy or
+// inside the frame) renames it and survives every subsequent navigation
+// (local Chrome 153 oracle: attribute-after-insert stays "", a name set
+// before insertion or assigned through contentWindow keeps its value after
+// loading a real document).
+const _frameBrowsingContextNames = new Map();
+function _frameContextName(hostNid, hostEl) {
+  let name = _frameBrowsingContextNames.get(hostNid);
+  if (name === undefined) {
+    name = (hostEl && hostEl.getAttribute && hostEl.getAttribute("name")) || "";
+    _frameBrowsingContextNames.set(hostNid, name);
+  }
+  return name;
+}
+// Insertion steps hook: freezes the name the browsing context is born with.
+// Called from __prepareInsertedSubtree for every connected iframe.
+function __frameFreezeContextName(hostEl) {
+  if (!hostEl) return;
+  const nid = hostEl[_nidSym];
+  if (nid === undefined || _frameBrowsingContextNames.has(nid)) return;
+  _frameBrowsingContextNames.set(nid, hostEl.getAttribute("name") || "");
+}
+
 // Rust rebuilds this context-local registry whenever a managed frame realm is
 // created or destroyed. Values are live, realm-owned bridges to the frame main
 // worlds, so same-origin WindowProxy access reaches the realm that executes the
@@ -686,7 +712,13 @@ function _frameWindowProxyFor(hostEl) {
     set location(v) { navigate(v); },
     get name() {
       if (!sameOrigin()) throw securityError();
-      return hostEl.getAttribute("name") || "";
+      return _frameContextName(hostNid, hostEl);
+    },
+    set name(v) {
+      if (!sameOrigin()) throw securityError();
+      // window.name assignment renames the browsing context and, unlike the
+      // iframe attribute, persists across navigations.
+      _frameBrowsingContextNames.set(hostNid, String(v == null ? "" : v));
     },
     // Single-realm: the top and (for frames embedded by the top document)
     // parent window are the main global. The full ancestor WindowProxy chain
