@@ -14449,3 +14449,27 @@ grep -aP "\tfetch\t" /tmp/cf-parity/ours/v2/run/ops.tsv  | grep -ac '/ci/'   # 0
 ⇒ 真问题**收窄为**：`/ci/` 的条目没有出现在我方 payload#2 的 `rPXg2` 里（Chrome 4 条含 `/ci/`，我方 3 条不含）。候选：① 条目在但被挑战的选取条件过滤（Chrome 那条 `EazF1=0`/`dtkfB9=101`/`gtlhH0=102` 数值极小，若我方给 0/未定义就很可能被丢）；② 挑战页的 CSP/跨源/no-cors 条件下 Image 条目确实没进。已按此重新定向追查。
 
 **教训（记进测量盲区）**：`--trace-op-file` **不是**网络全量记录——Image/`srcset`/CSS 资源不走该通道。凡"某请求 0 次"的结论，必须先排除该盲区（本文件 line 1821-1827 已记一次同类错误，这是第二次）。
+
+#### 354.23 `/ci/` 实测：确实发出，但响应体只有 Chrome 的 1/10，且不进 `rPXg2`
+
+用实弹轮 + 跨 realm 取数（widget realm 里 dump `performance.getEntriesByType('resource')`，经 `--tracelog-file` 的 `window.external.tracelog` 引出）：
+
+| initiatorType | duration | transferSize | encodedBodySize |
+|---|---|---|---|
+| `xmlhttprequest`（TS#1 `/fo/`） | 639 | 823180 | 822880 |
+| **`img`（即 `/ci/`）** | **2191** | **632** | **332** |
+| `xmlhttprequest`（TS#2 `/fo/`） | 218 | 127528 | 127228 |
+
+Chrome 的 `/ci/` 真实响应（三份 HAR 全查，均为 `image/png`）：
+
+| 轮 | status | size |
+|---|---|---|
+| headed-r4 | 200 | **2415** |
+| headed-0143 | 200 | **3810** |
+| cleanua | 200 | **3196** |
+
+⇒ ① `/ci/` **确实发出**（有 `img` 类型的 resource-timing 条目）；② 但**响应体只有 332 字节，Chrome 是 2415-3810 字节，差约 10 倍**，且 `duration` 2191ms（Chrome 侧是毫秒级）；③ 它**没有出现在 payload#2 的 `rPXg2` 里**（Chrome 4 条含 `/ci/`，我方 3 条不含）。
+
+**注意复现抖动**：两次实弹轮里只一次出现 `img` 条目——`/ci/` 不是每轮都触发，判定时不要用单次结果。
+
+**测量盲区补记**：`--trace-op-file` 不记录 Image/`srcset`/CSS 资源加载，凡"某请求 0 次"的结论必须先排除该盲区（本文件 line 1821、§354.21 各栽过一次，这是第三次同类教训）。
