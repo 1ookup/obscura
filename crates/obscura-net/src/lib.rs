@@ -1,3 +1,4 @@
+pub mod chrome_headers;
 pub mod client;
 pub mod cookies;
 pub mod encoding;

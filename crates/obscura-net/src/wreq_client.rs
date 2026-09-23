@@ -22,9 +22,9 @@ use crate::cookies::CookieJar;
 use wreq::IntoEmulation;
 #[cfg(feature = "stealth")]
 use crate::client::{
-    CallbackRegistry, InFlightGuard, ObscuraNetError, ReferrerPolicy, RequestInfo, RequestMode,
+    CallbackRegistry, InFlightGuard, ObscuraNetError, ReferrerPolicy, RequestInfo,
     ResourceRequest, Response, ResponseTiming, cors_required, fetch_file_url, redirect_taints_origin,
-    request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
+    response_too_large, serialized_request_origin,
     client_hint_origin, client_hint_value, parse_client_hint_list,
     validate_cors_response, validate_request_mode, validate_url, origin_header_required,
 };
@@ -448,72 +448,20 @@ impl StealthHttpClient {
             let is_frame_navigation = request_headers
                 .get("sec-fetch-dest")
                 .is_some_and(|value| value.eq_ignore_ascii_case("iframe"));
-            let has_header = |name: &str| {
-                extra_headers.contains_key(name) || request_headers.contains_key(name)
-            };
+            // One merged caller view, which is also exactly what the callback
+            // metadata below wants, so no third map is built. Chrome's wire
+            // order is then replayed from a fixed table rather than by
+            // iterating this map: a HashMap's iteration order is seeded per
+            // map, so the old loops serialized the header block differently on
+            // every request. See chrome_headers.rs for the measurements.
+            let mut caller = extra_headers;
+            caller.extend(request_headers);
+            // `Origin` is forbidden to callers and is always the derived one.
+            caller.remove("origin");
 
-            if !has_header("user-agent") && !fingerprint.user_agent.is_empty() {
-                req = req.header("user-agent", &fingerprint.user_agent);
-            }
-            if !has_header("accept") {
-                req = req.header("accept", request.accept());
-            }
-            if !has_header("accept-language") {
-                req = req.header("accept-language", fingerprint.accept_language());
-            }
-            if !has_header("accept-encoding") {
-                req = req.header("accept-encoding", "gzip, deflate, br, zstd");
-            }
-            if !has_header("priority") {
-                req = req.header(
-                    "priority",
-                    crate::client::request_priority(request.mode, request.destination()),
-                );
-            }
-            if !has_header("sec-fetch-site") {
-                req = req.header("sec-fetch-site", request_fetch_site(&request, &current_url));
-            }
-            if !has_header("sec-fetch-mode") {
-                req = req.header("sec-fetch-mode", request.mode.header_value());
-            }
-            if !has_header("sec-fetch-dest") {
-                req = req.header("sec-fetch-dest", request.destination());
-            }
-            if !fingerprint.brands.is_empty() {
-                if !has_header("sec-ch-ua") {
-                    req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
-                }
-                if !has_header("sec-ch-ua-mobile") {
-                    req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
-                }
-                if !has_header("sec-ch-ua-platform") {
-                    req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
-                }
-            }
-            if request.mode == RequestMode::Navigate {
-                if !has_header("upgrade-insecure-requests") {
-                    req = req.header("upgrade-insecure-requests", "1");
-                }
-                if !is_frame_navigation && !has_header("sec-fetch-user") {
-                    req = req.header("sec-fetch-user", "?1");
-                }
-                // No `cache-control` on a navigation. Chrome revalidates with
-                // `max-age=0` on the main-document request only for an explicit
-                // reload. Measured on Chrome 153.0.8010.48 over CDP network
-                // events, it is absent from a first navigation, a navigation to
-                // an already-visited URL, a re-navigation to the URL already
-                // loaded, a same-URL `document.location` assignment, and a
-                // cross-origin navigation; `Page.reload` was the only one of
-                // eight navigation kinds that carried it. Reload is not a
-                // concept this request layer has, so the header is never sent.
-                // Wire reload semantics up and restore it for reload alone.
-            }
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                req = req.header("referer", referer);
-            }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-
-            let cookie_header = if request.sends_credentials_to(&current_url) {
+            let sends_credentials = request.sends_credentials_to(&current_url);
+            let cookie_header = if sends_credentials {
                 self.cookie_jar.get_cookie_header(&current_url)
             } else {
                 String::new()
@@ -528,54 +476,71 @@ impl StealthHttpClient {
                     ?cookie_names,
                     "navigation request carries cookies"
                 );
-                req = req.header("Cookie", &cookie_header);
-            }
-
-            for (k, v) in extra_headers.iter() {
-                if request_headers.contains_key(k) {
-                    continue;
-                }
-                if k.eq_ignore_ascii_case("origin") {
-                    continue;
-                }
-                req = req.header(k.as_str(), v.as_str());
-            }
-            for (k, v) in &request_headers {
-                if k.eq_ignore_ascii_case("origin") {
-                    continue;
-                }
-                req = req.header(k.as_str(), v.as_str());
-            }
-            if origin_header_required(&request, &current_url, "GET") {
-                req = req.header("origin", &request_origin);
+                caller.insert("cookie".to_string(), cookie_header);
             }
 
             let hint_origin = client_hint_origin(&current_url);
-            // Low-entropy UA-CH fields may already have been emitted above
-            // from the fingerprint. Keep them in the sent set so an
-            // Accept-CH response cannot append a second value for the same
-            // field on this request.
-            let mut sent_client_hints = HashSet::new();
+            // Detached before the send: no hint lock is held across the
+            // transport. Sorted, so the same Accept-CH list always serializes
+            // the same way.
+            let mut accepted_hints: Vec<String> = self
+                .accepted_client_hints
+                .read()
+                .await
+                .get(&hint_origin)
+                .map(|accepted| accepted.iter().cloned().collect())
+                .unwrap_or_default();
+            accepted_hints.sort();
+            // Low-entropy UA-CH fields are emitted from the fingerprint, and an
+            // Accept-CH entry for one of them must not append a second value
+            // for a field this request carries once. `sec-ch-ua-mobile: ?0, ?0`
+            // is a value no browser produces, and the challenge platform lists
+            // Sec-CH-UA in Accept-CH, so without this every request carried it.
+            let mut sent_client_hints: HashSet<String> = HashSet::new();
             for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
-                if has_header(name) || !fingerprint.brands.is_empty() {
+                if caller.contains_key(name) || !fingerprint.brands.is_empty() {
                     sent_client_hints.insert(name.to_string());
                 }
             }
-            if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
-                for name in accepted {
-                    if has_header(name) || sent_client_hints.contains(name) {
-                        sent_client_hints.insert(name.clone());
-                        continue;
-                    }
-                    if let Some(value) = client_hint_value(name, &fingerprint) {
-                        req = req.header(name.as_str(), value);
-                        sent_client_hints.insert(name.clone());
-                    }
+            for hint in &accepted_hints {
+                if caller.contains_key(hint) || sent_client_hints.contains(hint) {
+                    sent_client_hints.insert(hint.clone());
+                } else if client_hint_value(hint, &fingerprint).is_some() {
+                    sent_client_hints.insert(hint.clone());
                 }
             }
 
-            let mut callback_headers = extra_headers;
-            callback_headers.extend(request_headers);
+            // No `cache-control` on a navigation. Chrome revalidates with
+            // `max-age=0` on the main-document request only for an explicit
+            // reload. Measured on Chrome 153.0.8010.48 over CDP network
+            // events, it is absent from a first navigation, a navigation to
+            // an already-visited URL, a re-navigation to the URL already
+            // loaded, a same-URL `document.location` assignment, and a
+            // cross-origin navigation; `Page.reload` was the only one of
+            // eight navigation kinds that carried it. Reload is not a
+            // concept this request layer has, so the header is never sent.
+            // Wire reload semantics up and restore it for reload alone.
+            let plan = crate::chrome_headers::ChromeHeaderPlan {
+                fingerprint: &fingerprint,
+                request: Some(&request),
+                current_url: &current_url,
+                shape: crate::chrome_headers::shape_for(&request),
+                origin: origin_header_required(&request, &current_url, "GET")
+                    .then_some(request_origin.as_str()),
+                priority: crate::client::request_priority(request.mode, request.destination()),
+                // This path is GET-only; scripted bodies go through
+                // `send_single`.
+                body_len: None,
+                is_frame_navigation,
+                caller: &caller,
+                accepted_hints: &accepted_hints,
+                sends_credentials,
+            };
+            for (name, value) in crate::chrome_headers::build_chrome_headers(&plan) {
+                req = req.header(name.as_str(), value.as_str());
+            }
+
+            let callback_headers = caller;
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: "GET".to_string(),
@@ -782,83 +747,81 @@ impl StealthHttpClient {
             .iter()
             .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
             .collect();
-        let has_header = |name: &str| {
-            extra_headers.contains_key(name) || request_headers.contains_key(name)
-        };
-        if !has_header("user-agent") && !fingerprint.user_agent.is_empty() {
-            req = req.header("user-agent", &fingerprint.user_agent);
-        }
-        if !has_header("accept-encoding") {
-            req = req.header("accept-encoding", "gzip, deflate, br, zstd");
-        }
-        if !has_header("priority") {
-            // Scripted fetch/XHR: Chrome sends `u=1, i` here (its navigation and
-            // subresource paths use `u=0, i` / `i`, set in fetch_with_profile).
-            req = req.header("priority", "u=1, i");
-        }
-        // Chrome omits sec-fetch-storage-access unless a storage-access grant
-        // is in play (a third-party iframe after requestStorageAccess). This
-        // client never holds one, and the reference Chrome sends no such header
-        // on scripted fetch/XHR, so adding `none` would be a tell, not parity.
-        if !fingerprint.brands.is_empty() {
-            if !has_header("sec-ch-ua") {
-                req = req.header("sec-ch-ua", fingerprint.sec_ch_ua());
-            }
-            if !has_header("sec-ch-ua-mobile") {
-                req = req.header("sec-ch-ua-mobile", fingerprint.sec_ch_ua_mobile());
-            }
-            if !has_header("sec-ch-ua-platform") {
-                req = req.header("sec-ch-ua-platform", fingerprint.sec_ch_ua_platform());
-            }
-        }
+        // Chrome's wire order, replayed from a fixed table rather than by
+        // iterating these maps: HashMap iteration order is seeded per map, so
+        // the loops that used to stand here put `origin` before
+        // `sec-fetch-site` on one request and after it on the next. See
+        // chrome_headers.rs for the measurements.
+        let mut caller = extra_headers;
+        caller.extend(request_headers);
+        // ops.rs derives `Origin` from the initiator, so a caller-supplied one
+        // is the same value; unlike the navigation path it is not stripped.
+        let hint_origin = client_hint_origin(url);
+        let mut accepted_hints: Vec<String> = self
+            .accepted_client_hints
+            .read()
+            .await
+            .get(&hint_origin)
+            .map(|accepted| accepted.iter().cloned().collect())
+            .unwrap_or_default();
+        accepted_hints.sort();
         // Chromium remembers the high-entropy UA hints a response asked for in
         // Accept-CH and sends them on every later request to that origin, not
         // only on navigations. A server that lists them in Critical-CH may
         // treat a request without them as an error, so a scripted fetch/XHR
         // submission that omits them is observably unlike the browser it
-        // claims to be.
-        let hint_origin = client_hint_origin(url);
-        // Same rule as fetch_with_profile: the low-entropy trio was already
-        // emitted above from the fingerprint, and an Accept-CH entry for one
-        // of them must not append a second value to a header this request
-        // carries once. `sec-ch-ua-mobile: ?0, ?0` is a value no browser
-        // produces, and the challenge platform lists Sec-CH-UA in Accept-CH,
-        // so without this every scripted request carried it.
+        // claims to be. Same rule as fetch_with_profile: the low-entropy trio
+        // is emitted once from the fingerprint, and an Accept-CH entry for one
+        // of them must not append a second value. `sec-ch-ua-mobile: ?0, ?0`
+        // is a value no browser produces, and the challenge platform lists
+        // Sec-CH-UA in Accept-CH, so without this every scripted request
+        // carried it.
         let mut sent_client_hints: HashSet<String> = HashSet::new();
         for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
-            if has_header(name) || !fingerprint.brands.is_empty() {
+            if caller.contains_key(name) || !fingerprint.brands.is_empty() {
                 sent_client_hints.insert(name.to_string());
             }
         }
-        if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
-            for name in accepted {
-                if has_header(name) || sent_client_hints.contains(name) {
-                    sent_client_hints.insert(name.clone());
-                    continue;
-                }
-                if let Some(value) = client_hint_value(name, &fingerprint) {
-                    req = req.header(name.as_str(), value);
-                    sent_client_hints.insert(name.clone());
-                }
+        for hint in &accepted_hints {
+            if caller.contains_key(hint) || sent_client_hints.contains(hint) {
+                sent_client_hints.insert(hint.clone());
+            } else if client_hint_value(hint, &fingerprint).is_some() {
+                sent_client_hints.insert(hint.clone());
             }
         }
 
         if send_cookies {
             let cookie_header = self.cookie_jar.get_cookie_header(url);
             if !cookie_header.is_empty() {
-                req = req.header("cookie", &cookie_header);
+                caller.insert("cookie".to_string(), cookie_header);
             }
         }
-        for (k, v) in extra_headers.iter() {
-            if request_headers.contains_key(k) {
-                continue;
-            }
-            req = req.header(k.as_str(), v.as_str());
+        // The body is attached before the header table is replayed, so the
+        // length Chrome puts first is known here rather than appended later by
+        // the transport.
+        let body_len = (!body.is_empty()).then(|| body.len());
+        let plan = crate::chrome_headers::ChromeHeaderPlan {
+            fingerprint: &fingerprint,
+            request: None,
+            current_url: url,
+            shape: crate::chrome_headers::ChromeRequestShape::Subresource,
+            origin: None,
+            // Scripted fetch/XHR: Chrome sends `u=1, i` here (its navigation
+            // and subresource paths use `u=0, i` / `i`, set in
+            // fetch_with_profile).
+            priority: "u=1, i",
+            body_len,
+            is_frame_navigation: false,
+            caller: &caller,
+            accepted_hints: &accepted_hints,
+            sends_credentials: send_cookies,
+        };
+        for (name, value) in crate::chrome_headers::build_chrome_headers(&plan) {
+            req = req.header(name.as_str(), value.as_str());
         }
-        for (k, v) in request_headers.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if !body.is_empty() {
+        if body_len.is_some() {
+            // `content-length` was emitted in Chrome's own slot above, which
+            // keeps the transport from appending it at the end.
             req = req.body(body.to_string());
         }
 
@@ -1132,6 +1095,214 @@ mod tests {
         assert!(request.contains(
             "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
         ), "{request}");
+    }
+
+    /// Header names in the order they reached the wire, lowercased. The
+    /// fixture captures the raw HTTP/1.1 request, so this is the real order
+    /// rather than the map's.
+    fn wire_header_names(raw: &str) -> Vec<String> {
+        raw.lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split(':').next())
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect()
+    }
+
+    /// The header set `ops.rs` hands a scripted fetch/XHR, which is where the
+    /// Fetch metadata comes from on this path.
+    fn scripted_headers() -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert("origin".to_string(), "https://example.test".to_string());
+        headers.insert("sec-fetch-site".to_string(), "cross-site".to_string());
+        headers.insert("sec-fetch-mode".to_string(), "cors".to_string());
+        headers.insert("sec-fetch-dest".to_string(), "empty".to_string());
+        headers.insert("accept".to_string(), "*/*".to_string());
+        headers.insert(
+            "referer".to_string(),
+            "https://example.test/".to_string(),
+        );
+        headers
+    }
+
+    /// Chrome 153.0.8010.48's wire order for a top-level navigation, measured
+    /// over HTTP/2 against a loopback echo endpoint. The stealth transport is
+    /// what a `--stealth` run puts on the wire, so the order is pinned here as
+    /// well as in `chrome_headers`. `host` trails because hyper emits it after
+    /// the request headers rather than first, which is where Chrome's h1
+    /// encoder puts it; h2 carries the same block after the pseudo-headers and
+    /// uses `:authority` instead, so the block itself is the contract.
+    #[tokio::test]
+    async fn stealth_navigation_header_order_matches_chrome() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint,
+        );
+        client
+            .fetch_resource_with_callbacks(
+                &url,
+                crate::client::ResourceRequest::navigation(),
+                None,
+            )
+            .await
+            .expect("fixture must be reachable");
+
+        let raw = request.await.unwrap();
+        assert_eq!(
+            wire_header_names(&raw),
+            vec![
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "upgrade-insecure-requests",
+                "user-agent",
+                "accept",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-user",
+                "sec-fetch-dest",
+                "accept-encoding",
+                "accept-language",
+                "priority",
+                "host",
+            ],
+            "{raw}",
+        );
+    }
+
+    /// The subresource shape on the wire, for a cross-site scripted fetch. The
+    /// navigation-only headers are absent and `Sec-CH-UA-Platform` leads, which
+    /// is what separates the two shapes.
+    #[tokio::test]
+    async fn stealth_scripted_fetch_header_order_matches_chrome() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint,
+        );
+        let headers = scripted_headers();
+        client
+            .send_single("GET", &url, &headers, "", true, true)
+            .await
+            .expect("fixture must be reachable");
+
+        let raw = request.await.unwrap();
+        assert_eq!(
+            wire_header_names(&raw),
+            vec![
+                "sec-ch-ua-platform",
+                "user-agent",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "accept",
+                "origin",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "sec-fetch-storage-access",
+                "referer",
+                "accept-encoding",
+                "accept-language",
+                "priority",
+                "host",
+            ],
+            "{raw}",
+        );
+    }
+
+    /// A scripted POST body puts `content-length` first and `content-type`
+    /// between the two client-hint groups, which is Chromium's insertion order
+    /// and not the order a list built by hand would produce. The length must
+    /// also be the one the transport sent, not a second copy appended.
+    #[tokio::test]
+    async fn stealth_scripted_post_puts_the_body_headers_in_chromes_slots() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint,
+        );
+        let mut headers = scripted_headers();
+        headers.insert(
+            "content-type".to_string(),
+            "text/plain;charset=UTF-8".to_string(),
+        );
+        client
+            .send_single("POST", &url, &headers, "hello", true, true)
+            .await
+            .expect("fixture must be reachable");
+
+        let raw = request.await.unwrap();
+        assert_eq!(
+            wire_header_names(&raw),
+            vec![
+                "content-length",
+                "sec-ch-ua-platform",
+                "user-agent",
+                "sec-ch-ua",
+                "content-type",
+                "sec-ch-ua-mobile",
+                "accept",
+                "origin",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "sec-fetch-storage-access",
+                "referer",
+                "accept-encoding",
+                "accept-language",
+                "priority",
+                "host",
+            ],
+            "{raw}",
+        );
+        assert_eq!(raw.matches("content-length:").count(), 1, "{raw}");
+        assert!(raw.contains("content-length: 5\r\n"), "{raw}");
+    }
+
+    /// The regression this whole change is about: the wire order must not move
+    /// between requests. Before the fixed table, the caller headers came from a
+    /// HashMap and every request serialized them in a different order.
+    #[tokio::test]
+    async fn stealth_scripted_fetch_wire_order_is_stable_across_requests() {
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        );
+        let mut orders = Vec::new();
+        for _ in 0..6 {
+            let (url, request) = header_fixture().await;
+            let client = StealthHttpClient::with_full_options_and_fingerprint(
+                Arc::new(CookieJar::new()),
+                None,
+                true,
+                fingerprint.clone(),
+            );
+            let headers = scripted_headers();
+            client
+                .send_single("GET", &url, &headers, "", true, true)
+                .await
+                .expect("fixture must be reachable");
+            orders.push(wire_header_names(&request.await.unwrap()));
+        }
+        assert!(
+            orders.windows(2).all(|pair| pair[0] == pair[1]),
+            "header order moved between requests: {orders:?}",
+        );
     }
 
     /// The stealth transport is the one a `--stealth` run actually puts on the

@@ -7,6 +7,18 @@ run covers are then removed.
 
 ## Pending
 
+- 2026-09-24: working tree, `crates/obscura-net` header order and set
+  (`chrome_headers.rs` plus the three build sites in `client.rs` /
+  `wreq_client.rs`; tests only elsewhere). No commit yet. Scoped suites ran
+  instead of the full gate: `cargo nextest run --release -p obscura-net
+  --config vendor/v8-source.toml` = 133/133, `cargo nextest run --release
+  --features render -p obscura-browser --no-fail-fast --config
+  vendor/v8-source.toml` = 131/131, `cargo check -p obscura-net
+  --no-default-features` (clean, no warnings) and `cargo check -p obscura-js
+  -p obscura-cli --no-default-features --config vendor/v8-source.toml`
+  (passes). The exact release build ran. Does not touch feature gates, build
+  config, or unsafe/FFI. Full gate still mandatory before push.
+
 - 2026-09-24: commit `b4a1bf5` (js: gate the font-platform call in the
   offscreen context test). Feature-gate adjacent: the guard restores the
   `--no-default-features` shape. Verified instead of the full gate:

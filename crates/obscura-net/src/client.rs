@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::net::{IpAddr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
@@ -492,19 +492,6 @@ pub(crate) fn client_hint_value(name: &str, fingerprint: &crate::fingerprint::Br
         _ => return None,
     };
     Some(value)
-}
-
-pub(crate) fn apply_client_hints(
-    headers: &mut HeaderMap,
-    accepted: &HashSet<String>,
-    fingerprint: &crate::fingerprint::BrowserFingerprint,
-) {
-    for name in accepted {
-        let Some(value) = client_hint_value(name, fingerprint) else { continue };
-        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-        let Ok(header_value) = HeaderValue::from_str(&value) else { continue };
-        headers.insert(header_name, header_value);
-    }
 }
 
 pub(crate) struct InFlightGuard {
@@ -1883,7 +1870,6 @@ impl ObscuraHttpClient {
             }
 
             let fingerprint = self.fingerprint.read().await.clone();
-            let ua = &fingerprint.user_agent;
             let is_frame_navigation = request
                 .headers
                 .iter()
@@ -1891,77 +1877,9 @@ impl ObscuraHttpClient {
                     name.eq_ignore_ascii_case("sec-fetch-dest")
                         && value.eq_ignore_ascii_case("iframe")
                 });
-            let mut headers = HeaderMap::new();
-            // Chrome's top-level navigation header order. (reqwest appends
-            // accept-encoding/host after these, so accept-encoding lands after
-            // accept-language rather than before it; the rest matches Chrome.)
-            if !fingerprint.brands.is_empty() {
-                if let Ok(value) = HeaderValue::from_str(&fingerprint.sec_ch_ua()) {
-                    headers.insert(HeaderName::from_static("sec-ch-ua"), value);
-                }
-                headers.insert(
-                    HeaderName::from_static("sec-ch-ua-mobile"),
-                    HeaderValue::from_static(fingerprint.sec_ch_ua_mobile()),
-                );
-                if let Ok(value) = HeaderValue::from_str(&fingerprint.sec_ch_ua_platform()) {
-                    headers.insert(HeaderName::from_static("sec-ch-ua-platform"), value);
-                }
-            }
-            if request.mode == RequestMode::Navigate {
-                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
-                // No `cache-control` on a navigation. Chrome revalidates with
-                // `max-age=0` on the main-document request only for an explicit
-                // reload. Measured on Chrome 153.0.8010.48 over CDP network
-                // events, it is absent from a first navigation, a navigation to
-                // an already-visited URL, a re-navigation to the URL already
-                // loaded, a same-URL `document.location` assignment, and a
-                // cross-origin navigation; `Page.reload` was the only one of
-                // eight navigation kinds that carried it. Reload is not a
-                // concept this request layer has, so the header is never sent.
-                // Wire reload semantics up and restore it for reload alone.
-            }
-            headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap_or_else(|_| {
-                HeaderValue::from_static(crate::fingerprint::DEFAULT_USER_AGENT)
-            }));
-            headers.insert(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static(request.accept()),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
-            );
-            headers.insert(
-                HeaderName::from_static("sec-fetch-mode"),
-                HeaderValue::from_static(request.mode.header_value()),
-            );
-            if request.mode == RequestMode::Navigate && !is_frame_navigation {
-                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
-            }
-            headers.insert(
-                HeaderName::from_static("sec-fetch-dest"),
-                HeaderValue::from_static(request.destination()),
-            );
-            if !headers.contains_key(HeaderName::from_static("priority")) {
-                headers.insert(
-                    HeaderName::from_static("priority"),
-                    HeaderValue::from_static(request_priority(request.mode, request.destination())),
-                );
-            }
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&referer) {
-                    headers.insert(reqwest::header::REFERER, value);
-                }
-            }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_str(&fingerprint.accept_language()).unwrap_or_else(|_| {
-                    HeaderValue::from_static("en-US,en;q=0.9")
-                }),
-            );
-
-            let cookie_header = if request.sends_credentials_to(&current_url) {
+            let sends_credentials = request.sends_credentials_to(&current_url);
+            let cookie_header = if sends_credentials {
                 self.cookie_jar.get_cookie_header(&current_url)
             } else {
                 String::new()
@@ -1972,64 +1890,111 @@ impl ObscuraHttpClient {
                 cookie_header.split("; ").filter(|s| !s.is_empty()).count(),
                 cookie_header.len(),
             );
+
+            // One merged caller view, then Chrome's wire order replayed from
+            // the fixed table in chrome_headers.rs. The caller maps used to be
+            // inserted by iterating them, and HashMap iteration order is
+            // seeded per map, so byte-identical requests serialized their
+            // headers in a different order every time.
+            let mut caller: HashMap<String, String> = self
+                .extra_headers
+                .read()
+                .await
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+                .collect();
+            caller.extend(
+                request
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.clone())),
+            );
+            // Origin is a forbidden browser request header. Keep it derived
+            // from the initiator even when callers supplied extra headers.
+            caller.remove("origin");
             if !cookie_header.is_empty() {
-                match HeaderValue::from_str(&cookie_header) {
-                    Ok(val) => {
-                        headers.insert(reqwest::header::COOKIE, val);
-                    }
-                    Err(_) => {
-                        let filtered: String = cookie_header
-                            .split("; ")
-                            .filter(|pair| HeaderValue::from_str(pair).is_ok())
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        if !filtered.is_empty() {
-                            if let Ok(val) = HeaderValue::from_str(&filtered) {
-                                headers.insert(reqwest::header::COOKIE, val);
-                            }
-                        }
-                        tracing::debug!(
-                            "Cookie header invalid chars, filtered {} -> {} bytes",
-                            cookie_header.len(), filtered.len(),
-                        );
-                    }
+                let usable = if HeaderValue::from_str(&cookie_header).is_ok() {
+                    Some(cookie_header.clone())
+                } else {
+                    let filtered: String = cookie_header
+                        .split("; ")
+                        .filter(|pair| HeaderValue::from_str(pair).is_ok())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    tracing::debug!(
+                        "Cookie header invalid chars, filtered {} -> {} bytes",
+                        cookie_header.len(), filtered.len(),
+                    );
+                    (!filtered.is_empty()).then_some(filtered)
+                };
+                if let Some(value) = usable {
+                    caller.insert("cookie".to_string(), value);
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(v),
-                ) {
-                    headers.insert(name, val);
+            // Navigation form submissions have a form-urlencoded default and
+            // are not cacheable. Scripted fetch/XHR requests own their
+            // Content-Type (and a plain string body otherwise has no implicit
+            // form encoding). Both are set before the table replay so they land
+            // in Chrome's own slots instead of at the end.
+            if request.mode == RequestMode::Navigate {
+                if method == Method::POST && !caller.contains_key("content-type") {
+                    caller.insert(
+                        "content-type".to_string(),
+                        "application/x-www-form-urlencoded".to_string(),
+                    );
                 }
-            }
-            for (k, v) in &request.headers {
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(v),
-                ) {
-                    headers.insert(name, val);
+                // Measured on Chrome 153.0.8010.48: a form-submission
+                // navigation carries `Cache-Control: max-age=0`, while the
+                // eight GET navigation kinds behind the comment below carry
+                // none. A body is what makes the difference, so it is keyed on
+                // the method rather than on the navigation.
+                if method != Method::GET
+                    && method != Method::HEAD
+                    && !caller.contains_key("cache-control")
+                {
+                    caller.insert("cache-control".to_string(), "max-age=0".to_string());
                 }
-            }
-            // Origin is a forbidden browser request header. Keep it derived
-            // from the initiator even when callers supplied extra headers.
-            if origin_header_required(&request, &current_url, method.as_str()) {
-                if let Ok(value) = HeaderValue::from_str(&request_origin) {
-                    headers.insert(reqwest::header::ORIGIN, value);
-                }
-            } else {
-                headers.remove(reqwest::header::ORIGIN);
             }
 
             let hint_origin = client_hint_origin(&current_url);
-            if let Some(accepted) = self.accepted_client_hints.read().await.get(&hint_origin) {
-                apply_client_hints(&mut headers, accepted, &fingerprint);
+            // Detached and sorted before the send, so no client-hint lock is
+            // held across the transport and the same Accept-CH list always
+            // serializes the same way. The accept set used to be iterated
+            // directly, which shuffled the high-entropy hints too.
+            let mut accepted_hints: Vec<String> = self
+                .accepted_client_hints
+                .read()
+                .await
+                .get(&hint_origin)
+                .map(|accepted| accepted.iter().cloned().collect())
+                .unwrap_or_default();
+            accepted_hints.sort();
+
+            let plan = crate::chrome_headers::ChromeHeaderPlan {
+                fingerprint: &fingerprint,
+                request: Some(&request),
+                current_url: &current_url,
+                shape: crate::chrome_headers::shape_for(&request),
+                origin: origin_header_required(&request, &current_url, method.as_str())
+                    .then_some(request_origin.as_str()),
+                priority: request_priority(request.mode, request.destination()),
+                body_len: body.as_ref().map(Vec::len),
+                is_frame_navigation,
+                caller: &caller,
+                accepted_hints: &accepted_hints,
+                sends_credentials,
+            };
+            let mut headers = HeaderMap::new();
+            for (name, value) in crate::chrome_headers::build_chrome_headers(&plan) {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(&value),
+                ) {
+                    headers.insert(name, value);
+                }
             }
 
-            let form_content_type = method == Method::POST
-                && request.mode == RequestMode::Navigate
-                && !headers.contains_key(reqwest::header::CONTENT_TYPE);
             let sent_client_hints: HashSet<String> = headers
                 .keys()
                 .map(|name| name.as_str().to_ascii_lowercase())
@@ -2038,16 +2003,6 @@ impl ObscuraHttpClient {
                 .headers(headers);
 
             if let Some(ref b) = body {
-                // Navigation form submissions have a form-urlencoded default.
-                // Scripted fetch/XHR requests own their Content-Type (and a
-                // plain string body otherwise has no implicit form encoding);
-                // never overwrite an explicit request header here.
-                if form_content_type {
-                    req_builder = req_builder.header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    );
-                }
                 req_builder = req_builder.body(b.clone());
             }
 
