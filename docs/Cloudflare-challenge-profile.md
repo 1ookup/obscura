@@ -14752,3 +14752,19 @@ obscura fetch "https://www.thelancet.com/cdn-cgi/challenge-platform/h/b/orchestr
 ⇒ §354.32 的缺口 ③ **实际不可闭合**。唯一可能的迂回是在**不解密**的前提下做形状匹配与置换（钩子能拿到活的 JS 对象、也能知道字段名——页面层字段名可从这份 236KB 脚本的字符串表里提），但**替换成什么值**无从得知（`1-page-req` 两引擎恒为 2370 字节，说明结构同形、内容不可比）。
 
 **结论**：payload 侧的可对拍空间**到此为止**。剩余候选只有请求/传输层（头顺序，正在修）与探针阶段耗时（正在修）。
+
+#### 354.38 请求头顺序对齐落地（`b5c76af`）——判决未翻转
+
+**最强的一条信号其实不是"顺序不一致"**：我们的**脚本化 fetch 头顺序是每次请求随机的**——caller headers 靠遍历 `HashMap` 重放，而 `HashMap` 的 hasher **每个 map 都带随机种子**，四次完全相同的 fetch 给出**四种顺序**。真实 Chrome 的顺序是确定的。
+
+**观测方法与可信度**（该 agent 自建，含三项对照）：Node `http2.createSecureServer({allowHTTP1:true})` 记录**到达顺序**的头名；① 乱序回显对照（含 POST body）逐字节保序；② **伪头对照**（保住 `:method,:scheme,:authority,:path` 的次序，正因有它才没有误判下面的伪头发现）；③ pcap 序交叉验证。**一个坑**：首版读的是每个场景**最后一条**请求（`/favicon.ico`，子资源，顺序完全不同）→ 得出错表；最终表按请求路径过滤。
+
+**Chrome 真实形状是两套**（不是一套）：**导航**（`sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, upgrade-insecure-requests, user-agent, accept, sec-fetch-site, sec-fetch-mode, sec-fetch-user, sec-fetch-dest, referer, accept-encoding, accept-language, cookie, priority`）与**子资源**（`sec-ch-ua-platform, user-agent, sec-ch-ua, sec-ch-ua-mobile, accept, origin(仅跨源), sec-fetch-*, sec-fetch-storage-access(仅跨站且带凭据), referer, accept-encoding, accept-language, cookie, priority(仅 h2)`）；表单 POST 是**第三个**变体（`content-length` 打头、`content-type` **交错在 `sec-ch-ua` 与 `sec-ch-ua-mobile` 之间**）。**纠正我一处**：Chrome 的 h1 GET 导航**没有** `upgrade-insecure-requests`（只有 POST 有），这点我们本来就是对的。
+
+**落地**：新增 `chrome_headers.rs`（固定顺序表 + 在 Chrome 自己的槽位里替换值、而不是追加），三处接线；顺带修了 `sec-fetch-storage-access`（Chrome 在跨站带凭据的脚本请求上**确实发**）与 caller 自带 `referer` 时产生**重复 Referer**。**性能净减少分配**。
+
+**改后**：h2 导航与脚本化 fetch **逐字节一致**；POST body 的 `content-length`/`content-type` 位置也一致。
+
+**判决轮 h1/h2（二进制 `3e14b849`）：仍然失败**，分岔 35/34。
+
+**唯一残留的线级差异**：h2 **伪头顺序**（我们 POST 是 `:method,:scheme,:authority,:path`，Chrome 是 `:method,:authority,:scheme,:path`；GET 我们已对）。它由 `wreq` 依赖的 profile 发出，**不在本仓库**，要改需上游或打补丁。**这条落在 CF 会看到的 POST 路径上**，已记入未决项。
