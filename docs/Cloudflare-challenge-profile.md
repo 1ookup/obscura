@@ -13718,3 +13718,96 @@ obJ/ref.json 为现役数值 oracle。
 widget 窗口 `--trace-api-calls`（TextMetrics 调用实参 + measureText 字符串清单，
 349 ② 未动）；③ 富配置区计数归属阶段（349 ③）仍待 retry 破或换代；④ Reqable
 8081 API + 注入工具链重建（349 ④ 扩围）；⑤ 工作区 gate 台账回填（349 ⑤）。
+
+### Step 351：批次 48——fresh 对拍全谱（obK TS#2+TS#3 双解，39 号臂定位为 PoW 基准臂：完成槽位插入、位次后移实锤但引擎面无干净排序修），window 几何键序 + srcdoc referrer 两处引擎面修复，信标字母表按构建轮换、判决轮改配同窗 rch probe，判决 0/5（3 停滞 + 2 retry 环）（2026-09-23 上午）
+
+**① obK 全谱对拍（TS#2 39 组 / TS#3 40 组 vs 通过参考 38 组，解密
+0954fd23… + obK rch 表）**。逐字段分类（与 /tmp/cf0919/ref/payload.json 逐键）：
+
+| 类 | 字段 |
+|---|---|
+| 全同 | WqxKW9/jvYQh4=3/mKiXm6=0/gdgSi6/gIBpo1(8×0)/eBdb6/LTkA3/HEywW9/OqAoN4/vHQxF7/IPeXW2/VnGsz1/KXkx2/yAFE2,zfniV9,rRSMV9,Ztwv3=0/DxSb8/tRta4/qAxn4=21/dJYZ1=[]/KDQCx4=0/RJpH8/EXCAQ5=0/rPAC6 |
+| 会话/机器特定 | TfPFa9,BkYo5(构建id)、Uheo3、oPhMk5,oQJEH1,JWTz7,WbdgY0,wuMCA2,EBwu9(令牌)、mFXVy7、vXDzj6(1.txt vs 参考123.txt harness页)、rPXg2(4 vs 3, 新代资源集)、maNnU6(34 vs 40, 代际DOM)、PWGF4(m=a 同; t=5 vs 6920 为参考 harness 点击时刻, 参考栈含 __warm_fiddle__ 帧=采集器特定)、zIyO8(本机fp HC15/DM32 vs 参考机6/16)、HPcn5(27.9375 vs 28.9375 栅格化)、CYsxg7(downlink动态)、thhSb9/cHIoX8/ppMls5(电池)、RPKTR7(+238 vs +314)、IHevN9/wFfX1、NemHG8/ZkTjK2/OyfhW8/ZwhIC5/NNZHC4/CzUP6,MnIr8(会话派生摘要)、RTC 臂取样时刻态(Aqcaj8,Bdwsn5,HDEX5,lIEA1,uZjT5,XqEQ3,uHNG9,KnOhl5)、DqomM2/jyDXx2 浮点尾差、BvrK3 臂(页面普查, 目标页不同)、Vhmq4=["lang","dir"](Step 303 定案) |
+| 负载带 | TzZRB1 21/11、ZMSOw0=twvE0 533/127、WHTpH6 21/12、uGyjw9 19/4、NnqX6 9675/7220、tZwbF3 1191/8155、wOvYJ5 1186/1235、eaaP6 1164/1223、Blsob5 2/6、poqG1 1/2、myWtu3 4/31(写点未解, 同机 headed Chrome 对照 678 亦漂) |
+| 已知残差 | SbVZ3 78 vs 91（trio 5 + dir 块 8, 挑战侧闭包信道, 本轮实弹再证实）; 标记 Qssv3×2/ODxGu4×1 与参考同; 哈希探针 4 槽全为真实摘要（RKUE0=6827dcb8…=Chrome oracle 摘要形） |
+| NEW | 顶层 aQgx8=1 键（参考无此键; TS#1 累积器字面量即有 aQgx8:0 初值, TS#2 期被 VM 翻 1, 写点未解）; TS#3 另有 nEJhr9="" 与第 40 号臂 |
+
+共享臂 34 组逐值对拍（obK 位次 ↔ 参考位次按探针键集双射）：4 组全同
+（4↔4、12↔16、15↔34、28↔7、29↔37、35↔31 部分同）; 引擎面候选分歧（未修,
+留证据）：OYbs6[10] powerPreference "default" vs "low-power"（echo 路径已
+在, 创建序列未证）、KMUh5[2] ["ldr","hdr"] vs ["ldr"]、kPEvW6 true vs
+false（字体臂实质全同: peEN1 六字体+XdgW5 摘要逐位一致）、IGBuA2/oHIQ6
+音频指数我方多出 vs 参考[]、gPOK0 帧游走 "root×4+VMQLo20" vs
+"root+VMQLo21+VMQLo20×3"、OjmeV1[85/86/103/104] innerHTML 回读我方空 vs
+参考 HTML（本地 div/template/table/implDoc/ownerDoc 别名/svg 全回读正常,
+挑战内部路径未定位）、OjmeV1[79] true/false、[118] "[object Object]" vs
+"611"、XCvwf5.ryJGE4 null vs 180602 + bYTbg6=QBlqQ3 我方同值 vs 参考两异、
+uUOw3 0.6 vs 22.2、dsKPy6 0.99 vs 1；lDUiR4/KMUh5/etmnR7 WebGPU 面属
+Chrome 代际差（参考旧 Chrome 报得更少）。
+
+**② bench 竞速（tQdUc5 39）落定**：多出的 39 号臂 = 6 键 PoW/哈希基准
+{MfOHt6 支持位, wikEk8=[0,1,3,2] 算法序, wopX8 四组迭代计数,
+jBVrk8 4×计时三元组, qdVjJ1/hCKCP8 派生值}。全历史 26 份解密横跨 5 代件：
+含 bench 轮出现位置 6/9/11/14/16/19/20/21/27/29/31/36/37/38 随完成槽位漂移
+（插入即后移其后全部位次, 位次硬伤实锤）; 排除轮遍布各负载带
+（headed-a ZMSOw0=129 排除, ver14=385 含, final106=318 含 vs final107=414
+排）——负载计数无法分离, 非纯速度比。机制：快照在电池尾（obK bench 2.9s
+完成采集, 电池跑到 9.7s 才提交）, 归属由挑战内部收集器登记次序决定, 引擎
+在不改挑战逻辑的前提下无决定性排序修 → 按纪律不落投机修复。ver55 复盘：
+降级臂 gate-only 无 TS#2; 其 tracelog TS#1 明文证 quiet 带 uGyjw9=16 /
+ZMSOw0=295（负载带敏感性成立）。
+
+**③ 引擎面修复两处（Chrome 153 本地 oracle 逐项实测）**：
+- **window 几何键序**（realms.js + 钉）：挑战普查桶把几何键读作一段连续
+  序; 我方 getOwnPropertyNames 答 screenX 先于 innerWidth、
+  devicePixelRatio 先于 innerWidth——真实 Chrome 153 序为 screen,
+  innerWidth, innerHeight, scrollX, pageXOffset, scrollY, pageYOffset,
+  visualViewport, screenX, screenY, outerWidth, outerHeight,
+  devicePixelRatio, clientInformation, offscreenBuffering, screenLeft,
+  screenTop, styleMedia（681-725 段实测）, 且 closed 在 status 之后、
+  opener 在 top 之后。rank 表按此落位; 钉
+  window_geometry_cluster_enumerates_in_chrome_153_order。
+- **srcdoc document.referrer**（page.rs + 钉）：实测 Chrome 153 srcdoc 子
+  帧在默认 strict-origin-when-cross-origin 下答 embedder origin 形
+  （about:srcdoc 目标永不计同源）, about:blank 保持 creator 全 URL; 我方
+  两者都答全 URL。live 载荷 RotPR2 面即此（参考="https://www.thelancet.com/"
+  origin 形, 我方 obK 空）。iframe referrerpolicy 属性仍清空。钉
+  srcdoc_frame_referrer_strips_to_origin_like_chrome。
+- 测试：obscura-js 689（worker_source_executes_once 1 败=台账在案并行负载
+  flake, 隔离过）+ obscura-browser 127 全绿; 发布形构建
+  （--features render + v8-source.toml）实弹。
+- **工具链**：信标字母表随引擎构建轮换（obK 09:25 表 10:52 已失效,
+  10:52-11:10 窗内先后见 z+yQROFp/VItj1ETr 两表）; capture 流程改每轮同窗
+  rch probe（curl 经代理 Chrome UA 打
+  /cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/<随机id>/<sitekey>/…,
+  全臂 ~334KB 含内联引擎; 降级臂 ~9KB/25 万级需重打）。
+
+**④ 判决 final120-124（capture_round 45s, click 16; 外部 VM 全窗
+4.8-7.4 污染, 30 分钟静窗轮询未得, 按现场负载记录）**：
+
+| 轮 | 时刻 | 负载 | 流形 | TS#2 | 判决 |
+|----|------|------|------|------|------|
+| final120 | 10:52 | 5.43 | 单周期（1 ray）, TS#2 达 TS#3 未达 | 38 无 bench | 停滞 |
+| final121 | 10:53 | 6.03 | 同上 | 38 无 bench（uGyjw9=14 入带） | 停滞 |
+| final122 | 10:54 | 5.66 | 同上 | 38 无 bench | 停滞 |
+| final123 | 11:02 | 4.99 | 全流程 + retry（2 ray, cycle2 TS#1） | 39, bench@20 | retry 环 |
+| final124 | 11:04 | ~5.0 | 全流程 + retry | 38 无 bench | retry 环 |
+
+**0/5**（0 过; 形分布 = 3 停滞 + 2 retry 环, 无拒绝形）。计数带：
+NnqX6 5641-9954（3/5 低于参考 7220, 全程耗时已入参考带）; uGyjw9
+14-1517（1/5 入 4-15 带）; ZMSOw0 241-723; TzZRB1 18-23; myWtu3 3-76;
+aQgx8=1 每轮（参考无键, VM 侧未解）。bench 竞速本轮 1/5 出现
+（final123 位次 20）, 位次硬伤仍在, 与 350 ④ retry 环同属 CF 臂/会话方差
+叠加。
+
+**产物**：/tmp/cf0919/{obK/dec3, final120..124（fo+run+dec+ov2probe）,
+fresh-probe-48*.html, round48.sh, oracle6*.html/json}。
+
+**下一批入口**：① aQgx8/nEJhr9 语义（VM 侧写点; 每轮 =1 而参考 TS#2 无键,
+TS#1 累积器字面量 aQgx8:0 初值已定位）——需 Reqable 注入工具链（350 ④）
+做信标累积器动态追; ② 剩余 engine-face 候选逐项落锤：OYbs6[10]
+powerPreference 回显序列、KMUh5 hdr、kPEvW6、IGBuA2/oHIQ6 音频指数、
+gPOK0、OjmeV1[85/86/103/104] innerHTML 空、XCvwf5.ryJGE4、uUOw3、dsKPy6、
+OjmeV1[79/118]; ③ bench 竞速若要根除需挑战侧收集器排序知识（bytecode 反
+编译）, 引擎面按 ② 已无干净修; ④ 停滞形（TS#2 达 TS#3 未达）与 retry 环
+的分布按轮续记, 静窗（负载<3）再补判决; ⑤ 工作区 gate 台账回填（350 ⑤）。
