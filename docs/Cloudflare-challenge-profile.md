@@ -14651,3 +14651,36 @@ g/BODY/challenges.cloudflare.com   '0|'
 3. **会话行为**：点击前后的时序、事件序列、`/fo/` 请求间隔与并发、cookie jar 演化、`cf_clearance` 的签发条件。空注入对照排除了"单次注入本身"，但没有排除**时序统计量**。
 
 **另一处未覆盖的 payload 缺口**：**页面层 `1-page-req` 从未被置换过**——它在**全部 15 轮里恒为 2370 字节**（说明不是帧层那个 flat 对象的同一实例）。要解它需要**页面层专属的 65 字符表**：裸 `curl` 拿挑战页返回 403，01:43 抓的 `chl_page*.js` 的表已随 build 轮换失效，而 obscura 的 CDP `Debugger.scriptParsed` 只暴露自身内部脚本、拿不到页面脚本。**这是唯一剩下的 payload 侧缺口，且它是"把页面层脚本的表取回来"这个具体、可解的问题。**
+
+#### 354.33 干净负载对照：负载/时序混淆排除
+
+在负载 **3.2** 下连跑两轮（c1/c2，二进制 `ac5b0414`，身份已对齐）：
+
+- **两轮都完整走完流程**（`1-page → 2-frame → 3-frame → 4-frame → 5-page`），即 TS#1→pat→ci→TS#2→TS#3→main#2 全通；
+- **判决仍然失败**，分岔稳定在 **33**。
+
+⇒ **负载/时序不是判决因素**。此前所有实弹轮都在 load 6-39 下跑、部分轮次停在 TS#2，那确实是时序噪声；但负载降到 3.2、流程完整后判决不变，这条混淆项正式排除。
+
+#### 354.34 请求头**顺序**差异（最后一个未被检验的层）
+
+裸 TCP 回显（按**收到顺序**打印头名），上下文已对齐（两引擎都在 `https://example.com` 页面内 `fetch('<local>', {mode:'cors'})`）：
+
+| # | Obscura | Chrome 153 |
+|---|---|---|
+| 1 | `user-agent` | `Host` |
+| 2 | `accept-encoding` | `Connection` |
+| 3 | `priority` | `sec-ch-ua-platform` |
+| 4 | `sec-ch-ua` | `User-Agent` |
+| 5 | `sec-ch-ua-mobile` | `sec-ch-ua` |
+| 6 | `sec-ch-ua-platform` | `sec-ch-ua-mobile` |
+| 7 | `sec-fetch-site` | `Accept` |
+| 8 | `accept` | `Origin` |
+| 9 | `origin` | `Sec-Fetch-Site` |
+| 10 | `accept-language` | `Sec-Fetch-Mode` |
+| 11 | `sec-fetch-dest` | `Sec-Fetch-Dest` |
+| 12 | `sec-fetch-mode` | `Accept-Encoding` |
+| 13 | `host` | `Accept-Language` |
+
+**集合基本相同，顺序几乎完全不同**。另有两处集合差：我方 fetch 多 `priority`（Chrome 的 h1 fetch 无、h2 有），Chrome h1 有 `Connection` 我方无——属 h1/h2 差异，需按 h2 基准判定。
+
+**为什么这可能重要**：HTTP 头的**顺序**是已知的客户端指纹向量，CF 的 **JA4H** 就包含它。此前 §10.13 只核过头的**取值**，从未核过顺序。已派修（要求先搭出可信的 **h2** 观测手段——因为经代理打 CF 走的是 h2，h1 的回显不能直接当基准——再按 Chrome 的 h2 行为对齐，且不得为排序引入每请求分配）。
