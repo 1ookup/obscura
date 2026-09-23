@@ -14473,3 +14473,22 @@ Chrome 的 `/ci/` 真实响应（三份 HAR 全查，均为 `image/png`）：
 **注意复现抖动**：两次实弹轮里只一次出现 `img` 条目——`/ci/` 不是每轮都触发，判定时不要用单次结果。
 
 **测量盲区补记**：`--trace-op-file` 不记录 Image/`srcset`/CSS 资源加载，凡"某请求 0 次"的结论必须先排除该盲区（本文件 line 1821、§354.21 各栽过一次，这是第三次同类教训）。
+
+#### 354.24 请求头级实锤：`Sec-Ch-Ua` 品牌表**顺序**与真实 Chrome 不符
+
+双引擎逐字对照（本机，经 `https://httpbin.org/headers` 回显；Chrome 侧用 CDP `fetch()`）：
+
+| | `Sec-Ch-Ua` |
+|---|---|
+| **真实 Chrome 153** | `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"` |
+| **Obscura** | `"Chromium";v="153", "Google Chrome";v="153", "Not_A Brand";v="8"` |
+
+三项内容相同、**顺序不同**。GA 品牌 `Not_A Brand`（GREASE 名/版本）与 `Chromium`/`Google Chrome` 的版本号都对——**只有排列错**。
+
+根因：`crates/obscura-net/src/fingerprint.rs:601 chromium_brands()` 用 `PERMUTATIONS[major % 6]` 重排 `[grease, chromium, chrome]`；`major=153` 得 `PERMUTATIONS[3] = [1,2,0]` → `[Chromium, Google Chrome, Not_A Brand]`，而真实需要 `[2,0,1]`。该 `major % 6` 映射是一处**未经验证的近似**。
+
+**为什么这条优先级高**：`Sec-Ch-Ua` 是 **CF 在每个请求上都能直接读到**的头。若它与真实 Chrome 不符，CF 可以在**流程极早期**（首个请求）就把我们归类——这与 §354.23 观察到的「`/ci/` 响应只有 332B（Chrome 2415-3810B）」自洽：**判定可能发生在 `/ci/` 之前**，而 payload 里的 35 项分岔也许是结果而非原因。已派修（要求按公开源码或 oracle 实测确定真实排列规则，不接受猜测；并顺带核对同批请求头）。
+
+同批复核一致：`Sec-Ch-Ua-Mobile: ?0`、`Sec-Ch-Ua-Platform: "macOS"`、`Accept-Language: zh-CN,zh;q=0.9`、`Accept-Encoding: gzip, deflate, br, zstd`、导航 `Priority: u=0, i` / fetch `u=1, i`。
+
+**另一条待核**：`Accept` 在导航上下文我们发 `text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7`（Chrome 导航同为该串），fetch 上下文两边都是 `*/*`——已列入顺带核对表，暂未发现差异。
