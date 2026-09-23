@@ -14429,3 +14429,23 @@ grep -aP "\tfetch\t" /tmp/cf-parity/ours/v2/run/ops.tsv  | grep -ac '/ci/'   # 0
 同族的另一条短缺：payload#2 的 `SbVZ3` 里 Chrome 多 4 个 token（`lzDF4`×2、`TBNgK7`×2、`QLaZp6`×4），且 `PhWMD5`/`AecW7` 各少 2 次。已合并派查。
 
 （注：`/ci/` 在 §10.3 的 Run A 描述里出现过——"走完 main#1→TS#1→pat401→ci→TS#2"，需确认那是参考流程还是当时我方确实发过；若是后者，说明是本轮次引入的回归。）
+
+#### 354.22 纠正 §354.21：`/ci/` **有**发出，缺的是它的 resource-timing 条目
+
+§354.21 的"我们从不发 `/ci/`"是**误读**，本文件自身在 line 1825 早已记过原因：
+
+> `/ci/` 的日志 0% 是**观测盲区**而非能力缺口：Image 走 wreq stealth_client、「Step 45 wreq 插桩证实 `/ci/` 实际发出且 200、解码出正确尺寸」
+
+即 `/ci/` 走 **`Image().src`**（`sec-fetch-dest: image` + `no-cors`），而 `--trace-op-file` 只记录 JS `fetch`/XHR 这类宿主 op，**不记录 Image 加载**。line 1549 还留有一处 `/ci/` 的 resource-timing 特判痕迹（`if (url.indexOf("/ci/") !== -1) return { domainLookupEnd: 0, responseStart: 1, responseEnd: 3 }`），说明历史上我们确实对它的计时做过 shim。
+
+**实测（本机 fixture，Obscura serve + CDP，`--allow-private-network`）**：我们的 resource timing **能**正确记录三种 initiator：
+
+```
+{"start":[],"afterFetch":["px.png|fetch"],
+ "afterImg":["px.png|fetch","px.png|img"],
+ "afterXhr":["px.png|fetch","px.png|img","px.png|xmlhttprequest"]}
+```
+
+⇒ 真问题**收窄为**：`/ci/` 的条目没有出现在我方 payload#2 的 `rPXg2` 里（Chrome 4 条含 `/ci/`，我方 3 条不含）。候选：① 条目在但被挑战的选取条件过滤（Chrome 那条 `EazF1=0`/`dtkfB9=101`/`gtlhH0=102` 数值极小，若我方给 0/未定义就很可能被丢）；② 挑战页的 CSP/跨源/no-cors 条件下 Image 条目确实没进。已按此重新定向追查。
+
+**教训（记进测量盲区）**：`--trace-op-file` **不是**网络全量记录——Image/`srcset`/CSS 资源不走该通道。凡"某请求 0 次"的结论，必须先排除该盲区（本文件 line 1821-1827 已记一次同类错误，这是第二次）。
