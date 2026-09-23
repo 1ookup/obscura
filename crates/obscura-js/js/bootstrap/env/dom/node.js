@@ -173,6 +173,7 @@ function __prepareInsertedSubtree(root) {
     _dom("create_blank_iframe_document", root[_nidSym]);
     _queueIframeNavigation(root[_nidSym]);
   }
+  _armPreloadImageLinks(root);
   // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
   // so an iframe inside a shadow root -- how widget embeds are built, Turnstile
   // among them -- was never queued when its host was connected, and the

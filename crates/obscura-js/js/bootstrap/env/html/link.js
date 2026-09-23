@@ -93,6 +93,31 @@ class HTMLLinkElement extends Element {
   }
   get [Symbol.toStringTag]() { return 'HTMLLinkElement'; }
 }
+// A preload link only arms its fetch through this class's setters, so script
+// that builds one with `createElement` + property writes works. A parser-built
+// link never calls them: `innerHTML`, `insertAdjacentHTML`, `<template>` +
+// cloneNode and the initial document parse apply the attributes on the native
+// node. Turnstile builds its `/ci/` preload that way, and the image GET a
+// browser issues for it was dropped -- only the later `Image.src` assignment
+// produced a request, a full round trip after the challenge expected it.
+// Sweep the subtree wherever the DOM already does its JS-side post-parse
+// bookkeeping.
+function _armPreloadImageLinks(root) {
+  if (!root || root.nodeType !== 1 || !root.isConnected) return;
+  const links = [];
+  if (root.localName === 'link' && typeof root._maybePreloadImage === 'function') {
+    links.push(root);
+  }
+  const ids = _domParse("query_selector_all_scoped", root[_nidSym], "link[rel]") || [];
+  for (const id of ids) {
+    const link = _wrapEl(+id);
+    if (link && typeof link._maybePreloadImage === 'function') links.push(link);
+  }
+  for (const link of links) {
+    try { link._maybePreloadImage(); } catch (_error) {}
+  }
+}
+globalThis._armPreloadImageLinks = _armPreloadImageLinks;
 _markNative(HTMLLinkElement);
 for (const name of Object.getOwnPropertyNames(HTMLLinkElement.prototype)) {
   const descriptor = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, name);

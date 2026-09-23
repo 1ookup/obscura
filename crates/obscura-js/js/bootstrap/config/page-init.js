@@ -195,6 +195,9 @@ globalThis.__obscura_init = function() {
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(globalThis.document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
+  // The served document is parsed natively, so a <link rel=preload as=image>
+  // in the markup never reached HTMLLinkElement's setters either.
+  _armPreloadImageLinks(globalThis.document.documentElement);
 
   const fingerprintScreen = _fingerprint().screen || {};
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
