@@ -33112,6 +33112,7 @@ RequestRedirect value",
         // The default identity is macOS, so the default font's advances come
         // from the built-in table: PingFang SC's 'a' is 559/1000 em, 5.59 at
         // 10px, not the bundled stand-in's 5.5625.
+        #[cfg(feature = "render")]
         obscura_render::inline::set_font_platform("MacIntel");
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
