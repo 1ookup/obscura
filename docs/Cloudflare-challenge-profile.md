@@ -14602,3 +14602,24 @@ script | style | xmp | iframe | noembed | noframes | plaintext | noscript
 改动 2 文件（`wreq_client.rs` 隐身路径 + `client.rs` 明文路径，两条独立代码路径各自覆盖），新增 2 条回归测试，`obscura-net` **120/120**。端到端 httpbin 双引擎对照：导航与 fetch 两种上下文 **0 DIFF**。
 
 **纠正我先前的一条观察**：我报告的「两条 baseURI 测试正在失败」是**快速变动的树里的瞬时状态**，并不可复现；该批工作**不是**该 agent 写的（它只动了 `obscura-net`）。当前 `-p obscura-js` 为 708 项、唯一失败是台账已记录的既有负载 flake（`timing_edits_preserve_identity_and_pause_holds_then_resumes`，单独跑通过）。
+
+#### 354.31 更正 §354.25/354.26：`OjmeV1` 的空串**不是**原始文本序列化造成的，根因仍未定
+
+**实弹验证（v3，二进制已含 `a7576a7`）**：`OjmeV1` 的七个下标 [79]/[82]/[85]/[86]/[103]/[104] **一字未变**。已确认修复确实在二进制里（`strings` 命中 `noembed`）。⇒ **原始文本序列化是第三个被证伪的解释**（前两个：srcdoc 带属性丢元素、CDP await 提交时序）。它是**真保真修复**（232 例容器矩阵 72→8），但**不是这项的根因**。
+
+**用 `innerHTML` 钩子直接读出探针的真实操作**（钩 `Element.prototype.innerHTML`，经 `window.external.tracelog` 跨 realm 引出）：
+
+```
+s/HTML/challenges.cloudflare.com   '<p>EnIF0</div><p>ikyR0</p>'      ← 写 <html>
+g/BODY/challenges.cloudflare.com   '0|'                              ← 读 <body>，长度 0（空串）
+s/HTML/challenges.cloudflare.com   '<div data-foo="&#34;"></div>'
+g/BODY/challenges.cloudflare.com   '0|'
+```
+
+⇒ 探针是「**把畸形/带实体转义的标记写进 `document.documentElement.innerHTML`，再读 `document.body.innerHTML`**」，并且**只在回读等于输入时才保留**。Chrome 把 `<p>EnIF0</div><p>ikyR0</p>` 解析成 `<p>EnIF0</p><p>ikyR0</p>`（多余的 `</div>` 被忽略），`body.innerHTML` 回读即该串；**我们的 `body.innerHTML` 是空串**。这同时解释了 [79]/[82] 两个「回读不等」布尔。
+
+**最小复现尝试失败**（说明它是上下文相关的）：在 `example.com` 顶层文档、以及自建 iframe 文档上，同样的「设 `documentElement.innerHTML` → 读 `body.innerHTML`」**两引擎逐字一致**（我们同样得到 `<head></head><body><p>EnIF0</p><p>ikyR0</p></body>`，`body` 回读正确）。差异只在挑战那个 `challenges.cloudflare.com/.../rch/...` realm 里出现。**待查方向**：该 realm 里 `document.body` 是否返回了一个**已被 innerHTML 设置分离（detached）的旧 body**（其子节点已被搬走 ⇒ 回读空），而新解析出的 body 没有被 `document.body` 解析到；或该文档的 `<html>`/`<body>` 有特殊属性/处于特殊模式。
+
+**已按此证据移交修复**（附上面两条日志与复现脚本）。
+
+**方法论**：这是 `OjmeV1` 的**第四个**解释尝试。前三个都被"实弹 payload 直接观测"推翻——**只有注入链路里的实测才算数**，代理实验（自建等价探针）可能重建出错误的模型。
