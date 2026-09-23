@@ -6755,6 +6755,22 @@ impl Page {
                 // produce a value no real Chrome reports.
                 obscura_net::referrer_value(&source, &target, frame_policy).unwrap_or_default()
             }
+            // A srcdoc document inherits the creator's URL as its referrer
+            // source, but Blink still runs the policy over it and the frame's
+            // request target (about:srcdoc) never counts as same-origin with
+            // the creator: measured Chrome 153 answers with the embedder's
+            // origin ("/" appended) under the default
+            // strict-origin-when-cross-origin policy. about:blank keeps the
+            // full creator URL instead, so only srcdoc strips here.
+            (Some(source), _) if request.srcdoc.is_some() => {
+                if frame_policy == obscura_net::ReferrerPolicy::NoReferrer {
+                    String::new()
+                } else {
+                    let mut origin = source.origin().ascii_serialization();
+                    origin.push('/');
+                    origin
+                }
+            }
             // about:blank/srcdoc and other non-network documents inherit the
             // creator's source URL as their environment referrer.
             _ => inherited_referrer.clone().unwrap_or_default(),
@@ -8158,6 +8174,46 @@ mod tests {
         let frame = page.frames.by_host(host).expect("browsing context");
         assert_eq!(frame.active_document_root, Some(root));
         assert_eq!(frame.document_generation, 1);
+    }
+
+    /// Chrome 153 strips a srcdoc frame's inherited referrer to the
+    /// embedder's origin under the default strict-origin-when-cross-origin
+    /// policy (the frame's request target about:srcdoc never counts as
+    /// same-origin with the creator), while an iframe `referrerpolicy`
+    /// attribute still empties it. about:blank keeps the full creator URL.
+    #[tokio::test(flavor = "current_thread")]
+    async fn srcdoc_frame_referrer_strips_to_origin_like_chrome() {
+        let mut page = frame_test_page(
+            "<!DOCTYPE html><html><body>\
+             <iframe id=a srcdoc=\"<p>a</p>\"></iframe>\
+             <iframe id=b srcdoc=\"<p>b</p>\" referrerpolicy=\"no-referrer\"></iframe>\
+             <iframe id=c></iframe>\
+             </body></html>",
+        );
+        let started = page.load_child_frames().await;
+        assert_eq!(started, 3);
+
+        let dom = page.dom.as_ref().unwrap();
+        let referrer_of = |selector: &str| -> String {
+            let host = dom.query_selector(selector).unwrap().unwrap();
+            let root = dom.iframe_content_document(host).expect("content document");
+            dom.document_scope(root).expect("scope recorded").referrer
+        };
+        assert_eq!(
+            referrer_of("#a"),
+            "https://top.example/",
+            "srcdoc referrer must strip to the embedder origin like Chrome"
+        );
+        assert_eq!(
+            referrer_of("#b"),
+            "",
+            "the iframe referrerpolicy attribute must still empty the srcdoc referrer"
+        );
+        assert_eq!(
+            referrer_of("#c"),
+            "https://top.example/app/",
+            "about:blank keeps the creator's full URL"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
