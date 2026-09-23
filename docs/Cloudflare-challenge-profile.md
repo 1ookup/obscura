@@ -14398,3 +14398,34 @@ C4 = function (Y, …) { console.log("payloadJSON:", JSON.stringify(Y)); … }
 | `AecW7` | 20 | **18** |
 
 其余全部逐项一致（含开头 `TKyxg5/PhWMD5/AecW7/Qssv3/cnrU5/ODxGu4/mfiL4/21`）。⇒ 我方在这条报告里**少了 2 组记录**，且有一组用了不同的键名。形态是"少记了 2 次某类事件"，不是"某值算错"——与 §354.20 的 `aQgx8` 同属**结构/路径差**类，优先级应高于纯值差（结构差更容易被判为"客户端行为不同"）。
+
+#### 354.21 结构性缺失实锤：我们从不发 `/ci/` 请求
+
+通过的 Chrome 153（本机、同代理、同 URL）HAR：
+
+```
+GET  /pat/<ray>/<ts>/<hash>/…                         → 401
+GET  brunhild.challenges.cloudflare.com/…/i/<ray>/…    → status 0（无响应；参考与我们一致）
+GET  /ci/<ray>/<ts>/<token>-<ts>-1.3.1.1-<长串>        → 200
+```
+
+Chrome payload#2 的 `rPXg2`（PerformanceResourceTiming 清单）**4 条**，第 4 条即 `/ci/`：
+
+```json
+{"PhWMD5":"…/h/g/ci/a3fb5a31fd548d31/1790185414…","EazF1":0,"dtkfB9":101,"gtlhH0":102,"nXUeQ6":4032,"FoGsT1":3732}
+```
+
+我方 payload#2 的 `rPXg2` **3 条**，无 `/ci/`。且**所有**实弹轮的 ops.tsv 里：
+
+```
+grep -aP "\tfetch\t" /tmp/cf-parity/ours/r01/run/ops.tsv | grep -ac '/ci/'   # 0
+grep -aP "\tfetch\t" /tmp/cf-parity/ours/v2/run/ops.tsv  | grep -ac '/ci/'   # 0
+```
+
+而 `/pat/` 我方**有**（`worker(4)[script@…/rch/…] fetch GET …/pat/<ray>/…` → 401）。
+
+对照 §5.1 的参考墙钟：`TS#1(49.418) → pat401(50.360) → **ci200(50.816)** → TS#2(52.474)`。**缺的正是夹在 TS#1 与 TS#2 之间的这一步**，而这两段之间的载荷恰恰是服务端下判决的地方（§354.3）。⇒ **这是目前最强的结构性线索**，优先级高于所有纯值差。
+
+同族的另一条短缺：payload#2 的 `SbVZ3` 里 Chrome 多 4 个 token（`lzDF4`×2、`TBNgK7`×2、`QLaZp6`×4），且 `PhWMD5`/`AecW7` 各少 2 次。已合并派查。
+
+（注：`/ci/` 在 §10.3 的 Run A 描述里出现过——"走完 main#1→TS#1→pat401→ci→TS#2"，需确认那是参考流程还是当时我方确实发过；若是后者，说明是本轮次引入的回归。）
