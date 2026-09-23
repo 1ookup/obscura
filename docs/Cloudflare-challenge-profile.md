@@ -14510,3 +14510,21 @@ script | style | xmp | iframe | noembed | noframes | plaintext | noscript
 - **无工作永久丢失**：stash 已做两份独立备份（`/tmp/agent-stash-backup.patch`、`/tmp/cf-parity/wsbackup/stash0-030210.patch`），14 个文件已逐个核对全部回到工作区。
 - **纪律（对后续所有并行 agent 生效）**：共享工作区内**禁止**任何改动工作区/历史的 git 命令——`stash`/`pop`/`apply`/`drop`/`clear`、`reset`、`checkout -- <path>`、`restore`、`clean`、`commit`、`add -A`、`rebase`、`merge`、`switch`、`branch -D`；只读的 `status`/`diff`/`log`/`stash list`/`stash show` 可用。
 - **"验证没有修复会失败"的正确做法**：写成可开关的形式、在仓库外副本上验证，或用隔离 worktree —— **绝不能用 `git stash`**。
+
+#### 354.26 `OjmeV1` 结案 + `Sec-Ch-Ua` 根因 + 两处新泄漏
+
+**`OjmeV1` 结案（`a7576a7`，§354.25 的进一步确证）**：前一个 agent 用 **232 例容器矩阵**（8 种输入 × 24 标签 + range/shadow/implDoc/domParser/xhtml × 2 realm）双引擎对照，修复前 **72 例不同**、修复后**只剩 8 例**（全在 `application/xhtml+xml` 路径，属另一条独立面）。差异全部落在**片段序列化的"原文元素"名单**：`textarea`/`title` 应转义（解析是 RCDATA），`noscript`/`xmp`/`plaintext`/`iframe`/`noembed`/`noframes` 应字面。**解析侧我们本来就是对的**（`textContent`/`childNodes` 与 Chrome 逐位相同），只有序列化错。
+
+**直接代理实验**（`keep = (readback===input) ? input : ''`，13 容器 × 2 输入）：修复后两引擎 **26/26 相同**，修复前那六个容器我方全为 `''`——与 payload 签名逐位吻合，且**同时解释 `[79]`/`[82]`**（同一探针的"回读不等"布尔）。`[75]` 经 6 份参考 payload 独立复核确认是噪声。
+
+**`[118]`（Chrome 数字 `611` / 我方 `[object Object]`）仍未定**：93 条表达式差分 + 303 个共有属性类型差分扫描，**没有**找到任何"Chrome 给数字、我方给普通对象"的 API。
+
+**`HPcn5` 部分定位**：该臂是 10 元素 × 8 字段，**8 个 Chrome 会话逐字节相同**（整个数组都是确定性分歧）。差 +1.0 的两处（`elem0` 的 `bZnfT3/McSd5`、`elem1` 的 `bZnfT3/OJxVr7/giwB1`）指向一个**常量 +1px 的宽度量**；`elem2..9` 差得很大且有结构（Chrome `±3.4028232737618185e+32` vs 我方 `33554430 = 0x1FFFFFE`，float32 饱和形态）。**根因未定**。`lgWCE7` 80px 未定位（挑战 UI 在 closed shadow root 里，页面侧枚举看不到）。
+
+**`Sec-Ch-Ua` 根因（`c01351c`）**：Chromium 的 `ShuffleBrandList` 是 **scatter**（`shuffled[order[i]] = list[i]`），输入序为 `{grease, "Chromium", brand}`；Rust 侧把同一张表读成了 **gather**。仅 residue 3/4 (mod 6) 会分歧，故既有 146/149 断言不受影响。三路交叉验证：Chromium 源码 + 其自带单测 golden（4 元素路径两行）+ 本机 Chrome 153 oracle 逐字。顺带发现并修了**无品牌 size-2 分支**（Chromium 是 `{seed%2, (seed+1)%2}`，偶数大版本 grease 在前；旧实现写死 `[Chromium, grease]`，CfT 154 实测证实）。
+
+**同批请求头核对**：16/16 字段在导航与 `fetch` 两种上下文逐字一致。**唯一不一致**：`Cache-Control: max-age=0` 我们**每次导航都发**，Chrome 只在 reload 时发（`wreq_client.rs:505` / `client.rs:1915`，其注释里的理由与 oracle 相反）。已派修——这行会出现在 CF 看到的**第一个请求**上。
+
+**两处新泄漏（已派修）**：① `getClientRects()[0]` / `.item(0)` 返回**带自有可枚举属性的普通对象**而非 branded `DOMRect`；② `window.visualViewport` 是 `Object.prototype` 的普通对象、自有可枚举键，Chrome 是 branded `VisualViewport`（原型访问器、自有键为空）。
+
+**另记三处帧生命周期真分岔（未修，已排除与 85/86 的因果）**：① `iframe.remove()` 后 Chrome 回 `contentDocument=null`、我方仍返回活的 `about:srcdoc` 文档；② `adoptNode` 进另一文档后 Chrome 为 null、我方仍是活文档；③ **父 srcdoc 尚未提交时，在其初始 `about:blank` 里创建的子 srcdoc 帧，我方导航永久丢失**（Chrome 直接销毁该元素）——独立的 realm/帧时序竞态。
