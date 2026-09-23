@@ -13982,3 +13982,308 @@ GET 位点已定（chl_page jf/OEkcY/jI/i 栈），写点在 widget VM 跨 isola
 零记录，需走完全流程的仪器轮（trace 开销需过滤方案，`--trace-api-filter`
 只控静态名，计算键探针不过滤，考虑分轮抽样）；④ retry 环臂型续记
 （final109-135 恒 retry 环）；⑤ 工作区 gate 台账回填（350 ⑤）。
+
+### Step 354：批次 51——**固定 key 解密打通上行 payload 明文**，同 epoch 四方对拍（headed 过 / headless 败于 UA / 干净 UA headless 过 / 我们败），首次拿到 payload#2 逐字段分岔表；实锤两项引擎缺陷（子帧窗口几何恒 0、window 缺 SharedArrayBuffer）+ 一项 harness 陈旧身份（UA 151/15 核），判决 0/1（轮次未走完，见 §354.7）（2026-09-24 凌晨）
+
+#### 354.1 方法突破：上行 payload 明文可解
+
+此前 §10.14/10.19 判定「上行密文不可解，只能靠远程 replay 引擎再生」——**该结论作废**。
+
+- 现行 ov2.js（注入链路服务的那份，`patch_fixed_key` 形态）把 `ot[40..118]` 覆写成 9 周期常量
+  `W=[0x7a,0x13,0x9c,0x41,0xe2,0x58,0xbd,0x06,0xf4]`，于是任意 `pad` 派生同一把 key：
+  `key = (W 重复 16B) ⊕ 垫 734761626b7876487759754e6654744e = 0954fd238920cb4e832366d227b62cf3`。
+  实测 W⊕垫 逐字节等于该常量（§7 旧文档的 `__OV2FIXEDKEY__` 注释标记已不再写出，**不要用 mark 计数判定补丁是否生效**，要看 `vy[40+i]=W[i%9]` 这行）。
+- 字母表随 build 轮换，且**分两层**：
+  - Turnstile 层：`ov2.js` 里 `v3 = \`<65 字符>\``（本轮 `tAwLxfRr…IeNDmj`）
+  - 页面层（`www.thelancet.com/…/h/b/orchestrate/chl_page`）：脚本里同形态 65 字符串，**与 Turnstile 层不同**
+- 解密命令（本轮实际使用，`--ov2js` 指本轮抓的 ov2probe.js 可自动提表）：
+
+```bash
+python3 .claude/skills/ov2-payload-decrypt/scripts/ov2_payload_codec.py \
+  --body-file <fo_N_host_LEN.txt> \
+  --key-hex 0954fd238920cb4e832366d227b62cf3 \
+  --ov2js <本轮 ov2probe.js> --out-dir <dir> --roundtrip --print json
+```
+
+- **边界**：页面层 `/fo/` 解不开（`magic 校验失败 0148 vs fd01`）——主页 `orchestrate/chl_page` 是**未 patch 的真 CF 脚本**，注入只在 `/turnstile/…/rch/` 生效，其 key 不可控。判决面在 Turnstile 三段落（TS#1/2/3）内，故不影响。
+- 交叉自证：headed Chrome 的 `payloadjson_02/03.txt`（console 明文，113821/117619 字符）与解密出的 `payload.json` **长度逐字节相同**，roundtrip 通过。
+
+#### 354.2 同 epoch 四方（本机 Chrome 153.0.8010.48，同代理 http://192.168.3.57:9000，同 URL）
+
+| 轮 | 模式 / UA | 点击 | 最终 `POST /1.txt` | 判定 |
+|---|---|---|---|---|
+| headed | 有头，自然 UA | 9s | **404** | **通过** |
+| headless | `--headless=new`，自然 UA（含 `HeadlessChrome`） | 9s | 无 | 失败（重开一环） |
+| headless-cleanua | `--headless=new` + 干净 153 UA | 9s | **404** | **通过** |
+| headless-cleanua-r3 | 同上（复现） | 9s | **404** | **通过** |
+| ours（r01） | obscura，`--user-agent …Chrome/151` | 14s | 无 | 失败（重开一环，2 ray） |
+
+`/fo/` 段数与体长（host 序列：page → ts → ts → ts → page）：
+- headed（5 段）：2370 / 4695 / **90487** / **93698** / 9090
+- cleanua（5 段）：2370 / 4716 / **91586** / **94850** / 9068
+- ours（7 段，重开）：2370 / 4716 / **90807** / **94274** / 7863 / 2370 / 4930
+
+**§10.22 的决定性推论被推翻**：「headless Chrome 也败 ⇒ 判决不在 payload#1」——实际 headless 的失败源于 **UA 里的 `HeadlessChrome` 标记**（`zIyO8.jKeeJ4` 在 payload#2 里明文记录了 UA），换成干净 UA 后 headless **三次全过**。故 headless 不是有效对照臂；**「headless 类客户端普遍敌对」（§10.6/10.11）的归因是错的，应记为 UA 明文 tell**。
+
+#### 354.3 响应字节码（W3 解，Turnstile 层）
+
+| 段 | 我方 r01 | 参考（0916 会话） |
+|---|---|---|
+| TS#1 | 475814 | 462724 |
+| TS#2 | **71569** | 71564 |
+| TS#3 | **2943** | **4029** |
+| main#2 | 1960 | 2056 |
+
+TS#2 程序**几乎等长**（差 5B）⇒ 服务端在 TS#2 **没有**给我们不同程序；TS#3 变短（失败变体）。裁决发生在 TS#2 报文被消费之后。
+
+#### 354.4 对拍器（新增，仓库外）
+
+- `/tmp/cf-parity/threeway.py <passA.json> <passB.json> <ours.json>`：**只报「两个通过臂互相一致、与我方不同」的字段**，把臂间噪声（会话随机）单独归类。这是本轮最有用的工具——它把 20+ 条候选压成一张确定性差异表。
+- `/tmp/cf-parity/align_diff.py A.json B.json`：按**条目标签名**（非头部键的排序连接）对齐，不按数组下标——探针完成顺序在两个引擎间会漂移（§10.21），按下标比会得到「几乎每个索引都不同」的假象。
+- 关键前提：**必须同 epoch**。payload 条目键名随 build 轮换；跨小时的两轮键名全不同，逐字段比无意义。
+
+#### 354.5 payload#2 确定性分岔表（headed == cleanua == cleanua-r3 == headless(UA) 四方一致，我方全部偏离）
+
+顶层：
+
+| 字段 | 四方（Chrome） | 我方 | 备注 |
+|---|---|---|---|
+| `TzZRB1` | 2 | 18 | |
+| `uGyjw9` | 2 | 310 | §10.20 同族（worker 进度消息洪泛） |
+| `WHTpH6` | 3 | 18 | |
+| `aQgx8` | **不存在** | 1 | 我方多一个顶层键 |
+
+条目内：
+
+| 字段 | Chrome | 我方 | 疑似语义 |
+|---|---|---|---|
+| `PlZqY9` | `["zh-CN","zh"]` | `["zh-CN"]` | navigator.languages（harness 传参） |
+| `zIyO8.TpsmW1` | 12 | 15 | worker navigator.hardwareConcurrency（harness 传参） |
+| `zIyO8.jKeeJ4` | `…Chrome/153.0.0.0…` | `…Chrome/151.0.0.0…` | worker navigator.userAgent（harness 传参） |
+| `dsKPy6` | 1 | 0.99 | |
+| `RPKTR7` | 10737418240 | 10737418728 | 10 GiB 整 vs +488 |
+| `uUOw3` | 0.5/0.625/0.565/0.51（各轮不同） | 0.5999… | **噪声**（Chrome 各轮自变） |
+| `kPEvW6` | false | true | 字体条目内布尔 |
+| `zYUn5` | 100 | 50 | |
+| `knVv1` | 7 | 5 | |
+| `HDEX5` | 12 | 9 | |
+| `wikEk8` | `[3,1,2,0]` | `[0,2,1,3]` | 置换 |
+| `zfym0` | `[2,0,0]` | `[1,0,0]` | |
+| `IGBuA2` | `[159,163]` | `[0,76,125,126,127,128,159,163,171,173,174]` | 扫描基准 |
+| `oHIQ6` | `[]` | `[27,43,59,…,517,518,…]`（1162+ 字符） | 扫描基准 |
+| `lgWCE7` | `"280|1168"` | `"280|1088"` | widget 帧几何（差 80px） |
+| `Ozfs8` | `"UGOeP6"` | `"WoUrS0"` | **四方同值** ⇒ 非随机，我们算错 |
+| `HPcn5` | `bZnfT3/McSd5=28.9375` | `27.9375` | 文本度量（差 1px） |
+| `XqEQ3` | `[…,[7,0,0,7,7,7,7,7],null]` | `[…,[3,0,0,3,3,3,3,3],[3,3,…]]` | 媒体能力矩阵 |
+| `Jpzg5` | `ANGLE Metal Renderer: Apple **M2 Max**` | `Apple **M2**` | WEBGL_debug_renderer_info |
+| `OYbs6[10]` | `"low-power"` | `"default"` | getContextAttributes().powerPreference |
+| `xkNI3`/`uHNG9`/`KnOhl5` | 长 +1311 / +1831 / +7785 | +1141 / +1354 / +7137 | 编解码/ICE/SDP |
+| `kRQwh3` | `5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9`（= **sha256("0")**） | 其它 | 哈希探针 |
+| `JRzmw6`/`RKUE0`/`oSIr8`/`CZUP6`/`MnIr8`/`NNZHC4`/`ZkTjK2`/`OyfhW8`/`ZwhIC5`/`auHG6`/`gAtz0`/`tUxL6` | — | 各不相同 | 各哈希探针 |
+| `XYvy9` | `…,192,192,192,…244,244,244,…53,53,53,…` | `…,191,191,191,…239,239,239,…48,48,48,…` | canvas 像素（已知光栅化低位差） |
+| `jyDXx2`（TS#3 条目 40） | `"0.004999876022338867"` | `"0.09999999999990905"` | 计时（我方是**硬编码字面量**，见 payload 构造文档 §3.5） |
+
+**计数器类**（`NnqX6` 9485 vs 4548/4175/5009/4414、`ZMSOw0`/`twvE0` 426 vs 124-133、`eaaP6`/`tZwbF3`/`wOvYJ5` 我方均约 1.3-1.5x）四方一致地低于我方 ⇒ 也是确定性差，不是时长缩放（§10.22 已记「不随时长收敛」）。
+
+#### 354.6 实锤引擎缺陷（可复现、已派修）
+
+**(A) 非顶层 realm 的浏览器窗口几何恒 0。** 复现命令与输出见 §354.7 的 eval；实测：
+- `document.createElement('iframe').contentWindow` → **null**（Chrome 返回 about:blank Window）
+- 已插入 iframe / srcdoc iframe / `frames[0]` 的 `outerWidth`/`screenX` → **0**，而 `screen.width`(=3440)/`devicePixelRatio`(=1) 正常
+- 顶层 frame 正常（`outerWidth=1440, screenX=22`，与 fingerprint 一致）
+
+真实浏览器窗口 outer 尺寸恒非零，`outerWidth:0` 是经典 headless tell，且该值确实进了 CF 普查（`gsLi5` 的 bucket `'0'` 里裸名 `outerWidth/screenX/screenLeft…`）。
+
+**(B) `window` 缺 `SharedArrayBuffer`。** `Object.getOwnPropertyNames(window)` 1238 项、`window===globalThis`、`FontFaceSet`/`HTMLUserMediaElement`/`InteractionContentfulPaint`/`PerformanceSoftNavigation` 都在，**唯独 `SharedArrayBuffer` 既非 own 也不 `in`**。Chrome 普查里有。线索：`crossOriginIsolated` 在我方 payload 里同时落 `F` 桶（裸名）与 `T` 桶（`o.` 前缀），即 per-realm COI 状态不对称——SAB 很可能是其下游（§10.20 ③ 的复现）。
+
+**(C) `colorDepth` 与 DPR 不一致。** DPR=1 时 Chrome 报 **24**，我们恒报 30（Retina 面板档）。同批已并入 (A) 的修复单。
+
+**(D) `getContextAttributes().powerPreference` 忽略请求值**（`webgl.js:412` 读自身默认而非调用者请求）。Chrome 回 `"low-power"`（挑战请求的值），我们回 `"default"`。
+
+#### 354.7 复现命令
+
+```bash
+# (A) 子帧几何 + (B) window 面
+FP='{"language":"zh-CN","languages":["zh-CN","zh"],"browserVersion":"153.0.0.0","hardwareConcurrency":12,"deviceMemory":32,"screen":{"width":3440,"height":1440,"availWidth":3440,"availHeight":1312,"availTop":30,"availLeft":0,"deviceScaleFactor":1,"outerWidth":1440,"outerHeight":900,"screenX":22,"screenY":52}}'
+./target/release/obscura fetch https://example.com --stealth \
+  --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36' \
+  --fingerprint "$FP" --eval '<见 skills/obscura-challenge-probe 的 census 探针>'
+
+# 实弹对拍轮（注入链路在线时）
+bash /tmp/cf-parity/ours/run2.sh <run> <click-after>   # 点击须晚于 TS#2，10s 太早→停在 TS#2
+```
+
+#### 354.8 harness 身份陈旧（本轮 0/1 的直接成因之一）
+
+`/tmp/cf0919/capture_round75.sh` 用的身份来自**旧文档的参考机**，与当前比对机不符：
+
+| 项 | 旧 harness | 当前机 Chrome 实测 |
+|---|---|---|
+| UA | Chrome/151.0.0.0 | **Chrome/153.0.0.0** |
+| hardwareConcurrency | 15 | **12** |
+| languages | `["zh-CN"]` | **`["zh-CN","zh"]`** |
+| screen | 1512×982 DPR2 | **3440×1440 avail 1312 top 30 DPR1** |
+| outer | 1200×816 @44,77 | **1440×900 @22,52** |
+| colorDepth | 30 | **24** |
+
+（`availTop` 30 两边一致。）已生成 `/tmp/cf-parity/ours/run2.sh` 使用对齐后的身份。
+注意：`--fingerprint` 的 `screen.outerWidth/outerHeight/screenX/screenY` 在**顶层**已确认生效（实测 1440/900/22/52），所以 (A) 的 0 是子帧取值路径问题，不是 fingerprint 解析问题。
+
+#### 354.9 判决与下一批入口
+
+本轮实弹轮 r01（旧身份）走完 main#1→TS#1→pat401→TS#2→TS#3→main#2 后重开一环；r02（新身份，点击 10s）**停在 TS#2**（点击早于 TS#2，符合 §10.6 的已知窗口，非引擎分岔）。**本轮 0/1 不构成对引擎状态的判决**——修复批次在飞，收口后需按 §354.7 重跑。
+
+下一批入口（按证据强度）：
+1. **(A)(B)(C)(D) 修复落地后重跑**，用 `threeway.py` 复算分岔表，看还有多少残留。
+2. **哈希探针群**（`kRQwh3 = sha256("0")` 等）：Chrome 的值简单（sha256("0")），说明我们在这些探针上喂了**不同的输入**。逐个找出输入源后极易对齐。
+3. **扫描基准 `IGBuA2`/`oHIQ6`**：Chrome `oHIQ6=[]`、`IGBuA2=[159,163]`，我方是大数组 ⇒ 我们的扫描**扫到了不该扫到的项**（很可能是 (B) 的同源：对象面/原型链差异）。
+4. **GPU/媒体面**：`Jpzg5` 走 `--fingerprint.gpu.renderer` 传参即可；`XqEQ3`/`xkNI3`（媒体能力矩阵）需要按 Chrome oracle 重算。
+5. **计数器族** `TzZRB1`/`uGyjw9`/`WHTpH6`/`NnqX6`/`ZMSOw0`：真实事件量差，需当轮 build 的 jsvmp 反编译定位（远程管线）。
+6. `Ozfs8`（四方同值 `UGOeP6`）：非随机值的算错，优先级高——它四方一致说明输入确定。
+7. 几何/渲染残差（`XYvy9` 像素、`HPcn5` 文本度量、`lgWCE7` 80px）：与 §10.19 同族，软信号。
+
+#### 354.10 纠错与新增实锤（同日复核）
+
+**纠错三条**（都用 Chrome 153 oracle 逐格对照过，避免把错误结论写进修复单）：
+
+1. **游离 iframe 的 `contentWindow`/`contentDocument` 返回 `null` 是 Chrome 的正确行为**，我方与之**一致**——§354.6(A) 里把它列为缺陷是错的。已撤销该项修复要求，并改为在测试里钉住"与 oracle 一致"。
+2. **`getContextAttributes().powerPreference` 我们是对的。** 12 种组合（webgl / webgl2 / experimental-webgl × 不传 / `default` / `low-power` / `high-performance`）与 Chrome **逐格相同**。§354.6(D) 系误读 `OYbs6[10]` 所致，已撤销。
+3. **`srcdoc` 内容是异步解析的**（同 tick 读回 Chrome 也是空串），不是缺陷。测试必须等一个 task。
+
+**新增实锤三条**（已派修）：
+
+**（E）`srcdoc` 解析丢掉带属性的元素。** 矩阵探针（srcdoc 写入 → 等 120ms → 读 `contentDocument.body.innerHTML`）：
+
+| srcdoc 内容 | Chrome | Obscura |
+|---|---|---|
+| `<p>EnIF0</p><p>ikyR0</p>` | ✅ | ✅ |
+| `<div data-foo="x"></div>` | ✅ | **`''`（元素消失）** |
+| `<div data-foo="&quot;"></div>` | ✅ | **`''`** |
+| `<img alt="&quot;">` | ✅ | **`''`** |
+| `<a href="?a=&quot;b">z</a>` | ✅ | **`''`** |
+
+即**只要元素带任意属性，srcdoc 解析后就整个消失**；无属性元素正常。innerHTML 路径不受影响。影响面大：挑战用 `srcdoc.set(TrustedHTML)` 实例化 `about:srcdoc`（§5.3）。这解释了 `OjmeV1[85]/[86]/[103]/[104]` 四个分岔。
+
+**（F）属性值序列化不转义 `<`、`>`、NBSP。** `innerHTML` 读回时 Chrome 输出 `&lt;` / `&gt;` / `&nbsp;`，我们输出裸 `<` / `>` / U+00A0（`&` 与 `"` 我们已正确）。这解释了 `OjmeV1` 的其余部分。
+
+**（G）`navigator.storage.estimate().quota` 不等于 10 GiB。** 真实 Chrome 153 在本机任意源上返回 **`10737418240`**（恰好 10 GiB，`usage: 0`）；我方两次运行得到 `10737418472` / `10737418728`——**既非 10 GiB 整，还随运行浮动**。这正是分岔项 `RPKTR7`（Chrome `10737418240` vs 我 `10737418728`）。
+
+同批复核为**一致**（写进测试当正向证据）：`performance.memory.jsHeapSizeLimit`=4395630592、`storage.persisted()`=false、`StorageManager` 原型 own 键 `["estimate","getDirectory","persist","persisted"]`、`storageBuckets`/`getDirectory` 在真实 https 源上 present、WebGPU limits 全套与 `info={apple,metal-3}`、WebGL `unmaskedRenderer` 前缀（差异仅在机型串，见 §354.8 的 `gpu.renderer` 传参）。
+
+#### 354.11 配置修正的干净验证（r03）
+
+用对齐后的身份（§354.8）重跑一轮，与两个通过臂做同一套三方对拍：
+
+- **消失的两项**：`PlZqY9`（`navigator.languages` 缺 `"zh"`）与 `zIyO8`（worker navigator 的 hc/UA）——证明确实是 harness 传参问题，已闭环。
+- **其余 37 项全部保留**（`HDEX5`/`XqEQ3`/`Ozfs8`/`knVv1`/`lgWCE7`/`dsKPy6`/`zYUn5`/`RPKTR7`/`kPEvW6`/`Jpzg5`/`OYbs6`/`OjmeV1`/`IGBuA2`/`oHIQ6`/哈希群/计数器群…）——证明它们与身份无关，是纯引擎/环境缺陷。
+- 注意 r03 因**机器负载 7.5（三个修复 agent 并发编译）**停在 TS#2：§10.9 的时序失真警告仍然适用，**验证轮必须与构建错开**。该轮只用于读 payload#2，不作为判决轮。
+
+**载荷键名未随 build 轮换**（r03 与参考臂的条目键名完全相同），但 **base64 表轮换了**（`qFcPNV8X2…`）。固定 key 补丁仍在，只是变量名轮换（`vy`→`Ek`）——**判定补丁存在不能靠变量名或注释标记 grep，要按 `Ek[40 + i] = W[i % 9]` + W 数组值识别**。
+
+#### 354.12 payload#1 与结构差异（Chrome 臂全解出）
+
+headed 臂的 `fo_02`（TS#1，4695B）与 `fo_04`（TS#3，93698B）**用旧表**解出（旧表 `tAwLxfRr…IeNDmj`，02:01 后 build 轮换为新表 `qFcPNV8X2…`）。TS#1 解出 4928 字符，与 console 的 `payloadjson_01.txt` 逐字节等长。
+
+**结构差异（重要）**：`aQgx8` 在**双方的 payload#1 都存在且为 `0`**；但 **Chrome 的 payload#2/#3 里该键不存在**（92/94 键），我们仍带着它（93/95 键，值翻成 `1`）。即：payload#2 阶段该键应被移除。参考构造文档 §5.2 的「删除必须 shift_remove（保序）」——若 CF 按位置消费，多出的键会顶掉后续位次。
+
+**payload#1 的确定性差异**（headed `payloadjson_01` 4928 vs 我们同轮）：
+
+| 字段 | Chrome | 我方 | 备注 |
+|---|---|---|---|
+| `TzZRB1` | 2 | 18 | §354.5 同族 |
+| `uGyjw9` | 2 | 310 | worker 进度消息量（§10.21/§10.22 追过，未收敛） |
+| `ZMSOw0` / `twvE0` | 133 | 426 | 同族 |
+| `WHTpH6` | 3 | 18 | |
+| `NnqX6` | 235 | 529 | |
+| `Blsob5` | 2 | 3 | |
+| `tZwbF3` | 1055 | 1599 | 耗时类（我们慢） |
+| `wOvYJ5` | 858 | 1333 | 同上 |
+| `eaaP6` | 853 | 1019 | 同上 |
+| `PWGF4[0].t` | **197** | 266 | **Chrome 自己也抛约 200 条**——错误洪泛是常态，非我方独有（修正 §10.20「Chrome=1」的口径：那是另一处统计） |
+
+其余 37 个非数字键（含 `WqxKW9`/`jvYQh4`/`HEywW9`/`OqAoN4`=managed/`KXkx2`=new/`vXDzj6`/`VnGsz1` 等）与 `rPXg2` 资源清单在 TS#1 阶段**逐值一致**。
+
+#### 354.13 (A) 项根因落定与修复（引擎侧，已验证）
+
+**(A) 子帧窗口几何恒 0** 的根因**不是** page-init 的取值为 0，而是**指纹播种与帧初始化的时序**：
+
+- `crates/obscura-js/src/realm.rs:1103` —— `ensure_frame_world_realm` 用 `execute_in_context` 播种指纹，而该函数**先 hydrate 再跑脚本体**（`execute_in_context_at` 首行 `hydrate_frame_realm_if_pending`）。于是 deferred-surface 的 `<obscura:init>`（page-init）在指纹播种**之前**执行，`_fingerprint()` 只能拿到硬编码兜底（1920×1080 / avail 1920×1080 / outer 0）→ 六项 = 1920/1080/0/0/0/0。
+- 同步路径（`spawn_frame_realm`，`run_script` 不 hydrate）在 facade 首次读取时才 hydrate，指纹已就位，所以 `appendChild` 后立即读是**对的**——这正是"顶层对、子帧错"的分岔来源。
+- **后果面**：所有经异步 loader 建 realm 的帧——**真正的 `src` 导航帧、srcdoc 提交帧、CF widget 帧**——几何全是兜底值。CF 的普查读到的就是这些。
+
+修复：`page-init.js` 删除"非顶层写 0"分支（统一取 fingerprint 窗口指标）；`realm.rs` 新增 `run_in_realm_before_hydration`，把指纹播种移到 `<obscura:frame-realm-init>` **之前**，保证 page-init 看到的是运行时身份；`screen.js` 的 `colorDepth/pixelDepth` 改为 `mac && DPR>=2 ? 30 : 24`（缓存键 `platform|dpr`）。
+
+验证（Chrome oracle 逐字段）：子帧六项修复后 = 顶层值（1440/900/22/52）；`display:none` 帧 `{ow:1440,sx:22,iw:0,cd:24}` 与 Chrome 逐字段一致；网络加载的 300×65 widget 形状帧同样命中。回归测试 4 条 + 全工作区门 1928/1928。
+
+**遗留（未修，另开）**：① `iframe.remove()` 之后 Chrome 回到 `contentWindow=null`，我们仍返回 WindowProxy（需动帧文档生命周期）；② 未设尺寸的 iframe（默认 300×150 盒）Chrome 报 `innerWidth=300`，我们在无布局路径报 764（显式 `width:300px` 正确）——属渲染/布局回退路径。两条都与本批分岔无直接关系。
+
+**关于 colorDepth 的物理含义**：Chrome 位深跟**物理面板**，不跟随 `--force-device-scale-factor`（实测 DSF=2 仍 24）。故 `DPR>=2 → 30` 只是"Retina Mac"的代理规则，已加 macOS 门限，避免 Windows 200% 缩放身份被误报 30。
+
+#### 354.14 又一项实锤：`navigator.connection.rtt`
+
+分岔表里的 `zYUn5`（Chrome `100` / 我方 `50`）属条目 `CYsxg7+CoJas5+DaNP8+LfzX7+axjt2+zYUn5`，该条目同含 `DaNP8="4g"`（`effectiveType`）⇒ 这是一条 **NetworkInformation** 探针。双引擎实测：
+
+```
+Chrome : {"downlink":1.8,  "effectiveType":"4g", "onchange":null, "rtt":100, "saveData":false}
+Obscura: {"downlink":1.55, "effectiveType":"4g", "onchange":null, "rtt":50,  "saveData":false}
+原型 own 键两边一致：["downlink","effectiveType","onchange","rtt","saveData"]；实例 own 键均为空
+```
+
+⇒ **`zYUn5` = `navigator.connection.rtt`，应为 100，我们给 50。** `downlink` 偏低（Chrome 1.8 vs 我们 1.55），且我方言次间会变（该轮 payload 里是 5.575，探针里是 1.55）——Chrome 侧是**测量值**，对拍口径应为同量级而非等值。已派回环境 API 批次。
+
+哈希探针群（`JRzmw6`/`RKUE0`/`oSIr8`）的输入**扩展爆破未果**（`kRQwh3 = sha256("0")` 已确认，其余三条跨四个 Chrome 会话恒定但输入非平凡字符串），仍归字节码反编译管线。
+
+#### 354.15 环境 API 批次落地（B/C/G/I 项）
+
+**（B）`crossOriginIsolated` / `SharedArrayBuffer` —— 真因是子帧隔离判定错。**
+
+Chrome 153 oracle（自建 COOP/COEP 双端口 fixture，CDP 逐 realm）定出的规则：
+
+| 场景 | coi | typeof SAB |
+|---|---|---|
+| about:blank（新标签，opaque） | false | undefined |
+| http 普通 / 仅 COOP / 仅 COEP require-corp / COEP credentialless | false | undefined |
+| **COOP same-origin + COEP require-corp** | **true** | **function** |
+| COOP unsafe-none + COEP require-corp | false | undefined |
+
+**父已隔离时**的子帧：同源 + 自身 COEP（require-corp 或 credentialless）⇒ **true/function**；**子文档自己的 COOP 与 `crossOriginIsolated` 无关**（COOP 只决定顶层 browsing context group）；跨源还需 `allow="cross-origin-isolated"`。
+
+根因：`page.rs:13679 frame_response_grants_cross_origin_isolation` 复用了专为顶层写的判定，要求子响应**同时**带 COOP 与 COEP。拆出 `response_requires_cross_origin_embedding`（只看 COEP）与 `response_denies_cross_origin_isolation`（`Permissions-Policy: cross-origin-isolated=()`），判定改为「父已隔离 && 同源 && COEP(非 unsafe-none) && 未被 PP 拒绝」。**没有**无条件挂 SAB——SAB 仍按每个文档的隔离位安装，只是这个位现在按 Chrome 规则算。测试 2 条（单元逐格 + 端到端起真 server 导航）。
+
+**（C）`o.` 前缀之谜解开 + 一条真分岔。**
+
+`gsLi5` 桶表的键是**值**，值是「产生该值的属性**路径**」列表；前缀是**宿主对象**：`n.`=navigator、`d.`=document、`s.`=screen、`so.`=screen.orientation、裸名=**普查 realm 自己的 window**、`o.`=**第二个窗口（Turnstile widget realm）**。判据：`o.innerWidth`=300/`o.innerHeight`=65（widget 尺寸）而裸 `innerWidth`=0；`o.runProgram`/`o._cf_chl_opt` 是 CF 注入 widget realm 的混淆全局。**普查跑在 widget 内部一个隐藏的 same-origin about:blank 子帧里**（`d.URL=about:blank`、`d.domain=challenges.cloudflare.com`、`d.referrer`=widget URL）。
+
+真分岔：四个 Chrome 参考轮**全部**只有一条**裸** `crossOriginIsolated`（桶 T）与一条**裸** `SharedArrayBuffer`（桶 N），`o.crossOriginIsolated`/`o.SharedArrayBuffer` 出现 0 次；我们 r01 恰好相反（裸的 `crossOriginIsolated` 落 F 桶、裸 `SharedArrayBuffer` 缺失、两者都出现在 `o.` 下），且我们 `o.` 条目 36 vs Chrome 30，多出的 6 个正是 `bootstrap.js` 的 `_nonIsolatedFrameHiddenNames` 那 4 个实验接口 + SAB + COI。⇒ **引擎自相矛盾：`o` 那侧既被当成"非隔离跨源帧"的缩减反射面，又报 `crossOriginIsolated===true`。**
+
+**未定案**：真实 Turnstile iframe 是否带 `allow="cross-origin-isolated"`、我们是否读到它。需要一次带网轮次的探针（widget realm 内读该 iframe 的 `allow` 属性 + 我们侧 `frame_container_info`/`document_scope_info` 的 `crossOriginIsolated`）。
+
+**（G）`storage.estimate().quota`。** 根因 `ops.rs:7027`：返回 `10 GiB + (200 + 宿主剩余空间 % 800)`。那套"Chrome 报 10 GiB + 小 delta"的注释**被 oracle 推翻**——Chrome 三个源 × 复用/全新 profile × 多次调用，**恒为 10737418240**。已改为固定 10 GiB，并删除因此成为死代码的 `host_free_bytes()`。
+
+**（I）`navigator.connection.rtt`。** Chrome oracle（`Network.emulateNetworkConditions` 各档）证明 `rtt` 是**测量值**（跟随实际/模拟时延并量化到 50ms：offline→0、150ms→150、50ms→50、333ms→350），**无观测时答 100**。我们硬编码 50 → 改为 100。`downlink` 同样是测量值（Chrome 1.65–1.8 之间浮动），**对拍口径为同量级而非等值**。
+
+**同批复核为一致（已写进测试当正向证据）**：`storage.persisted()`=false、`getDirectory`/`storageBuckets` present、`estimate()` 键 `["quota","usage","usageDetails"]`、`performance.memory.jsHeapSizeLimit`=4395630592、`effectiveType="4g"`、`saveData=false`、`onchange=null`。
+
+**两处已知系统差（未修，记录在案）**：① `constructor` 在原型 own 键中的**位次**（Chrome 把 `constructor` 排在中间/末尾，我们排首位）——全 WebIDL 接口系统性差异，非 storage 特有；② 隔离父下的同源子帧若自身无 COEP，Chrome 会拦成 `chrome-error://chromewebdata/`，我们照常加载只是不隔离。
+
+#### 354.16 批次 51 收口：3 个修复批次落地、判决仍 0/1
+
+**落地（4 个提交）**：`6b2acdc`（DOM 属性/文本转义）、`a98a5ef`（每 realm 的窗口几何 + colorDepth 面板规则）、`64f6e5a`（子帧隔离继承 COEP、quota 恒 10 GiB、rtt 默认 100、awaited evaluate 提交其创建的帧）。Scoped 门禁 `obscura-dom + obscura-browser + obscura-js + obscura-cdp` = **1100/1100 通过 / 3 跳过**；全量门与障碍课程按纪律记入 `docs/test-gate-ledger.md` 待回填。
+
+**配置层收口**：身份对齐（§354.8）+ GPU 机型串经 `--fingerprint.gpu.renderer` 传入。
+
+**判决轮 v1/v2（修复后二进制 02:32）**：分岔项 **38 → 35**。已消：`RPKTR7`（quota）、`zYUn5`（rtt）、`Jpzg5`（GPU 串）。**判决仍为 retry 环，未拿到 `POST /1.txt → 404`。**
+
+**B1 纠错（重要）**：§354.10(E) 的「srcdoc 带属性就丢元素」判断**被推翻**。真因是 **CDP `Runtime.evaluate` 的 await 期间，其表达式新建 iframe 的导航提交被推迟到 evaluate 返回之后**——探针本身触发了这条路径，`<div></div>`（无属性）同样复现，`Page.getFrameTree` 显示帧确实提交、只是读得早，页面自身脚本建 srcdoc 帧则一直正常。已修（真缺陷：影响任何 CDP 驱动流程）。**但 `OjmeV1[85]/[86]/[103]/[104]` 的页面侧根因因此仍未定**，需在页面脚本路径（非 CDP await）下重新验证。
+
+**剩余 35 项分岔（v2）**：
+`HDEX5 XqEQ3 xkNI3 Ozfs8 knVv1 lgWCE7 dsKPy6 CzUP6 MnIr8 DqomM2 kPEvW6 OYbs6 OyfhW8 XYvy9 ZwhIC5 auHG6 etmnR7 gAtz0 lDUiR4 tUxL6 zfym0 HPcn5 IGBuA2 oHIQ6 JRzmw6 RKUE0 kRQwh3 oSIr8 wikEk8 NNZHC4 OjmeV1 SbVZ3 hCfV6 ZkTjK2 jyDXx2`
+
+**下一批入口（按可操作性重排）**：
+1. **`OYbs6[10]`**（Chrome `"low-power"` / 我们 `"default"`）：已证 `getContextAttributes().powerPreference` 12/12 组合与 Chrome 一致 ⇒ 该位置**不是** context attributes，需重新识别 `OYbs6` 的结构（序列含 `16, 4352, false, 1, null, 1, 1, 1, 0, 0, …`，疑为 WebGL 参数 + 扩展枚举的混合转储）。
+2. **哈希探针群**：Chrome 侧跨四会话恒定 ⇒ 输入是常量。`kRQwh3 = sha256("0")` 已确认，其余三条扩展爆破未果。判定「极易对齐」（语义文档语）但需要输入源，走字节码管线。
+3. **`IGBuA2`/`oHIQ6`**：Chrome `oHIQ6=[]` / 我们千字符等差数组 ⇒ 我们的扫描**多检出**。疑与 §354.15(C) 的 per-realm 反射面差异同源（多了 6 个条目）。
+4. **`OjmeV1`**：页面脚本路径重验（见上），另 `[79]`/`[118]` 是批次 49 的既有未决项。
+5. **`HPcn5` 文本度量差 1px**、**`lgWCE7` widget 帧高差 80px**、**`XqEQ3`/`xkNI3` 媒体矩阵**：需要按 Chrome oracle 重算，各自独立。
+6. **`wikEk8`/`wopX8`/`hCKCP8`/`jBVrk8`（bench 臂）**：次序与耗时都随相对性能漂移，属性能对齐问题。
+7. **计数器族**（`TzZRB1`/`uGyjw9`/`WHTpH6`/`NnqX6`/`ZMSOw0`）：真实事件量差，需当轮 build 的 jsvmp 反编译定位。
