@@ -12110,6 +12110,100 @@ RequestRedirect value",
     "#;
 
     #[test]
+    fn range_extract_contents_moves_children_and_reads_back_like_chrome() {
+        // Chrome 153 oracle: selectNodeContents + extractContents hands the
+        // full child HTML to the destination and leaves the source empty;
+        // cloneContents copies without mutating. The challenge's innerHTML
+        // readback arm takes exactly this shape.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const src = document.createElement("div");
+                    src.innerHTML = '<p>AA1</p><p>BB2</p>';
+                    const range = document.createRange();
+                    range.selectNodeContents(src);
+                    const moved = range.extractContents();
+                    const dest = document.createElement("div");
+                    dest.appendChild(moved);
+                    const clonedSrc = document.createElement("div");
+                    clonedSrc.innerHTML = '<div data-foo="&quot;"></div>';
+                    const cloneRange = document.createRange();
+                    cloneRange.selectNodeContents(clonedSrc);
+                    const copied = cloneRange.cloneContents();
+                    const cloneDest = document.createElement("div");
+                    cloneDest.appendChild(copied);
+                    const kept = document.createElement("div");
+                    kept.innerHTML = '<p>CC3</p>';
+                    const deleteRange = document.createRange();
+                    deleteRange.selectNodeContents(kept);
+                    deleteRange.deleteContents();
+                    return {
+                        source: src.innerHTML,
+                        destination: dest.innerHTML,
+                        cloneSource: clonedSrc.innerHTML,
+                        cloneDestination: cloneDest.innerHTML,
+                        afterDelete: kept.innerHTML,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "source": "",
+                "destination": "<p>AA1</p><p>BB2</p>",
+                "cloneSource": "<div data-foo=\"&quot;\"></div>",
+                "cloneDestination": "<div data-foo=\"&quot;\"></div>",
+                "afterDelete": "",
+            })
+        );
+    }
+
+    #[test]
+    fn frame_window_proxy_name_follows_chrome_browsing_context_semantics() {
+        // Chrome 153 oracle: the name attribute is read once, when the nested
+        // browsing context is created at insertion; a later attribute change
+        // does not rename it, while a `contentWindow.name` assignment does and
+        // keeps the name across a navigation of the same context.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const before = document.createElement("iframe");
+                    before.name = "PerA";
+                    document.body.appendChild(before);
+                    const after = document.createElement("iframe");
+                    document.body.appendChild(after);
+                    after.name = "PerB";
+                    const assigned = document.createElement("iframe");
+                    document.body.appendChild(assigned);
+                    assigned.contentWindow.name = "PerD";
+                    const unsetAttribute = document.createElement("iframe");
+                    document.body.appendChild(unsetAttribute);
+                    return {
+                        beforeInsert: before.contentWindow.name,
+                        afterInsert: after.contentWindow.name,
+                        jsAssigned: assigned.contentWindow.name,
+                        assignedAttr: assigned.getAttribute("name"),
+                        unnamed: unsetAttribute.contentWindow.name,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "beforeInsert": "PerA",
+                "afterInsert": "",
+                "jsAssigned": "PerD",
+                "assignedAttr": serde_json::Value::Null,
+                "unnamed": "",
+            })
+        );
+    }
+
+    #[test]
     fn native_iframe_same_origin_content_document_is_scoped() {
         let mut rt = setup_runtime(
             "<html><body><iframe id=f></iframe><div id=outer></div></body></html>",
@@ -15637,6 +15731,45 @@ RequestRedirect value",
                 "methods": ["function", "function", "function", "function"],
                 "dispatched": 1,
             })
+        );
+    }
+
+    #[test]
+    fn match_media_default_variant_features_answer_chrome_153() {
+        // Headed + headless Chrome 153 oracle: the default/negative variant of
+        // each of these features matches, the forced variants do not, and a
+        // non-monochrome screen answers (monochrome: 0) with true.
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1280.0, 720.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    matchMedia("(prefers-reduced-transparency: no-preference)").matches,
+                    matchMedia("(prefers-reduced-transparency: reduce)").matches,
+                    matchMedia("(prefers-contrast: no-preference)").matches,
+                    matchMedia("(prefers-contrast: more)").matches,
+                    matchMedia("(forced-colors: none)").matches,
+                    matchMedia("(forced-colors: active)").matches,
+                    matchMedia("(display-mode: browser)").matches,
+                    matchMedia("(display-mode: standalone)").matches,
+                    matchMedia("(update: fast)").matches,
+                    matchMedia("(update: slow)").matches,
+                    matchMedia("(scripting: enabled)").matches,
+                    matchMedia("(scripting: none)").matches,
+                    matchMedia("(monochrome: 0)").matches,
+                    matchMedia("(monochrome: 8)").matches
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, false, true, false, true, false, true, false, true, false, true, false])
         );
     }
 
