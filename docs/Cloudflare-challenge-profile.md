@@ -14528,3 +14528,43 @@ script | style | xmp | iframe | noembed | noframes | plaintext | noscript
 **两处新泄漏（已派修）**：① `getClientRects()[0]` / `.item(0)` 返回**带自有可枚举属性的普通对象**而非 branded `DOMRect`；② `window.visualViewport` 是 `Object.prototype` 的普通对象、自有可枚举键，Chrome 是 branded `VisualViewport`（原型访问器、自有键为空）。
 
 **另记三处帧生命周期真分岔（未修，已排除与 85/86 的因果）**：① `iframe.remove()` 后 Chrome 回 `contentDocument=null`、我方仍返回活的 `about:srcdoc` 文档；② `adoptNode` 进另一文档后 Chrome 为 null、我方仍是活文档；③ **父 srcdoc 尚未提交时，在其初始 `about:blank` 里创建的子 srcdoc 帧，我方导航永久丢失**（Chrome 直接销毁该元素）——独立的 realm/帧时序竞态。
+
+#### 354.27 **决定性负结果**：35 项 payload 分岔**全都不是判据**
+
+用注入链路的 VM 在加密上行前必经的 `JSON.stringify` 做钩子（Proxy 包装、保持 `name/length/toString` 原生形状、只处理「自身数字键 ≥ 20」的对象、跨 realm 中继回顶层），把**指定字段的值换成 Chrome 参考臂的值**，再跑实弹轮看判决是否翻转为 `POST /1.txt → 404`。
+
+**有效前提已成立**：① 钩子只命中真 payload（同 realm 另一个 1211 键对象被正确放过）；② **空注入对照轮仍然失败**（只包不改），说明注入本身没有翻转判决；③ 解密后核验（`verify_swap.py`）确认被改字段**确实以 Chrome 的值落到了上行报文**。
+
+**结果（9 轮，全部失败）**：
+
+| 轮 | 规则 | 落到线上 | 判决 |
+|---|---|---|---|
+| control（空注入） | 0 | — | 失败 |
+| g1 哈希探针群 | 13 | 13/13 | 失败 |
+| g2 扫描基准 `IGBuA2`/`oHIQ6` | 2 | 2/2 | 失败 |
+| g3 `OjmeV1` | 1 | 1/1 | 失败 |
+| g4 计数器族 | 8 | 6/8 | 失败 |
+| g5 媒体/度量/顶层 | 11 | 11/11 | 失败 |
+| g6 余项 | 3 | 1/3 | 失败 |
+| g7 按键定位补齐 | 2 | 2/2 | 失败 |
+| **everything（34 条全上）** | 34 | 32/34 | **失败** |
+
+`everything` 轮把共识分岔**从 35 压到 5**，直接证明钩子改的就是真 payload——**判决依然不变**。
+
+⇒ **在 `3-frame-req` 阶段，CF 不依据这 ~35 项 payload 字段做裁决。** 这推翻了 §354.9 起"按分岔表排优先级"的整个前提：那些确实是**真缺陷**（几何、隔离、转义、quota、rtt、`Sec-Ch-Ua`、preload arming 都已修），但**不是判据**。
+
+**会话噪声表**（判据改为"三个通过臂**互不相同**"，而非"看起来可疑"）排除 54 键，含头部/时间戳三件套、顶层会话令牌、漂移计数器、条目内漂移键。**两处与先前的判断不符**：`Ozfs8` **不是**漂移键（三臂一致 `"UGOeP6"`，我方 `"WoUrS0"`，是确定性差）；`OjmeV1` **是**漂移键（R1==R2≠R3），故 G3 从根上失去意义。
+
+**已明确排除的方向**：payload 字段内容（本轮）、`/ci/` 是否发出（§354.22，且约半数轮次 `rPXg2` 本来就带它）。
+
+**尚未覆盖、因此仍可能是判据的**：① **更晚的阶段**——每轮实际产生 5-8 份 `/fo/` 上行，只有 `3-frame-req` 做过三方对拍与置换；② **请求/传输层**（头部、时序、连接复用）；③ **会话级行为**（网络请求的序列与时刻本身）；④ 交叉一致性校验（把某值与其派生哈希一起换成**别的会话**的值，本身制造了新的不一致，故不能完全排除 CF 做内部一致性校验）。
+
+#### 354.28 两条相关更正与进展
+
+**`/ci/` 的 `rPXg2` 缺失是非确定性**（又一次纠正我）：清点 13 轮的 `3-frame-req`，**7 轮带 `/ci/`、6 轮不带**。我们的 `/ci/` 条目字段形状与 Chrome 一致（`EazF1:0, dtkfB9:112, gtlhH0:112, nXUeQ6:3784, FoGsT1:3484`）。
+
+**`/ci/` 的真根因（已修，`06adea9`）**：preload `<link>` 的 arming **只在 `HTMLLinkElement` 的 JS setter 里触发**，而**解析器建的 link**（`innerHTML`、`insertAdjacentHTML`、`<template>`+cloneNode、初始文档解析）从不经过 setter ⇒ **完全不发请求**，只剩晚一步的 `Image.src`。这正是我测到 `duration 2191ms` 的成因，也解释了约 50% 的缺失率（快照时条目还没落地）。修复把 sweep 挂到 DOM 已有的 JS 侧 post-parse 记账点（含穿 shadow 的子树遍历）。**修复后实测 `/ci/` 条目：`transfer 632 → 6908`、`enc 332 → 6608`、`duration 2191 → 527ms`**（Chrome 三份 HAR 为 2415/3810/3196）。
+
+**残余保真缺口（未修）**：preload 驱动的条目我们报 `initiatorType: "img"`，Chrome 报 `"link"`（fixture 实证）。
+
+**流程事故（我的失误，已修复）**：我用不带路径的 `git commit`（`76cf924`）把另一个 agent **预先 staged 的 7 个源文件**一起提交了，而定义 `_armPreloadImageLinks` 的 `link.js` 当时未 staged ⇒ **HEAD 的 bootstrap 会抛 `ReferenceError`**（任何 `element.innerHTML =` 都失败，全新 checkout 大面积失效）。已用 `06adea9` 补齐定义与调用点，HEAD 恢复自洽。**纪律更正：任何提交必须显式带上路径（`git commit -- <paths>`），绝不用裸 `git commit`。**
