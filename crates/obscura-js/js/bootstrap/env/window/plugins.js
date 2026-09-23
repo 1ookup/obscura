@@ -68,11 +68,22 @@ class NetworkInformation {
   // `type` and `downlinkMax` are spec-only and absent there, and exposing
   // them surfaced in challenge payloads as values no real Chrome reports.
   get effectiveType() { _networkInformation(this); return '4g'; }
-  get rtt() { _networkInformation(this); return 50; }
+  // Chrome's rtt is a network-quality measurement, not a model: driven through
+  // CDP `Network.emulateNetworkConditions` it reports 50/150/350/2100 for
+  // emulated latencies of 50/150/333/2000 ms, and 0 when offline. With no
+  // observation to report it answers its 100 ms default, which is what it read
+  // on this engine's own environment -- a loopback fixture and a real site
+  // alike, before and after the page's transfers. This engine measures
+  // throughput but not latency, so it reports that default rather than a
+  // fabricated sample.
+  get rtt() { _networkInformation(this); return 100; }
   // Chrome's estimator answers observed transfer throughput quantized to
   // 25 kbps buckets, clamped to [0.05, 10] Mbps; the op keeps the same EWMA
   // over the engine's completed scripted fetches. A pinned 10 is the reporting
-  // cap, and a cap is the value the passing session did not report.
+  // cap, and a cap is the value the passing session did not report. It is a
+  // reading, not a constant: Chrome 153 answered 1.65-1.8 Mbps on this machine
+  // depending on the load, and CDP-emulated 500/1600/10000 kbps came back as
+  // 0.5/1.6/10 Mbps. The default before any sample stays in that band.
   get downlink() { _networkInformation(this); return Deno.core.ops.op_connection_downlink(); }
   get saveData() { _networkInformation(this); return false; }
 }

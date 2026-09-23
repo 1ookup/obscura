@@ -472,6 +472,11 @@ impl InputStrategy {
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+// How long one step of a `Runtime.evaluate` awaitPromise pump may run before
+// the caller drains pending frame navigations again. Small enough that a frame
+// appended mid-expression commits well within a task, large enough that the
+// per-slice bookkeeping stays off the hot path.
+const AWAIT_EVALUATE_FRAME_PUMP_SLICE_MS: u64 = 10;
 
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
@@ -5045,21 +5050,44 @@ impl Page {
                 .as_mut()
                 .ok_or("JavaScript runtime unavailable")?
                 .start_await_evaluate_for_cdp(expression)?;
-            // The expression above may synchronously set iframe.src or append
-            // a connected iframe and then await its load event. Commit those
+            // The expression may synchronously set iframe.src or append a
+            // connected iframe and then await its load event. Commit those
             // browser tasks before pumping the Promise, otherwise each side
             // waits for the other until the CDP timeout.
-            self.process_pending_frame_navigations().await;
-            return self
-                .js
-                .as_mut()
-                .ok_or("JavaScript runtime unavailable")?
-                .finish_await_evaluate_for_cdp(
-                    pending,
-                    return_by_value,
-                    await_timeout_ms,
-                )
-                .await;
+            //
+            // The same reason applies to every frame the awaited part creates
+            // afterwards: an expression that builds a srcdoc widget over
+            // several tasks and then reads `contentDocument` must see each
+            // document committed, which is what Chrome does from its own task
+            // queue. Step the Promise pump instead of running it to
+            // completion, draining pending frame navigations between slices.
+            // The budget stays measured from the expression's start, so the
+            // loop cannot extend the caller's timeout.
+            loop {
+                self.process_pending_frame_navigations().await;
+                let remaining_ms = pending.remaining_ms(await_timeout_ms);
+                if remaining_ms == 0 {
+                    return Err(pending.timeout_error(await_timeout_ms));
+                }
+                let js = self
+                    .js
+                    .as_mut()
+                    .ok_or("JavaScript runtime unavailable")?;
+                if js
+                    .pump_await_evaluate_slice(
+                        &pending,
+                        remaining_ms.min(AWAIT_EVALUATE_FRAME_PUMP_SLICE_MS),
+                    )
+                    .await
+                {
+                    // Settled: read the result. The budget above is the one
+                    // deadline for the whole evaluation, so the read half must
+                    // not start a second timeout of its own.
+                    return js
+                        .finish_settled_await_evaluate_for_cdp(pending, return_by_value)
+                        .await;
+                }
+            }
         }
         if let Some(js) = &mut self.js {
             js.evaluate_for_cdp_with_timeout(
@@ -7309,6 +7337,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn nested_frame_window_geometry_matches_the_browser_window() {
+        let mut page = frame_test_page(
+            "<html><body><iframe id=f></iframe></body></html>",
+        );
+        page.fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
+            &obscura_net::FingerprintOverrides {
+                screen: Some(obscura_net::ScreenFingerprint {
+                    width: 1512,
+                    height: 982,
+                    avail_width: 1512,
+                    avail_height: 944,
+                    avail_top: 38,
+                    avail_left: 0,
+                    device_scale_factor: 2.0,
+                    outer_width: 1200,
+                    outer_height: 816,
+                    screen_x: 44,
+                    screen_y: 77,
+                }),
+                ..obscura_net::FingerprintOverrides::default()
+            },
+        );
+        page.load_child_frames().await;
+        page.init_js();
+        page.execute_frame_scripts().await;
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]")
+                .unwrap(),
+            serde_json::json!([1200, 816, 44, 77, 44, 77]),
+        );
+        let child = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                r#"(() => {
+                    const f = document.getElementById('f');
+                    const w = f.contentWindow;
+                    if (w === null) return ['null-window', f.contentDocument === null];
+                    return [w.outerWidth, w.outerHeight, w.screenX, w.screenY,
+                        w.screenLeft, w.screenTop, w.innerWidth, w.screen.colorDepth,
+                        w.screen.pixelDepth, w.devicePixelRatio, w.top === window];
+                })()"#,
+            )
+            .unwrap();
+        let child = child.as_array().unwrap();
+        // The six window members and the display metrics are the top-level
+        // window's. innerWidth is the frame's own viewport box, so it is not
+        // the window width (the synthetic page leaves the frame unlaid out,
+        // which falls back to the embedding viewport, as in `readFrameMetric`).
+        assert_eq!(
+            child[..6],
+            serde_json::json!([1200, 816, 44, 77, 44, 77]).as_array().unwrap()[..],
+        );
+        assert!(child[6].as_f64().unwrap() > 0.0);
+        assert_ne!(child[6].as_f64().unwrap(), 1200.0);
+        assert_eq!(child[7], serde_json::json!(30));
+        assert_eq!(child[8], serde_json::json!(30));
+        assert_eq!(child[9], serde_json::json!(2));
+        assert_eq!(child[10], serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_iframe_navigation_uses_the_frame_controller() {
         let mut page = frame_test_page("<html><body></body></html>");
         page.document_origin = Some(obscura_dom::Origin::from_url(
@@ -8174,6 +8268,101 @@ mod tests {
         let frame = page.frames.by_host(host).expect("browsing context");
         assert_eq!(frame.active_document_root, Some(root));
         assert_eq!(frame.document_generation, 1);
+    }
+
+    /// A srcdoc frame created *inside* an awaited `Runtime.evaluate` must be
+    /// committed before the same expression reads it back. Chrome builds the
+    /// document from its own task queue, so a widget that appends several
+    /// srcdoc iframes over successive tasks and reads `contentDocument` sees
+    /// every one of them. With the Promise pumped in a single call, only the
+    /// first frame committed in time and every later read answered
+    /// about:blank with an empty body, which is the divergence the Cloudflare
+    /// challenge matrix exposed.
+    ///
+    /// The expected column is the Chrome 153 oracle: for these twelve inputs
+    /// the srcdoc document serializes exactly like the same markup assigned to
+    /// `div.innerHTML`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_evaluate_commits_every_srcdoc_frame_it_creates() {
+        let mut page = frame_test_page(
+            "<!doctype html><html><body><div id=host></div></body></html>",
+        );
+        page.document_origin = Some(obscura_dom::Origin::from_url(
+            "https://top.example/app/",
+        ));
+        page.init_js();
+
+        let cases = [
+            "<p>EnIF0</p><p>ikyR0</p>",
+            r#"<div data-foo="&quot;"></div>"#,
+            r#"<div data-foo="x"></div>"#,
+            r#"<div data-foo="a&quot;b"></div>"#,
+            r#"<div data-foo="&#34;"></div>"#,
+            "<div data-foo='\"'></div>",
+            r#"<div data-foo="&amp;"></div>"#,
+            r#"<div data-foo="&lt;"></div>"#,
+            r#"<div data-foo="&gt;"></div>"#,
+            r#"<div data-foo="&nbsp;"></div>"#,
+            r#"<img alt="&quot;">"#,
+            r#"<a href="?a=&quot;b">z</a>"#,
+        ];
+        // Chrome 153: one shared column for both paths here, since the srcdoc
+        // document's body serializes identically to the innerHTML assignment.
+        let expected = [
+            "<p>EnIF0</p><p>ikyR0</p>",
+            r#"<div data-foo="&quot;"></div>"#,
+            r#"<div data-foo="x"></div>"#,
+            r#"<div data-foo="a&quot;b"></div>"#,
+            r#"<div data-foo="&quot;"></div>"#,
+            r#"<div data-foo="&quot;"></div>"#,
+            r#"<div data-foo="&amp;"></div>"#,
+            r#"<div data-foo="&lt;"></div>"#,
+            r#"<div data-foo="&gt;"></div>"#,
+            r#"<div data-foo="&nbsp;"></div>"#,
+            r#"<img alt="&quot;">"#,
+            r#"<a href="?a=&quot;b">z</a>"#,
+        ];
+
+        let expression = format!(
+            "(async () => {{ const cases = {cases}; const host = document.getElementById('host'); \
+             const out = []; \
+             for (const c of cases) {{ \
+               const f = document.createElement('iframe'); \
+               f.setAttribute('srcdoc', c); \
+               host.appendChild(f); \
+               await new Promise(resolve => setTimeout(resolve, 20)); \
+               const doc = f.contentDocument; \
+               const srcdoc = doc && doc.body ? doc.body.innerHTML : null; \
+               const div = document.createElement('div'); \
+               div.innerHTML = c; \
+               out.push([c, srcdoc, div.innerHTML]); \
+               f.remove(); \
+             }} \
+             return JSON.stringify(out); }})()",
+            cases = serde_json::to_string(&cases).unwrap(),
+        );
+        let value = page
+            .evaluate_for_cdp_with_timeout(&expression, true, true, 10_000)
+            .await
+            .expect("the awaited expression must settle");
+        // The expression answers with `JSON.stringify`, so the remote object is
+        // a string primitive carrying the table.
+        let serialized = value.value.unwrap();
+        let rows: Vec<Vec<String>> =
+            serde_json::from_str(serialized.as_str().expect("JSON string result")).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row[1], expected[index],
+                "srcdoc document for {:?} diverged from Chrome 153",
+                cases[index],
+            );
+            assert_eq!(
+                row[2], expected[index],
+                "innerHTML for {:?} diverged from Chrome 153",
+                cases[index],
+            );
+        }
     }
 
     /// Chrome 153 strips a srcdoc frame's inherited referrer to the
@@ -9206,6 +9395,78 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_child_joins_isolation_from_its_embedder_policy_alone() {
+        let response = |headers: &[(&str, &str)]| obscura_net::Response {
+            url: url::Url::parse("https://isolated.example/child").unwrap(),
+            status: 200,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            body: Vec::new(),
+            redirected_from: Vec::new(),
+            timing: obscura_net::ResponseTiming::default(),
+        };
+        let top = obscura_dom::Origin::from_url("https://isolated.example/");
+        let coep = ("cross-origin-embedder-policy", "require-corp");
+
+        // A nested document inherits its embedder's COEP, so its own response
+        // only has to turn the embedding check on. Chrome 153 isolates all
+        // three of these; requiring the child's COOP as well did not.
+        for headers in [
+            vec![coep],
+            vec![coep, ("cross-origin-opener-policy", "unsafe-none")],
+            vec![("cross-origin-embedder-policy", "credentialless")],
+        ] {
+            assert!(
+                frame_response_grants_cross_origin_isolation(
+                    &response(&headers),
+                    &top,
+                    &top,
+                    true
+                ),
+                "expected isolation for {headers:?}",
+            );
+        }
+
+        // No COEP at all is the `unsafe-none` default. Chrome blocks the
+        // navigation outright under a COEP embedder; this engine loads it
+        // without isolation, which is the state the child's own
+        // `crossOriginIsolated` reports.
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response(&[]),
+            &top,
+            &top,
+            true
+        ));
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response(&[("cross-origin-opener-policy", "same-origin")]),
+            &top,
+            &top,
+            true
+        ));
+        // COOP alone does not turn the embedding check on either.
+        assert!(!super::response_requires_cross_origin_embedding(&response(&[(
+            "cross-origin-opener-policy",
+            "same-origin"
+        )])));
+        // A non-isolated embedder contributes nothing of its own.
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response(&[coep]),
+            &top,
+            &top,
+            false
+        ));
+        // A different origin never inherits, however its response looks.
+        assert!(!frame_response_grants_cross_origin_isolation(
+            &response(&[coep]),
+            &obscura_dom::Origin::from_url("https://widget.example/"),
+            &top,
+            true
+        ));
+    }
+
+    #[test]
     fn feature_policy_reads_committed_permissions_policy_header() {
         let mut page = frame_test_page("<!doctype html><html><body></body></html>");
         page.document_origin = Some(obscura_dom::Origin::from_url("https://top.example/app/"));
@@ -10102,6 +10363,120 @@ mod tests {
             .unwrap();
         assert_eq!(strict_ran, serde_json::json!("undefined"));
         assert_eq!(relaxed_ran, serde_json::json!(1.0));
+    }
+
+    /// Chrome 153 oracle, two-port COOP/COEP fixture: an isolated top-level
+    /// page with a same-origin child that carries `Cross-Origin-Embedder-Policy:
+    /// require-corp` and no COOP reads `crossOriginIsolated === true` with
+    /// `SharedArrayBuffer` a global; the same child without COEP reads `false`
+    /// with the constructor absent. The whole point is that withholding the
+    /// constructor outside cross-origin isolation is not enough -- an isolated
+    /// realm has to hand it back, and `crossOriginIsolated` has to track the
+    /// same bit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_shared_array_buffer_follows_embedder_isolation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                // The embedder is isolated; one child repeats only the COEP
+                // half, the other sends neither header.
+                let (headers, body) = match path.as_str() {
+                    "/" => (
+                        "Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\n",
+                        "<!doctype html><iframe id=coep-only src='/coep-only.html'></iframe><iframe id=plain src='/plain.html'></iframe>",
+                    ),
+                    "/coep-only.html" => (
+                        "Cross-Origin-Embedder-Policy: require-corp\r\n",
+                        "<!doctype html><p>coep only</p>",
+                    ),
+                    _ => ("", "<!doctype html><p>plain</p>"),
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-embedder-isolation".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-embedder-isolation".to_string(), context);
+        page.navigate(&origin).await.unwrap();
+
+        let (coep_only, plain, coep_id, coep_generation, plain_id, plain_generation) = page
+            .with_dom(|dom| {
+                let coep_host = dom.query_selector("#coep-only").unwrap().unwrap();
+                let plain_host = dom.query_selector("#plain").unwrap().unwrap();
+                let coep_root = dom.iframe_content_document(coep_host).unwrap();
+                let plain_root = dom.iframe_content_document(plain_host).unwrap();
+                let coep_frame = page.frames.by_host(coep_host).unwrap();
+                let plain_frame = page.frames.by_host(plain_host).unwrap();
+                (
+                    dom.document_scope(coep_root).unwrap(),
+                    dom.document_scope(plain_root).unwrap(),
+                    coep_frame.frame_id.clone(),
+                    coep_frame.document_generation,
+                    plain_frame.frame_id.clone(),
+                    plain_frame.document_generation,
+                )
+            })
+            .unwrap();
+        assert!(
+            page.cross_origin_isolated,
+            "the embedder commits the COOP+COEP document itself"
+        );
+        assert!(coep_only.cross_origin_isolated);
+        assert!(!plain.cross_origin_isolated);
+
+        let probe = "(() => [globalThis.crossOriginIsolated, typeof globalThis.SharedArrayBuffer, \
+                     Object.getOwnPropertyNames(globalThis).includes('SharedArrayBuffer')])()";
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_realm(
+                    &coep_id,
+                    coep_generation,
+                    "<isolation-probe>",
+                    probe,
+                )
+                .unwrap(),
+            serde_json::json!([true, "function", true]),
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_realm(
+                    &plain_id,
+                    plain_generation,
+                    "<isolation-probe>",
+                    probe,
+                )
+                .unwrap(),
+            serde_json::json!([false, "undefined", false]),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13254,20 +13629,53 @@ fn response_grants_cross_origin_isolation(response: &obscura_net::Response) -> b
     if token("cross-origin-opener-policy").as_deref() != Some("same-origin") {
         return false;
     }
-    if !matches!(
-        token("cross-origin-embedder-policy").as_deref(),
-        Some("require-corp" | "credentialless")
-    ) {
+    if !response_requires_cross_origin_embedding(response) {
         return false;
     }
-    !response
-        .header("permissions-policy")
-        .map(|value| value.to_ascii_lowercase().replace(' ', ""))
-        .is_some_and(|value| value.split(',').any(|entry| {
-            entry == "cross-origin-isolated=()"
-        }))
+    !response_denies_cross_origin_isolation(response)
 }
 
+/// The embedder-policy half of the isolation test on its own: a response that
+/// asks for cross-origin embedding restrictions. A nested document inherits
+/// its embedder's COEP rather than combining it with its own, so its own
+/// response only has to avoid the `unsafe-none` default -- which is also what
+/// a response without the header carries.
+fn response_requires_cross_origin_embedding(response: &obscura_net::Response) -> bool {
+    response
+        .header("cross-origin-embedder-policy")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("require-corp")
+                || value.eq_ignore_ascii_case("credentialless")
+        })
+}
+
+/// True when the document's own `Permissions-Policy` denies the
+/// `cross-origin-isolated` feature outright.
+fn response_denies_cross_origin_isolation(response: &obscura_net::Response) -> bool {
+    response
+        .header("permissions-policy")
+        .map(|value| value.to_ascii_lowercase().replace(' ', ""))
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|entry| entry == "cross-origin-isolated=()")
+        })
+}
+
+/// Whether a same-origin child document joins its embedder's cross-origin
+/// isolated agent cluster.
+///
+/// Only the child's `Cross-Origin-Embedder-Policy` matters. COOP shapes the
+/// top-level browsing context group and says nothing about a nested document,
+/// so a child that sends `require-corp` (or `credentialless`, which also
+/// turns the embedding check on) alone is isolated -- measured against Chrome
+/// 153 with a two-port fixture where an isolated top-level page embeds a
+/// same-origin child carrying only `Cross-Origin-Embedder-Policy`. Requiring
+/// the child's COOP as well left that child reading
+/// `crossOriginIsolated === false` with no `SharedArrayBuffer`, while the real
+/// browser reads `true` and exposes the constructor.
 fn frame_response_grants_cross_origin_isolation(
     response: &obscura_net::Response,
     response_origin: &obscura_dom::Origin,
@@ -13276,7 +13684,8 @@ fn frame_response_grants_cross_origin_isolation(
 ) -> bool {
     parent_cross_origin_isolated
         && response_origin == parent_origin
-        && response_grants_cross_origin_isolation(response)
+        && response_requires_cross_origin_embedding(response)
+        && !response_denies_cross_origin_isolation(response)
 }
 
 fn iframe_allow_applies_to_origin(

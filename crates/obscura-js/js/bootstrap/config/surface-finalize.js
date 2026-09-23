@@ -1799,12 +1799,11 @@ const _chromeInterfaceShells = new Set();
 
   method(StorageManager.prototype, 'estimate', async function estimate() {
     requireStorage(this);
-    // Chrome grants a share of free disk under a per-origin cap, floored near
-    // 10 GiB with a small host-accounting delta, and usage grows with what the
-    // origin wrote. Both numbers come from the engine's storage op so this
-    // realm, navigator.storage, and the worker realm report one origin's
-    // values; a flat 10 GiB with usage 0 is the stub shape the challenge's
-    // storage probe files under emulated environment.
+    // Chrome 153 answers exactly 10 GiB (10737418240) on every secure origin
+    // measured, and usage grows with what the origin wrote. Both numbers come
+    // from the engine's storage op so this realm, navigator.storage, and the
+    // worker realm report one origin's values; the quota is a constant rather
+    // than a disk-derived figure because that is what the browser reports.
     const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
     return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
   }, 0);

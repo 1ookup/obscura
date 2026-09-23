@@ -1243,10 +1243,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       try { delete G.StorageManager.prototype.persist; } catch (e) {}
       nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
         // The same quota and usage the document realm answers: one origin
-        // cannot report two. Both come from the engine's storage op (host
-        // free-space delta over the 10 GiB floor plus the bytes this origin
-        // actually wrote through OPFS), so the challenge's storage probe in
-        // this realm sees the machine-derived numbers a browser reports.
+        // cannot report two. Both come from the engine's storage op (the flat
+        // 10 GiB Chrome reports plus the bytes this origin actually wrote
+        // through OPFS), so the challenge's storage probe in this realm sees
+        // the numbers a browser reports.
         storageData(this);
         var parts = String(Deno.core.ops.op_storage_estimate()).split(',');
         return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };

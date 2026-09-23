@@ -509,6 +509,22 @@ pub struct PendingCdpEvaluation {
     expression_preview: String,
 }
 
+impl PendingCdpEvaluation {
+    /// The milliseconds left of `budget_ms`, counted from the moment the
+    /// expression started. Zero means the budget is spent.
+    pub fn remaining_ms(&self, budget_ms: u64) -> u64 {
+        budget_ms.saturating_sub(self.started_at.elapsed().as_millis() as u64)
+    }
+
+    /// The error for an expression that did not settle inside `budget_ms`.
+    /// Both the whole-pump entry point and a caller stepping the pump report
+    /// this same string, so the message names the budget the caller asked for
+    /// no matter which half noticed the timeout.
+    pub fn timeout_error(&self, budget_ms: u64) -> String {
+        format!("Runtime.evaluate promise did not settle within {budget_ms}ms")
+    }
+}
+
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
     if remaining.is_zero() {
@@ -2069,32 +2085,35 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        let timeout_error = pending.timeout_error(await_timeout_ms);
+        if !self
+            .pump_await_evaluate_slice(&pending, await_timeout_ms)
+            .await
+        {
+            return Err(timeout_error);
+        }
+        self.finish_settled_await_evaluate_for_cdp(pending, return_by_value)
+            .await
+    }
+
+    /// Read the result of an awaitPromise evaluation that has already settled.
+    ///
+    /// A caller that stepped the pump itself (see
+    /// [`Self::pump_await_evaluate_slice`]) owns the timeout loop, so this
+    /// half neither pumps nor times out: the settle sentinel is already set.
+    /// Splitting the two keeps one deadline per evaluation instead of one per
+    /// stage, which is what made a stepped caller wait its budget twice.
+    pub async fn finish_settled_await_evaluate_for_cdp(
+        &mut self,
+        pending: PendingCdpEvaluation,
+        return_by_value: bool,
+    ) -> Result<RemoteObjectInfo, String> {
         let PendingCdpEvaluation {
             oid,
-            done_counter,
+            done_counter: _,
             started_at,
             expression_preview,
         } = pending;
-        let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
-        let settled = self
-            .resolve_promises_until(
-                |runtime| {
-                    runtime
-                        .runtime
-                        .execute_script("<done?>", sentinel.clone())
-                        .ok()
-                        .and_then(|value| runtime.v8_to_json(value).ok())
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false)
-                },
-                await_timeout_ms,
-            )
-            .await;
-        if !settled {
-            return Err(format!(
-                "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
-            ));
-        }
         let elapsed = started_at.elapsed();
         if elapsed > std::time::Duration::from_secs(1) {
             tracing::debug!(
@@ -2157,6 +2176,39 @@ impl ObscuraJsRuntime {
             return Ok(Self::info_from_json(&self.v8_to_json(value)?));
         }
         Ok(Self::info_from_meta(&meta, Some(oid)))
+    }
+
+    /// One bounded slice of the Promise pump that
+    /// [`Self::finish_await_evaluate_for_cdp`] otherwise runs to completion.
+    /// Returns `true` once the awaited expression has settled.
+    ///
+    /// The browser layer brackets each slice with its own frame-navigation
+    /// drain. A `Runtime.evaluate` with `awaitPromise` can create and append
+    /// iframes over several tasks, and each frame's document has to commit
+    /// while the evaluate is still in flight: Chrome commits them from the
+    /// renderer's own task queue, so an expression that appends a srcdoc
+    /// widget and then reads its `contentDocument` sees the committed
+    /// document. Pumping the whole Promise in one call left every frame after
+    /// the first at about:blank until the caller's expression returned.
+    pub async fn pump_await_evaluate_slice(
+        &mut self,
+        pending: &PendingCdpEvaluation,
+        slice_ms: u64,
+    ) -> bool {
+        let sentinel = format!("globalThis.__obscura_done_{} === true", pending.done_counter);
+        self.resolve_promises_until(
+            |runtime| {
+                runtime
+                    .runtime
+                    .execute_script("<done?>", sentinel.clone())
+                    .ok()
+                    .and_then(|value| runtime.v8_to_json(value).ok())
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            },
+            slice_ms,
+        )
+        .await
     }
 
     pub async fn evaluate_for_cdp_with_timeout(
@@ -15303,13 +15355,14 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn frame_realm_window_geometry_reports_nested_context_zeros() {
-        // CSSOM View: a NESTED browsing context answers 0 for screenX, screenY,
-        // screenLeft, screenTop, outerWidth and outerHeight; only the top-level
-        // window carries the fingerprint placement. Chrome oracle: an iframe
-        // contentWindow reports 0 for all six. The CF challenge census reads
-        // all six from the widget frame, so leaking 44/77/1200/816 there was a
-        // direct payload hit (Step 300, census buckets 44/77/1200/816 vs 0).
+    async fn frame_realm_window_geometry_matches_the_top_level_window() {
+        // The six Window geometry members describe the OS window, and every
+        // realm of a document tree shares that one window. Chrome 153 oracle
+        // (windowed, 3440x1440 DPR 1, outer 1440x900 at 22,52): an attached
+        // iframe, a srcdoc iframe and `frames[i]` all answer
+        // outerWidth 1440 / outerHeight 900 / screenX 22 / screenY 52. An
+        // earlier build zeroed all six in nested realms; `outerWidth: 0` is a
+        // headless tell and the CF census reads it from the widget frame.
         let fingerprint = obscura_net::BrowserFingerprint::default().with_overrides(
             &obscura_net::FingerprintOverrides {
                 screen: Some(obscura_net::ScreenFingerprint {
@@ -15347,19 +15400,111 @@ RequestRedirect value",
         rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
         let result = rt.evaluate_in_frame_realm_for_cdp(
             "test-frame", 1, crate::realm::MAIN_WORLD,
-            "[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop,innerWidth,devicePixelRatio]",
+            "[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop,innerWidth,devicePixelRatio,screen.colorDepth,screen.pixelDepth]",
             true, true, 1_000,
         ).await.unwrap().value.unwrap();
-        // Only the six nested-window members zero out: the frame keeps its own
-        // viewport box (its iframe content box, not the top screen) and the
-        // display scale.
+        // The frame reports the same window as its top-level ancestor; only the
+        // viewport (its iframe content box) stays frame-local, and the display
+        // scale and derived bit depth ride along with it.
         let frame_values = result.as_array().unwrap().clone();
         assert_eq!(
             frame_values[..6],
-            serde_json::json!([0, 0, 0, 0, 0, 0]).as_array().unwrap()[..]
+            serde_json::json!([1200, 816, 44, 77, 44, 77]).as_array().unwrap()[..]
         );
         assert!(frame_values[6].as_f64().unwrap() > 0.0, "innerWidth must stay the frame viewport");
+        assert_ne!(frame_values[6].as_f64().unwrap(), 1200.0, "innerWidth is not the window width");
         assert_eq!(frame_values[7].as_f64().unwrap(), 2.0);
+        assert_eq!(frame_values[8].as_f64().unwrap(), 30.0);
+        assert_eq!(frame_values[9].as_f64().unwrap(), 30.0);
+    }
+
+    /// A nested browsing context is created when its iframe is connected, not
+    /// by `createElement`. Chrome 153 oracle: `contentWindow` and
+    /// `contentDocument` both answer null for a detached iframe -- also with
+    /// `src=about:blank` preset -- and a real WindowProxy once appended. This
+    /// pins the agreement with the oracle; a Window for a detached frame would
+    /// be the divergence. (Chrome answers null again after `remove()` and this
+    /// engine keeps returning the proxy; that residual is not asserted here.)
+    #[test]
+    fn detached_iframe_content_window_is_null_until_connected() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const plain = document.createElement('iframe');
+                    const withSrc = document.createElement('iframe');
+                    withSrc.setAttribute('src', 'about:blank');
+                    const attached = document.createElement('iframe');
+                    document.body.appendChild(attached);
+                    return {
+                        plainWindow: plain.contentWindow === null,
+                        plainDocument: plain.contentDocument === null,
+                        srcWindow: withSrc.contentWindow === null,
+                        connectedWindow: attached.contentWindow !== null,
+                        connectedDocument: attached.contentDocument !== null,
+                    };
+                })()"#
+            )
+            .unwrap(),
+            serde_json::json!({
+                "plainWindow": true,
+                "plainDocument": true,
+                "srcWindow": true,
+                "connectedWindow": true,
+                "connectedDocument": true,
+            })
+        );
+    }
+
+    /// Chrome 153 oracle, macOS 15 on a 3440x1440 DPR 1 display: `colorDepth`
+    /// and `pixelDepth` are 24, windowed and headless alike, and 24 even with
+    /// `--force-device-scale-factor=2` -- the DSF override does not move the
+    /// bit depth, the physical panel does. 30 is a 10-bit panel, which on a
+    /// macOS identity means the Retina-class one, so the answer follows the
+    /// claimed deviceScaleFactor; Windows and Linux stay 24 at any scale
+    /// (Windows at 200% scaling reports 24).
+    #[test]
+    fn screen_color_depth_follows_the_device_scale_factor() {
+        let color_depth = |user_agent: &str, scale: f64| {
+            let mut rt = ObscuraJsRuntime::new();
+            let fingerprint = obscura_net::BrowserFingerprint::from_user_agent(user_agent)
+                .with_overrides(&obscura_net::FingerprintOverrides {
+                    screen: Some(obscura_net::ScreenFingerprint {
+                        width: 1512,
+                        height: 982,
+                        avail_width: 1512,
+                        avail_height: 944,
+                        avail_top: 38,
+                        avail_left: 0,
+                        device_scale_factor: scale,
+                        outer_width: 1200,
+                        outer_height: 816,
+                        screen_x: 44,
+                        screen_y: 77,
+                    }),
+                    ..obscura_net::FingerprintOverrides::default()
+                });
+            rt.set_fingerprint(&fingerprint);
+            rt.set_dom(parse_html("<html><body></body></html>"));
+            rt.set_viewport(1200.0, 700.0);
+            rt.run_page_init();
+            rt.evaluate("[screen.colorDepth, screen.pixelDepth, devicePixelRatio]")
+                .unwrap()
+        };
+        const MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+        const WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+        assert_eq!(
+            color_depth(MAC, 1.0),
+            serde_json::json!([24, 24, 1])
+        );
+        assert_eq!(
+            color_depth(MAC, 2.0),
+            serde_json::json!([30, 30, 2])
+        );
+        assert_eq!(
+            color_depth(WINDOWS, 2.0),
+            serde_json::json!([24, 24, 2])
+        );
     }
 
     #[test]
@@ -31084,6 +31229,52 @@ RequestRedirect value",
         );
     }
 
+    // Chrome 153's NetworkInformation readings in this engine's own
+    // environment: `rtt` 100, `downlink` inside its 1.6-1.8 Mbps band,
+    // `effectiveType` "4g", `saveData` false and no `onchange` handler. rtt is
+    // the one this engine used to answer wrong (a pinned 50, so every payload
+    // field carrying it was off by exactly two). Chrome's rtt *is* a
+    // measurement -- driven through CDP `Network.emulateNetworkConditions` it
+    // reports 50/150/350/2100 for emulated latencies of 50/150/333/2000 ms and
+    // 0 when offline -- but with nothing observed it answers its 100 ms
+    // default, which is what it read here before and after a page's transfers.
+    // downlink stays a reading rather than a pinned value: this engine's
+    // estimator answers 1.55 before its first sample and Chrome's fluctuates
+    // across the same band, so only the range is asserted.
+    #[test]
+    fn network_information_reports_chromes_default_readings() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const connection = navigator.connection;
+                return {
+                    rtt: connection.rtt,
+                    downlinkInRange: connection.downlink > 1 && connection.downlink <= 10,
+                    effectiveType: connection.effectiveType,
+                    saveData: connection.saveData,
+                    onchange: connection.onchange,
+                    prototype: Object.getOwnPropertyNames(
+                        Object.getPrototypeOf(connection)),
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "rtt": 100,
+                "downlinkInRange": true,
+                "effectiveType": "4g",
+                "saveData": false,
+                "onchange": null,
+                "prototype": [
+                    "onchange", "effectiveType", "rtt", "downlink", "saveData", "constructor"
+                ],
+            })
+        );
+    }
+
     #[test]
     fn network_information_matches_chrome_desktop_shape() {
         let mut rt = setup_runtime("<div></div>");
@@ -32408,17 +32599,18 @@ RequestRedirect value",
     }
 
     // The challenge's storage probe (RPKTR7) hashes estimate().quota. Chrome
-    // answers a machine-derived quota: the 10 GiB floor plus a small
-    // host-accounting delta (the passing capture carried 10 GiB + 314), and
-    // usage grows with what the origin wrote. A bare 10 GiB with usage 0 is
-    // the stub shape that files the engine under emulated environment.
+    // 153 answers exactly 10 GiB (10737418240) on every secure origin tested --
+    // two loopback ports and `localhost`, in a reused and a fresh profile,
+    // repeated calls -- and usage grows with what the origin wrote. The exact
+    // value is the point: this engine used to add a host free-space delta, so
+    // the quota was a different number every process (10737418888 and
+    // 10737418600 measured) and hashed to a different value each run.
     #[tokio::test(flavor = "current_thread")]
-    async fn storage_estimate_quota_and_usage_track_written_bytes() {
+    async fn storage_estimate_quota_is_exactly_ten_gib() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
                 r#"(async () => {
-                    const quotaFloor = 10 * 1024 * 1024 * 1024;
                     const before = await navigator.storage.estimate();
                     const before2 = await navigator.storage.estimate();
                     const root = await navigator.storage.getDirectory();
@@ -32429,9 +32621,8 @@ RequestRedirect value",
                     const after = await navigator.storage.estimate();
                     return {
                         shape: Object.keys(before),
-                        quotaAboveFloor: before.quota > quotaFloor,
-                        quotaWithinDelta: before.quota - quotaFloor < 4096,
-                        quotaNotFlat: before.quota !== quotaFloor,
+                        quota: before.quota,
+                        quotaIsTenGib: before.quota === 10737418240,
                         stable: before.quota === before2.quota && before.usage === before2.usage,
                         usageBefore: before.usage,
                         usageAfterGrew: after.usage >= 4096,
@@ -32449,13 +32640,60 @@ RequestRedirect value",
             result,
             serde_json::json!({
                 "shape": ["quota", "usage", "usageDetails"],
-                "quotaAboveFloor": true,
-                "quotaWithinDelta": true,
-                "quotaNotFlat": true,
+                "quota": 10737418240u64,
+                "quotaIsTenGib": true,
                 "stable": true,
                 "usageBefore": 0,
                 "usageAfterGrew": true,
                 "usageIsInteger": true,
+            })
+        );
+    }
+
+    // The rest of the storage surface, against the same Chrome 153 oracle on a
+    // loopback secure origin: `persisted()` answers false, `storageBuckets` and
+    // `storage.getDirectory` exist, `estimate()` carries exactly
+    // quota/usage/usageDetails, and `performance.memory.jsHeapSizeLimit` is
+    // 4395630592. The one member this does not pin is the raw own-key ORDER of
+    // `StorageManager.prototype`: Chrome places `constructor` in the
+    // interface's declaration slot (estimate, persisted, constructor,
+    // getDirectory, persist) while this engine installs it first, which is the
+    // systemic interface-branding order rather than a storage-specific one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_surface_matches_the_chrome_oracle() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const storage = navigator.storage;
+                    return {
+                        persisted: await storage.persisted(),
+                        storageBuckets: typeof navigator.storageBuckets,
+                        getDirectory: typeof storage.getDirectory,
+                        estimateKeys: Object.keys(await storage.estimate()).sort(),
+                        heapSizeLimit: performance.memory.jsHeapSizeLimit,
+                        prototypeMethods: Object.getOwnPropertyNames(
+                            StorageManager.prototype).sort(),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "persisted": false,
+                "storageBuckets": "object",
+                "getDirectory": "function",
+                "estimateKeys": ["quota", "usage", "usageDetails"],
+                "heapSizeLimit": 4395630592u64,
+                "prototypeMethods": [
+                    "constructor", "estimate", "getDirectory", "persist", "persisted"
+                ],
             })
         );
     }
