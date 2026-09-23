@@ -13811,3 +13811,77 @@ gPOK0、OjmeV1[85/86/103/104] innerHTML 空、XCvwf5.ryJGE4、uUOw3、dsKPy6、
 OjmeV1[79/118]; ③ bench 竞速若要根除需挑战侧收集器排序知识（bytecode 反
 编译）, 引擎面按 ② 已无干净修; ④ 停滞形（TS#2 达 TS#3 未达）与 retry 环
 的分布按轮续记, 静窗（负载<3）再补判决; ⑤ 工作区 gate 台账回填（350 ⑤）。
+
+### Step 352：批次 49——Step 351 引擎面候选逐项落锤：三处 Chrome 153 oracle 实修（media 默认变体、帧名浏览器上下文语义、Range 内容搬移），gPOK0 实弹 1→3 命名帧，其余候选按证据定类（机器方差/未解），判决 0/5（5 retry 环, 全流程+cycle2）（2026-09-23 下午）
+
+**方法**：先 oracle 后动刀。本地三件套 fixture（/tmp/cf0919/b49/oracle*.html）
+同页对拍本机 Chrome 153.0.8010.48（headless + headed 仲裁, 仲裁规则 151 证据
+优先处已核）与我方二进制（--stealth --allow-private-network fetch, 本地
+http.server 9471 + /collect 回传 JSON）。VM 侧：obK rch 件再解析——外层串表
+1891 token、TS#1 累积器字面量在 stage-3 明文区、per-probe 键不在明文（同
+混淆器命名空间，无法字面 grep），故本批不改挑战语义，只对引擎面落锤。
+
+**oracle 实锤（每条一处 commit，各带钉）**：
+- **media 默认变体**（commit ce946fc，钉 match_media_default_variant_features_answer_chrome_153）：
+  Chrome 153 对 (prefers-reduced-transparency|prefers-contrast|forced-colors|
+  display-mode|update|scripting|monochrome) 的默认/否定变体应答 true、强制变体
+  false、inverted-colors 全 false（退役 feature, 双方一致故未动）。我方原先
+  七项默认变体全 false。修在 tools/encoding-media-query.js 共享求值器（env 的
+  MediaQueryList 与 tools 裸 matchMedia 同源）。
+- **帧名=浏览器上下文名**（commit b1d3593，钉 frame_window_proxy_name_follows_chrome_browsing_context_semantics）：
+  Chrome 在插入创建嵌套上下文时读一次 name 属性：插入后改属性不改名；
+  contentWindow.name 赋值改名且跨导航保留。我方 WindowProxy 门面原来活读属性
+  且无 setter——插入后赋的名全部丢失（gPOK0 的直接根因）。现插入步钩子
+  （__prepareInsertedSubtree 的 iframe 分支, 含 shadow-piercing 清单）冻结
+  初名, setter 按 host nid 写共享表跨导航存活；解析期 iframe 走惰性快照兜底。
+- **Range 内容搬移**（commit 334a0c1，钉 range_extract_contents_moves_children_and_reads_back_like_chrome）：
+  extractContents/cloneContents 原来只回空 fragment、deleteContents 空转;
+  现按 DOM 标准搬移/复制（整节点移动保 identity、字符数据边界 splitText）。
+  测试钉与上两条共一 commit（9b2aa3d）。
+
+**逐候选判决表（Step 351 表 → 本批处置）**：
+
+| 候选 | 本批实证 | 处置 |
+|---|---|---|
+| OYbs6[10] powerPreference | oracle：默认上下文 Chrome 答 "default"，显式 {powerPreference:"low-power"} 我方回显链（canvas/OffscreenCanvas）逐位同 Chrome。live 仍 "default" ⇒ 挑战创建序列的条件分支未命中，条件面未定位 | 回显路径已证 Chrome 形；创建序列未解（VM 侧） |
+| KMUh5[2] ["ldr","hdr"] | oracle：本机 M2 (ANGLE Metal) 真 Chrome 153 getSupportedProfiles()=["ldr","hdr"]，我方同。参考机 Paravirtual GPU 无 HDR ASTC ⇒ 硬件一致面 | 机器方差，不修（修了反而背离本机 GPU 身份） |
+| kPEvW6 (字体臂布尔) | 组内 peEN1/XdgW5/qEwJM8/mrxg2 全同；oracle 宽度对拍发现我方不把 Monaco 判"存在"（Chrome 判存在），但动字体会威胁已逐位一致的 XdgW5/peEN1 | 未动；疑探针异常旗标, 需 VM 定位 |
+| IGBuA2/oHIQ6 | 五轮恒 [11 项]/[233 项]，oHIQ6 网格 27+16k（636 处断点成对）⇒ 周期扫描信号, 我方输出周期性偏离；音频渲染网格与字体 cmap 两说中网格形态偏音频 | 未解（需字节码管线拿扫描基准） |
+| gPOK0 帧游走 | **修复生效**：obK 1 命名帧 → 本批 3 命名帧/轮（final126 rootVMQLo20VMQLo20rootVMQLo21 等）；VMQLo 编号比参考恒差 1（参考首帧 21, 我方首帧 20）⇒ 上下文计数差 1（引擎 boot 多/少建一个上下文的嫌疑） | 引擎面已修（Chrome 形）; 计数差 1 未解（VM 侧） |
+| OjmeV1[85/86/103/104] innerHTML | Range 臂已修（oracle 同形）但 live 仍空 ⇒ 挑战路径非 Range; 本地 div/template/table/implDoc/import/adopt/DOMParser/shadow/displayNone 全对拍同 Chrome | 该臂路径未定位（VM 侧） |
+| OjmeV1[79] | true vs false, 表面未定位 | 未解 |
+| OjmeV1[118] | "EBlFw4"+X：本地几何成员全为 number（offsetWidth 611 复现 "EBlFw4611" 同 Chrome）⇒ 简单几何读非其路径, X 的对象形态来源未定位 | 未解 |
+| XCvwf5.ryJGE4/bYTbg6/QBlqQ3 | oracle：estimate() 形状同 Chrome（usage 数值、quota 10GiB、usageDetails {}）；ryJGE4=null 非我方 estimate 路径所出 | 未解（疑似另一存储面, 需 VM） |
+| uUOw3 | 22.2 vs 0.7（estimate usage MB 量级, 参考会话暖 22MB）| 会话态（新档 vs 暖档）, 非引擎面, 不伪造 |
+| dsKPy6 | 0.99 vs 1 五轮恒; 邻键（xVwa3/RotPR2/KMbmk7）全同, 比值形似 DPR/视口比; 我方 DPR2 参考 DPR1 无关（恒 0.99） | 未解（需 VM） |
+| aQgx8 | 五轮恒 1（TS#1 字面量 0 → TS#2 翻 1）; 参考 TS#2 无键 ⇒ 参考会话未翻或 falsy 省略 | VM 侧, 需 Reqable 注入动态追（351 ①不变） |
+| nEJhr9 | TS#3 独有空串, child26 跨 build 同构; 参考 TS#3 从未解密 ⇒ 无参考可比 | 无参考, 不动作 |
+
+**判决 final125-129（capture_round 45s, click 16; 每轮同窗 rch probe 解密
+TS#2 全成; 负载 3.8-5.4, 无静窗）**：
+
+| 轮 | 时刻 | 负载 | 流形 | TS#2 | 判决 |
+|----|------|------|------|------|------|
+| final125 | 12:13 | 4.41 | 全流程+reopen+cycle2（2 ray） | 38 无 bench | retry 环 |
+| final126 | 12:16 | 4.26 | 同上 | 38 无 bench | retry 环 |
+| final127 | 12:17 | 3.83 | 同上（bench@22） | 39 含 bench | retry 环 |
+| final128 | 12:17 | 3.80 | 同上（bench@20） | 39 含 bench | retry 环 |
+| final129 | 12:18 | 5.39 | 同上（bench@14） | 39 含 bench | retry 环 |
+
+**0/5**（形分布 5 retry 环; 无停滞形、无拒绝形）。每轮不同 ov2 build
+（md5 2e9d…/19b0…/b402…/20da…/311b…, 五轮五代表）⇒ 当日构建轮换极快,
+同窗 rch 纪律继续必要。计数带：NnqX6 9278-12657、uGyjw9 16-592、
+ZMSOw0 475-907、myWtu3 31-121、TzZRB1 18-23; aQgx8=1 每轮; gPOK0 三命名帧
+每轮（obK 时代 1）。
+
+**产物**：/tmp/cf0919/b49/{oracle*.html, oracle.chrome.json, access.*.log,
+run_chrome.sh, run_both*.sh, run_headed.sh, serve_oracle.py, childA/B.html,
+run_fixcheck*.sh}, /tmp/cf0919/final125..129, /tmp/cf0919/round49.sh,
+/tmp/cf0919/obK/{inner_engine.js, outer_table.txt, stage2.js, strtable_obK.json}。
+
+**下一批入口**：① gPOK0 的 VMQLo 计数差 1：对拍 boot 期上下文创建数
+（worker/blob/about:blank 各算几个）, 引擎面有干净修的可能; ② OjmeV1
+innerHTML 臂与 OjmeV1[79]/[118]、XCvwf5.ryJGE4、dsKPy6、kPEvW6、
+IGBuA2/oHIQ6 扫描基准：全押字节码反编译管线（per-probe 键非明文, 字符串表
+法已到顶）; ③ aQgx8/nEJhr9 语义维持 351 ①（Reqable 注入工具链）; ④ retry
+环形分布续记; ⑤ 工作区 gate 台账回填（350 ⑤）。
