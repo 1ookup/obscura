@@ -497,13 +497,16 @@ impl StealthHttpClient {
                 if !is_frame_navigation && !has_header("sec-fetch-user") {
                     req = req.header("sec-fetch-user", "?1");
                 }
-                // Chrome revalidates the document on a navigation instead of
-                // taking it from cache: `max-age=0` rides on the main-document
-                // request and on nothing else, so a navigation without it is
-                // one no browser sends.
-                if !has_header("cache-control") {
-                    req = req.header("cache-control", "max-age=0");
-                }
+                // No `cache-control` on a navigation. Chrome revalidates with
+                // `max-age=0` on the main-document request only for an explicit
+                // reload. Measured on Chrome 153.0.8010.48 over CDP network
+                // events, it is absent from a first navigation, a navigation to
+                // an already-visited URL, a re-navigation to the URL already
+                // loaded, a same-URL `document.location` assignment, and a
+                // cross-origin navigation; `Page.reload` was the only one of
+                // eight navigation kinds that carried it. Reload is not a
+                // concept this request layer has, so the header is never sent.
+                // Wire reload semantics up and restore it for reload alone.
             }
             if let Some(referer) = request_referrer(&request, &current_url) {
                 req = req.header("referer", referer);
@@ -1128,6 +1131,42 @@ mod tests {
         assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
         assert!(request.contains(
             "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
+        ), "{request}");
+    }
+
+    /// The stealth transport is the one a `--stealth` run actually puts on the
+    /// wire, so the navigation header set is pinned here as well as on the plain
+    /// client. Chrome sends `Cache-Control: max-age=0` on the main-document
+    /// request only for an explicit reload; `client::ssrf_tests::navigation_does_not_send_cache_control`
+    /// carries the Chrome 153.0.8010.48 measurement behind that.
+    #[tokio::test]
+    async fn stealth_navigation_does_not_send_cache_control() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        );
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            fingerprint.clone(),
+        );
+        client
+            .fetch_resource_with_callbacks(
+                &url,
+                crate::client::ResourceRequest::navigation(),
+                None,
+            )
+            .await
+            .expect("fixture must be reachable");
+
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("cache-control"), "{request}");
+        assert!(request.contains("\r\nupgrade-insecure-requests: 1\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-fetch-mode: navigate\r\n"), "{request}");
+        assert!(request.contains("\r\nsec-fetch-dest: document\r\n"), "{request}");
+        assert!(request.contains(
+            "\r\nsec-ch-ua: \"google chrome\";v=\"153\", \"not_a brand\";v=\"8\", \"chromium\";v=\"153\"\r\n"
         ), "{request}");
     }
 
