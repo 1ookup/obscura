@@ -1776,3 +1776,24 @@ widget  Image     [accept, referer, sec-ch-ua*, user-agent]
 
 **未决**：窗口由什么决定。CF 的 build 轮换很快（base64 表每 ~2h 一换），但 5/5 只持续了约 10 分钟，
 比一次轮换窗口短得多；**是什么在 09-21 10:4x 那十分钟里对我们有利，仍未定位**。
+
+#### 354.56 `cf_chl_rc_ni`：CF 自己的失败标记，可当每轮的判决 oracle
+
+用 `obscura serve --storage-dir <dir>` 落盘 cookie jar，与通过臂 Chrome 的 `cookies.txt` 对照：
+
+| 轮次 | `cf_chl_rc_ni` |
+|---|---|
+| Chrome **通过**轮（headed / headed-r4 / headless-cleanua ×3） | **无** |
+| Chrome **失败**轮（带 `HeadlessChrome` UA 的两轮） | **有** |
+| **Obscura**（失败） | **有**（值 `1`，1 小时过期） |
+
+⇒ **`cf_chl_rc_ni`（"Not Interested"）与判决完全对应**：出现即失败，不出现即通过。这是 CF 亲口给出的信号，
+**比读页面文案（`请稍候…` vs `Missing resource /1.txt`）可靠得多**，建议从下一轮起作为每轮的辅助判据。
+
+**其他 cookie 差异（未判明因果）**：我方还持有 `cf_clearance`@`cloudflare.com`（853 字符，一年期），
+通过臂 Chrome 没有；Chrome 通过后另持有 `JSESSIONID`（32）。`cf_clearance`@`thelancet.com` 两侧都是 **597**
+——与 §10.11「失败路径同样下发 cf_clearance 且可以等长」一致，故**长度不构成通过证据**。
+
+**未定**：`cf_chl_rc_ni` 的下发**时机**。单次导航（不点击）不落 jar，且 Obscura 的 CDP 不实现 `Network.getAllCookies`
+（恒返回 0），所以暂时无法在轮内分时刻观察。**若能确定它是在第一个 403 就下发**，则说明 CF 在**边缘一次**就判定了；
+若在流程末段，则是失败的下游标记。这个区分对"判据在哪一层"很关键。
