@@ -15129,3 +15129,54 @@ widget  Image     [accept, referer, sec-ch-ua*, user-agent]
 线路上还有但对 Fetch 不可见：`accept-language`、`accept-encoding`、`sec-fetch-site/mode/dest/user`、`priority`。**`user-agent` 出现在每一个作用域**。**CF 自己的 `cf-chl` / `cf-chl-ra` 同时出现在 widget 的 XHR 与页面层的 XHR 上**——尚未与我们的对拍过，值得优先核。
 
 **仍未定**：判决在**边缘**还是 **widget 内**（现在只能说"两者各自都够"）。能一次回答的实验是 `hdr-{topdoc,widget,page}-set-user-agent-headless`——**只在文档请求上注入 `HeadlessChrome`**（widget 与其它的头保持干净）：若失败⇒判决在**边缘、文档请求**上；若通过而 widget-only 失败⇒判决在 **widget 内**。
+
+#### 354.54 **判决位置定案：在 CF 边缘、由顶层文档请求做出** + 三条硬要求 + 一个新环境判据
+
+**方法**：`Fetch` 域在暂停请求上重写头列表，按作用域施加；基线对照 `hdr-noop`（拦截全开、不改任何东西）**10/10 通过**，故拦截本身中性。
+
+**① 判决位置（此前悬而未决的问题，已答）**
+
+`hdr-topdoc-set-user-agent-headless`——**只**在**顶层文档请求**上注入 `HeadlessChrome`，widget realm、widget 的所有请求、页面层所有子资源**都保持干净** ⇒ **0/5 失败（生命周期 2）**。
+
+⇒ **裁决在边缘、从顶层文档请求做出，早于 widget 参与。**（widget-only 与 page-only 也各自足以失败，说明各作用域独立充分；但 topdoc 单独已被证明充分。）
+
+**② 三条"删掉即败"的硬要求**（基线 10/10 通过）
+
+| 要求 | 作用域 | 结果 |
+|---|---|---|
+| `/fo/` POST 带 `cf-chl` | widget | **0/4 失败** |
+| `/fo/` POST 带 `cf-chl-ra` | widget | **0/4 失败** |
+| **带 `Origin`** | widget | **0/4 失败** |
+| **带 `Origin`** | page | **0/4 失败** |
+| UA 产品标记 ≠ `HeadlessChrome` | topdoc | 0/5 失败 |
+
+（`cf-chl`/`cf-chl-ra` 只在 `challenges.cloudflare.com/…/h/g/fo/…` 上被删；其它请求本来就没有。对照：`hdr-widget-drop-accept` 重写了**同一条带 body 的 POST** 的头列表却 2/2 通过 ⇒ `cf-chl` 的失败是这两个头特有的，不是"重写列表"造成的。`content-type` 也 2/2 失败，但从带 body 的 POST 上删它是协议破坏，**不计为证据**。）
+
+**③ 无效果的头（边界）**：topdoc 上删 `sec-ch-ua`/`sec-ch-ua-mobile`/`sec-ch-ua-platform`/`Accept`/`Upgrade-Insecure-Requests`/`Origin`/`Priority` **全部通过**；值替换也通过（`sec-ch-ua-platform`→`"Windows"` 4/4、`sec-ch-ua`→Chrome/90 品牌、`Referer` 置空、`Sec-Fetch-Site`→`cross-site`、`Accept-Language`→`fr-FR`）。widget 与 page 上删 `Accept`/`Referer`/`sec-ch-ua*` 亦通过。
+
+**限制（每一行都带着）**：`Fetch.requestPaused` **只暴露渲染进程提供的头**；`accept-language`/`accept-encoding`/`sec-fetch-*`/`priority` 由网络服务在其后添加，**该路径上删不掉** ⇒ 这些行全部 `was-absent`，**零结果不构成证据**。
+
+**④ 新环境判据：`navigator.languages` 必须多项**（此前 40/40 的"环境值不是判据"出现例外）
+
+| 干预 | 结果 |
+|---|---|
+| JS 改 `navigator.languages = ['zh-CN']`（头不动） | **0/5 失败** |
+| JS 改 `= []` | **0/4 失败** |
+| 同一个 JS getter 返回**原值** `['zh-CN','zh']` | **5/5 通过**（⇒ 不是反对"篡改"，而是读**值**） |
+| CDP `acceptLanguage:'zh-CN'` / `'fr-FR'` / `'en-US'` / … | 全失败 |
+| CDP `acceptLanguage:''`（no-op） | 2/2 通过 |
+| 仅改 `Accept-Language` **头**为 `fr-FR`（JS 不动） | 2/2 通过 |
+
+现有数据与"**`navigator.languages.length ≥ 2`**"一致（CDP 各取值都会把 JS 侧变成单元素 ⇒ 全败）；"仅改头通过"那一行需注意 Accept-Language 是网络服务添加的、Fetch 改不动，**该行可能本身是 no-op**。
+
+**⑤ 我方复核（当前 binary，逐项）**：
+
+| 要求 | 我方 |
+|---|---|
+| `navigator.languages` | **`["zh-CN","zh"]`**（`language="zh-CN"`）✓ |
+| 同源 POST 带 `Origin` | ✓（本机 fixture 实测头列表含 `origin`） |
+| `/fo/` POST 带 `cf-chl`/`cf-chl-ra` | ✓（ops.tsv 记录） |
+
+⇒ **已发现的三条硬要求我方全部满足。** 结合 §354.51 的"环境值被 40/40 排除"，**剩余的判据仍未定位**，但**边界已收窄到：CF 边缘 + 顶层文档请求 + 尚未被测的那些属性**。
+
+**⑥ 正常 Chrome 的发包（按端点，供交叉核对）**：`cf-chl` 在**两个** `/fo/` 端点上都带同一 token、`cf-chl-ra: 0`；widget 的 `brunhild /i/` 只带 `accept, origin, user-agent`；`/pat/` 只带 `accept, user-agent`。
