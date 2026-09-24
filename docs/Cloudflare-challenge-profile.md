@@ -14857,3 +14857,40 @@ obscura fetch "https://www.thelancet.com/cdn-cgi/challenge-platform/h/b/orchestr
 **待核（可能推翻整个头部层）**：注入链路是 `Obscura/Chrome → :9000 代理（Reqable→上游 mitmdump）→ CF`。**代理会终结并重发**，因此 CF 看到的**头顺序与 h2 伪头顺序可能是代理自己构造的**、对两个客户端同为一份——若如此，§354.38 的全部头部顺序工作对判据**天然无效**（仍然是把行为改正确的正当改动，但不是判据）。这一点**尚未直接观测**，但它与"§10.11 记 TLS/HTTP 指纹因 mitmproxy 终结重发而两边一致"是同一个机制，**很可能同真**。
 
 ⇒ 若头部层同样不可见，则**所有可观测面都已对齐或排除，而判据仍未定位**。此时唯一剩余的入口是**服务端侧逻辑本身**（加密载荷内 VM 计算出的检测值 + CF 的裁决规则），而这需要当轮 build 的 jsvmp 反编译管线（远程 `cf-ov2-replay`）。
+
+#### 354.43 **VM tracelog 对拍通道打通**（用户指定的方向）
+
+**通道**：注入链路的 ov2.js 被 AST 插装器加了 `vmp-instrument: fulltrace` helper（`/*__OV2T_HELPER_BEGIN__*/` 段），在 VM 每步调用
+
+```js
+window.external.tracelog("vmp.deobf.0924.exec", { n, b:[op,pc,st, …] })   // 每 3000 三元组一批
+window.external.tracelog("vmp.deobf.0924.new",  { run, bc, a0, a1 })      // VM 实例边界
+```
+
+而 `crates/obscura-js/src/tracelog.rs` 的模块文档写明：**「被对拍的插桩 Chrome 构建把 `window.external.tracelog` 暴露给页面代码……Obscura 实现同一契约，使打过补丁的挑战脚本能在两个引擎上不改动地运行」**——这就是为本对拍设计的通道。实测：`obscura serve --tracelog-file` 一轮产出 **3.3MB / 256 行 / 7 个 VM 实例**。
+
+**VM 现场（从 ov2.js 读出）**：
+
+```js
+A.runProgram = function (S, rP, xb) { … __ov2t_…_n(S.length, 0, 32), new LF(S).run(0, 32, []); }
+switch (…) { case 14: La.call(this); break; case 77: LK.call(this); break; … }   // 两处 dispatch
+```
+
+即 `bc` 是 `S.length`（该实例的字节码长度），dispatch 传 `(op, pc = yU[yf]-1, st = yU[yQ])`。
+
+**首次对拍（我方 0924 vs 用户的 0923 参考 `trace.jsonl`）**——会话感知归一化后，每会话 4 个 VM 实例：
+
+| run | 我方 `bc` | 参考 session0 | 参考 session1 |
+|---|---|---|---|
+| 1 | 6944 | 6944 | 6944 |
+| 2 | 634336 | 634688 | 634396 |
+| 3 | **95424** | 95428 | **95424** |
+| 4（TS#3） | **3920** | **5432** | **5488** |
+
+**op 分布份额高度吻合**（run 2：我方 `[0.130,0.088,0.066]` vs 参考 `[0.130,0.088,0.067]`），说明两条 trace 对齐可比。**run 4 的 `bc` 我方明显更小**——即"失败变体"的短程序，在 VM 实例层面再次确证（与 §10.13 的 TS#3 长度观测同源）。
+
+**最干净的发现**：run 1 两边 `bc` **相同（6944）**，`pc` 序列**前 694 步逐位一致**，第 694 步在 **pc=415** 分岔——参考跳到 **pc=186（往回）**、我方跳到 **pc=1030（前进）**；参考共 1107 步、我方 847 步。**形状是参考多做了一轮循环。**
+
+**但有一个必须声明的保留**：`st`（寄存器 `yU[yQ]`）**从第 0 步就不同**（118 vs 32），因为 **0924 的 `runProgram` 硬编码 `a1=32`、0923 的 helper 传的是别的常量**——这是 **helper 版本差异**，不是引擎差异。因此 **`st` 不可跨 build 比**；而既然寄存器初值不同，**那个 pc 分岔有可能是 instrumentation 假象**。⇒ **必须有同 build 的 0924 Chrome trace 才能定论**（已派：用 CDP 在 main world 注入 `window.external.tracelog`，配合 OOPIF 的 `Target.setAutoAttach` + `waitForDebuggerOnStart` 才能覆盖 widget realm）。
+
+**run 2/3 只对齐 19 步**（共享序言），之后是**恒定偏移**（run2 差 44、run3 差 2）——说明服务端下发的程序是同源变体（有插入/删除），跨会话的程序本就不同。
