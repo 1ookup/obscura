@@ -13,50 +13,58 @@
 **目标**：`https://www.thelancet.com/1.txt` 经代理走 Cloudflare Turnstile 托管质询，
 以真实的 `POST /1.txt → 404` 为**唯一**通过判据。
 
-**结果：仍未通过。** 下面是已经**用实测支撑过**的结论，以及已经**用实测排除**的候选。
-未列出的主张，请到归档里查其 step 的原始证据，并自行判断是否仍然成立。
+**结果：仍未通过。**
+
+> **本节的每一条都经过一次独立的对抗式复核**（由另一个 agent 只从原始产物重新推导，
+> 不许信摘要、不许调他人写的结论脚本、要求主动找反例）。复核**推翻了 1 条、把 6 条从
+> "已验证"降级或改写了数字**——降级后的措辞就是下面写的。**凡是本节没列的，请到归档里
+> 查其 step 的原始证据并自行判断。**
 
 ### A. 已证伪：不要再拿这些当前提
 
-| # | 曾主张 | 推翻它的实测 | 出处 |
-|---|---|---|---|
-| A1 | 「headless 类客户端被 CF 普遍敌对」（headless 失败是引擎/模式的锅） | **实为 UA 里的 `HeadlessChrome` 标记**：同一 headless 换干净 153 UA 后 **3/3 通过**；headed 也通过 | §354.2 |
-| A2 | 「我们从不发 `/ci/` 请求」 | 误读：`/ci/` 走 `Image()`，**`--trace-op-file` 不记录 Image 加载**；实测会发 | §354.21/§354.22 |
-| A3 | 「`OjmeV1` 的四个空串＝原始文本元素序列化」 | 修复已进二进制（`strings` 命中 `noembed`），**实弹 payload 的七个下标一字未变** | §354.31 |
-| A4 | 「点击必须落在 TS#2 响应后 +2.27~+2.83s 的窗口」 | 那是 **harness 常数**（旧脚本固定 `fo-click-delay=3.0`）；实测 Chrome 通过范围是**单边**的 +0.73~+12.42s（17/17） | §354.41 |
-| A5 | 「Chrome 934 vs Obscura 847 是引擎级分离」 | 拆开是 `557 + 29×mid + 52×tail`，**`mid` 是平台属性**（参考机 10 / 本机 stock Chrome 13）；且**我方 run-1 与真实参考逐位一致** | §354.47–354.49 |
-| A6 | 「`pc=415` 的分岔是判据执行现场」 | 我方 4 轮里 **3 轮与 Chrome 走同一侧** ⇒ 会话数据决定，非引擎 | §354.45 |
-
-### B. 已验证：可以作为前提
-
-| # | 结论 | 证据 |
+| # | 曾主张 | 推翻它的实测 |
 |---|---|---|
-| B1 | **上行 payload 明文可解** | 固定 key `0954fd238920cb4e832366d227b62cf3`（注入版 ov2.js 把 `ot[40..118]` 覆写成 9 周期常量派生得到）＋**当轮** base64 表（`--ov2js <本轮 ov2probe.js>`）。`decrypt.sh` 的 `--roundtrip` 自证 + 与 console `payloadJSON` 长度逐字节相同。注：页面层走未打补丁的真 CF 脚本，key 不可控，**解不开** |
-| B2 | **同 epoch 四方判决**（本机 Chrome 153，同代理同 URL） | headed **通过**；headless（自然 UA）**失败**；clean-UA headless **通过**；obscura **失败** |
-| B3 | **payload 字段内容不是判据** | 53 个确定性分岔字段逐个/成组替换成 Chrome 值（`everything` 轮把分岔从 35 压到 5），**判决不翻转**。前提已验：空注入对照仍败、解密核验确认值确实落到上行 |
-| B4 | **负载与时序噪声不是判据** | 负载 3.2 下流程完整走完仍败；把通过臂用 CDP `Fetch` 拖到**每个间隔都比我们慢**（TS#1→TS#2 9.01s vs 我们 7.0s）仍拿到 404 |
-| B5 | **点击时机不是判据** | Chrome 通过范围单边（+0.73~+12.42s，17/17 通过）；Obscura 同档位 0/20，且**我们实际发布的固定 14s 点击正落在 Chrome 全通过带内** |
-| B6 | **大量环境值不是判据** | 18 项降级、40 轮、**40/40 全过**：device metrics/DPR、各种 screen（含我们的 `3440x1440`+`1440x900` 窗口）、platform 双向错配、时区、locale、hc 1/2/64、geolocation、WebGL→SwiftShader、以及全部叠加。每项都验证过补丁确实落地 |
-| B7 | **`navigator.languages` 是判据（B6 的例外）** | 改成 `['zh-CN']` **0/5 失败**、`[]` **0/4 失败**；同一 getter 返回**原值** `['zh-CN','zh']` **5/5 通过**（⇒ 读的是值，不是反对篡改）。**我方当前 binary 测得 `["zh-CN","zh"]` ✓** |
-| B8 | **`/fo/` POST 上的 `cf-chl`、`cf-chl-ra`、`Origin` 是硬要求** | 各删其一 ⇒ **0/4 失败**（基线 no-op 对照 10/10 通过）。**我方满足**：ops.tsv 记录显示 `cf-chl`/`cf-chl-ra` 在；本机 fixture 实测同源 POST 头列表含 `origin` |
-| B9 | **判决发生在 CF 边缘，由顶层文档请求做出** | **只**在顶层文档请求上注入 `HeadlessChrome`（widget 与其它请求全干净）⇒ **5/5 失败**、生命周期 2 |
-| B10 | **被拒/通过可由 VM 生命周期数区分** | 通过 ⇒ **1** 个 VM 生命周期；被拒 ⇒ **2**（拒绝后重开一轮）。44 个通过轮全为 1、9 个被拒轮全为 2、**Obscura 15/15 为 2** |
-| B11 | **代理现在走 `:8080`（mitmdump），`:9000`（Reqable）卡死** | `:9000` → `000`（`netstat` 显示 `*.9000 LISTEN` 但服务不响应）；`:8080` → `403`。链路本为 `客户端 → :9000 → :8080 mitmdump → CF`，**带注入 addon 的是 mitmdump**，直连 `:8080` 对 CF 侧透明 |
-| B12 | **opcode id 每次加载随机置换，只有 `pc` 稳定可比** | 同一份 run-1 的份额向量在不同 trace 里表现为 `{42,14,84,…}` 与 `{87,252,131,…}`（pc 集合双向包含度 1.00）。**此前所有"按 op 值"的对比都在比一个置换** |
+| A1 | 「headless 类客户端被 CF 普遍敌对」 | **实为 UA 里的 `HeadlessChrome` 标记**：同 headless 换干净 153 UA 后通过；两族 payload 的 175 个探针键里**只有 `zIyO8.jKeeJ4`(UA) 一个不同**，platform/languages/screen/cores 逐字节相同。**注意**：干净 UA 的那条臂也有 1 轮因点击过早而失败，对照 n 很小（2/2 vs 2/2） |
+| A2 | 「我们从不发 `/ci/` 请求」 | 误读：`/ci/` 走 `Image()`，**`--trace-op-file` 不记录 Image 加载** |
+| A3 | 「`OjmeV1` 空串＝原始文本元素序列化」 | 修复已进二进制，**实弹 payload 的七个下标一字未变** |
+| A4 | 「点击必须落在 TS#2 响应后 +2.27~+2.83s」 | 那是 **harness 常数**（旧脚本固定 `fo-click-delay=3.0`） |
+| A5 | 「Chrome 934 vs Obscura 847 是引擎级分离，且我方 run-1 与真实参考逐位一致」 | 复核**部分**成立：`87 = 29 个不同 pc × 3` 这个"常量"在 **934/986 臂与 Obscura 臂之间**成立（我方 pc 序列是它的子序列）。**但** ① `ours/tl1` 走另一分支、连子序列都不是（18/19 而非 19/19）；② 我用作"参考"的 `ref0924.jsonl` **是拼接产物**——12 个 `.new` 里 **4 个是我们自己 session（`a1=32`）**；③ 与它比时 **op 差 890/899、st 差 896/899**，逐位一致**只在 pc 上成立**；④ Chrome 934 与那个"参考"之间**不是**偏移（diff=35） |
+| A6 | 「`pc=415` 的分岔是判据执行现场」 | 我方 4 轮里 **3 轮与 Chrome 走同一侧** ⇒ 会话数据决定 |
+
+### B. 仍可作为前提（均已复核；数字已按复核改正）
+
+| # | 结论 | 证据 / 复核后的数字 |
+|---|---|---|
+| B1 | **上行 payload 明文可解** | 固定 key `0954fd238920cb4e832366d227b62cf3`（注入版 ov2.js 把 `ot[40..118]` 覆写成 9 周期常量派生得到）＋**当轮** base64 表（`--ov2js <本轮 ov2probe.js>`）。`--roundtrip` 自证 + 与 console `payloadJSON` 长度逐字节相同。页面层走未打补丁的真 CF 脚本、key 不可控，**解不开** |
+| B2 | **同 epoch 四方判决** | headed 通过；headless（自然 UA）失败；clean-UA headless 通过；obscura 失败。**复核用 HAR 逐轮重判，与 `summary` 一致** |
+| B3 | **payload 字段内容不是判据——但证据强度比原先写的弱** | 复核：产物里**找不到"53"**（cfg 112 条规则/52 个 key；最完整的 swap-everything 声明 35 条，我核对解密后上行**只落地 32/35**）；**payload#1 那条线三次运行"widget not found / no click"、零触发**。判决确实未翻转，**但空注入对照本身也失败** ⇒ 在"Obscura 从不通过"的前提下，这个实验**检不出翻转**，只能算弱证据 |
+| B4 | **时序不是判据——但存在上界** | 复核从 `round.json` 重算：delay 0 = PASS 5/5、+1s = 2/2、+2s = 2/3、+4s = 1/1、**+6s = 0/1（失败）**。"拖到比我们更慢仍通过"在 **+4s 档位**成立（该轮第 3 个 `/fo/` 响应 19.04s vs 我们约 9.5-10.7s），**但 +6s 就翻了** |
+| B5 | **点击时机不是 Obscura 的 blocker** | 17/17 通过轮的 `click − FO#3 响应` 跨 **+0.733 ~ +12.415s**；下限由 `early-ctl`(−0.11s FAIL) 与 `b2-time`(−2.42s FAIL) 支撑。**注意措辞**：+12.42s 只是**已测过的最大点**，"无上界"是"未找到上界"，不是"不存在" |
+| B6 | **大量环境值不是判据** | 复核重算：**18 项降级、36 轮、36/36 通过**（device metrics/DPR、screen(含我们的 `3440x1440`)、platform 双向、时区、locale、hc 1/2/64、geolocation、WebGL→SwiftShader、全部叠加）。**原写的"40/40"是错的**——要凑 40 轮得再加两项，那就成了 20 项 |
+| B7 | **`navigator.languages` 是判据（B6 的例外）** | 改成 `['zh-CN']` **0/5**、`[]` **0/4**；同一 getter 返回原值 `['zh-CN','zh']` **5/5**（realm 回读确认注入落地）。**复核：无反例。** 我方当前 binary 测得 `["zh-CN","zh"]` ✓ |
+| B8 | **`cf-chl` / `cf-chl-ra` 在 widget 的 `/fo/` POST 上是硬要求——`Origin` 那条被复核削弱** | cf-chl **0/4**、cf-chl-ra **0/4**、widget Origin **0/4**、page Origin **0/4**、widget content-type **0/2**。**复核的削弱**：① topdoc 的 `Origin` **2/4 通过**，它的两个 FAIL **全是 `clicked=False` 的轮次**（harness 没点到，不是头的效应）；② 这 20 轮的 `applied` 不含 header op，**落地无法独立核验**；③ `hdr-matrix.txt` 自相矛盾（"HARD REQUIREMENTS" 只列 4 条，漏掉同等失败的几条）。**我方满足**：ops.tsv 显示 `cf-chl`/`cf-chl-ra` 在；本机 fixture 实测同源 POST 头列表含 `origin` |
+| B9 | **UA 不一致足以失败；但"判决在边缘+顶层文档请求"这一定位未成立** | `hdr-topdoc-set-user-agent-headless` **0/5**（5 轮全 `clicked=True`，realm 回读 UA 干净）。**复核推翻定位**：同一向量在 **page 0/2、widget 0/2、`ua-headless-topdoc` 0/2、`ua-headless-widget` 0/2、`ua-headless` 0/3** 也全败 ⇒ 六路同强，**没有任何 scope 特异性**。数据只支持"**任何单点 UA 不一致都足以失败**" |
+| B10 | **通过 ⇒ 1 个 VM 生命周期（可靠）；被拒 ⇒ 2（不可靠）** | 复核：chrome **15/15 (life=1, pass)**；control 208 条里 pass⇒life=1 **128/128**；obscura 15/15 trace 为 life=2。**但"被拒⇒2"有 12 个反例**（都正常点击、wall 32-33s，非截断）——该断言只能单向用 |
+| B11 | **代理现在走 `:8080`（mitmdump）；`:9000`（Reqable）卡死** | `:9000` → `000`（`netstat` 显示在听但不服务）；`:8080` → `403`。链路本为 `客户端 → :9000 → :8080 mitmdump → CF`，**带注入 addon 的是 mitmdump**，直连 `:8080` 对 CF 侧透明 |
+| ~~B12~~ | ~~「opcode id 每次加载随机置换，只有 pc 稳定」~~ | **已证伪（见 A7）** |
+
+### A7（复核新增的证伪项）
+
+**「VM 的 opcode id 每次加载随机置换」是错的，而且方向相反。** 复核在 **220 次加载**（control 189 + chrome 16 + obscura 15）里只数出 **3 个不同的 op 标签字母表**；**全部 16 条 Chrome trace 与全部 15 条 Obscura round 共用同一个**。若真按 33! 每加载置换，220 次只出现 3 个字母表的概率约 1e-8。⇒ **op id 在 Chrome 与 Obscura 两臂之间恰恰是可比的**。`pc 稳定` 这一半成立（只有 2 个 pc 集合，551 个 pc 出现在 209 次加载里）。
 
 ### C. 未决
 
 | # | 问题 | 已有边界 |
 |---|---|---|
-| C1 | **剩余判据在哪** | 已收窄到：**CF 边缘 + 顶层文档请求 + 尚未被测的属性**。已知的非判据：payload 内容、时序、点击、绝大多数环境值、大多数请求头（`sec-ch-ua*`/`Accept`/`Upgrade-Insecure-Requests`/`Priority` 删掉均无影响） |
-| C2 | 参考机 `mid=10` 而本机 stock Chrome `mid=13` 的成因 | 对几何/DPR/UA/headed/throttle/全部页面可见环境值均不变。首要嫌疑：参考机跑的是**插桩过的 Chrome**（原生 tracelog 后端）而非 stock Chrome。**这意味着我们的"参考臂"并非 stock Chrome** |
-| C3 | `OjmeV1[118]`（Chrome 数字 `611` / 我方 `[object Object]`）、`HPcn5`（文本度量差 1px）、`lgWCE7`（widget 帧高差 80px） | 各自独立、已验证为**确定性**差异，但未定位根因 |
+| C1 | **剩余判据在哪** | 已排除：payload 内容（弱证据）、时序（有上界）、点击、绝大多数环境值、大多数请求头。**未建立**：任何 scope 定位（B9 已被推翻） |
+| C2 | 参考机 `mid=10` 而本机 stock Chrome `mid=13` 的成因 | 对几何/DPR/UA/headed/throttle/全部页面可见环境值均不变。首要嫌疑：参考机跑的是**插桩过的 Chrome**（原生 tracelog 后端）。**另需注意**：作为"参考"的 `ref0924.jsonl` 是**拼接文件**，含我们自己的 session，引用它时必须按 `a1` 过滤 |
+| C3 | `OjmeV1[118]`、`HPcn5`（差 1px）、`lgWCE7`（差 80px） | 各自已验证为确定性差异，根因未定位 |
 | C4 | Obscura 多出的 `run 4`（`bc=3868`，0 步） | 在任何 Chrome trace 里都不出现 |
 | C5 | 失败路径是否下发 `cf_clearance` | 归档 step 262 有此主张，**本轮无 cookie 采集，未复验** |
 
 ### D. 本轮（step 354）已提交的引擎修复
 
-全部带 Chrome oracle 逐格对照与回归测试，详见各 §354.x：子帧窗口几何（根因是指纹播种时序）、per-realm 隔离继承、DOM 属性转义、原始文本元素序列化、`storage.estimate().quota`、`connection.rtt`、CDP awaited-evaluate 帧提交、`Sec-Ch-Ua` 品牌表**顺序**（Chromium 是 scatter、我们实现成 gather）、`Cache-Control` 过度发送、preload arming（解析器建的 `<link rel=preload>` 不发请求）、跨 realm op 扇出（−45% op）、worker 内整族 canvas WebGL 返回 null、`MediaCapabilities` 字典校验、`DOMRect`/`DOMRectList`/`DOMPoint`/`DOMQuad`/`VisualViewport` 品牌泄漏、**Trusted Types 跨 realm brand + 解析重入 sink**、**DOM 变更路径的二次复杂度**（`appendChild`×300 20.4ms→2.5ms）、请求头顺序随机化。
+全部带 Chrome oracle 逐格对照与回归测试，详见各 §354.x：子帧窗口几何（根因是指纹播种时序）、per-realm 隔离继承、DOM 属性转义、原始文本元素序列化、`storage.estimate().quota`、`connection.rtt`、CDP awaited-evaluate 帧提交、`Sec-Ch-Ua` 品牌表**顺序**（Chromium 是 scatter、我们实现成 gather）、`Cache-Control` 过度发送、preload arming、跨 realm op 扇出（−45% op）、worker 内整族 canvas WebGL 返回 null、`MediaCapabilities` 字典校验、`DOMRect`/`DOMRectList`/`DOMPoint`/`DOMQuad`/`VisualViewport` 品牌泄漏、**Trusted Types 跨 realm brand + 解析重入 sink**、**DOM 变更路径的二次复杂度**、请求头顺序随机化。
 
 ## 复现
 
