@@ -15070,3 +15070,25 @@ run-1 steps = 557 + 29 × mid + 52 × tail
 3. 于是这条线的产出是：**"bootstrap 层的执行我们与通过臂完全一致"** + **"主程序层无法用 trace 对拍"**。判据不在这条通道能触及的范围内。
 
 **后续只剩两条**：① 正在跑的**阳性对照**（降级通过臂 Chrome 直到失败，建立因果关系）；② **用户在真实插桩 Chrome 上跑 ≥15 轮**，把参考从 n=1 做成分布。**不再对 trace 通道投入更多样本**——它已给出它能给的全部结论。
+
+#### 354.51 **阳性对照成功：第一次有了"已知会失败"的参照；环境值被硬性排除**
+
+**① 找到能翻转判决的降级**：**UA 里的 `HeadlessChrome` 产品标记**——3/3 失败（`ua-headless-topdoc` / `ua-headless-widget` / `ua-headless-nocli` 三个作用域变体各 2/2 失败）。**只有这个标记有决定权**：`Chrome/90`、Windows-Chrome/153、Firefox UA **全部通过**。且它**至少在两处独立被判定**：只把**顶层文档请求**的 UA 换成 headless 会失败；只把 **widget 会话**的 UA 换成 headless 也会失败（任一作用域单独足够）。
+
+**② 我们的失败在粗结构上与已知坏样本一致**：
+
+| | VM 生命周期数 |
+|---|---|
+| 通过臂 Chrome（44 轮） | **1** |
+| `HeadlessChrome` 失败轮（9 轮） | **2**（被拒后重开一轮） |
+| **Obscura（15/15）** | **2** |
+
+⇒ **我们确实在被"拒绝"，形态与被拒的 Chrome 完全一致。** 但**细结构不吻合**：该失败轮的 run-1 程序与同批**通过轮逐字节相同**（pc 前缀 986/986、551 个 pc 集合相同）⇒ **run-1 不编码判决**，我们的偏差也不是这类失败的指纹；同理，**run-1 层的 step/pc 证据无法支持或反驳任何关于 Obscura 的假设**。
+
+**③ 环境值被硬性排除**：**18 项降级、40 轮、40/40 全过**——device metrics/DPR、各种 screen（**含刻意设成 Obscura 那套 `screen 3440x1440` + `innerWidth 1440` 窗口**）、platform 双向错配、时区（两种做法）、locale、hardwareConcurrency 1/2/64、geolocation、WebGL→SwiftShader、以及**全部一次性叠加**。每项都验证过补丁**确实落地**（realm 回读 `hc=2/hc=64/tz=UTC/cal=de-DE/dpr=3/gl=Google SwiftShader/scr=3440x1440/inner=800x600`）⇒ "无效果"不是"没生效"。**注意**：通过臂基线本身就带 screen/window 错配（`screen 800x600` vs `innerWidth 1440`），所以"错配"本身不是门槛。
+
+**④ 方法学更正（重要，影响此前所有 op 值对比）**：**VM 的 opcode id 每次加载随机置换**——同一份 run-1 的份额向量在不同 trace 里表现为 `{42,14,84,…}` 与 `{87,252,131,…}`（pc 集合双向包含度 1.00）。⇒ **此前所有"按 op 值"的 Chrome-vs-Obscura 比较都在比一个置换**。`(op,pc,st)` 里**只有第二个字段（字节码 PC）稳定可比**，应以它为准。
+
+**⑤ 其他**：`a1` 在"插桩参考 Chrome 与 Obscura"读 32、"stock Chrome + shim"读 27——**非判决相关的 harness artifact**（该 agent 自己的失败轮也是 27），记录以免被误读为跨臂相关性。**Obscura 多出一个 `run 4`（`bc=3868`，0 步），在任何 Chrome trace 里都不出现，未解释。**
+
+**⑥ 判决位置仍未定**：`HeadlessChrome` 的失败被判定在**被追踪的 VM 程序之外**——该实验只能说"边缘按请求头拒"与"widget 内拒"**各自都足够**，无法区分是哪一边。
