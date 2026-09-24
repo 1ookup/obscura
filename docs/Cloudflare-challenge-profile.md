@@ -15092,3 +15092,40 @@ run-1 steps = 557 + 29 × mid + 52 × tail
 **⑤ 其他**：`a1` 在"插桩参考 Chrome 与 Obscura"读 32、"stock Chrome + shim"读 27——**非判决相关的 harness artifact**（该 agent 自己的失败轮也是 27），记录以免被误读为跨臂相关性。**Obscura 多出一个 `run 4`（`bc=3868`，0 步），在任何 Chrome trace 里都不出现，未解释。**
 
 **⑥ 判决位置仍未定**：`HeadlessChrome` 的失败被判定在**被追踪的 VM 程序之外**——该实验只能说"边缘按请求头拒"与"widget 内拒"**各自都足够**，无法区分是哪一边。
+
+#### 354.52 环境事故：代理 `:9000`（Reqable）卡死 → 改走 `:8080`（mitmdump）
+
+**现象**：某一 agent 报告 `192.168.3.57:9000` 自 ~12:11 起不可用、持续 95 分钟以上；它把此后所有轮次标为 INVALID（并加了 `location.href` 检测 + 30s 等待 + **不消耗轮次地重跑同一 index**，避免把故障记成发现）。
+
+**我复核（三处对照）**：
+
+| 通路 | 结果 |
+|---|---|
+| 远程自身 → `127.0.0.1:9000`（Reqable） | **`000` 卡死**（`netstat` 显示 `*.9000 LISTEN`、Reqable 进程在，但**监听在、不服务**） |
+| 远程自身 → `127.0.0.1:8080`（mitmdump） | **403** ✓ |
+| **本机 → `192.168.3.57:8080`** | **403 ✓ 可用** |
+
+**解法**：链路本是 `客户端 → :9000 Reqable → :8080 mitmdump → CF`，而**带 ov2 注入 addon 的是 mitmdump**；CF 看到的请求本来就是 mitmdump 重发的。**绕过 Reqable 直连 `:8080` 对 CF 侧透明**（TLS 仍由 mitmdump 终结；我们本就用 `OBSCURA_INSECURE_TLS` / `--ignore-certificate-errors`，不需要换 CA）。
+
+**已验证**：用 `:8080` 跑通一整轮实弹（五段 `/fo/` 全走完、体照常解密）。`verify_round.sh` 已改为读 `${PROXY_URL:-…}`（默认仍 9000，可覆盖）；已通知相关 agent 把 harness 与自动恢复脚本一起改到 `:8080`。
+
+#### 354.53 请求头矩阵（部分）：目前**未发现**任何头是 CF 边缘的硬要求
+
+**方法**：`Fetch.enable` + `requestPaused` → `continueRequest` 重写头列表，按作用域施加（`topdoc` = URL 等于目标的文档请求；`page` = 顶层会话的其它请求；`widget` = challenges.cloudflare.com OOPIF 会话）。**先做了对照**：`hdr-noop`（拦截全开但不改任何东西）**2/2 通过、生命周期 1** ⇒ 拦截本身中性。
+
+**有效结果（每项 2 轮，用 VM 生命周期数佐证：1=通过、2=被拒）**：删掉顶层文档请求的 `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform` / `Accept` —— **全部 2/2 通过**。⇒ **客户提示头族与 `Accept` 不是这条路径上的边缘要求。**
+
+**一条限制必须带着看**：`Fetch.requestPaused` **只能看到渲染进程提供的头**；`accept-language`、`accept-encoding`、`sec-fetch-*`、`priority` 是**网络服务在其后加的**（header dump 与 "was-absent" 的 op 都证实了），**在这条路径上删不掉** ⇒ 它们"无效果"**不构成证据**。
+
+**`hdr-noop` 观察到的正常 Chrome 请求（按作用域）**：
+
+```
+topdoc  Document  [accept, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, upgrade-insecure-requests, user-agent]
+page    Script    [accept, referer|origin, sec-ch-ua*, user-agent]
+page    XHR       [accept, cf-chl, cf-chl-ra, content-type, origin, referer, sec-ch-ua*, user-agent]
+widget  XHR       [accept, cf-chl, cf-chl-ra, content-type, origin, referer, sec-ch-ua*, user-agent]
+widget  Image     [accept, referer, sec-ch-ua*, user-agent]
+```
+线路上还有但对 Fetch 不可见：`accept-language`、`accept-encoding`、`sec-fetch-site/mode/dest/user`、`priority`。**`user-agent` 出现在每一个作用域**。**CF 自己的 `cf-chl` / `cf-chl-ra` 同时出现在 widget 的 XHR 与页面层的 XHR 上**——尚未与我们的对拍过，值得优先核。
+
+**仍未定**：判决在**边缘**还是 **widget 内**（现在只能说"两者各自都够"）。能一次回答的实验是 `hdr-{topdoc,widget,page}-set-user-agent-headless`——**只在文档请求上注入 `HeadlessChrome`**（widget 与其它的头保持干净）：若失败⇒判决在**边缘、文档请求**上；若通过而 widget-only 失败⇒判决在 **widget 内**。
