@@ -14948,3 +14948,18 @@ switch (…) { case 14: La.call(this); break; case 77: LK.call(this); break; …
 - 要在这条通道上取得统计意义上的结论，需要**每类各若干十轮的分布**（不是一两轮），以及一个**能在同 build 下批量产出参考轮**的手段。
 
 **结论**：tracelog 通道确实是**设计好的对拍通道**（同 build、同契约、指令级），但**"跨会话逐指令对齐"这条路不通**——它的正确用法是**分布对比**，而这需要把样本量做上去。
+
+#### 354.46 本地 run-1 fixture（5 秒/轮，可复用的对拍资产）+ 一处必须核实的误判
+
+**误判（已核实并纠正）**：某 agent 报告"插桩 helper 只对 obscura 生效、Chrome 拿到的页面里没有 tracer"，据此认为 Chrome 侧参考 trace 无法采集。**核实后是它的 harness 漏了代理**——`chrome_rounds.py` 的 argparse 里没有任何 `--proxy` 参数，那些轮次是**直连**跑的。经 **:9000 代理 + Chrome UA** 重新抓 rch 文档：**337,078 字节，含 `__OV2T_HELPER`(2) / `vmp.deobf`(4) / `payloadJSON`(1) / `runProgram`(4)** ⇒ **注入对任何客户端都生效**，用户那份参考 trace 里的 `vmp.deobf.0924.*` 也正是这么来的。已让该 agent 补上 `--proxy-server=http://192.168.3.57:9000` 重跑。
+
+**本地 fixture（真正有价值的成果）**：`/tmp/cf-parity/vmp/fixture/`，**约 5 秒一轮、完全不打 Cloudflare**：
+
+- 驱动原理：`S.ScvHT(runProgram, '<b64>')` 等价于 `runProgram('<b64>')`，而那个 **base64 字面量正好 6944 字符 = `bc`** —— 即 **run 1 的程序是页面内嵌字面量，不是服务端下发的**；`runProgram` 是**可达的页面全局**，返回 continuation（`yg = runProgram(yX, A); typeof yg === "function" && yg(x, Er)`）。
+- **实测：`bc=6944`，前 847 步与 0924 浏览器参考逐位一致，`s694 = (84,186,162)`；42/42 干净轮 + 12/12 负载轮都成立。**
+- 注入通道本身也被证过是有效的（覆盖 `runProgram` → 0 步；覆盖 `String.fromCharCode`/`JSON.parse` → 第 234 步分岔）。
+- 能力边界：**只覆盖 run 1**（bootstrap），不覆盖服务端下发的 run 2/3，也不含真实点击与流程推进。
+
+**34 项单变量环境扫描全部无效**（navigator 全家 / 几何全家 / 时钟与 RNG / cookie-referrer-时区 / visibility-focus-window.name / canvas 与 WebGL 置空 / Intl 置空 / 26 项一次性全改）——`s694` **恒为 `(84,186,162)`**。⇒ **第 694 步的分支不由这些宿主面驱动**，与 §354.45 的"会话数据决定"结论一致。
+
+**新的引擎线索：一个罕见非确定性**。54 轮本地 fixture 里抓到 **1 次** `DIVERGE@694 ours=(14,1030,175)`（与 tl1 完全同形）；而**真实轮次 4 轮就有 1 次**——**真实环境下的翻转率明显高于 fixture**。同一程序、同一寄存器、偶发走另一分支，指向未初始化状态 / 迭代顺序 / 时序相关的真 bug。已让该 agent 用 fixture 做高频循环把触发条件逼出来。
