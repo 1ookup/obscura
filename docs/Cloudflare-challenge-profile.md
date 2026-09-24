@@ -15015,3 +15015,37 @@ switch (…) { case 14: La.call(this); break; case 77: LK.call(this); break; …
 **已把靶子收窄并转给复算 agent**：不再是"解释 847 vs 934"，而是「**在 agent 的 Chrome harness 里找出让基线从 934 回到 847 的那一项**（先单变量试几何，尤其 **DPR 2 vs 1**，再看 UA 与 headed/headless）」。每项 ≥3 轮、看众数，以排除 `52` 量子的抖动。
 
 **同时已开阳性对照**（另一个 agent）：用 CDP **逐项降级通过臂 Chrome 直到它失败**，从而第一次拿到"**已知会失败的参照**"——这是把此前所有"相关性"升级为"因果"的唯一手段。若全部降级都不失败，那本身是强结论：**这些环境值不是判据**。
+
+#### 354.49 **run-1 分离的定论：不是采集条件，是平台差异——而我方与真实参考逐位一致**
+
+**精确分解**（该 agent 从全部来源的原始 trace 得出）：
+
+```
+run-1 steps = 557 + 29 × mid + 52 × tail
+```
+
+| 来源 | n | `mid` |
+|---|---|---|
+| 参考机（`reftrace2/ref0924.jsonl`，2 会话 + 2 代 helper） | 2 | **10** |
+| Obscura 实弹（`ours/*/run/trace.jsonl`） | 7 | **10** |
+| Obscura 本地 fixture | 241 | **10** |
+| agent 本机 stock Chrome（历史 16 + 本轮 36） | 55 | **13** |
+| agent 本机 Chrome 的**本地 fixture** | 7 | **13** |
+
+- `base = 557` **在所有来源的每一条 trace 里都相同**；
+- `tail` 是**时间驱动的旋转器**（8× CPU 节流下速率不变 ⇒ 计时器/事件节拍驱动），即那个 52 量子，**纯采样噪声** ⇒ **只有 `tail=0` 的值才可比**；
+- **`87 = 3 × 29`**，即 **pc 186–415 那段循环多做 3 次迭代**。用 `difflib` 对齐 55 条 Chrome trace：**全部等于 `ref847 + insert(87) + insert(52k)`**，即前 788 步与参考逐位相同。
+
+**单变量扫描（实弹，每项 3 轮，几何从 widget realm 读回）全部无效**：`dpr2` / `viewport(1512×982)` / `screen(1512×982 @44,77)` / `identity`（几何+DPR2+hc15+dm32+colorDepth30）/ `headed` / `win1200` / `comboid`（headed+win1200+full identity）/ `throttle2|4|8`（已先验证 `Emulation.setCPUThrottlingRate` 真的生效：忙循环 16.3→34.3→65.5→127.6 ms）——**`mid` 恒为 13**。另有本地 Chrome fixture（无代理、无实弹、无点击）**同样 mid=13**，以及**一次性伪造全部页面可见环境值**（探针确认补丁落进了 widget realm）**仍是 13**。
+
+⇒ **`mid` 对一切页面可见层的东西不变**，它是**执行该程序的引擎/宿主自身的属性**：本机 Chrome 153.0.8010.48 恒 13、Obscura 恒 10、参考机的（插桩）Chrome 恒 10（两个会话、两代 helper）。
+
+**⇒ 定论（比"排除一个候选"更强）**：
+
+- **"Chrome 934 vs Obscura 847" 不是引擎差异，而是「本机 stock Chrome vs 参考机 Chrome」的平台差**，**Obscura 站在参考那一侧**；
+- 而且证据不止步数：**Obscura 复现参考的 run-1 是逐位一致的全部 847 步**（`fixture847 == ref847` 为 True；241/241 本地实例、7/7 实弹轮共享同一 847 步前缀）——**这是整轮排查里最强的一次 parity 结果**；
+- 因此**步数总量在两个方向上都不能当判据**（同一引擎在两地给出 10 与 13，原因在页面可见层之下）。
+
+**顺带**：`ua-natural`（不覆盖 UA）的 3 轮**全部失败**——与先前"headless 自带 `HeadlessChrome` 标记即败"一致，判据与步数无关。
+
+**未定**：参考机 `mid=10` 的成因。首要嫌疑是**参考那台机器跑的是插桩过的 Chrome（原生 tracelog 后端）而非 stock Chrome 153**；Chrome 版本或 macOS 版本差异同样未排除。**这意味着我们的"参考臂"并非 stock Chrome**，这一点必须记住。
