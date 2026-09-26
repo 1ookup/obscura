@@ -14057,6 +14057,62 @@ RequestRedirect value",
         );
     }
 
+    /// A worker's clock keeps the 100 microsecond quantum but reads back
+    /// through float32: its smallest observable step sits one float32 epsilon
+    /// away from 0.1 (Chrome 153 oracle: 0.09999999403953552), where a
+    /// document's step is the plain double `n * 0.1`. A step that reads as
+    /// double-clean is a clock no browser exposes, in a loop the challenge
+    /// times from inside the worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_performance_now_step_carries_a_float32_quantum() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-clock-shape",
+            r#"(() => {
+                const source =
+                    'self.onmessage = () => {' +
+                    '  const now = performance.now.bind(performance);' +
+                    '  let smallest = Infinity; let previous = 0;' +
+                    '  for (let i = 0; i < 20000; i++) {' +
+                    '    const value = now();' +
+                    '    const step = value - previous;' +
+                    '    if (step > 0 && step < smallest) smallest = step;' +
+                    '    previous = value;' +
+                    '  }' +
+                    '  self.postMessage({ smallest: String(smallest) });' +
+                    '};';
+                const worker = new Worker(URL.createObjectURL(
+                    new Blob([source], { type: 'text/javascript' })));
+                worker.onmessage = event => { globalThis.__clockShape = event.data; };
+                worker.postMessage('go');
+            })()"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(5000).await.unwrap();
+        let shape = rt.evaluate("globalThis.__clockShape").unwrap();
+        let smallest: f64 = shape["smallest"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0);
+        assert!(smallest > 0.0, "worker reported no positive step: {shape}");
+        let drift = (smallest - 0.1).abs();
+        // float32 epsilon on a 0.1 quantum is 1.5e-8; a double-quantised step
+        // drifts 1e-13 and would read as a clock no browser ships.
+        assert!(
+            (1e-9..1e-6).contains(&drift),
+            "worker clock step {smallest} is not float32 shaped: drift {drift}",
+        );
+        // The document clock keeps the plain double quantum.
+        let document_step = rt
+            .evaluate(
+                "(function(){let s=Infinity,p=0;for(let i=0;i<20000;i++){const v=performance.now();const d=v-p;if(d>0&&d<s)s=d;p=v;}return s;})()",
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((document_step - 0.1).abs() < 1e-9, "document step {document_step}");
+    }
+
     /// `performance.timeOrigin` is when navigation started, so it is in the
     /// past and `now()` counts from there. A worker never runs the page init
     /// that assigns it, and a zero origin made `now()` report Unix epoch

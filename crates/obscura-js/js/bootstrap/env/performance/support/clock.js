@@ -14,6 +14,19 @@ function _monoMs() {
 // cross-origin isolated context. Deriving the value from Date.now() instead
 // yields whole milliseconds, which a page can measure directly.
 const _PERF_CLAMP_MS = 0.1;
+// A worker's clock carries the same 100 microsecond quantum but with the
+// float32 rounding a worker reading shows: the smallest step two consecutive
+// worker readings can show sits one float32 epsilon away from 0.1
+// (0.09999999403953552, Chrome 153 oracle), not at the double artefact of
+// `n * 0.1`. Rounding the *quantum* through f32 puts the step in that class
+// and keeps it there at every magnitude, where rounding the reading itself
+// would grow the error with the clock's age and eventually swallow the
+// quantum. Realms are seeded from the startup snapshot, so the realm-level
+// check has to be deferred to the first reading: WORKER_PREP_TEMPLATE defines
+// the marker in the worker before any worker script runs, but after this
+// module has already been evaluated.
+const _PERF_CLAMP_MS_F32 = Math.fround(_PERF_CLAMP_MS);
+var _perfWorkerQuantum = null;
 globalThis.__obscura_rebasePerformanceOrigin = function(timeOrigin) {
   var elapsed = Date.now() - timeOrigin;
   _perfOriginMono = _monoMs() - (elapsed > 0 ? elapsed : 0);
@@ -34,7 +47,11 @@ var _performanceNowImpl = (function() {
     if (_perfOriginMono === null) _perfOriginMono = mono;
     var ms = mono - _perfOriginMono;
     if (!(ms > 0)) ms = 0;
-    ms = Math.floor(ms / _PERF_CLAMP_MS) * _PERF_CLAMP_MS;
+    if (_perfWorkerQuantum === null) {
+      _perfWorkerQuantum = typeof globalThis.__obscuraIsWorker !== 'undefined'
+        ? _PERF_CLAMP_MS_F32 : _PERF_CLAMP_MS;
+    }
+    ms = Math.floor(ms / _PERF_CLAMP_MS) * _perfWorkerQuantum;
     if (ms < _last) return _last;
     _last = ms;
     return _last;
