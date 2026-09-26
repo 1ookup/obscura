@@ -25616,6 +25616,114 @@ RequestRedirect value",
         );
     }
 
+    /// Resource Timing names the entry after the element that started the
+    /// request. A `rel=preload` link is that element, so `as=image` reports
+    /// `link` -- not `img` -- even though the request runs with image
+    /// semantics, and the element that reuses the bytes adds no second entry
+    /// (Chrome 153 oracle: three preloads, all three entries `link`).
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preload_image_link_files_one_link_initiated_resource_entry() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = two_by_three_png();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let png = png.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(&png).unwrap();
+                });
+            }
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url(&format!("http://{address}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        rt.execute_script(
+            "preload-link",
+            "document.head.innerHTML = '<link rel=\"preload\" as=\"image\" href=\"ci.png\">';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        // The challenge assigns the preloaded URL to a fresh element.
+        rt.execute_script("challenge-image", "new Image().src = 'ci.png';")
+            .unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        let entries = rt
+            .evaluate(
+                "performance.getEntriesByType('resource').map(\
+                     entry => entry.initiatorType + ' ' + entry.name)",
+            )
+            .unwrap();
+        assert_eq!(
+            entries,
+            serde_json::json!([format!("link http://{address}/ci.png")]),
+            "one entry, filed by the link",
+        );
+    }
+
+    /// Chrome's preload fetcher acts on the destinations it knows and ignores
+    /// the rest; only `as=image` goes through the image path, so an unknown
+    /// destination starts no image request and buffers no entry.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preload_link_unknown_destination_starts_nothing() {
+        for as_value in ["", "bogus", "font"] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let loader_calls = calls.clone();
+            let png = two_by_three_png();
+            let mut rt = parser_image_runtime(
+                "<html><head></head><body></body></html>",
+                move |_url: &str| {
+                    loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(png.clone())
+                },
+            );
+            rt.execute_script(
+                "preload-unknown",
+                &format!(
+                    "const link = document.createElement('link'); \
+                     link.rel = 'preload'; link.as = {as_value:?}; \
+                     link.href = 'asset.bin'; document.head.appendChild(link);"
+                ),
+            )
+            .unwrap();
+            rt.run_event_loop_bounded(100).await.unwrap();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "as={as_value} must not start an image request",
+            );
+            assert_eq!(
+                rt.evaluate("performance.getEntriesByType('resource').length")
+                    .unwrap()
+                    .as_f64(),
+                Some(0.0),
+                "as={as_value} must buffer no resource entry",
+            );
+        }
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn parser_image_lifecycle_uses_shared_render_resource() {

@@ -79,6 +79,31 @@ function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigi
   });
 }
 
+// URLs a `rel=preload` link is fetching. Resource Timing names the entry after
+// the element that started the request, and a preload link is that element: an
+// `as=image` preload runs with <img> fetch semantics yet still reports `link`.
+// The mark is applied before the request leaves and retracted when it never
+// produced a response, so a failed preload leaves no label behind.
+const _linkPreloadUrls = new Set();
+function _markLinkPreload(url) {
+  _linkPreloadUrls.add(String(url));
+}
+function _unmarkLinkPreload(url) {
+  _linkPreloadUrls.delete(String(url));
+}
+
+// Whether `url` already has a resource entry, and which initiator filed it. A
+// preload link files the entry for the bytes it brought in; the element that
+// then reuses them is a cache hit, and Chrome buffers no second entry for a
+// cache hit.
+function _resourceEntryInitiatorFor(url) {
+  for (let i = _performanceEntries.length - 1; i >= 0; i--) {
+    const entry = _performanceEntries[i];
+    if (entry.entryType === 'resource' && entry.name === url) return entry.initiatorType;
+  }
+  return null;
+}
+
 // File an image fetch in this realm's Performance Timeline. Only the request
 // that actually went to the network carries `timing`, so followers of an
 // in-flight fetch and cache hits add no duplicate entry. Without a
@@ -89,6 +114,10 @@ function _recordImageResourceTiming(metadata, fetchStart) {
   if (!timing || typeof timing !== "object") return;
   const record = globalThis.__obscura_performance_record;
   if (typeof record !== "function") return;
+  const url = String(timing.url || "");
+  // A `rel=preload` link already filed this URL: the element reusing the bytes
+  // is a cache hit, so the link's entry stays the only one.
+  if (_resourceEntryInitiatorFor(url) === 'link') return;
   const allowed = timing.timingAllowed !== false;
   const responseStart = fetchStart + Math.max(0, +timing.responseStart || 0);
   const responseEnd = fetchStart + Math.max(0, +timing.responseEnd || 0);
@@ -96,11 +125,12 @@ function _recordImageResourceTiming(metadata, fetchStart) {
   const size = Math.max(0, +timing.encodedBodySize || 0);
   const decoded = Math.max(0, +timing.decodedBodySize || 0) || size;
   record({
-    name: String(timing.url || ""),
+    name: url,
     entryType: "resource",
     // Resource Timing names the initiator after the element's local name, so
-    // an <img> reports "img" -- not "image".
-    initiatorType: "img",
+    // an <img> reports "img" -- not "image". A preload link keeps its own
+    // name even though the request runs with image semantics.
+    initiatorType: _linkPreloadUrls.has(url) ? "link" : "img",
     startTime: fetchStart,
     duration: Math.max(0, responseEnd - fetchStart),
     redirectStart: redirected && allowed ? fetchStart : 0,
