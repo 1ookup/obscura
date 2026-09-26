@@ -2398,6 +2398,27 @@ impl Page {
             (budget != 0).then_some(budget)
         };
 
+        // A blocking parser script is a LoAF source like any other (see
+        // env/performance/long-animation-frame.js). Chrome attributes it to a
+        // `classic-script` entry named after the script's URL, so measure the
+        // body here -- the host runs it, no task source in the realm sees it --
+        // and only pay for the report when it actually blocked past 50 ms.
+        let record_classic_script_task =
+            |js: &mut ObscuraJsRuntime, started: std::time::Instant, invoker: &str| {
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                if elapsed_ms < 50.0 {
+                    return;
+                }
+                let _ = js.execute_script(
+                    "<loaf-task>",
+                    &format!(
+                        "globalThis.__obscura_record_host_task(\
+                             {elapsed_ms:.3}, {}, 'classic-script');",
+                        serde_json::json!(invoker),
+                    ),
+                );
+            };
+
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
@@ -2424,9 +2445,11 @@ impl Page {
                                     serde_json::json!(format!("script@{execution_url}")),
                                 ),
                             );
+                            let task_started = std::time::Instant::now();
                             if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
                                 tracing::warn!("Script error ({}): {}", execution_url, error);
                             }
+                            record_classic_script_task(js, task_started, &execution_url);
                             let _ = js.execute_script(
                                 "<current-script>",
                                 "globalThis.__currentScriptNid=0;__obscuraTraceLeave();",
@@ -2443,6 +2466,7 @@ impl Page {
                                 serde_json::json!(format!("script@{}", script.base_url)),
                             ),
                         );
+                        let task_started = std::time::Instant::now();
                         if let Err(error) =
                             js.execute_script_guarded_at_line(
                                 &script.base_url,
@@ -2452,6 +2476,7 @@ impl Page {
                         {
                             tracing::warn!("Inline script error: {}", error);
                         }
+                        record_classic_script_task(js, task_started, &script.base_url);
                         let _ = js.execute_script(
                             "<current-script>",
                             "globalThis.__currentScriptNid=0;__obscuraTraceLeave();",
@@ -3381,6 +3406,7 @@ impl Page {
                                 serde_json::json!(format!("script@{execution_url}")),
                             ),
                         );
+                        let task_started = std::time::Instant::now();
                         let result = if script.src.is_none() {
                             js.execute_script_in_frame_realm_at_line(
                                 frame_id,
@@ -3402,6 +3428,20 @@ impl Page {
                                 "Frame script error ({}): {}",
                                 execution_url,
                                 error
+                            );
+                        }
+                        // Same LoAF attribution as the main document's scripts.
+                        let elapsed_ms = task_started.elapsed().as_secs_f64() * 1_000.0;
+                        if elapsed_ms >= 50.0 {
+                            let _ = js.execute_script_in_frame_realm(
+                                frame_id,
+                                generation,
+                                "<loaf-task>",
+                                &format!(
+                                    "globalThis.__obscura_record_host_task(\
+                                         {elapsed_ms:.3}, {}, 'classic-script');",
+                                    serde_json::json!(execution_url),
+                                ),
                             );
                         }
                         let _ = js.execute_script_in_frame_realm(

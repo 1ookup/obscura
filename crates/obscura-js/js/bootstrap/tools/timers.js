@@ -40,7 +40,7 @@ function _clampNestedDelay(delay) {
 
 // Runs `f` at the nesting level its own timer scheduled, so timers it starts
 // nest deeper while unrelated work on the task queue keeps counting from zero.
-function _runAtNesting(level, f, args) {
+function _runAtNesting(level, f, args, invoker) {
   const previous = _timerNesting;
   _timerNesting = level;
   // Long task timings feed the LoAF timeline (see
@@ -59,7 +59,7 @@ function _runAtNesting(level, f, args) {
     finally { _timerNesting = previous; }
   };
   if (typeof globalThis.__obscura_measure_task === 'function') {
-    return globalThis.__obscura_measure_task('TimerHandler', run);
+    return globalThis.__obscura_measure_task(invoker, run);
   }
   return run();
 }
@@ -74,7 +74,7 @@ _defineWindowValue('setTimeout', (fn, delay = 0, ...args) => {
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
     if (_clearedTimers.has(id)) return;
-    _runAtNesting(nesting, f, args);
+    _runAtNesting(nesting, f, args, 'TimerHandler:setTimeout');
   });
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
@@ -109,7 +109,7 @@ _defineWindowValue('setInterval', (fn, delay = 0, ...args) => {
     : Math.max(0, Number(delay) || 0);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    _runAtNesting(nesting, f, args);
+    _runAtNesting(nesting, f, args, 'TimerHandler:setInterval');
     if (!_intervals.has(id)) return;
     const nativeId = _scheduleAfter(normalizedDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);

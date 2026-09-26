@@ -23,7 +23,16 @@ globalThis.MutationObserver = class MutationObserver {
     Promise.resolve().then(() => {
       if (this._records.length > 0) {
         const batch = this._records.splice(0);
-        try { this._callback(batch, this); } catch(e) { /* observer errors shouldn't propagate */ }
+        // Delivered at the microtask checkpoint, which is inside the task that
+        // caused the mutation: Chrome reports it in that frame's `scripts` as a
+        // `MutationCallback` user callback.
+        const owned = typeof globalThis.__obscura_task_begin === 'function'
+          && globalThis.__obscura_task_begin();
+        try { this._callback(batch, this); }
+        catch(e) { /* observer errors shouldn't propagate */ }
+        finally {
+          if (owned) globalThis.__obscura_task_end('MutationCallback', 'user-callback');
+        }
       }
     });
   }

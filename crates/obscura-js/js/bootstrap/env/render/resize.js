@@ -268,7 +268,12 @@ globalThis.ResizeObserver = class ResizeObserver {
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
     _hset(this, "_active", []);
+    const owned = typeof globalThis.__obscura_task_begin === 'function'
+      && globalThis.__obscura_task_begin();
     try { this._callback(entries, this); } catch (_error) {}
+    finally {
+      if (owned) globalThis.__obscura_task_end('ResizeObserverCallback', 'user-callback');
+    }
   }
   observe(target, options = {}) {
     if (!(target instanceof Element)) {

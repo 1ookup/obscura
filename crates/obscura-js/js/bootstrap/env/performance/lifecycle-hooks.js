@@ -4,6 +4,9 @@
 globalThis.__obscura_performance_record = function(init) {
   if (!init || typeof init !== 'object') return null;
   let entry;
+  if (init.entryType === 'long-animation-frame') {
+    return _queuePerformanceEntry(new PerformanceLongAnimationFrameTiming(init));
+  }
   if (init.entryType === 'navigation') {
     entry = new PerformanceNavigationTiming(init);
     const previous = _performanceEntries.findIndex(value => value.entryType === 'navigation');

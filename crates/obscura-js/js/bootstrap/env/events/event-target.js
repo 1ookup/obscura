@@ -11,6 +11,21 @@ function _isDomInstance(value, name) {
   if (name === 'Node') return value[_nidSym] !== undefined;
   return true;
 }
+// The listener currently being measured, and the invoker Chrome would name for
+// it: `MessagePort.onmessage`, `button#b.onclick`, `Window.onload`. The slots
+// are set only for the outermost measured listener, so a nested dispatch (which
+// is part of the same frame) never replaces the outer attribution.
+let _listenerInvokerTarget = null;
+let _listenerInvokerType = '';
+function _listenerInvoker() {
+  const target = _listenerInvokerTarget;
+  if (!target) return '';
+  const name = target.localName
+    || (target.constructor && target.constructor.name)
+    || '';
+  const id = target.id ? '#' + target.id : '';
+  return name + id + '.on' + _listenerInvokerType;
+}
 function _eventParent(target, composed) {
   if (_isDomInstance(target, 'ShadowRoot')) return composed ? target.host : null;
   if (_isDomInstance(target, 'Document')) return target.defaultView || null;
@@ -82,12 +97,19 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
   }
 
   const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+  // LoAF attribution (env/performance/long-animation-frame.js). The invoker is
+  // built from these two slots only when a listener blocks long enough to be
+  // recorded, which keeps the dispatch loop free of a string build per call.
+  const measureTask = typeof globalThis.__obscura_task_begin === 'function'
+    ? globalThis.__obscura_task_begin : null;
   for (const entry of listeners) {
     if (entry.capture !== capture) continue;
     const current = _eventTargetListeners.get(target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
     const callback = entry.callback;
+    const owned = measureTask ? measureTask() : false;
+    if (owned) { _listenerInvokerTarget = target; _listenerInvokerType = event.type; }
     try {
       if (typeof callback === "function") {
         __obscuraTraceCallWith(entry.from, callback, target, [event]);
@@ -96,6 +118,11 @@ function _eventInvoke(target, event, capture, atTarget, pathIndex) {
       }
     } catch (error) {
       console.error(error);
+    } finally {
+      if (owned) {
+        globalThis.__obscura_task_end(_listenerInvoker, 'event-listener');
+        _listenerInvokerTarget = null;
+      }
     }
     if (state.immediatePropagationStopped) break;
   }

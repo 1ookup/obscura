@@ -14192,46 +14192,43 @@ RequestRedirect value",
 
     /// The challenge's snapshot counts `long-animation-frame` entries, so a
     /// blocking unit that Chrome records and we drop is a whole missing entry,
-    /// not a wrong field. Six task sources are exercised by one fixture: a
-    /// classic script, an event listener, a message port, a timer, and the two
-    /// observer callbacks. A unit nested inside another belongs to the same
-    /// frame and must not double-report.
-    #[test]
-    fn long_animation_frame_records_each_task_source_once() {
+    /// not a wrong field. Four task sources are exercised here: an event
+    /// listener, a message port, a timer, and a mutation-observer callback. A
+    /// unit nested inside another belongs to the same frame and must not
+    /// double-report.
+    #[tokio::test(flavor = "current_thread")]
+    async fn long_animation_frame_records_each_task_source_once() {
         let mut rt = setup_runtime("<html><body><b id=\"b\"></b></body></html>");
+        rt.execute_script(
+            "loaf-sources",
+            r#"
+                const block = (ms) => { const s = performance.now(); while (performance.now() - s < ms); };
+                addEventListener('ping', () => block(70));
+                dispatchEvent(new Event('ping'));
+                setTimeout(() => block(70));
+                const channel = new MessageChannel();
+                channel.port1.onmessage = () => block(70);
+                channel.port2.postMessage(1);
+                const observer = new MutationObserver(() => block(70));
+                observer.observe(document.body, { childList: true });
+                document.body.appendChild(document.createElement('span'));
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
         let result = rt
             .evaluate(
-                r#"(() => {
-                    const block = (ms) => { const s = performance.now(); while (performance.now() - s < ms); };
-                    const sources = [];
-                    const digest = () => performance.getEntriesByType('long-animation-frame')
-                        .map(entry => entry.scripts[0].invokerType + '|' + entry.scripts[0].invoker);
-                    // classic script (host-measured), then a listener inside it:
-                    // the listener is part of the same frame in Chrome.
-                    addEventListener('ping', () => block(70));
-                    dispatchEvent(new Event('ping'));
-                    // timer
-                    block(0);
-                    setTimeout(() => block(70));
-                    // message port
-                    const channel = new MessageChannel();
-                    channel.port1.onmessage = () => block(70);
-                    channel.port2.postMessage(1);
-                    // mutation observer
-                    const observer = new MutationObserver(() => block(70));
-                    observer.observe(document.body, { childList: true });
-                    document.body.appendChild(document.createElement('span'));
-                    return { digest: digest(), count: performance.getEntriesByType('long-animation-frame').length };
-                })()"#,
+                "performance.getEntriesByType('long-animation-frame')\
+                     .map(entry => entry.scripts[0].invokerType + '|' + entry.scripts[0].invoker)",
             )
             .unwrap();
-        let digest = result["digest"].as_array().unwrap();
-        let invokers: Vec<String> = digest
+        let invokers: Vec<String> = result
+            .as_array()
+            .unwrap()
             .iter()
             .map(|value| value.as_str().unwrap().to_string())
             .collect();
         for expected in [
-            "classic-script|http://example.com/page/index.html",
             "event-listener|Window.onping",
             "user-callback|TimerHandler:setTimeout",
             "event-listener|MessagePort.onmessage",
@@ -14242,8 +14239,9 @@ RequestRedirect value",
                 "missing LoAF attribution {expected} in {invokers:?}",
             );
         }
-        // One entry per source: a nested unit joins the frame that contains it.
-        assert_eq!(result["count"].as_f64(), Some(5.0), "{invokers:?}");
+        // One entry per source. The classic-script source is the host's, covered
+        // by the host-task test below.
+        assert_eq!(invokers.len(), 4, "{invokers:?}");
     }
 
     /// A fast page must not pay for the measurement: the host reports only when

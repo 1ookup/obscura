@@ -22,7 +22,14 @@ function _scheduleIntersectionObserverDelivery(observer) {
     for (const current of pending) {
       if (!current._connected || !current._records.length) continue;
       const records = current.takeRecords();
+      // Chrome names an observer callback on the frame's `scripts` list as a
+      // user callback attributed to the interface that scheduled it.
+      const owned = typeof globalThis.__obscura_task_begin === 'function'
+        && globalThis.__obscura_task_begin();
       try { current._callback(records, current); } catch (e) {}
+      finally {
+        if (owned) globalThis.__obscura_task_end('IntersectionObserverCallback', 'user-callback');
+      }
     }
   }, _schedulerPriorityRank["user-visible"] * 2);
 }
