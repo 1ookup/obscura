@@ -6745,24 +6745,16 @@ impl Page {
                     // cross-origin isolation, even when its response carries
                     // COOP/COEP. `allow-same-origin` keeps the tuple origin
                     // and may therefore retain isolation.
-                    // A child with its own COOP/COEP response can join an
-                    // isolated agent cluster across an origin boundary when
-                    // the embedding policy delegates `cross-origin-isolated`
-                    // to that origin. Without the delegation, only a
-                    // same-origin child inherits the parent's capability.
+                    // Only a same-origin child inherits the parent's
+                    // capability. A cross-origin child keeps its own agent
+                    // cluster, so its own COOP/COEP response and an
+                    // `allow="cross-origin-isolated"` delegation alike leave
+                    // it non-isolated -- the challenge widget shape.
                     let document_cross_origin_isolated = frame_document_isolation(
                         &response,
                         &response_origin,
                         &parent_origin,
                         parent_cross_origin_isolated,
-                        request.allow.as_deref().is_some_and(|allow| {
-                            iframe_allow_applies_to_origin(
-                                allow,
-                                &response_origin,
-                                &parent_origin,
-                                parent_permissions_policy.as_deref(),
-                            )
-                        }),
                         sandbox,
                     );
                     let last_modified = response.header("last-modified").map(str::to_string);
@@ -9944,7 +9936,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_child_can_enable_cross_origin_isolation_when_delegated() {
+    fn cross_origin_child_stays_out_of_the_embedders_agent_cluster() {
         let response = obscura_net::Response {
             url: url::Url::parse("https://widget.example/frame").unwrap(),
             status: 200,
@@ -9970,40 +9962,31 @@ mod tests {
         assert!(frame_response_grants_cross_origin_isolation(
             &response, &widget, &widget, true,
         ));
-        assert!(super::frame_document_isolation(
-            &response, &widget, &page, true, true, obscura_dom::SandboxFlags::default(),
+        // Delegated or not, a cross-origin child owns an agent cluster that
+        // never joins the embedder's. Chrome 153 answers `false` for the
+        // challenge widget, which carries the delegation and its own
+        // COOP/COEP on top.
+        assert!(!super::frame_document_isolation(
+            &response, &widget, &page, true, obscura_dom::SandboxFlags::default(),
         ));
         assert!(!super::frame_document_isolation(
-            &response, &widget, &page, true, false, obscura_dom::SandboxFlags::default(),
+            &response, &widget, &page, false, obscura_dom::SandboxFlags::default(),
         ));
-        assert!(super::iframe_allow_applies_to_origin(
-            "cross-origin-isolated https://widget.example",
-            &widget, &page, None,
-        ));
-        assert!(!super::iframe_allow_applies_to_origin(
-            "cross-origin-isolated https://other.example",
-            &widget, &page, None,
-        ));
-        assert!(!super::iframe_allow_applies_to_origin(
-            "cross-origin-isolated 'self'",
-            &widget, &page, None,
-        ));
-        assert!(!super::iframe_allow_applies_to_origin(
-            "cross-origin-isolated",
-            &widget, &page, Some("cross-origin-isolated=()"),
+        // The same-origin reading of the very same response is untouched.
+        assert!(super::frame_document_isolation(
+            &response, &widget, &widget, true, obscura_dom::SandboxFlags::default(),
         ));
     }
 
-    /// A delegated child is a nested document: its own response only has to
-    /// turn the embedding check on. Demanding its COOP too -- the top-level
-    /// rule -- left a cross-origin widget that carries
-    /// `allow="cross-origin-isolated"` and `Cross-Origin-Embedder-Policy:
-    /// require-corp` reading `crossOriginIsolated === false` with no
-    /// SharedArrayBuffer, while Chrome 153 answers `true` for it. Measured
-    /// with a two-host fixture under an isolated top-level page; the same
-    /// child without the attribute has its navigation blocked outright there.
+    /// A cross-origin child never joins its embedder's isolated agent cluster,
+    /// whatever its own response carries. Measured Chrome 153 with the live
+    /// Turnstile widget shape (own COOP + require-corp + CORP, the delegation
+    /// attribute, and a `sandbox` attribute with `allow-same-origin`): the
+    /// child reads `crossOriginIsolated === false` with no
+    /// SharedArrayBuffer in every variant, so granting the delegation here is
+    /// what let a widget read `true` while the real browser reports none of it.
     #[test]
-    fn delegated_child_is_isolated_by_its_embedder_policy_alone() {
+    fn cross_origin_child_isolation_ignores_its_own_response_and_delegation() {
         let child = |headers: &[(&str, &str)], host: &str| obscura_net::Response {
             url: url::Url::parse(&format!("https://{host}/frame")).unwrap(),
             status: 200,
@@ -10020,41 +10003,36 @@ mod tests {
         let coop = ("cross-origin-opener-policy", "same-origin");
         let widget = obscura_dom::Origin::from_url("https://widget.example/frame");
         let page = obscura_dom::Origin::from_url("https://page.example/");
-        let isolated = |response: &obscura_net::Response, allow: bool| {
+        let isolated = |response: &obscura_net::Response| {
             super::frame_document_isolation(
                 response,
                 &widget,
                 &page,
                 true,
-                allow,
                 obscura_dom::SandboxFlags::default(),
             )
         };
 
-        assert!(isolated(&child(&[coep], "widget.example"), true));
-        assert!(!isolated(&child(&[coep], "widget.example"), false));
-        // The child's COOP stays irrelevant either way.
-        assert!(isolated(&child(&[coep, coop], "widget.example"), true));
-        assert!(!isolated(&child(&[coep, coop], "widget.example"), false));
+        assert!(!isolated(&child(&[coep], "widget.example")));
+        // The child's own COOP is a top-level binding and says nothing about a
+        // nested document; it isolates nothing here either.
+        assert!(!isolated(&child(&[coep, coop], "widget.example")));
+        assert!(!isolated(&child(&[coop], "widget.example")));
 
-        // A non-isolated embedder delegates nothing.
+        // A non-isolated embedder contributes nothing of its own.
         assert!(!super::frame_document_isolation(
             &child(&[coep], "widget.example"),
             &widget,
             &page,
             false,
-            true,
             obscura_dom::SandboxFlags::default(),
         ));
         // A document the child's own Permissions-Policy excludes never joins.
-        assert!(!isolated(
-            &child(
-                &[coep, ("permissions-policy", "cross-origin-isolated=()")],
-                "widget.example"
-            ),
-            true,
-        ));
-        // Isolation needs a secure context, delegation or not.
+        assert!(!isolated(&child(
+            &[coep, ("permissions-policy", "cross-origin-isolated=()")],
+            "widget.example"
+        )));
+        // Isolation needs a secure context even where it is reachable.
         let plain_http = obscura_net::Response {
             url: url::Url::parse("http://insecure.example/frame").unwrap(),
             status: 200,
@@ -10071,18 +10049,21 @@ mod tests {
             &widget,
             &page,
             true,
-            true,
             obscura_dom::SandboxFlags::default(),
         ));
     }
 
-    /// Committed frame scopes of an isolated top-level page embedding three
-    /// cross-origin children whose responses carry only
-    /// `Cross-Origin-Embedder-Policy: require-corp`: no `allow` attribute, no
-    /// isolation; a delegation naming the child's origin isolates it; a
-    /// delegation naming another origin does not.
+    /// Committed frame scopes of an isolated top-level page embedding the
+    /// challenge widget shape: every cross-origin child carries its own
+    /// `Cross-Origin-Opener-Policy: same-origin` plus `require-corp` and CORP,
+    /// with and without the `allow="cross-origin-isolated"` delegation and the
+    /// `sandbox` attribute, and each of them embeds a hidden same-origin child
+    /// of its own. Chrome 153 answers `crossOriginIsolated === false` for all
+    /// of the cross-origin children and for their children; only a same-origin
+    /// child carrying its own COEP joins the cluster. A second navigation to a
+    /// top-level document with no COOP pins the whole tree at `false`.
     #[tokio::test(flavor = "current_thread")]
-    async fn delegated_cross_origin_frame_isolation_follows_the_allow_attribute() {
+    async fn cross_origin_frames_stay_unisolated_under_an_isolated_top() {
         let parent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let child_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let child_origin = format!("http://{}", child_listener.local_addr().unwrap());
@@ -10091,20 +10072,27 @@ mod tests {
             "<!doctype html>\
              <iframe src=\"{child_origin}/no-allow\"></iframe>\
              <iframe src=\"{child_origin}/allow\" allow=\"cross-origin-isolated\"></iframe>\
-             <iframe src=\"{child_origin}/allow-other\" \
-                     allow=\"cross-origin-isolated https://other.example\"></iframe>"
+             <iframe src=\"{child_origin}/live-shape\" \
+                     allow=\"cross-origin-isolated; fullscreen; autoplay; keyboard-map; gamepad; \
+                            xr-spatial-tracking\" \
+                     sandbox=\"allow-same-origin allow-scripts allow-popups\"></iframe>\
+             <iframe src=\"{parent_origin}/same-child\"></iframe>"
         );
         let child_server = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
-            let body = "<!doctype html><p>child</p>";
-            // COEP alone: a nested document inherits its embedder's COEP, so
-            // the child sends no COOP of its own.
-            for _ in 0..6 {
+            // The widget shape: its own COOP and COEP, CORP so a COEP embedder
+            // loads it at all, and a 0x0 same-origin child with no src.
+            let body = format!(
+                "<!doctype html><p>child</p>\
+                 <iframe width=\"0\" height=\"0\" src=\"about:blank\"></iframe>"
+            );
+            for _ in 0..12 {
                 let Ok((mut stream, _)) = child_listener.accept() else { break };
                 let mut request = [0u8; 2048];
                 let _ = stream.read(&mut request);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Cross-Origin-Opener-Policy: same-origin\r\n\
                      Cross-Origin-Embedder-Policy: require-corp\r\n\
                      Cross-Origin-Resource-Policy: cross-origin\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -10116,15 +10104,32 @@ mod tests {
         let parent_body_clone = parent_body.clone();
         let parent_server = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
-            for _ in 0..4 {
+            for _ in 0..10 {
                 let Ok((mut stream, _)) = parent_listener.accept() else { break };
                 let mut request = [0u8; 2048];
-                let _ = stream.read(&mut request);
-                let body = parent_body_clone.clone();
+                let read = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                // The same-origin child needs a response of its own; the
+                // second top-level navigation serves the same document with no
+                // COOP at all.
+                let (body, coop, coep) = if head.contains("/same-child") {
+                    (
+                        "<!doctype html><p>same</p>".to_string(),
+                        "",
+                        "Cross-Origin-Embedder-Policy: require-corp\r\n",
+                    )
+                } else if head.contains("/plain") {
+                    (parent_body_clone.clone(), "", "")
+                } else {
+                    (
+                        parent_body_clone.clone(),
+                        "Cross-Origin-Opener-Policy: same-origin\r\n",
+                        "Cross-Origin-Embedder-Policy: require-corp\r\n",
+                    )
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
-                     Cross-Origin-Opener-Policy: same-origin\r\n\
-                     Cross-Origin-Embedder-Policy: require-corp\r\n\
+                     {coop}{coep}\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
                 );
@@ -10158,14 +10163,67 @@ mod tests {
             })
             .unwrap();
         rows.sort();
+        let mut expected = vec![
+            (format!("{child_origin}/allow"), false),
+            (format!("{child_origin}/live-shape"), false),
+            (format!("{child_origin}/no-allow"), false),
+            (format!("{parent_origin}/same-child"), true),
+        ];
+        expected.sort();
         assert_eq!(
-            rows,
-            vec![
-                (format!("{child_origin}/allow"), true),
-                (format!("{child_origin}/allow-other"), false),
-                (format!("{child_origin}/no-allow"), false),
-            ],
-            "only the delegated child joins the isolated agent cluster",
+            rows, expected,
+            "no cross-origin child joins the isolated agent cluster, delegated or not",
+        );
+        // A same-origin child of a cross-origin frame inherits that frame's
+        // bit, so reading false here is the same-origin proof the widget's
+        // hidden frames give.
+        let widget_children: Vec<bool> = page
+            .with_dom(|dom| {
+                let mut rows = Vec::new();
+                for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
+                    let Some(root) = dom.iframe_content_document(host) else { continue };
+                    let Some(scope) = dom.document_scope(root) else { continue };
+                    if scope.origin != obscura_dom::Origin::from_url(&child_origin) {
+                        continue;
+                    }
+                    for nested in dom.iframe_hosts_in_shadow_including_subtree(root) {
+                        let Some(nested_root) = dom.iframe_content_document(nested) else {
+                            continue;
+                        };
+                        if let Some(nested_scope) = dom.document_scope(nested_root) {
+                            rows.push(nested_scope.cross_origin_isolated);
+                        }
+                    }
+                }
+                rows
+            })
+            .unwrap();
+        assert!(
+            !widget_children.is_empty(),
+            "the widget fixtures should each carry a hidden child",
+        );
+        assert!(
+            widget_children.iter().all(|isolated| !isolated),
+            "the widget's same-origin children must not read isolated: {widget_children:?}",
+        );
+
+        // An embedder without COOP isolates nothing anywhere in the tree.
+        page.navigate(&format!("{parent_origin}/plain")).await.unwrap();
+        assert!(!page.cross_origin_isolated, "no COOP, no isolated top");
+        let rows = page
+            .with_dom(|dom| {
+                let mut rows = Vec::new();
+                for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
+                    let Some(root) = dom.iframe_content_document(host) else { continue };
+                    let Some(scope) = dom.document_scope(root) else { continue };
+                    rows.push((scope.url, scope.cross_origin_isolated));
+                }
+                rows
+            })
+            .unwrap();
+        assert!(
+            rows.iter().all(|(_, isolated)| !isolated),
+            "nothing in an unisolated tree reads isolated: {rows:?}",
         );
         // The servers block in `accept` past the requests this test makes;
         // they are dropped with the process rather than joined.
@@ -14473,80 +14531,36 @@ fn frame_response_grants_cross_origin_isolation(
         && !response_denies_cross_origin_isolation(response)
 }
 
-fn iframe_allow_applies_to_origin(
-    value: &str,
-    child_origin: &obscura_dom::Origin,
-    parent_origin: &obscura_dom::Origin,
-    parent_permissions_policy: Option<&str>,
-) -> bool {
-    if parent_permissions_policy.is_some_and(|policy| {
-        policy.split(',').any(|entry| {
-            let mut parts = entry.splitn(2, '=');
-            parts.next().map(str::trim).is_some_and(|name| {
-                name.eq_ignore_ascii_case("cross-origin-isolated")
-                    && parts.next().is_some_and(|value| value.trim() == "()")
-            })
-        })
-    }) {
-        return false;
-    }
-    value.split(';').any(|directive| {
-        let mut tokens = directive.split_whitespace();
-        if !tokens
-            .next()
-            .is_some_and(|feature| feature.eq_ignore_ascii_case("cross-origin-isolated"))
-        {
-            return false;
-        }
-        let origins = tokens.collect::<Vec<_>>();
-        if origins.is_empty() {
-            // A bare iframe allow directive delegates to the frame's src origin.
-            return true;
-        }
-        origins.iter().any(|token| match token.to_ascii_lowercase().as_str() {
-            "*" | "'src'" => true,
-            "'self'" => child_origin == parent_origin,
-            "'none'" => false,
-            value => url::Url::parse(value)
-                .ok()
-                .map(|url| obscura_dom::Origin::from_url(url.as_str()) == *child_origin)
-                .unwrap_or(false),
-        })
-    })
-}
-
+/// Whether a committed frame document joins its embedder's cross-origin
+/// isolated agent cluster.
+///
+/// Only a same-origin child can: a cross-origin child document owns an agent
+/// cluster of its own, and that cluster is never isolated, because COOP only
+/// ever isolates the browsing context group a top-level navigation creates.
+/// Measured Chrome 153 (CDP, two-host fixture under an isolated top) with the
+/// live Turnstile widget shape -- a child carrying its own
+/// `Cross-Origin-Opener-Policy: same-origin` plus `require-corp`, CORP, and
+/// `allow="cross-origin-isolated; fullscreen; ..."` with a
+/// `sandbox="allow-same-origin allow-scripts allow-popups"` attribute: the
+/// child itself answers `crossOriginIsolated === false` with no
+/// `SharedArrayBuffer` in every variant measured (allow or not, bare or listed
+/// delegation, sandbox or not, `require-corp` or `credentialless`). Granting
+/// the delegation here is what let a challenge widget read `true` and expose
+/// the constructor while the real browser reports none of it.
 fn frame_document_isolation(
     response: &obscura_net::Response,
     response_origin: &obscura_dom::Origin,
     parent_origin: &obscura_dom::Origin,
     parent_cross_origin_isolated: bool,
-    allow_cross_origin_isolated: bool,
     sandbox: obscura_dom::SandboxFlags,
 ) -> bool {
-    let own_isolation = if response_origin == parent_origin {
-        frame_response_grants_cross_origin_isolation(
+    response_origin == parent_origin
+        && frame_response_grants_cross_origin_isolation(
             response,
             response_origin,
             parent_origin,
             parent_cross_origin_isolated,
         )
-    } else {
-        // A delegated child is still a nested document, so its own response
-        // only has to turn the embedding check on. Measured Chrome 153 with a
-        // two-host fixture under an isolated top-level page: a child carrying
-        // `allow="cross-origin-isolated"` and `Cross-Origin-Embedder-Policy:
-        // require-corp` alone reads `crossOriginIsolated === true` with the
-        // SharedArrayBuffer constructor exposed, and the same child without
-        // the attribute has its navigation blocked outright. Reusing the
-        // top-level rule here demanded the child's COOP as well, which is a
-        // top-level binding and left the delegated widget non-isolated.
-        parent_cross_origin_isolated
-            && allow_cross_origin_isolated
-            && response_url_is_trustworthy(&response.url)
-            && response_requires_cross_origin_embedding(response)
-            && !response_denies_cross_origin_isolation(response)
-    };
-    own_isolation
         && (!sandbox.active
             || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))
 }

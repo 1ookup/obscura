@@ -7,6 +7,16 @@ run covers are then removed.
 
 ## Pending
 
+- 2026-09-27: frame cross-origin isolation commit (`crates/obscura-browser`
+  `page.rs` only: `frame_document_isolation` drops the delegated
+  cross-origin branch, three page.rs tests rewritten, one e2e added). Scoped
+  suites ran instead of the full gate: `cargo nextest run --release
+  --features render -p obscura-js -p obscura-browser --no-fail-fast --config
+  vendor/v8-source.toml` = 869/869, `cargo check -p obscura-js -p obscura-cli
+  --no-default-features --config vendor/v8-source.toml` (clean). The exact
+  release build ran. Does not touch feature gates, build config, or
+  unsafe/FFI. Full gate still mandatory before push.
+
 - 2026-09-24: working tree, `crates/obscura-net` header order and set
   (`chrome_headers.rs` plus the three build sites in `client.rs` /
   `wreq_client.rs`; tests only elsewhere). No commit yet. Scoped suites ran
