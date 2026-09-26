@@ -31,7 +31,7 @@ function registerNavigationSurface() {
     // Entries are minted per navigation, long after the finalize sweeps, so
     // each fresh instance carries its own getState/addEventListener/
     // removeEventListener functions and must be marked at construction.
-    return _markNativeObject({
+    const entry = _markNativeObject({
       id: key,
       key,
       index: Math.max(0, history.length - 1),
@@ -41,6 +41,14 @@ function registerNavigationSurface() {
       addEventListener() {},
       removeEventListener() {},
     });
+    // Brand where the object is minted: a one-time pass over
+    // navigation.currentEntry would miss every entry created after it. Chrome
+    // 153 answers Object.prototype.toString.call(navigation.currentEntry)
+    // with [object NavigationHistoryEntry] (2026-09-26 oracle); a bare
+    // namespace object answers [object Object].
+    Object.defineProperty(entry, Symbol.toStringTag,
+      { value: 'NavigationHistoryEntry', configurable: true });
+    return entry;
   };
   let entry = makeEntry();
   const changed = (from) => {

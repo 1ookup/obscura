@@ -86,7 +86,13 @@ var Document = _swappableInterface('Document', class extends Node {
   }
   get featurePolicy() {
     if (!_documentFeaturePolicies.has(this)) {
-      _documentFeaturePolicies.set(this, new FeaturePolicy(_featurePolicyKey, this));
+      // Chrome 153 brands this object PermissionsPolicy, not FeaturePolicy --
+      // Object.prototype.toString.call(document.featurePolicy) answers
+      // [object PermissionsPolicy] there (2026-09-26 oracle), and the iframe
+      // wrapper below already minted the PermissionsPolicy class. The global
+      // FeaturePolicy shell stays for the interface surface.
+      _documentFeaturePolicies.set(this,
+        new PermissionsPolicy(_permissionsPolicyKey, this));
     }
     return _documentFeaturePolicies.get(this);
   }

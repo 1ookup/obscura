@@ -128,6 +128,41 @@
   }
 })();
 
+// Namespace singletons the engine builds as plain JS objects. Without a tag
+// they answer String(obj)/Object.prototype.toString.call(obj) with
+// "[object Object]" where Chrome answers the interface name -- a challenge
+// probe reads both forms, and the 0926 payload diff pinned eight of these on
+// the same line. Chrome 153 oracle (2026-09-26): caches -> CacheStorage,
+// CSS -> CSS, the WebGPU enum namespaces -> their own names,
+// navigation.currentEntry -> NavigationHistoryEntry (branded where it is
+// minted, env/navigation/navigation.js) and performance.navigation ->
+// PerformanceNavigation. Descriptor shape is Chrome's own for the ones that
+// carry an own tag there (CSS and the GPU namespaces): non-writable,
+// non-enumerable, configurable. caches gets its tag on CacheStorage.prototype
+// in Chrome, which a plain namespace object cannot reproduce, so it lands as
+// an own symbol here -- symbols are invisible to getOwnPropertyNames,
+// for-in and JSON, so the enumerable own-name census does not move.
+(function _brandSingletonNamespaces() {
+  const brand = (object, tag) => {
+    if (!object || (typeof object !== 'object' && typeof object !== 'function')) return;
+    if (Object.prototype.hasOwnProperty.call(object, Symbol.toStringTag)) return;
+    try {
+      Object.defineProperty(object, Symbol.toStringTag, {
+        value: tag, writable: false, enumerable: false, configurable: true,
+      });
+    } catch (_error) {}
+  };
+  brand(globalThis.caches, 'CacheStorage');
+  brand(globalThis.CSS, 'CSS');
+  brand(globalThis.GPUBufferUsage, 'GPUBufferUsage');
+  brand(globalThis.GPUColorWrite, 'GPUColorWrite');
+  brand(globalThis.GPUMapMode, 'GPUMapMode');
+  brand(globalThis.GPUShaderStage, 'GPUShaderStage');
+  brand(globalThis.GPUTextureUsage, 'GPUTextureUsage');
+  brand(globalThis.performance && globalThis.performance.navigation,
+    'PerformanceNavigation');
+})();
+
 // Per-element [object XXX] tags. Every DOM element here is an instance of the
 // single Element class, so the interface-table brand would answer the generic
 // "Element" for a <div>. Chrome answers the concrete interface name, computed
@@ -493,7 +528,7 @@ function _obscuraMarkSurfaceNative(filterToPristine) {
   // Namespace and instance objects sitting on the global are as page-visible
   // as the constructors: WebAssembly.instantiateStreaming, CSS.supports,
   // console.error, navigation.*, caches.*, indexedDB.*, visualViewport.*,
-  // speechSynthesis.*, chrome.runtime.*, document.implementation.*, the
+  // speechSynthesis.*, chrome.app.*, document.implementation.*, the
   // Location accessors, screen/navigator sub-objects all used to answer
   // toString with bootstrap source. Walk them depth- and node-bounded with
   // cycle protection (window === window.window). Reading an accessor here

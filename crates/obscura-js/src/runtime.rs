@@ -5986,7 +5986,8 @@ mod tests {
                     documentObjects: {
                         registry: document.customElementRegistry === customElements,
                         policy: [Object.prototype.toString.call(document.featurePolicy),
-                            Object.getOwnPropertyNames(FeaturePolicy.prototype).sort(),
+                            Object.getOwnPropertyNames(
+                                Object.getPrototypeOf(document.featurePolicy)).sort(),
                             document.featurePolicy.allowsFeature('geolocation'),
                             document.featurePolicy.getAllowlistForFeature('geolocation')],
                         fragment: [Object.prototype.toString.call(document.fragmentDirective),
@@ -6027,7 +6028,7 @@ mod tests {
                 },
                 "documentObjects": {
                     "registry": true,
-                    "policy": ["[object FeaturePolicy]",
+                    "policy": ["[object PermissionsPolicy]",
                         ["allowedFeatures", "allowsFeature", "constructor", "features",
                             "getAllowlistForFeature"], true, ["http://example.com"]],
                     "fragment": ["[object FragmentDirective]", [], ["constructor"]],
@@ -34111,5 +34112,86 @@ RequestRedirect value",
         assert_eq!(value["values"], serde_json::json!(["", "from text"]));
         assert_eq!(value["selected"], "");
         assert_eq!(value["selectText"], "from text");
+    }
+
+    #[test]
+    fn singleton_namespaces_carry_their_chrome_to_string_tags() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const tag = value => Object.prototype.toString.call(value);
+                    const tagDescriptor = value => {
+                        const d = Object.getOwnPropertyDescriptor(value, Symbol.toStringTag);
+                        return d ? [d.writable, d.enumerable, d.configurable] : null;
+                    };
+                    return JSON.stringify({
+                        tags: {
+                            caches: tag(caches),
+                            css: tag(CSS),
+                            gpuBufferUsage: tag(GPUBufferUsage),
+                            gpuColorWrite: tag(GPUColorWrite),
+                            gpuMapMode: tag(GPUMapMode),
+                            gpuShaderStage: tag(GPUShaderStage),
+                            gpuTextureUsage: tag(GPUTextureUsage),
+                            navigationEntry: tag(navigation.currentEntry),
+                            performanceNavigation: tag(performance.navigation),
+                            featurePolicy: tag(document.featurePolicy),
+                        },
+                        stringForms: {
+                            caches: String(caches),
+                            css: String(CSS),
+                            gpuShaderStage: String(GPUShaderStage),
+                        },
+                        cssDescriptor: tagDescriptor(CSS),
+                        ownNamesUnchanged: {
+                            caches: Object.getOwnPropertyNames(caches).length,
+                            css: Object.getOwnPropertyNames(CSS).length,
+                        },
+                        gpuConstantsKept: [
+                            GPUBufferUsage.MAP_READ, GPUColorWrite.ALL,
+                            GPUMapMode.READ, GPUShaderStage.COMPUTE,
+                            GPUTextureUsage.RENDER_ATTACHMENT,
+                        ],
+                        entryStillLive: typeof navigation.currentEntry.getState,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value["tags"],
+            serde_json::json!({
+                "caches": "[object CacheStorage]",
+                "css": "[object CSS]",
+                "gpuBufferUsage": "[object GPUBufferUsage]",
+                "gpuColorWrite": "[object GPUColorWrite]",
+                "gpuMapMode": "[object GPUMapMode]",
+                "gpuShaderStage": "[object GPUShaderStage]",
+                "gpuTextureUsage": "[object GPUTextureUsage]",
+                "navigationEntry": "[object NavigationHistoryEntry]",
+                "performanceNavigation": "[object PerformanceNavigation]",
+                "featurePolicy": "[object PermissionsPolicy]",
+            })
+        );
+        // The string form is what the payload actually concatenates.
+        assert_eq!(
+            value["stringForms"],
+            serde_json::json!({
+                "caches": "[object CacheStorage]",
+                "css": "[object CSS]",
+                "gpuShaderStage": "[object GPUShaderStage]",
+            })
+        );
+        // Descriptor shape follows Chrome's own tags: non-writable,
+        // non-enumerable, configurable.
+        assert_eq!(value["cssDescriptor"], serde_json::json!([false, false, true]));
+        // Branding must not add enumerable own names to the namespace objects.
+        assert_eq!(value["ownNamesUnchanged"]["caches"], 5);
+        assert_eq!(value["ownNamesUnchanged"]["css"], 3);
+        assert_eq!(
+            value["gpuConstantsKept"],
+            serde_json::json!([1, 15, 1, 4, 16])
+        );
     }
 }
