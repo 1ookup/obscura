@@ -9707,6 +9707,11 @@ mod tests {
             page.evaluate("typeof Deno + '/' + ('Deno' in window)"),
             serde_json::json!("undefined/false")
         );
+        // deno_core's second carrier is gone from the same realms.
+        assert_eq!(
+            page.evaluate("typeof __bootstrap + '/' + ('__bootstrap' in window)"),
+            serde_json::json!("undefined/false")
+        );
 
         // Same-origin child realm, reached the way a fingerprinter reaches it.
         page.evaluate(
@@ -9721,10 +9726,12 @@ mod tests {
             page.evaluate(
                 r#"(() => {
                     const win = document.querySelector('iframe').contentWindow;
-                    return win.eval("typeof Deno + '/' + ('Deno' in globalThis)");
+                    return win.eval(
+                        "typeof Deno + '/' + ('Deno' in globalThis) + '/' + typeof __bootstrap",
+                    );
                 })()"#,
             ),
-            serde_json::json!("undefined/false")
+            serde_json::json!("undefined/false/undefined")
         );
 
         // The engine's own shim route still lands in the op table.

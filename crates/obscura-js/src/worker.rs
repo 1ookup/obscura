@@ -1795,8 +1795,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (val && typeof val === 'object') scan(val, 1);
     }
     // Engine carriers the reflection filter hides from enumeration but a
-    // script can still read directly. Same rule as the window realm.
-    var carriers = ['__bootstrap', 'Deno'];
+    // script can still read directly. `__bootstrap` is gone from the global
+    // before this prep runs, so only the namespace -- which this prep captured
+    // into its own scope at the top and which the host binds for the duration
+    // of the prep -- is left to walk. Same rule as the window realm.
+    var carriers = ['Deno'];
     for (var c = 0; c < carriers.length; c++) {
       var carrier;
       try { carrier = G[carriers[c]]; } catch (e) { continue; }
@@ -2181,7 +2184,9 @@ mod tests {
             r#"
             const src = "postMessage({ typeofDeno: typeof Deno," +
               "inSelf: 'Deno' in globalThis," +
-              "own: Object.prototype.hasOwnProperty.call(globalThis, 'Deno') });";
+              "own: Object.prototype.hasOwnProperty.call(globalThis, 'Deno')," +
+              "typeofCarrier: typeof __bootstrap," +
+              "carrierIn: '__bootstrap' in globalThis });";
             const url = 'data:text/javascript,' + encodeURIComponent(src);
             globalThis.__got = [];
             new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
@@ -2191,7 +2196,9 @@ mod tests {
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         assert_eq!(
             rt.evaluate("JSON.stringify(__got[0])").unwrap(),
-            serde_json::json!(r#"{"typeofDeno":"undefined","inSelf":false,"own":false}"#),
+            serde_json::json!(
+                r#"{"typeofDeno":"undefined","inSelf":false,"own":false,"typeofCarrier":"undefined","carrierIn":false}"#
+            ),
         );
         // The page realm answers the same.
         assert_eq!(

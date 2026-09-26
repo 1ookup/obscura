@@ -7,17 +7,25 @@ run covers are then removed.
 
 ## Pending
 
-- 2026-09-27: working tree, `Deno` removal from the page/worker-visible global
-  surface (bootstrap prologue capture, runtime internal namespace channel,
-  realm/worker/CDP migration, regression tests in three realms). Scoped
-  suites ran and then the FULL gate ran on the same tree: `cargo nextest run
-  --release --no-fail-fast --features render --config vendor/v8-source.toml`
-  = 1999/1999 (4 skipped), `cargo check -p obscura-js -p obscura-cli
-  --no-default-features --config vendor/v8-source.toml` (clean). Exact
-  release build ran, plus live three-realm and CDP probes. Does not touch
-  feature gates, build config, or unsafe/FFI. Obstacle course still
-  outstanding (the `obscura-benchmark` companion repo is absent on this
-  host); full gate still mandatory before push.
+- 2026-09-27: working tree, `__bootstrap` (deno_core's primordials carrier)
+  removed from the page/worker-visible global on top of the `Deno` removal
+  committed as `d544a99`. Bootstrap-prologue delete, no internal readers
+  (verified: the deno_core builtins destructure primordials at load time,
+  `mod.js` never runs because the extension declares ops only), worker native
+  sweep and webidl-branding surface lists updated, regression tests extended
+  (three realms + a raw property-table walk that bypasses the reflection
+  filter). Scoped suites: `-p obscura-js` 734 tests, `-p obscura-cdp` +
+  `-p obscura-browser` 319/319, then the FULL gate on the same tree:
+  `cargo nextest run --release --no-fail-fast --features render --config
+  vendor/v8-source.toml` = **2000/2000** (4 skipped),
+  `cargo check -p obscura-js -p obscura-cli --no-default-features --config
+  vendor/v8-source.toml` (clean). Exact release build ran, plus live
+  three-realm and CDP probes. Two worker/timer ordering tests flaked under
+  full-suite parallel load in one run and pass standalone; the same flake
+  reproduces on committed HEAD `d544a99` with this change stashed, so it is
+  pre-existing. Does not touch feature gates, build config, or unsafe/FFI.
+  Obstacle course still outstanding (the `obscura-benchmark` companion repo
+  is absent on this host); full gate still mandatory before push.
 
 - 2026-09-24: working tree, `crates/obscura-net` header order and set
   (`chrome_headers.rs` plus the three build sites in `client.rs` /

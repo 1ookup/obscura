@@ -594,8 +594,12 @@ function _obscuraMarkSurfaceNative(filterToPristine) {
       'chrome', 'speechSynthesis', 'console', 'performance', 'crypto',
       'screen', 'history', 'scheduler', 'customElements', 'cookieStore',
       'styleMedia', 'external', 'trustedTypes', 'localStorage',
-      'sessionStorage', 'location', 'document', 'navigator', 'Deno',
-      '__bootstrap',
+      'sessionStorage', 'location', 'document', 'navigator',
+      // 'Deno' and '__bootstrap' left this list: both engine carriers are off
+      // the global before this file runs (the bootstrap's own prologue), so
+      // `known()` skips them anyway. Deno.core's members stay marked through
+      // the runtime namespace walk in page-init (the same object the carrier
+      // exposed).
     ];
     for (const name of allSurfaces) {
       if (!known(name)) continue;

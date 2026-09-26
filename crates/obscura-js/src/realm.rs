@@ -2394,6 +2394,7 @@ fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String
 mod tests {
     use super::{rewrite_frame_dynamic_imports, FrameModuleCsp, MAIN_WORLD};
     use crate::runtime::ObscuraJsRuntime;
+    use deno_core::v8;
     use obscura_dom::parse_html;
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
@@ -2646,6 +2647,68 @@ mod tests {
     /// deleted before any page script runs -- here, in a same-origin frame
     /// realm and in a cross-origin one, the shape the challenge payload's
     /// `in`/`typeof` probes read.
+    /// The reflection-API filter hides engine names from
+    /// `Object.getOwnPropertyNames`, which is exactly why an `in` probe (which
+    /// cannot be intercepted) is the one that matters: it reads the property
+    /// table directly. This walks that table through the V8 API, past the
+    /// filter, and pins the two deno_core carriers a page must never find --
+    /// it fails with the offending names if one ever comes back.
+    #[test]
+    fn raw_global_own_keys_expose_no_engine_carriers() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
+        let mut all = Vec::new();
+        {
+            let main_context = rt.deno_runtime_mut().main_context();
+            let scope = &mut rt.deno_runtime_mut().handle_scope();
+            let context = v8::Local::new(scope, &main_context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            let args = v8::GetPropertyNamesArgs {
+                mode: v8::KeyCollectionMode::OwnOnly,
+                property_filter: v8::PropertyFilter::ALL_PROPERTIES
+                    | v8::PropertyFilter::SKIP_SYMBOLS,
+                index_filter: v8::IndexFilter::SkipIndices,
+                key_conversion: v8::KeyConversionMode::ConvertToString,
+            };
+            let names = global
+                .get_property_names(scope, args)
+                .expect("global own property names");
+            for i in 0..names.length() {
+                let name = names
+                    .get_index(scope, i)
+                    .and_then(|value| value.try_cast::<v8::String>().ok())
+                    .map(|value| value.to_rust_string_lossy(scope))
+                    .unwrap_or_default();
+                all.push(name);
+            }
+        }
+        let carriers: Vec<&String> = all
+            .iter()
+            .filter(|name| *name == "Deno" || *name == "__bootstrap" || *name == "__infra")
+            .collect();
+        assert!(
+            carriers.is_empty(),
+            "engine carriers reachable through the property table: {carriers:?}"
+        );
+        // A restored frame realm answers the same. Template realms never
+        // carried the primordials stash in the first place.
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        assert!(rt
+            .ensure_frame_realm("frame-carrier", 1, root, "http://example.com/frame")
+            .unwrap());
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-carrier",
+                1,
+                MAIN_WORLD,
+                "<carrier-probe>",
+                "['Deno', '__bootstrap'].filter(n => n in globalThis)",
+            )
+            .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
     #[test]
     fn deno_is_absent_from_page_and_frame_realms() {
         let mut rt = setup_runtime(
@@ -2653,12 +2716,15 @@ mod tests {
         );
         let probe = "({ typeofDeno: typeof Deno, inWindow: 'Deno' in globalThis, \
 own: Object.prototype.hasOwnProperty.call(globalThis, 'Deno'), \
-enumerated: Object.keys(globalThis).indexOf('Deno') !== -1 })";
+enumerated: Object.keys(globalThis).indexOf('Deno') !== -1, \
+typeofCarrier: typeof __bootstrap, carrierIn: '__bootstrap' in globalThis })";
         let hidden = serde_json::json!({
             "typeofDeno": "undefined",
             "inWindow": false,
             "own": false,
             "enumerated": false,
+            "typeofCarrier": "undefined",
+            "carrierIn": false,
         });
 
         // Main realm.

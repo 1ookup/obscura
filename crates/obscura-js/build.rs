@@ -73,6 +73,15 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
          \x20 delete globalThis[Symbol.for('obscura.internalNamespace')];\n\
          }\n",
     );
+    // deno_core leaves a second carrier on the global: `__bootstrap`, where
+    // 00_primordials/00_infra/01_core stash primordials, infra and internals
+    // while the builtins load. Chrome has no such global, and nothing reads it
+    // afterwards -- the deno_core builtins destructure their primordials at
+    // load time, `mod.js` (its only later reader) never runs because this
+    // extension declares ops only, and no bootstrap module touches it. So
+    // unlike `Deno` there is no capture: the carrier simply leaves the realm
+    // before page script runs, in every realm that executes this bootstrap.
+    source.push_str("delete globalThis.__bootstrap;\n");
     if timing {
         source.push_str(
             "var __obscura_btLast = Date.now();\n\
