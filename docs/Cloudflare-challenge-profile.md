@@ -1797,3 +1797,103 @@ widget  Image     [accept, referer, sec-ch-ua*, user-agent]
 **未定**：`cf_chl_rc_ni` 的下发**时机**。单次导航（不点击）不落 jar，且 Obscura 的 CDP 不实现 `Network.getAllCookies`
 （恒返回 0），所以暂时无法在轮内分时刻观察。**若能确定它是在第一个 403 就下发**，则说明 CF 在**边缘一次**就判定了；
 若在流程末段，则是失败的下游标记。这个区分对"判据在哪一层"很关键。
+
+### Step 355：当前二进制 + `:9000`（Reqable，已恢复）+ 指定身份跑满 3 轮点击 + 1 轮不点击对照，
+tracelog 覆盖全流程（1736 条 / 6 个 VM 生命周期），`cf_chl_rc_ni` 独立复现；并补一条自己踩到的测量盲区（2026-09-25）
+
+**背景**：§354.52 记录 `:9000` 卡死、改走 `:8080`。本轮开始时**两台都换了状态**（复测：`:9000` → `200`，
+`:8080` → `502`），故按用户指定改回 `:9000`。这是环境事实，不是代码差异。
+
+**方法**（全部可复跑）：
+
+```bash
+REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36'
+FP='{"language":"zh-CN","languages":["zh-CN","zh"],"hardwareConcurrency":6,
+     "screen":{"width":1440,"height":900,"availWidth":1440,"availHeight":900,"deviceScaleFactor":1}}'
+OBSCURA_INSECURE_TLS=1 RUST_LOG=obscura_js=debug,obscura=info \
+./target/release/obscura --tracelog-file "$RUN/tracelog.jsonl" \
+  serve --port 9265 --proxy http://192.168.3.57:9000 --stealth \
+  --user-agent "$REF_UA" --fingerprint "$FP" --storage-dir "$RUN/storage"
+python3 .claude/skills/obscura-challenge-probe/scripts/cdp_click_clean.py \
+  https://www.thelancet.com/1.txt --port 9265 --deadline 42 --settle 20 --click-after 10
+```
+
+`--fingerprint` 里的 `languages` **必须显式写成两项**：只给 `"language":"zh-CN"` 时 realm 回读得到
+`["zh-CN"]`（单元素），而 §354.54 ④ 已测出单元素是 0/5 的失败形态。显式给 `["zh-CN","zh"]` 后回读一致。
+
+**① 二进制自查通过**：`RUST_LOG=info ... serve --stealth` 打印
+`Stealth mode enabled (TLS fingerprint impersonation + tracker blocking)`（不是仅 `(tracker blocking)`）。
+
+**② 三轮点击轮：3/3 仍未通过。**
+
+| 轮 | 点击 | 终态 | `title` |
+|---|---|---|---|
+| 1 | t=12s，box=(192,280,300,65) → (216,313) | 停在挑战 | `请稍候…` |
+| 2 | t=10s，同一 box | 停在挑战 | `请稍候…` |
+| 3 | t=10s，同一 box | 停在挑战 | `请稍候…` |
+
+点击走 `cdp_click_clean.py`：**零页面注入**，用 `DOM.getDocument(pierce=true)` 穿 closed shadow root
+找到 widget iframe、`DOM.getBoxModel` 取框、`Input.dispatchMouseEvent` 下发（`isTrusted=true`）。
+三轮日志都有 `widget box=… -> click at (216,313)`，点击确实下发。
+
+**③ 一轮不点击对照（`--click-after 999`）结局相同**：同样是 `b/fo#1 → g/fo#1 → pat(401) → g/fo#2`
+三次 POST 后停住。⇒ 仅凭这 4 个样本，**点击不改变结局**；这与 §B5「点击时机不是 Obscura 的 blocker」一致，
+不是新证据。**该对照是单侧证据**：轮末 WebSocket 被服务端 1011 关闭，`document.title` 没取到。
+
+**④ 请求序列（点击轮，服务端日志，`op_fetch_url` / `stealth_fetch`，时刻为轮内相对值）**：
+
+```
++0.9s  GET  .../h/b/orchestrate/chl_page/v1?ray=…                  -> 200 (246136 B)
++1.2s  GET  challenges.cloudflare.com/turnstile/v0/b/…/api.js      -> 200 (85104 B)
++1.3s  POST www.thelancet.com/…/h/b/fo/3650149894:…                 -> 200 (106876 B)   # b/fo#1
++16.4s POST challenges.cloudflare.com/…/h/g/fo/3941058214:…         -> 200 (845884 B)   # g/fo#1
++18.2s GET  …/h/g/pat/a408624fef70d0a1/…                            -> 401 (1 B)
++18.2s GET  brunhild.challenges.cloudflare.com/…/h/g/i/…            -> 失败
++18.2s GET  …/h/g/ci/a408624fef70d0a1/…                             # Image() 路径
++22.5s POST challenges.cloudflare.com/…/h/g/fo/3941058214:…         -> 200 (127240 B)   # g/fo#2
+```
+
+轮 2 走到 6 次 POST（多出 `g/fo#3`、`b/fo#2`），并在 `[Cloudflare Turnstile] Cannot find Widget …` 之后
+由**页面自己**再导航一轮（服务端日志里 `Page.navigate (id=0)`，与客户端发起的 `id=6` 可区分）。
+与「被拒后重开一轮」的既有形态一致。
+
+**⑤ tracelog：1736 条 / 6 个 VM 生命周期 / 10.0 MB（覆盖全流程）。**
+本轮上游注入的是 **`vmp.deobf.0925`** 这一支（不是 `ov2.*`），键只有两个：
+`vmp.deobf.0925.new`（VM 程序加载）与 `vmp.deobf.0925.exec`（执行轨迹，占 99.7% 字节）。
+
+| 轮 | `.exec` 条数 | 程序 `(run, bc)` |
+|---|---|---|
+| 1 | 126 | (1, 6944) (2, 634412) (3, 95428) |
+| 2 | 122 | (1, 6944) (2, 617180) (3, 95424) **(4, 3868)** |
+| 3 | 123 | (1, 6944) (2, 617152) (3, 95428) |
+| 4 | 126 | (1, 6944) (2, 634460) (3, 95424) **(4, 3924)** |
+| 5 | 120 | (1, 6944) (2, 617120) (3, 95428) |
+| 6 | 1099 | (1, 6944) (2, 617244) (3, 95428) |
+
+`run=1` 恒为 `bc=6944`；`run=2` 在 617k/634k 两档之间摆动；**`run=4` 只在两轮出现**
+（`bc=3868/3924`、`a0=0/a1=135`），与 §C4 记的「Obscura 多出的 run 4」同形。
+轮 6 的 1099 条比其他轮高一个量级，成因未查（对应页面自我重开后的那一段）。
+
+**⑥ 判决复核：`cf_chl_rc_ni = 1` 出现 ⇒ 失败。** §354.56 的 oracle 本轮独立复现：
+
+| cookie | 域 | 长度 | expires |
+|---|---|---|---|
+| `cf_clearance` | `cloudflare.com` | 831 | 1821858184（一年期） |
+| `cf_clearance` | `thelancet.com` | **597** | 1821858184 |
+| **`cf_chl_rc_ni`** | `www.thelancet.com` | `1` | 1790325784（+1h） |
+
+`cf_clearance`@`thelancet.com` 长度 **597** 与 §354.56 记的两侧同值一致 ⇒ 仍然只有 `cf_chl_rc_ni` 有判别力。
+
+**⑦ 测量盲区（本轮自己踩到，应进表）**：**`--storage-dir/cookies.json` 不是实时落盘的。**
+轮中途读它得到 `[]`，据此一度写成「本轮一条 cookie 都没有、拿不到 oracle」；实际是
+**页关闭/进程退出时才写**。同一份数据在 `serve` 退出后读就拿到上面那张表。
+⇒ cookie 相关结论**只能在轮结束、进程退出之后读**；轮内取样要么走 CDP `Network.getCookies`
+（本引擎未实现 `getAllCookies`），要么不取样。
+
+**⑧ 另记一条**：对同一 URL 走 `fetch --dump cookies`，单次导航（不点击）结束时 jar 为 `[]`。
+`curl -x :9000` 显示首个 403 响应**根本没有任何 `set-cookie`**（只有 `cf-mitigated: challenge`），
+所以这一格是预期行为，不是缺陷。
+
+**结论**：本轮把「出口是 `:9000`、身份是 macOS Chrome 153 + `["zh-CN","zh"]`、点击确实下发」
+三条前提固定下来，结局仍是失败；`cf_chl_rc_ni=1` 与 §354.56 一致。**未产生新的判据候选**，
+§C1「剩余判据在哪」仍未决。
