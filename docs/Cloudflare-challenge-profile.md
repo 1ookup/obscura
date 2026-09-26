@@ -1897,3 +1897,80 @@ python3 .claude/skills/obscura-challenge-probe/scripts/cdp_click_clean.py \
 **结论**：本轮把「出口是 `:9000`、身份是 macOS Chrome 153 + `["zh-CN","zh"]`、点击确实下发」
 三条前提固定下来，结局仍是失败；`cf_chl_rc_ni=1` 与 §354.56 一致。**未产生新的判据候选**，
 §C1「剩余判据在哪」仍未决。
+
+### Step 356：payload 明文对拍通道打通（零解密）+ 首张 0926 代分岔清单，`aQgx8` 协议级残留与 7 项 P0 实锤（2026-09-26）
+
+**背景**：远程（`ssh l9h8@192.168.3.57`）的 ov2 研究线当天完成了 payloadJSON 逐 key 反推
+（`ov2-0926-01-payload-{genchain,key-taxonomy,annotated}.md`，91 键全量语义表）。其注入链
+（`:9000` Reqable → `:8080` mitmdump，`ov2_inject_enabled=true`，在线插桩件 md5 `37d5bf8b`）
+把**打满插桩的 ov2.js** 发给任何客户端，widget 里的 CF 脚本会把完整 payloadJSON 明文
+`console.log` 出来。obscura 的 `--tracelog-file` 通道直接接到它——**不需要解密请求体**。
+
+**方法**（全部可复跑，30s 预算）：
+
+```bash
+RUN=/tmp/cf-goal-0926/run-b1
+OBSCURA_INSECURE_TLS=1 OBSCURA_CAPTURE_FO=$RUN/fo RUST_LOG=obscura=info \
+./target/release/obscura --tracelog-file $RUN/tracelog.jsonl \
+  serve --port 9351 --proxy http://192.168.3.57:9000 --stealth \
+  --user-agent "$REF_UA" --fingerprint "$FP" --storage-dir $RUN/storage
+python3 .claude/skills/obscura-challenge-probe/scripts/cdp_click_clean.py \
+  https://www.thelancet.com/1.txt --port 9351 --click-after 16 --deadline 30 --settle 12
+# tracelog.jsonl 里 k=="payloadJSON" 的 v 即三段 beacon 的完整明文 JSON
+```
+
+参考件：远程 `/tmp/goal/fo{1,2,3}-payloadjson.json`（r1 会话，终端 success/token 837）+
+当晚 21:25 的 `~/chrome-profile/Default/tracelog/trace.jsonl`（2-run 短流程）。
+对拍脚本与台账：本机 `/tmp/cf-goal-0926/`（DIVERGENCE.md、family-diff.txt、elem-diff.txt）。
+
+**① 判决**：`cf_chl_rc_ni=1`，失败（基线复现）。轮内 3 次 `/fo/` 完成（2370B 页面层、
+4716B→822684B、88631B→127232B），第 4 次（TS#3）在 30s 截止时在途。
+
+**② 结构面对拍（fo1/fo2/fo3 顶层）**：
+
+| 层 | 我方 | 参考 r1 | 判定 |
+|---|---|---|---|
+| fo1 | 47 键 | 47 键 | 键集合+顺序全等；`WzICl1=false`、`aQgx8=0`（位置 17）双侧一致 |
+| fo2 | **92 键**/38 块 | **91 键**/38 块 | 差一个 `aQgx8`；其余键顺序一致；内容键族 35/35 匹配 |
+| fo3 | **94 键**/39 块 | **93 键**/39 块 | 同上，差 `aQgx8` |
+
+块序逐会话重排（genchain 已定案：块身份=键族指纹），骨架代数
+`hCfV6 == TPpkV4 - Vtvy6` 双侧 0 违例、Vtvy6 严格单调。**无缺失的测量族。**
+
+**③ P0（协议/形态级，确定性）**：
+
+1. **`aQgx8`**：参考侧它是 fo1-only 键（fo2 起被删除，序列化省略）；我方 fo2/fo3 残留且
+   `=1`（位置 87/88）。CF 按位消费 payload 字段（payload-construction §5.1），多一个序列化键
+   会把后续键整体后移——协议级分岔，当前最优先候选。
+2. **`OjmeV1[118]`**：我方 `"EBlFw4[object Object]"` vs 参考 `"EBlFw4611"`——§C3 悬案的
+   root cause 浮出：拼接值我方是对象、参考是 `611`。
+3. **`OjmeV1[79]`**：~120 项布尔探针唯一翻转项（true vs false）。
+4. **widget frame `document.referrer`**：`RotPR2` 我方 `""` vs 参考 `https://www.thelancet.com/`；
+   census 的 `d.referrer` 我方落 widget-URL 桶。10.3 时代已知缺口，仍在。
+5. **widget frame `crossOriginIsolated=true`**（census 桶T 我方含 `o.crossOriginIsolated`，
+   参考不含）——step 53 只修了顶层，frame realm 未覆盖/回归；连带桶N 多出
+   `o.SharedArrayBuffer`。
+6. **`when` 属性**：参考 census 桶N 有 `when`/`d.when`/`so.when`/`s.when`，我方全无。
+7. **`Pdbt7`（performance entries）**：参考 13 条 vs 我方 6 条；参考 6 条无字段条目
+   `{"nPmE7":"Lcfc8"}` 我方全缺，另缺 initiatorType=link 资源条。
+
+**④ P1/P2**（详见对拍台账）：storage.estimate 组 `ryJGE4:null`、WebRTC `XqEQ3[3]` 应 null、
+video codec 表多项、`xWWV8` 激励-响应我方恒定（参考第 10 位起随机化）、`SbVZ3` 少尾部 12 项、
+blk24 哈希原像（参考 `kRQwh3=sha256("0")`）、HPcn5 字体度量缺 float32 化+1px、WebGPU
+`architecture` 我方 `metal-3` vs 参考 `""` + limits 38 vs 37 + powerPreference、
+`maNnU6` widget 查询日志分岔（`option`×5 vs `script[nonce]`）、`DqomM2` 2 项 1-ULP、
+`jyDXx2` 缺 float32 舍入、**`uGyjw9` 我方 315 vs 参考 7（当晚 Chrome=6，跨会话最稳）**。
+
+**⑤ VM/worker 层**：`slot.snap`（Chrome 3 条/我方 0）**排除**——是远程 r20 诊断钩子，
+当前在线件已无该串。worker blob 复用我方 [1,3,6] 在 0916 史料包络内。
+**§C4 再审**：0916 HAR 显示 Chrome 收到第三段响应（7164→4029B 字节码）并执行出 token，
+但 r1 Chrome trace 无第 4 个 `.new` ⇒ 「run4 仅我方」很可能是 Chrome 侧插桩盲区，
+**在核实前不得把 run4 当我方异常修**。
+
+**⑥ 当晚 Chrome 交叉验证**：其 payload#2 同为 92 键/39 块；顶层 DOM 走查同为
+`main`/无 dir（两个 Chrome 会话一致，我方一致拿到 div+dir 变体）——插页变体差是
+**稳定的客户端相关差**；`NnqX6`/`myWtu3` 会话浮动大，单独不构成分岔；Chrome 自身
+payload#3 形态也逐会话变（93 键 vs 4 键），flow-shape 不是判据（B10 一致）。
+
+**⑦ 下一步**：4 路验证 agent 并行定位（census/探针原像/事件流/DOM 走查），定位后按文件
+分批修复+回归测试+commit，再以同一 30s 形态复跑判决。
