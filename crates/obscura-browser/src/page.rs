@@ -6358,11 +6358,26 @@ impl Page {
             .as_deref()
             .and_then(obscura_net::ReferrerPolicy::parse)
             .unwrap_or_else(|| obscura_net::ReferrerPolicy::parse(&parent_policy).unwrap_or_default());
-        let inherited_referrer = request.referrer.clone().or_else(|| {
-            self.frame_ancestor_chain(frame_id)
-                .first()
-                .map(|(url, _)| url.clone())
-        });
+        // An upstream that hands us the empty string means "no referrer of its
+        // own", not a referrer that is the empty string. CDP clients send
+        // `referrer: ""` for exactly that, and letting `or_else` treat it as a
+        // value short-circuited the ancestor fallback: a cross-origin child
+        // frame then reported `document.referrer === ""` where Chrome reports
+        // the embedding document.
+        let inherited_referrer = request
+            .referrer
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let chain = self.frame_ancestor_chain(frame_id);
+                if chain.is_empty() {
+                    tracing::warn!(
+                        frame_id,
+                        "frame navigation has no ancestor chain and no referrer of its own; document.referrer will be empty"
+                    );
+                }
+                chain.first().map(|(url, _)| url.clone())
+            });
         let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
         let ancestors = self.frame_ancestor_chain(frame_id);
 
@@ -8658,6 +8673,110 @@ mod tests {
         assert_ne!(
             child_referrer, serde_json::json!(expected_default),
             "the old origin floor produced a value Chrome never reports here",
+        );
+    }
+
+    /// A CDP client that does not have a referrer to offer sends
+    /// `referrer: ""`, which is "none" rather than a value. An empty string
+    /// used to satisfy the `or_else` that falls back to the frame's ancestor
+    /// chain, so a cross-origin child -- a payment widget inside a closed
+    /// shadow root, say -- reported `document.referrer === ""` where Chrome
+    /// reports the embedding document's origin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_referrer_from_the_client_still_falls_back_to_the_ancestor_chain() {
+        let parent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_origin = format!("http://{}", child_listener.local_addr().unwrap());
+        let parent_body = format!(
+            "<!doctype html><div id=host></div><script>\
+             const frame = document.createElement('iframe');\
+             frame.src = '{child_origin}/widget';\
+             document.getElementById('host').attachShadow({{mode:'closed'}}).appendChild(frame);\
+             </script>"
+        );
+        let parent_origin = format!("http://{}", parent_listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            std::thread::spawn(move || {
+                for _ in 0..3 {
+                    let Ok((mut stream, _)) = child_listener.accept() else { break };
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let body = "<!doctype html><p>widget</p>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = parent_listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{parent_body}",
+                    parent_body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-referrer-empty".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-referrer-empty".to_string(), context);
+        page.navigate(&format!("{parent_origin}/main")).await.unwrap();
+        page.load_child_frames().await;
+
+        let child_id = page
+            .frames
+            .get(page.frames.main_frame_id())
+            .unwrap()
+            .children[0]
+            .clone();
+        let referrer_of = |page: &mut super::Page| {
+            let generation = page.frames.get(&child_id).unwrap().document_generation;
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_realm(
+                    &child_id,
+                    generation,
+                    "<empty-referrer-probe>",
+                    "document.referrer",
+                )
+                .unwrap()
+        };
+        // The load the embedder drove carries no referrer of its own: the
+        // ancestor chain is what fills it in.
+        assert_eq!(
+            referrer_of(&mut page),
+            serde_json::json!(format!("{parent_origin}/")),
+            "a shadow-root child inherits the embedding document as its referrer",
+        );
+
+        // The same navigation a CDP client drives, through the same entry
+        // point: `Page.navigate` with `referrer: ""`.
+        page.navigate_frame_for_cdp(
+            &child_id,
+            super::FrameNavigationRequest {
+                url: Some(format!("{child_origin}/widget-two")),
+                referrer: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            referrer_of(&mut page),
+            serde_json::json!(format!("{parent_origin}/")),
+            "an empty client referrer means none, not the empty string",
         );
     }
 
