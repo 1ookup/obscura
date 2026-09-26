@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use deno_core::{JsRuntime, RuntimeOptions};
+use deno_core::v8;
 use obscura_dom::{DomTree, NodeId};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
@@ -489,6 +490,16 @@ pub struct ObscuraJsRuntime {
     /// Installed into the trace thread-local by the classic-script funnel
     /// before each execution. Only read when a trace stream is active.
     trace_ambient_label: std::cell::RefCell<String>,
+    /// The engine namespace (`Deno.core` and the op table), captured from the
+    /// main global before it is deleted. Real Chrome has no `Deno` global, and
+    /// `'Deno' in window` / `typeof Deno` are exactly the probes a challenge
+    /// payload answers for a browser, so the bootstrap captures the namespace
+    /// into its own lexical scope and the global leaves the realm. Engine
+    /// code keeps working through the lexical binding; the Rust-injected
+    /// snippets that run outside it re-install the namespace for the duration
+    /// of one internal script through [`Self::install_internal_namespace`].
+    /// `None` only before construction finishes.
+    deno_ns: Option<v8::Global<v8::Value>>,
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -651,6 +662,14 @@ struct WorkerBatch {
 }
 
 const FRAME_MESSAGE_DRAIN_ROUNDS: usize = 64;
+
+/// The `Deno` global property as it was before the internal channel bound the
+/// namespace, so the cleanup restores exactly that: a binding an engine test
+/// installed (or a nested internal call) survives.
+struct DenoGlobalState {
+    present: bool,
+    previous: Option<v8::Global<v8::Value>>,
+}
 
 impl ObscuraJsRuntime {
     /// Freeze the document timeline for one JavaScript task. Browser timelines
@@ -916,6 +935,7 @@ impl ObscuraJsRuntime {
             frame_message_pump_started: false,
             trace_ambient_label: std::cell::RefCell::new("window".to_string()),
             debugger_session: None,
+            deno_ns: None,
         };
         {
             // Share a stable pointer to the realm registry into the op-visible
@@ -924,8 +944,168 @@ impl ObscuraJsRuntime {
             let mut state = runtime.state.borrow_mut();
             state.frame_realms_ptr = runtime.frame_realms.as_mut() as *mut crate::realm::FrameRealmHost;
         }
+        // deno_core still needs the global until its op bindings are in place,
+        // which is why this runs after `JsRuntime::new` (and after the trace
+        // mode bootstrap, which captures the namespace into its lexical scope)
+        // rather than inside the snapshot. Every realm below sees no `Deno`.
+        runtime.capture_and_drop_deno_global();
+        // The synchronous op path (op_ensure_frame_realm) has no `&mut self`,
+        // so it reads the namespace out of the realm registry it already holds.
+        // Runs after the capture above, which is what fills the handle.
+        runtime.frame_realms.deno_ns = runtime.deno_ns.clone();
         runtime.set_fingerprint(&obscura_net::BrowserFingerprint::default());
         runtime
+    }
+
+    /// Take the engine namespace off the main global: capture it for the
+    /// internal script channel, then delete the property. The bootstrap keeps
+    /// its own lexical binding, so everything inside it keeps working.
+    fn capture_and_drop_deno_global(&mut self) {
+        let main_context = self.runtime.main_context();
+        let scope = &mut self.runtime.handle_scope();
+        let context = v8::Local::new(scope, &main_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        let Some(key) = v8::String::new(scope, "Deno") else {
+            return;
+        };
+        let Some(ns) = global.get(scope, key.into()) else {
+            return;
+        };
+        if !ns.is_object() {
+            // A snapshot built before the namespace existed: nothing to hide.
+            return;
+        }
+        self.deno_ns = Some(v8::Global::new(scope, ns));
+        global.delete(scope, key.into());
+    }
+
+    /// The engine namespace handle, for realm wiring. `None` before
+    /// construction finishes.
+    pub(crate) fn deno_namespace(&self) -> Option<v8::Global<v8::Value>> {
+        self.deno_ns.clone()
+    }
+
+    /// Bind the engine namespace on a context's global as the same
+    /// non-enumerable `Deno` data property deno_core installs, so a
+    /// Rust-injected engine snippet can reach the op table. Returns the state
+    /// to hand back to [`Self::release_internal_namespace_in`].
+    fn install_internal_namespace_in(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+    ) -> DenoGlobalState {
+        let Some(ns) = self.deno_ns.as_ref() else {
+            return DenoGlobalState { present: false, previous: None };
+        };
+        let scope = &mut self.runtime.handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let Ok(value) = v8::Local::new(scope, ns).try_cast::<v8::Object>() else {
+            return DenoGlobalState { present: false, previous: None };
+        };
+        let global = context.global(scope);
+        let Some(key) = v8::String::new(scope, "Deno") else {
+            return DenoGlobalState { present: false, previous: None };
+        };
+        let previous = global.get(scope, key.into());
+        let state = DenoGlobalState {
+            present: previous.as_ref().is_some_and(|v| !v.is_undefined()),
+            previous: previous
+                .filter(|v| !v.is_undefined())
+                .map(|v| v8::Global::new(scope, v)),
+        };
+        // Same shape deno_core installs and the bootstrap pre-hides:
+        // writable, non-enumerable, configurable.
+        let mut descriptor = v8::PropertyDescriptor::new_from_value_writable(value.into(), true);
+        descriptor.set_enumerable(false);
+        descriptor.set_configurable(true);
+        global.define_property(scope, key.into(), &descriptor);
+        state
+    }
+
+    fn release_internal_namespace_in(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        state: DenoGlobalState,
+    ) {
+        let scope = &mut self.runtime.handle_scope();
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        let Some(key) = v8::String::new(scope, "Deno") else {
+            return;
+        };
+        if let Some(previous) = state.previous {
+            let previous = v8::Local::new(scope, previous);
+            let mut descriptor =
+                v8::PropertyDescriptor::new_from_value_writable(previous.into(), true);
+            descriptor.set_enumerable(false);
+            descriptor.set_configurable(true);
+            global.define_property(scope, key.into(), &descriptor);
+        } else if !state.present {
+            global.delete(scope, key.into());
+        }
+    }
+
+    /// Bind the engine namespace on the main global for the rest of this
+    /// process turn. Engine tests that drive the op table through page-realm
+    /// snippets call this once at setup; production code uses the scoped
+    /// `*_internal` wrappers instead, which remove the binding again before
+    /// any page script can run.
+    #[doc(hidden)]
+    pub fn install_internal_namespace(&mut self) {
+        let main_context = self.runtime.main_context();
+        self.install_internal_namespace_in(&main_context);
+    }
+
+    /// Evaluate an engine-internal expression in the main realm: the engine
+    /// namespace is bound for the duration and removed again before returning,
+    /// so a probe run through the page-facing [`Self::evaluate`] never sees it.
+    pub fn evaluate_internal(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        let main_context = self.runtime.main_context();
+        let state = self.install_internal_namespace_in(&main_context);
+        let result = self.evaluate(expression);
+        self.release_internal_namespace_in(&main_context, state);
+        result
+    }
+
+    /// [`Self::execute_script`] twin with the engine namespace bound for the
+    /// duration. Source that installs closures keeps working after the binding
+    /// is removed only where it captured the namespace as a parameter or local.
+    pub fn execute_script_internal(&mut self, name: &str, source: &str) -> Result<(), String> {
+        let main_context = self.runtime.main_context();
+        let state = self.install_internal_namespace_in(&main_context);
+        let result = self.execute_script(name, source);
+        self.release_internal_namespace_in(&main_context, state);
+        result
+    }
+
+    /// [`Self::execute_in_context`] twin with the engine namespace bound on
+    /// that realm's global for the duration.
+    pub(crate) fn execute_in_context_internal(
+        &mut self,
+        context: &v8::Global<v8::Context>,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        let state = self.install_internal_namespace_in(context);
+        let result = self.execute_in_context(context, name, source);
+        self.release_internal_namespace_in(context, state);
+        result
+    }
+
+    /// [`Self::store_object_with_meta`] twin for engine-internal expressions
+    /// that reach the op table: the engine namespace is bound for the duration
+    /// and removed again before returning.
+    pub fn store_object_with_meta_internal(
+        &mut self,
+        js_expression: &str,
+    ) -> Result<RemoteObjectInfo, String> {
+        let main_context = self.runtime.main_context();
+        let state = self.install_internal_namespace_in(&main_context);
+        let result = self.store_object_with_meta(js_expression);
+        self.release_internal_namespace_in(&main_context, state);
+        result
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -3936,7 +4116,8 @@ impl ObscuraJsRuntime {
             return false;
         }
         tracing::trace!(target: "obscura::timers", "queued overdue timer wake repair");
-        let _ = self.execute_script(
+        // Internal channel: the engine namespace is bound only for this call.
+        let _ = self.execute_script_internal(
             "<obscura:timer-wake>",
             "try { Deno.core.queueUserTimer(0, false, 0, function () {}); } catch (_e) {}\n\
              void Deno.core.ops.op_posted_task().catch(() => {});",
@@ -4957,6 +5138,10 @@ mod tests {
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
         rt.run_page_init();
+        // These tests drive the op table through page-realm snippets, which
+        // production code no longer can: the engine namespace leaves the
+        // global before page script runs. Bind it for the whole test.
+        rt.install_internal_namespace();
         rt
     }
 
@@ -5140,6 +5325,7 @@ mod tests {
         rt.set_url("https://example.com/test");
         rt.set_title("Test Page");
         rt.run_page_init();
+        rt.install_internal_namespace();
         rt
     }
 
@@ -7735,6 +7921,8 @@ mod tests {
         let origin = format!("http://{address}");
 
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe><iframe id=g></iframe></body></html>"));
         rt.set_url("http://top.example/index.html");
         rt.set_http_client(std::sync::Arc::new(
@@ -7745,6 +7933,10 @@ mod tests {
             ),
         ));
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         // The page forbids every connection; the frame allows its own origin.
         rt.set_content_security_policy(Some("default-src 'none'; connect-src 'none'"));
         let root = rt
@@ -7801,9 +7993,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frame_svg_elements_expose_geometry_methods_after_namespace_creation() {
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://top.example/index.html");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         let root = rt
             .evaluate(&format!(
                 r#"(() => {{
@@ -8839,9 +9037,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frame_realm_console_routes_op_rows_with_full_fidelity() {
         let mut rt = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://example.com/console-frame");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
 
         const PROBE: &str = r#"
             (() => {
@@ -8941,8 +9145,17 @@ mod tests {
             "https://challenges.example/widget",
         )
         .unwrap();
+        // Engine-internal: the probe patches the console op, which is not
+        // page-visible. The patch lands on the shared ops object, so it
+        // outlives the namespace binding.
         let frame = rt
-            .execute_script_in_frame_realm("console-frame", 1, "<console-probe>", PROBE)
+            .execute_script_in_frame_world_realm_internal(
+                "console-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "<console-probe>",
+                PROBE,
+            )
             .unwrap();
         assert_eq!(
             frame
@@ -8991,9 +9204,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frame_console_answers_native_to_string_from_parent_realm() {
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://example.com/console-cross-realm");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
 
         let root = rt
             .evaluate(&format!(
@@ -9085,9 +9304,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cross_tostring_consult_does_not_reenter_itself() {
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://example.com/cross-no-reenter");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
 
         let root = rt
             .evaluate(&format!(
@@ -9955,10 +10180,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_isolation_restores_shared_array_buffer_in_page_and_frame_realms() {
         let mut rt = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://isolated.example/page");
         rt.set_cross_origin_isolated(true);
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         let main = rt
             .evaluate_for_cdp(
                 r#"(() => {
@@ -10138,9 +10369,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn window_surface_functions_all_stringify_native() {
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://example.com/native-sweep");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
 
         const WALKER: &str = r#"
             (() => {
@@ -10275,9 +10512,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn completed_realms_premark_surface_and_drop_lazy_scan_fallback() {
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_url("https://example.com/premark");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
 
         const AUDIT: &str = r#"
             (() => {
@@ -10390,8 +10633,16 @@ mod tests {
             "https://example.com/premark-frame",
         )
         .unwrap();
+        // Engine-internal: the audit reads the native-function registry off
+        // the engine namespace, which is not page-visible.
         let frame = rt
-            .execute_script_in_frame_realm("premark-frame", 1, "<premark>", AUDIT)
+            .execute_script_in_frame_world_realm_internal(
+                "premark-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "<premark>",
+                AUDIT,
+            )
             .unwrap();
         assert_eq!(
             frame.get("lazyHook").and_then(serde_json::Value::as_str),
@@ -12758,10 +13009,16 @@ RequestRedirect value",
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_navigation_discards_the_superseded_render_state() {
         let mut runtime = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         runtime.set_dom(parse_html(
             r#"<html><body><iframe id="frame"></iframe></body></html>"#,
         ));
         runtime.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        runtime.install_internal_namespace();
         let first_value = runtime
             .evaluate(
                 r##"(function() { try {
@@ -13163,9 +13420,15 @@ RequestRedirect value",
     fn scoped_document_domain_persists_the_relaxed_value() {
         let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(dom);
         rt.set_url("https://deep.assets.example.co.uk/page");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         let script = format!(
             r#"(() => {{
                 {FRAME_OPS_PRELUDE}
@@ -13253,9 +13516,15 @@ RequestRedirect value",
         // also serialize as "null" for a data: top-level URL.
         let dom = parse_html("<html><body><iframe id=f></iframe></body></html>");
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_dom(dom);
         rt.set_url("data:text/html,top");
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         let script = format!(
             r#"(() => {{
                 {FRAME_OPS_PRELUDE}
@@ -16280,10 +16549,16 @@ RequestRedirect value",
             },
         );
         let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
         rt.set_fingerprint(&fingerprint);
         rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
         rt.set_viewport(1200.0, 700.0);
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         assert_eq!(
             rt.evaluate("[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]")
                 .unwrap(),
@@ -22093,9 +22368,15 @@ RequestRedirect value",
             </body></html>"#,
         );
         let mut rt = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         rt.set_dom(dom);
         rt.set_viewport(400.0, 300.0);
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         rt.execute_script(
             "batch-resize-observer-targets",
             r#"
@@ -22244,9 +22525,15 @@ RequestRedirect value",
             </body></html>"#,
         );
         let mut rt = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         rt.execute_script(
             "observe-before-scroll",
             r#"
@@ -22460,9 +22747,15 @@ RequestRedirect value",
             </body></html>"#,
         );
         let mut rt = ObscuraJsRuntime::new();
+        // Engine-internal snippets below reach the op table, which is no
+        // longer page-visible: bind the namespace for this test.
         rt.set_dom(dom);
         rt.set_viewport(300.0, 200.0);
         rt.run_page_init();
+        // The engine snippets below reach the op table, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        rt.install_internal_namespace();
         rt.execute_script(
             "batch-intersection-observer-clip-graph",
             r#"

@@ -201,7 +201,9 @@ pub async fn handle(
             );
 
             let info = if let Some(js) = &mut page.js {
-                match js.store_object_with_meta(&js_code) {
+                // Internal channel: the node_type probe reads the engine op
+                // table, which is not page-visible.
+                match js.store_object_with_meta_internal(&js_code) {
                     Ok(info) => info,
                     Err(_) => {
                         return Ok(json!({

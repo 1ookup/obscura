@@ -311,6 +311,12 @@ pub struct PreloadScript {
     pub source: String,
     pub world_name: Option<String>,
     pub world_id: u64,
+    /// Engine-injected preload (CDP `Runtime.addBinding`): runs with the
+    /// engine namespace bound so its shim can capture it, then the namespace
+    /// is removed again before any page script runs. Operator-injected
+    /// preloads must keep the default, or page-level code would see a global
+    /// no browser has.
+    pub internal: bool,
 }
 
 impl PreloadScript {
@@ -319,6 +325,17 @@ impl PreloadScript {
             source: source.into(),
             world_name: None,
             world_id: obscura_js::realm::MAIN_WORLD,
+            internal: false,
+        }
+    }
+
+    /// Engine-injected variant: see the `internal` field note.
+    pub fn internal_main_world(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            world_name: None,
+            world_id: obscura_js::realm::MAIN_WORLD,
+            internal: true,
         }
     }
 }
@@ -4238,13 +4255,23 @@ impl Page {
                         .iter()
                         .filter_map(|frame_id| self.frames.get(frame_id))
                         .filter_map(|frame| frame.host_nid)
+                        // Only hosts whose content document the loader has
+                        // committed fire a load event. The script below used
+                        // to ask the op table per host; the same tree answers
+                        // here, so the injected script carries hosts only.
+                        .filter(|host| {
+                            self.dom
+                                .as_ref()
+                                .and_then(|dom| dom.iframe_content_document(*host))
+                                .is_some()
+                        })
                         .map(|host| host.raw().to_string())
                         .collect::<Vec<_>>()
                         .join(",")
                 })
                 .unwrap_or_default();
             let script = format!(
-                "setTimeout(function() {{ for (const nid of [{}]) {{ try {{ const f = globalThis._wrapEl(nid); if (f && +Deno.core.ops.op_dom('iframe_content_document_root', String(nid), '') >= 0) f.dispatchEvent(new Event('load')); }} catch (e) {{}} }} }}, 0);",
+                "setTimeout(function() {{ for (const nid of [{}]) {{ try {{ const f = globalThis._wrapEl(nid); if (f) f.dispatchEvent(new Event('load')); }} catch (e) {{}} }} }}, 0);",
                 hosts,
             );
             let _ = js.execute_script("<iframe-load>", &script);
@@ -5773,7 +5800,13 @@ impl Page {
             // Operator-injected code: one `host` execution-source unit.
             let _trace_source = js.trace_source_guard("host");
             let result = match script.world_name.as_deref() {
-                None => js.execute_script_guarded("<preload>", &script.source),
+                None => {
+                    if script.internal {
+                        js.execute_script_internal("<preload>", &script.source)
+                    } else {
+                        js.execute_script_guarded("<preload>", &script.source)
+                    }
+                }
                 Some(world_name) => js
                     .ensure_isolated_world_realm(
                         &frame_id,
@@ -5784,13 +5817,23 @@ impl Page {
                         &base_url,
                     )
                     .and_then(|_| {
-                        js.execute_script_in_frame_world_realm(
-                            &frame_id,
-                            generation,
-                            script.world_id,
-                            "<preload>",
-                            &script.source,
-                        )
+                        if script.internal {
+                            js.execute_script_in_frame_world_realm_internal(
+                                &frame_id,
+                                generation,
+                                script.world_id,
+                                "<preload>",
+                                &script.source,
+                            )
+                        } else {
+                            js.execute_script_in_frame_world_realm(
+                                &frame_id,
+                                generation,
+                                script.world_id,
+                                "<preload>",
+                                &script.source,
+                            )
+                        }
                         .map(|_| ())
                     }),
             };
@@ -5840,18 +5883,33 @@ impl Page {
         let _trace_source = js.trace_source_guard("host");
         match script.world_name.as_deref() {
             None => {
-                let _ = js.execute_script_guarded("<preload>", &script.source);
+                if script.internal {
+                    let _ = js.execute_script_internal("<preload>", &script.source);
+                } else {
+                    let _ = js.execute_script_guarded("<preload>", &script.source);
+                }
                 for (frame_id, generation, root, base) in child_targets {
                     if js
                         .ensure_frame_realm(&frame_id, generation, root, &base)
                         .is_ok()
                     {
-                        let _ = js.execute_script_in_frame_realm(
-                            &frame_id,
-                            generation,
-                            "<preload>",
-                            &script.source,
-                        );
+                        let result = if script.internal {
+                            js.execute_script_in_frame_world_realm_internal(
+                                &frame_id,
+                                generation,
+                                obscura_js::realm::MAIN_WORLD,
+                                "<preload>",
+                                &script.source,
+                            )
+                        } else {
+                            js.execute_script_in_frame_realm(
+                                &frame_id,
+                                generation,
+                                "<preload>",
+                                &script.source,
+                            )
+                        };
+                        let _ = result;
                     }
                 }
             }
@@ -5871,13 +5929,24 @@ impl Page {
                         )
                         .is_ok()
                     {
-                        let _ = js.execute_script_in_frame_world_realm(
-                            &frame_id,
-                            generation,
-                            script.world_id,
-                            "<preload>",
-                            &script.source,
-                        );
+                        let result = if script.internal {
+                            js.execute_script_in_frame_world_realm_internal(
+                                &frame_id,
+                                generation,
+                                script.world_id,
+                                "<preload>",
+                                &script.source,
+                            )
+                        } else {
+                            js.execute_script_in_frame_world_realm(
+                                &frame_id,
+                                generation,
+                                script.world_id,
+                                "<preload>",
+                                &script.source,
+                            )
+                        };
+                        let _ = result;
                     }
                 }
             }
@@ -9621,6 +9690,59 @@ mod tests {
             .is_some_and(|body| body.body.contains("404 body")));
     }
 
+    /// The probe the challenge payload answers per realm: real Chrome has no
+    /// `Deno`, so `typeof Deno` is "undefined" and `'Deno' in window` is false
+    /// in the page realm and in a frame realm alike. The engine's own CDP
+    /// binding shim keeps working, because it captures the namespace while the
+    /// engine still has it bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deno_is_absent_from_page_and_frame_realms_and_bindings_still_reach_ops() {
+        let mut page = frame_test_page(
+            "<html><body><iframe id=inner></iframe><p>body</p></body></html>",
+        );
+        page.init_js();
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.evaluate("typeof Deno + '/' + ('Deno' in window)"),
+            serde_json::json!("undefined/false")
+        );
+
+        // Same-origin child realm, reached the way a fingerprinter reaches it.
+        page.evaluate(
+            r#"(() => {
+                const frame = document.querySelector('iframe');
+                frame.srcdoc = '<p>frame body</p>';
+                document.body.appendChild(frame);
+            })()"#,
+        );
+        assert_eq!(page.process_pending_frame_navigations().await, 1);
+        assert_eq!(
+            page.evaluate(
+                r#"(() => {
+                    const win = document.querySelector('iframe').contentWindow;
+                    return win.eval("typeof Deno + '/' + ('Deno' in globalThis)");
+                })()"#,
+            ),
+            serde_json::json!("undefined/false")
+        );
+
+        // The engine's own shim route still lands in the op table.
+        page.run_preload_script_immediately(
+            &super::PreloadScript::internal_main_world(
+                "globalThis.__probe = (function (Deno) { return function (arg) {\
+                    Deno.core.ops.op_binding_called('__probe', String(arg));\
+                }; })(globalThis.Deno);"
+                    .to_string(),
+            ),
+        );
+        page.evaluate("globalThis.__probe('hello')");
+        assert_eq!(
+            page.take_pending_binding_calls(),
+            vec![("__probe".to_string(), "hello".to_string())]
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn top_csp_sandbox_blocks_parser_scripts_and_reports_scope_flags() {
         let mut page = frame_test_page(
@@ -9642,7 +9764,9 @@ mod tests {
             page.js
                 .as_mut()
                 .unwrap()
-                .evaluate(
+                // Engine-internal: the probe reads the op table, which is
+                // no longer page-visible.
+                .evaluate_internal(
                     "(() => { const info = JSON.parse(Deno.core.ops.op_dom('document_scope_info', '0', '')); return [info.sandboxActive, info.allowScripts, info.allowSameOrigin]; })()",
                 )
                 .unwrap(),
@@ -10449,6 +10573,7 @@ mod tests {
                 source: "globalThis.utilityValue='isolated'".to_string(),
                 world_name: Some("utility".to_string()),
                 world_id: 7,
+                internal: false,
             },
         ]);
         page.load_child_frames().await;

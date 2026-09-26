@@ -5198,6 +5198,10 @@ mod tests {
         ));
         runtime.set_url("http://example.com/iframe-content-ops");
         runtime.run_page_init();
+        // The op-table snippets below are engine-internal, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        runtime.install_internal_namespace();
         let result = runtime
             .evaluate(
                 r##"(function() {
@@ -5254,6 +5258,10 @@ mod tests {
         ));
         runtime.set_url("http://example.com/iframe-scope-ops");
         runtime.run_page_init();
+        // The op-table snippets below are engine-internal, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        runtime.install_internal_namespace();
         let result = runtime
             .evaluate(
                 r##"(function() {
@@ -5345,6 +5353,10 @@ mod tests {
         // leaked the bit into every rewritten frame scope.
         runtime.set_cross_origin_isolated(true);
         runtime.run_page_init();
+        // The op-table snippets below are engine-internal, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        runtime.install_internal_namespace();
         let result = runtime
             .evaluate(
                 r##"(function() {
@@ -5413,6 +5425,10 @@ mod tests {
         runtime.set_url("https://isolated.example/page");
         runtime.set_cross_origin_isolated(true);
         runtime.run_page_init();
+        // The op-table snippets below are engine-internal, which is no longer
+        // page-visible: bind the namespace after page init, in the shape
+        // production realms keep.
+        runtime.install_internal_namespace();
         let result = runtime
             .evaluate(
                 r##"(function() {
@@ -5444,7 +5460,7 @@ mod tests {
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-test");
         runtime.run_page_init();
-        runtime
+                runtime
             .execute_script(
                 "posted-task-throughput",
                 r#"
@@ -5517,7 +5533,7 @@ mod tests {
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-order");
         runtime.run_page_init();
-        runtime
+                runtime
             .execute_script(
                 "shared-posted-task-order",
                 r#"

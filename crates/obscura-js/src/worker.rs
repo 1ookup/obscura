@@ -686,7 +686,10 @@ fn worker_thread_main(
             if ready_tx.send(Ok(rt.isolate_handle())).is_err() {
                 return;
             }
-            if let Err(e) = rt.execute_script(
+            // Internal channel: the engine namespace is bound only while the
+            // prep runs, so its own `Deno.core` uses resolve and the worker
+            // global it leaves behind has no `Deno`.
+            if let Err(e) = rt.execute_script_internal(
                 "<obscura:worker-prep>",
                 &worker_prep_script(
                     &script_url,
@@ -906,6 +909,13 @@ fn worker_prep_script(
 const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
+  // The engine namespace is bound only while the host runs this prep: the
+  // worker global is page-visible surface, and no browser has a `Deno`
+  // global. Capturing it here keeps every closure this prep installs
+  // (postMessage, close, the OPFS methods, the tracelog sink) on the op table
+  // after the binding is gone, while `typeof Deno` and `'Deno' in self`
+  // answer exactly as a browser answers.
+  var Deno = globalThis.Deno;
   // Snapshot WorkerGlobalScope is a different function object than the one
   // this prep installs, so `globalThis instanceof WorkerGlobalScope` is false
   // here. An explicit flag is the only check fetch/Request can trust.
@@ -2156,6 +2166,39 @@ mod tests {
             &serde_json::json!("ok"),
         )
         .await;
+    }
+
+    /// A dedicated worker is the one scope an anti-bot payload owns outright,
+    /// and it must answer the same absence its window answers: real Chrome has
+    /// no `Deno` in a worker global either. The prep keeps the engine
+    /// namespace only as long as it runs, so its own installed closures
+    /// (postMessage below) still reach the op table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_realm_has_no_deno_global() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "postMessage({ typeofDeno: typeof Deno," +
+              "inSelf: 'Deno' in globalThis," +
+              "own: Object.prototype.hasOwnProperty.call(globalThis, 'Deno') });";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        assert_eq!(
+            rt.evaluate("JSON.stringify(__got[0])").unwrap(),
+            serde_json::json!(r#"{"typeofDeno":"undefined","inSelf":false,"own":false}"#),
+        );
+        // The page realm answers the same.
+        assert_eq!(
+            rt.evaluate("typeof Deno + '/' + ('Deno' in globalThis)")
+                .unwrap(),
+            serde_json::json!("undefined/false"),
+        );
     }
 
     /// The structural tells a fingerprinting payload reads first. Each of

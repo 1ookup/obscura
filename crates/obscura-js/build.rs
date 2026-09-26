@@ -39,6 +39,40 @@ fn load_bootstrap_source(manifest_path: &Path) -> String {
     // prefix code that was pulled above the marker still sees bindings from
     // the core half through the outer scope.
     let mut source = String::from("(function () {\n");
+    // The assembler's first module opens with "use strict"; keeping it as the
+    // first statement of this function body is load-bearing: it is what makes
+    // the whole assembled bootstrap strict. Anything emitted before it (the
+    // engine-namespace capture below) has to come after the directive.
+    source.push_str("\"use strict\";\n");
+    // deno_core installs the engine namespace as a `Deno` data property on the
+    // realm global before this script runs, and every module below reaches the
+    // op table through it. Real Chrome has no such global, and `'Deno' in
+    // window` / `typeof Deno` are exactly the probes the challenge payload
+    // answers for a browser with false/undefined. So the namespace is captured
+    // into this lexical binding -- which shadows the global for all 145
+    // internal uses -- and the embedder deletes the global again once its own
+    // boot work is done (runtime.rs, realm.rs). Nothing page-visible remains.
+    //
+    // The symbol-keyed hook re-points a realm's binding at the live runtime
+    // namespace. Frame realms restored from the snapshot template captured a
+    // context-local placeholder (the serializer rejects cross-context object
+    // graphs); realm.rs calls the hook with the live object right after
+    // restore, before any of the realm's script runs, and deletes it again.
+    // Only the template keeps it: build.rs flags that context before this
+    // bootstrap runs there, and every realm that executes the bootstrap with
+    // the live namespace in reach (main, fresh frame, worker) removes the
+    // hook below, so no page-reachable callable can touch the binding. A
+    // symbol key never answers `in`, Object.keys, for-in or
+    // getOwnPropertyNames, so the wiring adds no string-keyed surface.
+    source.push_str(
+        "var Deno = globalThis.Deno;\n\
+         globalThis[Symbol.for('obscura.internalNamespace')] = function (ns) {\n\
+         \x20 if (ns && typeof ns === 'object') { Deno = ns; }\n\
+         };\n\
+         if (globalThis.__obscura_frame_template_boot !== true) {\n\
+         \x20 delete globalThis[Symbol.for('obscura.internalNamespace')];\n\
+         }\n",
+    );
     if timing {
         source.push_str(
             "var __obscura_btLast = Date.now();\n\
@@ -169,12 +203,19 @@ fn build_frame_template_context(
         // (`Deno[sym] || (Deno[sym] = {...})`). The template cannot reference
         // the main context's Deno object (the V8 context serializer rejects
         // cross-context object graphs), so it gets a fresh context-local
-        // binding and both registries attach to it. Restored realms overwrite
-        // this global with the live runtime's Deno before any script runs;
-        // the restored bootstrap functions keep resolving the registries
-        // through their own lexical scope, which is the per-realm registry
-        // shape the deferred frame realms already have.
+        // binding and both registries attach to it. The bootstrap's first
+        // statement captures this placeholder into its lexical `Deno` binding
+        // and drops the global again, so a restored realm starts without a
+        // page-visible `Deno`; realm.rs then calls the bootstrap's
+        // `Symbol.for('obscura.internalNamespace')` hook with the live
+        // runtime's namespace before any of the realm's script runs. The
+        // restored bootstrap functions keep resolving the registries through
+        // their own lexical scope, which is the per-realm registry shape the
+        // deferred frame realms already have.
         run_template_script(scope, "globalThis.Deno = {};");
+        // Keep the namespace re-pointing hook alive in this context only (see
+        // the assembler prologue); realm.rs deletes it after using it.
+        run_template_script(scope, "globalThis.__obscura_frame_template_boot = true;");
         let global = context.global(scope);
         let nid_key = v8::String::new(scope, "__obscura_frame_document_nid")
             .expect("template global key");

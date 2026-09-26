@@ -108,6 +108,10 @@ pub struct FrameRealmHost {
     /// creation order. Matches the HaHaVM host frameCounter: one sequence for
     /// every frame of the page, remote and placeholder alike.
     next_trace_label: u64,
+    /// The runtime's engine namespace, kept here so the synchronous op path
+    /// (which has no `&mut ObscuraJsRuntime`) can bind it into a new realm.
+    /// The global property is gone; this handle is the only Rust-side way back.
+    pub(crate) deno_ns: Option<v8::Global<v8::Value>>,
 }
 
 impl FrameRealmHost {
@@ -775,20 +779,23 @@ fn frame_dynamic_import_helper(
 }
 
 impl ObscuraJsRuntime {
-    /// Create a fresh context in this runtime's isolate and inject the main
-    /// context's `Deno` binding object so ops are callable from realm script.
+    /// Create a fresh context in this runtime's isolate and bind the runtime's
+    /// engine namespace on it, so the bootstrap this realm executes captures
+    /// it into its lexical scope and ops stay callable from realm script.
     fn create_realm_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
+        let namespace = self.deno_namespace();
         let main_context = self.deno_runtime_mut().main_context();
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let main_context = v8::Local::new(scope, &main_context);
         let (deno_key, deno_val, token, context_state, module_map) = {
             let scope = &mut v8::ContextScope::new(scope, main_context);
-            let main_global = main_context.global(scope);
             let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
-            let deno_val = main_global
-                .get(scope, deno_key.into())
-                .filter(|v| v.is_object())
-                .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+            // The namespace lives on the runtime, not on the main global: the
+            // global property is deleted before page script runs.
+            let deno_val = namespace
+                .as_ref()
+                .ok_or_else(|| "realm: engine namespace missing".to_string())?;
+            let deno_val = v8::Local::new(scope, deno_val);
             let token = main_context.get_security_token(scope);
             let context_state = main_context.get_aligned_pointer_from_embedder_data(
                 deno_core::CONTEXT_STATE_SLOT_INDEX,
@@ -852,17 +859,19 @@ impl ObscuraJsRuntime {
         &mut self,
     ) -> Result<Option<v8::Global<v8::Context>>, String> {
         const FRAME_TEMPLATE_CONTEXT_INDEX: usize = 0;
+        let namespace = self.deno_namespace();
         let main_context = self.deno_runtime_mut().main_context();
         let scope = &mut self.deno_runtime_mut().handle_scope();
         let main_context = v8::Local::new(scope, &main_context);
         let (deno_key, deno_val, token, context_state, module_map) = {
             let scope = &mut v8::ContextScope::new(scope, main_context);
-            let main_global = main_context.global(scope);
             let deno_key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
-            let deno_val = main_global
-                .get(scope, deno_key.into())
-                .filter(|v| v.is_object())
-                .ok_or_else(|| "realm: main context has no Deno binding object".to_string())?;
+            // The namespace lives on the runtime, not on the main global: the
+            // global property is deleted before page script runs.
+            let deno_val = namespace
+                .as_ref()
+                .ok_or_else(|| "realm: engine namespace missing".to_string())?;
+            let deno_val = v8::Local::new(scope, deno_val);
             let token = main_context.get_security_token(scope);
             let context_state = main_context.get_aligned_pointer_from_embedder_data(
                 deno_core::CONTEXT_STATE_SLOT_INDEX,
@@ -905,19 +914,22 @@ impl ObscuraJsRuntime {
             let deno_key = v8::Local::new(scope, &deno_key);
             let deno_val = v8::Local::new(scope, &deno_val);
             global.set(scope, deno_key.into(), deno_val.into());
-        }
-        // The snapshot-baked surface marks live in the context-baked registry
-        // the baked Function.prototype.toString override closes over; the
-        // serializer cannot share that object with the live runtime's shared
-        // registry. Hand the shared registry the baked override itself: its
-        // toString consult (bootstrap.js `cross`) then resolves the template
-        // surface's marks for every other realm, keeping Chrome's
-        // "native answers native from any realm" contract (profile Step 330:
-        // the challenge's cross-realm console-identity validator read raw
-        // engine source here and flipped its probe outcomes).
-        {
-            let scope = &mut v8::ContextScope::new(scope, context);
+            // The snapshot-baked surface marks live in the context-baked
+            // registry the baked Function.prototype.toString override closes
+            // over; the serializer cannot share that object with the live
+            // runtime's shared registry. Hand the shared registry the baked
+            // override itself: its toString consult (bootstrap.js `cross`)
+            // then resolves the template surface's marks for every other
+            // realm, keeping Chrome's "native answers native from any realm"
+            // contract (profile Step 330: the challenge's cross-realm
+            // console-identity validator read raw engine source here and
+            // flipped its probe outcomes).
             run_script(scope, "<obscura:frame-cross-registry>", CROSS_REGISTRY_BRIDGE)?;
+            // The bridge is the last reader of the injected global: the
+            // bootstrap baked here resolves `Deno` lexically, so re-point that
+            // binding at the live namespace and take the global back off.
+            let namespace = v8::Local::new(scope, &deno_val);
+            bind_realm_namespace(scope, context, namespace);
         }
         Ok(Some(v8::Global::new(scope, context)))
     }
@@ -1096,6 +1108,12 @@ impl ObscuraJsRuntime {
             // would be wiped and the RemoteObject stash (Phase 6.2) would be
             // missing in the realm.
             self.execute_in_context(&context, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+            // The bootstrap captured `globalThis.Deno` (injected at context
+            // creation) into its lexical binding at the top of its scope; take
+            // the global back off so this realm matches the main one.
+            let scope = &mut self.deno_runtime_mut().handle_scope();
+            let context_local = v8::Local::new(scope, &context);
+            drop_realm_deno_global(scope, context_local);
         }
         if timing {
             realm_phase_print("bootstrap_core", t_phase.elapsed());
@@ -1688,6 +1706,24 @@ impl ObscuraJsRuntime {
         self.execute_in_context(&context, name, source)
     }
 
+    /// [`Self::execute_script_in_frame_world_realm`] twin for engine-injected
+    /// code: the engine namespace is bound on the realm's global for the
+    /// duration of `source` and removed again before returning, so author
+    /// script in the realm never sees it. Source that installs closures has to
+    /// capture the namespace while it is bound.
+    pub fn execute_script_in_frame_world_realm_internal(
+        &mut self,
+        frame_id: &str,
+        generation: u64,
+        world_id: u64,
+        name: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        let context = self.frame_world_context(frame_id, generation, world_id)?;
+        self.set_frame_realm_trace_ambient(frame_id, generation, world_id);
+        self.execute_in_context_internal(&context, name, source)
+    }
+
     pub fn execute_script_in_frame_world_realm_at_line(
         &mut self,
         frame_id: &str,
@@ -1812,6 +1848,11 @@ impl ObscuraJsRuntime {
             )?;
         }
         self.realm_execute_script(realm, "<obscura:realm-bootstrap>", BOOTSTRAP_SRC)?;
+        // The bootstrap captured the injected `Deno` binding into its lexical
+        // scope at the top of its run; take the global back off.
+        let scope = &mut self.deno_runtime_mut().handle_scope();
+        let context_local = v8::Local::new(scope, &realm.context);
+        drop_realm_deno_global(scope, context_local);
         Ok(())
     }
 
@@ -1991,6 +2032,60 @@ impl ObscuraJsRuntime {
     }
 }
 
+/// The bootstrap installs its lexical engine-namespace setter under this
+/// symbol (build.rs). A symbol key never answers `in`, `Object.keys`, for-in
+/// or `getOwnPropertyNames`, so the wiring below adds no string-keyed surface
+/// for a fingerprint census to read.
+const INTERNAL_NAMESPACE_HOOK: &str = "obscura.internalNamespace";
+
+/// Point the realm's lexical engine namespace at `namespace` through the
+/// bootstrap's symbol hook, then drop the realm's `Deno` global.
+///
+/// The bootstrap captures `globalThis.Deno` into its own scope at the top of
+/// its run, so a realm restored from the snapshot template holds the
+/// context-local placeholder the template had to bake (the serializer rejects
+/// cross-context object graphs). This re-points that binding at the live
+/// runtime namespace before any of the realm's script runs, and removes the
+/// temporary global the wiring used right after: `'Deno' in window` and
+/// `typeof Deno` answer false/undefined in every realm, exactly as they do in
+/// Chrome, while the realm's own bootstrap functions keep reaching the op
+/// table through their lexical binding.
+fn bind_realm_namespace(
+    scope: &mut v8::HandleScope,
+    context: v8::Local<v8::Context>,
+    namespace: v8::Local<v8::Value>,
+) {
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    if let Some(description) = v8::String::new(scope, INTERNAL_NAMESPACE_HOOK) {
+        let hook_key = v8::Symbol::for_key(scope, description);
+        if let Some(hook) = global.get(scope, hook_key.into()) {
+            if let Ok(hook) = hook.try_cast::<v8::Function>() {
+                let recv = v8::undefined(scope);
+                let _ = hook.call(scope, recv.into(), &[namespace]);
+            }
+            // Only the snapshot template carries the hook this far; no realm
+            // keeps a page-reachable callable into the engine binding.
+            global.delete(scope, hook_key.into());
+        }
+    }
+    drop_realm_deno_global(scope, context);
+}
+
+/// Delete the realm's `Deno` global. Callers run this after the one step that
+/// still needed the property: the bootstrap's capture, or the namespace hook
+/// above.
+fn drop_realm_deno_global(
+    scope: &mut v8::HandleScope,
+    context: v8::Local<v8::Context>,
+) {
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    if let Some(key) = v8::String::new(scope, "Deno") {
+        global.delete(scope, key.into());
+    }
+}
+
 /// Compile and run `source` in the scope's current context, discarding the
 /// completion value. Scope-based twin of `execute_in_context_at`, for the
 /// synchronous realm path where only an op's own scope is available.
@@ -2051,15 +2146,14 @@ pub(crate) fn spawn_frame_realm(
     // security token and embedder slots. Read them here; the new context copies
     // all three, exactly as the async path does.
     let current = scope.get_current_context();
-    let deno_val = {
-        let key = v8::String::new(scope, "Deno").ok_or_else(|| alloc_err("key"))?;
-        current
-            .global(scope)
-            .get(scope, key.into())
-            .filter(|value| value.is_object())
-            .ok_or_else(|| "realm: no Deno binding object".to_string())?
-    };
-    let deno_val = v8::Global::new(scope, deno_val);
+    // The namespace lives on the runtime, not on the realm global: the global
+    // property is deleted before page script runs.
+    let deno_local = frame_realms
+        .deno_ns
+        .as_ref()
+        .ok_or_else(|| "realm: engine namespace missing".to_string())?;
+    let deno_local = v8::Local::new(scope, deno_local);
+    let deno_val = v8::Global::new(scope, deno_local);
     let token = current.get_security_token(scope);
     let context_state =
         current.get_aligned_pointer_from_embedder_data(deno_core::CONTEXT_STATE_SLOT_INDEX);
@@ -2113,6 +2207,11 @@ pub(crate) fn spawn_frame_realm(
             // Register the baked toString override with the shared registry
             // (see create_frame_context_from_template for the rationale).
             run_script(scope, "<obscura:frame-cross-registry>", CROSS_REGISTRY_BRIDGE)?;
+            // The bridge is the last reader of the injected global; re-point
+            // the baked bootstrap's lexical binding at the live namespace and
+            // take the global back off (see bind_realm_namespace).
+            let namespace = v8::Local::new(scope, &deno_val);
+            bind_realm_namespace(scope, context, namespace);
         }
 
         let nid_key = v8::String::new(scope, "__obscura_frame_document_nid")
@@ -2167,6 +2266,10 @@ pub(crate) fn spawn_frame_realm(
         // snapshot build); the fallback executes the core half here.
         if !template_restored {
             run_script(scope, "<obscura:frame-realm-bootstrap>", BOOTSTRAP_SRC)?;
+            // The bootstrap captured the injected `Deno` global into its
+            // lexical binding as its first statement; take the global back
+            // off so this realm matches the main one.
+            drop_realm_deno_global(scope, context);
             if timing {
                 realm_phase_print("sync bootstrap_core", t_phase.elapsed());
             }
@@ -2289,7 +2392,7 @@ fn realm_error(scope: &mut v8::TryCatch<v8::HandleScope>, phase: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_frame_dynamic_imports, FrameModuleCsp};
+    use super::{rewrite_frame_dynamic_imports, FrameModuleCsp, MAIN_WORLD};
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
@@ -2528,11 +2631,113 @@ mod tests {
                 return created.root;
             }})()"#
         );
-        rt.evaluate(&script).unwrap().as_f64().unwrap() as u32
+        // Engine-internal expression: the op table is not page-visible, so
+        // this runs with the engine namespace bound for the duration.
+        rt.evaluate_internal(&script).unwrap().as_f64().unwrap() as u32
     }
 
     const FRAME_HTML: &str = "<html><head><title>Frame Title</title></head>\
         <body><div id=\"inner\">frame text</div></body></html>";
+
+    /// Real Chrome has no `Deno`: `typeof Deno` answers "undefined" and
+    /// `'Deno' in window` answers false in every realm. The engine namespace
+    /// (the op table) has to stay reachable to the engine itself, so the
+    /// bootstrap captures it into its own lexical scope and the global is
+    /// deleted before any page script runs -- here, in a same-origin frame
+    /// realm and in a cross-origin one, the shape the challenge payload's
+    /// `in`/`typeof` probes read.
+    #[test]
+    fn deno_is_absent_from_page_and_frame_realms() {
+        let mut rt = setup_runtime(
+            "<html><body><iframe id=same></iframe><iframe id=cross></iframe></body></html>",
+        );
+        let probe = "({ typeofDeno: typeof Deno, inWindow: 'Deno' in globalThis, \
+own: Object.prototype.hasOwnProperty.call(globalThis, 'Deno'), \
+enumerated: Object.keys(globalThis).indexOf('Deno') !== -1 })";
+        let hidden = serde_json::json!({
+            "typeofDeno": "undefined",
+            "inWindow": false,
+            "own": false,
+            "enumerated": false,
+        });
+
+        // Main realm.
+        assert_eq!(rt.evaluate(probe).unwrap(), hidden);
+        // The engine's own surface still works without the global: a page
+        // realm op round-trip through the bootstrap's lexical binding.
+        assert_eq!(
+            rt.evaluate("typeof document.createElement('div')")
+                .unwrap(),
+            serde_json::json!("object")
+        );
+
+        // Same-origin frame realm.
+        let same_root = setup_frame(&mut rt, "same", FRAME_HTML, "http://example.com/frame", 1);
+        assert!(rt
+            .ensure_frame_realm("frame-same", 1, same_root, "http://example.com/frame")
+            .unwrap());
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-same",
+                1,
+                MAIN_WORLD,
+                "<deno-probe>",
+                probe,
+            )
+            .unwrap(),
+            hidden
+        );
+        // Ops keep working in the realm: its own bootstrap reached the op
+        // table through the same lexical binding.
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-same",
+                1,
+                MAIN_WORLD,
+                "<deno-probe-ops>",
+                "document.getElementById('inner').textContent",
+            )
+            .unwrap(),
+            serde_json::json!("frame text")
+        );
+
+        // Cross-origin frame realm (the challenge widget's realm shape).
+        let cross_url = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+        let cross_root = setup_frame(&mut rt, "cross", FRAME_HTML, cross_url, 1);
+        assert!(rt
+            .ensure_frame_realm("frame-cross", 1, cross_root, cross_url)
+            .unwrap());
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-cross",
+                1,
+                MAIN_WORLD,
+                "<deno-probe>",
+                probe,
+            )
+            .unwrap(),
+            hidden
+        );
+
+        // The engine namespace still resolves for the engine: the re-pointing
+        // hook the template realms use is gone again after realm creation.
+        assert_eq!(
+            rt.evaluate("typeof Symbol.for('obscura.internalNamespace') !== 'string'")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.execute_script_in_frame_world_realm(
+                "frame-same",
+                1,
+                MAIN_WORLD,
+                "<deno-probe-hook>",
+                "typeof globalThis[Symbol.for('obscura.internalNamespace')]",
+            )
+            .unwrap(),
+            serde_json::json!("undefined")
+        );
+    }
 
     #[test]
     fn frame_realm_globals_stay_hidden_from_cross_realm_enumeration() {
@@ -3947,7 +4152,7 @@ mod tests {
         );
 
         let roots = rt
-            .evaluate(&format!(
+            .evaluate_internal(&format!(
                 r##"(() => {{
                     const op = (cmd, a1, a2) =>
                         Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
@@ -4172,7 +4377,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
         // Opaque origin (sandbox without allow-same-origin, scripts allowed).
         let root = rt
-            .evaluate(
+            .evaluate_internal(
                 r#"(() => {
                     const op = (cmd, a1, a2) =>
                         Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));

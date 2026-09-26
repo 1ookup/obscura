@@ -22,7 +22,10 @@
 // default deno_core reporting: inline module evaluation (and anything else
 // that reads a dispatched exception) depends on it.
 (function () {
-  const core = (globalThis.Deno && Deno.core) || null;
+  // The engine namespace lives in this bootstrap's lexical scope; the global
+  // is deleted before page script runs, so there is no `globalThis.Deno` to
+  // guard against any more.
+  const core = Deno.core;
   if (!core || typeof core.setUnhandledPromiseRejectionHandler !== 'function') {
     return;
   }

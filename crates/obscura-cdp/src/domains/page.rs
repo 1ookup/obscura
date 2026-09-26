@@ -2024,10 +2024,13 @@ async fn do_navigate(
     let preload_scripts: Vec<obscura_browser::PreloadScript> = ctx
         .preload_scripts
         .iter()
-        .map(|(_, source, world_name, world_id)| obscura_browser::PreloadScript {
+        .map(|(key, source, world_name, world_id)| obscura_browser::PreloadScript {
             source: source.clone(),
             world_name: world_name.clone(),
             world_id: *world_id,
+            // addBinding shims capture the engine namespace while they run;
+            // operator preloads are page-visible surface and never do.
+            internal: key.starts_with("__obscura_binding__"),
         })
         .collect();
 
@@ -2222,6 +2225,9 @@ pub async fn handle(
                     source: source.to_string(),
                     world_name: world_name.clone(),
                     world_id,
+                    // Operator-injected page code: page-visible surface, so
+                    // the engine namespace stays hidden from it.
+                    internal: false,
                 };
                 ctx.preload_scripts.push((
                     identifier.clone(),

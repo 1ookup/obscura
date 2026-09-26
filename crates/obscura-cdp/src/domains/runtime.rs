@@ -451,13 +451,15 @@ pub async fn handle(
                 // match the coercion (`String(arg)`) and silently drop
                 // calls with wrong arity, which is what Chrome does.
                 let shim = format!(
-                    "globalThis['{name}'] = function (arg) {{\
-                        if (arguments.length !== 1) return;\
-                        try {{\
-                            const payload = typeof arg === 'string' ? arg : String(arg);\
-                            Deno.core.ops.op_binding_called('{name}', payload);\
-                        }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
-                    }};",
+                    "globalThis['{name}'] = (function (Deno) {{\
+                        return function (arg) {{\
+                            if (arguments.length !== 1) return;\
+                            try {{\
+                                const payload = typeof arg === 'string' ? arg : String(arg);\
+                                Deno.core.ops.op_binding_called('{name}', payload);\
+                            }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
+                        }};\
+                    }})(globalThis.Deno);",
                     name = name,
                 );
                 // Re-install on every navigation: globalThis is wiped on
@@ -471,7 +473,7 @@ pub async fn handle(
                 // immediately, without waiting for the next navigation.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     page.run_preload_script_immediately(
-                        &obscura_browser::PreloadScript::main_world(shim),
+                        &obscura_browser::PreloadScript::internal_main_world(shim),
                     );
                 }
             }

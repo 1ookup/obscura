@@ -550,10 +550,11 @@ globalThis.__obscura_init = function() {
     // Batch 21: frame realms restored from the surface template skip the
     // init-end sweep, but deno_core re-binds its op wrappers per isolate at
     // runtime (the async ops are plain JS closures) and core_init wires frame
-    // machinery against them. Mark the runtime Deno surface -- the same walk
-    // the inline realms' init-end sweep does, bounded to the runtime binding.
+    // machinery against them. Mark the runtime namespace surface -- the same
+    // walk the inline realms' init-end sweep does, bounded to the lexical
+    // binding the bootstrap captured (the global is gone before page script).
     if (globalThis.__obscura_frame_snapshot_surface) {
-      try { _markNativeObject(globalThis.Deno, 2); } catch (_e) {}
+      try { _markNativeObject(Deno, 2); } catch (_e) {}
     }
   }
   try {
@@ -586,13 +587,6 @@ globalThis.__obscura_init = function() {
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
-  // deno_core's binding object. It matches none of the patterns above and was
-  // therefore the one internal name left in Object.getOwnPropertyNames(window)
-  // -- a global no browser has, sitting in plain sight next to the ones this
-  // list was written to remove. It stays reachable by name for the ~119 call
-  // sites and the Rust-injected snippets that use it; only the enumeration
-  // hides it.
-  || k === 'Deno'
 );
 // The four frame-realm identity globals are set by Rust (realm.rs / ops.rs) on
 // a fresh frame context *before* its bootstrap runs, so they never exist on the

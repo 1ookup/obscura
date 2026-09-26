@@ -153,13 +153,6 @@ for (const name of [
 // writable:true and configurable:true.
 (function _preHideInternals() {
   var _names = [
-    // Created by deno_core before this script runs, so it is already present
-    // with a value: the loop below preserves it rather than clearing it.
-    // Chrome has no such global at all -- hiding it from enumeration is the
-    // cheap half of the fix; `'Deno' in window` still answers true. Removing
-    // it outright means routing all 119 JS uses plus the Rust-injected
-    // snippets (page.rs, realm.rs) through a non-global reference first.
-    'Deno',
     // runtime-set by Rust (runtime.rs / page.rs) -- these were missing, and
     // Object.keys(window) listed them verbatim:
     //   __obscura_webgl_enabled, __obscura_referrer_policy,
@@ -242,8 +235,10 @@ for (const name of [
     'SVGImageElement', 'SVGSwitchElement', 'SVGSymbolElement', 'SVGUseElement',
   ];
   // Preserve whatever is already there. Most of these names do not exist yet
-  // at this point, but some do (`Deno`), and redefining those with
-  // `value: undefined` would wipe them.
+  // at this point, and redefining a missing one with `value: undefined`
+  // creates the slot, so a name must never be listed here once the engine
+  // stops putting it on the global (`Deno` left that list when the namespace
+  // moved into the bootstrap's lexical scope).
   for (var _i = 0; _i < _names.length; _i++) {
     try {
       var _prev = Object.getOwnPropertyDescriptor(globalThis, _names[_i]);
