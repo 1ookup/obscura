@@ -229,4 +229,21 @@ class Observable {
   }
   get [Symbol.toStringTag]() { return 'Observable'; }
 }
+// Chrome 153 carries one static beside length/name/prototype (2026-09-26
+// oracle: Object.getOwnPropertyNames(Observable) is length,name,prototype,from).
+// An Observable passes through as is; anything else streams as a cold source.
+Observable.from = function from(source) {
+  if (source instanceof Observable) return source;
+  if (source && typeof source[Symbol.iterator] === 'function') {
+    return new Observable(subscriber => {
+      for (const value of source) {
+        if (!subscriber.active) return;
+        subscriber.next(value);
+      }
+      subscriber.complete();
+    });
+  }
+  throw new TypeError("Failed to execute 'from' on 'Observable': parameter 1 is not of type 'Observable'.");
+};
+_markNative(Observable.from);
 globalThis.Observable = Observable;

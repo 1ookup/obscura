@@ -5498,7 +5498,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn observable_matches_chrome_shape_and_when_stays_off_the_prototypes() {
+    async fn observable_matches_chrome_shape_and_when_is_on_every_event_target() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
@@ -5549,10 +5549,13 @@ mod tests {
                         subscriberKeys: Object.getOwnPropertyNames(Subscriber.prototype).sort(),
                         run,
                         when: {
-                            // Chrome 151 (the identity the fingerprint claims;
-                            // Step 340 oracle) publishes no `when` anywhere on
-                            // the EventTarget chain, and no Screen/Window
-                            // prototype carries it as an own property either.
+                            // Chrome 153 owns `when` on EventTarget.prototype
+                            // (2026-09-26 oracle, after removeEventListener and
+                            // before constructor), so window, document, screen
+                            // and screen.orientation all reach it through their
+                            // EventTarget chain. Screen keeps it off its own
+                            // prototype exactly like the three event methods
+                            // next to it.
                             eventTargetProtoOwn:
                                 Object.getOwnPropertyNames(EventTarget.prototype).join(","),
                             inherited: [typeof globalThis.when, typeof document.when,
@@ -5609,9 +5612,9 @@ mod tests {
                 },
                 "when": {
                     "eventTargetProtoOwn":
-                        "constructor,addEventListener,dispatchEvent,removeEventListener",
-                    "inherited": ["undefined", "undefined", "undefined", "undefined"],
-                    "own": [false, false, false, false],
+                        "constructor,addEventListener,dispatchEvent,removeEventListener,when",
+                    "inherited": ["function", "function", "function", "function"],
+                    "own": [true, false, false, false],
                     "observableGlobal": "function",
                 },
             })
@@ -14184,6 +14187,115 @@ RequestRedirect value",
             "element,event,first-input,interaction-contentful-paint,\
              largest-contentful-paint,layout-shift,long-animation-frame,longtask,\
              mark,measure,navigation,paint,resource,soft-navigation,visibility-state",
+        );
+    }
+
+    /// The challenge's snapshot counts `long-animation-frame` entries, so a
+    /// blocking unit that Chrome records and we drop is a whole missing entry,
+    /// not a wrong field. Six task sources are exercised by one fixture: a
+    /// classic script, an event listener, a message port, a timer, and the two
+    /// observer callbacks. A unit nested inside another belongs to the same
+    /// frame and must not double-report.
+    #[test]
+    fn long_animation_frame_records_each_task_source_once() {
+        let mut rt = setup_runtime("<html><body><b id=\"b\"></b></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const block = (ms) => { const s = performance.now(); while (performance.now() - s < ms); };
+                    const sources = [];
+                    const digest = () => performance.getEntriesByType('long-animation-frame')
+                        .map(entry => entry.scripts[0].invokerType + '|' + entry.scripts[0].invoker);
+                    // classic script (host-measured), then a listener inside it:
+                    // the listener is part of the same frame in Chrome.
+                    addEventListener('ping', () => block(70));
+                    dispatchEvent(new Event('ping'));
+                    // timer
+                    block(0);
+                    setTimeout(() => block(70));
+                    // message port
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = () => block(70);
+                    channel.port2.postMessage(1);
+                    // mutation observer
+                    const observer = new MutationObserver(() => block(70));
+                    observer.observe(document.body, { childList: true });
+                    document.body.appendChild(document.createElement('span'));
+                    return { digest: digest(), count: performance.getEntriesByType('long-animation-frame').length };
+                })()"#,
+            )
+            .unwrap();
+        let digest = result["digest"].as_array().unwrap();
+        let invokers: Vec<String> = digest
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "classic-script|http://example.com/page/index.html",
+            "event-listener|Window.onping",
+            "user-callback|TimerHandler:setTimeout",
+            "event-listener|MessagePort.onmessage",
+            "user-callback|MutationCallback",
+        ] {
+            assert!(
+                invokers.iter().any(|entry| entry == expected),
+                "missing LoAF attribution {expected} in {invokers:?}",
+            );
+        }
+        // One entry per source: a nested unit joins the frame that contains it.
+        assert_eq!(result["count"].as_f64(), Some(5.0), "{invokers:?}");
+    }
+
+    /// A fast page must not pay for the measurement: the host reports only when
+    /// a script blocked past the threshold, and the reported start lands on the
+    /// page's own timeline with the render phases after it.
+    #[test]
+    fn long_animation_frame_host_task_reports_threshold_and_field_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "globalThis.__obscura_record_host_task(80, 'http://example.com/app.js', 'classic-script');",
+        )
+        .unwrap();
+        let entry = rt
+            .evaluate(
+                r#"(() => {
+                    const entry = performance.getEntriesByType('long-animation-frame')[0];
+                    return {
+                        invokerType: entry.scripts[0].invokerType,
+                        invoker: entry.scripts[0].invoker,
+                        start: entry.startTime,
+                        render: entry.renderStart,
+                        style: entry.styleAndLayoutStart,
+                        duration: entry.duration,
+                        blocking: entry.blockingDuration,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let duration = entry["duration"].as_f64().unwrap();
+        assert_eq!(entry["invokerType"], "classic-script");
+        assert_eq!(entry["invoker"], "http://example.com/app.js");
+        let (start, render, style) = (
+            entry["start"].as_f64().unwrap(),
+            entry["render"].as_f64().unwrap(),
+            entry["style"].as_f64().unwrap(),
+        );
+        assert!(
+            start <= render && render <= style && style <= start + duration,
+            "render phases must sit between the start and the frame end: {entry}",
+        );
+        assert!((80.0..=81.0).contains(&duration), "duration {duration}");
+        assert!((29.0..=31.0).contains(&entry["blocking"].as_f64().unwrap()));
+        // Under the threshold nothing is buffered at all.
+        rt.evaluate(
+            "globalThis.__obscura_record_host_task(10, 'http://example.com/fast.js', 'classic-script');",
+        )
+        .unwrap();
+        assert_eq!(
+            rt.evaluate("performance.getEntriesByType('long-animation-frame').length")
+                .unwrap()
+                .as_f64(),
+            Some(1.0),
         );
     }
 
@@ -33913,7 +34025,7 @@ RequestRedirect value",
         );
     }
 
-    // ── CF 0926 payload-diff regressions (bootstrap surface)
+    // ── CF 0926 payload-diff regressions (bootstrap surface) ─────────────────
     /// still override it explicitly.
     #[tokio::test(flavor = "current_thread")]
     async fn battery_level_reports_a_full_charging_battery() {
@@ -34184,5 +34296,124 @@ RequestRedirect value",
             value["gpuConstantsKept"],
             serde_json::json!([1, 15, 1, 4, 16])
         );
+    }
+
+    #[test]
+    fn event_target_when_returns_an_observable_that_delivers_and_unsubscribes() {
+        let mut rt = setup_runtime("<html><body><div id=\"host\"></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const host = document.getElementById('host');
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        EventTarget.prototype, 'when');
+                    const observable = host.when('probe');
+                    const seen = [];
+                    observable.subscribe({ next: event => seen.push(event) });
+                    const event = new Event('probe');
+                    host.dispatchEvent(event);
+                    const afterFirst = seen.length;
+                    // A signal-carrying subscription unsubscribes on abort: the
+                    // teardown removes the listener, so a later dispatch stops
+                    // reaching it. The signal-free subscription above stays
+                    // live across the same dispatches, exactly as a browser's.
+                    const controller = new AbortController();
+                    const late = [];
+                    host.when('probe', { signal: controller.signal })
+                        .subscribe({ next: () => late.push('hit') });
+                    host.dispatchEvent(event);
+                    const beforeAbort = late.length;
+                    controller.abort();
+                    host.dispatchEvent(event);
+                    return JSON.stringify({
+                        when: typeof EventTarget.prototype.when,
+                        whenName: descriptor.value.name,
+                        whenLength: descriptor.value.length,
+                        whenSource: Function.prototype.toString.call(descriptor.value),
+                        whenEnumerable: descriptor.enumerable,
+                        whenWritable: descriptor.writable,
+                        whenConfigurable: descriptor.configurable,
+                        tag: Object.prototype.toString.call(observable),
+                        instance: observable instanceof Observable,
+                        sameEvent: seen[0] === event,
+                        afterFirst,
+                        beforeAbort,
+                        seenAfterAbort: seen.length,
+                        lateAfterAbort: late.length,
+                        mapped: Object.prototype.toString.call(
+                            host.when('probe').map(value => value)),
+                        fromStatic: typeof Observable.from,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["when"], "function");
+        assert_eq!(value["whenName"], "when");
+        assert_eq!(value["whenLength"], 1);
+        assert_eq!(value["whenSource"], "function when() { [native code] }");
+        assert_eq!(value["whenEnumerable"], true);
+        assert_eq!(value["whenWritable"], true);
+        assert_eq!(value["whenConfigurable"], true);
+        assert_eq!(value["tag"], "[object Observable]");
+        assert_eq!(value["instance"], true);
+        assert_eq!(value["sameEvent"], true);
+        // One dispatch, one delivery -- the observable carries the Event object
+        // itself, not a copy.
+        assert_eq!(value["afterFirst"], 1);
+        assert_eq!(value["beforeAbort"], 1);
+        // The signal-free subscription keeps delivering; the aborted one stops.
+        assert_eq!(value["seenAfterAbort"], 3);
+        assert_eq!(value["lateAfterAbort"], 1);
+        assert_eq!(value["mapped"], "[object Observable]");
+        assert_eq!(value["fromStatic"], "function");
+    }
+
+    /// than one that is missing.    #[test]
+    fn when_is_inherited_by_window_document_screen_and_screen_orientation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const prefixes = {
+                        window: globalThis,
+                        document: document,
+                        screen: screen,
+                        orientation: screen.orientation,
+                    };
+                    const report = {};
+                    report.chain = [
+                        Object.getOwnPropertyNames(
+                            Object.getPrototypeOf(globalThis)).slice(0, 6).join(','),
+                        String(Object.getPrototypeOf(Object.getPrototypeOf(globalThis))
+                            === EventTarget.prototype),
+                        String(Object.getPrototypeOf(globalThis.Window.prototype)
+                            === EventTarget.prototype),
+                    ];
+                    for (const name of Object.keys(prefixes)) {
+                        const target = prefixes[name];
+                        try {
+                            const received = [];
+                            target.when('census-probe')
+                                .subscribe({ next: e => received.push(e.type) });
+                            target.dispatchEvent(new Event('census-probe'));
+                            report[name] = [typeof target.when, received.join(',')];
+                        } catch (error) {
+                            report[name] = ['threw', error.name + ': ' + error.message];
+                        }
+                    }
+                    return JSON.stringify(report);
+                })()"#,
+            )
+            .unwrap();
+        println!("RAW-INHERIT={}", result);
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        for prefix in ["window", "document", "screen", "orientation"] {
+            assert_eq!(
+                value[prefix],
+                serde_json::json!(["function", "census-probe"]),
+                "prefix {prefix} must inherit when and deliver"
+            );
+        }
     }
 }

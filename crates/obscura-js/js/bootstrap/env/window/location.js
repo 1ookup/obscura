@@ -443,10 +443,10 @@ if (!Object.getOwnPropertyDescriptor(Navigator.prototype,
       value: false, writable: true, enumerable: true, configurable: true,
     });
 }
-// No `window.when`: the Window prototype inherits from EventTarget.prototype,
-// and Chrome 151 (the claimed identity; Step 340 oracle) publishes no `when`
-// anywhere on that chain. An own `when` here was a page-visible own property
-// on the window surface enumeration that no real 151 has.
+// `window.when` arrives through the prototype chain: the Window prototype
+// inherits from EventTarget.prototype, which owns the Observable-API `when`
+// (Chrome 153, 2026-09-26 oracle). It stays inherited -- Chrome has no own
+// `when` on the window surface enumeration either.
 
 
 // The child browsing contexts, exposed as `window.length` and `window[i]`.

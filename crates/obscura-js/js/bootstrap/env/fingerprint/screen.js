@@ -20,6 +20,14 @@ class ScreenOrientation {
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
   get [Symbol.toStringTag]() { return 'ScreenOrientation'; }
 }
+// Chrome's ScreenOrientation is a real EventTarget subclass, so the event
+// methods -- and the Observable-API `when` that Chrome 153 puts on
+// EventTarget.prototype -- all resolve through that chain. Without the link a
+// `screen.orientation.when(...)` call is a TypeError, and the reference census
+// reports so.when on the same four prefixes as window/document/screen.
+if (typeof EventTarget === 'function' && EventTarget.prototype) {
+  Object.setPrototypeOf(ScreenOrientation.prototype, EventTarget.prototype);
+}
 globalThis.ScreenOrientation = _markNative(ScreenOrientation);
 
 // A symbol key, not `_w`: a probe reads own property *names* as well as
