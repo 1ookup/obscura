@@ -1497,6 +1497,14 @@ impl Page {
         let exposed_size = if timing_allowed { encoded_body_size } else { 0 };
         let exposed_decoded_size = if timing_allowed { body_size } else { 0 };
         let exposed_status = if timing_allowed { response.status } else { 0 };
+        // The raw header travels; the realm parses it into the entry's
+        // serverTiming array. Chrome exposes a server's own metrics only where
+        // it exposes the sizes, so a denied grant hides this one too.
+        let server_timing_header = if timing_allowed {
+            response.header("server-timing").unwrap_or("")
+        } else {
+            ""
+        };
         // transferSize counts the response headers too, so it is always larger
         // than encodedBodySize on a real connection; the gap is a flat 300
         // bytes over h2. Reporting them equal is one subtraction away from
@@ -1536,6 +1544,7 @@ impl Page {
             "encodedBodySize": exposed_size,
             "decodedBodySize": exposed_decoded_size,
             "responseStatus": exposed_status,
+            "serverTimingHeader": server_timing_header,
             "redirectCount": response.redirected_from.len(),
             "type": "navigate",
         });
@@ -1557,7 +1566,9 @@ impl Page {
     /// Build the navigation entry visible inside a committed frame document.
     /// Unlike the embedding page's cross-origin iframe resource entry, this
     /// entry belongs to the response's own realm and therefore exposes its
-    /// timing and body sizes without a Timing-Allow-Origin grant.
+    /// timing and body sizes without a Timing-Allow-Origin grant. The same
+    /// holds for the response's Server-Timing metrics, which is the one field
+    /// the entry carries while the embedding page's copy of it does not.
     fn frame_navigation_performance_entry(
         response: &obscura_net::Response,
     ) -> serde_json::Value {
@@ -1592,6 +1603,7 @@ impl Page {
             "encodedBodySize": encoded_body_size,
             "decodedBodySize": body_size,
             "responseStatus": response.status,
+            "serverTimingHeader": response.header("server-timing").unwrap_or(""),
             "redirectCount": response.redirected_from.len(),
             "type": "navigate",
         })
@@ -8922,6 +8934,307 @@ mod tests {
                 true,
             ]),
             "a frame document exposes its own complete navigation timing",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_and_frame_entries_report_server_timing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let frame_body = "<!doctype html><p>frame</p>";
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..length]).to_string();
+                let (server_timing, body) = if head.contains("/frame") {
+                    ("a;dur=123, b;dur=45.5;desc=\"x\"", frame_body.to_string())
+                } else {
+                    (
+                        "cfprobe;dur=250209",
+                        "<!doctype html><iframe src=\"/frame\"></iframe>".to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer-Timing: {server_timing}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "server-timing".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("server-timing".to_string(), context);
+        page.navigate(&format!("{origin}/main")).await.unwrap();
+
+        let probe = r#"(() => {
+            const entry = performance.getEntriesByType("navigation")[0] || {};
+            const metrics = entry.serverTiming || [];
+            return [
+                typeof PerformanceServerTiming,
+                metrics instanceof Array,
+                Object.isFrozen(metrics),
+                JSON.stringify(metrics),
+                metrics.map(item => item instanceof PerformanceServerTiming),
+                metrics.map(item => typeof item.duration),
+                metrics.map(item => item.toJSON()),
+            ];
+        })()"#;
+        let result = page
+            .evaluate_for_cdp_with_timeout(probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "function",
+                true,
+                true,
+                r#"[{"name":"cfprobe","duration":250209,"description":""}]"#,
+                [true],
+                ["number"],
+                [{"name": "cfprobe", "duration": 250209, "description": ""}],
+            ]),
+            "the document's Server-Timing header becomes the entry's serverTiming",
+        );
+
+        let child_id = page
+            .frames
+            .get(page.frames.main_frame_id())
+            .unwrap()
+            .children[0]
+            .clone();
+        let generation = page.frames.get(&child_id).unwrap().document_generation;
+        let child_timing = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &child_id,
+                generation,
+                "<frame-server-timing-probe>",
+                r#"(() => {
+                    const entry = performance.getEntriesByType('navigation')[0];
+                    return entry ? [
+                        entry.name.endsWith('/frame'),
+                        JSON.stringify(entry.serverTiming),
+                        entry.serverTiming.map(item => item.description),
+                    ] : null;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            child_timing,
+            serde_json::json!([
+                true,
+                r#"[{"name":"a","duration":123,"description":""},{"name":"b","duration":45.5,"description":"x"}]"#,
+                ["", "x"],
+            ]),
+            "a frame document reads its own response's Server-Timing metrics",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cross_origin_frame_hides_server_timing_without_timing_allow_origin() {
+        let main_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let main_address = main_listener.local_addr().unwrap();
+        let main_origin = format!("http://{main_address}");
+        let frame_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let frame_origin = format!("http://{}", frame_listener.local_addr().unwrap());
+        let frame_url = format!("{frame_origin}/frame");
+
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let Ok((mut stream, _)) = main_listener.accept() else { return };
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap_or(0);
+            let _head = String::from_utf8_lossy(&request[..length]).to_string();
+            let body = format!("<!doctype html><iframe src=\"{frame_url}\"></iframe>");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+
+            let Ok((mut stream, _)) = frame_listener.accept() else { return };
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..length]).to_string();
+            if !head.contains("/frame") {
+                return;
+            }
+            // No Timing-Allow-Origin: the embedding page may not see the
+            // frame's metrics, while the frame itself always can.
+            let body = "<!doctype html><p>frame</p>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer-Timing: a;dur=123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "server-timing-cross".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("server-timing-cross".to_string(), context);
+        page.navigate(&format!("{main_origin}/main")).await.unwrap();
+
+        let probe = r#"(() => {
+            const entry = performance.getEntriesByType("resource")
+                .find(value => value.initiatorType === "iframe") || {};
+            return [
+                entry.name === undefined ? null : entry.name.endsWith("/frame"),
+                JSON.stringify(entry.serverTiming || null),
+                entry.decodedBodySize,
+                entry.encodedBodySize,
+            ];
+        })()"#;
+        let result = page
+            .evaluate_for_cdp_with_timeout(probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, "[]", 0, 0]),
+            "a denied Timing-Allow-Origin hides the frame's server metrics",
+        );
+
+        let child_id = page
+            .frames
+            .get(page.frames.main_frame_id())
+            .unwrap()
+            .children[0]
+            .clone();
+        let generation = page.frames.get(&child_id).unwrap().document_generation;
+        let child_timing = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &child_id,
+                generation,
+                "<frame-server-timing-cross-probe>",
+                r#"(() => {
+                    const entry = performance.getEntriesByType('navigation')[0];
+                    return entry ? [entry.name.endsWith('/frame'), JSON.stringify(entry.serverTiming)] : null;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            child_timing,
+            serde_json::json!([true, r#"[{"name":"a","duration":123,"description":""}]"#]),
+            "the frame's own realm still reads its response's Server-Timing",
+        );
+    }
+
+    /// Every case below is what a browser reports for the same Server-Timing
+    /// header value, captured against a local fixture: quoted descriptions
+    /// keep their delimiters, parameters are case-insensitive, the first dur
+    /// wins, an unusable dur reports 0 and a nameless member is not a metric.
+    #[test]
+    fn server_timing_header_parses_like_the_browser() {
+        let mut page = frame_test_page("<html></html>");
+        page.init_js();
+        let cases: Vec<String> = vec![
+            "a;dur=123, b;dur=45.5;desc=\"x\"".to_string(),
+            "metric".to_string(),
+            "m;dur=1e3".to_string(),
+            "m;dur=-5".to_string(),
+            "m;dur=+8".to_string(),
+            "m;dur=0.25".to_string(),
+            "m;dur=abc".to_string(),
+            "m;dur=".to_string(),
+            "m;dur=1;dur=2".to_string(),
+            "m;foo=bar;dur=7".to_string(),
+            "m;desc=\"hello world\"".to_string(),
+            "m;desc=\"\"".to_string(),
+            "m;desc".to_string(),
+            "m;extra".to_string(),
+            "  a ; dur = 12 ; desc = \" hi \" ,  b".to_string(),
+            "m;dur=1,".to_string(),
+            "m;desc=\"a,b\",n;dur=2".to_string(),
+            "m;desc=\"say \\\"hi\\\"\"".to_string(),
+            "m;desc=a\"b".to_string(),
+            "a\"b;dur=1".to_string(),
+            "m;dur=1\"2".to_string(),
+            "m;desc=a\"b;c;dur=3,n;dur=4".to_string(),
+            "m;desc=a\"b\",n;dur=4".to_string(),
+            "MiX;DuR=9;DeSc=lower".to_string(),
+            ";dur=5".to_string(),
+            ",".to_string(),
+            "".to_string(),
+        ];
+        let script = format!(
+            r#"(function() {{
+                const cases = {};
+                cases.forEach(function(value, index) {{
+                    globalThis.__obscura_performance_record({{
+                        entryType: 'resource',
+                        name: 'https://srv.example/' + index,
+                        serverTimingHeader: value,
+                    }});
+                }});
+                return performance.getEntriesByType('resource')
+                    .map(function(entry) {{
+                        return entry.serverTiming.map(function(item) {{
+                            return [item.name, item.duration, item.description];
+                        }});
+                    }});
+            }})()"#,
+            serde_json::to_string(&cases).unwrap(),
+        );
+        let parsed = page.js.as_mut().unwrap().evaluate(&script).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                [["a", 123, ""], ["b", 45.5, "x"]],
+                [["metric", 0, ""]],
+                [["m", 1000, ""]],
+                [["m", -5, ""]],
+                [["m", 8, ""]],
+                [["m", 0.25, ""]],
+                [["m", 0, ""]],
+                [["m", 0, ""]],
+                [["m", 1, ""]],
+                [["m", 7, ""]],
+                [["m", 0, "hello world"]],
+                [["m", 0, ""]],
+                [["m", 0, ""]],
+                [["m", 0, ""]],
+                [["a", 12, " hi "], ["b", 0, ""]],
+                [["m", 1, ""]],
+                [["m", 0, "a,b"], ["n", 2, ""]],
+                [["m", 0, "say \"hi\""]],
+                [["m", 0, "a"]],
+                [["a", 1, ""]],
+                [["m", 1, ""]],
+                [["m", 3, "a"], ["n", 4, ""]],
+                [["m", 0, "a"], ["n", 4, ""]],
+                [["MiX", 9, "lower"]],
+                [],
+                [],
+                [],
+            ]),
+            "Server-Timing parses the way a browser parses it",
         );
     }
 

@@ -53,6 +53,11 @@ function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigi
   } catch (_error) {}
   const decodedSize = allowed ? Math.max(0, +bodySize || 0) : 0;
   const size = allowed ? _encodedBodySizeFor(parsed.headers, decodedSize) : 0;
+  // A denied Timing-Allow-Origin hides the server's metrics along with the
+  // sizes, exactly as it hides everything else but responseEnd.
+  const serverTimingHeader = allowed
+    ? String((parsed.headers || {})['server-timing'] || '')
+    : '';
   record({
     name: url,
     entryType: 'resource',
@@ -76,6 +81,7 @@ function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigi
     encodedBodySize: size,
     decodedBodySize: decodedSize,
     responseStatus: allowed ? parsed.status : 0,
+    serverTimingHeader,
   });
 }
 
@@ -148,6 +154,7 @@ function _recordImageResourceTiming(metadata, fetchStart) {
     encodedBodySize: allowed ? size : 0,
     decodedBodySize: allowed ? decoded : 0,
     responseStatus: allowed ? (+timing.status || 0) : 0,
+    serverTimingHeader: allowed ? String(timing.serverTimingHeader || '') : '',
   });
 }
 

@@ -8966,6 +8966,9 @@ fn image_resource_timing_json(
         "redirectCount": response.redirected_from.len(),
         "encodedBodySize": encoded_body_size,
         "decodedBodySize": body_size,
+        // The raw header, parsed by the realm that files the entry; the same
+        // Timing-Allow-Origin grant gates it there.
+        "serverTimingHeader": response.header("server-timing").unwrap_or(""),
         "timingAllowed": timing_allowed,
     })
 }
