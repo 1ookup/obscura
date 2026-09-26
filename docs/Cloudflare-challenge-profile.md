@@ -1974,3 +1974,78 @@ payload#3 形态也逐会话变（93 键 vs 4 键），flow-shape 不是判据�
 
 **⑦ 下一步**：4 路验证 agent 并行定位（census/探针原像/事件流/DOM 走查），定位后按文件
 分批修复+回归测试+commit，再以同一 30s 形态复跑判决。
+
+#### 356.1 验证轮定案（4 路并行，全部带 fixture 实测）
+
+- **P1-10 顶层 DOM 走查差=判决失败的下游**：`dir=ltr` 是 CF orchestrate i18n 在 t≈4s 自写
+  （Step 303 已判非缺陷，本机 Chrome 同形）；参考侧 VHsEp9 的文档不是插页而是**通过后重载的
+  真实页面**（`<main>`+格式化 HTML+`meta charset` 三特征）。连带归并 xDith4/lgWCE7/OaTs4/
+  wTQAz9/VwLIk3/pTTI9/TjPV9/gPOK0/Vhmq4-dir。**证据**：归一化后我方收到的插页与 0916 HAR
+  模板同族（只差 `cFPWv` 'b'/'g'）；obscura 解析同一字节后不加 dir 不丢元素（fixture 双向）。
+- **XCvwf5 破案**：`QBlqQ3`=encodedBodySize（参考 77937=rPXg2[0].FoGsT1 精确相等）、
+  `bYTbg6`=decodedBodySize（brotli 4.33x）；我方两字段同值=wreq 透明解压后 encoded 填了
+  decoded 长度。`ryJGE4`=**serverTiming**（CF 头 `server-timing: <name>;dur=`，我方恒 []）。
+- **Pdbt7 缺的 6 条=long-animation-frame**：Chrome 的 LoAF 进 getEntries；我方只包 timer/rAF。
+- **`wopX8`=5 个 PoW worker 回复之和**（132230 逐字节精确吻合）=固定 100ms 预算内完成量
+  ⇒ **我方快 2.3-3.3x**（digest 同栈结算，不跨任务边界）。
+- **`when`=EventTarget.prototype.when（Observable API）**：我方实现层按过时的
+  「Chrome 151 没有」oracle 故意不实现（event-target-object.js），键序模型里早就有它。
+- **`uGyjw9`=引导/普查窗口 wall-clock ms**（fo1 即定型、三段恒定、负载漂移）；315 vs 7 的
+  主体=frame realm 水合+每 context WebIDL sweep+跨 realm 读扇出。
+- **aQgx8 写点=挑战 VM 自己**（opcode 5182:26，t≈+10s，`window.aQgx8=1`）；payload 经
+  **window 自身可枚举键枚举+je 白名单**取数（trap 设不可枚举 ⇒ 91/93 键与参考全同形）。
+- **blk24 四哈希原像**：sha256("433.6700134277344"/"52.94…"/"17.94…"(参考="0")/"0.0537…")
+  ——确定性几何/像素统计值，极可能出自 OffscreenCanvas/WebGL 链（r10 时间线）。
+- **`dsKPy6`=battery.level**（Step 303 的 0.99 人格已过期，现参考=1）。
+- **select shim 泄漏**：value/options/selectedIndex 用页面可见 `querySelectorAll('option')`
+  实现（6 处），被 CF 的 QSA 钩子记走。
+- **`maNnU6`/`xWWV8`/`SbVZ3`**：maNnU6=select 泄漏（已修）；xWWV8 非随机性（参考 fo2/fo3
+  逐字节同），判决下游；SbVZ3 我方是参考的严格子序列（少 QLaZp6 组+前置对），疑 API 面差
+  的条件探针，待 COI/全局修复后复测。
+- **测量盲区新增**：`--trace-api-file` 覆盖不到 widget frame；`window['qmk…']` 标记读不产生
+  API trace；Object.prototype 数值面访问器引发页面 RangeError（r8 报废）。
+
+#### 356.2 修复批次（13 项，~20 commits，全部带回归测试）
+
+| commit | 内容 | 实弹验证 |
+|---|---|---|
+| `93b2899` | encodedBodySize=线上字节数（wreq/reqwest 自动解码会删 Content-Encoding/Length 头，隐身客户端自行解码并保留 wire 计数） | v1/v2/v4 payload：ebs≠dbs，比值 4.31x vs 参考 4.33x ✓ |
+| `11860ac` | referrer：客户端给空串仍回退祖先链（widget referrer=""→页面 URL） | fixture 8 形态 ✓ |
+| `1cc7d99`/`9c3d07d` | TextMetrics：空字形不入 ink union；对齐框过 f32（泄漏 45/10000→0） | ✓ |
+| `ee49993` | supportedEntryTypes=Chrome 153 的 15 项（原 13） | census 對齐 ✓ |
+| `9ad55f4`+`0ae2938` | **COI**：set_document_scope/about:blank 不再借顶层位；**跨源子帧一律不隔离**（Chrome 153 八变体全 false，allow="cross-origin-isolated" 不构成委派——FIX-6 的 true 格是 COEP 拦截错误页的测量混淆） | v2/v4 payload 桶T/桶N 干净 ✓✓ |
+| `30db16b` | link rel=preload 全目的地真实 fetch+initiatorType="link" | fixture ✓ |
+| `cdeec71` | battery.level=1 | payload dsKPy6 ✓ |
+| `0ef7c68` | select 表面 0 次页面可见 QSA（child 走查） | maNnU6 无 option ✓ |
+| `2016e62` | 8 单例 toStringTag+featurePolicy→PermissionsPolicy | ✓ |
+| `295a8f4` | 移除 Chrome 153 没有的 10 全局+chrome.runtime+modelContext | ✓ |
+| `87a63fc` | EventTarget.prototype.when（复用既有 Observable）+Observable.from | census 四前缀有 when ✓ |
+| `1827851` | LoAF 按任务源测量（classic-script/event-listener/MessagePort/Mutation/Resize/Intersection+timer 词汇修正）；`468b490` worker 时钟量子过 fround（保持 float32 步进类，不锁死时钟） | fixture LoAF 2→6 条，invokerType 词汇=Chrome ✓ |
+| `098b72e` | serverTiming 解析（27 个 oracle 头形态逐格；TAO 门） | v1 payload ryJGE4=95492（参考量级）✓ |
+| `44bfb5f` | OffscreenCanvas==canvas 共享 measureText 入口 pin（否定性结论：无接线分叉；😍/🏯 不在 emoji 表无 oracle，未编造） | 1080 组 bit 级一致 ✓ |
+| `c9d0b62` | worker async-op 正常结算/digest 吞吐不变量 pin（**P1 前提被配对实验推翻**：bench5 停滞=微任务风暴，真 Chrome 同形；digest 边界化会把偏差从快 2.4x 变成慢 9x 且破坏 PoW，先决条件=每-turn 成本 ≤4µs） | 防回归 ✓ |
+| `d544a99` | **Deno 移出页面/worker 可见面**（词法捕获+快照帧模板符号钩子；Rust 注入点 7 处迁移；sloppy-mode 泄漏一并修） | 三 realm typeof/in 干净，引擎功能零回归 ✓ |
+| （进行中） | `__bootstrap` 全局同机制隐匿 | 待验 OjmeV1[79] |
+
+**门禁**：全 workspace release nextest 1999/1999（d544a99 树）+ `--no-default-features`
+check 干净；ledger 已记。obstacle course 仓库不在本机，留待有检出的主机（多处已记 pending）。
+
+#### 356.3 收官判决轮（2026-09-27 凌晨，新二进制）
+
+| 轮 | 二进制 | beacon | 判决 |
+|---|---|---|---|
+| v1 | FIX-1~9 | 5 | fail（rc_ni=1）；XCvwf5 闭合生效 |
+| v2/v4 | +FIX-11/Deno | 2（截断，~40% 瞬态） | rc_ni 缺席（判决未定型，**不构成通过证据**） |
+| v3/v5/v6 | 完整流 | 5（0.5/4.2/13.6/19.0/22.5s，click@14s） | **fail（rc_ni=1）** |
+
+**已闭合（活体 payload 复核）**：XCvwf5 三字段、COI 桶T/桶N+SAB、`when`×4、battery、
+select/QSA、品牌串、多余全局、LoAF+2、link initiatorType、ebs/dbs、worker 时钟 f32。
+
+**剩余分岔（= §C1 的当前候选池）**：
+1. `OjmeV1[79]`=true（Deno 排除[v4 实测]、COI/SAB/已移除全局排除；`__bootstrap` 修复在途）
+2. `aQgx8`+`OjmeV1[118]`+blk24 四哈希=OffscreenCanvas/WebGL 像素统计链（光栅化保真级，
+   与 §10.13 像素墙同族；aQgx8 写点紧跟 blk24 后 0.42s=该链判定标记）
+3. `uGyjw9` 288 vs 7=引导窗口 wall-clock（frame realm 水合+WebIDL sweep，Step 318 级工程）
+4. `wopX8`=digest 每-turn 成本（16µs vs Chrome 1.7µs，先决条件同上）
+5. `Pdbt7` 8 vs 13 残差=微任务排空段 LoAF（realm 不可见检查点）
+6. 顶层 COEP 阻塞语义（Chrome 拒载 COEP 不兼容子帧，我方非隔离加载；既有记录差异）
