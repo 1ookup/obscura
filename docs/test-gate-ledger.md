@@ -72,3 +72,12 @@ run covers are then removed.
 - 2026-09-22: baseline. All code commits through `280cf2b` carried full
   workspace gates inside their batches (latest: 1914/1914 at the batch-41
   fix `f12dee4`; `6ac3488`/`280cf2b` are docs-only). Ledger starts empty.
+
+## Deferred
+
+- 2026-09-27: `ee49993` `30db16b` `1827851` `468b490` (performance-entry
+  surfaces: supportedEntryTypes, preload initiatorType, LoAF task sources,
+  worker clock quantum). Scoped run instead: `cargo nextest run --release
+  --features render -p obscura-js -p obscura-browser --config
+  vendor/v8-source.toml` = **861/861 passed**, plus the exact release build.
+  Full workspace run and the obstacle course remain to be executed.
