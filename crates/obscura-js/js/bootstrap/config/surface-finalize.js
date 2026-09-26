@@ -225,7 +225,7 @@
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
       'protectedAudience', 'storageBuckets',
     ]) _remove(globalThis.navigator, name);
-    for (const name of ['sharedStorage', 'documentPictureInPicture', 'launchQueue']) {
+    for (const name of ['documentPictureInPicture', 'launchQueue']) {
       _remove(globalThis, name);
     }
     _remove(globalThis.crypto, 'subtle');
@@ -782,7 +782,6 @@ const _chromeInterfaceTable = [
   ["MediaStreamTrackGenerator",0,2,"MediaStreamTrack","",1],
   ["MediaStreamTrackProcessor",0,2,"Object","",1],
   ["MediaStreamTrackVideoStats",0,0,"Object","",0],
-  ["ModelContext",0,0,"EventTarget","",0],
   ["MessageChannel",0,1,"Object","MessageChannel",0],
   ["MessageEvent",0,2,"Event","",1],
   ["MessagePort",0,0,"EventTarget","",0],
@@ -1032,13 +1031,6 @@ const _chromeInterfaceTable = [
   ["SVGUseElement",0,0,"SVGGraphicsElement","",0],
   ["SVGViewElement",0,0,"SVGElement","",0],
   ["Sanitizer",0,1,"Object","Sanitizer",0],
-  ["SharedStorage",0,0,"Object","",0],
-  ["SharedStorageWorklet",0,0,"Worklet","",0],
-  ["SharedStorageAppendMethod",0,0,"Object","",0],
-  ["SharedStorageClearMethod",0,0,"Object","",0],
-  ["SharedStorageDeleteMethod",0,0,"Object","",0],
-  ["SharedStorageModifierMethod",0,0,"Object","",0],
-  ["SharedStorageSetMethod",0,0,"Object","",0],
   ["Scheduler",0,0,"Object","",0],
   ["Scheduling",0,0,"Object","",0],
   ["Screen",0,0,"EventTarget","",0],
@@ -1173,7 +1165,6 @@ const _chromeInterfaceTable = [
   ["WGSLLanguageFeatures",0,0,"Object","",0],
   ["WakeLock",0,0,"Object","",0],
   ["WakeLockSentinel",0,0,"EventTarget","",0],
-  ["WebMCPEvent",0,2,"Event","",1],
   ["WaveShaperNode",0,2,"AudioNode","",1],
   ["WeakMap",0,1,"Object","WeakMap",0],
   ["WeakRef",0,4,"Object","",1],
@@ -1458,7 +1449,6 @@ const _chromeNavigatorTable = [
   ["mediaDevices", 1],
   ["mediaSession", 1],
   ["mimeTypes", 1],
-  ["modelContext", 1],
   ["permissions", 1],
   ["plugins", 1],
   ["presentation", 1],
@@ -1610,18 +1600,19 @@ const _chromeInterfaceShells = new Set();
     Object.defineProperty(globalThis, 'clientInformation',
       { get() { return globalThis.navigator; }, enumerable: true, configurable: true });
   }
-  // `sharedStorage` is present on every https window in the passing sessions
-  // (the Chrome 151 renderer trace reads window.sharedStorage in the top
-  // document, about:blank and the challenge frame alike), so the namespace
-  // object is installed here next to its enumerable-object siblings.
+  // `sharedStorage` used to be installed here next to its enumerable-object
+  // siblings on the strength of the Chrome 151 renderer trace. Both the local
+  // Chrome 153 window and the 0926 remote reference census answer
+  // `'sharedStorage' in window` with false -- the SharedStorage family is
+  // origin-gated off in every shape we can observe -- so it is gone, and with
+  // it the SharedStorage* constructors and ModelContext/WebMCPEvent.
   for (const name of ['cookieStore', 'crashReport', 'documentPictureInPicture',
-                      'sharedStorage', 'viewport', 'launchQueue']) {
+                      'viewport', 'launchQueue']) {
     if (typeof globalThis[name] !== 'undefined') continue;
     const object = {};
     Object.defineProperty(object, Symbol.toStringTag,
       { value: { cookieStore: 'CookieStore', crashReport: 'CrashReportedDetails',
                  documentPictureInPicture: 'DocumentPictureInPicture',
-                 sharedStorage: 'SharedStorage',
                  viewport: 'Viewport',
                  launchQueue: 'LaunchQueue' }[name], configurable: true });
     Object.defineProperty(globalThis, name,
@@ -2454,7 +2445,6 @@ const _chromeNavigatorKeyOrder = [
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
   'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection',
-  'modelContext',
   'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
@@ -2577,7 +2567,7 @@ const _chromeEnumerableWindowObjects = [
   'navigator', 'external', 'screen', 'visualViewport', 'clientInformation',
   'styleMedia', 'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
-  'cookieStore', 'caches', 'documentPictureInPicture', 'sharedStorage',
+  'cookieStore', 'caches', 'documentPictureInPicture',
   'viewport', 'launchQueue', 'speechSynthesis',
 ];
 const _chromeEnumerableWindowFunctions = [

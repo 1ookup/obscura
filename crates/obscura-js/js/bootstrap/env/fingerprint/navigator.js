@@ -288,7 +288,10 @@ registerNavigatorSurface();
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
+  // No `runtime`: an extension-free Chrome answers
+  // Object.getOwnPropertyNames(window.chrome) with loadTimes,csi,app and
+  // typeof chrome.runtime with "undefined" (Chrome 153 oracle, 2026-09-26).
+  // The property only exists on a window that hosts an extension process.
   csi() {
     const t = Date.now();
     return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
