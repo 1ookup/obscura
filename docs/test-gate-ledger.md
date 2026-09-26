@@ -81,3 +81,8 @@ run covers are then removed.
   --features render -p obscura-js -p obscura-browser --config
   vendor/v8-source.toml` = **861/861 passed**, plus the exact release build.
   Full workspace run and the obstacle course remain to be executed.
+- 2026-09-27: `098b72e` (Server-Timing parsed into entry.serverTiming).
+  Scoped run instead: `cargo nextest run --release --features render -p
+  obscura-js -p obscura-browser --config vendor/v8-source.toml` = **868/868
+  passed**, plus the exact release build. Full workspace run and the obstacle
+  course (companion repo absent on this host) remain to be executed.
