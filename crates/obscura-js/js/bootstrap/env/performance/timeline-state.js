@@ -2,10 +2,14 @@
 // consume this state, while no public constructor is defined here.
 const _performanceEntries = [];
 const _performanceObservers = new Set();
+// Chrome 153 order (2026-09-26 oracle). The list is published verbatim through
+// PerformanceObserver.supportedEntryTypes, so both the membership and the
+// ordering a page snapshots are observable.
 const _supportedPerformanceEntryTypes = Object.freeze([
-  'element', 'event', 'first-input', 'largest-contentful-paint',
-  'layout-shift', 'long-animation-frame', 'longtask', 'mark', 'measure',
-  'navigation', 'paint', 'resource', 'visibility-state'
+  'element', 'event', 'first-input', 'interaction-contentful-paint',
+  'largest-contentful-paint', 'layout-shift', 'long-animation-frame',
+  'longtask', 'mark', 'measure', 'navigation', 'paint', 'resource',
+  'soft-navigation', 'visibility-state'
 ]);
 let _resourceTimingBufferSize = 250;
 

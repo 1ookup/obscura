@@ -14167,6 +14167,24 @@ RequestRedirect value",
         );
     }
 
+    /// The published list is a page-visible surface: the challenge snapshots
+    /// `PerformanceObserver.supportedEntryTypes` wholesale, so a missing type or
+    /// a reordered one is as readable as a missing entry type. Order is
+    /// Chrome 153 (2026-09-26 oracle).
+    #[test]
+    fn supported_entry_types_match_chromes_list_and_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("PerformanceObserver.supportedEntryTypes.join(',')")
+            .unwrap();
+        assert_eq!(
+            result.as_str().unwrap(),
+            "element,event,first-input,interaction-contentful-paint,\
+             largest-contentful-paint,layout-shift,long-animation-frame,longtask,\
+             mark,measure,navigation,paint,resource,soft-navigation,visibility-state",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn performance_observer_delivers_entries_at_a_microtask_checkpoint() {
         let mut rt = setup_runtime("<html><body></body></html>");
