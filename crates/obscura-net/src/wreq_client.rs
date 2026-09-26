@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "stealth")]
 use futures_util::StreamExt;
 #[cfg(feature = "stealth")]
+use tokio::io::AsyncReadExt;
+#[cfg(feature = "stealth")]
 use tokio::sync::RwLock;
 #[cfg(feature = "stealth")]
 use url::Url;
@@ -135,7 +137,7 @@ async fn read_wreq_body_limited(
     response: wreq::Response,
     url: &Url,
     limit: usize,
-) -> Result<Vec<u8>, ObscuraNetError> {
+) -> Result<(Vec<u8>, Option<usize>), ObscuraNetError> {
     if response
         .headers()
         .get("content-length")
@@ -151,6 +153,14 @@ async fn read_wreq_body_limited(
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
+    // Read before the body consumes the response: `bytes_stream` takes it by
+    // value.
+    let coding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .map(str::to_owned);
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
@@ -163,7 +173,60 @@ async fn read_wreq_body_limited(
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+
+    // The client is built with auto-decompression off precisely so this is the
+    // bytes-as-sent count: decode here, with the same library the transport
+    // used to decode, and hand the caller both sizes.
+    let wire_body_len = body.len();
+    let decoded = match coding.as_deref() {
+        Some("gzip") => {
+            decode_body(async_compression::tokio::bufread::GzipDecoder::new(&body[..]), url, limit)
+                .await?
+        }
+        Some("deflate") => {
+            decode_body(
+                async_compression::tokio::bufread::DeflateDecoder::new(&body[..]),
+                url,
+                limit,
+            )
+            .await?
+        }
+        Some("br") => {
+            decode_body(async_compression::tokio::bufread::BrotliDecoder::new(&body[..]), url, limit)
+                .await?
+        }
+        Some("zstd") => {
+            decode_body(async_compression::tokio::bufread::ZstdDecoder::new(&body[..]), url, limit)
+                .await?
+        }
+        // No coding, or one the transport never decoded either (tower-http's
+        // decode is an exact match on these same four names). Serve as sent.
+        _ => body,
+    };
+    Ok((decoded, Some(wire_body_len)))
+}
+
+/// Undo one content coding over bytes already read. Bounded by the same limit
+/// as the read, so a crafted stream cannot expand past what the transport
+/// would have accepted.
+#[cfg(feature = "stealth")]
+async fn decode_body<D>(
+    decoder: D,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError>
+where
+    D: tokio::io::AsyncRead + Unpin,
+{
+    let mut decoded = Vec::new();
+    let mut take = decoder.take(limit as u64 + 1);
+    take.read_to_end(&mut decoded).await.map_err(|error| {
+        ObscuraNetError::Network(format!("Failed to decode response body: {}", error))
+    })?;
+    if decoded.len() > limit {
+        return Err(response_too_large(url, limit));
+    }
+    Ok(decoded)
 }
 
 #[cfg(feature = "stealth")]
@@ -251,6 +314,16 @@ impl StealthHttpClient {
         }
         let mut builder = wreq::Client::builder()
             .emulation(emulation)
+            // The transport's own decode would hide `Content-Length` and
+            // `Content-Encoding` from the response and leave nothing to report
+            // as a Resource Timing encodedBodySize. `read_wreq_body_limited`
+            // decodes instead, so the wire size survives. Chrome still asks for
+            // compression: `accept-encoding` is one of the headers this module
+            // replays itself.
+            .gzip(false)
+            .brotli(false)
+            .deflate(false)
+            .zstd(false)
             // Keep emulation's TLS/HTTP2 fingerprint, but generate request
             // headers in this module so default and explicit Client-Hints
             // can never be serialized twice by the transport layer.
@@ -405,6 +478,7 @@ impl StealthHttpClient {
                     url: current_url,
                     headers: HashMap::new(),
                     body: Vec::new(),
+                    wire_body_len: None,
                     redirected_from: Vec::new(),
                     timing: ResponseTiming::default(),
                 });
@@ -667,8 +741,8 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
+            let (body, wire_body_len) =
+                read_wreq_body_limited(resp, &current_url, request.max_response_bytes).await?;
             let response_end = fetch_started.elapsed();
             drop(in_flight);
 
@@ -677,6 +751,7 @@ impl StealthHttpClient {
                 status: status.as_u16(),
                 headers: response_headers,
                 body,
+                wire_body_len,
                 redirected_from: redirects,
                 timing: ResponseTiming {
                     start: fetch_started,
@@ -715,6 +790,7 @@ impl StealthHttpClient {
                     url: url.clone(),
                     headers: HashMap::new(),
                     body: Vec::new(),
+                    wire_body_len: None,
                     redirected_from: Vec::new(),
                     timing: ResponseTiming::default(),
                 });
@@ -920,7 +996,7 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        let (decoded_body, wire_body_len) = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
         let response_end = fetch_started.elapsed();
         drop(in_flight);
 
@@ -928,7 +1004,8 @@ impl StealthHttpClient {
             url: url.clone(),
             status: status.as_u16(),
             headers: response_headers,
-            body: resp_body,
+            body: decoded_body,
+            wire_body_len: wire_body_len,
             redirected_from: Vec::new(),
             timing: ResponseTiming {
                 start: fetch_started,
@@ -1053,6 +1130,20 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+        // The decode is invisible to the body but must not be invisible to
+        // Resource Timing: encodedBodySize is the bytes that crossed the wire,
+        // decodedBodySize is what the parser was handed.
+        assert_eq!(
+            resp.encoded_body_len(),
+            GZIP_BODY.len(),
+            "encoded length must come from the response's Content-Length",
+        );
+        assert_eq!(resp.body.len(), PLAIN_BODY.len(), "decoded length");
+        assert_ne!(
+            resp.encoded_body_len(),
+            resp.body.len(),
+            "a compressed body must not report its encoded and decoded sizes equal",
+        );
     }
 
     // The opt-in above must stay opt-in. A default-constructed stealth client

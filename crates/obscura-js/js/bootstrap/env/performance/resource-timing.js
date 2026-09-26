@@ -4,6 +4,21 @@
 // the two as equal is a one-subtraction tell.
 const _RESOURCE_HEADER_BYTES = 300;
 
+// The transport decodes gzip and brotli before the body reaches this realm, so
+// a response's own byte length is its decodedBodySize and says nothing about
+// what crossed the wire. Chrome reports the encoded length there, and a
+// document that is served compressed but claims a body-sized encodedBodySize
+// is a tell -- 77937 on the wire against 337517 decoded is what a real browser
+// sees for the same response. The encoded length survives the decode only as
+// the response's Content-Length, which is the compressed size whenever a
+// content coding was applied and the decoded size otherwise.
+function _encodedBodySizeFor(headers, decodedSize) {
+  const declared = Number(headers && headers['content-length']);
+  return Number.isFinite(declared) && declared >= 0
+    ? declared
+    : Math.max(0, +decodedSize || 0);
+}
+
 // The protocol a response arrived over. The transport does not surface the
 // negotiated ALPN value, and every https origin the engine talks to serves
 // h2, so derive it from the scheme rather than leave the attribute empty --
@@ -36,7 +51,8 @@ function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigi
         .some(value => value === '*' || value === pageOrigin);
     }
   } catch (_error) {}
-  const size = allowed ? Math.max(0, +bodySize || 0) : 0;
+  const decodedSize = allowed ? Math.max(0, +bodySize || 0) : 0;
+  const size = allowed ? _encodedBodySizeFor(parsed.headers, decodedSize) : 0;
   record({
     name: url,
     entryType: 'resource',
@@ -58,7 +74,7 @@ function _recordFetchResourceTiming(parsed, initiatorType, fetchStart, pageOrigi
     responseEnd,
     transferSize: size ? size + _RESOURCE_HEADER_BYTES : 0,
     encodedBodySize: size,
-    decodedBodySize: size,
+    decodedBodySize: decodedSize,
     responseStatus: allowed ? parsed.status : 0,
   });
 }
@@ -78,6 +94,7 @@ function _recordImageResourceTiming(metadata, fetchStart) {
   const responseEnd = fetchStart + Math.max(0, +timing.responseEnd || 0);
   const redirected = (+timing.redirectCount || 0) > 0;
   const size = Math.max(0, +timing.encodedBodySize || 0);
+  const decoded = Math.max(0, +timing.decodedBodySize || 0) || size;
   record({
     name: String(timing.url || ""),
     entryType: "resource",
@@ -99,7 +116,7 @@ function _recordImageResourceTiming(metadata, fetchStart) {
     nextHopProtocol: allowed ? _nextHopProtocolFor(timing.url || "") : '',
     transferSize: allowed && size ? size + _RESOURCE_HEADER_BYTES : 0,
     encodedBodySize: allowed ? size : 0,
-    decodedBodySize: allowed ? size : 0,
+    decodedBodySize: allowed ? decoded : 0,
     responseStatus: allowed ? (+timing.status || 0) : 0,
   });
 }

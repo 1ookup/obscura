@@ -1479,6 +1479,7 @@ impl Page {
             transport_start + response.timing.redirect_end.as_secs_f64() * 1_000.0
         };
         let body_size = response.body.len();
+        let encoded_body_size = response.encoded_body_len();
         let document_origin = self
             .url
             .as_ref()
@@ -1493,7 +1494,8 @@ impl Page {
                 })
             });
         let exposed_response_start = if timing_allowed { response_start } else { 0.0 };
-        let exposed_size = if timing_allowed { body_size } else { 0 };
+        let exposed_size = if timing_allowed { encoded_body_size } else { 0 };
+        let exposed_decoded_size = if timing_allowed { body_size } else { 0 };
         let exposed_status = if timing_allowed { response.status } else { 0 };
         // transferSize counts the response headers too, so it is always larger
         // than encodedBodySize on a real connection; the gap is a flat 300
@@ -1532,7 +1534,7 @@ impl Page {
             "nextHopProtocol": next_hop_protocol,
             "transferSize": transfer_size,
             "encodedBodySize": exposed_size,
-            "decodedBodySize": exposed_size,
+            "decodedBodySize": exposed_decoded_size,
             "responseStatus": exposed_status,
             "redirectCount": response.redirected_from.len(),
             "type": "navigate",
@@ -1546,6 +1548,7 @@ impl Page {
             response_start_ms = response_start,
             response_end_ms = response_end,
             body_size,
+            encoded_body_size,
             "recording Performance Timeline entry",
         );
         self.record_performance_entry(entry);
@@ -1566,6 +1569,7 @@ impl Page {
             response.timing.redirect_end.as_secs_f64() * 1_000.0
         };
         let body_size = response.body.len();
+        let encoded_body_size = response.encoded_body_len();
         const RESOURCE_HEADER_BYTES: usize = 300;
         serde_json::json!({
             "name": response.url.as_str(),
@@ -1584,8 +1588,8 @@ impl Page {
             "responseStart": response_start,
             "responseEnd": response_end,
             "nextHopProtocol": if response.url.scheme() == "https" { "h2" } else { "http/1.1" },
-            "transferSize": body_size + RESOURCE_HEADER_BYTES,
-            "encodedBodySize": body_size,
+            "transferSize": encoded_body_size + RESOURCE_HEADER_BYTES,
+            "encodedBodySize": encoded_body_size,
             "decodedBodySize": body_size,
             "responseStatus": response.status,
             "redirectCount": response.redirected_from.len(),
@@ -2220,6 +2224,7 @@ impl Page {
                             status: 200,
                             headers,
                             body,
+                            wire_body_len: None,
                             redirected_from: Vec::new(),
                             timing: obscura_net::ResponseTiming::default(),
                         };
@@ -3283,6 +3288,7 @@ impl Page {
                             status: 200,
                             headers,
                             body,
+                            wire_body_len: None,
                             redirected_from: Vec::new(),
                             timing: obscura_net::ResponseTiming::default(),
                         };
@@ -3996,6 +4002,7 @@ impl Page {
                 status: 200,
                 headers,
                 body: body_bytes,
+                wire_body_len: None,
                 redirected_from: Vec::new(),
                 timing: obscura_net::ResponseTiming::default(),
             })
@@ -8759,6 +8766,125 @@ mod tests {
         );
     }
 
+    /// gzip (level 9) of `PLAIN_DOCUMENT`, hardcoded so the fixture needs no
+    /// compression dependency. A wrong byte fails the decode assert below.
+    const GZIP_DOCUMENT: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcd, 0x8f,
+        0x4b, 0x0e, 0x80, 0x20, 0x0c, 0x05, 0xaf, 0x52, 0x4f, 0xc0, 0x05, 0x9a,
+        0xde, 0x45, 0x68, 0x55, 0x12, 0x08, 0x0d, 0xd4, 0x44, 0x3c, 0xbd, 0x1f,
+        0x3c, 0x84, 0x9b, 0xb7, 0x98, 0xbc, 0xc5, 0x0c, 0x4e, 0x5c, 0x82, 0x75,
+        0x15, 0xd8, 0x2c, 0x27, 0xc2, 0x6f, 0x65, 0x66, 0x42, 0x8b, 0x96, 0x84,
+        0xd6, 0x33, 0x2a, 0x2c, 0xf1, 0xb0, 0xbd, 0x0a, 0xba, 0xc1, 0xd0, 0x8d,
+        0x87, 0x2f, 0xdc, 0x09, 0x95, 0x42, 0xc9, 0x5a, 0xa5, 0x35, 0x61, 0x78,
+        0x10, 0xf8, 0x6e, 0xd2, 0xe0, 0xbf, 0x14, 0x9d, 0xde, 0x0d, 0xc3, 0xde,
+        0xbd, 0xc9, 0x17, 0x57, 0xb5, 0x23, 0x01, 0x08, 0x01, 0x00, 0x00,
+    ];
+    const PLAIN_DOCUMENT: &str = concat!(
+        "<!doctype html><html><head><title>gzip fixture</title></head><body><p>",
+        "compressed body bytes compressed body bytes compressed body bytes ",
+        "compressed body bytes compressed body bytes compressed body bytes ",
+        "compressed body bytes compressed body bytes </p></body></html>",
+    );
+
+    /// gzip (level 9) of `PLAIN_SCRIPT`, same reasoning as `GZIP_DOCUMENT`.
+    const GZIP_SCRIPT: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b, 0xcf, 0xc9, 0x4f,
+        0x4a, 0xcc, 0x09, 0xc9, 0xc8, 0x2c, 0xd6, 0x8b, 0x8f, 0x4f, 0xaf, 0xca, 0x2c, 0x08,
+        0x4e, 0x2e, 0xca, 0x2c, 0x28, 0x09, 0x4a, 0xcc, 0x53, 0xb0, 0x55, 0x30, 0xb4, 0x06,
+        0x00, 0xaf, 0x4b, 0xbb, 0x53, 0x1f, 0x00, 0x00, 0x00,
+    ];
+    const PLAIN_SCRIPT: &str = "globalThis.__gzipScriptRan = 1;";
+
+    /// The stealth transport used to decode gzip on the way in and lose the
+    /// wire size, so a document served compressed reported its decoded length
+    /// as both encodedBodySize and decodedBodySize -- 264 and 264 here, where
+    /// Chrome reports 107 and 264. transferSize rides on encodedBodySize, so
+    /// it was wrong by the same margin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_compressed_document_reports_its_wire_size_as_encoded_body_size() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..length]).to_string();
+                let (content_type, encoded) = if head.contains("/dyn.js") {
+                    ("application/javascript", GZIP_SCRIPT)
+                } else {
+                    ("text/html", GZIP_DOCUMENT)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    encoded.len(),
+                ).into_bytes();
+                let _ = stream.write_all(&response);
+                let _ = stream.write_all(encoded);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "gzip-timing".to_string(),
+            None,
+            // Through the stealth transport: it is the one that decodes in
+            // house, and the one whose sizes have to survive.
+            true,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("gzip-timing".to_string(), context.clone());
+        // Page::new builds the stealth transport with loopback refused; the
+        // fixture needs it reachable, which is the same opt-in the transport's
+        // own tests make.
+        page.stealth_client = Some(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::with_full_options_and_fingerprint(
+                context.cookie_jar.clone(),
+                None,
+                true,
+                obscura_net::BrowserFingerprint::from_user_agent(
+                    obscura_net::STEALTH_USER_AGENT,
+                ),
+            ),
+        ));
+        page.navigate(&format!("{origin}/main")).await.unwrap();
+
+        let probe = r#"(async () => {
+            await new Promise(resolve => {
+                const script = document.createElement("script");
+                script.src = "/dyn.js";
+                script.onload = script.onerror = resolve;
+                document.head.appendChild(script);
+            });
+            const nav = performance.getEntriesByType("navigation")[0] || {};
+            const resource = performance.getEntriesByType("resource")
+                .find(value => value.name.endsWith("/dyn.js")) || {};
+            return [
+                globalThis.__gzipScriptRan,
+                nav.encodedBodySize, nav.decodedBodySize, nav.transferSize,
+                resource.encodedBodySize, resource.decodedBodySize, resource.transferSize,
+            ];
+        })()"#;
+        let result = page
+            .evaluate_for_cdp_with_timeout(probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                1,
+                GZIP_DOCUMENT.len(), PLAIN_DOCUMENT.len(), GZIP_DOCUMENT.len() + 300,
+                GZIP_SCRIPT.len(), PLAIN_SCRIPT.len(), GZIP_SCRIPT.len() + 300,
+            ]),
+            "encodedBodySize and transferSize are wire sizes, decodedBodySize is not",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn response_frame_src_blocks_child_and_nested_frame_requests() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -9319,6 +9445,7 @@ mod tests {
                 ((*name).to_string(), (*value).to_string())
             }).collect(),
             body: Vec::new(),
+            wire_body_len: None,
             redirected_from: Vec::new(),
             timing: obscura_net::ResponseTiming::default(),
         };
@@ -9356,6 +9483,7 @@ mod tests {
             .into_iter()
             .collect(),
             body: Vec::new(),
+            wire_body_len: None,
             redirected_from: Vec::new(),
             timing: obscura_net::ResponseTiming::default(),
         };
@@ -9404,6 +9532,7 @@ mod tests {
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
             body: Vec::new(),
+            wire_body_len: None,
             redirected_from: Vec::new(),
             timing: obscura_net::ResponseTiming::default(),
         };

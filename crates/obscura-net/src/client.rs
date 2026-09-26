@@ -113,6 +113,10 @@ pub struct Response {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// Body size on the wire, before the transport undid a content coding.
+    /// `None` when nothing counted it: a transport that still decodes for us,
+    /// a local file, a synthetic response. See `encoded_body_len`.
+    pub wire_body_len: Option<usize>,
     pub redirected_from: Vec<Url>,
     /// Timing sampled by the transport. Durations are relative to `start` and
     /// describe observable network milestones rather than a synthetic profile.
@@ -154,6 +158,24 @@ impl Response {
 
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_lowercase()).map(|s| s.as_str())
+    }
+
+    /// Body size on the wire, before any content coding was undone.
+    ///
+    /// A browser reports this as Resource Timing's `encodedBodySize`, and it
+    /// is only ever the true count where the transport measured the bytes as
+    /// they crossed the connection (`wire_body_len`). Otherwise the closest
+    /// survivable signal is the response's own `Content-Length`, which is the
+    /// encoded length whenever a content coding was applied -- and the decoded
+    /// length, via the `body` fallback, when there is no coding and no header
+    /// at all.
+    pub fn encoded_body_len(&self) -> usize {
+        self.wire_body_len
+            .or_else(|| {
+                self.header("content-length")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(self.body.len())
     }
 
     pub fn content_type(&self) -> Option<&str> {
@@ -1006,6 +1028,7 @@ pub(crate) async fn fetch_file_url(
         status: 200,
         headers,
         body,
+        wire_body_len: None,
         redirected_from: Vec::new(),
         timing: ResponseTiming {
             start: started,
@@ -1818,6 +1841,7 @@ impl ObscuraHttpClient {
                         url: url.clone(),
                         headers: HashMap::new(),
                         body: Vec::new(),
+                        wire_body_len: None,
                         redirected_from: Vec::new(),
                         timing: ResponseTiming::default(),
                     });
@@ -2127,6 +2151,7 @@ impl ObscuraHttpClient {
                 status: status.as_u16(),
                 headers: response_headers,
                 body: body_bytes,
+                wire_body_len: None,
                 redirected_from: redirects,
                 timing: ResponseTiming {
                     start: fetch_started,

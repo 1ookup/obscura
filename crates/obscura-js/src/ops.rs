@@ -4600,6 +4600,9 @@ fn fetch_response(
         status,
         headers,
         body,
+        // Reassembled from what op_fetch_url already holds; the response's own
+        // Content-Length, when it carries one, is still the wire size.
+        wire_body_len: None,
         redirected_from: Vec::new(),
         timing: obscura_net::ResponseTiming::default(),
     }
@@ -8801,13 +8804,16 @@ fn image_resource_timing_json(
         });
     let response_start = response.timing.response_start.as_secs_f64() * 1_000.0;
     let response_end = response.timing.response_end.as_secs_f64() * 1_000.0;
+    let body_size = response.body.len();
+    let encoded_body_size = response.encoded_body_len();
     tracing::debug!(
         target: "obscura::performance",
         initiator_type = "img",
         url = %response.url,
         response_start_ms = response_start,
         response_end_ms = response_end,
-        body_size = response.body.len(),
+        body_size,
+        encoded_body_size,
         timing_allowed,
         "image transport timing handed to the element's realm",
     );
@@ -8818,7 +8824,8 @@ fn image_resource_timing_json(
         "responseEnd": response_end,
         "redirectEnd": response.timing.redirect_end.as_secs_f64() * 1_000.0,
         "redirectCount": response.redirected_from.len(),
-        "encodedBodySize": response.body.len(),
+        "encodedBodySize": encoded_body_size,
+        "decodedBodySize": body_size,
         "timingAllowed": timing_allowed,
     })
 }

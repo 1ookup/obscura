@@ -10,7 +10,7 @@ edition.workspace = true
 # requirement -- cmake, clang and libclang -- and is what the docker image and
 # the no-render release variants build.
 default = ["stealth"]
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util", "futures-util", "async-compression"]
 
 [dependencies]
 reqwest = { workspace = true }
@@ -27,6 +27,11 @@ async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
 futures-util = { version = "0.3", optional = true }
+# Content-coding decode for the stealth transport, which turns wreq's own
+# auto-decompression off so a response's wire size survives as
+# `Response::wire_body_len` (Resource Timing's encodedBodySize). Same decoders
+# tower-http would have run, just invoked here.
+async-compression = { version = "0.4", default-features = false, features = ["tokio", "gzip", "deflate", "brotli", "zstd"], optional = true }
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
