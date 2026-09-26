@@ -12231,6 +12231,149 @@ RequestRedirect value",
         assert!(!idle, "a turn that delivered a worker reply is not idle");
     }
 
+    /// A worker loop that awaits one async op per iteration must keep
+    /// settling. deno_core polls op futures from a task it spawns on the
+    /// worker thread's tokio runtime, so the completion path only runs while
+    /// that runtime gets a scheduling slot; a worker whose pump goes fully
+    /// idle still hands it one on every park. The PoW shape the challenge
+    /// profile exercises is exactly this chain, and a worker that stopped
+    /// settling it would hang the page's budget instead of finishing the
+    /// count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_async_op_chain_settles_without_a_concurrent_storm() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-op-chain",
+            r#"(() => {
+                const source = [
+                    "'use strict';",
+                    "const hops = (typeof Deno !== 'undefined') && Deno.core && Deno.core.ops;",
+                    "onmessage = (e) => {",
+                    "  const depth = e.data.depth;",
+                    "  let done = 0;",
+                    "  const t0 = performance.now();",
+                    "  (function step() {",
+                    "    const wait = hops ? hops.op_posted_task() : Promise.resolve(1);",
+                    "    wait.then(() => {",
+                    "      done += 1;",
+                    "      if (done < depth) step();",
+                    "      else self.postMessage({done: done, ms: performance.now() - t0});",
+                    "    });",
+                    "  })();",
+                    "};",
+                ].join("\n");
+                globalThis.__chain = null;
+                const worker = new Worker(URL.createObjectURL(
+                    new Blob([source], {type: 'text/javascript'})));
+                worker.onmessage = (e) => { globalThis.__chain = e.data; };
+                worker.postMessage({depth: 200});
+            })()"#,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while rt.evaluate("globalThis.__chain === null").unwrap() == serde_json::json!(true) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(8),
+                "worker async op chain did not settle: {:?}",
+                rt.evaluate("String(globalThis.__chain)").unwrap(),
+            );
+            assert!(
+                tokio::time::timeout_at(deadline, rt.run_autonomous_event_loop_turn())
+                    .await
+                    .is_ok(),
+                "page turn failed while the worker chain ran"
+            );
+        }
+        let chain = rt.evaluate("JSON.stringify(globalThis.__chain)").unwrap();
+        let chain = serde_json::from_str::<serde_json::Value>(chain.as_str().unwrap())
+            .expect("worker chain report is a JSON object");
+        assert_eq!(
+            chain["done"].as_f64(),
+            Some(200.0),
+            "worker chain completed every hop: {chain}"
+        );
+        // 200 hops of a yield-only op. A stalled completion path turns this
+        // into one hop per pump slice, which cannot finish inside the wait.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "200 async op hops took {elapsed:?} in a worker"
+        );
+    }
+
+    /// Throughput tripwire for the PoW shape: a worker loop that awaits one
+    /// `crypto.subtle.digest` per iteration, counted over 100 ms. The digest
+    /// resolves on the caller's stack (one op call, no task boundary), which
+    /// is the deliberate trade until the engine's per-turn cost drops: an
+    /// await-per-call boundary costs one full pump turn here (~16 us in a
+    /// worker) against Chrome's ~1.7 us task hop, so deferring the resolution
+    /// first would make the loop an order of magnitude slower than Chrome
+    /// instead of the current 2x faster.
+    ///
+    /// Oracle: headless Chrome 153 on the M-series macOS host that produced
+    /// these numbers counts ~26000-27000 iterations per 100 ms for the same
+    /// loop (crates/obscura-js/docs notes; re-measure before moving the
+    /// bound). The floor only guards against an accidental per-call turn
+    /// boundary or a stalled completion path, so it sits far below both the
+    /// oracle and the local measurement.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_dense_digest_loop_keeps_its_throughput() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-digest-throughput",
+            r#"(() => {
+                const source = [
+                    "'use strict';",
+                    "onmessage = (e) => {",
+                    "  const data = new Uint8Array(38);",
+                    "  let n = 0;",
+                    "  const t0 = performance.now();",
+                    "  (function step() {",
+                    "    crypto.subtle.digest('SHA-256', data).then(() => {",
+                    "      n += 1;",
+                    "      if (performance.now() - t0 < 100) step();",
+                    "      else self.postMessage({n: n, ms: performance.now() - t0});",
+                    "    });",
+                    "  })();",
+                    "};",
+                ].join("\n");
+                globalThis.__digestCount = null;
+                const worker = new Worker(URL.createObjectURL(
+                    new Blob([source], {type: 'text/javascript'})));
+                worker.onmessage = (e) => { globalThis.__digestCount = e.data; };
+                worker.postMessage({});
+            })()"#,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        while rt.evaluate("globalThis.__digestCount === null").unwrap() == serde_json::json!(true) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(8),
+                "worker digest loop did not report a count"
+            );
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                rt.run_autonomous_event_loop_turn(),
+            )
+            .await
+            .expect("page turn kept running while the worker counted");
+        }
+        let reported = rt
+            .evaluate("JSON.stringify(globalThis.__digestCount)")
+            .unwrap();
+        let reported = serde_json::from_str::<serde_json::Value>(reported.as_str().unwrap())
+            .expect("worker digest report is a JSON object");
+        let count = reported["n"].as_f64().unwrap_or(0.0);
+        // Locally this counts 63000-66000 per 100 ms window. The bound catches
+        // a boundary-per-call regression (which lands near 6000) rather than
+        // tracking the oracle closely; throughput assertions are tripwires.
+        assert!(
+            count >= 15_000.0,
+            "worker dense digest throughput collapsed to {count} per 100 ms ({reported})"
+        );
+    }
+
     /// A loopback server that answers every request with a fixed binary body.
     fn fo_capture_fixture(
         requests: usize,
