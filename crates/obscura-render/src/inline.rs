@@ -2500,6 +2500,16 @@ impl TextEngine {
                     })
                 });
             if let Some((x0, y0, x1, y1)) = ink {
+                // A glyph with no outline of its own (the space, any other
+                // blank) still reaches this loop with a degenerate box at the
+                // origin. Feeding it to the union would drag the extents
+                // toward zero: a run whose only real ink sits below the
+                // baseline (`_ _`) would answer ascent 0 where the reference
+                // answers the underscore's negative ink. The reference unions
+                // glyphs that draw, so an empty box joins nothing.
+                if x0 == x1 && y0 == y1 {
+                    continue;
+                }
                 min_x = min_x.min(x_offset + x0);
                 max_x = max_x.max(x_offset + x1);
                 // Outline bounds are y-up: ink above the baseline is positive
@@ -6302,6 +6312,42 @@ mod ink_tests {
         assert!(right > 0.0);
         let (_, _, space_ascent, space_descent) = engine.measure_canvas_ink("   ", &style);
         assert_eq!((space_ascent, space_descent), (0.0, 0.0));
+    }
+
+    /// A blank glyph carries no ink, so it must not join the union.
+    ///
+    /// The space still reaches the union as a degenerate outline at the
+    /// origin, and a run whose only real ink sits below the baseline answered
+    /// `actualBoundingBoxAscent` 0 once that box joined: the reference keeps
+    /// the underscore's negative ink for `_ _` (measured -7.3 at 100px
+    /// sans-serif, against our 0 before the skip).
+    #[test]
+    fn blank_glyphs_do_not_join_the_canvas_ink_union() {
+        let mut engine = TextEngine::new();
+        let style = style(16.0, "sans-serif");
+        let (left, right, ascent, descent) = engine.measure_canvas_ink("_", &style);
+        assert!(
+            ascent < 0.0 && descent > 0.0,
+            "an underscore draws only below the baseline: ({ascent}, {descent})"
+        );
+        assert!(right > left, "an underscore has horizontal ink");
+        for text in ["_ ", " _", "_ _", "_ _ _"] {
+            let spaced = engine.measure_canvas_ink(text, &style);
+            // The reference shifts the box with the pen the blanks advance
+            // but keeps the underscore's vertical ink for every one of them.
+            assert_eq!(
+                (spaced.2, spaced.3),
+                (ascent, descent),
+                "{text:?} vertical ink moved with the blanks"
+            );
+        }
+        // A trailing blank advances the pen and draws nothing: the box is the
+        // single underscore's.
+        let trailing = engine.measure_canvas_ink("_ ", &style);
+        assert_eq!(
+            trailing, (left, right, ascent, descent),
+            "a trailing blank moved the ink box"
+        );
     }
 
     /// Restores the font platform when the test ends, successful or not.
