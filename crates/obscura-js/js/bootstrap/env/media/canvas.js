@@ -440,14 +440,20 @@ class _Canvas2D {
     // render layer there are no outlines, and the font box remains the
     // fallback.
     const hasRealInk = Number.isFinite(box.inkLeft);
+    // Every number a TextMetrics carries is an SkScalar: the reference answers
+    // `v === Math.fround(v)` for all ten of them, and a center/right-aligned
+    // box is computed from the width in that precision rather than in doubles.
+    // Without the round the aligned boxes leak double-only tails
+    // (13.680000245571136 where the reference reads 13.680000305175781).
+    const f32 = Math.fround;
     return _makeTextMetrics({
       width: box.width,
-      actualBoundingBoxLeft: hasRealInk
+      actualBoundingBoxLeft: f32(hasRealInk
         ? alignmentOffset - box.inkLeft
-        : alignmentOffset,
-      actualBoundingBoxRight: hasRealInk
+        : alignmentOffset),
+      actualBoundingBoxRight: f32(hasRealInk
         ? box.inkRight - alignmentOffset
-        : (hasInk ? box.width : 0) - alignmentOffset,
+        : (hasInk ? box.width : 0) - alignmentOffset),
       fontBoundingBoxAscent: box.ascent,
       fontBoundingBoxDescent: box.descent,
       actualBoundingBoxAscent: hasRealInk ? box.inkAscent : (hasInk ? box.ascent : 0),
