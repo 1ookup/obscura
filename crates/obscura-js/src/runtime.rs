@@ -33954,4 +33954,162 @@ RequestRedirect value",
             })
         );
     }
+
+    /// EventTarget.prototype after removeEventListener, so every EventTarget --
+    /// the select's own options plus one optgroup level, in tree order.    #[test]
+    fn select_reads_never_call_page_visible_query_selector_all() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <select id="flat"><option value="a">A</option><option value="b" selected>B</option></select>
+                <select id="grouped"><optgroup label="g"><option value="x">X</option></optgroup><option value="z">Z</option></select>
+                <select id="nested"><optgroup><optgroup><option value="deep">D</option></optgroup></optgroup><option value="top">T</option></select>
+                <select id="empty"></select>
+                <form id="f"><select name="pick" id="fpick"><option value="one">one</option><option value="two">two</option></select></form>
+            </body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const calls = [];
+                    const original = Element.prototype.querySelectorAll;
+                    Element.prototype.querySelectorAll = function (selector) {
+                        calls.push(String(selector));
+                        return original.apply(this, arguments);
+                    };
+                    try {
+                        const flat = document.getElementById('flat');
+                        const grouped = document.getElementById('grouped');
+                        const nested = document.getElementById('nested');
+                        const empty = document.getElementById('empty');
+                        const facts = {
+                            flatValue: flat.value,
+                            flatSelectedIndex: flat.selectedIndex,
+                            flatOptions: [...flat.options].map(o => o.value),
+                            groupedOptions: [...grouped.options].map(o => o.value),
+                            groupedValue: grouped.value,
+                            groupedSelectedIndex: grouped.selectedIndex,
+                            nestedOptions: [...nested.options].map(o => o.value),
+                            nestedValue: nested.value,
+                            nestedSelectedIndex: nested.selectedIndex,
+                            emptyValue: empty.value,
+                            emptySelectedIndex: empty.selectedIndex,
+                            optionsInstanceOf: flat.options instanceof HTMLCollection,
+                        domNested: (() => {
+                            const select = document.createElement('select');
+                            const outer = document.createElement('optgroup');
+                            const inner = document.createElement('optgroup');
+                            const deep = document.createElement('option');
+                            deep.value = 'deep';
+                            inner.appendChild(deep);
+                            outer.appendChild(inner);
+                            select.appendChild(outer);
+                            const top = document.createElement('option');
+                            top.value = 'top';
+                            select.appendChild(top);
+                            document.body.appendChild(select);
+                            return {
+                                options: [...select.options].map(o => o.value),
+                                value: select.value,
+                                selectedIndex: select.selectedIndex,
+                            };
+                        })(),
+                        };
+                        // The setters take the same walk.
+                        flat.value = 'a';
+                        facts.afterSetValue = [flat.value, flat.selectedIndex];
+                        flat.selectedIndex = 1;
+                        facts.afterSetIndex = [flat.value, flat.selectedIndex];
+                        empty.selectedIndex = 0;
+                        facts.emptyAfterSet = empty.selectedIndex;
+                        // And the form serializer: the encoded pair comes from
+                        // the same walk (asserted on the Rust side through the
+                        // pending navigation this submit queues).
+                        document.getElementById('fpick').selectedIndex = 1;
+                        facts.pickValue = document.getElementById('fpick').value;
+                        facts.callsBeforeSubmit = calls.length;
+                        document.getElementById('f').submit();
+                        facts.calls = calls;
+                        return JSON.stringify(facts);
+                    } finally {
+                        Element.prototype.querySelectorAll = original;
+                    }
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["flatValue"], "b");
+        assert_eq!(value["flatSelectedIndex"], 1);
+        assert_eq!(value["flatOptions"], serde_json::json!(["a", "b"]));
+        // One optgroup level contributes its options; the trailing sibling
+        // keeps its position.
+        assert_eq!(value["groupedOptions"], serde_json::json!(["x", "z"]));
+        assert_eq!(value["groupedValue"], "x");
+        assert_eq!(value["groupedSelectedIndex"], 0);
+        // A nested optgroup in *parsed* markup is flattened by the HTML
+        // parser into sibling optgroups, so both options land in the list --
+        // Chrome 153 parses this shape to exactly the same two options.
+        assert_eq!(value["nestedOptions"], serde_json::json!(["deep", "top"]));
+        assert_eq!(value["nestedValue"], "deep");
+        assert_eq!(value["nestedSelectedIndex"], 0);
+        assert_eq!(value["emptyValue"], "");
+        assert_eq!(value["emptySelectedIndex"], -1);
+        assert_eq!(value["optionsInstanceOf"], true);
+        assert_eq!(value["afterSetValue"], serde_json::json!(["a", 0]));
+        assert_eq!(value["afterSetIndex"], serde_json::json!(["b", 1]));
+        assert_eq!(value["emptyAfterSet"], -1);
+        // A DOM-built nested optgroup is one level too deep for the list of
+        // options, so only the direct child shows up (Chrome 153: same).
+        assert_eq!(value["domNested"]["options"], serde_json::json!(["top"]));
+        assert_eq!(value["domNested"]["value"], "top");
+        assert_eq!(value["domNested"]["selectedIndex"], 0);
+        // Every read before the submit was selector-free. The submit itself
+        // still enumerates its own fields the way it always has
+        // ("input, select, textarea") -- that query names no option, which is
+        // the signal the challenge's selector hook records.
+        assert_eq!(value["callsBeforeSubmit"], 0);
+        // The form serializer answers the selected option's value through the
+        // same list-of-options walk.
+        assert_eq!(value["pickValue"], "two");
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/test?pick=two".to_string(), "GET".to_string(),
+                "".to_string()))
+        );
+        // The point of the fix: no option query reached the page.
+        assert!(
+            !value["calls"].as_array().unwrap().iter().any(|selector| {
+                selector.as_str().unwrap_or("").contains("option")
+            }),
+            "an option selector reached the page: {}",
+            value["calls"]
+        );
+    }
+
+    #[test]
+    fn select_option_value_falls_back_to_text_only_without_a_value_attribute() {
+        let mut rt = setup_runtime("<html><body><select id=\"s\"></select></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const select = document.getElementById('s');
+                    const empty = document.createElement('option');
+                    empty.setAttribute('value', '');
+                    empty.text = 'empty';
+                    const text = document.createElement('option');
+                    text.text = 'from text';
+                    select.add(empty);
+                    select.add(text);
+                    return JSON.stringify({
+                        values: [...select.options].map(option => option.value),
+                        selected: select.value,
+                        selectText: select.options[1].text,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["values"], serde_json::json!(["", "from text"]));
+        assert_eq!(value["selected"], "");
+        assert_eq!(value["selectText"], "from text");
+    }
 }

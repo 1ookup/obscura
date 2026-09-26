@@ -1040,13 +1040,11 @@ var Element = _swappableInterface('Element', class extends Node {
     const tag = this.localName;
     if (tag === 'select') {
       // Selected option wins; otherwise first option (HTML default).
-      const opts = this.querySelectorAll('option');
+      const opts = _selectOptions(this);
       for (let i = 0; i < opts.length; i++) {
-        if (opts[i].selected) {
-          return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
-        }
+        if (opts[i].selected) return _optionValue(opts[i]);
       }
-      if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      if (opts.length) return _optionValue(opts[0]);
       return '';
     }
     if (_formValues[this[_nidSym]] !== undefined) return _formValues[this[_nidSym]];
@@ -1088,12 +1086,10 @@ var Element = _swappableInterface('Element', class extends Node {
       // Set selected on matching option, clear on others. Puppeteer's
       // page.select(selector, value) round-trips through this setter.
       const wanted = String(v);
-      const opts = this.querySelectorAll('option');
+      const opts = _selectOptions(this);
       let matched = false;
       for (let i = 0; i < opts.length; i++) {
-        const attrV = opts[i].getAttribute('value');
-        const optVal = attrV !== null ? attrV : opts[i].textContent;
-        if (optVal === wanted) { opts[i].selected = true; matched = true; }
+        if (_optionValue(opts[i]) === wanted) { opts[i].selected = true; matched = true; }
         else { opts[i].selected = false; }
       }
       if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
@@ -1391,7 +1387,7 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   get options() {
     if (this.localName !== 'select') return [];
-    return _htmlCollectionFrom(this.querySelectorAll('option'));
+    return _htmlCollectionFrom(_selectOptions(this));
   }
   add(item, before = null) {
     if (this.localName !== 'select') {
@@ -1411,14 +1407,20 @@ var Element = _swappableInterface('Element', class extends Node {
     }
   }
   get selectedIndex() {
-    const opts = this.options;
+    const opts = _selectOptions(this);
     for (let i = 0; i < opts.length; i++) {
-      if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
+      const opt = opts[i];
+      // Scripted selectedness outranks the content attribute: once a script
+      // has set select.value/selectedIndex, a stale `selected` attribute on an
+      // earlier option must not win (Chrome 153 answers 1 for that sequence).
+      if (opt._selected !== undefined
+        ? opt._selected
+        : (opt.selected || opt.hasAttribute('selected'))) return i;
     }
     return opts.length ? 0 : -1;
   }
   set selectedIndex(v) {
-    const opts = this.options;
+    const opts = _selectOptions(this);
     for (let i = 0; i < opts.length; i++) {
       _hset(opts[i], "_selected", (i === v));
     }
@@ -1473,8 +1475,16 @@ var Element = _swappableInterface('Element', class extends Node {
 
       let val;
       if (tag === 'select') {
-        const opt = f.querySelector('option[selected]') || f.querySelector('option');
-        val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
+        // Same list-of-options walk as the getters above: the serialized
+        // value is the selected option's value, else the first option's
+        // (Chrome 153 keeps a select with no explicit selection on index 0).
+        const opts = _selectOptions(f);
+        let opt = null;
+        for (let i = 0; i < opts.length; i++) {
+          if (opts[i].selected || opts[i].hasAttribute('selected')) { opt = opts[i]; break; }
+        }
+        if (!opt) opt = opts[0] || null;
+        val = opt ? _optionValue(opt) : '';
       } else if (tag === 'textarea') {
         val = f.value || f.textContent || '';
       } else {
@@ -2017,6 +2027,42 @@ var Element = _swappableInterface('Element', class extends Node {
 // one, not the other way round. A deferred-surface frame realm has no parser
 // until it hydrates, which is also when it gets its DOMParser global.
 var _internalMarkupParse = null;
+
+// The HTML "list of options" for a <select>: its own <option> children plus
+// the <option> children of its <optgroup> children, in tree order. The list is
+// exactly one optgroup deep -- a nested <optgroup> contributes nothing, which
+// is what Chrome 153 answers too (select > optgroup > optgroup > option is
+// absent from select.options). Walked over the child-element op rather than
+// querySelectorAll so an internal read never issues a page-visible selector
+// query: the challenge's selector hook records those, and the 0926 payload
+// diff pinned five extra "option" entries on this engine because value,
+// options, selectedIndex and the form serializer all read through the CSS
+// selector engine.
+function _selectOptions(select) {
+  const options = [];
+  if (!select || select.localName !== 'select') return options;
+  const children = select.children;
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    const name = child && child.localName;
+    if (name === 'option') { options.push(child); continue; }
+    if (name !== 'optgroup') continue;
+    const nested = child.children;
+    for (let j = 0; j < nested.length; j++) {
+      const option = nested[j];
+      if (option && option.localName === 'option') options.push(option);
+    }
+  }
+  return options;
+}
+
+// An option's contribution to select.value: the value attribute when present,
+// otherwise its text (HTML's "option value" -- note the empty attribute is a
+// real value, not a fallback).
+function _optionValue(option) {
+  const attr = option.getAttribute('value');
+  return attr !== null ? attr : option.textContent;
+}
 
 // The body of the innerHTML setter, without the Trusted Types sink check.
 // Engine-internal parsers (DOMParser, implementation.createHTMLDocument,
