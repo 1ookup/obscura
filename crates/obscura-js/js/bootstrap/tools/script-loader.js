@@ -622,12 +622,14 @@ function _getFp() {
     compKnee: 30 + (_fpRand(103) - 0.5) * 4,
     compRatio: 12 + (_fpRand(104) - 0.5) * 4,
     // The default persona is a charged laptop on AC: Chrome answers a full
-    // charging battery there -- level 0.99, charging true, chargingTime 0,
-    // dischargingTime Infinity. The passing capture's sessions all report
-    // 0.99 ("99" in the battery probe), never a randomized value, and a
-    // fingerprint may still pin its own batteryLevel/batteryCharging.
+    // charging battery there -- level 1, charging true, chargingTime 0,
+    // dischargingTime Infinity. Headless Chrome 153 reports level === 1 on
+    // every run (file:, loopback and remote origins, 2026-09-26 oracle), and
+    // the 0926 payload diff pins the same value on the reference side, so the
+    // older "99" reading is expired. A fingerprint may still pin its own
+    // batteryLevel/batteryCharging.
     batteryLevel: Number.isFinite(fingerprint.batteryLevel)
-      ? Number(fingerprint.batteryLevel) : 0.99,
+      ? Number(fingerprint.batteryLevel) : 1,
     batteryCharging: fingerprint.batteryCharging === undefined
       ? true : !!fingerprint.batteryCharging,
     screen: [Number(fingerprint.screen && fingerprint.screen.width) || 1920,

@@ -33582,7 +33582,7 @@ RequestRedirect value",
                 "own": [],
                 "construct": "TypeError",
                 "values": ["boolean", "number", "number", "number"],
-                "desktop": [true, 0, true, 0.99],
+                "desktop": [true, 0, true, 1],
                 "events": [
                     [true, true, true, true], [true, true, true, true],
                     [true, true, true, true], [true, true, true, true],
@@ -33592,9 +33592,11 @@ RequestRedirect value",
         );
     }
 
-    // The passing sessions' battery probe reads "99" and the boolean pair of a
-    // charging laptop; a randomized or empty level is a value no charging
-    // Chrome reports. The whole surface is pinned here: shape, values, and the
+    // The passing sessions' battery probe reads a full charging laptop; a
+    // randomized or fractional level is a value no charging Chrome reports.
+    // Headless Chrome 153 answers level === 1 on every run, so the older "99"
+    // reading is expired (2026-09-26 oracle, see the 0926 payload diff
+    // P2-4/dsKPy6). The whole surface is pinned here: shape, values, and the
     // event handler slots.
     #[tokio::test(flavor = "current_thread")]
     async fn navigator_battery_answers_a_charging_laptop_shape() {
@@ -33624,8 +33626,8 @@ RequestRedirect value",
                 "charging": true,
                 "chargingTime": 0,
                 "dischargingTime": "Infinity",
-                "level": 0.99,
-                "levelTimes100": "99",
+                "level": 1,
+                "levelTimes100": "100",
             })
         );
     }
@@ -33915,6 +33917,40 @@ RequestRedirect value",
                 "overlays": false,
                 "rect": [0, 0, 0, 0],
                 "handler": "function",
+            })
+        );
+    }
+
+    // ── CF 0926 payload-diff regressions (bootstrap surface)
+    /// still override it explicitly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn battery_level_reports_a_full_charging_battery() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const battery = await navigator.getBattery();
+                    return {
+                        level: battery.level,
+                        charging: battery.charging,
+                        levelAsString: String(battery.level),
+                        timesHundred: battery.level * 100,
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "level": 1,
+                "charging": true,
+                "levelAsString": "1",
+                "timesHundred": 100,
             })
         );
     }
