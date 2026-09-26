@@ -9982,7 +9982,7 @@ mod tests {
                 r#"(() => {{
                     {FRAME_OPS_PRELUDE}
                     return setupFrame('f', '<html><body></body></html>',
-                        'https://isolated.example/frame', null);
+                        'https://isolated.example/frame', null, true);
                 }})()"#,
             ))
             .unwrap()
@@ -12711,6 +12711,10 @@ RequestRedirect value",
     const FRAME_OPS_PRELUDE: &str = r#"
         const op = (cmd, a1, a2) =>
             Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+        // `isolated` must be passed when the frame under test is meant to read
+        // isolated: an omitted bit keeps the document's own value, and the
+        // shared state's flag is the top document's alone, never a frame
+        // default.
         const setupFrame = (hostId, html, originUrl, csp, isolated) => {
             const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));

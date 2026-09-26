@@ -2117,7 +2117,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     // the loader's commit records the real one moments later.
                     String::new(),
                     obscura_dom::SandboxFlags::default(),
-                    gs.cross_origin_isolated,
+                    // The top document's isolation bit is not the frame's
+                    // either. Without a resolvable parent scope there is no
+                    // isolation to inherit, and the loader's commit recomputes
+                    // the committed document's bit from the response.
+                    false,
                 ),
             };
             // Sandboxing is inherited through every nested browsing context.
@@ -2482,7 +2486,9 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         // either originUrl (origin computed from the URL) or origin
         // ({"type":"tuple",scheme,host,port} or {"type":"opaque"} for an
         // inherited/serialized origin; opaque allocates a fresh id). quirks and
-        // csp are owned by other paths and survive a scope rewrite.
+        // csp are owned by other paths and survive a scope rewrite, and so does
+        // crossOriginIsolated: an omitted bit keeps the document's own, since
+        // the shared state's flag belongs to the top document alone.
         "set_document_scope" => {
             let root = match arg1.parse::<u32>() {
                 // The top-level document's scope is owned by page state, not
@@ -2592,10 +2598,18 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     frame_id,
                     document_generation,
                     quirks,
+                    // A scope rewrite that omits the bit keeps whatever the
+                    // document already had, the same rule csp, referrer and
+                    // lastModified follow. The top document's flag is not a
+                    // default a frame may fall back to: the shared state
+                    // describes the top-level document, and handing it to a
+                    // child realm made every frame of an isolated page read
+                    // isolated.
                     cross_origin_isolated: spec
                         .get("crossOriginIsolated")
                         .and_then(|value| value.as_bool())
-                        .unwrap_or(gs.cross_origin_isolated),
+                        .or(existing.as_ref().map(|scope| scope.cross_origin_isolated))
+                        .unwrap_or(false),
                 },
             );
             "true".into()
@@ -3511,7 +3525,11 @@ fn initial_iframe_cross_origin_isolated(
         .ok()
         .and_then(|base| base.join(raw).ok())
     else {
-        return true;
+        // A src that cannot be resolved against the parent's base gives no
+        // evidence of a same-origin successor document, and this realm is
+        // replaced by whichever response lands. Treating that as isolated
+        // handed a frame the parent capability on a guess.
+        return false;
     };
     obscura_dom::Origin::from_url(target.as_str()) == *parent_origin
 }
@@ -5102,6 +5120,20 @@ mod tests {
             "https://page.example/",
             None,
         ));
+        // A src that cannot be resolved against the parent base is unknown,
+        // not same-origin: the old `true` answered a guess with a capability.
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "not a url",
+            Some("/same-origin-frame"),
+        ));
+        assert!(!initial_iframe_cross_origin_isolated(
+            &parent,
+            true,
+            "https://page.example/",
+            Some("http://[::page.example"),
+        ));
         assert!(!initial_iframe_cross_origin_isolated(
             &parent,
             false,
@@ -5296,6 +5328,114 @@ mod tests {
         assert_eq!(result["opaqueInfo"]["allowSameOrigin"], serde_json::json!(true));
         assert_eq!(result["opaqueInfo"]["documentGeneration"], serde_json::json!(4));
         assert_eq!(result["opaqueInfo"]["quirks"], serde_json::json!(true));
+    }
+
+    /// The shared state's isolation bit describes the top-level document. A
+    /// frame scope rewrite that omits `crossOriginIsolated` used to fall back
+    /// to it, so every frame of an isolated page could be flipped to isolated
+    /// by any caller that did not know the bit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scope_rewrite_without_an_isolation_bit_keeps_the_document_own() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            r#"<html><body><iframe id="frame"></iframe></body></html>"#,
+        ));
+        runtime.set_url("http://example.com/frame-scope-isolation");
+        // The top page is isolated: exactly the state where the old fallback
+        // leaked the bit into every rewritten frame scope.
+        runtime.set_cross_origin_isolated(true);
+        runtime.run_page_init();
+        let result = runtime
+            .evaluate(
+                r##"(function() {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    const created = JSON.parse(
+                        op("create_iframe_content_document", host));
+                    const missing = JSON.parse(
+                        op("document_scope_info", created.root) || "null");
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://frame.example/page",
+                        originUrl: "https://frame.example/page",
+                        frameId: "frame-coi",
+                        documentGeneration: 1,
+                        crossOriginIsolated: true,
+                    }));
+                    const explicit = JSON.parse(
+                        op("document_scope_info", created.root));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://frame.example/page",
+                        originUrl: "https://frame.example/page",
+                        frameId: "frame-coi",
+                        documentGeneration: 2,
+                    }));
+                    const rewritten = JSON.parse(
+                        op("document_scope_info", created.root));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://frame.example/page",
+                        originUrl: "https://frame.example/page",
+                        frameId: "frame-coi",
+                        documentGeneration: 3,
+                        crossOriginIsolated: false,
+                    }));
+                    const cleared = JSON.parse(
+                        op("document_scope_info", created.root));
+                    return {
+                        missing: missing === null,
+                        explicit: explicit.crossOriginIsolated,
+                        rewritten: rewritten.crossOriginIsolated,
+                        cleared: cleared.crossOriginIsolated,
+                    };
+                })()"##,
+            )
+            .unwrap();
+        // No prior scope and no bit in the spec: false, never the top page's.
+        assert_eq!(result["missing"], serde_json::json!(true));
+        assert_eq!(result["explicit"], serde_json::json!(true));
+        // A rewrite that omits the bit keeps what the document already had.
+        assert_eq!(result["rewritten"], serde_json::json!(true));
+        // An explicit false still clears it.
+        assert_eq!(result["cleared"], serde_json::json!(false));
+    }
+
+    /// The initial about:blank document of a frame whose parent scope cannot
+    /// be resolved has no isolation to inherit. Falling back to the shared
+    /// state's bit presented the top document's isolation as the frame's own
+    /// for the whole window between the iframe's insertion and the loader's
+    /// commit, which is the transient realm early fingerprint probes read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_blank_frame_scope_does_not_inherit_the_top_isolation_bit() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(
+            r#"<html><body><iframe id="frame" src="/child"></iframe></body></html>"#,
+        ));
+        runtime.set_url("https://isolated.example/page");
+        runtime.set_cross_origin_isolated(true);
+        runtime.run_page_init();
+        let result = runtime
+            .evaluate(
+                r##"(function() {
+                    const op = (cmd, a1, a2) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+                    const host = Number(op("query_selector", "#frame"));
+                    const root = Number(op("create_blank_iframe_document", host));
+                    const info = JSON.parse(op("document_scope_info", String(root)));
+                    return {
+                        coi: info.crossOriginIsolated,
+                        origin: info.origin,
+                        url: info.url,
+                    };
+                })()"##,
+            )
+            .unwrap();
+        // A same-origin src used to read `true` here, because the shared
+        // state's bit stood in for the unresolvable parent scope.
+        assert_eq!(result["coi"], serde_json::json!(false));
+        // The origin still comes from the top document; only the isolation
+        // bit stops inheriting.
+        assert_eq!(result["origin"], serde_json::json!("https://isolated.example"));
+        assert_eq!(result["url"], serde_json::json!("about:blank"));
     }
 
     #[tokio::test(flavor = "current_thread")]

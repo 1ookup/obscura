@@ -9641,6 +9641,185 @@ mod tests {
         ));
     }
 
+    /// A delegated child is a nested document: its own response only has to
+    /// turn the embedding check on. Demanding its COOP too -- the top-level
+    /// rule -- left a cross-origin widget that carries
+    /// `allow="cross-origin-isolated"` and `Cross-Origin-Embedder-Policy:
+    /// require-corp` reading `crossOriginIsolated === false` with no
+    /// SharedArrayBuffer, while Chrome 153 answers `true` for it. Measured
+    /// with a two-host fixture under an isolated top-level page; the same
+    /// child without the attribute has its navigation blocked outright there.
+    #[test]
+    fn delegated_child_is_isolated_by_its_embedder_policy_alone() {
+        let child = |headers: &[(&str, &str)], host: &str| obscura_net::Response {
+            url: url::Url::parse(&format!("https://{host}/frame")).unwrap(),
+            status: 200,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            body: Vec::new(),
+            wire_body_len: None,
+            redirected_from: Vec::new(),
+            timing: obscura_net::ResponseTiming::default(),
+        };
+        let coep = ("cross-origin-embedder-policy", "require-corp");
+        let coop = ("cross-origin-opener-policy", "same-origin");
+        let widget = obscura_dom::Origin::from_url("https://widget.example/frame");
+        let page = obscura_dom::Origin::from_url("https://page.example/");
+        let isolated = |response: &obscura_net::Response, allow: bool| {
+            super::frame_document_isolation(
+                response,
+                &widget,
+                &page,
+                true,
+                allow,
+                obscura_dom::SandboxFlags::default(),
+            )
+        };
+
+        assert!(isolated(&child(&[coep], "widget.example"), true));
+        assert!(!isolated(&child(&[coep], "widget.example"), false));
+        // The child's COOP stays irrelevant either way.
+        assert!(isolated(&child(&[coep, coop], "widget.example"), true));
+        assert!(!isolated(&child(&[coep, coop], "widget.example"), false));
+
+        // A non-isolated embedder delegates nothing.
+        assert!(!super::frame_document_isolation(
+            &child(&[coep], "widget.example"),
+            &widget,
+            &page,
+            false,
+            true,
+            obscura_dom::SandboxFlags::default(),
+        ));
+        // A document the child's own Permissions-Policy excludes never joins.
+        assert!(!isolated(
+            &child(
+                &[coep, ("permissions-policy", "cross-origin-isolated=()")],
+                "widget.example"
+            ),
+            true,
+        ));
+        // Isolation needs a secure context, delegation or not.
+        let plain_http = obscura_net::Response {
+            url: url::Url::parse("http://insecure.example/frame").unwrap(),
+            status: 200,
+            headers: [("cross-origin-embedder-policy".to_string(), "require-corp".to_string())]
+                .into_iter()
+                .collect(),
+            body: Vec::new(),
+            wire_body_len: None,
+            redirected_from: Vec::new(),
+            timing: obscura_net::ResponseTiming::default(),
+        };
+        assert!(!super::frame_document_isolation(
+            &plain_http,
+            &widget,
+            &page,
+            true,
+            true,
+            obscura_dom::SandboxFlags::default(),
+        ));
+    }
+
+    /// Committed frame scopes of an isolated top-level page embedding three
+    /// cross-origin children whose responses carry only
+    /// `Cross-Origin-Embedder-Policy: require-corp`: no `allow` attribute, no
+    /// isolation; a delegation naming the child's origin isolates it; a
+    /// delegation naming another origin does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delegated_cross_origin_frame_isolation_follows_the_allow_attribute() {
+        let parent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_origin = format!("http://{}", child_listener.local_addr().unwrap());
+        let parent_origin = format!("http://{}", parent_listener.local_addr().unwrap());
+        let parent_body = format!(
+            "<!doctype html>\
+             <iframe src=\"{child_origin}/no-allow\"></iframe>\
+             <iframe src=\"{child_origin}/allow\" allow=\"cross-origin-isolated\"></iframe>\
+             <iframe src=\"{child_origin}/allow-other\" \
+                     allow=\"cross-origin-isolated https://other.example\"></iframe>"
+        );
+        let child_server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let body = "<!doctype html><p>child</p>";
+            // COEP alone: a nested document inherits its embedder's COEP, so
+            // the child sends no COOP of its own.
+            for _ in 0..6 {
+                let Ok((mut stream, _)) = child_listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Cross-Origin-Embedder-Policy: require-corp\r\n\
+                     Cross-Origin-Resource-Policy: cross-origin\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let parent_body_clone = parent_body.clone();
+        let parent_server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = parent_listener.accept() else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = parent_body_clone.clone();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Cross-Origin-Opener-Policy: same-origin\r\n\
+                     Cross-Origin-Embedder-Policy: require-corp\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-coi-gate".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-coi-gate".to_string(), context);
+        page.navigate(&format!("{parent_origin}/main")).await.unwrap();
+        assert!(
+            page.cross_origin_isolated,
+            "the embedder must itself be isolated for any of this to matter",
+        );
+        let mut rows = page
+            .with_dom(|dom| {
+                let mut rows = Vec::new();
+                for host in dom.iframe_hosts_in_shadow_including_subtree(dom.document()) {
+                    let Some(root) = dom.iframe_content_document(host) else { continue };
+                    let Some(scope) = dom.document_scope(root) else { continue };
+                    rows.push((scope.url, scope.cross_origin_isolated));
+                }
+                rows
+            })
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (format!("{child_origin}/allow"), true),
+                (format!("{child_origin}/allow-other"), false),
+                (format!("{child_origin}/no-allow"), false),
+            ],
+            "only the delegated child joins the isolated agent cluster",
+        );
+        // The servers block in `accept` past the requests this test makes;
+        // they are dropped with the process rather than joined.
+        drop(child_server);
+        drop(parent_server);
+    }
+
     #[test]
     fn same_origin_child_joins_isolation_from_its_embedder_policy_alone() {
         let response = |headers: &[(&str, &str)]| obscura_net::Response {
@@ -13852,19 +14031,24 @@ impl From<ObscuraNetError> for PageError {
     }
 }
 
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn response_grants_cross_origin_isolation(response: &obscura_net::Response) -> bool {
-    let trustworthy = response.url.scheme() == "https"
-        || response.url.scheme() == "wss"
-        || response.url.host_str().is_some_and(|host| {
+/// Whether the response's URL names a potentially trustworthy origin, the
+/// secure-context floor every cross-origin isolated document stands on.
+fn response_url_is_trustworthy(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        || url.scheme() == "wss"
+        || url.host_str().is_some_and(|host| {
             host.eq_ignore_ascii_case("localhost")
                 || host.ends_with(".localhost")
                 || host == "::1"
                 || host.starts_with("127.")
-        });
-    if !trustworthy {
+        })
+}
+
+/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
+/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
+/// be base64-encoded so Network.getResponseBody returns intact bytes.
+fn response_grants_cross_origin_isolation(response: &obscura_net::Response) -> bool {
+    if !response_url_is_trustworthy(&response.url) {
         return false;
     }
     let token = |name: &str| {
@@ -13994,9 +14178,20 @@ fn frame_document_isolation(
             parent_cross_origin_isolated,
         )
     } else {
+        // A delegated child is still a nested document, so its own response
+        // only has to turn the embedding check on. Measured Chrome 153 with a
+        // two-host fixture under an isolated top-level page: a child carrying
+        // `allow="cross-origin-isolated"` and `Cross-Origin-Embedder-Policy:
+        // require-corp` alone reads `crossOriginIsolated === true` with the
+        // SharedArrayBuffer constructor exposed, and the same child without
+        // the attribute has its navigation blocked outright. Reusing the
+        // top-level rule here demanded the child's COOP as well, which is a
+        // top-level binding and left the delegated widget non-isolated.
         parent_cross_origin_isolated
             && allow_cross_origin_isolated
-            && response_grants_cross_origin_isolation(response)
+            && response_url_is_trustworthy(&response.url)
+            && response_requires_cross_origin_embedding(response)
+            && !response_denies_cross_origin_isolation(response)
     };
     own_isolation
         && (!sandbox.active
