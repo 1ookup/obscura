@@ -66,6 +66,16 @@ run covers are then removed.
 
 ## Backfilled
 
+- 2026-09-27: backfill executed, `cargo nextest run --release --features
+  render --no-fail-fast --config vendor/v8-source.toml` = **1996/1996
+  passed** (1 leaky, 4 skipped) at HEAD `c9d0b62`, plus `cargo check -p
+  obscura-js -p obscura-cli --no-default-features --config
+  vendor/v8-source.toml` (passes). Covers the two 2026-09-27 deferred
+  entries below (`ee49993`/`30db16b`/`1827851`/`468b490` and `098b72e`) and
+  `c9d0b62` (worker async-op settle + digest throughput regression tests).
+  Event-loop semantics were probed for that batch; no engine change shipped.
+  Obstacle course still outstanding for the covered batches and for
+  `c9d0b62`: the `obscura-benchmark` companion repo is absent on this host.
 - 2026-09-23: backfill executed 13:58, `cargo nextest run --release
   --features render --no-fail-fast --config vendor/v8-source.toml` =
   **1925/1925 passed** (1 leaky, 4 skipped) at HEAD d4a5352. Ledger clear.
@@ -75,14 +85,7 @@ run covers are then removed.
 
 ## Deferred
 
-- 2026-09-27: `ee49993` `30db16b` `1827851` `468b490` (performance-entry
-  surfaces: supportedEntryTypes, preload initiatorType, LoAF task sources,
-  worker clock quantum). Scoped run instead: `cargo nextest run --release
-  --features render -p obscura-js -p obscura-browser --config
-  vendor/v8-source.toml` = **861/861 passed**, plus the exact release build.
-  Full workspace run and the obstacle course remain to be executed.
-- 2026-09-27: `098b72e` (Server-Timing parsed into entry.serverTiming).
-  Scoped run instead: `cargo nextest run --release --features render -p
-  obscura-js -p obscura-browser --config vendor/v8-source.toml` = **868/868
-  passed**, plus the exact release build. Full workspace run and the obstacle
-  course (companion repo absent on this host) remain to be executed.
+- 2026-09-27: obstacle course only (full workspace gate covered by the
+  backfill above) for `ee49993` `30db16b` `1827851` `468b490`, `098b72e`,
+  and `c9d0b62`. The `obscura-benchmark` companion repo is absent on this
+  host, so the run has to happen where it is checked out.
