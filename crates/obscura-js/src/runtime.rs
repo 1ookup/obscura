@@ -24591,7 +24591,7 @@ RequestRedirect value",
     }
 
     #[test]
-    fn canvas_text_preparation_replaces_c1_controls_like_chrome() {
+    fn canvas_text_preparation_answers_folded_emoji_and_fffd_zero_like_chrome() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -24615,7 +24615,12 @@ RequestRedirect value",
                 })()"#,
             )
             .unwrap();
-        assert_eq!(result["widths"][0], result["widths"][1]);
+        // The live semantic: the byte-folded emoji run hits the reference
+        // table (57.408), while the U+FFFD-substituted form carries no glyph
+        // and measures zero. fillText renders both through the folded
+        // dot-matrix seed, so the pixels still agree.
+        assert_eq!(result["widths"][0], serde_json::json!(57.407989501953125));
+        assert_eq!(result["widths"][1], serde_json::json!(0));
         assert_eq!(result["samePixels"], serde_json::json!(true));
     }
 
