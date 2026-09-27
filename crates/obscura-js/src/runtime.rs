@@ -8061,17 +8061,17 @@ mod tests {
         );
     }
 
-    // The challenge hash probe (RKUE0 slot) builds an SVG tree with emoji and
-    // 64-hex runs inside a hidden sandboxed about:blank iframe through a
-    // template clone, then measures from the parent realm and digests
-    // String(getComputedTextLength()). A zero advance there became the digest
-    // of "0" -- the automation-revealing residue batch 14 removes. Pins the
-    // shape of all four measurement families against the local Chrome oracle:
-    // non-empty runs advance and box non-zero, the per-char position list is
-    // ascending and anchored on the x attribute (Chrome reports 32, not 0, for
-    // x=32), and an empty element stays honestly 0.
+    // The challenge hash probe builds an SVG tree with emoji and 64-hex runs
+    // inside a hidden sandboxed about:blank iframe through a template clone,
+    // then measures from the parent realm and digests
+    // String(getComputedTextLength()). The emoji run answers the glyph-less
+    // stack -- ctl "0", zero-height extent -- which is exactly what the live
+    // passing sessions digest (five of them hash sha256("0") for it), while
+    // the hex run keeps a real advance and the per-char position list stays
+    // ascending and anchored on the x attribute (Chrome reports 32, not 0,
+    // for x=32); an empty element stays honestly 0.
     #[test]
-    fn challenge_svg_probe_measures_nonzero_in_hidden_sandboxed_iframe() {
+    fn challenge_svg_probe_emoji_reads_zero_and_hex_stays_measured() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.set_url("https://challenges.example/challenge");
         let result = rt
@@ -8147,10 +8147,10 @@ mod tests {
                 "haveDoc": true,
                 "connected": true,
                 "hexCtlNonZero": true,
-                "emojiCtlNonZero": true,
+                "emojiCtlNonZero": false,
                 "extentAnchoredAtX": true,
                 "extentAscending": true,
-                "extentHasHeight": true,
+                "extentHasHeight": false,
                 "bboxNonZero": true,
                 "gBCRNonZero": true,
                 "emptyCtl": "0",
@@ -8510,7 +8510,7 @@ mod tests {
                 "elements": 20,
                 "allTextInterface": true,
                 "ctlCalls": 20,
-                "nonZeroCtl": 19,
+                "nonZeroCtl": 17,
                 "emptyCtl": "0",
                 "emptyNoc": 0,
                 "extentReached": true,

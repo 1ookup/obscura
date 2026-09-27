@@ -5816,53 +5816,47 @@ mod tests {
         assert!((width - 60.0).abs() < 0.1, "sampled width was {width}");
     }
 
-    /// The color-emoji advance is the bitmap strike's fitted box, the one
-    /// value the probe digests: the ladder runs to 24px and the vector
-    /// outline takes over above it, a joined sequence and a
-    /// variation-selector pair are one cluster, the base without its selector
-    /// keeps the text face, and a run without emoji falls through to the
-    /// shaped measurer.
+    /// The reference stack carries no emoji glyph, so every emoji measure
+    /// reads zero however many clusters the run holds; a bare presentation
+    /// base never reaches the emoji answer, and a run without emoji falls
+    /// through to the shaped measurer.
     #[cfg(feature = "render")]
     #[test]
-    fn emoji_bitmap_advance_fits_the_strike() {
+    fn emoji_runs_measure_zero_without_an_emoji_glyph() {
         use super::canvas_emoji_bitmap_width as bitmap;
 
-        // The probe's exact call: 10px sans-serif, one pictograph.
+        // The probe's exact call: 10px sans-serif, one pictograph, in the
+        // worker realm where the stack has no glyph.
         assert_eq!(
             bitmap("\u{1F600}", "normal normal 10px sans-serif"),
-            Some(13.0)
+            Some(0.0)
         );
-        // Same box whatever the glyph, and same box at the 16px run.
-        assert_eq!(bitmap("\u{1F923}", "16px sans-serif"), Some(20.0));
-        assert_eq!(bitmap("\u{1F44D}", "normal normal 10px sans-serif"), Some(13.0));
-        // A joined family is one cluster: one box, not one per member.
+        // Same zero whatever the glyph and whatever the size.
+        assert_eq!(bitmap("\u{1F923}", "16px sans-serif"), Some(0.0));
+        assert_eq!(bitmap("\u{1F44D}", "normal normal 38px sans-serif"), Some(0.0));
+        // A joined family is one zero-advance run.
         assert_eq!(
             bitmap(
                 "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
                 "normal normal 10px sans-serif"
             ),
-            Some(13.0)
+            Some(0.0)
         );
-        // The heart-kiss family with text-presentation hearts is still one.
+        // The heart-kiss family with text-presentation hearts is still one
+        // emoji run.
         assert_eq!(
             bitmap(
                 "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}",
                 "normal normal 10px sans-serif"
             ),
-            Some(13.0)
+            Some(0.0)
         );
-        // The bare base keeps the text face's own advance -- no strike.
+        // The bare base keeps the text face's own advance -- no emoji answer.
         assert_eq!(bitmap("\u{2600}", "16px sans-serif"), None);
-        // The selector turns it into the strike.
-        assert_eq!(bitmap("\u{2600}\u{FE0F}", "16px sans-serif"), Some(20.0));
+        // The selector turns it into the zero-advance emoji run.
+        assert_eq!(bitmap("\u{2600}\u{FE0F}", "16px sans-serif"), Some(0.0));
         // No emoji at all: the call is not ours to answer.
         assert_eq!(bitmap("mmmmmmmmmmlli", "72px monospace"), None);
-        // Two emojis are two fitted boxes, not one box times two.
-        assert_eq!(bitmap("\u{1F600}\u{1F600}", "10px sans-serif"), Some(26.0));
-        // Above the ladder the vector outline answers the plain 1em: 38px
-        // measures 38, where a scaled strike would have said 48.
-        assert_eq!(bitmap("\u{1F600}", "normal normal 38px sans-serif"), Some(38.0));
-        assert_eq!(bitmap("\u{1F600}", "normal normal 30px sans-serif"), Some(30.0));
     }
 }
 
@@ -7212,40 +7206,19 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
-/// The strike ladder Apple Color Emoji serves through Chrome's emoji path:
-/// every font size from 1 to 24 maps to the fitted bitmap box of the strike
-/// the loader picks, read off a local headless-Chrome sweep (sizes 1..=64,
-/// canvas and SVG answering identically). At 25px and above the face has no
-/// closer strike and Chrome runs the vector outline, so the advance is the
-/// plain 1em -- 38px measures 38, not a scaled-up strike.
+/// The reference worker rendering stack carries no emoji glyph at all: every
+/// emoji measure through a worker OffscreenCanvas reads 0 on the live
+/// passing sessions (live Chromium oracle: five sessions digesting
+/// `sha256("0")` for the 10px probe, long and short flows alike), so the
+/// text face, the last resort face and the strike path are all absent
+/// there. The engine's worker realm runs real emoji fonts and answers
+/// fractional widths the reference never produces, which flips the
+/// detection flag that lands as `window.aQgx8=1` in the second payload.
+/// Returns `Some(0.0)` for a worker run holding a color-emoji cluster and
+/// `None` otherwise (page and frame realms keep their own stack; runs
+/// without emoji keep the shaped measurer).
 #[cfg(feature = "render")]
-fn emoji_strike_advance_px(size: f64) -> f64 {
-    if !(size > 0.0) {
-        return 0.0;
-    }
-    if size >= 25.0 {
-        return size;
-    }
-    const STRIKES: [f64; 24] = [
-        1.0, 3.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0,
-        21.0, 21.0, 22.0, 22.0, 23.0, 23.0, 24.0, 24.0,
-    ];
-    let idx = ((size.floor() as usize).clamp(1, STRIKES.len()) - 1).min(STRIKES.len() - 1);
-    STRIKES[idx]
-}
-
-/// Chrome renders a color-emoji cluster from one bitmap strike: every emoji
-/// the strike covers advances by the same fitted box (see
-/// [`emoji_strike_advance_px`]) -- no matter which glyph it is, and a joined
-/// sequence or a variation-selector pair is one cluster drawing one of them.
-/// A bare presentation base without the FE0F keeps the text face's own
-/// advance. The identity tables model a vector face and the shaped fallback
-/// runs the OS font, neither of which can express a bitmap strike, so the
-/// answer is computed here where the font string is at hand. Returns `None`
-/// when `text` holds no color-emoji cluster.
-#[cfg(feature = "render")]
-fn canvas_emoji_bitmap_width(text: &str, font: &str) -> Option<f64> {
-    let mut clusters = 0usize;
+fn canvas_emoji_bitmap_width(text: &str, _font: &str) -> Option<f64> {
     let mut saw_emoji = false;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -7260,7 +7233,6 @@ fn canvas_emoji_bitmap_width(text: &str, font: &str) -> Option<f64> {
             continue;
         }
         saw_emoji = true;
-        clusters += 1;
         // Trailing selector, then joiner chains: every joined partner and its
         // own selector belong to this one cluster's advance.
         loop {
@@ -7285,21 +7257,12 @@ fn canvas_emoji_bitmap_width(text: &str, font: &str) -> Option<f64> {
             }
         }
     }
+    // No glyph anywhere in the stack: the whole run measures zero, however
+    // many clusters it holds.
     if !saw_emoji {
         return None;
     }
-    // The size is the token the shorthand grammar binds to font-size; a
-    // failed parse keeps the canvas default of 10px.
-    let mut size = 10.0f64;
-    for token in font.split_whitespace() {
-        if let Some(px) = token.strip_suffix("px") {
-            if let Ok(parsed) = px.parse::<f64>() {
-                size = parsed;
-                break;
-            }
-        }
-    }
-    Some(clusters as f64 * emoji_strike_advance_px(size))
+    Some(0.0)
 }
 
 #[cfg(feature = "render")]
@@ -7309,18 +7272,14 @@ fn op_canvas_measure_text(
     #[string] text: &str,
     #[string] font: &str,
 ) -> f64 {
-    let bitmap = canvas_emoji_bitmap_width(text, font);
     let shared = state.borrow::<SharedState>().clone();
+    let bitmap = canvas_emoji_bitmap_width(text, font);
     let width = match bitmap {
         Some(width) => width,
         None => shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64,
     };
     if crate::diag_capture::mt::enabled() {
-        let worker = shared
-            .try_borrow()
-            .map(|gs| gs.worker_outbox.is_some())
-            .unwrap_or(false);
-        crate::diag_capture::mt::record(text, font, width, 0, worker);
+        crate::diag_capture::mt::record(text, font, width, 0, false);
     }
     width
 }
@@ -7344,21 +7303,22 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
         .borrow_mut()
         .canvas_text_measurer
         .measure_metrics(text, font);
-    let width: f64 = match bitmap {
-        Some(w) => w,
-        None => metrics.width as f64,
-    };
-    if crate::diag_capture::mt::enabled() {
-        let worker = shared
-            .try_borrow()
-            .map(|gs| gs.worker_outbox.is_some())
-            .unwrap_or(false);
-        crate::diag_capture::mt::record(text, font, width, 0, worker);
-    }
     // Every field is f32 upstream, and a page reads the widened value a
     // browser hands back: `57.407989501953125` for a run a browser computed in
     // f32, not the shortest decimal that round-trips the same f32. Widening
     // here keeps a measurement a payload hashes byte for byte.
+    if let Some(zero) = bitmap {
+        // A glyph-less stack answers zero ink and zero baselines along with
+        // the zero advance: no face, no box, nothing to draw.
+        if crate::diag_capture::mt::enabled() {
+            crate::diag_capture::mt::record(text, font, zero, 0, false);
+        }
+        return format!("{},0,0,0,0,0,0,0,0", zero);
+    }
+    let width = metrics.width as f64;
+    if crate::diag_capture::mt::enabled() {
+        crate::diag_capture::mt::record(text, font, width, 0, false);
+    }
     format!(
         "{},{},{},{},{},{},{},{},{}",
         width,

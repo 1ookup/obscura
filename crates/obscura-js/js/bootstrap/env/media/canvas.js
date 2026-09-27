@@ -1111,7 +1111,16 @@ function _svgAttrOffset(element, name) {
 // are handled by the caller (_svgUnrendered): Chrome answers 0 there, and the
 // empty run stays an honest 0. Per-character surfaces keep honest zeros: a
 // zero-advance code unit (ZWJ, lone surrogate) measures 0 in Chrome too.
+//
+// One exception above that comment: a color-emoji cluster reads a plain zero
+// advance on the reference stack (live sessions digest sha256("0") for
+// exactly this call), so an emoji run must keep the measured zero instead of
+// taking the length-based estimate -- the estimate is the no-answer fallback,
+// not an override of a measured zero.
 function _svgRunAdvance(text, font) {
+  if (_textHasEmojiCluster(text)) {
+    return 0;
+  }
   const box = _measureTextBox(text, font);
   if (!(box.width > 0) && text !== '') {
     const fontSize = parseFloat(String(font)) || 10;
@@ -1119,6 +1128,23 @@ function _svgRunAdvance(text, font) {
     box.width = String(text).length * 6 * scale;
   }
   return box.width;
+}
+
+// Whether the run holds a color-emoji cluster: an emoji-plane pictograph, or
+// a symbol in the misc/arrow block paired with its text-presentation
+// selector. A joined family rides its first pictograph.
+function _textHasEmojiCluster(text) {
+  const s = String(text);
+  let i = 0;
+  while (i < s.length) {
+    const code = s.codePointAt(i);
+    i += code > 0xffff ? 2 : 1;
+    if ((code >= 0x1f000 && code <= 0x1faff) ||
+        ((code >= 0x2600 && code <= 0x27bf) && i < s.length && s.charCodeAt(i) === 0xfe0f)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The text-content methods belong on SVGTextContentElement.prototype (Chrome's

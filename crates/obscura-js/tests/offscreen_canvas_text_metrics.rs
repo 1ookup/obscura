@@ -29,13 +29,10 @@ const PROBE: &str = r#"
      ["sun","\u{2600}\u{FE0F}"]]
 "#;
 
-/// The challenge's ten emoji measured through `OffscreenCanvas` advance by the
-/// bitmap strike's grid-fitted box -- one rounded 1.25-em advance, 20 at
-/// `16px`, whatever the glyph, joined sequences included (local headless
-/// Chrome oracle; the live passing session digests exactly these) -- while the
-/// ink ascent stays per glyph, because the strike still draws each face's own
-/// art. The per-glyph width table this test used to pin is the shape of a
-/// vector face, which is not what answers for color emoji in a browser.
+/// The challenge's ten emoji measured through `OffscreenCanvas` answer the
+/// glyph-less stack: a zero advance and zero ink per emoji, exactly what the
+/// live passing sessions digest. The identity emoji table stays out of the
+/// answer.
 #[tokio::test(flavor = "current_thread")]
 async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     let mut rt = runtime();
@@ -64,18 +61,18 @@ async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     assert_eq!(
         result,
         serde_json::json!({
-            "grinning":  [20, 12.128000259399414],
-            "rofl":      [20, 12.128000259399414],
-            "heartEyes": [20, 12.859375],
-            "thumbsUp":  [20, 12.128000259399414],
-            "fire":      [20, 12.128000259399414],
-            "rocket":    [20, 12.128000259399414],
-            "brain":     [20, 13.343999862670898],
-            "dog":       [20, 12.97599983215332],
-            "castle":    [20, 10.671875],
-            "sun":       [20, 11.456000328063965],
+            "grinning":  [0, 0],
+            "rofl":      [0, 0],
+            "heartEyes": [0, 0],
+            "thumbsUp":  [0, 0],
+            "fire":      [0, 0],
+            "rocket":    [0, 0],
+            "brain":     [0, 0],
+            "dog":       [0, 0],
+            "castle":    [0, 0],
+            "sun":       [0, 0],
         }),
-        "the offscreen emoji probe advances by the strike and keeps per-glyph ink"
+        "the emoji probe answers the glyph-less stack: zero width, zero ink"
     );
 }
 
