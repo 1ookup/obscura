@@ -143,7 +143,11 @@ const _CANVAS_AA_2X2 = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]];
 const _CANVAS_AA_4X4 = Array.from({length: 16}, (_, index) =>
   [(index % 4 + 0.5) / 4, (Math.floor(index / 4) + 0.5) / 4]);
 function _prepareCanvasText(value) {
-  return String(value).replace(/[\x80-\x9f]/g, '\uFFFD');
+  // No character rewriting here: the reference answers C1 code points from
+  // its font stack as-is (the emoji probe sends UTF-8 bytes latin1-folded
+  // into C1 and digests real advances for them), so a replacement here
+  // would both erase the run's identity and shift every width.
+  return String(value);
 }
 
 class _Canvas2D {
@@ -390,11 +394,15 @@ class _Canvas2D {
     let cx = Math.round(tx) - this._textAlignOffset(str, scale);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
+      // The reference draws C1 controls with the same replacement glyph as
+      // U+FFFD, so the dot-matrix seed has to fold them together or a probe
+      // diffing the two renders reads a difference Chrome never produces.
+      const glyph = code >= 0x80 && code <= 0x9f ? 0xfffd : code;
       for (let row = 0; row < 7; row++) {
         for (let col = 0; col < 5; col++) {
-          const on = ((_fpRand(code * 100 + row * 10 + col) > 0.45) &&
+          const on = ((_fpRand(glyph * 100 + row * 10 + col) > 0.45) &&
                       (row > 0 && row < 6 && col > 0 && col < 4)) ||
-                     (_fpRand(code * 200 + row * 7 + col) > 0.7);
+                     (_fpRand(glyph * 200 + row * 7 + col) > 0.7);
           if (on) {
             for (let sy = 0; sy < scale; sy++) {
               for (let sx = 0; sx < scale; sx++) {

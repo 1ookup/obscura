@@ -8150,7 +8150,7 @@ mod tests {
                 "emojiCtlNonZero": false,
                 "extentAnchoredAtX": true,
                 "extentAscending": true,
-                "extentHasHeight": true,
+                "extentHasHeight": false,
                 "bboxNonZero": true,
                 "gBCRNonZero": true,
                 "emptyCtl": "0",

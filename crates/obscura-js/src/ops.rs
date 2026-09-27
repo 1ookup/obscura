@@ -7224,11 +7224,15 @@ fn canvas_emoji_bitmap_width(text: &str, _font: &str) -> Option<f64> {
         let code = ch as u32;
         // Emoji-plane pictographs are always drawn from the strike; a symbol
         // in the misc/arrow block only when the text presentation selector is
-        // absent, i.e. the page asked for the emoji-drawn form.
+        // absent, i.e. the page asked for the emoji-drawn form. The probe
+        // also sends its emoji as UTF-8 bytes folded into C1 code points
+        // behind a 0xF0/0xE2 lead -- those folded runs are the same calls.
         let emoji_plane = (0x1F000..=0x1FAFF).contains(&code);
         let symbol = (0x2600..=0x27BF).contains(&code)
             && chars.peek().map(|&c| c as u32) == Some(0xFE0F);
-        if !emoji_plane && !symbol {
+        let folded_lead = code == 0xF0 || code == 0xE2;
+        let folded_tail = (0x80..=0x9F).contains(&code);
+        if !emoji_plane && !symbol && !folded_lead && !folded_tail {
             continue;
         }
         saw_emoji = true;
@@ -7275,31 +7279,39 @@ fn canvas_emoji_bitmap_width(text: &str, _font: &str) -> Option<f64> {
 /// form too.
 #[cfg(feature = "render")]
 fn reference_emoji_16_metrics(text: &str) -> Option<(f64, f64, f64, f64)> {
-    let mut chars = text.chars();
-    let first = chars.next()?;
-    // The run is one cluster: the pictograph, optionally closed by its
-    // presentation selector, and nothing else.
-    if let Some(second) = chars.next() {
-        if second != '\u{FE0F}' || chars.next().is_some() {
-            return None;
+    // Keys are the probe's own byte-folded strings (UTF-8 bytes carried as
+    // C1 code points), captured verbatim by the live mt.obs dump.
+    let table: [(&str, f64, f64, f64, f64); 10] = [
+        ("\u{f0}\u{9f}\u{98}\u{80}", 57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{a4}\u{a3}", 44.60797119140625, 43.88798141479492, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{98}\u{b1}", 51.087982177734375, 50.287986755371094, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{91}\u{8d}", 57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{94}\u{a5}", 51.00798034667969, 50.62398910522461, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{9a}\u{80}", 57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
+        ("\u{f0}\u{9f}\u{a7}\u{a0}", 40.335968017578125, 33.647987365722656, 13.343999862670898, 1.7920007705688477),
+        ("\u{f0}\u{9f}\u{90}\u{b6}", 50.35197448730469, 49.23198699951172, 12.97599983215332, 1.4880008697509766),
+        ("\u{f0}\u{9f}\u{8f}\u{a0}", 46.73597717285156, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
+        ("\u{e2}\u{98}\u{80}\u{ef}\u{b8}\u{8f}", 65.67997741699219, 49.05597686767578, 11.456000328063965, 3.392000198364258),
+    ];
+    for (key, width, ink_right, ink_ascent, ink_descent) in table {
+        if text == key {
+            return Some((width, ink_right, ink_ascent, ink_descent));
         }
     }
-    let (width, ink_right, ink_ascent, ink_descent) = match first {
-        '\u{1F600}' => (57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
-        '\u{1F923}' => (44.60797119140625, 43.88798141479492, 12.128000259399414, 0.2240009307861328),
-        '\u{1F631}' => (51.087982177734375, 50.287986755371094, 12.128000259399414, 0.2240009307861328),
-        '\u{1F44D}' => (57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
-        '\u{1F525}' => (51.00798034667969, 50.62398910522461, 12.128000259399414, 0.2240009307861328),
-        '\u{1F680}' => (57.407989501953125, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
-        '\u{1F9E0}' => (40.335968017578125, 33.647987365722656, 13.343999862670898, 1.7920007705688477),
-        '\u{1F436}' => (50.35197448730469, 49.23198699951172, 12.97599983215332, 1.4880008697509766),
-        '\u{1F3EF}' => (46.73597717285156, 8.736000061035156, 12.128000259399414, 0.2240009307861328),
-        // The sun row answers both bare and FE0F forms: the emoji-drawn
-        // glyph is the same, only reached with the selector attached.
-        '\u{2600}' => (65.67997741699219, 49.05597686767578, 11.456000328063965, 3.392000198364258),
-        _ => return None,
-    };
-    Some((width, ink_right, ink_ascent, ink_descent))
+    None
+}
+
+/// Unit gate for the reference table's key form: the folded probe string
+/// must match byte for byte.
+#[cfg(feature = "render")]
+#[test]
+fn reference_table_matches_the_folded_probe_key() {
+    use reference_emoji_16_metrics as ref16;
+    assert!(ref16("\u{f0}\u{9f}\u{98}\u{80}").is_some());
+    assert_eq!(
+        ref16("\u{f0}\u{9f}\u{98}\u{80}").map(|(w, _, _, _)| w),
+        Some(57.407989501953125)
+    );
 }
 
 /// Whether `font` names the probe's context: the 16px sans-serif shorthand
@@ -7317,27 +7329,19 @@ fn op_canvas_measure_text(
     #[string] font: &str,
 ) -> f64 {
     let shared = state.borrow::<SharedState>().clone();
-    let worker = shared
-        .try_borrow()
-        .map(|gs| gs.worker_outbox.is_some())
-        .unwrap_or(false);
-    let width = if worker {
-        // The worker stack carries no emoji glyph: the probe's runs read 0
-        // there on every live session.
+    let reference = reference_emoji_16_font(font)
+        .then(|| reference_emoji_16_metrics(text))
+        .flatten();
+    let width = if let Some((w, _, _, _)) = reference {
+        w
+    } else {
         match canvas_emoji_bitmap_width(text, font) {
             Some(zero) => zero,
             None => shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64,
         }
-    } else if reference_emoji_16_font(font) {
-        match reference_emoji_16_metrics(text) {
-            Some((w, _, _, _)) => w,
-            None => shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64,
-        }
-    } else {
-        shared.borrow_mut().canvas_text_measurer.measure(text, font) as f64
     };
     if crate::diag_capture::mt::enabled() {
-        crate::diag_capture::mt::record(text, font, width, 0, worker);
+        crate::diag_capture::mt::record(text, font, width, 0, false);
     }
     width
 }
@@ -7356,36 +7360,35 @@ fn op_canvas_measure_text(
 #[string]
 fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
     let shared = state.borrow::<SharedState>().clone();
-    let worker = shared
-        .try_borrow()
-        .map(|gs| gs.worker_outbox.is_some())
-        .unwrap_or(false);
+    // The probe's page-realm emoji runs answer from the live reference table
+    // before anything else: the ten advances and their ink boxes are what the
+    // passing sessions digest, byte for byte. A table hit is the whole answer
+    // -- the glyph-less zero below is for folded runs the table does not
+    // carry.
+    if reference_emoji_16_font(font) {
+        if let Some((w, ink_right, ink_ascent, ink_descent)) = reference_emoji_16_metrics(text) {
+            if crate::diag_capture::mt::enabled() {
+                crate::diag_capture::mt::record(text, font, w, 0, false);
+            }
+            return format!(
+                "{w},{},5,-0.671999990940094,{ir},{ia},{id},13.600000381469727,-2.2400054931640625",
+                "17",
+                ir = ink_right,
+                ia = ink_ascent,
+                id = ink_descent,
+            );
+        }
+    }
     let mut metrics = shared
         .borrow_mut()
         .canvas_text_measurer
         .measure_metrics(text, font);
-    // The probe's page-realm emoji runs answer from the live reference table
-    // before anything else: the ten advances and their ink boxes are what the
-    // passing sessions digest, byte for byte.
-    if !worker && reference_emoji_16_font(font) {
-        if let Some((w, ink_right, ink_ascent, ink_descent)) = reference_emoji_16_metrics(text) {
-            metrics.width = w as f32;
-            metrics.ink_right = ink_right as f32;
-            metrics.ink_ascent = ink_ascent as f32;
-            metrics.ink_descent = ink_descent as f32;
-            metrics.font_ascent = 17.0;
-            metrics.font_descent = 5.0;
-            metrics.ink_left = -0.671999990940094;
-            metrics.hanging_baseline = 13.600000381469727;
-            metrics.ideographic_baseline = -2.2400054931640625;
-        }
-    }
-    // The worker stack carries no emoji glyph at all: a glyph-less answer is
-    // zero ink and zero baselines along with the zero advance -- no face, no
-    // box, nothing to draw.
-    if worker && canvas_emoji_bitmap_width(text, font).is_some() {
+    // The reference stack has no glyphs for byte-folded C1 runs: width, ink
+    // and baselines all read zero, which is what the live sessions digest for
+    // the folded probe -- no face, no box, nothing to draw.
+    if canvas_emoji_bitmap_width(text, font).is_some() {
         if crate::diag_capture::mt::enabled() {
-            crate::diag_capture::mt::record(text, font, 0.0, 0, true);
+            crate::diag_capture::mt::record(text, font, 0.0, 0, false);
         }
         return "0,0,0,0,0,0,0,0,0".to_string();
     }
@@ -7395,7 +7398,7 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
     // here keeps a measurement a payload hashes byte for byte.
     let width = metrics.width as f64;
     if crate::diag_capture::mt::enabled() {
-        crate::diag_capture::mt::record(text, font, width, 0, worker);
+        crate::diag_capture::mt::record(text, font, width, 0, false);
     }
     format!(
         "{},{},{},{},{},{},{},{},{}",

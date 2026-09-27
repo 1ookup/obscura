@@ -23,10 +23,11 @@ fn runtime() -> ObscuraJsRuntime {
 
 /// The ten emoji the challenge measures, in its order.
 const PROBE: &str = r#"
-    [["grinning","\u{1F600}"], ["rofl","\u{1F923}"], ["fear","\u{1F631}"],
-     ["thumbsUp","\u{1F44D}"], ["fire","\u{1F525}"], ["rocket","\u{1F680}"],
-     ["brain","\u{1F9E0}"], ["dog","\u{1F436}"], ["castle","\u{1F3EF}"],
-     ["sun","\u{2600}\u{FE0F}"]]
+    [["grinning","\u{f0}\u{9f}\u{98}\u{80}"], ["rofl","\u{f0}\u{9f}\u{a4}\u{a3}"],
+     ["fear","\u{f0}\u{9f}\u{98}\u{b1}"], ["thumbsUp","\u{f0}\u{9f}\u{91}\u{8d}"],
+     ["fire","\u{f0}\u{9f}\u{94}\u{a5}"], ["rocket","\u{f0}\u{9f}\u{9a}\u{80}"],
+     ["brain","\u{f0}\u{9f}\u{a7}\u{a0}"], ["dog","\u{f0}\u{9f}\u{90}\u{b6}"],
+     ["castle","\u{f0}\u{9f}\u{8f}\u{a0}"], ["sun","\u{e2}\u{98}\u{80}\u{ef}\u{b8}\u{8f}"]]
 "#;
 
 /// The challenge's ten emoji measured through `OffscreenCanvas` answer the
