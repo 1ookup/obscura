@@ -2053,3 +2053,53 @@ LoAF+2、link initiatorType、ebs/dbs、worker 时钟 f32。
 4. `wopX8`=digest 每-turn 成本（16µs vs Chrome 1.7µs，先决条件同上）
 5. `Pdbt7` 8 vs 13 残差=微任务排空段 LoAF（realm 不可见检查点）
 6. 顶层 COEP 阻塞语义（Chrome 拒载 COEP 不兼容子帧，我方非隔离加载；既有记录差异）
+
+### Step 357：判定 slot 路径 emoji 度量归 0 命中活体 + XYvy9 活体表 + WebGPU 表面三落（2026-09-27）
+
+**判别定案**：validator 九轮 Chrome（含打点轮）`window.aQgx8` 全程 undefined——写路径活体不执行，
+**H2（判定差）定案，非时序分岔**。五会话（refA + validator r2/r3/r5/r8）四统计格哈希逐字节一致 ⇒
+slot→测量绑定跨会话稳定，H-B（映射轮转）否证。写点实测：op197（SetProperty helper，栈
+T6.IS←T6.run←Ig，setter trap 捕获）；exec 形状前 123,847 步全同 ⇒ 判定在数值层不在控制流层。
+
+**blk24 四 slot 终局认知**：
+- `kRQwh3`=sha256("0")：活体该 emoji 度量确定性 0（参考渲染栈无 emoji 字形，worker/页面/帧全
+  realm 一致，五会话长短期同值）——结构性归零，非机器态差异。
+- `RKUE0`=随机 hex 串矢量宽度：每会话 hex 不同 ⇒ 原像必然不同，**不可逐字节对齐**，只有
+  偏移形态可作信号。
+- `JRzmw6` 我方=35+emoji_advance（两轮 52.94=35+17.94、48=35+13 双自洽）；活体原像未解。
+- `oSIr8` 随 emoji 线性联动（0.0536833→0.0535340→0.0534040，emoji 17.94→13→0）。
+
+**活体 mt.obs 十组**（页面 realm OffscreenCanvas `16px sans-serif`，全字段）：
+width 😀57.408 🤣44.608 😱51.088 👍57.408 🔥51.008 🚀57.408 🧠40.336 🐶50.352 🏠46.736 ☀️65.680；
+abbA 12.128×6/13.344/12.976/11.456，abbD 0.224×6/1.792/1.488/3.392；常量 abbL=-0.672、
+fBA=17、fBD=5、hanging=13.6、ideographic=-2.24。**数据落点 /tmp/cf-parity-0927/chrome-mt-obs.jsonl**。
+
+**修复（本步 7 commits，scoped 735/735 + no-default 干净）**：
+- `082222b` emoji 度量归 0（glyph-less stack，worker/页面/帧全 realm）⇒ **kRQwh3=sha256("0")
+  逐字节命中活体**（run-f19 TE#15="0" 实测）
+- `01d05bf` XYvy9[5] 十组活体 TextMetrics 表（page/frame `16px sans-serif` 门；PROBE 第 3 项修正
+  😍→😱 对齐活体 emoji 集）
+- `a5b2603` WebGPU architecture 'metal-3'→''、subgroupMin/MaxSize null→0（活体五行
+  ['apple','','','','0']；fingerprint.gpu.webgpuArchitecture 覆盖点保留）
+- `82e2dc1` GPUAdapterInfo 补 powerPreference getter（apple→'low-power'；原缺字段使挑战回退
+  'default' = etmnR7 组 34 与 OYbs6 的分岔源）
+- `d02e2f1` GPUCanvasContext toneMapping 静默读回 'standard'（KMUh5 ['ldr','hdr']→['ldr'] 的
+  HDR 剔除）
+- 配套：`OBSCURA_CAPTURE_MT` diag（每次文本测量的 text/font/width 落盘，定位主工具）；三测试
+  更新到活体语义（offscreen 十组、svg probe emoji ctl 0、20-ctl 扫描 nonZero 19→17）。
+
+**arc 解析覆盖尝试（回滚，结论存档）**：XYvy9[0]=2x2 OffscreenCanvas 的
+`arc(0,0,2,0,1,anticlockwise)`+'#fff' 扇形（4 像素 255/191/239/48，px.hit 实录），活体
+255/192/244/53。采样分级（≤16x16 画布 32x32 网格）+ 弧折线加密落码后收敛到几何真值
+186/233/47——**活体 Skia 覆盖比解析几何大 ~2.5%**，加密不可达，需 Skia conic 权重与
+half-plane 覆盖语义的源码级研究。回滚保留 4x4 量化（差 1 优于差 6）。
+
+**教训**：给挑战面加拒绝语义（82e2dc1 曾给 configure 加 hdr TypeError）必须先确认调用点有无
+try/catch——无保护抛错使探测序列整体死亡（f21 断流程元凶之一，`4901636` 回退）。
+
+**retry 态（IP 级）**：rc_ni 1→4 递增后服务端只下发短重试臂（fo1+4 键中止报告，无 fo2）。
+换人格/新 storage 无效；本机直连=代理出口同 IP（212.107.29.195）无从换；Chrome 同 IP 可过 ⇒
+IP 未封，retry 键含引擎特征维度。TTL 冷却（主 Agent 19:50/20:20 探测）。
+
+**判决终态**：待冷却解除后组合判决轮补（验证清单：XYvy9[5] 表传导、kRQwh3="0" 保持、
+etmnR7 组 34 powerPreference、lDUiR4 architecture、aQgx8 走向、rc_ni 重置、POST /1.txt）。
