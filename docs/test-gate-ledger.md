@@ -55,6 +55,9 @@ run covers are then removed.
   and `c9d0b62`. The `obscura-benchmark` companion repo is absent on this
   host, so the run has to happen where it is checked out.
 
+- 2026-09-27: `a0626a7`/`ab8cc87` successor (color-emoji zero-advance,
+  glyph-less stack) scoped to the same obscura-js shape as below, 735/735
+  and the no-default check clean; full gate rides the same backfill.
 - 2026-09-27: `ab8cc87` (color-emoji bitmap-strike advance) scoped to
   `cargo nextest run --release --features render -p obscura-js
   --config vendor/v8-source.toml` 735/735 and
