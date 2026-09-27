@@ -24824,9 +24824,9 @@ RequestRedirect value",
             result["directionPixels"],
             serde_json::json!([
                 255, 255, 255, 255,
-                191, 191, 191, 255,
-                239, 239, 239, 255,
-                48, 48, 48, 255,
+                192, 192, 192, 255,
+                244, 244, 244, 255,
+                53, 53, 53, 255,
             ]),
         );
         assert_eq!(result["negativeRadius"], serde_json::json!("IndexSizeError"));
