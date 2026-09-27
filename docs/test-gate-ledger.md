@@ -54,3 +54,10 @@ run covers are then removed.
   backfill above) for `ee49993` `30db16b` `1827851` `468b490`, `098b72e`,
   and `c9d0b62`. The `obscura-benchmark` companion repo is absent on this
   host, so the run has to happen where it is checked out.
+
+- 2026-09-27: `ab8cc87` (color-emoji bitmap-strike advance) scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  --config vendor/v8-source.toml` 735/735 and
+  `cargo check -p obscura-js --no-default-features
+  --config vendor/v8-source.toml` clean. Full workspace gate deferred to the
+  next backfill; obstacle course absent on this host as above.
