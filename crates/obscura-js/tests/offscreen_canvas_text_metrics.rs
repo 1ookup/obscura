@@ -1,11 +1,11 @@
 //! The CF challenge measures ten emoji through an `OffscreenCanvas` 2D context
-//! (`16px sans-serif`), so the offscreen path has to answer the same per-glyph
-//! numbers the element canvas does. Both contexts are one implementation
+//! (`16px sans-serif`), so the offscreen path has to answer the same numbers
+//! the element canvas does. Both contexts are one implementation
 //! (`OffscreenCanvas.getContext('2d')` builds the same `_Canvas2D`, and the
 //! offscreen prototype holds the very same `measureText` function object), and
-//! these tests pin that: lose the shared entry and every emoji collapses onto
-//! one advance and one ascent again, which is the shape a real browser never
-//! produces when it covers the run.
+//! these tests pin that: the advance comes from the bitmap strike's
+//! grid-fitted box while the ink ascent stays per glyph, which is the shape a
+//! real browser produces when it covers the run.
 
 #![cfg(feature = "render")]
 
@@ -29,13 +29,13 @@ const PROBE: &str = r#"
      ["sun","\u{2600}\u{FE0F}"]]
 "#;
 
-/// The challenge's ten emoji measured through `OffscreenCanvas` keep their own
-/// advance and their own ink ascent: the identity sans face's emoji table is
-/// consulted on the offscreen path exactly as it is on the element canvas.
-///
-/// 😀 = 👍 = 🚀 is *correct* — those three share one advance in the face, as
-/// they do in the reference. What would be a regression is the ten of them
-/// collapsing onto one pair of numbers.
+/// The challenge's ten emoji measured through `OffscreenCanvas` advance by the
+/// bitmap strike's grid-fitted box -- one rounded 1.25-em advance, 20 at
+/// `16px`, whatever the glyph, joined sequences included (local headless
+/// Chrome oracle; the live passing session digests exactly these) -- while the
+/// ink ascent stays per glyph, because the strike still draws each face's own
+/// art. The per-glyph width table this test used to pin is the shape of a
+/// vector face, which is not what answers for color emoji in a browser.
 #[tokio::test(flavor = "current_thread")]
 async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     let mut rt = runtime();
@@ -64,18 +64,18 @@ async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     assert_eq!(
         result,
         serde_json::json!({
-            "grinning":  [28.70400047302246, 12.128000259399414],
-            "rofl":      [22.304000854492188, 12.128000259399414],
-            "heartEyes": [15.984000205993652, 12.859375],
-            "thumbsUp":  [28.70400047302246, 12.128000259399414],
-            "fire":      [25.503999710083008, 12.128000259399414],
-            "rocket":    [28.70400047302246, 12.128000259399414],
-            "brain":     [20.167999267578125, 13.343999862670898],
-            "dog":       [25.176000595092773, 12.97599983215332],
-            "castle":    [15.984000205993652, 10.671875],
-            "sun":       [32.84000015258789, 11.456000328063965],
+            "grinning":  [20, 12.128000259399414],
+            "rofl":      [20, 12.128000259399414],
+            "heartEyes": [20, 12.859375],
+            "thumbsUp":  [20, 12.128000259399414],
+            "fire":      [20, 12.128000259399414],
+            "rocket":    [20, 12.128000259399414],
+            "brain":     [20, 13.343999862670898],
+            "dog":       [20, 12.97599983215332],
+            "castle":    [20, 10.671875],
+            "sun":       [20, 11.456000328063965],
         }),
-        "the offscreen emoji probe must stay per glyph"
+        "the offscreen emoji probe advances by the strike and keeps per-glyph ink"
     );
 }
 

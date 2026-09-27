@@ -200,6 +200,56 @@ pub(crate) mod te {
     }
 }
 
+/// Sibling facility filing every canvas/SVG text measurement, keyed on
+/// `OBSCURA_CAPTURE_MT`. One file per measurement under
+/// `<seq>-<realm>.txt`, body `text \x1f font \x1f width`, so a probe that
+/// digests a glyph advance can be traced back to the exact call that
+/// produced it. Never enabled by default; shares `realm` with `te`.
+pub(crate) mod mt {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    fn capture_dir() -> Option<&'static str> {
+        static DIR: OnceLock<Option<String>> = OnceLock::new();
+        DIR.get_or_init(|| {
+            std::env::var("OBSCURA_CAPTURE_MT")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref()
+    }
+
+    /// Whether this measurement should be filed. Called from the measure ops'
+    /// fast path, so the flag is one cached lookup.
+    pub(crate) fn enabled() -> bool {
+        capture_dir().is_some()
+    }
+
+    /// File one measurement. Best-effort like `te::record`: a diagnostic must
+    /// never take the measurement down with it.
+    pub(crate) fn record(text: &str, font: &str, width: f64, root: u64, worker: bool) {
+        let Some(dir) = capture_dir() else {
+            return;
+        };
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+        let path = std::path::Path::new(dir).join(format!(
+            "{}-{}.txt",
+            sequence,
+            super::realm(root, worker)
+        ));
+        let body = format!("{}\u{1f}{}\u{1f}{}", text, font, width);
+        if let Err(error) = std::fs::write(&path, body.as_bytes()) {
+            tracing::debug!(
+                "OBSCURA_CAPTURE_MT: could not write {}: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
