@@ -9004,6 +9004,7 @@ fn layout_dom_once(
                             // Already seeded into the walk's definite-height
                             // set before the adoption point above.
                             definite_heights: _,
+                            #[cfg(feature = "paint")]
                             engine: mut retained_engine,
                             // Seeded into the local reuse bookkeeping before
                             // the build section; the adoption point never
@@ -9046,10 +9047,6 @@ fn layout_dom_once(
                                 let _ = retained_engine;
                             }
                         }
-                        #[cfg(not(feature = "paint"))]
-                        {
-                            let _ = retained_engine;
-                        }
                         incremental_root = reverse.get(&root_id).copied();
                         incremental_applied = incremental_root.is_some();
                         structural_resync = incremental_applied && has_tree_damage;
@@ -9080,19 +9077,23 @@ fn layout_dom_once(
         let prof_engine = std::time::Instant::now();
         engine.materialize_now();
         let prof_engine = prof_engine.elapsed();
+        #[cfg(feature = "paint")]
         let prof_build = std::time::Instant::now();
         tree_reusable = false;
         let taffy_root_holder = if incremental_applied {
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
-                let (hits, misses) = cosmic_text::shape_run_cache_stats();
-                let kind = if structural_resync { "resync" } else { "incremental" };
-                eprintln!(
-                    "[timing] build-walk={} fresh={} shape-hits={} shape-misses={}",
-                    kind,
-                    fresh_styles.as_ref().map_or(0, |fresh| fresh.len()),
-                    hits,
-                    misses,
-                );
+                #[cfg(feature = "paint")]
+                {
+                    let (hits, misses) = cosmic_text::shape_run_cache_stats();
+                    let kind = if structural_resync { "resync" } else { "incremental" };
+                    eprintln!(
+                        "[timing] build-walk={} fresh={} shape-hits={} shape-misses={}",
+                        kind,
+                        fresh_styles.as_ref().map_or(0, |fresh| fresh.len()),
+                        hits,
+                        misses,
+                    );
+                }
             }
             tree_reusable = true;
             incremental_root
@@ -9189,20 +9190,23 @@ fn layout_dom_once(
                 pruned_dom.clear();
             }
             if std::env::var_os("OBSCURA_RENDER_TIMING").is_some() {
-                let (shape_ms, shape_calls, cosmic_ms) = crate::inline::shape_prof_take();
-                let (hits, misses) = cosmic_text::shape_run_cache_stats();
-                let (build_ms, layout_ms) = cosmic_text::line_phase_stats();
-                eprintln!(
-                    "[timing] build-walk={:?} shape-total={:.3}ms shape-cosmic={:.3}ms line-build={:.3}ms line-layout={:.3}ms shape-calls={} shape-hits={} shape-misses={}",
-                    prof_build.elapsed(),
-                    shape_ms,
-                    cosmic_ms,
-                    build_ms,
-                    layout_ms,
-                    shape_calls,
-                    hits,
-                    misses
-                );
+                #[cfg(feature = "paint")]
+                {
+                    let (shape_ms, shape_calls, cosmic_ms) = crate::inline::shape_prof_take();
+                    let (hits, misses) = cosmic_text::shape_run_cache_stats();
+                    let (build_ms, layout_ms) = cosmic_text::line_phase_stats();
+                    eprintln!(
+                        "[timing] build-walk={:?} shape-total={:.3}ms shape-cosmic={:.3}ms line-build={:.3}ms line-layout={:.3}ms shape-calls={} shape-hits={} shape-misses={}",
+                        prof_build.elapsed(),
+                        shape_ms,
+                        cosmic_ms,
+                        build_ms,
+                        layout_ms,
+                        shape_calls,
+                        hits,
+                        misses
+                    );
+                }
             }
             // Taffy has no outer display type and only gives an auto-width
             // Block root the initial-containing-block width. CSS blockifies
