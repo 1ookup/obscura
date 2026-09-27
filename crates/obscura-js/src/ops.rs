@@ -7371,7 +7371,7 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
                 crate::diag_capture::mt::record(text, font, w, 0, false);
             }
             return format!(
-                "{w},{},5,-0.671999990940094,{ir},{ia},{id},13.600000381469727,-2.2400054931640625",
+                "{w},{},5,0.671999990940094,{ir},{ia},{id},13.600000381469727,-2.2400054931640625",
                 "17",
                 ir = ink_right,
                 ia = ink_ascent,
