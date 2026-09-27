@@ -24,3 +24,25 @@ globalThis.GPUAdapterInfo = class GPUAdapterInfo {
   get powerPreference() { return _webglProfile() === 'apple' ? 'low-power' : 'default'; }
   get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
 };
+
+// Probe-sequence capture: the challenge walks the adapter info row before
+// assembling one of its stats blocks, and the read order is what ties each
+// reported value to the surface it came from. Getters log their own reads;
+// with tracelog unconfigured this is one boolean check per read.
+(() => {
+  if (typeof window === 'undefined' || !window.external || !window.external.tracelog) return;
+  const proto = globalThis.GPUAdapterInfo && globalThis.GPUAdapterInfo.prototype;
+  if (!proto) return;
+  for (const name of ['vendor', 'architecture', 'device', 'description',
+      'subgroupMinSize', 'subgroupMaxSize', 'powerPreference']) {
+    const d = Object.getOwnPropertyDescriptor(proto, name);
+    if (!d || !d.get) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: d.enumerable,
+      get() {
+        try { window.external.tracelog('gpu.read', { s: 'info.' + name }); } catch (e) {}
+        return d.get.call(this);
+      },
+    });
+  }
+})();

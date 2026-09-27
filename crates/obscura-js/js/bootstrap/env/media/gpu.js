@@ -26,3 +26,42 @@ globalThis.GPU = class GPU {
   get [Symbol.toStringTag]() { return 'GPU'; }
 };
 navigator.gpu = Object.create(globalThis.GPU.prototype);
+
+// Probe-sequence capture for the adapter entry points: requestAdapter
+// arguments and the adapter-level surface walks.
+(() => {
+  if (typeof window === 'undefined' || !window.external || !window.external.tracelog) return;
+  const gpuProto = globalThis.GPU && globalThis.GPU.prototype;
+  if (gpuProto && typeof gpuProto.requestAdapter === 'function') {
+    const d = Object.getOwnPropertyDescriptor(gpuProto, 'requestAdapter');
+    const orig = d.value;
+    Object.defineProperty(gpuProto, 'requestAdapter', {
+      configurable: true, enumerable: d.enumerable,
+      value(options) {
+        try { window.external.tracelog('gpu.read', { s: 'requestAdapter', o: JSON.stringify(options || null) }); } catch (e) {}
+        return orig.call(this, options);
+      },
+    });
+  }
+  const adProto = globalThis.GPUAdapter && globalThis.GPUAdapter.prototype;
+  if (adProto) {
+    for (const name of ['features', 'limits', 'info', 'isFallbackAdapter']) {
+      const d = Object.getOwnPropertyDescriptor(adProto, name);
+      if (!d || !d.get) continue;
+      Object.defineProperty(adProto, name, {
+        configurable: true, enumerable: d.enumerable,
+        get() {
+          try { window.external.tracelog('gpu.read', { s: 'adapter.' + name }); } catch (e) {}
+          return d.get.call(this);
+        },
+      });
+    }
+    const origReq = adProto.requestDevice;
+    if (typeof origReq === 'function') {
+      adProto.requestDevice = function (options) {
+        try { window.external.tracelog('gpu.read', { s: 'requestDevice', o: JSON.stringify(options || null).slice(0, 120) }); } catch (e) {}
+        return origReq.call(this, options);
+      };
+    }
+  }
+})();
