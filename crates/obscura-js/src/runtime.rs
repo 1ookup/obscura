@@ -4358,9 +4358,14 @@ impl ObscuraJsRuntime {
             // deliveries may have enqueued main-realm messages whose recv op
             // resolves on the next tick, so callers must keep pumping.
             Ok(idle) => {
+                // The stashed batches were collected inside the poll, so they
+                // hold older entries than anything still in the outboxes: a
+                // worker post that landed between the in-poll collect and this
+                // dispatch would otherwise overtake them and reorder
+                // onmessage. Deliver the stash first, then the fresh drain.
+                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 let delivered_after_poll =
                     self.drain_frame_messages() + self.drain_worker_messages();
-                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 tracing::trace!(
                     target: "obscura::timers",
                     elapsed_ms = tick_started.elapsed().as_secs_f64() * 1000.0,
@@ -4514,9 +4519,11 @@ impl ObscuraJsRuntime {
                 // Delivered ops resolved promises; run their continuations
                 // before returning so a wake always completes its delivery.
                 self.runtime.v8_isolate().perform_microtask_checkpoint();
+                // Same stash-first ordering as the cooperative tick: the
+                // in-poll collect predates anything still in the outboxes.
+                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 let delivered_after_poll =
                     self.drain_frame_messages() + self.drain_worker_messages();
-                self.dispatch_worker_batches(std::mem::take(&mut slipped));
                 Ok(idle && delivered_before_poll == 0 && delivered_after_poll == 0)
             }
             Err(error) => Err(error),
