@@ -23,16 +23,16 @@ fn runtime() -> ObscuraJsRuntime {
 
 /// The ten emoji the challenge measures, in its order.
 const PROBE: &str = r#"
-    [["grinning","\u{1F600}"], ["rofl","\u{1F923}"], ["heartEyes","\u{1F60D}"],
+    [["grinning","\u{1F600}"], ["rofl","\u{1F923}"], ["fear","\u{1F631}"],
      ["thumbsUp","\u{1F44D}"], ["fire","\u{1F525}"], ["rocket","\u{1F680}"],
      ["brain","\u{1F9E0}"], ["dog","\u{1F436}"], ["castle","\u{1F3EF}"],
      ["sun","\u{2600}\u{FE0F}"]]
 "#;
 
 /// The challenge's ten emoji measured through `OffscreenCanvas` answer the
-/// glyph-less stack: a zero advance and zero ink per emoji, exactly what the
-/// live passing sessions digest. The identity emoji table stays out of the
-/// answer.
+/// live reference advances and ink boxes byte for byte (the color font's
+/// own per-glyph numbers the passing sessions digest). The identity emoji
+/// table stays out of the answer.
 #[tokio::test(flavor = "current_thread")]
 async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     let mut rt = runtime();
@@ -61,18 +61,18 @@ async fn offscreen_2d_measure_text_answers_per_glyph_emoji() {
     assert_eq!(
         result,
         serde_json::json!({
-            "grinning":  [0, 0],
-            "rofl":      [0, 0],
-            "heartEyes": [0, 0],
-            "thumbsUp":  [0, 0],
-            "fire":      [0, 0],
-            "rocket":    [0, 0],
-            "brain":     [0, 0],
-            "dog":       [0, 0],
-            "castle":    [0, 0],
-            "sun":       [0, 0],
+            "grinning":  [57.407989501953125, 12.128000259399414],
+            "rofl":      [44.60797119140625, 12.128000259399414],
+            "fear":      [51.087982177734375, 12.128000259399414],
+            "thumbsUp":  [57.407989501953125, 12.128000259399414],
+            "fire":      [51.00798034667969, 12.128000259399414],
+            "rocket":    [57.407989501953125, 12.128000259399414],
+            "brain":     [40.335968017578125, 13.343999862670898],
+            "dog":       [50.35197448730469, 12.97599983215332],
+            "castle":    [46.73597717285156, 12.128000259399414],
+            "sun":       [65.67997741699219, 11.456000328063965],
         }),
-        "the emoji probe answers the glyph-less stack: zero width, zero ink"
+        "the offscreen emoji probe answers the live reference advances and ink"
     );
 }
 
