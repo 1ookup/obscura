@@ -2037,12 +2037,16 @@ check 干净；ledger 已记。obstacle course 仓库不在本机，留待有检
 | v1 | FIX-1~9 | 5 | fail（rc_ni=1）；XCvwf5 闭合生效 |
 | v2/v4 | +FIX-11/Deno | 2（截断，~40% 瞬态） | rc_ni 缺席（判决未定型，**不构成通过证据**） |
 | v3/v5/v6 | 完整流 | 5（0.5/4.2/13.6/19.0/22.5s，click@14s） | **fail（rc_ni=1）** |
+| v7 | +`__bootstrap`（c606d18，全量门 2000/2000） | 5（完整流+重启轮 47/92） | **fail（rc_ni=1）** |
 
 **已闭合（活体 payload 复核）**：XCvwf5 三字段、COI 桶T/桶N+SAB、`when`×4、battery、
-select/QSA、品牌串、多余全局、LoAF+2、link initiatorType、ebs/dbs、worker 时钟 f32。
+select/QSA、品牌串、多余全局、Deno+`__bootstrap`（raw 键表审计=再无引擎全局残留）、
+LoAF+2、link initiatorType、ebs/dbs、worker 时钟 f32。
 
 **剩余分岔（= §C1 的当前候选池）**：
-1. `OjmeV1[79]`=true（Deno 排除[v4 实测]、COI/SAB/已移除全局排除；`__bootstrap` 修复在途）
+1. `OjmeV1[79]`=true（**候选已穷尽**：Deno[v4 实测排除]、`__bootstrap`[v7 实测排除]、
+   COI/SAB/已移除六全局逐一排除；下一手段=同 build 插桩 Chrome 的 pc-window 对比，
+   定位写点 opcode 5182:26 与 5264:109 之间该布尔的读取点）
 2. `aQgx8`+`OjmeV1[118]`+blk24 四哈希=OffscreenCanvas/WebGL 像素统计链（光栅化保真级，
    与 §10.13 像素墙同族；aQgx8 写点紧跟 blk24 后 0.42s=该链判定标记）
 3. `uGyjw9` 288 vs 7=引导窗口 wall-clock（frame realm 水合+WebIDL sweep，Step 318 级工程）
