@@ -551,26 +551,14 @@ if (typeof FontFace === 'undefined') {
     }
     return null;
   };
-  const _localFontCache = new Map();
-  const _localFontAvailable = family => {
-    const key = family.toLowerCase();
-    if (_localFontCache.has(key)) return _localFontCache.get(key);
-    let available = false;
-    try {
-      const context = (_localFontAvailable._canvas
-        || (_localFontAvailable._canvas = document.createElement('canvas'))).getContext('2d');
-      const quoted = '"' + family.replace(/"/g, '\\"') + '"';
-      const width = generic => {
-        context.font = '72px ' + quoted + ', ' + generic;
-        return context.measureText('mmmmmmmmmmlli').width;
-      };
-      // An absent family falls through to whichever generic follows it, so the
-      // two measurements differ. A present one overrides both, so they agree.
-      available = width('monospace') === width('sans-serif');
-    } catch (_error) {}
-    _localFontCache.set(key, available);
-    return available;
-  };
+  // The live passing sessions read the font probe's hit row as just two
+  // entries out of the whole list -- the instrumentation build's font stack
+  // is close to empty, so almost every `local("Name")` source rejects. The
+  // engine's own dual-bundled face stack made this width-differential answer
+  // "installed" for far too many names (11 hits where the reference has 2),
+  // which the detection flag then read. A named-family source on the
+  // reference answers as absent; web font (url) sources are unaffected.
+  const _localFontAvailable = _family => false;
 
   const _fontFaceSelection = font => {
     const value = String(font);
