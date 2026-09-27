@@ -16,6 +16,16 @@
 # frame realm. The upstream header exposes it alongside GetScriptName, but this
 # rusty_v8 release binds the name/id methods and omits only the source method.
 #
+# `Isolate::SetModifyCodeGenerationFromStringsCallback` backs eval() under
+# Trusted Types and the per-realm CSP `unsafe-eval` gate (runtime.rs installs
+# it, then flips AllowCodeGenerationFromStrings(false) per context). The V8 C++
+# API exists in this release; the rusty_v8 binding does not. The bridge lives
+# in binding.cc and always allows codegen; it converts a TrustedScript-branded
+# object to its source and denies plain strings only when the running realm's
+# `globalThis.__obscura_csp_allows_unsafe_eval` is explicitly false. The Rust
+# side is a no-arg method; do not confuse it with upstream's later
+# parameterised API of the same name.
+#
 # vendor/rusty_v8 is gitignored (several GB of upstream source), so the change
 # lives here as a script rather than as a diff because the upstream checkout is
 # gitignored. Re-running is a no-op on an already-patched tree.
@@ -34,19 +44,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 V8_DIR="${1:-$ROOT/vendor/rusty_v8}"
 
-if [[ ! -f "$V8_DIR/src/binding.cc" || ! -f "$V8_DIR/src/template.rs" ]]; then
+if [[ ! -f "$V8_DIR/src/binding.cc" || ! -f "$V8_DIR/src/template.rs" || ! -f "$V8_DIR/src/isolate.rs" ]]; then
   echo "not a rusty_v8 checkout: $V8_DIR" >&2
-  echo "  (expects <path>/src/binding.cc and <path>/src/template.rs)" >&2
+  echo "  (expects <path>/src/binding.cc, <path>/src/template.rs and <path>/src/isolate.rs)" >&2
   exit 1
 fi
 
-python3 - "$V8_DIR/src/binding.cc" "$V8_DIR/src/template.rs" "$V8_DIR/src/exception.rs" <<'PY'
+python3 - "$V8_DIR/src/binding.cc" "$V8_DIR/src/template.rs" "$V8_DIR/src/exception.rs" "$V8_DIR/src/isolate.rs" <<'PY'
 import sys
 
-binding_path, template_path, exception_path = sys.argv[1], sys.argv[2], sys.argv[3]
+binding_path, template_path, exception_path, isolate_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 binding = open(binding_path).read()
 template = open(template_path).read()
 exception = open(exception_path).read()
+isolate = open(isolate_path).read()
 dirty = []
 
 # --- binding.cc -------------------------------------------------------------
@@ -88,6 +99,80 @@ if "v8__StackFrame__GetScriptSource" not in binding:
     if stack_anchor_cc not in binding:
         sys.exit("binding.cc: StackFrame GetScriptNameOrSourceURL anchor not found")
     binding = binding.replace(stack_anchor_cc, stack_anchor_cc + stack_addition_cc, 1)
+    if binding_path not in dirty:
+        dirty.append(binding_path)
+
+# --- binding.cc: cstring include for the TrustedScript brand check -----------
+cstring_anchor_cc = """#include <cstdio>
+#include <thread>
+"""
+cstring_addition_cc = """#include <cstdio>
+#include <cstring>
+#include <thread>
+"""
+if "#include <cstring>" not in binding:
+    if cstring_anchor_cc not in binding:
+        sys.exit("binding.cc: cstdio/thread include anchor not found (rusty_v8 v137.3.0?)")
+    binding = binding.replace(cstring_anchor_cc, cstring_addition_cc, 1)
+    if binding_path not in dirty:
+        dirty.append(binding_path)
+
+# --- binding.cc: TrustedScript code-generation bridge ------------------------
+# Inserted ahead of the wasm async resolve shim, temporarily closing and
+# reopening the extern "C" block so the bridge can use C++ types directly.
+gate_anchor_cc = """void v8__Isolate__SetWasmAsyncResolvePromiseCallback(
+    v8::Isolate* isolate, v8::WasmAsyncResolvePromiseCallback callback) {
+"""
+gate_addition_cc = """}  // extern "C"
+
+// Trusted Types passes TrustedScript objects to eval(). V8's public callback
+// is not otherwise exposed by rusty_v8; keep the bridge narrow and preserve
+// ordinary eval(object) semantics by converting only the TrustedScript brand.
+v8::ModifyCodeGenerationFromStringsResult ObscuraModifyCodeGeneration(
+    v8::Local<v8::Context> context,
+    v8::Local<v8::Value> source,
+    bool is_code_like) {
+  (void)is_code_like;
+  // `eval()` and Function constructors run through this callback before V8
+  // compiles their source. Each Obscura realm publishes its document CSP as a
+  // hidden boolean, allowing the callback to enforce `unsafe-eval` without
+  // wrapping the intrinsic eval function and breaking direct-eval scope.
+  if (source->IsString()) {
+    auto key = v8::String::NewFromUtf8Literal(
+        context->GetIsolate(), "__obscura_csp_allows_unsafe_eval");
+    v8::Local<v8::Value> allowed;
+    if (context->Global()->Get(context, key).ToLocal(&allowed)
+        && allowed->IsBoolean()
+        && !allowed->BooleanValue(context->GetIsolate())) {
+      return {false, {}};
+    }
+  }
+  if (!source->IsObject()) {
+    return {true, {}};
+  }
+  auto object = source.As<v8::Object>();
+  auto name = object->GetConstructorName();
+  v8::String::Utf8Value utf8(context->GetIsolate(), name);
+  if (*utf8 && std::strcmp(*utf8, "TrustedScript") == 0) {
+    v8::MaybeLocal<v8::String> converted = source->ToString(context);
+    return {true, converted};
+  }
+  return {true, {}};
+}
+
+extern "C" {
+void v8__Isolate__SetModifyCodeGenerationFromStringsCallback(
+    v8::Isolate* isolate) {
+  isolate->SetModifyCodeGenerationFromStringsCallback(
+      &ObscuraModifyCodeGeneration);
+}
+
+
+"""
+if "ObscuraModifyCodeGeneration" not in binding:
+    if gate_anchor_cc not in binding:
+        sys.exit("binding.cc: SetWasmAsyncResolvePromiseCallback anchor not found (rusty_v8 v137.3.0?)")
+    binding = binding.replace(gate_anchor_cc, gate_addition_cc + gate_anchor_cc, 1)
     if binding_path not in dirty:
         dirty.append(binding_path)
 
@@ -182,12 +267,56 @@ if "pub fn get_script_source<'s>" not in exception:
     if exception_path not in dirty:
         dirty.append(exception_path)
 
+# --- isolate.rs: extern declaration ------------------------------------------
+gate_anchor_extern = """  fn v8__Isolate__SetPromiseRejectCallback(
+    isolate: *mut Isolate,
+    callback: PromiseRejectCallback,
+  );
+"""
+gate_addition_extern = """  fn v8__Isolate__SetModifyCodeGenerationFromStringsCallback(
+    isolate: *mut Isolate,
+  );
+"""
+if "fn v8__Isolate__SetModifyCodeGenerationFromStringsCallback" not in isolate:
+    if gate_anchor_extern not in isolate:
+        sys.exit("isolate.rs: SetPromiseRejectCallback extern anchor not found")
+    isolate = isolate.replace(gate_anchor_extern, gate_anchor_extern + gate_addition_extern, 1)
+    if isolate_path not in dirty:
+        dirty.append(isolate_path)
+
+# --- isolate.rs: safe wrapper -------------------------------------------------
+gate_anchor_method = """  #[inline(always)]
+  pub fn set_promise_reject_callback(
+    &mut self,
+    callback: PromiseRejectCallback,
+  ) {
+    unsafe { v8__Isolate__SetPromiseRejectCallback(self, callback) }
+  }
+"""
+gate_addition_method = """
+  /// Install the TrustedScript code-generation bridge used by eval().
+  #[inline(always)]
+  pub fn set_modify_code_generation_from_strings_callback(&mut self) {
+    unsafe {
+      v8__Isolate__SetModifyCodeGenerationFromStringsCallback(self);
+    }
+  }
+"""
+if "pub fn set_modify_code_generation_from_strings_callback" not in isolate:
+    if gate_anchor_method not in isolate:
+        sys.exit("isolate.rs: set_promise_reject_callback anchor not found")
+    isolate = isolate.replace(gate_anchor_method, gate_anchor_method + gate_addition_method, 1)
+    if isolate_path not in dirty:
+        dirty.append(isolate_path)
+
 if binding_path in dirty:
     open(binding_path, "w").write(binding)
 if template_path in dirty:
     open(template_path, "w").write(template)
 if exception_path in dirty:
     open(exception_path, "w").write(exception)
+if isolate_path in dirty:
+    open(isolate_path, "w").write(isolate)
 
 print("patched: " + ", ".join(dirty) if dirty else "already patched")
 PY
