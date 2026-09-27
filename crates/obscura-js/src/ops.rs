@@ -5816,11 +5816,12 @@ mod tests {
         assert!((width - 60.0).abs() < 0.1, "sampled width was {width}");
     }
 
-    /// The color-emoji advance is the bitmap strike's grid-fitted box, the
-    /// one value the probe digests: every glyph answers the same rounded
-    /// 1.25-em advance, a joined sequence and a variation-selector pair are
-    /// one cluster, the base without its selector keeps the text face, and a
-    /// run without emoji falls through to the shaped measurer.
+    /// The color-emoji advance is the bitmap strike's fitted box, the one
+    /// value the probe digests: the ladder runs to 24px and the vector
+    /// outline takes over above it, a joined sequence and a
+    /// variation-selector pair are one cluster, the base without its selector
+    /// keeps the text face, and a run without emoji falls through to the
+    /// shaped measurer.
     #[cfg(feature = "render")]
     #[test]
     fn emoji_bitmap_advance_fits_the_strike() {
@@ -5858,6 +5859,10 @@ mod tests {
         assert_eq!(bitmap("mmmmmmmmmmlli", "72px monospace"), None);
         // Two emojis are two fitted boxes, not one box times two.
         assert_eq!(bitmap("\u{1F600}\u{1F600}", "10px sans-serif"), Some(26.0));
+        // Above the ladder the vector outline answers the plain 1em: 38px
+        // measures 38, where a scaled strike would have said 48.
+        assert_eq!(bitmap("\u{1F600}", "normal normal 38px sans-serif"), Some(38.0));
+        assert_eq!(bitmap("\u{1F600}", "normal normal 30px sans-serif"), Some(30.0));
     }
 }
 
@@ -7207,16 +7212,37 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+/// The strike ladder Apple Color Emoji serves through Chrome's emoji path:
+/// every font size from 1 to 24 maps to the fitted bitmap box of the strike
+/// the loader picks, read off a local headless-Chrome sweep (sizes 1..=64,
+/// canvas and SVG answering identically). At 25px and above the face has no
+/// closer strike and Chrome runs the vector outline, so the advance is the
+/// plain 1em -- 38px measures 38, not a scaled-up strike.
+#[cfg(feature = "render")]
+fn emoji_strike_advance_px(size: f64) -> f64 {
+    if !(size > 0.0) {
+        return 0.0;
+    }
+    if size >= 25.0 {
+        return size;
+    }
+    const STRIKES: [f64; 24] = [
+        1.0, 3.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0,
+        21.0, 21.0, 22.0, 22.0, 23.0, 23.0, 24.0, 24.0,
+    ];
+    let idx = ((size.floor() as usize).clamp(1, STRIKES.len()) - 1).min(STRIKES.len() - 1);
+    STRIKES[idx]
+}
+
 /// Chrome renders a color-emoji cluster from one bitmap strike: every emoji
-/// the strike covers advances by the same grid-fitted box, `round(size *
-/// 1.25)` pixels -- 13 at `10px` and 20 at `16px` (local headless-Chrome
-/// oracle, both canvas and OffscreenCanvas, worker realms included) -- no
-/// matter which glyph it is, and a joined sequence or a variation-selector
-/// pair is one cluster drawing one of them. A bare presentation base without
-/// the FE0F keeps the text face's own advance. The identity tables model a
-/// vector face and the shaped fallback runs the OS font, neither of which can
-/// express a bitmap strike, so the answer is computed here where the font
-/// string is at hand. Returns `None` when `text` holds no color-emoji cluster.
+/// the strike covers advances by the same fitted box (see
+/// [`emoji_strike_advance_px`]) -- no matter which glyph it is, and a joined
+/// sequence or a variation-selector pair is one cluster drawing one of them.
+/// A bare presentation base without the FE0F keeps the text face's own
+/// advance. The identity tables model a vector face and the shaped fallback
+/// runs the OS font, neither of which can express a bitmap strike, so the
+/// answer is computed here where the font string is at hand. Returns `None`
+/// when `text` holds no color-emoji cluster.
 #[cfg(feature = "render")]
 fn canvas_emoji_bitmap_width(text: &str, font: &str) -> Option<f64> {
     let mut clusters = 0usize;
@@ -7273,7 +7299,7 @@ fn canvas_emoji_bitmap_width(text: &str, font: &str) -> Option<f64> {
             }
         }
     }
-    Some(clusters as f64 * (size * 1.25).round())
+    Some(clusters as f64 * emoji_strike_advance_px(size))
 }
 
 #[cfg(feature = "render")]
