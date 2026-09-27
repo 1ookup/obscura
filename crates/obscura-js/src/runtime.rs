@@ -30441,7 +30441,7 @@ RequestRedirect value",
         let value = result.value.unwrap();
         assert_eq!(
             value["info"],
-            serde_json::json!(["apple", "metal-3", "", ""]),
+            serde_json::json!(["apple", "", "", ""]),
         );
         // Chrome's limits object carries no own members: every limit is an
         // enumerable prototype getter, which is the surface a probe walks.
