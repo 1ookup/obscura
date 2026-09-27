@@ -7,84 +7,29 @@ run covers are then removed.
 
 ## Pending
 
-- 2026-09-27: working tree, `__bootstrap` (deno_core's primordials carrier)
-  removed from the page/worker-visible global on top of the `Deno` removal
-  committed as `d544a99`. Bootstrap-prologue delete, no internal readers
-  (verified: the deno_core builtins destructure primordials at load time,
-  `mod.js` never runs because the extension declares ops only), worker native
-  sweep and webidl-branding surface lists updated, regression tests extended
-  (three realms + a raw property-table walk that bypasses the reflection
-  filter). Scoped suites: `-p obscura-js` 734 tests, `-p obscura-cdp` +
-  `-p obscura-browser` 319/319, then the FULL gate on the same tree:
-  `cargo nextest run --release --no-fail-fast --features render --config
-  vendor/v8-source.toml` = **2000/2000** (4 skipped),
-  `cargo check -p obscura-js -p obscura-cli --no-default-features --config
-  vendor/v8-source.toml` (clean). Exact release build ran, plus live
-  three-realm and CDP probes. Two worker/timer ordering tests flaked under
-  full-suite parallel load in one run and pass standalone; the same flake
-  reproduces on committed HEAD `d544a99` with this change stashed, so it is
-  pre-existing. Does not touch feature gates, build config, or unsafe/FFI.
-  Obstacle course still outstanding (the `obscura-benchmark` companion repo
-  is absent on this host); full gate still mandatory before push.
-
-- 2026-09-24: working tree, `crates/obscura-net` header order and set
-  (`chrome_headers.rs` plus the three build sites in `client.rs` /
-  `wreq_client.rs`; tests only elsewhere). No commit yet. Scoped suites ran
-  instead of the full gate: `cargo nextest run --release -p obscura-net
-  --config vendor/v8-source.toml` = 133/133, `cargo nextest run --release
-  --features render -p obscura-browser --no-fail-fast --config
-  vendor/v8-source.toml` = 131/131, `cargo check -p obscura-net
-  --no-default-features` (clean, no warnings) and `cargo check -p obscura-js
-  -p obscura-cli --no-default-features --config vendor/v8-source.toml`
-  (passes). The exact release build ran. Does not touch feature gates, build
-  config, or unsafe/FFI. Full gate still mandatory before push.
-
-- 2026-09-24: commit `b4a1bf5` (js: gate the font-platform call in the
-  offscreen context test). Feature-gate adjacent: the guard restores the
-  `--no-default-features` shape. Verified instead of the full gate:
-  `cargo check -p obscura-js -p obscura-cli --no-default-features --config
-  vendor/v8-source.toml` (passes) and `cargo check --tests -p obscura-js
-  --no-default-features` (now compiles; failed with E0433 before). The
-  render-shape suites were green at `bfbf226`. Full gate still mandatory
-  before push.
-
-- 2026-09-24: commit `bfbf226` (js: cross-realm ops, worker canvas, media
-  capabilities, geometry branding). The geometry-branding hunks in that commit
-  -- getClientRects() entries are real DOMRect instances, DOMRectList /
-  DOMPoint / DOMQuad adopt Chrome's interface shape, visualViewport is a
-  VisualViewport instance -- ran scoped suites instead:
-  `cargo nextest run --release --features render --no-fail-fast -p
-  obscura-js -p obscura-browser -p obscura-cdp -p obscura-render --config
-  vendor/v8-source.toml` = **1627 run, 0 failed, 4 skipped**, plus
-  `-p obscura-dom` (no render feature) at 93/93; exact release build current
-  at `ac5b04146391768c`. Two obscura-js failures seen under parallel load are
-  pre-existing flakes (`timing_edits_preserve_identity_...`, already recorded
-  below, and `worker_canvas_subsystem_follows_the_creator_gpu_profile`); both
-  pass standalone and the suite re-ran 708/708. Deferred full gate plus the
-  obstacle course remain mandatory before any push or verdict claim.
-
-- 2026-09-24: commits `6b2acdc` (dom: attribute and text escaping match
-  Chrome 153) + `a98a5ef` (js: every realm reports the browser window
-  geometry) + `64f6e5a` (browser: frame isolation, storage quota, connection
-  rtt, awaited-evaluate frame commits). Scoped suites ran instead:
-  `cargo nextest run --release --features render --no-fail-fast -p
-  obscura-dom -p obscura-browser -p obscura-js -p obscura-cdp --config
-  vendor/v8-source.toml` = **1100/1100 passed, 3 skipped**, exact release
-  build current at `6d7fa057e621c5a3`. The changes touch frame realm
-  ordering, isolation policy, HTML escaping and the CDP evaluate pump, so
-  the deferred full gate plus the obstacle course are mandatory before any
-  push or verdict claim.
-
-- 2026-09-23: commits `f07489d` (rtc: icecandidate events are
-  RTCPeerConnectionIceEvent instances) + `894598c` (dom: Document.prototype
-  stringifies [object Document]). Scoped suite ran instead:
-  `cargo nextest run --release --features render -p obscura-js --config
-  vendor/v8-source.toml`, 686 tests, 685 pass + 1 pre-existing load flake
-  (`timing_edits_preserve_identity_and_pause_holds_then_resumes`, fails on the
-  clean tree at b9ef38c under parallel load, passes standalone). Bootstrap-only
-  change plus tests; exact release build ran before the verdict rounds.
+(none)
 
 ## Backfilled
+
+- 2026-09-27: backfill executed at HEAD `38f6f84`,
+  `cargo nextest run --release --features render --no-fail-fast --config
+  vendor/v8-source.toml` = **2000/2000 passed** (4 skipped), plus
+  `cargo check -p obscura-js -p obscura-cli --no-default-features --config
+  vendor/v8-source.toml` (clean). Covers every pending entry below this line
+  as it stood before this run (the 09-23 through 09-27 batches, whose full
+  gates were deferred), the 09-27 `__bootstrap` working-tree batch committed
+  as `c606d18`, and two push-driven fixes from today: `eb0c3ce` (render:
+  cfg-gate the paint-only timing probes and the retained engine binding --
+  the pre-push hook's default-feature render shape had rotted; default
+  372/372, paint 609/609 scoped) and `38f6f84` (worker: dispatch the
+  stashed in-poll batches before the post-poll drain -- the root cause of
+  the "pre-existing" worker ordering flakes: a reply posted between the
+  in-poll collect and the post-poll `drain_worker_messages` overtook the
+  stashed batch, reordering onmessage; the two flaky round-trip tests now
+  pass 20/20 standalone). The push-hook gate re-runs the
+  js/browser/cdp/render suites at push time. Obstacle course still
+  outstanding (the `obscura-benchmark` companion repo is absent on this
+  host).
 
 - 2026-09-27: backfill executed, `cargo nextest run --release --features
   render --no-fail-fast --config vendor/v8-source.toml` = **1996/1996
