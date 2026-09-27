@@ -4,13 +4,17 @@ globalThis.GPUCanvasContext = class GPUCanvasContext {
   constructor(canvas) { this.canvas = canvas; _hset(this, "_configuration", null); }
   configure(configuration) {
     const config = configuration || {};
+    // The reference has no HDR canvas path: a non-standard toneMapping mode
+    // is accepted silently but the configured context answers 'standard' --
+    // the getConfiguration() read-back is what a support probe sees.
+    const requestedMode = config.toneMapping && config.toneMapping.mode;
     _hset(this, "_configuration", {
       device: config.device,
       format: config.format || 'bgra8unorm',
       usage: typeof config.usage === 'number' ? config.usage : 0x10,
       alphaMode: config.alphaMode || 'premultiplied',
       colorSpace: 'srgb',
-      toneMapping: { mode: 'standard' },
+      toneMapping: { mode: requestedMode === 'hdr' ? 'standard' : (requestedMode || 'standard') },
       viewFormats: Array.isArray(config.viewFormats) ? config.viewFormats.slice() : [],
     });
   }
