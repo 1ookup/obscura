@@ -4,6 +4,16 @@ globalThis.GPUCanvasContext = class GPUCanvasContext {
   constructor(canvas) { this.canvas = canvas; _hset(this, "_configuration", null); }
   configure(configuration) {
     const config = configuration || {};
+    // The reference build has no HDR canvas path: a toneMapping mode other
+    // than 'standard' rejects the configuration the way Chrome throws on an
+    // enum value it cannot honor, so a probe that tests for HDR support
+    // reads no support here.
+    const mode = config.toneMapping && config.toneMapping.mode;
+    if (mode !== undefined && mode !== 'standard') {
+      throw new TypeError(
+        "Failed to execute 'configure' on 'GPUCanvasContext': The provided value '"
+        + String(mode) + "' is not a valid enum value of type GPUCanvasToneMappingMode.");
+    }
     _hset(this, "_configuration", {
       device: config.device,
       format: config.format || 'bgra8unorm',

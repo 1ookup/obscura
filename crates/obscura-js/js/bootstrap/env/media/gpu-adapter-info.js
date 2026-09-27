@@ -18,5 +18,9 @@ globalThis.GPUAdapterInfo = class GPUAdapterInfo {
   // profile -- no nulls, and no subgroup feature exposure.
   get subgroupMinSize() { return _webglProfile() === 'apple' ? 0 : 8; }
   get subgroupMaxSize() { return _webglProfile() === 'apple' ? 0 : 32; }
+  // A no-argument requestAdapter on the Mac integrated GPU lands its power
+  // class on the info row: 'low-power', not the 'default' a missing field
+  // would fall back to.
+  get powerPreference() { return _webglProfile() === 'apple' ? 'low-power' : 'default'; }
   get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
 };
