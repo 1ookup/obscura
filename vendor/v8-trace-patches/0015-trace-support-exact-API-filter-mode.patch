@@ -1,0 +1,46 @@
+From 9c637f09928d0003abf6f17ad349cc700bd00683 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sun, 13 Sep 2026 14:48:19 +0800
+Subject: [PATCH 15/16] trace: support exact API filter mode
+
+---
+ src/ic/ic.cc | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index c8cbe8a2..66201525 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -205,6 +205,7 @@ FILE* TracePropertyLookupFile() {
+ 
+ struct TraceApiFilter {
+   bool active = false;
++  bool exact = false;
+   bool has_includes = false;
+   std::vector<std::string> includes;
+   std::vector<std::string> excludes;
+@@ -222,6 +223,10 @@ const TraceApiFilter& TraceApiFilters() {
+     const char* spec = std::getenv("OBSCURA_TRACE_API_FILTER");
+     if (spec == nullptr || spec[0] == '\0') return f;
+     f->active = true;
++    const char* exact = std::getenv("OBSCURA_TRACE_API_FILTER_EXACT");
++    f->exact = exact != nullptr && (strcmp(exact, "1") == 0 ||
++                                    strcmp(exact, "true") == 0 ||
++                                    strcmp(exact, "on") == 0);
+     std::string text(spec);
+     size_t start = 0;
+     for (;;) {
+@@ -269,7 +274,9 @@ bool TraceApiNameAccepted(const std::string& name) {
+   }
+   if (!f.has_includes) return true;
+   for (const std::string& entry : f.includes) {
+-    if (name.find(entry) != std::string::npos) return true;
++    if (f.exact ? name == entry : name.find(entry) != std::string::npos) {
++      return true;
++    }
+   }
+   return false;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

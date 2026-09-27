@@ -1,0 +1,1850 @@
+From 4632570dba2c3ca3a4c62d82463e3ee75a3a574d Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 12 Sep 2026 12:07:40 +0800
+Subject: [PATCH 14/16] trace API calls as jsonl with a compile-time member
+ filter
+
+Add the API-call record layer: one jsonl record per call carrying t, src,
+name, args and result, emitted from the call hook; a compile-time member
+filter, so a statically named access outside the filter carries no probe
+bytecode at all and a filtered run stays cheap enough to reach a
+challenge frame; and the shared async writer behind both sinks.
+
+Name a call by the member the read probe remembers when the callee's own
+name is an inferred path. A function stored under a computed key is named
+by V8 as a path such as "s.<computed>", which no interface owns, so such
+a call was either spelled in a way no comparison can match or dropped
+outright. The old spelling stays as the fallback when nothing was
+remembered.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ src/ic/ic.cc                              | 1391 ++++++++++++++++++++-
+ src/interpreter/bytecode-array-builder.cc |  121 +-
+ src/interpreter/bytecode-array-builder.h  |    8 +-
+ src/interpreter/bytecode-generator.cc     |   40 +-
+ src/runtime/runtime.h                     |    3 +-
+ 5 files changed, 1539 insertions(+), 24 deletions(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 04c34810..c8cbe8a2 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -4,12 +4,15 @@
+ 
+ #include "src/ic/ic.h"
+ 
++#include <atomic>
++#include <cstdint>
+ #include <optional>
+ #include <tuple>
+ 
+ #include "src/api/api-arguments-inl.h"
+ #include "src/ast/ast.h"
+ #include "src/base/logging.h"
++#include "src/base/platform/time.h"
+ #include "src/builtins/accessors.h"
+ #include "src/common/assert-scope.h"
+ #include "src/common/globals.h"
+@@ -40,13 +43,24 @@
+ #include "src/objects/prototype.h"
+ #include "src/runtime/runtime.h"
+ #include "src/tracing/trace-event.h"
++#include "src/heap/factory.h"
++#include "src/objects/function-kind.h"
+ #include "src/objects/js-objects.h"
++#include "src/objects/keys.h"
++#include "src/objects/lookup.h"
++#include "src/objects/property-details.h"
+ #include "src/objects/script.h"
+ #include "src/objects/shared-function-info.h"
++#include <cmath>
+ #include <condition_variable>
++#include <cstdio>
+ #include <cstdlib>
++#include <map>
+ #include <mutex>
++#include <string>
+ #include <thread>
++#include <unordered_map>
++#include <vector>
+ #include "src/tracing/tracing-category-observer.h"
+ #include "src/utils/ostreams.h"
+ 
+@@ -128,8 +142,33 @@ bool TraceCallEnterEnabled();
+ void TraceCallEnter(Isolate* isolate);
+ void TraceCallExit(Isolate* isolate, Tagged<Object> value);
+ 
++// Compile-time half of the API name filter. bytecode-array-builder.cc calls
++// this while emitting a probe for a statically named access so that an access
++// outside the filter carries no probe bytecode at all, which is the only way
++// to keep a filtered trace cheap enough to reach a challenge frame. Returns
++// true when the name cannot be ruled out from the member name alone.
++bool TraceApiStaticMemberWanted(const uint8_t* data, int byte_length,
++                                bool is_one_byte);
++// Whether the call-hook bytecodes are wanted. Only the exit hook is emitted:
++// one record per call, carrying both arguments and the return value.
++bool TraceApiCallExitEnabled();
++
+ namespace {
+ 
++// Defined later in this file; the JSON record helpers below are placed with
++// their filter state, ahead of the property hooks they serve.
++void TraceEnqueueLine(const std::string& line);
++bool TraceDescribeFrame(Isolate* isolate, JavaScriptFrame* frame,
++                        std::string* where, int* line, int* column,
++                        std::string* func);
++bool TraceIsWorkerAuthorScript(const char* name);
++std::string TraceWorkerTag(Isolate* isolate);
++bool TraceCallOrigin(Isolate* isolate, std::string* where, int* line,
++                     int* column, std::string* stack);
++bool TraceApiEngineCallRecords();
++std::string TraceFunctionDefinition(Isolate* isolate,
++                                    DirectHandle<SharedFunctionInfo> shared);
++
+ // Opened once and never closed: the process exits with it, and closing on a
+ // last-lookup signal that does not exist would only risk losing the tail.
+ FILE* TracePropertyLookupFile() {
+@@ -148,6 +187,1166 @@ FILE* TracePropertyLookupFile() {
+   return file;
+ }
+ 
++// --- API trace: JSON records ------------------------------------------------
++//
++// The JSON mode emits one record per API access or call in the shape the
++// HaHaVM reference trace uses: {t, src, name, args, result}. The probe
++// bytecodes are the same ones the TSV mode uses; only the record shape, the
++// filtering and, for reads, the probe position differ.
++//
++// Two things make this affordable enough to trace a live challenge:
++//
++//   * the name filter is applied before any value is rendered, and for
++//     statically named accesses again at bytecode emission time, so a filtered
++//     access carries no probe at all;
++//   * reads are probed after the load, where the accumulator already holds the
++//     value. That removes the LookupIterator walk the TSV mode needs and is
++//     what makes a real result available without invoking an accessor twice.
++
++struct TraceApiFilter {
++  bool active = false;
++  bool has_includes = false;
++  std::vector<std::string> includes;
++  std::vector<std::string> excludes;
++  // Member part of each include entry, compared against the statically known
++  // member name at bytecode emission time. An entry without a dot is its own
++  // member; an entry with one keeps the text after the last dot, which is a
++  // superset test, since a full "Interface.member" name can only contain the
++  // entry if its member part contains that text.
++  std::vector<std::string> static_hints;
++};
++
++const TraceApiFilter& TraceApiFilters() {
++  static const TraceApiFilter* filter = []() {
++    TraceApiFilter* f = new TraceApiFilter();
++    const char* spec = std::getenv("OBSCURA_TRACE_API_FILTER");
++    if (spec == nullptr || spec[0] == '\0') return f;
++    f->active = true;
++    std::string text(spec);
++    size_t start = 0;
++    for (;;) {
++      size_t comma = text.find(',', start);
++      std::string clause =
++          text.substr(start, comma == std::string::npos ? std::string::npos
++                                                        : comma - start);
++      size_t first = clause.find_first_not_of(" \t");
++      size_t last = clause.find_last_not_of(" \t");
++      clause = first == std::string::npos ? std::string()
++                                          : clause.substr(first, last - first + 1);
++      if (!clause.empty()) {
++        bool exclude = clause[0] == '-';
++        if (exclude || clause[0] == '+') clause.erase(0, 1);
++        if (!clause.empty()) {
++          if (exclude) {
++            f->excludes.push_back(clause);
++          } else {
++            f->includes.push_back(clause);
++            size_t dot = clause.rfind('.');
++            f->static_hints.push_back(dot == std::string::npos
++                                          ? clause
++                                          : clause.substr(dot + 1));
++          }
++        }
++      }
++      if (comma == std::string::npos) break;
++      start = comma + 1;
++    }
++    f->has_includes = !f->includes.empty();
++    return f;
++  }();
++  return *filter;
++}
++
++// A record is kept when it matches no exclusion and, if any include entries
++// exist, at least one of them. Entries are plain substrings of the
++// "Interface.member" name, so "setAttribute" selects it on every interface and
++// "Element.setAttribute" selects the subclasses that end in that text too.
++bool TraceApiNameAccepted(const std::string& name) {
++  const TraceApiFilter& f = TraceApiFilters();
++  if (!f.active) return true;
++  for (const std::string& entry : f.excludes) {
++    if (name.find(entry) != std::string::npos) return false;
++  }
++  if (!f.has_includes) return true;
++  for (const std::string& entry : f.includes) {
++    if (name.find(entry) != std::string::npos) return true;
++  }
++  return false;
++}
++
++// Whether a call whose caller is engine code is recorded as well. The default
++// keeps the page boundary: engine code calling its own API members is how the
++// engine builds the document, and those records have no counterpart on the
++// reference side.
++bool TraceApiEngineCallRecords() {
++  static const bool on = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_API_ENGINE_CALLS");
++    if (value == nullptr) return false;
++    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
++           strcmp(value, "on") == 0;
++  }();
++  return on;
++}
++
++bool TraceJsonMode() {
++  static const bool json = []() {
++    const char* format = std::getenv("OBSCURA_TRACE_API_FORMAT");
++    if (format == nullptr) return false;
++    return strcmp(format, "json") == 0 || strcmp(format, "jsonl") == 0 ||
++           strcmp(format, "hahavm") == 0;
++  }();
++  return json;
++}
++
++bool TraceApiCallsEnv() {
++  static const bool on = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_API_CALLS");
++    if (value == nullptr) return false;
++    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
++           strcmp(value, "on") == 0;
++  }();
++  return on;
++}
++
++// Samples that share one clock: the JSON stream's t field is milliseconds
++// since the first traced event, so two sides of a comparison only need to
++// agree on their first event rather than on a wall-clock epoch.
++double TraceApiNowMs() {
++  static const base::TimeTicks start = base::TimeTicks::Now();
++  return (base::TimeTicks::Now() - start).InMillisecondsF();
++}
++
++// --- Mid-flight arming ------------------------------------------------------
++//
++// A trace that runs from process start pays for its probes inside the setup
++// phase a comparison depends on, and on a live challenge that is enough to
++// change the page: with the trace on, the run no longer reaches the proof
++// request the untraced run sends. The arm gate keeps every record path at its
++// cheapest until a trigger fires, so the early phase runs at close to
++// untraced speed while the trace still covers the phase of interest.
++//
++// Triggers, read once at first use:
++//   OBSCURA_TRACE_ARM_AT_MS=<ms>   arm once the trace clock passes this value
++//   OBSCURA_TRACE_ARM_FILE=<path>  arm once this path exists (polled, 5 ms)
++// Both may be set; whichever fires first arms the trace. With neither set the
++// trace is armed from the start, which is the behaviour existing callers
++// expect.
++//
++// The gate is checked before any record work: while unarmed there is no name
++// rendering, no constructor-name lookup and no stack walk, so an unarmed probe
++// costs one runtime call plus one relaxed load.
++struct TraceArmConfig {
++  bool time_trigger = false;
++  bool file_trigger = false;
++  double at_ms = 0.0;
++  std::string file;
++};
++
++const TraceArmConfig& TraceArmConfigRef() {
++  static const TraceArmConfig* config = []() {
++    TraceArmConfig* c = new TraceArmConfig();
++    const char* at = std::getenv("OBSCURA_TRACE_ARM_AT_MS");
++    if (at != nullptr && at[0] != '\0') {
++      c->time_trigger = true;
++      c->at_ms = strtod(at, nullptr);
++    }
++    const char* file = std::getenv("OBSCURA_TRACE_ARM_FILE");
++    if (file != nullptr && file[0] != '\0') {
++      c->file_trigger = true;
++      c->file = file;
++    }
++    return c;
++  }();
++  return *config;
++}
++
++// Process-lifetime arming state. Relaxed ordering: the flag only ever moves
++// from unarmed to armed, and a probe that misses the transition still records
++// the ones after it.
++std::atomic<bool>* g_trace_armed = new std::atomic<bool>(false);
++std::atomic<int64_t>* g_trace_arm_poll_ms = new std::atomic<int64_t>(0);
++
++bool TraceArmed() {
++  std::atomic<bool>& armed = *g_trace_armed;
++  if (armed.load(std::memory_order_relaxed)) return true;
++  const TraceArmConfig& config = TraceArmConfigRef();
++  if (!config.time_trigger && !config.file_trigger) {
++    armed.store(true, std::memory_order_relaxed);
++    return true;
++  }
++  if (config.time_trigger && TraceApiNowMs() >= config.at_ms) {
++    armed.store(true, std::memory_order_relaxed);
++    return true;
++  }
++  if (config.file_trigger) {
++    const int64_t now = static_cast<int64_t>(TraceApiNowMs());
++    int64_t last = g_trace_arm_poll_ms->load(std::memory_order_relaxed);
++    // One stat per 5 ms per process: the check is on the probe path, so it may
++    // not be a syscall per access.
++    if (now - last >= 5 &&
++        g_trace_arm_poll_ms->compare_exchange_strong(last, now,
++                                                     std::memory_order_relaxed)) {
++      FILE* trigger = fopen(config.file.c_str(), "rb");
++      if (trigger != nullptr) {
++        fclose(trigger);
++        armed.store(true, std::memory_order_relaxed);
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++std::string TraceApiMs(double ms) {
++  char buffer[32];
++  snprintf(buffer, sizeof(buffer), "%.1f", ms);
++  return std::string(buffer);
++}
++
++// One byte budget for every rendered field, shared by both sides of a
++// comparison. The marker counts against the budget, the unit is UTF-8 bytes,
++// and the cut is backed off to a character boundary, so a field at or under
++// the limit is byte-identical whichever engine wrote it and a longer one is
++// cut in the same place with the same suffix. OBSCURA_TRACE_LIMIT overrides it;
++// the reference side reads the same number from its own trace config.
++constexpr int kTraceDefaultFieldLimit = 4096;
++constexpr char kTraceTruncationMarker[] = "...[truncated]";
++
++int TraceFieldLimit() {
++  static const int limit = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_LIMIT");
++    if (value == nullptr || value[0] == '\0') return kTraceDefaultFieldLimit;
++    const int parsed = atoi(value);
++    return parsed > 0 ? parsed : kTraceDefaultFieldLimit;
++  }();
++  return limit;
++}
++
++std::string TraceTruncate(const std::string& value) {
++  const int limit = TraceFieldLimit();
++  if (static_cast<int>(value.size()) <= limit) return value;
++  const int marker = static_cast<int>(sizeof(kTraceTruncationMarker) - 1);
++  int cut = limit - marker;
++  if (cut < 0) cut = 0;
++  // Back off to a UTF-8 lead byte: a cut inside a multi-byte sequence would
++  // leave a field that is neither the original nor a valid prefix of it.
++  while (cut > 0 && (static_cast<unsigned char>(value[cut]) & 0xC0) == 0x80) {
++    cut--;
++  }
++  std::string text = value.substr(0, cut);
++  text += kTraceTruncationMarker;
++  return text;
++}
++
++void TraceAppendJsonString(const std::string& value, std::string* out) {
++  const std::string text = TraceTruncate(value);
++  *out += '"';
++  for (char ch : text) {
++    switch (ch) {
++      case '"': *out += "\\\""; break;
++      case '\\': *out += "\\\\"; break;
++      case '\n': *out += "\\n"; break;
++      case '\r': *out += "\\r"; break;
++      case '\t': *out += "\\t"; break;
++      default:
++        if (static_cast<unsigned char>(ch) < 0x20) {
++          *out += ' ';
++        } else {
++          *out += ch;
++        }
++    }
++  }
++  *out += '"';
++}
++
++// The JS spelling of a number ("1", "1.5"), which is what the reference writer
++// produces with String(v). Non-finite values have no JSON number form and are
++// quoted, as the reference quotes them.
++void TraceAppendJsonNumber(Isolate* isolate, Tagged<Object> value,
++                           std::string* out) {
++  const double number = IsSmi(value) ? static_cast<double>(Smi::ToInt(value))
++                                     : Cast<HeapNumber>(value)->value();
++  if (std::isfinite(number)) {
++    DirectHandle<String> text =
++        isolate->factory()->NumberToString(direct_handle(value, isolate));
++    std::unique_ptr<char[]> c = text->ToCString();
++    *out += c ? c.get() : "0";
++    return;
++  }
++  if (std::isnan(number)) {
++    *out += "\"NaN\"";
++  } else {
++    *out += number > 0 ? "\"Infinity\"" : "\"-Infinity\"";
++  }
++}
++
++void TraceAppendValuePreview(Isolate* isolate, Tagged<Object> value, int depth,
++                             std::string* out);
++void TraceAppendValueText(Isolate* isolate, Tagged<Object> value, int depth,
++                          std::string* out);
++
++// The body of an object value. It is left opaque on purpose: enumerating the
++// object's own keys means allocating a key array inside the trace probe, and
++// on a live page that has crashed runs outright (a GC triggered from the exit
++// hook). The class tag in front of this marker is what a comparison matches
++// on; the reference's key list is a convenience, not an identifier.
++void TraceAppendObjectBody(Isolate* isolate, DirectHandle<JSObject> object,
++                           int depth, std::string* out) {
++  *out += "{}";
++}
++
++// The name a callable reports, including the "bound " prefix a bound
++// function carries. That prefix is what tells one scheduled callback from
++// another in a trace: the reference renders "ƒ bound z9", where "Function {}"
++// leaves the reader unable to say which callback a setTimeout was handed. A
++// bound function is its own type in V8 rather than a kind of JSFunction, so it
++// has to be recognised before the plain function case.
++std::string TraceCallableName(Isolate* isolate, Tagged<Object> value) {
++  if (IsJSBoundFunction(value)) {
++    Tagged<Object> target = Cast<JSBoundFunction>(value)->bound_target_function();
++    if (IsJSFunction(target) || IsJSBoundFunction(target)) {
++      return "bound " + TraceCallableName(isolate, target);
++    }
++    return "bound anonymous";
++  }
++  if (!IsJSFunction(value)) return "anonymous";
++  std::unique_ptr<char[]> name = Cast<JSFunction>(value)->shared()->DebugNameCStr();
++  return (name && name.get()[0] != '\0') ? name.get() : "anonymous";
++}
++
++// The text body of a value, without any JSON quoting: what an object summary
++// or an array reads as inside the string a record carries it in.
++void TraceAppendValueText(Isolate* isolate, Tagged<Object> value, int depth,
++                          std::string* out) {
++  if (IsJSArray(value)) {
++    DirectHandle<JSReceiver> array =
++        direct_handle(Cast<JSReceiver>(value), isolate);
++    // A JSArray's length is an own data property, so this reads no accessor.
++    Tagged<Object> length = Cast<JSArray>(value)->length();
++    int count = IsSmi(length) ? Smi::ToInt(length) : 0;
++    *out += '[';
++    const int shown = count > 8 ? 8 : count;
++    for (int i = 0; i < shown; i++) {
++      if (i) *out += ", ";
++      DirectHandle<Object> element;
++      if (JSReceiver::GetElement(isolate, array, static_cast<uint32_t>(i))
++              .ToHandle(&element)) {
++        TraceAppendValuePreview(isolate, *element, depth + 1, out);
++      } else {
++        *out += "?";
++      }
++    }
++    if (count > shown) *out += ", …+" + std::to_string(count - shown);
++    *out += ']';
++    return;
++  }
++  TraceAppendValuePreview(isolate, value, depth, out);
++}
++
++// Re-entrancy guard. Building a record can run page-visible code: naming a
++// global member goes through the global proxy's interceptor, and reading a
++// descriptor can reach a proxy trap. That code's own accesses would re-enter
++// the trace, and the recursion is unbounded (it ends in a stack overflow that
++// shows up as a bus error on macOS). One flag per thread, set for the whole
++// time a record is being built, is the same guard the reference uses.
++thread_local bool g_trace_rendering = false;
++
++struct TraceRenderScope {
++  TraceRenderScope() { g_trace_rendering = true; }
++  ~TraceRenderScope() { g_trace_rendering = false; }
++};
++
++// A function with no name of its own is still a named member of the object it
++// is bound on, and the record needs that member's name. Recovering it at call
++// time means enumerating the object the function lives on, which allocates
++// inside the exit hook and ends in a stack overflow when the global proxy's
++// interceptor re-enters the trace; that is why the name is recorded while the
++// member is READ instead. The property probe already has both the name and the
++// value in hand, and a read precedes every call in practice: a bare identifier
++// call is a global read, which the read probe covers.
++//
++// The exit hook then does one lookup. No allocation, no enumeration, and the
++// key is a script id and a start position rather than a tagged pointer, which
++// GC moves.
++using TraceCallableKey = std::tuple<void*, int, int>;
++
++TraceCallableKey TraceCallableKeyOf(Isolate* isolate, Tagged<Object> callable) {
++  Tagged<Object> target = callable;
++  if (IsJSBoundFunction(target)) {
++    target = Cast<JSBoundFunction>(target)->bound_target_function();
++  }
++  if (!IsJSFunction(target)) return TraceCallableKey(isolate, -1, -1);
++  Tagged<SharedFunctionInfo> shared = Cast<JSFunction>(target)->shared();
++  int script_id = -1;
++  Tagged<Object> script_obj = shared->script();
++  if (IsScript(script_obj)) script_id = Cast<Script>(script_obj)->id();
++  return TraceCallableKey(isolate, script_id, shared->StartPosition());
++}
++
++std::map<TraceCallableKey, std::string>* TraceCallableTable() {
++  static std::map<TraceCallableKey, std::string>* table =
++      new std::map<TraceCallableKey, std::string>();
++  return table;
++}
++
++std::mutex* TraceCallableMutex() {
++  static std::mutex* mutex = new std::mutex();
++  return mutex;
++}
++
++void TraceRememberCallableName(Isolate* isolate, Tagged<Object> callable,
++                               const std::string& name) {
++  if (name.empty()) return;
++  if (!IsJSFunction(callable) && !IsJSBoundFunction(callable)) return;
++  const TraceCallableKey key = TraceCallableKeyOf(isolate, callable);
++  if (std::get<1>(key) < 0) return;
++  std::lock_guard<std::mutex> lock(*TraceCallableMutex());
++  std::map<TraceCallableKey, std::string>& table = *TraceCallableTable();
++  if (table.find(key) == table.end()) table[key] = name;
++}
++
++std::string TraceRememberedCallableName(Isolate* isolate,
++                                        Tagged<Object> callable) {
++  if (!IsJSFunction(callable) && !IsJSBoundFunction(callable)) return "";
++  const TraceCallableKey key = TraceCallableKeyOf(isolate, callable);
++  if (std::get<1>(key) < 0) return "";
++  std::lock_guard<std::mutex> lock(*TraceCallableMutex());
++  std::map<TraceCallableKey, std::string>& table = *TraceCallableTable();
++  auto it = table.find(key);
++  return it == table.end() ? std::string() : it->second;
++}
++
++// Engine-internal class tags never reach a record: a comparison is against
++// page-visible names. The global object and the location object are spelled
++// lowercase, which is the spelling the reference uses for both.
++std::string TraceNormalizeInterface(std::string owner) {
++  if (owner.empty()) return owner;
++  if (owner[0] == '_') owner.erase(0, 1);
++  if (owner == "ScopedDocument") owner = "Document";
++  if (owner == "Window") owner = "window";
++  if (owner == "Location") owner = "location";
++  return owner;
++}
++
++// A data property's string value, or empty. Reading the descriptor never runs
++// a getter, so nothing the page can observe changes.
++std::string TraceOwnDataString(Isolate* isolate, DirectHandle<JSObject> object,
++                               const char* name) {
++  DirectHandle<Name> key = isolate->factory()->InternalizeUtf8String(name);
++  PropertyDescriptor desc;
++  Maybe<bool> found =
++      JSObject::GetOwnPropertyDescriptor(isolate, object, key, &desc);
++  if (found.IsNothing() || !found.FromJust()) return "";
++  if (!desc.has_value() || !IsString(*desc.value())) return "";
++  std::unique_ptr<char[]> c = Cast<String>(*desc.value())->ToCString();
++  return c ? c.get() : "";
++}
++
++// "<div>" for an element, from the tag the engine stores on the object as own
++// data. The engine's generic Element class carries no tag in its class name,
++// and "Element {}" tells a reader nothing; this is the same data a renderer
++// would use, read without running any getter.
++std::string TraceOwnTagText(Isolate* isolate, Tagged<Object> value) {
++  if (!IsJSObject(value) || IsJSProxy(value)) return "";
++  DirectHandle<JSObject> object = direct_handle(Cast<JSObject>(value), isolate);
++  std::string tag = TraceOwnDataString(isolate, object, "_lname");
++  if (tag.empty()) tag = TraceOwnDataString(isolate, object, "_tagName");
++  if (tag.empty() || tag.size() > 24) return "";
++  for (char& ch : tag) {
++    if (ch >= 'A' && ch <= 'Z') {
++      ch = static_cast<char>(ch - 'A' + 'a');
++    } else if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) {
++      return "";
++    }
++  }
++  return "<" + tag + ">";
++}
++
++// The interface an object reports through its prototype's own constructor,
++// used only where V8 gives the object no class name of its own: a style object
++// is an "Object" by map and a CSSStyleDeclaration by prototype, and only the
++// second one tells a reader anything. Read as a descriptor, so no getter runs.
++std::string TracePrototypeClassText(Isolate* isolate, Tagged<Object> value) {
++  if (!IsJSObject(value) || IsJSProxy(value)) return "";
++  DirectHandle<JSObject> object = direct_handle(Cast<JSObject>(value), isolate);
++  PrototypeIterator iterator(isolate, object);
++  if (iterator.IsAtEnd()) return "";
++  DirectHandle<JSReceiver> prototype =
++      PrototypeIterator::GetCurrent<JSReceiver>(iterator);
++  if (!IsJSObject(*prototype)) return "";
++  PropertyDescriptor desc;
++  Maybe<bool> found = JSObject::GetOwnPropertyDescriptor(
++      isolate, prototype, isolate->factory()->constructor_string(), &desc);
++  if (found.IsNothing() || !found.FromJust()) return "";
++  if (!desc.has_value() || !IsJSFunction(*desc.value())) return "";
++  std::unique_ptr<char[]> name =
++      Cast<JSFunction>(*desc.value())->shared()->DebugNameCStr();
++  return (name && name.get()[0] != '\0') ? name.get() : "";
++}
++
++// A DOM element's class tag stands in for the element: "HTMLDivElement" is
++// <div> on the reference side, and a tag is what a reader compares.
++std::string TraceElementTagText(const std::string& class_name) {
++  const char* kHtmlPrefix = "HTML";
++  const char* kElementSuffix = "Element";
++  if (class_name.compare(0, 4, kHtmlPrefix) != 0) return "";
++  if (class_name.size() <= 10) return "";
++  if (class_name.compare(class_name.size() - 7, 7, kElementSuffix) != 0) {
++    return "";
++  }
++  std::string tag = class_name.substr(4, class_name.size() - 11);
++  if (tag.empty()) return "";
++  for (char& ch : tag) {
++    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
++    else if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) return "";
++  }
++  return "<" + tag + ">";
++}
++
++// The preview string one non-scalar value renders as. The reference carries
++// object summaries and arrays inside a JSON string, so this text is a string
++// value on both sides rather than a nested JSON structure.
++void TraceAppendValuePreview(Isolate* isolate, Tagged<Object> value, int depth,
++                             std::string* out) {
++  if (IsString(value)) {
++    std::unique_ptr<char[]> c = Cast<String>(value)->ToCString();
++    std::string text = c ? c.get() : "";
++    *out += '"';
++    *out += text;  // quoting is applied once, by the field writer
++    *out += '"';
++    return;
++  }
++  if (IsSmi(value)) {
++    *out += std::to_string(Smi::ToInt(value));
++    return;
++  }
++  if (IsHeapNumber(value)) {
++    DirectHandle<String> text =
++        isolate->factory()->NumberToString(direct_handle(value, isolate));
++    std::unique_ptr<char[]> c = text->ToCString();
++    *out += c ? c.get() : "0";
++    return;
++  }
++  if (IsTrue(value, isolate)) {
++    *out += "true";
++    return;
++  }
++  if (IsFalse(value, isolate)) {
++    *out += "false";
++    return;
++  }
++  if (IsUndefined(value, isolate)) {
++    *out += "undefined";
++    return;
++  }
++  if (IsNull(value, isolate)) {
++    *out += "null";
++    return;
++  }
++  if (IsJSFunction(value) || IsJSBoundFunction(value)) {
++    *out += "\xC6\x92 ";
++    *out += TraceCallableName(isolate, value);
++    return;
++  }
++  if (IsSymbol(value, isolate)) {
++    *out += "Symbol()";
++    return;
++  }
++  if (IsJSReceiver(value)) {
++    DirectHandle<JSReceiver> receiver =
++        direct_handle(Cast<JSReceiver>(value), isolate);
++    DirectHandle<String> ctor =
++        JSReceiver::GetConstructorName(isolate, receiver);
++    std::unique_ptr<char[]> c = ctor->ToCString();
++    // The class name as the engine spells it. The interface normalization
++    // applies to record names, not to values: a reader comparing class names
++    // is comparing what the page can see, and rewriting one here would hide a
++    // real difference between the engines.
++    std::string tag = c ? c.get() : "?";
++    const std::string element = TraceElementTagText(tag);
++    if (!element.empty()) {
++      *out += element;
++      return;
++    }
++    const std::string own_tag = TraceOwnTagText(isolate, value);
++    if (!own_tag.empty()) {
++      *out += own_tag;
++      return;
++    }
++    if (tag == "Object") {
++      const std::string prototype_class = TracePrototypeClassText(isolate, value);
++      if (!prototype_class.empty()) tag = prototype_class;
++    }
++    *out += tag;
++    *out += " ";
++    if (depth < 2 && IsJSObject(value) && !IsJSProxy(value) &&
++        !IsJSGlobalProxy(value)) {
++      TraceAppendObjectBody(isolate,
++                            direct_handle(Cast<JSObject>(value), isolate), depth,
++                            out);
++    } else {
++      // Past the depth budget the reference collapses to a bare summary, so
++      // the shape matches at any nesting level.
++      *out += "{}";
++    }
++    return;
++  }
++  *out += "<value>";
++}
++
++// The record's rendering of one value: the spellings above, as JSON. A scalar
++// is a JSON native or a short string; anything with a body is one JSON string
++// holding its preview, which is how the reference carries the same value. The
++// whole preview goes through the same byte budget and the same escaping.
++void TraceAppendJsonValue(Isolate* isolate, Tagged<Object> value,
++                          std::string* out) {
++  if (IsString(value)) {
++    std::unique_ptr<char[]> c = Cast<String>(value)->ToCString();
++    TraceAppendJsonString(c ? c.get() : "", out);
++    return;
++  }
++  if (IsSmi(value) || IsHeapNumber(value)) {
++    TraceAppendJsonNumber(isolate, value, out);
++    return;
++  }
++  if (IsTrue(value, isolate)) {
++    *out += "true";
++    return;
++  }
++  if (IsFalse(value, isolate)) {
++    *out += "false";
++    return;
++  }
++  if (IsUndefined(value, isolate)) {
++    *out += "\"undefined\"";
++    return;
++  }
++  if (IsNull(value, isolate)) {
++    *out += "null";
++    return;
++  }
++  std::string preview;
++  TraceAppendValueText(isolate, value, 0, &preview);
++  TraceAppendJsonString(preview, out);
++}
++
++// What a member resolves to on the receiver's chain: the interface that owns
++// it, whether it is an accessor, and where that accessor was defined.
++struct TraceMemberInfo {
++  std::string holder;
++  std::string definition;
++  bool found = false;
++  bool accessor = false;
++};
++
++// One walk answers all three questions, and it runs only for a record that
++// already passed the name filter. Interceptors are skipped and no accessor is
++// invoked, so nothing the page can observe changes.
++//
++// The interface is the holder's own class name. A page calls appendChild on an
++// HTMLBodyElement, but the member belongs to Node, and that is the name the
++// reference records and the one the spec defines it on: V8 reports a
++// prototype object under the class it is the prototype of. The global object
++// is the exception, because its class is what makes a record read "window."
++// and the holder's class is not that.
++TraceMemberInfo TraceLookupMember(Isolate* isolate, DirectHandle<JSAny> receiver,
++                                  DirectHandle<Name> name, bool is_set,
++                                  bool want_definition = true) {
++  TraceMemberInfo info;
++  if (name.is_null() || IsNullOrUndefined(*receiver) ||
++      !IsJSReceiver(*receiver)) {
++    return info;
++  }
++  DirectHandle<JSReceiver> object =
++      direct_handle(Cast<JSReceiver>(*receiver), isolate);
++  const bool is_global = IsJSGlobalProxy(*object);
++  if (is_global) {
++    // Every global read arrives with the global proxy as its receiver, and the
++    // proxy's own lookup is an interceptor that the walk below skips. The
++    // members live on the global object behind it.
++    PrototypeIterator iterator(isolate, object);
++    if (iterator.IsAtEnd()) return info;
++    object = PrototypeIterator::GetCurrent<JSReceiver>(iterator);
++  }
++  LookupIterator it(isolate, object, name,
++                    LookupIterator::PROTOTYPE_CHAIN_SKIP_INTERCEPTOR);
++  if (!it.IsFound()) return info;
++  info.found = true;
++  if (!is_global) {
++    DirectHandle<JSReceiver> holder = it.GetHolder<JSReceiver>();
++    if (!holder.is_null()) {
++      DirectHandle<String> ctor =
++          JSReceiver::GetConstructorName(isolate, holder);
++      std::unique_ptr<char[]> c = ctor->ToCString();
++      info.holder = c ? c.get() : "";
++    }
++  }
++  if (it.state() != LookupIterator::ACCESSOR) return info;
++  info.accessor = true;
++  if (!want_definition) return info;
++  DirectHandle<Object> accessors = it.GetAccessors();
++  if (!IsAccessorPair(*accessors)) return info;
++  Tagged<Object> accessor = Cast<AccessorPair>(*accessors)
++                                ->get(is_set ? ACCESSOR_SETTER : ACCESSOR_GETTER);
++  if (!IsJSFunction(accessor)) return info;
++  DirectHandle<JSFunction> function =
++      direct_handle(Cast<JSFunction>(accessor), isolate);
++  info.definition =
++      TraceFunctionDefinition(isolate, direct_handle(function->shared(), isolate));
++  return info;
++}
++
++// "Interface.member", the name shape both traces use.
++std::string TraceApiRecordName(Isolate* isolate, DirectHandle<JSAny> receiver,
++                               const std::string& member,
++                               DirectHandle<Name> member_name) {
++  if (member.empty()) return "";
++  std::string owner;
++  if (!IsNullOrUndefined(*receiver) && IsJSFunction(*receiver)) {
++    // A static read off a constructor function is named by that constructor's
++    // own name ("URL" for URL.createObjectURL), not by "Function".
++    DirectHandle<SharedFunctionInfo> shared(
++        Cast<JSFunction>(*receiver)->shared(), isolate);
++    std::unique_ptr<char[]> name = shared->DebugNameCStr();
++    if (name && name.get()[0] != '\0') owner = name.get();
++  }
++  if (owner.empty()) {
++    // The name is needed before the filter runs, so this walk asks only for the
++    // holder: resolving an accessor's definition here would pay for every
++    // access the filter is about to drop.
++    owner =
++        TraceLookupMember(isolate, receiver, member_name, false, false).holder;
++  }
++  if (owner.empty()) {
++    // The global object has no constructor to read, and its members are the
++    // window's: that is the interface the reference names them under.
++    if (IsJSGlobalProxy(*receiver) || IsJSGlobalObject(*receiver)) {
++      owner = "window";
++    }
++  }
++  if (owner.empty() && !IsNullOrUndefined(*receiver) && IsJSReceiver(*receiver)) {
++    DirectHandle<String> ctor = JSReceiver::GetConstructorName(
++        isolate, direct_handle(Cast<JSReceiver>(*receiver), isolate));
++    std::unique_ptr<char[]> c = ctor->ToCString();
++    owner = c ? c.get() : "";
++  }
++  if (owner.empty()) {
++    // A member the window holds is the window's, whatever receiver the call
++    // arrived on: the host surface is bound on the global, and a receiver that
++    // reports no class of its own would otherwise leave the record nameless.
++    // Only the receiver's own identity is consulted here - walking the global
++    // object to confirm ownership is what the anonymous-callee path already
++    // does, and doing it again on every named call is not worth its cost.
++    if (IsJSGlobalProxy(*receiver) || IsJSGlobalObject(*receiver)) {
++      owner = "window";
++    }
++  }
++  if (owner.empty()) {
++    if (IsString(*receiver)) {
++      owner = "String";
++    } else if (IsNumber(*receiver)) {
++      owner = "Number";
++    } else if (IsBoolean(*receiver)) {
++      owner = "Boolean";
++    } else if (IsSymbol(*receiver, isolate)) {
++      owner = "Symbol";
++    } else if (IsBigInt(*receiver)) {
++      owner = "BigInt";
++    }
++  }
++  owner = TraceNormalizeInterface(owner);
++  if (owner.empty()) return member;
++  return owner + "." + member;
++}
++
++// The property key behind a member name, for the holder walk on a path that
++// only has the name as text (a call, whose name comes from the callee).
++DirectHandle<Name> TraceMemberName(Isolate* isolate, const std::string& member) {
++  if (member.find('<') != std::string::npos) return DirectHandle<Name>();
++  return isolate->factory()->InternalizeUtf8String(member.c_str());
++}
++
++// The key of a probe, as a Name for the holder walk: a symbol key is already
++// one, and an index key has a name derived from it.
++DirectHandle<Name> TraceKeyName(Isolate* isolate, DirectHandle<Object> key) {
++  if (IsName(*key)) return direct_handle(Cast<Name>(*key), isolate);
++  PropertyKey property_key(isolate, key);
++  return property_key.GetName(isolate);
++}
++
++// Page code the page itself evaluated carries no script name. Both sides call
++// that frame "<page-eval>", which is a realm tag of its own rather than an
++// engine script.
++constexpr char kTracePageEvalTag[] = "<page-eval>";
++
++// The CLI wraps an --eval expression in a fixed one-line prefix, so a position
++// inside that script sits one line below the expression the caller wrote. The
++// CLI sets this when it takes that path; every other entry point leaves it 0.
++int TraceEvalLineBias() {
++  static const int bias = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_EVAL_LINE_BIAS");
++    if (value == nullptr || value[0] == '\0') return 0;
++    return atoi(value);
++  }();
++  return bias;
++}
++
++// Position info both sides read the same way: a line in the script's own
++// source. kNoOffset matters for eval'd code, where the default would report a
++// line in the host script the code was evaluated from instead of the line the
++// page wrote.
++void TraceScriptPosition(Isolate* isolate, DirectHandle<Script> script,
++                         int position, int* line, int* column) {
++  Script::PositionInfo info;
++  *line = 1;
++  *column = 1;
++  if (Script::GetPositionInfo(script, position, &info,
++                              Script::OffsetFlag::kNoOffset)) {
++    *line = info.line + 1;
++    *column = info.column + 1;
++  }
++}
++
++// Where a function was defined: script URL plus start position. This is the
++// left half of the record's src, the "definitions" side.
++std::string TraceFunctionDefinition(Isolate* isolate,
++                                    DirectHandle<SharedFunctionInfo> shared) {
++  Tagged<Object> script_obj = shared->script();
++  if (!IsScript(script_obj)) return "<native>";
++  DirectHandle<Script> script(Cast<Script>(script_obj), isolate);
++  std::string name = "<anonymous>";
++  if (IsString(script->name())) {
++    std::unique_ptr<char[]> c = Cast<String>(script->name())->ToCString();
++    if (c && c.get()[0] != '\0') name = c.get();
++    // A function the worker defined is not engine code, and the definition side
++    // carries the same realm tag as the call site side.
++    if (TraceIsWorkerAuthorScript(name.c_str())) name = TraceWorkerTag(isolate);
++  }
++  SharedFunctionInfo::EnsureSourcePositionsAvailable(isolate, shared);
++  int line = 1;
++  int column = 1;
++  TraceScriptPosition(isolate, script, shared->StartPosition(), &line, &column);
++  if (name == "<eval>") {
++    name = kTracePageEvalTag;
++    line = std::max(1, line - TraceEvalLineBias());
++  }
++  return name + ":" + std::to_string(line) + ":" + std::to_string(column);
++}
++
++// The right half of src: the page frame performing the access, or an empty
++// string when that frame is engine code.
++//
++// Engine-internal accesses are dropped rather than recorded. Bootstrap reads
++// its own API members constantly while it builds the document, and those
++// records describe the engine's implementation, not what the page observed;
++// the reference trace has no counterpart for them. The same rule already
++// selects the TSV stream's records.
++std::string TraceCallSite(Isolate* isolate) {
++  JavaScriptStackFrameIterator frames(isolate);
++  if (frames.done()) return "";
++  std::string where;
++  int line = 0;
++  int column = 0;
++  if (!TraceDescribeFrame(isolate, frames.frame(), &where, &line, &column,
++                          nullptr)) {
++    return "";
++  }
++  return where + ":" + std::to_string(line) + ":" + std::to_string(column);
++}
++
++// The src field: "<operation> <name> (<definition>) <- <call site>".
++//
++// Both halves are always present. "<native>" on the left is an implementation
++// with no JS source position to point at; "<engine>" on the right is an access
++// the engine made rather than the page. A missing half is spelled, never
++// dropped and never "?", so no record is ambiguous about which half is absent.
++std::string TraceApiSrc(const char* operation, const std::string& name,
++                        const std::string& definition,
++                        const std::string& call_site) {
++  std::string src = std::string(operation) + " " + name + " (";
++  src += definition.empty() ? "<native>" : definition;
++  src += ") <- ";
++  src += call_site.empty() ? "<engine>" : call_site;
++  return src;
++}
++
++
++// Renders a property key as display text for a record name.
++std::string TracePropertyMemberText(Isolate* isolate, DirectHandle<Object> key) {
++  if (IsString(*key)) {
++    std::unique_ptr<char[]> c = Cast<String>(*key)->ToCString();
++    return c ? c.get() : "";
++  }
++  if (IsNumber(*key)) {
++    PropertyKey property_key(isolate, key);
++    if (IsString(*property_key.GetName(isolate))) {
++      std::unique_ptr<char[]> c =
++          Cast<String>(*property_key.GetName(isolate))->ToCString();
++      return c ? c.get() : "";
++    }
++    return "<key>";
++  }
++  if (IsSymbol(*key, isolate)) return "<symbol>";
++  return "<key>";
++}
++
++// t is milliseconds since this stream's first record, one decimal, so both
++// sides of a comparison start at 0.0 and only their deltas are compared. The
++// arm gate reads a different clock on purpose: it has to be sampled before the
++// first record exists. A comparison across sides aligns the two streams by
++// their first page-origin record; absolute timestamps are not comparable.
++double TraceApiRecordMs() {
++  static const double* origin = new double(TraceApiNowMs());
++  return TraceApiNowMs() - *origin;
++}
++
++void TraceEnqueueJsonRecord(const std::string& src, const std::string& name,
++                            const std::string& args, const std::string& result) {
++  std::string record = "{\"t\":";
++  record += TraceApiMs(TraceApiRecordMs());
++  record += ",\"src\":";
++  TraceAppendJsonString(src, &record);
++  record += ",\"name\":";
++  TraceAppendJsonString(name, &record);
++  record += ",\"args\":[";
++  record += args;
++  record += "],\"result\":";
++  record += result;
++  record += "}\n";
++  TraceEnqueueLine(record);
++}
++
++// Whether a definition site is page code. A member the page defines itself -
++// a helper function, an object it built - is not a browser API access, and the
++// reference trace has no counterpart for one: it only ever sees members its
++// own environment implements. Recording them would put every page-local call
++// in the way of a comparison that is about API use, so they are dropped rather
++// than left for the reader to filter out.
++bool TraceIsPageDefinition(const std::string& definition) {
++  if (definition.empty()) return false;
++  const size_t column = definition.rfind(':');
++  if (column == std::string::npos) return false;
++  const size_t line = definition.rfind(':', column - 1);
++  if (line == std::string::npos) return false;
++  const std::string script = definition.substr(0, line);
++  return script == kTracePageEvalTag || script == "<eval>" ||
++         script == "<eval-remote>" || script == "<eval-remote-frame>" ||
++         script == "<eval-frame-value>" || script == "<cdp-eval-frame>" ||
++         script == "<anonymous>";
++}
++
++// The definition side of a property record. A callable value is the useful
++// case: it says where the method the page just read or wrote was defined.
++std::string TraceValueDefinition(Isolate* isolate, Tagged<Object> value) {
++  if (IsJSFunction(value)) {
++    DirectHandle<JSFunction> function =
++        direct_handle(Cast<JSFunction>(value), isolate);
++    DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate);
++    return TraceFunctionDefinition(isolate, shared);
++  }
++  return "";
++}
++
++// A write. The value being assigned travels in args, as the reference has it,
++// and the result is "undefined": a setter returns undefined to the caller that
++// invoked it, which is the result a record reports.
++void TraceJsonPropertySet(Isolate* isolate, DirectHandle<JSAny> receiver,
++                          DirectHandle<Object> key, Tagged<Object> value) {
++  if (g_trace_rendering) return;
++  TraceRenderScope render_scope;
++  // Held across the member walk and the value rendering, both of which
++  // allocate: a raw tagged value is only valid until the next allocation.
++  DirectHandle<Object> assigned(value, isolate);
++  const std::string member = TracePropertyMemberText(isolate, key);
++  if (member.empty()) return;
++  const std::string name =
++      TraceApiRecordName(isolate, receiver, member, TraceKeyName(isolate, key));
++  if (name.empty() || !TraceApiNameAccepted(name)) return;
++
++  const std::string call_site = TraceCallSite(isolate);
++  if (call_site.empty() && !TraceApiEngineCallRecords()) return;
++  const TraceMemberInfo member_info =
++      TraceLookupMember(isolate, receiver, TraceKeyName(isolate, key), true);
++  // The reference records a write only when its environment defined a setter
++  // for the member: a store into an ordinary data property dispatches nothing
++  // there. Requiring the same here drops the writes a page makes to its own
++  // objects, which have no counterpart on the other side.
++  if (!member_info.accessor) return;
++  if (TraceIsPageDefinition(member_info.definition)) return;
++  std::string args;
++  TraceAppendJsonValue(isolate, *assigned, &args);
++  std::string src = TraceApiSrc("set", name, member_info.definition, call_site);
++  TraceEnqueueJsonRecord(src, name, args, "\"undefined\"");
++}
++
++// A read: the value has already been loaded, so no accessor runs twice.
++void TraceJsonPropertyGet(Isolate* isolate, DirectHandle<JSAny> receiver,
++                          DirectHandle<Object> key, Tagged<Object> value) {
++  if (g_trace_rendering) return;
++  TraceRenderScope render_scope;
++  // Held across the member walk and the value rendering, both of which
++  // allocate: a raw tagged value is only valid until the next allocation.
++  DirectHandle<Object> read(value, isolate);
++  const std::string member = TracePropertyMemberText(isolate, key);
++  if (member.empty()) return;
++  const std::string name =
++      TraceApiRecordName(isolate, receiver, member, TraceKeyName(isolate, key));
++  if (name.empty() || !TraceApiNameAccepted(name)) return;
++
++  // Record what this member is called, so a later call into it can be named
++  // without enumerating anything (see TraceRememberCallableName).
++  if (IsJSFunction(*read) || IsJSBoundFunction(*read)) {
++    TraceRememberCallableName(isolate, *read, name);
++  }
++  const std::string call_site = TraceCallSite(isolate);
++  if (call_site.empty() && !TraceApiEngineCallRecords()) return;
++  const TraceMemberInfo member_info =
++      TraceLookupMember(isolate, receiver, TraceKeyName(isolate, key), false);
++  // A read whose value is a function is a method reference. The reference
++  // records nothing for one: its members are plain data properties, so reading
++  // one dispatches nothing, and the call record that follows carries the same
++  // information. Only an accessor read is a record on both sides, so a page
++  // that touches a method produces one record there rather than two here.
++  if (IsJSFunction(*read) && !member_info.accessor) return;
++  std::string definition = member_info.definition;
++  if (definition.empty()) definition = TraceValueDefinition(isolate, *read);
++  if (TraceIsPageDefinition(definition)) return;
++  std::string result;
++  TraceAppendJsonValue(isolate, *read, &result);
++  std::string src = TraceApiSrc("get", name, definition, call_site);
++  TraceEnqueueJsonRecord(src, name, std::string(), result);
++}
++
++// One call, emitted at exit so that a single record carries the arguments and
++// the return value. The caller's frame still holds the call site.
++//
++// A class constructor can only be entered through `new`, which is how a
++// construct is told from a call: one exit hook serves both, and the object a
++// construct produced is the frame's receiver rather than its return value. The
++// reference records the same event with the same "new" operation, so a
++// constructor is one record on both sides rather than a call with an undefined
++// result on one of them.
++void TraceCallRecordJson(Isolate* isolate, Tagged<Object> value) {
++  JavaScriptStackFrameIterator frames(isolate);
++  if (frames.done()) return;
++  JavaScriptFrame* frame = frames.frame();
++  // Both of these are held across allocations below (the member walk and the
++  // value rendering both allocate), so they have to be handles: a raw tagged
++  // value is only valid until the next allocation, which is free to move it.
++  DirectHandle<Object> call_value(value, isolate);
++  DirectHandle<JSAny> receiver =
++      direct_handle(Cast<JSAny>(frame->receiver()), isolate);
++  if (g_trace_rendering) return;
++  TraceRenderScope render_scope;
++  DirectHandle<SharedFunctionInfo> callee(frame->function()->shared(), isolate);
++  std::unique_ptr<char[]> fname = callee->DebugNameCStr();
++  // Anonymous host functions (the timer and network surface bootstrap binds)
++  // carry no name of their own; their record's name comes from the table the
++  // read probe fills, and a call whose name was never read is left unrecorded.
++  // OBSCURA_TRACE_ANON_CALLS=0 turns the whole path off.
++  static const bool anon_calls = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_ANON_CALLS");
++    if (value == nullptr) return true;
++    return !(strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
++             strcmp(value, "off") == 0);
++  }();
++  const bool anonymous = anon_calls && (!fname || fname.get()[0] == '\0');
++  bool is_construct = false;
++  std::string member;
++  if (!anonymous) {
++    member = fname.get();
++    if (member[0] == '.') member.erase(0, 1);
++    // An accessor's function is named "get title"/"set title" by V8. The
++    // property record for the same access already carries the value and the
++    // property name, so recording the accessor call as well would count one
++    // page-level access twice.
++    if (member.rfind("get ", 0) == 0 || member.rfind("set ", 0) == 0) return;
++    is_construct = IsClassConstructor(callee->kind());
++    if (is_construct) member = "constructor";
++  }
++
++  std::string name;
++  // A function stored under a computed key carries an inferred name, which V8
++  // spells as a path ("s.<computed>") rather than as a property. No interface
++  // owns a member shaped like that, so a record named from it can never line
++  // up with the member the page actually called, and the membership walk below
++  // is skipped for it on purpose. The read probe remembers the name a member
++  // was read under, and for a dispatch that reaches an interface member
++  // through a computed key that remembered name is the only one that names the
++  // API. Fall through to the old path when nothing was remembered.
++  if (!anonymous && member.find('.') != std::string::npos) {
++    name = TraceRememberedCallableName(isolate, *frame->function());
++  }
++  if (name.empty()) {
++    if (anonymous) {
++      // One table lookup: the name was recorded when the member was read.
++      name = TraceRememberedCallableName(isolate, *frame->function());
++      if (name.empty()) return;
++    } else if (IsJSReceiver(*receiver)) {
++      DirectHandle<Name> member_name = TraceMemberName(isolate, member);
++      // A call is recorded only when the callee is reachable as a member of its
++      // receiver. That is what makes it an API call: the reference sees one
++      // because its environment implemented that member. An engine helper
++      // reached through a native accessor is not a member of anything the page
++      // can name, and recording it would put the engine's own plumbing in the
++      // stream. A dotted debug name is an inferred function name rather than a
++      // property, so the walk does not apply to it.
++      if (member.find('.') == std::string::npos &&
++          !TraceLookupMember(isolate, receiver, member_name, false, false)
++               .found) {
++        return;
++      }
++      name = TraceApiRecordName(isolate, receiver, member, member_name);
++    } else {
++      // A callee whose `this` is lexical (an arrow) or undefined still resolves
++      // as a bare identifier, which is to say as a member of the global object.
++      // Naming it under the global's interface is what makes it line up with the
++      // reference's "window.setTimeout".
++      DirectHandle<JSAny> global_handle =
++          direct_handle(Cast<JSAny>(*isolate->global_proxy()), isolate);
++      name = TraceApiRecordName(isolate, global_handle, member,
++                                TraceMemberName(isolate, member));
++    }
++  }
++  if (name.empty() || !TraceApiNameAccepted(name)) return;
++  // A member of a plain object is not a browser API member. The reference has
++  // no record named Object., and a call the engine makes into its own wrapper
++  // objects is not a call the page made.
++  if (name.rfind("Object.", 0) == 0) return;
++
++  // The caller: the frame beneath the callee, still positioned at the call.
++  // TraceCallOrigin is the same predicate the TSV call stream uses, and it
++  // reports whether a page frame, rather than engine code, made the call.
++  std::string where;
++  int line = 0;
++  int column = 0;
++  const bool page_call =
++      TraceCallOrigin(isolate, &where, &line, &column, nullptr);
++  if (!page_call && !TraceApiEngineCallRecords()) return;
++  std::string call_site =
++      page_call ? where + ":" + std::to_string(line) + ":" +
++                      std::to_string(column)
++                : std::string("<engine>");
++
++  const std::string definition = TraceFunctionDefinition(isolate, callee);
++  if (TraceIsPageDefinition(definition)) return;
++  std::string src = TraceApiSrc(is_construct ? "new" : "call", name, definition,
++                                call_site);
++  std::string args;
++  // The count the caller actually passed, not the callee's formal count: V8
++  // pads a frame to the formals, and reporting the padding would put an
++  // "undefined" argument in every record for a call that omitted one, which
++  // the reference (reading the arguments object) does not have.
++  const int count = frame->GetActualArgumentCount();
++  for (int i = 0; i < count; i++) {
++    if (i) args += ",";
++    TraceAppendJsonValue(isolate, frame->GetParameter(i), &args);
++  }
++  std::string result;
++  TraceAppendJsonValue(isolate, is_construct ? *receiver : *call_value, &result);
++  TraceEnqueueJsonRecord(src, name, args, result);
++}
++
+ // Whether a script name is engine-internal. Named engine scripts all start
+ // with '<' (timer wakeups, frame bootstraps, injected shims); ext:/deno: are
+ // the runtime's own builtins. Page code that ran through eval has no script
+@@ -322,6 +1521,45 @@ void TraceAppendValue(Isolate* isolate, Tagged<Object> value, std::string* out)
+ //
+ // Shared by both hooks so that entries and returns are selected by the same
+ // predicate; filtering only one of them leaves returns that pair with nothing.
++// A worker's own script. It runs in the worker's isolate, not the page's, but
++// it is author code: its accesses are what the page observed, so they are kept
++// rather than filtered with the engine scripts around them. The realm has to
++// be visible in src -- a worker record must not read as a frame or top-level
++// one -- and `<worker #n>` is that tag. The name stays engine-internal so
++// nothing page-visible (worker error text, stacks) changes.
++bool TraceIsWorkerAuthorScript(const char* name) {
++  return name != nullptr && strncmp(name, "<obscura:worker-script", 22) == 0;
++}
++
++// The instance number in a worker tag. A page that builds probe workers gets
++// one record stream per worker, and without an instance number a terminated
++// worker, its replacement and a live one all read `<worker>`: a worker that
++// stopped producing records cannot be told from one that never spoke, and the
++// replacement silently inherits the tag. The isolate is the instance, so
++// number isolates in the order their author scripts first appear. Held for the
++// process: an id has to outlive the worker it names, otherwise the silence
++// that matters (the worker stopped) is exactly what erases the evidence.
++//
++// An isolate freed and reallocated at the same address would inherit the
++// number. That direction is safe here: it can only make a dead worker look
++// alive, never the reverse, so a missing record is still a real absence.
++int TraceWorkerInstanceId(Isolate* isolate) {
++  static std::mutex* mutex = new std::mutex();
++  static std::unordered_map<Isolate*, int>* ids =
++      new std::unordered_map<Isolate*, int>();
++  static int next = 1;
++  std::lock_guard<std::mutex> lock(*mutex);
++  auto it = ids->find(isolate);
++  if (it != ids->end()) return it->second;
++  const int id = next++;
++  (*ids)[isolate] = id;
++  return id;
++}
++
++std::string TraceWorkerTag(Isolate* isolate) {
++  return "<worker #" + std::to_string(TraceWorkerInstanceId(isolate)) + ">";
++}
++
+ // Describes one frame, or reports that it is engine code.
+ bool TraceDescribeFrame(Isolate* isolate, JavaScriptFrame* frame,
+                         std::string* where, int* line, int* column,
+@@ -333,18 +1571,38 @@ bool TraceDescribeFrame(Isolate* isolate, JavaScriptFrame* frame,
+ 
+   if (IsString(script->name())) {
+     std::unique_ptr<char[]> n = Cast<String>(script->name())->ToCString();
+-    if (TraceIsEngineScript(n ? n.get() : "")) return false;
+-    *where = n.get();
++    const char* script_name = n ? n.get() : "";
++    if (TraceIsWorkerAuthorScript(script_name)) {
++      *where = TraceWorkerTag(isolate);
++    } else if (TraceIsEngineScript(script_name)) {
++      return false;
++    } else {
++      *where = script_name;
++    }
+   } else {
+-    // Code the page ran through eval carries no script name of its own.
++    // Code the page ran through eval carries no script name of its own. A
++    // worker's message handler evals the command it is sent, so an eval whose
++    // origin is the worker's own script is worker code and keeps the worker
++    // tag; every other nameless script stays <page-eval>.
+     *where = "<page-eval>";
++    Tagged<Script> eval_origin = script->GetEvalOrigin();
++    if (IsScript(eval_origin)) {
++      DirectHandle<Script> origin_script(Cast<Script>(eval_origin), isolate);
++      if (IsString(origin_script->name())) {
++        std::unique_ptr<char[]> origin_name =
++            Cast<String>(origin_script->name())->ToCString();
++        if (TraceIsWorkerAuthorScript(origin_name ? origin_name.get() : "")) {
++          *where = TraceWorkerTag(isolate);
++        }
++      }
++    }
+   }
+ 
+   SharedFunctionInfo::EnsureSourcePositionsAvailable(isolate, shared);
+-  Script::PositionInfo info;
+-  if (Script::GetPositionInfo(script, frame->position(), &info)) {
+-    *line = info.line + 1;
+-    *column = info.column + 1;
++  TraceScriptPosition(isolate, script, frame->position(), line, column);
++  if (*where == "<eval>") {
++    *where = kTracePageEvalTag;
++    *line = std::max(1, *line - TraceEvalLineBias());
+   }
+   if (func != nullptr) {
+     std::unique_ptr<char[]> n = shared->DebugNameCStr();
+@@ -437,6 +1695,11 @@ void TraceCallEnterImpl(Isolate* isolate) {
+ void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
+                          DirectHandle<Name> name, const char* resolution,
+                          const char* operation = "GET") {
++  // The GLOBAL cold-lookup path also reaches this writer. In JSON mode the
++  // file must stay one record per line, and the global reads the page cares
++  // about are already covered by the result probe.
++  if (TraceJsonMode()) return;
++  if (!TraceArmed()) return;
+   HandleScope scope(isolate);
+ 
+   std::unique_ptr<char[]> owner;
+@@ -528,10 +1791,69 @@ void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
+ }  // namespace
+ 
+ bool TraceCallEnterEnabled() {
+-  return TracePropertyLookupFile() != nullptr;
++  return TracePropertyLookupFile() != nullptr &&
++         (v8_flags.trace || TraceApiCallsEnv());
++}
++
++// Only the exit hook is emitted for API call records: one record per call,
++// written when the frame still holds both its arguments and its return value.
++bool TraceApiCallExitEnabled() {
++  return TracePropertyLookupFile() != nullptr && TraceApiCallsEnv();
++}
++
++// Whether reads are probed after the load. JSON records need the value, which
++// only exists once the load has run; the TSV stream keeps the pre-load probe,
++// whose resolution field says whether the property was found.
++bool TraceJsonPropertyResultEnabled() {
++  return TracePropertyLookupFile() != nullptr && TraceJsonMode();
++}
++
++// Keyed and iterator read probes carry no statically known name, so they can
++// only be filtered at runtime. They are the bulk of a page-internal trace, so
++// the run can turn them off entirely; named accesses are unaffected.
++bool TraceApiKeyedProbesEnabled() {
++  static const bool on = []() {
++    const char* value = std::getenv("OBSCURA_TRACE_API_KEYED");
++    if (value == nullptr) return true;
++    return !(strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
++             strcmp(value, "off") == 0);
++  }();
++  return on;
++}
++
++// Compile-time half of the name filter, called from bytecode-array-builder.cc
++// while emitting a probe for a statically named access. The runtime half in
++// TraceApiNameAccepted sees the full "Interface.member" name; here only the
++// member is known, so a name is kept whenever an include entry still could
++// match it. With no include entries everything is kept and exclusions are
++// decided at runtime.
++bool TraceApiStaticMemberWanted(const uint8_t* data, int byte_length,
++                                bool is_one_byte) {
++  const TraceApiFilter& filter = TraceApiFilters();
++  if (!TraceJsonMode()) return true;
++  if (!filter.active || !filter.has_includes) return true;
++  std::string member;
++  if (is_one_byte) {
++    member.assign(reinterpret_cast<const char*>(data), byte_length);
++  } else {
++    for (int i = 0; i + 1 < byte_length; i += 2) {
++      uint16_t unit = static_cast<uint16_t>(data[i]) |
++                      (static_cast<uint16_t>(data[i + 1]) << 8);
++      member.push_back(unit < 0x80 ? static_cast<char>(unit) : '?');
++    }
++  }
++  for (const std::string& hint : filter.static_hints) {
++    if (member.find(hint) != std::string::npos) return true;
++  }
++  return false;
+ }
+ 
+-void TraceCallEnter(Isolate* isolate) { TraceCallEnterImpl(isolate); }
++void TraceCallEnter(Isolate* isolate) {
++  if (!TraceArmed()) return;
++  // Records are emitted at exit. The entry hook still exists for the TSV CALL
++  // stream, which reports arguments where they are first readable.
++  if (!TraceJsonMode()) TraceCallEnterImpl(isolate);
++}
+ 
+ // Reports what a call returned. V8 already routes every function exit through
+ // Runtime_TraceExit under --trace and hands it the value on the top of stack, so
+@@ -540,7 +1862,12 @@ void TraceCallEnter(Isolate* isolate) { TraceCallEnterImpl(isolate); }
+ // what the indentation in V8's own output conveys.
+ void TraceCallExit(Isolate* isolate, Tagged<Object> value) {
+   if (TracePropertyLookupFile() == nullptr) return;
++  if (!TraceArmed()) return;
+   HandleScope scope(isolate);
++  if (TraceJsonMode()) {
++    TraceCallRecordJson(isolate, value);
++    return;
++  }
+   std::string where;
+   int line = 0, column = 0;
+   if (!TraceCallOrigin(isolate, &where, &line, &column, nullptr)) return;
+@@ -3192,6 +4519,20 @@ RUNTIME_FUNCTION(Runtime_TracePropertyLookup) {
+   if (!v8_flags.trace_property_lookup || TracePropertyLookupFile() == nullptr) {
+     return args[2];
+   }
++  // Mid-flight arming: while unarmed the whole record path stays untouched.
++  if (!TraceArmed()) return args[2];
++
++  // JSON records for writes are emitted here, where the stored value is still
++  // in the register the store bytecode will use. Reads are emitted from
++  // Runtime_TracePropertyResult after the load instead, and membership tests
++  // have no counterpart in the reference contract.
++  if (TraceJsonMode()) {
++    if (args.smi_value_at(3) == 1 && !IsNullOrUndefined(*receiver, isolate) &&
++        (IsName(*key) || IsNumber(*key))) {
++      TraceJsonPropertySet(isolate, receiver, key, args[2]);
++    }
++    return args[2];
++  }
+ 
+   // Reject internal work before allocating names or walking prototype chains.
+   JavaScriptStackFrameIterator frames(isolate);
+@@ -3255,6 +4596,38 @@ RUNTIME_FUNCTION(Runtime_TracePropertyLookup) {
+   return args[2];
+ }
+ 
++// One read, probed after the load so the value is already in the accumulator.
++// Emitted instead of the pre-load probe in JSON mode: the value is what a
++// comparison against a reference trace needs, and it cannot be read before the
++// load without running an accessor twice.
++//
++// mode: 0 = named read on the receiver, 1 = keyed read on the receiver,
++// 2 = global read, where the receiver is the global proxy.
++RUNTIME_FUNCTION(Runtime_TracePropertyResult) {
++  HandleScope scope(isolate);
++  DCHECK_EQ(4, args.length());
++  if (!v8_flags.trace_property_lookup || !TraceJsonMode() ||
++      TracePropertyLookupFile() == nullptr) {
++    return args[2];
++  }
++  // Mid-flight arming: the read path is the hot one, so this check runs before
++  // the key, receiver and record work.
++  if (!TraceArmed()) return args[2];
++  Handle<Object> key = args.at(1);
++  if (!IsName(*key) && !IsNumber(*key) && !IsSymbol(*key, isolate)) {
++    return args[2];
++  }
++  Handle<JSAny> receiver;
++  if (args.smi_value_at(3) == 2) {
++    receiver = Cast<JSAny>(isolate->global_proxy());
++  } else {
++    receiver = args.at<JSAny>(0);
++  }
++  if (IsNullOrUndefined(*receiver, isolate)) return args[2];
++  TraceJsonPropertyGet(isolate, receiver, key, args[2]);
++  return args[2];
++}
++
+ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(4, args.length());
+diff --git a/src/interpreter/bytecode-array-builder.cc b/src/interpreter/bytecode-array-builder.cc
+index 9269a72b..77c1fb88 100644
+--- a/src/interpreter/bytecode-array-builder.cc
++++ b/src/interpreter/bytecode-array-builder.cc
+@@ -22,8 +22,32 @@
+ 
+ namespace v8 {
+ namespace internal {
++
++// Defined in ic.cc, where the API trace lives.
++//
++// TraceApiStaticMemberWanted is the compile-time half of the API name filter:
++// an access whose statically known name cannot match the filter is emitted
++// without a probe at all, which is what keeps a filtered trace cheap enough to
++// reach a challenge frame. TraceJsonPropertyResultEnabled selects the JSON
++// record mode, in which reads are probed after the load so the record can
++// carry the value.
++bool TraceApiStaticMemberWanted(const uint8_t* data, int byte_length,
++                                bool is_one_byte);
++bool TraceJsonPropertyResultEnabled();
++bool TraceApiKeyedProbesEnabled();
++
+ namespace interpreter {
+ 
++namespace {
++
++bool TraceStaticNameWanted(const AstRawString* name) {
++  if (name == nullptr) return true;
++  return TraceApiStaticMemberWanted(name->raw_data(), name->byte_length(),
++                                    name->is_one_byte());
++}
++
++}  // namespace
++
+ class RegisterTransferWriter final
+     : public NON_EXPORTED_BASE(BytecodeRegisterOptimizer::BytecodeWriter),
+       public NON_EXPORTED_BASE(ZoneObject) {
+@@ -581,7 +605,7 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::CompareOperation(
+       OutputTestInstanceOf(reg, feedback_slot);
+       break;
+     case Token::kIn: {
+-      if (v8_flags.trace_property_lookup) {
++      if (v8_flags.trace_property_lookup && !TraceJsonPropertyResultEnabled()) {
+         Register object = register_allocator()->NewRegister();
+         StoreAccumulatorInRegister(object);
+         TracePropertyAccess(object, std::nullopt, reg, 2);
+@@ -777,6 +801,13 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadGlobal(const AstRawString* name,
+       OutputLdaGlobal(name_index, feedback_slot);
+       break;
+   }
++  // A global read is an API access on the page's global object, and in JSON
++  // mode it is the only place a script's bare identifier reads become
++  // visible. The runtime supplies the global proxy as the receiver.
++  if (TraceJsonPropertyResultEnabled() && TraceStaticNameWanted(name)) {
++    TracePropertyResult(Register::invalid_value(), name_index,
++                        Register::invalid_value(), 2);
++  }
+   return *this;
+ }
+ 
+@@ -902,8 +933,12 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::StoreLookupSlot(
+ 
+ void BytecodeArrayBuilder::TracePropertyAccess(
+     Register object, std::optional<size_t> name_index, Register key,
+-    int operation) {
++    int operation, const AstRawString* static_name) {
+   if (!v8_flags.trace_property_lookup) return;
++  // A statically known name that cannot match the API name filter is not
++  // emitted at all. This is the cheap half of the filter: with a member list
++  // configured, the untraced rest of the page carries no probe bytecode.
++  if (!TraceStaticNameWanted(static_name)) return;
+   // Emit once before the access, independently of IC state or execution tier.
+   // The runtime returns the saved accumulator without evaluating getters or
+   // coercing object keys. No probe bytecodes exist when tracing is disabled.
+@@ -922,10 +957,43 @@ void BytecodeArrayBuilder::TracePropertyAccess(
+   register_allocator()->ReleaseRegisters(args.first_register().index());
+ }
+ 
++// Emitted after a read instead of before it, so that the record carries the
++// value the page actually received. The accumulator holds the value, the
++// object register is still live, and for a keyed access the key survives in
++// the register the caller kept it in. The runtime returns the value, which
++// restores the accumulator.
++//
++// mode: 0 = named read, 1 = keyed read, 2 = global read (the receiver is
++// supplied by the runtime).
++void BytecodeArrayBuilder::TracePropertyResult(Register object,
++                                               std::optional<size_t> name_index,
++                                               Register key, int mode) {
++  if (!TraceJsonPropertyResultEnabled()) return;
++  RegisterList args = register_allocator()->NewRegisterList(4);
++  StoreAccumulatorInRegister(args[2]);
++  // Unused for a global read, but the register must hold a tagged value.
++  MoveRegister(object.is_valid() ? object : args[2], args[0]);
++  if (name_index.has_value()) {
++    OutputLdaConstant(*name_index);
++    StoreAccumulatorInRegister(args[1]);
++  } else {
++    MoveRegister(key.is_valid() ? key : args[2], args[1]);
++  }
++  LoadLiteral(Smi::FromInt(mode));
++  StoreAccumulatorInRegister(args[3]);
++  CallRuntime(Runtime::kTracePropertyResult, args);
++  register_allocator()->ReleaseRegisters(args.first_register().index());
++}
++
+ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadNamedProperty(
+     Register object, const AstRawString* name, int feedback_slot) {
+   size_t name_index = GetConstantPoolEntry(name);
+-  TracePropertyAccess(object, name_index);
++  if (TraceJsonPropertyResultEnabled() && TraceStaticNameWanted(name)) {
++    OutputGetNamedProperty(object, name_index, feedback_slot);
++    TracePropertyResult(object, name_index, Register::invalid_value(), 0);
++    return *this;
++  }
++  TracePropertyAccess(object, name_index, Register::invalid_value(), 0, name);
+   OutputGetNamedProperty(object, name_index, feedback_slot);
+   return *this;
+ }
+@@ -939,7 +1007,23 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadNamedPropertyFromSuper(
+ 
+ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadKeyedProperty(
+     Register object, int feedback_slot) {
+-  TracePropertyAccess(object, std::nullopt);
++  if (TraceJsonPropertyResultEnabled() && TraceApiKeyedProbesEnabled()) {
++    // The load reads the key from the accumulator, so the key is kept in a
++    // register that survives it for the result probe.
++    Register key = register_allocator()->NewRegister();
++    StoreAccumulatorInRegister(key);
++    OutputGetKeyedProperty(object, feedback_slot);
++    TracePropertyResult(object, std::nullopt, key, 1);
++    register_allocator()->ReleaseRegister(key);
++    return *this;
++  }
++  // JSON reads are recorded by the result probe. With keyed probes off that
++  // probe is not emitted, and the pre-load probe has nothing to record either
++  // (JSON mode writes records only for stores), so it is left out entirely
++  // rather than making every keyed read pay for a runtime call.
++  if (!TraceJsonPropertyResultEnabled()) {
++    TracePropertyAccess(object, std::nullopt);
++  }
+   OutputGetKeyedProperty(object, feedback_slot);
+   return *this;
+ }
+@@ -947,7 +1031,10 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadKeyedProperty(
+ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadEnumeratedKeyedProperty(
+     Register object, Register enum_index, Register cache_type,
+     int feedback_slot) {
+-  TracePropertyAccess(object, std::nullopt);
++  // A JSON record needs a property name; an enumeration index is not one.
++  if (!TraceJsonPropertyResultEnabled()) {
++    TracePropertyAccess(object, std::nullopt);
++  }
+   OutputGetEnumeratedKeyedProperty(object, enum_index, cache_type,
+                                    feedback_slot);
+   return *this;
+@@ -956,7 +1043,11 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadEnumeratedKeyedProperty(
+ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadIteratorProperty(
+     Register object, int feedback_slot) {
+   size_t name_index = IteratorSymbolConstantPoolEntry();
+-  TracePropertyAccess(object, name_index);
++  // The key is the iterator symbol, which names nothing a comparison against
++  // a reference trace can use.
++  if (!TraceJsonPropertyResultEnabled()) {
++    TracePropertyAccess(object, name_index);
++  }
+   OutputGetNamedProperty(object, name_index, feedback_slot);
+   return *this;
+ }
+@@ -970,7 +1061,11 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::GetIterator(
+ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadAsyncIteratorProperty(
+     Register object, int feedback_slot) {
+   size_t name_index = AsyncIteratorSymbolConstantPoolEntry();
+-  TracePropertyAccess(object, name_index);
++  // Symbol keys, as in LoadIteratorProperty: no record for a reference
++  // comparison to match on.
++  if (!TraceJsonPropertyResultEnabled()) {
++    TracePropertyAccess(object, name_index);
++  }
+   OutputGetNamedProperty(object, name_index, feedback_slot);
+   return *this;
+ }
+@@ -984,12 +1079,13 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::DefineKeyedOwnPropertyInLiteral(
+ 
+ BytecodeArrayBuilder& BytecodeArrayBuilder::SetNamedProperty(
+     Register object, size_t name_index, int feedback_slot,
+-    LanguageMode language_mode) {
++    LanguageMode language_mode, const AstRawString* static_name) {
+   // Ensure that language mode is in sync with the IC slot kind.
+   DCHECK_EQ(GetLanguageModeFromSlotKind(feedback_vector_spec()->GetKind(
+                 FeedbackVector::ToSlot(feedback_slot))),
+             language_mode);
+-  TracePropertyAccess(object, name_index, Register::invalid_value(), 1);
++  TracePropertyAccess(object, name_index, Register::invalid_value(), 1,
++                      static_name);
+   OutputSetNamedProperty(object, name_index, feedback_slot);
+   return *this;
+ }
+@@ -998,7 +1094,8 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::SetNamedProperty(
+     Register object, const AstRawString* name, int feedback_slot,
+     LanguageMode language_mode) {
+   size_t name_index = GetConstantPoolEntry(name);
+-  return SetNamedProperty(object, name_index, feedback_slot, language_mode);
++  return SetNamedProperty(object, name_index, feedback_slot, language_mode,
++                          name);
+ }
+ 
+ BytecodeArrayBuilder& BytecodeArrayBuilder::DefineNamedOwnProperty(
+@@ -1019,7 +1116,9 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::SetKeyedProperty(
+   DCHECK_EQ(GetLanguageModeFromSlotKind(feedback_vector_spec()->GetKind(
+                 FeedbackVector::ToSlot(feedback_slot))),
+             language_mode);
+-  TracePropertyAccess(object, std::nullopt, key, 1);
++  if (!TraceJsonPropertyResultEnabled() || TraceApiKeyedProbesEnabled()) {
++    TracePropertyAccess(object, std::nullopt, key, 1);
++  }
+   OutputSetKeyedProperty(object, key, feedback_slot);
+   return *this;
+ }
+diff --git a/src/interpreter/bytecode-array-builder.h b/src/interpreter/bytecode-array-builder.h
+index 6f42da11..ec0cce56 100644
+--- a/src/interpreter/bytecode-array-builder.h
++++ b/src/interpreter/bytecode-array-builder.h
+@@ -182,7 +182,8 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
+   BytecodeArrayBuilder& SetNamedProperty(Register object,
+                                          size_t constant_pool_entry,
+                                          int feedback_slot,
+-                                         LanguageMode language_mode);
++                                         LanguageMode language_mode,
++                                         const AstRawString* static_name = nullptr);
+ 
+   // Define an own property named by a constant from the constant pool,
+   // trigger the defineProperty traps if necessary. The value to be
+@@ -605,7 +606,10 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
+  private:
+   void TracePropertyAccess(Register object, std::optional<size_t> name_index,
+                            Register key = Register::invalid_value(),
+-                           int operation = 0);
++                           int operation = 0,
++                           const AstRawString* static_name = nullptr);
++  void TracePropertyResult(Register object, std::optional<size_t> name_index,
++                           Register key, int mode);
+ 
+   friend class BytecodeRegisterAllocator;
+   template <Bytecode bytecode, ImplicitRegisterUse implicit_register_use,
+diff --git a/src/interpreter/bytecode-generator.cc b/src/interpreter/bytecode-generator.cc
+index 9c24e1e8..504a310d 100644
+--- a/src/interpreter/bytecode-generator.cc
++++ b/src/interpreter/bytecode-generator.cc
+@@ -42,6 +42,42 @@
+ 
+ namespace v8 {
+ namespace internal {
++
++// Defined in ic.cc, where the API trace lives.
++bool TraceApiCallExitEnabled();
++bool TraceApiStaticMemberWanted(const uint8_t* data, int byte_length,
++                                bool is_one_byte);
++
++namespace {
++
++// Whether this function's exit hook is wanted. Without an API filter every
++// named function is hooked; with one, only names that could match get the
++// hook, which is what keeps a call trace affordable.
++bool TraceCallExitWanted(const FunctionLiteral* literal, bool trace_flag) {
++  if (trace_flag) return true;
++  if (literal == nullptr || !TraceApiCallExitEnabled()) return false;
++  const AstConsString* name = literal->raw_name();
++  // A function with no name of its own still needs the hook. The host
++  // functions the engine binds (setTimeout, setInterval, fetch,
++  // requestAnimationFrame) are anonymous arrows handed to a binding helper, so
++  // nothing else would ever record a page's call into one, and the exit hook
++  // is the only place such a call is visible at all. The record's name is
++  // recovered at runtime from the receiver, where the function is a named
++  // member, and a call whose name cannot be recovered is dropped there. The
++  // static half of the filter cannot apply to a function with no static name,
++  // so an anonymous literal pays one runtime call per return under a trace.
++  if (name == nullptr || name->IsEmpty()) return true;
++  for (const AstRawString* part : name->ToRawStrings()) {
++    if (TraceApiStaticMemberWanted(part->raw_data(), part->byte_length(),
++                                   part->is_one_byte())) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ namespace interpreter {
+ 
+ // Scoped class tracking context objects created by the visitor. Represents
+@@ -1740,6 +1776,8 @@ void BytecodeGenerator::GenerateBodyPrologue() {
+ 
+   // Emit tracing call if requested to do so.
+   if (v8_flags.trace) builder()->CallRuntime(Runtime::kTraceEnter);
++  // The API call trace needs no entry hook: its record is written at exit,
++  // where the frame still holds the arguments and the return value.
+ 
+   // Increment the function-scope block coverage counter.
+   BuildIncrementBlockCoverageCounterIfEnabled(literal, SourceRangeKind::kBody);
+@@ -4598,7 +4636,7 @@ void BytecodeGenerator::BuildVariableLoadForAccumulatorValue(
+ }
+ 
+ void BytecodeGenerator::BuildReturn(int source_position) {
+-  if (v8_flags.trace) {
++  if (TraceCallExitWanted(info()->literal(), v8_flags.trace)) {
+     RegisterAllocationScope register_scope(this);
+     Register result = register_allocator()->NewRegister();
+     // Runtime returns {result} value, preserving accumulator.
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 7f531c65..6a6a0155 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -829,7 +829,8 @@ namespace internal {
+   F(KeyedHasIC_Miss, 4, 1)                   \
+   F(HasElementWithInterceptor, 2, 1)         \
+   F(ObjectAssignTryFastcase, 2, 1)                \
+-  F(TracePropertyLookup, 4, 1)
++  F(TracePropertyLookup, 4, 1)                \
++  F(TracePropertyResult, 4, 1)
+ 
+ #define FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL(F, I)               \
+   FOR_EACH_INTRINSIC_ARRAY(F, I)                                  \
+-- 
+2.50.1 (Apple Git-155)
+

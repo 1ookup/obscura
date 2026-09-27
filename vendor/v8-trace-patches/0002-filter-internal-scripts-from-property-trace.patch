@@ -1,0 +1,25 @@
+From f0f833f5bad847a6a907960fd7fde417b7ab0cb0 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 19:43:37 +0800
+Subject: [PATCH 02/16] filter internal scripts from property trace
+
+---
+ src/ic/ic.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 56721268..f78fcf90 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -473,7 +473,7 @@ void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
+   // slow the page enough to change what it does. Skip them when the call/return
+   // hook is on. lookups mode (--trace off) keeps them: engine evidence (e.g.
+   // the PAT-API bootstrap self-checks) is small there and sometimes the point.
+-  if (v8_flags.trace && script_name && TraceIsEngineScript(script_name.get())) {
++  if (script_name && TraceIsEngineScript(script_name.get())) {
+     return;
+   }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,34 @@
+From 008aae52d6e881f9646576e4f0aec0cc7226d407 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 19:51:59 +0800
+Subject: [PATCH 04/16] fix runtime lookup trace helper flags
+
+---
+ src/ic/ic.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 14fee885..affdb3bf 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -3170,7 +3170,7 @@ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
+ 
+   if (v8_flags.trace_property_lookup) {
+     LookupIterator trace_it(isolate, receiver, key);
+-    LookupForRead(&trace_it, IsAnyHas());
++    LookupForRead(&trace_it, false);
+     TracePropertyLookup(isolate, receiver, key, trace_it.IsFound());
+   }
+ 
+@@ -3310,7 +3310,7 @@ RUNTIME_FUNCTION(Runtime_KeyedLoadIC_Miss) {
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+   if (v8_flags.trace_property_lookup && IsName(*key)) {
+     LookupIterator trace_it(isolate, receiver, Cast<Name>(key));
+-    LookupForRead(&trace_it, IsAnyHas());
++    LookupForRead(&trace_it, false);
+     TracePropertyLookup(isolate, receiver, Cast<Name>(key), trace_it.IsFound());
+   }
+   KeyedLoadIC ic(isolate, vector, vector_slot, FeedbackSlotKind::kLoadKeyed);
+-- 
+2.50.1 (Apple Git-155)
+

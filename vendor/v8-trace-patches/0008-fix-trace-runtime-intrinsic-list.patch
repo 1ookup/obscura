@@ -1,0 +1,25 @@
+From dd60757542b7861c5b79f0cc5495ec13540b7003 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 20:18:46 +0800
+Subject: [PATCH 08/16] fix trace runtime intrinsic list
+
+---
+ src/runtime/runtime.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 28021d5b..a5e6bc6a 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -828,7 +828,7 @@ namespace internal {
+   F(CloneObjectIC_Miss, 4, 1)                \
+   F(KeyedHasIC_Miss, 4, 1)                   \
+   F(HasElementWithInterceptor, 2, 1)         \
+-  F(ObjectAssignTryFastcase, 2, 1)
++  F(ObjectAssignTryFastcase, 2, 1)                \
+   F(TracePropertyLookup, 2, 1)
+ 
+ #define FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL(F, I)               \
+-- 
+2.50.1 (Apple Git-155)
+

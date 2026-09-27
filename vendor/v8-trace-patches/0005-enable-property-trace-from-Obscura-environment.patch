@@ -1,0 +1,58 @@
+From 1273fda45a12080a5dbd79c57e7fdfeefd2d930b Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 19:57:35 +0800
+Subject: [PATCH 05/16] enable property trace from Obscura environment
+
+---
+ src/ic/ic.cc | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index affdb3bf..fa7786fd 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -137,8 +137,12 @@ FILE* TracePropertyLookupFile() {
+   static bool tried = false;
+   if (!tried) {
+     tried = true;
+-    if (v8_flags.trace_property_lookup_file != nullptr) {
+-      file = fopen(v8_flags.trace_property_lookup_file, "w");
++    const char* path = v8_flags.trace_property_lookup_file;
++    if (path == nullptr || path[0] == '\0') {
++      path = std::getenv("OBSCURA_TRACE_API_FILE");
++    }
++    if (path != nullptr && path[0] != '\0') {
++      file = fopen(path, "w");
+     }
+   }
+   return file;
+@@ -853,7 +857,7 @@ MaybeDirectHandle<Object> LoadIC::Load(Handle<JSAny> object, Handle<Name> name,
+   // Named lookup in the object.
+   LookupForRead(&it, IsAnyHas());
+ 
+-  if (V8_UNLIKELY(v8_flags.trace_property_lookup)) {
++  if (V8_UNLIKELY(TracePropertyLookupFile() != nullptr)) {
+     TracePropertyLookup(isolate(), receiver, name, it.IsFound());
+   }
+ 
+@@ -3168,7 +3172,7 @@ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
+   Handle<FeedbackVector> vector = args.at<FeedbackVector>(3);
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+ 
+-  if (v8_flags.trace_property_lookup) {
++  if (TracePropertyLookupFile() != nullptr) {
+     LookupIterator trace_it(isolate, receiver, key);
+     LookupForRead(&trace_it, false);
+     TracePropertyLookup(isolate, receiver, key, trace_it.IsFound());
+@@ -3308,7 +3312,7 @@ RUNTIME_FUNCTION(Runtime_KeyedLoadIC_Miss) {
+     vector = Cast<FeedbackVector>(maybe_vector);
+   }
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+-  if (v8_flags.trace_property_lookup && IsName(*key)) {
++  if (TracePropertyLookupFile() != nullptr && IsName(*key)) {
+     LookupIterator trace_it(isolate, receiver, Cast<Name>(key));
+     LookupForRead(&trace_it, false);
+     TracePropertyLookup(isolate, receiver, Cast<Name>(key), trace_it.IsFound());
+-- 
+2.50.1 (Apple Git-155)
+

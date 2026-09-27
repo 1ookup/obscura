@@ -1,0 +1,531 @@
+From e296b664a9dcb65d5b405c629607bfeee95b7f0b Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 18:48:05 +0800
+Subject: [PATCH 01/16] add native property and call trace hooks
+
+---
+ src/flags/flag-definitions.h |  10 +
+ src/ic/ic.cc                 | 427 +++++++++++++++++++++++++++++++++++
+ src/runtime/runtime-test.cc  |  15 +-
+ 3 files changed, 451 insertions(+), 1 deletion(-)
+
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index 1430734c..921be582 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -257,6 +257,16 @@ DEFINE_BOOL(allow_overwriting_for_next_flag, false,
+ DEFINE_BOOL(use_strict, false, "enforce strict mode")
+ 
+ DEFINE_BOOL(trace_temporal, false, "trace temporal code")
++// Added by obscura. Reports every property lookup that reaches the runtime, with
++// the receiver's constructor name and whether the property was found. Pair with
++// --no-lazy-feedback-allocation: a function that has not run enough times to be
++// given a feedback vector loads properties through a generic runtime path that
++// skips this entirely, which is most of page script. Do not pair with
++// --no-use-ic, which pushes every load onto that same path and suppresses this.
++DEFINE_BOOL(trace_property_lookup, false,
++            "trace property lookups with receiver and resolution")
++DEFINE_STRING(trace_property_lookup_file, nullptr,
++              "file to write property lookup records to")
+ 
+ DEFINE_BOOL(harmony, false, "enable all completed harmony features")
+ DEFINE_BOOL(harmony_shipping, true, "enable all shipped harmony features")
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 5c916aa6..56721268 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -40,6 +40,13 @@
+ #include "src/objects/prototype.h"
+ #include "src/runtime/runtime.h"
+ #include "src/tracing/trace-event.h"
++#include "src/objects/js-objects.h"
++#include "src/objects/script.h"
++#include "src/objects/shared-function-info.h"
++#include <condition_variable>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
+ #include "src/tracing/tracing-category-observer.h"
+ #include "src/utils/ostreams.h"
+ 
+@@ -105,6 +112,422 @@ const char* GetModifier(KeyedAccessStoreMode mode) {
+ 
+ }  // namespace
+ 
++// Reports one property lookup: the receiver's JavaScript-visible constructor
++// name, the property, whether it resolved, and where in the source it happened.
++//
++// GetConstructorName is what makes this worth doing at all. The IC log's Map
++// pointer resolves at best to a hidden class; this returns the name the page
++// itself would see.
++//
++// Deliberately not routed through Logger, whose IC paths hang off the
++// cache-update branch below and so do not run for every lookup that reaches
++// here.
++// Reachable from runtime-test.cc, where the call hook lives. Everything else
++// here stays internal.
++bool TraceCallEnterEnabled();
++void TraceCallEnter(Isolate* isolate);
++void TraceCallExit(Isolate* isolate, Tagged<Object> value);
++
++namespace {
++
++// Opened once and never closed: the process exits with it, and closing on a
++// last-lookup signal that does not exist would only risk losing the tail.
++FILE* TracePropertyLookupFile() {
++  static FILE* file = nullptr;
++  static bool tried = false;
++  if (!tried) {
++    tried = true;
++    if (v8_flags.trace_property_lookup_file != nullptr) {
++      file = fopen(v8_flags.trace_property_lookup_file, "w");
++    }
++  }
++  return file;
++}
++
++// Whether a script name is engine-internal. Named engine scripts all start
++// with '<' (timer wakeups, frame bootstraps, injected shims); ext:/deno: are
++// the runtime's own builtins. Page code that ran through eval has no script
++// name at all and is reported as <page-eval> instead of reaching here.
++bool TraceIsEngineScript(const char* name) {
++  if (name == nullptr || name[0] == '\0') return true;
++  return name[0] == '<' || strncmp(name, "ext:", 4) == 0 ||
++         strncmp(name, "deno:", 5) == 0;
++}
++
++// --- async writer -----------------------------------------------------------
++// Records are appended to a chunked in-memory queue on the isolate thread and
++// written to disk by one background thread. Writing synchronously put a FILE*
++// call on the property-lookup hot path, and the trace slowed the page enough
++// to change what it did before its deadline (on a Cloudflare challenge: 3
++// requests under the trace, 7 without). The queue moves the fwrite off the hot
++// path; formatting still happens on the isolate thread, where the V8 objects
++// it renders are only reachable.
++//
++// Chunks are 1 MiB. The main thread appends under the mutex and swaps a full
++// chunk into a pending slot; the writer drains it. If the writer is still on a
++// previous chunk the main thread waits -- backpressure keeps memory bounded,
++// and a chunk drains in a couple of milliseconds, so a stall means a stuck
++// disk rather than normal load. TraceShutdown flushes the tail and joins, and
++// is registered with atexit on first use.
++
++constexpr size_t kTraceChunkBytes = 1 << 20;
++
++// Heap-allocated, never freed: process-lifetime state. A global object would
++// trip Chromium's -Wexit-time-destructors; the writer is flushed and joined
++// at exit, and the OS reclaims the rest.
++std::mutex* g_trace_mu = new std::mutex();
++std::condition_variable* g_trace_cv = new std::condition_variable();
++std::string* g_trace_active = new std::string();
++std::string* g_trace_pending = nullptr;  // guarded by *g_trace_mu
++bool g_trace_shutdown = false;           // guarded by *g_trace_mu
++bool g_trace_started = false;            // guarded by *g_trace_mu
++std::thread* g_trace_writer = nullptr;   // guarded by *g_trace_mu
++
++void TraceWriterLoop();
++void TraceShutdown();
++
++void TraceEnqueueLine(const std::string& line) {
++  std::unique_lock<std::mutex> lock(*g_trace_mu);
++  if (!g_trace_started) {
++    g_trace_started = true;
++    g_trace_writer = new std::thread(TraceWriterLoop);
++    std::atexit(TraceShutdown);
++  }
++  if (g_trace_active->size() + line.size() > kTraceChunkBytes) {
++    g_trace_cv->wait(lock, [] { return g_trace_pending == nullptr; });
++    g_trace_pending = g_trace_active;
++    g_trace_active = new std::string();
++    g_trace_active->reserve(kTraceChunkBytes);
++    g_trace_cv->notify_one();
++  }
++  g_trace_active->append(line);
++}
++
++void TraceWriterLoop() {
++  FILE* out = TracePropertyLookupFile();
++  if (out == nullptr) return;
++  for (;;) {
++    std::string* chunk;
++    {
++      std::unique_lock<std::mutex> lock(*g_trace_mu);
++      g_trace_cv->wait(lock, [] {
++        return g_trace_pending != nullptr || g_trace_shutdown;
++      });
++      if (g_trace_pending == nullptr && g_trace_shutdown) break;
++      chunk = g_trace_pending;
++      g_trace_pending = nullptr;
++    }
++    if (!chunk->empty()) fwrite(chunk->data(), 1, chunk->size(), out);
++    delete chunk;
++    g_trace_cv->notify_one();
++  }
++  fclose(out);
++}
++
++void TraceShutdown() {
++  {
++    std::unique_lock<std::mutex> lock(*g_trace_mu);
++    // A producer can have published one chunk while the writer is between
++    // wakeup and lock acquisition. Wait for that slot before publishing the
++    // tail, otherwise the assignment below would discard the older chunk.
++    if (!g_trace_active->empty()) {
++      g_trace_cv->wait(lock, [] { return g_trace_pending == nullptr; });
++    }
++    if (!g_trace_active->empty()) {
++      g_trace_pending = g_trace_active;
++      g_trace_active = new std::string();
++    }
++    g_trace_shutdown = true;
++  }
++  g_trace_cv->notify_one();
++  if (g_trace_writer != nullptr) {
++    g_trace_writer->join();
++    delete g_trace_writer;
++    g_trace_writer = nullptr;
++  }
++}
++
++// Compact, side-effect-free rendering of one value. ShortPrint would be the
++// obvious choice but it writes straight to a FILE* and can emit tabs and
++// newlines, which the record format cannot carry. Nothing here calls back into
++// JavaScript: no toString, no valueOf, no accessor.
++void TraceAppendValue(Isolate* isolate, Tagged<Object> value, std::string* out) {
++  if (IsString(value)) {
++    std::unique_ptr<char[]> c = Cast<String>(value)->ToCString();
++    std::string s(c ? c.get() : "");
++    if (s.size() > 64) { s.resize(64); s += "..."; }
++    for (char& ch : s) {
++      if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
++    }
++    *out += "string:\"" + s + "\"";
++  } else if (IsSmi(value)) {
++    *out += "number:" + std::to_string(Smi::ToInt(value));
++  } else if (IsHeapNumber(value)) {
++    *out += "number:" + std::to_string(Cast<HeapNumber>(value)->value());
++  } else if (IsTrue(value, isolate)) {
++    *out += "boolean:true";
++  } else if (IsFalse(value, isolate)) {
++    *out += "boolean:false";
++  } else if (IsUndefined(value, isolate)) {
++    *out += "undefined";
++  } else if (IsNull(value, isolate)) {
++    *out += "null";
++  } else if (IsJSReceiver(value)) {
++    DirectHandle<String> ctor = JSReceiver::GetConstructorName(
++        isolate, direct_handle(Cast<JSReceiver>(value), isolate));
++    std::unique_ptr<char[]> c = ctor->ToCString();
++    *out += std::string("object:") + (c ? c.get() : "?");
++  } else {
++    *out += "other";
++  }
++}
++
++// Reports one function call with its receiver and arguments.
++//
++// V8 already emits a call to this on every JavaScript function entry when
++// --trace is on; the stock body prints a raw dump to stdout. Replacing that with
++// a structured record turns an existing mechanism into a source for the trace
++// rather than adding a parallel one.
++// Whether the current call was made by page code, and where.
++//
++// What matters is who called, not where the callee lives. Filtering on the
++// callee's script looked right and dropped almost everything worth having:
++// getElementById and setAttribute are defined in bootstrap.js, so a page calling
++// them is a frame whose callee is engine code. The caller's frame is the one that
++// says whether the page did this, and its position is the call site a reader
++// wants.
++//
++// Shared by both hooks so that entries and returns are selected by the same
++// predicate; filtering only one of them leaves returns that pair with nothing.
++// Describes one frame, or reports that it is engine code.
++bool TraceDescribeFrame(Isolate* isolate, JavaScriptFrame* frame,
++                        std::string* where, int* line, int* column,
++                        std::string* func) {
++  DirectHandle<SharedFunctionInfo> shared(frame->function()->shared(), isolate);
++  Tagged<Object> script_obj = shared->script();
++  if (!IsScript(script_obj)) return false;
++  DirectHandle<Script> script(Cast<Script>(script_obj), isolate);
++
++  if (IsString(script->name())) {
++    std::unique_ptr<char[]> n = Cast<String>(script->name())->ToCString();
++    if (TraceIsEngineScript(n ? n.get() : "")) return false;
++    *where = n.get();
++  } else {
++    // Code the page ran through eval carries no script name of its own.
++    *where = "<page-eval>";
++  }
++
++  SharedFunctionInfo::EnsureSourcePositionsAvailable(isolate, shared);
++  Script::PositionInfo info;
++  if (Script::GetPositionInfo(script, frame->position(), &info)) {
++    *line = info.line + 1;
++    *column = info.column + 1;
++  }
++  if (func != nullptr) {
++    std::unique_ptr<char[]> n = shared->DebugNameCStr();
++    *func = n ? n.get() : "";
++  }
++  return true;
++}
++
++// Whether the current call was made by page code, where, and the page frames
++// beneath it.
++//
++// What matters is who called, not where the callee lives. Filtering on the
++// callee's script looked right and dropped almost everything worth having:
++// getElementById and setAttribute are defined in bootstrap.js, so a page calling
++// them is a frame whose callee is engine code. The caller's frame is the one that
++// says whether the page did this, and its position is the call site a reader
++// wants.
++//
++// Shared by both hooks so that entries and returns are selected by the same
++// predicate; filtering only one of them leaves returns that pair with nothing.
++bool TraceCallOrigin(Isolate* isolate, std::string* where, int* line, int* column,
++                     std::string* stack) {
++  JavaScriptStackFrameIterator frames(isolate);
++  if (frames.done()) return false;
++  frames.Advance();
++  if (frames.done()) return false;
++  if (!TraceDescribeFrame(isolate, frames.frame(), where, line, column, nullptr)) {
++    return false;
++  }
++  if (stack == nullptr) return true;
++
++  // Frames above the call site, engine ones skipped rather than ending the walk:
++  // page code reaches the DOM through bootstrap, so an engine frame in the middle
++  // is the normal case and stopping there would truncate every stack to nothing.
++  int kept = 0;
++  for (; !frames.done() && kept < 8; frames.Advance()) {
++    std::string w, f;
++    int l = 0, c = 0;
++    if (!TraceDescribeFrame(isolate, frames.frame(), &w, &l, &c, &f)) continue;
++    if (kept) *stack += " <- ";
++    *stack += (f.empty() ? "<anonymous>" : f) + ":" + std::to_string(l) + ":" +
++              std::to_string(c);
++    kept++;
++  }
++  return true;
++}
++
++void TraceCallEnterImpl(Isolate* isolate) {
++  if (TracePropertyLookupFile() == nullptr) return;
++
++  HandleScope scope(isolate);
++  std::string where;
++  int line = 0, column = 0;
++  std::string stack;
++  if (!TraceCallOrigin(isolate, &where, &line, &column, &stack)) return;
++
++  JavaScriptStackFrameIterator frames(isolate);
++  JavaScriptFrame* frame = frames.frame();
++  std::string owner;
++  Tagged<Object> recv = frame->receiver();
++  if (IsJSReceiver(recv)) {
++    DirectHandle<String> ctor = JSReceiver::GetConstructorName(
++        isolate, direct_handle(Cast<JSReceiver>(recv), isolate));
++    std::unique_ptr<char[]> c = ctor->ToCString();
++    owner = c ? c.get() : "?";
++  } else {
++    owner = "?";
++  }
++
++  // The callee, not the caller whose frame supplied the position.
++  DirectHandle<SharedFunctionInfo> callee(frame->function()->shared(), isolate);
++  std::unique_ptr<char[]> fname = callee->DebugNameCStr();
++  if (!fname || fname.get()[0] == '\0') return;
++
++  std::string args;
++  const int count = frame->ComputeParametersCount();
++  for (int i = 0; i < count; i++) {
++    if (i) args += ", ";
++    TraceAppendValue(isolate, frame->GetParameter(i), &args);
++  }
++
++  std::string rec = "CALL\t" + owner + "\t" + (fname ? fname.get() : "?") +
++                    "\t" + where + "\t" + std::to_string(line) + "\t" +
++                    std::to_string(column) + "\t" + args + "\t" + stack + "\n";
++  TraceEnqueueLine(rec);
++}
++
++void TracePropertyLookup(Isolate* isolate, DirectHandle<JSAny> receiver,
++                         DirectHandle<Name> name, bool found) {
++  HandleScope scope(isolate);
++
++  std::unique_ptr<char[]> owner;
++  if (IsJSReceiver(*receiver)) {
++    DirectHandle<String> ctor =
++        JSReceiver::GetConstructorName(isolate, Cast<JSReceiver>(receiver));
++    owner = ctor->ToCString();
++  }
++
++  std::unique_ptr<char[]> prop;
++  if (IsString(*name)) {
++    prop = Cast<String>(name)->ToCString();
++  }
++
++  // Source position. frame->position() reads 0 for an interpreted frame, which
++  // is what page script runs as, and every record came out as 1:1 because of it.
++  // TraceIC takes the route below instead: ask the frame for its active code and
++  // the offset within it, then let the code translate that offset back to a
++  // source position. An absent frame is normal for lookups the runtime performs
++  // on its own behalf rather than for page code.
++  std::unique_ptr<char[]> script_name;
++  int line = 0;
++  int column = 0;
++  JavaScriptStackFrameIterator frames(isolate);
++  if (!frames.done()) {
++    JavaScriptFrame* frame = frames.frame();
++    DirectHandle<SharedFunctionInfo> shared(frame->function()->shared(),
++                                            isolate);
++    Tagged<Object> script_obj = shared->script();
++    if (IsScript(script_obj)) {
++      DirectHandle<Script> script(Cast<Script>(script_obj), isolate);
++      // Both halves are required and neither is obvious. Source position tables
++      // are built lazily, so without EnsureSourcePositionsAvailable the position
++      // is 0; and the position has to come from frame->position(), not from
++      // translating a code offset, which also yields 0 here. This is exactly what
++      // Isolate::GetAbstractPC does.
++      SharedFunctionInfo::EnsureSourcePositionsAvailable(isolate, shared);
++      int source_pos = frame->position();
++      Script::PositionInfo info;
++      if (source_pos >= 0 && Script::GetPositionInfo(script, source_pos, &info)) {
++        line = info.line + 1;
++        column = info.column + 1;
++      }
++      if (IsString(script->name())) {
++        script_name = Cast<String>(script->name())->ToCString();
++      }
++      // Code the page ran through eval has no script name of its own. Leaving it
++      // blank makes it indistinguishable from engine-internal work, and a
++      // consumer that treats unnamed as internal throws away exactly the records
++      // worth having -- a challenge payload arrives as a dynamically inserted
++      // script, which is to say through eval. On a live Cloudflare page 2555 of
++      // 4008 records were unnamed, and the one lookup that explained the failure
++      // was among them.
++    }
++  }
++
++  // Full --trace mode is the page view: engine-internal scripts (timer wakeups,
++  // frame bootstraps, injected shims) drown the page's own records -- one
++  // challenge run logged 6.77M timer-wake hits out of 8.16M total -- and can
++  // slow the page enough to change what it does. Skip them when the call/return
++  // hook is on. lookups mode (--trace off) keeps them: engine evidence (e.g.
++  // the PAT-API bootstrap self-checks) is small there and sometimes the point.
++  if (v8_flags.trace && script_name && TraceIsEngineScript(script_name.get())) {
++    return;
++  }
++
++  FILE* out = TracePropertyLookupFile();
++  if (out == nullptr) return;
++  const char* where = script_name ? script_name.get()
++                                  : (frames.done() ? "" : "<page-eval>");
++  std::string stack;
++  {
++    JavaScriptStackFrameIterator walk(isolate);
++    int kept = 0;
++    for (; !walk.done() && kept < 8; walk.Advance()) {
++      std::string w, f;
++      int l = 0, c = 0;
++      if (!TraceDescribeFrame(isolate, walk.frame(), &w, &l, &c, &f)) continue;
++      if (kept) stack += " <- ";
++      stack += (f.empty() ? "<anonymous>" : f) + ":" + std::to_string(l) + ":" +
++               std::to_string(c);
++      kept++;
++    }
++  }
++  std::string rec = std::string(found ? "HIT" : "MISS") + "\t" +
++                    (owner ? owner.get() : "?") + "\t" +
++                    (prop ? prop.get() : "<symbol>") + "\t" + where + "\t" +
++                    std::to_string(line) + "\t" + std::to_string(column) +
++                    "\t\t" + stack + "\n";
++  TraceEnqueueLine(rec);
++}
++
++}  // namespace
++
++bool TraceCallEnterEnabled() {
++  return TracePropertyLookupFile() != nullptr;
++}
++
++void TraceCallEnter(Isolate* isolate) { TraceCallEnterImpl(isolate); }
++
++// Reports what a call returned. V8 already routes every function exit through
++// Runtime_TraceExit under --trace and hands it the value on the top of stack, so
++// this is the same borrowed mechanism as the entry hook. Paired by nesting depth
++// rather than by identity: a reader matches a RET to the CALL above it, which is
++// what the indentation in V8's own output conveys.
++void TraceCallExit(Isolate* isolate, Tagged<Object> value) {
++  if (TracePropertyLookupFile() == nullptr) return;
++  HandleScope scope(isolate);
++  std::string where;
++  int line = 0, column = 0;
++  if (!TraceCallOrigin(isolate, &where, &line, &column, nullptr)) return;
++  std::string rendered;
++  TraceAppendValue(isolate, value, &rendered);
++  std::string rec = "RET\t\t\t" + where + "\t" + std::to_string(line) + "\t" +
++                    std::to_string(column) + "\t" + rendered + "\n";
++  TraceEnqueueLine(rec);
++}
+ void IC::TraceIC(const char* type, DirectHandle<Object> name) {
+   if (V8_LIKELY(!TracingFlags::is_ic_stats_enabled())) return;
+   State new_state =
+@@ -430,6 +853,10 @@ MaybeDirectHandle<Object> LoadIC::Load(Handle<JSAny> object, Handle<Name> name,
+   // Named lookup in the object.
+   LookupForRead(&it, IsAnyHas());
+ 
++  if (V8_UNLIKELY(v8_flags.trace_property_lookup)) {
++    TracePropertyLookup(isolate(), receiver, name, it.IsFound());
++  }
++
+   if (it.IsFound() || !ShouldThrowReferenceError()) {
+     // Update inline cache and stub cache.
+     if (use_ic) {
+diff --git a/src/runtime/runtime-test.cc b/src/runtime/runtime-test.cc
+index 2669e606..cd1a4ad9 100644
+--- a/src/runtime/runtime-test.cc
++++ b/src/runtime/runtime-test.cc
+@@ -56,6 +56,11 @@
+ namespace v8 {
+ namespace internal {
+ 
++// Defined in src/ic/ic.cc by the obscura property-trace patch.
++bool TraceCallEnterEnabled();
++void TraceCallEnter(Isolate* isolate);
++void TraceCallExit(Isolate* isolate, Tagged<Object> value);
++
+ namespace {
+ // This function is mostly used instead of (D)CHECKs for functions exposed to
+ // fuzzers. TODO(353685107): consider being more permissive in functions using
+@@ -1601,6 +1606,10 @@ void PrintIndentation(int stack_size) {
+ }  // namespace
+ 
+ RUNTIME_FUNCTION(Runtime_TraceEnter) {
++  if (v8::internal::TraceCallEnterEnabled()) {
++    v8::internal::TraceCallEnter(isolate);
++    return ReadOnlyRoots(isolate).undefined_value();
++  }
+   SealHandleScope shs(isolate);
+   PrintIndentation(StackSize(isolate));
+   JavaScriptFrame::PrintTop(isolate, stdout, true, false);
+@@ -1609,11 +1618,15 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
+ }
+ 
+ RUNTIME_FUNCTION(Runtime_TraceExit) {
+-  SealHandleScope shs(isolate);
+   if (args.length() != 1) {
+     return CrashUnlessFuzzing(isolate);
+   }
+   Tagged<Object> obj = args[0];
++  if (v8::internal::TraceCallEnterEnabled()) {
++    v8::internal::TraceCallExit(isolate, obj);
++    return obj;
++  }
++  SealHandleScope shs(isolate);
+   PrintIndentation(StackSize(isolate));
+   PrintF("} -> ");
+   ShortPrint(obj);
+-- 
+2.50.1 (Apple Git-155)
+

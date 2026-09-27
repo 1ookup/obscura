@@ -1,0 +1,75 @@
+From cc2c7ff4def1eac48b2708af67e9671173e6e81d Mon Sep 17 00:00:00 2001
+From: l9h8 <l9h8@local>
+Date: Sun, 27 Sep 2026 14:25:14 +0800
+Subject: [PATCH 16/16] trace: stamp jsonl records with the realm from label
+
+Recovered uncommitted work from the previous checkout: each jsonl API
+record gains a from field read from the realm's
+__obscura_trace_from (falling back to __obscura_trace_default_from,
+then window), so cross-frame traces say which realm called.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ src/ic/ic.cc | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 66201525..2093a637 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -1107,10 +1107,23 @@ double TraceApiRecordMs() {
+   return TraceApiNowMs() - *origin;
+ }
+ 
+-void TraceEnqueueJsonRecord(const std::string& src, const std::string& name,
+-                            const std::string& args, const std::string& result) {
++std::string TraceCurrentFrom(Isolate* isolate) {
++  DirectHandle<JSObject> global =
++      direct_handle(isolate->native_context()->global_object(), isolate);
++  std::string label = TraceOwnDataString(isolate, global, "__obscura_trace_from");
++  if (label.empty()) {
++    label = TraceOwnDataString(isolate, global, "__obscura_trace_default_from");
++  }
++  return label.empty() ? std::string("window") : label;
++}
++
++void TraceEnqueueJsonRecord(Isolate* isolate, const std::string& src,
++                            const std::string& name, const std::string& args,
++                            const std::string& result) {
+   std::string record = "{\"t\":";
+   record += TraceApiMs(TraceApiRecordMs());
++  record += ",\"from\":";
++  TraceAppendJsonString(TraceCurrentFrom(isolate), &record);
+   record += ",\"src\":";
+   TraceAppendJsonString(src, &record);
+   record += ",\"name\":";
+@@ -1183,7 +1196,7 @@ void TraceJsonPropertySet(Isolate* isolate, DirectHandle<JSAny> receiver,
+   std::string args;
+   TraceAppendJsonValue(isolate, *assigned, &args);
+   std::string src = TraceApiSrc("set", name, member_info.definition, call_site);
+-  TraceEnqueueJsonRecord(src, name, args, "\"undefined\"");
++  TraceEnqueueJsonRecord(isolate, src, name, args, "\"undefined\"");
+ }
+ 
+ // A read: the value has already been loaded, so no accessor runs twice.
+@@ -1221,7 +1234,7 @@ void TraceJsonPropertyGet(Isolate* isolate, DirectHandle<JSAny> receiver,
+   std::string result;
+   TraceAppendJsonValue(isolate, *read, &result);
+   std::string src = TraceApiSrc("get", name, definition, call_site);
+-  TraceEnqueueJsonRecord(src, name, std::string(), result);
++  TraceEnqueueJsonRecord(isolate, src, name, std::string(), result);
+ }
+ 
+ // One call, emitted at exit so that a single record carries the arguments and
+@@ -1351,7 +1364,7 @@ void TraceCallRecordJson(Isolate* isolate, Tagged<Object> value) {
+   }
+   std::string result;
+   TraceAppendJsonValue(isolate, is_construct ? *receiver : *call_value, &result);
+-  TraceEnqueueJsonRecord(src, name, args, result);
++  TraceEnqueueJsonRecord(isolate, src, name, args, result);
+ }
+ 
+ // Whether a script name is engine-internal. Named engine scripts all start
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,26 @@
+From af0ac5657f28e24f37d0b819ec65df388f1a545a Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 20:32:26 +0800
+Subject: [PATCH 09/16] fix generated trace context arguments
+
+---
+ src/ic/accessor-assembler.cc | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/ic/accessor-assembler.cc b/src/ic/accessor-assembler.cc
+index 9649a717..7ee335fb 100644
+--- a/src/ic/accessor-assembler.cc
++++ b/src/ic/accessor-assembler.cc
+@@ -4370,8 +4370,7 @@ void AccessorAssembler::GenerateLoadIC_Megamorphic() {
+   HandleLoadICHandlerCase(&p, var_handler.value(), &miss, &direct_exit);
+ 
+   BIND(&miss);
+-  CallRuntime(Runtime::kTracePropertyLookup, p->context(), p->receiver(),
+-              p->name());
++  CallRuntime(Runtime::kTracePropertyLookup, context, receiver, name);
+   direct_exit.ReturnCallRuntime(Runtime::kLoadIC_Miss, context, receiver, name,
+                                 slot, vector);
+ }
+-- 
+2.50.1 (Apple Git-155)
+

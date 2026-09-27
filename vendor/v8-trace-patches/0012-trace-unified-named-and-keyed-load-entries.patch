@@ -1,0 +1,32 @@
+From bcbaecb1602e96f1f24c4102698ba779da6f4745 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 21:33:34 +0800
+Subject: [PATCH 12/16] trace unified named and keyed load entries
+
+---
+ src/ic/accessor-assembler.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/ic/accessor-assembler.cc b/src/ic/accessor-assembler.cc
+index 91133271..49d17e32 100644
+--- a/src/ic/accessor-assembler.cc
++++ b/src/ic/accessor-assembler.cc
+@@ -4336,6 +4336,7 @@ void AccessorAssembler::GenerateLoadIC() {
+   auto vector = Parameter<HeapObject>(Descriptor::kVector);
+   auto context = Parameter<Context>(Descriptor::kContext);
+ 
++  CallRuntime(Runtime::kTracePropertyLookup, context, receiver, name);
+   LoadICParameters p(context, receiver, name, slot, vector);
+   LoadIC(&p);
+ }
+@@ -4660,6 +4661,7 @@ void AccessorAssembler::GenerateKeyedLoadIC() {
+   auto vector = Parameter<HeapObject>(Descriptor::kVector);
+   auto context = Parameter<Context>(Descriptor::kContext);
+ 
++  CallRuntime(Runtime::kTracePropertyLookup, context, receiver, name);
+   LoadICParameters p(context, receiver, name, slot, vector);
+   KeyedLoadIC(&p, LoadAccessMode::kLoad);
+ }
+-- 
+2.50.1 (Apple Git-155)
+

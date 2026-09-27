@@ -1,0 +1,63 @@
+From d8142db6a3dc6141f9252d173d2c2c583459cf0d Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 20:17:48 +0800
+Subject: [PATCH 07/16] trace generated named load fallback
+
+---
+ src/ic/accessor-assembler.cc |  2 ++
+ src/ic/ic.cc                 | 13 +++++++++++++
+ src/runtime/runtime.h        |  1 +
+ 3 files changed, 16 insertions(+)
+
+diff --git a/src/ic/accessor-assembler.cc b/src/ic/accessor-assembler.cc
+index cf6fadfe..9649a717 100644
+--- a/src/ic/accessor-assembler.cc
++++ b/src/ic/accessor-assembler.cc
+@@ -4370,6 +4370,8 @@ void AccessorAssembler::GenerateLoadIC_Megamorphic() {
+   HandleLoadICHandlerCase(&p, var_handler.value(), &miss, &direct_exit);
+ 
+   BIND(&miss);
++  CallRuntime(Runtime::kTracePropertyLookup, p->context(), p->receiver(),
++              p->name());
+   direct_exit.ReturnCallRuntime(Runtime::kLoadIC_Miss, context, receiver, name,
+                                 slot, vector);
+ }
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index bd5440bc..17cde6d2 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -3162,6 +3162,19 @@ MaybeDirectHandle<Object> StoreInArrayLiteralIC::Store(
+ // Static IC stub generators.
+ //
+ //
++RUNTIME_FUNCTION(Runtime_TracePropertyLookup) {
++  HandleScope scope(isolate);
++  DCHECK_EQ(2, args.length());
++  Handle<JSAny> receiver = args.at<JSAny>(0);
++  Handle<Object> key = args.at(1);
++  if (TracePropertyLookupFile() != nullptr && IsName(*key)) {
++    LookupIterator trace_it(isolate, receiver, Cast<Name>(key));
++    LookupForRead(&trace_it, false);
++    TracePropertyLookup(isolate, receiver, Cast<Name>(key), trace_it.IsFound());
++  }
++  return ReadOnlyRoots(isolate).undefined_value();
++}
++
+ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(4, args.length());
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 495cd6ce..28021d5b 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -829,6 +829,7 @@ namespace internal {
+   F(KeyedHasIC_Miss, 4, 1)                   \
+   F(HasElementWithInterceptor, 2, 1)         \
+   F(ObjectAssignTryFastcase, 2, 1)
++  F(TracePropertyLookup, 2, 1)
+ 
+ #define FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL(F, I)               \
+   FOR_EACH_INTRINSIC_ARRAY(F, I)                                  \
+-- 
+2.50.1 (Apple Git-155)
+

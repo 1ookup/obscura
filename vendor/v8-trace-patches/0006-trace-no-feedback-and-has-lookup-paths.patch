@@ -1,0 +1,52 @@
+From a9022ec53d8ed9b44d512635aaa9cf781fa96382 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 20:03:25 +0800
+Subject: [PATCH 06/16] trace no-feedback and has lookup paths
+
+---
+ src/ic/ic.cc | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index fa7786fd..bd5440bc 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -3217,6 +3217,11 @@ RUNTIME_FUNCTION(Runtime_LoadNoFeedbackIC_Miss) {
+   // it is safe to call LoadIC::Load for global loads as well.
+   LoadIC ic(isolate, vector, vector_slot, kind);
+   ic.UpdateState(receiver, key);
++  if (TracePropertyLookupFile() != nullptr) {
++    LookupIterator trace_it(isolate, receiver, key);
++    LookupForRead(&trace_it, false);
++    TracePropertyLookup(isolate, receiver, key, trace_it.IsFound());
++  }
+   RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
+ }
+ 
+@@ -3232,6 +3237,11 @@ RUNTIME_FUNCTION(Runtime_LoadWithReceiverNoFeedbackIC_Miss) {
+   FeedbackSlot vector_slot = FeedbackSlot::Invalid();
+   LoadIC ic(isolate, vector, vector_slot, FeedbackSlotKind::kLoadProperty);
+   ic.UpdateState(object, key);
++  if (TracePropertyLookupFile() != nullptr) {
++    LookupIterator trace_it(isolate, object, key);
++    LookupForRead(&trace_it, false);
++    TracePropertyLookup(isolate, object, key, trace_it.IsFound());
++  }
+   RETURN_RESULT_OR_FAILURE(isolate, ic.Load(object, key, true, receiver));
+ }
+ 
+@@ -4531,6 +4541,11 @@ RUNTIME_FUNCTION(Runtime_KeyedHasIC_Miss) {
+     vector = Cast<FeedbackVector>(maybe_vector);
+   }
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
++  if (TracePropertyLookupFile() != nullptr && IsName(*key)) {
++    LookupIterator trace_it(isolate, receiver, Cast<Name>(key));
++    LookupForRead(&trace_it, false);
++    TracePropertyLookup(isolate, receiver, Cast<Name>(key), trace_it.IsFound());
++  }
+   KeyedLoadIC ic(isolate, vector, vector_slot, FeedbackSlotKind::kHasKeyed);
+   ic.UpdateState(receiver, key);
+   RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
+-- 
+2.50.1 (Apple Git-155)
+

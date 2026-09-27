@@ -14,13 +14,14 @@ ignore/watch/devtools CLI options now fail explicitly instead of silently doing
 nothing. Their environment equivalents are not implemented by the V8 monitor.
 
 The implementation is edited directly in `vendor/rusty_v8/v8`, a nested Git
-repository. There is no build-time V8 trace patch script:
-The bytecode migration is committed in that checkout as `59ee73ae`, and the
-API-call layer on top of it as `4632570d`, which is the tip of the local
-`obscura-trace` branch. That checkout sits on a detached HEAD, so keep the
-branch: without it those commits are reachable only from HEAD and a checkout
-of another ref would leave them to be collected. The outer cleanup is committed
-as `9ea95aa`.
+repository. There is no build-time V8 trace patch script: the sources are
+carried as a tracked format-patch series in `vendor/v8-trace-patches/`
+(16 commits on the pinned submodule base `f68bbb6cda`, exported from the
+nested repo's `obscura-trace` branch) and applied to a fresh clone with
+`vendor/v8-trace-restore.sh`. The series was originally live only as local
+commits in a gitignored checkout; that checkout was lost once, and the
+series in this repository is what makes the trace reproducible. The outer
+cleanup is committed as `9ea95aa`.
 
 Two build notes. Nothing watches the V8 source tree: `vendor/rusty_v8/build.rs`
 re-runs on `.gn`, `BUILD.gn` and `src/binding.cc`, so an edit under

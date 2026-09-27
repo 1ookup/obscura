@@ -1,0 +1,27 @@
+From c3623906c7bb4d5377e11cc6fd26904d4e562404 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 21:26:15 +0800
+Subject: [PATCH 11/16] retry native trace sink initialization
+
+---
+ src/ic/ic.cc | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index 17cde6d2..135c82be 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -134,9 +134,7 @@ namespace {
+ // last-lookup signal that does not exist would only risk losing the tail.
+ FILE* TracePropertyLookupFile() {
+   static FILE* file = nullptr;
+-  static bool tried = false;
+-  if (!tried) {
+-    tried = true;
++  if (file == nullptr) {
+     const char* path = v8_flags.trace_property_lookup_file;
+     if (path == nullptr || path[0] == '\0') {
+       path = std::getenv("OBSCURA_TRACE_API_FILE");
+-- 
+2.50.1 (Apple Git-155)
+

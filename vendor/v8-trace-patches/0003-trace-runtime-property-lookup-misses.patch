@@ -1,0 +1,41 @@
+From dc297593b11f990f7c4333df01019bef70c2eba9 Mon Sep 17 00:00:00 2001
+From: l8h6 <l8h6@l8h6deMac-Studio-2.local>
+Date: Sat, 5 Sep 2026 19:50:45 +0800
+Subject: [PATCH 03/16] trace runtime property lookup misses
+
+---
+ src/ic/ic.cc | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/ic/ic.cc b/src/ic/ic.cc
+index f78fcf90..14fee885 100644
+--- a/src/ic/ic.cc
++++ b/src/ic/ic.cc
+@@ -3168,6 +3168,12 @@ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
+   Handle<FeedbackVector> vector = args.at<FeedbackVector>(3);
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+ 
++  if (v8_flags.trace_property_lookup) {
++    LookupIterator trace_it(isolate, receiver, key);
++    LookupForRead(&trace_it, IsAnyHas());
++    TracePropertyLookup(isolate, receiver, key, trace_it.IsFound());
++  }
++
+   // A monomorphic or polymorphic KeyedLoadIC with a string key can call the
+   // LoadIC miss handler if the handler misses. Since the vector Nexus is
+   // set up outside the IC, handle that here.
+@@ -3302,6 +3308,11 @@ RUNTIME_FUNCTION(Runtime_KeyedLoadIC_Miss) {
+     vector = Cast<FeedbackVector>(maybe_vector);
+   }
+   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
++  if (v8_flags.trace_property_lookup && IsName(*key)) {
++    LookupIterator trace_it(isolate, receiver, Cast<Name>(key));
++    LookupForRead(&trace_it, IsAnyHas());
++    TracePropertyLookup(isolate, receiver, Cast<Name>(key), trace_it.IsFound());
++  }
+   KeyedLoadIC ic(isolate, vector, vector_slot, FeedbackSlotKind::kLoadKeyed);
+   ic.UpdateState(receiver, key);
+   RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
+-- 
+2.50.1 (Apple Git-155)
+
