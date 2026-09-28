@@ -1,45 +1,3 @@
-// Live 49x44 probe rendering: the challenge's multiply-composited arc
-// cluster and evenodd ring rasterize to 192/244/53-class coverage in Chrome.
-// The sampled rasterizer lands a few gray levels off on the AA edges, so the
-// probe's fixed draw sequence answers the live Chromium coverage bitmap
-// directly (captured from the same Chromium build the reference passes run
-// on). Downstream hashes (md5/sha256 over the pixels) then match by
-// construction, whatever the digest implementation.
-const _ob49PixelsB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8k/wf/If9O/yL/o/8h/87/Iv/i/yL/9v8i//X/Iv/h/yL/zf8i/6P/If9N/zP/BQAAAAAAAAAAAAAAAAAAAAAk//8HIf//TiL//6Mh///OIv//4iL///Yi///1Iv//4SL//80i//+jIf//TTP//wUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/x7/Ef8j/4v/Iv/z/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//D/I/+L/x7/ER7//xEj//+LIv//8yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///wI///ix7//xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/Kv8G/yL/cv8i/+7/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//+iL//5gp//Yomf/2Ivr//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///uIv//cSr//wYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/JP8O/yL/vf8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//8yL//1si//8iIv//IiL//yJm//8i8///Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8h//+wJP//DgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/If8n/yL/2P8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//3SL//0Qi//8iIv//IiL//yIi//8iIv//IkX//yLc//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//9cg//8oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/Jv8U/yL/2v8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//7iL//0Ii//8iIv//IiL//yIi//8iIv//IiL//yIi//8iQ///Iu3//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//2ST//xUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/M/8F/yH/xv8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//+yL//1Mi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yJV//8i+///Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///EM///BQAAAAAAAAAAAAAAAAAAAAAAAAAA/yL/eP8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//5ci//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//Ipf//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//3gAAAAAAAAAAAAAAAAAAAAA/yT/Ff8i//L/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//+0i//8tIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIu//8i7P//Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///xI///FgAAAAAAAAAAAAAAAP8i/5j/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//97Iv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//Inv//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//5gAAAAAAAAAAP8i/w//Iv/5/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///yIv//JyL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIo//8i8v//Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///4Iv//DwAAAAD/I/9Q/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//uiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//Irr//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yP//1AAAAAA/yL/mP8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//3si//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yJ7//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//+YAAAAAP8i/8j/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//9SIv//IiL//yIi//8iIv//IiL//1lZ//+EhP//qKj//7+///+goP//fX3//0hI//8iIv//IiL//yIi//8iUv//Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//yAAAAAD/Iv/g/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//PSL//yIi//8iIv//NDT//7+////////////////////////////////////9/f//mpr//ygo//8iIv//Ij3//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//+AAAAAA/yL/+P8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//ygi//8iIv//VVX///Dw///////////////////////////////////////////////////g4P//Ojr//yIo//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///4AAAAAP8i//j/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//8oIv//Li7//+np/////////////////////////////////////////////////////////////8XF//8iKP//Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//+AAAAAD/Iv/g/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//PSLw/6ur0v//////////////////////qKio/3Z2dv9fX1//fX19/8DAwP//////////////////////fIz2/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL//+AAAAAA/yL/yP8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Ivr//yKc/10wPv//////////////////////XFxc/yIiIv8iIiL/IiIi/yIiIv8iIiL/jo6O/////////////////93k3/8i/53/Iv/6/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i///IAAAAAP8i/5j/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////IvP//yJb//8iIv+dXFz/////////////////vr6+/yIiIv8iIiL/IiIi/yIiIv8iIiL/IiIi/yQkJP/o6Oj/////////////////LP8s/yL/Zv8i//P/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv//mAAAAAD/I/9Q/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////It3//yJE//8iIv//IiL/2oiI/////////////////5GRkf8iIiL/IiIi/yIiIv8iIiL/IiIi/yIiIv8iIiL/vr6+/////////////////1f/V/8i/yL/Iv9F/yL/3P8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yP//0gAAAAA/yL/D/8i//j/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iu7//yJC//8iIv//IiL//yIi//mYmP////////////////+Dg4P/IiIi/yIiIv8iIiL/IiIi/yIiIv8iIiL/IiIi/7CwsP////////////////9q/2r/Iv8i/yL/Iv8i/0P/Iv/t/yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///kq//8GAAAAAAAAAAD/Iv+Y/yL///8i////Iv///yL///8i////Iv///yL///8i////Ivv//yJT//8iIv//IiL//yIi//8iIv//cnL/////////////////oaGh/yIiIv8iIiL/IiIi/yIiIv8iIiL/IiIi/yIiIv/Ozs7/////////////////Q/9D/yL/Iv8i/yL/Iv8i/yL/Vf8i//v/Iv///yL///8i////Iv///yL///8i////Iv///yL///8i//+YAAAAAAAAAAAAAAAA/yD/GP8i//f/Iv///yL///8i////Iv///yL///8i////Iv///yKX//8iIv//IiL//yIi//8iIv//IiL//0lJ/////////////////+np6f8qKir/IiIi/yIiIv8iIiL/IiIi/yIiIv9DQ0P//Pz8////////////9//3/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv+X/yL///8i////Iv///yL///8i////Iv///yL///8i///3I///FgAAAAAAAAAAAAAAAAAAAAD/Iv+Q/yL///8i////Iv///yL///8i////Iv///yLt//8iLf//IiL//yIi//8iIv//IiL//yIi//8iIv//yMj/////////////////wsLC/zs7O/8iIiL/IiIi/yIiIv9RUVH/3Nzc/////////////////5f/l/8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Lv8i/+z/Iv///yL///8i////Iv///yL///8i////Iv//iAAAAAAAAAAAAAAAAAAAAAAAAAAA/yT/Dv8i/9H/Iv///yL///8i////Iv///yL///8ie///IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//z4+///4+P/////////////////+/v7/5eXl/87Ozv/s7Oz//////////////////////9//3/8o/yj/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv97/yL///8i////Iv///yL///8i////I///xxz//wkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/JP8c/yL/4/8i////Iv///yL///8i8v//Iif//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//e3v///////////////////////////////////////////////////////n/+f9S/1L/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/KP8i//L/Iv///yL///8i////Iv//2yb//xQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8h/y7/Iv/x/yL///8i////Irr//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//9ZWf/76Oj//////////////////////////////////////9L/0v9B/0H/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv+6/yL///8i////Iv//6yP//yQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/yj/E/8i/8X/Iv///yJ7//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//y0t//eUlP/Zzs7//f39///////5+vn/xvvG/4H/gf8j/yP/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/e/8i////Iv//uyj//xMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AP8C/yH/Y/8yT/r/IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//SIi/6w8Kv9fuU//Jf0l/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8x/0/6If//ZQD//wIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/8yPi/4ki//8sIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//yIi//8iIv//IiL//y8i//+JIv//9CL/9P8i/4n/Iv8s/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/yL/Iv8i/y//Iv+J/yL/8/8j4gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8i+P//Iv//+SL//7wi//9yIv//TSL//zwi//8rIv//KiL//zsi//9MIv//ciL//7si///7Iv///yL///8i////Iv///yL/+f8i/7z/Iv9y/yL/Tf8i/zz/Iv8r/yL/Kv8i/zv/Iv9M/yL/cv8i/7v/Iv/7/yL///8i////IvgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP//Ivj//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//yLg//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8iyP//Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////IsgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP//Ipj//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yKYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//yNQ//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8jSAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8iD///Ivj//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i+f//KgYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//yKY//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////IpgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8gGP//Ivf//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Ivf//yMWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//yKQ//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yKIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8kDv//ItH//yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yPH//8cCQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//yQc//8i4///Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yLb//8mFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP//IyT//yLk//8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yL///8i////Iv///yLg//8lIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-let _ob49PixelsCache = null;
-function _ob49Pixels() {
-  if (_ob49PixelsCache) return _ob49PixelsCache;
-  let bin = '';
-  try { bin = atob(_ob49PixelsB64); } catch (e) {
-    const CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    const idx = {}; for (let i = 0; i < 64; i++) idx[CH[i]] = i;
-    let b = 0, bits = 0, out = '';
-    for (let i = 0; i < _ob49PixelsB64.length; i++) {
-      const c = _ob49PixelsB64[i];
-      if (c === '=') break;
-      b = (b << 6) | (idx[c] || 0); bits += 6;
-      if (bits >= 8) { bits -= 8; out += String.fromCharCode((b >> bits) & 255); }
-    }
-    bin = out;
-  }
-  const u = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-  _ob49PixelsCache = u;
-  return u;
-}
-function _ob49IsProbe(path) {
-  if (!Array.isArray(path)) return false;
-  let ringA = false, ringB = false;
-  for (let i = 0; i < path.length; i++) {
-    const s = path[i];
-    if (s && s.t === 'A' && s.x === 61 && s.y === 53) {
-      if (s.r === 20) ringA = true;
-      if (s.r === 10) ringB = true;
-    }
-  }
-  return ringA && ringB;
-}
-
 const _imageDataState = new WeakMap();
 // ImageBitmap pixel snapshots and OffscreenCanvas 2D contexts. The
 // OffscreenCanvas module registers what it constructs (transferToImageBitmap /
@@ -864,39 +822,6 @@ class _Canvas2D {
       }
     }
     const evenOdd = String(fillRule).toLowerCase() === 'evenodd';
-    if (this._w === 49 && this._h === 44 && evenOdd && _ob49IsProbe(this._path)) {
-      // The table is un-premultiplied sRGB, exactly what getImageData answers
-      // with. Store it straight: _setPixel would re-blend each entry against
-      // whatever this canvas already holds, and the probe's antialiased edges
-      // carry partial alpha, so the blend would drift off the reference.
-      const px = _ob49Pixels();
-      const plain = !this._floatBuf && this._colorSpace === 'srgb';
-      for (let i = 0; i < 2156; i++) {
-        const o = i * 4;
-        if (plain) {
-          this._colorBuf[o] = px[o];
-          this._colorBuf[o + 1] = px[o + 1];
-          this._colorBuf[o + 2] = px[o + 2];
-          this._colorBuf[o + 3] = px[o + 3];
-          continue;
-        }
-        const converted = _convertCanvasColor([px[o] / 255, px[o + 1] / 255,
-          px[o + 2] / 255], 'srgb', this._colorSpace);
-        if (this._floatBuf) {
-          this._floatBuf[o] = converted[0];
-          this._floatBuf[o + 1] = converted[1];
-          this._floatBuf[o + 2] = converted[2];
-          this._floatBuf[o + 3] = px[o + 3] / 255;
-        }
-        this._colorBuf[o] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
-        this._colorBuf[o + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
-        this._colorBuf[o + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
-        this._colorBuf[o + 3] = px[o + 3];
-        this._syncRendererPixel(o);
-      }
-      this._markPaintDamage();
-      return;
-    }
     const subpaths = this._flattenPath(3);
     if (!subpaths.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
