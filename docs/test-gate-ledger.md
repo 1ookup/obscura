@@ -173,3 +173,10 @@ run covers are then removed.
   -p obscura-browser -p obscura-net --no-fail-fast
   --config vendor/v8-source.toml` = **1016/1016 passed** at HEAD `69189da`.
   Full workspace gate deferred to the next backfill.
+
+- 2026-09-29: host-locale default language (`8fe3e1b`) and the worker
+  FontFaceSet.check semantics (`0cbdb03`), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-net --no-fail-fast
+  --config vendor/v8-source.toml` = **1017/1017 passed** at HEAD `8fe3e1b`.
+  Full workspace gate deferred to the next backfill.
