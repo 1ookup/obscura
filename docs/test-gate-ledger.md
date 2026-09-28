@@ -163,3 +163,12 @@ run covers are then removed.
   where 149 answered W4, scoped to `cargo nextest run --release --features
   render -p obscura-render -p obscura-js -p obscura-browser -p obscura-net`
   1629/1629. Full workspace gate deferred to the next backfill.
+
+- 2026-09-28: secure-context gating batch (`654ad05` opaque-origin
+  isSecureContext, `081bb49` deviceMemory 16 + gate, `dd5e490` full 253-name
+  insecure window gate, `b598962` worker secure-context interface set,
+  `17fe980` worker caches onto the prototype), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-net --no-fail-fast
+  --config vendor/v8-source.toml`. Full workspace gate deferred to the next
+  backfill.

@@ -6119,7 +6119,7 @@ mod tests {
 
     #[test]
     fn zok_non_native_object_and_state_buckets_match_chrome() {
-        let mut rt = setup_runtime(
+        let mut rt = setup_secure_runtime(
             "<html><body><a name=anchor-name></a><applet></applet>\
              <embed id=plugin name=plugin></embed></body></html>",
         );
@@ -6226,7 +6226,7 @@ mod tests {
                     "registry": true,
                     "policy": ["[object FeaturePolicy]",
                         ["allowedFeatures", "allowsFeature", "constructor", "features",
-                            "getAllowlistForFeature"], true, ["http://example.com"]],
+                            "getAllowlistForFeature"], true, ["https://example.com"]],
                     "fragment": ["[object FragmentDirective]", [], ["constructor"]],
                 },
                 "windowObjects": {
@@ -7270,7 +7270,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
         let result = rt
             .evaluate_for_cdp(
@@ -7396,7 +7396,7 @@ mod tests {
     /// worker, where the answers are identical.
     #[test]
     fn offscreen_canvas_get_context_takes_the_rendering_context_type_enum() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
         let result = rt
             .evaluate(
@@ -11207,7 +11207,7 @@ provided documentURL ('https://other.example') does not match the current origin
     /// The worklet capture, read in full rather than sampled.
     #[tokio::test(flavor = "current_thread")]
     async fn worklet_entry_points_match_the_full_chrome_capture() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         // Keep the fetch-before-reject behavior deterministic and offline.
         rt.set_url("http://127.0.0.1:9/index.html");
         let probe = include_str!("../../../js-repros/worklet-entrypoints/probe.js")
@@ -16832,11 +16832,13 @@ RequestRedirect value",
                 "members": [
                     ["get connection", true, true],
                     ["get permissions", true, true],
-                    ["get gpu", true, true],
+                    // gpu is [SecureContext]: on this insecure origin the gate
+                    // has removed it, prototype getter and all.
+                    null,
                     ["get geolocation", true, true],
                     [null, true, true],
                 ],
-                "values": [true, true, true, true],
+                "values": [true, true, false, true],
             })
         );
     }
@@ -16952,6 +16954,11 @@ RequestRedirect value",
         });
         rt.set_fingerprint(&fingerprint);
         rt.set_dom(parse_html("<html><body></body></html>"));
+        // The contract names secure-context members (userAgentData,
+        // deviceMemory): without a URL the document sits at about:blank, whose
+        // opaque origin the secure-context gate now answers the way Chrome
+        // does, and the members it gates are gone.
+        rt.set_url("https://example.com/test");
         rt.run_page_init();
 
         let result = rt.evaluate_for_cdp(
@@ -29989,7 +29996,7 @@ RequestRedirect value",
 
     #[test]
     fn optional_zero_argument_platform_methods_do_not_throw_synchronously() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
                 r#"(() => {
@@ -30232,7 +30239,7 @@ RequestRedirect value",
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_keyboard_layout_map_matches_the_reference_session_order() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
@@ -30688,7 +30695,7 @@ RequestRedirect value",
 
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_describes_the_same_adapter_the_webgl_renderer_claims() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         // No profile, no adapter -- which is also Chrome's answer when the GPU
         // is unavailable.
         let without = rt
@@ -30764,7 +30771,7 @@ RequestRedirect value",
     /// places. Both columns are the reference's own values, field for field.
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_each_tier_reports_the_reference_limits() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         rt.set_stealth(true);
         let result = rt
             .call_function_on_for_cdp(
@@ -33880,7 +33887,7 @@ RequestRedirect value",
     /// classes as a bare "Object" in property-lookup traces.
     #[test]
     fn webidl_interfaces_expose_name_and_to_string_tag() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
                 r#"
@@ -34848,7 +34855,7 @@ RequestRedirect value",
 
     #[test]
     fn navigator_virtual_keyboard_uses_the_interface_shape_without_fake_geometry() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
                 r#"(() => {
