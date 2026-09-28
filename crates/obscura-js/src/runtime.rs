@@ -24745,6 +24745,62 @@ RequestRedirect value",
         );
     }
 
+    // `local()` matches a font's own names, not its family name: the oracle
+    // loads `Menlo Regular` and rejects `Menlo`, loads `Skia Regular` and
+    // rejects `Skia`, and answers the full names the reference session's font
+    // probe reports (`InaiMathi Bold`, `PingFang HK Light`) while rejecting
+    // the family of the same face (`PingFang HK`). On a macOS identity the
+    // engine answers from its own name list; a measured answer cannot tell a
+    // full name from a family name, which is what put `Skia` in the list and
+    // dropped the two full names.
+    #[tokio::test(flavor = "current_thread")]
+    async fn font_face_local_matches_full_names_like_chrome() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        rt.set_platform("MacIntel", "macOS", "26.4.0");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const probe = async name => {
+                        try {
+                            await new FontFace('p' + Math.random().toString(36).slice(2),
+                                'local("' + name + '")').load();
+                            return 'loaded';
+                        } catch (error) { return error.name; }
+                    };
+                    const names = ['InaiMathi Bold', 'PingFang HK Light', 'Menlo Regular',
+                        'Skia Regular', 'Geneva', 'Apple Symbols', 'Verdana', 'Menlo',
+                        'Skia', 'PingFang HK', 'SF Mono', 'Segoe UI', 'DefinitelyMissing123'];
+                    const out = {};
+                    for (const name of names) out[name] = await probe(name);
+                    return out;
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "InaiMathi Bold": "loaded",
+                "PingFang HK Light": "loaded",
+                "Menlo Regular": "loaded",
+                "Skia Regular": "loaded",
+                "Geneva": "loaded",
+                "Apple Symbols": "loaded",
+                "Verdana": "loaded",
+                "Menlo": "NetworkError",
+                "Skia": "NetworkError",
+                "PingFang HK": "NetworkError",
+                "SF Mono": "NetworkError",
+                "Segoe UI": "NetworkError",
+                "DefinitelyMissing123": "NetworkError",
+            })
+        );
+    }
+
     #[test]
     fn canvas_filltext_honors_baseline_alignment_and_filter_like_chrome() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -539,6 +539,101 @@ if (typeof FontFace === 'undefined') {
   // family that survives being measured against two different generics is one
   // the renderer actually has. Keeping the answer on that side means the two
   // can never disagree about which fonts exist.
+  //
+  // A macOS identity answers from a name list instead, because `local()`
+  // matches a font's own names and not its family name: the oracle loads
+  // `local("Menlo Regular")` and rejects `local("Menlo")`, loads
+  // `local("Skia Regular")` and rejects `local("Skia")`, while a font whose
+  // full name equals its family name ("Geneva", "Apple Symbols", "Verdana")
+  // answers for both. Measuring cannot tell those two apart, and the
+  // challenge's font probe reads exactly this surface: its reference answer is
+  // the six names of the list below that this machine has.
+  const _MACOS_LOCAL_FACES = {
+    'andale mono': [''],
+    'apple symbols': [''],
+    'arial': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'arial black': [''],
+    'arial narrow': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'avenir': ['Black', 'Heavy', 'Light', 'Medium'],
+    'avenir next': ['Bold', 'Bold Italic', 'Heavy', 'Italic', 'Medium', 'Regular'],
+    'baskerville': ['', 'Bold', 'Bold Italic', 'Italic', 'Semibold'],
+    'bodoni 72': ['Bold'],
+    'chalkboard': ['', 'Bold'],
+    'charter': ['Black', 'Bold', 'Bold Italic', 'Italic'],
+    'cochin': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'comic sans ms': ['', 'Bold'],
+    'courier new': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'didot': ['', 'Bold', 'Italic'],
+    'futura': ['Bold', 'Medium'],
+    'galvji': ['', 'Bold'],
+    'geneva': [''],
+    'georgia': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'gill sans': ['', 'Bold', 'Bold Italic', 'Italic', 'Light', 'Semibold'],
+    'hannotate sc': ['Bold', 'Regular'],
+    'heiti sc': ['Light', 'Medium'],
+    'helvetica': ['', 'Bold', 'Light'],
+    'helvetica neue': ['', 'Bold', 'Bold Italic', 'Italic', 'Light', 'Medium', 'Thin'],
+    'hoefler text': ['', 'Black', 'Italic'],
+    'inaimathi': ['', 'Bold'],
+    'kaiti sc': ['Black', 'Bold', 'Regular'],
+    'lantinghei sc': ['Heavy'],
+    'libian sc': ['Regular'],
+    'lucida grande': ['', 'Bold'],
+    'luminari': [''],
+    'marker felt': ['Thin'],
+    'menlo': ['Bold', 'Bold Italic', 'Italic', 'Regular'],
+    'monaco': [''],
+    'optima': ['Bold', 'Bold Italic', 'Italic', 'Regular'],
+    'palatino': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'pingfang hk': ['Light', 'Medium', 'Regular', 'Semibold', 'Thin'],
+    'pingfang sc': ['Light', 'Medium', 'Regular', 'Semibold', 'Thin'],
+    'pingfang tc': ['Light', 'Medium', 'Regular', 'Semibold', 'Thin'],
+    'pt sans': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'skia': ['Black', 'Bold', 'Light', 'Regular'],
+    'songti sc': ['Black', 'Bold', 'Light', 'Regular'],
+    'superclarendon': ['Black', 'Bold', 'Bold Italic', 'Italic', 'Light', 'Regular'],
+    'tahoma': ['', 'Bold'],
+    'times': ['Bold', 'Bold Italic', 'Italic'],
+    'times new roman': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'trebuchet ms': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'verdana': ['', 'Bold', 'Bold Italic', 'Italic'],
+    'wawati sc': ['Regular'],
+    'webdings': [''],
+    'weibei sc': ['Bold'],
+    'wingdings': [''],
+    'xingkai sc': ['Bold', 'Light'],
+    'yuanti sc': ['Bold', 'Light', 'Regular'],
+  };
+  // The names those fonts answer to that are not family plus face: the
+  // PostScript spellings, and the macOS faces this identity otherwise does not
+  // name (they resolve here the way the reference's do).
+  const _MACOS_LOCAL_ALIASES = [
+    'apple color emoji', 'applecoloremoji', 'applegothic', 'arialmt', 'chalkduster',
+    'helveticaneue', 'herculanum', 'kokonor', 'papyrus', 'stheiti', 'stsong',
+    'timesnewromanpsmt', 'zapfino',
+  ];
+  let _macosLocalNames;
+  const _macosLocalNameSet = () => {
+    if (_macosLocalNames !== undefined) return _macosLocalNames;
+    let names = null;
+    try {
+      const platform = String((_fingerprint().navigatorPlatform) || '').toLowerCase();
+      // An identity that has not been installed yet is not a non-macOS one:
+      // answering "measure instead" here would stick for the life of the
+      // realm, so only a named platform decides.
+      if (!platform) return null;
+      if (platform.includes('mac') || platform.includes('darwin')) {
+        names = new Set(_MACOS_LOCAL_ALIASES);
+        for (const family of Object.keys(_MACOS_LOCAL_FACES)) {
+          for (const face of _MACOS_LOCAL_FACES[family]) {
+            names.add(face ? (family + ' ' + face).toLowerCase() : family);
+          }
+        }
+      }
+    } catch (_error) { names = null; }
+    _macosLocalNames = names;
+    return names;
+  };
   const _fontFaceLocalSourceMissing = source => {
     const text = String(source == null ? '' : source);
     const locals = text.match(/local\(\s*(?:"[^"]*"|'[^']*'|[^)]*)\s*\)/gi);
@@ -557,6 +652,11 @@ if (typeof FontFace === 'undefined') {
     if (_localFontCache.has(key)) return _localFontCache.get(key);
     let available = false;
     try {
+      const macos = _macosLocalNameSet();
+      if (macos !== null) {
+        _localFontCache.set(key, macos.has(key));
+        return macos.has(key);
+      }
       const context = (_localFontAvailable._canvas
         || (_localFontAvailable._canvas = document.createElement('canvas'))).getContext('2d');
       const quoted = '"' + family.replace(/"/g, '\\"') + '"';
