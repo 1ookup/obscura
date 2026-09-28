@@ -24624,6 +24624,127 @@ RequestRedirect value",
         assert_eq!(result["samePixels"], serde_json::json!(true));
     }
 
+    // `ctx.font` is the font shorthand, parsed on assignment and serialized on
+    // read (Chrome, this host): quotes drop when the family needs none, the
+    // `normal`, stretch and `/line-height` parts drop, absolute lengths and
+    // size keywords come back in px, and an unparseable value leaves the
+    // previous font in place. A probe that round-trips the property reads the
+    // rules back, and the engine used to store the raw string.
+    #[test]
+    fn canvas_font_parses_and_serializes_the_shorthand_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const context = document.createElement('canvas').getContext('2d');
+                    const read = value => {
+                        context.font = '12px serif';
+                        context.font = value;
+                        return context.font;
+                    };
+                    return {
+                        quoted: read('72px "Geneva", monospace'),
+                        kept: read('16px "Apple Symbols"'),
+                        normals: read('normal normal 10px sans-serif'),
+                        lineHeight: read('italic bold 12px/30px Georgia, serif'),
+                        weight: read('700 italic 12px serif'),
+                        absolute: read('10pt serif'),
+                        keyword: read('x-large serif'),
+                        system: read('caption'),
+                        invalid: read('bogus'),
+                        empty: read(''),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "quoted": "72px Geneva, monospace",
+                "kept": "16px \"Apple Symbols\"",
+                "normals": "10px sans-serif",
+                "lineHeight": "italic bold 12px Georgia, serif",
+                "weight": "italic bold 12px serif",
+                "absolute": "13.3333px serif",
+                "keyword": "24px serif",
+                "system": "16px Arial",
+                "invalid": "12px serif",
+                "empty": "12px serif",
+            })
+        );
+    }
+
+    // Chromium pins every WebGL context in a frame that is not same-origin with
+    // the top-level frame to the low-power preference, whatever the caller
+    // asked for; the top-level document keeps what it asks for. The challenge's
+    // WebGL rows are built in the cross-origin widget frame, and the reference
+    // answers `low-power` where the echoed request read `default`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_frame_webgl_contexts_report_low_power() {
+        let mut rt = ObscuraJsRuntime::new();
+        // The frame setup prelude reaches the op table, which is no longer
+        // page-visible: bind the engine namespace for this test.
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("http://top.example/index.html");
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let origin = "http://evil.example.net/frame";
+        let root = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame("f", "<html><body></body></html>", "{origin}");
+                }})()"#
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("test-frame", 1, root, origin).unwrap();
+
+        let probe = r#"(() => {
+            globalThis.__obscura_webgl_enabled = true;
+            const read = opts => {
+                const canvas = document.createElement('canvas');
+                const context = opts === undefined
+                    ? canvas.getContext('webgl') : canvas.getContext('webgl', opts);
+                return context ? context.getContextAttributes().powerPreference : null;
+            };
+            return [
+                read(undefined),
+                read({ powerPreference: 'default' }),
+                read({ powerPreference: 'high-performance' }),
+                read({ powerPreference: 'low-power' }),
+            ];
+        })()"#;
+        let from_frame = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "test-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                probe,
+                true,
+                true,
+                5_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let from_page = rt
+            .evaluate_for_cdp_with_timeout(probe, true, true, 5_000)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            (from_frame, from_page),
+            (
+                serde_json::json!(["low-power", "low-power", "low-power", "low-power"]),
+                serde_json::json!(["default", "default", "high-performance", "low-power"]),
+            )
+        );
+    }
+
     #[test]
     fn canvas_filltext_honors_baseline_alignment_and_filter_like_chrome() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -30462,8 +30583,9 @@ RequestRedirect value",
             );
             assert_eq!(device[name].as_u64(), Some(*low), "device.limits.{name}");
         }
-        // Fields only one tier carries stay pinned too.
-        assert_eq!(adapter["maxImmediateSize"].as_u64(), Some(64));
+        // Fields only one tier carries stay pinned too: the oracle's adapter
+        // row has no maxImmediateSize to enumerate, the device row has it.
+        assert_eq!(adapter["maxImmediateSize"].as_u64(), None);
         assert_eq!(device["maxImmediateSize"].as_u64(), Some(64));
     }
 
@@ -30805,7 +30927,9 @@ RequestRedirect value",
             assert_eq!(result[context]["own"], serde_json::json!([]));
             assert_eq!(result[context]["prototype"], prototype);
             assert_eq!(result[context]["bounds"], serde_json::json!([37808,37821,37840,37853]));
-            assert_eq!(result[context]["profiles"], serde_json::json!(["ldr","hdr"]));
+            // The reference Mac decodes ASTC in LDR only; the oracle and the
+            // challenge payload both answer the one-element list.
+            assert_eq!(result[context]["profiles"], serde_json::json!(["ldr"]));
             assert_eq!(result[context]["fresh"], true);
             assert_eq!(result[context]["descriptor"], serde_json::json!([true,true,true]));
             assert_eq!(result[context]["native"],
