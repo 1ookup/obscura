@@ -2206,6 +2206,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
     }
     try { if (G.crypto) delete G.crypto.subtle; } catch (e) {}
+  } else if (typeof G.caches !== 'undefined') {
+    // Chrome keeps `caches` off the worker global's own surface: it is an
+    // accessor on WorkerGlobalScope.prototype (measured 149), and the
+    // snapshot carries it as an own data property. The accessor serves the
+    // one CacheStorage instance the snapshot built.
+    var cachesValue = G.caches;
+    delete G.caches;
+    defGet(WorkerGlobalScope.prototype, 'caches', function () { return cachesValue; }, true);
   }
 
   // A window realm gets external.tracelog from the bootstrap, gated on whether
