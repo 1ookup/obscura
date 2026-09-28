@@ -161,11 +161,13 @@ function _ancestorOriginsList() {
     for (let depth = 0; depth < 8 && root > 0; depth++) {
       const container = _domParse('frame_container_info', root) || {};
       const parentRoot = Number(container.parentRoot) || 0;
-      if (parentRoot <= 0) break;
-      const info = _domParse('document_scope_info', parentRoot) || {};
+      // The parent document is an ancestor too: a frame whose parent is the
+      // top-level document reports one entry, and the walk previously broke
+      // before reading it because the top document's content root is 0.
+      const info = _domParse('document_scope_info', parentRoot > 0 ? parentRoot : 0) || {};
       const origin = typeof info.origin === 'string' && info.origin ? info.origin : null;
       if (origin && origins[origins.length - 1] !== origin) origins.push(origin);
-      root = parentRoot;
+      root = parentRoot > 0 ? parentRoot : 0;
     }
   } catch (_e) {}
   const proto = {
@@ -177,9 +179,19 @@ function _ancestorOriginsList() {
     contains(s) { return origins.indexOf(String(s)) !== -1; },
   };
   const list = Object.create(proto);
+  // Members are own enumerable indexed properties, the shape a WebIDL index
+  // getter produces and the one Chrome answers: `list[0]` and
+  // `Object.keys(list)` both see the origins.
+  for (let i = 0; i < origins.length; i++) {
+    try {
+      Object.defineProperty(list, String(i), {
+        value: origins[i], enumerable: true, writable: false, configurable: true,
+      });
+    } catch (_e2) {}
+  }
   try {
     Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMStringList', configurable: true });
-  } catch (_e2) {}
+  } catch (_e3) {}
   return list;
 }
 let _locationObj;

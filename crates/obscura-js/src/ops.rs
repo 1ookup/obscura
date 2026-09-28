@@ -2304,8 +2304,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
             match dom.iframe_host(root) {
                 Some(host) => {
+                    // The parent browsing context is the document that owns the
+                    // host element, shadow trees included: a widget frame
+                    // appended inside a closed shadow root still reports the
+                    // embedding document as its parent. The strict walk missed
+                    // that case and left the frame with no ancestors.
                     let parent_root = dom
-                        .containing_iframe_content_document(host)
+                        .containing_document_root_shadow_including(host)
                         .map(|id| id.index() as i64)
                         .unwrap_or(0);
                     serde_json::json!({ "host": host.index(), "parentRoot": parent_root })
