@@ -818,7 +818,11 @@ function _canvas2dGradientColorAt(self, grad, x, y) {
         const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
         const span = t1 - t0 || 1;
         const f = (t - t0) / span;
-        return [0, 1, 2, 3].map(k => Math.round(c0[k] + (c1[k] - c0[k]) * f));
+        // Skia packs the interpolated float color with truncation, not
+        // rounding: a mid-gradient reading of 15.9375 answers 15 on the
+        // reference where rounding answers 16 (measured 149, both engines,
+        // five gradient shapes).
+        return [0, 1, 2, 3].map(k => Math.floor(c0[k] + (c1[k] - c0[k]) * f));
       }
     }
     return lastStop[1].slice();
