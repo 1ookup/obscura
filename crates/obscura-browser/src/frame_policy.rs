@@ -20,6 +20,9 @@ pub enum FrameBlockedReason {
     CspFrameAncestors,
     CspFrameSrc,
     CspEmbeddedEnforcement,
+    /// The embedder requires a cross-origin embedder policy and this document
+    /// does not carry one.
+    CoepEmbeddedDocument,
 }
 
 impl std::fmt::Display for FrameBlockedReason {
@@ -32,9 +35,100 @@ impl std::fmt::Display for FrameBlockedReason {
             Self::CspEmbeddedEnforcement => {
                 "blocked by iframe embedded Content-Security-Policy enforcement"
             }
+            Self::CoepEmbeddedDocument => {
+                "blocked by Cross-Origin-Embedder-Policy on the embedder"
+            }
         };
         f.write_str(message)
     }
+}
+
+/// Whether a container's `allow` attribute grants a cross-origin child the
+/// `cross-origin-isolated` feature.
+///
+/// `None` when the attribute says nothing about the feature, which leaves the
+/// feature's default allowlist (`self`) in charge.
+///
+/// Measured Chrome on the four `allow` spellings of this feature, with an
+/// isolated top and a cross-origin child:
+///
+/// | `allow` value                             | child granted |
+/// |-------------------------------------------|---------------|
+/// | absent                                    | no            |
+/// | `cross-origin-isolated`                   | yes           |
+/// | `cross-origin-isolated=self`              | no            |
+/// | `cross-origin-isolated=*`                 | no            |
+/// | `cross-origin-isolated=()`                | no            |
+/// | `cross-origin-isolated=(self "https://child")` | no       |
+///
+/// Only the bare legacy spelling widens it. The explicit allowlists cannot:
+/// this feature's allowlist is intersected with the embedder's, whose default
+/// is `self`, so naming a cross-origin child in the attribute still leaves it
+/// outside -- which is why `*` grants nothing here while it grants everything
+/// for, say, `fullscreen`.
+pub fn container_grants_cross_origin_isolation(
+    allow: Option<&str>,
+    child_origin: &Origin,
+    parent_origin: &Origin,
+) -> Option<bool> {
+    let allow = allow?;
+    for part in allow.split(';') {
+        let part = part.trim();
+        let (name, value) = match part.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (part, None),
+        };
+        if !name.eq_ignore_ascii_case("cross-origin-isolated") {
+            continue;
+        }
+        return Some(match value {
+            // The legacy bare form: the feature is enabled for this frame.
+            None => true,
+            // An explicit allowlist, which the embedder's own default clamps
+            // to `self`.
+            Some(_) => child_origin.same_origin(parent_origin),
+        });
+    }
+    None
+}
+
+/// Whether a document is granted the `cross-origin-isolated` feature.
+///
+/// The grant is what `featurePolicy.allowsFeature('cross-origin-isolated')`
+/// reports and it is *independent* of whether isolation actually happens:
+/// measured Chrome answers `true` for a cross-origin child under a plain top
+/// with `allow="cross-origin-isolated"` while the child still reads
+/// `crossOriginIsolated === false`. Isolation needs the grant, the embedder's
+/// own isolation, and a sandbox that keeps the origin.
+///
+/// The feature's default allowlist is `self`, so a same-origin child is
+/// granted without any attribute and a cross-origin child only through the
+/// container's bare delegation. A frame's policy is the intersection of its
+/// container's and its embedder's, which is why `parent_allowed` gates it.
+pub fn cross_origin_isolated_allowed(
+    allow: Option<&str>,
+    child_origin: &Origin,
+    parent_origin: &Origin,
+    parent_allowed: bool,
+) -> bool {
+    if !parent_allowed {
+        return false;
+    }
+    container_grants_cross_origin_isolation(allow, child_origin, parent_origin)
+        .unwrap_or_else(|| child_origin.same_origin(parent_origin))
+}
+
+/// Whether an embedder carrying `require-corp` may embed this document.
+///
+/// A document without a cross-origin embedder policy of its own never loads
+/// inside one, whatever its other headers say: measured Chrome drops the load
+/// and the frame stays empty, where an engine that runs it exposes a document
+/// the real browser never executes.
+pub fn embedder_policy_admits_embedded_document(
+    embedder_requires_corp: bool,
+    response_has_embedder_policy: bool,
+) -> bool {
+    !embedder_requires_corp || response_has_embedder_policy
 }
 
 /// A parsed Content-Security-Policy header value (enforced policies only;

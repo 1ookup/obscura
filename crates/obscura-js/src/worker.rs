@@ -1953,6 +1953,30 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // The creator document's isolation decision, not a constant: a worker of a
   // cross-origin-isolated page answers true exactly like its window does.
   defGet(G, 'crossOriginIsolated', function () { return __OBSCURA_WORKER_ISOLATED__; }, true);
+  // The same bit owns the SharedArrayBuffer global on this side too. V8 only
+  // installs the constructor through the per-context callback this engine
+  // leaves answering no, so an isolated realm has to put it back -- and a
+  // worker that reported `crossOriginIsolated === true` with no constructor
+  // was the self-contradiction a page could read: measured Chrome's worker
+  // carries it as an own property (`hasOwnProperty('SharedArrayBuffer')`
+  // true, `typeof` "function"), its non-isolated worker carries neither.
+  if (__OBSCURA_WORKER_ISOLATED__) {
+    var sabCtor = null;
+    try {
+      sabCtor = new WebAssembly.Memory({initial: 1, maximum: 1, shared: true})
+        .buffer.constructor;
+    } catch (_sabError) {}
+    if (typeof sabCtor === 'function') {
+      Object.defineProperty(G, 'SharedArrayBuffer', {
+        value: sabCtor,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  } else {
+    try { delete G.SharedArrayBuffer; } catch (_sabDelete) {}
+  }
 
   // ---------------------------------------------------------------------
   // 6. Event plumbing.
@@ -2848,8 +2872,16 @@ mod tests {
             rt.execute_script(
                 "<test>",
                 r#"
+                // The isolation bit and the SharedArrayBuffer global are one
+                // state: measured Chrome's isolated worker carries the
+                // constructor as an own property and constructs it, its
+                // non-isolated worker has neither.
                 const src = "postMessage({isolated: crossOriginIsolated," +
-                  "type: typeof crossOriginIsolated});";
+                  "type: typeof crossOriginIsolated, sab: typeof SharedArrayBuffer," +
+                  "sabOwn: Object.prototype.hasOwnProperty.call(self, 'SharedArrayBuffer')," +
+                  "sabIn: ('SharedArrayBuffer' in self)," +
+                  "ok: (function () { try { new SharedArrayBuffer(8); return true }" +
+                  " catch (e) { return String(e.name) } })()});";
                 const url = 'data:text/javascript,' + encodeURIComponent(src);
                 globalThis.__got = [];
                 new Worker(url).onmessage = (e) => { globalThis.__got.push(e.data); };
@@ -2863,7 +2895,9 @@ mod tests {
         let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
         assert_eq!(
             got,
-            serde_json::json!(r#"{"isolated":true,"type":"boolean"}"#),
+            serde_json::json!(
+                r#"{"isolated":true,"type":"boolean","sab":"function","sabOwn":true,"sabIn":true,"ok":true}"#
+            ),
         );
 
         let mut rt = spawn_probe(false);
@@ -2871,7 +2905,9 @@ mod tests {
         let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
         assert_eq!(
             got,
-            serde_json::json!(r#"{"isolated":false,"type":"boolean"}"#),
+            serde_json::json!(
+                r#"{"isolated":false,"type":"boolean","sab":"undefined","sabOwn":false,"sabIn":false,"ok":"ReferenceError"}"#
+            ),
         );
     }
 

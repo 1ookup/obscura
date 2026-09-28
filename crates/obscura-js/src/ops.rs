@@ -2094,6 +2094,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 referrer_policy,
                 parent_sandbox,
                 parent_cross_origin_isolated,
+                parent_cross_origin_isolated_allowed,
+                parent_requires_cross_origin_embedding,
             ) = match parent_scope {
                 Some(scope) => (
                     scope.origin,
@@ -2104,6 +2106,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     scope.referrer_policy,
                     scope.sandbox,
                     scope.cross_origin_isolated,
+                    scope.cross_origin_isolated_allowed,
+                    scope.requires_cross_origin_embedding,
                 ),
                 None => (
                     gs.top_origin
@@ -2121,6 +2125,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     // either. Without a resolvable parent scope there is no
                     // isolation to inherit, and the loader's commit recomputes
                     // the committed document's bit from the response.
+                    false,
+                    // Nor is its feature grant: without a parent scope there is
+                    // nothing that could have delegated it.
+                    false,
                     false,
                 ),
             };
@@ -2201,6 +2209,14 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     // controller replaces the document.
                     quirks: true,
                     cross_origin_isolated: initial_cross_origin_isolated,
+                    // An initial about:blank is same-origin with the document
+                    // that embedded it, so the feature's `self` default grants
+                    // it whatever its embedder had; the embedder's policy
+                    // container also hands its embedder policy down. The
+                    // committed navigation recomputes both from the response
+                    // and the container's own `allow` attribute.
+                    cross_origin_isolated_allowed: parent_cross_origin_isolated_allowed,
+                    requires_cross_origin_embedding: parent_requires_cross_origin_embedding,
                 },
             );
             if let Some(name) = name_snapshot {
@@ -2455,6 +2471,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                         .is_none_or(|flags| flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN)),
                     "permissionsPolicy": gs.document_permissions_policy,
                     "crossOriginIsolated": gs.cross_origin_isolated,
+                    // The top-level document grants itself every feature its
+                    // own policy does not deny, `cross-origin-isolated`
+                    // included; only a child can be refused by its container.
+                    "crossOriginIsolatedAllowed": true,
                     "lastModified": gs.document_last_modified,
                     // The top document's parse mode: doctypeless and
                     // about:blank documents are BackCompat in Chrome.
@@ -2481,6 +2501,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     "csp": scope.csp,
                     "permissionsPolicy": scope.permissions_policy,
                     "crossOriginIsolated": scope.cross_origin_isolated,
+                    "crossOriginIsolatedAllowed": scope.cross_origin_isolated_allowed,
                 })
                 .to_string(),
                 None => "null".into(),
@@ -2614,6 +2635,23 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                         .get("crossOriginIsolated")
                         .and_then(|value| value.as_bool())
                         .or(existing.as_ref().map(|scope| scope.cross_origin_isolated))
+                        .unwrap_or(false),
+                    // Same rule for the page's two other document-policy bits:
+                    // the loader sends them when it committed a navigation and
+                    // omits them on a rewrite that only re-states a scope.
+                    cross_origin_isolated_allowed: spec
+                        .get("crossOriginIsolatedAllowed")
+                        .and_then(|value| value.as_bool())
+                        .or(existing
+                            .as_ref()
+                            .map(|scope| scope.cross_origin_isolated_allowed))
+                        .unwrap_or(false),
+                    requires_cross_origin_embedding: spec
+                        .get("requiresCrossOriginEmbedderPolicy")
+                        .and_then(|value| value.as_bool())
+                        .or(existing
+                            .as_ref()
+                            .map(|scope| scope.requires_cross_origin_embedding))
                         .unwrap_or(false),
                 },
             );
@@ -5386,6 +5424,9 @@ mod tests {
                 "quirks": false,
                 "csp": null,
                 "permissionsPolicy": null,
+                // The frame scope's feature grant and embedder-policy bits,
+                // both false until a navigation commits with them.
+                "crossOriginIsolatedAllowed": false,
                 "crossOriginIsolated": false,
             }),
         );

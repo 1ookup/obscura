@@ -309,6 +309,19 @@ pub struct DocumentScope {
     /// about:blank and srcdoc documents inherit the creator's value; network
     /// documents derive it from their COOP/COEP response headers.
     pub cross_origin_isolated: bool,
+    /// Whether this document was granted the `cross-origin-isolated` feature
+    /// by its container: the `allow` attribute of the iframe that embedded it,
+    /// intersected with its embedder's own grant. The top-level document is
+    /// granted it by definition. This is what
+    /// `featurePolicy.allowsFeature('cross-origin-isolated')` answers, and it
+    /// is *not* the same bit as `cross_origin_isolated`: measured Chrome
+    /// answers `true` here for a cross-origin child under a plain top while
+    /// the child still reads `crossOriginIsolated === false`.
+    pub cross_origin_isolated_allowed: bool,
+    /// Whether this document carries a cross-origin embedder policy of its
+    /// own. An embedder under `require-corp` loads no nested document without
+    /// one, so a child navigation reads the embedder's bit before committing.
+    pub requires_cross_origin_embedding: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2524,6 +2537,8 @@ mod tests {
                 document_generation: 1,
                 quirks: false,
                 cross_origin_isolated: false,
+                cross_origin_isolated_allowed: false,
+                requires_cross_origin_embedding: false,
             },
         );
 
@@ -2612,6 +2627,8 @@ mod tests {
                 document_generation: 1,
                 quirks: false,
                 cross_origin_isolated: false,
+                cross_origin_isolated_allowed: false,
+                requires_cross_origin_embedding: false,
             },
         );
 

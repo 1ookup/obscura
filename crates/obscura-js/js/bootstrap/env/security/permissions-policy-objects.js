@@ -11,12 +11,23 @@ const _featurePolicyDeclaredFeatures = new Set([
 function _documentPermissionsPolicy(document) {
   let header = '';
   let origin = '';
+  // Whether the frame was *granted* `cross-origin-isolated`: the container's
+  // `allow` attribute (an iframe's default allowlist is `self`, so a
+  // cross-origin child needs one) intersected with its embedder's own grant,
+  // decided by the navigation layer. It is independent of whether isolation
+  // happened -- measured Chrome answers this true for a cross-origin child
+  // under a plain top with the delegation while the child itself still reads
+  // `crossOriginIsolated === false` -- so it cannot be derived from the
+  // document's own headers, and the `self` this policy resolves against is the
+  // frame's own origin either way.
+  let crossOriginIsolatedAllowed = false;
   try {
     const root = document && typeof document[_scopeRootSym] === 'number'
       ? document[_scopeRootSym] : 0;
     const info = _domParse('document_scope_info', root) || {};
     header = typeof info.permissionsPolicy === 'string' ? info.permissionsPolicy : '';
     origin = typeof info.origin === 'string' ? info.origin : String(document.location.origin || '');
+    crossOriginIsolatedAllowed = info.crossOriginIsolatedAllowed === true;
   } catch (_error) {}
   const directives = new Map();
   for (const part of header.split(/[,;]/)) {
@@ -41,6 +52,16 @@ function _documentPermissionsPolicy(document) {
     if (requestedOrigin !== undefined) {
       try { subject = new URL(String(requestedOrigin), origin || undefined).origin; }
       catch (_error) { subject = String(requestedOrigin); }
+    }
+    if (name === 'cross-origin-isolated') {
+      // The granted set decides, not this document's own headers: the owner's
+      // `self` default and the container's delegation are resolved where the
+      // frame tree is known. A header that denies the feature outright still
+      // wins, exactly as it does for every other feature.
+      if (directives.has(name) && !directives.get(name).some(token => matchesOrigin(token, subject))) {
+        return false;
+      }
+      return crossOriginIsolatedAllowed;
     }
     if (!directives.has(name)) {
       if (_featurePolicyDeniedByDefault.has(name)) return false;

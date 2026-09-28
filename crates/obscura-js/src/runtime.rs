@@ -10186,6 +10186,76 @@ mod tests {
         );
     }
 
+    /// The grant and the isolation are separate bits, and the feature policy
+    /// reports the grant: measured Chrome answers
+    /// `featurePolicy.allowsFeature('cross-origin-isolated') === true` for a
+    /// cross-origin child under a *plain* top carrying the delegation, while
+    /// the same child reads `crossOriginIsolated === false` with no
+    /// `SharedArrayBuffer`. Deriving the policy answer from the isolation bit
+    /// (or the reverse) collapses the two.
+    #[tokio::test(flavor = "current_thread")]
+    async fn feature_policy_reports_the_containers_cross_origin_isolation_grant() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body><iframe id=f></iframe></body></html>"));
+        rt.set_url("https://page.example/");
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let granted = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://widget.example/frame', null, false, true);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("granted-frame", 1, granted, "https://widget.example/frame")
+            .unwrap();
+        let granted_facts = rt
+            .execute_script_in_frame_realm(
+                "granted-frame",
+                1,
+                "<grant-probe>",
+                "[document.featurePolicy.allowsFeature('cross-origin-isolated'), \
+                 crossOriginIsolated, typeof SharedArrayBuffer, \
+                 document.featurePolicy.allowedFeatures().includes('cross-origin-isolated')]",
+            )
+            .unwrap();
+        assert_eq!(
+            granted_facts,
+            serde_json::json!([true, false, "undefined", true]),
+            "a granted child that is not isolated still reports the grant",
+        );
+
+        // The same frame with the grant withheld: the policy answers false and
+        // nothing else moves.
+        let refused = rt
+            .evaluate(&format!(
+                r#"(() => {{
+                    {FRAME_OPS_PRELUDE}
+                    return setupFrame('f', '<html><body></body></html>',
+                        'https://widget.example/frame', null, false, false);
+                }})()"#,
+            ))
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("refused-frame", 1, refused, "https://widget.example/frame")
+            .unwrap();
+        let refused_facts = rt
+            .execute_script_in_frame_realm(
+                "refused-frame",
+                1,
+                "<grant-probe>",
+                "[document.featurePolicy.allowsFeature('cross-origin-isolated'), \
+                 crossOriginIsolated, typeof SharedArrayBuffer]",
+            )
+            .unwrap();
+        assert_eq!(refused_facts, serde_json::json!([false, false, "undefined"]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_isolation_restores_shared_array_buffer_in_page_and_frame_realms() {
         let mut rt = ObscuraJsRuntime::new();
@@ -13154,7 +13224,7 @@ RequestRedirect value",
         // isolated: an omitted bit keeps the document's own value, and the
         // shared state's flag is the top document's alone, never a frame
         // default.
-        const setupFrame = (hostId, html, originUrl, csp, isolated) => {
+        const setupFrame = (hostId, html, originUrl, csp, isolated, allowed) => {
             const host = document.getElementById(hostId)[Symbol.for('obscura.nid')];
             const created = JSON.parse(op("create_iframe_content_document", host));
             // The scope is registered before the parse so the parse op can
@@ -13167,6 +13237,7 @@ RequestRedirect value",
                 documentGeneration: 1,
                 csp: csp ?? null,
                 ...(isolated === undefined ? {} : {crossOriginIsolated: !!isolated}),
+                ...(allowed === undefined ? {} : {crossOriginIsolatedAllowed: !!allowed}),
             }));
             if (html) op("parse_into_subtree", created.root, html);
             return created.root;

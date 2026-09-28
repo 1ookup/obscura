@@ -147,3 +147,11 @@ run covers are then removed.
   on element widths), scoped to `cargo nextest run --release --features render
   -p obscura-render -p obscura-js -p obscura-browser -p obscura-net`
   1628/1628. Full workspace gate deferred to the next backfill.
+
+- 2026-09-28: cross-origin isolation follows the container's grant (frame COI
+  rule, container permissions policy for `cross-origin-isolated`, the COEP
+  embedded-document gate, worker SharedArrayBuffer), scoped to
+  `cargo nextest run --release --features render -p obscura-render
+  -p obscura-js -p obscura-browser -p obscura-net` 1629/1629, plus the
+  two-host isolation fixture against the reference Chrome, 11/11 routes.
+  Full workspace gate deferred to the next backfill.
