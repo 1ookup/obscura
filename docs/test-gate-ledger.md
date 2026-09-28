@@ -64,3 +64,10 @@ run covers are then removed.
   `cargo check -p obscura-js --no-default-features
   --config vendor/v8-source.toml` clean. Full workspace gate deferred to the
   next backfill; obstacle course absent on this host as above.
+
+- 2026-09-28: `ad9d37a` (client-hints delegation) scoped to
+  `cargo nextest run --release -p obscura-net --config vendor/v8-source.toml`
+  134/134 (`obscura-net` has no `render` feature) and
+  `cargo nextest run --release --features render -p obscura-js
+  --config vendor/v8-source.toml` 739/739. Full workspace gate deferred to the
+  next backfill.
