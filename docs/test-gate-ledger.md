@@ -167,8 +167,9 @@ run covers are then removed.
 - 2026-09-28: secure-context gating batch (`654ad05` opaque-origin
   isSecureContext, `081bb49` deviceMemory 16 + gate, `dd5e490` full 253-name
   insecure window gate, `b598962` worker secure-context interface set,
-  `17fe980` worker caches onto the prototype), scoped to
+  `17fe980` worker caches onto the prototype, `83107d3` navigator member
+  gate, `69189da` tests on a secure origin), scoped to
   `cargo nextest run --release --features render -p obscura-js
   -p obscura-browser -p obscura-net --no-fail-fast
-  --config vendor/v8-source.toml`. Full workspace gate deferred to the next
-  backfill.
+  --config vendor/v8-source.toml` = **1016/1016 passed** at HEAD `69189da`.
+  Full workspace gate deferred to the next backfill.
