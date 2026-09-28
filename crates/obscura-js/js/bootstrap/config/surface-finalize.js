@@ -102,9 +102,10 @@
     if (href === 'about:blank' || href === 'about:srcdoc' || href.startsWith('blob:')) {
       const own = _scopeOrigin(_callingFrameRoot());
       const origin = own !== null && own !== 'null' ? own : _inheritedDocumentOrigin();
-      // A top-level about:blank has no creator to inherit from; that keeps the
-      // previous answer, which is also Chrome's for a fresh tab.
-      if (origin === null) return true;
+      // A top-level about:blank has no creator to inherit from: its origin is
+      // opaque, and Chrome answers isSecureContext false there (measured
+      // Chrome 149 -- page false, and the page's own worker agrees).
+      if (origin === null) return false;
       return origin !== 'null' && _isPotentiallyTrustworthy(origin);
     }
     return _isPotentiallyTrustworthy(href);
@@ -228,9 +229,10 @@
       // undefined, on an insecure origin (measured).
       'userAgentData',
     ]) _remove(globalThis.navigator, name);
-    for (const name of ['documentPictureInPicture', 'launchQueue']) {
-      _remove(globalThis, name);
-    }
+    // `documentPictureInPicture` is [SecureContext]; `launchQueue` is not --
+    // Chrome 149 keeps it on insecure origins too (measured), so the older
+    // Chrome 146 oracle row that removed it has expired.
+    _remove(globalThis, 'documentPictureInPicture');
     _remove(globalThis.crypto, 'subtle');
 
     // `geolocation` and `Notification` deliberately stay. Chrome keeps both
