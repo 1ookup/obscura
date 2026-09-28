@@ -951,7 +951,7 @@ fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String 
             function syncSheet() {{
                 if (!style) {{
                     style = document.createElement('style');
-                    style.setAttribute('data-obscura-external-stylesheets', '');
+                    style.setAttribute('data-css-ext', '');
                     style.textContent = `{escaped_css}`;
                     globalThis.__obscura_registerLinkedStylesheet(link, style);
                 }}
@@ -993,14 +993,14 @@ fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
             var authorIndex = -1;
             for (var i = 0; i < styles.length; i++) {{
                 var candidate = styles[i];
-                if (candidate.hasAttribute('data-obscura-external-stylesheets')
-                    || candidate.hasAttribute('data-obscura-inline-import')) continue;
+                if (candidate.hasAttribute('data-css-ext')
+                    || candidate.hasAttribute('data-css-import')) continue;
                 authorIndex++;
                 if (authorIndex === {style_index}) {{ source = candidate; break; }}
             }}
             if (!source || !source.parentNode) return;
             var imported = document.createElement('style');
-            imported.setAttribute('data-obscura-inline-import', '');
+            imported.setAttribute('data-css-import', '');
             var media = source.getAttribute('media') || '';
             if (media.trim()) imported.setAttribute('media', media);
             imported.textContent = `{escaped_css}`;
@@ -1046,9 +1046,9 @@ fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImp
             continue;
         };
         if node
-            .get_attribute("data-obscura-external-stylesheets")
+            .get_attribute("data-css-ext")
             .is_some()
-            || node.get_attribute("data-obscura-inline-import").is_some()
+            || node.get_attribute("data-css-import").is_some()
         {
             continue;
         }
@@ -7121,7 +7121,7 @@ impl Page {
     /// Fetch and install external stylesheets for one committed frame content
     /// document (Phase 3.6). Each fetched graph is inserted as a `<style>`
     /// node right after its source `<link>`, tagged
-    /// `data-obscura-materialized`, which the per-root render pipeline's
+    /// `data-css-materialized`, which the per-root render pipeline's
     /// `<style>` scan picks up. Discovery mirrors the main document's
     /// `linked_stylesheet_requests`: disabled alternates stay dormant and
     /// media-gated sheets still fetch, carrying the media condition onto the
@@ -7221,7 +7221,7 @@ impl Page {
             };
             let already = link.next_sibling.and_then(|sibling| {
                 dom.with_node(sibling, |node| {
-                    node.get_attribute("data-obscura-materialized").is_some()
+                    node.get_attribute("data-css-materialized").is_some()
                 })
             });
             if already == Some(true) {
@@ -7238,7 +7238,7 @@ impl Page {
                 mathml_annotation_xml_integration_point: false,
             });
             dom.with_node_mut(style, |node| {
-                node.set_attribute("data-obscura-materialized", "1".to_string());
+                node.set_attribute("data-css-materialized", "1".to_string());
                 if let Some(media) = &media {
                     if !media.trim().is_empty() {
                         node.set_attribute("media", media.clone());
@@ -11577,7 +11577,7 @@ mod tests {
                     .filter(|sid| {
                         dom.get_node(*sid)
                             .and_then(|node| {
-                                node.get_attribute("data-obscura-materialized")
+                                node.get_attribute("data-css-materialized")
                                     .map(|_| ())
                             })
                             .is_some()
@@ -12046,7 +12046,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .with_dom(|dom| {
-                dom.query_selector_all("style[data-obscura-external-stylesheets]")
+                dom.query_selector_all("style[data-css-ext]")
                     .unwrap()
                     .into_iter()
                     .map(|nid| dom.text_content(nid))
@@ -12141,7 +12141,7 @@ mod tests {
                     .map(|nid| {
                         let node = dom.get_node(nid).unwrap();
                         (
-                            node.get_attribute("data-obscura-inline-import").is_some(),
+                            node.get_attribute("data-css-import").is_some(),
                             node.get_attribute("media").map(str::to_string),
                             dom.text_content(nid),
                         )
@@ -14240,7 +14240,7 @@ mod tests {
                     .expect("valid selector")
                     .expect("async link");
                 let styles = dom
-                    .query_selector_all("style[data-obscura-external-stylesheets]")
+                    .query_selector_all("style[data-css-ext]")
                     .expect("valid selector");
                 (
                     dom.get_node(link)
@@ -14289,7 +14289,7 @@ mod tests {
                 (
                     dom.get_node(link)
                         .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
-                    dom.query_selector("style[data-obscura-external-stylesheets]")
+                    dom.query_selector("style[data-css-ext]")
                         .expect("valid selector")
                         .and_then(|style| {
                             dom.get_node(style)
@@ -14364,7 +14364,7 @@ mod tests {
                     }
                     sameSheet.insertRule('.added { height: 9px }', sameRules.length);
                     const source = document.querySelector(
-                        'style[data-obscura-external-stylesheets]'
+                        'style[data-css-ext]'
                     );
                     return {
                         stableList: list === document.styleSheets,

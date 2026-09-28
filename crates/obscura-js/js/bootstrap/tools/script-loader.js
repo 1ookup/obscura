@@ -549,7 +549,7 @@ async function _loadLinkedStylesheet(c) {
     if (previous?.parentNode) previous.parentNode.removeChild(previous);
     const media = c.getAttribute("media") || "";
     const style = document.createElement("style");
-    style.setAttribute("data-obscura-linked", fullUrl);
+    style.setAttribute("data-css-linked", fullUrl);
     style.textContent = css;
     _registerLinkedStylesheet(c, style, fullUrl);
     if (c.parentNode && !c.disabled && _cssImportApplies(media)) {

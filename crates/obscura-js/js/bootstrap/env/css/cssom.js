@@ -91,10 +91,10 @@ function _cssRuleFromText(text) {
 
 const _styleElementSheets = new WeakMap();
 function _styleElementIsCssomBridge(style) {
-  return style.hasAttribute("data-obscura-adopted")
-    || style.hasAttribute("data-obscura-linked")
-    || style.hasAttribute("data-obscura-external-stylesheets")
-    || style.hasAttribute("data-obscura-inline-import");
+  return style.hasAttribute("data-css-adopted")
+    || style.hasAttribute("data-css-linked")
+    || style.hasAttribute("data-css-ext")
+    || style.hasAttribute("data-css-import");
 }
 function _styleElementHasCssSheet(style) {
   if (!style || style.localName !== "style" || !style.isConnected) return false;
@@ -216,7 +216,7 @@ function _syncAdoptedStyles(root) {
     let node = nodes.get(sheet);
     if (!node || node.parentNode !== target) {
       node = (root.ownerDocument || globalThis.document).createElement("style");
-      node.setAttribute("data-obscura-adopted", "");
+      node.setAttribute("data-css-adopted", "");
       target.appendChild(node);
       nodes.set(sheet, node);
     }

@@ -24214,7 +24214,7 @@ RequestRedirect value",
                     const sheet = new CSSStyleSheet();
                     document.adoptedStyleSheets.push(sheet);
                     sheet.insertRule('.card { display: flex; color: red; }', 0);
-                    const node = document.querySelector('style[data-obscura-adopted]');
+                    const node = document.querySelector('style[data-css-adopted]');
                     const inserted = node.textContent;
                     sheet.replaceSync('.card { content: "a;b"; background-image: url("data:image/svg+xml;utf8,<svg/>"); }');
                     const preserved = [
@@ -24226,7 +24226,7 @@ RequestRedirect value",
                     sheet.deleteRule(0);
                     return [
                         document.adoptedStyleSheets.length,
-                        document.querySelectorAll('style[data-obscura-adopted]').length,
+                        document.querySelectorAll('style[data-css-adopted]').length,
                         inserted.includes('display: flex'),
                         preserved,
                         node.textContent,
@@ -24278,9 +24278,9 @@ RequestRedirect value",
                     second.adoptedStyleSheets.push(shared);
                     document.adoptedStyleSheets = [shared];
 
-                    const firstNode = first.querySelector('style[data-obscura-adopted]');
-                    const secondNode = second.querySelector('style[data-obscura-adopted]');
-                    const documentNode = document.querySelector('style[data-obscura-adopted]');
+                    const firstNode = first.querySelector('style[data-css-adopted]');
+                    const secondNode = second.querySelector('style[data-css-adopted]');
+                    const documentNode = document.querySelector('style[data-css-adopted]');
                     const initial = [
                         first.styleSheets === firstList,
                         firstList.length,
@@ -24309,7 +24309,7 @@ RequestRedirect value",
                         second.adoptedStyleSheets === secondAdopted,
                         secondAdopted.length,
                         secondNode.parentNode,
-                        second.querySelectorAll('style[data-obscura-adopted]').length,
+                        second.querySelectorAll('style[data-css-adopted]').length,
                         firstNode.textContent.includes('width: 47px'),
                         documentNode.textContent.includes('width: 47px'),
                         secondNode.textContent.includes('width: 31px'),
@@ -29260,7 +29260,7 @@ RequestRedirect value",
                         });
                         document.head.appendChild(link);
                         await loaded;
-                        const style = document.querySelector("style[data-obscura-linked]");
+                        const style = document.querySelector("style[data-css-linked]");
                         const css = style.textContent;
                         const afterLink = link.nextSibling === style;
                         const list = document.styleSheets;
@@ -29283,7 +29283,7 @@ RequestRedirect value",
                             routeUrl:
                                 css.includes("http://example.com/img/card.png"),
                             removedWithLink:
-                                !document.querySelector("style[data-obscura-linked]"),
+                                !document.querySelector("style[data-css-linked]"),
                             cssom,
                             detachedCssom: sheet.ownerNode === null
                                 && link.sheet === null
@@ -29343,7 +29343,7 @@ RequestRedirect value",
                             link.onerror = () => resolve('error');
                             document.head.appendChild(link);
                         });
-                        return [outcome, calls, !!document.querySelector('style[data-obscura-linked]')];
+                        return [outcome, calls, !!document.querySelector('style[data-css-linked]')];
                     } finally {
                         Deno.core.ops.op_fetch_url = originalFetchOp;
                     }
@@ -29376,7 +29376,7 @@ RequestRedirect value",
                             link.onerror = () => resolve('error');
                             document.head.appendChild(link);
                         });
-                        return [outcome, origins, !!document.querySelector('style[data-obscura-linked]')];
+                        return [outcome, origins, !!document.querySelector('style[data-css-linked]')];
                     } finally {
                         Deno.core.ops.op_fetch_url = originalFetchOp;
                     }
