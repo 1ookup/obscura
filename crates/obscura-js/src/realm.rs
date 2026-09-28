@@ -3804,6 +3804,77 @@ typeofCarrier: typeof __bootstrap, carrierIn: '__bootstrap' in globalThis })";
         );
     }
 
+    /// A frame realm's window carries the same IDL attribute shapes as the
+    /// top-level one: accessors whose getters report "get <name>", the same
+    /// non-configurable set, and the live viewport getters the frame installs.
+    /// The cross-origin challenge widget lives in exactly this realm, so the
+    /// descriptor shape a page reflects over there has to match Chrome's --
+    /// config/window-attributes.js converts the top-level window and runs from
+    /// __obscura_init, which every realm runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_window_attributes_are_accessors() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            "<html><head></head><body>\
+             <iframe id=f style=\"display:block;width:300px;height:65px;border:0\"></iframe>\
+             </body></html>",
+        ));
+        rt.set_url("http://example.com/test");
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        let root = setup_frame(&mut rt, "f", FRAME_HTML, "http://example.com/frame", 1);
+        rt.ensure_frame_realm("frame-test", 1, root, "http://example.com/frame")
+            .unwrap();
+        let result = rt
+            .execute_script_in_frame_realm(
+                "frame-test",
+                1,
+                "<t>",
+                r#"JSON.stringify((function () {
+                     const facts = name => {
+                       const d = Object.getOwnPropertyDescriptor(window, name);
+                       if (!d) return 'absent';
+                       if (!d.get) return 'data';
+                       return [String(d.get.name), d.set === undefined ? 'no-set' : String(d.set.name),
+                               d.enumerable, d.configurable,
+                               Function.prototype.toString.call(d.get)];
+                     };
+                     return {
+                       document: facts('document'),
+                       navigator: facts('navigator'),
+                       innerWidth: facts('innerWidth'),
+                       location: facts('location'),
+                       localStorage: facts('localStorage'),
+                       topIsSelf: top === window,
+                       selfIsWindow: self === window,
+                       navigatorTag: Object.prototype.toString.call(navigator),
+                       fontsStatus: document.fonts.status,
+                     };
+                   })())"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "document": ["get document", "no-set", true, false,
+                             "function get document() { [native code] }"],
+                "navigator": ["get navigator", "no-set", true, true,
+                              "function get navigator() { [native code] }"],
+                "innerWidth": ["get innerWidth", "set innerWidth", true, true,
+                               "function get innerWidth() { [native code] }"],
+                "location": ["get location", "set location", true, false,
+                             "function get location() { [native code] }"],
+                "localStorage": ["get localStorage", "no-set", true, true,
+                                 "function get localStorage() { [native code] }"],
+                "topIsSelf": false,
+                "selfIsWindow": true,
+                "navigatorTag": "[object Navigator]",
+                "fontsStatus": "loaded",
+            })
+        );
+    }
+
     /// CSSOM geometry for a node inside an iframe must come from that frame's
     /// own layout, not the top-level document's. Reading it from the top-level
     /// `prepared_render` -- which does not contain frame content -- reported

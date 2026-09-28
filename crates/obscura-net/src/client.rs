@@ -421,6 +421,25 @@ impl ResourceRequest {
         }
     }
 
+    /// Whether the high-entropy UA hints this origin published in Accept-CH
+    /// may go to `target`. Two conditions, both measured on Chrome 153/149:
+    /// the initiating context must hold the delegation (a frame that is not
+    /// same-origin with the top-level document does not), and the target must
+    /// be same-origin with the initiating document -- a first-party page
+    /// fetching `sub.localhost` from `localhost` sends the low-entropy trio
+    /// only, with the target's hints already cached. A request with no
+    /// initiator (a top-level navigation) has no client to compare against and
+    /// keeps its hints, which is what makes Accept-CH survive a navigation.
+    pub fn may_send_accepted_client_hints(&self, target: &Url) -> bool {
+        if !self.client_hints_delegated {
+            return false;
+        }
+        match self.initiator.as_ref() {
+            Some(initiator) => initiator.origin() == target.origin(),
+            None => true,
+        }
+    }
+
     /// The initiating context cannot send high-entropy UA client hints: it is
     /// a frame that is not same-origin with the top-level document and no
     /// ancestor delegates the `ch-ua-*` features to it.
@@ -2015,11 +2034,11 @@ impl ObscuraHttpClient {
 
             // High-entropy hints ride on the `Accept-CH` cache, which is per
             // origin and knows nothing about who is asking. The features
-            // behind them default to an allowlist of `self`, so a frame that
-            // is not same-origin with the top-level document must not send
-            // them: Chrome answers the low-entropy trio there and nothing
-            // else.
-            let accepted_hints: &[String] = if request.client_hints_delegated {
+            // behind them default to an allowlist of `self`, so only a
+            // request whose initiator is same-origin with the target and
+            // holds the delegation carries them; every other context answers
+            // the low-entropy trio. See may_send_accepted_client_hints.
+            let accepted_hints: &[String] = if request.may_send_accepted_client_hints(&current_url) {
                 &accepted_hints
             } else {
                 &[]
@@ -2118,7 +2137,7 @@ impl ObscuraHttpClient {
             // would add are exactly the ones a non-delegated frame may not
             // send: retrying there would re-issue the request for nothing.
             if !client_hint_retry
-                && request.client_hints_delegated
+                && request.may_send_accepted_client_hints(&current_url)
                 && !critical_hints.is_empty()
                 && !is_frame_document_request(&request)
                 && critical_hints

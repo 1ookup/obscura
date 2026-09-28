@@ -4798,6 +4798,11 @@ async fn stealth_fetch_all(
             referrer_policy.as_str(),
         );
 
+        // The hints also require the target to be same-origin with the
+        // initiating realm: a first-party fetch to a cross-origin origin that
+        // published Accept-CH answers the low-entropy trio only.
+        let hints_delegated_here = client_hints_delegated
+            && parsed_current.origin().ascii_serialization() == page_origin;
         let r = match stealth
             .send_single(
                 &current_method,
@@ -4806,7 +4811,7 @@ async fn stealth_fetch_all(
                 &current_body,
                 credentials_allowed,
                 credentials_allowed,
-                client_hints_delegated,
+                hints_delegated_here,
             )
             .await
         {

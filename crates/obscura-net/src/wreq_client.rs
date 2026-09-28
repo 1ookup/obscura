@@ -572,7 +572,7 @@ impl StealthHttpClient {
             // trio, which the plan emits from the fingerprint. Measured
             // against Chromium with the client-hints fixture: three hints in
             // the cross-origin iframe, nine at the top level.
-            if !request.client_hints_delegated {
+            if !request.may_send_accepted_client_hints(&current_url) {
                 accepted_hints.clear();
             }
             // Low-entropy UA-CH fields are emitted from the fingerprint, and an
@@ -709,7 +709,7 @@ impl StealthHttpClient {
                     .extend(hints);
             }
             if !client_hint_retry
-                && request.client_hints_delegated
+                && request.may_send_accepted_client_hints(&current_url)
                 && !critical_hints.is_empty()
                 && !crate::client::is_frame_document_request(&request)
                 && critical_hints.iter().any(|hint| !sent_client_hints.contains(hint))
@@ -893,7 +893,8 @@ impl StealthHttpClient {
         // length Chrome puts first is known here rather than appended later by
         // the transport.
         let body_len = (!body.is_empty()).then(|| body.len());
-        // A non-delegated frame may not send the high-entropy hints at all:
+        // A frame without the delegation, or any request whose initiator is
+        // cross-origin to the target, may not send the high-entropy hints:
         // dropping them from the accepted set leaves the low-entropy trio,
         // which the plan emits from the fingerprint.
         let accepted_hints: &[String] = if client_hints_delegated {
@@ -1072,6 +1073,7 @@ mod tests {
     use url::Url;
 
     use super::StealthHttpClient;
+    use crate::client::{ResourceRequest, ResourceType};
     use crate::cookies::CookieJar;
 
     const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
@@ -1689,6 +1691,56 @@ mod tests {
             assert!(
                 !request.contains(&format!("\r\n{name}:")),
                 "{name} must not be sent without delegation: {request}"
+            );
+        }
+    }
+
+    // The other half of the client-hints rule: even a first-party document
+    // does not send the high-entropy hints to a cross-origin target, with the
+    // target's Accept-CH entry already cached. Measured on the fixture where
+    // localhost fetches sub.localhost (one registrable domain, two origins):
+    // Chrome answers three hints there and nine on its own origin.
+    #[tokio::test]
+    async fn a_cross_origin_target_gets_the_low_entropy_trio_only() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT);
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.accepted_client_hints.write().await.insert(
+            super::client_hint_origin(&url),
+            std::collections::HashSet::from([
+                "sec-ch-ua-arch".to_string(),
+                "sec-ch-ua-bitness".to_string(),
+                "sec-ch-ua-full-version".to_string(),
+                "sec-ch-ua-model".to_string(),
+                "sec-ch-ua-platform-version".to_string(),
+                "sec-ch-ua-full-version-list".to_string(),
+            ]),
+        );
+        let mut cross_origin = ResourceRequest::subresource(ResourceType::Fetch, &url);
+        // No-CORS keeps the fixture's missing ACAO header out of the way; the
+        // hint decision under test does not depend on the request mode.
+        cross_origin.mode = crate::client::RequestMode::NoCors;
+        cross_origin.initiator = Some(Url::parse("http://initiator.test/page").unwrap());
+        client
+            .fetch_resource_with_callbacks(&url, cross_origin, None)
+            .await
+            .expect("fixture must be reachable");
+        let seen = request.await.unwrap().to_ascii_lowercase();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            assert_eq!(
+                seen.matches(&format!("\r\n{name}:")).count(),
+                1,
+                "{name} is low-entropy and always sent: {seen}"
+            );
+        }
+        for name in ["sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version",
+                     "sec-ch-ua-model", "sec-ch-ua-platform-version",
+                     "sec-ch-ua-full-version-list"] {
+            assert!(
+                !seen.contains(&format!("\r\n{name}:")),
+                "{name} must not cross an origin boundary: {seen}"
             );
         }
     }

@@ -76,3 +76,9 @@ run covers are then removed.
   scoped to `cargo nextest run --release --features render -p obscura-js`
   739/739 and `-p obscura-browser` 139/139, plus `-p obscura-net` 134/134 for
   the client-hints commit. Full workspace gate deferred to the next backfill.
+
+- 2026-09-28: client-hints target-origin gate, scoped to
+  `cargo nextest run --release -p obscura-net` 135/135 and
+  `cargo nextest run --release --features render -p obscura-browser` 139/139.
+  Full workspace gate deferred to the next backfill; the fixture comparisons
+  (three local fixtures, both engines) are in the commit message.
