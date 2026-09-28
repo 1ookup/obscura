@@ -6497,7 +6497,21 @@ impl Page {
                         "frame navigation has no ancestor chain and no referrer of its own; document.referrer will be empty"
                     );
                 }
-                chain.first().map(|(url, _)| url.clone())
+                // The chain runs nearest ancestor first. A frame that never
+                // committed a document URL (about:blank, an empty scope) is not
+                // a referrer source of its own: Blink resolves the referrer of
+                // a blank frame to the nearest ancestor that has one, which is
+                // why the widget frame embedded through a blank runner reports
+                // the embedding page rather than the empty string.
+                chain
+                    .iter()
+                    .find(|(url, _)| {
+                        Url::parse(url)
+                            .map(|parsed| matches!(parsed.scheme(), "http" | "https"))
+                            .unwrap_or(false)
+                    })
+                    .or_else(|| chain.last())
+                    .map(|(url, _)| url.clone())
             });
         let mut sandbox = request.sandbox.merged_with_parent(parent_sandbox);
         let ancestors = self.frame_ancestor_chain(frame_id);
