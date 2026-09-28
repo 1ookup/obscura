@@ -215,24 +215,90 @@
       }
     }
 
-    for (const name of ['caches', 'CacheStorage', 'Cache']) _remove(globalThis, name);
+    // The full [SecureContext] interface surface, measured Chrome 149 as the
+    // exact own-name delta between a secure and an insecure window (1234 vs
+    // 981): every name below is own on a secure origin and gone on an
+    // insecure one. `launchQueue` is deliberately absent -- the reference
+    // keeps it on insecure origins.
+    for (const name of [
+      'AbsoluteOrientationSensor', 'Accelerometer', 'AudioDecoder', 'AudioEncoder',
+      'AudioPlaybackStats', 'AudioWorklet', 'AuthenticatorAssertionResponse', 'AuthenticatorAttestationResponse',
+      'AuthenticatorResponse', 'BarcodeDetector', 'BatteryManager', 'Bluetooth',
+      'BluetoothCharacteristicProperties', 'BluetoothDevice', 'BluetoothRemoteGATTCharacteristic', 'BluetoothRemoteGATTDescriptor',
+      'BluetoothRemoteGATTServer', 'BluetoothRemoteGATTService', 'Cache', 'CacheStorage',
+      'CaptureController', 'Clipboard', 'ClipboardChangeEvent', 'ClipboardItem',
+      'CookieChangeEvent', 'CookieStore', 'CookieStoreManager', 'CreateMonitor',
+      'Credential', 'CredentialsContainer', 'CryptoKey', 'DeviceMotionEvent',
+      'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate', 'DeviceOrientationEvent', 'DevicePosture',
+      'DigitalCredential', 'DocumentPictureInPicture', 'EyeDropper', 'FederatedCredential',
+      'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle',
+      'FileSystemObserver', 'FileSystemWritableFileStream', 'FontData', 'GPU',
+      'GPUAdapter', 'GPUAdapterInfo', 'GPUBindGroup', 'GPUBindGroupLayout',
+      'GPUBuffer', 'GPUBufferUsage', 'GPUCanvasContext', 'GPUColorWrite',
+      'GPUCommandBuffer', 'GPUCommandEncoder', 'GPUCompilationInfo', 'GPUCompilationMessage',
+      'GPUComputePassEncoder', 'GPUComputePipeline', 'GPUDevice', 'GPUDeviceLostInfo',
+      'GPUError', 'GPUExternalTexture', 'GPUInternalError', 'GPUMapMode',
+      'GPUOutOfMemoryError', 'GPUPipelineError', 'GPUPipelineLayout', 'GPUQuerySet',
+      'GPUQueue', 'GPURenderBundle', 'GPURenderBundleEncoder', 'GPURenderPassEncoder',
+      'GPURenderPipeline', 'GPUSampler', 'GPUShaderModule', 'GPUShaderStage',
+      'GPUSupportedFeatures', 'GPUSupportedLimits', 'GPUTexture', 'GPUTextureUsage',
+      'GPUTextureView', 'GPUUncapturedErrorEvent', 'GPUValidationError', 'GravitySensor',
+      'Gyroscope', 'HID', 'HIDConnectionEvent', 'HIDDevice',
+      'HIDInputReportEvent', 'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider',
+      'IdleDetector', 'ImageCapture', 'ImageDecoder', 'ImageTrack',
+      'ImageTrackList', 'Keyboard', 'KeyboardLayoutMap', 'LanguageDetector',
+      'LanguageModel', 'LinearAccelerationSensor', 'Lock', 'LockManager',
+      'MIDIAccess', 'MIDIConnectionEvent', 'MIDIInput', 'MIDIInputMap',
+      'MIDIMessageEvent', 'MIDIOutput', 'MIDIOutputMap', 'MIDIPort',
+      'MediaDeviceInfo', 'MediaDevices', 'MediaKeyMessageEvent', 'MediaKeySession',
+      'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys', 'ModelContext',
+      'NavigationPreloadManager', 'NavigatorLogin', 'NavigatorManagedData', 'OTPCredential',
+      'OrientationSensor', 'PasswordCredential', 'PaymentAddress', 'PaymentManager',
+      'PaymentMethodChangeEvent', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse',
+      'Presentation', 'PresentationAvailability', 'PresentationConnection', 'PresentationConnectionAvailableEvent',
+      'PresentationConnectionCloseEvent', 'PresentationConnectionList', 'PresentationReceiver', 'PresentationRequest',
+      'PressureObserver', 'PressureRecord', 'ProtectedAudience', 'PublicKeyCredential',
+      'RelativeOrientationSensor', 'ScreenDetailed', 'ScreenDetails', 'Sensor',
+      'SensorErrorEvent', 'Serial', 'SerialPort', 'ServiceWorker',
+      'ServiceWorkerContainer', 'ServiceWorkerRegistration', 'SpeechRecognitionPhrase', 'StorageBucket',
+      'StorageBucketManager', 'StorageManager', 'SubtleCrypto', 'Summarizer',
+      'Translator', 'USB', 'USBAlternateInterface', 'USBConfiguration',
+      'USBConnectionEvent', 'USBDevice', 'USBEndpoint', 'USBInTransferResult',
+      'USBInterface', 'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket',
+      'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'VideoDecoder', 'VideoEncoder',
+      'VirtualKeyboard', 'WGSLLanguageFeatures', 'WakeLock', 'WakeLockSentinel',
+      'WebTransport', 'WebTransportBidirectionalStream', 'WebTransportDatagramDuplexStream', 'WebTransportError',
+      'Worklet', 'XRAnchor', 'XRAnchorSet', 'XRBoundedReferenceSpace',
+      'XRCPUDepthInformation', 'XRCamera', 'XRCompositionLayer', 'XRCubeLayer',
+      'XRCylinderLayer', 'XRDOMOverlayState', 'XRDepthInformation', 'XREquirectLayer',
+      'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource',
+      'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
+      'XRJointPose', 'XRJointSpace', 'XRLayer', 'XRLayerEvent',
+      'XRLightEstimate', 'XRLightProbe', 'XRPlane', 'XRPlaneSet',
+      'XRPose', 'XRProjectionLayer', 'XRQuadLayer', 'XRRay',
+      'XRReferenceSpace', 'XRReferenceSpaceEvent', 'XRRenderState', 'XRRigidTransform',
+      'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSubImage',
+      'XRSystem', 'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource', 'XRView',
+      'XRViewerPose', 'XRViewport', 'XRVisibilityMaskChangeEvent', 'XRWebGLBinding',
+      'XRWebGLDepthInformation', 'XRWebGLLayer', 'XRWebGLSubImage', 'caches',
+      'cookieStore', 'documentPictureInPicture', 'fetchLater', 'getScreenDetails',
+      'ondevicemotion', 'ondeviceorientation', 'ondeviceorientationabsolute', 'onpointerrawupdate',
+      'queryLocalFonts', 'sharedStorage', 'showDirectoryPicker', 'showOpenFilePicker',
+      'showSaveFilePicker'
+    ]) _remove(globalThis, name);
     for (const name of [
       'serviceWorker', 'mediaDevices', 'storage', 'clipboard', 'wakeLock',
       'credentials', 'locks',
       // Secure-only hardware/device APIs from the interface surface install.
-      // Keyboard deliberately stays: Chrome keeps it on insecure origins
-      // too, and gpu stays for engine continuity (its shell predates this
-      // table and callers rely on it in tests).
+      // gpu is [SecureContext] too: the reference hides it on insecure
+      // origins in both realms (measured 149); Keyboard goes with the
+      // interface list above, where the reference also hides it.
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
-      'protectedAudience', 'storageBuckets',
+      'protectedAudience', 'storageBuckets', 'gpu',
       // `userAgentData` and `deviceMemory` are [SecureContext] in Chrome and
       // are absent, not undefined, on an insecure origin (measured 149).
       'userAgentData', 'deviceMemory',
     ]) _remove(globalThis.navigator, name);
-    // `documentPictureInPicture` is [SecureContext]; `launchQueue` is not --
-    // Chrome 149 keeps it on insecure origins too (measured), so the older
-    // Chrome 146 oracle row that removed it has expired.
-    _remove(globalThis, 'documentPictureInPicture');
     _remove(globalThis.crypto, 'subtle');
 
     // `geolocation` and `Notification` deliberately stay. Chrome keeps both
