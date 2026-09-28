@@ -292,9 +292,13 @@
       // Secure-only hardware/device APIs from the interface surface install.
       // gpu is [SecureContext] too: the reference hides it on insecure
       // origins in both realms (measured 149); Keyboard goes with the
-      // interface list above, where the reference also hides it.
-      'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
+      // interface list above, where the reference also hides it. `ink` stays:
+      // the reference keeps navigator.ink on insecure origins.
+      'bluetooth', 'hid', 'serial', 'usb', 'xr', 'login', 'managed',
       'protectedAudience', 'storageBuckets', 'gpu',
+      'keyboard', 'virtualKeyboard', 'presentation', 'devicePosture',
+      'adAuctionComponents', 'runAdAuction', 'canLoadAdAuctionFencedFrame',
+      'deprecatedRunAdAuctionEnforcesKAnonymity',
       // `userAgentData` and `deviceMemory` are [SecureContext] in Chrome and
       // are absent, not undefined, on an insecure origin (measured 149).
       'userAgentData', 'deviceMemory',
