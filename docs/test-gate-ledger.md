@@ -88,3 +88,9 @@ run covers are then removed.
   `-p obscura-browser` 139/139 and `-p obscura-js` 739/740 (one animation
   timing test flaked under parallel load, passes alone). Full workspace gate
   deferred to the next backfill.
+
+- 2026-09-28: gsLi5 surface (document/doctype/implementation/featurePolicy),
+  scoped to `cargo nextest run --release --features render -p obscura-js`
+  739/740 (one animation timing test flakes under parallel load, passes
+  alone) and `-p obscura-browser` 139/139. Full workspace gate deferred to
+  the next backfill.

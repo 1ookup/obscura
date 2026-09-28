@@ -86,13 +86,12 @@ var Document = _swappableInterface('Document', class extends Node {
   }
   get featurePolicy() {
     if (!_documentFeaturePolicies.has(this)) {
-      // Chrome 153 brands this object PermissionsPolicy, not FeaturePolicy --
-      // Object.prototype.toString.call(document.featurePolicy) answers
-      // [object PermissionsPolicy] there (2026-09-26 oracle), and the iframe
-      // wrapper below already minted the PermissionsPolicy class. The global
-      // FeaturePolicy shell stays for the interface surface.
+      // Chrome brands this object FeaturePolicy, and the 2026-09-28 census of
+      // the passing round lists the tag among its divergences; an earlier
+      // oracle answered PermissionsPolicy here. The two interfaces carry the
+      // same four operations, so this is the legacy view of one policy.
       _documentFeaturePolicies.set(this,
-        new PermissionsPolicy(_permissionsPolicyKey, this));
+        new FeaturePolicy(_featurePolicyKey, this));
     }
     return _documentFeaturePolicies.get(this);
   }
@@ -122,20 +121,22 @@ var Document = _swappableInterface('Document', class extends Node {
   get pictureInPictureEnabled() { return true; }
   get webkitFullscreenEnabled() { return true; }
   get doctype() {
-    if (typeof this[_scopeRootSym] === 'number') {
-      const ids = _domParse("child_nodes", this[_scopeRootSym]) || [];
-      for (const cid of ids) {
-        if (+_dom("node_type", cid) === 10) return _wrap(+cid);
-      }
-      return null;
-    }
+    // The doctype is the document's own child node, and it has to be the same
+    // object the node wrapper returns: Chrome answers
+    // `document.doctype === document.firstChild` with true. The document-level
+    // `document_doctype` op this used to read only describes the top-level
+    // document, so a frame's doctype was wrong there as well.
     if (this._doctype !== undefined) return this._doctype;
-    const info = _domParse("document_doctype");
-    if (info && info.name) {
-      _hset(this, "_doctype", new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || ""));
-    } else {
-      _hset(this, "_doctype", null);
+    const root = typeof this[_scopeRootSym] === 'number'
+      ? this[_scopeRootSym] : +_dom("document_node_id");
+    const ids = _domParse("child_nodes", root) || [];
+    for (const cid of ids) {
+      if (+_dom("node_type", cid) === 10) {
+        _hset(this, "_doctype", _wrap(+cid));
+        return this._doctype;
+      }
     }
+    _hset(this, "_doctype", null);
     return this._doctype;
   }
   get title() {
@@ -734,60 +735,15 @@ var Document = _swappableInterface('Document', class extends Node {
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
   get implementation() {
-    const ownerDoc = this;
-    // Fresh per read, so its methods are marked at construction rather than
-    // relying on the finalize sweeps.
-    return _markNativeObject({
-      // Spec: createHTMLDocument returns a NEW detached Document. jQuery
-      // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result — when we returned `globalThis.document`, the real
-      // `<body>` was wiped, taking every page on the open web that ships
-      // jQuery 3.x with it. DOMParser now builds the complete detached
-      // document skeleton, so only the optional title needs adding here.
-      createHTMLDocument(title) {
-        // Engine-internal parse: Chrome's createHTMLDocument takes no markup
-        // and is not a Trusted Types sink, so it must not route through
-        // parseFromString's argument check.
-        const doc = _internalMarkupParse("", "text/html");
-        if (arguments.length > 0) {
-          const titleEl = document.createElement("title");
-          titleEl.textContent = String(title);
-          doc.head.appendChild(titleEl);
-        }
-        return doc;
-      },
-      // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
-      // an XML document with a root element of the given name. We don't
-      // have a separate XML stack, so return a minimal detached document
-      // with an element of the requested local name as documentElement.
-      createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
-        const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = _internalMarkupParse(html, "application/xml");
-        if (_doctype) _hset(doc, "_docType", _doctype);
-        return doc;
-      },
-      // createDocumentType(qualifiedName, publicId, systemId): build a detached
-      // DocumentType node. Browsers validate leniently here (only a name with
-      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
-      // owner document is the document whose implementation was used.
-      createDocumentType(qualifiedName, publicId, systemId) {
-        const name = String(qualifiedName);
-        if (name === "" || /[\t\n\f\r >]/.test(name)) {
-          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
-        }
-        const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
-          name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
-        );
-        _hset(dt, "_ownerDocument", ownerDoc);
-        return dt;
-      },
-      hasFeature() { return true; },
-    });
+    // One stable object per document, chained to the interface prototype: the
+    // operations live on DOMImplementation.prototype
+    // (env/dom/dom-implementation.js) and an instance keeps its owner
+    // document in a WeakMap, so the shape a page reflects over has no own
+    // properties, as in Chrome.
+    if (typeof globalThis.__obscura_implementation_for === 'function') {
+      return globalThis.__obscura_implementation_for(this);
+    }
+    return _markNativeObject({});
   }
   get styleSheets() {
     if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);

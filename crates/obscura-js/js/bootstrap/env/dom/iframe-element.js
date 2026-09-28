@@ -73,7 +73,10 @@ class HTMLIFrameElement extends Element {
   get featurePolicy() {
     let policy = _iframeFeaturePolicies.get(this);
     if (!policy) {
-      policy = new PermissionsPolicy(_permissionsPolicyKey, this.ownerDocument || globalThis.document);
+      // Chrome brands this FeaturePolicy, like document.featurePolicy; the
+      // 2026-09-28 census of the passing round is what moved both off
+      // PermissionsPolicy.
+      policy = new FeaturePolicy(_featurePolicyKey, this.ownerDocument || globalThis.document);
       _iframeFeaturePolicies.set(this, policy);
     }
     return policy;
@@ -293,6 +296,19 @@ function _wrap(nid) {
   }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
+  else if (t === 10) {
+    // A doctype is an ordinary child node of its document, and Chrome answers
+    // the same object for `document.doctype` and for its place among the
+    // children -- `document.doctype === document.firstChild` is true there.
+    // Wrapping it as a bare Node answered "[object Node]" and made the two
+    // reads different objects.
+    n = new DocumentType(
+      nid,
+      String(_domParse("doctype_name", String(nid)) ?? ""),
+      String(_domParse("doctype_public_id", String(nid)) ?? ""),
+      String(_domParse("doctype_system_id", String(nid)) ?? ""),
+    );
+  }
   else if (t === 9) {
     // The only non-main document nodes in the arena are iframe content-
     // document roots; hand back the scoped wrapper so queries stay in-frame.

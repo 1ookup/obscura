@@ -600,6 +600,35 @@ globalThis.__obscura_init = function() {
       globalThis.__obscura_install_window_attributes(globalThis);
     }
   } catch(e) {}
+  // Chrome's document is an HTMLDocument instance: its immediate prototype is
+  // HTMLDocument.prototype, which carries nothing of its own, and Document
+  // sits one level up -- that is where `implementation`, `featurePolicy` and
+  // the rest are declared. The engine built the document straight from
+  // Document, so `document instanceof HTMLDocument` answered false and every
+  // Document member sat one level too low.
+  try {
+    const documentPrototype = Object.getPrototypeOf(globalThis.document);
+    if (typeof globalThis.HTMLDocument === 'function' && globalThis.HTMLDocument.prototype
+        && documentPrototype !== globalThis.HTMLDocument.prototype
+        && Object.getPrototypeOf(globalThis.HTMLDocument.prototype) === globalThis.Document.prototype) {
+      if (documentPrototype === globalThis.Document.prototype) {
+        Object.setPrototypeOf(globalThis.document, globalThis.HTMLDocument.prototype);
+      } else if (Object.getPrototypeOf(documentPrototype) === globalThis.Document.prototype) {
+        // A scoped (frame) document keeps its own prototype and gains
+        // HTMLDocument underneath it.
+        Object.setPrototypeOf(documentPrototype, globalThis.HTMLDocument.prototype);
+      }
+    }
+  } catch(e) {}
+
+  // DocumentType's member order is settled here rather than at module time:
+  // the ChildNode mixin appends its four operations after the class body ran.
+  try {
+    if (typeof globalThis.__obscura_park_document_type_constructor === 'function') {
+      globalThis.__obscura_park_document_type_constructor();
+    }
+  } catch(e) {}
+
   // Namespace-shaped surfaces that chain onto interface objects the table in
   // config/surface-finalize.js installs, which is after every module has run:
   // the CSS namespace and V8's Temporal member set.

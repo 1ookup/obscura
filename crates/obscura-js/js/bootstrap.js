@@ -184,6 +184,7 @@
 // @obscura-module env/dom/dom-parser.js
 // @obscura-module env/dom/xml-serializer.js
 // @obscura-module env/dom/document-all.js
+// @obscura-module env/dom/dom-implementation.js
 // @obscura-module env/storage/storage-history.js
 // @obscura-module env/navigation/navigation.js
 // @obscura-module env/storage/shared-storage.js

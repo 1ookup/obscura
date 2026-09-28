@@ -6224,7 +6224,7 @@ mod tests {
                 },
                 "documentObjects": {
                     "registry": true,
-                    "policy": ["[object PermissionsPolicy]",
+                    "policy": ["[object FeaturePolicy]",
                         ["allowedFeatures", "allowsFeature", "constructor", "features",
                             "getAllowlistForFeature"], true, ["http://example.com"]],
                     "fragment": ["[object FragmentDirective]", [], ["constructor"]],
@@ -6390,12 +6390,12 @@ mod tests {
                 "values": ["camera *", true, true, "lazy", "left", "no", "2", "/frame-desc", "3", "4", true, "connect-src 'none'"],
                 "elementIframeMembers": [],
                 "featurePolicy": {
-                    "tag": "[object PermissionsPolicy]",
+                    "tag": "[object FeaturePolicy]",
                     "own": [],
                     "prototype": ["allowedFeatures", "allowsFeature", "features",
                         "getAllowlistForFeature", "constructor"],
-                    "constructor": ["PermissionsPolicy", 0,
-                        "function PermissionsPolicy() { [native code] }"],
+                    "constructor": ["FeaturePolicy", 0,
+                        "function FeaturePolicy() { [native code] }"],
                 },
                 "featurePolicySame": true,
             }),
@@ -15320,6 +15320,9 @@ RequestRedirect value",
                         detachedToString: Object.prototype.toString.call(detached),
                         documentProtoIsDocument:
                             Object.getPrototypeOf(document) === Document.prototype,
+                        documentProtoTag:
+                            Object.prototype.toString.call(Object.getPrototypeOf(document)),
+                        documentInstanceOfHtmlDocument: document instanceof HTMLDocument,
                     };
                 })()"#,
             )
@@ -15330,7 +15333,9 @@ RequestRedirect value",
                 "protoToString": "[object Document]",
                 "instanceToString": "[object HTMLDocument]",
                 "detachedToString": "[object HTMLDocument]",
-                "documentProtoIsDocument": true,
+                "documentProtoIsDocument": false,
+                "documentProtoTag": "[object HTMLDocument]",
+                "documentInstanceOfHtmlDocument": true,
             })
         );
     }
@@ -15343,10 +15348,15 @@ RequestRedirect value",
         // with), and its static chain sits on Document like every other
         // interface pair. The shell used to leave the static chain on
         // Function.prototype -- the one interface whose constructor walk
-        // missed Chrome's lattice. The live document's own prototype stays
-        // Document.prototype: the gate reads querySelector off it and the
-        // passing reference saw '[object Document]' there, so the instance
-        // chain is not repointed onto HTMLDocument.prototype.
+        // missed Chrome's lattice. The live document's own prototype is
+        // HTMLDocument.prototype (local Chrome 149 oracle, 2026-09-28), so
+        // `document instanceof HTMLDocument` holds and the tag read off that
+        // object is '[object HTMLDocument]'. Document.prototype, where
+        // querySelector and the Document members are declared, sits one level
+        // up; an earlier capture of a different Chrome answered
+        // '[object Document]' there and left the instance chain on
+        // Document.prototype, and the passing round's own 149 census is what
+        // moved it.
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -15379,8 +15389,8 @@ RequestRedirect value",
                 "protoDistinct": true,
                 "protoTag": "[object HTMLDocument]",
                 "staticChain": true,
-                "documentProtoIsDocument": true,
-                "protoTagRead": "[object Document]",
+                "documentProtoIsDocument": false,
+                "protoTagRead": "[object HTMLDocument]",
                 "documentTag": "[object HTMLDocument]",
                 "detachedInstanceOfHd": true,
                 "detachedTag": "[object HTMLDocument]",
@@ -35010,7 +35020,7 @@ RequestRedirect value",
                 "gpuTextureUsage": "[object GPUTextureUsage]",
                 "navigationEntry": "[object NavigationHistoryEntry]",
                 "performanceNavigation": "[object PerformanceNavigation]",
-                "featurePolicy": "[object PermissionsPolicy]",
+                "featurePolicy": "[object FeaturePolicy]",
             })
         );
         // The string form is what the payload actually concatenates.

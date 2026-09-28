@@ -10576,14 +10576,17 @@ mod tests {
         assert_eq!(result["micOther"], false);
         assert_eq!(result["fullscreen"], true);
         assert_eq!(result["pictureOther"], true);
+        // Chrome's own enumeration order, minus the two features this
+        // document's Permissions-Policy header denies (geolocation first in
+        // the list, and the page denies it).
         assert_eq!(
             result["features"],
             serde_json::json!([
                 "ch-ua-full-version-list",
                 "cross-origin-isolated",
+                "screen-wake-lock",
                 "on-device-speech-recognition",
                 "translator",
-                "shared-storage-select-url",
             ])
         );
         assert_eq!(result["geoList"], serde_json::json!([]));

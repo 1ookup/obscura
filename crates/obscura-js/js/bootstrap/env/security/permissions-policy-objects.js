@@ -43,6 +43,7 @@ function _documentPermissionsPolicy(document) {
       catch (_error) { subject = String(requestedOrigin); }
     }
     if (!directives.has(name)) {
+      if (_featurePolicyDeniedByDefault.has(name)) return false;
       return requestedOrigin === undefined || _featurePolicyWildcardDefaults.has(name)
         || subject === origin;
     }
@@ -52,6 +53,7 @@ function _documentPermissionsPolicy(document) {
     const name = String(feature || '').toLowerCase();
     if (!_featurePolicyDeclaredFeatures.has(name)) return [];
     if (!directives.has(name)) {
+      if (_featurePolicyDeniedByDefault.has(name)) return [];
       return _featurePolicyWildcardDefaults.has(name) ? ['*'] : (origin ? [origin] : []);
     }
     return directives.get(name).filter(token => {
@@ -85,7 +87,12 @@ class FeaturePolicy {
     }
     return _documentPermissionsPolicy(_featurePolicyDocuments.get(this)).allows(feature, _origin);
   }
-  features() { return this.allowedFeatures(); }
+  features() {
+    // The full feature enumeration, not the allowed subset: Chrome lists
+    // `unload` here and omits it from allowedFeatures().
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    return _featurePolicyFeatures.slice();
+  }
   getAllowlistForFeature(feature) {
     if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) {
@@ -95,6 +102,16 @@ class FeaturePolicy {
     return _documentPermissionsPolicy(_featurePolicyDocuments.get(this)).allowlist(feature);
   }
   get [Symbol.toStringTag]() { return 'FeaturePolicy'; }
+}
+// Chrome lists the operations before `constructor` on FeaturePolicy.prototype
+// (its PermissionsPolicy prototype has them in the same order); a class body
+// puts the constructor first, so it is rebuilt into Chrome's slot.
+{
+  const descriptor = Object.getOwnPropertyDescriptor(FeaturePolicy.prototype, 'constructor');
+  if (descriptor) {
+    delete FeaturePolicy.prototype.constructor;
+    Object.defineProperty(FeaturePolicy.prototype, 'constructor', descriptor);
+  }
 }
 globalThis.FeaturePolicy = FeaturePolicy;
 // document.featurePolicy / iframe.featurePolicy mint fresh instances on
@@ -123,7 +140,10 @@ class PermissionsPolicy {
     }
     return _documentPermissionsPolicy(_permissionsPolicyDocuments.get(this)).allows(feature, _origin);
   }
-  features() { return this.allowedFeatures(); }
+  features() {
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    return _featurePolicyFeatures.slice();
+  }
   getAllowlistForFeature(feature) {
     if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) {

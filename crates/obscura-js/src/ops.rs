@@ -3123,6 +3123,17 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
+        "doctype_system_id" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let val = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::Doctype { system_id, .. } => Some(system_id.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or_default();
+            serde_json::to_string(&val).unwrap_or("\"\"".into())
+        }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom
