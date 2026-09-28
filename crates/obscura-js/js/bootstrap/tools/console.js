@@ -304,6 +304,11 @@ function _newConsoleTask() {
 
 function registerConsoleSurface() {
   globalThis.console = _bootstrapObject('console', () => ({}));
+  // Chrome's console hangs off an empty intermediary object: its
+  // [[Prototype]] carries no own members at all, so the chain reads
+  // console -> (empty shell) -> Object.prototype. One sitting straight on
+  // Object.prototype answers twelve inherited names a browser does not.
+  Object.setPrototypeOf(globalThis.console, Object.create(Object.prototype));
 }
 registerConsoleSurface();
 for (const name of _consoleMethodNames) {
