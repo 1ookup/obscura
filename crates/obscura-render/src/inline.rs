@@ -692,24 +692,37 @@ fn windows_face_for_css_token(token: &str) -> Option<BundledFace> {
 /// (`Segoe UI`, `Calibri`, `Lucida Console`, `Nirmala UI`, `Javanese Text`,
 /// `Sitka`, ...) are absent here on purpose: a real macOS Chrome does not have
 /// them, and claiming them is exactly the inconsistency this split removes.
+///
+/// The same test keeps five entries out that used to sit here. `SF Mono`,
+/// `Apple Garamond`, `St Heiti`, `InaiMathi Bold` and `PingFang HK Light` are
+/// not families this host's Chrome answers for: a full-style name (`InaiMathi
+/// Bold`, `PingFang HK Light`) is a *face* name, and the probe that resolves a
+/// style separately still finds the family (`InaiMathi`, `PingFang HK`), so
+/// dropping them changes no detected font while removing five fonts the
+/// reference machine does not have. `SF Mono`, `Apple Garamond` and `St Heiti`
+/// are installed on the host but stay out of Chrome's family list, which is
+/// what the probe reads. `Skia` goes the other way: Chrome resolves it, so a
+/// macOS identity has to answer for it.
+///
+/// The probe is the standard font-presence one, measured against Chrome on
+/// this host: `'X', monospace` and `'X', sans-serif` agree exactly when X is
+/// installed, and the two agree for precisely the names in this table.
 fn macos_face_for_css_token(token: &str) -> Option<BundledFace> {
     let face = match token {
-        "courier new" | "menlo" | "monaco" | "sf mono" | "andale mono" => BundledFace::Mono,
+        "courier new" | "menlo" | "monaco" | "andale mono" => BundledFace::Mono,
 
         "times new roman" | "times" | "georgia" | "baskerville" | "charter" | "cochin"
-        | "didot" | "hoefler text" | "inaimathi" | "inaimathi bold" | "luminari"
-        | "palatino" | "apple garamond" | "bodoni 72" | "optima" | "superclarendon" => {
-            BundledFace::Serif
-        }
+        | "didot" | "hoefler text" | "inaimathi" | "luminari"
+        | "palatino" | "bodoni 72" | "optima" | "superclarendon" => BundledFace::Serif,
 
         "arial" | "arial narrow" | "arial black" | "helvetica" | "helvetica neue" | "geneva"
         | "lucida grande" | "tahoma" | "verdana" | "trebuchet ms" | "comic sans ms" | "futura"
-        | "avenir" | "avenir next" | "gill sans" | "chalkboard" | "marker felt" | "pt sans" => {
-            BundledFace::Sans
-        }
+        | "avenir" | "avenir next" | "gill sans" | "chalkboard" | "marker felt" | "pt sans"
+        | "skia" => BundledFace::Sans,
+
         "apple symbols" | "galvji" | "hiragino sans" | "hiragino sans gb"
         | "hiragino mincho pron" | "pingfang sc" | "pingfang tc" | "pingfang hk"
-        | "pingfang hk light" | "songti sc" | "heiti sc" | "st heiti" | "kaiti sc"
+        | "songti sc" | "heiti sc" | "kaiti sc"
         | "lantinghei sc" | "yuanti sc" | "weibei sc" | "xingkai sc" | "wawati sc"
         | "hannotate sc" | "libian sc" | "webdings" | "wingdings" => BundledFace::System,
 
