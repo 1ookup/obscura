@@ -258,4 +258,5 @@
 // @obscura-module config/window-attributes.js
 // @obscura-module config/window-surface.js
 // @obscura-module config/surface-finalize.js
+// @obscura-module env/media/webcodecs.js
 // @obscura-module config/webidl-branding.js
