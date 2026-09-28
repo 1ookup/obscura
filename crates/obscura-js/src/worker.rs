@@ -2003,17 +2003,22 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // in place meant `dispatchEvent(new MessageEvent('message'))` reached
   // nothing that `addEventListener('message', ...)` had registered.
   //
-  // The three event methods install on EventTarget.prototype, not on the
-  // global: Chrome keeps them off a worker's own surface (measured over a
-  // blob worker), and this realm's EventTarget.prototype serves nothing but
-  // the scope chain, so the registry below stays the one dispatch reads.
-  // Moving only the *installation target* -- not to the snapshot's own
-  // implementations, which write the Window registry -- is what keeps
-  // message delivery intact; relocating them wholesale once cost the worker
-  // its messages.
+  // The three event methods install on EventTarget.prototype -- where Chrome
+  // keeps them for a worker -- as *dispatching wrappers*: the worker global
+  // (this === G) answers through this section's registry, the same one
+  // dispatch reads, and every other EventTarget user in the realm (XHR, fetch
+  // signals, their prototypes) forwards to the snapshot's own
+  // implementations. Two earlier shapes failed one side each: installing the
+  // registry-backed versions on the global left three own names, and
+  // overwriting the prototype outright redirected XHR's internal listeners
+  // into the registry, where nothing dispatched them.
   // ---------------------------------------------------------------------
   var listeners = Object.create(null);
+  var _etAdd = EventTargetProto.addEventListener;
+  var _etRemove = EventTargetProto.removeEventListener;
+  var _etDispatch = EventTargetProto.dispatchEvent;
   def(EventTargetProto, 'addEventListener', function addEventListener(type, fn, options) {
+    if (this !== G) return _etAdd.call(this, type, fn, options);
     if (!fn) return;
     var handler = typeof fn === 'function' ? fn
       : (typeof fn.handleEvent === 'function' ? fn.handleEvent.bind(fn) : null);
@@ -2024,6 +2029,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     ls.push({ original: fn, handler: handler, once: !!(options && options.once) });
   });
   def(EventTargetProto, 'removeEventListener', function removeEventListener(type, fn) {
+    if (this !== G) return _etRemove.call(this, type, fn);
     var ls = listeners[String(type)];
     if (!ls) return;
     for (var idx = 0; idx < ls.length; idx++) {
@@ -2053,6 +2059,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   }
   def(EventTargetProto, 'dispatchEvent', function dispatchEvent(event) {
+    if (this !== G) return _etDispatch.call(this, event);
     if (!event || typeof event.type !== 'string') {
       throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
     }
