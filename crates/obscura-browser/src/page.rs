@@ -6889,13 +6889,15 @@ impl Page {
                     )
                     .map_err(FrameNavigateError::Blocked)?;
                     // An embedder under `require-corp` loads no nested
-                    // document that does not carry an embedder policy of its
-                    // own: measured Chrome leaves the frame empty where an
-                    // engine that runs it exposes a document the real browser
-                    // never executes.
+                    // document without a `Cross-Origin-Resource-Policy:
+                    // cross-origin` of its own: measured Chrome 149 leaves the
+                    // frame empty where an engine that runs it exposes a
+                    // document the real browser never executes. A same-origin
+                    // response skips the check entirely.
                     if !crate::frame_policy::embedder_policy_admits_embedded_document(
                         parent_requires_cross_origin_embedding,
-                        response_requires_cross_origin_embedding(&response),
+                        response_origin.same_origin(&parent_origin),
+                        response_allows_cross_origin_embedding(&response),
                     ) {
                         return Err(FrameNavigateError::Blocked(
                             crate::frame_policy::FrameBlockedReason::CoepEmbeddedDocument,
@@ -11640,14 +11642,13 @@ mod tests {
                 let coep_host = dom.query_selector("#coep-only").unwrap().unwrap();
                 let plain_host = dom.query_selector("#plain").unwrap().unwrap();
                 let coep_root = dom.iframe_content_document(coep_host).unwrap();
-                // The embedder demands a cross-origin embedder policy, so the
-                // plain child's navigation is blocked before it commits and
-                // leaves the frame with no document of its own. (Chrome keeps
-                // the initial about:blank there instead; that difference is
-                // older than this gate and separate from it.)
+                // The embedder's require-corp binds cross-origin embeds only:
+                // both children are same-origin here, so both commit whatever
+                // their own headers say. Isolation follows each child's own
+                // embedder policy, not the load decision.
                 assert!(
-                    dom.iframe_content_document(plain_host).is_none(),
-                    "a COEP-blocked child commits nothing",
+                    dom.iframe_content_document(plain_host).is_some(),
+                    "a same-origin child loads without any embedder policy",
                 );
                 let coep_frame = page.frames.by_host(coep_host).unwrap();
                 let plain_frame = page.frames.by_host(plain_host).unwrap();
@@ -11682,10 +11683,24 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, "function", true]),
         );
-        // The blocked frame keeps its browsing context and generation; it just
-        // never got a document to put a realm behind.
+        // The plain child commits too; without an embedder policy of its own
+        // it never joins the isolated state, so it keeps answering the plain
+        // realm's clock and no SharedArrayBuffer.
         assert!(!plain_id.is_empty());
-        assert_eq!(plain_generation, 0);
+        assert!(plain_generation > 0);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .execute_script_in_frame_realm(
+                    &plain_id,
+                    plain_generation,
+                    "<isolation-probe>",
+                    probe,
+                )
+                .unwrap(),
+            serde_json::json!([false, "undefined", false]),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14863,6 +14878,17 @@ fn response_requires_cross_origin_embedding(response: &obscura_net::Response) ->
             value.eq_ignore_ascii_case("require-corp")
                 || value.eq_ignore_ascii_case("credentialless")
         })
+}
+
+/// Whether the response carries `Cross-Origin-Resource-Policy: cross-origin`
+/// (case-insensitive), the token a `require-corp` embedder accepts for a
+/// nested document. Measured Chrome 149 drops a child that answers with only
+/// its own embedder policy and no CORP.
+fn response_allows_cross_origin_embedding(response: &obscura_net::Response) -> bool {
+    response
+        .header("cross-origin-resource-policy")
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-origin"))
 }
 
 /// True when the document's own `Permissions-Policy` denies the

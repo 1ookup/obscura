@@ -120,15 +120,20 @@ pub fn cross_origin_isolated_allowed(
 
 /// Whether an embedder carrying `require-corp` may embed this document.
 ///
-/// A document without a cross-origin embedder policy of its own never loads
-/// inside one, whatever its other headers say: measured Chrome drops the load
-/// and the frame stays empty, where an engine that runs it exposes a document
-/// the real browser never executes.
+/// The check binds cross-origin embeds only: a same-origin response skips it.
+/// A cross-origin document needs a
+/// `Cross-Origin-Resource-Policy: cross-origin` of its own -- measured
+/// Chrome 149 drops a nested document that answers with only its own
+/// `require-corp` embedder policy and no CORP (the older reading that
+/// accepted any embedder-policy response has expired), and the frame stays
+/// empty where an engine that runs it exposes a document the real browser
+/// never executes.
 pub fn embedder_policy_admits_embedded_document(
     embedder_requires_corp: bool,
-    response_has_embedder_policy: bool,
+    response_same_origin: bool,
+    response_has_corp_cross_origin: bool,
 ) -> bool {
-    !embedder_requires_corp || response_has_embedder_policy
+    response_same_origin || !embedder_requires_corp || response_has_corp_cross_origin
 }
 
 /// A parsed Content-Security-Policy header value (enforced policies only;
