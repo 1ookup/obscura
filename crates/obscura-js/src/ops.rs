@@ -3827,6 +3827,32 @@ async fn op_fetch_url_inner(
             request_csp,
         )
     };
+    // Client hints and the storage-access view both key off how the initiating
+    // realm relates to the top-level document, which the bootstrap cannot see:
+    // it carries the realm's own document root and origin only.
+    let (client_hints_delegated, top_origin) = {
+        let state_borrow = state.borrow();
+        let gs = state_borrow.borrow::<SharedState>().clone();
+        let gs = gs.borrow();
+        let top = gs
+            .top_origin
+            .clone()
+            .unwrap_or_else(|| obscura_dom::Origin::from_url(&gs.url));
+        // Permissions-Policy: the high-entropy `sec-ch-ua-*` features default
+        // to an allowlist of `self`, so a frame that is not same-origin with
+        // the top-level document never inherits the delegation the top-level
+        // origin got from `Accept-CH`; it answers the low-entropy trio only.
+        // Same-origin frames do inherit it. Fails closed on a missing scope,
+        // like `iframe_scope_same_origin`.
+        let delegated = request_root.raw() == 0
+            || gs
+                .dom
+                .as_ref()
+                .and_then(|dom| dom.document_scope(request_root))
+                .is_some_and(|scope| scope.origin.same_origin(&top));
+        (delegated, top.serialize())
+    };
+
     // The private-network opt-in is a BrowserContext policy, not only a
     // process-wide environment setting.  Navigation already honours the
     // context's configured HTTP client; scripted fetch/XHR must use the same
@@ -4117,6 +4143,8 @@ async fn op_fetch_url_inner(
                 allow_private_network,
                 request_csp.clone(),
                 request_destination.clone(),
+                client_hints_delegated,
+                top_origin.clone(),
             )
             .await;
         }
@@ -4676,6 +4704,8 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
     request_csp: Option<String>,
     request_destination: String,
+    client_hints_delegated: bool,
+    top_origin: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let performance_started = std::time::Instant::now();
     let mut current_url = url.clone();
@@ -4700,7 +4730,19 @@ async fn stealth_fetch_all(
             }
         };
 
+        let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let mut req_headers: HashMap<String, String> = HashMap::new();
+        // `Sec-Fetch-Storage-Access` reports whether this request carries
+        // unpartitioned (third-party) credentials. Measured on Chrome 153 over
+        // the client-hints fixture: `active` on every credentialed request
+        // whose target origin differs from the top-level document's origin,
+        // including a same-origin fetch from inside a cross-site frame, and
+        // absent on the rest (first-party requests, and cross-site requests
+        // without credentials). Left to the caller map so it lands in Chrome's
+        // own slot in the header table.
+        if credentials_allowed && parsed_current.origin().ascii_serialization() != top_origin {
+            req_headers.insert("sec-fetch-storage-access".to_string(), "active".to_string());
+        }
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         // Origin is present on every non-GET/HEAD request, including a
         // same-origin form POST, and on cross-origin CORS GET/HEAD requests.
@@ -4756,7 +4798,6 @@ async fn stealth_fetch_all(
             referrer_policy.as_str(),
         );
 
-        let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = match stealth
             .send_single(
                 &current_method,
@@ -4765,6 +4806,7 @@ async fn stealth_fetch_all(
                 &current_body,
                 credentials_allowed,
                 credentials_allowed,
+                client_hints_delegated,
             )
             .await
         {

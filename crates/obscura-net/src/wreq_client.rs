@@ -565,6 +565,16 @@ impl StealthHttpClient {
                 .map(|accepted| accepted.iter().cloned().collect())
                 .unwrap_or_default();
             accepted_hints.sort();
+            // Permissions-Policy: the high-entropy UA-CH features default to
+            // an allowlist of `self`, so a frame that is not same-origin with
+            // the top-level document may not send the hints this origin
+            // published in Accept-CH. Clearing the set leaves the low-entropy
+            // trio, which the plan emits from the fingerprint. Measured
+            // against Chromium with the client-hints fixture: three hints in
+            // the cross-origin iframe, nine at the top level.
+            if !request.client_hints_delegated {
+                accepted_hints.clear();
+            }
             // Low-entropy UA-CH fields are emitted from the fingerprint, and an
             // Accept-CH entry for one of them must not append a second value
             // for a field this request carries once. `sec-ch-ua-mobile: ?0, ?0`
@@ -699,6 +709,7 @@ impl StealthHttpClient {
                     .extend(hints);
             }
             if !client_hint_retry
+                && request.client_hints_delegated
                 && !critical_hints.is_empty()
                 && !crate::client::is_frame_document_request(&request)
                 && critical_hints.iter().any(|hint| !sent_client_hints.contains(hint))
@@ -772,6 +783,11 @@ impl StealthHttpClient {
     /// One request with no redirect following, for scripted fetch()/XHR. The
     /// caller supplies the Fetch credentials decision for this redirect hop,
     /// while this method preserves the Chrome transport fingerprint.
+    /// `client_hints_delegated` says whether the initiating context may send
+    /// the high-entropy UA client hints this client cached from `Accept-CH`.
+    /// The features default to an allowlist of `self`, so a frame that is not
+    /// same-origin with the top-level document answers the low-entropy trio
+    /// only; the caller resolves that from the realm it is sending for.
     pub async fn send_single(
         &self,
         method: &str,
@@ -780,6 +796,7 @@ impl StealthHttpClient {
         body: &str,
         send_cookies: bool,
         store_cookies: bool,
+        client_hints_delegated: bool,
     ) -> Result<Response, ObscuraNetError> {
         let fetch_started = Instant::now();
         if let Some(host) = url.host_str() {
@@ -876,6 +893,14 @@ impl StealthHttpClient {
         // length Chrome puts first is known here rather than appended later by
         // the transport.
         let body_len = (!body.is_empty()).then(|| body.len());
+        // A non-delegated frame may not send the high-entropy hints at all:
+        // dropping them from the accepted set leaves the low-entropy trio,
+        // which the plan emits from the fingerprint.
+        let accepted_hints: &[String] = if client_hints_delegated {
+            &accepted_hints
+        } else {
+            &[]
+        };
         let plan = crate::chrome_headers::ChromeHeaderPlan {
             fingerprint: &fingerprint,
             request: None,
@@ -889,7 +914,7 @@ impl StealthHttpClient {
             body_len,
             is_frame_navigation: false,
             caller: &caller,
-            accepted_hints: &accepted_hints,
+            accepted_hints,
             sends_credentials: send_cookies,
         };
         for (name, value) in crate::chrome_headers::build_chrome_headers(&plan) {
@@ -1284,7 +1309,7 @@ mod tests {
         );
         let headers = scripted_headers();
         client
-            .send_single("GET", &url, &headers, "", true, true)
+            .send_single("GET", &url, &headers, "", true, true, true)
             .await
             .expect("fixture must be reachable");
 
@@ -1334,7 +1359,7 @@ mod tests {
             "text/plain;charset=UTF-8".to_string(),
         );
         client
-            .send_single("POST", &url, &headers, "hello", true, true)
+            .send_single("POST", &url, &headers, "hello", true, true, true)
             .await
             .expect("fixture must be reachable");
 
@@ -1385,7 +1410,7 @@ mod tests {
             );
             let headers = scripted_headers();
             client
-                .send_single("GET", &url, &headers, "", true, true)
+                .send_single("GET", &url, &headers, "", true, true, true)
                 .await
                 .expect("fixture must be reachable");
             orders.push(wire_header_names(&request.await.unwrap()));
@@ -1604,7 +1629,7 @@ mod tests {
             ]),
         );
         client
-            .send_single("GET", &url, &HashMap::new(), "", false, false)
+            .send_single("GET", &url, &HashMap::new(), "", false, false, true)
             .await
             .expect("fixture must be reachable");
         let request = request.await.unwrap().to_ascii_lowercase();
@@ -1613,6 +1638,57 @@ mod tests {
                 request.matches(&format!("\r\n{name}:")).count(),
                 1,
                 "{name} must be sent exactly once: {request}"
+            );
+        }
+    }
+
+    // A frame that is not same-origin with the top-level document does not
+    // inherit the client-hints delegation: the six high-entropy fields the
+    // origin published in Accept-CH stay off the wire, and only the
+    // low-entropy trio the plan emits from the fingerprint goes out. Measured
+    // against Chromium over the client-hints fixture, where the cross-origin
+    // widget frame sends three and the same fetch at the top level sends nine.
+    #[tokio::test]
+    async fn a_frame_without_client_hint_delegation_sends_the_low_entropy_trio_only() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT);
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.accepted_client_hints.write().await.insert(
+            super::client_hint_origin(&url),
+            std::collections::HashSet::from([
+                "sec-ch-ua-arch".to_string(),
+                "sec-ch-ua-bitness".to_string(),
+                "sec-ch-ua-full-version".to_string(),
+                "sec-ch-ua-model".to_string(),
+                "sec-ch-ua-platform-version".to_string(),
+                "sec-ch-ua-full-version-list".to_string(),
+            ]),
+        );
+        client
+            .send_single("GET", &url, &HashMap::new(), "", false, false, false)
+            .await
+            .expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            assert_eq!(
+                request.matches(&format!("\r\n{name}:")).count(),
+                1,
+                "{name} is low-entropy and always sent: {request}"
+            );
+        }
+        for name in [
+            "sec-ch-ua-arch",
+            "sec-ch-ua-bitness",
+            "sec-ch-ua-full-version",
+            "sec-ch-ua-model",
+            "sec-ch-ua-platform-version",
+            "sec-ch-ua-full-version-list",
+        ] {
+            assert!(
+                !request.contains(&format!("\r\n{name}:")),
+                "{name} must not be sent without delegation: {request}"
             );
         }
     }
@@ -1715,7 +1791,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = client
-            .send_single("GET", &url, &HashMap::new(), "", false, false)
+            .send_single("GET", &url, &HashMap::new(), "", false, false, true)
             .await;
         let elapsed = started.elapsed();
         assert!(result.is_err(), "a closed connection must fail the fetch");

@@ -316,6 +316,13 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// Whether the initiating context may send the high-entropy UA client
+    /// hints (`sec-ch-ua-arch` and friends) this client has cached from
+    /// `Accept-CH`. The features' default allowlist is `self`, so a frame that
+    /// is not same-origin with the top-level document sends the low-entropy
+    /// trio only, unless its ancestors delegate the features. Requests from
+    /// the top-level document, and from same-origin frames, keep this true.
+    pub client_hints_delegated: bool,
 }
 
 impl ResourceRequest {
@@ -329,6 +336,7 @@ impl ResourceRequest {
             credentials: RequestCredentials::Include,
             headers: HashMap::new(),
             max_response_bytes: 64 * 1024 * 1024,
+            client_hints_delegated: true,
         }
     }
 
@@ -367,6 +375,7 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            client_hints_delegated: true,
         }
     }
 
@@ -408,7 +417,16 @@ impl ResourceRequest {
             credentials: RequestCredentials::SameOrigin,
             headers: HashMap::new(),
             max_response_bytes: 32 * 1024 * 1024,
+            client_hints_delegated: true,
         }
+    }
+
+    /// The initiating context cannot send high-entropy UA client hints: it is
+    /// a frame that is not same-origin with the top-level document and no
+    /// ancestor delegates the `ch-ua-*` features to it.
+    pub fn without_client_hint_delegation(mut self) -> Self {
+        self.client_hints_delegated = false;
+        self
     }
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
@@ -1995,6 +2013,17 @@ impl ObscuraHttpClient {
                 .unwrap_or_default();
             accepted_hints.sort();
 
+            // High-entropy hints ride on the `Accept-CH` cache, which is per
+            // origin and knows nothing about who is asking. The features
+            // behind them default to an allowlist of `self`, so a frame that
+            // is not same-origin with the top-level document must not send
+            // them: Chrome answers the low-entropy trio there and nothing
+            // else.
+            let accepted_hints: &[String] = if request.client_hints_delegated {
+                &accepted_hints
+            } else {
+                &[]
+            };
             let plan = crate::chrome_headers::ChromeHeaderPlan {
                 fingerprint: &fingerprint,
                 request: Some(&request),
@@ -2006,7 +2035,7 @@ impl ObscuraHttpClient {
                 body_len: body.as_ref().map(Vec::len),
                 is_frame_navigation,
                 caller: &caller,
-                accepted_hints: &accepted_hints,
+                accepted_hints,
                 sends_credentials,
             };
             let mut headers = HeaderMap::new();
@@ -2085,7 +2114,11 @@ impl ObscuraHttpClient {
                     .or_default()
                     .extend(hints);
             }
+            // A retry exists to satisfy `Critical-CH`, and the hints a retry
+            // would add are exactly the ones a non-delegated frame may not
+            // send: retrying there would re-issue the request for nothing.
             if !client_hint_retry
+                && request.client_hints_delegated
                 && !critical_hints.is_empty()
                 && !is_frame_document_request(&request)
                 && critical_hints
