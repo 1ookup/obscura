@@ -35027,7 +35027,9 @@ RequestRedirect value",
         assert_eq!(value["cssDescriptor"], serde_json::json!([false, false, true]));
         // Branding must not add enumerable own names to the namespace objects.
         assert_eq!(value["ownNamesUnchanged"]["caches"], 5);
-        assert_eq!(value["ownNamesUnchanged"]["css"], 3);
+        // CSS carries Chrome's 69 own names once env/css/css-namespace.js has
+        // installed the unit factories and the highlight registry.
+        assert_eq!(value["ownNamesUnchanged"]["css"], 69);
         assert_eq!(
             value["gpuConstantsKept"],
             serde_json::json!([1, 15, 1, 4, 16])

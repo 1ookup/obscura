@@ -176,6 +176,7 @@
 // @obscura-module env/dom/child-node.js
 // @obscura-module tools/encoding-media-query.js
 // @obscura-module env/css/computed-style.js
+// @obscura-module env/css/css-namespace.js
 // @obscura-module env/css/mutation-observer.js
 // @obscura-module env/dom/element-internals.js
 // @obscura-module env/render/intersection-entry.js

@@ -562,7 +562,43 @@ globalThis.CSS = {
       return _cssSupportsCondition(String(prop));
     } catch (e) { return false; }
   },
-  escape(s){ return s; }
+  // The CSSOM serialization escape (selectors-4). A pass-through answered
+  // `CSS.escape('a b')` with "a b" where Chrome answers "a\ b", which a page
+  // can read as one string comparison.
+  escape(value) {
+    const string = String(value);
+    const length = string.length;
+    let result = '';
+    for (let index = 0; index < length; index++) {
+      const code = string.charCodeAt(index);
+      const character = string.charAt(index);
+      // NUL is replaced, not escaped.
+      if (code === 0x0000) { result += '�'; continue; }
+      // Control characters, a leading digit, and a digit in the second place
+      // after a leading dash are escaped by code point.
+      if ((code >= 0x0001 && code <= 0x001F) || code === 0x007F
+          || (index === 0 && code >= 0x0030 && code <= 0x0039)
+          || (index === 1 && code >= 0x0030 && code <= 0x0039
+              && string.charCodeAt(0) === 0x002D)) {
+        result += '\\' + code.toString(16) + ' ';
+        continue;
+      }
+      // A lone dash is escaped with a backslash rather than by code point.
+      if (index === 0 && code === 0x002D && length === 1) {
+        result += '\\' + character;
+        continue;
+      }
+      if (code >= 0x0080 || character === '-' || character === '_'
+          || (code >= 0x0030 && code <= 0x0039)
+          || (code >= 0x0041 && code <= 0x005A)
+          || (code >= 0x0061 && code <= 0x007A)) {
+        result += character;
+        continue;
+      }
+      result += '\\' + character;
+    }
+    return result;
+  }
 };
 
 globalThis.HTMLElement = Element;

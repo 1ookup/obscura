@@ -600,6 +600,17 @@ globalThis.__obscura_init = function() {
       globalThis.__obscura_install_window_attributes(globalThis);
     }
   } catch(e) {}
+  // Namespace-shaped surfaces that chain onto interface objects the table in
+  // config/surface-finalize.js installs, which is after every module has run:
+  // the CSS namespace and V8's Temporal member set.
+  try {
+    if (typeof globalThis.__obscura_install_css_namespace === 'function') {
+      globalThis.__obscura_install_css_namespace();
+    }
+    if (typeof globalThis.__obscura_trim_temporal_namespace === 'function') {
+      globalThis.__obscura_trim_temporal_namespace();
+    }
+  } catch(e) {}
   delete globalThis.__obscura_init;
 };
 

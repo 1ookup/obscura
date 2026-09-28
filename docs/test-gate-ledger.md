@@ -71,3 +71,8 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-js
   --config vendor/v8-source.toml` 739/739. Full workspace gate deferred to the
   next backfill.
+
+- 2026-09-28: `9f63826` (window interface set) and the CSS namespace batch,
+  scoped to `cargo nextest run --release --features render -p obscura-js`
+  739/739 and `-p obscura-browser` 139/139, plus `-p obscura-net` 134/134 for
+  the client-hints commit. Full workspace gate deferred to the next backfill.
