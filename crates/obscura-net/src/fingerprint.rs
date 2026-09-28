@@ -289,7 +289,7 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
                 hardware_concurrency: host_hardware_concurrency(),
-                device_memory: 8.0,
+                device_memory: 16.0,
                 screen: ScreenFingerprint {
                     width: 412,
                     height: 915,
@@ -330,7 +330,7 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
                 hardware_concurrency: host_hardware_concurrency(),
-                device_memory: 8.0,
+                device_memory: 16.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Intel)".to_string(),
@@ -360,7 +360,7 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
                 hardware_concurrency: host_hardware_concurrency(),
-                device_memory: 8.0,
+                device_memory: 16.0,
                 screen: ScreenFingerprint {
                     width: 1440,
                     height: 900,
@@ -406,7 +406,7 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
                 hardware_concurrency: host_hardware_concurrency(),
-                device_memory: 8.0,
+                device_memory: 16.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Intel)".to_string(),
@@ -432,7 +432,7 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
                 hardware_concurrency: host_hardware_concurrency(),
-                device_memory: 8.0,
+                device_memory: 16.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint { vendor: String::new(), renderer: String::new(), webgpu_profile: String::new() },
             }

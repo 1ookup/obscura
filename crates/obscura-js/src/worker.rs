@@ -1684,14 +1684,15 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     // NavigatorLanguage, NavigatorOnLine, NavigatorConcurrentHardware,
     // NavigatorDeviceMemory, NavigatorStorage, NavigatorLocks,
     // NavigatorPermissions, NavigatorBeacon, plus userAgentData/connection/
-    // serviceWorker/mediaCapabilities/gpu.
+    // mediaCapabilities/gpu. `serviceWorker` stays off: WorkerNavigator has
+    // no such member in Chrome (measured -- the page's Navigator does).
     var NAV_ALLOW = [
       'appCodeName', 'appName', 'appVersion', 'platform', 'product',
       'productSub', 'userAgent', 'vendor', 'vendorSub',
       'language', 'languages', 'onLine',
-      'hardwareConcurrency',
+      'hardwareConcurrency', 'deviceMemory',
       'userAgentData', 'connection', 'locks', 'permissions',
-      'mediaCapabilities', 'serviceWorker', 'sendBeacon', 'gpu',
+      'mediaCapabilities', 'sendBeacon', 'gpu',
     ];
     for (var n = 0; n < NAV_ALLOW.length; n++) {
       var prop = NAV_ALLOW[n];
@@ -2168,10 +2169,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     for (var gi = 0; gi < gatedGlobals.length; gi++) {
       try { delete G[gatedGlobals[gi]]; } catch (e) {}
     }
-    // `userAgentData` is [SecureContext] in Chrome and absent, not undefined,
-    // on an insecure origin, in this realm too.
-    var gatedOnNavigator = ['serviceWorker', 'storage', 'locks', 'mediaDevices',
-      'userAgentData'];
+    // `userAgentData`, `deviceMemory` and `gpu` are [SecureContext] in Chrome
+    // and absent, not undefined, on an insecure origin, in this realm too.
+    var gatedOnNavigator = ['storage', 'locks', 'mediaDevices',
+      'userAgentData', 'deviceMemory', 'gpu'];
     for (var ni = 0; ni < gatedOnNavigator.length; ni++) {
       try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
     }

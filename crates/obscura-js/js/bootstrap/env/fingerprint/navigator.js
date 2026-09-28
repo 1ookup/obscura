@@ -281,10 +281,11 @@ registerNavigatorSurface();
 
   // Values set per-page by __obscura_init (avoids own data props on navigator).
   defGetter('hardwareConcurrency', function() { return _fingerprint().hardwareConcurrency || 1; });
-  // No `deviceMemory`: Chrome on the platform this identity presents does not
-  // expose one (measured in both realms against the local oracle, where the
-  // property is absent and not merely undefined). A Windows identity would
-  // carry it back.
+  // `deviceMemory` is [SecureContext]: present on a secure origin, absent
+  // (deleted by the secure-context gate) on an insecure one. The 16 is the
+  // reference machine's answer, measured Chrome 149 page and worker alike --
+  // the earlier "absent everywhere" reading was taken on an insecure origin.
+  defGetter('deviceMemory', function() { return _fingerprint().deviceMemory || 16; });
 
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));

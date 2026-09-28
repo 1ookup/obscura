@@ -16963,7 +16963,6 @@ RequestRedirect value",
               return {
                 ua:navigator.userAgent, appVersion:navigator.appVersion,
                 platform:navigator.platform, hardwareConcurrency:navigator.hardwareConcurrency,
-                // Chrome on this platform exposes no deviceMemory at all.
                 deviceMemory:String(navigator.deviceMemory), low:navigator.userAgentData.toJSON(), high,
                 screen:[screen.width,screen.height,screen.availWidth,screen.availHeight,screen.availTop,screen.availLeft,devicePixelRatio],
                 window:[outerWidth,outerHeight,screenX,screenY,screenLeft,screenTop]
@@ -16977,7 +16976,7 @@ RequestRedirect value",
             "appVersion": fingerprint.user_agent.trim_start_matches("Mozilla/"),
             "platform": "MacIntel",
             "hardwareConcurrency": 12,
-            "deviceMemory": "undefined",
+            "deviceMemory": "16",
             "low": {
                 "brands": fingerprint.brands,
                 "mobile": false,

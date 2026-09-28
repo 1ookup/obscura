@@ -225,9 +225,9 @@
       // table and callers rely on it in tests).
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
       'protectedAudience', 'storageBuckets',
-      // `userAgentData` is [SecureContext] in Chrome and is absent, not
-      // undefined, on an insecure origin (measured).
-      'userAgentData',
+      // `userAgentData` and `deviceMemory` are [SecureContext] in Chrome and
+      // are absent, not undefined, on an insecure origin (measured 149).
+      'userAgentData', 'deviceMemory',
     ]) _remove(globalThis.navigator, name);
     // `documentPictureInPicture` is [SecureContext]; `launchQueue` is not --
     // Chrome 149 keeps it on insecure origins too (measured), so the older
