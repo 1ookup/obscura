@@ -1127,23 +1127,23 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'MediaDevices', 'ElementInternals', 'SharedStorageModifierMethod',
     'SharedStorageAppendMethod', 'SharedStorageSetMethod', 'SharedStorageDeleteMethod',
     'SharedStorageClearMethod', 'SharedStorageWorklet', 'SharedStorage', 'sharedStorage',
-    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet', 'NavigationPreloadManager',
+    'ServiceWorker', 'Worklet', 
     'ServiceWorkerContainer', 'AudioBuffer', 'AudioContext', 'OfflineAudioContext',
     'MediaStream', 'MediaStreamTrack', 'RTCPeerConnection', 'RTCRtpSender', 'RTCRtpReceiver',
     'RTCSessionDescription', 'RTCIceCandidate', 'RTCPeerConnectionIceEvent',
-    'KeyboardLayoutMap', 'Keyboard', 'GPUSupportedLimits', 'GPUSupportedFeatures',
-    'GPUAdapterInfo', 'GPUTextureView', 'GPUTexture', 'GPUBuffer', 'GPUShaderModule',
-    'GPUBindGroupLayout', 'GPUBindGroup', 'GPUPipelineLayout', 'GPUSampler', 'GPUQuerySet',
-    'GPURenderPipeline', 'GPUComputePipeline', 'GPUCommandBuffer', 'GPURenderPassEncoder',
-    'GPUComputePassEncoder', 'GPUCommandEncoder', 'GPUQueue', 'GPUDevice', 'GPUAdapter', 'GPU',
-    'GPUCanvasContext', 'CryptoKey', 'SubtleCrypto', 'AudioWorklet', 'event',
+    'KeyboardLayoutMap', 'Keyboard', 
+    
+    
+    
+    
+    'AudioWorklet', 'event',
     'AbsoluteOrientationSensor', 'Accelerometer', 'AnalyserNode', 'AnimationEffect',
     'AnimationPlaybackEvent', 'AnimationTimeline', 'AnimationTrigger', 'AudioBufferSourceNode',
-    'AudioDecoder', 'AudioDestinationNode', 'AudioEncoder', 'AudioListener', 'AudioNode',
+    'AudioDestinationNode', 'AudioListener', 'AudioNode',
     'AudioParam', 'AudioParamMap', 'AudioPlaybackStats', 'AudioProcessingEvent',
     'AudioScheduledSourceNode', 'AudioSinkInfo', 'AudioWorkletNode',
     'AuthenticatorAssertionResponse', 'AuthenticatorAttestationResponse',
-    'AuthenticatorResponse', 'BarcodeDetector', 'BaseAudioContext', 'BeforeInstallPromptEvent',
+    'AuthenticatorResponse', 'BaseAudioContext', 'BeforeInstallPromptEvent',
     'BeforeUnloadEvent', 'BiquadFilterNode', 'BlobEvent', 'Bluetooth',
     'BluetoothCharacteristicProperties', 'BluetoothDevice',
     'BluetoothRemoteGATTCharacteristic', 'BluetoothRemoteGATTDescriptor',
@@ -1166,28 +1166,28 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'CharacterBoundsUpdateEvent', 'Clipboard', 'ClipboardChangeEvent', 'ClipboardItem',
     'CloseWatcher', 'CommandEvent', 'ConstantSourceNode',
     'ContentVisibilityAutoStateChangeEvent', 'ConvolverNode', 'CookieChangeEvent',
-    'CookieStore', 'CookieStoreManager', 'CrashReportContext', 'CreateMonitor', 'Credential',
+    'CookieStore', 'CookieStoreManager', 'CrashReportContext', 'Credential',
     'CredentialsContainer', 'CustomStateSet', 'DOMError', 'DataTransfer', 'DataTransferItem',
     'DataTransferItemList', 'DelayNode', 'DelegatedInkTrailPresenter', 'DeviceMotionEvent',
     'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate', 'DeviceOrientationEvent',
     'DevicePosture', 'DigitalCredential', 'DocumentPictureInPicture',
     'DocumentPictureInPictureEvent', 'DragEvent', 'DynamicsCompressorNode', 'EditContext',
     'EventCounts', 'EyeDropper', 'FederatedCredential', 'Fence', 'FencedFrameConfig',
-    'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle',
-    'FileSystemHandle', 'FileSystemObserver', 'FileSystemWritableFileStream', 'FontData',
-    'FontFaceSetLoadEvent', 'FormDataEvent', 'FragmentDirective', 'GPUCompilationInfo',
-    'GPUCompilationMessage', 'GPUDeviceLostInfo', 'GPUError', 'GPUExternalTexture',
-    'GPUInternalError', 'GPUOutOfMemoryError', 'GPUPipelineError', 'GPURenderBundle',
-    'GPURenderBundleEncoder', 'GPUUncapturedErrorEvent', 'GPUValidationError', 'GainNode',
+    'FetchLaterResult', 
+    'FontData',
+    'FontFaceSetLoadEvent', 'FormDataEvent', 'FragmentDirective', 
+    
+    
+    'GainNode',
     'Gamepad', 'GamepadButton', 'GamepadEvent', 'GamepadHapticActuator', 'Geolocation',
     'GeolocationCoordinates', 'GeolocationPosition', 'GeolocationPositionError',
-    'GravitySensor', 'Gyroscope', 'HID', 'HIDConnectionEvent', 'HIDDevice',
-    'HIDInputReportEvent', 'Highlight', 'HighlightRegistry', 'IIRFilterNode',
+    'GravitySensor', 'Gyroscope', 
+    'Highlight', 'HighlightRegistry', 'IIRFilterNode',
     'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider', 'IdleDeadline',
-    'IdleDetector', 'ImageCapture', 'ImageDecoder', 'ImageTrack', 'ImageTrackList', 'Ink',
+    'ImageCapture', 'Ink',
     'InputDeviceInfo', 'IntegrityViolationReportBody', 'InterestEvent', 'LanguageDetector',
     'LanguageModel', 'LargestContentfulPaint', 'LaunchParams', 'LaunchQueue', 'LayoutShift',
-    'LayoutShiftAttribution', 'LinearAccelerationSensor', 'Lock', 'LockManager', 'MIDIAccess',
+    'LayoutShiftAttribution', 'LinearAccelerationSensor', 'MIDIAccess',
     'MIDIConnectionEvent', 'MIDIInput', 'MIDIInputMap', 'MIDIMessageEvent', 'MIDIOutput',
     'MIDIOutputMap', 'MIDIPort', 'MediaDeviceInfo', 'MediaElementAudioSourceNode',
     'MediaEncryptedEvent', 'MediaError', 'MediaKeyMessageEvent', 'MediaKeySession',
@@ -1209,7 +1209,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'PresentationAvailability', 'PresentationConnection',
     'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent',
     'PresentationConnectionList', 'PresentationReceiver', 'PresentationRequest',
-    'PressureObserver', 'PressureRecord', 'Profiler', 'ProtectedAudience',
+    'Profiler', 'ProtectedAudience',
     'PublicKeyCredential', 'RTCCertificate', 'RTCDTMFSender', 'RTCDTMFToneChangeEvent',
     'RTCDataChannelEvent', 'RTCDtlsTransport', 'RTCError', 'RTCErrorEvent', 'RTCIceTransport',
     'RTCPeerConnectionIceErrorEvent', 'RTCRtpScriptTransform', 'RTCRtpTransceiver',
@@ -1222,22 +1222,22 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'SVGPointList', 'SVGPreserveAspectRatio', 'SVGStringList', 'SVGTransform',
     'SVGTransformList', 'SVGUnitTypes', 'Sanitizer', 'Scheduling', 'ScreenDetailed',
     'ScreenDetails', 'ScriptProcessorNode', 'ScrollTimeline', 'Sensor', 'SensorErrorEvent',
-    'Serial', 'SerialPort', 'SnapEvent', 'SpeechGrammar', 'SpeechGrammarList',
+    'SnapEvent', 'SpeechGrammar', 'SpeechGrammarList',
     'SpeechRecognition', 'SpeechRecognitionErrorEvent', 'SpeechRecognitionEvent',
     'SpeechRecognitionPhrase', 'SpeechSynthesis', 'SpeechSynthesisErrorEvent',
-    'SpeechSynthesisEvent', 'SpeechSynthesisVoice', 'StereoPannerNode', 'StorageBucket',
-    'StorageBucketManager', 'StorageManager', 'StylePropertyMap', 'StylePropertyMapReadOnly',
+    'SpeechSynthesisEvent', 'SpeechSynthesisVoice', 'StereoPannerNode', 
+    'StylePropertyMap', 'StylePropertyMapReadOnly',
     'Summarizer', 'TaskAttributionTiming', 'TextEvent', 'TextFormat', 'TextFormatUpdateEvent',
     'TextUpdateEvent', 'TimelineTrigger', 'TimelineTriggerRange', 'TimelineTriggerRangeList',
-    'Touch', 'TouchEvent', 'TouchList', 'TrackEvent', 'Translator', 'USB',
-    'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice',
-    'USBEndpoint', 'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket',
-    'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket',
-    'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'VideoDecoder', 'VideoEncoder',
-    'ViewTimeline', 'Viewport', 'VirtualKeyboardGeometryChangeEvent', 'WGSLLanguageFeatures',
+    'Touch', 'TouchEvent', 'TouchList', 'TrackEvent', 'Translator', 
+    
+    
+    
+    
+    'ViewTimeline', 'Viewport', 'VirtualKeyboardGeometryChangeEvent', 
     'WakeLock', 'WakeLockSentinel', 'WaveShaperNode', 'WebKitCSSMatrix',
-    'WebKitMutationObserver', 'WebTransport', 'WebTransportBidirectionalStream',
-    'WebTransportDatagramDuplexStream', 'WebTransportError', 'WindowControlsOverlay',
+    'WebKitMutationObserver', 
+    'WindowControlsOverlay',
     'WindowControlsOverlayGeometryChangeEvent', 'XRAnchor', 'XRAnchorSet',
     'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRCompositionLayer',
     'XRCubeLayer', 'XRCylinderLayer', 'XRDOMOverlayState', 'XRDepthInformation',
@@ -1258,8 +1258,8 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'credentialless', 'originAgentCluster', 'navigation', 'locationbar', 'menubar',
     'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status', 'closed', 'external',
     'clientInformation', 'offscreenBuffering', 'styleMedia', 'crashReport', 'cookieStore',
-    'documentPictureInPicture', 'viewport', 'launchQueue', 'GPUBufferUsage', 'GPUColorWrite',
-    'GPUMapMode', 'GPUShaderStage', 'GPUTextureUsage', 'onoffline', 'ononline', 'fence',
+    'documentPictureInPicture', 'viewport', 'launchQueue', 
+    'onoffline', 'ononline', 'fence',
     'addEventListener', 'removeEventListener', 'dispatchEvent'
   ];
   for (var absent = 0; absent < WORKER_ABSENT.length; absent++) {
@@ -2162,10 +2162,39 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // go away here as on the page. Last in the prep script so it removes what
   // the steps above have finished installing. `isSecureContext` matching while
   // `crypto.subtle` still answered would be an engine-internal contradiction
-  // any script could read in two lines. Checked against Chrome 146 in
-  // js-repros/secure-context/chrome-oracle.json.
+  // any script could read in two lines. The interface list is the measured
+  // Chrome 149 delta between a secure and an insecure blob worker: every name
+  // below is own on a secure worker and gone on an insecure one (the
+  // FileSystemSyncAccessHandle shell is built by the OPFS section above, which
+  // only runs when secure, so it needs no entry here).
   if (!__OBSCURA_WORKER_SECURE__) {
-    var gatedGlobals = ['caches', 'CacheStorage', 'Cache'];
+    var gatedGlobals = ['caches', 'CacheStorage', 'Cache',
+      'AudioDecoder', 'AudioEncoder', 'BarcodeDetector', 'CreateMonitor',
+      'CryptoKey', 'FileSystemDirectoryHandle', 'FileSystemFileHandle',
+      'FileSystemHandle', 'FileSystemObserver', 'FileSystemWritableFileStream',
+      'GPU', 'GPUAdapter', 'GPUAdapterInfo', 'GPUBindGroup', 'GPUBindGroupLayout',
+      'GPUBuffer', 'GPUBufferUsage', 'GPUCanvasContext', 'GPUColorWrite',
+      'GPUCommandBuffer', 'GPUCommandEncoder', 'GPUCompilationInfo',
+      'GPUCompilationMessage', 'GPUComputePassEncoder', 'GPUComputePipeline',
+      'GPUDevice', 'GPUDeviceLostInfo', 'GPUError', 'GPUExternalTexture',
+      'GPUInternalError', 'GPUMapMode', 'GPUOutOfMemoryError', 'GPUPipelineError',
+      'GPUPipelineLayout', 'GPUQuerySet', 'GPUQueue', 'GPURenderBundle',
+      'GPURenderBundleEncoder', 'GPURenderPassEncoder', 'GPURenderPipeline',
+      'GPUSampler', 'GPUShaderModule', 'GPUShaderStage', 'GPUSupportedFeatures',
+      'GPUSupportedLimits', 'GPUTexture', 'GPUTextureUsage', 'GPUTextureView',
+      'GPUUncapturedErrorEvent', 'GPUValidationError', 'HID',
+      'HIDConnectionEvent', 'HIDDevice', 'HIDInputReportEvent', 'IdleDetector',
+      'ImageDecoder', 'ImageTrack', 'ImageTrackList', 'Lock', 'LockManager',
+      'NavigationPreloadManager', 'PressureObserver', 'PressureRecord',
+      'Serial', 'SerialPort', 'ServiceWorkerRegistration', 'StorageBucket',
+      'StorageBucketManager', 'StorageManager', 'SubtleCrypto', 'USB',
+      'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent',
+      'USBDevice', 'USBEndpoint', 'USBInTransferResult', 'USBInterface',
+      'USBIsochronousInTransferPacket', 'USBIsochronousInTransferResult',
+      'USBIsochronousOutTransferPacket', 'USBIsochronousOutTransferResult',
+      'USBOutTransferResult', 'VideoDecoder', 'VideoEncoder',
+      'WGSLLanguageFeatures', 'WebTransport', 'WebTransportBidirectionalStream',
+      'WebTransportDatagramDuplexStream', 'WebTransportError'];
     for (var gi = 0; gi < gatedGlobals.length; gi++) {
       try { delete G[gatedGlobals[gi]]; } catch (e) {}
     }
