@@ -155,3 +155,9 @@ run covers are then removed.
   -p obscura-js -p obscura-browser -p obscura-net` 1629/1629, plus the
   two-host isolation fixture against the reference Chrome, 11/11 routes.
   Full workspace gate deferred to the next backfill.
+
+- 2026-09-28: font reference data re-measured from the reference browser's
+  current version (Chrome 153), which answers Hiragino Sans with its W3 face
+  where 149 answered W4, scoped to `cargo nextest run --release --features
+  render -p obscura-render -p obscura-js -p obscura-browser -p obscura-net`
+  1629/1629. Full workspace gate deferred to the next backfill.
