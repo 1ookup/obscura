@@ -14550,6 +14550,40 @@ RequestRedirect value",
     /// A DOMHighResTimeStamp carries sub-millisecond precision, floored to
     /// 100 microseconds. Deriving it from `Date.now()` makes every reading a
     /// whole millisecond, and a page that times two consecutive calls reads a
+    /// A cross-origin isolated realm opens the clock to Chrome's 5
+    /// microsecond floor: the smallest step between two readings sits on the
+    /// 0.005 grid (with the double error of the derivation), where the plain
+    /// realm keeps the 0.1 step. The challenge times this resolution in both
+    /// of its realms, so the isolation state has to move the clock, not just
+    /// the boolean.
+    #[test]
+    fn performance_now_opens_to_five_microseconds_when_isolated() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://isolated.example/page");
+        rt.set_cross_origin_isolated(true);
+        rt.run_page_init();
+        let smallest_step = rt
+            .evaluate(
+                "(function () {
+                   let smallest = Infinity;
+                   for (let i = 0; i < 200000; i++) {
+                     const a = performance.now();
+                     const b = performance.now();
+                     if (b > a && b - a < smallest) smallest = b - a;
+                   }
+                   return smallest;
+                 })()",
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            (smallest_step - 0.005).abs() < 1e-6,
+            "isolated smallest step was {smallest_step}, expected ~0.005"
+        );
+    }
+
     /// 1 ms clock where a browser reports 0.1 -- Turnstile times exactly that
     /// loop and sends the result home.
     #[test]
