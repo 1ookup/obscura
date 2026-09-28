@@ -420,9 +420,25 @@ fn identity_cluster_units(cluster: &str, face: IdentityFace) -> Option<f32> {
 /// answers for *every* family and not only for the two generics that have an
 /// advance table: a page that measures an emoji in the default font sees the
 /// same single 999-unit glyph the generics report.
-fn identity_measured_cluster(face: Option<IdentityFace>, cluster: &str) -> Option<f32> {
+fn identity_measured_cluster(
+    face: Option<IdentityFace>,
+    table: Option<&'static crate::font_tables::FontTable>,
+    previous: Option<char>,
+    cluster: &str,
+) -> Option<f32> {
     if cluster.is_empty() {
         return None;
+    }
+    // A family macOS ships a font for answers that font's own advances and
+    // kern pairs, scaled to the 1000-unit em this metric path assumes. It
+    // outranks the identity face: a named family resolves to a bundled
+    // stand-in, whose identity face would otherwise answer the identity's own
+    // face for it (Courier reading back PingFang's width). A cluster the table
+    // does not carry falls through to everything below.
+    if let Some(table) = table {
+        if let Some(units) = table_cluster_units(table, previous, cluster) {
+            return Some(units);
+        }
     }
     if let Some(face) = face {
         return identity_cluster_units(cluster, face);
@@ -442,6 +458,29 @@ fn identity_measured_cluster(face: Option<IdentityFace>, cluster: &str) -> Optio
         }
     }
     None
+}
+
+/// One cluster's units in a family table's own em, the kern pair with the
+/// cluster before it included. `None` when the table does not carry every
+/// character of the cluster.
+fn table_cluster_units(
+    table: &'static crate::font_tables::FontTable,
+    previous: Option<char>,
+    cluster: &str,
+) -> Option<f32> {
+    let mut units = 0.0;
+    let mut before = previous;
+    for ch in cluster.chars() {
+        units += table.advance(ch)?;
+        // Pairs inside one cluster count too: the stand-in shapes `fl` as one
+        // glyph, and the reference's own answer for that run has the pair in
+        // it, so a cluster's characters cannot be summed without them.
+        if let Some(before) = before {
+            units += table.kern(before, ch);
+        }
+        before = Some(ch);
+    }
+    Some(units * 1000.0 / table.upem)
 }
 
 /// East Asian wide and fullwidth characters: the ranges the identity's CJK face
@@ -530,9 +569,16 @@ fn ink_union(
 /// no covered text.
 fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -> (f32, f32, f32) {
     let face = item.identity_face;
-    let (ligature_spans, mut units) = match face {
-        Some(face) => identity_ligature_spans(run.text, face),
-        None => (Vec::new(), 0.0),
+    let table = item.identity_table;
+    // A family table answers for the clusters of the family's own file, its
+    // ligatures included -- the reference's own measured pairs carry those
+    // ('ff' in Arial measures 37 units under the plain sum). The identity
+    // face's ligature table belongs to a different font and must not override
+    // it: `fl` in Courier answered the stand-in sans ligature (608 units)
+    // instead of Courier's two 1229-unit advances.
+    let (ligature_spans, mut units) = match (table, face) {
+        (None, Some(face)) => identity_ligature_spans(run.text, face),
+        _ => (Vec::new(), 0.0),
     };
     let mut line = line_w;
     let mut size = 0.0f32;
@@ -540,15 +586,22 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
     // whole cluster's byte range. The cluster's advance is counted once; every
     // glyph's own advance still leaves the line.
     let mut counted: Vec<(usize, usize)> = Vec::new();
+    // Kern pairs straddle two clusters, so the cluster before this one is kept
+    // for the table's kern lookup.
+    let mut previous: Option<char> = None;
     for glyph in run.glyphs.iter() {
         let span = (glyph.start, glyph.end);
         let ligature = ligature_spans
             .iter()
             .any(|(start, end)| *start <= span.0 && span.1 <= *end);
-        let cluster_units = run
-            .text
-            .get(span.0..span.1)
-            .and_then(|cluster| identity_measured_cluster(face, cluster));
+        let cluster = run.text.get(span.0..span.1);
+        let cluster_units = cluster
+            .and_then(|cluster| identity_measured_cluster(face, table, previous, cluster));
+        if let Some(cluster) = cluster {
+            if let Some(last) = cluster.chars().last() {
+                previous = Some(last);
+            }
+        }
         if !ligature && cluster_units.is_none() {
             continue;
         }
@@ -565,6 +618,18 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
         }
     }
     (line, units, size)
+}
+
+/// Snap a width to Blink's `LayoutUnit` grid, 1/64 px, ties away from zero.
+///
+/// Every element width a browser reports goes through this: the reference
+/// answers `getBoundingClientRect()` for a 16px Arial `Cloudflare` as 72.9375
+/// where its own `measureText` says 72.9296875, and 948.875 where the canvas
+/// says 948.8671875 -- each exactly the canvas value rounded to the nearest
+/// 1/64. The canvas channel keeps the unrounded value, which is why this is
+/// applied on the element side only.
+fn snap_layout_unit(value: f32) -> f32 {
+    (value * 64.0).round() / 64.0
 }
 
 /// Pixel width of a scaled unit count, zero when the line had no covered text
@@ -680,12 +745,22 @@ pub(crate) fn bundled_face_for_css_token(token: &str) -> Option<BundledFace> {
     // invented name that happened to contain one of those words as an installed
     // font -- which is how it came to claim a machine with Windows, Linux and
     // macOS font sets installed at once. Matching stays exact.
+    // Which keywords Chrome knows is the platform's set, and on macOS it is the
+    // narrow one: `system-ui`, `BlinkMacSystemFont` and the three classic
+    // generics answer a face, while the `ui-` family keywords and
+    // `-apple-system` are *unknown families* and fall back to the default
+    // family. Measured on the local oracle at 16px, `Hamburgefonstiv`:
+    // `system-ui` 124.8125, `-apple-system` and `ui-monospace` 126.5119 -- the
+    // same width an invented name answers, and the width `sans-serif` and the
+    // default family answer too.
+    let macos = font_platform() == FontPlatform::MacOs;
     let generic = match token.as_str() {
-        "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => {
-            Some(BundledFace::System)
-        }
-        "monospace" | "ui-monospace" => Some(BundledFace::Mono),
-        "serif" | "ui-serif" => Some(BundledFace::Serif),
+        "system-ui" | "blinkmacsystemfont" => Some(BundledFace::System),
+        "ui-sans-serif" | "-apple-system" if !macos => Some(BundledFace::System),
+        "monospace" => Some(BundledFace::Mono),
+        "ui-monospace" if !macos => Some(BundledFace::Mono),
+        "serif" => Some(BundledFace::Serif),
+        "ui-serif" if !macos => Some(BundledFace::Serif),
         "sans-serif" => Some(BundledFace::Sans),
         _ => None,
     };
@@ -806,6 +881,10 @@ struct ResolvedFont {
     /// it scales the bundled mono face's uniform advance instead of replacing
     /// it with a table.
     identity_face: Option<IdentityFace>,
+    /// The advance table for a family macOS ships a font for, when the
+    /// requested family names one. `None` keeps the shaped stand-in's metrics
+    /// (or the identity face's, for the generics).
+    identity_table: Option<&'static crate::font_tables::FontTable>,
 }
 
 #[derive(Clone)]
@@ -814,6 +893,109 @@ pub(crate) struct WebFont {
     pub family: Option<String>,
     pub weight: Option<(u16, u16)>,
     pub italic: Option<bool>,
+}
+
+/// The advance table for the first family in a CSS stack that macOS ships a
+/// font for. A stack's generic tail (`Arial, sans-serif`) leaves the answer to
+/// the identity faces, which is why the search stops at the first name with a
+/// table rather than at the first name at all.
+#[cfg(test)]
+mod font_table_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn a_named_family_answers_its_own_metrics() {
+        // The identity the runtime is under when a page measures: the macOS
+        // early-return in `resolve_loaded_font` is what a named family used to
+        // read the identity face's metrics through.
+        set_font_platform("MacIntel");
+        // The reference widths the tracker recorded for these families; the
+        // canvas measurement channel is what a page reads.
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        for (font, expected) in [
+            ("16px Courier", 144.0234f32),
+            ("16px Helvetica", 120.9453),
+            ("16px Menlo", 144.4922),
+            ("16px Times New Roman", 111.6875),
+            ("16px Apple Symbols", 93.5391),
+            ("16px Galvji", 138.4922),
+        ] {
+            let measured = measurer.measure("Hamburgefonstiv", font);
+            assert!(
+                (measured - expected).abs() < 0.002,
+                "{font}: measured {measured}, reference {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stack_answers_through_its_first_family_with_a_table() {
+        set_font_platform("MacIntel");
+        let mut measurer = crate::CanvasTextMeasurer::new();
+        // The first name with a table answers, whether or not it is quoted.
+        for font in ["16px \"Courier\"", "16px Courier, monospace"] {
+            let measured = measurer.measure("Hamburgefonstiv", font);
+            assert!(
+                (measured - 144.0234f32).abs() < 0.002,
+                "{font}: measured {measured}, reference 144.0234"
+            );
+        }
+        // A family with no table keeps the identity face's answer, which is
+        // the PingFang SC width on this identity.
+        for font in ["16px Segoe UI", "16px sans-serif"] {
+            let measured = measurer.measure("Hamburgefonstiv", font);
+            assert!(
+                (measured - 126.5119f32).abs() < 0.002,
+                "{font}: measured {measured}, reference 126.5119"
+            );
+        }
+        // The tables are the host's macOS files: an identity claiming another
+        // platform keeps the bundled stand-in's metrics for the same family.
+        set_font_platform("Win32");
+        let windows = measurer.measure("0123456789abcdef", "16px Georgia");
+        assert!(
+            (windows - 122.640625).abs() < 1e-3,
+            "Georgia under a Windows identity: measured {windows}, stand-in 122.640625"
+        );
+    }
+}
+
+/// The table a CSS token answers through: a family this host ships, or the
+/// generic token macOS resolves to one of them.
+///
+/// `monospace` is Menlo, `fantasy` is Papyrus (oracle: 144.4921875 and
+/// 121.34375 at 16px, exactly the two families' own widths), and `system-ui`
+/// is the system font, which no family file carries -- its table is measured
+/// from the reference instead. `BlinkMacSystemFont` is the same font as
+/// `system-ui`; the other `ui-` keywords and `-apple-system` are unknown to
+/// Chrome on macOS and fall through to the default family, which is what the
+/// identity face already answers.
+fn identity_table_for_token(name: &str) -> Option<&'static crate::font_tables::FontTable> {
+    let lowered = name.to_ascii_lowercase();
+    let family = match lowered.as_str() {
+        "monospace" => "Menlo",
+        "fantasy" => "Papyrus",
+        "blinkmacsystemfont" => "system-ui",
+        other => other,
+    };
+    crate::font_tables::table_for_family(family)
+}
+
+fn identity_table_for_stack(fam: Option<&str>) -> Option<&'static crate::font_tables::FontTable> {
+    // The tables are the files this host ships for the families a macOS
+    // identity names; an identity that claims another platform keeps the
+    // bundled stand-ins' metrics, exactly as its identity faces do.
+    if font_platform() != FontPlatform::MacOs {
+        return None;
+    }
+    let stack = fam?;
+    for token in stack.split(',') {
+        let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if let Some(table) = identity_table_for_token(name) {
+            return Some(table);
+        }
+    }
+    None
 }
 
 fn resolve_loaded_font(
@@ -864,6 +1046,16 @@ fn resolve_loaded_font(
                     // webfont is never a stand-in.
                     resolved.identity_face =
                         if entry.is_webfont { None } else { IdentityFace::of_token(name) };
+                    // A family macOS ships a font for answers that font's own
+                    // metrics; the generics keep the identity faces above. The
+                    // stack decides, not the matched token: `Courier, monospace`
+                    // matches the bundled mono stand-in but the page asked for
+                    // Courier first.
+                    resolved.identity_table = if entry.is_webfont {
+                        None
+                    } else {
+                        identity_table_for_stack(fam)
+                    };
                     if !entry.is_webfont {
                         if let Some(metrics) = identity_metrics_for_token(name) {
                             resolved.metrics = metrics;
@@ -882,12 +1074,14 @@ fn resolve_loaded_font(
     // identity is resolved here (layout time), not at engine construction,
     // because set_font_platform lands after the engine exists.
     let identity_face = IdentityFace::of_family(fallback);
+    let identity_table = identity_table_for_stack(fam);
     if font_platform() == FontPlatform::MacOs {
         if let Some(family) = loaded.get("__obscura_system_pingfang") {
             if let Some(mut resolved) =
                 select_loaded_face(family, requested_weight, requested_italic)
             {
                 resolved.identity_face = identity_face;
+                resolved.identity_table = identity_table;
                 return resolved;
             }
         }
@@ -898,6 +1092,7 @@ fn resolve_loaded_font(
         metrics: bundled_face_metrics(fallback),
         synthetic_italic: false,
         identity_face,
+        identity_table,
     }
 }
 
@@ -931,6 +1126,7 @@ fn select_loaded_face(
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
             identity_face: None,
+            identity_table: None,
         });
     }
     let available: Vec<_> = candidates.iter().map(|face| face.min_weight).collect();
@@ -944,6 +1140,7 @@ fn select_loaded_face(
             metrics: face.metrics,
             synthetic_italic: requested_italic && !face.italic,
             identity_face: None,
+            identity_table: None,
         })
 }
 
@@ -1234,6 +1431,10 @@ pub struct InlineItem {
     /// widens and the last-resort cluster) come from the built-in table rather
     /// than from the bundled stand-in that shapes the run.
     identity_face: Option<IdentityFace>,
+    /// The advance table for a family macOS ships a font for, when the
+    /// requested family names one. `None` keeps the shaped stand-in's metrics
+    /// (or the identity face's, for the generics).
+    identity_table: Option<&'static crate::font_tables::FontTable>,
     /// Alignment is applied against the original content width. Cosmic-text
     /// uses its buffer width for both wrapping and alignment, so a balanced
     /// (narrower) buffer needs a corresponding origin inset.
@@ -2436,6 +2637,7 @@ impl TextEngine {
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, None, wrap);
         let identity_face = item.identity_face;
+        let identity_table = item.identity_table;
         // Collect the shaped glyph specs first: scaling needs &mut font_system
         // while the runs borrow the buffer.
         let mut specs: Vec<(cosmic_text::fontdb::ID, u16, f32, f32)> = Vec::new();
@@ -2457,14 +2659,21 @@ impl TextEngine {
                 Some(face) => identity_ligature_spans(run.text, face),
                 None => (Vec::new(), 0.0),
             };
+            let mut previous: Option<char> = None;
             for glyph in run.glyphs.iter() {
                 let span = (glyph.start, glyph.end);
                 let ligature = ligature_spans
                     .iter()
                     .any(|(start, end)| *start <= span.0 && span.1 <= *end);
                 let cluster = run.text.get(span.0..span.1);
-                let cluster_units =
-                    cluster.and_then(|cluster| identity_measured_cluster(identity_face, cluster));
+                let cluster_units = cluster.and_then(|cluster| {
+                    identity_measured_cluster(identity_face, identity_table, previous, cluster)
+                });
+                if let Some(cluster) = cluster {
+                    if let Some(last) = cluster.chars().last() {
+                        previous = Some(last);
+                    }
+                }
                 let covered = ligature || cluster_units.is_some();
                 let advance = if covered {
                     // A ligature's advance belongs to its first cluster; the
@@ -2808,6 +3017,7 @@ impl TextEngine {
         // needs no separate identity check.
         let advance_scale = identity_advance_scale(&identity_font.family);
         let identity_face = identity_font.identity_face;
+        let identity_table = identity_font.identity_table;
         self.items.push(InlineItem {
             buffer,
             layout_wrap,
@@ -2818,6 +3028,7 @@ impl TextEngine {
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
             advance_scale,
             identity_face,
+            identity_table,
             align,
             forced_min_height,
             origin: (0.0, 0.0),
@@ -2910,7 +3121,12 @@ impl TextEngine {
             height = height.max(run.line_top + run.line_height);
         }
         (
-            (width + identity_width(emoji_units, emoji_size)) * item.advance_scale,
+            // The stand-in's own advances are what `advance_scale` corrects;
+            // the identity face's answer is already in the identity's units and
+            // must not be scaled with them (the canvas path does the same).
+            snap_layout_unit(
+                width * item.advance_scale + identity_width(emoji_units, emoji_size),
+            ),
             height.max(item.forced_min_height),
         )
     }
@@ -3609,6 +3825,7 @@ fn collect_node_spans(
                     metrics: ctx.font_metrics,
                     synthetic_italic: ctx.synthetic_italic,
                     identity_face: None,
+                    identity_table: None,
                 });
             let variations = style
                 .map(|style| resolved_font_variations(style, &font))
@@ -3813,7 +4030,10 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     }
     let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
-        ((w + identity_width(emoji_units, emoji_size)) * item.advance_scale).ceil(),
+        // This is the paragraph IFC's intrinsic width, which the engine has
+        // always ceiled to a whole pixel (the word path above keeps the 1/64
+        // grid instead); only the stand-in's share of it is scaled.
+        (w * item.advance_scale + identity_width(emoji_units, emoji_size)).ceil(),
         if clamped {
             clamp_height.unwrap_or(h)
         } else {
@@ -5557,6 +5777,7 @@ mod tests {
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
             identity_face: None,
+            identity_table: None,
         };
         assert!(resolved_font_variations(&style, &static_font).is_none());
         let styles = HashMap::from([(copy, style)]);
@@ -5588,6 +5809,7 @@ mod tests {
             metrics: bundled_face_metrics(FAMILY),
             synthetic_italic: false,
             identity_face: None,
+            identity_table: None,
         };
         assert!(resolved_font_variations(&style, &font).is_none());
     }
@@ -6692,12 +6914,13 @@ mod ink_tests {
                 "{text:?} at {font} width {width} != {expected}"
             );
         }
-        // A named family that routes to the same bundled face keeps the
-        // stand-in's advances, so only the generic carries the identity.
+        // A named family macOS ships a font for answers that font's advances
+        // (oracle: Georgia reads 134.0546875 for this run, the bundled stand-in
+        // 122.640625), while the generic keeps the identity face.
         let georgia = measurer.measure("0123456789abcdef", "16px Georgia");
         assert!(
-            (georgia - 122.640625).abs() < 1e-3,
-            "Georgia width {georgia} must stay on the bundled stand-in"
+            (georgia - 134.0546875).abs() < 1e-3,
+            "Georgia width {georgia} must be the host font's"
         );
     }
 
@@ -6798,4 +7021,6 @@ mod ink_tests {
         assert!(right >= left);
     }
 }
+
+
 

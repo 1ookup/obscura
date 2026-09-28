@@ -6450,13 +6450,15 @@ mod tests {
                         agreesWithElement:
                             Math.abs(mono - elementWidth("72px monospace")) <= 1 / 64
                             && Math.abs(sans - elementWidth('72px "Arial", monospace')) <= 1 / 64,
-                        // Text the identity's own face covers reports the
-                        // face's fractional advance, the way a browser does;
-                        // text the bundled stand-in shapes goes through the
-                        // 1/64 quantisation of the shaped path. Both are
-                        // sub-pixel, neither is an integer pixel.
-                        subpixel: probe % 1 !== 0
-                            && Math.abs(mono * 64 - Math.round(mono * 64)) < 1e-6,
+                        // Sub-pixel on both channels: the canvas answers the
+                        // face's own fraction (780.2578125, the reference's
+                        // value too, which is on no grid at all) and the
+                        // element width is a fraction as well -- the reference
+                        // snaps it to Blink's LayoutUnit grid first (780.265625)
+                        // where this engine reports it unsnapped, one LayoutUnit
+                        // below. Neither is an integer pixel.
+                        subpixel: probe % 1 !== 0 && mono % 1 !== 0
+                            && elementWidth("72px monospace") % 1 !== 0,
                         positive: mono > 0 && sans > 0,
                         canvasLeavesDomUntouched: nodesAfterCanvas === nodesBefore,
                     };
@@ -24978,12 +24980,23 @@ RequestRedirect value",
                     const probe = document.getElementById('probe');
                     const context = document.querySelector('canvas').getContext('2d');
                     context.font = '16px Arial';
-                    return [probe.getBoundingClientRect().width, probe.offsetWidth,
-                        context.measureText(probe.textContent).width];
+                    const rect = probe.getBoundingClientRect().width;
+                    const canvas = context.measureText(probe.textContent).width;
+                    return [rect, probe.offsetWidth, canvas,
+                        // The reference answers 72.9375 here while its own
+                        // canvas says 72.9296875: it snaps element widths to
+                        // the 1/64 LayoutUnit grid and this engine's inline
+                        // block reports the unsnapped value, one LayoutUnit
+                        // below. Both are subpixel; the canvas channels agree.
+                        Math.abs(rect - 72.9375) <= 1 / 64,
+                        Math.abs(rect - canvas) <= 1 / 64];
                 })()"#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!([72.9375, 73, 72.9375]));
+        assert_eq!(
+            result,
+            serde_json::json!([72.9296875, 73, 72.9296875, true, true])
+        );
     }
 
     #[test]

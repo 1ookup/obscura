@@ -140,3 +140,10 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-render
   -p obscura-js -p obscura-browser` 1491/1491. Full workspace gate deferred to
   the next backfill.
+
+- 2026-09-28: canvas text metrics answer each family's own font (measured
+  tables from the reference browser, per-family advance and pair data, the
+  identity-face ligature override, cluster-internal pairs, the LayoutUnit snap
+  on element widths), scoped to `cargo nextest run --release --features render
+  -p obscura-render -p obscura-js -p obscura-browser -p obscura-net`
+  1628/1628. Full workspace gate deferred to the next backfill.
