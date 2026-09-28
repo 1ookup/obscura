@@ -307,6 +307,34 @@ const _WEBGL_IFP_FLOAT_RENDERABLE = new Set([
 const _WEBGL_PRECISION_FLOAT = { rangeMin: 127, rangeMax: 127, precision: 23 };
 const _WEBGL_PRECISION_INT = { rangeMin: 31, rangeMax: 30, precision: 0 };
 
+// Chromium pins every WebGL context created in a frame that is not same-origin
+// with the top-level frame to the low-power preference and reports that
+// preference back, whatever the caller asked for: the oracle answers
+/// `low-power` for no options, `{powerPreference: 'default'}` and
+/// `{powerPreference: 'high-performance'}` alike, on the element and the
+/// OffscreenCanvas path, in a cross-origin frame and in same-origin frames
+/// nested inside one. A top-level document and a same-origin frame keep what
+/// they asked for, and a worker keeps it too. The widget frame that builds the
+/// challenge payload is cross-origin, which is why the reference answers
+/// `low-power` where an echoed request reads `default`.
+let _webglLowPowerFrame = null;
+function _webglLowPowerForCrossOriginFrame() {
+  if (_webglLowPowerFrame !== null) return _webglLowPowerFrame;
+  let forced = false;
+  try {
+    // Workers have no document and no frame scope: Chrome leaves their
+    // preference alone (oracle: `default` from a worker built in a
+    // cross-origin frame).
+    if (typeof document !== 'undefined'
+        && typeof _dom === 'function') {
+      const root = Number(globalThis.__obscura_frame_document_nid) || 0;
+      if (root > 0) forced = _dom('iframe_scope_same_origin', root) === 'false';
+    }
+  } catch (_e) { forced = false; }
+  _webglLowPowerFrame = forced;
+  return forced;
+}
+
 function _webglExtensionObject(tag, constants, methods = {}) {
   const prototype = {};
   for (const [name, value] of Object.entries(constants)) {
@@ -411,7 +439,9 @@ class _WebGLContext {
       depth: this._attrs.depth !== undefined ? !!this._attrs.depth : true,
       desynchronized: false,
       failIfMajorPerformanceCaveat: !!this._attrs.failIfMajorPerformanceCaveat,
-      powerPreference: this._attrs.powerPreference || 'default',
+      powerPreference: _webglLowPowerForCrossOriginFrame()
+        ? 'low-power'
+        : (this._attrs.powerPreference || 'default'),
       premultipliedAlpha: this._attrs.premultipliedAlpha !== undefined ? !!this._attrs.premultipliedAlpha : true,
       preserveDrawingBuffer: !!this._attrs.preserveDrawingBuffer,
       stencil: !!this._attrs.stencil,
