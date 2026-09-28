@@ -8,6 +8,22 @@
 // __obscura_init, which the deferred-surface hydration runs. Only prefix
 // bootstrap bindings may be referenced here: the deferred modules have not
 // run yet when this executes.
+// Window attributes are accessors once config/window-attributes.js has run
+// (the end of __obscura_init), and the document/navigator binding below runs
+// again on every init: a hydration pass that re-runs this file after the
+// conversion would assign into a getter with no setter and throw in the
+// module's strict mode. Write through the slot instead; the plain assignment
+// is still correct for the first pass, and for a realm whose boot surface has
+// not been converted yet (a deferred-surface frame's core init).
+function _bindWindowAttribute(name, value) {
+  if (typeof globalThis.__obscura_set_window_attribute === 'function'
+      && globalThis.__obscura_set_window_attribute(globalThis, name, value)) {
+    return value;
+  }
+  try { globalThis[name] = value; } catch (_error) {}
+  return value;
+}
+
 globalThis.__obscura_core_init = function() {
   // Secure-context gating lives in surface-finalize (deferred); the optional
   // call is a no-op now and re-runs with the full init at hydration.
@@ -22,16 +38,16 @@ globalThis.__obscura_core_init = function() {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root, so the later full
     // __obscura_init rebind at hydration returns this same object.
-    globalThis.document = _scopedDocumentFor(frameRootNid);
+    _bindWindowAttribute('document', _scopedDocumentFor(frameRootNid));
     globalThis.document[_defaultViewProxySym] = globalThis;
     const container = _domParse("frame_container_info", frameRootNid) || {};
     const parentRoot =
       typeof container.parentRoot === "number" && container.parentRoot > 0
         ? container.parentRoot : 0;
     const topRef = _ancestorWindowRef(frameRootNid, 0, true);
-    globalThis.top = topRef;
-    globalThis.parent =
-      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef;
+    _bindWindowAttribute('top', topRef);
+    _bindWindowAttribute('parent',
+      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef);
     globalThis.frameElement = null;
     try {
       if (typeof container.host === "number" && container.host > 0
@@ -40,7 +56,7 @@ globalThis.__obscura_core_init = function() {
       }
     } catch (e) {}
   } else {
-    globalThis.document = new Document(documentNid);
+    _bindWindowAttribute('document', new Document(documentNid));
     _cache.set(documentNid, globalThis.document);
   }
   try {
@@ -120,7 +136,7 @@ globalThis.__obscura_init = function() {
   if (typeof frameRootNid === "number" && frameRootNid > 0) {
     // _scopedDocumentFor caches the wrapper in _cache as the canonical
     // Document object for the content root.
-    globalThis.document = _scopedDocumentFor(frameRootNid);
+    _bindWindowAttribute('document', _scopedDocumentFor(frameRootNid));
     globalThis.document[_defaultViewProxySym] = globalThis;
     // Ancestor window wiring (Phase 4): `parent` addresses the direct parent
     // document's realm, `top` the main Window; frameElement follows the
@@ -130,9 +146,9 @@ globalThis.__obscura_init = function() {
       typeof container.parentRoot === "number" && container.parentRoot > 0
         ? container.parentRoot : 0;
     const topRef = _ancestorWindowRef(frameRootNid, 0, true);
-    globalThis.top = topRef;
-    globalThis.parent =
-      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef;
+    _bindWindowAttribute('top', topRef);
+    _bindWindowAttribute('parent',
+      parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef);
     globalThis.frameElement = null;
     try {
       if (typeof container.host === "number" && container.host > 0
@@ -141,7 +157,7 @@ globalThis.__obscura_init = function() {
       }
     } catch (e) {}
   } else {
-    globalThis.document = new Document(documentNid);
+    _bindWindowAttribute('document', new Document(documentNid));
     // parentNode on <html> reaches the backing document node. Keep that wrapper
     // canonical so getRootNode(), isConnected, and identity comparisons return
     // the same Document object exposed as globalThis.document.
@@ -228,7 +244,7 @@ globalThis.__obscura_init = function() {
   // the interface). The old placeholder was a plain object whose seven fields
   // were own enumerable keys, and every field derives from the window metrics
   // set just below.
-  globalThis.visualViewport = OBSCURA_VISUAL_VIEWPORT_NEW();
+  _bindWindowAttribute('visualViewport', OBSCURA_VISUAL_VIEWPORT_NEW());
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -411,7 +427,7 @@ globalThis.__obscura_init = function() {
         }
       }
     }
-    globalThis.navigator = _identityObject('navigator', nav);
+    _bindWindowAttribute('navigator', _identityObject('navigator', nav));
     globalThis.console = _identityObject('console', globalThis.console);
     globalThis.visualViewport = _identityObject(
       'visualViewport', globalThis.visualViewport);
@@ -507,6 +523,17 @@ globalThis.__obscura_init = function() {
       globalThis.__obscura_install_window_surface(globalThis, _chromeWindowKeyOrder);
     } else {
       _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
+    }
+  } catch(e) {}
+  // Window IDL attributes are accessors in Chrome, not data properties, and
+  // the conversion runs here: every internal write (document, navigator,
+  // visualViewport, the viewport metrics) has already happened by this point,
+  // and re-running the modules later would otherwise assign into an accessor
+  // that no longer has a setter. See config/window-attributes.js for the
+  // per-name flags this restores.
+  try {
+    if (typeof globalThis.__obscura_install_window_attributes === 'function') {
+      globalThis.__obscura_install_window_attributes(globalThis);
     }
   } catch(e) {}
   // Native presentation (batch 20). Init replaced visualViewport, the

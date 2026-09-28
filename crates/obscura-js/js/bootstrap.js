@@ -251,6 +251,7 @@
 // @obscura-module env/worker/shared-worker.js
 // @obscura-module env/media/media-source-worklet.js
 // @obscura-module env/fingerprint/math-tanh.js
+// @obscura-module config/window-attributes.js
 // @obscura-module config/window-surface.js
 // @obscura-module config/surface-finalize.js
 // @obscura-module config/webidl-branding.js
