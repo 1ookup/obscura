@@ -1283,8 +1283,8 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       try { delete G.StorageManager.prototype.persist; } catch (e) {}
       nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
         // The same quota and usage the document realm answers: one origin
-        // cannot report two. Both come from the engine's storage op (the flat
-        // 10 GiB Chrome reports plus the bytes this origin actually wrote
+        // cannot report two. Both come from the engine's storage op (the 10 GiB
+        // floor Chrome reports plus the bytes this origin actually wrote
         // through OPFS), so the challenge's storage probe in this realm sees
         // the numbers a browser reports.
         storageData(this);

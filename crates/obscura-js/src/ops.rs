@@ -7509,18 +7509,23 @@ fn op_storage_usage_add(#[smi] delta: f64) {
 
 /// `navigator.storage.estimate()` quota and usage as `"quota,usage"`.
 ///
-/// Chrome 153 answers exactly 10 GiB, not a disk-derived figure: measured on
-/// this machine as 10737418240 across three secure origins (two loopback
-/// ports, one `localhost`) in both a reused and a fresh profile, repeated
-/// calls, always with `usage` 0. The earlier flat `10 GiB + host free-space
-/// delta` shape made the quota drift between processes (10737418888 and
-/// 10737418600 were measured), which is not something the browser does. Usage stays the
-/// origin's real written bytes.
+/// Chrome answers 10 GiB plus what the origin has stored, not a disk-derived
+/// figure: an empty origin reads exactly 10737418240 (measured across three
+/// secure origins in a reused and a fresh profile), and writing to the same
+/// origin moves quota with usage byte for byte -- 1049088 bytes of CacheStorage
+/// took quota to 10738467328, a further 73728 of IndexedDB to 10738541056.
+/// That is also the shape the challenge's reference session reports: its
+/// 10737418398 is 10 GiB plus the 158 bytes challenges.cloudflare.com had
+/// stored when the probe read it, not a fixed tail delta. The earlier
+/// `10 GiB + host free-space delta` shape made the quota drift between
+/// processes (10737418888 and 10737418600 were measured), which is what the
+/// browser does not do. Usage stays the origin's real written bytes.
 #[op2]
 #[string]
 fn op_storage_estimate() -> String {
     const GIB: u64 = 1 << 30;
-    format!("{},{}", 10 * GIB, storage_usage_bytes())
+    let usage = storage_usage_bytes();
+    format!("{},{}", 10 * GIB + usage, usage)
 }
 
 // --- navigator.connection.downlink estimator -------------------------------
@@ -7581,6 +7586,16 @@ fn downlink_estimate() -> f64 {
 #[op2(fast)]
 fn op_connection_downlink() -> f64 {
     downlink_estimate()
+}
+
+/// The platform libm's `tanh`. The reference Chrome's `Math.tanh` resolves to
+/// exactly these values (checked value for value against that build), while
+/// the fdlibm port this V8 carries drifts by one ulp on some inputs -- and the
+/// challenge fingerprints the engine through a battery of Math results, so the
+/// bootstrap routes `Math.tanh` here.
+#[op2(fast)]
+fn op_math_tanh(x: f64) -> f64 {
+    x.tanh()
 }
 
 
@@ -8446,6 +8461,7 @@ pub fn build_extension() -> Extension {
         op_storage_estimate(),
         op_storage_usage_add(),
         op_connection_downlink(),
+        op_math_tanh(),
         op_worker_spawn(),
         op_worker_post_message(),
         op_worker_terminate(),

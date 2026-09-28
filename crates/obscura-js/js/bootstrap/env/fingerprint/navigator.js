@@ -198,10 +198,10 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     clearWatch() {},
   })),
   storage: _bootstrapObject('navigator.storage', () => ({
-    // Quota and usage come from the engine's storage op (host-derived quota
-    // delta over the 10 GiB floor plus the origin's real written bytes), so
-    // this realm, the document realm, and the worker realm answer with one
-    // origin's numbers instead of three flat constants.
+    // Quota and usage come from the engine's storage op (the 10 GiB floor plus
+    // the origin's real written bytes, the shape Chrome answers), so this
+    // realm, the document realm, and the worker realm answer with one origin's
+    // numbers instead of three flat constants.
     estimate() {
       const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
       return Promise.resolve({

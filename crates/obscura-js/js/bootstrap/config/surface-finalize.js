@@ -1790,11 +1790,13 @@ const _chromeInterfaceShells = new Set();
 
   method(StorageManager.prototype, 'estimate', async function estimate() {
     requireStorage(this);
-    // Chrome 153 answers exactly 10 GiB (10737418240) on every secure origin
-    // measured, and usage grows with what the origin wrote. Both numbers come
-    // from the engine's storage op so this realm, navigator.storage, and the
-    // worker realm report one origin's values; the quota is a constant rather
-    // than a disk-derived figure because that is what the browser reports.
+    // Chrome answers 10 GiB plus what the origin has stored, and usage grows
+    // with the same writes: an empty origin reads 10737418240, and the
+    // reference session's 10737418398 is 10 GiB plus the 158 bytes that origin
+    // held. Both numbers come from the engine's storage op so this realm,
+    // navigator.storage, and the worker realm report one origin's values; the
+    // quota is a constant floor plus usage rather than a disk-derived figure
+    // because that is what the browser reports.
     const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
     return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
   }, 0);
@@ -2283,9 +2285,12 @@ const _navigatorMemberLengths = {
     + ' argument' + (count > 1 ? 's' : '') + ' required, but only 0 present.';
   method(quotaProto, 'queryUsageAndQuota', 1, function queryUsageAndQuota(successCallback) {
     if (arguments.length === 0) throw new TypeError(quotaArgCount('queryUsageAndQuota', 1));
-    // The captured quota is the shared origin quota the capture reported;
-    // usage is the same 0 the StorageManager estimate reports.
-    if (typeof successCallback === 'function') successCallback(0, 10737418240);
+    // The deprecated quota carries the same origin numbers StorageManager
+    // reports: usage first, then the 10 GiB floor plus that usage.
+    const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
+    if (typeof successCallback === 'function') {
+      successCallback(Number(parts[1]), Number(parts[0]));
+    }
   });
   method(quotaProto, 'requestQuota', 1, function requestQuota(quota) {
     if (arguments.length === 0) throw new TypeError(quotaArgCount('requestQuota', 1));

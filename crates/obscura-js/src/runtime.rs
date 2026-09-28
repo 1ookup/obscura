@@ -34238,15 +34238,17 @@ RequestRedirect value",
         );
     }
 
-    // The challenge's storage probe (RPKTR7) hashes estimate().quota. Chrome
-    // 153 answers exactly 10 GiB (10737418240) on every secure origin tested --
-    // two loopback ports and `localhost`, in a reused and a fresh profile,
-    // repeated calls -- and usage grows with what the origin wrote. The exact
-    // value is the point: this engine used to add a host free-space delta, so
-    // the quota was a different number every process (10737418888 and
-    // 10737418600 measured) and hashed to a different value each run.
+    // The challenge's storage probe (RPKTR7) reads estimate().quota, which the
+    // reference session answered 10737418398: 10 GiB plus the 158 bytes that
+    // origin had stored. An empty origin reads exactly 10737418240, and quota
+    // moves with usage byte for byte (10 GiB plus 1049088 bytes of CacheStorage
+    // measured as 10738467328), so the engine answers the same floor plus its
+    // own usage. The exact value is the point: this engine used to add a host
+    // free-space delta, so the quota was a different number every process
+    // (10737418888 and 10737418600 measured) and hashed to a different value
+    // each run.
     #[tokio::test(flavor = "current_thread")]
-    async fn storage_estimate_quota_is_exactly_ten_gib() {
+    async fn storage_estimate_quota_is_ten_gib_plus_usage() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate_for_cdp(
@@ -34262,10 +34264,11 @@ RequestRedirect value",
                     return {
                         shape: Object.keys(before),
                         quota: before.quota,
-                        quotaIsTenGib: before.quota === 10737418240,
+                        quotaIsTenGibPlusUsage: before.quota === 10737418240 + before.usage,
                         stable: before.quota === before2.quota && before.usage === before2.usage,
                         usageBefore: before.usage,
                         usageAfterGrew: after.usage >= 4096,
+                        quotaTracksUsage: after.quota === 10737418240 + after.usage,
                         usageIsInteger: Number.isInteger(after.usage),
                     };
                 })()"#,
@@ -34281,10 +34284,11 @@ RequestRedirect value",
             serde_json::json!({
                 "shape": ["quota", "usage", "usageDetails"],
                 "quota": 10737418240u64,
-                "quotaIsTenGib": true,
+                "quotaIsTenGibPlusUsage": true,
                 "stable": true,
                 "usageBefore": 0,
                 "usageAfterGrew": true,
+                "quotaTracksUsage": true,
                 "usageIsInteger": true,
             })
         );
