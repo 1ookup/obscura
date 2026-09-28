@@ -102,7 +102,15 @@ globalThis.__obscura_init = function() {
   // First: the document URL is known now, and the gating below removes APIs
   // that later init steps would otherwise hand out on an insecure origin.
   try { _applySecureContextGating?.(); } catch (_e) {}
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  // The synthetic-fingerprint seed stays constant across pages and sessions:
+  // the values it drives (audio latency, compression thresholds, the heap
+  // readings, geo jitter) answer from hardware or settings on a real browser
+  // and are stable there. Seeding them from Date.now()/Math.random() made
+  // every session answer a different synthetic fingerprint -- a per-session
+  // entropy a real browser does not emit, and one the challenge's payload
+  // hash surfaced (auHG6 answered a different row every run on this engine
+  // while the reference answered the same one across builds).
+  _fpSeed = 0;
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
