@@ -180,3 +180,13 @@ run covers are then removed.
   -p obscura-browser -p obscura-net --no-fail-fast
   --config vendor/v8-source.toml` = **1017/1017 passed** at HEAD `8fe3e1b`.
   Full workspace gate deferred to the next backfill.
+
+- 2026-09-29: the COI-following clock (`120b792`), the offer without the
+  high-profile H264 pair (`84b2216`), the console prototype shell
+  (`8524ec0`), the lagging quota accounting (`2496bc9`), the worker event
+  methods off the global's own surface (`d43dc89` + `30af415`), and the
+  CORP-shaped require-corp embed check (`93ffc4d`), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-net --no-fail-fast
+  --config vendor/v8-source.toml` = **1018/1018 passed** at HEAD `30af415`.
+  Full workspace gate deferred to the next backfill.
