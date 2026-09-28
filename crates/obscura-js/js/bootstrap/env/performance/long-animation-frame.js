@@ -165,7 +165,11 @@ globalThis.__obscura_measure_task = function (invoker, task, invokerType) {
 globalThis.__obscura_record_host_task = function (elapsedMs, invoker, invokerType) {
   const duration = Math.max(0, +elapsedMs || 0);
   if (duration < _LOAF_THRESHOLD_MS) return;
+  // A performance entry's startTime is never negative in Chrome, and a task
+  // that outlasts the page it is reported on is the case that would produce
+  // one here: the derived start clamps to the timeline's origin.
+  const start = Math.max(0, performance.now() - duration);
   _recordLongAnimationFrame(
-    performance.now() - duration, duration, String(invoker || ''),
+    start, duration, String(invoker || ''),
     String(invokerType || 'classic-script'));
 };

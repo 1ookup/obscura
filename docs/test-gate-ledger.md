@@ -117,3 +117,9 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-js
   -p obscura-browser -p obscura-render` 1489/1489. Full workspace gate deferred
   to the next backfill.
+
+- 2026-09-28: East Asian wide characters measure one em in every family, and a
+  long-animation-frame entry's startTime clamps at zero, scoped to
+  `cargo nextest run --release --features render -p obscura-render
+  -p obscura-js -p obscura-browser` 1489/1489. Full workspace gate deferred to
+  the next backfill.

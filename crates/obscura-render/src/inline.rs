@@ -375,6 +375,12 @@ fn identity_glyph(ch: char, face: IdentityFace) -> Option<f32> {
     if (0x4E00..=0x9FFF).contains(&code) {
         return Some(1000.0);
     }
+    // So do the rest of the East Asian wide and fullwidth ranges this face
+    // covers: kana, CJK punctuation, compatibility ideographs and fullwidth
+    // forms all answer one em (measured: 'あ', '、' and 'Ａ' are 16px at 16px).
+    if identity_wide_rune(ch) {
+        return Some(1000.0);
+    }
     face.punctuation()
         .iter()
         .find(|(candidate, _)| *candidate == ch)
@@ -421,10 +427,40 @@ fn identity_measured_cluster(face: Option<IdentityFace>, cluster: &str) -> Optio
     if let Some(face) = face {
         return identity_cluster_units(cluster, face);
     }
-    if font_platform() == FontPlatform::MacOs && cluster.chars().any(identity_last_resort_rune) {
-        return Some(IdentityFace::LAST_RESORT_ADVANCE);
+    if font_platform() == FontPlatform::MacOs {
+        if cluster.chars().any(identity_last_resort_rune) {
+            return Some(IdentityFace::LAST_RESORT_ADVANCE);
+        }
+        // An East Asian wide character reaches the platform's CJK face in
+        // every family: none of the stand-ins this engine shapes with carries
+        // one, and a macOS identity resolves them through PingFang SC, the
+        // identity's own sans face. Measured on the local oracle: '中', 'あ',
+        // 'Ａ' and '、' answer 16px at 16px for Arial, Times, monospace and
+        // PingFang SC alike, where the shaped stand-in answered 5.8 to 9.6.
+        if cluster.chars().any(identity_wide_rune) {
+            return identity_cluster_units(cluster, IdentityFace::Sans);
+        }
     }
     None
+}
+
+/// East Asian wide and fullwidth characters: the ranges the identity's CJK face
+/// covers and every bundled stand-in of this engine does not. Hangul syllables
+/// are left out on purpose -- a macOS identity resolves those through a third
+/// face whose advances are per-family (13.84px at 16px against this engine's
+/// shaped stand-in), so they stay a documented residual.
+fn identity_wide_rune(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2E80..=0x303E        // CJK radicals, Kangxi, CJK symbols and punctuation
+        | 0x3041..=0x33FF      // kana, kana supplement, CJK compatibility
+        | 0x3400..=0x4DBF      // CJK unified ideographs extension A
+        | 0x4E00..=0x9FFF      // CJK unified ideographs
+        | 0xA000..=0xA4CF      // Yi
+        | 0xF900..=0xFAFF      // CJK compatibility ideographs
+        | 0xFE30..=0xFE4F      // CJK compatibility forms
+        | 0xFF00..=0xFF60      // fullwidth forms
+        | 0xFFE0..=0xFFE6      // fullwidth signs
+    )
 }
 
 /// The ligature the identity face would form at `text[offset..]`, longest
