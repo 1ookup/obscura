@@ -129,3 +129,8 @@ run covers are then removed.
   scoped to `cargo nextest run --release --features render -p obscura-js
   -p obscura-browser -p obscura-render -p obscura-net` 1624/1624. Full
   workspace gate deferred to the next backfill.
+
+- 2026-09-28: storage.estimate usageDetails shape and the quota formula
+  comment, scoped to `cargo nextest run --release --features render
+  -p obscura-js -p obscura-browser -p obscura-render -p obscura-net`
+  1624/1624. Full workspace gate deferred to the next backfill.

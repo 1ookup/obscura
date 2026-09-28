@@ -7583,7 +7583,12 @@ fn op_storage_usage_add(#[smi] delta: f64) {
 fn op_storage_estimate() -> String {
     const GIB: u64 = 1 << 30;
     let usage = storage_usage_bytes();
-    format!("{},{}", 10 * GIB + usage, usage)
+    // Chrome's quota follows the origin's usage: an origin holding 1164 bytes
+    // answers 10737418240 + 1164 (measured), and one holding nothing answers
+    // the 10 GiB floor. The third field is the fileSystem sub-score Chrome
+    // reports in `usageDetails` once the origin stores anything; its own
+    // accounting adds per-file overhead this engine does not model.
+    format!("{},{},{}", 10 * GIB + usage, usage, usage)
 }
 
 // --- navigator.connection.downlink estimator -------------------------------

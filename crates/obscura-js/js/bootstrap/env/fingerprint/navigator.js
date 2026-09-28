@@ -204,8 +204,13 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     // numbers instead of three flat constants.
     estimate() {
       const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
+      const fileSystem = Number(parts[2]);
+      // Chrome answers `usageDetails` with one entry per storage system the
+      // origin actually uses, and an empty object when it uses none.
+      const usageDetails = {};
+      if (fileSystem > 0) usageDetails.fileSystem = fileSystem;
       return Promise.resolve({
-        quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {},
+        quota: Number(parts[0]), usage: Number(parts[1]), usageDetails,
       });
     },
     persist() { return Promise.resolve(false); },

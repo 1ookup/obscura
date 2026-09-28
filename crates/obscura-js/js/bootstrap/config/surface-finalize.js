@@ -1801,7 +1801,13 @@ const _chromeInterfaceShells = new Set();
     // quota is a constant floor plus usage rather than a disk-derived figure
     // because that is what the browser reports.
     const parts = String(Deno.core.ops.op_storage_estimate()).split(',');
-    return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
+    const fileSystem = Number(parts[2]);
+    // Chrome lists one `usageDetails` entry per storage system the origin uses
+    // and leaves the object empty when it uses none (measured: an origin with
+    // an OPFS file answers `{fileSystem: <bytes>}`, an empty one `{}`).
+    const usageDetails = {};
+    if (fileSystem > 0) usageDetails.fileSystem = fileSystem;
+    return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails };
   }, 0);
   method(StorageManager.prototype, 'persisted', async function persisted() {
     requireStorage(this); return false;
