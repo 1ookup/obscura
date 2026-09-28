@@ -224,6 +224,9 @@
       // table and callers rely on it in tests).
       'bluetooth', 'hid', 'serial', 'usb', 'xr', 'ink', 'login', 'managed',
       'protectedAudience', 'storageBuckets',
+      // `userAgentData` is [SecureContext] in Chrome and is absent, not
+      // undefined, on an insecure origin (measured).
+      'userAgentData',
     ]) _remove(globalThis.navigator, name);
     for (const name of ['documentPictureInPicture', 'launchQueue']) {
       _remove(globalThis, name);

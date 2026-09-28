@@ -276,7 +276,10 @@ registerNavigatorSurface();
 
   // Values set per-page by __obscura_init (avoids own data props on navigator).
   defGetter('hardwareConcurrency', function() { return _fingerprint().hardwareConcurrency || 1; });
-  defGetter('deviceMemory', function() { return _fingerprint().deviceMemory || 0.25; });
+  // No `deviceMemory`: Chrome on the platform this identity presents does not
+  // expose one (measured in both realms against the local oracle, where the
+  // property is absent and not merely undefined). A Windows identity would
+  // carry it back.
 
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));

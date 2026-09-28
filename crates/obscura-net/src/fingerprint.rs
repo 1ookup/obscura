@@ -233,6 +233,13 @@ fn authored_languages(language: &str) -> Vec<String> {
     vec![language.to_string()]
 }
 
+pub fn host_hardware_concurrency() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(8)
+}
+
+/// The machine's own core count, for the profiles below.
 impl Default for BrowserFingerprint {
     fn default() -> Self {
         Self::from_user_agent(DEFAULT_USER_AGENT)
@@ -243,7 +250,10 @@ impl BrowserFingerprint {
     /// Derive one deterministic identity from a User-Agent. Reduced UA values
     /// are deliberately not expanded into unknowable OS or browser patch
     /// versions. Embedders with real values supply them as policy overrides.
-    pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
+    /// The machine's own core count. Chrome reports the host's, so a profile that
+/// hardcodes one answers a value no two machines agree on (the local oracle
+/// reports 6 where this profile used to claim 8).
+pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
         let user_agent = user_agent.into();
         let browser_version =
             resolve_browser_version(chrome_version(&user_agent).unwrap_or_default());
@@ -278,7 +288,7 @@ impl BrowserFingerprint {
                 model,
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
-                hardware_concurrency: 8,
+                hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 8.0,
                 screen: ScreenFingerprint {
                     width: 412,
@@ -319,7 +329,7 @@ impl BrowserFingerprint {
                 model: String::new(),
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
-                hardware_concurrency: 8,
+                hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 8.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint {
@@ -349,7 +359,7 @@ impl BrowserFingerprint {
                 model: String::new(),
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
-                hardware_concurrency: 8,
+                hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 8.0,
                 screen: ScreenFingerprint {
                     width: 1440,
@@ -395,7 +405,7 @@ impl BrowserFingerprint {
                 model: String::new(),
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
-                hardware_concurrency: 8,
+                hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 8.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint {
@@ -421,7 +431,7 @@ impl BrowserFingerprint {
                 model: String::new(),
                 brands: Vec::new(),
                 full_version_list: Vec::new(),
-                hardware_concurrency: 8,
+                hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 8.0,
                 screen: desktop_screen(1.0),
                 gpu: GpuFingerprint { vendor: String::new(), renderer: String::new(), webgpu_profile: String::new() },

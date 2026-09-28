@@ -1689,14 +1689,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       'appCodeName', 'appName', 'appVersion', 'platform', 'product',
       'productSub', 'userAgent', 'vendor', 'vendorSub',
       'language', 'languages', 'onLine',
-      'hardwareConcurrency', 'deviceMemory',
+      'hardwareConcurrency',
       'userAgentData', 'connection', 'locks', 'permissions',
       'mediaCapabilities', 'serviceWorker', 'sendBeacon', 'gpu',
     ];
     for (var n = 0; n < NAV_ALLOW.length; n++) {
       var prop = NAV_ALLOW[n];
       // Accessors are re-installed as accessors so per-page overrides
-      // (hardwareConcurrency, deviceMemory) keep tracking their source.
+      // (hardwareConcurrency) keep tracking their source.
       var own = Object.getOwnPropertyDescriptor(pageNav, prop);
       var proto = Object.getPrototypeOf(pageNav);
       var inherited = (!own && proto) ? Object.getOwnPropertyDescriptor(proto, prop) : null;
@@ -2144,7 +2144,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     for (var gi = 0; gi < gatedGlobals.length; gi++) {
       try { delete G[gatedGlobals[gi]]; } catch (e) {}
     }
-    var gatedOnNavigator = ['serviceWorker', 'storage', 'locks', 'mediaDevices'];
+    // `userAgentData` is [SecureContext] in Chrome and absent, not undefined,
+    // on an insecure origin, in this realm too.
+    var gatedOnNavigator = ['serviceWorker', 'storage', 'locks', 'mediaDevices',
+      'userAgentData'];
     for (var ni = 0; ni < gatedOnNavigator.length; ni++) {
       try { if (G.navigator) delete G.navigator[gatedOnNavigator[ni]]; } catch (e) {}
     }
@@ -2647,7 +2650,6 @@ mod tests {
               userAgent:navigator.userAgent,
               platform:navigator.platform,
               hardwareConcurrency:navigator.hardwareConcurrency,
-              deviceMemory:navigator.deviceMemory,
               userAgentData:navigator.userAgentData.toJSON()
             })`;
             globalThis.__got = [];
@@ -2657,7 +2659,7 @@ mod tests {
         ).unwrap();
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         assert_eq!(rt.evaluate("JSON.stringify(globalThis.__got[0])").unwrap(), serde_json::json!(
-            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"deviceMemory":4,"userAgentData":{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"Linux"}}"#
+            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"userAgentData":{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"Linux"}}"#
         ));
     }
 

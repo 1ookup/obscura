@@ -577,7 +577,7 @@ function _fingerprint() {
     userAgent: '', language: 'en-US', languages: ['en-US', 'en'], browserVersion: '', browserMajor: 0,
     navigatorPlatform: '', uaPlatform: '', uaPlatformVersion: '',
     architecture: '', bitness: '', wow64: false, mobile: false, model: '',
-    brands: [], fullVersionList: [], hardwareConcurrency: 8, deviceMemory: 8,
+    brands: [], fullVersionList: [], hardwareConcurrency: 8,
     screen: {width:1920,height:1080,availWidth:1920,availHeight:1080,deviceScaleFactor:1},
     gpu: {vendor:'',renderer:''},
   };

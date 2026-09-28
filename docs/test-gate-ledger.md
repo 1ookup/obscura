@@ -123,3 +123,9 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-render
   -p obscura-js -p obscura-browser` 1489/1489. Full workspace gate deferred to
   the next backfill.
+
+- 2026-09-28: navigator host facts (hardwareConcurrency from the host,
+  deviceMemory removed, userAgentData secure-context gated in both realms),
+  scoped to `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-render -p obscura-net` 1624/1624. Full
+  workspace gate deferred to the next backfill.
