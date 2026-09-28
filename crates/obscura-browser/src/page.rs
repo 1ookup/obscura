@@ -340,6 +340,35 @@ impl PreloadScript {
     }
 }
 
+/// Whether a request initiated by `initiator` may carry the high-entropy UA
+/// client hints the target origin published in `Accept-CH`. The `ch-ua-*`
+/// features default to a Permissions-Policy allowlist of `self`, and a frame
+/// inherits its parent's policy: a frame that is not same-origin with the
+/// top-level document never holds the delegation. Measured against the
+/// reference round, where the cross-origin widget frame's own subresources
+/// answer the low-entropy trio while a same-origin frame's answer nine.
+fn client_hints_delegated_for(top: Option<&url::Url>, initiator: &url::Url) -> bool {
+    match top {
+        Some(top) => top.origin() == initiator.origin(),
+        None => true,
+    }
+}
+
+/// `Sec-Fetch-Storage-Access` reports whether a request carries unpartitioned
+/// credentials. Measured on Chrome: `active` on every credentialed request
+/// whose target origin differs from the top-level document's, including a
+/// same-origin fetch from inside a cross-site frame, which is the shape the
+/// widget frame's own subresources have. The header goes in the request's own
+/// map so the plan emits it in Chrome's slot.
+fn note_storage_access(request: &mut ResourceRequest, top: Option<&url::Url>, target: &url::Url) {
+    let cross_site = top.is_some_and(|top| top.origin() != target.origin());
+    if cross_site && request.sends_credentials_to(target) {
+        request
+            .headers
+            .insert("sec-fetch-storage-access".to_string(), "active".to_string());
+    }
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -2214,6 +2243,8 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let referrer_policy = self.referrer_policy;
         let script_initiator = self
@@ -2224,6 +2255,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2264,10 +2297,28 @@ impl Page {
                         cross_origin.as_deref(),
                     );
                     request.referrer_policy = referrer_policy;
-                    match client
+                    // Parser scripts used the plain transport while
+                    // navigations, stylesheets and images used the stealth one,
+                    // so a stealth run announced two TLS/header identities from
+                    // the same page.
+                    #[cfg(feature = "stealth")]
+                    let fetched = match stealth_client {
+                        Some(stealth) => {
+                            stealth
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                                .await
+                        }
+                        None => {
+                            client
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                                .await
+                        }
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let fetched = client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
+                        .await;
+                    match fetched {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -3311,16 +3362,23 @@ impl Page {
             fetch_tasks.push((index, full_url));
         }
         let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
+        let hints_delegated = client_hints_delegated_for(self.url.as_ref(), &initiator);
+        let top_document_url = self.url.clone();
         let referrer_policy = obscura_net::ReferrerPolicy::parse(&scope.referrer_policy)
             .unwrap_or_default();
         let fetch_futures: Vec<_> = fetch_tasks
             .into_iter()
             .map(|(index, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
                 let cross_origin = scripts[index].cross_origin.clone();
+                let top_document_url = top_document_url.clone();
                 let referrer_policy = referrer_policy;
                 async move {
                     let parsed =
@@ -3353,10 +3411,26 @@ impl Page {
                         cross_origin.as_deref(),
                     );
                     request.referrer_policy = referrer_policy;
-                    match client
+                    request.client_hints_delegated = hints_delegated;
+                    note_storage_access(&mut request, top_document_url.as_ref(), &parsed);
+                    #[cfg(feature = "stealth")]
+                    let fetched = match stealth_client {
+                        Some(stealth) => {
+                            stealth
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                                .await
+                        }
+                        None => {
+                            client
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
+                                .await
+                        }
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let fetched = client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
-                        .await
-                    {
+                        .await;
+                    match fetched {
                         Ok(resp) => Some((index, url, resp)),
                         Err(error) => {
                             tracing::warn!("Failed to fetch frame script {}: {}", url, error);
@@ -4652,6 +4726,7 @@ impl Page {
         let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
         let initiator = document_url.clone();
+        let top_level_url = self.url.clone();
         let referrer_policy = self.referrer_policy;
         use futures::StreamExt as _;
         let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
@@ -4669,10 +4744,14 @@ impl Page {
                 .get(&(raw.clone(), profile))
                 .map(|(_, policy)| *policy)
                 .unwrap_or(referrer_policy);
+            let top_document_url = top_level_url.clone();
             async move {
                 let parsed = url::Url::parse(&raw).expect("validated render resource URL");
                 let mut request = ResourceRequest::subresource(kind, &initiator);
                 request.referrer_policy = referrer_policy;
+                request.client_hints_delegated =
+                    client_hints_delegated_for(top_document_url.as_ref(), &initiator);
+                note_storage_access(&mut request, top_document_url.as_ref(), &parsed);
                 match profile {
                     Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
                         request.mode = obscura_net::RequestMode::Cors;
@@ -7289,6 +7368,8 @@ impl Page {
             return cached.clone();
         }
         let callbacks = self.callbacks.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
         let mut scheduled = std::collections::HashSet::new();
@@ -7306,11 +7387,28 @@ impl Page {
             } else {
                 let mut request = ResourceRequest::subresource(ResourceType::Stylesheet, base);
                 request.referrer_policy = referrer_policy;
-                let response = match self
+                request.client_hints_delegated = client_hints_delegated_for(self.url.as_ref(), base);
+                let top_document_url = self.url.clone();
+                note_storage_access(&mut request, top_document_url.as_ref(), &requested_url);
+                #[cfg(feature = "stealth")]
+                let fetched = match stealth_client.as_ref() {
+                    Some(stealth) => {
+                        stealth
+                            .fetch_resource_with_callbacks(&requested_url, request, Some(&callbacks))
+                            .await
+                    }
+                    None => {
+                        self.http_client
+                            .fetch_resource_with_callbacks(&requested_url, request, Some(&callbacks))
+                            .await
+                    }
+                };
+                #[cfg(not(feature = "stealth"))]
+                let fetched = self
                     .http_client
                     .fetch_resource_with_callbacks(&requested_url, request, Some(&callbacks))
-                    .await
-                {
+                    .await;
+                let response = match fetched {
                     Ok(response) => response,
                     Err(error) => {
                         tracing::debug!(

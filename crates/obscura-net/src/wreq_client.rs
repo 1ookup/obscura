@@ -565,6 +565,13 @@ impl StealthHttpClient {
                 .map(|accepted| accepted.iter().cloned().collect())
                 .unwrap_or_default();
             accepted_hints.sort();
+            tracing::debug!(
+                "client hints: {} initiator={:?} delegated={} accepted={:?}",
+                current_url,
+                request.initiator.as_ref().map(Url::as_str),
+                request.client_hints_delegated,
+                accepted_hints,
+            );
             // Permissions-Policy: the high-entropy UA-CH features default to
             // an allowlist of `self`, so a frame that is not same-origin with
             // the top-level document may not send the hints this origin

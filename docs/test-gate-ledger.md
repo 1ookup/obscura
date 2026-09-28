@@ -82,3 +82,9 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-browser` 139/139.
   Full workspace gate deferred to the next backfill; the fixture comparisons
   (three local fixtures, both engines) are in the commit message.
+
+- 2026-09-28: parser-script transport and page-path storage-access, scoped to
+  `cargo nextest run --release -p obscura-net` 135/135,
+  `-p obscura-browser` 139/139 and `-p obscura-js` 739/740 (one animation
+  timing test flaked under parallel load, passes alone). Full workspace gate
+  deferred to the next backfill.

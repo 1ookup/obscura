@@ -480,7 +480,10 @@ impl ResourceRequest {
         }
     }
 
-    pub(crate) fn sends_credentials_to(&self, target: &Url) -> bool {
+    /// Whether this request carries credentials to `target`: an explicit
+    /// `include`, or `same-origin` mode against a target the initiator
+    /// matches.
+    pub fn sends_credentials_to(&self, target: &Url) -> bool {
         match self.credentials {
             RequestCredentials::Omit => false,
             RequestCredentials::Include => true,
