@@ -611,8 +611,13 @@ function _canvas2dParseColor(self, css) {
       if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
       if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
     }
+    // The channels clamp to 0-255 and the alpha to 0-1 before it is scaled,
+    // so `rgba(1,2,3,4)` paints opaque and `rgb(300,0,0)` paints #ff0000, the
+    // way the reference parses them. Gradient stops arrive here as written;
+    // the style attributes are already normalized to hex by their setter.
     const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
+    if (m) return [Math.min(255, +m[1]), Math.min(255, +m[2]), Math.min(255, +m[3]),
+      m[4] !== undefined ? Math.round(Math.max(0, Math.min(1, +m[4])) * 255) : 255];
     const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
     const value = named[css] || [0,0,0,255];
     if (state.colorSpace === 'srgb') return value;

@@ -112,3 +112,8 @@ run covers are then removed.
   scoped to `cargo nextest run --release --features render -p obscura-js
   -p obscura-browser -p obscura-render` 1489/1489. Full workspace gate deferred
   to the next backfill.
+
+- 2026-09-28: canvas alpha rules and createImageBitmap crop/resize, scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-render` 1489/1489. Full workspace gate deferred
+  to the next backfill.

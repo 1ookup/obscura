@@ -344,12 +344,66 @@ if (typeof OffscreenCanvas === 'undefined') {
     } else {
       throw new TypeError("Failed to execute 'createImageBitmap': The provided value is not an image source.");
     }
+    // The arguments are either `(sx, sy, sw, sh, options)` or `(options)`, and
+    // the options dictionary carries the resize Chrome applies after the crop
+    // (measured: a 5x4 crop resized to 11x12 answers 11x12, and a resize
+    // without a crop answers the resized size).
+    let options = null;
     if (crop.length >= 4) {
-      width = Math.abs(Math.trunc(Number(crop[2])));
-      height = Math.abs(Math.trunc(Number(crop[3])));
+      const left = Math.trunc(Number(crop[0]));
+      const top = Math.trunc(Number(crop[1]));
+      const cropWidth = Math.abs(Math.trunc(Number(crop[2])));
+      const cropHeight = Math.abs(Math.trunc(Number(crop[3])));
+      options = crop[4] && typeof crop[4] === 'object' ? crop[4] : null;
+      const resized = _canvasBitmapResize(options);
+      if (pixels) {
+        [width, height, pixels] = _canvasBitmapSample(
+          pixels, width, height, left, top, cropWidth, cropHeight, resized);
+      } else {
+        width = cropWidth; height = cropHeight;
+      }
+    } else {
+      options = crop[0] && typeof crop[0] === 'object' ? crop[0] : null;
+      const resized = _canvasBitmapResize(options);
+      if (pixels && resized) {
+        [width, height, pixels] = _canvasBitmapSample(
+          pixels, width, height, 0, 0, width, height, resized);
+      }
     }
     return new globalThis.ImageBitmap(_bitmapKey, width, height, pixels, colorSpace);
   });
+  // The requested output size, or null when the dictionary does not ask for one.
+  const _canvasBitmapResize = options => {
+    if (!options) return null;
+    const width = Math.trunc(Number(options.resizeWidth));
+    const height = Math.trunc(Number(options.resizeHeight));
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return [width, height];
+  };
+  // Crop (and optionally resize) a pixel buffer. Sampling is nearest-neighbour
+  // at pixel centres; Chrome resamples with a filter, so the values of a
+  // resized bitmap are close but not identical (documented residual).
+  const _canvasBitmapSample = (pixels, sourceWidth, sourceHeight, left, top,
+                                cropWidth, cropHeight, resized) => {
+    const outWidth = resized ? resized[0] : cropWidth;
+    const outHeight = resized ? resized[1] : cropHeight;
+    const out = new Uint8ClampedArray(outWidth * outHeight * 4);
+    for (let y = 0; y < outHeight; y++) {
+      const sourceY = Math.min(sourceHeight - 1, Math.max(0,
+        top + Math.floor((y + 0.5) * cropHeight / outHeight)));
+      for (let x = 0; x < outWidth; x++) {
+        const sourceX = Math.min(sourceWidth - 1, Math.max(0,
+          left + Math.floor((x + 0.5) * cropWidth / outWidth)));
+        const from = (sourceY * sourceWidth + sourceX) * 4;
+        const to = (y * outWidth + x) * 4;
+        out[to] = pixels[from];
+        out[to + 1] = pixels[from + 1];
+        out[to + 2] = pixels[from + 2];
+        out[to + 3] = pixels[from + 3];
+      }
+    }
+    return [outWidth, outHeight, out];
+  };
 }
 
 if (typeof Path2D === 'undefined') {
