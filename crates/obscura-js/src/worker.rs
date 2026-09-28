@@ -1508,7 +1508,12 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     // the surface is built here: Chrome's worker answers "[object FontFaceSet]"
     // for `self.fonts` and carries the same members document.fonts has.
     var WorkerFontFaceSet = function () { throw new TypeError('Illegal constructor'); };
-    var workerFontFaceSetProto = {};
+    // The window realm's FontFaceSet has no own constructor either -- an
+    // instance answers `fonts.constructor` with EventTarget, and the worker
+    // one reads the same, so the prototype hangs off EventTarget.prototype.
+    var workerFontFaceSetProto = Object.create(
+      (typeof EventTarget === 'function' && EventTarget.prototype)
+        ? EventTarget.prototype : Object.prototype);
     defineProperty(workerFontFaceSetProto, Symbol.toStringTag, {
       value: 'FontFaceSet', configurable: true,
     });
@@ -1523,7 +1528,18 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     defGet(workerFontFaceSetProto, 'ready', function () { return workerFontReady; }, true);
     defGet(workerFontFaceSetProto, 'status', function () { return 'loaded'; }, true);
     defGet(workerFontFaceSetProto, 'size', function () { return workerFontFaces.size; }, true);
-    def(workerFontFaceSetProto, 'check', function () { return workerFontFaces.size > 0; }, true);
+    // Chrome's check(): true when nothing in the set still needs loading for
+    // the request. An empty set answers true -- `fonts.check('12px Arial')`
+    // asks about a system face, and the window realm answers the same through
+    // `matches.length === 0`. The old `size > 0` inverted the empty-set
+    // answer, and the challenge's worker font probe reads it.
+    def(workerFontFaceSetProto, 'check', function () {
+      var pending = false;
+      workerFontFaces.forEach(function (face) {
+        if (!face || face.status !== 'loaded') pending = true;
+      });
+      return !pending;
+    }, true);
     def(workerFontFaceSetProto, 'load', function () {
       return Promise.resolve(Array.prototype.slice.call(workerFontFaces));
     }, true);
