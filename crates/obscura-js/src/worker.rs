@@ -2002,9 +2002,18 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // bootstrap's dispatchEvent writes to the Window registry, so leaving it
   // in place meant `dispatchEvent(new MessageEvent('message'))` reached
   // nothing that `addEventListener('message', ...)` had registered.
+  //
+  // The three event methods install on EventTarget.prototype, not on the
+  // global: Chrome keeps them off a worker's own surface (measured over a
+  // blob worker), and this realm's EventTarget.prototype serves nothing but
+  // the scope chain, so the registry below stays the one dispatch reads.
+  // Moving only the *installation target* -- not to the snapshot's own
+  // implementations, which write the Window registry -- is what keeps
+  // message delivery intact; relocating them wholesale once cost the worker
+  // its messages.
   // ---------------------------------------------------------------------
   var listeners = Object.create(null);
-  def(G, 'addEventListener', function addEventListener(type, fn, options) {
+  def(EventTargetProto, 'addEventListener', function addEventListener(type, fn, options) {
     if (!fn) return;
     var handler = typeof fn === 'function' ? fn
       : (typeof fn.handleEvent === 'function' ? fn.handleEvent.bind(fn) : null);
@@ -2014,7 +2023,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     for (var idx = 0; idx < ls.length; idx++) if (ls[idx].original === fn) return;
     ls.push({ original: fn, handler: handler, once: !!(options && options.once) });
   });
-  def(G, 'removeEventListener', function removeEventListener(type, fn) {
+  def(EventTargetProto, 'removeEventListener', function removeEventListener(type, fn) {
     var ls = listeners[String(type)];
     if (!ls) return;
     for (var idx = 0; idx < ls.length; idx++) {
@@ -2043,7 +2052,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       try { G.event = previousEvent; } catch (_) {}
     }
   }
-  def(G, 'dispatchEvent', function dispatchEvent(event) {
+  def(EventTargetProto, 'dispatchEvent', function dispatchEvent(event) {
     if (!event || typeof event.type !== 'string') {
       throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
     }
@@ -2404,11 +2413,12 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'structuredClone', 'queueMicrotask', 'reportError', 'clearInterval',
     'clearTimeout', 'setInterval', 'setTimeout',
     'onerror', 'onlanguagechange', 'onrejectionhandled', 'onunhandledrejection',
-    // addEventListener, removeEventListener and dispatchEvent stay as own
-    // properties: this scope's listener registry is the prep's own (section
-    // 6), and the EventTarget.prototype implementations key their state on a
-    // target the worker global does not provide, so moving them cost message
-    // delivery.
+    // addEventListener, removeEventListener and dispatchEvent are not own
+    // members here either: section 6 installs its registry-backed versions
+    // on EventTarget.prototype, which is where Chrome keeps them for a
+    // worker. The old note that kept them as own properties was about the
+    // snapshot's implementations writing the Window registry -- installing
+    // the registry-backed ones on the prototype has no such problem.
     ];
   // Chrome has no online/offline handler slots on a worker at all: neither
   // name appears on WorkerGlobalScope.prototype and `'ononline' in self` is
