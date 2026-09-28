@@ -360,10 +360,44 @@ if (typeof FontFace === 'undefined') {
     }
     return out;
   };
+  // The shallow font-container check behind `status` for a BufferSource
+  // source. Chrome parses the data; this reads the container header only. The
+  // two cases a probe takes are both right -- a buffer that is not a font
+  // answers 'error' and rejects, a real font answers 'loaded' -- while a
+  // container whose directory is plausible but whose tables are truncated
+  // still passes here and is rejected by Chrome (documented residual).
+  const _fontFaceContainerValid = bytes => {
+    if (!bytes || bytes.length < 12) return false;
+    const u16 = offset => (bytes[offset] << 8) | bytes[offset + 1];
+    const u32 = offset => ((bytes[offset] * 0x1000000) + (bytes[offset + 1] << 16)
+      + (bytes[offset + 2] << 8) + bytes[offset + 3]) >>> 0;
+    const magic = u32(0);
+    if (magic === 0x74746366) {                       // 'ttcf': a collection
+      const fonts = u32(8);
+      return fonts > 0 && 12 + fonts * 4 <= bytes.length;
+    }
+    if (magic === 0x774f4646 || magic === 0x774f4632) {   // 'wOFF' / 'wOF2'
+      return u32(4) === 0x00010000 && u16(12) > 0;
+    }
+    if (magic === 0x00010000 || magic === 0x74727565    // sfnt, 'true',
+        || magic === 0x74797031 || magic === 0x4f54544f) {  // 'typ1', 'OTTO'
+      const tables = u16(4);
+      return tables > 0 && 12 + tables * 16 <= bytes.length;
+    }
+    return false;
+  };
+  // `parseError` carries the raw source text Chrome puts in the message a
+  // source that is not a value list produces at load(); the constructor does
+  // not throw for it (measured: `new FontFace('X', '')` answers status
+  // 'error', and only load() rejects).
   const _fontFaceSource = source => {
     if (typeof source === 'string') {
-      if (!source.trim()) throw new DOMException('The font source is empty', 'SyntaxError');
-      return { css: source, binary: false };
+      return {
+        css: source,
+        binary: false,
+        bytes: null,
+        parseError: /local\s*\(|url\s*\(/i.test(source) ? null : source,
+      };
     }
     let bytes;
     if (source instanceof ArrayBuffer) {
@@ -375,7 +409,9 @@ if (typeof FontFace === 'undefined') {
     }
     return {
       css: 'url("data:font/ttf;base64,' + _fontFaceBytesBase64(bytes) + '")',
-      binary: true
+      binary: true,
+      bytes,
+      parseError: null,
     };
   };
   const _fontFaceDescriptor = (descriptors, name, fallback) =>
@@ -429,108 +465,14 @@ if (typeof FontFace === 'undefined') {
             display: declarations['font-display'] || 'auto',
             ascentOverride: declarations['ascent-override'] || 'normal',
             descentOverride: declarations['descent-override'] || 'normal',
-            lineGapOverride: declarations['line-gap-override'] || 'normal'
+            lineGapOverride: declarations['line-gap-override'] || 'normal',
+            sizeAdjust: declarations['size-adjust'] || '100%'
           }
         });
       }
     }
     return out;
   };
-
-  globalThis.FontFace = class FontFace {
-    constructor(family, source, descriptors={}) {
-      if (arguments.length < 2) throw new TypeError('FontFace requires family and source');
-      this._sets = new Set();
-      this._family = _fontFaceString(family);
-      if (!this._family.trim()) throw new DOMException('The font family is empty', 'SyntaxError');
-      const normalizedSource = _fontFaceSource(source);
-      this._source = normalizedSource.css;
-      this._style = _fontFaceDescriptor(descriptors, 'style', 'normal');
-      this._weight = _fontFaceDescriptor(descriptors, 'weight', 'normal');
-      this._stretch = _fontFaceDescriptor(descriptors, 'stretch', 'normal');
-      this._unicodeRange = _fontFaceDescriptor(descriptors, 'unicodeRange', 'U+0-10FFFF');
-      this._variant = _fontFaceDescriptor(descriptors, 'variant', 'normal');
-      this._featureSettings = _fontFaceDescriptor(descriptors, 'featureSettings', 'normal');
-      this._variationSettings = _fontFaceDescriptor(descriptors, 'variationSettings', 'normal');
-      this._display = _fontFaceDescriptor(descriptors, 'display', 'auto');
-      this._ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
-      this._descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
-      this._lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
-      this._status = normalizedSource.binary ? 'loaded' : 'unloaded';
-      this._loadedPromise = normalizedSource.binary ? Promise.resolve(this) : null;
-    }
-    _changed() { for (const set of this._sets) set._faceChanged(this); }
-    _setDescriptor(slot, value) {
-      this[slot] = String(value);
-      this._changed();
-    }
-    get family() { return this._family; }
-    set family(value) { this._setDescriptor('_family', value); }
-    get style() { return this._style; }
-    set style(value) { this._setDescriptor('_style', value); }
-    get weight() { return this._weight; }
-    set weight(value) { this._setDescriptor('_weight', value); }
-    get stretch() { return this._stretch; }
-    set stretch(value) { this._setDescriptor('_stretch', value); }
-    get unicodeRange() { return this._unicodeRange; }
-    set unicodeRange(value) { this._setDescriptor('_unicodeRange', value); }
-    get variant() { return this._variant; }
-    set variant(value) { this._setDescriptor('_variant', value); }
-    get featureSettings() { return this._featureSettings; }
-    set featureSettings(value) { this._setDescriptor('_featureSettings', value); }
-    get variationSettings() { return this._variationSettings; }
-    set variationSettings(value) { this._setDescriptor('_variationSettings', value); }
-    get display() { return this._display; }
-    set display(value) { this._setDescriptor('_display', value); }
-    get ascentOverride() { return this._ascentOverride; }
-    set ascentOverride(value) { this._setDescriptor('_ascentOverride', value); }
-    get descentOverride() { return this._descentOverride; }
-    set descentOverride(value) { this._setDescriptor('_descentOverride', value); }
-    get lineGapOverride() { return this._lineGapOverride; }
-    set lineGapOverride(value) { this._setDescriptor('_lineGapOverride', value); }
-    get status() { return this._status; }
-    get loaded() {
-      if (!this._loadedPromise) {
-        this._loadedPromise = new Promise((resolve, reject) => {
-          this._resolveLoaded = resolve;
-          this._rejectLoaded = reject;
-        });
-      }
-      return this._loadedPromise;
-    }
-    load() {
-      if (this._status === 'loaded') return this.loaded;
-      if (this._status === 'loading') return this.loaded;
-      this._status = 'loading';
-      this._changed();
-      const loaded = this.loaded;
-      Promise.resolve().then(() => {
-        if (this._status !== 'loading') return;
-        // A `local()` source names a font the machine either has or does not.
-        // Resolving unconditionally answers "installed" for every name a
-        // caller can invent, which is how the engine came to claim it had
-        // Windows, Linux and macOS font sets at the same time -- this is the
-        // probe that produced that list, not text measurement.
-        const missing = _fontFaceLocalSourceMissing(this._source);
-        if (missing !== null) {
-          this._status = 'error';
-          const error = new DOMException(
-            `A network error occurred loading font "${missing}".`, 'NetworkError');
-          this._rejectLoaded?.(error);
-          // The rejection is delivered through `loaded`; without a sink here
-          // an unobserved probe would report an unhandled rejection.
-          loaded.catch(() => {});
-          this._changed();
-          return;
-        }
-        this._status = 'loaded';
-        this._resolveLoaded?.(this);
-        this._changed();
-      });
-      return loaded;
-    }
-  };
-
   // The first `local()` family in a source that this machine does not have,
   // or null when every one of them is available.
   //
@@ -685,9 +627,277 @@ if (typeof FontFace === 'undefined') {
   const _fontFaceMatches = (face, selection) => {
     if (face.family.trim().replace(/^(['"])(.*)\1$/, '$2').toLowerCase() !== selection.family) return false;
     const faceWeight = face.weight.toLowerCase() === 'bold' ? 700 :
-      face.weight.toLowerCase() === 'normal' ? 400 : +(face.weight.split(/\s+/)[0]) || 400;
-    const italic = /^(?:italic|oblique)/i.test(face.style);
+      face.weight.toLowerCase() === 'normal' ? 400 : +face.weight;
+    const italic = face.style.toLowerCase() !== 'normal';
     return Math.abs(faceWeight - selection.weight) < 350 && italic === (selection.style !== 'normal');
+  };
+
+  // ---------------------------------------------------------------------
+  // FontFace.
+  //
+  // Every internal slot lives in a WeakMap: Chrome's `new FontFace(...)` has
+  // no own properties at all (`Object.getOwnPropertyNames(face)` is []), and
+  // the four `_`-prefixed helpers this class used to carry were prototype
+  // members Chrome does not have. The prototype's member set, order and
+  // descriptor kinds are the ones measured on the local oracle (149).
+  // ---------------------------------------------------------------------
+  const _fontFaceState = new WeakMap();
+  const _fontFaceStateOf = face => {
+    const state = _fontFaceState.get(face);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const _fontFaceAttach = (face, set) => { _fontFaceStateOf(face).sets.add(set); };
+  const _fontFaceDetach = (face, set) => { _fontFaceStateOf(face).sets.delete(set); };
+  const _fontFaceMarkCssConnected = face => { _fontFaceStateOf(face).cssConnected = true; };
+  const _fontFaceIsCssConnected = face => !!_fontFaceStateOf(face).cssConnected;
+  const _fontFaceCssSource = face => _fontFaceStateOf(face).source;
+  const _fontFaceNotifySets = face => {
+    const state = _fontFaceState.get(face);
+    if (!state) return;
+    for (const set of state.sets) _fontFaceSetFaceChanged(set, face);
+  };
+  // The `loaded` promise is created on first read and settles with whatever
+  // the status already is, so `face.loaded` on an errored face rejects the
+  // same way `load()` does (measured). A sink keeps that rejection from
+  // reaching the engine's unhandled-rejection reporting when a page only
+  // reads the property.
+  const _fontFaceLoaded = face => {
+    const state = _fontFaceStateOf(face);
+    if (!state.loadedPromise) {
+      state.loadedPromise = new Promise((resolve, reject) => {
+        state.resolveLoaded = resolve;
+        state.rejectLoaded = reject;
+      });
+      state.loadedPromise.catch(() => {});
+      if (state.status === 'loaded') state.resolveLoaded(face);
+      else if (state.status === 'error') state.rejectLoaded(state.failure);
+    }
+    return state.loadedPromise;
+  };
+  const _fontFaceFail = (face, error) => {
+    const state = _fontFaceStateOf(face);
+    state.status = 'error';
+    state.failure = error;
+    const existing = !!state.loadedPromise;
+    _fontFaceLoaded(face);
+    if (existing) state.rejectLoaded?.(error);
+    _fontFaceNotifySets(face);
+  };
+  const _fontFaceSetDescriptor = (face, slot, value) => {
+    _fontFaceStateOf(face)[slot] = String(value);
+    _fontFaceNotifySets(face);
+  };
+  const _fontFaceLoad = face => {
+    const state = _fontFaceStateOf(face);
+    const loaded = _fontFaceLoaded(face);
+    if (state.status !== 'unloaded') return loaded;
+    state.status = 'loading';
+    _fontFaceNotifySets(face);
+    Promise.resolve().then(() => {
+      if (state.status !== 'loading') return;
+      const missing = _fontFaceLocalSourceMissing(state.source);
+      if (missing !== null) {
+        _fontFaceFail(face, new DOMException('A network error occurred.', 'NetworkError'));
+        return;
+      }
+      state.status = 'loaded';
+      state.resolveLoaded?.(face);
+      _fontFaceNotifySets(face);
+    });
+    return loaded;
+  };
+  // Chrome's member order for the prototype, measured on the oracle: the
+  // CSSOM descriptors, then sizeAdjust, status, loaded, load, and
+  // variationSettings after load. The class body emits the accessors in the
+  // order below, and `constructor` is parked into the last slot afterwards.
+  const _chromeFontFaceMemberOrder = [
+    'family', 'style', 'weight', 'stretch', 'unicodeRange', 'variant',
+    'featureSettings', 'display', 'ascentOverride', 'descentOverride',
+    'lineGapOverride', 'sizeAdjust', 'status', 'loaded', 'load',
+    'variationSettings', 'constructor',
+  ];
+  globalThis.FontFace = class FontFace {
+    constructor(family, source, descriptors={}) {
+      if (arguments.length < 2) throw new TypeError('FontFace requires family and source');
+      const state = {
+        sets: new Set(), cssConnected: false, status: 'unloaded', failure: null,
+        loadedPromise: null, resolveLoaded: null, rejectLoaded: null,
+        source: '', bytes: null,
+      };
+      _fontFaceState.set(this, state);
+      state.family = _fontFaceString(family);
+      if (!state.family.trim()) throw new DOMException('The font family is empty', 'SyntaxError');
+      const normalized = _fontFaceSource(source);
+      state.source = normalized.css;
+      state.bytes = normalized.bytes;
+      state.style = _fontFaceDescriptor(descriptors, 'style', 'normal');
+      state.weight = _fontFaceDescriptor(descriptors, 'weight', 'normal');
+      state.stretch = _fontFaceDescriptor(descriptors, 'stretch', 'normal');
+      state.unicodeRange = _fontFaceDescriptor(descriptors, 'unicodeRange', 'U+0-10FFFF');
+      state.variant = _fontFaceDescriptor(descriptors, 'variant', 'normal');
+      state.featureSettings = _fontFaceDescriptor(descriptors, 'featureSettings', 'normal');
+      state.variationSettings = _fontFaceDescriptor(descriptors, 'variationSettings', 'normal');
+      state.display = _fontFaceDescriptor(descriptors, 'display', 'auto');
+      state.ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
+      state.descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
+      state.lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
+      state.sizeAdjust = _fontFaceDescriptor(descriptors, 'sizeAdjust', '100%');
+      if (normalized.parseError !== null) {
+        _fontFaceFail(this, new DOMException(
+          "The source provided ('" + normalized.parseError + "') could not be parsed as a value list.",
+          'SyntaxError'));
+      } else if (normalized.binary) {
+        if (_fontFaceContainerValid(state.bytes)) {
+          state.status = 'loaded';
+        } else {
+          _fontFaceFail(this, new DOMException('Invalid font data in ArrayBuffer.', 'SyntaxError'));
+        }
+      }
+    }
+    get family() { return _fontFaceStateOf(this).family; }
+    set family(value) { _fontFaceSetDescriptor(this, 'family', value); }
+    get style() { return _fontFaceStateOf(this).style; }
+    set style(value) { _fontFaceSetDescriptor(this, 'style', value); }
+    get weight() { return _fontFaceStateOf(this).weight; }
+    set weight(value) { _fontFaceSetDescriptor(this, 'weight', value); }
+    get stretch() { return _fontFaceStateOf(this).stretch; }
+    set stretch(value) { _fontFaceSetDescriptor(this, 'stretch', value); }
+    get unicodeRange() { return _fontFaceStateOf(this).unicodeRange; }
+    set unicodeRange(value) { _fontFaceSetDescriptor(this, 'unicodeRange', value); }
+    get variant() { return _fontFaceStateOf(this).variant; }
+    set variant(value) { _fontFaceSetDescriptor(this, 'variant', value); }
+    get featureSettings() { return _fontFaceStateOf(this).featureSettings; }
+    set featureSettings(value) { _fontFaceSetDescriptor(this, 'featureSettings', value); }
+    get display() { return _fontFaceStateOf(this).display; }
+    set display(value) { _fontFaceSetDescriptor(this, 'display', value); }
+    get ascentOverride() { return _fontFaceStateOf(this).ascentOverride; }
+    set ascentOverride(value) { _fontFaceSetDescriptor(this, 'ascentOverride', value); }
+    get descentOverride() { return _fontFaceStateOf(this).descentOverride; }
+    set descentOverride(value) { _fontFaceSetDescriptor(this, 'descentOverride', value); }
+    get lineGapOverride() { return _fontFaceStateOf(this).lineGapOverride; }
+    set lineGapOverride(value) { _fontFaceSetDescriptor(this, 'lineGapOverride', value); }
+    get sizeAdjust() { return _fontFaceStateOf(this).sizeAdjust; }
+    set sizeAdjust(value) { _fontFaceSetDescriptor(this, 'sizeAdjust', value); }
+    get status() { return _fontFaceStateOf(this).status; }
+    get loaded() { return _fontFaceLoaded(this); }
+    load() { return _fontFaceLoad(this); }
+    get variationSettings() { return _fontFaceStateOf(this).variationSettings; }
+    set variationSettings(value) { _fontFaceSetDescriptor(this, 'variationSettings', value); }
+  };
+  // Re-slot `constructor` into Chrome's position (the class body puts it
+  // first) and drop anything a later pass may have added.
+  const _parkFontFacePrototype = prototype => {
+    const current = Object.getOwnPropertyNames(prototype);
+    const wanted = _chromeFontFaceMemberOrder.filter(name => current.includes(name));
+    const extras = current.filter(name => !wanted.includes(name));
+    const order = [...wanted, ...extras];
+    const descriptors = new Map();
+    for (const name of current) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+      // Chrome marks every member of this prototype enumerable; the
+      // constructor is the one exception (and the class body already leaves
+      // it non-enumerable, as does the oracle).
+      if (name !== 'constructor') descriptor.enumerable = true;
+      descriptors.set(name, descriptor);
+    }
+    if (order.length === current.length && order.every((name, i) => name === current[i])) return;
+    for (const name of current) { try { delete prototype[name]; } catch (_e) {} }
+    for (const name of order) {
+      const descriptor = descriptors.get(name);
+      if (descriptor) { try { Object.defineProperty(prototype, name, descriptor); } catch (_e) {} }
+    }
+  };
+  _parkFontFacePrototype(globalThis.FontFace.prototype);
+
+  // ---------------------------------------------------------------------
+  // FontFaceSet.
+  //
+  // Chrome's prototype has no own `constructor` (`document.fonts.constructor`
+  // is EventTarget), carries no `_`-prefixed helpers, keeps the three
+  // onloading* handlers as accessors rather than instance properties, and its
+  // @@iterator is the very same function object as `values`. The instance
+  // itself has no own property (`Object.getOwnPropertyNames(document.fonts)`
+  // is []), so every slot moved into the WeakMap below.
+  // ---------------------------------------------------------------------
+  const _fontFaceSetState = new WeakMap();
+  const _fontFaceSetStateOf = set => {
+    const state = _fontFaceSetState.get(set);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  const _fontFaceSetGetHandler = (set, name) => _fontFaceSetStateOf(set)[name];
+  const _fontFaceSetSetHandler = (set, name, value) => {
+    _fontFaceSetStateOf(set)[name] =
+      (typeof value === 'function' || (value && typeof value === 'object')) ? value : null;
+    return value;
+  };
+  const _fontFaceSetDiscover = set => {
+    const state = _fontFaceSetStateOf(set);
+    if (!state.ownerDocument) return;
+    const retained = new Set();
+    for (const rule of _fontFaceAuthoredRules(state.ownerDocument)) {
+      const key = JSON.stringify([rule.family, rule.source, rule.descriptors]);
+      retained.add(key);
+      if (state.cssFaces.has(key)) continue;
+      try {
+        const face = new FontFace(rule.family, rule.source, rule.descriptors);
+        _fontFaceMarkCssConnected(face);
+        _fontFaceAttach(face, set);
+        state.cssFaces.set(key, face);
+        state.faces.add(face);
+      } catch (_) {}
+    }
+    for (const [key, face] of state.cssFaces) {
+      if (retained.has(key)) continue;
+      _fontFaceDetach(face, set);
+      state.faces.delete(face);
+      state.cssFaces.delete(key);
+    }
+  };
+  const _fontFaceSetDispatch = (set, type, faces) => {
+    const event = new Event(type);
+    event.fontfaces = faces;
+    set.dispatchEvent(event);
+    const handler = _fontFaceSetGetHandler(set, 'on' + type);
+    if (typeof handler === 'function') {
+      try { handler.call(set, event); } catch (error) { console.error(error); }
+    }
+  };
+  const _fontFaceSetSyncNative = set => {
+    const state = _fontFaceSetStateOf(set);
+    if (!state.ownerDocument || typeof Deno.core.ops.op_set_dynamic_fonts !== 'function') return;
+    const registrations = [];
+    for (const face of state.faces) {
+      if (_fontFaceIsCssConnected(face) || face.status === 'error') continue;
+      registrations.push({
+        family: face.family,
+        source: _fontFaceCssSource(face),
+        style: face.style,
+        weight: face.weight,
+        unicodeRange: face.unicodeRange
+      });
+    }
+    Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations));
+    _scheduleResizeRenderCheckpoint();
+  };
+  const _fontFaceSetFaceChanged = (set, face) => {
+    const state = _fontFaceSetStateOf(set);
+    _fontFaceSetSyncNative(set);
+    if (face.status === 'loading' && state.status !== 'loading') {
+      state.status = 'loading';
+      const pending = Array.from(state.faces).filter(candidate => candidate.status === 'loading');
+      // A face that fails must not take `ready` down with it: Chrome resolves
+      // it once nothing is loading any more, errors included.
+      state.readyPromise = Promise.all(
+        pending.map(candidate => candidate.loaded.catch(() => null))
+      ).then(() => {
+        state.status = 'loaded';
+        _fontFaceSetDispatch(set, 'loadingdone', Array.from(state.faces));
+        return set;
+      });
+      _fontFaceSetDispatch(set, 'loading', [face]);
+    }
   };
 
   // Lexical binding as well as the global: the global is deleted from a
@@ -696,131 +906,115 @@ if (typeof FontFace === 'undefined') {
   const FontFaceSet = globalThis.FontFaceSet = class FontFaceSet extends EventTarget {
     constructor(initialFaces=[], ownerDocument=null) {
       super();
-      this._faces = new Set();
-      this._ownerDocument = ownerDocument;
-      this._cssFaces = new Map();
-      this._status = 'loaded';
-      this._readyPromise = Promise.resolve(this);
-      this.onloading = null;
-      this.onloadingdone = null;
-      this.onloadingerror = null;
+      _fontFaceSetState.set(this, {
+        faces: new Set(), ownerDocument, cssFaces: new Map(), status: 'loaded',
+        readyPromise: null, onloading: null, onloadingdone: null, onloadingerror: null,
+      });
       if (initialFaces != null) for (const face of initialFaces) this.add(face);
     }
-    get status() { return this._status; }
-    get ready() { return this._readyPromise; }
-    get size() { this._discoverCssFaces(); return this._faces.size; }
-    _discoverCssFaces() {
-      if (!this._ownerDocument) return;
-      const retained = new Set();
-      for (const rule of _fontFaceAuthoredRules(this._ownerDocument)) {
-        const key = JSON.stringify([rule.family, rule.source, rule.descriptors]);
-        retained.add(key);
-        if (this._cssFaces.has(key)) continue;
-        try {
-          const face = new FontFace(rule.family, rule.source, rule.descriptors);
-          face._cssConnected = true;
-          face._sets.add(this);
-          this._cssFaces.set(key, face);
-          this._faces.add(face);
-        } catch (_) {}
-      }
-      for (const [key, face] of this._cssFaces) {
-        if (retained.has(key)) continue;
-        face._sets.delete(this);
-        this._faces.delete(face);
-        this._cssFaces.delete(key);
-      }
+    get onloading() { return _fontFaceSetGetHandler(this, 'onloading'); }
+    set onloading(value) { _fontFaceSetSetHandler(this, 'onloading', value); }
+    get onloadingdone() { return _fontFaceSetGetHandler(this, 'onloadingdone'); }
+    set onloadingdone(value) { _fontFaceSetSetHandler(this, 'onloadingdone', value); }
+    get onloadingerror() { return _fontFaceSetGetHandler(this, 'onloadingerror'); }
+    set onloadingerror(value) { _fontFaceSetSetHandler(this, 'onloadingerror', value); }
+    get ready() {
+      const state = _fontFaceSetStateOf(this);
+      if (!state.readyPromise) state.readyPromise = Promise.resolve(this);
+      return state.readyPromise;
     }
-    _dispatch(type, faces) {
-      const event = new Event(type);
-      event.fontfaces = faces;
-      this.dispatchEvent(event);
-      const handler = this['on' + type];
-      if (typeof handler === 'function') {
-        try { handler.call(this, event); } catch (error) { console.error(error); }
-      }
-    }
-    _syncNative() {
-      if (!this._ownerDocument || typeof Deno.core.ops.op_set_dynamic_fonts !== 'function') return;
-      const registrations = [];
-      for (const face of this._faces) registrations.push({
-        ...(face._cssConnected ? { skip: true } : {}),
-        family: face.family,
-        source: face._source,
-        style: face.style,
-        weight: face.weight,
-        unicodeRange: face.unicodeRange
-      });
-      Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
-      _scheduleResizeRenderCheckpoint();
-    }
-    _faceChanged(face) {
-      this._syncNative();
-      if (face.status === 'loading' && this._status !== 'loading') {
-        this._status = 'loading';
-        const pending = Array.from(this._faces).filter(candidate => candidate.status === 'loading');
-        this._readyPromise = Promise.all(pending.map(candidate => candidate.loaded)).then(() => {
-          this._status = 'loaded';
-          this._dispatch('loadingdone', Array.from(this._faces));
-          return this;
-        });
-        this._dispatch('loading', [face]);
-      }
-    }
-    add(face) {
-      if (!(face instanceof FontFace)) throw new TypeError('FontFaceSet.add requires a FontFace');
-      this._discoverCssFaces();
-      if (!this._faces.has(face)) {
-        this._faces.add(face);
-        face._sets.add(this);
-        this._syncNative();
-      }
-      return this;
-    }
+    get status() { return _fontFaceSetStateOf(this).status; }
+    get size() { _fontFaceSetDiscover(this); return _fontFaceSetStateOf(this).faces.size; }
     check(font, text=' ') {
       void String(text);
-      this._discoverCssFaces();
+      _fontFaceSetDiscover(this);
+      const state = _fontFaceSetStateOf(this);
       const selection = _fontFaceSelection(font);
-      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
+      const matches = Array.from(state.faces).filter(face => _fontFaceMatches(face, selection));
       return matches.length === 0 || matches.every(face => face.status === 'loaded');
-    }
-    clear() {
-      for (const face of Array.from(this._faces)) {
-        if (face._cssConnected) continue;
-        face._sets.delete(this);
-        this._faces.delete(face);
-      }
-      this._syncNative();
-    }
-    delete(face) {
-      this._discoverCssFaces();
-      if (!(face instanceof FontFace) || face._cssConnected || !this._faces.delete(face)) return false;
-      face._sets.delete(this);
-      this._syncNative();
-      return true;
     }
     load(font, text=' ') {
       void String(text);
-      this._discoverCssFaces();
+      _fontFaceSetDiscover(this);
+      const state = _fontFaceSetStateOf(this);
       const selection = _fontFaceSelection(font);
-      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
+      const matches = Array.from(state.faces).filter(face => _fontFaceMatches(face, selection));
       return Promise.all(matches.map(face => face.load())).then(() => matches);
+    }
+    add(face) {
+      if (!(face instanceof FontFace)) throw new TypeError('FontFaceSet.add requires a FontFace');
+      _fontFaceSetDiscover(this);
+      const state = _fontFaceSetStateOf(this);
+      if (!state.faces.has(face)) {
+        state.faces.add(face);
+        _fontFaceAttach(face, this);
+        _fontFaceSetSyncNative(this);
+      }
+      return this;
+    }
+    clear() {
+      const state = _fontFaceSetStateOf(this);
+      for (const face of Array.from(state.faces)) {
+        if (_fontFaceIsCssConnected(face)) continue;
+        _fontFaceDetach(face, this);
+        state.faces.delete(face);
+      }
+      _fontFaceSetSyncNative(this);
+    }
+    delete(face) {
+      _fontFaceSetDiscover(this);
+      const state = _fontFaceSetStateOf(this);
+      if (!(face instanceof FontFace) || _fontFaceIsCssConnected(face)
+          || !state.faces.delete(face)) return false;
+      _fontFaceDetach(face, this);
+      _fontFaceSetSyncNative(this);
+      return true;
+    }
+    entries() {
+      _fontFaceSetDiscover(this);
+      return Array.from(_fontFaceSetStateOf(this).faces, face => [face, face])[Symbol.iterator]();
     }
     forEach(callback, thisArg=undefined) {
       if (typeof callback !== 'function') throw new TypeError('FontFaceSet.forEach callback must be callable');
-      this._discoverCssFaces();
-      for (const face of this._faces) callback.call(thisArg, face, face, this);
+      _fontFaceSetDiscover(this);
+      for (const face of _fontFaceSetStateOf(this).faces) callback.call(thisArg, face, face, this);
     }
-    has(face) { this._discoverCssFaces(); return this._faces.has(face); }
-    entries() { this._discoverCssFaces(); return Array.from(this._faces, face => [face, face])[Symbol.iterator](); }
-    keys() { this._discoverCssFaces(); return Array.from(this._faces).values(); }
-    values() { this._discoverCssFaces(); return Array.from(this._faces).values(); }
-    [Symbol.iterator]() { return this.values(); }
+    has(face) { _fontFaceSetDiscover(this); return _fontFaceSetStateOf(this).faces.has(face); }
+    keys() { _fontFaceSetDiscover(this); return Array.from(_fontFaceSetStateOf(this).faces).values(); }
+    values() { return this.keys(); }
   };
+  // Chrome's prototype carries no `constructor` and lists @@iterator as a
+  // non-enumerable data property holding the same function object `values` is.
+  // The tag has to be declared here: with `constructor` gone,
+  // config/webidl-branding.js skips this interface (it brands only a prototype
+  // whose `constructor` is the interface itself), and the realm would answer
+  // "[object EventTarget]" for `document.fonts`.
+  const _fontFaceSetPrototype = FontFaceSet.prototype;
+  Object.defineProperty(_fontFaceSetPrototype, Symbol.toStringTag, {
+    value: 'FontFaceSet', writable: false, enumerable: false, configurable: true,
+  });
+  for (const name of Object.getOwnPropertyNames(_fontFaceSetPrototype)) {
+    if (name === 'constructor') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(_fontFaceSetPrototype, name);
+    if (descriptor && !descriptor.enumerable) {
+      descriptor.enumerable = true;
+      try { Object.defineProperty(_fontFaceSetPrototype, name, descriptor); } catch (_error) {}
+    }
+  }
+  try { delete _fontFaceSetPrototype.constructor; } catch (_error) {}
+  Object.defineProperty(_fontFaceSetPrototype, Symbol.iterator, {
+    value: _fontFaceSetPrototype.values, enumerable: false, configurable: true,
+  });
+
+  const _documentFonts = new WeakMap();
   Object.defineProperty(Document.prototype, 'fonts', {
     get() {
-      if (!this[_fontsSym]) this[_fontsSym] = new FontFaceSet([], this);
-      return this[_fontsSym];
+      let set = _documentFonts.get(this);
+      if (!set) {
+        set = new FontFaceSet([], this);
+        _documentFonts.set(this, set);
+      }
+      return set;
     },
     configurable: true
   });

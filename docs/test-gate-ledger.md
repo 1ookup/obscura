@@ -100,3 +100,9 @@ run covers are then removed.
   constants), scoped to `cargo nextest run --release --features render
   -p obscura-js -p obscura-browser` 880/880. Full workspace gate deferred to
   the next backfill.
+
+- 2026-09-28: font surface (FontFace/FontFaceSet prototypes, instance shapes,
+  source status rules, worker FontFaceSet fallback order), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser` 880/880. Full workspace gate deferred to the next
+  backfill.

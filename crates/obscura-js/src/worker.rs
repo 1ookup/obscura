@@ -1514,31 +1514,67 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     });
     var workerFontFaces = new Set();
     var workerFontReady = Promise.resolve(workerFonts);
-    def(workerFontFaceSetProto, 'add', function (face) { workerFontFaces.add(face); return this; }, true);
-    def(workerFontFaceSetProto, 'has', function (face) { return workerFontFaces.has(face); }, true);
-    def(workerFontFaceSetProto, 'delete', function (face) {
-      var had = workerFontFaces.delete(face);
-      return { face: face, status: had ? 'deleted' : 'not_found' };
-    }, true);
-    def(workerFontFaceSetProto, 'clear', function () { workerFontFaces.clear(); }, true);
+    // Chrome's member order for this prototype, measured over a blob worker:
+    // the three handlers, ready, status, size, then the operations. The class
+    // the window realm uses lists the same sixteen names in the same slots.
+    defEventHandler(workerFontFaceSetProto, 'onloading');
+    defEventHandler(workerFontFaceSetProto, 'onloadingdone');
+    defEventHandler(workerFontFaceSetProto, 'onloadingerror');
+    defGet(workerFontFaceSetProto, 'ready', function () { return workerFontReady; }, true);
+    defGet(workerFontFaceSetProto, 'status', function () { return 'loaded'; }, true);
+    defGet(workerFontFaceSetProto, 'size', function () { return workerFontFaces.size; }, true);
     def(workerFontFaceSetProto, 'check', function () { return workerFontFaces.size > 0; }, true);
     def(workerFontFaceSetProto, 'load', function () {
       return Promise.resolve(Array.prototype.slice.call(workerFontFaces));
     }, true);
-    def(workerFontFaceSetProto, 'forEach', function (callback, thisArg) {
-      workerFontFaces.forEach(function (face) { callback.call(thisArg, face, face, workerFonts); });
+    def(workerFontFaceSetProto, 'add', function (face) { workerFontFaces.add(face); return this; }, true);
+    def(workerFontFaceSetProto, 'clear', function () { workerFontFaces.clear(); }, true);
+    def(workerFontFaceSetProto, 'delete', function (face) {
+      var had = workerFontFaces.delete(face);
+      return { face: face, status: had ? 'deleted' : 'not_found' };
     }, true);
     def(workerFontFaceSetProto, 'entries', function () {
       return workerFontFaces.entries();
     }, true);
+    def(workerFontFaceSetProto, 'forEach', function (callback, thisArg) {
+      workerFontFaces.forEach(function (face) { callback.call(thisArg, face, face, workerFonts); });
+    }, true);
+    def(workerFontFaceSetProto, 'has', function (face) { return workerFontFaces.has(face); }, true);
     def(workerFontFaceSetProto, 'keys', function () { return workerFontFaces.keys(); }, true);
     def(workerFontFaceSetProto, 'values', function () { return workerFontFaces.values(); }, true);
-    defGet(workerFontFaceSetProto, 'size', function () { return workerFontFaces.size; }, true);
-    defGet(workerFontFaceSetProto, 'status', function () { return 'loaded'; }, true);
-    defGet(workerFontFaceSetProto, 'ready', function () { return workerFontReady; }, true);
-    defEventHandler(workerFontFaceSetProto, 'onloading');
-    defEventHandler(workerFontFaceSetProto, 'onloadingdone');
-    defEventHandler(workerFontFaceSetProto, 'onloadingerror');
+    // @@iterator is the same function object `values` is, non-enumerable, as
+    // the counter on this prototype is Chrome's.
+    defineProperty(workerFontFaceSetProto, Symbol.iterator, {
+      value: workerFontFaceSetProto.values, enumerable: false, configurable: true,
+    });
+    // Function names carry the slot, the way the sweep that renames the rest
+    // of this realm's surface leaves them: without this pass the getters here
+    // answer "get" (the descriptor key they were written under) and `values`
+    // answers "", both of which a reflection pass reads.
+    for (var fontSetIndex = 0, fontSetNames = getOwnPropertyNames(workerFontFaceSetProto);
+         fontSetIndex < fontSetNames.length; fontSetIndex++) {
+      var fontSetDescriptor = Object.getOwnPropertyDescriptor(
+        workerFontFaceSetProto, fontSetNames[fontSetIndex]);
+      if (!fontSetDescriptor) continue;
+      if (fontSetDescriptor.get) {
+        try {
+          defineProperty(fontSetDescriptor.get, 'name',
+            { value: 'get ' + fontSetNames[fontSetIndex], configurable: true });
+        } catch (e) {}
+      }
+      if (fontSetDescriptor.set) {
+        try {
+          defineProperty(fontSetDescriptor.set, 'name',
+            { value: 'set ' + fontSetNames[fontSetIndex], configurable: true });
+        } catch (e) {}
+      }
+      if (typeof fontSetDescriptor.value === 'function') {
+        try {
+          defineProperty(fontSetDescriptor.value, 'name',
+            { value: fontSetNames[fontSetIndex], configurable: true });
+        } catch (e) {}
+      }
+    }
     workerFonts = Object.create(workerFontFaceSetProto);
     workerFontReady = Promise.resolve(workerFonts);
   }

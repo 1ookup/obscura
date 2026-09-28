@@ -591,7 +591,6 @@ const _treeParentSym = Symbol.for('obscura.treeParent');
 const _treeParentEpochSym = Symbol.for('obscura.treeParentEpoch');
 const _ownerDocRootSym = Symbol.for('obscura.ownerDocRoot');
 const _styleSheetListSym = Symbol.for('obscura.styleSheetList');
-const _fontsSym = Symbol.for('obscura.fonts');
 const _inputFocusedSym = Symbol.for('obscura.inputFocused');
 const _inputClickTargetSym = Symbol.for('obscura.inputClickTarget');
 const _detachedNodeOwners = new WeakMap();

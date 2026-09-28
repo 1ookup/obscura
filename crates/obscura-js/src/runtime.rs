@@ -18110,8 +18110,8 @@ RequestRedirect value",
         );
     }
 
-    #[test]
-    fn font_face_set_tracks_authored_and_script_created_faces() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn font_face_set_tracks_authored_and_script_created_faces() {
         let mut rt = setup_runtime(
             r#"<html><head><style>
                 @font-face {
@@ -18126,59 +18126,86 @@ RequestRedirect value",
                 }
             </style></head><body></body></html>"#,
         );
-        let result = rt
-            .evaluate(
-                r#"(() => {
-                    const authored = Array.from(document.fonts);
-                    const cssDelete = document.fonts.delete(authored[0]);
-                    const dynamic = new FontFace("Dynamic", "url('/dynamic.ttf')", {
-                        style: "oblique 12deg",
-                        weight: "700",
-                        stretch: "condensed",
-                        unicodeRange: "U+20-7E",
-                        display: "swap"
-                    });
-                    const addResult = document.fonts.add(dynamic);
-                    const visited = [];
-                    document.fonts.forEach((value, key, set) => {
-                        visited.push(value === key && set === document.fonts);
-                    });
-                    const afterAdd = [
-                        document.fonts.size,
-                        document.fonts.has(dynamic),
-                        addResult === document.fonts,
-                        dynamic.family,
-                        dynamic.style,
-                        dynamic.weight,
-                        dynamic.stretch,
-                        dynamic.unicodeRange,
-                        dynamic.display,
-                        visited.every(Boolean)
-                    ];
-                    const deleted = document.fonts.delete(dynamic);
-                    document.fonts.clear();
-                    const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
-                    const binary = new FontFace("Binary", bytes, { weight: 600 });
-                    return [
-                        authored.length,
-                        authored.map(face => face.family),
-                        cssDelete,
-                        afterAdd,
-                        deleted,
-                        document.fonts.size,
-                        binary.status,
-                        binary.loaded === binary.load()
-                    ];
-                })()"#,
-            )
-            .unwrap();
+        rt.execute_script(
+            "font-face-shapes",
+            r#"
+                globalThis.__faceOut = {};
+                const authored = Array.from(document.fonts);
+                const cssDelete = document.fonts.delete(authored[0]);
+                const dynamic = new FontFace("Dynamic", "url('/dynamic.ttf')", {
+                    style: "oblique 12deg",
+                    weight: "700",
+                    stretch: "condensed",
+                    unicodeRange: "U+20-7E",
+                    display: "swap"
+                });
+                const addResult = document.fonts.add(dynamic);
+                const visited = [];
+                document.fonts.forEach((value, key, set) => {
+                    visited.push(value === key && set === document.fonts);
+                });
+                const afterAdd = [
+                    document.fonts.size,
+                    document.fonts.has(dynamic),
+                    addResult === document.fonts,
+                    dynamic.family,
+                    dynamic.style,
+                    dynamic.weight,
+                    dynamic.stretch,
+                    dynamic.unicodeRange,
+                    dynamic.display,
+                    visited.every(Boolean)
+                ];
+                const deleted = document.fonts.delete(dynamic);
+                document.fonts.clear();
+                // A BufferSource that is not a font answers status "error" and
+                // rejects from construction on, the way the oracle does; one
+                // whose container header is plausible answers "loaded" without
+                // a load() call.
+                const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
+                const binary = new FontFace("Binary", bytes, { weight: 600 });
+                binary.load().then(
+                    () => { globalThis.__faceOut.binaryLoad = "resolved"; },
+                    error => { globalThis.__faceOut.binaryLoad = error.name + ": " + error.message; });
+                const container = new Uint8Array(28);
+                container.set([0, 1, 0, 0]);
+                container[5] = 1;
+                const shaped = new FontFace("Shaped", container);
+                shaped.load().then(
+                    face => { globalThis.__faceOut.shapedLoad = face === shaped ? "self" : "other"; },
+                    error => { globalThis.__faceOut.shapedLoad = error.name; });
+                // A source string that is not a value list constructs and
+                // reports through status and load().
+                const empty = new FontFace("Empty", "");
+                empty.load().then(
+                    () => { globalThis.__faceOut.emptyLoad = "resolved"; },
+                    error => { globalThis.__faceOut.emptyLoad = error.name + ": " + error.message; });
+                Object.assign(globalThis.__faceOut, {
+                    authored: authored.length,
+                    families: authored.map(face => face.family),
+                    cssDelete,
+                    afterAdd,
+                    deleted,
+                    size: document.fonts.size,
+                    binaryStatus: binary.status,
+                    binaryLoadIdentity: binary.loaded === binary.load(),
+                    binaryOwnNames: Object.getOwnPropertyNames(binary),
+                    shapedStatus: shaped.status,
+                    emptyStatus: empty.status,
+                    sizeAdjust: dynamic.sizeAdjust
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("return __faceOut;").unwrap();
         assert_eq!(
             result,
-            serde_json::json!([
-                2,
-                ["Authored One", "AuthoredTwo"],
-                false,
-                [
+            serde_json::json!({
+                "authored": 2,
+                "families": ["Authored One", "AuthoredTwo"],
+                "cssDelete": false,
+                "afterAdd": [
                     3,
                     true,
                     true,
@@ -18190,11 +18217,18 @@ RequestRedirect value",
                     "swap",
                     true
                 ],
-                true,
-                2,
-                "loaded",
-                true
-            ])
+                "deleted": true,
+                "size": 2,
+                "binaryStatus": "error",
+                "binaryLoad": "SyntaxError: Invalid font data in ArrayBuffer.",
+                "binaryLoadIdentity": true,
+                "binaryOwnNames": [],
+                "shapedStatus": "loaded",
+                "shapedLoad": "self",
+                "emptyStatus": "error",
+                "emptyLoad": "SyntaxError: The source provided ('') could not be parsed as a value list.",
+                "sizeAdjust": "100%"
+            })
         );
     }
 
