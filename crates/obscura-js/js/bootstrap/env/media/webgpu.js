@@ -108,7 +108,6 @@ const _GPU_APPLE = {
     maxVertexAttributes: 30,
     maxVertexBufferArrayStride: 2048,
     maxInterStageShaderVariables: 28,
-    maxImmediateSize: 64,
     maxColorAttachments: 8,
     maxColorAttachmentBytesPerSample: 128,
     maxComputeWorkgroupStorageSize: 32768,

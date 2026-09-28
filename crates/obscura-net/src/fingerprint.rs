@@ -369,7 +369,11 @@ impl BrowserFingerprint {
                 },
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Apple)".to_string(),
-                    renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)".to_string(),
+                    // The reference Mac answers a paravirtual GPU: the live
+                    // Chrome on it reports this exact renderer row, and the
+                    // challenge payload carries it, so the default follows the
+                    // reference rather than a physical part name.
+                    renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, Unspecified Version)".to_string(),
                     webgpu_profile: "apple".to_string(),
                 },
             }

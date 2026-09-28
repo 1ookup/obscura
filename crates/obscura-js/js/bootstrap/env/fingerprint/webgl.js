@@ -387,7 +387,9 @@ function _webglCompressedTextureAstc() {
     COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR: 0x93DC,
     COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR: 0x93DD,
   }, {
-    getSupportedProfiles() { return ['ldr', 'hdr']; },
+    // The reference Mac decodes ASTC in LDR only; Chrome's oracle and the
+    // challenge payload both answer the one-element list.
+    getSupportedProfiles() { return ['ldr']; },
   });
 }
 

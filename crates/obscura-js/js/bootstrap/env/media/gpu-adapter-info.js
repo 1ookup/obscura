@@ -14,10 +14,11 @@ globalThis.GPUAdapterInfo = class GPUAdapterInfo {
   }
   get device() { return ''; }
   get description() { return ''; }
-  // The live adapter rows answer 0 for both subgroup bounds on the apple
-  // profile -- no nulls, and no subgroup feature exposure.
-  get subgroupMinSize() { return _webglProfile() === 'apple' ? 0 : 8; }
-  get subgroupMaxSize() { return _webglProfile() === 'apple' ? 0 : 32; }
+  // The reference adapter answers 32 for both subgroup bounds on the apple
+  // profile -- Chrome oracle on the reference Mac -- while its limits row
+  // leaves the same two names null.
+  get subgroupMinSize() { return _webglProfile() === 'apple' ? 32 : 8; }
+  get subgroupMaxSize() { return _webglProfile() === 'apple' ? 32 : 32; }
   // A no-argument requestAdapter on the Mac integrated GPU lands its power
   // class on the info row: 'low-power', not the 'default' a missing field
   // would fall back to.
