@@ -1,5 +1,7 @@
 # 挑战指纹缺陷修复计划（step 90 缺陷 1-6）
 
+> **已迁移到 Notion**：[挑战指纹缺陷修复计划](https://app.notion.com/p/3e9ea41ebc488158b51fdff2f0138cdd) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 来源：step 90（见 `Cloudflare-challenge-profile.md`）对拍发现的六组缺陷，由 6 个并行代码调研产出
 （2026-08-27，分支 `feat/challenge-fingerprint-parity`）。每份计划含现状定位（文件:行）、根因、
 方案、分步实施、验证、风险；本文开头是跨计划的合并结论。

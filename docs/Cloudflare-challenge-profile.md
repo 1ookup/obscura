@@ -1,5 +1,7 @@
 # Cloudflare 挑战：诊断记录
 
+> **已迁移到 Notion**：[Cloudflare 挑战：诊断记录](https://app.notion.com/p/3e9ea41ebc488167afd2c350fcd0da18) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 > **阅读约定（2026-09-24 起）**
 >
 > 本文是**活文档**。历史 step 1–353 的正文已归档到

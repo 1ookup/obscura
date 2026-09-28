@@ -1,5 +1,7 @@
 # HaHaVM environment parity ledger
 
+> **已迁移到 Notion**：[HaHaVM environment parity ledger](https://app.notion.com/p/3e9ea41ebc4881aa972af98a516493da) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 This document records the parts of HaHaVM-General that are intentionally not
 copied into Obscura. It is a handoff ledger for future browser-surface parity
 work, not a promise that every HaHaVM value or implementation is correct.

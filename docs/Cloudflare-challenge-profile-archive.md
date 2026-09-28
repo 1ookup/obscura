@@ -1,5 +1,7 @@
 # Cloudflare 挑战：诊断记录 —— 历史归档（Step 1–353）
 
+> **已迁移到 Notion**：[CF 挑战诊断归档（Step 1–353）](https://app.notion.com/p/3e9ea41ebc488100a504f10d18808602) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 > 从 [Cloudflare-challenge-profile.md](Cloudflare-challenge-profile.md) 归档而来，正文逐字未改。
 > 仅 step 标题层级由 `###` 降为 `##`，以便本文件以 `##` 为一级标题。
 > 索引与状态标注见主文档。

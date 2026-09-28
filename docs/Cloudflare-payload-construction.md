@@ -1,5 +1,7 @@
 # CF 挑战 payload 构造说明
 
+> **已迁移到 Notion**：[CF 挑战 payload 构造说明](https://app.notion.com/p/3e9ea41ebc488159a79dd57d2ad9f805) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 > **知识库定位**：本文描述的是**静态求解路线**——不执行 JS/VM，由独立求解器
 > （Rust）直接构造并提交 payload。文内 `文件:行号` 引用（`vm_parser.rs`、`task.rs`、
 > `task_client.rs`、`waf_task.rs`、`reverse/` 及 `docs/update-0616.md` 等）均指向

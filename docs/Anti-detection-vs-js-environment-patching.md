@@ -1,5 +1,7 @@
 # Anti-detection: real engine vs. JS environment patching
 
+> **已迁移到 Notion**：[Anti-detection: real engine vs. JS environment patching](https://app.notion.com/p/3e9ea41ebc4881ada0a7f1cf8007db15) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 This page compares how Obscura approaches anti-detection against a well-known
 alternative: **pure-JS browser-environment patching** (the "hahavm" style of
 JS reverse-engineering frameworks, as seen in `cloudflare-solver-node`'s

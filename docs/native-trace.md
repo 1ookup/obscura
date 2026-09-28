@@ -1,5 +1,7 @@
 # Native Trace
 
+> **已迁移到 Notion**：[Obscura Trace 能力](https://app.notion.com/p/3e9ea41ebc4881e2a044d1a7f83b89f3) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 ## Architecture
 
 `--trace-api-file FILE` selects the property instrumentation in the pinned

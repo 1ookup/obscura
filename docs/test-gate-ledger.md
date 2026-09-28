@@ -1,5 +1,7 @@
 # Test gate ledger
 
+> **已迁移到 Notion**：[Test gate ledger](https://app.notion.com/p/3e9ea41ebc4881eaad16d321e040b5b7) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 Full-workspace release gates that were DEFERRED under the scoped-first policy
 (AGENTS.md, "Scoped-first test gating"). Each pending entry is backfilled by
 one consolidated `cargo v8-test` + the no-default-features check; entries the

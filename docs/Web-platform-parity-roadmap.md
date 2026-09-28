@@ -1,5 +1,7 @@
 # 浏览器通用能力对齐路线图(Web Platform Parity Roadmap)
 
+> **已迁移到 Notion**：[浏览器通用能力对齐路线图](https://app.notion.com/p/3e9ea41ebc4881beb2a7ced8ed954bdb) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 > 状态:评审稿 · 日期:2026-08-14 · 分支:`feat/web-platform-parity`
 > 相关文档:[Cloudflare challenge 诊断记录](Cloudflare-challenge-profile.md)、[Trace 页面脚本](Trace-page-script.md)、[Anti-detection: real engine vs. JS patching](Anti-detection-vs-js-environment-patching.md)、[Iframe 设计](Iframe-support-design.md)
 > 外部参考:[HaHaVM-General](https://github.com/1ookup/HaHaVM-General)(通用补环境框架,含 `examples/cloudflare/` 外置模式)

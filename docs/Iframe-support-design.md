@@ -1,5 +1,7 @@
 # Iframe support: design document
 
+> **已迁移到 Notion**：[Iframe support: design document](https://app.notion.com/p/3e9ea41ebc4881ba8978cba852ca22e5) —— 后续维护以 Notion 版本为准；本文件保留作为开发参考。
+
 > Status: **design only — not yet implemented.** This page records the planned
 > architecture for complete `<iframe>` support. It is a forward-looking design
 > doc, not a description of current behavior.
