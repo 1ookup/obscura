@@ -10291,11 +10291,14 @@ mod tests {
     /// Rows are [in window, reflection, enumerable, configurable, descriptor
     /// kind, typeof]. HTMLCameraElement/HTMLMicrophoneElement and the
     /// XSLT/Range/Policy legacy set are ABSENT in both passing oracles even
-    /// though a local 153-headless window has them. The 0926 payload diff
-    /// reversed the ModelContext/WebMCPEvent/SharedStorage family: the
-    /// reference census and a local Chrome 153 window both answer absent for
-    /// every one of them, so absence wins now (see
-    /// model_context_shared_storage_and_webmcp_surfaces_are_gone).
+    /// though a local 153-headless window has them. The ModelContext/
+    /// WebMCPEvent/SharedStorage family was reversed twice: absent after the
+    /// 0926 payload diff, present again on 2026-09-28, when the reference
+    /// dump of the passing round showed all of them on the challenge page's
+    /// window and a local Chrome oracle agreed. FontFaceSet,
+    /// HTMLUserMediaElement, InteractionContentfulPaint and
+    /// PerformanceSoftNavigation went the other way in the same measurement
+    /// (see model_context_shared_storage_and_webmcp_surfaces_match_the_reference).
     #[test]
     fn window_census_surface_matches_chrome_oracle() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
@@ -10338,23 +10341,28 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
+                // Rows are [in window, reflection, enumerable, configurable,
+                // descriptor kind, typeof]. The expected values are the local
+                // Chrome oracle's own answer for this list (2026-09-28); the four
+                // names whose comment sits above them are the ones this change
+                // moved.
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
+                [false, "absent", null, null, null, "undefined"],
                 [false, "absent", null, null, null, "undefined"],
                 [true, "own", false, true, "data", "function"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
                 [true, "own", false, true, "data", "function"],
                 [true, "own", false, true, "data", "function"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
                 [true, "own", false, true, "data", "function"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
-                [false, "absent", null, null, null, "undefined"],
+                [true, "own", true, true, "accessor", "object"],
                 [true, "own", true, true, "accessor", "boolean"],
             ])
         );
@@ -10677,7 +10685,7 @@ mod tests {
     /// not ship, which is exactly the "we have names Chrome lacks" class the
     /// census flags.
     #[test]
-    fn model_context_shared_storage_and_webmcp_surfaces_are_gone() {
+    fn model_context_shared_storage_and_webmcp_surfaces_match_the_reference() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -10687,12 +10695,26 @@ mod tests {
                         'SharedStorageDeleteMethod', 'SharedStorageModifierMethod',
                         'SharedStorageSetMethod', 'ModelContext', 'WebMCPEvent',
                         'sharedStorage'];
+                    const sharedStorageProto = Object.getOwnPropertyNames(
+                        SharedStorage.prototype);
                     return {
-                        missing: names.filter(name => name in window),
-                        present: names.filter(name => !(name in window)).length,
+                        missing: names.filter(name => !(name in window)),
+                        present: names.filter(name => name in window).length,
                         sharedStorageType: typeof window.sharedStorage,
+                        sharedStorageTag: Object.prototype.toString.call(window.sharedStorage),
+                        sharedStorageProto,
+                        methodCtor: (() => {
+                            try { new SharedStorageAppendMethod(); return 'no-throw'; }
+                            catch (error) { return error.message; }
+                        })(),
                         modelContextType: typeof navigator.modelContext,
+                        modelContextTag: Object.prototype.toString.call(navigator.modelContext),
                         modelContextInProto: 'modelContext' in Navigator.prototype,
+                        webmcpEventToolName: (() => {
+                            const event = new WebMCPEvent('toolchange', {toolName: 'x'});
+                            return [event.toolName, event instanceof Event,
+                                    Object.getOwnPropertyNames(event).length];
+                        })(),
                         chromeKeys: Object.getOwnPropertyNames(window.chrome),
                         chromeRuntime: typeof window.chrome.runtime,
                     };
@@ -10704,10 +10726,17 @@ mod tests {
             serde_json::json!({
                 "missing": [],
                 "present": 10,
-                "sharedStorageType": "undefined",
-                "modelContextType": "undefined",
-                "modelContextInProto": false,
-                "chromeKeys": ["app", "csi", "loadTimes"],
+                "sharedStorageType": "object",
+                "sharedStorageTag": "[object SharedStorage]",
+                "sharedStorageProto": ["append", "clear", "delete", "set", "batchUpdate",
+                                       "constructor", "worklet", "createWorklet", "run",
+                                       "selectURL"],
+                "methodCtor": "Failed to construct 'SharedStorageAppendMethod': 2 arguments required, but only 0 present.",
+                "modelContextType": "object",
+                "modelContextTag": "[object ModelContext]",
+                "modelContextInProto": true,
+                "webmcpEventToolName": ["x", true, 1],
+                "chromeKeys": ["loadTimes", "csi", "app"],
                 "chromeRuntime": "undefined",
             })
         );
@@ -16345,7 +16374,11 @@ RequestRedirect value",
                 r#"(() => {
                     const enumerableConstructors = Object.keys(window)
                         .filter(name => /^[A-Z]/.test(name));
-                    const samples = ['Image', 'XMLSerializer', 'Element', 'FontFaceSet']
+                    // FontFaceSet left this list on 2026-09-28: it is not an
+                    // own property of a non-isolated window in Chrome, so the
+                    // engine deletes it and its enumerability has no shape to
+                    // compare.
+                    const samples = ['Image', 'XMLSerializer', 'Element']
                         .map(name => {
                             const descriptor = Object.getOwnPropertyDescriptor(window, name);
                             return [name, descriptor && descriptor.enumerable];
@@ -16358,8 +16391,7 @@ RequestRedirect value",
             result,
             serde_json::json!([
                 [],
-                [["Image", false], ["XMLSerializer", false],
-                 ["Element", false], ["FontFaceSet", false]],
+                [["Image", false], ["XMLSerializer", false], ["Element", false]],
             ])
         );
     }
@@ -16777,12 +16809,11 @@ RequestRedirect value",
 
     #[test]
     fn chrome151_persona_interfaces_are_present_on_secure_documents() {
-        // Reversed by the 0926 payload diff: the Chrome 151 renderer trace
-        // that put navigator.modelContext and window.sharedStorage on this
-        // window is not what a current Chrome exposes. Both the local Chrome
-        // 153 window and the remote reference census answer absent for the
-        // whole family, so the names stay off the secure-origin surface too
-        // (see model_context_shared_storage_and_webmcp_surfaces_are_gone).
+        // Reversed by the 0926 payload diff, then restored on 2026-09-28: the
+        // reference dump of the passing round carries navigator.modelContext
+        // and window.sharedStorage on the challenge page, and a local Chrome
+        // oracle answers both the same way (see
+        // model_context_shared_storage_and_webmcp_surfaces_match_the_reference).
         let mut rt = setup_secure_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -16801,12 +16832,12 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!({
-                "modelContext": "undefined",
-                "modelContextTag": "[object Undefined]",
-                "modelContextCtor": "undefined",
-                "webMcpEvent": "undefined",
-                "sharedStorage": "undefined",
-                "sharedStorageTag": "[object Undefined]",
+                "modelContext": "object",
+                "modelContextTag": "[object ModelContext]",
+                "modelContextCtor": "function",
+                "webMcpEvent": "function",
+                "sharedStorage": "object",
+                "sharedStorageTag": "[object SharedStorage]",
                 "designMode": "off",
                 "navigatorOwn": [],
             })
@@ -33737,13 +33768,18 @@ RequestRedirect value",
                     'Node', 'Headers', 'Request', 'Response',
                     'HTMLInputElement',
                     'URL', 'FormData', 'AbortController', 'XMLHttpRequest', 'DOMParser',
-                    'Navigator', 'Location', 'HTMLUserMediaElement',
-                    'InteractionContentfulPaint', 'PerformanceSoftNavigation',
+                    'Navigator', 'Location',
                     // The XSLT/Range trio this list used to pin is gone (both
-                    // passing oracles lack it), and so is the Chrome 151
-                    // ModelContext/WebMCPEvent/SharedStorage set since the 0926
-                    // payload diff: a local Chrome 153 window answers absent
-                    // for all ten names.
+                    // passing oracles lack it). HTMLUserMediaElement,
+                    // InteractionContentfulPaint and PerformanceSoftNavigation
+                    // left it on 2026-09-28, when the reference dump and a
+                    // local Chrome oracle agreed they are not own properties
+                    // of a non-isolated window; ModelContext, WebMCPEvent and
+                    // the SharedStorage family replaced them the same day.
+                    'ModelContext', 'WebMCPEvent', 'SharedStorage',
+                    'SharedStorageWorklet', 'SharedStorageModifierMethod',
+                    'SharedStorageAppendMethod', 'SharedStorageSetMethod',
+                    'SharedStorageDeleteMethod', 'SharedStorageClearMethod',
                 ];
                 const bad = [];
                 for (const n of names) {

@@ -286,34 +286,70 @@ registerNavigatorSurface();
   Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
+// The extension-free `chrome` object. Chrome 153 answers
+// Object.getOwnPropertyNames(window.chrome) with loadTimes,csi,app in that
+// order, both functions anonymous (`function () { [native code] }`, an empty
+// own `name`), and `chrome` itself non-configurable; `chrome.runtime` is
+// absent, because the property only exists on a window that hosts an
+// extension process. app carries the three callbacks the extension bindings
+// install, each of which fails or answers the same way it does without an
+// extension installed.
+const _chromeLoadTimes = function () {
+  const t = Date.now() / 1000;
+  const request = t - 0.5 - _fpRand(611) * 0.5;
+  const startLoad = request + 0.05 + _fpRand(612) * 0.02;
+  const commit = request + 0.3 + _fpRand(613) * 0.4;
+  const finishDoc = commit + 0.1 + _fpRand(614) * 0.2;
+  const finish = finishDoc + 0.05 + _fpRand(615) * 0.1;
+  const firstPaint = commit + 0.03 + _fpRand(616) * 0.1;
+  const navTypes = ["BackForward", "Reload", "Link", "Other"];
+  return {
+    requestTime: request, startLoadTime: startLoad * 1000, commitLoadTime: commit * 1000,
+    finishDocumentLoadTime: finishDoc * 1000, finishLoadTime: finish * 1000,
+    firstPaintTime: firstPaint * 1000, firstPaintAfterLoadTime: 0,
+    navigationType: navTypes[Math.floor(_fpRand(617) * 4)],
+    wasFetchedViaSpdy: false, wasNpnNegotiated: false,
+    npnNegotiatedProtocol: "http/1.1",
+    wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
+  };
+};
+const _chromeCsi = function () {
+  const t = Date.now();
+  return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
+};
+const _chromeAppGetDetails = function getDetails() {
+  throw new Error("Error in invocation of app.getDetails(): ");
+};
+const _chromeAppRunningState = function runningState() {
+  throw new Error("Error in invocation of app.runningState(): ");
+};
+// The callbacks still run without an extension: getIsInstalled answers false
+// and installState answers undefined without consulting its callback, which is
+// the observable Chrome 153 behaviour on an extension-free window.
+const _chromeAppGetIsInstalled = function getIsInstalled() { return false; };
+const _chromeAppInstallState = function () { void arguments; };
+for (const fn of [_chromeLoadTimes, _chromeCsi, _chromeAppGetDetails, _chromeAppRunningState,
+                  _chromeAppGetIsInstalled, _chromeAppInstallState]) {
+  _markNative(fn);
+}
+for (const fn of [_chromeLoadTimes, _chromeCsi]) {
+  try { Object.defineProperty(fn, 'name', { value: '', configurable: true }); } catch (_e) {}
+}
+try {
+  Object.defineProperty(_chromeAppInstallState, 'name', { value: 'installState', configurable: true });
+  Object.defineProperty(_chromeAppInstallState, 'length', { value: 0, configurable: true });
+} catch (_e) {}
 globalThis.chrome = {
-  app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  // No `runtime`: an extension-free Chrome answers
-  // Object.getOwnPropertyNames(window.chrome) with loadTimes,csi,app and
-  // typeof chrome.runtime with "undefined" (Chrome 153 oracle, 2026-09-26).
-  // The property only exists on a window that hosts an extension process.
-  csi() {
-    const t = Date.now();
-    return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
-  },
-  loadTimes() {
-    const t = Date.now() / 1000;
-    const request = t - 0.5 - _fpRand(611) * 0.5;
-    const startLoad = request + 0.05 + _fpRand(612) * 0.02;
-    const commit = request + 0.3 + _fpRand(613) * 0.4;
-    const finishDoc = commit + 0.1 + _fpRand(614) * 0.2;
-    const finish = finishDoc + 0.05 + _fpRand(615) * 0.1;
-    const firstPaint = commit + 0.03 + _fpRand(616) * 0.1;
-    const navTypes = ["BackForward","Reload","Link","Other"];
-    return {
-      requestTime: request, startLoadTime: startLoad * 1000, commitLoadTime: commit * 1000,
-      finishDocumentLoadTime: finishDoc * 1000, finishLoadTime: finish * 1000,
-      firstPaintTime: firstPaint * 1000, firstPaintAfterLoadTime: 0,
-      navigationType: navTypes[Math.floor(_fpRand(617) * 4)],
-      wasFetchedViaSpdy: false, wasNpnNegotiated: false,
-      npnNegotiatedProtocol: "http/1.1",
-      wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
-    };
+  loadTimes: _chromeLoadTimes,
+  csi: _chromeCsi,
+  app: {
+    isInstalled: false,
+    getDetails: _chromeAppGetDetails,
+    getIsInstalled: _chromeAppGetIsInstalled,
+    installState: _chromeAppInstallState,
+    runningState: _chromeAppRunningState,
+    InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" },
+    RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" },
   },
 };
 

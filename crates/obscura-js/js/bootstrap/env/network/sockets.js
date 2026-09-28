@@ -690,7 +690,10 @@ if (typeof FontFace === 'undefined') {
     return Math.abs(faceWeight - selection.weight) < 350 && italic === (selection.style !== 'normal');
   };
 
-  globalThis.FontFaceSet = class FontFaceSet extends EventTarget {
+  // Lexical binding as well as the global: the global is deleted from a
+  // non-isolated window (Chrome does not expose FontFaceSet there), while
+  // the `fonts` getter below still has to construct one.
+  const FontFaceSet = globalThis.FontFaceSet = class FontFaceSet extends EventTarget {
     constructor(initialFaces=[], ownerDocument=null) {
       super();
       this._faces = new Set();

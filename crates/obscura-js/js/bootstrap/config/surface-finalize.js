@@ -1611,7 +1611,7 @@ const _chromeInterfaceShells = new Set();
     if (typeof globalThis[name] !== 'undefined') continue;
     const object = {};
     Object.defineProperty(object, Symbol.toStringTag,
-      { value: { cookieStore: 'CookieStore', crashReport: 'CrashReportedDetails',
+      { value: { cookieStore: 'CookieStore', crashReport: 'CrashReportContext',
                  documentPictureInPicture: 'DocumentPictureInPicture',
                  viewport: 'Viewport',
                  launchQueue: 'LaunchQueue' }[name], configurable: true });
@@ -2712,3 +2712,150 @@ Object.defineProperty(globalThis, '__obscura_filter_prepare_stack_trace', {
     return result;
   },
 });
+
+// Legacy vendor-prefixed aliases are the same function objects as the
+// unprefixed interfaces, not lookalikes. Chrome answers `WebKitCSSMatrix ===
+// DOMMatrix` with true, so `String(WebKitCSSMatrix)` is "function DOMMatrix()
+// { [native code] }", `WebKitCSSMatrix.name` is "DOMMatrix" and its prototype
+// carries DOMMatrix's members; the interface table installed each prefixed
+// name as its own shell, which a name or identity check separates from the
+// browser it claims to be. The alias property itself keeps its own slot,
+// flags and position -- only the value moves.
+(function installLegacyAliases() {
+  const aliases = [
+    ['WebKitCSSMatrix', 'DOMMatrix'],
+    ['WebKitMutationObserver', 'MutationObserver'],
+    ['webkitURL', 'URL'],
+    ['webkitRTCPeerConnection', 'RTCPeerConnection'],
+    ['webkitMediaStream', 'MediaStream'],
+    ['webkitSpeechGrammar', 'SpeechGrammar'],
+    ['webkitSpeechGrammarList', 'SpeechGrammarList'],
+    ['webkitSpeechRecognition', 'SpeechRecognition'],
+    ['webkitSpeechRecognitionError', 'SpeechRecognitionErrorEvent'],
+    ['webkitSpeechRecognitionEvent', 'SpeechRecognitionEvent'],
+  ];
+  for (const [alias, canonical] of aliases) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, alias);
+    const target = globalThis[canonical];
+    if (!descriptor || !descriptor.configurable || typeof target !== 'function') continue;
+    if (descriptor.value === target) continue;
+    try {
+      Object.defineProperty(globalThis, alias, {
+        value: target,
+        writable: descriptor.writable !== false,
+        enumerable: descriptor.enumerable === true,
+        configurable: true,
+      });
+    } catch (_error) {}
+  }
+  // `URL` takes one required argument (Chrome reports URL.length === 1); the
+  // engine's implementation declared two.
+  try {
+    if (typeof globalThis.URL === 'function' && globalThis.URL.length !== 1) {
+      Object.defineProperty(globalThis.URL, 'length', { value: 1, configurable: true });
+    }
+  } catch (_error) {}
+
+  // Members of five interfaces the interface table installs as shells. Member
+  // names and order come from the Chrome 153 census that produced the table;
+  // the bodies are the shape a feature probe sees, not working features.
+  (function installInterfaceMemberLongTail() {
+    const define = (proto, name, value) => {
+      try {
+        Object.defineProperty(proto, name, {
+          value, writable: true, enumerable: true, configurable: true,
+        });
+      } catch (_error) {}
+    };
+    const method = (proto, name, length, fn) => {
+      try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_error) {}
+      try { Object.defineProperty(fn, 'length', { value: length, configurable: true }); } catch (_error) {}
+      define(proto, name, _markNative(fn));
+    };
+    const getter = (proto, name, read) => {
+      const get = read || function () { return null; };
+      try { Object.defineProperty(get, 'name', { value: 'get ' + name, configurable: true }); } catch (_error) {}
+      try {
+        Object.defineProperty(proto, name, {
+          get: _markNative(get), set: undefined, enumerable: true, configurable: true,
+        });
+      } catch (_error) {}
+    };
+    const setter = (proto, name) => {
+      const get = function () { return null; };
+      const set = function (value) { void value; };
+      try {
+        Object.defineProperty(get, 'name', { value: 'get ' + name, configurable: true });
+        Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true });
+      } catch (_error) {}
+      try {
+        Object.defineProperty(proto, name, {
+          get: _markNative(get), set: _markNative(set),
+          enumerable: true, configurable: true,
+        });
+      } catch (_error) {}
+    };
+    // Chrome keeps `constructor` in the middle of these prototypes, so the
+    // descriptor is rebuilt after the members that precede it.
+    const parkConstructor = proto => {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'constructor');
+      if (!descriptor) return;
+      try {
+        delete proto.constructor;
+        Object.defineProperty(proto, 'constructor', descriptor);
+      } catch (_error) {}
+    };
+
+    if (typeof CookieStore === 'function') {
+      const proto = CookieStore.prototype;
+      method(proto, 'delete', 1, function (name) { void name; return Promise.resolve(); });
+      method(proto, 'get', 1, function (name) { void name; return Promise.resolve(null); });
+      method(proto, 'getAll', 0, function () { return Promise.resolve([]); });
+      method(proto, 'set', 2, function (name, value) { void name; void value; return Promise.resolve(); });
+      parkConstructor(proto);
+      setter(proto, 'onchange');
+    }
+    if (typeof CrashReportContext === 'function') {
+      const proto = CrashReportContext.prototype;
+      method(proto, 'delete', 1, function (key) { void key; });
+      method(proto, 'initialize', 1, function (key) { void key; });
+      method(proto, 'set', 2, function (key, value) { void key; void value; });
+      parkConstructor(proto);
+    }
+    if (typeof Viewport === 'function') {
+      // A document with no viewport segments reports an empty list.
+      getter(Viewport.prototype, 'segments', function () { return []; });
+      parkConstructor(Viewport.prototype);
+    }
+    if (typeof LaunchQueue === 'function') {
+      method(LaunchQueue.prototype, 'setConsumer', 1, function (consumer) {
+        // One consumer per document, and no launch to deliver here.
+        void consumer;
+      });
+      parkConstructor(LaunchQueue.prototype);
+    }
+    if (typeof DocumentPictureInPicture === 'function') {
+      const proto = DocumentPictureInPicture.prototype;
+      getter(proto, 'window', function () { return null; });
+      setter(proto, 'onenter');
+      method(proto, 'requestWindow', 0, function () {
+        return Promise.reject(new DOMException(
+          'Document PiP requires a user gesture', 'NotAllowedError'));
+      });
+      parkConstructor(proto);
+    }
+  })();
+
+  // A non-isolated document's window does not own the experimental
+  // constructors in _nonIsolatedHiddenNames at all. The reflection filter in
+  // config/bootstrap.js hides them from getOwnPropertyNames, which is what a
+  // page that enumerates sees, but getOwnPropertyDescriptor still answers with
+  // a descriptor where a real browser answers undefined. Isolated realms keep
+  // the complete set.
+  if (globalThis.crossOriginIsolated !== true) {
+    for (const name of _nonIsolatedHiddenNames) {
+      try { delete globalThis[name]; } catch (_error) {}
+    }
+  }
+
+})();

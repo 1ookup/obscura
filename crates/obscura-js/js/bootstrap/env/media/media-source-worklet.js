@@ -78,6 +78,15 @@ if (typeof globalThis.MediaSource === 'undefined') {
     writable: true, enumerable: false, configurable: true,
   });
 
+  // Chrome's member order on Worklet.prototype is addModule, then constructor.
+  {
+    const descriptor = Object.getOwnPropertyDescriptor(Worklet.prototype, 'constructor');
+    if (descriptor) {
+      delete Worklet.prototype.constructor;
+      Object.defineProperty(Worklet.prototype, 'constructor', descriptor);
+    }
+  }
+
   const AudioWorklet = function () {
     throw new TypeError("Failed to construct 'AudioWorklet': Illegal constructor");
   };

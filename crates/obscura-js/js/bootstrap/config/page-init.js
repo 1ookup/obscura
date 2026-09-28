@@ -525,17 +525,6 @@ globalThis.__obscura_init = function() {
       _alignPropertiesOrder(globalThis, _chromeWindowKeyOrder);
     }
   } catch(e) {}
-  // Window IDL attributes are accessors in Chrome, not data properties, and
-  // the conversion runs here: every internal write (document, navigator,
-  // visualViewport, the viewport metrics) has already happened by this point,
-  // and re-running the modules later would otherwise assign into an accessor
-  // that no longer has a setter. See config/window-attributes.js for the
-  // per-name flags this restores.
-  try {
-    if (typeof globalThis.__obscura_install_window_attributes === 'function') {
-      globalThis.__obscura_install_window_attributes(globalThis);
-    }
-  } catch(e) {}
   // Native presentation (batch 20). Init replaced visualViewport, the
   // frame-metric accessors and the named-property getters, and a fresh
   // context mints its own ECMAScript intrinsics (WebAssembly, Temporal and
@@ -600,6 +589,17 @@ globalThis.__obscura_init = function() {
   // expect; an unmarked function must answer toString with its source, the
   // way a page function does in a browser, rather than tip the scan.
   try { delete globalThis.__obscura_lazy_mark_surface; } catch (_e) {}
+  // Window IDL attributes are accessors in Chrome, not data properties. The
+  // conversion runs last: every internal write (document, navigator,
+  // visualViewport, the viewport metrics) has happened by then, and so has the
+  // surface-marking sweep above, which renames an anonymous function after its
+  // slot (chrome's entry points answer with an empty name). See
+  // config/window-attributes.js for the per-name flags this restores.
+  try {
+    if (typeof globalThis.__obscura_install_window_attributes === 'function') {
+      globalThis.__obscura_install_window_attributes(globalThis);
+    }
+  } catch(e) {}
   delete globalThis.__obscura_init;
 };
 

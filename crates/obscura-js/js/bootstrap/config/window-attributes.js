@@ -8,7 +8,8 @@
 // data property is a shape no Chromium build produces, and the getter's own
 // name ("get navigator", not "navigator") is part of the same tell.
 //
-// Measured on Chrome 153 over the challenge page. The flags are per name
+// Measured on the local Chrome oracle (149) over a page on this host. The
+// flags are per name
 // because Chrome's are not uniform: `document`, `location`, `top` and
 // `window` are non-configurable, `offscreenBuffering` is the single
 // non-enumerable entry, and everything else is an enumerable, configurable
@@ -45,7 +46,7 @@ const _chromeNonEnumerableWindowAttributes = new Set(['offscreenBuffering']);
 // The slot a minted getter reads. The value is captured when the attribute is
 // converted, and the minted setter writes it back, so the descriptor stays an
 // accessor after a page assigns one. A real [Replaceable] setter replaces the
-// property with a data property instead (measured on Chrome 153); the value a
+// property with a data property instead (same measurement); the value a
 // page reads afterwards is the same either way, and keeping the accessor keeps
 // the engine's own rebinds from splitting one attribute across two shapes.
 const _windowAttributeSlots = new WeakMap();
@@ -76,6 +77,8 @@ function _markWindowAttributeHalf(fn, kind, name) {
 
 function _obscuraInstallWindowAttributeAccessors(target) {
   if (!target) return;
+  _obscuraRestoreChromeEntryPointNames(target);
+  _obscuraLockChromeObject(target);
   for (const name of _chromeWindowAttributeNames) {
     let descriptor;
     try {
@@ -115,6 +118,54 @@ function _obscuraInstallWindowAttributeAccessors(target) {
     }
     try {
       Object.defineProperty(target, name, aligned);
+    } catch (_error) {}
+  }
+}
+
+// Chrome keeps `chrome.loadTimes` and `chrome.csi` anonymous (name "",
+// toString "function () { [native code] }"), while every other entry point in
+// the surface carries its slot's name. The surface-marking sweep renames them
+// through the `constructor` key of their own prototype, so the shape is
+// restored here, after that sweep has run.
+// Chrome's `chrome` object is non-configurable, and the lock belongs here
+// rather than in the finalize module: a worker realm runs that module too and
+// then deletes `chrome` (its scope has none), which a locked property would
+// refuse. The window key-order walk ahead of this pass moves properties by
+// deleting and redefining them, so the flag is only set once that has run.
+function _obscuraLockChromeObject(target) {
+  let descriptor = null;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(target, 'chrome');
+  } catch (_error) {
+    return;
+  }
+  if (!descriptor || !descriptor.configurable) return;
+  try {
+    Object.defineProperty(target, 'chrome', {
+      value: descriptor.value,
+      writable: descriptor.writable !== false,
+      enumerable: descriptor.enumerable === true,
+      configurable: false,
+    });
+  } catch (_error) {}
+}
+
+function _obscuraRestoreChromeEntryPointNames(target) {
+  let chrome = null;
+  try {
+    chrome = target.chrome;
+  } catch (_error) {
+    return;
+  }
+  if (!chrome || typeof chrome !== 'object') return;
+  for (const name of ['loadTimes', 'csi']) {
+    const fn = chrome[name];
+    if (typeof fn !== 'function' || fn.name === '') continue;
+    try {
+      Object.defineProperty(fn, 'name', { value: '', configurable: true });
+    } catch (_error) {}
+    try {
+      _markNativeAs(fn, 'function () { [native code] }');
     } catch (_error) {}
   }
 }

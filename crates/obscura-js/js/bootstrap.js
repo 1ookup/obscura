@@ -163,6 +163,7 @@
 // @obscura-module config/core-surface-finalize.js
 // @obscura-deferred-surface
 // @obscura-module env/fingerprint/navigator.js
+// @obscura-module env/agent/model-context.js
 // @obscura-module env/media/support/media-devices-behavior.js
 // @obscura-module env/media/media-devices.js
 // @obscura-module env/fingerprint/support/webgl-profile.js
@@ -184,6 +185,7 @@
 // @obscura-module env/dom/document-all.js
 // @obscura-module env/storage/storage-history.js
 // @obscura-module env/navigation/navigation.js
+// @obscura-module env/storage/shared-storage.js
 // @obscura-module env/window/geometry.js
 // @obscura-module env/html/image-constructor.js
 // @obscura-module env/media/audio-constructor.js

@@ -626,11 +626,18 @@ let _SharedArrayBufferCtor = globalThis.SharedArrayBuffer || (() => {
 let _applySecureContextGating = null;
 let _applyCrossOriginIsolation = null;
 let _crossOriginIsolatedValue = false;
-// Chrome's non-isolated child Window surface omits these experimental
+// A non-isolated document's Window surface omits these experimental
 // constructors from own-key reflection. The values remain available through
 // direct property access in realms that implement them; only the reflected
-// surface is gated, and isolated frames keep the complete set.
-const _nonIsolatedFrameHiddenNames = new Set([
+// surface is gated, and cross-origin-isolated realms keep the complete set.
+//
+// This used to be gated to cross-origin child frames, because the frame's
+// WindowProxy shape was the only census taken. The challenge page's own top
+// window answers the same way (Chrome 153, 2026-09-28): FontFaceSet,
+// HTMLUserMediaElement, InteractionContentfulPaint and
+// PerformanceSoftNavigation are not own properties there either, so the gate
+// follows the document's isolation, not its position in the frame tree.
+const _nonIsolatedHiddenNames = new Set([
   'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
   'PerformanceSoftNavigation',
 ]);
@@ -680,10 +687,14 @@ _markNative(globalThis.dispatchEvent);
     // object does not, so this is a cheap, side-effect-free discriminator.
     try { return !!t && t.globalThis === t; } catch (_e) { return false; }
   }
-  function _isNonIsolatedFrameGlobal(t) {
+  function _isNonIsolatedGlobal(t) {
     let root = 0;
     try { root = Number(t && t.__obscura_frame_document_nid) || 0; } catch (_e) {}
-    if (root <= 0) return false;
+    if (root <= 0) {
+      // Top-level realm: its own document decides, and an ordinary page is not
+      // cross-origin isolated.
+      try { return t.crossOriginIsolated !== true; } catch (_e) { return true; }
+    }
     try {
       const info = _domParse('document_scope_info', root) || {};
       if (info.crossOriginIsolated === true) return false;
@@ -732,9 +743,9 @@ _markNative(globalThis.dispatchEvent);
         if (_isEngineName(name)) { return false; }
         return !set || !set.has(name);
       });
-      if (_isNonIsolatedFrameGlobal(t)) {
+      if (_isNonIsolatedGlobal(t)) {
         out = out.filter(function(name) {
-          return typeof name !== 'string' || !_nonIsolatedFrameHiddenNames.has(name);
+          return typeof name !== 'string' || !_nonIsolatedHiddenNames.has(name);
         });
       }
     }
@@ -773,10 +784,10 @@ _markNative(globalThis.dispatchEvent);
       for (var i = 0; i < ks.length; i++) {
         if (_isEngineName(ks[i]) || (set && set.has(ks[i]))) { delete all[ks[i]]; }
       }
-      if (_isNonIsolatedFrameGlobal(t)) {
+      if (_isNonIsolatedGlobal(t)) {
         var frameKeys = _oGOPN(all);
         for (var fi = 0; fi < frameKeys.length; fi++) {
-          if (_nonIsolatedFrameHiddenNames.has(frameKeys[fi])) delete all[frameKeys[fi]];
+          if (_nonIsolatedHiddenNames.has(frameKeys[fi])) delete all[frameKeys[fi]];
         }
       }
     }
