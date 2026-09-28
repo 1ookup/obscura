@@ -143,6 +143,11 @@ pub use paint::{
 #[cfg(feature = "paint")]
 pub mod inline;
 
+/// Per-family advance tables generated from the fonts this host ships, used by
+/// the text engine's metric substitution. Data only.
+#[cfg(feature = "paint")]
+pub mod font_tables;
+
 #[cfg(feature = "paint")]
 pub struct CanvasTextMeasurer {
     engine: inline::TextEngine,

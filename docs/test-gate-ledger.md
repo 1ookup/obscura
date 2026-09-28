@@ -134,3 +134,9 @@ run covers are then removed.
   comment, scoped to `cargo nextest run --release --features render
   -p obscura-js -p obscura-browser -p obscura-render -p obscura-net`
   1624/1624. Full workspace gate deferred to the next backfill.
+
+- 2026-09-28: per-family font tables generated from the host's fonts (data and
+  a pinning test only, no behaviour change yet), scoped to
+  `cargo nextest run --release --features render -p obscura-render
+  -p obscura-js -p obscura-browser` 1491/1491. Full workspace gate deferred to
+  the next backfill.
