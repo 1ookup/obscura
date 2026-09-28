@@ -7563,24 +7563,62 @@ fn opfs_io(what: &str, error: std::io::Error) -> deno_error::JsErrorBox {
 /// without shared mutable bookkeeping. The counter covers the one shim without
 /// backing files: the document realm's in-memory writable streams report their
 /// written bytes here, and the total answers for every realm alike.
+/// Chrome's quota manager batches its accounting, so bytes a page wrote
+/// moments ago are not in the next `estimate()`: the challenge writes a
+/// one-byte OPFS file and reads the quota in the same session, where the
+/// reference still answers the bare 10 GiB floor -- while bytes the origin
+/// stored earlier do show up (10 GiB + 158 measured on a used origin). A file
+/// modified inside this lag window therefore stays out of the answer until
+/// it ages past it.
+const USAGE_LAG: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn storage_usage_bytes() -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(opfs_root()) {
         for entry in entries.flatten() {
-            let size = entry
-                .metadata()
-                .map(|m| if m.is_file() { m.len() } else { 0 })
-                .unwrap_or(0);
-            total += size;
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let in_lag_window = meta
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < USAGE_LAG);
+            if in_lag_window {
+                continue;
+            }
+            total += meta.len();
         }
     }
-    let js_bytes = storage_js_bytes().load(std::sync::atomic::Ordering::Relaxed);
-    total + js_bytes.max(0) as u64
+    let js_bytes = storage_js_bytes()
+        .lock()
+        .map(|mut state| {
+            let now = std::time::Instant::now();
+            let mut settled = state.0;
+            let mut still_pending = Vec::new();
+            for (at, delta) in state.1.drain(..) {
+                if now.duration_since(at) >= USAGE_LAG {
+                    settled += delta;
+                } else {
+                    still_pending.push((at, delta));
+                }
+            }
+            state.0 = settled;
+            state.1 = still_pending;
+            settled.max(0) as u64
+        })
+        .unwrap_or(0);
+    total + js_bytes
 }
 
-fn storage_js_bytes() -> &'static std::sync::atomic::AtomicI64 {
-    static BYTES: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
-    BYTES.get_or_init(|| std::sync::atomic::AtomicI64::new(0))
+/// The storage shim's byte counter, split by the same lag the file side
+/// observes: `settled` is in the answer, `pending` entries join it once they
+/// age past `USAGE_LAG`.
+fn storage_js_bytes() -> &'static std::sync::Mutex<(i64, Vec<(std::time::Instant, i64)>)> {
+    static BYTES: std::sync::OnceLock<std::sync::Mutex<(i64, Vec<(std::time::Instant, i64)>)>> =
+        std::sync::OnceLock::new();
+    BYTES.get_or_init(|| std::sync::Mutex::new((0, Vec::new())))
 }
 
 /// Report bytes written through a storage shim without backing files. Never
@@ -7589,20 +7627,8 @@ fn storage_js_bytes() -> &'static std::sync::atomic::AtomicI64 {
 fn op_storage_usage_add(#[smi] delta: f64) {
     let delta = if delta.is_finite() { delta as i64 } else { 0 };
     let counter = storage_js_bytes();
-    loop {
-        let current = counter.load(std::sync::atomic::Ordering::Relaxed);
-        let next = current.saturating_add(delta).max(0);
-        if counter
-            .compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            return;
-        }
+    if let Ok(mut state) = counter.lock() {
+        state.1.push((std::time::Instant::now(), delta));
     }
 }
 

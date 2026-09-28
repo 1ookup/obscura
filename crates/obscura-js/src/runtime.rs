@@ -34646,6 +34646,12 @@ RequestRedirect value",
     // free-space delta, so the quota was a different number every process
     // (10737418888 and 10737418600 measured) and hashed to a different value
     // each run.
+    //
+    // The accounting lags, though: the challenge writes a one-byte file and
+    // reads the quota in the same session, and the reference still answers the
+    // bare floor there -- the write lands in the answer only once it has aged
+    // past the batch window. A write inside the window therefore leaves the
+    // reading where it was.
     #[tokio::test(flavor = "current_thread")]
     async fn storage_estimate_quota_is_ten_gib_plus_usage() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
@@ -34666,7 +34672,10 @@ RequestRedirect value",
                         quotaIsTenGibPlusUsage: before.quota === 10737418240 + before.usage,
                         stable: before.quota === before2.quota && before.usage === before2.usage,
                         usageBefore: before.usage,
-                        usageAfterGrew: after.usage >= 4096,
+                        // The write is minutes inside the batch window, so the
+                        // quota the challenge reads right after writing is the
+                        // one the reference answers too.
+                        usageAfterWriteStillBeforeWindow: after.usage === before.usage,
                         quotaTracksUsage: after.quota === 10737418240 + after.usage,
                         usageIsInteger: Number.isInteger(after.usage),
                     };
@@ -34686,7 +34695,7 @@ RequestRedirect value",
                 "quotaIsTenGibPlusUsage": true,
                 "stable": true,
                 "usageBefore": 0,
-                "usageAfterGrew": true,
+                "usageAfterWriteStillBeforeWindow": true,
                 "quotaTracksUsage": true,
                 "usageIsInteger": true,
             })
