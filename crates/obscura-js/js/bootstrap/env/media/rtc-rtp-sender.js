@@ -1,6 +1,6 @@
 globalThis.RTCRtpSender = class RTCRtpSender {
   constructor() { throw new TypeError('Illegal constructor'); }
-  static getCapabilities(kind) { return _rtcCapabilities(String(kind)); }
+  static getCapabilities(kind) { return _rtcCapabilities(String(kind), true); }
   get track() { return null; }
   get transport() { return null; }
   getParameters() { return { codecs: [], encodings: [], headerExtensions: [], rtcp: {} }; }

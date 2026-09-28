@@ -572,16 +572,59 @@ function _rtcGatherCandidates(connection, slots) {
 }
 
 
-// `RTCRtpSender.getCapabilities(kind)` is a static query -- no peer connection
-// involved -- and an environment probe reads it as a codec fingerprint. Both
-// interfaces were absent, so the call threw.
+// `RTCRtpSender.getCapabilities(kind)` and its receiver twin are static
+// queries -- no peer connection involved -- and an environment probe reads
+// them as a codec fingerprint. Both interfaces were absent, so the call threw.
 //
 // The answer is derived from the same SDP sections the offer is built from,
 // so codec ordering and clock rates stay aligned. Per-offer payload mappings
 // for RTX and RED remain in SDP rather than the static capability view.
-function _rtcCapabilities(kind) {
+//
+// The two views are not the offer's list, though, and they are not each
+// other's either. The oracle answers 23 video entries for the offer, 21 for
+// the receiver view (the two High-profile H264 entries the offer carries are
+// absent) and 14 for the sender view, which is a shorter list of its own: no
+// H264 f4001f/64001f, one AV1 profile, two VP9 profiles, H265 at level 186
+// rather than 180, and no flexfec. Video codec dictionaries carry clockRate,
+// mimeType and sdpFmtpLine only; `channels` is an audio member. The challenge
+// probe reads both views, and the payload's video capability list is the 21
+// the receiver answers.
+const _RTC_SENDER_VIDEO_CODECS = [
+  ['video/VP8', undefined],
+  ['video/rtx', undefined],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f'],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f'],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f'],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f'],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f'],
+  ['video/H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f'],
+  ['video/AV1', 'level-idx=5;profile=0;tier=0'],
+  ['video/VP9', 'profile-id=0'],
+  ['video/VP9', 'profile-id=2'],
+  ['video/H265', 'level-id=186;profile-id=1;tier-flag=0;tx-mode=SRST'],
+  ['video/red', undefined],
+  ['video/ulpfec', undefined],
+];
+// The offer's High-profile H264 entries sit in the SDP but not in the
+// receiver's static view.
+const _RTC_UNVIEWED_H264_PROFILES = '64001f';
+
+function _rtcCapabilities(kind, sender = false) {
   if (kind !== 'audio' && kind !== 'video') return null;
   const section = _RTC_SDP_SECTIONS[kind];
+  const headerExtensions = section.extmaps
+    .map(line => /^a=extmap:\d+(?:\/\S+)? (\S+)$/.exec(line))
+    .filter(Boolean)
+    .map(match => ({ uri: match[1] }));
+  if (sender && kind === 'video') {
+    const codecs = [];
+    for (const [mimeType, fmtp] of _RTC_SENDER_VIDEO_CODECS) {
+      const codec = { clockRate: 90000, mimeType };
+      if (fmtp !== undefined) codec.sdpFmtpLine = fmtp;
+      codecs.push(codec);
+    }
+    return { codecs, headerExtensions };
+  }
   const formats = new Map();
   for (const line of section.body) {
     const match = /^a=fmtp:(\d+) (.*)$/.exec(line);
@@ -599,20 +642,22 @@ function _rtcCapabilities(kind) {
     const lowerName = name.toLowerCase();
     const hasPayloadMapping = lowerName === 'rtx' || lowerName === 'red';
     const parameters = hasPayloadMapping ? undefined : formats.get(match[1]);
+    if (kind === 'video' && parameters
+        && parameters.includes(_RTC_UNVIEWED_H264_PROFILES)) continue;
     // The clock rate is part of a codec's identity: telephone-event is
     // offered at both 48000 and 8000, and keying on the name alone collapsed
     // them into one.
     const key = name + '/' + match[3] + '|' + (parameters || '');
     if (seen.has(key)) continue;
     seen.add(key);
-    const codec = { mimeType: kind + '/' + name, clockRate: +match[3] };
-    codec.channels = match[4] ? +match[4] : 1;
+    // The member order is Chrome's: a video codec carries no `channels`, and
+    // the rest sort the way the oracle's own keys do.
+    const codec = {};
+    if (kind === 'audio') codec.channels = match[4] ? +match[4] : 1;
+    codec.clockRate = +match[3];
+    codec.mimeType = kind + '/' + name;
     if (parameters !== undefined) codec.sdpFmtpLine = parameters;
     codecs.push(codec);
   }
-  const headerExtensions = section.extmaps
-    .map(line => /^a=extmap:\d+(?:\/\S+)? (\S+)$/.exec(line))
-    .filter(Boolean)
-    .map(match => ({ uri: match[1] }));
   return { codecs, headerExtensions };
 }

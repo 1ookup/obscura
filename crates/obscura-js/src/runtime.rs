@@ -30080,17 +30080,14 @@ RequestRedirect value",
                         rtxOnce: video.codecs.filter(c => c.mimeType === 'video/rtx').length,
                         videoCount: video.codecs.length,
                         h264Profiles: video.codecs.filter(c => c.mimeType === 'video/H264').length,
-                        // Chrome lists the High-profile pair between AV1 and
-                        // H265; the challenge's codec probe compares the whole
-                        // ordered list, not just its length.
+                        // The offer carries two High-profile H264 modes that
+                        // the receiver's static view does not.
                         highProfile: video.codecs
                             .map(codec => codec.sdpFmtpLine || '')
                             .filter(line => line.includes('profile-level-id=64001f')),
-                        highProfileAfterAv1: (() => {
+                        av1BeforeH265: (() => {
                             const list = video.codecs.map(name);
-                            return list.findIndex(e => e.includes('64001f'))
-                                > list.findIndex(e => e === 'video/AV1;level-idx=5;profile=1;tier=0')
-                                && list.findIndex(e => e.includes('64001f'))
+                            return list.findIndex(e => e.startsWith('video/AV1'))
                                 < list.findIndex(e => e.startsWith('video/H265'));
                         })(),
                         firstVideo: name(video.codecs[0]),
@@ -30102,6 +30099,12 @@ RequestRedirect value",
                             video.headerExtensions.length],
                         // Only the two media kinds have capabilities.
                         data: RTCRtpSender.getCapabilities('data'),
+                        // The sender's video view is a shorter list of its own,
+                        // and video codec dictionaries carry no `channels`.
+                        senderVideo: RTCRtpSender.getCapabilities('video')
+                            .codecs.map(name),
+                        videoHasChannels: video.codecs.some(c => 'channels' in c),
+                        videoOwnKeys: Object.keys(video.codecs[0]),
                     };
                 })()"#,
             )
@@ -30113,22 +30116,33 @@ RequestRedirect value",
                     "audio/PCMU/8000", "audio/PCMA/8000", "audio/CN/8000",
                     "audio/telephone-event/48000", "audio/telephone-event/8000"],
                 "rtxOnce": 1,
-                // Chrome 153 offers 23 video codecs: the 21 below plus the two
-                // High-profile H264 packetization modes the challenge capture
-                // showed us missing.
-                "videoCount": 23,
-                "h264Profiles": 10,
-                "highProfile": [
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f",
-                    "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=64001f",
-                ],
-                "highProfileAfterAv1": true,
+                // The oracle answers 21 for the receiver's video view: the
+                // offer's 23 entries less the two High-profile H264 modes.
+                "videoCount": 21,
+                "h264Profiles": 8,
+                "highProfile": [],
+                "av1BeforeH265": true,
                 "firstVideo": "video/VP8",
                 "redHasFmtp": false,
                 "redFmtp": null,
                 "senderReceiverAgree": true,
                 "headerExtensions": [4, 11],
                 "data": null,
+                "senderVideo": [
+                    "video/VP8", "video/rtx",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f",
+                    "video/H264;level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f",
+                    "video/AV1;level-idx=5;profile=0;tier=0",
+                    "video/VP9;profile-id=0", "video/VP9;profile-id=2",
+                    "video/H265;level-id=186;profile-id=1;tier-flag=0;tx-mode=SRST",
+                    "video/red", "video/ulpfec",
+                ],
+                "videoHasChannels": false,
+                "videoOwnKeys": ["clockRate", "mimeType"],
             })
         );
     }
