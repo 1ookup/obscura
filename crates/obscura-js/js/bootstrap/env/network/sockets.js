@@ -387,13 +387,18 @@ if (typeof OffscreenCanvas === 'undefined') {
                                 cropWidth, cropHeight, resized) => {
     const outWidth = resized ? resized[0] : cropWidth;
     const outHeight = resized ? resized[1] : cropHeight;
+    // Pixels the crop rectangle reaches past the source stay transparent
+    // black: measured Chrome answers 00000000 for the out-of-bounds half of
+    // a partially off-canvas crop, where clamping to the edge pixel filled
+    // them with copied colour (and a probe that expects the transparent half
+    // fails its own check -- the shape behind the tUxL6 fallback).
     const out = new Uint8ClampedArray(outWidth * outHeight * 4);
     for (let y = 0; y < outHeight; y++) {
-      const sourceY = Math.min(sourceHeight - 1, Math.max(0,
-        top + Math.floor((y + 0.5) * cropHeight / outHeight)));
+      const sourceY = top + Math.floor((y + 0.5) * cropHeight / outHeight);
+      if (sourceY < 0 || sourceY >= sourceHeight) continue;
       for (let x = 0; x < outWidth; x++) {
-        const sourceX = Math.min(sourceWidth - 1, Math.max(0,
-          left + Math.floor((x + 0.5) * cropWidth / outWidth)));
+        const sourceX = left + Math.floor((x + 0.5) * cropWidth / outWidth);
+        if (sourceX < 0 || sourceX >= sourceWidth) continue;
         const from = (sourceY * sourceWidth + sourceX) * 4;
         const to = (y * outWidth + x) * 4;
         out[to] = pixels[from];
