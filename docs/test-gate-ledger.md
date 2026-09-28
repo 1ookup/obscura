@@ -94,3 +94,9 @@ run covers are then removed.
   739/740 (one animation timing test flakes under parallel load, passes
   alone) and `-p obscura-browser` 139/139. Full workspace gate deferred to
   the next backfill.
+
+- 2026-09-28: worker realm surface (WorkerGlobalScope.prototype member set and
+  order, the interface-name sweep, `self.fonts`, the dedicated-scope storage
+  constants), scoped to `cargo nextest run --release --features render
+  -p obscura-js -p obscura-browser` 880/880. Full workspace gate deferred to
+  the next backfill.

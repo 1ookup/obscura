@@ -951,6 +951,24 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var IS_SHARED = __OBSCURA_WORKER_SHARED__;
   var SCOPE_NAME = IS_SHARED ? 'SharedWorkerGlobalScope' : 'DedicatedWorkerGlobalScope';
 
+  // A worker's `self.fonts` is a FontFaceSet, and the class the page
+  // bootstrap installed is about to be stripped with the rest of the Window
+  // surface: hold the constructor here so the scope attribute can build one.
+  var FontFaceSetConstructor = (typeof FontFaceSet === 'function') ? FontFaceSet : null;
+  // The OPFS section builds `navigator.storage` on these classes, and Chrome's
+  // worker exposes the instances without the constructors -- the globals are
+  // deleted from the scope below, so they are held here instead.
+  var StorageManagerConstructor = (typeof StorageManager === 'function') ? StorageManager : null;
+  var FileSystemHandleConstructor = (typeof FileSystemHandle === 'function') ? FileSystemHandle : null;
+  var FileSystemDirectoryHandleConstructor =
+    (typeof FileSystemDirectoryHandle === 'function') ? FileSystemDirectoryHandle : null;
+  var FileSystemFileHandleConstructor =
+    (typeof FileSystemFileHandle === 'function') ? FileSystemFileHandle : null;
+  var FileSystemSyncAccessHandleConstructor =
+    (typeof FileSystemSyncAccessHandle === 'function') ? FileSystemSyncAccessHandle : null;
+  var FileSystemWritableFileStreamConstructor =
+    (typeof FileSystemWritableFileStream === 'function') ? FileSystemWritableFileStream : null;
+
   function def(target, name, value, enumerable) {
     defineProperty(target, name, {
       value: value, writable: true, enumerable: !!enumerable, configurable: true,
@@ -1082,6 +1100,173 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   }
 
   // ---------------------------------------------------------------------
+  // 1b. The interface shells a worker does not expose.
+  //
+  // The page bootstrap's interface table installs every interface it knows as
+  // a global, and a worker's scope inherits all of them from the snapshot:
+  // Animation, CSSStyleRule, the XR family, Geolocation, the Audio* graph --
+  // 599 names Chrome's DedicatedWorkerGlobalScope does not have and that a
+  // census of the scope reads straight off. The list is the measured
+  // difference between this realm's own names and a blob worker's in the local
+  // Chrome oracle (2026-09-28), with the names the sections below re-install
+  // (navigator, fetch, setTimeout, the timers and friends) left out because
+  // they leave the global there instead.
+  // ---------------------------------------------------------------------
+  var WORKER_ABSENT = [
+    'Animation', 'KeyframeEffect', 'DocumentTimeline', 'CaretPosition', 'FeaturePolicy',
+    'ViewTransitionTypeSet', 'ViewTransition', 'TimeRanges', 'VideoPlaybackQuality',
+    'TextTrack', 'TextTrackList', 'TextTrackCue', 'TextTrackCueList', 'VTTCue', 'External',
+    'ScreenOrientation', 'ResizeObserverSize', 'CSSKeyframeRule', 'CSSKeyframesRule',
+    'CSSStyleRule', 'InputDeviceCapabilities', 'MouseEvent', 'KeyboardEvent', 'FocusEvent',
+    'InputEvent', 'PointerEvent', 'AnimationEvent', 'TransitionEvent', 'UIEvent', 'WheelEvent',
+    'CompositionEvent', 'PopStateEvent', 'HashChangeEvent', 'ClipboardEvent', 'SubmitEvent',
+    'ToggleEvent', 'StorageEvent', 'PerformanceTiming', 'PerformanceNavigationTiming',
+    'PerformancePaintTiming', 'PerformanceEventTiming', 'PerformanceLongAnimationFrameTiming',
+    'PerformanceScriptTiming', 'VisibilityStateEntry', 'SVGRect', 'SVGPoint', 'SVGMatrix',
+    'ValidityState', 'BatteryManager', 'VirtualKeyboard', 'ModelContext', 'WebMCPEvent',
+    'MediaDevices', 'ElementInternals', 'SharedStorageModifierMethod',
+    'SharedStorageAppendMethod', 'SharedStorageSetMethod', 'SharedStorageDeleteMethod',
+    'SharedStorageClearMethod', 'SharedStorageWorklet', 'SharedStorage', 'sharedStorage',
+    'ServiceWorker', 'ServiceWorkerRegistration', 'Worklet', 'NavigationPreloadManager',
+    'ServiceWorkerContainer', 'AudioBuffer', 'AudioContext', 'OfflineAudioContext',
+    'MediaStream', 'MediaStreamTrack', 'RTCPeerConnection', 'RTCRtpSender', 'RTCRtpReceiver',
+    'RTCSessionDescription', 'RTCIceCandidate', 'RTCPeerConnectionIceEvent',
+    'KeyboardLayoutMap', 'Keyboard', 'GPUSupportedLimits', 'GPUSupportedFeatures',
+    'GPUAdapterInfo', 'GPUTextureView', 'GPUTexture', 'GPUBuffer', 'GPUShaderModule',
+    'GPUBindGroupLayout', 'GPUBindGroup', 'GPUPipelineLayout', 'GPUSampler', 'GPUQuerySet',
+    'GPURenderPipeline', 'GPUComputePipeline', 'GPUCommandBuffer', 'GPURenderPassEncoder',
+    'GPUComputePassEncoder', 'GPUCommandEncoder', 'GPUQueue', 'GPUDevice', 'GPUAdapter', 'GPU',
+    'GPUCanvasContext', 'CryptoKey', 'SubtleCrypto', 'AudioWorklet', 'event',
+    'AbsoluteOrientationSensor', 'Accelerometer', 'AnalyserNode', 'AnimationEffect',
+    'AnimationPlaybackEvent', 'AnimationTimeline', 'AnimationTrigger', 'AudioBufferSourceNode',
+    'AudioDecoder', 'AudioDestinationNode', 'AudioEncoder', 'AudioListener', 'AudioNode',
+    'AudioParam', 'AudioParamMap', 'AudioPlaybackStats', 'AudioProcessingEvent',
+    'AudioScheduledSourceNode', 'AudioSinkInfo', 'AudioWorkletNode',
+    'AuthenticatorAssertionResponse', 'AuthenticatorAttestationResponse',
+    'AuthenticatorResponse', 'BarcodeDetector', 'BaseAudioContext', 'BeforeInstallPromptEvent',
+    'BeforeUnloadEvent', 'BiquadFilterNode', 'BlobEvent', 'Bluetooth',
+    'BluetoothCharacteristicProperties', 'BluetoothDevice',
+    'BluetoothRemoteGATTCharacteristic', 'BluetoothRemoteGATTDescriptor',
+    'BluetoothRemoteGATTServer', 'BluetoothRemoteGATTService', 'BluetoothUUID',
+    'BrowserCaptureMediaStreamTrack', 'CSPViolationReportBody', 'CSSAnimation',
+    'CSSConditionRule', 'CSSContainerRule', 'CSSCounterStyleRule', 'CSSFontFaceRule',
+    'CSSFontFeatureValuesRule', 'CSSFontPaletteValuesRule', 'CSSFunctionDeclarations',
+    'CSSFunctionDescriptors', 'CSSFunctionRule', 'CSSGroupingRule', 'CSSImageValue',
+    'CSSImportRule', 'CSSKeywordValue', 'CSSLayerBlockRule', 'CSSLayerStatementRule',
+    'CSSMarginRule', 'CSSMathClamp', 'CSSMathInvert', 'CSSMathMax', 'CSSMathMin',
+    'CSSMathNegate', 'CSSMathProduct', 'CSSMathSum', 'CSSMathValue', 'CSSMatrixComponent',
+    'CSSMediaRule', 'CSSNamespaceRule', 'CSSNestedDeclarations', 'CSSNumericArray',
+    'CSSNumericValue', 'CSSPageRule', 'CSSPerspective', 'CSSPositionTryDescriptors',
+    'CSSPositionTryRule', 'CSSPositionValue', 'CSSPropertyRule', 'CSSPseudoElement',
+    'CSSRotate', 'CSSScale', 'CSSScopeRule', 'CSSSkew', 'CSSStartingStyleRule',
+    'CSSStyleValue', 'CSSSupportsRule', 'CSSTransformComponent', 'CSSTransformValue',
+    'CSSTransition', 'CSSTranslate', 'CSSUnitValue', 'CSSUnparsedValue',
+    'CSSVariableReferenceValue', 'CSSViewTransitionRule', 'CanvasCaptureMediaStreamTrack',
+    'CaptureController', 'ChannelMergerNode', 'ChannelSplitterNode', 'ChapterInformation',
+    'CharacterBoundsUpdateEvent', 'Clipboard', 'ClipboardChangeEvent', 'ClipboardItem',
+    'CloseWatcher', 'CommandEvent', 'ConstantSourceNode',
+    'ContentVisibilityAutoStateChangeEvent', 'ConvolverNode', 'CookieChangeEvent',
+    'CookieStore', 'CookieStoreManager', 'CrashReportContext', 'CreateMonitor', 'Credential',
+    'CredentialsContainer', 'CustomStateSet', 'DOMError', 'DataTransfer', 'DataTransferItem',
+    'DataTransferItemList', 'DelayNode', 'DelegatedInkTrailPresenter', 'DeviceMotionEvent',
+    'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate', 'DeviceOrientationEvent',
+    'DevicePosture', 'DigitalCredential', 'DocumentPictureInPicture',
+    'DocumentPictureInPictureEvent', 'DragEvent', 'DynamicsCompressorNode', 'EditContext',
+    'EventCounts', 'EyeDropper', 'FederatedCredential', 'Fence', 'FencedFrameConfig',
+    'FetchLaterResult', 'FileSystemDirectoryHandle', 'FileSystemFileHandle',
+    'FileSystemHandle', 'FileSystemObserver', 'FileSystemWritableFileStream', 'FontData',
+    'FontFaceSetLoadEvent', 'FormDataEvent', 'FragmentDirective', 'GPUCompilationInfo',
+    'GPUCompilationMessage', 'GPUDeviceLostInfo', 'GPUError', 'GPUExternalTexture',
+    'GPUInternalError', 'GPUOutOfMemoryError', 'GPUPipelineError', 'GPURenderBundle',
+    'GPURenderBundleEncoder', 'GPUUncapturedErrorEvent', 'GPUValidationError', 'GainNode',
+    'Gamepad', 'GamepadButton', 'GamepadEvent', 'GamepadHapticActuator', 'Geolocation',
+    'GeolocationCoordinates', 'GeolocationPosition', 'GeolocationPositionError',
+    'GravitySensor', 'Gyroscope', 'HID', 'HIDConnectionEvent', 'HIDDevice',
+    'HIDInputReportEvent', 'Highlight', 'HighlightRegistry', 'IIRFilterNode',
+    'IdentityCredential', 'IdentityCredentialError', 'IdentityProvider', 'IdleDeadline',
+    'IdleDetector', 'ImageCapture', 'ImageDecoder', 'ImageTrack', 'ImageTrackList', 'Ink',
+    'InputDeviceInfo', 'IntegrityViolationReportBody', 'InterestEvent', 'LanguageDetector',
+    'LanguageModel', 'LargestContentfulPaint', 'LaunchParams', 'LaunchQueue', 'LayoutShift',
+    'LayoutShiftAttribution', 'LinearAccelerationSensor', 'Lock', 'LockManager', 'MIDIAccess',
+    'MIDIConnectionEvent', 'MIDIInput', 'MIDIInputMap', 'MIDIMessageEvent', 'MIDIOutput',
+    'MIDIOutputMap', 'MIDIPort', 'MediaDeviceInfo', 'MediaElementAudioSourceNode',
+    'MediaEncryptedEvent', 'MediaError', 'MediaKeyMessageEvent', 'MediaKeySession',
+    'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys', 'MediaList', 'MediaMetadata',
+    'MediaQueryListEvent', 'MediaRecorder', 'MediaSession', 'MediaStreamAudioDestinationNode',
+    'MediaStreamAudioSourceNode', 'MediaStreamEvent', 'MediaStreamTrackAudioStats',
+    'MediaStreamTrackEvent', 'MediaStreamTrackGenerator', 'MediaStreamTrackProcessor',
+    'MediaStreamTrackVideoStats', 'MimeType', 'MimeTypeArray', 'NavigateEvent', 'Navigation',
+    'NavigationActivation', 'NavigationCurrentEntryChangeEvent', 'NavigationDestination',
+    'NavigationHistoryEntry', 'NavigationPrecommitController', 'NavigationTransition',
+    'NavigatorLogin', 'NavigatorManagedData', 'NotRestoredReasonDetails', 'NotRestoredReasons',
+    'OTPCredential', 'OfflineAudioCompletionEvent', 'OrientationSensor', 'OscillatorNode',
+    'OverconstrainedError', 'PageRevealEvent', 'PageSwapEvent', 'PageTransitionEvent',
+    'PannerNode', 'PasswordCredential', 'PaymentAddress', 'PaymentManager',
+    'PaymentMethodChangeEvent', 'PaymentRequest', 'PaymentRequestUpdateEvent',
+    'PaymentResponse', 'PerformanceElementTiming', 'PerformanceLongTaskTiming',
+    'PerformanceNavigation', 'PerformanceTimingConfidence', 'PeriodicWave',
+    'PictureInPictureEvent', 'PictureInPictureWindow', 'Plugin', 'PluginArray', 'Presentation',
+    'PresentationAvailability', 'PresentationConnection',
+    'PresentationConnectionAvailableEvent', 'PresentationConnectionCloseEvent',
+    'PresentationConnectionList', 'PresentationReceiver', 'PresentationRequest',
+    'PressureObserver', 'PressureRecord', 'Profiler', 'ProtectedAudience',
+    'PublicKeyCredential', 'RTCCertificate', 'RTCDTMFSender', 'RTCDTMFToneChangeEvent',
+    'RTCDataChannelEvent', 'RTCDtlsTransport', 'RTCError', 'RTCErrorEvent', 'RTCIceTransport',
+    'RTCPeerConnectionIceErrorEvent', 'RTCRtpScriptTransform', 'RTCRtpTransceiver',
+    'RTCSctpTransport', 'RTCStatsReport', 'RTCTrackEvent', 'RadioNodeList',
+    'RelativeOrientationSensor', 'RemotePlayback', 'SVGAngle', 'SVGAnimatedAngle',
+    'SVGAnimatedBoolean', 'SVGAnimatedEnumeration', 'SVGAnimatedInteger', 'SVGAnimatedLength',
+    'SVGAnimatedLengthList', 'SVGAnimatedNumber', 'SVGAnimatedNumberList',
+    'SVGAnimatedPreserveAspectRatio', 'SVGAnimatedRect', 'SVGAnimatedString',
+    'SVGAnimatedTransformList', 'SVGLength', 'SVGLengthList', 'SVGNumber', 'SVGNumberList',
+    'SVGPointList', 'SVGPreserveAspectRatio', 'SVGStringList', 'SVGTransform',
+    'SVGTransformList', 'SVGUnitTypes', 'Sanitizer', 'Scheduling', 'ScreenDetailed',
+    'ScreenDetails', 'ScriptProcessorNode', 'ScrollTimeline', 'Sensor', 'SensorErrorEvent',
+    'Serial', 'SerialPort', 'SnapEvent', 'SpeechGrammar', 'SpeechGrammarList',
+    'SpeechRecognition', 'SpeechRecognitionErrorEvent', 'SpeechRecognitionEvent',
+    'SpeechRecognitionPhrase', 'SpeechSynthesis', 'SpeechSynthesisErrorEvent',
+    'SpeechSynthesisEvent', 'SpeechSynthesisVoice', 'StereoPannerNode', 'StorageBucket',
+    'StorageBucketManager', 'StorageManager', 'StylePropertyMap', 'StylePropertyMapReadOnly',
+    'Summarizer', 'TaskAttributionTiming', 'TextEvent', 'TextFormat', 'TextFormatUpdateEvent',
+    'TextUpdateEvent', 'TimelineTrigger', 'TimelineTriggerRange', 'TimelineTriggerRangeList',
+    'Touch', 'TouchEvent', 'TouchList', 'TrackEvent', 'Translator', 'USB',
+    'USBAlternateInterface', 'USBConfiguration', 'USBConnectionEvent', 'USBDevice',
+    'USBEndpoint', 'USBInTransferResult', 'USBInterface', 'USBIsochronousInTransferPacket',
+    'USBIsochronousInTransferResult', 'USBIsochronousOutTransferPacket',
+    'USBIsochronousOutTransferResult', 'USBOutTransferResult', 'VideoDecoder', 'VideoEncoder',
+    'ViewTimeline', 'Viewport', 'VirtualKeyboardGeometryChangeEvent', 'WGSLLanguageFeatures',
+    'WakeLock', 'WakeLockSentinel', 'WaveShaperNode', 'WebKitCSSMatrix',
+    'WebKitMutationObserver', 'WebTransport', 'WebTransportBidirectionalStream',
+    'WebTransportDatagramDuplexStream', 'WebTransportError', 'WindowControlsOverlay',
+    'WindowControlsOverlayGeometryChangeEvent', 'XRAnchor', 'XRAnchorSet',
+    'XRBoundedReferenceSpace', 'XRCPUDepthInformation', 'XRCamera', 'XRCompositionLayer',
+    'XRCubeLayer', 'XRCylinderLayer', 'XRDOMOverlayState', 'XRDepthInformation',
+    'XREquirectLayer', 'XRFrame', 'XRHand', 'XRHitTestResult', 'XRHitTestSource',
+    'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
+    'XRJointPose', 'XRJointSpace', 'XRLayer', 'XRLayerEvent', 'XRLightEstimate',
+    'XRLightProbe', 'XRPlane', 'XRPlaneSet', 'XRPose', 'XRProjectionLayer', 'XRQuadLayer',
+    'XRRay', 'XRReferenceSpace', 'XRReferenceSpaceEvent', 'XRRenderState', 'XRRigidTransform',
+    'XRSession', 'XRSessionEvent', 'XRSpace', 'XRSubImage', 'XRSystem',
+    'XRTransientInputHitTestResult', 'XRTransientInputHitTestSource', 'XRView', 'XRViewerPose',
+    'XRViewport', 'XRVisibilityMaskChangeEvent', 'XRWebGLBinding', 'XRWebGLDepthInformation',
+    'XRWebGLLayer', 'XRWebGLSubImage', 'captureEvents', 'fetchLater', 'find',
+    'getScreenDetails', 'queryLocalFonts', 'releaseEvents', 'showDirectoryPicker',
+    'showOpenFilePicker', 'showSaveFilePicker', 'webkitCancelAnimationFrame',
+    'webkitMediaStream', 'webkitRTCPeerConnection', 'webkitRequestAnimationFrame',
+    'webkitSpeechGrammar', 'webkitSpeechGrammarList', 'webkitSpeechRecognition',
+    'webkitSpeechRecognitionError', 'webkitSpeechRecognitionEvent', 'webkitURL',
+    'credentialless', 'originAgentCluster', 'navigation', 'locationbar', 'menubar',
+    'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status', 'closed', 'external',
+    'clientInformation', 'offscreenBuffering', 'styleMedia', 'crashReport', 'cookieStore',
+    'documentPictureInPicture', 'viewport', 'launchQueue', 'GPUBufferUsage', 'GPUColorWrite',
+    'GPUMapMode', 'GPUShaderStage', 'GPUTextureUsage', 'onoffline', 'ononline', 'fence',
+    'addEventListener', 'removeEventListener', 'dispatchEvent'
+  ];
+  for (var absent = 0; absent < WORKER_ABSENT.length; absent++) {
+    try { delete G[WORKER_ABSENT[absent]]; } catch (e) {}
+  }
+
+  // ---------------------------------------------------------------------
   // 2. Brand the global as a DedicatedWorkerGlobalScope.
   //
   //   self -> DedicatedWorkerGlobalScope.prototype
@@ -1114,6 +1299,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     var carried = getOwnPropertyNames(inheritedProto);
     for (var c = 0; c < carried.length; c++) {
       if (carried[c] === 'constructor') continue;
+      // FileSystem's constants belong one level down, on
+      // DedicatedWorkerGlobalScope.prototype; carrying them here would put
+      // them on WorkerGlobalScope, where Chrome has them for neither scope.
+      if (carried[c] === 'TEMPORARY' || carried[c] === 'PERSISTENT') continue;
       if (Object.prototype.hasOwnProperty.call(WorkerGlobalScope.prototype, carried[c])) continue;
       var descriptor = Object.getOwnPropertyDescriptor(inheritedProto, carried[c]);
       if (descriptor) {
@@ -1122,13 +1311,43 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   }
 
+  // EventTarget carries these on its own prototype; Chrome's
+  // WorkerGlobalScope.prototype does not repeat them.
+  try {
+    delete WorkerGlobalScope.prototype.addEventListener;
+    delete WorkerGlobalScope.prototype.removeEventListener;
+    delete WorkerGlobalScope.prototype.dispatchEvent;
+  } catch (e) {}
+
   var DedicatedWorkerGlobalScope = illegalConstructor(SCOPE_NAME);
   DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype);
+  // FileSystem's two constants live on DedicatedWorkerGlobalScope.prototype in
+  // Chrome, above WorkerGlobalScope's own members, and are constants rather
+  // than writable properties.
+  defineProperty(DedicatedWorkerGlobalScope.prototype, 'TEMPORARY', {
+    value: 0, writable: false, enumerable: true, configurable: false,
+  });
+  defineProperty(DedicatedWorkerGlobalScope.prototype, 'PERSISTENT', {
+    value: 1, writable: false, enumerable: true, configurable: false,
+  });
   def(DedicatedWorkerGlobalScope.prototype, 'constructor', DedicatedWorkerGlobalScope);
   defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
     value: SCOPE_NAME, configurable: true,
   });
   try { Object.setPrototypeOf(G, DedicatedWorkerGlobalScope.prototype); } catch (e) {}
+
+  // postMessage and close are enumerable own properties in Chrome; the page
+  // bootstrap installed them non-enumerable.
+  try {
+    for (var ownIndex = 0, ownNames = ['postMessage', 'close', 'importScripts'];
+         ownIndex < ownNames.length; ownIndex++) {
+      var ownDescriptor = Object.getOwnPropertyDescriptor(G, ownNames[ownIndex]);
+      if (ownDescriptor && ownDescriptor.configurable && !ownDescriptor.enumerable) {
+        ownDescriptor.enumerable = true;
+        defineProperty(G, ownNames[ownIndex], ownDescriptor);
+      }
+    }
+  } catch (e) {}
 
   // The page bootstrap pins `constructor` as an own property of the global so
   // framework environment gates see `self.constructor === Window`. In a worker
@@ -1147,10 +1366,237 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     try { delete G[idx]; } catch (e) {}
   }
 
+  // ---------------------------------------------------------------------
+  // 2c. The worker globals Chrome has and this realm did not.
+  //
+  // Measured over a blob worker in both engines (2026-09-28): Chrome's global
+  // carries requestAnimationFrame/cancelAnimationFrame, FileReaderSync,
+  // RTCRtpScriptTransformer, RTCTransformEvent, onrtctransform and the two
+  // synchronous FileSystem entry points. The animation frames are timer-backed
+  // here (the paint loop a window drives does not exist in a worker).
+  // ---------------------------------------------------------------------
+  // FileReaderSync reads the bytes the Blob already holds -- the worker-side
+  // realm keeps blob contents in memory, so the read is a synchronous slice
+  // rather than a second fetch.
+  // A wrapper that keeps the name and length a browser reports while hiding
+  // the implementation's async-function kind behind a plain function.
+  function __obscuraPlainFunction(name, implementation, length) {
+    if (typeof implementation !== 'function') return implementation;
+    var wrapper = function () {
+      return implementation.apply(this, arguments);
+    };
+    try { defineProperty(wrapper, 'name', { value: name, configurable: true }); } catch (e) {}
+    try { defineProperty(wrapper, 'length', { value: length, configurable: true }); } catch (e) {}
+    return wrapper;
+  }
+
+  function __obscuraReadBlobSync(blob, mode, encoding) {
+    if (!blob || typeof blob !== 'object') {
+      throw new TypeError("Failed to execute 'readAsArrayBuffer' on 'FileReaderSync': parameter 1 is not of type 'Blob'.");
+    }
+    var bytes = null;
+    try { bytes = blob.__obscuraBytes || null; } catch (e) { bytes = null; }
+    if (!bytes) {
+      var size = Number(blob.size) || 0;
+      bytes = new Uint8Array(size);
+    }
+    if (mode === 'arraybuffer') {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    }
+    var text = '';
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    if (mode === 'dataurl') {
+      var type = (blob.type || 'application/octet-stream');
+      return 'data:' + type + ';base64,' + G.btoa(text);
+    }
+    void encoding;
+    return new TextDecoder(String(encoding || 'utf-8')).decode(bytes);
+  }
+
+  var workerFrameHandles = {};
+  var workerFrameSeq = 1;
+  // Chrome keeps requestAnimationFrame, cancelAnimationFrame and
+  // onrtctransform as own properties of the worker global rather than on
+  // WorkerGlobalScope.prototype.
+  def(G, 'requestAnimationFrame', function (callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to execute 'requestAnimationFrame' on 'WorkerGlobalScope': The callback provided as parameter 1 is not a function.");
+    }
+    var handle = workerFrameSeq++;
+    workerFrameHandles[handle] = G.setTimeout(function () {
+      delete workerFrameHandles[handle];
+      callback(Date.now());
+    }, 16);
+    return handle;
+  }, true);
+  def(G, 'cancelAnimationFrame', function (handle) {
+    var timeout = workerFrameHandles[handle];
+    if (timeout !== undefined) {
+      delete workerFrameHandles[handle];
+      G.clearTimeout(timeout);
+    }
+  }, true);
+  defEventHandler(G, 'onrtctransform');
+
+  if (typeof FileReaderSync !== 'function') {
+    var FileReaderSync = illegalConstructor('FileReaderSync');
+    def(FileReaderSync.prototype, 'readAsArrayBuffer', function (blob) {
+      return __obscuraReadBlobSync(blob, 'arraybuffer');
+    }, true);
+    def(FileReaderSync.prototype, 'readAsText', function (blob, encoding) {
+      return __obscuraReadBlobSync(blob, 'text', encoding);
+    }, true);
+    def(FileReaderSync.prototype, 'readAsDataURL', function (blob) {
+      return __obscuraReadBlobSync(blob, 'dataurl');
+    }, true);
+    def(G, 'FileReaderSync', FileReaderSync);
+  }
+  if (typeof RTCRtpScriptTransformer !== 'function') {
+    var RTCRtpScriptTransformer = illegalConstructor('RTCRtpScriptTransformer');
+    def(G, 'RTCRtpScriptTransformer', RTCRtpScriptTransformer);
+  }
+  if (typeof RTCTransformEvent !== 'function') {
+    var RTCTransformEvent = illegalConstructor('RTCTransformEvent');
+    def(G, 'RTCTransformEvent', RTCTransformEvent);
+  }
+  if (typeof G.webkitRequestFileSystemSync !== 'function') {
+    def(G, 'webkitRequestFileSystemSync', function (type, size) {
+      void type; void size;
+      return { name: '', root: null, filesystem: function () { return this; } };
+    }, true);
+  }
+  if (typeof G.webkitResolveLocalFileSystemSyncURL !== 'function') {
+    def(G, 'webkitResolveLocalFileSystemSyncURL', function (url) {
+      void url;
+      return null;
+    }, true);
+  }
+
   def(G, 'WorkerGlobalScope', WorkerGlobalScope);
   def(G, SCOPE_NAME, DedicatedWorkerGlobalScope);
   // `self` is a getter-only attribute in a browser, not a data property.
-  defGet(G, 'self', function () { return G; }, true);
+  // `self` is not an own property of the global in a worker: it is
+  // WorkerGlobalScope.prototype's first member, and the own getter the page
+  // bootstrap pinned is dropped below with the rest of the moved attributes.
+  defGet(WorkerGlobalScope.prototype, 'self', function () { return G; }, true);
+
+  // ---------------------------------------------------------------------
+  // 2b. Chrome's WorkerGlobalScope attributes.
+  //
+  // The realm boots from the page's snapshot, so every one of these was an
+  // own property of the global. In Chrome they hang off
+  // WorkerGlobalScope.prototype -- that is how a worker resolves
+  // `setTimeout`, `fetch`, `navigator` or `self` -- and the own copies are
+  // deleted afterwards, which is what the own-property census of a worker
+  // global reads. Values are captured first because a getter that read
+  // `G[name]` would resolve through this very prototype.
+  // ---------------------------------------------------------------------
+  var scopeValues = {
+    location: G.location, navigator: G.navigator, performance: G.performance,
+    trustedTypes: G.trustedTypes, crypto: G.crypto, indexedDB: G.indexedDB,
+    origin: G.origin, isSecureContext: G.isSecureContext,
+    crossOriginIsolated: G.crossOriginIsolated, scheduler: G.scheduler,
+    createImageBitmap: G.createImageBitmap, fetch: G.fetch,
+    importScripts: G.importScripts, atob: G.atob, btoa: G.btoa,
+    structuredClone: G.structuredClone, queueMicrotask: G.queueMicrotask,
+    reportError: G.reportError, clearInterval: G.clearInterval,
+    clearTimeout: G.clearTimeout, setInterval: G.setInterval, setTimeout: G.setTimeout,
+  };
+  var workerFonts = FontFaceSetConstructor ? new FontFaceSetConstructor([], null) : null;
+  if (!workerFonts) {
+    // The page bootstrap's FontFaceSet class is not in the worker snapshot, so
+    // the surface is built here: Chrome's worker answers "[object FontFaceSet]"
+    // for `self.fonts` and carries the same members document.fonts has.
+    var WorkerFontFaceSet = function () { throw new TypeError('Illegal constructor'); };
+    var workerFontFaceSetProto = {};
+    defineProperty(workerFontFaceSetProto, Symbol.toStringTag, {
+      value: 'FontFaceSet', configurable: true,
+    });
+    var workerFontFaces = new Set();
+    var workerFontReady = Promise.resolve(workerFonts);
+    def(workerFontFaceSetProto, 'add', function (face) { workerFontFaces.add(face); return this; }, true);
+    def(workerFontFaceSetProto, 'has', function (face) { return workerFontFaces.has(face); }, true);
+    def(workerFontFaceSetProto, 'delete', function (face) {
+      var had = workerFontFaces.delete(face);
+      return { face: face, status: had ? 'deleted' : 'not_found' };
+    }, true);
+    def(workerFontFaceSetProto, 'clear', function () { workerFontFaces.clear(); }, true);
+    def(workerFontFaceSetProto, 'check', function () { return workerFontFaces.size > 0; }, true);
+    def(workerFontFaceSetProto, 'load', function () {
+      return Promise.resolve(Array.prototype.slice.call(workerFontFaces));
+    }, true);
+    def(workerFontFaceSetProto, 'forEach', function (callback, thisArg) {
+      workerFontFaces.forEach(function (face) { callback.call(thisArg, face, face, workerFonts); });
+    }, true);
+    def(workerFontFaceSetProto, 'entries', function () {
+      return workerFontFaces.entries();
+    }, true);
+    def(workerFontFaceSetProto, 'keys', function () { return workerFontFaces.keys(); }, true);
+    def(workerFontFaceSetProto, 'values', function () { return workerFontFaces.values(); }, true);
+    defGet(workerFontFaceSetProto, 'size', function () { return workerFontFaces.size; }, true);
+    defGet(workerFontFaceSetProto, 'status', function () { return 'loaded'; }, true);
+    defGet(workerFontFaceSetProto, 'ready', function () { return workerFontReady; }, true);
+    defEventHandler(workerFontFaceSetProto, 'onloading');
+    defEventHandler(workerFontFaceSetProto, 'onloadingdone');
+    defEventHandler(workerFontFaceSetProto, 'onloadingerror');
+    workerFonts = Object.create(workerFontFaceSetProto);
+    workerFontReady = Promise.resolve(workerFonts);
+  }
+  defGet(WorkerGlobalScope.prototype, 'location', function () { return scopeValues.location; }, true);
+  defEventHandler(WorkerGlobalScope.prototype, 'onerror');
+  defEventHandler(WorkerGlobalScope.prototype, 'onlanguagechange');
+  defGet(WorkerGlobalScope.prototype, 'navigator', function () { return scopeValues.navigator; }, true);
+  defEventHandler(WorkerGlobalScope.prototype, 'onrejectionhandled');
+  defEventHandler(WorkerGlobalScope.prototype, 'onunhandledrejection');
+  defineProperty(WorkerGlobalScope.prototype, 'origin', {
+    get: function () { return scopeValues.origin; },
+    set: function (value) { scopeValues.origin = String(value); },
+    enumerable: true, configurable: true,
+  });
+  defineProperty(WorkerGlobalScope.prototype, 'performance', {
+    get: function () { return scopeValues.performance; },
+    set: function (value) { scopeValues.performance = value; },
+    enumerable: true, configurable: true,
+  });
+  defGet(WorkerGlobalScope.prototype, 'trustedTypes', function () { return scopeValues.trustedTypes; }, true);
+  defGet(WorkerGlobalScope.prototype, 'crypto', function () { return scopeValues.crypto; }, true);
+  defGet(WorkerGlobalScope.prototype, 'indexedDB', function () { return scopeValues.indexedDB; }, true);
+  defGet(WorkerGlobalScope.prototype, 'fonts', function () { return workerFonts; }, true);
+  // Chrome's are ordinary functions: an async function answers
+  // "[object AsyncFunction]" to Object.prototype.toString.
+  def(WorkerGlobalScope.prototype, 'createImageBitmap',
+    __obscuraPlainFunction('createImageBitmap', scopeValues.createImageBitmap, 1), true);
+  def(WorkerGlobalScope.prototype, 'fetch',
+    __obscuraPlainFunction('fetch', scopeValues.fetch, 1), true);
+  def(WorkerGlobalScope.prototype, 'importScripts', scopeValues.importScripts, true);
+  defGet(WorkerGlobalScope.prototype, 'isSecureContext', function () { return scopeValues.isSecureContext; }, true);
+  defGet(WorkerGlobalScope.prototype, 'crossOriginIsolated', function () { return scopeValues.crossOriginIsolated; }, true);
+  defineProperty(WorkerGlobalScope.prototype, 'scheduler', {
+    get: function () { return scopeValues.scheduler; },
+    set: function (value) { scopeValues.scheduler = value; },
+    enumerable: true, configurable: true,
+  });
+  def(WorkerGlobalScope.prototype, 'atob', scopeValues.atob, true);
+  def(WorkerGlobalScope.prototype, 'btoa', scopeValues.btoa, true);
+  def(WorkerGlobalScope.prototype, 'queueMicrotask', scopeValues.queueMicrotask, true);
+  def(WorkerGlobalScope.prototype, 'reportError', scopeValues.reportError, true);
+  def(WorkerGlobalScope.prototype, 'structuredClone', scopeValues.structuredClone, true);
+  def(WorkerGlobalScope.prototype, 'clearInterval', scopeValues.clearInterval, true);
+  def(WorkerGlobalScope.prototype, 'clearTimeout', scopeValues.clearTimeout, true);
+  def(WorkerGlobalScope.prototype, 'setInterval', scopeValues.setInterval, true);
+  def(WorkerGlobalScope.prototype, 'setTimeout', scopeValues.setTimeout, true);
+  // The own copies leave the global; `location` is pinned non-configurable by
+  // the page bootstrap, so it stays where it is and the prototype getter above
+  // is shadowed by it.
+  var movedToScope = ['self', 'navigator', 'performance', 'trustedTypes', 'crypto',
+    'indexedDB', 'origin', 'isSecureContext', 'crossOriginIsolated', 'scheduler',
+    'createImageBitmap', 'fetch', 'importScripts', 'atob', 'btoa',
+    'structuredClone', 'queueMicrotask', 'reportError', 'clearInterval',
+    'clearTimeout', 'setInterval', 'setTimeout',
+    'onerror', 'onlanguagechange', 'onrejectionhandled', 'onunhandledrejection'];
+  for (var moved = 0; moved < movedToScope.length; moved++) {
+    try { delete G[movedToScope[moved]]; } catch (e) {}
+  }
 
   // ---------------------------------------------------------------------
   // 3. WorkerLocation.
@@ -1222,15 +1668,14 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (!found) continue;
       try { defineProperty(workerNav, prop, found); } catch (e) {}
     }
-    if (__OBSCURA_WORKER_SECURE__ && typeof G.StorageManager === 'function'
-        && typeof G.FileSystemHandle === 'function'
-        && typeof G.FileSystemDirectoryHandle === 'function'
-        && typeof G.FileSystemFileHandle === 'function') {
+    if (__OBSCURA_WORKER_SECURE__ && StorageManagerConstructor
+        && FileSystemHandleConstructor && FileSystemDirectoryHandleConstructor
+        && FileSystemFileHandleConstructor) {
       var storageBrands = new WeakSet();
       var handleState = new WeakMap();
       var syncAccessState = new WeakMap();
       var rootNode = { kind: 'directory', name: '', parent: null, children: new Map() };
-      var storageManager = Object.create(G.StorageManager.prototype);
+      var storageManager = Object.create(StorageManagerConstructor.prototype);
       storageBrands.add(storageManager);
       var nativeRegistry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
       function nativeMethod(proto, name, length, fn) {
@@ -1261,7 +1706,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       }
       function makeHandle(node) {
         var proto = node.kind === 'directory'
-          ? G.FileSystemDirectoryHandle.prototype : G.FileSystemFileHandle.prototype;
+          ? FileSystemDirectoryHandleConstructor.prototype : FileSystemFileHandleConstructor.prototype;
         var handle = Object.create(proto);
         handleState.set(handle, node);
         return handle;
@@ -1275,13 +1720,13 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       }
       var rootHandle = makeHandle(rootNode);
       var storageCtorDescriptor = Object.getOwnPropertyDescriptor(
-        G.StorageManager.prototype, 'constructor');
+        StorageManagerConstructor.prototype, 'constructor');
       for (var smi = 0; smi < 4; smi++) {
-        try { delete G.StorageManager.prototype[
+        try { delete StorageManagerConstructor.prototype[
           ['constructor', 'estimate', 'persisted', 'getDirectory'][smi]]; } catch (e) {}
       }
-      try { delete G.StorageManager.prototype.persist; } catch (e) {}
-      nativeMethod(G.StorageManager.prototype, 'estimate', 0, async function () {
+      try { delete StorageManagerConstructor.prototype.persist; } catch (e) {}
+      nativeMethod(StorageManagerConstructor.prototype, 'estimate', 0, async function () {
         // The same quota and usage the document realm answers: one origin
         // cannot report two. Both come from the engine's storage op (the 10 GiB
         // floor Chrome reports plus the bytes this origin actually wrote
@@ -1291,22 +1736,22 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         var parts = String(Deno.core.ops.op_storage_estimate()).split(',');
         return { quota: Number(parts[0]), usage: Number(parts[1]), usageDetails: {} };
       });
-      nativeMethod(G.StorageManager.prototype, 'persisted', 0, async function () {
+      nativeMethod(StorageManagerConstructor.prototype, 'persisted', 0, async function () {
         storageData(this); return false;
       });
       if (storageCtorDescriptor) {
-        defineProperty(G.StorageManager.prototype, 'constructor', storageCtorDescriptor);
+        defineProperty(StorageManagerConstructor.prototype, 'constructor', storageCtorDescriptor);
       }
-      nativeMethod(G.StorageManager.prototype, 'getDirectory', 0, async function () {
+      nativeMethod(StorageManagerConstructor.prototype, 'getDirectory', 0, async function () {
         storageData(this); return rootHandle;
       });
-      nativeGetter(G.FileSystemHandle.prototype, 'kind', function () {
+      nativeGetter(FileSystemHandleConstructor.prototype, 'kind', function () {
         return handleData(this).kind;
       });
-      nativeGetter(G.FileSystemHandle.prototype, 'name', function () {
+      nativeGetter(FileSystemHandleConstructor.prototype, 'name', function () {
         return handleData(this).name;
       });
-      nativeMethod(G.FileSystemHandle.prototype, 'isSameEntry', 1, async function (other) {
+      nativeMethod(FileSystemHandleConstructor.prototype, 'isSameEntry', 1, async function (other) {
         return handleData(this) === handleData(other);
       });
       function child(directory, value, kind, options) {
@@ -1324,21 +1769,21 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         }
         return makeHandle(node);
       }
-      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getDirectoryHandle', 1,
+      nativeMethod(FileSystemDirectoryHandleConstructor.prototype, 'getDirectoryHandle', 1,
         async function (name, options) { return child(this, name, 'directory', options); });
-      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'getFileHandle', 1,
+      nativeMethod(FileSystemDirectoryHandleConstructor.prototype, 'getFileHandle', 1,
         async function (name, options) { return child(this, name, 'file', options); });
-      nativeMethod(G.FileSystemDirectoryHandle.prototype, 'resolve', 1, async function (possible) {
+      nativeMethod(FileSystemDirectoryHandleConstructor.prototype, 'resolve', 1, async function (possible) {
         var directory = handleData(this), node = handleData(possible), path = [];
         while (node && node !== directory) { path.unshift(node.name); node = node.parent; }
         return node === directory ? path : null;
       });
-      nativeMethod(G.FileSystemFileHandle.prototype, 'getFile', 0, async function () {
+      nativeMethod(FileSystemFileHandleConstructor.prototype, 'getFile', 0, async function () {
         var node = handleData(this);
         if (node.kind !== 'file') throw new TypeError('Illegal invocation');
         return new File([node.bytes], node.name);
       });
-      var SyncAccessHandle = G.FileSystemSyncAccessHandle;
+      var SyncAccessHandle = FileSystemSyncAccessHandleConstructor;
       if (typeof SyncAccessHandle !== 'function') {
         SyncAccessHandle = illegalConstructor('FileSystemSyncAccessHandle');
         defineProperty(SyncAccessHandle.prototype, Symbol.toStringTag, {
@@ -1432,7 +1877,7 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
       if (syncCtorDescriptor) {
         defineProperty(SyncAccessHandle.prototype, 'constructor', syncCtorDescriptor);
       }
-      nativeMethod(G.FileSystemFileHandle.prototype, 'createSyncAccessHandle', 0,
+      nativeMethod(FileSystemFileHandleConstructor.prototype, 'createSyncAccessHandle', 0,
         async function () {
           var node = handleData(this);
           if (node.kind !== 'file') throw new TypeError('Illegal invocation');
@@ -1819,6 +2264,116 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // must never fire the full sweep inside the payload's timed windows
   // (batch 20, uGyjw9).
   try { delete G.__obscura_lazy_mark_surface; } catch (e) {}
+
+  // 9. Settle the attribute placement the sections above kept re-creating.
+  // Every later section installs its object as an own property of the global
+  // (navigator, isSecureContext, the handler slots), which is where the page
+  // realm keeps them; a worker resolves them through
+  // WorkerGlobalScope.prototype instead, so the own copies are dropped once
+  // every installer has run. `location` is non-configurable and stays.
+  var protoAccessors = {
+    location: true, navigator: true, performance: true, trustedTypes: true,
+    addEventListener: true, removeEventListener: true, dispatchEvent: true,
+    // (the three listener methods are absent from finalOwn above; listing them
+    // here only keeps the refresh branch from redefining them)
+    crypto: true, indexedDB: true, origin: true, isSecureContext: true,
+    crossOriginIsolated: true, scheduler: true, self: true,
+    onerror: true, onlanguagechange: true, onrejectionhandled: true,
+    onunhandledrejection: true,
+  };
+  var finalOwn = ['self', 'navigator', 'performance', 'trustedTypes', 'crypto',
+    'indexedDB', 'origin', 'isSecureContext', 'crossOriginIsolated', 'scheduler',
+    'createImageBitmap', 'fetch', 'importScripts', 'atob', 'btoa',
+    'structuredClone', 'queueMicrotask', 'reportError', 'clearInterval',
+    'clearTimeout', 'setInterval', 'setTimeout',
+    'onerror', 'onlanguagechange', 'onrejectionhandled', 'onunhandledrejection',
+    // addEventListener, removeEventListener and dispatchEvent stay as own
+    // properties: this scope's listener registry is the prep's own (section
+    // 6), and the EventTarget.prototype implementations key their state on a
+    // target the worker global does not provide, so moving them cost message
+    // delivery.
+    ];
+  // Chrome has no online/offline handler slots on a worker at all: neither
+  // name appears on WorkerGlobalScope.prototype and `'ononline' in self` is
+  // false (measured over a blob worker in the local Chrome 149 oracle). The
+  // page bootstrap's bulk GlobalEventHandlers install leaves them as own
+  // properties of the global, so both copies go -- leaving them to the
+  // refresh branch below put a data property of value `undefined` on the
+  // prototype, which `in` still reports.
+  for (var offline = 0, offlineNames = ['ononline', 'onoffline'];
+       offline < offlineNames.length; offline++) {
+    try { delete G[offlineNames[offline]]; } catch (e) {}
+    try { delete WorkerGlobalScope.prototype[offlineNames[offline]]; } catch (e) {}
+  }
+  for (var drop = 0; drop < finalOwn.length; drop++) {
+    var name = finalOwn[drop];
+    if (name === 'self') continue;
+    // The sections between the capture above and here replace several of these
+    // (navigator becomes a WorkerNavigator instance, importScripts arrives with
+    // the script loader), so the value the prototype serves is the one on the
+    // global now, not the one captured before they ran.
+    try { scopeValues[name] = G[name]; } catch (e) {}
+    try { delete G[name]; } catch (e) {}
+    // A data member on the prototype holds a copy, so the value the section
+    // above installed has to be written into it again.
+    if (!protoAccessors[name]) {
+      try {
+        def(WorkerGlobalScope.prototype, name, scopeValues[name], true);
+      } catch (e) {}
+    } else if (protoAccessors[name] && name !== 'addEventListener'
+               && name !== 'removeEventListener' && name !== 'dispatchEvent') {
+      // Setter-backed attributes (origin, performance, scheduler, the
+      // handler slots) take the value through their setter so the closure
+      // behind it moves with the global; getter-only ones read the captured
+      // value already.
+      try { WorkerGlobalScope.prototype[name] = scopeValues[name]; } catch (e) {}
+    }
+  }
+  // postMessage and close are enumerable own properties in Chrome.
+  try {
+    for (var flagIndex = 0, flagNames = ['postMessage', 'close'];
+         flagIndex < flagNames.length; flagIndex++) {
+      var flagDescriptor = Object.getOwnPropertyDescriptor(G, flagNames[flagIndex]);
+      if (flagDescriptor && flagDescriptor.configurable && !flagDescriptor.enumerable) {
+        flagDescriptor.enumerable = true;
+        defineProperty(G, flagNames[flagIndex], flagDescriptor);
+      }
+    }
+  } catch (e) {}
+  // A class body emits `constructor` as the prototype's first member, while
+  // Chrome lists it in the slot between importScripts and isSecureContext
+  // (the same measurement as the census above). Re-slotted here, after every
+  // member has been defined, so a reflection pass reads Chrome's order.
+  (function parkWorkerGlobalScopeConstructor() {
+    var prototype = WorkerGlobalScope.prototype;
+    var chromeOrder = ['self', 'location', 'onerror', 'onlanguagechange',
+      'navigator', 'onrejectionhandled', 'onunhandledrejection', 'origin',
+      'performance', 'trustedTypes', 'crypto', 'indexedDB', 'fonts',
+      'createImageBitmap', 'fetch', 'importScripts', 'constructor',
+      'isSecureContext', 'crossOriginIsolated', 'scheduler', 'atob', 'btoa',
+      'queueMicrotask', 'reportError', 'structuredClone', 'clearInterval',
+      'clearTimeout', 'setInterval', 'setTimeout'];
+    var current = Object.getOwnPropertyNames(prototype);
+    var wanted = chromeOrder.filter(function (name) { return current.indexOf(name) >= 0; });
+    var extras = current.filter(function (name) { return wanted.indexOf(name) < 0; });
+    var order = wanted.concat(extras);
+    if (order.length === current.length
+        && order.every(function (name, index) { return name === current[index]; })) {
+      return;
+    }
+    var descriptors = {};
+    for (var i = 0; i < current.length; i++) {
+      descriptors[current[i]] = Object.getOwnPropertyDescriptor(prototype, current[i]);
+    }
+    for (var d = 0; d < current.length; d++) {
+      try { delete prototype[current[d]]; } catch (e) {}
+    }
+    for (var r = 0; r < order.length; r++) {
+      if (descriptors[order[r]]) {
+        try { defineProperty(prototype, order[r], descriptors[order[r]]); } catch (e) {}
+      }
+    }
+  })();
 })();
 "#;
 
@@ -2615,7 +3170,7 @@ mod tests {
               'MutationObserver','IntersectionObserver','CSS','Image',
               'localStorage','sessionStorage','history','screen','customElements',
               'chrome','alert','matchMedia','getComputedStyle',
-              'requestAnimationFrame','innerWidth','devicePixelRatio',
+              'innerWidth','devicePixelRatio',
               'Window','Navigator','SharedWorker'];
             // The other direction: stripping the Window surface must not take
             // anything [Exposed=(Window,Worker)] with it. DOMRect and
@@ -2628,7 +3183,11 @@ mod tests {
               'Response','fetch','WebSocket','XMLHttpRequest','FormData','crypto',
               'performance','PerformanceObserver','ImageData','OffscreenCanvas',
               'createImageBitmap','Worker','indexedDB','caches','structuredClone',
-              'queueMicrotask','reportError','atob','btoa','setTimeout','setInterval'];
+              'queueMicrotask','reportError','atob','btoa','setTimeout','setInterval',
+              // The animation frames are worker globals in Chrome (measured on
+              // a blob worker in the local 149 oracle, 2026-09-28), not part of
+              // the Window surface this assertion guards against.
+              'requestAnimationFrame','cancelAnimationFrame'];
             const src = "const names = " + JSON.stringify(names) + ";" +
               "const kept = " + JSON.stringify(kept) + ";" +
               "postMessage({ leaked: names.filter((n) => typeof self[n] !== 'undefined')," +
@@ -2703,15 +3262,16 @@ mod tests {
               "const readBytes=new Uint8Array(3);const read=access.read(readBytes,{at:0});" +
               "postMessage({navOwn:Object.prototype.hasOwnProperty.call(navigator,'storage')," +
               "storageTag:Object.prototype.toString.call(storage)," +
-              "storageInstance:storage instanceof StorageManager," +
-              "storageProto:Object.getOwnPropertyNames(StorageManager.prototype)," +
+              "storageInstance:storage instanceof Object.getPrototypeOf(storage).constructor," +
+              "storageProto:Object.getOwnPropertyNames(Object.getPrototypeOf(storage))," +
               "rootTag:Object.prototype.toString.call(root),kind:root.kind,name:root.name," +
-              "directory:root instanceof FileSystemDirectoryHandle," +
-              "handle:root instanceof FileSystemHandle,stable:storage===navigator.storage," +
+              "directory:Object.prototype.toString.call(root)==='[object FileSystemDirectoryHandle]'," +
+              "handle:Object.prototype.toString.call(Object.getPrototypeOf(Object.getPrototypeOf(root))).indexOf('FileSystemHandle')!==-1," +
+              "stable:storage===navigator.storage," +
               "resolve:await root.resolve(child),syncTag:Object.prototype.toString.call(access)," +
-              "syncInstance:access instanceof FileSystemSyncAccessHandle," +
+              "syncInstance:Object.prototype.toString.call(access)==='[object FileSystemSyncAccessHandle]'," +
               "syncOwn:Object.getOwnPropertyNames(access)," +
-              "syncProto:Object.getOwnPropertyNames(FileSystemSyncAccessHandle.prototype)," +
+              "syncProto:Object.getOwnPropertyNames(Object.getPrototypeOf(access))," +
               "written,read,bytes:Array.from(readBytes),size:access.getSize(),mode:access.mode});" +
               "access.close();}catch(error){postMessage({error:error.name+': '+error.message})}}";
             const url = 'data:text/javascript,' + encodeURIComponent(src);
@@ -2729,6 +3289,104 @@ mod tests {
                 r#"{"navOwn":false,"storageTag":"[object StorageManager]","storageInstance":true,"storageProto":["estimate","persisted","constructor","getDirectory"],"rootTag":"[object FileSystemDirectoryHandle]","kind":"directory","name":"","directory":true,"handle":true,"stable":true,"resolve":["sub"],"syncTag":"[object FileSystemSyncAccessHandle]","syncInstance":true,"syncOwn":[],"syncProto":["close","flush","getSize","read","truncate","write","mode","constructor"],"written":3,"read":3,"bytes":[7,8,9],"size":3,"mode":"readwrite"}"#
             ),
         );
+    }
+
+    /// The worker scope's surface against the reference worker: the members a
+    /// worker resolves through WorkerGlobalScope.prototype rather than as own
+    /// properties of the global, the members Chrome's worker owns, and the
+    /// interface shells a worker does not expose at all. Measured over a blob
+    /// worker in the local Chrome 149 oracle (2026-09-28).
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_census_matches_the_reference_worker() {
+        let mut rt = page_runtime();
+        rt.execute_script(
+            "<test>",
+            r#"
+            const src = "const owns = (n) => Object.prototype.hasOwnProperty.call(self, n);" +
+              "const scopeProto = Object.getOwnPropertyNames(WorkerGlobalScope.prototype);" +
+              "const dedicatedProto = Object.getOwnPropertyNames(DedicatedWorkerGlobalScope.prototype);" +
+              "postMessage({" +
+              "  scopeProto," +
+              "  dedicatedProto," +
+              "  ownedByGlobal: ['postMessage','close','onmessage','onrtctransform'," +
+              "    'requestAnimationFrame','cancelAnimationFrame','FileReaderSync'," +
+              "    'RTCRtpScriptTransformer','RTCTransformEvent','webkitRequestFileSystemSync'," +
+              "    'webkitResolveLocalFileSystemSyncURL'].filter(owns)," +
+              "  inherited: ['setTimeout','setInterval','fetch','navigator','self'," +
+              "    'performance','crypto','indexedDB','atob','btoa','structuredClone'," +
+              "    'createImageBitmap','isSecureContext'].filter((n) => !owns(n) && typeof self[n] !== 'undefined')," +
+              "  gone: ['HTMLElement','Document','Animation','CSSStyleRule','Geolocation'," +
+              "    'AudioContext','XRSystem','FontFaceSet','localStorage','sessionStorage'," +
+              "    'chrome','window','top','parent','document','caches','speechSynthesis'," +
+              "    'cookieStore','RTCPeerConnection','DOMParser','CSS']" +
+              "    .filter((n) => typeof self[n] !== 'undefined')," +
+              "  keptTypes: ['XMLHttpRequest','WebSocket','EventSource','Notification'," +
+              "    'OffscreenCanvas','Path2D','ImageData','TextEncoder','PerformanceObserver'," +
+              "    'Worker','indexedDB','location','navigator','self','trustedTypes'," +
+              "    'importScripts','FileReaderSync'].map((n) => typeof self[n]).join(',')," +
+              "  fontsTag: Object.prototype.toString.call(self.fonts)," +
+              "  navigatorTag: Object.prototype.toString.call(navigator)," +
+              "  rtcHandler: typeof self.onrtctransform," +
+              "});";
+            const url = 'data:text/javascript,' + encodeURIComponent(src);
+            globalThis.__got = [];
+            const worker = new Worker(url);
+            worker.onmessage = (event) => { globalThis.__got.push(event.data); };
+            "#,
+        )
+        .unwrap();
+        pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
+        let got = rt.evaluate("JSON.stringify(__got[0])").unwrap();
+        let value: serde_json::Value = serde_json::from_str(got.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value["scopeProto"],
+            serde_json::json!([
+                "self", "location", "onerror", "onlanguagechange", "navigator",
+                "onrejectionhandled", "onunhandledrejection", "origin", "performance",
+                "trustedTypes", "crypto", "indexedDB", "fonts", "createImageBitmap",
+                "fetch", "importScripts", "constructor", "isSecureContext",
+                "crossOriginIsolated", "scheduler", "atob", "btoa", "queueMicrotask",
+                "reportError", "structuredClone", "clearInterval", "clearTimeout",
+                "setInterval", "setTimeout",
+            ])
+        );
+        assert_eq!(
+            value["dedicatedProto"],
+            serde_json::json!(["TEMPORARY", "PERSISTENT", "constructor"])
+        );
+        assert_eq!(
+            value["ownedByGlobal"],
+            serde_json::json!([
+                "postMessage", "close", "onmessage", "onrtctransform",
+                "requestAnimationFrame", "cancelAnimationFrame", "FileReaderSync",
+                "RTCRtpScriptTransformer", "RTCTransformEvent",
+                "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL",
+            ])
+        );
+        assert_eq!(
+            value["inherited"],
+            serde_json::json!([
+                "setTimeout", "setInterval", "fetch", "navigator", "self", "performance",
+                "crypto", "indexedDB", "atob", "btoa", "structuredClone",
+                "createImageBitmap", "isSecureContext",
+            ])
+        );
+        assert_eq!(
+            value["gone"],
+            serde_json::json!([]),
+            "a worker scope must not carry Window-only interfaces"
+        );
+        assert_eq!(
+            value["keptTypes"],
+            serde_json::json!(
+                "function,function,function,function,function,function,function,function,\
+function,function,object,object,object,object,object,function,function"
+            ),
+            "a worker keeps the globals Chrome's worker exposes"
+        );
+        assert_eq!(value["fontsTag"], serde_json::json!("[object FontFaceSet]"));
+        assert_eq!(value["navigatorTag"], serde_json::json!("[object WorkerNavigator]"));
+        assert_eq!(value["rtcHandler"], serde_json::json!("object"));
     }
 
     /// addEventListener and dispatchEvent have to share one registry. They did
