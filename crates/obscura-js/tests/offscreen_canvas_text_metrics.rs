@@ -203,7 +203,10 @@ async fn offscreen_2d_shares_the_canvas_measure_text_entry() {
         result,
         serde_json::json!({
             "sharedMeasureText": true,
-            "missing": [],
+            // Chrome's canvas interface carries drawFocusIfNeeded and its
+            // offscreen interface does not: 74 members against 73 on the local
+            // oracle, that member being the whole difference.
+            "missing": ["drawFocusIfNeeded"],
             "extra": [],
             "offParent": true,
             // Chrome's offscreen interface owns its members (its parent is

@@ -106,3 +106,9 @@ run covers are then removed.
   `cargo nextest run --release --features render -p obscura-js
   -p obscura-browser` 880/880. Full workspace gate deferred to the next
   backfill.
+
+- 2026-09-28: canvas 2D surface (context slots into a WeakMap, internals to
+  module scope, Chrome's 74/73 member order and the 28 measured attributes),
+  scoped to `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser -p obscura-render` 1489/1489. Full workspace gate deferred
+  to the next backfill.

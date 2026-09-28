@@ -79,6 +79,14 @@ if (typeof OffscreenCanvas === 'undefined') {
   const _offscreenCanvasState = new WeakMap();
   const _imageBitmapState = new WeakMap();
   const _bitmapKey = Symbol('ImageBitmap');
+  // An `on*` handler slot: assignment sticks, reads answer the last value or
+  // null, exactly as the rest of this realm's handler attributes behave.
+  const _offscreenCanvasHandler = (canvas, name, value) => {
+    const state = _offscreenCanvasState.get(canvas);
+    if (!state) throw new TypeError('Illegal invocation');
+    state[name] = (typeof value === 'function' || (value && typeof value === 'object')) ? value : null;
+    return value;
+  };
 
   globalThis.OffscreenCanvasRenderingContext2D = class OffscreenCanvasRenderingContext2D {
     constructor() { throw new TypeError('Illegal constructor'); }
@@ -126,25 +134,30 @@ if (typeof OffscreenCanvas === 'undefined') {
       }
       width = Math.max(0, Math.trunc(Number(width)) || 0);
       height = Math.max(0, Math.trunc(Number(height)) || 0);
-      _offscreenCanvasState.set(this, {width, height, context: null, contextType: null});
+      _offscreenCanvasState.set(this, {
+        width, height, context: null, contextType: null,
+        oncontextlost: null, oncontextrestored: null,
+      });
     }
     get width() { return _offscreenCanvasState.get(this).width; }
     set width(value) {
       const state = _offscreenCanvasState.get(this);
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) state.context._resizeFromCanvas();
+      if (state.context) _canvas2dResizeFromCanvas(state.context);
     }
     get height() { return _offscreenCanvasState.get(this).height; }
     set height(value) {
       const state = _offscreenCanvasState.get(this);
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) state.context._resizeFromCanvas();
+      if (state.context) _canvas2dResizeFromCanvas(state.context);
     }
-    getAttribute(name) {
-      if (name === 'width') return String(this.width);
-      if (name === 'height') return String(this.height);
-      return null;
-    }
+    // Chrome's OffscreenCanvas has no getAttribute; the context reads
+    // width/height off this surface as properties (see _canvasSizeAttribute).
+    // The two context handlers are real attributes here, in Chrome's slots.
+    get oncontextlost() { return _offscreenCanvasState.get(this).oncontextlost; }
+    set oncontextlost(value) { _offscreenCanvasHandler(this, 'oncontextlost', value); }
+    get oncontextrestored() { return _offscreenCanvasState.get(this).oncontextrestored; }
+    set oncontextrestored(value) { _offscreenCanvasHandler(this, 'oncontextrestored', value); }
     getContext(type, attrs = undefined) {
       const state = _offscreenCanvasState.get(this);
       // The argument is an OffscreenRenderingContextType enum, not the
@@ -235,12 +248,12 @@ if (typeof OffscreenCanvas === 'undefined') {
           "Failed to execute 'convertToBlob' on 'OffscreenCanvas': The OffscreenCanvas has no rendering context.",
           'InvalidStateError'));
       }
-      if (!state.context._buf) {
+      if (!_isCanvas2DContext(state.context)) {
         // A WebGL surface has no CPU-side 2D buffer to encode here; Chrome
         // snapshots the drawing buffer, which this consistency layer does
         // not paint. A blank PNG keeps the promise shape intact.
         return Promise.resolve(_canvasPngBlob(
-          new _Canvas2D({ width: state.width, height: state.height, getAttribute() { return null; } })));
+          new _Canvas2D({ width: state.width, height: state.height })));
       }
       return Promise.resolve(_canvasPngBlob(state.context));
     }
@@ -254,21 +267,55 @@ if (typeof OffscreenCanvas === 'undefined') {
           + 'Cannot transfer an ImageBitmap from an OffscreenCanvas with no context',
           'InvalidStateError');
       }
-      const context = state.context && state.context._buf
+      const context = state.context && _canvas2dPixels(state.context)
         ? state.context
         : this.getContext('2d');
-      const pixels = context && context._buf
-        ? context._buf.slice()
+      const pixels = context && _canvas2dPixels(context)
+        ? _canvas2dPixels(context).slice()
         : new Uint8ClampedArray(state.width * state.height * 4);
       // _buf is the srgb unorm8 renderer buffer, whatever the canvas's own
       // color space is, so the snapshot is tagged srgb.
       const bitmap = new globalThis.ImageBitmap(_bitmapKey, state.width, state.height,
         pixels, 'srgb');
-      if (context && context._resizeFromCanvas) context._resizeFromCanvas();
+      if (context) _canvas2dResizeFromCanvas(context);
       return bitmap;
     }
     get [Symbol.toStringTag]() { return 'OffscreenCanvas'; }
   };
+  // Chrome lists `constructor` last on both offscreen prototypes and marks the
+  // rest of the members enumerable; a class body emits it first and hides them.
+  const _parkOffscreenPrototype = (prototype, order) => {
+    const current = Object.getOwnPropertyNames(prototype);
+    const wanted = order.filter(name => current.indexOf(name) >= 0);
+    const extras = current.filter(name => wanted.indexOf(name) < 0);
+    const descriptors = new Map();
+    for (const name of current) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+      if (name !== 'constructor' && !descriptor.enumerable) descriptor.enumerable = true;
+      descriptors.set(name, descriptor);
+    }
+    for (const name of wanted.concat(extras)) {
+      try { delete prototype[name]; } catch (_error) {}
+    }
+    for (const name of wanted.concat(extras)) {
+      if (descriptors.has(name)) {
+        try { Object.defineProperty(prototype, name, descriptors.get(name)); } catch (_error) {}
+      }
+    }
+  };
+  _parkOffscreenPrototype(globalThis.OffscreenCanvas.prototype,
+    ['width', 'height', 'oncontextlost', 'oncontextrestored', 'convertToBlob',
+      'getContext', 'transferToImageBitmap', 'constructor']);
+  // The offscreen context lists the same members as the canvas prototype minus
+  // drawFocusIfNeeded, and it lists `getContextAttributes` last rather than
+  // between fillText and getImageData -- both measured, so the canvas order is
+  // shifted into the offscreen one here rather than duplicated.
+  const _offscreenContextOrder = _CHROME_CANVAS_2D_MEMBER_ORDER
+    .filter(name => name !== 'getContextAttributes');
+  _offscreenContextOrder.splice(
+    _offscreenContextOrder.indexOf('constructor'), 0, 'getContextAttributes');
+  _parkOffscreenPrototype(globalThis.OffscreenCanvasRenderingContext2D.prototype,
+    _offscreenContextOrder);
 
   globalThis.createImageBitmap = _markNative(async function createImageBitmap(source, ...crop) {
     let width = 0, height = 0, pixels, colorSpace = 'srgb';
@@ -277,10 +324,10 @@ if (typeof OffscreenCanvas === 'undefined') {
       const context = offscreen.context || source.getContext('2d');
       width = offscreen.width; height = offscreen.height;
       // _buf is the srgb unorm8 renderer buffer regardless of canvas space.
-      pixels = context && context._buf ? context._buf.slice() : undefined;
-    } else if (source && source._ctx instanceof _Canvas2D) {
-      width = source._ctx._w; height = source._ctx._h;
-      pixels = source._ctx._buf.slice();
+      pixels = context && _canvas2dPixels(context) ? _canvas2dPixels(context).slice() : undefined;
+    } else if (source && _isCanvas2DContext(source._ctx)) {
+      [width, height] = _canvas2dPixelSize(source._ctx);
+      pixels = _canvas2dPixels(source._ctx).slice();
     } else if (_imageDataState.has(source)) {
       const image = _imageData(source);
       width = image.width; height = image.height; colorSpace = image.colorSpace;

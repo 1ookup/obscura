@@ -17,17 +17,21 @@ class HTMLCanvasElement extends Element {
   setAttribute(name, value) {
     super.setAttribute(name, value);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')
-        && typeof this._ctx._resizeFromCanvas === 'function') {
-      this._ctx._resizeFromCanvas();
+    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+      // A 2D context resizes through the module helper; a WebGL context owns
+      // its own drawing buffer and its own resize.
+      if (_isCanvas2DContext(this._ctx)) _canvas2dResizeFromCanvas(this._ctx);
+      else if (typeof this._ctx._resizeFromCanvas === 'function') this._ctx._resizeFromCanvas();
     }
   }
   removeAttribute(name) {
     super.removeAttribute(name);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')
-        && typeof this._ctx._resizeFromCanvas === 'function') {
-      this._ctx._resizeFromCanvas();
+    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
+      // A 2D context resizes through the module helper; a WebGL context owns
+      // its own drawing buffer and its own resize.
+      if (_isCanvas2DContext(this._ctx)) _canvas2dResizeFromCanvas(this._ctx);
+      else if (typeof this._ctx._resizeFromCanvas === 'function') this._ctx._resizeFromCanvas();
     }
   }
 }
@@ -88,15 +92,18 @@ HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
 };
 HTMLCanvasElement.prototype.toDataURL = function toDataURL(type) {
   const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
+  if (_isCanvas2DContext(ctx) && _canvas2dPixels(ctx)) {
+    const [width, height] = _canvas2dPixelSize(ctx);
+    if (width === 0 || height === 0) return 'data:,';
+    return _encodePNG(width, height, _canvas2dPixels(ctx));
   }
   return 'data:,';
 };
 function _canvasPngBlob(ctx) {
-  if (!ctx || !ctx._buf || ctx._w === 0 || ctx._h === 0) return null;
-  const url = _encodePNG(ctx._w, ctx._h, ctx._buf);
+  if (!_isCanvas2DContext(ctx) || !_canvas2dPixels(ctx)) return null;
+  const [width, height] = _canvas2dPixelSize(ctx);
+  if (width === 0 || height === 0) return null;
+  const url = _encodePNG(width, height, _canvas2dPixels(ctx));
   const comma = url.indexOf(',');
   const binary = atob(url.slice(comma + 1));
   const bytes = new Uint8Array(binary.length);

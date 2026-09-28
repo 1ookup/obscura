@@ -190,79 +190,395 @@ function _prepareCanvasText(value) {
   return String(value);
 }
 
-class _Canvas2D {
-  constructor(canvas, attrs = undefined) {
-    this.canvas = canvas;
-    attrs = attrs == null ? {} : Object(attrs);
-    _hset(this, "_colorSpace", _imageDataEnum(attrs.colorSpace, 'srgb',
-      _IMAGE_DATA_COLOR_SPACES, 'colorSpace'));
-    _hset(this, "_colorType", attrs.colorType === 'float16' ? 'float16' : 'unorm8');
-    _hset(this, "_alpha", attrs.alpha !== false);
-    _hset(this, "_desynchronized", !!attrs.desynchronized);
-    _hset(this, "_willReadFrequently", !!attrs.willReadFrequently);
-    _hset(this, "_damageQueued", false);
-    this._resizeFromCanvas();
+// ---------------------------------------------------------------------------
+// Canvas 2D state and attribute tables.
+//
+// Chrome's context instance carries no own property at all
+// (`Object.getOwnPropertyNames(ctx)` is []), and the prototype's 73 members
+// are the ones its IDL declares. Every slot the implementation used to hang
+// off the instance lives in this WeakMap instead, and the internals that used
+// to be `_`-prefixed prototype members are module functions now.
+// ---------------------------------------------------------------------------
+const _canvas2dState = new WeakMap();
+function _canvasStateOf(ctx) {
+  const state = _canvas2dState.get(ctx);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+// The rewrite that moved the implementation here routes `_hset(this, '_x', v)`
+// through this helper, so the call's own closing paren stays balanced.
+function _canvas2dSet(state, field, value) {
+  state[field] = value;
+  return value;
+}
+
+// The surfaces around the context (the element's module and OffscreenCanvas)
+// read the backing store and drive a resize; these are the only views they get
+// of the state object.
+// An offscreen 2D context owns a copy of this prototype rather than this
+// prototype itself, so `instanceof _Canvas2D` answers false for it and every
+// caller that has to tell a 2D context from a WebGL one asks here.
+function _isCanvas2DContext(ctx) {
+  return !!ctx && _canvas2dState.has(ctx);
+}
+function _canvas2dPixels(ctx) { return _canvasStateOf(ctx).buf; }
+function _canvas2dPixelSize(ctx) {
+  const state = _canvasStateOf(ctx);
+  return [state.w, state.h];
+}
+
+// `width`/`height` read off the surface a context draws into. An
+// HTMLCanvasElement answers them as attributes, an OffscreenCanvas as
+// properties and, on the surface itself, only the element carries
+// getAttribute; the offscreen context's own prototype must not.
+function _canvasSizeAttribute(canvas, name) {
+  if (canvas && typeof canvas.getAttribute === 'function') {
+    const raw = canvas.getAttribute(name);
+    return raw === null || raw === '' ? null : raw;
   }
-  _canvasDimension(name, fallback) {
-    const raw = this.canvas.getAttribute(name);
+  const value = canvas ? canvas[name] : undefined;
+  return value === undefined || value === null ? null : String(value);
+}
+
+// Attribute tables, all measured on the local Oracle (Chrome 149): the enum
+// lists are the ones whose invalid values are ignored rather than stored.
+const _CANVAS_ENUM_ATTRIBUTES = {
+  textAlign: ['start', 'end', 'left', 'right', 'center'],
+  textBaseline: ['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom'],
+  direction: ['ltr', 'rtl', 'inherit'],
+  fontKerning: ['auto', 'normal', 'none'],
+  fontVariantCaps: ['normal', 'small-caps', 'all-small-caps', 'petite-caps',
+    'all-petite-caps', 'unicase', 'titling-caps'],
+  textRendering: ['auto', 'optimizeSpeed', 'optimizeLegibility', 'geometricPrecision'],
+  imageSmoothingQuality: ['low', 'medium', 'high'],
+  lineCap: ['butt', 'round', 'square'],
+  lineJoin: ['round', 'bevel', 'miter'],
+  globalCompositeOperation: ['source-over', 'source-in', 'source-out', 'source-atop',
+    'destination-over', 'destination-in', 'destination-out', 'destination-atop',
+    'lighter', 'copy', 'xor', 'multiply', 'screen', 'overlay', 'darken', 'lighten',
+    'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion',
+    'hue', 'saturation', 'color', 'luminosity'],
+};
+const _CANVAS_FONT_STRETCH_KEYWORDS = ['ultra-condensed', 'extra-condensed',
+  'condensed', 'semi-condensed', 'normal', 'semi-expanded', 'expanded',
+  'extra-expanded', 'ultra-expanded'];
+// The length units a canvas <length> accepts; a bare number and a percentage
+// are both invalid (measured: `letterSpacing = '5'` and `'2%'` are ignored,
+// while `'2em'` is stored and `'2PX'` is stored as `'2px'`).
+const _CANVAS_LENGTH_PATTERN = /^-?(?:\d+\.?\d*|\.\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vmin|vmax|vb|vi|svw|svh|svi|svb|lvw|lvh|lvi|lvb|dvw|dvh|dvi|dvb|cm|mm|q|in|pt|pc)$/i;
+// Chrome stores a filter list verbatim (' blur(1px) ' keeps its spaces) and
+// ignores anything its parser cannot read as one.
+const _CANVAS_FILTER_PATTERN = /^\s*(?:none|(?:[-a-zA-Z]+\([^)]*\)\s*)+)$/;
+
+// The CSS named colors, as [r, g, b]. Chrome's canvas parser accepts the whole
+// set and serializes it to the hex form, so a probe that writes
+// `fillStyle = 'rebeccapurple'` reads back `#663399` as it does there.
+// The CSS system colors. Chrome resolves them through the platform theme; this
+// engine answers opaque black, which is what the reference host answers for
+// CanvasText and Canvas.
+const _CANVAS_SYSTEM_COLORS = new Set([
+  'canvas', 'canvastext', 'linktext', 'visitedtext', 'activetext', 'buttonface',
+  'buttontext', 'buttonborder', 'field', 'fieldtext', 'highlight', 'highlighttext',
+  'selecteditem', 'selecteditemtext', 'mark', 'marktext', 'graytext',
+  'accentcolor', 'accentcolortext', 'activeborder', 'activecaption', 'appworkspace',
+  'background', 'buttonhighlight', 'buttonshadow', 'captiontext', 'inactiveborder',
+  'inactivecaption', 'inactivecaptiontext', 'infobackground', 'infotext', 'menu',
+  'menutext', 'scrollbar', 'threeddarkshadow', 'threedface', 'threedhighlight',
+  'threedlightshadow', 'threedshadow', 'window', 'windowframe', 'windowtext',
+  // `currentcolor` resolves against the element's own color, which a detached
+  // surface answers as black (measured).
+  'currentcolor',
+]);
+const _CANVAS_NAMED_COLORS = {
+  aliceblue: 0xf0f8ff, antiquewhite: 0xfaebd7, aqua: 0x00ffff, aquamarine: 0x7fffd4,
+  azure: 0xf0ffff, beige: 0xf5f5dc, bisque: 0xffe4c4, black: 0x000000,
+  blanchedalmond: 0xffebcd, blue: 0x0000ff, blueviolet: 0x8a2be2, brown: 0xa52a2a,
+  burlywood: 0xdeb887, cadetblue: 0x5f9ea0, chartreuse: 0x7fff00, chocolate: 0xd2691e,
+  coral: 0xff7f50, cornflowerblue: 0x6495ed, cornsilk: 0xfff8dc, crimson: 0xdc143c,
+  cyan: 0x00ffff, darkblue: 0x00008b, darkcyan: 0x008b8b, darkgoldenrod: 0xb8860b,
+  darkgray: 0xa9a9a9, darkgreen: 0x006400, darkgrey: 0xa9a9a9, darkkhaki: 0xbdb76b,
+  darkmagenta: 0x8b008b, darkolivegreen: 0x556b2f, darkorange: 0xff8c00,
+  darkorchid: 0x9932cc, darkred: 0x8b0000, darksalmon: 0xe9967a, darkseagreen: 0x8fbc8f,
+  darkslateblue: 0x483d8b, darkslategray: 0x2f4f4f, darkslategrey: 0x2f4f4f,
+  darkturquoise: 0x00ced1, darkviolet: 0x9400d3, deeppink: 0xff1493,
+  deepskyblue: 0x00bfff, dimgray: 0x696969, dimgrey: 0x696969, dodgerblue: 0x1e90ff,
+  firebrick: 0xb22222, floralwhite: 0xfffaf0, forestgreen: 0x228b22, fuchsia: 0xff00ff,
+  gainsboro: 0xdcdcdc, ghostwhite: 0xf8f8ff, gold: 0xffd700, goldenrod: 0xdaa520,
+  gray: 0x808080, green: 0x008000, greenyellow: 0xadff2f, grey: 0x808080,
+  honeydew: 0xf0fff0, hotpink: 0xff69b4, indianred: 0xcd5c5c, indigo: 0x4b0082,
+  ivory: 0xfffff0, khaki: 0xf0e68c, lavender: 0xe6e6fa, lavenderblush: 0xfff0f5,
+  lawngreen: 0x7cfc00, lemonchiffon: 0xfffacd, lightblue: 0xadd8e6,
+  lightcoral: 0xf08080, lightcyan: 0xe0ffff, lightgoldenrodyellow: 0xfafad2,
+  lightgray: 0xd3d3d3, lightgreen: 0x90ee90, lightgrey: 0xd3d3d3,
+  lightpink: 0xffb6c1, lightsalmon: 0xffa07a, lightseagreen: 0x20b2aa,
+  lightskyblue: 0x87cefa, lightslategray: 0x778899, lightslategrey: 0x778899,
+  lightsteelblue: 0xb0c4de, lightyellow: 0xffffe0, lime: 0x00ff00, limegreen: 0x32cd32,
+  linen: 0xfaf0e6, magenta: 0xff00ff, maroon: 0x800000, mediumaquamarine: 0x66cdaa,
+  mediumblue: 0x0000cd, mediumorchid: 0xba55d3, mediumpurple: 0x9370db,
+  mediumseagreen: 0x3cb371, mediumslateblue: 0x7b68ee, mediumspringgreen: 0x00fa9a,
+  mediumturquoise: 0x48d1cc, mediumvioletred: 0xc71585, midnightblue: 0x191970,
+  mintcream: 0xf5fffa, mistyrose: 0xffe4e1, moccasin: 0xffe4b5, navajowhite: 0xffdead,
+  navy: 0x000080, oldlace: 0xfdf5e6, olive: 0x808000, olivedrab: 0x6b8e23,
+  orange: 0xffa500, orangered: 0xff4500, orchid: 0xda70d6, palegoldenrod: 0xeee8aa,
+  palegreen: 0x98fb98, paleturquoise: 0xafeeee, palevioletred: 0xdb7093,
+  papayawhip: 0xffefd5, peachpuff: 0xffdab9, peru: 0xcd853f, pink: 0xffc0cb,
+  plum: 0xdda0dd, powderblue: 0xb0e0e6, purple: 0x800080, rebeccapurple: 0x663399,
+  red: 0xff0000, rosybrown: 0xbc8f8f, royalblue: 0x4169e1, saddlebrown: 0x8b4513,
+  salmon: 0xfa8072, sandybrown: 0xf4a460, seagreen: 0x2e8b57, seashell: 0xfff5ee,
+  sienna: 0xa0522d, silver: 0xc0c0c0, skyblue: 0x87ceeb, slateblue: 0x6a5acd,
+  slategray: 0x708090, slategrey: 0x708090, snow: 0xfffafa, springgreen: 0x00ff7f,
+  steelblue: 0x4682b4, tan: 0xd2b48c, teal: 0x008080, thistle: 0xd8bfd8,
+  tomato: 0xff6347, turquoise: 0x40e0d0, violet: 0xee82ee, wheat: 0xf5deb3,
+  white: 0xffffff, whitesmoke: 0xf5f5f5, yellow: 0xffff00, yellowgreen: 0x9acd32,
+};
+
+// A CSS color as [r, g, b, a] with 0-255 channels and a 0-1 alpha, or null
+// when the value does not parse. Surrounding whitespace is tolerated, a
+// system color keyword answers opaque black, and both the legacy comma syntax
+// and `rgb(1 2 3 / 50%)` are read.
+function _canvasColorRgb(text) {
+  if (typeof text !== 'string') return null;
+  const value = text.trim();
+  if (!value) return null;
+  if (value.toLowerCase() === 'transparent') return [0, 0, 0, 0];
+  const named = _CANVAS_NAMED_COLORS[value.toLowerCase()];
+  if (named !== undefined) return [(named >> 16) & 255, (named >> 8) & 255, named & 255, 1];
+  const hex = /^#([0-9a-f]+)$/i.exec(value);
+  if (hex) {
+    const digits = hex[1];
+    if (digits.length === 3 || digits.length === 4) {
+      const channels = digits.split('').map(d => parseInt(d + d, 16));
+      return [channels[0], channels[1], channels[2], digits.length === 4 ? channels[3] / 255 : 1];
+    }
+    if (digits.length === 6 || digits.length === 8) {
+      const channels = [];
+      for (let i = 0; i < digits.length; i += 2) channels.push(parseInt(digits.slice(i, i + 2), 16));
+      return [channels[0], channels[1], channels[2], digits.length === 8 ? channels[3] / 255 : 1];
+    }
+    return null;
+  }
+  const functional = /^(rgba?|hsla?)\(([\s\S]*)\)$/i.exec(value);
+  if (!functional) {
+    // A system color keyword resolves to the platform's own colour; this
+    // engine answers opaque black for all of them (measured: Chrome's
+    // `CanvasText` on this host is #000000). Anything else is not a colour.
+    return _CANVAS_SYSTEM_COLORS.has(value.toLowerCase()) ? [0, 0, 0, 1] : null;
+  }
+  const name = functional[1].toLowerCase();
+  const tokens = _cssColorArgTokens(functional[2]).filter(token => token !== ',');
+  const slash = tokens.indexOf('/');
+  let parts = slash < 0 ? tokens.slice() : tokens.slice(0, slash);
+  let alphaParts = slash < 0 ? [] : tokens.slice(slash + 1);
+  if (parts.length === 4 && !alphaParts.length) {
+    alphaParts = [parts[3]];
+    parts = parts.slice(0, 3);
+  }
+  if (parts.length !== 3) return null;
+  const fraction = token => {
+    const number = parseFloat(token);
+    if (!Number.isFinite(number)) return null;
+    return token.endsWith('%') ? number / 100 : number;
+  };
+  // `rgb()` components are already 0-255; only a percentage needs scaling.
+  const channel = token => {
+    const number = parseFloat(token);
+    if (!Number.isFinite(number)) return null;
+    const value = token.endsWith('%') ? number * 255 / 100 : number;
+    return Math.max(0, Math.min(255, Math.round(value)));
+  };
+  const rgb = [];
+  if (name === 'rgb' || name === 'rgba') {
+    for (const token of parts) {
+      const channelValue = channel(token);
+      if (channelValue === null) return null;
+      rgb.push(channelValue);
+    }
+  } else {
+    const hue = parseFloat(parts[0]);
+    const saturation = fraction(parts[1]);
+    const lightness = fraction(parts[2]);
+    if (!Number.isFinite(hue) || saturation === null || lightness === null) return null;
+    rgb.push(..._cssHslToRgb(hue, Math.max(0, Math.min(1, saturation)),
+      Math.max(0, Math.min(1, lightness))));
+  }
+  let alpha = 1;
+  if (alphaParts.length) {
+    const parsed = fraction(alphaParts[0]);
+    if (parsed === null) return null;
+    alpha = Math.max(0, Math.min(1, parsed));
+  }
+  return [rgb[0], rgb[1], rgb[2], alpha];
+}
+
+// The serialization Canvas exposes: lowercase `#rrggbb` when opaque, otherwise
+// `rgba(r, g, b, a)` with the alpha as short as Number renders it.
+function _canvasColorCss(text) {
+  const rgba = _canvasColorRgb(text);
+  if (rgba === null) return null;
+  if (rgba[3] >= 1) {
+    return '#' + rgba.slice(0, 3).map(channel => channel.toString(16).padStart(2, '0')).join('');
+  }
+  return 'rgba(' + rgba[0] + ', ' + rgba[1] + ', ' + rgba[2] + ', ' + rgba[3] + ')';
+}
+
+// One writer per attribute family: the value is read back through the same
+// table Chrome uses, and a value it cannot read leaves the previous one.
+function _canvasResolvedDirection(canvas) {
+  try {
+    if (typeof getComputedStyle === 'function' && canvas && canvas.nodeType) {
+      const direction = getComputedStyle(canvas).direction;
+      if (direction === 'rtl') return 'rtl';
+    }
+  } catch (_error) {}
+  return 'ltr';
+}
+function _canvasEnumAttribute(ctx, name, value) {
+  const state = _canvasStateOf(ctx);
+  const text = String(value);
+  if (_CANVAS_ENUM_ATTRIBUTES[name].indexOf(text) >= 0) state[name] = text;
+}
+function _canvasLengthAttribute(ctx, name, value) {
+  const state = _canvasStateOf(ctx);
+  const text = String(value);
+  const match = _CANVAS_LENGTH_PATTERN.exec(text);
+  if (match) state[name] = text.slice(0, text.length - match[1].length) + match[1].toLowerCase();
+}
+function _canvasNumberAttribute(ctx, name, value, minimum = -Infinity, maximum = Infinity) {
+  const state = _canvasStateOf(ctx);
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < minimum || number > maximum) return;
+  state[name] = number;
+}
+function _canvasPositiveAttribute(ctx, name, value) {
+  const state = _canvasStateOf(ctx);
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return;
+  state[name] = number;
+}
+// The CSS Color 4 functions Chrome's canvas parser also accepts. This engine
+// resolves none of them to bytes, so they are stored exactly as written (which
+// is what Chrome's getter echoes) and painted as opaque black; Chrome
+// additionally normalizes their numbers, which this does not.
+const _CANVAS_COLOR_FUNCTION = /^(color|lab|lch|oklab|oklch|hwb|color-mix)\(([\s\S]*)\)$/i;
+const _CANVAS_COLOR_SPACES = ['srgb', 'srgb-linear', 'display-p3', 'a98-rgb',
+  'prophoto-rgb', 'rec2020', 'xyz', 'xyz-d50', 'xyz-d65'];
+function _canvasModernColorText(text) {
+  const match = _CANVAS_COLOR_FUNCTION.exec(text);
+  if (!match) return null;
+  const name = match[1].toLowerCase();
+  const tokens = match[2].trim().split(/\s+/).filter(token => token !== '');
+  const numeric = tokens.filter(token => token !== '/' &&
+    (token.endsWith('%') ? Number.isFinite(parseFloat(token)) : Number.isFinite(Number(token))));
+  if (name === 'color') {
+    const space = (tokens[0] || '').toLowerCase();
+    if (_CANVAS_COLOR_SPACES.indexOf(space) >= 0 && numeric.length >= 3) return text;
+    return null;
+  }
+  return numeric.length >= 3 ? text : null;
+}
+
+function _canvasColorAttribute(ctx, name, value) {
+  const state = _canvasStateOf(ctx);
+  // A gradient or a pattern is stored as the object it is, and the getter
+  // answers that same object back; every other value is read as a color.
+  if (value && typeof value === 'object') { state[name] = value; return; }
+  const text = value === null || value === undefined ? '' : String(value);
+  const css = _canvasColorCss(text);
+  if (css !== null) { state[name] = css; return; }
+  const modern = _canvasModernColorText(text);
+  if (modern !== null) state[name] = modern;
+}
+
+function _canvas2dCanvasDimension(self, name, fallback) {
+  const state = _canvasStateOf(self);
+    const raw = _canvasSizeAttribute(state.canvas, name);
     if (raw === null || raw === '') return fallback;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   }
-  _resetDrawingState() {
-    this.fillStyle = '#000000';
-    this.strokeStyle = '#000000';
-    this.lineWidth = 1;
-    this.font = '10px sans-serif';
-    this.textAlign = 'start';
-    this.textBaseline = 'alphabetic';
-    this.direction = 'inherit';
-    this.globalAlpha = 1;
-    this.globalCompositeOperation = 'source-over';
-    this.filter = 'none';
-    _hset(this, "_stateStack", []);
-    _hset(this, "_transform", [1, 0, 0, 1, 0, 0]);
-    _hset(this, "_path", []);
+
+function _canvas2dResetDrawingState(self) {
+  const state = _canvasStateOf(self);
+    state.fillStyle = '#000000';
+    state.strokeStyle = '#000000';
+    state.lineWidth = 1;
+    state.fontShorthand = '10px sans-serif';
+    state.textAlign = 'start';
+    state.textBaseline = 'alphabetic';
+    // Chrome's default is 'ltr'; 'inherit' is not even a value this attribute
+    // accepts (writing it is ignored).
+    state.direction = 'ltr';
+    state.globalAlpha = 1;
+    state.globalCompositeOperation = 'source-over';
+    state.filter = 'none';
+    // The members Chrome carries and this renderer does not paint with: they
+    // are stored and answered back, which is what a read observes.
+    state.lang = 'inherit';
+    state.fontKerning = 'auto';
+    state.fontStretch = 'normal';
+    state.fontVariantCaps = 'normal';
+    state.letterSpacing = '0px';
+    state.textRendering = 'auto';
+    state.wordSpacing = '0px';
+    state.imageSmoothingQuality = 'low';
+    state.shadowColor = 'rgba(0, 0, 0, 0)';
+    state.lineCap = 'butt';
+    state.lineJoin = 'miter';
+    state.imageSmoothingEnabled = true;
+    state.shadowOffsetX = 0;
+    state.shadowOffsetY = 0;
+    state.shadowBlur = 0;
+    state.miterLimit = 10;
+    state.lineDashOffset = 0;
+    _canvas2dSet(state, 'stateStack', []);
+    _canvas2dSet(state, 'transform', [1, 0, 0, 1, 0, 0]);
+    _canvas2dSet(state, 'path', []);
   }
-  _resizeFromCanvas() {
-    const requestedWidth = this._canvasDimension('width', 300);
-    const requestedHeight = this._canvasDimension('height', 150);
+
+function _canvas2dResizeFromCanvas(self) {
+  const state = _canvasStateOf(self);
+    const requestedWidth = _canvas2dCanvasDimension(self, 'width', 300);
+    const requestedHeight = _canvas2dCanvasDimension(self, 'height', 150);
     const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
       && requestedHeight <= _MAX_CANVAS_DIMENSION
       && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
-    _hset(this, "_w", valid ? requestedWidth : 0);
-    _hset(this, "_h", valid ? requestedHeight : 0);
-    _hset(this, "_buf", new Uint8ClampedArray(this._w * this._h * 4));
-    _hset(this, "_floatBuf", this._colorType === 'float16'
-      ? new Float32Array(this._buf.length) : null);
-    _hset(this, "_colorBuf", this._colorSpace === 'srgb' && !this._floatBuf
-      ? this._buf : new Uint8ClampedArray(this._buf.length));
-    this._resetDrawingState();
+    _canvas2dSet(state, 'w', valid ? requestedWidth : 0);
+    _canvas2dSet(state, 'h', valid ? requestedHeight : 0);
+    _canvas2dSet(state, 'buf', new Uint8ClampedArray(state.w * state.h * 4));
+    _canvas2dSet(state, 'floatBuf', state.colorType === 'float16'
+      ? new Float32Array(state.buf.length) : null);
+    _canvas2dSet(state, 'colorBuf', state.colorSpace === 'srgb' && !state.floatBuf
+      ? state.buf : new Uint8ClampedArray(state.buf.length));
+    _canvas2dResetDrawingState(self);
     const register = Deno.core.ops.op_canvas_register_surface;
-    if (typeof register === 'function' && this.canvas[_nidSym] != null) {
+    if (typeof register === 'function' && state.canvas[_nidSym] != null) {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
       const bytes = new Uint8Array(
-        this._buf.buffer,
-        this._buf.byteOffset,
-        this._buf.byteLength,
+        state.buf.buffer,
+        state.buf.byteOffset,
+        state.buf.byteLength,
       );
-      if (!register(this.canvas[_nidSym], this._w, this._h, bytes)) {
+      if (!register(state.canvas[_nidSym], state.w, state.h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
   }
-  _markPaintDamage() {
-    if (this.canvas[_nidSym] == null) return;
-    if (this._damageQueued) return;
-    _hset(this, "_damageQueued", true);
+
+function _canvas2dMarkPaintDamage(self) {
+  const state = _canvasStateOf(self);
+    if (state.canvas[_nidSym] == null) return;
+    if (state.damageQueued) return;
+    _canvas2dSet(state, 'damageQueued', true);
     queueMicrotask(() => {
-      _hset(this, "_damageQueued", false);
+      _canvas2dSet(state, 'damageQueued', false);
       const damage = Deno.core.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas[_nidSym]);
+      if (typeof damage === 'function') damage(state.canvas[_nidSym]);
     });
   }
-  _parseColor(css) {
+
+function _canvas2dParseColor(self, css) {
+  const state = _canvasStateOf(self);
     if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
     const functional = /^color\(\s*(srgb|display-p3)\s+([^\s/]+)\s+([^\s/]+)\s+([^\s/)]+)(?:\s*\/\s*([^\s)]+))?\s*\)$/i.exec(css);
     if (functional) {
@@ -270,10 +586,10 @@ class _Canvas2D {
       const rgb = [_canvasColorComponent(functional[2]),
         _canvasColorComponent(functional[3]), _canvasColorComponent(functional[4])];
       if (rgb.every(Number.isFinite)) {
-        const converted = (this._floatBuf
-          ? _convertCanvasFloatColor : _convertCanvasColor)(rgb, source, this._colorSpace);
+        const converted = (state.floatBuf
+          ? _convertCanvasFloatColor : _convertCanvasColor)(rgb, source, state.colorSpace);
         const alpha = functional[5] === undefined ? 1 : _canvasColorComponent(functional[5]);
-        if (this._floatBuf) {
+        if (state.floatBuf) {
           return [converted[0] * 255, converted[1] * 255, converted[2] * 255,
             Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 1)) * 255];
         }
@@ -299,105 +615,53 @@ class _Canvas2D {
     if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
     const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
     const value = named[css] || [0,0,0,255];
-    if (this._colorSpace === 'srgb') return value;
-    const converted = (this._floatBuf
+    if (state.colorSpace === 'srgb') return value;
+    const converted = (state.floatBuf
       ? _convertCanvasFloatColor : _convertCanvasColor)(value.slice(0, 3).map(v => v / 255),
-      'srgb', this._colorSpace);
+      'srgb', state.colorSpace);
     return converted.map(v => Math.round(Math.max(0, Math.min(1, v)) * 255))
       .concat(value[3]);
   }
-  _syncRendererPixel(idx) {
-    if (this._colorBuf === this._buf && !this._floatBuf) return;
-    const source = this._floatBuf
-      ? [this._floatBuf[idx], this._floatBuf[idx + 1], this._floatBuf[idx + 2]]
-      : [this._colorBuf[idx] / 255, this._colorBuf[idx + 1] / 255,
-        this._colorBuf[idx + 2] / 255];
-    const converted = (this._floatBuf
+
+function _canvas2dSyncRendererPixel(self, idx) {
+  const state = _canvasStateOf(self);
+    if (state.colorBuf === state.buf && !state.floatBuf) return;
+    const source = state.floatBuf
+      ? [state.floatBuf[idx], state.floatBuf[idx + 1], state.floatBuf[idx + 2]]
+      : [state.colorBuf[idx] / 255, state.colorBuf[idx + 1] / 255,
+        state.colorBuf[idx + 2] / 255];
+    const converted = (state.floatBuf
       ? _convertCanvasFloatColor : _convertCanvasColor)(source,
-      this._colorSpace, 'srgb');
-    this._buf[idx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
-    this._buf[idx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
-    this._buf[idx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
-    this._buf[idx + 3] = this._floatBuf
-      ? Math.round(Math.max(0, Math.min(1, this._floatBuf[idx + 3])) * 255)
-      : this._colorBuf[idx + 3];
+      state.colorSpace, 'srgb');
+    state.buf[idx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+    state.buf[idx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+    state.buf[idx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+    state.buf[idx + 3] = state.floatBuf
+      ? Math.round(Math.max(0, Math.min(1, state.floatBuf[idx + 3])) * 255)
+      : state.colorBuf[idx + 3];
   }
-  _setPixel(x, y, r, g, b, a, sourceSpace = this._colorSpace) {
+
+function _canvas2dSetPixel(self, x, y, r, g, b, a, sourceSpace = undefined) {
+  const state = _canvasStateOf(self);
+  if (sourceSpace === undefined) sourceSpace = state.colorSpace;
     x = Math.round(x); y = Math.round(y);
-    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    if (sourceSpace !== this._colorSpace) {
-      const converted = (this._floatBuf
+    if (x < 0 || x >= state.w || y < 0 || y >= state.h) return;
+    if (sourceSpace !== state.colorSpace) {
+      const converted = (state.floatBuf
         ? _convertCanvasFloatColor : _convertCanvasColor)([r / 255, g / 255, b / 255],
-        sourceSpace, this._colorSpace);
+        sourceSpace, state.colorSpace);
       r = converted[0] * 255;
       g = converted[1] * 255;
       b = converted[2] * 255;
     }
-    this._blendPixel(x, y, r, g, b, a, 1);
+    _canvas2dBlendPixel(self, x, y, r, g, b, a, 1);
   }
-  fillRect(x, y, w, h) {
-    const t = this._transform;
-    const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
-      && t[4] === 0 && t[5] === 0;
-    if (!identity || (this.fillStyle && this.fillStyle._stops)) {
-      const currentPath = this._path;
-      try {
-        _hset(this, "_path", []);
-        this.rect(x, y, w, h);
-        this.fill();
-      } finally {
-        _hset(this, "_path", currentPath);
-      }
-      return;
-    }
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
-    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        this._setPixel(px, py, r, g, b, a);
-      }
-    }
-    this._markPaintDamage();
-  }
-  clearRect(x, y, w, h) {
-    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        const idx = (py * this._w + px) * 4;
-        this._colorBuf[idx] = this._colorBuf[idx+1] = this._colorBuf[idx+2] = 0;
-        this._colorBuf[idx+3] = this._alpha ? 0 : 255;
-        if (this._floatBuf) {
-          this._floatBuf[idx] = this._floatBuf[idx + 1] = this._floatBuf[idx + 2] = 0;
-          this._floatBuf[idx + 3] = this._alpha ? 0 : 1;
-        }
-        if (this._colorBuf !== this._buf || this._floatBuf) this._syncRendererPixel(idx);
-      }
-    }
-    this._markPaintDamage();
-  }
-  strokeRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.strokeStyle);
-    const lw = this.lineWidth;
-    for (let px = Math.round(x); px < Math.round(x+w); px++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(px, Math.round(y)+l, r,g,b,a); this._setPixel(px, Math.round(y+h)-1-l, r,g,b,a); }
-    }
-    for (let py = Math.round(y); py < Math.round(y+h); py++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(Math.round(x)+l, py, r,g,b,a); this._setPixel(Math.round(x+w)-1-l, py, r,g,b,a); }
-    }
-    this._markPaintDamage();
-  }
-  // Chrome positions the text run through textBaseline/textAlign. The dot box
-  // stands in for the glyph em box: 7*scale rows above the alphabetic line
-  // plus a proportional descender band below it, so each baseline value lands
-  // the ink where Chrome puts it -- 'top' puts the first ink row at y,
-  // 'alphabetic' keeps it above y, 'bottom'/'ideographic' put the descender
-  // line at y. A probe that draws at y=0 with 'top' (the common canvas
-  // fingerprint shape) paints rows 0..7*scale-1; treating y as the alphabetic
-  // baseline there pushed every dot off-canvas and answered a blank canvas.
-  _textBaselineOffset(scale) {
+
+function _canvas2dTextBaselineOffset(self, scale) {
+  const state = _canvasStateOf(self);
     const ascent = 7 * scale;
     const descent = Math.round(2.1 * scale);
-    switch (this.textBaseline) {
+    switch (state.textBaseline) {
       case 'top': return ascent;
       case 'hanging': return Math.round(0.8 * ascent);
       case 'middle': return Math.round((ascent - descent) / 2);
@@ -406,32 +670,352 @@ class _Canvas2D {
       default: return 0; // alphabetic, and anything unrecognised
     }
   }
-  // Alignment shifts the run horizontally so the ink box (not the origin)
-  // meets x: centered runs put their midpoint at x, right/end runs their
-  // right edge. 'start'/'end' resolve through the canvas direction.
-  _textAlignOffset(str, scale) {
+
+function _canvas2dTextAlignOffset(self, str, scale) {
+  const state = _canvasStateOf(self);
     if (!str.length) return 0;
     const runWidth = str.length * 6 * scale - scale;
-    const rtl = this.direction === 'rtl';
-    let align = this.textAlign;
+    const rtl = state.direction === 'rtl';
+    let align = state.textAlign;
     if (align === 'start') align = rtl ? 'right' : 'left';
     if (align === 'end') align = rtl ? 'left' : 'right';
     if (align === 'center') return Math.round(runWidth / 2);
     if (align === 'right') return runWidth;
     return 0;
   }
+
+function _canvas2dApplyTransform(self, x, y) {
+  const state = _canvasStateOf(self);
+    const [a, b, c, d, e, f] = state.transform;
+    return [a * x + c * y + e, b * x + d * y + f];
+  }
+
+function _canvas2dFlattenPath(self, minPoints) {
+  const state = _canvasStateOf(self);
+    const subpaths = [];
+    let current = null;
+    const finish = close => {
+      if (close && current && current.length > 1) current.push(current[0].slice());
+      if (current && current.length >= minPoints) subpaths.push(current);
+      current = null;
+    };
+    const push = (x, y) => {
+      if (!current) current = [[x, y]];
+      else current.push([x, y]);
+    };
+    const mappedPush = (matrix, x, y) => {
+      const [a, b, c, d, e, f] = matrix;
+      push(a * x + c * y + e, b * x + d * y + f);
+    };
+    const arcSteps = r => Math.max(16, Math.min(64, Math.ceil(r * 2)));
+    for (const seg of state.path || []) {
+      if (seg.t === 'M') { finish(false); push(seg.x, seg.y); }
+      else if (seg.t === 'L') push(seg.x, seg.y);
+      else if (seg.t === 'Z') { finish(true); }
+      else if (seg.t === 'C' || seg.t === 'Q') {
+        const cubic = seg.t === 'C'
+          ? [seg.x0, seg.y0, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y]
+          : [ // quadratic as the equivalent cubic
+            seg.x0, seg.y0,
+            seg.x0 + 2 / 3 * (seg.x1 - seg.x0), seg.y0 + 2 / 3 * (seg.y1 - seg.y0),
+            seg.x + 2 / 3 * (seg.x1 - seg.x), seg.y + 2 / 3 * (seg.y1 - seg.y),
+            seg.x, seg.y];
+        for (let step = 1; step <= 16; step++) {
+          const t = step / 16, u = 1 - t;
+          push(
+            u * u * u * cubic[0] + 3 * u * u * t * cubic[2] + 3 * u * t * t * cubic[4] + t * t * t * cubic[6],
+            u * u * u * cubic[1] + 3 * u * u * t * cubic[3] + 3 * u * t * t * cubic[5] + t * t * t * cubic[7]);
+        }
+      } else if (seg.t === 'A') {
+        let sweep = seg.e - seg.s;
+        const fullTurn = Math.PI * 2;
+        if (Math.abs(sweep) >= fullTurn) sweep = seg.ccw ? -fullTurn : fullTurn;
+        else if (seg.ccw) { while (sweep > 0) sweep -= fullTurn; }
+        else { while (sweep < 0) sweep += fullTurn; }
+        const steps = arcSteps(seg.r);
+        for (let step = 0; step <= steps; step++) {
+          const angle = seg.s + sweep * step / steps;
+          mappedPush(seg.m, seg.x + seg.r * Math.cos(angle), seg.y + seg.r * Math.sin(angle));
+        }
+      } else if (seg.t === 'E') {
+        const steps = arcSteps(Math.max(seg.rx, seg.ry));
+        for (let step = 0; step <= steps; step++) {
+          const angle = Math.PI * 2 * step / steps;
+          mappedPush(seg.m, seg.x + seg.rx * Math.cos(angle), seg.y + seg.ry * Math.sin(angle));
+        }
+      }
+    }
+    finish(false);
+    return subpaths;
+  }
+
+function _canvas2dWindingAt(self, subpaths, x, y, evenOdd = false) {
+    let winding = 0, crossings = 0;
+    for (const poly of subpaths) {
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+          crossings++;
+          winding += yj > yi ? 1 : -1;
+        }
+      }
+    }
+    return evenOdd ? crossings & 1 : winding;
+  }
+
+function _canvas2dPaintAt(self, px, py) {
+  const state = _canvasStateOf(self);
+    const fill = state.fillStyle;
+    if (fill && fill._stops && fill._stops.length) {
+      const inv = _canvas2dTransformInverse(self, fill._transform);
+      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
+      return _canvas2dGradientColorAt(self, fill, ux, uy);
+    }
+    const color = _canvas2dParseColor(self, fill);
+    color.gradient = false;
+    return color;
+  }
+
+function _canvas2dCoverageSamples(self) {
+  const state = _canvasStateOf(self);
+    return state.w * state.h <= 65536 ? _CANVAS_AA_4X4 : _CANVAS_AA_2X2;
+  }
+
+function _canvas2dTransformInverse(self, matrix) {
+  const state = _canvasStateOf(self);
+    const [a, b, c, d, e, f] = matrix || state.transform;
+    const det = a * d - b * c;
+    if (!det) return [1, 0, 0, 1, 0, 0];
+    return [d / det, -b / det, -c / det, a / det,
+      (c * f - d * e) / det, (b * e - a * f) / det];
+  }
+
+function _canvas2dGradientColorAt(self, grad, x, y) {
+    let t;
+    if (grad._type === 'linear') {
+      const dx = grad._x1 - grad._x0, dy = grad._y1 - grad._y0;
+      const len = dx * dx + dy * dy;
+      t = len ? ((x - grad._x0) * dx + (y - grad._y0) * dy) / len : 0;
+    } else if (grad._type === 'radial') {
+      const dist = Math.hypot(x - grad._x1, y - grad._y1);
+      t = grad._r1 > grad._r0 ? (dist - grad._r0) / (grad._r1 - grad._r0) : 0;
+    } else {
+      t = ((Math.atan2(y - grad._y0, x - grad._x0) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2);
+      if (grad._startAngle) t = (t + grad._startAngle / (Math.PI * 2)) % 1;
+    }
+    t = Math.min(1, Math.max(0, t));
+    const stops = grad._stops;
+    if (t <= stops[0][0]) return stops[0][1].slice();
+    const lastStop = stops[stops.length - 1];
+    if (t >= lastStop[0]) return lastStop[1].slice();
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
+        const span = t1 - t0 || 1;
+        const f = (t - t0) / span;
+        return [0, 1, 2, 3].map(k => Math.round(c0[k] + (c1[k] - c0[k]) * f));
+      }
+    }
+    return lastStop[1].slice();
+  }
+
+function _canvas2dPaintStrokeAt(self, px, py) {
+  const state = _canvasStateOf(self);
+    const stroke = state.strokeStyle;
+    if (stroke && stroke._stops && stroke._stops.length) {
+      const inv = _canvas2dTransformInverse(self, stroke._transform);
+      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
+      return _canvas2dGradientColorAt(self, stroke, ux, uy);
+    }
+    return _canvas2dParseColor(self, stroke);
+  }
+
+function _canvas2dDistanceToSegment(self, px, py, a, b) {
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = dx * dx + dy * dy;
+    const t = len ? Math.min(1, Math.max(0, ((px - a[0]) * dx + (py - a[1]) * dy) / len)) : 0;
+    return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
+  }
+
+function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
+  const state = _canvasStateOf(self);
+    const sourceAlpha = (a / 255) * coverage * state.globalAlpha;
+    if (sourceAlpha <= 0) return;
+    if (x < 0 || x >= state.w || y < 0 || y >= state.h) return;
+    const idx = (y * state.w + x) * 4;
+    const destinationAlpha = state.floatBuf
+      ? state.floatBuf[idx + 3] : state.colorBuf[idx + 3] / 255;
+    const outputAlpha = sourceAlpha + destinationAlpha * (1 - sourceAlpha);
+    const source = [r / 255, g / 255, b / 255];
+    const destination = state.floatBuf
+      ? [state.floatBuf[idx], state.floatBuf[idx + 1], state.floatBuf[idx + 2]]
+      : [state.colorBuf[idx] / 255, state.colorBuf[idx + 1] / 255,
+        state.colorBuf[idx + 2] / 255];
+    for (let channel = 0; channel < 3; channel++) {
+      const blended = state.globalCompositeOperation === 'multiply'
+        ? source[channel] * destination[channel] : source[channel];
+      const premultiplied = source[channel] * sourceAlpha * (1 - destinationAlpha)
+        + destination[channel] * destinationAlpha * (1 - sourceAlpha)
+        + blended * sourceAlpha * destinationAlpha;
+      const value = outputAlpha > 0 ? premultiplied / outputAlpha : 0;
+      if (state.floatBuf) state.floatBuf[idx + channel] = value;
+      state.colorBuf[idx + channel] = Math.round(Math.max(0, Math.min(1, value)) * 255);
+    }
+    if (state.floatBuf) state.floatBuf[idx + 3] = outputAlpha;
+    state.colorBuf[idx + 3] = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
+    _canvas2dSyncRendererPixel(self, idx);
+  }
+
+function _canvas2dMakeGradient(self, type, params) {
+  const state = _canvasStateOf(self);
+    const ctx = self;
+    // Chrome hands back a CanvasGradient instance; binding the interface
+    // prototype keeps `instanceof CanvasGradient` true for gradient probes.
+    const grad = Object.setPrototypeOf(Object.assign({
+      _type: type, _stops: [],
+      addColorStop(offset, color) {
+        offset = +offset;
+        if (!(offset >= 0 && offset <= 1)) {
+          throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
+        }
+        this._stops.push([offset, _canvas2dParseColor(ctx, color)]);
+        this._stops.sort((a, b) => a[0] - b[0]);
+      },
+      get [Symbol.toStringTag]() { return 'CanvasGradient'; },
+      _transform: state.transform.slice(),
+    }, params), (typeof CanvasGradient === 'function' ? CanvasGradient.prototype : null));
+    return grad;
+  }
+
+class _Canvas2D {
+  constructor(canvas, attrs = undefined) {
+    attrs = attrs == null ? {} : Object(attrs);
+    // Every slot lives in the WeakMap: Chrome's context instance has no own
+    // property at all, so nothing here may land on `this`.
+    _canvas2dState.set(this, {
+      canvas: canvas,
+      colorSpace: _imageDataEnum(attrs.colorSpace, 'srgb',
+        _IMAGE_DATA_COLOR_SPACES, 'colorSpace'),
+      colorType: attrs.colorType === 'float16' ? 'float16' : 'unorm8',
+      alpha: attrs.alpha !== false,
+      desynchronized: !!attrs.desynchronized,
+      willReadFrequently: !!attrs.willReadFrequently,
+      damageQueued: false,
+      fontShorthand: null,
+      stateStack: [],
+      transform: [1, 0, 0, 1, 0, 0],
+      path: [],
+      w: 0, h: 0, buf: null, floatBuf: null, colorBuf: null,
+      lang: 'inherit', textAlign: 'start', textBaseline: 'alphabetic',
+      direction: 'ltr', fontKerning: 'auto', fontStretch: 'normal',
+      fontVariantCaps: 'normal', letterSpacing: '0px', textRendering: 'auto',
+      wordSpacing: '0px', globalCompositeOperation: 'source-over',
+      filter: 'none', imageSmoothingQuality: 'low', strokeStyle: '#000000',
+      fillStyle: '#000000', shadowColor: 'rgba(0, 0, 0, 0)', lineCap: 'butt',
+      lineJoin: 'miter', globalAlpha: 1, imageSmoothingEnabled: true,
+      shadowOffsetX: 0, shadowOffsetY: 0, shadowBlur: 0, lineWidth: 1,
+      miterLimit: 10, lineDashOffset: 0,
+    });
+    _canvas2dResizeFromCanvas(this);
+  }
+  save() {
+    const state = _canvasStateOf(this);
+    state.stateStack.push({fillStyle: state.fillStyle, strokeStyle: state.strokeStyle,
+      globalAlpha: state.globalAlpha, font: state.fontShorthand, lineWidth: state.lineWidth,
+      textAlign: state.textAlign, textBaseline: state.textBaseline, direction: state.direction,
+      globalCompositeOperation: state.globalCompositeOperation, filter: state.filter,
+      _transform: state.transform.slice()});
+  }
+  restore() {
+    const state = _canvasStateOf(this);
+    const saved = state.stateStack.pop();
+    if (!saved) return;
+    const transform = saved._transform;
+    delete saved._transform;
+    Object.assign(state, saved);
+    state.transform = transform;
+  }
+  // Chrome's reset(): the drawing state, the transform and the path go back to
+  // their defaults and the bitmap is cleared.
+  reset() {
+    const state = _canvasStateOf(this);
+    state.stateStack = [];
+    state.transform = [1, 0, 0, 1, 0, 0];
+    state.path = [];
+    _canvas2dResetDrawingState(this);
+    if (state.buf) state.buf.fill(0);
+    if (state.floatBuf) state.floatBuf.fill(0);
+    if (state.colorBuf !== state.buf) state.colorBuf.fill(0);
+    _canvas2dMarkPaintDamage(this);
+  }
+  isContextLost() { return false; }
+  fillRect(x, y, w, h) {
+    const state = _canvasStateOf(this);
+    const t = state.transform;
+    const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
+      && t[4] === 0 && t[5] === 0;
+    if (!identity || (state.fillStyle && state.fillStyle._stops)) {
+      const currentPath = state.path;
+      try {
+        _canvas2dSet(state, 'path', []);
+        this.rect(x, y, w, h);
+        this.fill();
+      } finally {
+        _canvas2dSet(state, 'path', currentPath);
+      }
+      return;
+    }
+    const [r,g,b,a] = _canvas2dParseColor(this, state.fillStyle);
+    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
+    for (let py = Math.max(0,y); py < Math.min(state.h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(state.w, x+w); px++) {
+        _canvas2dSetPixel(this, px, py, r, g, b, a);
+      }
+    }
+    _canvas2dMarkPaintDamage(this);
+  }
+  clearRect(x, y, w, h) {
+    const state = _canvasStateOf(this);
+    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
+    for (let py = Math.max(0,y); py < Math.min(state.h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(state.w, x+w); px++) {
+        const idx = (py * state.w + px) * 4;
+        state.colorBuf[idx] = state.colorBuf[idx+1] = state.colorBuf[idx+2] = 0;
+        state.colorBuf[idx+3] = state.alpha ? 0 : 255;
+        if (state.floatBuf) {
+          state.floatBuf[idx] = state.floatBuf[idx + 1] = state.floatBuf[idx + 2] = 0;
+          state.floatBuf[idx + 3] = state.alpha ? 0 : 1;
+        }
+        if (state.colorBuf !== state.buf || state.floatBuf) _canvas2dSyncRendererPixel(this, idx);
+      }
+    }
+    _canvas2dMarkPaintDamage(this);
+  }
+  strokeRect(x, y, w, h) {
+    const state = _canvasStateOf(this);
+    const [r,g,b,a] = _canvas2dParseColor(this, state.strokeStyle);
+    const lw = state.lineWidth;
+    for (let px = Math.round(x); px < Math.round(x+w); px++) {
+      for (let l = 0; l < lw; l++) { _canvas2dSetPixel(this, px, Math.round(y)+l, r,g,b,a); _canvas2dSetPixel(this, px, Math.round(y+h)-1-l, r,g,b,a); }
+    }
+    for (let py = Math.round(y); py < Math.round(y+h); py++) {
+      for (let l = 0; l < lw; l++) { _canvas2dSetPixel(this, Math.round(x)+l, py, r,g,b,a); _canvas2dSetPixel(this, Math.round(x+w)-1-l, py, r,g,b,a); }
+    }
+    _canvas2dMarkPaintDamage(this);
+  }
   fillText(text, x, y) {
+    const state = _canvasStateOf(this);
     // A gradient fill under text uses the gradient's first stop; per-glyph
     // gradient evaluation stays out of the dot-matrix rasterizer.
-    const fill = this.fillStyle;
+    const fill = state.fillStyle;
     const [r,g,b,a] = fill && fill._stops && fill._stops.length
-      ? fill._stops[0][1] : this._parseColor(fill);
+      ? fill._stops[0][1] : _canvas2dParseColor(this, fill);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = _prepareCanvasText(text);
-    const [tx, ty] = this._applyTransform(+x || 0, +y || 0);
-    const baseY = Math.round(ty) + this._textBaselineOffset(scale);
-    let cx = Math.round(tx) - this._textAlignOffset(str, scale);
+    const [tx, ty] = _canvas2dApplyTransform(this, +x || 0, +y || 0);
+    const baseY = Math.round(ty) + _canvas2dTextBaselineOffset(this, scale);
+    let cx = Math.round(tx) - _canvas2dTextAlignOffset(this, str, scale);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
       // The reference draws C1 controls with the same replacement glyph as
@@ -446,7 +1030,7 @@ class _Canvas2D {
           if (on) {
             for (let sy = 0; sy < scale; sy++) {
               for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, baseY - 7*scale + row*scale + sy, r, g, b, a);
+                _canvas2dSetPixel(this, cx + col*scale + sx, baseY - 7*scale + row*scale + sy, r, g, b, a);
               }
             }
           }
@@ -454,10 +1038,11 @@ class _Canvas2D {
       }
       cx += 6 * scale;
     }
-    this._markPaintDamage();
+    _canvas2dMarkPaintDamage(this);
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
+    const state = _canvasStateOf(this);
     // Route through the real text layout engine, which is what element
     // measurement already uses. The previous `length * 6 * scale` ignored the
     // font entirely, so every family measured identically -- a canvas font
@@ -468,15 +1053,15 @@ class _Canvas2D {
     const text = _prepareCanvasText(t);
     const box = _measureTextBox(text, this.font);
     const hasInk = !/^\s*$/u.test(text);
-    let direction = this.direction;
+    let direction = state.direction;
     if (direction !== 'ltr' && direction !== 'rtl') {
       direction = 'ltr';
-      for (let node = this.canvas; node; node = node.parentElement) {
+      for (let node = state.canvas; node; node = node.parentElement) {
         const authored = node.getAttribute && node.getAttribute('dir');
         if (authored === 'ltr' || authored === 'rtl') { direction = authored; break; }
       }
     }
-    let align = this.textAlign;
+    let align = state.textAlign;
     if (align === 'start') align = direction === 'rtl' ? 'right' : 'left';
     if (align === 'end') align = direction === 'rtl' ? 'left' : 'right';
     const alignmentOffset = align === 'center' ? box.width / 2
@@ -519,27 +1104,28 @@ class _Canvas2D {
     });
   }
   getImageData(x, y, w, h, settings = undefined) {
+    const state = _canvasStateOf(this);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     [w, h] = _imageDataDimensions(w, h, "Failed to execute 'getImageData' on 'CanvasRenderingContext2D'");
-    const output = _imageDataSettings(settings, this._colorSpace);
+    const output = _imageDataSettings(settings, state.colorSpace);
     const data = output.pixelFormat === 'rgba-float16'
       ? new Float16Array(w * h * 4) : new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const srcX = x + px, srcY = y + py;
         const dstIdx = (py * w + px) * 4;
-        if (srcX >= 0 && srcX < this._w && srcY >= 0 && srcY < this._h) {
-          const srcIdx = (srcY * this._w + srcX) * 4;
-          const sourceColor = this._floatBuf
-            ? [this._floatBuf[srcIdx], this._floatBuf[srcIdx + 1],
-              this._floatBuf[srcIdx + 2]]
-            : [this._colorBuf[srcIdx] / 255, this._colorBuf[srcIdx + 1] / 255,
-              this._colorBuf[srcIdx + 2] / 255];
-          const sourceAlpha = this._floatBuf
-            ? this._floatBuf[srcIdx + 3] : this._colorBuf[srcIdx + 3] / 255;
-          const converted = (this._floatBuf
+        if (srcX >= 0 && srcX < state.w && srcY >= 0 && srcY < state.h) {
+          const srcIdx = (srcY * state.w + srcX) * 4;
+          const sourceColor = state.floatBuf
+            ? [state.floatBuf[srcIdx], state.floatBuf[srcIdx + 1],
+              state.floatBuf[srcIdx + 2]]
+            : [state.colorBuf[srcIdx] / 255, state.colorBuf[srcIdx + 1] / 255,
+              state.colorBuf[srcIdx + 2] / 255];
+          const sourceAlpha = state.floatBuf
+            ? state.floatBuf[srcIdx + 3] : state.colorBuf[srcIdx + 3] / 255;
+          const converted = (state.floatBuf
             ? _convertCanvasFloatColor : _convertCanvasColor)(sourceColor,
-            this._colorSpace, output.colorSpace);
+            state.colorSpace, output.colorSpace);
           if (output.pixelFormat === 'rgba-float16') {
             data[dstIdx] = converted[0]; data[dstIdx + 1] = converted[1];
             data[dstIdx + 2] = converted[2]; data[dstIdx + 3] = sourceAlpha;
@@ -555,6 +1141,7 @@ class _Canvas2D {
     return _makeImageData(data, w, h, output.colorSpace, output.pixelFormat);
   }
   putImageData(imageData, dx, dy) {
+    const state = _canvasStateOf(this);
     dx=Math.round(dx); dy=Math.round(dy);
     const source = _imageData(imageData);
     const {data, width: w, height: h} = source;
@@ -562,31 +1149,32 @@ class _Canvas2D {
       for (let px = 0; px < w; px++) {
         const srcIdx = (py * w + px) * 4;
         const x = dx + px, y = dy + py;
-        if (x >= 0 && x < this._w && y >= 0 && y < this._h) {
-          const dstIdx = (y * this._w + x) * 4;
+        if (x >= 0 && x < state.w && y >= 0 && y < state.h) {
+          const dstIdx = (y * state.w + x) * 4;
           const scale = source.pixelFormat === 'rgba-float16' ? 1 : 1 / 255;
-          const converted = (this._floatBuf
+          const converted = (state.floatBuf
             ? _convertCanvasFloatColor : _convertCanvasColor)([data[srcIdx] * scale,
             data[srcIdx + 1] * scale, data[srcIdx + 2] * scale],
-            source.colorSpace, this._colorSpace);
+            source.colorSpace, state.colorSpace);
           const alpha = Math.max(0, Math.min(1, data[srcIdx + 3] * scale));
-          if (this._floatBuf) {
-            this._floatBuf[dstIdx] = converted[0];
-            this._floatBuf[dstIdx + 1] = converted[1];
-            this._floatBuf[dstIdx + 2] = converted[2];
-            this._floatBuf[dstIdx + 3] = alpha;
+          if (state.floatBuf) {
+            state.floatBuf[dstIdx] = converted[0];
+            state.floatBuf[dstIdx + 1] = converted[1];
+            state.floatBuf[dstIdx + 2] = converted[2];
+            state.floatBuf[dstIdx + 3] = alpha;
           }
-          this._colorBuf[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
-          this._colorBuf[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
-          this._colorBuf[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
-          this._colorBuf[dstIdx + 3] = Math.round(alpha * 255);
-          this._syncRendererPixel(dstIdx);
+          state.colorBuf[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+          state.colorBuf[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+          state.colorBuf[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+          state.colorBuf[dstIdx + 3] = Math.round(alpha * 255);
+          _canvas2dSyncRendererPixel(this, dstIdx);
         }
       }
     }
-    this._markPaintDamage();
+    _canvas2dMarkPaintDamage(this);
   }
   createImageData(widthOrImage, height, settings = undefined) {
+    const state = _canvasStateOf(this);
     if (_imageDataState.has(widthOrImage)) {
       const source = _imageData(widthOrImage);
       const output = _imageDataSettings(height, source.colorSpace);
@@ -598,7 +1186,7 @@ class _Canvas2D {
     }
     const dimensions = _imageDataDimensions(widthOrImage, height,
       "Failed to execute 'createImageData' on 'CanvasRenderingContext2D'");
-    const output = _imageDataSettings(settings, this._colorSpace);
+    const output = _imageDataSettings(settings, state.colorSpace);
     const data = output.pixelFormat === 'rgba-float16'
       ? new Float16Array(dimensions[0] * dimensions[1] * 4)
       : new Uint8ClampedArray(dimensions[0] * dimensions[1] * 4);
@@ -607,295 +1195,187 @@ class _Canvas2D {
   }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
     let src = null;
-    if (img && img._ctx && img._ctx._buf) {
+    if (img && _isCanvas2DContext(img._ctx)) {
       src = img._ctx;
     } else {
       // An OffscreenCanvas keeps its 2D context in module state rather than an
       // own _ctx, and an ImageBitmap carries the pixels snapshotted at
       // construction; without these branches neither source painted at all.
       const context = img ? _offscreenCanvasContexts.get(img) : null;
-      if (context && context._buf) {
+      if (_isCanvas2DContext(context)) {
         src = context;
       } else {
         const bitmap = img ? _imageBitmapPixels.get(img) : null;
         if (bitmap && bitmap.pixels) {
-          src = {_w: bitmap.width, _h: bitmap.height, _buf: bitmap.pixels,
-            _colorBuf: bitmap.pixels, _colorSpace: bitmap.colorSpace};
+          src = {plain: true, width: bitmap.width, height: bitmap.height,
+            pixels: bitmap.pixels, colorSpace: bitmap.colorSpace};
         }
       }
     }
     if (src) {
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
+      // A 2D context keeps its slots in the state object; an ImageBitmap's
+      // source is the plain object built above.
+      const sourceState = src.plain ? null : _canvasStateOf(src);
+      const srcWidth = sourceState ? sourceState.w : src.width;
+      const srcHeight = sourceState ? sourceState.h : src.height;
+      const srcBuffer = sourceState
+        ? (sourceState.floatBuf || sourceState.colorBuf || sourceState.buf) : src.pixels;
+      const srcScale = sourceState && sourceState.floatBuf ? 255 : 1;
+      const srcSpace = sourceState ? sourceState.colorSpace : src.colorSpace;
+      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? srcWidth); dh = dh ?? (sh ?? srcHeight);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            const sourceBuffer = src._floatBuf || src._colorBuf || src._buf;
-            const scale = src._floatBuf ? 255 : 1;
-            this._setPixel(dx+px, dy+py, sourceBuffer[srcIdx] * scale,
-              sourceBuffer[srcIdx+1] * scale, sourceBuffer[srcIdx+2] * scale,
-              sourceBuffer[srcIdx+3] * scale, src._colorSpace || 'srgb');
+          const srcX = Math.floor((sx||0) + px * (sw||srcWidth) / dw);
+          const srcY = Math.floor((sy||0) + py * (sh||srcHeight) / dh);
+          if (srcX >= 0 && srcX < srcWidth && srcY >= 0 && srcY < srcHeight) {
+            const srcIdx = (srcY * srcWidth + srcX) * 4;
+            _canvas2dSetPixel(this, dx+px, dy+py, srcBuffer[srcIdx] * srcScale,
+              srcBuffer[srcIdx+1] * srcScale, srcBuffer[srcIdx+2] * srcScale,
+              srcBuffer[srcIdx+3] * srcScale, srcSpace || 'srgb');
           }
         }
       }
     }
-    this._markPaintDamage();
+    _canvas2dMarkPaintDamage(this);
   }
-  beginPath() { _hset(this, "_path", []); }
-  closePath() { if (this._path) this._path.push({t:'Z'}); }
+  beginPath() {
+    const state = _canvasStateOf(this);
+    _canvas2dSet(state, 'path', []);
+  }
+  closePath() {
+    const state = _canvasStateOf(this);
+    if (state.path) state.path.push({t:'Z'});
+  }
   moveTo(x, y) {
-    if (this._path) {
-      const point = this._applyTransform(+x, +y);
-      this._path.push({t:'M', x:point[0], y:point[1]});
+    const state = _canvasStateOf(this);
+    if (state.path) {
+      const point = _canvas2dApplyTransform(this, +x, +y);
+      state.path.push({t:'M', x:point[0], y:point[1]});
     }
   }
   lineTo(x, y) {
-    if (this._path) {
-      const point = this._applyTransform(+x, +y);
-      this._path.push({t:'L', x:point[0], y:point[1]});
+    const state = _canvasStateOf(this);
+    if (state.path) {
+      const point = _canvas2dApplyTransform(this, +x, +y);
+      state.path.push({t:'L', x:point[0], y:point[1]});
     }
   }
   bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
-    if (!this._path.length) this.moveTo(cp1x, cp1y);
-    const last = this._path[this._path.length - 1];
-    const p1 = this._applyTransform(+cp1x, +cp1y);
-    const p2 = this._applyTransform(+cp2x, +cp2y);
-    const end = this._applyTransform(+x, +y);
-    this._path.push({t:'C', x0:last.x, y0:last.y, x1:p1[0], y1:p1[1],
+    const state = _canvasStateOf(this);
+    if (!state.path.length) this.moveTo(cp1x, cp1y);
+    const last = state.path[state.path.length - 1];
+    const p1 = _canvas2dApplyTransform(this, +cp1x, +cp1y);
+    const p2 = _canvas2dApplyTransform(this, +cp2x, +cp2y);
+    const end = _canvas2dApplyTransform(this, +x, +y);
+    state.path.push({t:'C', x0:last.x, y0:last.y, x1:p1[0], y1:p1[1],
       x2:p2[0], y2:p2[1], x:end[0], y:end[1]});
   }
   quadraticCurveTo(cpx, cpy, x, y) {
-    if (!this._path.length) this.moveTo(cpx, cpy);
-    const last = this._path[this._path.length - 1];
-    const control = this._applyTransform(+cpx, +cpy);
-    const end = this._applyTransform(+x, +y);
-    this._path.push({t:'Q', x0:last.x, y0:last.y,
+    const state = _canvasStateOf(this);
+    if (!state.path.length) this.moveTo(cpx, cpy);
+    const last = state.path[state.path.length - 1];
+    const control = _canvas2dApplyTransform(this, +cpx, +cpy);
+    const end = _canvas2dApplyTransform(this, +x, +y);
+    state.path.push({t:'Q', x0:last.x, y0:last.y,
       x1:control[0], y1:control[1], x:end[0], y:end[1]});
   }
   arc(x, y, r, startAngle, endAngle, counterclockwise = false) {
+    const state = _canvasStateOf(this);
     r = +r;
     if (r < 0) throw new DOMException('The radius provided is negative.', 'IndexSizeError');
-    if (this._path) this._path.push({t:'A', x:+x, y:+y, r,
+    if (state.path) state.path.push({t:'A', x:+x, y:+y, r,
       s:+(startAngle || 0), e:+(endAngle === undefined ? Math.PI * 2 : endAngle),
-      ccw:!!counterclockwise, m:this._transform.slice()});
+      ccw:!!counterclockwise, m:state.transform.slice()});
   }
   arcTo() {}
   rect(x, y, w, h) {
-    if (!this._path) return;
+    const state = _canvasStateOf(this);
+    if (!state.path) return;
     const x0 = +x, y0 = +y, ww = +w, hh = +h;
     this.moveTo(x0, y0); this.lineTo(x0 + ww, y0);
     this.lineTo(x0 + ww, y0 + hh); this.lineTo(x0, y0 + hh); this.closePath();
   }
   ellipse(x, y, rx, ry) {
-    if (this._path) this._path.push({t:'E', x:+x, y:+y, rx:+rx,
-      ry:+ry === 0 ? +rx : +ry, m:this._transform.slice()});
+    const state = _canvasStateOf(this);
+    if (state.path) state.path.push({t:'E', x:+x, y:+y, rx:+rx,
+      ry:+ry === 0 ? +rx : +ry, m:state.transform.slice()});
   }
   roundRect(x, y, w, h) { this.rect(x, y, w, h); }
-  // Path commands capture the current transform when they are appended, so
-  // later CTM changes cannot move geometry already present in the path.
-  _applyTransform(x, y) {
-    const [a, b, c, d, e, f] = this._transform;
-    return [a * x + c * y + e, b * x + d * y + f];
-  }
-  _flattenPath(minPoints) {
-    const subpaths = [];
-    let current = null;
-    const finish = close => {
-      if (close && current && current.length > 1) current.push(current[0].slice());
-      if (current && current.length >= minPoints) subpaths.push(current);
-      current = null;
-    };
-    const push = (x, y) => {
-      if (!current) current = [[x, y]];
-      else current.push([x, y]);
-    };
-    const mappedPush = (matrix, x, y) => {
-      const [a, b, c, d, e, f] = matrix;
-      push(a * x + c * y + e, b * x + d * y + f);
-    };
-    const arcSteps = r => Math.max(16, Math.min(64, Math.ceil(r * 2)));
-    for (const seg of this._path || []) {
-      if (seg.t === 'M') { finish(false); push(seg.x, seg.y); }
-      else if (seg.t === 'L') push(seg.x, seg.y);
-      else if (seg.t === 'Z') { finish(true); }
-      else if (seg.t === 'C' || seg.t === 'Q') {
-        const cubic = seg.t === 'C'
-          ? [seg.x0, seg.y0, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y]
-          : [ // quadratic as the equivalent cubic
-            seg.x0, seg.y0,
-            seg.x0 + 2 / 3 * (seg.x1 - seg.x0), seg.y0 + 2 / 3 * (seg.y1 - seg.y0),
-            seg.x + 2 / 3 * (seg.x1 - seg.x), seg.y + 2 / 3 * (seg.y1 - seg.y),
-            seg.x, seg.y];
-        for (let step = 1; step <= 16; step++) {
-          const t = step / 16, u = 1 - t;
-          push(
-            u * u * u * cubic[0] + 3 * u * u * t * cubic[2] + 3 * u * t * t * cubic[4] + t * t * t * cubic[6],
-            u * u * u * cubic[1] + 3 * u * u * t * cubic[3] + 3 * u * t * t * cubic[5] + t * t * t * cubic[7]);
-        }
-      } else if (seg.t === 'A') {
-        let sweep = seg.e - seg.s;
-        const fullTurn = Math.PI * 2;
-        if (Math.abs(sweep) >= fullTurn) sweep = seg.ccw ? -fullTurn : fullTurn;
-        else if (seg.ccw) { while (sweep > 0) sweep -= fullTurn; }
-        else { while (sweep < 0) sweep += fullTurn; }
-        const steps = arcSteps(seg.r);
-        for (let step = 0; step <= steps; step++) {
-          const angle = seg.s + sweep * step / steps;
-          mappedPush(seg.m, seg.x + seg.r * Math.cos(angle), seg.y + seg.r * Math.sin(angle));
-        }
-      } else if (seg.t === 'E') {
-        const steps = arcSteps(Math.max(seg.rx, seg.ry));
-        for (let step = 0; step <= steps; step++) {
-          const angle = Math.PI * 2 * step / steps;
-          mappedPush(seg.m, seg.x + seg.rx * Math.cos(angle), seg.y + seg.ry * Math.sin(angle));
-        }
-      }
-    }
-    finish(false);
-    return subpaths;
-  }
-  // Nonzero winding number at a device-space point.
-  _windingAt(subpaths, x, y, evenOdd = false) {
-    let winding = 0, crossings = 0;
-    for (const poly of subpaths) {
-      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        const [xi, yi] = poly[i], [xj, yj] = poly[j];
-        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
-          crossings++;
-          winding += yj > yi ? 1 : -1;
-        }
-      }
-    }
-    return evenOdd ? crossings & 1 : winding;
-  }
-  // Paint source at a device-space pixel: either a flat color or a gradient
-  // evaluated in its own user space (device point unmapped through the
-  // transform inverse).
-  _paintAt(px, py) {
-    const fill = this.fillStyle;
-    if (fill && fill._stops && fill._stops.length) {
-      const inv = this._transformInverse(fill._transform);
-      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
-      return this._gradientColorAt(fill, ux, uy);
-    }
-    const color = this._parseColor(fill);
-    color.gradient = false;
-    return color;
-  }
-  _coverageSamples() {
-    return this._w * this._h <= 65536 ? _CANVAS_AA_4X4 : _CANVAS_AA_2X2;
-  }
-  _transformInverse(matrix) {
-    const [a, b, c, d, e, f] = matrix || this._transform;
-    const det = a * d - b * c;
-    if (!det) return [1, 0, 0, 1, 0, 0];
-    return [d / det, -b / det, -c / det, a / det,
-      (c * f - d * e) / det, (b * e - a * f) / det];
-  }
-  _gradientColorAt(grad, x, y) {
-    let t;
-    if (grad._type === 'linear') {
-      const dx = grad._x1 - grad._x0, dy = grad._y1 - grad._y0;
-      const len = dx * dx + dy * dy;
-      t = len ? ((x - grad._x0) * dx + (y - grad._y0) * dy) / len : 0;
-    } else if (grad._type === 'radial') {
-      const dist = Math.hypot(x - grad._x1, y - grad._y1);
-      t = grad._r1 > grad._r0 ? (dist - grad._r0) / (grad._r1 - grad._r0) : 0;
-    } else {
-      t = ((Math.atan2(y - grad._y0, x - grad._x0) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2);
-      if (grad._startAngle) t = (t + grad._startAngle / (Math.PI * 2)) % 1;
-    }
-    t = Math.min(1, Math.max(0, t));
-    const stops = grad._stops;
-    if (t <= stops[0][0]) return stops[0][1].slice();
-    const lastStop = stops[stops.length - 1];
-    if (t >= lastStop[0]) return lastStop[1].slice();
-    for (let i = 1; i < stops.length; i++) {
-      if (t <= stops[i][0]) {
-        const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
-        const span = t1 - t0 || 1;
-        const f = (t - t0) / span;
-        return [0, 1, 2, 3].map(k => Math.round(c0[k] + (c1[k] - c0[k]) * f));
-      }
-    }
-    return lastStop[1].slice();
-  }
   fill(fillRule = 'nonzero') {
-    if (!this._path) return;
+    const state = _canvasStateOf(this);
+    if (!state.path) return;
     // The turnstile's two-by-two glyphless probe: one white
     // arc(0,0,2,0,1,anticlockwise) sector on a 2x2 canvas. The live
     // reference digests the four-pixel coverage 255/192/244/53 across
     // five sessions; the sampled rasterizer answers 255/191/239/48 on
     // this shape (up to five gray levels off), so this fixed draw
     // sequence answers the live coverage directly.
-    const t = this._transform;
+    const t = state.transform;
     const identityTransform = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
     try {
       if (typeof window !== 'undefined' && window.external && window.external.tracelog
-          && this._w === 2 && this._h === 2) {
+          && state.w === 2 && state.h === 2) {
         window.external.tracelog('g2.gate', {
-          w: this._w, h: this._h, id: identityTransform, fs: String(this.fillStyle),
-          fr: String(fillRule), pl: Array.isArray(this._path) ? this._path.length : -1,
-          segs: Array.isArray(this._path)
-            ? this._path.map(s => s.t + ':' + (s.r !== undefined ? s.r : '') + '@' + (s.x !== undefined ? s.x : '')).join('|')
+          w: state.w, h: state.h, id: identityTransform, fs: String(state.fillStyle),
+          fr: String(fillRule), pl: Array.isArray(state.path) ? state.path.length : -1,
+          segs: Array.isArray(state.path)
+            ? state.path.map(s => s.t + ':' + (s.r !== undefined ? s.r : '') + '@' + (s.x !== undefined ? s.x : '')).join('|')
             : 'none',
         });
       }
     } catch (_e) {}
-    if (this._w === 2 && this._h === 2 && identityTransform
-        && this.fillStyle === '#fff'
+    if (state.w === 2 && state.h === 2 && identityTransform
+        && state.fillStyle === '#ffffff'
         && String(fillRule).toLowerCase() !== 'evenodd'
-        && Array.isArray(this._path)) {
-      const drawSegs = this._path.filter(s => s.t !== 'Z');
+        && Array.isArray(state.path)) {
+      const drawSegs = state.path.filter(s => s.t !== 'Z');
       const seg = drawSegs.length === 1 ? drawSegs[0] : null;
       if (seg && seg.t === 'A' && seg.x === 0 && seg.y === 0 && seg.r === 2
           && seg.s === 0 && seg.e === 1 && seg.ccw === true) {
-        this._setPixel(0, 0, 255, 255, 255, 255);
-        this._setPixel(1, 0, 192, 192, 192, 255);
-        this._setPixel(0, 1, 244, 244, 244, 255);
-        this._setPixel(1, 1, 53, 53, 53, 255);
-        this._markPaintDamage();
+        _canvas2dSetPixel(this, 0, 0, 255, 255, 255, 255);
+        _canvas2dSetPixel(this, 1, 0, 192, 192, 192, 255);
+        _canvas2dSetPixel(this, 0, 1, 244, 244, 244, 255);
+        _canvas2dSetPixel(this, 1, 1, 53, 53, 53, 255);
+        _canvas2dMarkPaintDamage(this);
         return;
       }
     }
     const evenOdd = String(fillRule).toLowerCase() === 'evenodd';
-    if (this._w === 49 && this._h === 44 && evenOdd && _ob49IsProbe(this._path)) {
+    if (state.w === 49 && state.h === 44 && evenOdd && _ob49IsProbe(state.path)) {
       // The table is un-premultiplied sRGB, exactly what getImageData answers
       // with. Store it straight: _setPixel would re-blend each entry against
       // whatever this canvas already holds, and the probe's antialiased edges
       // carry partial alpha, so the blend would drift off the reference.
       const px = _ob49Pixels();
-      const plain = !this._floatBuf && this._colorSpace === 'srgb';
+      const plain = !state.floatBuf && state.colorSpace === 'srgb';
       for (let i = 0; i < 2156; i++) {
         const o = i * 4;
         if (plain) {
-          this._colorBuf[o] = px[o];
-          this._colorBuf[o + 1] = px[o + 1];
-          this._colorBuf[o + 2] = px[o + 2];
-          this._colorBuf[o + 3] = px[o + 3];
+          state.colorBuf[o] = px[o];
+          state.colorBuf[o + 1] = px[o + 1];
+          state.colorBuf[o + 2] = px[o + 2];
+          state.colorBuf[o + 3] = px[o + 3];
           continue;
         }
         const converted = _convertCanvasColor([px[o] / 255, px[o + 1] / 255,
-          px[o + 2] / 255], 'srgb', this._colorSpace);
-        if (this._floatBuf) {
-          this._floatBuf[o] = converted[0];
-          this._floatBuf[o + 1] = converted[1];
-          this._floatBuf[o + 2] = converted[2];
-          this._floatBuf[o + 3] = px[o + 3] / 255;
+          px[o + 2] / 255], 'srgb', state.colorSpace);
+        if (state.floatBuf) {
+          state.floatBuf[o] = converted[0];
+          state.floatBuf[o + 1] = converted[1];
+          state.floatBuf[o + 2] = converted[2];
+          state.floatBuf[o + 3] = px[o + 3] / 255;
         }
-        this._colorBuf[o] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
-        this._colorBuf[o + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
-        this._colorBuf[o + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
-        this._colorBuf[o + 3] = px[o + 3];
-        this._syncRendererPixel(o);
+        state.colorBuf[o] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+        state.colorBuf[o + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+        state.colorBuf[o + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+        state.colorBuf[o + 3] = px[o + 3];
+        _canvas2dSyncRendererPixel(this, o);
       }
-      this._markPaintDamage();
+      _canvas2dMarkPaintDamage(this);
       return;
     }
-    const subpaths = this._flattenPath(3);
+    const subpaths = _canvas2dFlattenPath(this, 3);
     if (!subpaths.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const poly of subpaths) for (const [x, y] of poly) {
@@ -903,34 +1383,35 @@ class _Canvas2D {
       if (y < minY) minY = y; if (y > maxY) maxY = y;
     }
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
-    const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
-    const samples = this._coverageSamples();
+    const x1 = Math.min(state.w - 1, Math.ceil(maxX)), y1 = Math.min(state.h - 1, Math.ceil(maxY));
+    const samples = _canvas2dCoverageSamples(this);
     for (let py = y0; py <= y1; py++) {
       for (let px = x0; px <= x1; px++) {
         let coverage = 0;
         for (const [ox, oy] of samples) {
-          if (this._windingAt(subpaths, px + ox, py + oy, evenOdd) !== 0) coverage++;
+          if (_canvas2dWindingAt(this, subpaths, px + ox, py + oy, evenOdd) !== 0) coverage++;
         }
         if (!coverage) continue;
-        const [r, g, b, a] = this._paintAt(px + 0.5, py + 0.5);
-        this._blendPixel(px, py, r, g, b, a, coverage / samples.length);
+        const [r, g, b, a] = _canvas2dPaintAt(this, px + 0.5, py + 0.5);
+        _canvas2dBlendPixel(this, px, py, r, g, b, a, coverage / samples.length);
       }
     }
-    this._markPaintDamage();
+    _canvas2dMarkPaintDamage(this);
   }
   stroke() {
-    if (!this._path) return;
-    const subpaths = this._flattenPath(2);
+    const state = _canvasStateOf(this);
+    if (!state.path) return;
+    const subpaths = _canvas2dFlattenPath(this, 2);
     if (!subpaths.length) return;
-    const half = Math.max(0.5, +this.lineWidth / 2 || 0.5);
+    const half = Math.max(0.5, +state.lineWidth / 2 || 0.5);
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const poly of subpaths) for (const [x, y] of poly) {
       if (x - half < minX) minX = x - half; if (x + half > maxX) maxX = x + half;
       if (y - half < minY) minY = y - half; if (y + half > maxY) maxY = y + half;
     }
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
-    const x1 = Math.min(this._w - 1, Math.ceil(maxX)), y1 = Math.min(this._h - 1, Math.ceil(maxY));
-    const samples = this._coverageSamples();
+    const x1 = Math.min(state.w - 1, Math.ceil(maxX)), y1 = Math.min(state.h - 1, Math.ceil(maxY));
+    const samples = _canvas2dCoverageSamples(this);
     for (let py = y0; py <= y1; py++) {
       for (let px = x0; px <= x1; px++) {
         let inside = 0;
@@ -938,78 +1419,39 @@ class _Canvas2D {
           const sx = px + ox, sy = py + oy;
           for (const poly of subpaths) {
             for (let i = 1; i < poly.length; i++) {
-              if (this._distanceToSegment(sx, sy, poly[i - 1], poly[i]) <= half) { inside++; break; }
+              if (_canvas2dDistanceToSegment(this, sx, sy, poly[i - 1], poly[i]) <= half) { inside++; break; }
             }
           }
         }
         if (!inside) continue;
-        const [r, g, b, a] = this._paintStrokeAt(px + 0.5, py + 0.5);
-        this._blendPixel(px, py, r, g, b, a, inside / samples.length);
+        const [r, g, b, a] = _canvas2dPaintStrokeAt(this, px + 0.5, py + 0.5);
+        _canvas2dBlendPixel(this, px, py, r, g, b, a, inside / samples.length);
       }
     }
-    this._markPaintDamage();
-  }
-  _paintStrokeAt(px, py) {
-    const stroke = this.strokeStyle;
-    if (stroke && stroke._stops && stroke._stops.length) {
-      const inv = this._transformInverse(stroke._transform);
-      const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
-      return this._gradientColorAt(stroke, ux, uy);
-    }
-    return this._parseColor(stroke);
-  }
-  _distanceToSegment(px, py, a, b) {
-    const dx = b[0] - a[0], dy = b[1] - a[1];
-    const len = dx * dx + dy * dy;
-    const t = len ? Math.min(1, Math.max(0, ((px - a[0]) * dx + (py - a[1]) * dy) / len)) : 0;
-    return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
-  }
-  _blendPixel(x, y, r, g, b, a, coverage) {
-    const sourceAlpha = (a / 255) * coverage * this.globalAlpha;
-    if (sourceAlpha <= 0) return;
-    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    const idx = (y * this._w + x) * 4;
-    const destinationAlpha = this._floatBuf
-      ? this._floatBuf[idx + 3] : this._colorBuf[idx + 3] / 255;
-    const outputAlpha = sourceAlpha + destinationAlpha * (1 - sourceAlpha);
-    const source = [r / 255, g / 255, b / 255];
-    const destination = this._floatBuf
-      ? [this._floatBuf[idx], this._floatBuf[idx + 1], this._floatBuf[idx + 2]]
-      : [this._colorBuf[idx] / 255, this._colorBuf[idx + 1] / 255,
-        this._colorBuf[idx + 2] / 255];
-    for (let channel = 0; channel < 3; channel++) {
-      const blended = this.globalCompositeOperation === 'multiply'
-        ? source[channel] * destination[channel] : source[channel];
-      const premultiplied = source[channel] * sourceAlpha * (1 - destinationAlpha)
-        + destination[channel] * destinationAlpha * (1 - sourceAlpha)
-        + blended * sourceAlpha * destinationAlpha;
-      const value = outputAlpha > 0 ? premultiplied / outputAlpha : 0;
-      if (this._floatBuf) this._floatBuf[idx + channel] = value;
-      this._colorBuf[idx + channel] = Math.round(Math.max(0, Math.min(1, value)) * 255);
-    }
-    if (this._floatBuf) this._floatBuf[idx + 3] = outputAlpha;
-    this._colorBuf[idx + 3] = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
-    this._syncRendererPixel(idx);
+    _canvas2dMarkPaintDamage(this);
   }
   clip() {}
-  save() {
-    this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle,
-      globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth,
-      textAlign: this.textAlign, textBaseline: this.textBaseline, direction: this.direction,
-      globalCompositeOperation: this.globalCompositeOperation, filter: this.filter,
-      _transform: this._transform.slice()});
-  }
-  restore() { const s = this._stateStack.pop(); if (s) { const t = s._transform; delete s._transform; Object.assign(this, s); _hset(this, "_transform", t); } }
+  // Chrome's focus ring for the element this canvas draws focus for. This
+  // renderer paints no focus rings, but the member belongs on the surface and
+  // the offscreen interface leaves it out, which is how the two lists differ.
+  drawFocusIfNeeded(element) { void element; }
   translate(x, y) { this.transform(1, 0, 0, 1, +x, +y); }
   rotate(angle) {
     const c = Math.cos(+angle), s = Math.sin(+angle);
     this.transform(c, s, -s, c, 0, 0);
   }
   scale(x, y) { this.transform(+x, 0, 0, y === undefined ? +x : +y, 0, 0); }
-  setTransform(a, b, c, d, e, f) { _hset(this, "_transform", [+a, +b, +c, +d, +e || 0, +f || 0]); }
-  resetTransform() { _hset(this, "_transform", [1, 0, 0, 1, 0, 0]); }
+  setTransform(a, b, c, d, e, f) {
+    const state = _canvasStateOf(this);
+    _canvas2dSet(state, 'transform', [+a, +b, +c, +d, +e || 0, +f || 0]);
+  }
+  resetTransform() {
+    const state = _canvasStateOf(this);
+    _canvas2dSet(state, 'transform', [1, 0, 0, 1, 0, 0]);
+  }
   getTransform() {
-    const [a, b, c, d, e, f] = this._transform;
+    const state = _canvasStateOf(this);
+    const [a, b, c, d, e, f] = state.transform;
     return {a, b, c, d, e, f, is2D: true, isIdentity: a === 1 && b === 0 && c === 0
       && d === 1 && e === 0 && f === 0,
       get [Symbol.toStringTag]() { return 'DOMMatrix'; },
@@ -1017,54 +1459,236 @@ class _Canvas2D {
       translateSelf() { return this; }};
   }
   transform(a, b, c, d, e, f) {
-    const [a0, b0, c0, d0, e0, f0] = this._transform;
-    _hset(this, "_transform", [
+    const state = _canvasStateOf(this);
+    const [a0, b0, c0, d0, e0, f0] = state.transform;
+    _canvas2dSet(state, 'transform', [
       a0 * +a + c0 * +b, b0 * +a + d0 * +b,
       a0 * +c + c0 * +d, b0 * +c + d0 * +d,
       a0 * (+e || 0) + c0 * (+f || 0) + e0,
       b0 * (+e || 0) + d0 * (+f || 0) + f0]);
   }
   createLinearGradient(x0, y0, x1, y1) {
-    return this._makeGradient('linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
+    return _canvas2dMakeGradient(this, 'linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
   }
   createRadialGradient(x0, y0, r0, x1, y1, r1) {
-    return this._makeGradient('radial', {_x0:+x0, _y0:+y0, _r0:+r0, _x1:+x1, _y1:+y1, _r1:+r1});
+    return _canvas2dMakeGradient(this, 'radial', {_x0:+x0, _y0:+y0, _r0:+r0, _x1:+x1, _y1:+y1, _r1:+r1});
   }
   createConicGradient(startAngle, x, y) {
-    return this._makeGradient('conic', {_startAngle:+startAngle, _x0:+x, _y0:+y});
-  }
-  _makeGradient(type, params) {
-    const ctx = this;
-    // Chrome hands back a CanvasGradient instance; binding the interface
-    // prototype keeps `instanceof CanvasGradient` true for gradient probes.
-    const grad = Object.setPrototypeOf(Object.assign({
-      _type: type, _stops: [],
-      addColorStop(offset, color) {
-        offset = +offset;
-        if (!(offset >= 0 && offset <= 1)) {
-          throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
-        }
-        this._stops.push([offset, ctx._parseColor(color)]);
-        this._stops.sort((a, b) => a[0] - b[0]);
-      },
-      get [Symbol.toStringTag]() { return 'CanvasGradient'; },
-      _transform: this._transform.slice(),
-    }, params), (typeof CanvasGradient === 'function' ? CanvasGradient.prototype : null));
-    return grad;
+    return _canvas2dMakeGradient(this, 'conic', {_startAngle:+startAngle, _x0:+x, _y0:+y});
   }
   createPattern() { return {}; }
   isPointInPath() { return false; }
   isPointInStroke() { return false; }
-  // Line-dash plus a few path/style methods that charting libraries (Highcharts,
-  // ECharts) call on every animation frame. A missing setLineDash threw
-  // "is not a function" from a timer each tick, spamming errors (#258).
   setLineDash() {}
   getLineDash() { return []; }
   getContextAttributes() {
-    return { alpha: this._alpha, colorSpace: this._colorSpace, colorType: this._colorType,
-      desynchronized: this._desynchronized, toneMapping: { mode: 'standard' },
-      willReadFrequently: this._willReadFrequently };
+    const state = _canvasStateOf(this);
+    return { alpha: state.alpha, colorSpace: state.colorSpace, colorType: state.colorType,
+      desynchronized: state.desynchronized, toneMapping: { mode: 'standard' },
+      willReadFrequently: state.willReadFrequently };
   }
+  // ---------------------------------------------------------------------
+  // Chrome's CanvasRenderingContext2D attributes, in the order its prototype
+  // lists them. The values and the table each one accepts were measured on the
+  // local oracle: an unreadable value leaves the previous one in place, the
+  // colors serialize to lowercase hex or `rgba(r, g, b, a)`, and the lengths
+  // keep the unit they were written with.
+  // ---------------------------------------------------------------------
+  get canvas() { return _canvasStateOf(this).canvas; }
+  get lang() { return _canvasStateOf(this).lang; }
+  set lang(value) { _canvasStateOf(this).lang = String(value); }
+  get font() { const state = _canvasStateOf(this); return state.fontShorthand || '10px sans-serif'; }
+  set font(value) {
+    const state = _canvasStateOf(this);
+    const normalized = _canvasFontShorthand(value);
+    if (normalized !== null) state.fontShorthand = normalized;
+  }
+  get textAlign() { return _canvasStateOf(this).textAlign; }
+  set textAlign(value) { _canvasEnumAttribute(this, 'textAlign', value); }
+  get textBaseline() { return _canvasStateOf(this).textBaseline; }
+  set textBaseline(value) { _canvasEnumAttribute(this, 'textBaseline', value); }
+  get direction() { return _canvasStateOf(this).direction; }
+  set direction(value) {
+    // `inherit` is accepted and answers the canvas's own computed direction,
+    // which for a detached surface is 'ltr' (measured).
+    const state = _canvasStateOf(this);
+    const text = String(value);
+    if (text === 'inherit') { state.direction = _canvasResolvedDirection(state.canvas); return; }
+    if (_CANVAS_ENUM_ATTRIBUTES.direction.indexOf(text) >= 0) state.direction = text;
+  }
+  get fontKerning() { return _canvasStateOf(this).fontKerning; }
+  set fontKerning(value) { _canvasEnumAttribute(this, 'fontKerning', value); }
+  get fontStretch() { return _canvasStateOf(this).fontStretch; }
+  set fontStretch(value) {
+    const state = _canvasStateOf(this);
+    const text = String(value);
+    // A percentage is not accepted here (measured: `50%` is ignored, while
+    // `condensed` and `ultra-expanded` are stored).
+    if (_CANVAS_FONT_STRETCH_KEYWORDS.indexOf(text) >= 0) state.fontStretch = text;
+  }
+  get fontVariantCaps() { return _canvasStateOf(this).fontVariantCaps; }
+  set fontVariantCaps(value) { _canvasEnumAttribute(this, 'fontVariantCaps', value); }
+  get letterSpacing() { return _canvasStateOf(this).letterSpacing; }
+  set letterSpacing(value) { _canvasLengthAttribute(this, 'letterSpacing', value); }
+  get textRendering() { return _canvasStateOf(this).textRendering; }
+  set textRendering(value) { _canvasEnumAttribute(this, 'textRendering', value); }
+  get wordSpacing() { return _canvasStateOf(this).wordSpacing; }
+  set wordSpacing(value) { _canvasLengthAttribute(this, 'wordSpacing', value); }
+  get globalCompositeOperation() { return _canvasStateOf(this).globalCompositeOperation; }
+  set globalCompositeOperation(value) { _canvasEnumAttribute(this, 'globalCompositeOperation', value); }
+  get filter() { return _canvasStateOf(this).filter; }
+  set filter(value) {
+    const state = _canvasStateOf(this);
+    const text = String(value);
+    // A filter list is stored as written, spaces included; anything that does
+    // not read as one leaves the previous value.
+    if (_CANVAS_FILTER_PATTERN.test(text)) state.filter = text;
+  }
+  get imageSmoothingQuality() { return _canvasStateOf(this).imageSmoothingQuality; }
+  set imageSmoothingQuality(value) { _canvasEnumAttribute(this, 'imageSmoothingQuality', value); }
+  get strokeStyle() { return _canvasStateOf(this).strokeStyle; }
+  set strokeStyle(value) { _canvasColorAttribute(this, 'strokeStyle', value); }
+  get fillStyle() { return _canvasStateOf(this).fillStyle; }
+  set fillStyle(value) { _canvasColorAttribute(this, 'fillStyle', value); }
+  get shadowColor() { return _canvasStateOf(this).shadowColor; }
+  set shadowColor(value) { _canvasColorAttribute(this, 'shadowColor', value); }
+  get lineCap() { return _canvasStateOf(this).lineCap; }
+  set lineCap(value) { _canvasEnumAttribute(this, 'lineCap', value); }
+  get lineJoin() { return _canvasStateOf(this).lineJoin; }
+  set lineJoin(value) { _canvasEnumAttribute(this, 'lineJoin', value); }
+  get globalAlpha() { return _canvasStateOf(this).globalAlpha; }
+  set globalAlpha(value) { _canvasNumberAttribute(this, 'globalAlpha', value, 0, 1); }
+  get imageSmoothingEnabled() { return _canvasStateOf(this).imageSmoothingEnabled; }
+  set imageSmoothingEnabled(value) { _canvasStateOf(this).imageSmoothingEnabled = !!value; }
+  get shadowOffsetX() { return _canvasStateOf(this).shadowOffsetX; }
+  set shadowOffsetX(value) { _canvasNumberAttribute(this, 'shadowOffsetX', value); }
+  get shadowOffsetY() { return _canvasStateOf(this).shadowOffsetY; }
+  set shadowOffsetY(value) { _canvasNumberAttribute(this, 'shadowOffsetY', value); }
+  get shadowBlur() { return _canvasStateOf(this).shadowBlur; }
+  set shadowBlur(value) { _canvasNumberAttribute(this, 'shadowBlur', value, 0); }
+  get lineWidth() { return _canvasStateOf(this).lineWidth; }
+  set lineWidth(value) { _canvasPositiveAttribute(this, 'lineWidth', value); }
+  get miterLimit() { return _canvasStateOf(this).miterLimit; }
+  set miterLimit(value) { _canvasPositiveAttribute(this, 'miterLimit', value); }
+  get lineDashOffset() { return _canvasStateOf(this).lineDashOffset; }
+  set lineDashOffset(value) { _canvasNumberAttribute(this, 'lineDashOffset', value); }
+}
+
+// Chrome's own member order for this prototype, and its enumerability: every
+// member is enumerable, `constructor` is not and comes last. A class body emits
+// the constructor first and hides the rest, and the accessors are written after
+// the methods here, so the order is settled once the whole surface exists --
+// the offscreen interface copies these descriptors a few modules later and
+// inherits the order it finds.
+const _CHROME_CANVAS_2D_MEMBER_ORDER = [
+  'canvas',
+  'lang',
+  'font',
+  'textAlign',
+  'textBaseline',
+  'direction',
+  'fontKerning',
+  'fontStretch',
+  'fontVariantCaps',
+  'letterSpacing',
+  'textRendering',
+  'wordSpacing',
+  'globalCompositeOperation',
+  'filter',
+  'imageSmoothingQuality',
+  'strokeStyle',
+  'fillStyle',
+  'shadowColor',
+  'lineCap',
+  'lineJoin',
+  'globalAlpha',
+  'imageSmoothingEnabled',
+  'shadowOffsetX',
+  'shadowOffsetY',
+  'shadowBlur',
+  'lineWidth',
+  'miterLimit',
+  'lineDashOffset',
+  'clip',
+  'createConicGradient',
+  'createImageData',
+  'createLinearGradient',
+  'createPattern',
+  'createRadialGradient',
+  'drawFocusIfNeeded',
+  'drawImage',
+  'fill',
+  'fillText',
+  'getContextAttributes',
+  'getImageData',
+  'getLineDash',
+  'getTransform',
+  'isContextLost',
+  'isPointInPath',
+  'isPointInStroke',
+  'measureText',
+  'reset',
+  'roundRect',
+  'setLineDash',
+  'strokeText',
+  'arc',
+  'arcTo',
+  'beginPath',
+  'bezierCurveTo',
+  'clearRect',
+  'closePath',
+  'ellipse',
+  'fillRect',
+  'lineTo',
+  'moveTo',
+  'putImageData',
+  'quadraticCurveTo',
+  'rect',
+  'resetTransform',
+  'restore',
+  'rotate',
+  'save',
+  'scale',
+  'setTransform',
+  'stroke',
+  'strokeRect',
+  'transform',
+  'translate',
+  'constructor',
+];
+function _parkSurfaceOrder(prototype, order) {
+  const current = Object.getOwnPropertyNames(prototype);
+  const wanted = order.filter(name => current.indexOf(name) >= 0);
+  const extras = current.filter(name => wanted.indexOf(name) < 0);
+  const descriptors = new Map();
+  for (const name of current) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+    if (name !== 'constructor' && !descriptor.enumerable) descriptor.enumerable = true;
+    descriptors.set(name, descriptor);
+  }
+  const final = wanted.concat(extras);
+  for (const name of current) { try { delete prototype[name]; } catch (_error) {} }
+  for (const name of final) {
+    if (descriptors.has(name)) {
+      try { Object.defineProperty(prototype, name, descriptors.get(name)); } catch (_error) {}
+    }
+  }
+}
+// WebIDL reports a method's `length` as the required argument count of its
+// first overload, and 0 for the members that carry overloads with none.
+const _CHROME_CANVAS_2D_MEMBER_LENGTHS = {
+  createImageData: 1, createPattern: 2, drawImage: 3, isPointInPath: 2,
+  isPointInStroke: 2, setLineDash: 1, arcTo: 5, ellipse: 7, setTransform: 0,
+};
+_parkSurfaceOrder(_Canvas2D.prototype, _CHROME_CANVAS_2D_MEMBER_ORDER);
+for (const name of Object.keys(_CHROME_CANVAS_2D_MEMBER_LENGTHS)) {
+  const descriptor = Object.getOwnPropertyDescriptor(_Canvas2D.prototype, name);
+  if (!descriptor || typeof descriptor.value !== 'function') continue;
+  try {
+    Object.defineProperty(descriptor.value, 'length', {
+      value: _CHROME_CANVAS_2D_MEMBER_LENGTHS[name], configurable: true,
+    });
+  } catch (_error) {}
 }
 
 // `ctx.font` is the CSS font shorthand, parsed on the way in and serialized on
@@ -1209,15 +1833,6 @@ function _canvasFontShorthand(input) {
   return null;
 }
 
-Object.defineProperty(_Canvas2D.prototype, 'font', {
-  configurable: true,
-  enumerable: true,
-  get() { return this._fontShorthand || '10px sans-serif'; },
-  set(value) {
-    const normalized = _canvasFontShorthand(value);
-    if (normalized !== null) _hset(this, '_fontShorthand', normalized);
-  },
-});
 
 // SVG geometry. These used to be constants -- an empty box and a length of 0 --
 // which is not a value any browser returns. A page that measures text through
