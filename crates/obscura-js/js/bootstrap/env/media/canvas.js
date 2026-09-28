@@ -1067,6 +1067,158 @@ class _Canvas2D {
   }
 }
 
+// `ctx.font` is the CSS font shorthand, parsed on the way in and serialized on
+// the way out; it is not a string store. The oracle (Chrome, this host) answers
+// `72px Geneva, monospace` for a set of `72px "Geneva", monospace`, drops the
+// `normal` keywords, the stretch keywords and any `/line-height`, reduces
+// `700`/`bolder` to `bold` and the absolute lengths and size keywords to px,
+// and leaves the previous font in place when the value does not parse at all
+// (`bogus`, `''`, `12`, `'Single' 12px serif`). A probe that round-trips the
+// property reads those rules back, so the setter stores the serialized form and
+// the getter answers it.
+const _CANVAS_FONT_SYSTEM = {
+  caption: '16px Arial', icon: '16px Arial', menu: '16px Arial',
+  'message-box': '16px Arial', 'small-caption': '16px Arial', 'status-bar': '16px Arial',
+};
+const _CANVAS_FONT_STRETCH = new Set([
+  'ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed',
+  'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded',
+]);
+const _CANVAS_FONT_SIZE_KEYWORD = {
+  'xx-small': 9, 'x-small': 10, small: 13, medium: 16,
+  large: 18, 'x-large': 24, 'xx-large': 32, 'xxx-large': 48,
+};
+const _CANVAS_FONT_GENERIC = new Set([
+  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', 'math', 'emoji', 'fangsong',
+]);
+const _CANVAS_FONT_ABSOLUTE_PX = {
+  px: 1, pt: 96 / 72, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,
+};
+// Relative lengths stay as authored: Chrome resolves them against a base that
+// moves with the family (1em is 10px for `serif` and 8.125px for `monospace`),
+// which this engine does not model yet.
+const _CANVAS_FONT_RELATIVE = /^(?:em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vmin|vmax|vi|vb|%|smaller|larger)$/;
+const _CANVAS_FONT_LENGTH = /^([+-]?(?:\d+\.?\d*|\.\d+))([a-z%]*)$/i;
+
+/// The size token's px value, the token itself when it is a relative length
+/// (kept as authored), or null when the token is not a size at all.
+function _canvasFontSize(token) {
+  const match = _CANVAS_FONT_LENGTH.exec(token);
+  if (!match) return null;
+  const amount = parseFloat(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  const unit = match[2].toLowerCase();
+  if (unit === '') return amount === 0 ? '0px' : null;
+  if (_CANVAS_FONT_RELATIVE.test(unit)) return match[1] + unit;
+  const factor = _CANVAS_FONT_ABSOLUTE_PX[unit];
+  if (factor === undefined) return null;
+  // Chrome's serializer keeps four decimals: 10pt reads back 13.3333px.
+  return String(Math.round(amount * factor * 10000) / 10000) + 'px';
+}
+
+/// One family name, re-quoted the way Chrome serializes it: a bare identifier
+/// loses its quotes, anything else keeps them.
+function _canvasFontFamily(token) {
+  const raw = token.trim();
+  if (!raw) return null;
+  const quoted = raw.length > 1 && (raw[0] === '"' || raw[0] === "'")
+    && raw[raw.length - 1] === raw[0];
+  if (!quoted && /^["']/.test(raw)) return null;
+  const name = quoted ? raw.slice(1, -1) : raw;
+  if (!name || /["\\]/.test(name)) return null;
+  if (!quoted && _CANVAS_FONT_GENERIC.has(name.toLowerCase())) return name.toLowerCase();
+  if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(name)) return name;
+  return '"' + name + '"';
+}
+
+function _canvasFontFamilies(text) {
+  const parts = [];
+  for (const token of text.split(',')) {
+    const family = _canvasFontFamily(token);
+    if (family === null) return null;
+    parts.push(family);
+  }
+  return parts.length ? parts.join(', ') : null;
+}
+
+/// The parsed shorthand serialized back, or null when Chrome would leave the
+/// previous font in place.
+function _canvasFontShorthand(input) {
+  const text = String(input).trim();
+  if (!text) return null;
+  const system = _CANVAS_FONT_SYSTEM[text.toLowerCase()];
+  if (system) return system;
+  const tokens = text.split(/\s+/);
+  let style = null;
+  let weight = null;
+  let variant = null;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    const lower = token.toLowerCase();
+    const slash = token.indexOf('/');
+    const head = slash === -1 ? token : token.slice(0, slash);
+    const size = _canvasFontSize(head);
+    const keywordPx = slash === -1 ? _CANVAS_FONT_SIZE_KEYWORD[lower] : undefined;
+    const resolved = size !== null ? size
+      : keywordPx !== undefined ? String(keywordPx) + 'px' : null;
+    if (resolved !== null) {
+      const families = _canvasFontFamilies(tokens.slice(index + 1).join(' '));
+      if (families !== null) {
+        const parts = [];
+        if (style) parts.push(style);
+        if (weight) parts.push(weight);
+        if (variant) parts.push(variant);
+        parts.push(resolved, families);
+        return parts.join(' ');
+      }
+    }
+    // Keywords that may precede the size. A repeated slot is invalid.
+    if (lower === 'normal') continue;
+    if (lower === 'italic' || lower === 'oblique') {
+      if (style !== null) return null;
+      style = 'italic';
+      continue;
+    }
+    // `oblique <angle>` drops the style in Chrome's serializer (oracle:
+    // `oblique 10deg 12px serif` reads back `12px serif`).
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)deg$/.test(lower)) { style = null; continue; }
+    if (lower === 'small-caps') {
+      if (variant !== null) return null;
+      variant = 'small-caps';
+      continue;
+    }
+    if (lower === 'bold' || lower === 'bolder') {
+      if (weight !== null) return null;
+      weight = 'bold';
+      continue;
+    }
+    if (lower === 'lighter') {
+      if (weight !== null) return null;
+      weight = 'lighter';
+      continue;
+    }
+    if (/^[1-9]00$/.test(lower)) {
+      if (weight !== null) return null;
+      weight = lower === '400' ? null : lower === '700' ? 'bold' : lower;
+      continue;
+    }
+    if (_CANVAS_FONT_STRETCH.has(lower)) continue;
+    return null;
+  }
+  return null;
+}
+
+Object.defineProperty(_Canvas2D.prototype, 'font', {
+  configurable: true,
+  enumerable: true,
+  get() { return this._fontShorthand || '10px sans-serif'; },
+  set(value) {
+    const normalized = _canvasFontShorthand(value);
+    if (normalized !== null) _hset(this, '_fontShorthand', normalized);
+  },
+});
+
 // SVG geometry. These used to be constants -- an empty box and a length of 0 --
 // which is not a value any browser returns. A page that measures text through
 // SVG therefore got the same answer for every family and every string, and the
