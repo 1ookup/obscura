@@ -106,11 +106,71 @@ pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 fn default_language() -> String {
-    "en-US".to_string()
+    host_language()
 }
 
 fn default_languages() -> Vec<String> {
-    vec!["en-US".to_string()]
+    vec![default_language()]
+}
+
+/// Chrome reports the machine's preferred language, so the default identity
+/// derives it from the host instead of pinning one: an automation session
+/// stays on the machine's own voice, and a host without a readable locale
+/// falls back to `en-US`. Read once; every persona and serde default shares
+/// the answer.
+fn host_language() -> String {
+    static HOST_LANGUAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST_LANGUAGE
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                // GUI processes on macOS have no LANG; the global preference
+                // is where System Settings keeps the primary language.
+                if let Ok(output) = std::process::Command::new("defaults")
+                    .args(["read", "-g", "AppleLocale"])
+                    .output()
+                {
+                    if output.status.success() {
+                        if let Ok(text) = String::from_utf8(output.stdout) {
+                            if let Some(tag) = normalize_locale(text.trim()) {
+                                return tag;
+                            }
+                        }
+                    }
+                }
+            }
+            for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+                if let Ok(value) = std::env::var(key) {
+                    if let Some(tag) = normalize_locale(&value) {
+                        return tag;
+                    }
+                }
+            }
+            "en-US".to_string()
+        })
+        .clone()
+}
+
+/// `zh_CN.UTF-8`, `zh_CN@rg=zzzz`, `en_US` -> `zh-CN`/`en-US`; `C` and
+/// `POSIX` are not locales and answer None so the next source is tried.
+fn normalize_locale(raw: &str) -> Option<String> {
+    let base = raw.split('.').next().unwrap_or("").split('@').next().unwrap_or("");
+    let mut parts = base.split('_').filter(|part| !part.is_empty());
+    let language = parts.next()?;
+    // "C" and "POSIX" name the default locale, not a language.
+    if language.eq_ignore_ascii_case("c") || language.eq_ignore_ascii_case("posix") {
+        return None;
+    }
+    if language.len() < 2 || !language.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let language = language.to_ascii_lowercase();
+    match parts.next() {
+        Some(region) if region.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            Some(format!("{language}-{}", region.to_ascii_uppercase()))
+        }
+        _ => Some(language),
+    }
 }
 
 /// Overrides from `OBSCURA_FINGERPRINT_JSON`, the transport the `--fingerprint`
@@ -668,9 +728,19 @@ mod tests {
     #[test]
     fn default_is_a_macos_chrome_149_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
-        assert_eq!(fingerprint.language, "en-US");
-        assert_eq!(fingerprint.languages, vec!["en-US"]);
-        assert_eq!(fingerprint.accept_language(), "en-US,en;q=0.9");
+        // The language is the host's, not a constant: the surfaces must agree
+        // with whichever locale this machine reports (header synthesis
+        // included), which is the property the census reads.
+        let language = default_language();
+        assert_eq!(fingerprint.language, language);
+        assert_eq!(fingerprint.languages, vec![language.clone()]);
+        let expected_header = if language.contains('-') {
+            let base = language.split('-').next().unwrap();
+            format!("{language},{base};q=0.9")
+        } else {
+            language.clone()
+        };
+        assert_eq!(fingerprint.accept_language(), expected_header);
         assert_eq!(fingerprint.navigator_platform, "MacIntel");
         assert_eq!(fingerprint.ua_platform, "macOS");
         assert_eq!(fingerprint.ua_platform_version, MACOS_UA_PLATFORM_VERSION);
@@ -865,5 +935,16 @@ mod tests {
         assert_eq!(value["screen"]["deviceScaleFactor"], 2.0);
         assert_eq!(value["brands"][0]["brand"], "Google Chrome");
         assert_eq!(value["gpu"]["webgpuProfile"], "apple");
+    }
+
+    #[test]
+    fn normalizes_host_locale_spellings_to_bcp47() {
+        assert_eq!(normalize_locale("zh_CN.UTF-8"), Some("zh-CN".to_string()));
+        assert_eq!(normalize_locale("zh_CN@rg=zzzz"), Some("zh-CN".to_string()));
+        assert_eq!(normalize_locale("en_US"), Some("en-US".to_string()));
+        assert_eq!(normalize_locale("de"), Some("de".to_string()));
+        assert_eq!(normalize_locale("C"), None);
+        assert_eq!(normalize_locale("POSIX"), None);
+        assert_eq!(normalize_locale(""), None);
     }
 }
