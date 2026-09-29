@@ -1057,6 +1057,20 @@ function _canvas2dStrokeHit(subpaths, sx, sy, half, cap) {
     return false;
   }
 
+// Per-channel blend functions B(Cb, Cs), keyed by globalCompositeOperation. An
+// operator missing from this table composites as plain source, which is what
+// source-over does. The remaining separable modes (screen, overlay, darken,
+// lighten, color-dodge, color-burn, hard-light, soft-light, exclusion) are
+// more entries here. The four non-separable modes (hue, saturation, color,
+// luminosity) need the luminance helpers, and the Porter-Duff family
+// (source-in/out/atop, destination-*, copy, lighter, xor) needs the
+// composition factors rather than the blend function, so neither is a table
+// entry.
+const _canvas2dBlendFunctions = {
+  multiply: (backdrop, source) => backdrop * source,
+  difference: (backdrop, source) => Math.abs(backdrop - source),
+};
+
 function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
   const state = _canvasStateOf(self);
     const sourceAlpha = (a / 255) * coverage * state.globalAlpha;
@@ -1078,9 +1092,12 @@ function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
     // alpha independently would otherwise leave a full strength colour behind
     // at a sub quantum alpha, which getImageData reads back as a ghost.
     const storedAlpha = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
+    // Resolved once per pixel rather than once per channel. The arguments run
+    // backdrop first and source second, which is the B(Cb, Cs) order.
+    const blend = _canvas2dBlendFunctions[state.globalCompositeOperation];
     for (let channel = 0; channel < 3; channel++) {
-      const blended = state.globalCompositeOperation === 'multiply'
-        ? source[channel] * destination[channel] : source[channel];
+      const blended = blend === undefined
+        ? source[channel] : blend(destination[channel], source[channel]);
       const premultiplied = source[channel] * sourceAlpha * (1 - destinationAlpha)
         + destination[channel] * destinationAlpha * (1 - sourceAlpha)
         + blended * sourceAlpha * destinationAlpha;
