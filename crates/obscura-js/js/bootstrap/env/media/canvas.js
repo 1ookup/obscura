@@ -1268,6 +1268,47 @@ function _canvas2dShadowBelow(self, plan, mask, x0, y0, w, h) {
     }
   }
 
+// One intrinsic for every gradient and every install: the reference's
+// addColorStop is the same function object on the shared prototype, and
+// a per-install closure fails the probe's identity comparison. The
+// reference's addColorStop also answers [native code] from toString --
+// the probe's nativity check reads exactly this after the radial battery.
+function _canvas2dAddColorStopCreate() {
+  if (!_canvas2dAddColorStopIntrinsic) {
+    _canvas2dAddColorStopIntrinsic = function addColorStop(offset, color) {
+      offset = +offset;
+      if (!(offset >= 0 && offset <= 1)) {
+        throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
+      }
+      const st = _gradientState.get(this);
+      _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
+      if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this), color)]); st.stops.sort((a, b) => a[0] - b[0]); }
+    };
+    if (typeof _markNative === 'function') { _markNative(_canvas2dAddColorStopIntrinsic); }
+  }
+  return _canvas2dAddColorStopIntrinsic;
+}
+// CanvasGradient.prototype shaping, called once the surface-finalize shell
+// exists (config/proto-order-fixups.js). Chrome reads the prototype's own
+// keys as ["addColorStop","constructor"]; the shell mints constructor first
+// and the original code only installed addColorStop on the first
+// createLinearGradient, so an early census read
+// ["constructor","addColorStop"]. Pre-installing here and moving the
+// constructor to the tail fixes the order without touching the runtime
+// behavior -- _canvas2dMakeGradient keeps redefining the same key, which
+// never moves an own-key position.
+function _canvas2dInstallGradientProto() {
+  if (typeof CanvasGradient !== 'function' || !CanvasGradient.prototype) return;
+  const proto = CanvasGradient.prototype;
+  if (!Object.prototype.hasOwnProperty.call(proto, 'addColorStop')) {
+    Object.defineProperty(proto, 'addColorStop', {
+      value: _canvas2dAddColorStopCreate(),
+      writable: true, enumerable: true, configurable: true,
+    });
+  }
+  OBSCURA_GEOM_CTOR_LAST(proto);
+}
+
 function _canvas2dMakeGradient(self, type, params) {
   const state = _canvasStateOf(self);
     const ctx = self;
@@ -1289,26 +1330,8 @@ function _canvas2dMakeGradient(self, type, params) {
     // write (its `this`-keyed state lives in the retired map), leaving the
     // gradient with zero stops and the fill transparent.
     {
-      // One intrinsic for every gradient and every install: the reference's
-      // addColorStop is the same function object on the shared prototype, and
-      // a per-install closure fails the probe's identity comparison.
-      if (!_canvas2dAddColorStopIntrinsic) {
-        _canvas2dAddColorStopIntrinsic = function addColorStop(offset, color) {
-          offset = +offset;
-          if (!(offset >= 0 && offset <= 1)) {
-            throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
-          }
-          const st = _gradientState.get(this);
-          _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
-          if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this) || ctx, color)]); st.stops.sort((a, b) => a[0] - b[0]); }
-        };
-        // The reference's addColorStop answers [native code] from toString --
-        // the probe's nativity check reads exactly this after the radial
-        // battery.
-        if (typeof _markNative === 'function') { _markNative(_canvas2dAddColorStopIntrinsic); }
-      }
       Object.defineProperty(proto, 'addColorStop', {
-        value: _canvas2dAddColorStopIntrinsic,
+        value: _canvas2dAddColorStopCreate(),
         writable: true, enumerable: true, configurable: true,
       });
     }
@@ -2164,12 +2187,10 @@ class _Canvas2D {
   }
   getTransform() {
     const state = _canvasStateOf(this);
-    const [a, b, c, d, e, f] = state.transform;
-    return {a, b, c, d, e, f, is2D: true, isIdentity: a === 1 && b === 0 && c === 0
-      && d === 1 && e === 0 && f === 0,
-      get [Symbol.toStringTag]() { return 'DOMMatrix'; },
-      multiplySelf() { return this; }, scaleSelf() { return this; },
-      translateSelf() { return this; }};
+    // A real DOMMatrix instance: the reference's getTransform answers one
+    // (instanceof DOMMatrix, prototype accessors, no own keys), not a bare
+    // literal whose prototype is Object.prototype.
+    return new DOMMatrix(state.transform);
   }
   transform(a, b, c, d, e, f) {
     const state = _canvasStateOf(this);

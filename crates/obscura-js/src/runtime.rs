@@ -9911,8 +9911,9 @@ mod tests {
             serde_json::json!({
                 "tag": "[object TextMetrics]",
                 "ownProps": [],
+                // Chrome's own-key order: declared members first, the
+                // constructor last (the proto-order fixup moves it there).
                 "members": [
-                    "constructor",
                     "width",
                     "actualBoundingBoxLeft",
                     "actualBoundingBoxRight",
@@ -9923,6 +9924,7 @@ mod tests {
                     "hangingBaseline",
                     "alphabeticBaseline",
                     "ideographicBaseline",
+                    "constructor",
                 ],
                 "globalEnumerable": false,
                 "illegalConstructor":
@@ -24678,6 +24680,83 @@ RequestRedirect value",
                 "transformedRect": [true, false],
                 "pathCapturedTransform": true,
                 "fillRectPreservedPath": true,
+            })
+        );
+    }
+
+    /// Chrome reads an interface prototype's own keys as members first and
+    /// `constructor` last (WebIDL declaration order); the class-shaped
+    /// bootstrap interfaces used to read constructor-first, and the bench8
+    /// proto-order scan diffs exactly this list. This pins the fixed order
+    /// for the four interfaces from that scan plus the two L2 surfaces: the
+    /// MutationObserver prototype carries no internal `_notify` (it lives in
+    /// the instance's internal slot set beside _callback/_records), and
+    /// DOMMatrix reads as a real interface prototype (no Object.prototype
+    /// legacy methods, no own-key matrix fields, ctx.getTransform() answers
+    /// an actual instance whose *Self mutators compose the matrix).
+    #[test]
+    fn canvas_interface_prototypes_order_keys_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const order = (value) => Object.getOwnPropertyNames(Object.getPrototypeOf(value));
+                    const ctx = document.createElement('canvas').getContext('2d');
+                    const octx = new OffscreenCanvas(8, 8).getContext('2d');
+                    const matrix = ctx.getTransform();
+                    matrix.translateSelf(5, 0);
+                    matrix.scaleSelf(2, 2);
+                    return {
+                        gradientMain: order(ctx.createLinearGradient(0, 0, 1, 1)),
+                        gradientOff: order(octx.createLinearGradient(0, 0, 1, 1)),
+                        textMetrics: order(ctx.measureText('x')),
+                        imageData: order(ctx.createImageData(1, 1)),
+                        path2d: order(new Path2D()),
+                        mutationObserver: order(new MutationObserver(function() {})),
+                        domMatrix: order(ctx.getTransform()),
+                        matrixIsInstance: matrix instanceof DOMMatrix,
+                        matrixValues: [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f],
+                        matrixOwnKeys: Object.getOwnPropertyNames(matrix),
+                        noNotify: !Object.prototype.hasOwnProperty.call(
+                            MutationObserver.prototype, '_notify'),
+                        noDefineGetter: !Object.prototype.hasOwnProperty.call(
+                            DOMMatrix.prototype, '__defineGetter__'),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "gradientMain": ["addColorStop", "constructor"],
+                "gradientOff": ["addColorStop", "constructor"],
+                "textMetrics": [
+                    "width", "actualBoundingBoxLeft", "actualBoundingBoxRight",
+                    "fontBoundingBoxAscent", "fontBoundingBoxDescent",
+                    "actualBoundingBoxAscent", "actualBoundingBoxDescent",
+                    "hangingBaseline", "alphabeticBaseline", "ideographicBaseline",
+                    "constructor",
+                ],
+                "imageData": ["width", "height", "colorSpace", "data", "pixelFormat", "constructor"],
+                "path2d": ["addPath", "arc", "closePath", "lineTo", "moveTo", "rect", "constructor"],
+                "mutationObserver": ["disconnect", "observe", "takeRecords", "constructor"],
+                "domMatrix": [
+                    "a", "b", "c", "d", "e", "f",
+                    "m11", "m12", "m13", "m14", "m21", "m22", "m23", "m24",
+                    "m31", "m32", "m33", "m34", "m41", "m42", "m43", "m44",
+                    "invertSelf", "multiplySelf", "preMultiplySelf", "rotateAxisAngleSelf",
+                    "rotateFromVectorSelf", "rotateSelf", "scale3dSelf", "scaleSelf",
+                    "skewXSelf", "skewYSelf", "translateSelf",
+                    "constructor", "setMatrixValue",
+                ],
+                "matrixIsInstance": true,
+                // Post-multiplied composition: translateSelf(5, 0) then
+                // scaleSelf(2, 2) leaves e at 5 -- the scale applies to the
+                // point before the translation does.
+                "matrixValues": [2, 0, 0, 2, 5, 0],
+                "matrixOwnKeys": [],
+                "noNotify": true,
+                "noDefineGetter": true,
             })
         );
     }

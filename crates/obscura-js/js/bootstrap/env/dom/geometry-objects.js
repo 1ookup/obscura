@@ -321,22 +321,267 @@ if (typeof globalThis.DOMQuad === 'undefined') {
     writable: true, enumerable: true, configurable: true,
   });
 }
-if (typeof DOMMatrix === 'undefined') {
-  globalThis.DOMMatrix = class DOMMatrix {
-    constructor() {
-      this.a=1;this.b=0;this.c=0;this.d=1;this.e=0;this.f=0;
-      this.is2D=true;this.isIdentity=true;
-    }
-    static fromMatrix() { return new DOMMatrix(); }
-    static fromFloat32Array() { return new DOMMatrix(); }
-    static fromFloat64Array() { return new DOMMatrix(); }
-    multiply() { return new DOMMatrix(); }
-    inverse() { return new DOMMatrix(); }
-    translate() { return new DOMMatrix(); }
-    scale() { return new DOMMatrix(); }
-    rotate() { return new DOMMatrix(); }
-    transformPoint(p) { return new DOMPoint(p?.x||0,p?.y||0); }
+// DOMMatrix / DOMMatrixReadOnly. Chrome publishes the matrix as two
+// interfaces: the read-only base owns the derived-view accessors and the
+// non-mutating operations, DOMMatrix extends it and adds the *Self mutators
+// plus setMatrixValue. Values live in the shared geometry slot -- instances
+// carry no own keys, the earlier stub's `this.a = 1` own assignments read as
+// an own-key census no browser produces. DOMMatrix.prototype's own-key order
+// follows the WebIDL declaration order: the 2D/3D field accessors, the
+// eleven *Self mutators, the constructor, and setMatrixValue last (Chrome
+// 153 oracle; the bench8 proto-order scan reads exactly this list). The
+// earlier stub kept the legacy WebKitCSSMatrix-style methods on the same
+// prototype, and ctx.getTransform() answered a bare object literal whose
+// prototype was Object.prototype outright.
+const _OBSCURA_MATRIX_FIELDS = ['a', 'b', 'c', 'd', 'e', 'f'];
+const _OBSCURA_MATRIX_3D = [
+  'm11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24',
+  'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44',
+];
+// The 2D triple answers the 3D entry it aliases; the remaining eight 3D
+// entries hold the values a purely 2D matrix keeps.
+function _obscuraMatrix3D(slot, name) {
+  switch (name) {
+    case 'm11': return slot.a;
+    case 'm12': return slot.b;
+    case 'm21': return slot.c;
+    case 'm22': return slot.d;
+    case 'm41': return slot.e;
+    case 'm42': return slot.f;
+    case 'm33': case 'm44': return 1;
+    default: return 0;
+  }
+}
+function _obscuraMatrixSlotOf(value) {
+  const slot = OBSCURA_GEOM_SLOTS.get(value);
+  return slot && typeof slot.a === 'number' ? slot : null;
+}
+function _obscuraMatrixIsIdentity(slot) {
+  return slot.a === 1 && slot.b === 0 && slot.c === 0 && slot.d === 1
+    && slot.e === 0 && slot.f === 0;
+}
+// Matrix composition: (s x o), the order the ctx transform methods use.
+function _obscuraMatrix2DMul(s, o) {
+  return {
+    a: s.a * o.a + s.c * o.b,
+    b: s.b * o.a + s.d * o.b,
+    c: s.a * o.c + s.c * o.d,
+    d: s.b * o.c + s.d * o.d,
+    e: s.a * o.e + s.c * o.f + s.e,
+    f: s.b * o.e + s.d * o.f + s.f,
   };
+}
+function _obscuraMatrix2DTranslate(x, y) {
+  return { a: 1, b: 0, c: 0, d: 1, e: x, f: y };
+}
+function _obscuraMatrix2DScale(sx, sy) {
+  return { a: sx, b: 0, c: 0, d: sy, e: 0, f: 0 };
+}
+function _obscuraMatrix2DRotateZ(deg) {
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return { a: cos, b: sin, c: -sin, d: cos, e: 0, f: 0 };
+}
+// WebIDL DOMMatrixInit: a 6- or 16-entry sequence, or a value answering a/f
+// (a DOMMatrix*, DOMPoint, DOMRect). Anything else constructs the identity,
+// the shape the earlier stub answered for every input.
+function _obscuraMatrixInit(init) {
+  const identity = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+  if (init === undefined || init === null) return identity;
+  if (typeof init === 'object' && typeof init.a === 'number') {
+    return { a: init.a, b: init.b, c: init.c, d: init.d, e: init.e, f: init.f };
+  }
+  if (typeof init.length === 'number') {
+    if (init.length === 6) {
+      return { a: +init[0], b: +init[1], c: +init[2], d: +init[3], e: +init[4], f: +init[5] };
+    }
+    if (init.length === 16) {
+      return { a: +init[0], b: +init[1], c: +init[4], d: +init[5], e: +init[12], f: +init[13] };
+    }
+  }
+  return identity;
+}
+if (typeof DOMMatrixReadOnly === 'undefined') {
+  const ReadOnlyCtor = class DOMMatrixReadOnly {
+    constructor(init) {
+      OBSCURA_GEOM_SLOTS.set(this, _obscuraMatrixInit(init));
+    }
+    static fromMatrix(init = {}) { return new DOMMatrixReadOnly(init); }
+    static fromFloat32Array(array) { return new DOMMatrixReadOnly(array); }
+    static fromFloat64Array(array) { return new DOMMatrixReadOnly(array); }
+  };
+  const readOnlyProto = ReadOnlyCtor.prototype;
+  const readOnlyAccessor = (name, read) => {
+    const box = { get [name]() { return read(this); } };
+    const descriptor = Object.getOwnPropertyDescriptor(box, name);
+    Object.defineProperty(readOnlyProto, name, {
+      get: descriptor.get, enumerable: true, configurable: true,
+    });
+  };
+  for (const name of _OBSCURA_MATRIX_FIELDS) {
+    readOnlyAccessor(name, (self) => _obscuraMatrixSlotOf(self)?.[name]);
+  }
+  for (const name of _OBSCURA_MATRIX_3D) {
+    readOnlyAccessor(name, (self) => {
+      const slot = _obscuraMatrixSlotOf(self);
+      return slot ? _obscuraMatrix3D(slot, name) : undefined;
+    });
+  }
+  readOnlyAccessor('is2D', () => true);
+  readOnlyAccessor('isIdentity', (self) => {
+    const slot = _obscuraMatrixSlotOf(self);
+    return slot ? _obscuraMatrixIsIdentity(slot) : false;
+  });
+  const readOnlyOperate = (name, apply) => {
+    // Named via a computed-key literal: a bare `function [name]()` is not
+    // legal syntax, and the reference answers the member name from
+    // Function.prototype.toString.
+    const fn = { [name](...args) {
+      const slot = _obscuraMatrixSlotOf(this);
+      if (!slot) throw new TypeError('Illegal invocation');
+      return new DOMMatrixReadOnly(apply(slot, ...args));
+    } }[name];
+    Object.defineProperty(readOnlyProto, name, {
+      value: _markNative(fn),
+      writable: true, enumerable: true, configurable: true,
+    });
+  };
+  readOnlyOperate('multiply', (slot, other = {}) => _obscuraMatrix2DMul(slot, _obscuraMatrixInit(other)));
+  readOnlyOperate('inverse', (slot) => {
+    const det = slot.a * slot.d - slot.b * slot.c;
+    if (!det) return { a: NaN, b: NaN, c: NaN, d: NaN, e: NaN, f: NaN };
+    return {
+      a: slot.d / det, b: -slot.b / det, c: -slot.c / det, d: slot.a / det,
+      e: (slot.c * slot.f - slot.d * slot.e) / det,
+      f: (slot.b * slot.e - slot.a * slot.f) / det,
+    };
+  });
+  readOnlyOperate('translate', (slot, x = 0, y = 0) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DTranslate(+x, +y)));
+  readOnlyOperate('scale', (slot, scaleX = 1, scaleY = scaleX) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DScale(+scaleX, +scaleY)));
+  readOnlyOperate('rotate', (slot, angle = 0) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DRotateZ(+angle)));
+  readOnlyOperate('rotateFromVector', (slot, x = 0, y = 0) => (
+    (+x || +y) ? _obscuraMatrix2DMul(slot, _obscuraMatrix2DRotateZ(Math.atan2(+y, +x) * 180 / Math.PI)) : slot
+  ));
+  Object.defineProperty(readOnlyProto, 'transformPoint', {
+    value: _markNative(function transformPoint(point = {}) {
+      const slot = _obscuraMatrixSlotOf(this);
+      const x = +(point?.x || 0), y = +(point?.y || 0);
+      const px = slot.a * x + slot.c * y + slot.e;
+      const py = slot.b * x + slot.d * y + slot.f;
+      return new DOMPoint(px, py, 0, 1);
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
+  OBSCURA_GEOM_ENUMERABLE_STATICS(ReadOnlyCtor,
+    ['fromMatrix', 'fromFloat32Array', 'fromFloat64Array']);
+  OBSCURA_GEOM_CTOR_LAST(readOnlyProto);
+  _markNative(globalThis.DOMMatrixReadOnly = ReadOnlyCtor);
+  Object.defineProperty(ReadOnlyCtor, 'name', { value: 'DOMMatrixReadOnly', configurable: true });
+}
+if (typeof DOMMatrix === 'undefined') {
+  const MatrixCtor = class DOMMatrix extends DOMMatrixReadOnly {
+    constructor(init) {
+      super(init);
+    }
+  };
+  const matrixProto = MatrixCtor.prototype;
+  // Writable 2D fields (a write re-syncs the aliasing 3D entry through the
+  // shared slot); the 3D entries and the derived views stay read-only, the
+  // way Chrome's interface declares them.
+  for (const name of _OBSCURA_MATRIX_FIELDS) {
+    const box = { get [name]() { return _obscuraMatrixSlotOf(this)?.[name]; },
+      set [name](v) { const slot = _obscuraMatrixSlotOf(this); if (slot) slot[name] = +v; } };
+    const descriptor = Object.getOwnPropertyDescriptor(box, name);
+    Object.defineProperty(matrixProto, name, {
+      get: descriptor.get, set: descriptor.set,
+      enumerable: true, configurable: true,
+    });
+  }
+  for (const name of _OBSCURA_MATRIX_3D) {
+    const box = { get [name]() {
+      const slot = _obscuraMatrixSlotOf(this);
+      return slot ? _obscuraMatrix3D(slot, name) : undefined;
+    } };
+    const descriptor = Object.getOwnPropertyDescriptor(box, name);
+    Object.defineProperty(matrixProto, name, {
+      get: descriptor.get, enumerable: true, configurable: true,
+    });
+  }
+  // is2D/isIdentity stay on DOMMatrixReadOnly.prototype: Chrome's
+  // DOMMatrix.prototype own-key census stops at the eleven *Self mutators,
+  // and the derived views read through the prototype chain regardless.
+  const mutate = (name, apply) => {
+    // Declaration order matters: the *Self mutators install in Chrome's
+    // own-key order (alphabetical, between the field accessors and the
+    // constructor), so the mutate calls below must run in that exact
+    // sequence. Same computed-key literal trick as the read-only side.
+    const fn = { [name](...args) {
+      const slot = _obscuraMatrixSlotOf(this);
+      if (!slot) throw new TypeError('Illegal invocation');
+      Object.assign(slot, apply(slot, ...args));
+      return this;
+    } }[name];
+    Object.defineProperty(matrixProto, name, {
+      value: _markNative(fn),
+      writable: true, enumerable: true, configurable: true,
+    });
+  };
+  mutate('invertSelf', (slot) => {
+    const det = slot.a * slot.d - slot.b * slot.c;
+    if (!det) return { a: NaN, b: NaN, c: NaN, d: NaN, e: NaN, f: NaN };
+    return {
+      a: slot.d / det, b: -slot.b / det, c: -slot.c / det, d: slot.a / det,
+      e: (slot.c * slot.f - slot.d * slot.e) / det,
+      f: (slot.b * slot.e - slot.a * slot.f) / det,
+    };
+  });
+  mutate('multiplySelf', (slot, other = {}) => _obscuraMatrix2DMul(slot, _obscuraMatrixInit(other)));
+  mutate('preMultiplySelf', (slot, other = {}) => _obscuraMatrix2DMul(_obscuraMatrixInit(other), slot));
+  mutate('rotateAxisAngleSelf', (slot, _x = 0, _y = 0, _z = 0, angle = 0) => (
+    _obscuraMatrix2DMul(slot, _obscuraMatrix2DRotateZ(+angle))
+  ));
+  mutate('rotateFromVectorSelf', (slot, x = 0, y = 0) => (
+    (+x || +y) ? _obscuraMatrix2DMul(slot, _obscuraMatrix2DRotateZ(Math.atan2(+y, +x) * 180 / Math.PI)) : slot
+  ));
+  mutate('rotateSelf', (slot, angle = 0) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DRotateZ(+angle)));
+  mutate('scale3dSelf', (slot, scale = 1) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DScale(+scale, +scale)));
+  mutate('scaleSelf', (slot, scaleX = 1, scaleY = scaleX) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DScale(+scaleX, +scaleY)));
+  mutate('skewXSelf', (slot, sx = 0) => {
+    const rad = (+sx * Math.PI) / 180;
+    return _obscuraMatrix2DMul(slot, { a: 1, b: 0, c: Math.tan(rad), d: 1, e: 0, f: 0 });
+  });
+  mutate('skewYSelf', (slot, sy = 0) => {
+    const rad = (+sy * Math.PI) / 180;
+    return _obscuraMatrix2DMul(slot, { a: 1, b: Math.tan(rad), c: 0, d: 1, e: 0, f: 0 });
+  });
+  mutate('translateSelf', (slot, x = 0, y = 0) => _obscuraMatrix2DMul(slot, _obscuraMatrix2DTranslate(+x, +y)));
+  // Chrome carries setMatrixValue *after* the constructor in the own-key
+  // order, the one member that breaks the members-then-constructor rule.
+  Object.defineProperty(matrixProto, 'setMatrixValue', {
+    value: _markNative(function setMatrixValue(transformList) {
+      const slot = _obscuraMatrixSlotOf(this);
+      if (!slot) throw new TypeError('Illegal invocation');
+      void transformList;
+      Object.assign(slot, { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 });
+      return this;
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
+  OBSCURA_GEOM_CTOR_LAST(matrixProto);
+  _markNative(globalThis.DOMMatrix = MatrixCtor);
+  Object.defineProperty(MatrixCtor, 'name', { value: 'DOMMatrix', configurable: true });
+  Object.defineProperty(MatrixCtor, 'fromMatrix', {
+    value: _markNative(function fromMatrix(init = {}) { return new DOMMatrix(init); }),
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(MatrixCtor, 'fromFloat32Array', {
+    value: _markNative(function fromFloat32Array(array) { return new DOMMatrix(array); }),
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(MatrixCtor, 'fromFloat64Array', {
+    value: _markNative(function fromFloat64Array(array) { return new DOMMatrix(array); }),
+    writable: true, enumerable: true, configurable: true,
+  });
 }
 
 // VisualViewport. Chrome's is an EventTarget-derived interface whose fields sit

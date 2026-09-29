@@ -231,3 +231,15 @@ run covers are then removed.
   (wraps `crypto.getRandomValues` and asserts the whole offer/candidate path
   calls it zero times while the SDP shape assertions hold). Full workspace
   gate deferred to the next backfill.
+
+- 2026-09-30: the canvas interface prototype key order fixups (CanvasGradient
+  main+offscreen, TextMetrics, ImageData, Path2D relative order,
+  MutationObserver minus the leaked `_notify`, and the DOMMatrix prototype
+  rebuilt as a clean interface shape), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **884/884 passed** with the new
+  `canvas_interface_prototypes_order_keys_like_chrome` test; the live
+  bench8 proto-order scan moved from 4/15 to 10/15 interfaces byte-equal to
+  the reference Chrome (remaining five are member-set gaps queued as L3).
+  Full workspace gate deferred to the next backfill.
