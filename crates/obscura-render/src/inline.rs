@@ -2600,6 +2600,15 @@ fn render_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_RENDER_TIMING").is_some())
 }
 
+/// Whether macOS identity glyphs rasterize through CoreText. On by default;
+/// setting OBSCURA_NO_CT falls back to the software sampler. Cached because the
+/// gate sits in the per-glyph loop.
+#[cfg(target_os = "macos")]
+fn coretext_glyph_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_NO_CT").is_none())
+}
+
 impl ShapeProfGuard {
     fn new() -> Self {
         ShapeProfGuard(render_timing_enabled().then(std::time::Instant::now))
@@ -3650,14 +3659,13 @@ impl TextEngine {
                 }
                                 GlyphDraw::Identity { family, ch, size, x, line_dy } => {
                     let base_row = baseline_row + line_dy;
-                    // macOS identity glyphs can rasterize through CoreText
-                    // (OBSCURA_USE_CT=1): the system pipeline's mask mapped
-                    // onto the software sampler's placement box -- the bbox
-                    // mapping absorbs every per-size bearing difference the
-                    // system rasterizer introduces -- and its strength walks
-                    // the LUT that pins the four probe anchors. The default
-                    // stays the software sampler until the mapping is proven
-                    // across the size range.
+                    // macOS identity glyphs rasterize through CoreText by
+                    // default: the system pipeline's mask mapped onto the
+                    // software sampler's placement box -- the bbox mapping
+                    // absorbs every per-size bearing difference the system
+                    // rasterizer introduces -- and its strength walks the LUT
+                    // that pins the four probe anchors. OBSCURA_NO_CT falls
+                    // back to the software sampler.
                     #[cfg(target_os = "macos")]
                     {
                         let size_f64 = f64::from(size);
@@ -3665,7 +3673,7 @@ impl TextEngine {
                             .coretext_face(family, size_f64)
                             .and_then(|f| f.glyph_for_char(ch));
                         let placement = identity_glyph_faces.glyph_placement(family, ch, size);
-                        let ct_enabled = std::env::var("OBSCURA_USE_CT").is_ok();
+                        let ct_enabled = coretext_glyph_enabled();
                         if ct_enabled {
                             if let (Some(face), Some(glyph), Some((sw_left, sw_top, sw_w, sw_h))) = (
                                 identity_glyph_faces.coretext_face(family, size_f64),
