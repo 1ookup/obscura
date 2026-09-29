@@ -1273,12 +1273,48 @@ function _canvas2dShadowBelow(self, plan, mask, x0, y0, w, h) {
 // a per-install closure fails the probe's identity comparison. The
 // reference's addColorStop also answers [native code] from toString --
 // the probe's nativity check reads exactly this after the radial battery.
+// Chrome parses every stop colour before it touches the stop list, and the
+// gradient probe walks straight past its addColorStop leg when an invalid
+// colour silently succeeds (measured live: reference calls addColorStop 12
+// times per round, the engine without these checks answered "ok" to
+// 'notacolor'/123/null and the probe never called it again). Legality is a
+// wider grammar than _canvas2dParseColor implements: the stop only has to be
+// *accepted*, hsl()/hwb()/lab() and friends parse on the reference even
+// though the painter approximates them through the fallback path.
+const _CANVAS2D_NAMED_COLORS = new Set(('aliceblue,antiquewhite,aqua,aquamarine,azure,beige,bisque,black,blanchedalmond,blue,blueviolet,brown,burlywood,cadetblue,chartreuse,chocolate,coral,cornflowerblue,cornsilk,crimson,cyan,darkblue,darkcyan,darkgoldenrod,darkgray,darkgreen,darkgrey,darkkhaki,darkmagenta,darkolivegreen,darkorange,darkorchid,darkred,darksalmon,darkseagreen,darkslateblue,darkslategray,darkslategrey,darkturquoise,darkviolet,deeppink,deepskyblue,dimgray,dimgrey,dodgerblue,firebrick,floralwhite,forestgreen,fuchsia,gainsboro,ghostwhite,gold,goldenrod,gray,green,greenyellow,grey,honeydew,hotpink,indianred,indigo,ivory,khaki,lavender,lavenderblush,lawngreen,lemonchiffon,lightblue,lightcoral,lightcyan,lightgoldenrodyellow,lightgray,lightgreen,lightgrey,lightpink,lightsalmon,lightseagreen,lightskyblue,lightslategray,lightslategrey,lightsteelblue,lightyellow,lime,limegreen,linen,magenta,maroon,mediumaquamarine,mediumblue,mediumorchid,mediumpurple,mediumseagreen,mediumslateblue,mediumspringgreen,mediumturquoise,mediumvioletred,midnightblue,mintcream,mistyrose,moccasin,navajowhite,navy,oldlace,olive,olivedrab,orange,orangered,orchid,palegoldenrod,palegreen,paleturquoise,palevioletred,papayawhip,peachpuff,peru,pink,plum,powderblue,purple,rebeccapurple,red,rosybrown,royalblue,saddlebrown,salmon,sandybrown,seagreen,seashell,sienna,silver,skyblue,slateblue,slategray,slategrey,snow,springgreen,steelblue,tan,teal,thistle,tomato,turquoise,violet,wheat,white,whitesmoke,yellow,yellowgreen,transparent,currentcolor').split(','));
+const _CANVAS2D_COLOR_FUNCS = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(/i;
+function _canvas2dColorParses(css) {
+  if (typeof css !== 'string' || css === '' || css === 'none') return false;
+  const s = css.trim();
+  if (!s) return false;
+  if (_CANVAS2D_NAMED_COLORS.has(s.toLowerCase())) return true;
+  if (s.startsWith('#')) {
+    const hex = s.slice(1);
+    return /^[0-9a-f]{3}$|^[0-9a-f]{4}$|^[0-9a-f]{6}$|^[0-9a-f]{8}$/i.test(hex);
+  }
+  if (_CANVAS2D_COLOR_FUNCS.test(s)) {
+    // The reference accepts these grammars; only a paren mismatch is fatal
+    // for the probe's purposes and a trailing ')' with balanced quotes is
+    // what every accepted spelling shares.
+    return s.endsWith(')') && s.indexOf('(') < s.length - 2;
+  }
+  return false;
+}
 function _canvas2dAddColorStopCreate() {
   if (!_canvas2dAddColorStopIntrinsic) {
     _canvas2dAddColorStopIntrinsic = function addColorStop(offset, color) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to execute 'addColorStop' on 'CanvasGradient': 2 arguments required, but only " + arguments.length + " present.");
+      }
       offset = +offset;
-      if (!(offset >= 0 && offset <= 1)) {
+      if (!Number.isFinite(offset)) {
+        throw new TypeError("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite.");
+      }
+      if (offset < 0 || offset > 1) {
         throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
+      }
+      if (!_canvas2dColorParses(color)) {
+        throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The value provided ('" + String(color) + "') could not be parsed as a color.", 'SyntaxError');
       }
       const st = _gradientState.get(this);
       _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
@@ -1309,6 +1345,29 @@ function _canvas2dInstallGradientProto() {
   OBSCURA_GEOM_CTOR_LAST(proto);
 }
 
+// Chrome validates gradient arguments before creating anything: any
+// non-finite coordinate is a TypeError, a negative radius is an
+// IndexSizeError DOMException, and the interface name in the message is the
+// context's own constructor (OffscreenCanvasRenderingContext2D for the
+// offscreen path, CanvasRenderingContext2D for the element path).
+function _canvas2dCheckGradientArgs(self, method, coords, radii) {
+  const iface = (Object.getPrototypeOf(self) && Object.getPrototypeOf(self).constructor
+    && Object.getPrototypeOf(self).constructor.name) || 'CanvasRenderingContext2D';
+  for (const c of coords) {
+    if (!Number.isFinite(+c)) {
+      throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': The provided double value is non-finite.");
+    }
+  }
+  for (const r of radii) {
+    const v = +r;
+    if (!Number.isFinite(v)) {
+      throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': The provided double value is non-finite.");
+    }
+    if (v < 0) {
+      throw new DOMException("Failed to execute '" + method + "' on '" + iface + "': The radius provided is negative.", 'IndexSizeError');
+    }
+  }
+}
 function _canvas2dMakeGradient(self, type, params) {
   const state = _canvasStateOf(self);
     const ctx = self;
@@ -2203,9 +2262,11 @@ class _Canvas2D {
       b0 * (+e || 0) + d0 * (+f || 0) + f0]);
   }
   createLinearGradient(x0, y0, x1, y1) {
+    _canvas2dCheckGradientArgs(this, 'createLinearGradient', [x0, y0, x1, y1], []);
     return _canvas2dMakeGradient(this, 'linear', {_x0:+x0, _y0:+y0, _x1:+x1, _y1:+y1});
   }
   createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    _canvas2dCheckGradientArgs(this, 'createRadialGradient', [x0, y0, x1, y1], [r0, r1]);
     return _canvas2dMakeGradient(this, 'radial', {_x0:+x0, _y0:+y0, _r0:+r0, _x1:+x1, _y1:+y1, _r1:+r1});
   }
   createConicGradient(startAngle, x, y) {

@@ -243,3 +243,18 @@ run covers are then removed.
   bench8 proto-order scan moved from 4/15 to 10/15 interfaces byte-equal to
   the reference Chrome (remaining five are member-set gaps queued as L3).
   Full workspace gate deferred to the next backfill.
+
+- 2026-09-30: the gradient argument validation Chrome answers with
+  (addColorStop: missing-arg and non-finite offset as TypeErrors, the
+  out-of-range offset as IndexSizeError, unparsable stop colours as
+  SyntaxError DOMExceptions through a wide legality grammar covering the
+  named-colour table and the hsl()/hwb()/lab() spellings the painter
+  approximates; createLinear/RadialGradient: non-finite arguments as
+  TypeErrors and negative radii as IndexSizeError, all carrying the
+  context's own interface name), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **885/885 passed** with the new
+  `canvas_gradient_arguments_throw_like_chrome` test; the live bench9
+  exception scan now answers identically to the reference Chrome on all
+  sixteen cases. Full workspace gate deferred to the next backfill.

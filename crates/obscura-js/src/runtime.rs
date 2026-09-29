@@ -24687,6 +24687,75 @@ RequestRedirect value",
     /// Chrome reads an interface prototype's own keys as members first and
     /// `constructor` last (WebIDL declaration order); the class-shaped
     /// bootstrap interfaces used to read constructor-first, and the bench8
+    /// Chrome rejects gradient material the way the live probe expects it
+    /// to: an invalid stop colour or a negative radius must throw (the
+    /// Cloudflare gradient probe skips its entire addColorStop leg when a
+    /// call that should fail silently succeeds -- measured as addColorStop
+    /// 12 calls on the reference against 0 without these checks), a missing
+    /// argument and a non-finite offset are TypeErrors, an out-of-range
+    /// offset is an IndexSizeError, and the messages carry the exact
+    /// interface names Chrome prints.
+    #[test]
+    fn canvas_gradient_arguments_throw_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const out = {};
+                    const attempt = (label, fn) => {
+                        try { fn(); out[label] = 'ok'; }
+                        catch (e) { out[label] = e.constructor.name + ':'
+                            + e.message.slice(0, e.message.indexOf(': The') >= 0 ? e.message.indexOf(': The') + 1 : 60); }
+                    };
+                    const ctx = new OffscreenCanvas(8, 8).getContext('2d');
+                    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+                    attempt('normal', () => g.addColorStop(0, 'red'));
+                    attempt('rgb', () => g.addColorStop(1, 'rgb(255,0,0)'));
+                    attempt('hsl', () => g.addColorStop(1, 'hsl(120, 50%, 50%)'));
+                    attempt('neg_offset', () => g.addColorStop(-0.1, 'red'));
+                    attempt('gt1_offset', () => g.addColorStop(1.1, 'red'));
+                    attempt('bad_color', () => g.addColorStop(0, 'notacolor'));
+                    attempt('empty_color', () => g.addColorStop(0, ''));
+                    attempt('nan_offset', () => g.addColorStop(NaN, 'red'));
+                    attempt('no_args', () => g.addColorStop());
+                    attempt('one_arg', () => g.addColorStop(0));
+                    attempt('numeric_color', () => g.addColorStop(0, 123));
+                    attempt('null_color', () => g.addColorStop(0, null));
+                    attempt('radial_neg_r', () => ctx.createRadialGradient(0, 0, -1, 0, 0, 1));
+                    attempt('radial_nonfinite', () => ctx.createRadialGradient(Infinity, 0, 1, 0, 0, 1));
+                    attempt('linear_nonfinite', () => ctx.createLinearGradient(NaN, 0, 1, 1));
+                    attempt('linear_ok', () => ctx.createLinearGradient(0, 0, 1, 1));
+                    return out;
+                })()"#,
+            )
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        let expect = [
+            ("normal", "ok"), ("rgb", "ok"), ("hsl", "ok"),
+            ("neg_offset", "DOMException:"),
+            ("gt1_offset", "DOMException:"),
+            ("bad_color", "DOMException:"),
+            ("empty_color", "DOMException:"),
+            ("nan_offset", "TypeError:"),
+            ("no_args", "TypeError:"),
+            ("one_arg", "TypeError:"),
+            ("numeric_color", "DOMException:"),
+            ("null_color", "DOMException:"),
+            ("radial_neg_r", "DOMException:"),
+            ("radial_nonfinite", "TypeError:"),
+            ("linear_nonfinite", "TypeError:"),
+            ("linear_ok", "ok"),
+        ];
+        for (k, prefix) in expect {
+            let got = obj.get(k).unwrap().as_str().unwrap();
+            assert!(
+                got.starts_with(prefix),
+                "{}: expected prefix {:?}, got {:?}",
+                k, prefix, got
+            );
+        }
+    }
+
     /// proto-order scan diffs exactly this list. This pins the fixed order
     /// for the four interfaces from that scan plus the two L2 surfaces: the
     /// MutationObserver prototype carries no internal `_notify` (it lives in
