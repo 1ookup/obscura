@@ -1256,7 +1256,10 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'webkitSpeechGrammar', 'webkitSpeechGrammarList', 'webkitSpeechRecognition',
     'webkitSpeechRecognitionError', 'webkitSpeechRecognitionEvent', 'webkitURL',
     'credentialless', 'originAgentCluster', 'navigation', 'locationbar', 'menubar',
-    'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status', 'closed', 'external',
+    // `external` stays (see the Window-only strip above): it is the tracing
+    // primitive's host, and deleting it here silently cut every worker
+    // tracelog record off.
+    'personalbar', 'scrollbars', 'statusbar', 'toolbar', 'status', 'closed',
     'clientInformation', 'offscreenBuffering', 'styleMedia', 'crashReport', 'cookieStore',
     'documentPictureInPicture', 'viewport', 'launchQueue', 
     'onoffline', 'ononline', 'fence',
@@ -2254,12 +2257,17 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   // has to be installed here too, or the one scope an anti-bot payload owns
   // outright is the one scope that cannot be instrumented. Present only when
   // the host asked for tracing, same as the window realm.
+  //
+  // The host lands on the `external` instance, not the External prototype:
+  // the Window-only strip above deletes the External constructor (a worker
+  // realm has no such binding, and a probe classifies the scope off it), so
+  // a prototype lookup finds nothing and the install used to skip silently
+  // -- every worker tracelog record vanished with it.
   if (__OBSCURA_TRACELOG__) {
     try {
-      var ExternalCtor = G.External;
-      if (ExternalCtor && ExternalCtor.prototype &&
-          typeof ExternalCtor.prototype.tracelog !== 'function') {
-        defineProperty(ExternalCtor.prototype, 'tracelog', {
+      var tracelogHost = G.external || (G.External && G.External.prototype);
+      if (tracelogHost && typeof tracelogHost.tracelog !== 'function') {
+        defineProperty(tracelogHost, 'tracelog', {
           value: function tracelog(key, value) {
             var json;
             try { json = JSON.stringify(value); } catch (e) { json = undefined; }
