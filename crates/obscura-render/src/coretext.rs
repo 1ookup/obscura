@@ -15,7 +15,7 @@ use std::sync::Arc;
 // and without a reference the linker drops the crates that carry the
 // #pragma-link directives.
 use core_foundation::array::CFArray;
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFRetain, TCFType};
 use core_foundation::data::CFData;
 use core_graphics as _core_graphics_link;
 use core_text as _core_text_link;
@@ -131,12 +131,26 @@ extern "C" {
         encoding: u32,
     ) -> bool;
     fn CFRelease(cf: *const c_void);
+    fn CTFontCreateWithName(
+        name: *const c_void,
+        size: f64,
+        matrix: *const c_void,
+    ) -> CTFontRef;
     fn CTFontDrawGlyphs(
         font: CTFontRef,
         glyphs: *const CGGlyph,
         positions: *const CGPoint,
         count: usize,
         context: CGContextRef,
+    );
+    fn CGContextSetFont(context: CGContextRef, font: CGFontRef);
+    fn CGContextSetFontSize(context: CGContextRef, size: f64);
+    fn CGContextShowGlyphsAtPoint(
+        context: CGContextRef,
+        x: f64,
+        y: f64,
+        glyphs: *const CGGlyph,
+        count: usize,
     );
 }
 
@@ -147,6 +161,9 @@ unsafe extern "C" fn noop_release(_info: *const c_void, _data: *const c_void) {}
 /// outlive every CTFont minted from them.
 pub struct CoreTextFace {
     font: CTFontRef,
+    cgfont: CGFontRef,
+    /// The face's point size: the CGFont draw path scales through it.
+    size: f64,
     _data: Arc<Vec<u8>>,
 }
 
@@ -212,12 +229,78 @@ impl CoreTextFace {
             if font.is_null() {
                 continue;
             }
+            // A CGFont twin of the same face for the coverage draw path.
+            let (provider, cgfont) = unsafe {
+                let provider = CGDataProviderCreateWithData(
+                    std::ptr::null(),
+                    data.as_ptr(),
+                    data.len(),
+                    Some(noop_release),
+                );
+                let cgfont = CGFontCreateWithDataProvider(provider);
+                CFRetain(cgfont as *const c_void);
+                (provider, cgfont)
+            };
             return Some(Self {
                 font,
+                cgfont,
+                size,
                 _data: data,
             });
         }
         None
+    }
+
+    /// Mint a CTFont from the system registry by PostScript name -- the
+    /// same registry lookup the reference browser performs. The collection
+    /// path (from_collection) renders nothing at tiny sizes, so the color
+    /// and coverage rasters resolve faces this way.
+    pub fn from_system_name(name: &str, size: f64) -> Option<Self> {
+        unsafe {
+            let cf_name = CFStringCreateWithCString(
+                std::ptr::null(),
+                name.as_ptr() as *const i8,
+                kCFStringEncodingUTF8,
+            );
+            if cf_name.is_null() {
+                return None;
+            }
+            let font = CTFontCreateWithName(
+                cf_name as *const c_void,
+                size,
+                std::ptr::null(),
+            );
+            CFRelease(cf_name as *const c_void);
+            if font.is_null() {
+                return None;
+            }
+                        let provider = CGDataProviderCreateWithData(
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                Some(noop_release),
+            );
+            let cgfont = CGFontCreateWithDataProvider(provider);
+            CFRetain(cgfont as *const c_void);
+            Some(Self {
+                font,
+                cgfont,
+                size,
+                _data: Arc::new(Vec::new()),
+            })
+        }
+    }
+
+    /// The PostScript face name a reference family resolves to on this host.
+    pub fn postscript_name(family: &str) -> &'static str {
+        match family {
+            "PingFang SC" => "PingFangSC-Regular",
+            "Arial" => "ArialMT",
+            "Helvetica" => "Helvetica",
+            "Times New Roman" => "TimesNewRomanPSMT",
+            "Menlo" => "Menlo-Regular",
+            _ => "",
+        }
     }
 
     /// Register `data` (a font file's bytes) with CoreGraphics and mint a
@@ -242,7 +325,74 @@ impl CoreTextFace {
             if font.is_null() {
                 return None;
             }
-            Some(Self { font, _data: data })
+            // The CGFont is retained: the coverage draw path paints through
+            // CGContextShowGlyphsAtPoint, which needs the CGFont itself.
+            CFRetain(cgfont as *const c_void);
+            Some(Self {
+                font,
+                cgfont: cgfont,
+                size,
+                _data: data,
+            })
+        }
+    }
+
+    /// Render one character into `mask` (a single-channel buffer, row-major)
+    /// with its pen origin at (pen_x, pen_y), storing the raw CoreGraphics
+    /// sample per pixel. Returns true when the path ran (a character the face
+    /// has no glyph for is also "done" -- it simply leaves the mask blank).
+    pub fn draw_char_coverage_into(
+        &self,
+        ch: char,
+        pen_x: usize,
+        pen_y: usize,
+        mask: &mut [u8],
+        w: usize,
+        h: usize,
+    ) -> bool {
+        unsafe {
+            let space = CGColorSpaceCreateDeviceRGB();
+            let mut buf = vec![0u8; w * h * 4];
+            let ctx = CGBitmapContextCreate(
+                buf.as_mut_ptr() as *mut c_void,
+                w,
+                h,
+                8,
+                w * 4,
+                space,
+                1, // kCGImageAlphaPremultipliedLast
+            );
+            if ctx.is_null() {
+                return false;
+            }
+            CGContextSetShouldAntialias(ctx, true);
+            CGContextSetShouldSmoothFonts(ctx, true);
+            CGContextSetAllowsFontSmoothing(ctx, true);
+            CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
+            CGContextSetTextMatrix(ctx, CGAffineTransform::IDENTITY);
+            let pos = CGPoint { x: pen_x as f64, y: pen_y as f64 };
+            CGContextSetTextPosition(ctx, pos.x, pos.y);
+            // Paint through the CGFont directly: CTFontDrawGlyphs on a face
+            // minted from raw collection bytes rendered nothing, while the
+            // CGFont draw path (what the reference's rasterizer bottoms out
+            // in) paints the same glyph with full smoothing.
+            CGContextSetFont(ctx, self.cgfont);
+            CGContextSetFontSize(ctx, self.size);
+            let mut glyph: CGGlyph = 0;
+            let c = ch as UniChar;
+            let have = CTFontGetGlyphsForCharacters(self.font, &c, &mut glyph, 1) && glyph != 0;
+            if have {
+                CGContextShowGlyphsAtPoint(ctx, pos.x, pos.y, &glyph, 1);
+            }
+            for (i, px) in buf.chunks_exact(4).enumerate() {
+                mask[i] = px[3];
+            }
+            if std::env::var_os("OBSCURA_COVERAGE_DEBUG").is_some() {
+                let sum: u32 = mask.iter().map(|v| *v as u32).sum();
+                eprintln!("ct-draw: ch={:?} glyph={} w={} h={} pen=({},{}) mask_sum={}",
+                    ch, glyph, w, h, pen_x, pen_y, sum);
+            }
+            true
         }
     }
 
@@ -521,3 +671,4 @@ mod probe_tests {
         }
     }
 }
+

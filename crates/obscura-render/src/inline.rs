@@ -2120,6 +2120,11 @@ struct IdentityGlyphFaces {
     faces: HashMap<&'static str, Option<IdentityFaceFile>>,
     images: HashMap<IdentityRasterKey, Option<SwashImage>>,
     context: ScaleContext,
+    /// CoreText faces minted from the same host files (macOS): the coverage
+    /// rasterizer's system-pipeline path. Keyed by family and size.
+    #[cfg(target_os = "macos")]
+    coretext_faces:
+        HashMap<(&'static str, u32), Option<crate::coretext::CoreTextFace>>,
 }
 
 /// One loaded host file: the shared bytes and the collection index of the
@@ -2143,6 +2148,8 @@ impl IdentityGlyphFaces {
             faces: HashMap::new(),
             images: HashMap::new(),
             context: ScaleContext::new(),
+            #[cfg(target_os = "macos")]
+            coretext_faces: HashMap::new(),
         }
     }
 
@@ -2158,6 +2165,31 @@ impl IdentityGlyphFaces {
             self.faces.insert(family, loaded);
         }
         self.faces.get(family).and_then(|file| file.as_ref())
+    }
+
+    /// The family's CoreText face at `size` (macOS): minted from the same
+    /// host file the software sampler loads, cached per (family, size).
+    #[cfg(target_os = "macos")]
+    fn coretext_face(
+        &mut self,
+        family: &'static str,
+        size: f64,
+    ) -> Option<&mut crate::coretext::CoreTextFace> {
+        let key = (family, (size * 64.0).round() as u32);
+        if !self.coretext_faces.contains_key(&key) {
+            // Same source the LUT anchors were measured from: the collection
+            // file's primary face through the CGFont path.
+            let face = self
+                .face(family)
+                .and_then(|file| {
+                    crate::coretext::CoreTextFace::from_bytes(
+                        std::sync::Arc::clone(&file.bytes),
+                        size,
+                    )
+                });
+            self.coretext_faces.insert(key, face);
+        }
+        self.coretext_faces.get_mut(&key).and_then(|f| f.as_mut())
     }
 
     fn load(family: &'static str) -> Option<IdentityFaceFile> {
