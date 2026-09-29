@@ -204,3 +204,9 @@ run covers are then removed.
   `coretext.rs`) the default rather than changing the boundary itself, so
   the backfill must still cover it; the obstacle course has to run where
   `obscura-benchmark` is checked out, absent on this host as above.
+
+- 2026-09-30: `3a084e6` (`difference` through the module-scope blend table),
+  scoped to `cargo nextest run --release --features render -p obscura-js
+  -p obscura-render --config vendor/v8-source.toml` = **1365/1365 passed**
+  (1 skipped) at HEAD `3a084e6`. Full workspace gate deferred to the next
+  backfill.
