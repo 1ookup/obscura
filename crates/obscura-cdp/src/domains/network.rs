@@ -331,10 +331,16 @@ mod tests {
         assert_eq!(page.fingerprint.ua_platform_version, "26.3.2");
         assert_eq!(page.fingerprint.architecture, "arm");
         assert_eq!(page.http_client.browser_fingerprint().await, page.fingerprint);
+        // The override reaches the live JS identity. `userAgentData` is part
+        // of the secure-context surface, and a data: URL document is an
+        // opaque origin -- `isSecureContext` is false and the gated member is
+        // hidden exactly as Chrome hides it, so the JSON assertion carries
+        // the two ungated members plus the gate state itself. The overridden
+        // metadata itself is asserted on the fingerprint above.
         assert_eq!(page.evaluate(
-            "JSON.stringify([navigator.userAgent,navigator.platform,navigator.userAgentData.toJSON()])"
+            "JSON.stringify([navigator.userAgent,navigator.platform,navigator.userAgentData === undefined, isSecureContext === false])"
         ), json!(
-            r#"["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","MacIntel",{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"mobile":false,"platform":"macOS"}]"#
+            r#"["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","MacIntel",true,true]"#
         ));
     }
 
