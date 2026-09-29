@@ -31536,6 +31536,66 @@ RequestRedirect value",
         );
     }
 
+    /// ICE 材料的随机字节走引擎内部 op 桥（`op_random_bytes`），不再经过页面
+    /// 可见的 `crypto.getRandomValues`：真 Chrome 在原生层生成这些字节，而 CF
+    /// 的宿主调用计数面对每次页面 JS 调 `crypto.getRandomValues` 记一次
+    /// （WebRTC 探针一轮 createOffer ~4 次、共 ~4 轮 ⇒ 16 次，参照侧只有
+    /// VM 自己的 1 次）。本测试在页面侧包装 `crypto.getRandomValues` 计数，
+    /// 断言整条 offer/candidate 生成路径一次都不触它，同时用结构性断言
+    /// （foundation 宽度、mDNS 形状、candidate 数量）证明内部随机路径的
+    /// 产出格式与原来完全一致。
+    #[tokio::test(flavor = "current_thread")]
+    async fn webrtc_offer_generation_never_touches_the_page_visible_crypto_rng() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    let cryptoCalls = 0;
+                    const raw = crypto.getRandomValues.bind(crypto);
+                    crypto.getRandomValues = (...args) => {
+                        cryptoCalls++;
+                        return raw(...args);
+                    };
+                    const pc = new RTCPeerConnection({iceServers: []});
+                    pc.createDataChannel('probe');
+                    const offer = await pc.createOffer(
+                        {offerToReceiveAudio: true, offerToReceiveVideo: true});
+                    const candidates = [];
+                    pc.onicecandidate = event => candidates.push(
+                        event.candidate ? event.candidate.candidate : null);
+                    await pc.setLocalDescription(offer);
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const foundation = candidates[0].split(' ')[0]
+                        .slice('candidate:'.length);
+                    return {
+                        cryptoCalls,
+                        foundationLen: foundation.length,
+                        candidateCount: candidates.length,
+                        trailingNull: candidates[candidates.length - 1] === null,
+                        allMdnsHost: candidates.slice(0, -1).every(value =>
+                            / typ host /.test(value) && /\.local /.test(value)),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "cryptoCalls": 0,
+                "foundationLen": 10,
+                "candidateCount": 7,
+                "trailingNull": true,
+                "allMdnsHost": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn peer_connection_can_trickle_and_folds_candidates_into_local_sdp() {
         let mut rt = setup_runtime("<html><body></body></html>");

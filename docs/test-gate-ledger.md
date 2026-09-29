@@ -218,3 +218,16 @@ run covers are then removed.
   (1 skipped) at HEAD `c90dfdb`. Full workspace gate deferred to the next
   backfill. Bootstrap-surface change only: no feature gate, build config, or
   FFI boundary is touched.
+
+- 2026-09-30: the WebRTC ICE material off the page-visible crypto RNG
+  (`webrtc.js` `_rtcRandomHex`/`_rtcRandomBase64`/`_rtcRandomUint` and the
+  candidate port now draw from `op_random_bytes`, the same internal op
+  `subtle.js` uses; a real Chrome generates these bytes natively so page-side
+  `crypto.getRandomValues` stays untouched), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **883/883 passed** at the worktree with the
+  new `webrtc_offer_generation_never_touches_the_page_visible_crypto_rng` test
+  (wraps `crypto.getRandomValues` and asserts the whole offer/candidate path
+  calls it zero times while the SDP shape assertions hold). Full workspace
+  gate deferred to the next backfill.

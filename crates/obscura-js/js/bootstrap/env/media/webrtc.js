@@ -234,22 +234,30 @@ const _RTC_SDP_SECTIONS = {
   },
 };
 
+// ICE 材料（ufrag/pwd/foundation/候选端口）的随机字节必须绕开页面可见的
+// crypto.getRandomValues：真 Chrome 在原生层生成这些字节，而每次页面 JS 调
+// crypto.getRandomValues 都会被 CF 的宿主调用计数面（ov2 的 vmcall 对拍）
+// 记一次——WebRTC 探针每轮 createOffer 触发 ~4 次、共 ~4 轮 ⇒ 我方 16 次，
+// 参照侧只有 VM 自己的 1 次，这是双侧 vmcall 对比里唯一稳健的调用次数差。
+// op_random_bytes 走引擎内部 op 桥（页面不可见），底层与 crypto.getRandomValues
+// 是同一个 CSPRNG，输出分布不变。op 返回的字节属于 op 运行所在的 realm，
+// 拷进本 realm 的 TypedArray 是 op 消费者的惯用法（subtle.js 同款处理）。
+function _rtcRandomBytes(count) {
+  return new Uint8Array(Deno.core.ops.op_random_bytes(count));
+}
 function _rtcRandomHex(bytes) {
-  const values = new Uint8Array(bytes);
-  crypto.getRandomValues(values);
+  const values = _rtcRandomBytes(bytes);
   return Array.from(values, byte => byte.toString(16).padStart(2, '0').toUpperCase());
 }
 function _rtcRandomBase64(length) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const values = new Uint8Array(length);
-  crypto.getRandomValues(values);
+  const values = _rtcRandomBytes(length);
   return Array.from(values, byte => alphabet[byte & 63]).join('');
 }
 // A fixed-width decimal with no leading zero, which is what a number
 // formatted by the real implementation always is.
 function _rtcRandomUint(digits) {
-  const values = new Uint32Array(2);
-  crypto.getRandomValues(values);
+  const values = new Uint32Array(_rtcRandomBytes(8).buffer);
   const value = (BigInt(values[0]) << 32n) | BigInt(values[1]);
   const text = String(value).padStart(digits, '1').slice(-digits);
   return text[0] === '0' ? '1' + text.slice(1) : text;
@@ -352,7 +360,7 @@ function _rtcCandidatePlan(slots) {
       // The two type-preference/local-preference pairs Chrome emits for its
       // first two interfaces.
       const priority = hostIndex === 0 ? 2113937151 : 2113942271;
-      const port = 49152 + Math.floor(crypto.getRandomValues(new Uint16Array(1))[0] / 4);
+      const port = 49152 + Math.floor(new Uint16Array(_rtcRandomBytes(2).buffer)[0] / 4);
       plan.push({
         candidate: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 ufrag ${slots.ufrag} network-cost 999`,
         sdpLine: `candidate:${foundation} 1 udp ${priority} ${host} ${port} typ host generation 0 network-cost 999`,
