@@ -877,7 +877,10 @@ function _canvas2dFlattenPath(self, minPoints) {
     let current = null;
     const finish = close => {
       if (close && current && current.length > 1) current.push(current[0].slice());
-      if (current && current.length >= minPoints) subpaths.push(current);
+      if (current && current.length >= minPoints) {
+        if (close) current.closed = true;
+        subpaths.push(current);
+      }
       current = null;
     };
     const push = (x, y) => {
@@ -1017,11 +1020,41 @@ function _canvas2dPaintStrokeAt(self, px, py) {
     return _canvas2dParseColor(self, stroke);
   }
 
-function _canvas2dDistanceToSegment(self, px, py, a, b) {
-    const dx = b[0] - a[0], dy = b[1] - a[1];
-    const len = dx * dx + dy * dy;
-    const t = len ? Math.min(1, Math.max(0, ((px - a[0]) * dx + (py - a[1]) * dy) / len)) : 0;
-    return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
+// Whether a coverage sample falls in the stroked region of any subpath. The
+// segment body is the butt ended rectangle, so a sample past an end counts
+// only when something covers that end: an interior vertex, where the two
+// segments meet and the join disc goes, or a subpath end, where the cap goes.
+// The default cap is butt, which stops dead at the end, and a closed subpath
+// has no ends at all.
+function _canvas2dStrokeHit(subpaths, sx, sy, half, cap) {
+    for (const poly of subpaths) {
+      const n = poly.length, closed = poly.closed === true;
+      for (let i = 1; i < n; i++) {
+        const a = poly[i - 1], b = poly[i];
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        const len2 = dx * dx + dy * dy;
+        const t = len2 ? ((sx - a[0]) * dx + (sy - a[1]) * dy) / len2 : 0;
+        if (t >= 0 && t <= 1) {
+          if (Math.hypot(sx - (a[0] + t * dx), sy - (a[1] + t * dy)) <= half) return true;
+          continue;
+        }
+        const start = t < 0;
+        const ex = start ? a[0] : b[0], ey = start ? a[1] : b[1];
+        if (closed || (start ? i - 1 > 0 : i < n - 1)) {
+          if (Math.hypot(sx - ex, sy - ey) <= half) return true;
+          continue;
+        }
+        if (cap === 'round') {
+          if (Math.hypot(sx - ex, sy - ey) <= half) return true;
+        } else if (cap === 'square') {
+          const len = Math.sqrt(len2);
+          const past = (start ? -t : t - 1) * len;
+          const perp = len ? Math.abs((sx - a[0]) * dy - (sy - a[1]) * dx) / len : 0;
+          if (past <= half && perp <= half) return true;
+        }
+      }
+    }
+    return false;
   }
 
 function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
@@ -2023,6 +2056,7 @@ class _Canvas2D {
     const subpaths = _canvas2dFlattenPath(this, 2);
     if (!subpaths.length) return;
     const half = Math.max(0.5, +state.lineWidth / 2 || 0.5);
+    const cap = state.lineCap;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const poly of subpaths) for (const [x, y] of poly) {
       if (x - half < minX) minX = x - half; if (x + half > maxX) maxX = x + half;
@@ -2051,12 +2085,7 @@ class _Canvas2D {
       for (let px = mx0; px <= mx1; px++) {
         let inside = 0;
         for (const [ox, oy] of samples) {
-          const sx = px + ox, sy = py + oy;
-          for (const poly of subpaths) {
-            for (let i = 1; i < poly.length; i++) {
-              if (_canvas2dDistanceToSegment(this, sx, sy, poly[i - 1], poly[i]) <= half) { inside++; break; }
-            }
-          }
+          if (_canvas2dStrokeHit(subpaths, px + ox, py + oy, half, cap)) inside++;
         }
         if (!inside) continue;
         if (mask) { mask[maskRow + px] = inside / samples.length; continue; }
