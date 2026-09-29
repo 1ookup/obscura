@@ -210,3 +210,11 @@ run covers are then removed.
   -p obscura-render --config vendor/v8-source.toml` = **1365/1365 passed**
   (1 skipped) at HEAD `3a084e6`. Full workspace gate deferred to the next
   backfill.
+
+- 2026-09-30: `0efac30` (intersection MutationObserver wiring guarded for
+  frame realms, with a retry from the deferred half), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-render --config vendor/v8-source.toml` = **1365/1365 passed**
+  (1 skipped) at HEAD `c90dfdb`. Full workspace gate deferred to the next
+  backfill. Bootstrap-surface change only: no feature gate, build config, or
+  FFI boundary is touched.
