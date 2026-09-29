@@ -5,7 +5,10 @@
 // back to their symbol names. Method shorthand (no .prototype), own
 // length/name, per the reference's function shape.
 (function _installQueryLocalFonts() {
-  if (typeof _localFontData !== 'function') return;
+  // Worker realms have no Local Font Access and no `window` binding; the
+  // query is a document-surface API. Guard on `window` so the worker
+  // bootstrap doesn't throw a ReferenceError.
+  if (typeof window === 'undefined' || typeof _localFontData !== 'function') return;
   const queryLocalFonts = () => Promise.resolve(_localFontData());
   Object.defineProperty(window, 'queryLocalFonts', {
     value: queryLocalFonts,

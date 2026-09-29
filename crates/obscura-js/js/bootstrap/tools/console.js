@@ -308,7 +308,12 @@ function registerConsoleSurface() {
   // [[Prototype]] carries no own members at all, so the chain reads
   // console -> (empty shell) -> Object.prototype. One sitting straight on
   // Object.prototype answers twelve inherited names a browser does not.
-  Object.setPrototypeOf(globalThis.console, Object.create(Object.prototype));
+  // Chrome's console hangs off an empty intermediary object: its
+  // [[Prototype]] carries no own members at all, so the chain reads
+  // console -> (empty shell) -> Object.prototype. One sitting straight on
+  // Object.prototype answers twelve inherited names a browser does not.
+  // (Reverted: the intermediary broke the worker realm's tracelog -- the
+  // worker bootstrap's console.error path depends on the direct chain.)
 }
 registerConsoleSurface();
 for (const name of _consoleMethodNames) {
