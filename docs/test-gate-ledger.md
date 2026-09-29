@@ -190,3 +190,17 @@ run covers are then removed.
   -p obscura-browser -p obscura-net --no-fail-fast
   --config vendor/v8-source.toml` = **1018/1018 passed** at HEAD `30af415`.
   Full workspace gate deferred to the next backfill.
+
+- 2026-09-29: the canvas/render batch behind the Turnstile parity work --
+  `a98c186` (CoreText glyph rasterization on by default), `24205bc`
+  (off-canvas coverage kept in shadow masks), `9a5e4af` (lineCap in stroke
+  geometry), `2e80498` (zero-alpha pixels colourless), `9469888` (stroke
+  style sampled for gradient strokeText), `586a772` (CoreText glyphs drawn
+  at a single text position) -- scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-render --config vendor/v8-source.toml` = **1365/1365 passed**
+  (1 skipped) at HEAD `586a772`. Full workspace gate deferred to the next
+  backfill. `a98c186` makes an existing FFI path (CoreText through
+  `coretext.rs`) the default rather than changing the boundary itself, so
+  the backfill must still cover it; the obstacle course has to run where
+  `obscura-benchmark` is checked out, absent on this host as above.
