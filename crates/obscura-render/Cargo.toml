@@ -11,7 +11,7 @@ default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff", "dep:core-text", "dep:core-graphics"]
 # Alias, so that a workspace-wide `--features render` reaches this crate too.
 # This crate is itself a workspace member, and `render` is the name every other
 # member uses. Without the alias, `cargo test --features render` from the root
@@ -56,3 +56,7 @@ path = "src/lib.rs"
 name = "paint_file"
 path = "src/bin/paint_file.rs"
 required-features = ["paint"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = { version = "20", optional = true }
+core-graphics = { version = "0.24", optional = true }

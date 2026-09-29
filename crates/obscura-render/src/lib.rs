@@ -143,6 +143,11 @@ pub use paint::{
 #[cfg(feature = "paint")]
 pub mod inline;
 
+/// CoreText glyph raster for canvas fillText (macOS only; other hosts keep
+/// the software rasterizer).
+#[cfg(all(target_os = "macos", feature = "paint"))]
+pub mod coretext;
+
 /// Per-family advance tables generated from the fonts this host ships, used by
 /// the text engine's metric substitution. Data only.
 #[cfg(feature = "paint")]
