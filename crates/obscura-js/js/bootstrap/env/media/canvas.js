@@ -45,6 +45,7 @@ const _imageDataState = new WeakMap();
 // Shared module state, like _imageDataState above.
 const _imageBitmapPixels = new WeakMap();
 const _offscreenCanvasContexts = new WeakMap();
+const _gradientState = new WeakMap();
 const _IMAGE_DATA_COLOR_SPACES = new Set(['srgb', 'display-p3']);
 const _IMAGE_DATA_PIXEL_FORMATS = new Set(['rgba-unorm8', 'rgba-float16']);
 function _imageDataEnum(value, fallback, allowed, member) {
@@ -771,10 +772,11 @@ function _canvas2dWindingAt(self, subpaths, x, y, evenOdd = false) {
 function _canvas2dPaintAt(self, px, py) {
   const state = _canvasStateOf(self);
     const fill = state.fillStyle;
-    if (fill && fill._stops && fill._stops.length) {
-      const inv = _canvas2dTransformInverse(self, fill._transform);
+    const fillSt = fill && _gradientState.get(fill);
+    if (fillSt && fillSt.stops.length) {
+      const inv = _canvas2dTransformInverse(self, fillSt.transform);
       const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
-      return _canvas2dGradientColorAt(self, fill, ux, uy);
+      return _canvas2dGradientColorAt(self, fillSt, ux, uy);
     }
     const color = _canvas2dParseColor(self, fill);
     color.gradient = false;
@@ -795,21 +797,21 @@ function _canvas2dTransformInverse(self, matrix) {
       (c * f - d * e) / det, (b * e - a * f) / det];
   }
 
-function _canvas2dGradientColorAt(self, grad, x, y) {
+function _canvas2dGradientColorAt(self, st, x, y) {
     let t;
-    if (grad._type === 'linear') {
-      const dx = grad._x1 - grad._x0, dy = grad._y1 - grad._y0;
+    if (st.type === 'linear') {
+      const dx = st._x1 - st._x0, dy = st._y1 - st._y0;
       const len = dx * dx + dy * dy;
-      t = len ? ((x - grad._x0) * dx + (y - grad._y0) * dy) / len : 0;
-    } else if (grad._type === 'radial') {
-      const dist = Math.hypot(x - grad._x1, y - grad._y1);
-      t = grad._r1 > grad._r0 ? (dist - grad._r0) / (grad._r1 - grad._r0) : 0;
+      t = len ? ((x - st._x0) * dx + (y - st._y0) * dy) / len : 0;
+    } else if (st.type === 'radial') {
+      const dist = Math.hypot(x - st._x1, y - st._y1);
+      t = st._r1 > st._r0 ? (dist - st._r0) / (st._r1 - st._r0) : 0;
     } else {
-      t = ((Math.atan2(y - grad._y0, x - grad._x0) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2);
-      if (grad._startAngle) t = (t + grad._startAngle / (Math.PI * 2)) % 1;
+      t = ((Math.atan2(y - st._y0, x - st._x0) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2);
+      if (st._startAngle) t = (t + st._startAngle / (Math.PI * 2)) % 1;
     }
     t = Math.min(1, Math.max(0, t));
-    const stops = grad._stops;
+    const stops = st.stops;
     if (t <= stops[0][0]) return stops[0][1].slice();
     const lastStop = stops[stops.length - 1];
     if (t >= lastStop[0]) return lastStop[1].slice();
@@ -831,10 +833,11 @@ function _canvas2dGradientColorAt(self, grad, x, y) {
 function _canvas2dPaintStrokeAt(self, px, py) {
   const state = _canvasStateOf(self);
     const stroke = state.strokeStyle;
-    if (stroke && stroke._stops && stroke._stops.length) {
-      const inv = _canvas2dTransformInverse(self, stroke._transform);
+    const strokeSt = stroke && _gradientState.get(stroke);
+    if (strokeSt && strokeSt.stops.length) {
+      const inv = _canvas2dTransformInverse(self, strokeSt.transform);
       const [ux, uy] = [inv[0] * px + inv[2] * py + inv[4], inv[1] * px + inv[3] * py + inv[5]];
-      return _canvas2dGradientColorAt(self, stroke, ux, uy);
+      return _canvas2dGradientColorAt(self, strokeSt, ux, uy);
     }
     return _canvas2dParseColor(self, stroke);
   }
@@ -878,23 +881,36 @@ function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
 function _canvas2dMakeGradient(self, type, params) {
   const state = _canvasStateOf(self);
     const ctx = self;
-    // Chrome hands back a CanvasGradient instance; binding the interface
-    // prototype keeps `instanceof CanvasGradient` true for gradient probes.
-    const grad = Object.setPrototypeOf(Object.assign({
-      _type: type, _stops: [],
-      addColorStop(offset, color) {
-        offset = +offset;
-        if (!(offset >= 0 && offset <= 1)) {
-          throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
-        }
-        this._stops.push([offset, _canvas2dParseColor(ctx, color)]);
-        this._stops.sort((a, b) => a[0] - b[0]);
-      },
-      get [Symbol.toStringTag]() { return 'CanvasGradient'; },
-      _transform: state.transform.slice(),
-    }, params), (typeof CanvasGradient === 'function' ? CanvasGradient.prototype : null));
+    // Chrome's CanvasGradient instances carry no own enumerable properties:
+    // internal state lives in a WeakMap, addColorStop sits on the prototype,
+    // and the prototype chain ends at Object.prototype (measured: own=[],
+    // proto=["addColorStop","constructor"]).
+    const proto = (typeof CanvasGradient === 'function' && CanvasGradient.prototype)
+      ? CanvasGradient.prototype : Object.prototype;
+    const grad = Object.create(proto);
+    _gradientState.set(grad, {
+      type: type, stops: [],
+      transform: state.transform.slice(),
+      ...params,
+    });
+    if (!proto._addColorStop_installed) {
+      Object.defineProperty(proto, 'addColorStop', {
+        value: function addColorStop(offset, color) {
+          offset = +offset;
+          if (!(offset >= 0 && offset <= 1)) {
+            throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
+          }
+          const st = _gradientState.get(this);
+          if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this) || ctx, color)]); st.stops.sort((a, b) => a[0] - b[0]); }
+        },
+        writable: true, enumerable: true, configurable: true,
+      });
+      Object.defineProperty(proto, '_addColorStop_installed', { value: true });
+    }
+    _gradientCtx.set(grad, ctx);
     return grad;
   }
+  const _gradientCtx = new WeakMap();
 
 class _Canvas2D {
   constructor(canvas, attrs = undefined) {
