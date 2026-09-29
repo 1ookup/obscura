@@ -1071,6 +1071,13 @@ function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
       ? [state.floatBuf[idx], state.floatBuf[idx + 1], state.floatBuf[idx + 2]]
       : [state.colorBuf[idx] / 255, state.colorBuf[idx + 1] / 255,
         state.colorBuf[idx + 2] / 255];
+    // The reference keeps its canvas premultiplied, so a pixel whose stored
+    // alpha is zero carries no colour at all: it answers 0,0,0,0 whatever the
+    // fade or the blurred tail divided out of the premultiplied value. Keep
+    // that invariant on the straight store. Rounding the channels and the
+    // alpha independently would otherwise leave a full strength colour behind
+    // at a sub quantum alpha, which getImageData reads back as a ghost.
+    const storedAlpha = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
     for (let channel = 0; channel < 3; channel++) {
       const blended = state.globalCompositeOperation === 'multiply'
         ? source[channel] * destination[channel] : source[channel];
@@ -1079,10 +1086,11 @@ function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
         + blended * sourceAlpha * destinationAlpha;
       const value = outputAlpha > 0 ? premultiplied / outputAlpha : 0;
       if (state.floatBuf) state.floatBuf[idx + channel] = value;
-      state.colorBuf[idx + channel] = Math.round(Math.max(0, Math.min(1, value)) * 255);
+      state.colorBuf[idx + channel] = storedAlpha
+        ? Math.round(Math.max(0, Math.min(1, value)) * 255) : 0;
     }
     if (state.floatBuf) state.floatBuf[idx + 3] = outputAlpha;
-    state.colorBuf[idx + 3] = Math.round(Math.max(0, Math.min(1, outputAlpha)) * 255);
+    state.colorBuf[idx + 3] = storedAlpha;
     _canvas2dSyncRendererPixel(self, idx);
   }
 
@@ -1748,16 +1756,24 @@ class _Canvas2D {
             data[srcIdx + 1] * scale, data[srcIdx + 2] * scale],
             source.colorSpace, state.colorSpace);
           const alpha = Math.max(0, Math.min(1, data[srcIdx + 3] * scale));
+          // Same invariant as the blend: a zero alpha entry stores no colour,
+          // even when the caller handed one in. The reference premultiplies on
+          // put, so a transparent source pixel reads back as 0,0,0,0.
           if (state.floatBuf) {
-            state.floatBuf[dstIdx] = converted[0];
-            state.floatBuf[dstIdx + 1] = converted[1];
-            state.floatBuf[dstIdx + 2] = converted[2];
+            state.floatBuf[dstIdx] = alpha ? converted[0] : 0;
+            state.floatBuf[dstIdx + 1] = alpha ? converted[1] : 0;
+            state.floatBuf[dstIdx + 2] = alpha ? converted[2] : 0;
             state.floatBuf[dstIdx + 3] = alpha;
           }
-          state.colorBuf[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
-          state.colorBuf[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
-          state.colorBuf[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
-          state.colorBuf[dstIdx + 3] = Math.round(alpha * 255);
+          const storedAlpha = Math.round(alpha * 255);
+          if (storedAlpha) {
+            state.colorBuf[dstIdx] = Math.round(Math.max(0, Math.min(1, converted[0])) * 255);
+            state.colorBuf[dstIdx + 1] = Math.round(Math.max(0, Math.min(1, converted[1])) * 255);
+            state.colorBuf[dstIdx + 2] = Math.round(Math.max(0, Math.min(1, converted[2])) * 255);
+          } else {
+            state.colorBuf[dstIdx] = state.colorBuf[dstIdx + 1] = state.colorBuf[dstIdx + 2] = 0;
+          }
+          state.colorBuf[dstIdx + 3] = storedAlpha;
           _canvas2dSyncRendererPixel(this, dstIdx);
         }
       }
