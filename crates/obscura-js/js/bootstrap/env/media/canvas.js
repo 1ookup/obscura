@@ -1016,7 +1016,11 @@ function _canvas2dMakeGradient(self, type, params) {
       transform: state.transform.slice(),
       ...params,
     });
-    if (!proto._addColorStop_installed) {
+    // Install unconditionally: a reloaded module minted a fresh WeakMap, and
+    // a stale addColorStop from the previous load would silently skip the
+    // write (its `this`-keyed state lives in the retired map), leaving the
+    // gradient with zero stops and the fill transparent.
+    {
       Object.defineProperty(proto, 'addColorStop', {
         value: function addColorStop(offset, color) {
           offset = +offset;
@@ -1028,7 +1032,6 @@ function _canvas2dMakeGradient(self, type, params) {
         },
         writable: true, enumerable: true, configurable: true,
       });
-      Object.defineProperty(proto, '_addColorStop_installed', { value: true });
     }
     _gradientCtx.set(grad, ctx);
     return grad;
@@ -1102,7 +1105,10 @@ class _Canvas2D {
     const t = state.transform;
     const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
-    if (!identity || (state.fillStyle && state.fillStyle._stops)) {
+    // A gradient fillStyle is an own-property-free object now (the shape the
+    // reference carries); its stops live in the state WeakMap, so that map --
+    // not a legacy `_stops` field -- is what recognizes it here.
+    if (!identity || (state.fillStyle && _gradientState.has(state.fillStyle))) {
       const currentPath = state.path;
       try {
         _canvas2dSet(state, 'path', []);

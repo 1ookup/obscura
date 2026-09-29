@@ -670,5 +670,27 @@ mod probe_tests {
             }
         }
     }
+
+    #[test]
+    fn probe_pen_zero() {
+        if std::env::var("OBSCURA_DUMP_CT5").is_err() {
+            return;
+        }
+        // Discriminator: render with pen_x = 0 on a wide scratch and see
+        // which column the ink lands in. +0 => the pen semantics are clean
+        // and the live offsets come from the frame math; +3 => CG itself
+        // shifts unhinted tiny glyphs.
+        let pingfang = std::fs::read("/System/Library/AssetsV2/com_apple_MobileAsset_Font8/86ba2c91f017a3749571a82f2c6d890ac7ffb2fb.asset/AssetData/PingFang.ttc").expect("pf");
+        for size in [1.0f64, 2.0, 10.0] {
+            let face = CoreTextFace::from_bytes(std::sync::Arc::new(pingfang.clone()), size).expect("face");
+            let g = face.glyph_for_char('A').expect("g");
+            if let Some(m) = face.draw_glyph_gray_flags(g, 0.0, size * 2.0, 32, 32, true, true) {
+                let cells: Vec<String> = m.iter().enumerate().filter(|(_, v)| **v > 0)
+                    .map(|(i, v)| format!("(r{},c{},a{:02x})", i / 32, i % 32, v)).collect();
+                let first = cells.iter().take(4).cloned().collect::<Vec<_>>().join(" ");
+                println!("size={} cells={} first={}", size, cells.len(), first);
+            }
+        }
+    }
 }
 

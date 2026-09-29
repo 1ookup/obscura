@@ -2167,6 +2167,49 @@ impl IdentityGlyphFaces {
         self.faces.get(family).and_then(|file| file.as_ref())
     }
 
+    /// The software sampler's placement for one glyph: the (left, top, w, h)
+    /// the reference frame expects the ink at. The CoreText arm maps its own
+    /// mask onto this box, which absorbs every per-size bearing difference
+    /// the system rasterizer introduces.
+    #[cfg(target_os = "macos")]
+    fn glyph_placement(
+        &mut self,
+        family: &'static str,
+        ch: char,
+        size: f32,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let Some(file) = self.face(family) else { return None };
+        let file = file.clone();
+        let Some(font) = swash::FontRef::from_index(&file.bytes, file.index as usize) else { return None };
+        let glyph_id = font.charmap().map(ch as u32);
+        if glyph_id == 0 {
+            return None;
+        }
+        let key = IdentityRasterKey {
+            family,
+            glyph_id,
+            size_bits: size.to_bits(),
+        };
+        let image = self.images.entry(key).or_insert_with(|| {
+            let mut scaler = self.context.builder(font).size(size).hint(false).build();
+            Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .render(&mut scaler, glyph_id)
+        });
+        image.as_ref().map(|im| {
+            (
+                im.placement.left,
+                im.placement.top,
+                im.placement.width,
+                im.placement.height,
+            )
+        })
+    }
+
     /// The family's CoreText face at `size` (macOS): minted from the same
     /// host file the software sampler loads, cached per (family, size).
     #[cfg(target_os = "macos")]
@@ -3605,88 +3648,99 @@ impl TextEngine {
                         },
                     );
                 }
-                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
+                                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
                     let base_row = baseline_row + line_dy;
-                    // macOS identity glyphs rasterize through CoreText into a
-                    // padded scratch surface, then map into the coverage frame
-                    // through the strength LUT: the system pipeline's mask is
-                    // what the reference digests, and the LUT maps its strength
-                    // onto the reference's answers (the anchor test pins the
-                    // four probe values). Non-macOS keeps the software sampler.
+                    // macOS identity glyphs can rasterize through CoreText
+                    // (OBSCURA_USE_CT=1): the system pipeline's mask mapped
+                    // onto the software sampler's placement box -- the bbox
+                    // mapping absorbs every per-size bearing difference the
+                    // system rasterizer introduces -- and its strength walks
+                    // the LUT that pins the four probe anchors. The default
+                    // stays the software sampler until the mapping is proven
+                    // across the size range.
                     #[cfg(target_os = "macos")]
                     {
                         let size_f64 = f64::from(size);
                         let glyph = identity_glyph_faces
                             .coretext_face(family, size_f64)
                             .and_then(|f| f.glyph_for_char(ch));
+                        let placement = identity_glyph_faces.glyph_placement(family, ch, size);
                         let ct_enabled = std::env::var("OBSCURA_USE_CT").is_ok();
                         if ct_enabled {
-                        if let (Some(face), Some(glyph)) =
-                            (identity_glyph_faces.coretext_face(family, size_f64), glyph)
-                        {
-                            // The scratch carries the ascent above and the
-                            // descent below the pen's baseline, plus a margin,
-                            // so the glyph's ink never clips against the frame
-                            // guard the way a directly-mapped bitmap does.
-                            const PAD: i32 = 2;
-                            let asc = ascent.ceil() as i32;
-                            let desc = descent.ceil() as i32;
-                            let w = (width as i32 + 2 * PAD).max(1) as usize;
-                            let h = (asc + desc + 2 * PAD).max(1) as usize;
-                            let baseline = (asc + PAD) as f64;
-                            if let Some(mask) = face.draw_glyph_gray_flags(
+                            if let (Some(face), Some(glyph), Some((sw_left, sw_top, sw_w, sw_h))) = (
+                                identity_glyph_faces.coretext_face(family, size_f64),
                                 glyph,
-                                (x - left + PAD) as f64,
-                                baseline,
-                                w,
-                                h,
-                                true,
-                                true,
+                                placement,
                             ) {
-                                if std::env::var("OBSCURA_DEBUG_CT").is_ok() {
-                                    let sum: u32 = mask.iter().map(|v| *v as u32).sum();
-                                    let cells: Vec<String> = mask
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, v)| **v > 0)
-                                        .map(|(i, v)| {
-                                            format!("(r{},c{},a{:02x})", i / w, i % w, v)
-                                        })
-                                        .collect();
-                                    eprintln!(
-                                        "[ct] family={} ch={} size={} cov_wh={}x{} left={} asc={} base_row={} sum={} cells={}",
-                                        family, ch, size, width, height, left, asc, base_row, sum,
-                                        cells.join(" ")
-                                    );
-                                }
-                                for (index, alpha) in mask.iter().copied().enumerate() {
-                                    if alpha == 0 {
+                                const PAD: i32 = 4;
+                                let w = (sw_w as i32 + 2 * PAD).max(1) as usize;
+                                let h = (sw_h as i32 + 2 * PAD).max(1) as usize;
+                                let baseline = sw_h as f64 + PAD as f64;
+                                if let Some(mask) = face.draw_glyph_gray_flags(
+                                    glyph,
+                                    PAD as f64,
+                                    baseline,
+                                    w,
+                                    h,
+                                    true,
+                                    true,
+                                ) {
+                                    let mut min_r = i32::MAX;
+                                    let mut min_c = i32::MAX;
+                                    for (index, alpha) in mask.iter().enumerate() {
+                                        if *alpha > 0 {
+                                            min_r = min_r.min((index / w) as i32);
+                                            min_c = min_c.min((index % w) as i32);
+                                        }
+                                    }
+                                    let mut max_r = i32::MIN;
+                                    let mut max_c = i32::MIN;
+                                    for (index, alpha) in mask.iter().enumerate() {
+                                        if *alpha > 0 {
+                                            max_r = max_r.max((index / w) as i32);
+                                            max_c = max_c.max((index % w) as i32);
+                                        }
+                                    }
+                                    // The CG unhinted outline runs a different width
+                                    // than the hinted swash box (a tenth of a column
+                                    // at 10px, growing with size), so the ink maps
+                                    // linearly onto the placement box instead of
+                                    // translating: the shape stretches to the box
+                                    // the reference frame expects.
+                                    let cg_cols = (max_c - min_c).max(1);
+                                    let cg_rows = (max_r - min_r).max(1);
+                                    let sw_cols = (sw_w as i32 - 1).max(1);
+                                    let sw_rows = (sw_h as i32 - 1).max(1);
+                                    if min_r != i32::MAX {
+                                        for (index, alpha) in mask.iter().enumerate() {
+                                            if *alpha == 0 {
+                                                continue;
+                                            }
+                                            let mapped = crate::coretext::coverage_lut(*alpha);
+                                            let c_rel = (index % w) as i32 - min_c;
+                                            let r_rel = (index / w) as i32 - min_r;
+                                            let col_scaled = (c_rel * sw_cols + cg_cols / 2) / cg_cols;
+                                            let row_scaled = (r_rel * sw_rows + cg_rows / 2) / cg_rows;
+                                            let col_cov = x + sw_left + col_scaled - left;
+                                            let row_cov = base_row - sw_top as i32 + row_scaled;
+                                            if col_cov < 0
+                                                || row_cov < 0
+                                                || col_cov >= width as i32
+                                                || row_cov >= height as i32
+                                            {
+                                                continue;
+                                            }
+                                            let cell_i =
+                                                row_cov as usize * width as usize + col_cov as usize;
+                                            composite_glyph_pixel(
+                                                &mut coverage[cell_i],
+                                                Color::rgba(0, 0, 0, mapped),
+                                            );
+                                        }
                                         continue;
                                     }
-                                    let mapped = crate::coretext::coverage_lut(alpha);
-                                    // Scratch col i sits PAD left of the frame's
-                                    // first coverage column (the pen was placed
-                                    // at x-left+PAD in scratch space); the
-                                    // returned rows are top-down (the buffer
-                                    // already flipped the user-space y axis).
-                                    let col_cov = (index % w) as i32 - PAD;
-                                    let row_cov = (index / w) as i32 - (asc + PAD) + base_row;
-                                    if col_cov < 0
-                                        || row_cov < 0
-                                        || col_cov >= width as i32
-                                        || row_cov >= height as i32
-                                    {
-                                        continue;
-                                    }
-                                    let cell_i = row_cov as usize * width as usize + col_cov as usize;
-                                    composite_glyph_pixel(
-                                        &mut coverage[cell_i],
-                                        Color::rgba(0, 0, 0, mapped),
-                                    );
                                 }
-                                continue;
                             }
-                        }
                         }
                     }
                     identity_glyph_faces.with_glyph_pixels(
@@ -3707,7 +3761,7 @@ impl TextEngine {
                 }
             }
         }
-        Some((width, height, left, top, coverage))
+Some((width, height, left, top, coverage))
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
