@@ -1316,6 +1316,9 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
   if (gradient) _gpx('PAINT fillText mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' stops=' + (gradient.stops ? gradient.stops.length : -1) + ' text=' + String(text).slice(0, 16) + ' font=' + String(state.font) + _gpxStyle(state));
   const paint = stroke ? state.strokeStyle : fill;
   const paintGradient = stroke ? (paint && _gradientState.get(paint)) : gradient;
+  // The sampler follows the same choice, so a gradient stroke samples the
+  // stroke style rather than the fill the run's coverage came from.
+  const sampleAt = stroke ? _canvas2dPaintStrokeAt : _canvas2dPaintAt;
   const solid = paintGradient ? null : _canvas2dParseColor(self, paint);
   const str = _prepareCanvasText(text);
   if (str.length) {
@@ -1381,7 +1384,7 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
           if (mask ? (gx < box[0] || gx > box[2]) : (gx < 0 || gx >= state.w)) continue;
           if (mask) { mask[maskRow + gx] = c / 255; continue; }
           const [r, g, b, a] = paintGradient
-            ? _canvas2dPaintAt(self, gx + 0.5, gy + 0.5) : solid;
+            ? sampleAt(self, gx + 0.5, gy + 0.5) : solid;
           _canvas2dBlendPixel(self, gx, gy, r, g, b, a, c / 255);
         }
       }
@@ -1395,7 +1398,7 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
             const c = mask[maskRow + px];
             if (!c) continue;
             const [r, g, b, a] = paintGradient
-              ? _canvas2dPaintAt(self, px + 0.5, py + 0.5) : solid;
+              ? sampleAt(self, px + 0.5, py + 0.5) : solid;
             _canvas2dBlendPixel(self, px, py, r, g, b, a, c);
           }
         }
