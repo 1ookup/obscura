@@ -1302,7 +1302,11 @@ function _canvas2dColorParses(css) {
 }
 function _canvas2dAddColorStopCreate() {
   if (!_canvas2dAddColorStopIntrinsic) {
-    _canvas2dAddColorStopIntrinsic = function addColorStop(offset, color) {
+    // Method shorthand: a shorthand method owns no `prototype` (measured on
+    // the reference: addColorStop.hasOwnProperty('prototype') === false),
+    // which a function expression can never achieve -- its `prototype` is
+    // non-configurable -- so the gradient probe reads exactly this shape.
+    _canvas2dAddColorStopIntrinsic = { addColorStop(offset, color) {
       if (arguments.length < 2) {
         throw new TypeError("Failed to execute 'addColorStop' on 'CanvasGradient': 2 arguments required, but only " + arguments.length + " present.");
       }
@@ -1319,7 +1323,7 @@ function _canvas2dAddColorStopCreate() {
       const st = _gradientState.get(this);
       _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
       if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this), color)]); st.stops.sort((a, b) => a[0] - b[0]); }
-    };
+    } }.addColorStop;
     if (typeof _markNative === 'function') { _markNative(_canvas2dAddColorStopIntrinsic); }
   }
   return _canvas2dAddColorStopIntrinsic;

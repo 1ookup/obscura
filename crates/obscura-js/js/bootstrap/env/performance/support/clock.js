@@ -80,7 +80,9 @@ var _performanceNowImpl = (function() {
   };
 })();
 globalThis.performance = globalThis.performance || {
-  now: function now() {
+  // Method shorthand: owns no `prototype`, like the reference's native
+  // performance.now (measured: hasOwnProperty('prototype') === false).
+  now() {
     if (!_performanceBrand.has(this)) throw new TypeError('Illegal invocation');
     return _performanceNowImpl();
   },

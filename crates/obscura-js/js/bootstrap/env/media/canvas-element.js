@@ -37,7 +37,7 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
+HTMLCanvasElement.prototype.getContext = ({ getContext(type, attrs) {
   if (type === '2d') {
     // A canvas carries exactly one context family; the first request wins
     // and everything else, including a repeat with different attributes,
@@ -89,7 +89,7 @@ HTMLCanvasElement.prototype.getContext = function getContext(type, attrs) {
     return this._webgpuCtx;
   }
   return null;
-};
+} }).getContext;
 HTMLCanvasElement.prototype.toDataURL = function toDataURL(type) {
   const ctx = this._ctx || this.getContext('2d');
   if (_isCanvas2DContext(ctx) && _canvas2dPixels(ctx)) {
@@ -118,6 +118,6 @@ HTMLCanvasElement.prototype.toBlob = function toBlob(callback, type, quality) {
   callback(blob);
 };
 
-_markNative(HTMLCanvasElement.prototype.getContext);
+
 _markNative(HTMLCanvasElement.prototype.toDataURL);
 _markNative(HTMLCanvasElement.prototype.toBlob);

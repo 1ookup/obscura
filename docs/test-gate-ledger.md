@@ -258,3 +258,15 @@ run covers are then removed.
   `canvas_gradient_arguments_throw_like_chrome` test; the live bench9
   exception scan now answers identically to the reference Chrome on all
   sixteen cases. Full workspace gate deferred to the next backfill.
+
+- 2026-09-30: the native-method `prototype` shape (addColorStop, the canvas
+  element getContext, performance.now, Object.keys/getOwnPropertyNames and
+  Reflect.ownKeys wrappers redefined as method shorthand, which owns no
+  `prototype`; a function expression cannot match -- its `prototype` is
+  non-configurable, and a Proxy violates the invariant by hiding it),
+  scoped to `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **886/886 passed** with the new
+  `native_methods_own_no_prototype` test; the live bench11 scan reads
+  identically to the reference Chrome on all twenty probes. Full workspace
+  gate deferred to the next backfill.

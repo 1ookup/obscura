@@ -759,14 +759,16 @@ _markNative(globalThis.dispatchEvent);
   var _oGOPD = Object.getOwnPropertyDescriptor;
   var _oGOPDs = Object.getOwnPropertyDescriptors;
   function define(obj, prop, impl) {
-    try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    try {
+      Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true });
+    } catch (e) {}
   }
-  define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
-  define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
+  define(Object, 'getOwnPropertyNames', ({ getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); } }).getOwnPropertyNames);
+  define(Reflect, 'ownKeys', ({ ownKeys(t) { return _filter(t, _oOwnKeys(t)); } }).ownKeys);
   // Object.keys only reports enumerable properties, and every engine slot is
   // non-enumerable now, so the DOM-wrapper filter would only hide fields a
   // page itself created (Chrome shows those). The global/frame hiding stays.
-  define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t), true); });
+  define(Object, 'keys', ({ keys(t) { return _filter(t, _oKeys(t), true); } }).keys);
   define(Object, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, name) {
     if (typeof name === 'string' && name.charAt(0) === '_') {
       var d0 = _oGOPD(t, name);

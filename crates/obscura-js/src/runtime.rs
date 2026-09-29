@@ -24756,6 +24756,57 @@ RequestRedirect value",
         }
     }
 
+    /// A native method owns no `prototype`, and the live gradient probe
+    /// reads that shape (hasOwnProperty('prototype') === false) before it
+    /// ever calls the method -- the engine answered true while the four
+    /// methods here were function expressions, because a function
+    /// expression's `prototype` is non-configurable and no delete or Proxy
+    /// can hide it. Method shorthand is the only JS shape that matches.
+    #[test]
+    fn native_methods_own_no_prototype() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const g = new OffscreenCanvas(2, 2).getContext('2d')
+                        .createLinearGradient(0, 0, 1, 1);
+                    const ctx2d = document.createElement('canvas').getContext('2d');
+                    return {
+                        addColorStop: Object.prototype.hasOwnProperty.call(
+                            g.addColorStop, 'prototype'),
+                        getContext: Object.prototype.hasOwnProperty.call(
+                            ctx2d.canvas.getContext, 'prototype'),
+                        pnow: Object.prototype.hasOwnProperty.call(
+                            performance.now, 'prototype'),
+                        keys: Object.prototype.hasOwnProperty.call(
+                            Object.keys, 'prototype'),
+                        gopa: Object.prototype.hasOwnProperty.call(
+                            Object.getOwnPropertyNames, 'prototype'),
+                        addStillWorks: (() => {
+                            g.addColorStop(0, 'red');
+                            return true;
+                        })(),
+                        nowStillWorks: typeof performance.now() === 'number',
+                        keysStillWorks: Object.keys({ a: 1 }).length === 1,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "addColorStop": false,
+                "getContext": false,
+                "pnow": false,
+                "keys": false,
+                "gopa": false,
+                "addStillWorks": true,
+                "nowStillWorks": true,
+                "keysStillWorks": true,
+            })
+        );
+    }
+
     /// proto-order scan diffs exactly this list. This pins the fixed order
     /// for the four interfaces from that scan plus the two L2 surfaces: the
     /// MutationObserver prototype carries no internal `_notify` (it lives in
