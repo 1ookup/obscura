@@ -2319,6 +2319,12 @@ impl IdentityGlyphFaces {
         let Some(image) = image else { return };
         let left = image.placement.left;
         let top = -image.placement.top;
+        if std::env::var("OBSCURA_DEBUG_CT").is_ok() {
+            eprintln!(
+                "[swp] family={} ch={} size={} place_left={} place_top={} w={} h={}",
+                family, ch, size, left, image.placement.top, image.placement.width, image.placement.height
+            );
+        }
         match image.content {
             SwashContent::Mask => {
                 for (index, alpha) in image.data.iter().copied().enumerate() {
@@ -3601,6 +3607,88 @@ impl TextEngine {
                 }
                 GlyphDraw::Identity { family, ch, size, x, line_dy } => {
                     let base_row = baseline_row + line_dy;
+                    // macOS identity glyphs rasterize through CoreText into a
+                    // padded scratch surface, then map into the coverage frame
+                    // through the strength LUT: the system pipeline's mask is
+                    // what the reference digests, and the LUT maps its strength
+                    // onto the reference's answers (the anchor test pins the
+                    // four probe values). Non-macOS keeps the software sampler.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let size_f64 = f64::from(size);
+                        let glyph = identity_glyph_faces
+                            .coretext_face(family, size_f64)
+                            .and_then(|f| f.glyph_for_char(ch));
+                        let ct_enabled = std::env::var("OBSCURA_USE_CT").is_ok();
+                        if ct_enabled {
+                        if let (Some(face), Some(glyph)) =
+                            (identity_glyph_faces.coretext_face(family, size_f64), glyph)
+                        {
+                            // The scratch carries the ascent above and the
+                            // descent below the pen's baseline, plus a margin,
+                            // so the glyph's ink never clips against the frame
+                            // guard the way a directly-mapped bitmap does.
+                            const PAD: i32 = 2;
+                            let asc = ascent.ceil() as i32;
+                            let desc = descent.ceil() as i32;
+                            let w = (width as i32 + 2 * PAD).max(1) as usize;
+                            let h = (asc + desc + 2 * PAD).max(1) as usize;
+                            let baseline = (asc + PAD) as f64;
+                            if let Some(mask) = face.draw_glyph_gray_flags(
+                                glyph,
+                                (x - left + PAD) as f64,
+                                baseline,
+                                w,
+                                h,
+                                true,
+                                true,
+                            ) {
+                                if std::env::var("OBSCURA_DEBUG_CT").is_ok() {
+                                    let sum: u32 = mask.iter().map(|v| *v as u32).sum();
+                                    let cells: Vec<String> = mask
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, v)| **v > 0)
+                                        .map(|(i, v)| {
+                                            format!("(r{},c{},a{:02x})", i / w, i % w, v)
+                                        })
+                                        .collect();
+                                    eprintln!(
+                                        "[ct] family={} ch={} size={} cov_wh={}x{} left={} asc={} base_row={} sum={} cells={}",
+                                        family, ch, size, width, height, left, asc, base_row, sum,
+                                        cells.join(" ")
+                                    );
+                                }
+                                for (index, alpha) in mask.iter().copied().enumerate() {
+                                    if alpha == 0 {
+                                        continue;
+                                    }
+                                    let mapped = crate::coretext::coverage_lut(alpha);
+                                    // Scratch col i sits PAD left of the frame's
+                                    // first coverage column (the pen was placed
+                                    // at x-left+PAD in scratch space); the
+                                    // returned rows are top-down (the buffer
+                                    // already flipped the user-space y axis).
+                                    let col_cov = (index % w) as i32 - PAD;
+                                    let row_cov = (index / w) as i32 - (asc + PAD) + base_row;
+                                    if col_cov < 0
+                                        || row_cov < 0
+                                        || col_cov >= width as i32
+                                        || row_cov >= height as i32
+                                    {
+                                        continue;
+                                    }
+                                    let cell_i = row_cov as usize * width as usize + col_cov as usize;
+                                    composite_glyph_pixel(
+                                        &mut coverage[cell_i],
+                                        Color::rgba(0, 0, 0, mapped),
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        }
+                    }
                     identity_glyph_faces.with_glyph_pixels(
                         family,
                         ch,
