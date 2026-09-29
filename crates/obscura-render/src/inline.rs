@@ -1985,9 +1985,6 @@ impl IdentityGlyphFaces {
     fn face(&mut self, family: &'static str) -> Option<&IdentityFaceFile> {
         if !self.faces.contains_key(family) {
             let loaded = Self::load(family);
-            if std::env::var_os("OBSCURA_COVERAGE_DEBUG").is_some() {
-                eprintln!("identity-face load {:?} -> {}", family, loaded.as_ref().map(|f| f.index).map(|i| i.to_string()).unwrap_or_else(|| "FAILED".into()));
-            }
             self.faces.insert(family, loaded);
         }
         self.faces.get(family).and_then(|file| file.as_ref())
@@ -3138,12 +3135,16 @@ impl TextEngine {
         }
         let previous_len = self.items.len();
         let idx = self.push_generated_text(text, style)?;
-        let result = self.canvas_item_coverage(idx);
+        let result = self.canvas_item_coverage(idx, text);
         self.items.truncate(previous_len);
         result
     }
 
-    fn canvas_item_coverage(&mut self, idx: usize) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+    fn canvas_item_coverage(
+        &mut self,
+        idx: usize,
+        original: &str,
+    ) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
         // The ink union frames the bitmap: no outline sample can land outside
         // it, so its bounds plus a one-pixel margin bound every glyph pixel.
         // The union ignores blank glyphs (`canvas_item_ink` skips degenerate
@@ -3247,8 +3248,33 @@ impl TextEngine {
                 let x = pen + glyph.x_offset;
                 pen += advance;
 
+                // C1 controls carry advance (the tables' latin1 block covers
+                // 0x80..=0x9F, which is what keeps the run's width right) but
+                // no ink: the reference renders them blank. The shaper has
+                // already swapped them for U+FFFD in the buffer text, so the
+                // check reads the original character at the cluster's index.
+                // Character index of this cluster's start within the run
+                // text; the shaper swapped C1 controls for U+FFFD one-for-one,
+                // so the same index reads the original character.
+                let cluster_start_chars = run
+                    .text
+                    .get(..span.0)
+                    .map(|prefix| prefix.chars().count())
+                    .unwrap_or(0);
+                let cluster_has_ink = cluster
+                    .map(|c| {
+                        c.chars().enumerate().any(|(i, _ch)| {
+                            original
+                                .chars()
+                                .nth(cluster_start_chars + i)
+                                .map_or(true, |orig| {
+                                    !(0x80..=0x9F).contains(&(orig as u32))
+                                })
+                        })
+                    })
+                    .unwrap_or(false);
                 let mut identity_spec = None;
-                if covered && !ligature {
+                if covered && !ligature && cluster_has_ink {
                     if let Some(cluster) = cluster {
                         let single = cluster.chars().collect::<Vec<_>>();
                         // Emoji and the wide/last-resort fallbacks carry their
@@ -3292,6 +3318,20 @@ impl TextEngine {
                         x: (line_offset + x).round() as i32,
                         line_dy,
                     }),
+                    // A C1-only cluster draws nothing in the reference, no
+                    // matter which path covered its advance -- the shaped
+                    // stand-in is a .notdef block whose ink the reference
+                    // does not have.
+                    None if !cluster_has_ink => {}
+                    // Uncovered clusters draw the shaped stand-in.
+                    None if !covered => {
+                        let physical = glyph.physical((line_offset, 0.0), 1.0);
+                        draws.push(GlyphDraw::Shaped {
+                            cache_key: physical.cache_key,
+                            x: physical.x,
+                            line_dy,
+                        });
+                    }
                     None => {
                         let physical = glyph.physical((line_offset, 0.0), 1.0);
                         draws.push(GlyphDraw::Shaped {
@@ -3300,15 +3340,6 @@ impl TextEngine {
                             line_dy,
                         });
                     }
-                }
-            }
-        }
-        if std::env::var_os("OBSCURA_COVERAGE_DEBUG").is_some() {
-            eprintln!("coverage: table={:?} face={:?} draws={}",
-                identity_table.map(|t| t.family), identity_face.map(|f| if matches!(f, IdentityFace::Sans) { "Sans" } else { "Serif" }), draws.len());
-            for d in &draws {
-                if let GlyphDraw::Identity { family, ch, size, x, line_dy } = d {
-                    eprintln!("coverage: identity {} {:?} size={} x={} dy={}", family, ch, size, x, line_dy);
                 }
             }
         }

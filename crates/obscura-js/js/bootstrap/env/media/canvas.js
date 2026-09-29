@@ -713,7 +713,33 @@ function _canvasRasterText(text, font) {
   const op = Deno.core.ops.op_canvas_raster_text;
   if (typeof op !== 'function') return null;
   let packed;
-  try { packed = op(text, String(font || '10px sans-serif')); } catch (_error) { return null; }
+  // UTF-8 bytes, not a string: the op-string conversion lossy-decodes a
+  // one-byte v8 string's raw bytes, which turns C1 controls into U+FFFD --
+  // and TextEncoder rides the same string conversion, so the encoding is
+  // done here by hand.
+  try {
+    const bytes = new Uint8Array(text.length * 3);
+    let n = 0;
+    for (const ch of text) {
+      const c = ch.codePointAt(0);
+      if (c < 0x80) {
+        bytes[n++] = c;
+      } else if (c < 0x800) {
+        bytes[n++] = 0xC0 | (c >> 6);
+        bytes[n++] = 0x80 | (c & 63);
+      } else if (c < 0x10000) {
+        bytes[n++] = 0xE0 | (c >> 12);
+        bytes[n++] = 0x80 | ((c >> 6) & 63);
+        bytes[n++] = 0x80 | (c & 63);
+      } else {
+        bytes[n++] = 0xF0 | (c >> 18);
+        bytes[n++] = 0x80 | ((c >> 12) & 63);
+        bytes[n++] = 0x80 | ((c >> 6) & 63);
+        bytes[n++] = 0x80 | (c & 63);
+      }
+    }
+    packed = op(bytes.subarray(0, n), String(font || '10px sans-serif'));
+  } catch (_error) { return null; }
   if (!packed) return null;
   const parts = String(packed).split('|');
   if (parts.length !== 5) return null;
@@ -1082,7 +1108,7 @@ class _Canvas2D {
       // C1 controls draw with the U+FFFD replacement glyph (the folded-emoji
       // probe digests the two spellings as one render), so the folding happens
       // before the raster, not on the drawn pixels.
-      const raster = _canvasRasterText(str.replace(/[\x80-\x9f]/g, '�'), this.font);
+      const raster = _canvasRasterText(str, this.font);
       if (raster) {
         // Real glyph coverage from the shape engine: every glyph pixel
         // composites through the blend helper, so a 1px glyph answers a

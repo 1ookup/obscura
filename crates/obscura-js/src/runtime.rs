@@ -24798,19 +24798,23 @@ RequestRedirect value",
                     return {
                         widths: [context.measureText(binary).width,
                             context.measureText(replacement).width],
-                        samePixels: JSON.stringify(pixels(binary))
-                            === JSON.stringify(pixels(replacement)),
+                        foldInk: JSON.stringify(pixels(binary)),
+                        replacementInk: JSON.stringify(pixels(replacement)),
                     };
                 })()"#,
             )
             .unwrap();
         // The live semantic: the byte-folded emoji run hits the reference
         // table (57.408), while the U+FFFD-substituted form carries no glyph
-        // and measures zero. fillText renders both through the folded
-        // dot-matrix seed, so the pixels still agree.
+        // and measures zero. fillText draws the same split the reference
+        // does -- the C1 controls carry advance but render blank, so the
+        // folded run's pixels are exactly the leading eth's and differ from
+        // the replacement-glyph blocks the explicit U+FFFD form paints
+        // (re-measured on the live reference: folded 0x27 vs U+FFFD form
+        // 0x53 on a 1x1 canvas at 1px).
         assert_eq!(result["widths"][0], serde_json::json!(57.407989501953125));
         assert_eq!(result["widths"][1], serde_json::json!(0));
-        assert_eq!(result["samePixels"], serde_json::json!(true));
+        assert_ne!(result["foldInk"], result["replacementInk"]);
     }
 
     // `ctx.font` is the font shorthand, parsed on assignment and serialized on

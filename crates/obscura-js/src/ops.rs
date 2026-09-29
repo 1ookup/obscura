@@ -7531,7 +7531,16 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_canvas_raster_text(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
+fn op_canvas_raster_text(
+    state: &OpState,
+    #[buffer] text: &[u8],
+    #[string] font: &str,
+) -> String {
+    // The text arrives UTF-8-encoded from the JS side: the op-string
+    // conversion lossy-decodes a one-byte v8 string's raw bytes, which turned
+    // every C1 control (U+0080..=U+009F) into U+FFFD -- a glyph the probes'
+    // byte-folded runs must not draw.
+    let text = std::str::from_utf8(text).unwrap_or("");
     let shared = state.borrow::<SharedState>().clone();
     let packed = shared
         .borrow_mut()
