@@ -709,6 +709,34 @@ function _b64Decode(text) {
   return out.subarray(0, o);
 }
 
+// The ranges the reference renders from the color emoji face: pictographic
+// blocks, the regional indicators flags are built from, variation selectors
+// and the two text-presentation exceptions Chrome still colorizes.
+function _textHasEmoji(text) {
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x1F000 && c <= 0x1FAFF) || (c >= 0x2600 && c <= 0x27BF)
+      || (c >= 0x1F1E6 && c <= 0x1F1FF) || (c >= 0xFE00 && c <= 0xFE0F)
+      || c === 0x2B50 || c === 0x2764 || (c >= 0x1F900 && c <= 0x1F9FF)) return true;
+  }
+  return false;
+}
+function _canvasEmojiBitmap(text, font) {
+  const op = Deno.core.ops.op_canvas_emoji_bitmap;
+  if (typeof op !== 'function' || !_textHasEmoji(text)) return null;
+  let packed;
+  try { packed = op(text, String(font || '10px sans-serif')); } catch (_error) { return null; }
+  if (!packed) return null;
+  const parts = String(packed).split('|');
+  if (parts.length !== 5) return null;
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  const left = Number(parts[2]);
+  const top = Number(parts[3]);
+  if (!(w > 0 && h > 0 && Number.isFinite(left) && Number.isFinite(top))) return null;
+  return [w, h, left, top, _b64Decode(parts[4])];
+}
+
 function _canvasRasterText(text, font) {
   const op = Deno.core.ops.op_canvas_raster_text;
   if (typeof op !== 'function') return null;
@@ -749,6 +777,28 @@ function _canvasRasterText(text, font) {
   const top = Number(parts[3]);
   if (!(w > 0 && h > 0 && Number.isFinite(left) && Number.isFinite(top))) return null;
   return [w, h, left, top, _b64Decode(parts[4])];
+}
+
+function _canvasEmojiComposite(self, text, font, penX, baselineY) {
+  const state = _canvasStateOf(self);
+  const emoji = _canvasEmojiBitmap(text, font);
+  if (!emoji) return false;
+  const [w, h, left, top, rgba] = emoji;
+  const px0 = Math.round(penX + left);
+  const py0 = Math.round(baselineY + top);
+  for (let row = 0; row < h; row++) {
+    const gy = py0 + row;
+    if (gy < 0 || gy >= state.h) continue;
+    const rowBase = row * w * 4;
+    for (let col = 0; col < w; col++) {
+      const gx = px0 + col;
+      if (gx < 0 || gx >= state.w) continue;
+      const o = rowBase + col * 4;
+      if (rgba[o + 3] === 0) continue;
+      _canvas2dBlendPixel(self, gx, gy, rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3], 1);
+    }
+  }
+  return true;
 }
 
 function _canvas2dApplyTransform(self, x, y) {
@@ -1137,6 +1187,14 @@ class _Canvas2D {
           }
         }
         _canvas2dMarkPaintDamage(this);
+        // Color emoji: the coverage raster deliberately leaves emoji clusters
+        // blank (they paint their own RGB from the sbix strikes), so the
+        // color layer composites after the glyphs.
+        if (_textHasEmoji(str)) {
+          if (_canvasEmojiComposite(this, str, this.font, cx, baseY)) {
+            _canvas2dMarkPaintDamage(this);
+          }
+        }
         return;
       }
       // No coverage op (layout-only build): the dot matrix stays as the

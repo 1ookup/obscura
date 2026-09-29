@@ -252,6 +252,112 @@ impl Default for CanvasTextMeasurer {
     }
 }
 
+/// Color-emoji raster for canvas `fillText`, backed by the host's Apple Color
+/// Emoji collection through its own font system. The face is deliberately not
+/// registered in the shaping database the text engine uses: loading it there
+/// shifts Latin shaping (documented in the inline module notes), so the emoji
+/// path shapes in this private database and hands back one straight-alpha RGBA
+/// bitmap holding every emoji glyph of the run, pen-relative like the coverage
+/// bitmap. Characters the emoji face has no glyph for (all of Latin) are
+/// simply absent -- the coverage raster draws those.
+#[cfg(feature = "paint")]
+pub struct CanvasEmojiRaster {
+    engine: inline::EmojiEngine,
+}
+
+#[cfg(feature = "paint")]
+impl CanvasEmojiRaster {
+    pub fn new() -> Self {
+        Self {
+            engine: inline::EmojiEngine::new(),
+        }
+    }
+
+    /// The emoji run of `text` rasterized at `font`'s size into one RGBA
+    /// bitmap, flat-packed `"<width>|<height>|<left>|<top>|<base64 RGBA>"` --
+    /// `left`/`top` place the bitmap relative to the pen origin and the
+    /// alphabetic baseline. Empty when the run carries no emoji ink.
+    pub fn raster_emoji(&mut self, text: &str, font: &str) -> Option<String> {
+        let mut style = crate::LayoutStyle::default();
+        style.font_size = Some(16.0);
+        style.font_family = Some("sans-serif".to_string());
+        style.white_space = Some(WhiteSpace::Pre);
+        style::apply_font_shorthand(&mut style, font);
+        let size = style.font_size.unwrap_or(16.0);
+        let laid = self.engine.canvas_emoji_layout(text, size)?;
+
+        use base64::Engine as _;
+        // Aggregating buffer: every glyph blits at its shaped position.
+        let min_x = laid
+            .glyphs
+            .iter()
+            .map(|g| g.x + g.left as f32)
+            .fold(f32::MAX, f32::min);
+        let max_x = laid
+            .glyphs
+            .iter()
+            .map(|g| g.x + (g.left + g.width as i32) as f32)
+            .fold(f32::MIN, f32::max);
+        let min_y = laid
+            .glyphs
+            .iter()
+            .map(|g| g.y + g.top as f32)
+            .fold(f32::MAX, f32::min);
+        let max_y = laid
+            .glyphs
+            .iter()
+            .map(|g| g.y + (g.top + g.height as i32) as f32)
+            .fold(f32::MIN, f32::max);
+        if !(max_x > min_x && max_y > min_y) {
+            return None;
+        }
+        let left = min_x.floor() as i32;
+        let top = min_y.floor() as i32;
+        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
+        let height = (max_y.ceil() as i32 - top + 1).max(1) as u32;
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        for glyph in &laid.glyphs {
+            let gx = glyph.x + glyph.left as f32 - left as f32;
+            let gy = glyph.y + glyph.top as f32 - top as f32;
+            let x0 = gx.floor() as i32;
+            let y0 = gy.floor() as i32;
+            for (row, src) in glyph.pixels.chunks_exact(glyph.width as usize * 4).enumerate() {
+                for (col, px) in src.chunks_exact(4).enumerate() {
+                    let dx = x0 + col as i32;
+                    let dy = y0 + row as i32;
+                    if dx < 0 || dy < 0 || dx >= width as i32 || dy >= height as i32 {
+                        continue;
+                    }
+                    let dst = &mut rgba[(dy as usize * width as usize + dx as usize) * 4..][..4];
+                    // Straight-alpha over; the emoji bitmaps carry color.
+                    let sa = px[3] as u32;
+                    let da = dst[3] as u32;
+                    let out_a = sa + da * (255 - sa) / 255;
+                    for ch in 0..3 {
+                        let sc = px[ch] as u32;
+                        let dc = dst[ch] as u32;
+                        dst[ch] = if out_a == 0 {
+                            0
+                        } else {
+                            ((sc * sa + dc * da * (255 - sa) / 255) / out_a).min(255) as u8
+                        };
+                    }
+                    dst[3] = out_a.min(255) as u8;
+                }
+            }
+        }
+        let packed = base64::engine::general_purpose::STANDARD.encode(&rgba);
+        Some(format!("{width}|{height}|{left}|{top}|{packed}"))
+    }
+}
+
+#[cfg(feature = "paint")]
+impl Default for CanvasEmojiRaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(not(feature = "paint"))]
 pub mod inline {
     use obscura_dom::tree::{DomTree, NodeId};

@@ -1928,6 +1928,135 @@ impl VariableSwashCache {
 
 const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
+/// Color-emoji layout and raster, isolated from the text engine: the Apple
+/// Color Emoji face lives in its own font system (loading it in the main one
+/// shifts Latin shaping), shapes with the same pipeline (so flag sequences
+/// and ZWJ clusters resolve through GSUB), and hands back straight color
+/// bitmaps for the glyphs it covers. Characters the face has no glyph for
+/// are absent -- the coverage raster draws those.
+pub(crate) struct EmojiEngine {
+    font_system: FontSystem,
+    swash: SwashCache,
+    /// The collection's bytes, shared so the FontRef can outlive database
+    /// borrows (the file is large; one read per process).
+    data: Arc<Vec<u8>>,
+    face_index: u32,
+}
+
+/// One laid-out emoji glyph's color bitmap. `pixels` is RGBA (the sbix
+/// strike's own straight alpha, scaled to the requested size) and
+/// `x`/`y`/`left`/`top` place it pen-relative with y growing downward.
+pub struct EmojiGlyphBitmap {
+    pub x: f32,
+    pub y: f32,
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+pub struct EmojiLayout {
+    pub glyphs: Vec<EmojiGlyphBitmap>,
+}
+
+impl EmojiEngine {
+    pub(crate) fn new() -> Self {
+        let mut db = cosmic_text::fontdb::Database::new();
+        let mut data = None;
+        let mut face_index = 0u32;
+        for path in [
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "/System/Library/Fonts/Core/Apple Color Emoji.ttc",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
+                    bytes.clone(),
+                )));
+                data = Some(bytes);
+                break;
+            }
+        }
+        if let Some(bytes) = &data {
+            // The regular face inside the collection: same probe the identity
+            // faces use, just against the emoji family.
+            let mut probe = cosmic_text::fontdb::Database::new();
+            let ids = probe.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
+                bytes.clone(),
+            )));
+            for id in ids {
+                if let Some(face) = probe.face(id) {
+                    if face.families.iter().any(|(name, _)| name == "Apple Color Emoji") {
+                        probe.with_face_data(id, |_d, index| face_index = index as u32);
+                        break;
+                    }
+                }
+            }
+        }
+        let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        Self {
+            font_system,
+            swash: SwashCache::new(),
+            data: Arc::new(data.unwrap_or_default()),
+            face_index,
+        }
+    }
+
+    /// Layout `text` at `size` in the emoji face and rasterize every glyph
+    /// the sbix strikes cover. `None` when the face is absent on this host.
+    pub(crate) fn canvas_emoji_layout(&mut self, text: &str, size: f32) -> Option<EmojiLayout> {
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics { font_size: size, line_height: size },
+        );
+        let attrs = Attrs::new().family(Family::Name("Apple Color Emoji"));
+        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let mut glyphs: Vec<EmojiGlyphBitmap> = Vec::new();
+        // The face is the only entry in this engine's database; swash needs
+        // its own FontRef to run the sbix strikes.
+        if self.data.is_empty() {
+            return None;
+        }
+        let Some(font) = swash::FontRef::from_index(&self.data, self.face_index as usize) else {
+            return None;
+        };
+        let mut context = ScaleContext::new();
+        let mut scaler = context.builder(font).size(size).hint(false).build();
+
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let glyph_id = physical.cache_key.glyph_id;
+                // sbix strikes ship PNG; swash decodes and scales them into
+                // color images for the requested size.
+                let Some(image) =
+                    scaler.scale_color_bitmap(glyph_id, StrikeWith::BestFit)
+                else {
+                    continue;
+                };
+                if image.content != SwashContent::Color || image.placement.width == 0 {
+                    continue;
+                }
+                glyphs.push(EmojiGlyphBitmap {
+                    x: physical.x as f32,
+                    y: run.line_y + physical.y as f32,
+                    left: image.placement.left,
+                    top: -image.placement.top,
+                    width: image.placement.width,
+                    height: image.placement.height,
+                    pixels: image.data.to_vec(),
+                });
+            }
+        }
+        if glyphs.is_empty() {
+            return None;
+        }
+        Some(EmojiLayout { glyphs })
+    }
+}
+
 /// Source-over one glyph sample onto the coverage bitmap cell: the way an
 /// opaque fill composites when strokes cross on a transparent surface.
 fn composite_glyph_pixel(cell: &mut u8, color: Color) {
@@ -7640,6 +7769,7 @@ mod ink_tests {
         assert!(right >= left);
     }
 }
+
 
 
 

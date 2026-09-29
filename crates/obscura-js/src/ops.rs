@@ -372,6 +372,9 @@ pub struct ObscuraState {
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
     pub(crate) canvas_text_measurer: obscura_render::CanvasTextMeasurer,
+    /// Color-emoji raster for canvas fillText (sbix strikes from the host's
+    /// Apple Color Emoji collection, isolated from the shaping database).
+    pub(crate) canvas_emoji_raster: obscura_render::CanvasEmojiRaster,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -537,6 +540,7 @@ impl ObscuraState {
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             canvas_text_measurer: obscura_render::CanvasTextMeasurer::new(),
+            canvas_emoji_raster: obscura_render::CanvasEmojiRaster::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -7549,6 +7553,24 @@ fn op_canvas_raster_text(
     packed.unwrap_or_default()
 }
 
+/// Color-emoji raster for `CanvasRenderingContext2D.fillText`, flat-packed
+/// `"<width>|<height>|<left>|<top>|<base64 RGBA>"` like the coverage op. The
+/// bitmap holds every emoji glyph of the run at the shaped positions, pen-
+/// and baseline-relative; the context composites it straight-alpha onto the
+/// surface (color emoji paint in their own RGB, unlike the monochrome
+/// coverage the text glyphs use). An empty string means no emoji ink.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_emoji_bitmap(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let packed = shared
+        .borrow_mut()
+        .canvas_emoji_raster
+        .raster_emoji(text, font);
+    packed.unwrap_or_default()
+}
+
 // --- OPFS sync access handles (worker realm, src/worker.rs) ---
 //
 // `FileSystemSyncAccessHandle` is the worker-only OPFS surface, and a browser
@@ -8654,6 +8676,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_measure_text());
         ops.push(op_canvas_text_metrics());
         ops.push(op_canvas_raster_text());
+        ops.push(op_canvas_emoji_bitmap());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
