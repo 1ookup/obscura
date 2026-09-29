@@ -1674,6 +1674,9 @@ struct VariationIntentKey {
 struct VariableSwashCache {
     context: ScaleContext,
     images: HashMap<VariableCacheKey, Option<SwashImage>>,
+    /// Unhinted rasters keyed by glyph cache key, for the canvas coverage
+    /// sampler (`with_pixels_unhinted`).
+    rasters: HashMap<CacheKey, Option<SwashImage>>,
     /// Canonical coordinates supported by the face actually selected for a
     /// glyph. This is deliberately separate from authored intent: unsupported
     /// axes and values that clamp to the same endpoint share raster entries.
@@ -1685,6 +1688,7 @@ impl VariableSwashCache {
         Self {
             context: ScaleContext::new(),
             images: HashMap::new(),
+            rasters: HashMap::new(),
             instances: HashMap::new(),
         }
     }
@@ -1780,6 +1784,74 @@ impl VariableSwashCache {
                 .size(f32::from_bits(cache_key.font_size_bits))
                 .hint(true)
                 .variations(settings)
+                .build();
+            let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+            Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .offset(offset)
+            .transform(
+                cache_key
+                    .flags
+                    .contains(CacheKeyFlags::FAKE_ITALIC)
+                    .then(|| Transform::skew(Angle::from_degrees(14.0), Angle::from_degrees(0.0))),
+            )
+            .render(&mut scaler, cache_key.glyph_id)
+        });
+        let Some(image) = image else { return };
+        let left = image.placement.left;
+        let top = -image.placement.top;
+        match image.content {
+            SwashContent::Mask => {
+                for (index, alpha) in image.data.iter().copied().enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color(((alpha as u32) << 24) | base.0 & 0x00FF_FFFF),
+                    );
+                }
+            }
+            SwashContent::Color => {
+                for (index, rgba) in image.data.chunks_exact(4).enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
+                    );
+                }
+            }
+            SwashContent::SubpixelMask => {}
+        }
+    }
+
+    /// The canvas-coverage sampler: the same raster stack as `with_pixels`
+    /// but with TrueType hinting off. Chrome on macOS rasterizes canvas text
+    /// through CoreText, which never grid-fits outlines, so the coverage a
+    /// probe reads off `fillText` must come from the unhinted outlines --
+    /// a hinted sample grid-fits a small glyph onto different coverage than
+    /// the reference digests, while the unhinted one tracks it to the byte
+    /// at the sizes probed.
+    fn with_pixels_unhinted<F: FnMut(i32, i32, Color)>(
+        &mut self,
+        font_system: &mut FontSystem,
+        cache_key: CacheKey,
+        base: Color,
+        mut f: F,
+    ) {
+        let image = self.rasters.entry(cache_key).or_insert_with(|| {
+            let font = font_system.get_font(cache_key.font_id)?;
+            let mut scaler = self
+                .context
+                .builder(font.as_swash())
+                .size(f32::from_bits(cache_key.font_size_bits))
+                .hint(false)
                 .build();
             let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
             Render::new(&[
@@ -2799,6 +2871,98 @@ impl TextEngine {
         } else {
             (0.0, 0.0, 0.0, 0.0)
         }
+    }
+
+    /// Coverage raster for `CanvasRenderingContext2D.fillText`: the shaped
+    /// run rasterized into a single-channel coverage bitmap. The bitmap is
+    /// `(width, height, left, top, coverage)` with `left` measured from the
+    /// pen origin and `top` (negative) from the alphabetic baseline, in CSS
+    /// pixels. Glyph placement reuses the frame-paint path -- the same
+    /// `physical()` positions and the same hinting the element text next
+    /// door rasterizes with -- so a canvas fill and a laid-out run cannot
+    /// disagree about where a glyph lands.
+    pub(crate) fn canvas_text_coverage(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+    ) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let previous_len = self.items.len();
+        let idx = self.push_generated_text(text, style)?;
+        let result = self.canvas_item_coverage(idx);
+        self.items.truncate(previous_len);
+        result
+    }
+
+    fn canvas_item_coverage(&mut self, idx: usize) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+        // The ink union frames the bitmap: no outline sample can land outside
+        // it, so its bounds plus a one-pixel margin bound every glyph pixel.
+        // The union ignores blank glyphs (`canvas_item_ink` skips degenerate
+        // boxes), which keeps a run of spaces from pretending it draws.
+        let (min_x, max_x, ascent, descent) = self.canvas_item_ink(idx);
+        if !(min_x < max_x && ascent > 0.0) {
+            return None;
+        }
+        let left = min_x.floor() as i32 - 1;
+        let top = -(ascent.ceil() as i32 + 1);
+        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
+        let height = (ascent.ceil() as i32 + descent.ceil() as i32 + 3).max(1) as u32;
+        let baseline_row = ascent.ceil() as i32 + 1;
+        let mut coverage = vec![0u8; width as usize * height as usize];
+
+        let TextEngine {
+            font_system,
+            items,
+            variable_swash,
+            ..
+        } = self;
+        let item = items.get_mut(idx)?;
+        let wrap = item.layout_wrap;
+        shape_with_text_indent(font_system, item, None, wrap);
+        let line_offset = item.first_line_offset;
+        // `run.line_y` is the baseline's position in buffer space; the bitmap
+        // is already baseline-relative, so only the offset between wrapped
+        // lines may shift a row. A canvas run never wraps (`white-space: pre`
+        // under an unbounded width), and the first line lands on the row the
+        // ink box framed.
+        let mut first_line_y = 0.0f32;
+        let mut first_line = true;
+        for run in item.buffer.layout_runs() {
+            if first_line {
+                first_line_y = run.line_y;
+                first_line = false;
+            }
+            let base_row = baseline_row + (run.line_y - first_line_y) as i32;
+            for glyph in run.glyphs {
+                let physical = glyph.physical((line_offset, 0.0), 1.0);
+                variable_swash.with_pixels_unhinted(
+                    font_system,
+                    physical.cache_key,
+                    Color::rgba(0, 0, 0, 255),
+                    |x, y, color| {
+                        let alpha = color.a() as u32;
+                        if alpha == 0 {
+                            return;
+                        }
+                        let px = physical.x + x - left;
+                        let py = base_row + physical.y + y;
+                        if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                            return;
+                        }
+                        let cell =
+                            &mut coverage[py as usize * width as usize + px as usize];
+                        // Overlapping glyphs composite source-over onto the
+                        // coverage itself, which is what an opaque fill does
+                        // when strokes cross on a transparent surface.
+                        let out = alpha + *cell as u32 * (255 - alpha) / 255;
+                        *cell = out.min(255) as u8;
+                    },
+                );
+            }
+        }
+        Some((width, height, left, top, coverage))
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected

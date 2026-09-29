@@ -663,24 +663,26 @@ function _canvas2dSetPixel(self, x, y, r, g, b, a, sourceSpace = undefined) {
     _canvas2dBlendPixel(self, x, y, r, g, b, a, 1);
   }
 
-function _canvas2dTextBaselineOffset(self, scale) {
+function _canvas2dTextBaselineOffset(self, ascent, descent) {
   const state = _canvasStateOf(self);
-    const ascent = 7 * scale;
-    const descent = Math.round(2.1 * scale);
+    // 'top' rides a size-scaled placement, not the font box: measured on the
+    // reference, Chrome shifts a top-baselined fill down by floor(0.8 * the
+    // font size) on every Arial size probed (8/10/12/16/20/32px -> offsets
+    // 6/8/9/12/16/25), which puts the first ink row where the oracle puts
+    // it; the font-box ascent answers two rows lower. The measured residuals
+    // on the other baselines stay within one row and keep their ordering.
     switch (state.textBaseline) {
-      case 'top': return ascent;
+      case 'top': return Math.floor(0.8 * (parseFloat(self.font) || 10));
       case 'hanging': return Math.round(0.8 * ascent);
-      case 'middle': return Math.round((ascent - descent) / 2);
+      case 'middle': return (ascent - descent) / 2;
       case 'bottom':
       case 'ideographic': return -descent;
       default: return 0; // alphabetic, and anything unrecognised
     }
   }
 
-function _canvas2dTextAlignOffset(self, str, scale) {
+function _canvas2dTextAlignOffset(self, runWidth) {
   const state = _canvasStateOf(self);
-    if (!str.length) return 0;
-    const runWidth = str.length * 6 * scale - scale;
     const rtl = state.direction === 'rtl';
     let align = state.textAlign;
     if (align === 'start') align = rtl ? 'right' : 'left';
@@ -689,6 +691,39 @@ function _canvas2dTextAlignOffset(self, str, scale) {
     if (align === 'right') return runWidth;
     return 0;
   }
+
+const _B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function _b64Decode(text) {
+  const out = new Uint8Array((text.length * 3 / 4) | 0);
+  let o = 0, buf = 0, bits = 0;
+  for (let i = 0; i < text.length; i++) {
+    const v = _B64_ALPHABET.indexOf(text[i]);
+    if (v < 0) continue; // padding and whitespace
+    buf = (buf << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[o++] = (buf >> bits) & 0xff;
+    }
+  }
+  return out.subarray(0, o);
+}
+
+function _canvasRasterText(text, font) {
+  const op = Deno.core.ops.op_canvas_raster_text;
+  if (typeof op !== 'function') return null;
+  let packed;
+  try { packed = op(text, String(font || '10px sans-serif')); } catch (_error) { return null; }
+  if (!packed) return null;
+  const parts = String(packed).split('|');
+  if (parts.length !== 5) return null;
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  const left = Number(parts[2]);
+  const top = Number(parts[3]);
+  if (!(w > 0 && h > 0 && Number.isFinite(left) && Number.isFinite(top))) return null;
+  return [w, h, left, top, _b64Decode(parts[4])];
+}
 
 function _canvas2dApplyTransform(self, x, y) {
   const state = _canvasStateOf(self);
@@ -1030,38 +1065,82 @@ class _Canvas2D {
   }
   fillText(text, x, y) {
     const state = _canvasStateOf(this);
-    // A gradient fill under text uses the gradient's first stop; per-glyph
-    // gradient evaluation stays out of the dot-matrix rasterizer.
+    // A gradient fill samples per covered pixel, exactly what the path fills
+    // next door do; a solid fill keeps its parsed constant.
     const fill = state.fillStyle;
-    const [r,g,b,a] = fill && fill._stops && fill._stops.length
-      ? fill._stops[0][1] : _canvas2dParseColor(this, fill);
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
+    const gradient = fill && _gradientState.get(fill);
+    const solid = gradient ? null : _canvas2dParseColor(this, fill);
     const str = _prepareCanvasText(text);
-    const [tx, ty] = _canvas2dApplyTransform(this, +x || 0, +y || 0);
-    const baseY = Math.round(ty) + _canvas2dTextBaselineOffset(this, scale);
-    let cx = Math.round(tx) - _canvas2dTextAlignOffset(this, str, scale);
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      // The reference draws C1 controls with the same replacement glyph as
-      // U+FFFD, so the dot-matrix seed has to fold them together or a probe
-      // diffing the two renders reads a difference Chrome never produces.
-      const glyph = code >= 0x80 && code <= 0x9f ? 0xfffd : code;
-      for (let row = 0; row < 7; row++) {
-        for (let col = 0; col < 5; col++) {
-          const on = ((_fpRand(glyph * 100 + row * 10 + col) > 0.45) &&
-                      (row > 0 && row < 6 && col > 0 && col < 4)) ||
-                     (_fpRand(glyph * 200 + row * 7 + col) > 0.7);
-          if (on) {
-            for (let sy = 0; sy < scale; sy++) {
-              for (let sx = 0; sx < scale; sx++) {
-                _canvas2dSetPixel(this, cx + col*scale + sx, baseY - 7*scale + row*scale + sy, r, g, b, a);
+    if (str.length) {
+      const [tx, ty] = _canvas2dApplyTransform(this, +x || 0, +y || 0);
+      // Alignment and the non-alphabetic baselines ride the same shaped box
+      // measureText answers, so a fill placed at measureText-derived
+      // coordinates cannot disagree with the metrics it measured first.
+      const box = _measureTextBox(str, this.font);
+      const baseY = Math.round(ty) + _canvas2dTextBaselineOffset(this, box.ascent, box.descent);
+      const cx = Math.round(tx) - _canvas2dTextAlignOffset(this, box.width);
+      // C1 controls draw with the U+FFFD replacement glyph (the folded-emoji
+      // probe digests the two spellings as one render), so the folding happens
+      // before the raster, not on the drawn pixels.
+      const raster = _canvasRasterText(str.replace(/[\x80-\x9f]/g, '�'), this.font);
+      if (raster) {
+        // Real glyph coverage from the shape engine: every glyph pixel
+        // composites through the blend helper, so a 1px glyph answers a
+        // partial alpha and the coverage grows with the point size -- the
+        // signature of a renderer that antialiases text. An all-or-nothing
+        // dot matrix here read solid at every size, and the probes that
+        // sample glyph pixels judged the whole rendering environment broken.
+        const [w, h, left, top, cov] = raster;
+        // The blend helper indexes the backing store directly, so the origin
+        // must be integral: a right-aligned pen lands on a fractional x, and
+        // a fractional index into the TypedArray drops every write silently.
+        const px0 = Math.round(cx + left);
+        const py0 = Math.round(baseY + top);
+        for (let row = 0; row < h; row++) {
+          const gy = py0 + row;
+          if (gy < 0 || gy >= state.h) continue;
+          const rowBase = row * w;
+          for (let col = 0; col < w; col++) {
+            const c = cov[rowBase + col];
+            if (!c) continue;
+            const gx = px0 + col;
+            if (gx < 0 || gx >= state.w) continue;
+            const [r, g, b, a] = gradient
+              ? _canvas2dPaintAt(this, gx + 0.5, gy + 0.5) : solid;
+            _canvas2dBlendPixel(this, gx, gy, r, g, b, a, c / 255);
+          }
+        }
+        _canvas2dMarkPaintDamage(this);
+        return;
+      }
+      // No coverage op (layout-only build): the dot matrix stays as the
+      // drawn-anything fallback.
+      const [r, g, b, a] = solid;
+      const fontSize = parseInt(this.font) || 10;
+      const scale = Math.max(1, Math.round(fontSize / 10));
+      let dotX = cx;
+      for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        // The reference draws C1 controls with the same replacement glyph as
+        // U+FFFD, so the dot-matrix seed has to fold them together or a probe
+        // diffing the two renders reads a difference Chrome never produces.
+        const glyph = code >= 0x80 && code <= 0x9f ? 0xfffd : code;
+        for (let row = 0; row < 7; row++) {
+          for (let col = 0; col < 5; col++) {
+            const on = ((_fpRand(glyph * 100 + row * 10 + col) > 0.45) &&
+                        (row > 0 && row < 6 && col > 0 && col < 4)) ||
+                       (_fpRand(glyph * 200 + row * 7 + col) > 0.7);
+            if (on) {
+              for (let sy = 0; sy < scale; sy++) {
+                for (let sx = 0; sx < scale; sx++) {
+                  _canvas2dSetPixel(this, dotX + col*scale + sx, baseY - 7*scale + row*scale + sy, r, g, b, a);
+                }
               }
             }
           }
         }
+        dotX += 6 * scale;
       }
-      cx += 6 * scale;
     }
     _canvas2dMarkPaintDamage(this);
   }

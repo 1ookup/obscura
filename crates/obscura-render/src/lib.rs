@@ -203,6 +203,19 @@ impl CanvasTextMeasurer {
         style::apply_font_shorthand(&mut style, font);
         style
     }
+
+    /// Coverage raster for canvas `fillText`, flat-packed as
+    /// `"<width>|<height>|<left>|<top>|<base64 coverage>"` (the parse cost is
+    /// the whole cost on a draw path, so no JSON). `left`/`top` place the
+    /// bitmap relative to the pen origin and the alphabetic baseline. `None`
+    /// means the run carries no ink -- whitespace, or text a zero-width face
+    /// cannot draw -- and the caller draws nothing.
+    pub fn raster_text(&mut self, text: &str, font: &str) -> Option<String> {
+        let (width, height, left, top, coverage) = self.engine.canvas_text_coverage(text, &self.style_for(font))?;
+        use base64::Engine as _;
+        let packed = base64::engine::general_purpose::STANDARD.encode(&coverage);
+        Some(format!("{width}|{height}|{left}|{top}|{packed}"))
+    }
 }
 
 /// What `CanvasRenderingContext2D.measureText` needs from the layout engine.

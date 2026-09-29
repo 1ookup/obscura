@@ -7518,6 +7518,28 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
     )
 }
 
+/// Coverage raster for `CanvasRenderingContext2D.fillText`, flat-packed as
+/// `"<width>|<height>|<left>|<top>|<base64 coverage>"` -- the parse cost is
+/// the whole cost on a draw path, so no JSON. `left`/`top` place the bitmap
+/// relative to the pen origin and the alphabetic baseline. The context fills
+/// each glyph pixel through the same blend helper every other draw op uses,
+/// so glyph edges carry the shaper's real per-pixel coverage instead of a
+/// solid 255: a 1px glyph answers a partial alpha, which is what separates a
+/// renderer that antialiases text from one that does not.
+///
+/// An empty string means the run carries no ink and the caller draws nothing.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_raster_text(state: &OpState, #[string] text: &str, #[string] font: &str) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let packed = shared
+        .borrow_mut()
+        .canvas_text_measurer
+        .raster_text(text, font);
+    packed.unwrap_or_default()
+}
+
 // --- OPFS sync access handles (worker realm, src/worker.rs) ---
 //
 // `FileSystemSyncAccessHandle` is the worker-only OPFS surface, and a browser
@@ -8622,6 +8644,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_paint_damage());
         ops.push(op_canvas_measure_text());
         ops.push(op_canvas_text_metrics());
+        ops.push(op_canvas_raster_text());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
