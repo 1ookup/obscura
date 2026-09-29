@@ -2039,14 +2039,55 @@ impl EmojiEngine {
                 if image.content != SwashContent::Color || image.placement.width == 0 {
                     continue;
                 }
+                // The strike ships at a fixed ppem; scale it to the
+                // requested size with a box filter (the reference rescales
+                // the nearest strike the same way). sbix offsets are
+                // baseline-relative with y up -- convert to y-down pixels at
+                // the scaled size.
+                let src_w = image.placement.width as usize;
+                let src_h = image.placement.height as usize;
+                let scale = size / src_w.max(1) as f32;
+                let target_w = ((src_w as f32 * scale).round() as usize).max(1);
+                let target_h = ((src_h as f32 * scale).round() as usize).max(1);
+                let mut scaled = vec![0u8; target_w * target_h * 4];
+                for (row, out_row) in scaled.chunks_exact_mut(target_w * 4).enumerate() {
+                    let sy0 = (row as f32 / scale) as usize;
+                    let sy1 = (((row + 1) as f32 / scale) as usize).clamp(sy0 + 1, src_h);
+                    for (col, out_px) in out_row.chunks_exact_mut(4).enumerate() {
+                        let sx0 = (col as f32 / scale) as usize;
+                        let sx1 = (((col + 1) as f32 / scale) as usize).clamp(sx0 + 1, src_w);
+                        let mut acc = [0u32; 4];
+                        let mut count = 0u32;
+                        for sy in sy0..sy1 {
+                            for sx in sx0..sx1 {
+                                let src_px = &image.data[(sy * src_w + sx) * 4..][..4];
+                                for ch in 0..4 {
+                                    acc[ch] += src_px[ch] as u32;
+                                }
+                                count += 1;
+                            }
+                        }
+                        if count > 0 {
+                            for ch in 0..4 {
+                                out_px[ch] = (acc[ch] / count).min(255) as u8;
+                            }
+                        }
+                    }
+                }
                 glyphs.push(EmojiGlyphBitmap {
                     x: physical.x as f32,
                     y: run.line_y + physical.y as f32,
-                    left: image.placement.left,
-                    top: -image.placement.top,
-                    width: image.placement.width,
-                    height: image.placement.height,
-                    pixels: image.data.to_vec(),
+                    left: (image.placement.left as f32 * scale).round() as i32,
+                    // The emoji face sits the whole bitmap on the baseline
+                    // (emoji draw no descender), so the scaled bitmap's top
+                    // edge is exactly target_h above it -- swash's own
+                    // placement comes back 0 after its internal rescale,
+                    // which planted the bitmap below the baseline and put
+                    // every row outside a short canvas.
+                    top: -(target_h as i32),
+                    width: target_w as u32,
+                    height: target_h as u32,
+                    pixels: scaled,
                 });
             }
         }
@@ -7774,3 +7815,30 @@ mod ink_tests {
 
 
 
+
+#[cfg(test)]
+mod emoji_alpha_tests {
+    use super::*;
+
+    #[test]
+    fn dump_emoji_alpha() {
+        if std::env::var("OBSCURA_DUMP_EMOJI").is_err() {
+            return;
+        }
+        let mut engine = EmojiEngine::new();
+        if let Some(laid) = engine.canvas_emoji_layout("🇺🇸", 16.0) {
+            for g in &laid.glyphs {
+                let alphas: Vec<u8> = g.pixels.chunks_exact(4).map(|p| p[3]).collect();
+                let nonzero = alphas.iter().filter(|a| **a > 0).count();
+                let mut rgb0 = [0u8; 3];
+                for (i, px) in g.pixels.chunks_exact(4).enumerate() {
+                    if px[3] > 0 { rgb0 = [px[0], px[1], px[2]]; break; }
+                }
+                println!("emoji {}x{} nonzero_alpha={} first_colored_rgb={:?} alpha_hist[:20]={:?}",
+                    g.width, g.height, nonzero, rgb0, &alphas[..alphas.len().min(20)]);
+            }
+        } else {
+            println!("no layout");
+        }
+    }
+}

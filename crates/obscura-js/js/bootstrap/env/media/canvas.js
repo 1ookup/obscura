@@ -786,18 +786,30 @@ function _canvasEmojiComposite(self, text, font, penX, baselineY) {
   const [w, h, left, top, rgba] = emoji;
   const px0 = Math.round(penX + left);
   const py0 = Math.round(baselineY + top);
+  let drawn = 0;
+  let skippedAlpha = 0;
+  let skippedGx = 0;
+  let skippedGy = 0;
   for (let row = 0; row < h; row++) {
     const gy = py0 + row;
-    if (gy < 0 || gy >= state.h) continue;
+    if (gy < 0 || gy >= state.h) { skippedGy++; continue; }
     const rowBase = row * w * 4;
     for (let col = 0; col < w; col++) {
       const gx = px0 + col;
-      if (gx < 0 || gx >= state.w) continue;
+      if (gx < 0 || gx >= state.w) { skippedGx++; continue; }
       const o = rowBase + col * 4;
-      if (rgba[o + 3] === 0) continue;
+      if (rgba[o + 3] === 0) { skippedAlpha++; continue; }
+      drawn++;
       _canvas2dBlendPixel(self, gx, gy, rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3], 1);
     }
   }
+  try {
+    Deno.core.ops.op_tracelog('cvdbg.comp', JSON.stringify({
+      w, h, px0, py0, drawn, skippedAlpha, skippedGx, skippedGy,
+      canvasW: state.w, canvasH: state.h,
+      a0: rgba[3], aMid: rgba[((h >> 1) * w + (w >> 1)) * 4 + 3],
+    }));
+  } catch (_e3) {}
   return true;
 }
 
