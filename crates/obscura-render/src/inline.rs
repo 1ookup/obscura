@@ -1568,6 +1568,11 @@ pub struct TextEngine {
     variable_swash: VariableSwashCache,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+    /// Host files behind the identity faces, sampled only by the canvas
+    /// coverage rasterizer: `measureText` and element layout keep answering
+    /// from the bundled stand-ins and the per-family tables that parity was
+    /// checked against.
+    identity_glyph_faces: IdentityGlyphFaces,
     /// Web-font declaration-set identity of `font_system`'s database. When
     /// the engine is dropped, its shaped-run cache returns to the per-thread
     /// pool under this key so the next pass of the same document (or any
@@ -1575,6 +1580,27 @@ pub struct TextEngine {
     /// built outside `new_with_web_fonts`, which are never pooled.
     shape_pool_key: Option<u64>,
 }
+
+/// The host files behind the two identity faces the canvas probes read.
+/// Paths are tried in order; the on-demand asset store is where current
+/// macOS keeps PingFang.ttc (`/System/Library/Fonts/PingFang.ttc` does not
+/// exist on this class of host). The face inside the collection is picked
+/// by family name and weight, so a release that reshuffles the collection
+/// order still lands on the regular cut.
+const IDENTITY_GLYPH_SOURCES: &[(&str, &[&str])] = &[
+    (
+        "PingFang SC",
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Core/PingFang.ttc",
+        ],
+    ),
+    ("Arial", &["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf"]),
+];
+
+/// The on-demand asset store holds the CJK faces on current macOS; the first
+/// asset directory carrying the file wins.
+const PINGFANG_ASSET_GLOB: &str = "/System/Library/AssetsV2/com_apple_MobileAsset_Font8";
 
 /// Per-thread shaped-run cache pool, keyed by the web-font declaration set
 /// (see `new_with_web_fonts`). Small and bounded: each entry is one page's
@@ -1901,6 +1927,226 @@ impl VariableSwashCache {
 }
 
 const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
+
+/// Source-over one glyph sample onto the coverage bitmap cell: the way an
+/// opaque fill composites when strokes cross on a transparent surface.
+fn composite_glyph_pixel(cell: &mut u8, color: Color) {
+    let alpha = color.a() as u32;
+    if alpha == 0 {
+        return;
+    }
+    let out = alpha + *cell as u32 * (255 - alpha) / 255;
+    *cell = out.min(255) as u8;
+}
+
+/// The host files behind the identity faces, for the canvas coverage
+/// rasterizer alone. Deliberately outside `font_system`'s database:
+/// registering them there would put the faces into cosmic-text's shaping
+/// fallback chain and shift shaping for characters the bundled stand-ins do
+/// not carry, which is a parity surface. This cache never touches shaping --
+/// it maps (reference family, character, size) to one unhinted coverage
+/// raster and answers nothing else.
+struct IdentityGlyphFaces {
+    faces: HashMap<&'static str, Option<IdentityFaceFile>>,
+    images: HashMap<IdentityRasterKey, Option<SwashImage>>,
+    context: ScaleContext,
+}
+
+/// One loaded host file: the shared bytes and the collection index of the
+/// face the reference family names (the regular cut).
+#[derive(Clone)]
+struct IdentityFaceFile {
+    bytes: std::sync::Arc<Vec<u8>>,
+    index: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct IdentityRasterKey {
+    family: &'static str,
+    glyph_id: u16,
+    size_bits: u32,
+}
+
+impl IdentityGlyphFaces {
+    fn new() -> Self {
+        Self {
+            faces: HashMap::new(),
+            images: HashMap::new(),
+            context: ScaleContext::new(),
+        }
+    }
+
+    /// Lazily load one reference family's host file. The on-demand asset
+    /// store is where current macOS keeps PingFang.ttc; the fixed paths are
+    /// the classic locations and the fallback for hosts whose store lives
+    /// elsewhere. The face inside a collection is picked by family name and
+    /// regular weight, so a release that reshuffles collection order still
+    /// lands on the right cut.
+    fn face(&mut self, family: &'static str) -> Option<&IdentityFaceFile> {
+        if !self.faces.contains_key(family) {
+            let loaded = Self::load(family);
+            if std::env::var_os("OBSCURA_COVERAGE_DEBUG").is_some() {
+                eprintln!("identity-face load {:?} -> {}", family, loaded.as_ref().map(|f| f.index).map(|i| i.to_string()).unwrap_or_else(|| "FAILED".into()));
+            }
+            self.faces.insert(family, loaded);
+        }
+        self.faces.get(family).and_then(|file| file.as_ref())
+    }
+
+    fn load(family: &'static str) -> Option<IdentityFaceFile> {
+        let mut candidates: Vec<String> = Vec::new();
+        if family == "PingFang SC" {
+            if let Some(asset) = Self::pingfang_asset_path() {
+                candidates.push(asset);
+            }
+        }
+        match family {
+            "PingFang SC" => candidates.extend([
+                "/System/Library/Fonts/PingFang.ttc".to_string(),
+                "/System/Library/Fonts/Core/PingFang.ttc".to_string(),
+            ]),
+            "Arial" => candidates.extend([
+                "/System/Library/Fonts/Supplemental/Arial.ttf".to_string(),
+                "/Library/Fonts/Arial.ttf".to_string(),
+            ]),
+            "Helvetica" => candidates.extend([
+                "/System/Library/Fonts/Helvetica.ttc".to_string(),
+                "/System/Library/Fonts/Core/Helvetica.ttc".to_string(),
+            ]),
+            _ => return None,
+        }
+        for path in candidates {
+            let Some(bytes) = TextEngine::shared_host_font(&path) else { continue };
+            // The collection index of the regular face of the family, via a
+            // throwaway fontdb probe (binary access plus face metadata) --
+            // fontdb itself is never given these bytes for shaping.
+            let mut probe = cosmic_text::fontdb::Database::new();
+            let ids = probe.load_font_source(cosmic_text::fontdb::Source::Binary(
+                bytes.clone(),
+            ));
+            for id in ids {
+                let Some(face) = probe.face(id) else { continue };
+                let families_match = face
+                    .families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(family));
+                if !families_match || face.weight.0 != 400 {
+                    continue;
+                }
+                let mut index = None;
+                probe.with_face_data(id, |data, face_index| {
+                    index = Some(face_index as u32);
+                    let _ = data;
+                });
+                if let Some(index) = index {
+                    return Some(IdentityFaceFile { bytes, index });
+                }
+            }
+        }
+        None
+    }
+
+    fn pingfang_asset_path() -> Option<String> {
+        let root = std::fs::read_dir(PINGFANG_ASSET_GLOB).ok()?;
+        for entry in root.flatten() {
+            let candidate = entry.path().join("AssetData").join("PingFang.ttc");
+            if candidate.is_file() {
+                return candidate.into_os_string().into_string().ok();
+            }
+        }
+        None
+    }
+
+    /// The outline bounds of one character in the family's host face,
+    /// baseline-relative (y up). The coverage bitmap frames itself with these
+    /// in the union: the ink path's frame comes from the shaped stand-in's
+    /// outlines, which a different face's glyph can and does step outside.
+    fn glyph_bounds(
+        &mut self,
+        family: &'static str,
+        ch: char,
+        size: f32,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let file = self.face(family)?.clone();
+        let font = swash::FontRef::from_index(&file.bytes, file.index as usize)?;
+        let glyph_id = font.charmap().map(ch as u32);
+        if glyph_id == 0 {
+            return None;
+        }
+        let mut scaler = self.context.builder(font).size(size).hint(false).build();
+        let bounds = scaler.scale_outline(glyph_id)?.bounds();
+        Some((bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y))
+    }
+
+    /// Sample one character's unhinted coverage from the family's host face.
+    /// `f` receives (x, y, color) relative to the glyph's origin on the
+    /// baseline, y growing downward -- the same convention the shaped-glyph
+    /// sampler uses, so the caller composites both identically.
+    fn with_glyph_pixels<F: FnMut(i32, i32, Color)>(
+        &mut self,
+        family: &'static str,
+        ch: char,
+        size: f32,
+        base: Color,
+        mut f: F,
+    ) {
+        let Some(file) = self.face(family) else { return };
+        let file = file.clone();
+        let Some(font) = swash::FontRef::from_index(&file.bytes, file.index as usize) else { return };
+        let glyph_id = font.charmap().map(ch as u32);
+        if glyph_id == 0 {
+            return;
+        }
+        let key = IdentityRasterKey {
+            family,
+            glyph_id,
+            size_bits: size.to_bits(),
+        };
+        let image = self.images.entry(key).or_insert_with(|| {
+            let mut scaler = self
+                .context
+                .builder(font)
+                .size(size)
+                .hint(false)
+                .build();
+            Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(Format::Alpha)
+            .render(&mut scaler, glyph_id)
+        });
+        let Some(image) = image else { return };
+        let left = image.placement.left;
+        let top = -image.placement.top;
+        match image.content {
+            SwashContent::Mask => {
+                for (index, alpha) in image.data.iter().copied().enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color(((alpha as u32) << 24) | base.0 & 0x00FF_FFFF),
+                    );
+                }
+            }
+            SwashContent::Color => {
+                for (index, rgba) in image.data.chunks_exact(4).enumerate() {
+                    let x = index as i32 % image.placement.width as i32;
+                    let y = index as i32 / image.placement.width as i32;
+                    f(
+                        left + x,
+                        top + y,
+                        Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
+                    );
+                }
+            }
+            SwashContent::SubpixelMask => {}
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
@@ -2371,6 +2617,7 @@ impl TextEngine {
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
+            identity_glyph_faces: IdentityGlyphFaces::new(),
             items: Vec::new(),
             replaced: Vec::new(),
             shape_pool_key,
@@ -2901,27 +3148,48 @@ impl TextEngine {
         // it, so its bounds plus a one-pixel margin bound every glyph pixel.
         // The union ignores blank glyphs (`canvas_item_ink` skips degenerate
         // boxes), which keeps a run of spaces from pretending it draws.
-        let (min_x, max_x, ascent, descent) = self.canvas_item_ink(idx);
+        let (mut min_x, mut max_x, mut ascent, mut descent) = self.canvas_item_ink(idx);
         if !(min_x < max_x && ascent > 0.0) {
             return None;
         }
-        let left = min_x.floor() as i32 - 1;
-        let top = -(ascent.ceil() as i32 + 1);
-        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
-        let height = (ascent.ceil() as i32 + descent.ceil() as i32 + 3).max(1) as u32;
-        let baseline_row = ascent.ceil() as i32 + 1;
-        let mut coverage = vec![0u8; width as usize * height as usize];
+
+        // First pass, borrowing the item mutably for shaping: decide, per
+        // glyph, where its ink comes from. A cluster the identity machinery
+        // covers (the tables and faces whose advances `measureText` answers)
+        // must rasterize from the identity's own host face -- the shaped
+        // stand-in's outline is what the small-size probes used to read a
+        // solid or a low byte from, and it is not the face the reference
+        // draws with. Single-character clusters only: a ligature or a
+        // combining sequence has no per-character origin, and those keep the
+        // shaped stand-in the way the ink path does.
+        enum GlyphDraw {
+            Shaped { cache_key: CacheKey, x: i32, line_dy: i32 },
+            Identity {
+                family: &'static str,
+                ch: char,
+                size: f32,
+                x: i32,
+                line_dy: i32,
+            },
+        }
+        let mut draws: Vec<GlyphDraw> = Vec::new();
 
         let TextEngine {
             font_system,
             items,
-            variable_swash,
             ..
         } = self;
         let item = items.get_mut(idx)?;
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, None, wrap);
         let line_offset = item.first_line_offset;
+        let identity_face = item.identity_face;
+        let identity_table = item.identity_table;
+        // Covered text advances by the identity face's own numbers, so the
+        // pen the ink is placed at is the same one the reported width came
+        // from -- identical to the loop in `canvas_item_ink`.
+        let mut pen = 0.0f32;
+        let mut previous: Option<char> = None;
         // `run.line_y` is the baseline's position in buffer space; the bitmap
         // is already baseline-relative, so only the offset between wrapped
         // lines may shift a row. A canvas run never wraps (`white-space: pre`
@@ -2934,32 +3202,188 @@ impl TextEngine {
                 first_line_y = run.line_y;
                 first_line = false;
             }
-            let base_row = baseline_row + (run.line_y - first_line_y) as i32;
+            let line_dy = (run.line_y - first_line_y) as i32;
+            let (ligature_spans, _) = match identity_face {
+                Some(face) => identity_ligature_spans(run.text, face),
+                None => (Vec::new(), 0.0),
+            };
             for glyph in run.glyphs {
-                let physical = glyph.physical((line_offset, 0.0), 1.0);
-                variable_swash.with_pixels_unhinted(
-                    font_system,
-                    physical.cache_key,
-                    Color::rgba(0, 0, 0, 255),
-                    |x, y, color| {
-                        let alpha = color.a() as u32;
-                        if alpha == 0 {
-                            return;
+                let span = (glyph.start, glyph.end);
+                let ligature = ligature_spans
+                    .iter()
+                    .any(|(start, end)| *start <= span.0 && span.1 <= *end);
+                let cluster = run.text.get(span.0..span.1);
+                let cluster_units = cluster.and_then(|cluster| {
+                    identity_measured_cluster(identity_face, identity_table, previous, cluster)
+                });
+                if let Some(cluster) = cluster {
+                    if let Some(last) = cluster.chars().last() {
+                        previous = Some(last);
+                    }
+                }
+                let covered = ligature || cluster_units.is_some();
+                let advance = if covered {
+                    // A ligature's advance belongs to its first cluster; the
+                    // rest of it adds nothing on top.
+                    let first = !ligature
+                        || ligature_spans
+                            .iter()
+                            .any(|(start, _)| *start == span.0);
+                    let units = if ligature {
+                        if first {
+                            identity_face
+                                .and_then(|face| identity_ligature_at(run.text, span.0, face))
+                                .map_or(0.0, |(_, u)| u)
+                        } else {
+                            0.0
                         }
-                        let px = physical.x + x - left;
-                        let py = base_row + physical.y + y;
-                        if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
-                            return;
+                    } else {
+                        cluster_units.unwrap_or(0.0)
+                    };
+                    identity_width(units, glyph.font_size)
+                } else {
+                    glyph.w
+                };
+                let x = pen + glyph.x_offset;
+                pen += advance;
+
+                let mut identity_spec = None;
+                if covered && !ligature {
+                    if let Some(cluster) = cluster {
+                        let single = cluster.chars().collect::<Vec<_>>();
+                        // Emoji and the wide/last-resort fallbacks carry their
+                        // own placement rules the ink path owns; they keep the
+                        // shaped sample here.
+                        let emoji = identity_face
+                            .and_then(|face| face.emoji_metric(cluster))
+                            .and_then(|metric| metric.ink)
+                            .is_some();
+                        if single.len() == 1 && !emoji {
+                            let ch = single[0];
+                            // Which reference face the advance came from: a
+                            // family table outranks the identity face, same
+                            // order `identity_measured_cluster` resolves in.
+                            // `previous` still holds the character before this
+                            // cluster at this point, which is the pair the
+                            // table's kern answers for.
+                            let from_table = identity_table
+                                .and_then(|table| table_cluster_units(table, previous, cluster))
+                                .is_some();
+                            let family = if from_table {
+                                identity_table.map(|table| table.family)
+                            } else {
+                                match identity_face {
+                                    Some(IdentityFace::Sans) => Some("PingFang SC"),
+                                    Some(IdentityFace::Serif) => Some("Songti SC"),
+                                    None => None,
+                                }
+                            };
+                            if let Some(family) = family {
+                                identity_spec = Some((family, ch));
+                            }
                         }
-                        let cell =
-                            &mut coverage[py as usize * width as usize + px as usize];
-                        // Overlapping glyphs composite source-over onto the
-                        // coverage itself, which is what an opaque fill does
-                        // when strokes cross on a transparent surface.
-                        let out = alpha + *cell as u32 * (255 - alpha) / 255;
-                        *cell = out.min(255) as u8;
-                    },
-                );
+                    }
+                }
+                match identity_spec {
+                    Some((family, ch)) => draws.push(GlyphDraw::Identity {
+                        family,
+                        ch,
+                        size: glyph.font_size,
+                        x: (line_offset + x).round() as i32,
+                        line_dy,
+                    }),
+                    None => {
+                        let physical = glyph.physical((line_offset, 0.0), 1.0);
+                        draws.push(GlyphDraw::Shaped {
+                            cache_key: physical.cache_key,
+                            x: physical.x,
+                            line_dy,
+                        });
+                    }
+                }
+            }
+        }
+        if std::env::var_os("OBSCURA_COVERAGE_DEBUG").is_some() {
+            eprintln!("coverage: table={:?} face={:?} draws={}",
+                identity_table.map(|t| t.family), identity_face.map(|f| if matches!(f, IdentityFace::Sans) { "Sans" } else { "Serif" }), draws.len());
+            for d in &draws {
+                if let GlyphDraw::Identity { family, ch, size, x, line_dy } = d {
+                    eprintln!("coverage: identity {} {:?} size={} x={} dy={}", family, ch, size, x, line_dy);
+                }
+            }
+        }
+        drop(items);
+
+        // The identity glyphs' own outlines join the frame here, after the
+        // item borrow is done: the ink union above is built from the shaped
+        // stand-in's outlines, and a different face's glyph at the same pen
+        // position can step outside it -- without this union every pixel the
+        // identity glyph spends outside the stand-in's box is clipped away.
+        for draw in &draws {
+            if let GlyphDraw::Identity { family, ch, size, x, .. } = draw {
+                if let Some((x0, y0, x1, y1)) =
+                    self.identity_glyph_faces.glyph_bounds(family, *ch, *size)
+                {
+                    min_x = min_x.min(*x as f32 + x0);
+                    max_x = max_x.max(*x as f32 + x1);
+                    ascent = ascent.max(y1);
+                    descent = descent.max(-y0);
+                }
+            }
+        }
+        if !(min_x < max_x && ascent > 0.0) {
+            return None;
+        }
+
+        let left = min_x.floor() as i32 - 1;
+        let top = -(ascent.ceil() as i32 + 1);
+        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
+        let height = (ascent.ceil() as i32 + descent.ceil() as i32 + 3).max(1) as u32;
+        let baseline_row = ascent.ceil() as i32 + 1;
+        let mut coverage = vec![0u8; width as usize * height as usize];
+
+        let TextEngine {
+            variable_swash,
+            identity_glyph_faces,
+            ..
+        } = self;
+        for draw in draws {
+            match draw {
+                GlyphDraw::Shaped { cache_key, x, line_dy } => {
+                    let base_row = baseline_row + line_dy;
+                    variable_swash.with_pixels_unhinted(
+                        font_system,
+                        cache_key,
+                        Color::rgba(0, 0, 0, 255),
+                        |gx, gy, color| {
+                            let px = x + gx - left;
+                            let py = base_row + gy;
+                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                                return;
+                            }
+                            let cell = &mut coverage[py as usize * width as usize + px as usize];
+                            composite_glyph_pixel(cell, color);
+                        },
+                    );
+                }
+                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
+                    let base_row = baseline_row + line_dy;
+                    identity_glyph_faces.with_glyph_pixels(
+                        family,
+                        ch,
+                        size,
+                        Color::rgba(0, 0, 0, 255),
+                        |gx, gy, color| {
+                            let px = x + gx - left;
+                            let py = base_row + gy;
+                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                                return;
+                            }
+                            let cell = &mut coverage[py as usize * width as usize + px as usize];
+                            composite_glyph_pixel(cell, color);
+                        },
+                    );
+                }
             }
         }
         Some((width, height, left, top, coverage))
@@ -7185,6 +7609,7 @@ mod ink_tests {
         assert!(right >= left);
     }
 }
+
 
 
 
