@@ -469,7 +469,6 @@ impl CoreTextFace {
                 x: pen_x,
                 y: height as f64 - baseline_y,
             };
-            CGContextSetTextPosition(ctx, pos.x, pos.y);
             CTFontDrawGlyphs(self.font, &glyph, &pos, 1, ctx);
             // Extract the alpha channel row-major (the canvas coverage).
             let mut out = Vec::with_capacity(width * height);

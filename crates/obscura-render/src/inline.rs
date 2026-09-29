@@ -3683,7 +3683,11 @@ impl TextEngine {
                                 const PAD: i32 = 4;
                                 let w = (sw_w as i32 + 2 * PAD).max(1) as usize;
                                 let h = (sw_h as i32 + 2 * PAD).max(1) as usize;
-                                let baseline = sw_h as f64 + PAD as f64;
+                                // `sw_top` is the swash box top above the
+                                // baseline, so putting the baseline this far
+                                // below the top pad lands the box on mask rows
+                                // [PAD, PAD + sw_h) for either sign.
+                                let baseline = PAD as f64 + sw_top as f64;
                                 if let Some(mask) = face.draw_glyph_gray_flags(
                                     glyph,
                                     PAD as f64,
