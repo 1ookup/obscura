@@ -1324,14 +1324,20 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
       const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
       for (let row = 0; row < h; row++) {
         const gy = py0 + row;
-        if (gy < 0 || gy >= state.h) continue;
+        // Under a mask the raster's own bounds bound the pass, not the canvas:
+        // the glyph coverage that falls off the edge is what the blur carries
+        // back on, so a glyph entirely off canvas still shadows what its blur
+        // reaches. The mask box bounds it instead, which also keeps the flat
+        // index inside its own row. Without a mask the pixel lands directly,
+        // and there the canvas edge is the clip.
+        if (mask ? (gy < box[1] || gy > box[3]) : (gy < 0 || gy >= state.h)) continue;
         const rowBase = row * w;
         const maskRow = mask ? (gy - box[1]) * bw - box[0] : 0;
         for (let col = 0; col < w; col++) {
           const c = cov[rowBase + col];
           if (!c) continue;
           const gx = px0 + col;
-          if (gx < 0 || gx >= state.w) continue;
+          if (mask ? (gx < box[0] || gx > box[2]) : (gx < 0 || gx >= state.w)) continue;
           if (mask) { mask[maskRow + gx] = c / 255; continue; }
           const [r, g, b, a] = paintGradient
             ? _canvas2dPaintAt(self, gx + 0.5, gy + 0.5) : solid;
@@ -1971,9 +1977,20 @@ class _Canvas2D {
     const bw = box ? box[2] - box[0] + 1 : 0;
     const bh = box ? box[3] - box[1] + 1 : 0;
     const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
-    for (let py = y0; py <= y1; py++) {
+    // The coverage pass runs over the shape's own bounds clipped to the mask
+    // box, which is the canvas-clipped box above only while the shape stays
+    // inside. Past the edge the mask keeps the coverage regardless: the blur
+    // reads it where it falls off and carries it back in, so a shape entirely
+    // off canvas still shadows the pixels its blur reaches, and a shape
+    // crossing the edge keeps the part the edge cut. The composite below is
+    // where the canvas clip belongs.
+    const mx0 = mask ? Math.max(box[0], Math.floor(minX)) : x0;
+    const my0 = mask ? Math.max(box[1], Math.floor(minY)) : y0;
+    const mx1 = mask ? Math.min(box[2], Math.ceil(maxX)) : x1;
+    const my1 = mask ? Math.min(box[3], Math.ceil(maxY)) : y1;
+    for (let py = my0; py <= my1; py++) {
       const maskRow = mask ? (py - box[1]) * bw - box[0] : 0;
-      for (let px = x0; px <= x1; px++) {
+      for (let px = mx0; px <= mx1; px++) {
         let coverage = 0;
         for (const [ox, oy] of samples) {
           if (_canvas2dWindingAt(this, subpaths, px + ox, py + oy, evenOdd) !== 0) coverage++;
@@ -2022,9 +2039,16 @@ class _Canvas2D {
     const bw = box ? box[2] - box[0] + 1 : 0;
     const bh = box ? box[3] - box[1] + 1 : 0;
     const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
-    for (let py = y0; py <= y1; py++) {
+    // Same widened pass as fill(): the stroke's coverage off the edge is what
+    // the blur reads back onto it, so the mask collects over the stroke's own
+    // bounds clipped to the mask box and only the composite is clipped.
+    const mx0 = mask ? Math.max(box[0], Math.floor(minX)) : x0;
+    const my0 = mask ? Math.max(box[1], Math.floor(minY)) : y0;
+    const mx1 = mask ? Math.min(box[2], Math.ceil(maxX)) : x1;
+    const my1 = mask ? Math.min(box[3], Math.ceil(maxY)) : y1;
+    for (let py = my0; py <= my1; py++) {
       const maskRow = mask ? (py - box[1]) * bw - box[0] : 0;
-      for (let px = x0; px <= x1; px++) {
+      for (let px = mx0; px <= mx1; px++) {
         let inside = 0;
         for (const [ox, oy] of samples) {
           const sx = px + ox, sy = py + oy;
