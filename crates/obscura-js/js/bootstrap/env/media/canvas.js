@@ -1232,15 +1232,38 @@ class _Canvas2D {
       const srcScale = sourceState && sourceState.floatBuf ? 255 : 1;
       const srcSpace = sourceState ? sourceState.colorSpace : src.colorSpace;
       dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? srcWidth); dh = dh ?? (sh ?? srcHeight);
+      const shrinking = (dw < sw) || (dh < sh);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||srcWidth) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||srcHeight) / dh);
-          if (srcX >= 0 && srcX < srcWidth && srcY >= 0 && srcY < srcHeight) {
-            const srcIdx = (srcY * srcWidth + srcX) * 4;
-            _canvas2dSetPixel(this, dx+px, dy+py, srcBuffer[srcIdx] * srcScale,
-              srcBuffer[srcIdx+1] * srcScale, srcBuffer[srcIdx+2] * srcScale,
-              srcBuffer[srcIdx+3] * srcScale, srcSpace || 'srgb');
+          if (shrinking) {
+            // Chrome's drawImage downscale averages the mapped source region
+            // (box filter in premultiplied space) -- a single nearest-neighbour
+            // sample answers white where the reference answers the mean.
+            const srcX0 = Math.max(0, Math.floor((sx||0) + px * (sw||srcWidth) / dw));
+            const srcX1 = Math.min(srcWidth, Math.ceil((sx||0) + (px+1) * (sw||srcWidth) / dw));
+            const srcY0 = Math.max(0, Math.floor((sy||0) + py * (sh||srcHeight) / dh));
+            const srcY1 = Math.min(srcHeight, Math.ceil((sy||0) + (py+1) * (sh||srcHeight) / dh));
+            let r = 0, g = 0, b = 0, a = 0, count = 0;
+            for (let sy2 = srcY0; sy2 < Math.max(srcY0 + 1, srcY1); sy2++) {
+              for (let sx2 = srcX0; sx2 < Math.max(srcX0 + 1, srcX1); sx2++) {
+                const idx = (sy2 * srcWidth + sx2) * 4;
+                r += srcBuffer[idx]; g += srcBuffer[idx+1];
+                b += srcBuffer[idx+2]; a += srcBuffer[idx+3];
+                count++;
+              }
+            }
+            if (count) {
+              _canvas2dSetPixel(this, dx+px, dy+py, r/count, g/count, b/count, a/count, srcSpace || 'srgb');
+            }
+          } else {
+            const srcX = Math.floor((sx||0) + px * (sw||srcWidth) / dw);
+            const srcY = Math.floor((sy||0) + py * (sh||srcHeight) / dh);
+            if (srcX >= 0 && srcX < srcWidth && srcY >= 0 && srcY < srcHeight) {
+              const srcIdx = (srcY * srcWidth + srcX) * 4;
+              _canvas2dSetPixel(this, dx+px, dy+py, srcBuffer[srcIdx] * srcScale,
+                srcBuffer[srcIdx+1] * srcScale, srcBuffer[srcIdx+2] * srcScale,
+                srcBuffer[srcIdx+3] * srcScale, srcSpace || 'srgb');
+            }
           }
         }
       }
