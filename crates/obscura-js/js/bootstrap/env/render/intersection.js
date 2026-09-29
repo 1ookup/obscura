@@ -336,37 +336,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   get thresholds() { return this._thresholds.slice(); }
 };
 
-// A realm that boots the two halves as separate scripts (a frame realm whose
-// snapshot template is unavailable) reaches the checkpoint below with its DOM
-// installed but MutationObserver still undefined. The wiring is deferred to the
-// deferred half there instead of throwing out of the microtask; see
-// env/render/intersection-entry.js, which retries once the binding exists.
-let _intersectionObserverWired = false;
-let _intersectionObserverPending = false;
-
-function _wireIntersectionMutationObserver() {
-  if (_intersectionObserverWired) return;
-  if (!globalThis.document || typeof MutationObserver !== "function") {
-    _intersectionObserverPending = true;
-    return;
-  }
-  // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
-  // MutationObserver is only needed for intersection geometry. Scheduling RO
-  // again here would escape its depth-bounded delivery cycle and allow a
-  // self-resizing callback to create an infinite chain of zero-delay tasks.
-  const observer = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
-  try {
-    observer.observe(globalThis.document, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true,
-    });
-  } catch {}
-  _intersectionObserverWired = true;
-  _intersectionObserverPending = false;
-}
-
 (function() {
   const renderingUpdate = () => {
     _scheduleIntersectionRenderCheckpoint();
@@ -376,6 +345,4 @@ function _wireIntersectionMutationObserver() {
   // rendering update and schedules both observer families.
   globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
   globalThis.addEventListener("resize", renderingUpdate);
-  if (globalThis.document) _wireIntersectionMutationObserver();
-  else Promise.resolve().then(_wireIntersectionMutationObserver);
 })();
