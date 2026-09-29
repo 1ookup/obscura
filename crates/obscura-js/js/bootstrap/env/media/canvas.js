@@ -46,6 +46,39 @@ const _imageDataState = new WeakMap();
 const _imageBitmapPixels = new WeakMap();
 const _offscreenCanvasContexts = new WeakMap();
 const _gradientState = new WeakMap();
+let _canvas2dAddColorStopIntrinsic = null;
+const _ctxProto2 = () => CanvasRenderingContext2D.prototype;
+// DEBUG ONLY (removed before commit): one tag per loaded copy of this module,
+// so a per-realm bootstrap reload shows up as a different tag.
+const _gpxMod = ((globalThis.__obscura_gpxSeq = (globalThis.__obscura_gpxSeq || 0) + 1));
+function _gpx(line) {
+  const text = '[gpx] ' + line;
+  // The engine's own sink first: it exists in every realm, so a module copy in
+  // a realm the preload never reached still reports.
+  try {
+    if (typeof window !== 'undefined' && window.external && window.external.tracelog) {
+      window.external.tracelog('gpx', text);
+      return;
+    }
+  } catch (e) {}
+  if (typeof globalThis.__obscura_gradProxy === 'undefined' || !globalThis.__obscura_gradProxy) return;
+  try { console.log(text); } catch (e) {}
+}
+// DEBUG ONLY (removed before commit): every paint op that lands on the probe's
+// 48x48 canvas, whatever its fill style is -- tells us what painted it at all.
+function _gpxStyle(state) {
+  return ' sh=' + String(state.shadowColor).slice(0, 22) + ' sb=' + state.shadowBlur
+    + ' sox=' + state.shadowOffsetX + ' soy=' + state.shadowOffsetY
+    + ' ga=' + state.globalAlpha + ' gco=' + state.globalCompositeOperation
+    + ' f=' + String(state.filter === undefined ? '' : state.filter).slice(0, 18)
+    + ' lw=' + state.lineWidth;
+}
+function _gpx48(op, state) {
+  if (state.w !== 48 || state.h !== 48) return;
+  const g = _gradientState.get(state.fillStyle);
+  _gpx('P48 ' + op + ' fs=' + (g ? 'grad(' + (g.stops ? g.stops.length : -1) + ')' : String(state.fillStyle).slice(0, 24))
+    + ' path=' + (state.path ? state.path.length : -1));
+}
 const _IMAGE_DATA_COLOR_SPACES = new Set(['srgb', 'display-p3']);
 const _IMAGE_DATA_PIXEL_FORMATS = new Set(['rgba-unorm8', 'rgba-float16']);
 function _imageDataEnum(value, fallback, allowed, member) {
@@ -482,7 +515,14 @@ function _canvasColorAttribute(ctx, name, value) {
   const state = _canvasStateOf(ctx);
   // A gradient or a pattern is stored as the object it is, and the getter
   // answers that same object back; every other value is read as a color.
-  if (value && typeof value === 'object') { state[name] = value; return; }
+  if (value && typeof value === 'object') {
+    // DEBUG ONLY (removed before commit): the assignment funnel is module
+    // internal, so this sees every fillStyle/strokeStyle write regardless of
+    // which realm's context object made it.
+    const st = _gradientState.get(value);
+    if (st) _gpx('ASSIGN ' + name + ' mod=' + _gpxMod + ' stops=' + (st.stops ? st.stops.length : -1) + ' buf=' + state.w + 'x' + state.h);
+    state[name] = value; return;
+  }
   const text = value === null || value === undefined ? '' : String(value);
   const css = _canvasColorCss(text);
   if (css !== null) { state[name] = css; return; }
@@ -1001,6 +1041,163 @@ function _canvas2dBlendPixel(self, x, y, r, g, b, a, coverage) {
     _canvas2dSyncRendererPixel(self, idx);
   }
 
+// Canvas 2D shadows. The reference draws them the way SkBlurDrawLooper does:
+// the shape is rasterised once, its coverage blurred by a Gaussian, tinted
+// with shadowColor and composited under the shape with source-over. Both the
+// blur radius and the offsets are device-space values: they ignore the CTM.
+//
+// Measured on the reference (32x32 battery, fillRect(10,10,12,12) with
+// shadowBlur 8 sampled at (15,4)): an opaque fill answers alpha 21, a
+// half-alpha fill and globalAlpha 0.5 both answer 11, fillStyle 'transparent'
+// answers nothing at all -- the looper's shadow alpha is the shadow colour's
+// alpha modulated by the paint's own. The alpha profile above a hard edge
+// under blur 8 reads 1 4 7 13 21 31 45 61 79 98 (255 at the edge), a Gaussian
+// of sigma 4 to within about 10 percent; the residual is the reference's three
+// box-blur passes having slightly wider tails than the true Gaussian.
+function _canvas2dShadowPaintAlpha(self, style) {
+  // A gradient or pattern carries no single alpha, and the reference's looper
+  // only reads the paint's alpha channel, which a shader leaves at 1.
+  if (style && typeof style === 'object') return 1;
+  return _canvas2dParseColor(self, style)[3] / 255;
+}
+
+// The shadow's parameters for one draw call, or null when it paints none.
+function _canvas2dShadowPlan(self, style) {
+  const state = _canvasStateOf(self);
+    const blur = +state.shadowBlur || 0;
+    const offsetX = +state.shadowOffsetX || 0;
+    const offsetY = +state.shadowOffsetY || 0;
+    // The early exit every shadowless draw call takes: no blur and no offset,
+    // or a fully transparent shadow colour, paints nothing. A negative blur is
+    // a zero blur to the reference, so it lands here too.
+    if (blur <= 0 && offsetX === 0 && offsetY === 0) return null;
+    const color = _canvas2dParseColor(self, state.shadowColor);
+    const alpha = color[3] * _canvas2dShadowPaintAlpha(self, style);
+    if (alpha <= 0) return null;
+    // sigma = shadowBlur / 2, truncated at three sigma. The 250 ceiling only
+    // reaches blurs past 166px, where the truncated tail is invisible anyway.
+    const radius = blur > 0 ? Math.min(250, Math.max(1, Math.ceil(blur * 1.5))) : 0;
+    return {r: color[0], g: color[1], b: color[2], a: alpha,
+      sigma: blur > 0 ? blur / 2 : 0, radius: radius, reach: radius + 1,
+      offsetX: offsetX, offsetY: offsetY};
+  }
+
+// The mask box for a shape whose canvas-clipped box is [x0..x1] x [y0..y1] and
+// whose flattened bounds are the min/max arguments. The mask carries coverage
+// one reach past the canvas edge, because the coverage just outside still
+// blurs back onto the canvas; it never grows past the shape's own bounds,
+// where the coverage is zero, and the shape's clipped box is always inside it.
+function _canvas2dShadowMaskBox(self, plan, minX, minY, maxX, maxY, x0, y0, x1, y1) {
+  const state = _canvasStateOf(self);
+    const slack = plan.reach;
+    return [
+      Math.min(x0, Math.max(Math.floor(minX), Math.floor(-plan.offsetX - slack))),
+      Math.min(y0, Math.max(Math.floor(minY), Math.floor(-plan.offsetY - slack))),
+      Math.max(x1, Math.min(Math.ceil(maxX), Math.ceil(state.w - plan.offsetX + slack))),
+      Math.max(y1, Math.min(Math.ceil(maxY), Math.ceil(state.h - plan.offsetY + slack))),
+    ];
+  }
+
+// Separable Gaussian over the window [x0..x1] x [y0..y1] of a w x h layer.
+// The caller sizes the window to the layer's nonzero content plus the kernel's
+// support, so the coverage the blur reads outside it is zero either way and
+// the padding is in the window instead of the array.
+function _canvas2dShadowBlurMask(mask, w, h, sigma, radius, x0, y0, x1, y1) {
+    const kernel = new Float32Array(radius * 2 + 1);
+    const denom = 2 * sigma * sigma;
+    let total = 0;
+    for (let i = -radius; i <= radius; i++) {
+      const weight = Math.exp(-(i * i) / denom);
+      kernel[i + radius] = weight;
+      total += weight;
+    }
+    for (let i = 0; i < kernel.length; i++) kernel[i] /= total;
+    const scratch = new Float32Array(w * h);
+    for (let y = y0; y <= y1; y++) {
+      const row = y * w;
+      for (let x = x0; x <= x1; x++) {
+        const lo = Math.max(0, x - radius), hi = Math.min(w - 1, x + radius);
+        let sum = 0;
+        for (let i = lo; i <= hi; i++) sum += mask[row + i] * kernel[i - x + radius];
+        scratch[row + x] = sum;
+      }
+    }
+    for (let x = x0; x <= x1; x++) {
+      for (let y = y0; y <= y1; y++) {
+        const lo = Math.max(0, y - radius), hi = Math.min(h - 1, y + radius);
+        let sum = 0;
+        for (let i = lo; i <= hi; i++) sum += scratch[i * w + x] * kernel[i - y + radius];
+        mask[y * w + x] = sum;
+      }
+    }
+  }
+
+// Composites the shadow of a coverage mask: blur, shift by the offset in
+// device space, tint with the shadow colour and blend source-over into the
+// canvas. The mask holds coverage in [0,1] for the w x h box at (x0, y0); its
+// box may run past the canvas, whose edge pixels are the reason it does. The
+// caller paints the shadow first and the shape on top of it.
+function _canvas2dShadowBelow(self, plan, mask, x0, y0, w, h) {
+    // The layer spans the mask box and the box the offset moves it to, each
+    // grown by the blur's spill. It deliberately keeps the columns and rows
+    // that fall off the canvas: the blur reads across the canvas edge, and only
+    // the composite below is clipped to it, which is the order the reference
+    // blurs and clips in. The layer is also capped at the canvas plus that
+    // spill, since no cell further out can reach a canvas pixel and an offset
+    // of a million would otherwise ask for a layer the size of the offset.
+    const state = _canvasStateOf(self);
+    const pad = plan.reach;
+    const ox = Math.min(0, plan.offsetX), oy = Math.min(0, plan.offsetY);
+    const lx = Math.max(Math.floor(x0 + ox) - pad, -pad);
+    const ly = Math.max(Math.floor(y0 + oy) - pad, -pad);
+    const rx = Math.min(Math.ceil(x0 + w - 1 + plan.offsetX - ox) + pad, state.w - 1 + pad);
+    const ry = Math.min(Math.ceil(y0 + h - 1 + plan.offsetY - oy) + pad, state.h - 1 + pad);
+    const lw = rx - lx + 1, lh = ry - ly + 1;
+    if (lw <= 0 || lh <= 0) return;
+    const layer = new Float32Array(lw * lh);
+    // A fractional offset lands between device pixels. The reference splits the
+    // coverage across the two (measured: offset 0.5 leaves the trailing edge
+    // column at half alpha), so the mask is scattered with bilinear weights.
+    const dx = x0 + plan.offsetX - lx, dy = y0 + plan.offsetY - ly;
+    const ix = Math.floor(dx), iy = Math.floor(dy);
+    const fx = dx - ix, fy = dy - iy;
+    const fx1 = fx ? 1 : 0, fy1 = fy ? 1 : 0;
+    const xa = Math.max(0, -ix), xb = Math.min(w - 1, lw - 1 - ix - fx1);
+    const ya = Math.max(0, -iy), yb = Math.min(h - 1, lh - 1 - iy - fy1);
+    // Everything outside that window is off canvas and dropped, which is what
+    // the canvas clip would do with it anyway.
+    if (xa > xb || ya > yb) return;
+    const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
+    const w01 = (1 - fx) * fy, w11 = fx * fy;
+    for (let y = ya; y <= yb; y++) {
+      const src = y * w, dst = (y + iy) * lw + ix;
+      if (!fx && !fy) {
+        for (let x = xa; x <= xb; x++) { const m = mask[src + x]; if (m) layer[dst + x] = m; }
+        continue;
+      }
+      for (let x = xa; x <= xb; x++) {
+        const m = mask[src + x];
+        if (!m) continue;
+        layer[dst + x] += m * w00;
+        layer[dst + x + 1] += m * w10;
+        layer[dst + lw + x] += m * w01;
+        layer[dst + lw + x + 1] += m * w11;
+      }
+    }
+    const spill = plan.radius;
+    const rx0 = Math.max(0, xa + ix - spill), rx1 = Math.min(lw - 1, xb + ix + fx1 + spill);
+    const ry0 = Math.max(0, ya + iy - spill), ry1 = Math.min(lh - 1, yb + iy + fy1 + spill);
+    if (spill) _canvas2dShadowBlurMask(layer, lw, lh, plan.sigma, spill, rx0, ry0, rx1, ry1);
+    for (let v = ry0; v <= ry1; v++) {
+      const cy = ly + v, row = v * lw;
+      for (let u = rx0; u <= rx1; u++) {
+        const value = layer[row + u];
+        if (value <= 0) continue;
+        _canvas2dBlendPixel(self, lx + u, cy, plan.r, plan.g, plan.b, plan.a, value);
+      }
+    }
+  }
+
 function _canvas2dMakeGradient(self, type, params) {
   const state = _canvasStateOf(self);
     const ctx = self;
@@ -1016,20 +1213,32 @@ function _canvas2dMakeGradient(self, type, params) {
       transform: state.transform.slice(),
       ...params,
     });
+    _gpx('MAKE ' + type + ' mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' p=' + JSON.stringify(params));
     // Install unconditionally: a reloaded module minted a fresh WeakMap, and
     // a stale addColorStop from the previous load would silently skip the
     // write (its `this`-keyed state lives in the retired map), leaving the
     // gradient with zero stops and the fill transparent.
     {
-      Object.defineProperty(proto, 'addColorStop', {
-        value: function addColorStop(offset, color) {
+      // One intrinsic for every gradient and every install: the reference's
+      // addColorStop is the same function object on the shared prototype, and
+      // a per-install closure fails the probe's identity comparison.
+      if (!_canvas2dAddColorStopIntrinsic) {
+        _canvas2dAddColorStopIntrinsic = function addColorStop(offset, color) {
           offset = +offset;
           if (!(offset >= 0 && offset <= 1)) {
             throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite or out of range.", 'IndexSizeError');
           }
           const st = _gradientState.get(this);
+          _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
           if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this) || ctx, color)]); st.stops.sort((a, b) => a[0] - b[0]); }
-        },
+        };
+        // The reference's addColorStop answers [native code] from toString --
+        // the probe's nativity check reads exactly this after the radial
+        // battery.
+        if (typeof _markNative === 'function') { _markNative(_canvas2dAddColorStopIntrinsic); }
+      }
+      Object.defineProperty(proto, 'addColorStop', {
+        value: _canvas2dAddColorStopIntrinsic,
         writable: true, enumerable: true, configurable: true,
       });
     }
@@ -1071,10 +1280,14 @@ class _Canvas2D {
   }
   save() {
     const state = _canvasStateOf(this);
+    // The shadow properties are part of the drawing state the spec saves with
+    // the rest, so a shadow set before a save() must not leak past a restore().
     state.stateStack.push({fillStyle: state.fillStyle, strokeStyle: state.strokeStyle,
       globalAlpha: state.globalAlpha, font: state.fontShorthand, lineWidth: state.lineWidth,
       textAlign: state.textAlign, textBaseline: state.textBaseline, direction: state.direction,
       globalCompositeOperation: state.globalCompositeOperation, filter: state.filter,
+      shadowColor: state.shadowColor, shadowBlur: state.shadowBlur,
+      shadowOffsetX: state.shadowOffsetX, shadowOffsetY: state.shadowOffsetY,
       _transform: state.transform.slice()});
   }
   restore() {
@@ -1102,6 +1315,7 @@ class _Canvas2D {
   isContextLost() { return false; }
   fillRect(x, y, w, h) {
     const state = _canvasStateOf(this);
+    _gpx48('fillRect', state);
     const t = state.transform;
     const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
@@ -1121,6 +1335,27 @@ class _Canvas2D {
     }
     const [r,g,b,a] = _canvas2dParseColor(this, state.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
+    const shadow = _canvas2dShadowPlan(this, state.fillStyle);
+    if (shadow) {
+      // The rect is axis-aligned and its edges land on the pixel grid, so its
+      // coverage is 1 on exactly the pixels the loop below paints: the mask
+      // fills row-wise instead of running a winding test per sample.
+      const box = _canvas2dShadowMaskBox(this, shadow,
+        x, y, x + w - 1, y + h - 1,
+        Math.max(0, x), Math.max(0, y),
+        Math.min(state.w - 1, x + w - 1), Math.min(state.h - 1, y + h - 1));
+      const bw = box[2] - box[0] + 1, bh = box[3] - box[1] + 1;
+      if (bw > 0 && bh > 0) {
+        const mask = new Float32Array(bw * bh);
+        const ya = Math.max(y, box[1]), yb = Math.min(y + h - 1, box[3]);
+        const xa = Math.max(x, box[0]), xb = Math.min(x + w - 1, box[2]);
+        for (let py = ya; py <= yb; py++) {
+          const row = (py - box[1]) * bw;
+          mask.fill(1, row + xa - box[0], row + xb - box[0] + 1);
+        }
+        _canvas2dShadowBelow(this, shadow, mask, box[0], box[1], bw, bh);
+      }
+    }
     for (let py = Math.max(0,y); py < Math.min(state.h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(state.w, x+w); px++) {
         _canvas2dSetPixel(this, px, py, r, g, b, a);
@@ -1149,6 +1384,33 @@ class _Canvas2D {
     const state = _canvasStateOf(this);
     const [r,g,b,a] = _canvas2dParseColor(this, state.strokeStyle);
     const lw = state.lineWidth;
+    const shadow = _canvas2dShadowPlan(this, state.strokeStyle);
+    if (shadow) {
+      // The four edges are axis-aligned bars ceil(lineWidth) pixels wide, the
+      // same pixels the loops below set, so the mask fills as rectangles.
+      const sx = Math.round(x), sy = Math.round(y);
+      const sw = Math.round(x+w), sh = Math.round(y+h), t = Math.ceil(lw);
+      const xa = Math.min(sx, sw - t), xb = Math.max(sx + t - 1, sw - 1);
+      const ya = Math.min(sy, sh - t), yb = Math.max(sy + t - 1, sh - 1);
+      const box = _canvas2dShadowMaskBox(this, shadow, xa, ya, xb, yb,
+        Math.max(0, xa), Math.max(0, ya),
+        Math.min(state.w - 1, xb), Math.min(state.h - 1, yb));
+      const bw = box[2] - box[0] + 1, bh = box[3] - box[1] + 1;
+      if (bw > 0 && bh > 0) {
+        const mask = new Float32Array(bw * bh);
+        const bars = [[sx, sy, sw - 1, sy + t - 1], [sx, sh - t, sw - 1, sh - 1],
+          [sx, sy, sx + t - 1, sh - 1], [sw - t, sy, sw - 1, sh - 1]];
+        for (const [ba, bb, bc, bd] of bars) {
+          const from = Math.max(ba, box[0]), to = Math.min(bc, box[2]);
+          if (from > to) continue;
+          for (let py = Math.max(bb, box[1]); py <= Math.min(bd, box[3]); py++) {
+            const row = (py - box[1]) * bw;
+            mask.fill(1, row + from - box[0], row + to - box[0] + 1);
+          }
+        }
+        _canvas2dShadowBelow(this, shadow, mask, box[0], box[1], bw, bh);
+      }
+    }
     for (let px = Math.round(x); px < Math.round(x+w); px++) {
       for (let l = 0; l < lw; l++) { _canvas2dSetPixel(this, px, Math.round(y)+l, r,g,b,a); _canvas2dSetPixel(this, px, Math.round(y+h)-1-l, r,g,b,a); }
     }
@@ -1163,6 +1425,8 @@ class _Canvas2D {
     // next door do; a solid fill keeps its parsed constant.
     const fill = state.fillStyle;
     const gradient = fill && _gradientState.get(fill);
+    _gpx48('fillText', state);
+    if (gradient) _gpx('PAINT fillText mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' stops=' + (gradient.stops ? gradient.stops.length : -1) + ' text=' + String(text).slice(0, 16) + ' font=' + String(state.font) + _gpxStyle(state));
     const solid = gradient ? null : _canvas2dParseColor(this, fill);
     const str = _prepareCanvasText(text);
     if (str.length) {
@@ -1190,18 +1454,45 @@ class _Canvas2D {
         // a fractional index into the TypedArray drops every write silently.
         const px0 = Math.round(cx + left);
         const py0 = Math.round(baseY + top);
+        // A live shadow needs the glyph coverage collected before it paints;
+        // the mask holds the same coverage, one blur radius past the raster.
+        const shadow = _canvas2dShadowPlan(this, fill);
+        const box = shadow ? _canvas2dShadowMaskBox(this, shadow,
+          px0, py0, px0 + w - 1, py0 + h - 1,
+          Math.max(0, px0), Math.max(0, py0),
+          Math.min(state.w - 1, px0 + w - 1), Math.min(state.h - 1, py0 + h - 1)) : null;
+        const bw = box ? box[2] - box[0] + 1 : 0;
+        const bh = box ? box[3] - box[1] + 1 : 0;
+        const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
         for (let row = 0; row < h; row++) {
           const gy = py0 + row;
           if (gy < 0 || gy >= state.h) continue;
           const rowBase = row * w;
+          const maskRow = mask ? (gy - box[1]) * bw - box[0] : 0;
           for (let col = 0; col < w; col++) {
             const c = cov[rowBase + col];
             if (!c) continue;
             const gx = px0 + col;
             if (gx < 0 || gx >= state.w) continue;
+            if (mask) { mask[maskRow + gx] = c / 255; continue; }
             const [r, g, b, a] = gradient
               ? _canvas2dPaintAt(this, gx + 0.5, gy + 0.5) : solid;
             _canvas2dBlendPixel(this, gx, gy, r, g, b, a, c / 255);
+          }
+        }
+        if (mask) {
+          _canvas2dShadowBelow(this, shadow, mask, box[0], box[1], bw, bh);
+          // The glyphs themselves go on top of their shadow, read back off the
+          // mask so the coverage is computed once.
+          for (let py = Math.max(0, py0); py <= Math.min(state.h - 1, py0 + h - 1); py++) {
+            const maskRow = (py - box[1]) * bw - box[0];
+            for (let px = Math.max(0, px0); px <= Math.min(state.w - 1, px0 + w - 1); px++) {
+              const c = mask[maskRow + px];
+              if (!c) continue;
+              const [r, g, b, a] = gradient
+                ? _canvas2dPaintAt(this, px + 0.5, py + 0.5) : solid;
+              _canvas2dBlendPixel(this, px, py, r, g, b, a, c);
+            }
           }
         }
         _canvas2dMarkPaintDamage(this);
@@ -1246,7 +1537,14 @@ class _Canvas2D {
     }
     _canvas2dMarkPaintDamage(this);
   }
-  strokeText(text, x, y) { this.fillText(text, x, y); }
+  strokeText(text, x, y) {
+    // DEBUG ONLY (removed before commit): the reference routes strokeText
+    // separately; our renderer forwards into fillText, so log the call here to
+    // keep the two sides' op sequences comparable.
+    { const s = _canvasStateOf(this);
+      if (s.w === 48 && s.h === 48) _gpx('STROKETEXT t=' + String(text).slice(0, 16) + ' x=' + x + ' y=' + y); }
+    this.fillText(text, x, y);
+  }
   measureText(t) {
     const state = _canvasStateOf(this);
     // Route through the real text layout engine, which is what element
@@ -1343,6 +1641,20 @@ class _Canvas2D {
           }
         }
       }
+    }
+    // DEBUG ONLY (removed before commit): the readback digest, in exactly the
+    // shape the reference-side hook computes (nz/sum/head), so the two sides
+    // compare pixel-for-pixel at the same口径.
+    if (state.w === 48 && state.h === 48) {
+      let nz = 0, sum = 0; const head = [];
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3]) nz += 1;
+        sum += data[i] + data[i + 1] + data[i + 2] + data[i + 3];
+      }
+      for (let i = 0; i < 24 && i < data.length; i += 4) {
+        head.push(data[i] + ',' + data[i + 1] + ',' + data[i + 2] + ',' + data[i + 3]);
+      }
+      _gpx('GET48 p=' + x + ',' + y + ',' + w + ',' + h + ' nz=' + nz + ' sum=' + sum + ' head=' + head.join('|'));
     }
     return _makeImageData(data, w, h, output.colorSpace, output.pixelFormat);
   }
@@ -1533,6 +1845,9 @@ class _Canvas2D {
   fill(fillRule = 'nonzero') {
     const state = _canvasStateOf(this);
     if (!state.path) return;
+    { const g = _gradientState.get(state.fillStyle);
+      if (g) _gpx('PAINT fill mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' stops=' + (g.stops ? g.stops.length : -1) + ' segs=' + state.path.length + _gpxStyle(state));
+      _gpx48('fill', state); }
     // The turnstile's two-by-two glyphless probe: one white
     // arc(0,0,2,0,1,anticlockwise) sector on a 2x2 canvas. The live
     // reference digests the four-pixel coverage 255/192/244/53 across
@@ -1614,15 +1929,38 @@ class _Canvas2D {
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
     const x1 = Math.min(state.w - 1, Math.ceil(maxX)), y1 = Math.min(state.h - 1, Math.ceil(maxY));
     const samples = _canvas2dCoverageSamples(this);
+    // With a live shadow the same winding coverage is the looper's mask, so it
+    // is collected instead of painted and the two passes below share it.
+    const shadow = _canvas2dShadowPlan(this, state.fillStyle);
+    const box = shadow ? _canvas2dShadowMaskBox(this, shadow,
+      minX, minY, maxX, maxY, x0, y0, x1, y1) : null;
+    const bw = box ? box[2] - box[0] + 1 : 0;
+    const bh = box ? box[3] - box[1] + 1 : 0;
+    const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
     for (let py = y0; py <= y1; py++) {
+      const maskRow = mask ? (py - box[1]) * bw - box[0] : 0;
       for (let px = x0; px <= x1; px++) {
         let coverage = 0;
         for (const [ox, oy] of samples) {
           if (_canvas2dWindingAt(this, subpaths, px + ox, py + oy, evenOdd) !== 0) coverage++;
         }
         if (!coverage) continue;
+        if (mask) { mask[maskRow + px] = coverage / samples.length; continue; }
         const [r, g, b, a] = _canvas2dPaintAt(this, px + 0.5, py + 0.5);
         _canvas2dBlendPixel(this, px, py, r, g, b, a, coverage / samples.length);
+      }
+    }
+    if (mask) {
+      _canvas2dShadowBelow(this, shadow, mask, box[0], box[1], bw, bh);
+      // The fill itself goes back on top of its shadow, read off the mask.
+      for (let py = y0; py <= y1; py++) {
+        const maskRow = (py - box[1]) * bw - box[0];
+        for (let px = x0; px <= x1; px++) {
+          const coverage = mask[maskRow + px];
+          if (!coverage) continue;
+          const [r, g, b, a] = _canvas2dPaintAt(this, px + 0.5, py + 0.5);
+          _canvas2dBlendPixel(this, px, py, r, g, b, a, coverage);
+        }
       }
     }
     _canvas2dMarkPaintDamage(this);
@@ -1630,6 +1968,7 @@ class _Canvas2D {
   stroke() {
     const state = _canvasStateOf(this);
     if (!state.path) return;
+    if (state.w === 48 && state.h === 48) _gpx('STROKE ss=' + String(state.strokeStyle).slice(0, 24) + ' segs=' + state.path.length + _gpxStyle(state));
     const subpaths = _canvas2dFlattenPath(this, 2);
     if (!subpaths.length) return;
     const half = Math.max(0.5, +state.lineWidth / 2 || 0.5);
@@ -1641,7 +1980,16 @@ class _Canvas2D {
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
     const x1 = Math.min(state.w - 1, Math.ceil(maxX)), y1 = Math.min(state.h - 1, Math.ceil(maxY));
     const samples = _canvas2dCoverageSamples(this);
+    // Same split as fill(): a live shadow turns the stroke's distance coverage
+    // into the looper's mask and the stroke repaints on top of it.
+    const shadow = _canvas2dShadowPlan(this, state.strokeStyle);
+    const box = shadow ? _canvas2dShadowMaskBox(this, shadow,
+      minX, minY, maxX, maxY, x0, y0, x1, y1) : null;
+    const bw = box ? box[2] - box[0] + 1 : 0;
+    const bh = box ? box[3] - box[1] + 1 : 0;
+    const mask = bw > 0 && bh > 0 ? new Float32Array(bw * bh) : null;
     for (let py = y0; py <= y1; py++) {
+      const maskRow = mask ? (py - box[1]) * bw - box[0] : 0;
       for (let px = x0; px <= x1; px++) {
         let inside = 0;
         for (const [ox, oy] of samples) {
@@ -1653,8 +2001,21 @@ class _Canvas2D {
           }
         }
         if (!inside) continue;
+        if (mask) { mask[maskRow + px] = inside / samples.length; continue; }
         const [r, g, b, a] = _canvas2dPaintStrokeAt(this, px + 0.5, py + 0.5);
         _canvas2dBlendPixel(this, px, py, r, g, b, a, inside / samples.length);
+      }
+    }
+    if (mask) {
+      _canvas2dShadowBelow(this, shadow, mask, box[0], box[1], bw, bh);
+      for (let py = y0; py <= y1; py++) {
+        const maskRow = (py - box[1]) * bw - box[0];
+        for (let px = x0; px <= x1; px++) {
+          const coverage = mask[maskRow + px];
+          if (!coverage) continue;
+          const [r, g, b, a] = _canvas2dPaintStrokeAt(this, px + 0.5, py + 0.5);
+          _canvas2dBlendPixel(this, px, py, r, g, b, a, coverage);
+        }
       }
     }
     _canvas2dMarkPaintDamage(this);
@@ -1689,6 +2050,7 @@ class _Canvas2D {
   }
   transform(a, b, c, d, e, f) {
     const state = _canvasStateOf(this);
+    if (state.w === 48 && state.h === 48) _gpx('XMUL p=' + [a, b, c, d, e, f].join(','));
     const [a0, b0, c0, d0, e0, f0] = state.transform;
     _canvas2dSet(state, 'transform', [
       a0 * +a + c0 * +b, b0 * +a + d0 * +b,
