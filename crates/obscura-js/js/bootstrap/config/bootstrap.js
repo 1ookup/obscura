@@ -737,6 +737,14 @@ _markNative(globalThis.dispatchEvent);
   function _filter(t, names, skipDomSlots) {
     var out = names;
     if (_isGlobal(t)) {
+      // The current Turnstile payload walks the window's enumerable own keys.
+      // Its VM writes a one-shot aQgx8 marker on Obscura, while Chrome never
+      // exposes that marker to the walk. Keep the actual global property
+      // semantics untouched and hide only this exact key from the filtered
+      // reflection surfaces used by the payload collector.
+      if (skipDomSlots) {
+        out = out.filter(function(name) { return name !== 'aQgx8'; });
+      }
       var set = _set();
       out = out.filter(function(name) {
         if (_isEngineName(name)) { return false; }
