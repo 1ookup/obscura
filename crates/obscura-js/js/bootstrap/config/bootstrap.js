@@ -737,6 +737,14 @@ _markNative(globalThis.dispatchEvent);
   function _filter(t, names, skipDomSlots) {
     var out = names;
     if (_isGlobal(t)) {
+      // Turnstile writes a one-shot aQgx8 marker on the page window while it
+      // classifies the rendering probe. Chrome keeps the property readable,
+      // but its enumerable window walk does not expose this internal marker;
+      // the latter is the surface used to assemble the follow-up payload.
+      // Preserve normal property access and own-property-name semantics.
+      if (skipDomSlots) {
+        out = out.filter(function(name) { return name !== 'aQgx8'; });
+      }
       var set = _set();
       out = out.filter(function(name) {
         if (_isEngineName(name)) { return false; }
