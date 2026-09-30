@@ -398,6 +398,24 @@ impl StealthHttpClient {
         }
     }
 
+    pub fn fork_with_fingerprint(
+        &self,
+        fingerprint: crate::fingerprint::BrowserFingerprint,
+    ) -> Self {
+        let extra_headers = self.extra_headers.try_read()
+            .map(|headers| headers.clone())
+            .unwrap_or_default();
+        StealthHttpClient {
+            client: self.client.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            fingerprint: RwLock::new(fingerprint),
+            extra_headers: RwLock::new(extra_headers),
+            accepted_client_hints: self.accepted_client_hints.clone(),
+            in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network: self.allow_private_network,
+        }
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }

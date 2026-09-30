@@ -39,6 +39,15 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+    /// Context-owned stealth transport, built once and shared by every page.
+    /// Chrome's connection pool and TLS session cache are browser-context
+    /// state, not per-navigation state: a fresh wreq client per page threw
+    /// away both, and the challenge platform's second scripted asset
+    /// (api.js) paid a full cross-origin TLS handshake again (~1s against
+    /// the ~10ms a reused session costs -- measured 09-30, rPXg2 carried
+    /// the slow load straight into the scored payload).
+    #[cfg(feature = "stealth")]
+    pub stealth_client: Option<Arc<obscura_net::StealthHttpClient>>,
 }
 
 impl BrowserContext {
@@ -141,6 +150,15 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         let http_client = Arc::new(client);
+        #[cfg(feature = "stealth")]
+        let stealth_client = stealth.then(|| {
+            Arc::new(obscura_net::StealthHttpClient::with_full_options_and_fingerprint(
+                cookie_jar.clone(),
+                proxy_url.as_deref(),
+                allow_private_network,
+                fingerprint.clone(),
+            ))
+        });
         BrowserContext {
             id,
             cookie_jar,
@@ -157,6 +175,8 @@ impl BrowserContext {
             allow_file_access: false,
             storage_dir,
             allow_private_network,
+            #[cfg(feature = "stealth")]
+            stealth_client,
         }
     }
 
@@ -196,6 +216,15 @@ impl BrowserContext {
         if self.stealth {
             client.block_trackers = true;
         }
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth.then(|| {
+            Arc::new(obscura_net::StealthHttpClient::with_full_options_and_fingerprint(
+                cookie_jar.clone(),
+                self.proxy_url.as_deref(),
+                self.allow_private_network,
+                self.fingerprint.clone(),
+            ))
+        });
         BrowserContext {
             id,
             cookie_jar,
@@ -212,6 +241,8 @@ impl BrowserContext {
             allow_file_access: self.allow_file_access,
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
             allow_private_network: self.allow_private_network,
+            #[cfg(feature = "stealth")]
+            stealth_client,
         }
     }
 
@@ -272,7 +303,7 @@ mod tests {
         let source = BrowserContext::with_full_options(
             "source".to_string(),
             None,
-            false,
+            cfg!(feature = "stealth"),
             Some("Template-UA/1.0".to_string()),
         );
         source.cookie_jar.set_cookie("sid=source", &url::Url::parse("https://example.com").unwrap());
@@ -287,5 +318,20 @@ mod tests {
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
         assert_eq!(source.http_client.browser_fingerprint().await.user_agent, "Template-UA/1.0");
+        #[cfg(feature = "stealth")]
+        {
+            let source_client = source.stealth_client.as_ref().unwrap();
+            let persistent_client = persistent.stealth_client.as_ref().unwrap();
+            let incognito_client = incognito.stealth_client.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&persistent_client.cookie_jar, &persistent.cookie_jar));
+            assert!(Arc::ptr_eq(&incognito_client.cookie_jar, &incognito.cookie_jar));
+            assert!(!Arc::ptr_eq(source_client, persistent_client));
+            assert!(!Arc::ptr_eq(source_client, incognito_client));
+            persistent_client.set_fingerprint(
+                BrowserFingerprint::from_user_agent("Changed-UA/2.0"),
+            ).await;
+            assert_eq!(source_client.fingerprint.read().await.user_agent, "Template-UA/1.0");
+            assert_eq!(incognito_client.fingerprint.read().await.user_agent, "Template-UA/1.0");
+        }
     }
 }

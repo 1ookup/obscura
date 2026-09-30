@@ -1110,21 +1110,9 @@ impl Page {
         // triggering a Target.closeTarget and "Frame has been detached".
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
-        let stealth_client = if context.stealth {
-            // The wreq client backing StealthHttpClient does not speak SOCKS5.
-            // Callers must validate the proxy scheme up front and fail loudly
-            // (see obscura-cli) rather than silently rewriting socks5:// to
-            // http://, which only works when the upstream happens to be a
-            // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
-            // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy_and_fingerprint(
-                context.cookie_jar.clone(),
-                context.proxy_url.as_deref(),
-                fingerprint.clone(),
-            )))
-        } else {
-            None
-        };
+        let stealth_client = context.stealth_client.as_ref().map(|client| {
+            Arc::new(client.fork_with_fingerprint(fingerprint.clone()))
+        });
 
         Page {
             id,
@@ -7608,6 +7596,71 @@ mod tests {
         page
     }
 
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_pages_reuse_connections_without_sharing_request_overrides() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request.to_ascii_lowercase());
+                stream.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nCache-Control: no-store\r\n\r\nOK",
+                ).await.unwrap();
+            }
+            requests
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "shared-stealth".to_string(), None, true,
+            Some("Context-UA/1.0".to_string()), None, true,
+        ));
+        let mut first = super::Page::new("first".to_string(), context.clone());
+        let second = super::Page::new("second".to_string(), context.clone());
+        let url = url::Url::parse(&format!("http://{address}/")).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            assert_eq!(first.do_fetch(&url, "", Default::default()).await.unwrap().text(), "OK");
+            first.set_browser_fingerprint(
+                obscura_net::BrowserFingerprint::from_user_agent("Page-UA/2.0"),
+            ).await;
+            first.stealth_client.as_ref().unwrap().set_extra_headers(
+                std::collections::HashMap::from([("X-Page".to_string(), "first".to_string())]),
+            ).await;
+            assert_eq!(second.do_fetch(&url, "", Default::default()).await.unwrap().text(), "OK");
+            assert_eq!(first.do_fetch(&url, "", Default::default()).await.unwrap().text(), "OK");
+        }).await.expect("all pages must reuse the server's single accepted connection");
+
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("user-agent: context-ua/1.0\r\n"));
+        assert!(requests[1].contains("user-agent: context-ua/1.0\r\n"));
+        assert!(!requests[1].contains("x-page:"));
+        assert!(requests[2].contains("user-agent: page-ua/2.0\r\n"));
+        assert!(requests[2].contains("x-page: first\r\n"));
+        assert_eq!(
+            context.stealth_client.as_ref().unwrap().fingerprint.read().await.user_agent,
+            "Context-UA/1.0",
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.stealth_client.as_ref().unwrap().in_flight,
+            &second.stealth_client.as_ref().unwrap().in_flight,
+        ));
+    }
+
     #[test]
     fn web_storage_lifetimes_match_context_and_page() {
         let context = std::sync::Arc::new(crate::BrowserContext::new(
@@ -9564,19 +9617,6 @@ mod tests {
             true,
         ));
         let mut page = super::Page::new("gzip-timing".to_string(), context.clone());
-        // Page::new builds the stealth transport with loopback refused; the
-        // fixture needs it reachable, which is the same opt-in the transport's
-        // own tests make.
-        page.stealth_client = Some(std::sync::Arc::new(
-            obscura_net::StealthHttpClient::with_full_options_and_fingerprint(
-                context.cookie_jar.clone(),
-                None,
-                true,
-                obscura_net::BrowserFingerprint::from_user_agent(
-                    obscura_net::STEALTH_USER_AGENT,
-                ),
-            ),
-        ));
         page.navigate(&format!("{origin}/main")).await.unwrap();
 
         let probe = r#"(async () => {
