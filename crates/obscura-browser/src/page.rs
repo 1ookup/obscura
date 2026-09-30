@@ -3516,10 +3516,6 @@ impl Page {
                 &resp,
                 "script",
             );
-            // A child frame's network resources also belong to the top
-            // document's Resource Timing buffer. Keep the frame-local entry
-            // above and expose the parent copy with the normal TAO gating.
-            self.record_performance_response(&resp, "resource", "script");
             if !script_response_is_executable(resp.status) {
                 self.record_network_event_with_body_for_frame(
                     frame_id,
@@ -7587,7 +7583,6 @@ impl Page {
                     &response,
                     "link",
                 );
-                self.record_performance_response(&response, "resource", "link");
                 self.record_network_event_with_body_for_frame(
                     frame_id,
                     response_url.as_str(),
