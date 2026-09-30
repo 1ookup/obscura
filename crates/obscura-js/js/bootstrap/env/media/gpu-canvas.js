@@ -50,23 +50,3 @@ globalThis.GPUCanvasContext = class GPUCanvasContext {
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
 globalThis.opener = null;
-
-
-// Probe-sequence capture for the canvas configuration: the toneMapping and
-// alphaMode a probe asks for land here before the read-back.
-(() => {
-  if (typeof window === 'undefined' || !window.external || !window.external.tracelog) return;
-  const proto = globalThis.GPUCanvasContext && globalThis.GPUCanvasContext.prototype;
-  if (!proto || typeof proto.configure !== 'function') return;
-  const d = Object.getOwnPropertyDescriptor(proto, 'configure');
-  const orig = d.value;
-  proto.configure = function (configuration) {
-    try {
-      window.external.tracelog('gpu.read', {
-        s: 'configure',
-        o: JSON.stringify(configuration || null, (k, v) => (k === 'device' ? 'GPUDevice' : v)).slice(0, 200),
-      });
-    } catch (e) {}
-    return orig.call(this, configuration);
-  };
-})();
