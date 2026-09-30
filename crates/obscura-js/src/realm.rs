@@ -2842,7 +2842,6 @@ typeofCarrier: typeof __bootstrap, carrierIn: '__bootstrap' in globalThis })";
     }
 
     #[test]
-    #[test]
     fn frame_window_proxy_methods_read_as_native_code() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(

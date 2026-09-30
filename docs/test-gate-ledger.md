@@ -322,3 +322,12 @@ run covers are then removed.
   paired round kept the top DOM (frame blank is the DOM.getDocument
   observation gap, fixed separately). No unsafe/FFI or feature-gate changes.
   Full workspace gate deferred to the next backfill.
+
+- 2026-10-01: the duplicate `#[test]` the `7b0a01d` revert left before
+  `frame_window_proxy_methods_read_as_native_code` (one line removed from
+  `crates/obscura-js/src/realm.rs`; test-only, no behaviour change), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  frame_window_proxy_methods_read_as_native_code
+  --config /tmp/obscura-prebuilt-v8.toml` = **1/1 passed** against the
+  pinned prebuilt-V8 archive (source build lacks Xcode on this host). Full
+  workspace gate deferred to the next backfill.
