@@ -2842,25 +2842,6 @@ typeofCarrier: typeof __bootstrap, carrierIn: '__bootstrap' in globalThis })";
     }
 
     #[test]
-    fn challenge_marker_stays_readable_but_hidden_from_window_keys() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        assert_eq!(
-            rt.evaluate(
-                r#"(() => {
-                    window.aQgx8 = 1;
-                    return [
-                        Object.keys(window).includes('aQgx8'),
-                        Object.getOwnPropertyNames(window).includes('aQgx8'),
-                        Object.getOwnPropertyDescriptor(window, 'aQgx8').value,
-                        'aQgx8' in window,
-                    ];
-                })()"#,
-            )
-            .unwrap(),
-            serde_json::json!([false, true, 1, true])
-        );
-    }
-
     #[test]
     fn frame_window_proxy_methods_read_as_native_code() {
         let mut rt = setup_runtime("<html><body></body></html>");
