@@ -21,11 +21,14 @@ use cosmic_text::{
     Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
-use swash::zeno::{Angle, Format, Transform, Vector};
+use swash::zeno::{
+    Angle, Cap as ZenoCap, Format, Join as ZenoJoin, Mask as ZenoMask, Stroke as ZenoStroke,
+    Style as ZenoStyle, Transform, Vector,
+};
 
 use obscura_dom::tree::{DomTree, NodeId};
 
-use crate::{Dimension, Display, LayoutStyle, Rect, TextTransform};
+use crate::{CanvasLineCap, CanvasLineJoin, CanvasStrokeParams, Dimension, Display, LayoutStyle, Rect, TextTransform};
 
 // Bundled faces. Chrome on this class of host renders `sans-serif` and the
 // ubiquitous Arial/Helvetica stacks as Liberation Sans, `system-ui` as DejaVu
@@ -1703,6 +1706,9 @@ struct VariableSwashCache {
     /// Unhinted rasters keyed by glyph cache key, for the canvas coverage
     /// sampler (`with_pixels_unhinted`).
     rasters: HashMap<CacheKey, Option<SwashImage>>,
+    /// Stroked-outline rasters for the canvas stroke sampler
+    /// (`shaped_stroke_mask`), keyed by glyph and stroke parameters.
+    stroke_rasters: HashMap<ShapedStrokeKey, Option<StrokeMask>>,
     /// Canonical coordinates supported by the face actually selected for a
     /// glyph. This is deliberately separate from authored intent: unsupported
     /// axes and values that clamp to the same endpoint share raster entries.
@@ -1715,6 +1721,7 @@ impl VariableSwashCache {
             context: ScaleContext::new(),
             images: HashMap::new(),
             rasters: HashMap::new(),
+            stroke_rasters: HashMap::new(),
             instances: HashMap::new(),
         }
     }
@@ -1924,6 +1931,33 @@ impl VariableSwashCache {
             SwashContent::SubpixelMask => {}
         }
     }
+
+    /// The stroked outline of one shaped glyph: zeno strokes the unhinted
+    /// outline the fill sampler would fill, so the band follows the same
+    /// face, size and subpixel bin the fill coverage came from.
+    fn shaped_stroke_mask(
+        &mut self,
+        font_system: &mut FontSystem,
+        cache_key: CacheKey,
+        params: &CanvasStrokeParams,
+    ) -> Option<StrokeMask> {
+        let key = ShapedStrokeKey::new(cache_key, params);
+        self.stroke_rasters
+            .entry(key)
+            .or_insert_with(|| {
+                let font = font_system.get_font(cache_key.font_id)?;
+                let mut scaler = self
+                    .context
+                    .builder(font.as_swash())
+                    .size(f32::from_bits(cache_key.font_size_bits))
+                    .hint(false)
+                    .build();
+                let outline = scaler.scale_outline(cache_key.glyph_id)?;
+                let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+                render_stroke_mask(&outline, offset, params)
+            })
+            .clone()
+    }
 }
 
 const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
@@ -2119,6 +2153,9 @@ fn composite_glyph_pixel(cell: &mut u8, color: Color) {
 struct IdentityGlyphFaces {
     faces: HashMap<&'static str, Option<IdentityFaceFile>>,
     images: HashMap<IdentityRasterKey, Option<SwashImage>>,
+    /// Stroked outlines of the same file-loaded faces, for the canvas stroke
+    /// sampler (`glyph_stroke_mask`).
+    stroke_images: HashMap<IdentityStrokeKey, Option<StrokeMask>>,
     context: ScaleContext,
     /// CoreText faces minted from the same host files (macOS): the coverage
     /// rasterizer's system-pipeline path. Keyed by family and size.
@@ -2147,6 +2184,7 @@ impl IdentityGlyphFaces {
         Self {
             faces: HashMap::new(),
             images: HashMap::new(),
+            stroke_images: HashMap::new(),
             context: ScaleContext::new(),
             #[cfg(target_os = "macos")]
             coretext_faces: HashMap::new(),
@@ -2165,6 +2203,33 @@ impl IdentityGlyphFaces {
             self.faces.insert(family, loaded);
         }
         self.faces.get(family).and_then(|file| file.as_ref())
+    }
+
+    /// The stroked outline of one identity glyph: zeno strokes the same
+    /// file-loaded face the software fill sampler reads, so the band follows
+    /// the identity face's own outline rather than a mapped box.
+    fn glyph_stroke_mask(
+        &mut self,
+        family: &'static str,
+        ch: char,
+        size: f32,
+        params: &CanvasStrokeParams,
+    ) -> Option<StrokeMask> {
+        let file = self.face(family)?.clone();
+        let font = swash::FontRef::from_index(&file.bytes, file.index as usize)?;
+        let glyph_id = font.charmap().map(ch as u32);
+        if glyph_id == 0 {
+            return None;
+        }
+        let key = IdentityStrokeKey::new(family, glyph_id, size, params);
+        self.stroke_images
+            .entry(key)
+            .or_insert_with(|| {
+                let mut scaler = self.context.builder(font).size(size).hint(false).build();
+                let outline = scaler.scale_outline(glyph_id)?;
+                render_stroke_mask(&outline, Vector::new(0.0, 0.0), params)
+            })
+            .clone()
     }
 
     /// The software sampler's placement for one glyph: the (left, top, w, h)
@@ -2675,6 +2740,163 @@ pub fn shape_prof_take() -> (f64, u32, f64) {
         }) as f64
             / 1_000_000.0;
         (nanos as f64 / 1_000_000.0, calls, cosmic_ms)
+    })
+}
+
+/// One glyph's placement in a canvas run, decided once by the draws pass and
+/// shared by the fill and stroke rasterizers: which face the ink comes from
+/// (the identity machinery's own host face, or the shaped stand-in) and
+/// where its pen sits.
+enum GlyphDraw {
+    Shaped { cache_key: CacheKey, x: i32, line_dy: i32 },
+    Identity {
+        family: &'static str,
+        ch: char,
+        size: f32,
+        x: i32,
+        line_dy: i32,
+    },
+}
+
+/// What the draws pass hands the rasterizers: every glyph's placement, plus
+/// the shaped/identity ink union that frames the fill bitmap.
+struct CanvasDraws {
+    draws: Vec<GlyphDraw>,
+    min_x: f32,
+    max_x: f32,
+    ascent: f32,
+    descent: f32,
+}
+
+/// One glyph's stroked outline, rasterized by zeno: the alpha mask and its
+/// own placement (left/top relative to the glyph origin, y-down like the
+/// fill sampler's rows). The bounds come from the stroked geometry itself --
+/// miter tips included -- so no fill box ever frames or compresses the band.
+#[derive(Clone)]
+struct StrokeMask {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+}
+
+/// Cache key for a shaped glyph's stroke: the fill raster's glyph key plus
+/// the stroke parameters that change the geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShapedStrokeKey {
+    glyph: CacheKey,
+    width_bits: u32,
+    join: u8,
+    miter_bits: u32,
+    cap: u8,
+}
+
+impl ShapedStrokeKey {
+    fn new(glyph: CacheKey, params: &CanvasStrokeParams) -> Self {
+        let (width_bits, join, miter_bits, cap) = stroke_key_bits(params);
+        Self { glyph, width_bits, join, miter_bits, cap }
+    }
+}
+
+/// Cache key for an identity glyph's stroke, mirroring `IdentityRasterKey`
+/// plus the stroke parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct IdentityStrokeKey {
+    family: &'static str,
+    glyph_id: u16,
+    size_bits: u32,
+    width_bits: u32,
+    join: u8,
+    miter_bits: u32,
+    cap: u8,
+}
+
+impl IdentityStrokeKey {
+    fn new(family: &'static str, glyph_id: u16, size: f32, params: &CanvasStrokeParams) -> Self {
+        let (width_bits, join, miter_bits, cap) = stroke_key_bits(params);
+        Self {
+            family,
+            glyph_id,
+            size_bits: size.to_bits(),
+            width_bits,
+            join,
+            miter_bits,
+            cap,
+        }
+    }
+}
+
+/// The stroke parameters in cache-key form: raw bit patterns for the floats,
+/// discriminants for the enums.
+fn stroke_key_bits(params: &CanvasStrokeParams) -> (u32, u8, u32, u8) {
+    (
+        params.width.to_bits(),
+        match params.join {
+            CanvasLineJoin::Bevel => 0,
+            CanvasLineJoin::Miter => 1,
+            CanvasLineJoin::Round => 2,
+        },
+        params.miter_limit.to_bits(),
+        match params.cap {
+            CanvasLineCap::Butt => 0,
+            CanvasLineCap::Round => 1,
+            CanvasLineCap::Square => 2,
+        },
+    )
+}
+
+/// Render one scaled outline as a stroked alpha mask. The mask's coverage is
+/// zeno's own antialiased fill of the stroke band -- used raw, with no
+/// strength mapping, the same unhinted-alpha basis the software fill sampler
+/// gives `fillText`.
+fn render_stroke_mask(
+    outline: &swash::scale::outline::Outline,
+    offset: Vector,
+    params: &CanvasStrokeParams,
+) -> Option<StrokeMask> {
+    let stroke = ZenoStroke {
+        width: params.width,
+        join: match params.join {
+            CanvasLineJoin::Bevel => ZenoJoin::Bevel,
+            CanvasLineJoin::Miter => ZenoJoin::Miter,
+            CanvasLineJoin::Round => ZenoJoin::Round,
+        },
+        miter_limit: params.miter_limit,
+        start_cap: match params.cap {
+            CanvasLineCap::Butt => ZenoCap::Butt,
+            CanvasLineCap::Round => ZenoCap::Round,
+            CanvasLineCap::Square => ZenoCap::Square,
+        },
+        end_cap: match params.cap {
+            CanvasLineCap::Butt => ZenoCap::Butt,
+            CanvasLineCap::Round => ZenoCap::Round,
+            CanvasLineCap::Square => ZenoCap::Square,
+        },
+        dashes: &[],
+        offset: 0.0,
+        scale: false,
+    };
+    let (data, placement) = ZenoMask::new(outline.path())
+        .style(ZenoStyle::Stroke(stroke))
+        .format(Format::Alpha)
+        // Font outlines are y-up; the raster rows are y-down from the
+        // baseline like the fill sampler's, so the geometry flips here.
+        // Without it the band lands mirrored below the pen (measured: the
+        // whole glyph shifted one ascent down) and every placement sign
+        // downstream is wrong.
+        .transform(Some(Transform::new(1.0, 0.0, 0.0, -1.0, 0.0, 0.0)))
+        .offset(offset)
+        .render();
+    if placement.width == 0 || placement.height == 0 {
+        return None;
+    }
+    Some(StrokeMask {
+        left: placement.left,
+        top: placement.top,
+        width: placement.width,
+        height: placement.height,
+        data,
     })
 }
 
@@ -3200,6 +3422,10 @@ impl TextEngine {
         result
     }
 
+    /// One glyph's placement in a canvas run, decided once by the draws pass
+    /// and shared by the fill and stroke rasterizers: which face the ink
+    /// comes from (the identity machinery's own host face, or the shaped
+    /// stand-in) and where its pen sits.
     fn canvas_item_ink(&mut self, idx: usize) -> (f32, f32, f32, f32) {
         let TextEngine {
             font_system,
@@ -3400,11 +3626,189 @@ impl TextEngine {
         result
     }
 
+    /// Coverage raster for canvas `strokeText`: the same draws pass the fill
+    /// rasterizer shapes, with every glyph's outline stroked by zeno instead
+    /// of filled. The bitmap frame unions the stroked placements themselves,
+    /// so the band keeps its full width -- miter tips included -- and no
+    /// fill box ever compresses it.
+    pub(crate) fn canvas_text_stroke_coverage(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+        params: &CanvasStrokeParams,
+    ) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+        if text.trim().is_empty() || !(params.width > 0.0) {
+            return None;
+        }
+        let previous_len = self.items.len();
+        let idx = self.push_generated_text(text, style)?;
+        let result = self.canvas_item_stroke_coverage(idx, text, params);
+        self.items.truncate(previous_len);
+        result
+    }
+
     fn canvas_item_coverage(
         &mut self,
         idx: usize,
         original: &str,
     ) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+        let CanvasDraws { draws, min_x, max_x, ascent, descent } =
+            self.canvas_item_draws(idx, original)?;
+        let left = min_x.floor() as i32 - 1;
+        let top = -(ascent.ceil() as i32 + 1);
+        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
+        let height = (ascent.ceil() as i32 + descent.ceil() as i32 + 3).max(1) as u32;
+        let baseline_row = ascent.ceil() as i32 + 1;
+        let mut coverage = vec![0u8; width as usize * height as usize];
+
+        let TextEngine {
+            variable_swash,
+            font_system,
+            identity_glyph_faces,
+            ..
+        } = self;
+        for draw in draws {
+            match draw {
+                GlyphDraw::Shaped { cache_key, x, line_dy } => {
+                    let base_row = baseline_row + line_dy;
+                    variable_swash.with_pixels_unhinted(
+                        font_system,
+                        cache_key,
+                        Color::rgba(0, 0, 0, 255),
+                        |gx, gy, color| {
+                            let px = x + gx - left;
+                            let py = base_row + gy;
+                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                                return;
+                            }
+                            let cell = &mut coverage[py as usize * width as usize + px as usize];
+                            composite_glyph_pixel(cell, color);
+                        },
+                    );
+                }
+                                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
+                    let base_row = baseline_row + line_dy;
+                    // macOS identity glyphs rasterize through CoreText by
+                    // default: the system pipeline's mask mapped onto the
+                    // software sampler's placement box -- the bbox mapping
+                    // absorbs every per-size bearing difference the system
+                    // rasterizer introduces -- and its strength walks the LUT
+                    // that pins the four probe anchors. OBSCURA_NO_CT falls
+                    // back to the software sampler.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let size_f64 = f64::from(size);
+                        let glyph = identity_glyph_faces
+                            .coretext_face(family, size_f64)
+                            .and_then(|f| f.glyph_for_char(ch));
+                        let placement = identity_glyph_faces.glyph_placement(family, ch, size);
+                        let ct_enabled = coretext_glyph_enabled();
+                        if ct_enabled {
+                            if let (Some(face), Some(glyph), Some((sw_left, sw_top, sw_w, sw_h))) = (
+                                identity_glyph_faces.coretext_face(family, size_f64),
+                                glyph,
+                                placement,
+                            ) {
+                                const PAD: i32 = 4;
+                                let w = (sw_w as i32 + 2 * PAD).max(1) as usize;
+                                let h = (sw_h as i32 + 2 * PAD).max(1) as usize;
+                                // `sw_top` is the swash box top above the
+                                // baseline, so putting the baseline this far
+                                // below the top pad lands the box on mask rows
+                                // [PAD, PAD + sw_h) for either sign.
+                                let baseline = PAD as f64 + sw_top as f64;
+                                if let Some(mask) = face.draw_glyph_gray_flags(
+                                    glyph,
+                                    PAD as f64,
+                                    baseline,
+                                    w,
+                                    h,
+                                    true,
+                                    true,
+                                ) {
+                                    let mut min_r = i32::MAX;
+                                    let mut min_c = i32::MAX;
+                                    for (index, alpha) in mask.iter().enumerate() {
+                                        if *alpha > 0 {
+                                            min_r = min_r.min((index / w) as i32);
+                                            min_c = min_c.min((index % w) as i32);
+                                        }
+                                    }
+                                    let mut max_r = i32::MIN;
+                                    let mut max_c = i32::MIN;
+                                    for (index, alpha) in mask.iter().enumerate() {
+                                        if *alpha > 0 {
+                                            max_r = max_r.max((index / w) as i32);
+                                            max_c = max_c.max((index % w) as i32);
+                                        }
+                                    }
+                                    // The CG unhinted outline runs a different width
+                                    // than the hinted swash box (a tenth of a column
+                                    // at 10px, growing with size), so the ink maps
+                                    // linearly onto the placement box instead of
+                                    // translating: the shape stretches to the box
+                                    // the reference frame expects.
+                                    let cg_cols = (max_c - min_c).max(1);
+                                    let cg_rows = (max_r - min_r).max(1);
+                                    let sw_cols = (sw_w as i32 - 1).max(1);
+                                    let sw_rows = (sw_h as i32 - 1).max(1);
+                                    if min_r != i32::MAX {
+                                        for (index, alpha) in mask.iter().enumerate() {
+                                            if *alpha == 0 {
+                                                continue;
+                                            }
+                                            let mapped = crate::coretext::coverage_lut(*alpha);
+                                            let c_rel = (index % w) as i32 - min_c;
+                                            let r_rel = (index / w) as i32 - min_r;
+                                            let col_scaled = (c_rel * sw_cols + cg_cols / 2) / cg_cols;
+                                            let row_scaled = (r_rel * sw_rows + cg_rows / 2) / cg_rows;
+                                            let col_cov = x + sw_left + col_scaled - left;
+                                            let row_cov = base_row - sw_top as i32 + row_scaled;
+                                            if col_cov < 0
+                                                || row_cov < 0
+                                                || col_cov >= width as i32
+                                                || row_cov >= height as i32
+                                            {
+                                                continue;
+                                            }
+                                            let cell_i =
+                                                row_cov as usize * width as usize + col_cov as usize;
+                                            composite_glyph_pixel(
+                                                &mut coverage[cell_i],
+                                                Color::rgba(0, 0, 0, mapped),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    identity_glyph_faces.with_glyph_pixels(
+                        family,
+                        ch,
+                        size,
+                        Color::rgba(0, 0, 0, 255),
+                        |gx, gy, color| {
+                            let px = x + gx - left;
+                            let py = base_row + gy;
+                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                                return;
+                            }
+                            let cell = &mut coverage[py as usize * width as usize + px as usize];
+                            composite_glyph_pixel(cell, color);
+                        },
+                    );
+                }
+            }
+        }
+Some((width, height, left, top, coverage))
+    }
+
+    /// The draws pass shared by the fill and stroke rasterizers: shape the
+    /// item, decide per glyph which face its ink comes from, and frame the
+    /// shaped/identity ink union the fill bitmap uses.
+    fn canvas_item_draws(&mut self, idx: usize, original: &str) -> Option<CanvasDraws> {
         // The ink union frames the bitmap: no outline sample can land outside
         // it, so its bounds plus a one-pixel margin bound every glyph pixel.
         // The union ignores blank glyphs (`canvas_item_ink` skips degenerate
@@ -3423,16 +3827,6 @@ impl TextEngine {
         // draws with. Single-character clusters only: a ligature or a
         // combining sequence has no per-character origin, and those keep the
         // shaped stand-in the way the ink path does.
-        enum GlyphDraw {
-            Shaped { cache_key: CacheKey, x: i32, line_dy: i32 },
-            Identity {
-                family: &'static str,
-                ch: char,
-                size: f32,
-                x: i32,
-                line_dy: i32,
-            },
-        }
         let mut draws: Vec<GlyphDraw> = Vec::new();
 
         let TextEngine {
@@ -3626,154 +4020,81 @@ impl TextEngine {
             return None;
         }
 
-        let left = min_x.floor() as i32 - 1;
-        let top = -(ascent.ceil() as i32 + 1);
-        let width = (max_x.ceil() as i32 - left + 1).max(1) as u32;
-        let height = (ascent.ceil() as i32 + descent.ceil() as i32 + 3).max(1) as u32;
-        let baseline_row = ascent.ceil() as i32 + 1;
-        let mut coverage = vec![0u8; width as usize * height as usize];
+        Some(CanvasDraws { draws, min_x, max_x, ascent, descent })
+    }
 
-        let TextEngine {
-            variable_swash,
-            identity_glyph_faces,
-            ..
-        } = self;
+    /// Stroke counterpart of [`Self::canvas_item_coverage`]: rasterize the
+    /// same draws as stroked bands and composite their raw alpha, exactly the
+    /// way the fill tail composites its coverage.
+    fn canvas_item_stroke_coverage(
+        &mut self,
+        idx: usize,
+        original: &str,
+        params: &CanvasStrokeParams,
+    ) -> Option<(u32, u32, i32, i32, Vec<u8>)> {
+        let draws = self.canvas_item_draws(idx, original)?.draws;
+        // Every glyph's stroke rasterizes through its cache first, keeping
+        // the mask's own zeno placement: the frame below unions what was
+        // actually stroked, so a wide band or a miter tip extends the bitmap
+        // instead of being clipped to any fill-time box.
+        let mut placed: Vec<(i32, i32, StrokeMask)> = Vec::new();
         for draw in draws {
             match draw {
                 GlyphDraw::Shaped { cache_key, x, line_dy } => {
-                    let base_row = baseline_row + line_dy;
-                    variable_swash.with_pixels_unhinted(
-                        font_system,
-                        cache_key,
-                        Color::rgba(0, 0, 0, 255),
-                        |gx, gy, color| {
-                            let px = x + gx - left;
-                            let py = base_row + gy;
-                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
-                                return;
-                            }
-                            let cell = &mut coverage[py as usize * width as usize + px as usize];
-                            composite_glyph_pixel(cell, color);
-                        },
-                    );
-                }
-                                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
-                    let base_row = baseline_row + line_dy;
-                    // macOS identity glyphs rasterize through CoreText by
-                    // default: the system pipeline's mask mapped onto the
-                    // software sampler's placement box -- the bbox mapping
-                    // absorbs every per-size bearing difference the system
-                    // rasterizer introduces -- and its strength walks the LUT
-                    // that pins the four probe anchors. OBSCURA_NO_CT falls
-                    // back to the software sampler.
-                    #[cfg(target_os = "macos")]
+                    let TextEngine { variable_swash, font_system, .. } = self;
+                    if let Some(mask) =
+                        variable_swash.shaped_stroke_mask(font_system, cache_key, params)
                     {
-                        let size_f64 = f64::from(size);
-                        let glyph = identity_glyph_faces
-                            .coretext_face(family, size_f64)
-                            .and_then(|f| f.glyph_for_char(ch));
-                        let placement = identity_glyph_faces.glyph_placement(family, ch, size);
-                        let ct_enabled = coretext_glyph_enabled();
-                        if ct_enabled {
-                            if let (Some(face), Some(glyph), Some((sw_left, sw_top, sw_w, sw_h))) = (
-                                identity_glyph_faces.coretext_face(family, size_f64),
-                                glyph,
-                                placement,
-                            ) {
-                                const PAD: i32 = 4;
-                                let w = (sw_w as i32 + 2 * PAD).max(1) as usize;
-                                let h = (sw_h as i32 + 2 * PAD).max(1) as usize;
-                                // `sw_top` is the swash box top above the
-                                // baseline, so putting the baseline this far
-                                // below the top pad lands the box on mask rows
-                                // [PAD, PAD + sw_h) for either sign.
-                                let baseline = PAD as f64 + sw_top as f64;
-                                if let Some(mask) = face.draw_glyph_gray_flags(
-                                    glyph,
-                                    PAD as f64,
-                                    baseline,
-                                    w,
-                                    h,
-                                    true,
-                                    true,
-                                ) {
-                                    let mut min_r = i32::MAX;
-                                    let mut min_c = i32::MAX;
-                                    for (index, alpha) in mask.iter().enumerate() {
-                                        if *alpha > 0 {
-                                            min_r = min_r.min((index / w) as i32);
-                                            min_c = min_c.min((index % w) as i32);
-                                        }
-                                    }
-                                    let mut max_r = i32::MIN;
-                                    let mut max_c = i32::MIN;
-                                    for (index, alpha) in mask.iter().enumerate() {
-                                        if *alpha > 0 {
-                                            max_r = max_r.max((index / w) as i32);
-                                            max_c = max_c.max((index % w) as i32);
-                                        }
-                                    }
-                                    // The CG unhinted outline runs a different width
-                                    // than the hinted swash box (a tenth of a column
-                                    // at 10px, growing with size), so the ink maps
-                                    // linearly onto the placement box instead of
-                                    // translating: the shape stretches to the box
-                                    // the reference frame expects.
-                                    let cg_cols = (max_c - min_c).max(1);
-                                    let cg_rows = (max_r - min_r).max(1);
-                                    let sw_cols = (sw_w as i32 - 1).max(1);
-                                    let sw_rows = (sw_h as i32 - 1).max(1);
-                                    if min_r != i32::MAX {
-                                        for (index, alpha) in mask.iter().enumerate() {
-                                            if *alpha == 0 {
-                                                continue;
-                                            }
-                                            let mapped = crate::coretext::coverage_lut(*alpha);
-                                            let c_rel = (index % w) as i32 - min_c;
-                                            let r_rel = (index / w) as i32 - min_r;
-                                            let col_scaled = (c_rel * sw_cols + cg_cols / 2) / cg_cols;
-                                            let row_scaled = (r_rel * sw_rows + cg_rows / 2) / cg_rows;
-                                            let col_cov = x + sw_left + col_scaled - left;
-                                            let row_cov = base_row - sw_top as i32 + row_scaled;
-                                            if col_cov < 0
-                                                || row_cov < 0
-                                                || col_cov >= width as i32
-                                                || row_cov >= height as i32
-                                            {
-                                                continue;
-                                            }
-                                            let cell_i =
-                                                row_cov as usize * width as usize + col_cov as usize;
-                                            composite_glyph_pixel(
-                                                &mut coverage[cell_i],
-                                                Color::rgba(0, 0, 0, mapped),
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
+                        placed.push((x, line_dy, mask));
                     }
-                    identity_glyph_faces.with_glyph_pixels(
-                        family,
-                        ch,
-                        size,
-                        Color::rgba(0, 0, 0, 255),
-                        |gx, gy, color| {
-                            let px = x + gx - left;
-                            let py = base_row + gy;
-                            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
-                                return;
-                            }
-                            let cell = &mut coverage[py as usize * width as usize + px as usize];
-                            composite_glyph_pixel(cell, color);
-                        },
-                    );
+                }
+                GlyphDraw::Identity { family, ch, size, x, line_dy } => {
+                    if let Some(mask) =
+                        self.identity_glyph_faces
+                            .glyph_stroke_mask(family, ch, size, params)
+                    {
+                        placed.push((x, line_dy, mask));
+                    }
                 }
             }
         }
-Some((width, height, left, top, coverage))
+        if placed.is_empty() {
+            return None;
+        }
+        let mut min_col = i32::MAX;
+        let mut max_col = i32::MIN;
+        let mut min_top = i32::MAX;
+        let mut max_bottom = i32::MIN;
+        for (x, _, mask) in &placed {
+            min_col = min_col.min(x + mask.left);
+            max_col = max_col.max(x + mask.left + mask.width as i32 - 1);
+            min_top = min_top.min(mask.top);
+            max_bottom = max_bottom.max(mask.top + mask.height as i32 - 1);
+        }
+        // The same one-pixel margin the fill frame keeps around its ink
+        // union; the bitmap stays baseline-relative (`top` negative up).
+        let left = min_col - 1;
+        let top = min_top - 1;
+        let width = (max_col - left + 2).max(1) as u32;
+        let height = (max_bottom - top + 2).max(1) as u32;
+        let baseline_row = -top;
+        let mut coverage = vec![0u8; width as usize * height as usize];
+        for (x, line_dy, mask) in placed {
+            for (index, alpha) in mask.data.iter().copied().enumerate() {
+                let gx = index as i32 % mask.width as i32;
+                let gy = index as i32 / mask.width as i32;
+                let px = x + mask.left + gx - left;
+                let py = baseline_row + line_dy + mask.top + gy;
+                if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                    continue;
+                }
+                composite_glyph_pixel(
+                    &mut coverage[py as usize * width as usize + px as usize],
+                    Color((alpha as u32) << 24),
+                );
+            }
+        }
+        Some((width, height, left, top, coverage))
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -8026,5 +8347,159 @@ mod emoji_alpha_tests {
         } else {
             println!("no layout");
         }
+    }
+}
+
+#[cfg(test)]
+mod canvas_stroke_tests {
+    use super::*;
+
+    fn canvas_style(font: &str) -> LayoutStyle {
+        let mut style = LayoutStyle::default();
+        style.font_size = Some(10.0);
+        style.font_family = Some("sans-serif".to_string());
+        style.white_space = Some(crate::WhiteSpace::Pre);
+        crate::style::apply_font_shorthand(&mut style, font);
+        style
+    }
+
+    fn stroke_params(width: f32) -> CanvasStrokeParams {
+        CanvasStrokeParams {
+            width,
+            join: CanvasLineJoin::Miter,
+            miter_limit: 10.0,
+            cap: CanvasLineCap::Butt,
+        }
+    }
+
+    fn alpha_sum(coverage: &[u8]) -> u32 {
+        coverage.iter().map(|alpha| *alpha as u32).sum()
+    }
+
+    fn stroke_coverage(text: &str, params: &CanvasStrokeParams) -> (u32, u32, Vec<u8>) {
+        let mut engine = TextEngine::new();
+        let style = canvas_style("20px sans-serif");
+        let (width, height, _left, _top, coverage) = engine
+            .canvas_text_stroke_coverage(text, &style, params)
+            .expect("a stroked run must rasterize");
+        (width, height, coverage)
+    }
+
+    #[test]
+    fn stroke_coverage_grows_with_line_width_and_closes_the_counter() {
+        let (w1, h1, cov1) = stroke_coverage("O", &stroke_params(1.0));
+        let (w4, h4, cov4) = stroke_coverage("O", &stroke_params(4.0));
+        let (w8, h8, cov8) = stroke_coverage("O", &stroke_params(8.0));
+        let sum1 = alpha_sum(&cov1);
+        let sum4 = alpha_sum(&cov4);
+        let sum8 = alpha_sum(&cov8);
+        assert!(sum1 < sum4, "1px ({sum1}) must be lighter than 4px ({sum4})");
+        assert!(sum4 < sum8, "4px ({sum4}) must be lighter than 8px ({sum8})");
+        // The counter's open area, not its exact centre sample: a bundled
+        // face can keep a pixel or two of residual hole where Chrome's host
+        // face closes fully, so the invariant is the neighbourhood -- wide
+        // open (all zero) at 1px, mostly inked at 8px.
+        fn centre3x3_sum(width: u32, height: u32, coverage: &[u8]) -> u32 {
+            let cx = (width / 2) as i32;
+            let cy = (height / 2) as i32;
+            let mut sum = 0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let x = cx + dx;
+                    let y = cy + dy;
+                    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                        continue;
+                    }
+                    sum += coverage[y as usize * width as usize + x as usize] as u32;
+                }
+            }
+            sum
+        }
+        assert_eq!(
+            centre3x3_sum(w1, h1, &cov1),
+            0,
+            "a 1px stroke must leave the counter open"
+        );
+        assert!(
+            centre3x3_sum(w8, h8, &cov8) > 0,
+            "an 8px stroke must mostly swallow the counter"
+        );
+    }
+
+    #[test]
+    fn stroke_zero_width_draws_nothing() {
+        let mut engine = TextEngine::new();
+        let style = canvas_style("20px sans-serif");
+        assert!(
+            engine
+                .canvas_text_stroke_coverage("O", &style, &stroke_params(0.0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stroke_join_changes_the_band_geometry() {
+        let mut miter = stroke_params(4.0);
+        miter.join = CanvasLineJoin::Miter;
+        let mut bevel = stroke_params(4.0);
+        bevel.join = CanvasLineJoin::Bevel;
+        let (_, _, cov_miter) = stroke_coverage("W", &miter);
+        let (_, _, cov_bevel) = stroke_coverage("W", &bevel);
+        // Bevel trims the miter tips the spiky glyph would otherwise grow,
+        // so its band carries strictly less coverage at the same width.
+        assert!(
+            alpha_sum(&cov_bevel) < alpha_sum(&cov_miter),
+            "bevel ({}) must be lighter than miter ({}) on W",
+            alpha_sum(&cov_bevel),
+            alpha_sum(&cov_miter),
+        );
+    }
+
+    #[test]
+    fn stroke_frame_widens_beyond_the_fill_ink_union() {
+        // A wide band must extend the bitmap past what the fill union would
+        // frame: the 8px stroke's box is strictly wider and taller than the
+        // 1px one for the same glyph.
+        let (w1, h1, _) = stroke_coverage("O", &stroke_params(1.0));
+        let (w8, h8, _) = stroke_coverage("O", &stroke_params(8.0));
+        assert!(w8 > w1, "8px box ({w8}) must be wider than 1px ({w1})");
+        assert!(h8 > h1, "8px box ({h8}) must be taller than 1px ({h1})");
+    }
+
+    #[test]
+    fn stroke_placement_aligns_with_the_fill_ink() {
+        // Both rasters answer in the same frame -- placement relative to the
+        // pen and the alphabetic baseline -- so a thin stroke's box must sit
+        // on the fill's ink box, not below it (the y-flip regression) and
+        // not shifted sideways. Slack of one pixel absorbs the frame
+        // margins' rounding; the band itself must contain the fill ink.
+        let mut engine = TextEngine::new();
+        let style = canvas_style("20px sans-serif");
+        let (fw, fh, fleft, ftop, _fcov) = engine
+            .canvas_text_coverage("Og", &style)
+            .expect("fill coverage");
+        let (sw, sh, sleft, stop, _scov) = engine
+            .canvas_text_stroke_coverage("Og", &style, &stroke_params(1.0))
+            .expect("stroke coverage");
+        assert!(
+            sleft <= fleft + 1,
+            "stroke left {sleft} must not sit right of fill ink {fleft}"
+        );
+        assert!(
+            stop <= ftop + 1,
+            "stroke top {stop} must not sit below fill ink {ftop} (y-flip regression)"
+        );
+        assert!(
+            sleft + sw as i32 >= fleft + fw as i32 - 1,
+            "stroke right {} must cover fill ink right {}",
+            sleft + sw as i32,
+            fleft + fw as i32,
+        );
+        assert!(
+            stop + sh as i32 >= ftop + fh as i32 - 1,
+            "stroke bottom {} must cover fill ink bottom {}",
+            stop + sh as i32,
+            ftop + fh as i32,
+        );
     }
 }

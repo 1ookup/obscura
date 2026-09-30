@@ -7553,6 +7553,37 @@ fn op_canvas_raster_text(
     packed.unwrap_or_default()
 }
 
+/// Stroke coverage raster for `CanvasRenderingContext2D.strokeText`:
+/// flat-packed like the fill op, with every glyph's outline stroked by the
+/// same shaping pass the fill coverage came from. An empty string means no
+/// stroke ink (zero width draws nothing, per the canvas contract).
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_raster_stroke_text(
+    state: &OpState,
+    #[buffer] text: &[u8],
+    #[string] font: &str,
+    line_width: f64,
+    #[string] join: &str,
+    miter_limit: f64,
+    #[string] cap: &str,
+) -> String {
+    // Same UTF-8 handoff as the fill op: the op-string conversion
+    // lossy-decodes one-byte v8 strings, which the folded-emoji probes must
+    // not observe.
+    let text = std::str::from_utf8(text).unwrap_or("");
+    let params = obscura_render::CanvasStrokeParams::from_context(
+        line_width, join, miter_limit, cap,
+    );
+    let shared = state.borrow::<SharedState>().clone();
+    let packed = shared
+        .borrow_mut()
+        .canvas_text_measurer
+        .raster_stroke_text(text, font, params);
+    packed.unwrap_or_default()
+}
+
 /// Color-emoji raster for `CanvasRenderingContext2D.fillText`, flat-packed
 /// `"<width>|<height>|<left>|<top>|<base64 RGBA>"` like the coverage op. The
 /// bitmap holds every emoji glyph of the run at the shaped positions, pen-
@@ -8676,6 +8707,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_measure_text());
         ops.push(op_canvas_text_metrics());
         ops.push(op_canvas_raster_text());
+        ops.push(op_canvas_raster_stroke_text());
         ops.push(op_canvas_emoji_bitmap());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());

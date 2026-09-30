@@ -778,7 +778,19 @@ function _canvasEmojiBitmap(text, font) {
 }
 
 function _canvasRasterText(text, font) {
-  const op = Deno.core.ops.op_canvas_raster_text;
+  return _canvasRasterTextOp(text, font, 0, null, 0, null, false);
+}
+
+// The stroke twin: same packing and placement contract, with the glyph
+// outlines stroked rather than filled. `lineWidth` is already scaled to the
+// raster font's vertical factor by the caller.
+function _canvasRasterStrokeText(text, font, lineWidth, join, miterLimit, cap) {
+  return _canvasRasterTextOp(text, font, lineWidth, join, miterLimit, cap, true);
+}
+
+function _canvasRasterTextOp(text, font, lineWidth, join, miterLimit, cap, stroke) {
+  const op = stroke ? Deno.core.ops.op_canvas_raster_stroke_text
+    : Deno.core.ops.op_canvas_raster_text;
   if (typeof op !== 'function') return null;
   let packed;
   // UTF-8 bytes, not a string: the op-string conversion lossy-decodes a
@@ -806,7 +818,10 @@ function _canvasRasterText(text, font) {
         bytes[n++] = 0x80 | (c & 63);
       }
     }
-    packed = op(bytes.subarray(0, n), String(font || '10px sans-serif'));
+    packed = stroke
+      ? op(bytes.subarray(0, n), String(font || '10px sans-serif'), lineWidth,
+          join == null ? 'miter' : String(join), miterLimit, cap == null ? 'butt' : String(cap))
+      : op(bytes.subarray(0, n), String(font || '10px sans-serif'));
   } catch (_error) { return null; }
   if (!packed) return null;
   const parts = String(packed).split('|');
@@ -1445,7 +1460,21 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
     // C1 controls draw with the U+FFFD replacement glyph (the folded-emoji
     // probe digests the two spellings as one render), so the folding happens
     // before the raster, not on the drawn pixels.
-    const raster = _canvasRasterText(str, font);
+    let raster;
+    if (stroke) {
+      // A stroke run's ink is the band along each glyph's outline, not the
+      // fill coverage: the raster op strokes the same shaped outlines, with
+      // lineWidth a user-space metric riding the same vertical factor the
+      // scaled raster font rides. Zero, negative or NaN width draws
+      // nothing (the canvas contract).
+      const lineWidth = +state.lineWidth;
+      if (!(lineWidth > 0)) return;
+      raster = _canvasRasterStrokeText(str, font, lineWidth * scaleY,
+        state.lineJoin, +state.miterLimit || 10, state.lineCap);
+      if (!raster) return;
+    } else {
+      raster = _canvasRasterText(str, font);
+    }
     if (raster) {
       // Real glyph coverage from the shape engine: every glyph pixel
       // composites through the blend helper, so a 1px glyph answers a

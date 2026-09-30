@@ -158,6 +158,59 @@ pub struct CanvasTextMeasurer {
     engine: inline::TextEngine,
 }
 
+/// Canvas stroke state a `strokeText` run needs at raster time. The defaults
+/// match the context's: miter joins at limit 10, butt caps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanvasStrokeParams {
+    pub width: f32,
+    pub join: CanvasLineJoin,
+    pub miter_limit: f32,
+    pub cap: CanvasLineCap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CanvasLineJoin {
+    Bevel,
+    Miter,
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CanvasLineCap {
+    Butt,
+    Round,
+    Square,
+}
+
+impl CanvasStrokeParams {
+    /// Parse the context's attribute strings the way the setters do:
+    /// unrecognized values fall back to the defaults rather than erroring,
+    /// and a non-positive width or miter limit is clamped away.
+    pub fn from_context(width: f64, join: &str, miter_limit: f64, cap: &str) -> Self {
+        let join = match join.to_ascii_lowercase().as_str() {
+            "bevel" => CanvasLineJoin::Bevel,
+            "round" => CanvasLineJoin::Round,
+            _ => CanvasLineJoin::Miter,
+        };
+        let cap = match cap.to_ascii_lowercase().as_str() {
+            "round" => CanvasLineCap::Round,
+            "square" => CanvasLineCap::Square,
+            _ => CanvasLineCap::Butt,
+        };
+        let miter_limit = if miter_limit.is_finite() && miter_limit > 0.0 {
+            miter_limit as f32
+        } else {
+            10.0
+        };
+        Self {
+            width: if width.is_finite() && width > 0.0 { width as f32 } else { 0.0 },
+            join,
+            miter_limit,
+            cap,
+        }
+    }
+}
+
 #[cfg(feature = "paint")]
 impl CanvasTextMeasurer {
     pub fn new() -> Self {
@@ -217,6 +270,23 @@ impl CanvasTextMeasurer {
     /// cannot draw -- and the caller draws nothing.
     pub fn raster_text(&mut self, text: &str, font: &str) -> Option<String> {
         let (width, height, left, top, coverage) = self.engine.canvas_text_coverage(text, &self.style_for(font))?;
+        use base64::Engine as _;
+        let packed = base64::engine::general_purpose::STANDARD.encode(&coverage);
+        Some(format!("{width}|{height}|{left}|{top}|{packed}"))
+    }
+
+    /// Coverage raster for canvas `strokeText`, flat-packed exactly like
+    /// [`Self::raster_text`]: the same placement contract, with every glyph's
+    /// outline stroked rather than filled.
+    pub fn raster_stroke_text(
+        &mut self,
+        text: &str,
+        font: &str,
+        params: CanvasStrokeParams,
+    ) -> Option<String> {
+        let (width, height, left, top, coverage) = self
+            .engine
+            .canvas_text_stroke_coverage(text, &self.style_for(font), &params)?;
         use base64::Engine as _;
         let packed = base64::engine::general_purpose::STANDARD.encode(&coverage);
         Some(format!("{width}|{height}|{left}|{top}|{packed}"))
