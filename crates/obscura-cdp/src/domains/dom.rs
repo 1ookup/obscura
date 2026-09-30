@@ -143,6 +143,7 @@ pub async fn handle(
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
+            let pierce = params.get("pierce").and_then(Value::as_bool).unwrap_or(false);
 
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
@@ -161,7 +162,11 @@ pub async fn handle(
             };
 
             let node = page.with_dom(|dom| {
-                serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0)
+                let mut node = serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0);
+                if pierce {
+                    attach_shadow_roots(dom, &mut node, depth as u32);
+                }
+                node
             }).unwrap_or(json!(null));
             Ok(json!({ "node": node }))
         }
@@ -401,6 +406,10 @@ fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
             result["nodeType"] = json!(9); result["nodeName"] = json!("#document");
             result["localName"] = json!(""); result["nodeValue"] = json!("");
             result["documentURL"] = json!(""); result["baseURL"] = json!(""); result["xmlVersion"] = json!("");
+            if let Some(scope) = dom.document_scope(node_id) {
+                result["documentURL"] = json!(scope.url);
+                result["baseURL"] = json!(scope.base_url);
+            }
         }
         NodeData::Doctype { name, public_id, system_id } => {
             result["nodeType"] = json!(10); result["nodeName"] = json!(name);
@@ -415,6 +424,11 @@ fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
             let cdp_attrs: Vec<String> = attrs.iter()
                 .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();
             result["attributes"] = json!(cdp_attrs);
+            if let Some(root) = dom.iframe_content_document(node_id) {
+                if let Some(scope) = dom.document_scope(root) {
+                    result["frameId"] = json!(scope.frame_id);
+                }
+            }
         }
         NodeData::Text { contents } => {
             result["nodeType"] = json!(3); result["nodeName"] = json!("#text");
@@ -511,7 +525,7 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
     }
 }
 
-/// Add `shadowRoots` to every shadow host in an already-serialized tree.
+/// Add shadow roots and iframe documents to an already-serialized tree.
 ///
 /// CDP carries a shadow root beside its host rather than under `children`,
 /// because it is not an ordinary child: `parentNode` stays scoped to one tree.
@@ -521,6 +535,7 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
 /// stack, never recurses, so a nested shadow tree cannot overflow a worker
 /// stack the way the depth cap above is meant to prevent.
 fn attach_shadow_roots(dom: &DomTree, value: &mut Value, max_depth: u32) {
+    let max_depth = max_depth.min(MAX_SERIALIZE_DEPTH);
     let mut stack: Vec<(&mut Value, u32)> = vec![(value, 0)];
     while let Some((node, depth)) = stack.pop() {
         // `backendNodeId` is the engine's own nid, so the host edge is directly
@@ -530,13 +545,13 @@ fn attach_shadow_roots(dom: &DomTree, value: &mut Value, max_depth: u32) {
             .and_then(Value::as_u64)
             .filter(|_| node.get("nodeType").and_then(Value::as_u64) == Some(1))
             .map(|id| NodeId::new(id as u32));
-        if let Some(host) = host {
+        if let Some(host) = host.filter(|_| depth < max_depth) {
             if let Some(root) = dom.shadow_root(host) {
                 let mode = match dom.shadow_root_info(root).map(|info| info.mode) {
                     Some(ShadowRootMode::Open) => "open",
                     _ => "closed",
                 };
-                let mut serialized = serialize_node(dom, root, max_depth, depth + 1);
+                let mut serialized = serialize_node(dom, root, max_depth - depth - 1, 0);
                 if let Some(object) = serialized.as_object_mut() {
                     object.insert("shadowRootType".to_string(), json!(mode));
                     // CDP reports a shadow root as a document fragment; the
@@ -549,10 +564,23 @@ fn attach_shadow_roots(dom: &DomTree, value: &mut Value, max_depth: u32) {
                 }
                 node["shadowRoots"] = json!([serialized]);
             }
+            if let Some(root) = dom.iframe_content_document(host) {
+                node["contentDocument"] = serialize_node(dom, root, max_depth - depth - 1, 0);
+            }
         }
-        if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
-            for child in children.iter_mut() {
-                stack.push((child, depth + 1));
+        if let Some(object) = node.as_object_mut() {
+            for (key, value) in object.iter_mut() {
+                match key.as_str() {
+                    "children" | "shadowRoots" => {
+                        if let Some(children) = value.as_array_mut() {
+                            for child in children {
+                                stack.push((child, depth + 1));
+                            }
+                        }
+                    }
+                    "contentDocument" => stack.push((value, depth + 1)),
+                    _ => {}
+                }
             }
         }
     }
@@ -562,6 +590,35 @@ fn attach_shadow_roots(dom: &DomTree, value: &mut Value, max_depth: u32) {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[test]
+    fn pierced_document_includes_frames_and_nested_closed_shadow_roots() {
+        let dom = obscura_dom::parse_html("<iframe id='frame'></iframe>");
+        let host = dom.query_selector("iframe").unwrap().unwrap();
+        let (root, _) = dom.create_iframe_content_document(host).unwrap();
+        let inner = dom.clone_node(host, false).unwrap();
+        dom.append_child(root, inner);
+        let shadow = dom.attach_shadow_root(inner, ShadowRootMode::Closed).unwrap();
+        let nested_host = dom.clone_node(host, false).unwrap();
+        dom.append_child(shadow, nested_host);
+        let nested_shadow = dom.attach_shadow_root(nested_host, ShadowRootMode::Closed).unwrap();
+        let leaf = dom.new_node(NodeData::Text { contents: "Verify you are human".into() });
+        dom.append_child(nested_shadow, leaf);
+
+        let mut node = serialize_node(&dom, host, u32::MAX, 0);
+        assert!(node.get("contentDocument").is_none());
+        attach_shadow_roots(&dom, &mut node, u32::MAX);
+        let frame = &node["contentDocument"];
+        assert_eq!(frame["nodeType"], 9);
+        let first = &frame["children"][0]["shadowRoots"][0];
+        assert_eq!(first["shadowRootType"], "closed");
+        let second = &first["children"][0]["shadowRoots"][0];
+        assert_eq!(second["children"][0]["nodeValue"], "Verify you are human");
+
+        let mut shallow = serialize_node(&dom, host, 0, 0);
+        attach_shadow_roots(&dom, &mut shallow, 0);
+        assert!(shallow.get("contentDocument").is_none());
+    }
 
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
