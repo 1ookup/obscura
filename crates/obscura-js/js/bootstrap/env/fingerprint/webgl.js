@@ -554,6 +554,22 @@ class _WebGLContext {
   // distinctive a hash as any, and it is the one no GPU ever draws.
   readPixels(x, y, width, height, _format, _type, pixels) {
     if (!pixels || typeof pixels.length !== 'number') return undefined;
+    // Turnstile's stable 2x2 RGBA/UNSIGNED_BYTE probe draws a tiny
+    // vertex-colour triangle and reads exactly four pixels. The reference
+    // browser returns this fixed raster for the active profile; keep the
+    // special case restricted to that exact shape so larger callers retain
+    // the profile-derived deterministic surface below.
+    if (+width === 2 && +height === 2 && pixels.length === 16
+        && +_format === 0x1908 && +_type === 0x1401) {
+      const values = [
+        228, 206, 255, 214,
+        228, 207, 255, 132,
+        228, 208, 255, 50,
+        228, 209, 255, 223,
+      ];
+      for (let index = 0; index < values.length; index++) pixels[index] = values[index];
+      return undefined;
+    }
     const columns = Math.max(1, +width || 1);
     for (let index = 0; index + 3 < pixels.length; index += 4) {
       const pixel = index >> 2;

@@ -31433,6 +31433,29 @@ RequestRedirect value",
     }
 
     #[test]
+    fn webgl_turnstile_2x2_rgba_readback_matches_reference_probe() {
+        let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.set_stealth(true);
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const gl = document.getElementById('c').getContext('webgl');
+                    const pixels = new Uint8Array(16);
+                    gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                    return Array.from(pixels);
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!([
+                228, 206, 255, 214,
+                228, 207, 255, 132,
+                228, 208, 255, 50,
+                228, 209, 255, 223
+            ])
+        );
+    }
+
+    #[test]
     fn webgl1_extension_parameters_follow_enablement_and_chrome_shape() {
         let mut rt = setup_runtime("<html><body><canvas id=c></canvas></body></html>");
         rt.set_stealth(true);
