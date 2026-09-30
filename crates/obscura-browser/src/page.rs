@@ -3155,6 +3155,18 @@ impl Page {
                 tracing::warn!("frame performance origin install failed ({frame_id}): {error}");
             }
         }
+        // The initial visibility-state entry exists before the frame's
+        // navigation/paint entries in Chrome. Deferred frame realms used to
+        // seed it during full surface hydration, after paint callbacks had
+        // already been queued, which reordered the frame's PerformanceEntry
+        // census. Seeding is idempotent and keeps about:blank and hydrated
+        // realms consistent.
+        let _ = js.execute_script_in_frame_realm(
+            frame_id,
+            generation,
+            "<frame-visibility-state>",
+            "try { globalThis.__obscura_seed_visibility_entry?.(); } catch(e) {}",
+        );
         if let Some(entry) = navigation_timing {
             if let Err(error) = js.execute_script_in_frame_realm(
                 frame_id,
