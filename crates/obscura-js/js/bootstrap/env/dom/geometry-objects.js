@@ -446,6 +446,17 @@ if (typeof DOMMatrixReadOnly === 'undefined') {
       writable: true, enumerable: true, configurable: true,
     });
   };
+  // The reference stringifies a matrix through its CSS form ("matrix(1, 0, 0, 1, 0, 0)"
+  // measured live; String(new DOMMatrix()) answered exactly that while the
+  // engine answered "[object DOMMatrix]").
+  Object.defineProperty(readOnlyProto, 'toString', {
+    value: _markNative({ toString() {
+      const slot = _obscuraMatrixSlotOf(this);
+      if (!slot) throw new TypeError('Illegal invocation');
+      return 'matrix(' + [slot.a, slot.b, slot.c, slot.d, slot.e, slot.f].join(', ') + ')';
+    } }.toString),
+    writable: true, enumerable: true, configurable: true,
+  });
   readOnlyOperate('multiply', (slot, other = {}) => _obscuraMatrix2DMul(slot, _obscuraMatrixInit(other)));
   readOnlyOperate('inverse', (slot) => {
     const det = slot.a * slot.d - slot.b * slot.c;

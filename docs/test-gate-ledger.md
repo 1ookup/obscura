@@ -270,3 +270,15 @@ run covers are then removed.
   `native_methods_own_no_prototype` test; the live bench11 scan reads
   identically to the reference Chrome on all twenty probes. Full workspace
   gate deferred to the next backfill.
+
+- 2026-09-30: the constructor-message and DOMMatrix stringification shapes
+  (ctorMode-0 shells raise the bare 'Illegal constructor' when called
+  without new and the long "Failed to construct" form under new, as the
+  reference splits them; Performance's constructor takes the long form;
+  DOMMatrixReadOnly answers toString with the CSS "matrix(a, b, c, d, e, f)"
+  form instead of "[object DOMMatrix]"), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **886/886 passed**; the live bench13
+  constructor scan reads identically to the reference Chrome on all
+  thirteen cases. Full workspace gate deferred to the next backfill.

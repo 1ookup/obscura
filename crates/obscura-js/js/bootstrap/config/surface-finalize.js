@@ -1622,7 +1622,12 @@ const _chromeInterfaceShells = new Set();
             ctor = () => { throw new TypeError(argMessage(name, 1)); };
           }
         } else if (ctorMode === 0) {
+          // The reference splits by invocation form: `new X()` raises the
+          // long "Failed to construct" message while calling `X()` without
+          // new raises the bare 'Illegal constructor' (measured on
+          // CanvasGradient() vs new CanvasGradient()).
           ctor = function() {
+            if (!new.target) throw new TypeError('Illegal constructor');
             throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
           };
         } else if (ctorMode === 1) {

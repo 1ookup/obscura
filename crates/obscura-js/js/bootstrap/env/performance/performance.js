@@ -2,7 +2,9 @@
 // state are installed by the dedicated behavior modules below.
 const _performanceEventListeners = new Map();
 class Performance {
-  constructor() { throw new TypeError('Illegal constructor'); }
+  // The reference raises the long form under `new` ("Failed to construct
+  // 'Performance': Illegal constructor", measured live).
+  constructor() { throw new TypeError("Failed to construct 'Performance': Illegal constructor"); }
   addEventListener(type, callback) {
     if (typeof callback !== 'function' && typeof callback?.handleEvent !== 'function') return;
     type = String(type);
