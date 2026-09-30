@@ -24756,6 +24756,34 @@ RequestRedirect value",
         }
     }
 
+    /// A real browser mints the blob URL's uuid natively, so
+    /// createObjectURL never surfaces through the page-visible
+    /// crypto.randomUUID -- the live vmcall count read 1 on the reference
+    /// against 4 here (three blob workers plus the VM's own call). Wrap
+    /// crypto.randomUUID, mint a blob URL, and pin both the zero call count
+    /// and the uuid-v4 shape of the URL.
+    #[test]
+    fn blob_url_ids_never_touch_the_page_visible_crypto_rng() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    let calls = 0;
+                    const raw = crypto.randomUUID.bind(crypto);
+                    crypto.randomUUID = (...args) => { calls++; return raw(...args); };
+                    const url = URL.createObjectURL(new Blob(['x'], {type: 'text/plain'}));
+                    const m = /blob:.*\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(url);
+                    return { calls, url, shaped: !!m };
+                })()"#,
+            )
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("calls").unwrap().as_i64().unwrap(), 0);
+        assert!(obj.get("shaped").unwrap().as_bool().unwrap(),
+                "blob url must carry a uuid v4: {:?}",
+                obj.get("url").unwrap());
+    }
+
     /// A native method owns no `prototype`, and the live gradient probe
     /// reads that shape (hasOwnProperty('prototype') === false) before it
     /// ever calls the method -- the engine answered true while the four

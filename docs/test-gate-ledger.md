@@ -282,3 +282,15 @@ run covers are then removed.
   --config vendor/v8-source.toml` = **886/886 passed**; the live bench13
   constructor scan reads identically to the reference Chrome on all
   thirteen cases. Full workspace gate deferred to the next backfill.
+
+- 2026-09-30: the blob URL uuid off the page-visible crypto rng
+  (`_blobUrlId` draws its 16 bytes through op_random_bytes, copied into the
+  calling realm before the v4 version bits land, because a real browser
+  mints the blob URL natively and the live vmcall count read 1 on the
+  reference against 4 here -- three blob workers plus the VM's own call),
+  scoped to `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast
+  --config vendor/v8-source.toml` = **887/887 passed** with the new
+  `blob_url_ids_never_touch_the_page_visible_crypto_rng` test (wraps
+  crypto.randomUUID, mints a blob URL, asserts zero calls and the uuid-v4
+  shape). Full workspace gate deferred to the next backfill.

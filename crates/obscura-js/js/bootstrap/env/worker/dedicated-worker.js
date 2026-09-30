@@ -510,8 +510,25 @@ globalThis.__blobTypeStore = globalThis.__blobTypeStore || {};
 // `blob:obscura/<base36>` named the engine outright and left workers reporting
 // a "null" origin for pages that had a real one.
 function _blobUrlId() {
+  // A real browser mints the blob URL's uuid natively -- the page-visible
+  // crypto.randomUUID stays untouched by createObjectURL (the live vmcall
+  // count read 1 on the reference against 4 here: three blob workers plus
+  // the VM's own call). Draw from the internal op the WebRTC ICE material
+  // already uses, and only fall back to Math.random inside hosts without
+  // the bridge.
   let uuid;
-  try { uuid = globalThis.crypto && crypto.randomUUID && crypto.randomUUID(); } catch (e) {}
+  try {
+    // Copy into this realm first (op results belong to the op runtime's
+    // realm; the WebRTC and subtle paths copy the same way).
+    const bytes = new Uint8Array(Deno.core.ops.op_random_bytes(16));
+    if (bytes && bytes.length === 16) {
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const h2 = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      uuid = h2.slice(0, 8) + '-' + h2.slice(8, 12) + '-' + h2.slice(12, 16)
+        + '-' + h2.slice(16, 20) + '-' + h2.slice(20, 32);
+    }
+  } catch (e) {}
   if (!uuid) {
     const hex = [];
     for (let i = 0; i < 36; i++) hex.push(Math.floor(Math.random() * 16).toString(16));
