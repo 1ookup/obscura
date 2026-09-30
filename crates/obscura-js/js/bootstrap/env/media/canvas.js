@@ -48,37 +48,6 @@ const _offscreenCanvasContexts = new WeakMap();
 const _gradientState = new WeakMap();
 let _canvas2dAddColorStopIntrinsic = null;
 const _ctxProto2 = () => CanvasRenderingContext2D.prototype;
-// DEBUG ONLY (removed before commit): one tag per loaded copy of this module,
-// so a per-realm bootstrap reload shows up as a different tag.
-const _gpxMod = ((globalThis.__obscura_gpxSeq = (globalThis.__obscura_gpxSeq || 0) + 1));
-function _gpx(line) {
-  const text = '[gpx] ' + line;
-  // The engine's own sink first: it exists in every realm, so a module copy in
-  // a realm the preload never reached still reports.
-  try {
-    if (typeof window !== 'undefined' && window.external && window.external.tracelog) {
-      window.external.tracelog('gpx', text);
-      return;
-    }
-  } catch (e) {}
-  if (typeof globalThis.__obscura_gradProxy === 'undefined' || !globalThis.__obscura_gradProxy) return;
-  try { console.log(text); } catch (e) {}
-}
-// DEBUG ONLY (removed before commit): every paint op that lands on the probe's
-// 48x48 canvas, whatever its fill style is -- tells us what painted it at all.
-function _gpxStyle(state) {
-  return ' sh=' + String(state.shadowColor).slice(0, 22) + ' sb=' + state.shadowBlur
-    + ' sox=' + state.shadowOffsetX + ' soy=' + state.shadowOffsetY
-    + ' ga=' + state.globalAlpha + ' gco=' + state.globalCompositeOperation
-    + ' f=' + String(state.filter === undefined ? '' : state.filter).slice(0, 18)
-    + ' lw=' + state.lineWidth;
-}
-function _gpx48(op, state) {
-  if (state.w !== 48 || state.h !== 48) return;
-  const g = _gradientState.get(state.fillStyle);
-  _gpx('P48 ' + op + ' fs=' + (g ? 'grad(' + (g.stops ? g.stops.length : -1) + ')' : String(state.fillStyle).slice(0, 24))
-    + ' path=' + (state.path ? state.path.length : -1));
-}
 const _IMAGE_DATA_COLOR_SPACES = new Set(['srgb', 'display-p3']);
 const _IMAGE_DATA_PIXEL_FORMATS = new Set(['rgba-unorm8', 'rgba-float16']);
 function _imageDataEnum(value, fallback, allowed, member) {
@@ -516,11 +485,7 @@ function _canvasColorAttribute(ctx, name, value) {
   // A gradient or a pattern is stored as the object it is, and the getter
   // answers that same object back; every other value is read as a color.
   if (value && typeof value === 'object') {
-    // DEBUG ONLY (removed before commit): the assignment funnel is module
-    // internal, so this sees every fillStyle/strokeStyle write regardless of
-    // which realm's context object made it.
     const st = _gradientState.get(value);
-    if (st) _gpx('ASSIGN ' + name + ' mod=' + _gpxMod + ' stops=' + (st.stops ? st.stops.length : -1) + ' buf=' + state.w + 'x' + state.h);
     state[name] = value; return;
   }
   const text = value === null || value === undefined ? '' : String(value);
@@ -858,13 +823,6 @@ function _canvasEmojiComposite(self, text, font, penX, baselineY) {
       _canvas2dBlendPixel(self, gx, gy, rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3], 1);
     }
   }
-  try {
-    Deno.core.ops.op_tracelog('cvdbg.comp', JSON.stringify({
-      w, h, px0, py0, drawn, skippedAlpha, skippedGx, skippedGy,
-      canvasW: state.w, canvasH: state.h,
-      a0: rgba[3], aMid: rgba[((h >> 1) * w + (w >> 1)) * 4 + 3],
-    }));
-  } catch (_e3) {}
   return true;
 }
 
@@ -1336,7 +1294,6 @@ function _canvas2dAddColorStopCreate() {
         throw new DOMException("Failed to execute 'addColorStop' on 'CanvasGradient': The value provided ('" + String(color) + "') could not be parsed as a color.", 'SyntaxError');
       }
       const st = _gradientState.get(this);
-      _gpx('CALL addColorStop(' + offset + ',' + String(color).slice(0, 20) + ') st=' + (st ? (st.stops ? st.stops.length : -1) : 'none'));
       if (st) { st.stops.push([offset, _canvas2dParseColor(_gradientCtx.get(this), color)]); st.stops.sort((a, b) => a[0] - b[0]); }
     } }.addColorStop;
     if (typeof _markNative === 'function') { _markNative(_canvas2dAddColorStopIntrinsic); }
@@ -1402,7 +1359,6 @@ function _canvas2dMakeGradient(self, type, params) {
       transform: state.transform.slice(),
       ...params,
     });
-    _gpx('MAKE ' + type + ' mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' p=' + JSON.stringify(params));
     // Install unconditionally: a reloaded module minted a fresh WeakMap, and
     // a stale addColorStop from the previous load would silently skip the
     // write (its `this`-keyed state lives in the retired map), leaving the
@@ -1430,8 +1386,6 @@ function _canvas2dDrawText(self, text, x, y, stroke) {
   // next door do; a solid fill keeps its parsed constant.
   const fill = state.fillStyle;
   const gradient = fill && _gradientState.get(fill);
-  _gpx48('fillText', state);
-  if (gradient) _gpx('PAINT fillText mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' stops=' + (gradient.stops ? gradient.stops.length : -1) + ' text=' + String(text).slice(0, 16) + ' font=' + String(state.font) + _gpxStyle(state));
   const paint = stroke ? state.strokeStyle : fill;
   const paintGradient = stroke ? (paint && _gradientState.get(paint)) : gradient;
   // The sampler follows the same choice, so a gradient stroke samples the
@@ -1646,7 +1600,6 @@ class _Canvas2D {
   isContextLost() { return false; }
   fillRect(x, y, w, h) {
     const state = _canvasStateOf(this);
-    _gpx48('fillRect', state);
     const t = state.transform;
     const identity = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
@@ -1754,11 +1707,6 @@ class _Canvas2D {
     _canvas2dDrawText(this, text, x, y, false);
   }
   strokeText(text, x, y) {
-    // DEBUG ONLY (removed before commit): the reference routes strokeText
-    // separately; ours draws through the same run as fillText, so log the call
-    // here to keep the two sides' op sequences comparable.
-    { const s = _canvasStateOf(this);
-      if (s.w === 48 && s.h === 48) _gpx('STROKETEXT t=' + String(text).slice(0, 16) + ' x=' + x + ' y=' + y); }
     _canvas2dDrawText(this, text, x, y, true);
   }
   measureText(t) {
@@ -1857,20 +1805,6 @@ class _Canvas2D {
           }
         }
       }
-    }
-    // DEBUG ONLY (removed before commit): the readback digest, in exactly the
-    // shape the reference-side hook computes (nz/sum/head), so the two sides
-    // compare pixel-for-pixel at the same口径.
-    if (state.w === 48 && state.h === 48) {
-      let nz = 0, sum = 0; const head = [];
-      for (let i = 0; i < data.length; i += 4) {
-        if (data[i + 3]) nz += 1;
-        sum += data[i] + data[i + 1] + data[i + 2] + data[i + 3];
-      }
-      for (let i = 0; i < 24 && i < data.length; i += 4) {
-        head.push(data[i] + ',' + data[i + 1] + ',' + data[i + 2] + ',' + data[i + 3]);
-      }
-      _gpx('GET48 p=' + x + ',' + y + ',' + w + ',' + h + ' nz=' + nz + ' sum=' + sum + ' head=' + head.join('|'));
     }
     return _makeImageData(data, w, h, output.colorSpace, output.pixelFormat);
   }
@@ -2069,9 +2003,6 @@ class _Canvas2D {
   fill(fillRule = 'nonzero') {
     const state = _canvasStateOf(this);
     if (!state.path) return;
-    { const g = _gradientState.get(state.fillStyle);
-      if (g) _gpx('PAINT fill mod=' + _gpxMod + ' buf=' + state.w + 'x' + state.h + ' stops=' + (g.stops ? g.stops.length : -1) + ' segs=' + state.path.length + _gpxStyle(state));
-      _gpx48('fill', state); }
     // The turnstile's two-by-two glyphless probe: one white
     // arc(0,0,2,0,1,anticlockwise) sector on a 2x2 canvas. The live
     // reference digests the four-pixel coverage 255/192/244/53 across
@@ -2081,18 +2012,6 @@ class _Canvas2D {
     const t = state.transform;
     const identityTransform = t[0] === 1 && t[1] === 0 && t[2] === 0 && t[3] === 1
       && t[4] === 0 && t[5] === 0;
-    try {
-      if (typeof window !== 'undefined' && window.external && window.external.tracelog
-          && state.w === 2 && state.h === 2) {
-        window.external.tracelog('g2.gate', {
-          w: state.w, h: state.h, id: identityTransform, fs: String(state.fillStyle),
-          fr: String(fillRule), pl: Array.isArray(state.path) ? state.path.length : -1,
-          segs: Array.isArray(state.path)
-            ? state.path.map(s => s.t + ':' + (s.r !== undefined ? s.r : '') + '@' + (s.x !== undefined ? s.x : '')).join('|')
-            : 'none',
-        });
-      }
-    } catch (_e) {}
     if (state.w === 2 && state.h === 2 && identityTransform
         && state.fillStyle === '#ffffff'
         && String(fillRule).toLowerCase() !== 'evenodd'
@@ -2203,7 +2122,6 @@ class _Canvas2D {
   stroke() {
     const state = _canvasStateOf(this);
     if (!state.path) return;
-    if (state.w === 48 && state.h === 48) _gpx('STROKE ss=' + String(state.strokeStyle).slice(0, 24) + ' segs=' + state.path.length + _gpxStyle(state));
     const subpaths = _canvas2dFlattenPath(this, 2);
     if (!subpaths.length) return;
     const half = Math.max(0.5, +state.lineWidth / 2 || 0.5);
@@ -2286,7 +2204,6 @@ class _Canvas2D {
   }
   transform(a, b, c, d, e, f) {
     const state = _canvasStateOf(this);
-    if (state.w === 48 && state.h === 48) _gpx('XMUL p=' + [a, b, c, d, e, f].join(','));
     const [a0, b0, c0, d0, e0, f0] = state.transform;
     _canvas2dSet(state, 'transform', [
       a0 * +a + c0 * +b, b0 * +a + d0 * +b,
