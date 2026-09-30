@@ -124,13 +124,16 @@ const _GPU_APPLE = {
     maxStorageTexturesInVertexStage: 8,
   },
   features: [
-    'core-features-and-limits', 'depth-clip-control', 'indirect-first-instance',
-    'shader-f16', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
-    'float32-filterable', 'float32-blendable', 'clip-distances', 'dual-source-blending',
-    'texture-compression-bc', 'texture-compression-bc-sliced-3d',
-    'texture-compression-astc', 'texture-compression-astc-sliced-3d',
-    'texture-compression-etc2', 'texture-formats-tier1', 'texture-formats-tier2',
-    'texture-component-swizzle', 'depth32float-stencil8', 'subgroups',
+    // Chrome exposes this set in adapter enumeration order. GPUSupportedFeatures
+    // is iterable, so preserving the order matters to the challenge payload.
+    'depth32float-stencil8', 'rg11b10ufloat-renderable',
+    'texture-formats-tier1', 'bgra8unorm-storage', 'texture-compression-bc',
+    'dual-source-blending', 'core-features-and-limits', 'float32-filterable',
+    'indirect-first-instance', 'texture-compression-astc-sliced-3d',
+    'float32-blendable', 'depth-clip-control', 'texture-compression-astc',
+    'texture-compression-etc2', 'texture-compression-bc-sliced-3d',
+    'shader-f16', 'texture-formats-tier2', 'clip-distances',
+    'texture-component-swizzle', 'subgroups',
   ],
 };
 function _gpuAdapterProfile() {
