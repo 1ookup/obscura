@@ -294,3 +294,17 @@ run covers are then removed.
   `blob_url_ids_never_touch_the_page_visible_crypto_rng` test (wraps
   crypto.randomUUID, mints a blob URL, asserts zero calls and the uuid-v4
   shape). Full workspace gate deferred to the next backfill.
+
+- 2026-09-30: `c6b8701` (the remaining five prototypes read in Chrome's
+  order: Text, HTMLCanvasElement, Performance, Path2D, Uint8Array --
+  constructor-tail ordering, the canvas resize coupling moved to the
+  Element-layer attribute mutators, transferControlToOffscreen,
+  Performance through the shared EventTarget, the full Path2D segment
+  recorder, and the ES2025 base64/hex shims), scoped to
+  `cargo nextest run --release --features render -p obscura-js
+  -p obscura-browser --no-fail-fast --config vendor/v8-source.toml` =
+  **888/888 passed** (0 skipped) at HEAD `c6b8701`, with the new
+  `interface_prototypes_the_proto_scan_reads_as_chrome` test pinning the
+  five own-key orders plus the Text node-minting, resize-coupling,
+  transfer-state, EventTarget dispatch and base64/hex round-trip
+  behaviours. Full workspace gate deferred to the next backfill.
