@@ -3926,16 +3926,32 @@ impl Page {
         }
     }
 
+    /// Advance one wake-driven V8 tick, with no Rust-side frame work. This is
+    /// the only slice a CDP server may cancel: a dropped poll costs at most
+    /// one delivered wake, because deno_core parks its pending ops inside the
+    /// runtime. Frame navigations are deliberately NOT part of this turn --
+    /// they borrow the DOM tree across await points (`take_dom` /
+    /// `return_borrowed_dom`), and a cancellation mid-borrow would strand the
+    /// tree on the page, drop the queued frame requests and pin the deferred
+    /// performance-entry count. Servers must run
+    /// [`Page::process_pending_frame_navigations`] after their select has
+    /// picked a winner; [`Page::run_autonomous_event_loop_turn`] folds both
+    /// halves for owners that cannot cancel.
+    #[doc(hidden)]
+    pub async fn run_autonomous_javascript_turn(&mut self) -> Result<bool, String> {
+        match self.js.as_mut() {
+            Some(js) => js.run_autonomous_event_loop_turn().await,
+            None => Ok(true),
+        }
+    }
+
     /// Advance one wake-driven browser task for a continuously owned page.
     /// `true` means deno_core reached full idle; `false` means one wake/task was
     /// delivered and the owner should offer another turn after servicing any
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        let idle = match self.js.as_mut() {
-            Some(js) => js.run_autonomous_event_loop_turn().await,
-            None => Ok(true),
-        }?;
+        let idle = self.run_autonomous_javascript_turn().await?;
         let navigated = self.process_pending_frame_navigations().await;
         Ok(idle && navigated == 0)
     }

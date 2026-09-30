@@ -308,3 +308,17 @@ run covers are then removed.
   five own-key orders plus the Text node-minting, resize-coupling,
   transfer-state, EventTarget dispatch and base64/hex round-trip
   behaviours. Full workspace gate deferred to the next backfill.
+
+- 2026-09-30: pump-cancellation split (`crates/obscura-browser/src/page.rs`,
+  `crates/obscura-cdp/src/server.rs`) scoped to
+  `cargo nextest run --release --features render -p obscura-cdp
+  --config vendor/v8-source.toml --lib` (5 server/page pump and screencast
+  tests, incl. the new
+  `command_wait_cannot_cancel_a_pending_frame_navigation`, red on the old
+  combined pump) and
+  `cargo nextest run --release --features render -p obscura-browser
+  --config vendor/v8-source.toml -E 'test(frame) | test(autonomous) |
+  test(pending_navigation)'` 58/58. Exact release build passed and a live
+  paired round kept the top DOM (frame blank is the DOM.getDocument
+  observation gap, fixed separately). No unsafe/FFI or feature-gate changes.
+  Full workspace gate deferred to the next backfill.

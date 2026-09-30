@@ -768,7 +768,14 @@ async fn cdp_processor(
                     match pump_result {
                         Ok(reached_idle) => {
                             runtime_pump_error_streak = 0;
-                            runtime_pump_armed = !reached_idle;
+                            // Frame work happens here, outside the
+                            // cancellable pump future (see
+                            // `finish_live_page_pump`): the pump only reports
+                            // the V8 tick's idle, so the armed decision folds
+                            // in whether the frame pass did anything.
+                            let frame_navigated =
+                                finish_live_page_pump(&mut ctx).await;
+                            runtime_pump_armed = !reached_idle || frame_navigated;
                         }
                         Err(error) => {
                             runtime_pump_error_streak = runtime_pump_error_streak.saturating_add(1);
@@ -961,11 +968,25 @@ fn emit_intercepted_request(
     intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
 }
 
+// The future parked inside the connection's `select!` may be dropped the
+// moment a CDP message arrives, so it must contain the V8 tick ONLY: a frame
+// navigation borrows the DOM tree out of the runtime across awaits, and a
+// cancellation mid-borrow would strand the tree on the page, drop the queued
+// frame requests and pin the deferred performance-entry count. The frame pass
+// runs in `finish_live_page_pump` after the select has already picked a
+// winner, where nothing can cancel it.
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
     let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
         return Ok(true);
     };
-    page.run_autonomous_event_loop_turn().await
+    page.run_autonomous_javascript_turn().await
+}
+
+async fn finish_live_page_pump(ctx: &mut CdpContext) -> bool {
+    match ctx.pages.iter_mut().find(|page| page.has_js()) {
+        Some(page) => page.process_pending_frame_navigations().await > 0,
+        None => false,
+    }
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
@@ -1607,8 +1628,9 @@ mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
     };
+    use super::{finish_live_page_pump, pump_live_page_event_loop};
     #[cfg(feature = "render")]
-    use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
+    use super::pump_and_forward_screencast_frames;
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1883,6 +1905,7 @@ mod tests {
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:green'), 0)",
             );
         pump_live_page_event_loop(&mut ctx).await.unwrap();
+        finish_live_page_pump(&mut ctx).await;
         pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
         let first_update: serde_json::Value = serde_json::from_str(
             &reply_rx.try_recv().expect("timer mutation should emit a frame"),
@@ -1902,6 +1925,7 @@ mod tests {
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:blue'), 0)",
             );
         pump_live_page_event_loop(&mut ctx).await.unwrap();
+        finish_live_page_pump(&mut ctx).await;
         pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
         assert!(reply_rx.try_recv().is_err());
         assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
@@ -1984,6 +2008,7 @@ mod tests {
             );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         pump_live_page_event_loop(&mut ctx).await.unwrap();
+        finish_live_page_pump(&mut ctx).await;
         pump_and_forward_screencast_frames(&mut ctx, None).await;
         let raf_frame = ctx
             .pending_events
@@ -1994,6 +2019,164 @@ mod tests {
             raf_frame.params["data"].as_str().unwrap(),
             initial_data,
             "RAF-driven paint must capture the updated visible state"
+        );
+    }
+
+    // A local origin serving the main document, with /frame held on the wire
+    // for a while after its request lands. The oneshot fires when /frame is
+    // actually on the wire -- the handshake that proves the navigation was
+    // mid-fetch rather than merely assumed to be.
+    async fn spawn_holding_frame_server(
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (frame_arrived_tx, frame_arrived_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return; };
+                let mut stream = BufReader::new(stream);
+                let mut request_line = String::new();
+                if stream.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                loop {
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let respond = |body: String| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    )
+                };
+                if request_line.starts_with("GET /frame") {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = frame_arrived_tx.send(());
+                    // Park the response so the frame pass is demonstrably
+                    // mid-fetch, then release it on its own.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let body =
+                        "<html><body><script>parent.__frameRan = true;</script></body></html>"
+                            .to_string();
+                    let _ = stream.get_mut().write_all(respond(body).as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                let body = "<html><body><script>window.topMain = 1;</script></body></html>".to_string();
+                let _ = stream
+                    .get_mut()
+                    .write_all(respond(body).as_bytes())
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (address, frame_arrived_rx)
+    }
+
+    fn frame_session() -> (crate::dispatch::CdpContext, Option<String>) {
+        // The fixture talks to a loopback HTTP server, which the SSRF gate
+        // refuses unless the context opted in -- the same shape the transport
+        // tests use.
+        let context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+            "default".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(context);
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        (ctx, Some(session_id))
+    }
+
+    // The connection's select! parks on the pump future and drops it the
+    // moment a CDP message arrives, so the pump may only carry the V8 tick:
+    // a dropped poll costs at most one delivered wake. The frame pass runs
+    // after the select has picked its winner, where nothing can drop it
+    // mid-borrow of the DOM tree. The sleep below stands in for an arriving
+    // command; cancelling the tick (or letting it finish) must leave the
+    // queued navigation, the DOM tree and the frame realm fully intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_wait_cannot_cancel_a_pending_frame_navigation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let (address, mut frame_arrived) = spawn_holding_frame_server(hits.clone()).await;
+        let (mut ctx, session) = frame_session();
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": format!("http://{address}/"), "waitUntil": "load"}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate main document");
+        ctx.pending_events.clear();
+
+        // Script creates the iframe synchronously; the frame request parks in
+        // the runtime's pending queue (a browsing context cannot start while
+        // script owns the isolate) and only the Rust-side frame pass commits
+        // it.
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .evaluate(
+                "(() => { const f = document.createElement('iframe'); f.src = '/frame'; document.body.appendChild(f); return document.querySelectorAll('iframe').length; })()",
+            );
+
+        // The cancellable window: a tick-only pump finishes (or is dropped
+        // mid-wake, which is safe); either way the queued navigation
+        // survives. The sleep stands in for an arriving CDP command.
+        let _ = tokio::select! {
+            result = pump_live_page_event_loop(&mut ctx) => result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => Ok(true),
+        };
+
+        // The frame pass runs after the select has picked its winner.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finish_live_page_pump(&mut ctx),
+        )
+        .await
+        .expect("frame pass completes");
+
+        // Handshake: the navigation actually reached the server.
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut frame_arrived)
+            .await
+            .expect("frame request must reach the fixture server")
+            .expect("server task must stay alive until the handshake");
+
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the queued frame request must be navigated exactly once, not lost or retried",
+        );
+        assert_eq!(
+            page.evaluate("document.querySelectorAll('iframe').length")
+                .as_f64(),
+            Some(1.0),
+            "the DOM tree must be back in the runtime after the frame pass",
+        );
+        assert_eq!(page.evaluate("window.topMain").as_f64(), Some(1.0));
+        assert_eq!(
+            page.evaluate("window.__frameRan === true").as_bool(),
+            Some(true),
+            "the committed frame's realm must have run its body script",
         );
     }
 }
