@@ -31,25 +31,6 @@
       return false;
     }
   }
-  // Subsequence mode for interfaces that are still missing members: lay the
-  // members we do have out in the reference's relative order. Anything the
-  // oracle list does not name (none today) keeps its relative position at
-  // the tail.
-  function reorderSubsequence(proto, oracleOrder) {
-    try {
-      const current = Object.getOwnPropertyNames(proto);
-      const present = new Set(current);
-      const target = oracleOrder.filter((key) => present.has(key));
-      // Members the oracle list does not name keep their relative position
-      // at the tail (none today, but a stub rename should not strand a key).
-      for (const key of current) {
-        if (target.indexOf(key) === -1) target.push(key);
-      }
-      return reorder(proto, target);
-    } catch (_e) {
-      return false;
-    }
-  }
   // CanvasGradient: pre-install addColorStop on the shell's prototype and
   // move the constructor behind it (canvas.js owns the intrinsic so
   // createLinearGradient redefinition keeps pointing at the same function).
@@ -72,11 +53,10 @@
     reorder(ImageData.prototype,
       ['width', 'height', 'colorSpace', 'data', 'pixelFormat', 'constructor']);
   }
-  // Path2D is still the six-member stub (roundRect and friends lack path
-  // semantics to hang); members-then-constructor in the reference's relative
-  // order is what this round promises.
+  // Path2D now carries the full eleven-member method set (the segment
+  // recorder in sockets.js), so the census goes through the exact mode.
   if (typeof Path2D === 'function' && Path2D.prototype) {
-    reorderSubsequence(Path2D.prototype, [
+    reorder(Path2D.prototype, [
       'addPath', 'roundRect', 'arc', 'arcTo', 'bezierCurveTo', 'closePath',
       'ellipse', 'lineTo', 'moveTo', 'quadraticCurveTo', 'rect', 'constructor',
     ]);
@@ -97,5 +77,24 @@
   if (typeof MutationObserver === 'function' && MutationObserver.prototype) {
     reorder(MutationObserver.prototype,
       ['disconnect', 'observe', 'takeRecords', 'constructor']);
+  }
+  if (typeof Text === 'function' && Text.prototype) {
+    reorder(Text.prototype,
+      ['wholeText', 'assignedSlot', 'splitText', 'constructor']);
+  }
+  if (typeof HTMLCanvasElement === 'function' && HTMLCanvasElement.prototype) {
+    reorder(HTMLCanvasElement.prototype, [
+      'width', 'height', 'captureStream', 'getContext', 'toBlob', 'toDataURL',
+      'transferControlToOffscreen', 'constructor',
+    ]);
+  }
+  if (typeof Performance === 'function' && Performance.prototype) {
+    reorder(Performance.prototype, [
+      'timeOrigin', 'onresourcetimingbufferfull', 'clearMarks', 'clearMeasures',
+      'clearResourceTimings', 'getEntries', 'getEntriesByName',
+      'getEntriesByType', 'mark', 'measure', 'setResourceTimingBufferSize',
+      'toJSON', 'now', 'constructor', 'timing', 'navigation', 'memory',
+      'eventCounts', 'interactionCount',
+    ]);
   }
 })();

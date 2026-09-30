@@ -24886,7 +24886,11 @@ RequestRedirect value",
                     "constructor",
                 ],
                 "imageData": ["width", "height", "colorSpace", "data", "pixelFormat", "constructor"],
-                "path2d": ["addPath", "arc", "closePath", "lineTo", "moveTo", "rect", "constructor"],
+                "path2d": [
+                    "addPath", "roundRect", "arc", "arcTo", "bezierCurveTo",
+                    "closePath", "ellipse", "lineTo", "moveTo", "quadraticCurveTo",
+                    "rect", "constructor",
+                ],
                 "mutationObserver": ["disconnect", "observe", "takeRecords", "constructor"],
                 "domMatrix": [
                     "a", "b", "c", "d", "e", "f",
@@ -24905,6 +24909,121 @@ RequestRedirect value",
                 "matrixOwnKeys": [],
                 "noNotify": true,
                 "noDefineGetter": true,
+            })
+        );
+    }
+
+    /// The five surfaces the bench8 proto-order scan still read as DIFF
+    /// after the first round: Text, HTMLCanvasElement, Performance, Path2D
+    /// and Uint8Array. Each pins the Chrome own-key order from
+    /// proto-order-9222.json plus the behaviour the reordering must not
+    /// disturb -- the Text constructor now mints a real node (nodeName and
+    /// cloneNode answer from Node.prototype with no shadowing), the canvas
+    /// resize coupling follows setAttribute from the Element layer, the
+    /// Performance singleton dispatches through the shared EventTarget, and
+    /// the Uint8Array base64/hex shims round-trip.
+    #[test]
+    fn interface_prototypes_the_proto_scan_reads_as_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                  try {
+                    const order = (value) => Object.getOwnPropertyNames(Object.getPrototypeOf(value));
+                    const ctx = document.createElement('canvas').getContext('2d');
+                    const u8 = new Uint8Array([104, 105]);
+                    const back = new Uint8Array(2);
+                    const b64 = u8.toBase64();
+                    const fromB64 = back.setFromBase64(b64);
+                    const text = new Text('hello');
+                    const clone = text.cloneNode();
+                    const canvas = document.createElement('canvas');
+                    const cctx = canvas.getContext('2d');
+                    // The resize coupling reads through the pixels: a stroke
+                    // placed past the shrunken width disappears when the
+                    // backing buffer follows the attribute, and survives if
+                    // the coupling was lost.
+                    cctx.fillStyle = 'red';
+                    cctx.fillRect(250, 10, 10, 10);
+                    const had = cctx.getImageData(250, 10, 1, 1).data[3] > 0;
+                    canvas.setAttribute('width', '8');
+                    const lost = cctx.getImageData(250, 10, 1, 1).data[3] === 0;
+                    const off = canvas.transferControlToOffscreen();
+                    let transferredTwice = '';
+                    try { canvas.transferControlToOffscreen(); }
+                    catch (e) { transferredTwice = e.name; }
+                    let transferredCtx = '';
+                    try { canvas.getContext('2d'); }
+                    catch (e) { transferredCtx = e.name; }
+                    const seen = [];
+                    performance.addEventListener('ping', (e) => seen.push(e.type));
+                    performance.dispatchEvent(new Event('ping'));
+                    const hexBack = new Uint8Array(1);
+                    const fromHex = hexBack.setFromHex('ff');
+                    return {
+                        textOrder: order(new Text('x')),
+                        canvasOrder: order(document.createElement('canvas')),
+                        performanceOrder: order(performance),
+                        path2dOrder: order(new Path2D()),
+                        uint8Order: order(new Uint8Array(1)),
+                        textData: text.data + '|' + text.nodeName + '|' + text.nodeType,
+                        textClone: clone.data,
+                        offIsOffscreen: off instanceof OffscreenCanvas,
+                        offSize: off.width,
+                        resizeCoupled: [had, lost],
+                        transferredTwice,
+                        transferredCtx,
+                        perfEvents: seen,
+                        perfToJSON: typeof performance.toJSON(),
+                        perfCounts: [performance.eventCounts ? 'obj' : 'null',
+                          performance.interactionCount],
+                        b64: [b64, fromB64.read, fromB64.written, back[0], back[1]],
+                        hex: new Uint8Array([255, 0]).toHex(),
+                        fromHex: [fromHex.read, fromHex.written, hexBack[0]],
+                    };
+                  } catch (error) {
+                    return { jsError: error.name + ': ' + error.message };
+                  }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "textOrder": ["wholeText", "assignedSlot", "splitText", "constructor"],
+                "canvasOrder": [
+                    "width", "height", "captureStream", "getContext", "toBlob",
+                    "toDataURL", "transferControlToOffscreen", "constructor",
+                ],
+                "performanceOrder": [
+                    "timeOrigin", "onresourcetimingbufferfull", "clearMarks",
+                    "clearMeasures", "clearResourceTimings", "getEntries",
+                    "getEntriesByName", "getEntriesByType", "mark", "measure",
+                    "setResourceTimingBufferSize", "toJSON", "now", "constructor",
+                    "timing", "navigation", "memory", "eventCounts", "interactionCount",
+                ],
+                "path2dOrder": [
+                    "addPath", "roundRect", "arc", "arcTo", "bezierCurveTo",
+                    "closePath", "ellipse", "lineTo", "moveTo", "quadraticCurveTo",
+                    "rect", "constructor",
+                ],
+                "uint8Order": [
+                    "constructor", "BYTES_PER_ELEMENT", "toBase64",
+                    "setFromBase64", "toHex", "setFromHex",
+                ],
+                "textData": "hello|#text|3",
+                "textClone": "hello",
+                "offIsOffscreen": true,
+                "offSize": 8,
+                "resizeCoupled": [true, true],
+                "transferredTwice": "InvalidStateError",
+                "transferredCtx": "InvalidStateError",
+                "perfEvents": ["ping"],
+                "perfToJSON": "object",
+                "perfCounts": ["obj", 0],
+                "b64": ["aGk=", 4, 2, 104, 105],
+                "hex": "ff00",
+                "fromHex": [2, 1, 255],
             })
         );
     }

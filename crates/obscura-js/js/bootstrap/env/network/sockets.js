@@ -412,7 +412,59 @@ if (typeof OffscreenCanvas === 'undefined') {
 }
 
 if (typeof Path2D === 'undefined') {
-  globalThis.Path2D = class Path2D { constructor(){} moveTo(){} lineTo(){} arc(){} rect(){} closePath(){} addPath(){} };
+  // The path model records segments into a per-instance slot the canvas
+  // pipeline can consume later; nothing here rasterizes. Arguments go through
+  // the WebIDL double conversion so a string "10" behaves like 10 and a
+  // missing count degrades the way the canvas methods next door degrade.
+  const _path2dSegments = new WeakMap();
+  const _path2dSegs = (p) => {
+    let segs = _path2dSegments.get(p);
+    if (!segs) { segs = []; _path2dSegments.set(p, segs); }
+    return segs;
+  };
+  const _num = (v) => +v;
+  // Zero-arity segments first, then the arity families in Chrome's own-key
+  // order -- the install sequence below is the prototype's own-key order.
+  const _path2dMembers = [
+    ['addPath', function addPath(path) {
+      if (path) for (const seg of _path2dSegs(path)) _path2dSegs(this).push(seg);
+    }],
+    ['roundRect', function roundRect(x, y, w, h, radii) {
+      _path2dSegs(this).push(['roundRect', _num(x), _num(y), _num(w), _num(h), _num(radii || 0)]);
+    }],
+    ['arc', function arc(x, y, radius, startAngle, endAngle, counterclockwise) {
+      _path2dSegs(this).push(['arc', _num(x), _num(y), _num(radius), _num(startAngle || 0), _num(endAngle || 0), Boolean(counterclockwise)]);
+    }],
+    ['arcTo', function arcTo(x1, y1, x2, y2, radius) {
+      _path2dSegs(this).push(['arcTo', _num(x1), _num(y1), _num(x2), _num(y2), _num(radius)]);
+    }],
+    ['bezierCurveTo', function bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+      _path2dSegs(this).push(['bezierCurveTo', _num(cp1x), _num(cp1y), _num(cp2x), _num(cp2y), _num(x), _num(y)]);
+    }],
+    ['closePath', function closePath() { _path2dSegs(this).push(['closePath']); }],
+    ['ellipse', function ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise) {
+      _path2dSegs(this).push(['ellipse', _num(x), _num(y), _num(radiusX), _num(radiusY), _num(rotation || 0), _num(startAngle || 0), _num(endAngle || 0), Boolean(counterclockwise)]);
+    }],
+    ['lineTo', function lineTo(x, y) { _path2dSegs(this).push(['lineTo', _num(x), _num(y)]); }],
+    ['moveTo', function moveTo(x, y) { _path2dSegs(this).push(['moveTo', _num(x), _num(y)]); }],
+    ['quadraticCurveTo', function quadraticCurveTo(cpx, cpy, x, y) {
+      _path2dSegs(this).push(['quadraticCurveTo', _num(cpx), _num(cpy), _num(x), _num(y)]);
+    }],
+    ['rect', function rect(x, y, w, h) {
+      _path2dSegs(this).push(['rect', _num(x), _num(y), _num(w), _num(h)]);
+    }],
+  ];
+  const Path2DCtor = { Path2D: class Path2D {
+    constructor(path) {
+      if (path) for (const seg of _path2dSegs(path)) _path2dSegs(this).push(seg);
+    }
+  } }.Path2D;
+  for (const [name, fn] of _path2dMembers) {
+    Object.defineProperty(Path2DCtor.prototype, name, {
+      value: fn, writable: true, enumerable: true, configurable: true,
+    });
+  }
+  globalThis.Path2D = Path2DCtor;
 }
 
 if (typeof ImageBitmap === 'undefined') {

@@ -1,36 +1,17 @@
 // Performance object shape and event behavior. Timeline methods and backing
-// state are installed by the dedicated behavior modules below.
-const _performanceEventListeners = new Map();
+// state are installed by the dedicated behavior modules below. Event
+// membership comes from the shared EventTarget dispatcher: Chrome's
+// Performance.prototype carries no addEventListener/removeEventListener/
+// dispatchEvent own keys (they answer from EventTarget.prototype), and the
+// earlier local reimplementations sat on the prototype as an own-key trio no
+// browser produces -- while missing the capture/options handling and the
+// LoAF event-listener attribution the shared dispatcher already provides.
 class Performance {
   // The reference raises the long form under `new` ("Failed to construct
   // 'Performance': Illegal constructor", measured live).
   constructor() { throw new TypeError("Failed to construct 'Performance': Illegal constructor"); }
-  addEventListener(type, callback) {
-    if (typeof callback !== 'function' && typeof callback?.handleEvent !== 'function') return;
-    type = String(type);
-    const listeners = _performanceEventListeners.get(type) || [];
-    if (!listeners.includes(callback)) listeners.push(callback);
-    _performanceEventListeners.set(type, listeners);
-  }
-  removeEventListener(type, callback) {
-    const listeners = _performanceEventListeners.get(String(type));
-    if (!listeners) return;
-    const index = listeners.indexOf(callback);
-    if (index >= 0) listeners.splice(index, 1);
-  }
-  dispatchEvent(event) {
-    if (!event || !event.type) throw new TypeError('Invalid event');
-    for (const callback of [...(_performanceEventListeners.get(String(event.type)) || [])]) {
-      try {
-        if (typeof callback === 'function') callback.call(this, event);
-        else callback.handleEvent.call(callback, event);
-      } catch (error) { queueMicrotask(() => { throw error; }); }
-    }
-    const handler = this['on' + event.type];
-    if (typeof handler === 'function') handler.call(this, event);
-    return !event.defaultPrevented;
-  }
 }
+Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
 Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: 'Performance' });
 Object.setPrototypeOf(globalThis.performance, Performance.prototype);
 globalThis.Performance = Performance;
@@ -146,6 +127,39 @@ Object.defineProperty(Performance.prototype, 'onresourcetimingbufferfull', {
   set(value) {
     _performanceResourceTimingBufferFull = typeof value === 'function' ? value : null;
   },
+  enumerable: true,
+  configurable: true,
+});
+
+// Chrome's Performance surface carries three members the behavior modules
+// above never installed: the serializer, and the two read-only views the
+// spec hangs off the singleton. The engine tracks no event-type counters, so
+// an empty EventCounts shape is the truthful rendering of that state --
+// every lookup answers 0, exactly what an unobserved counter list means.
+const _performanceEventCounts = (() => {
+  const counts = Object.create(null);
+  Object.defineProperty(counts, Symbol.toStringTag, {
+    value: 'EventCounts', writable: false, enumerable: false, configurable: true,
+  });
+  return counts;
+})();
+Object.defineProperty(Performance.prototype, 'eventCounts', {
+  get() { return _performanceEventCounts; },
+  enumerable: true,
+  configurable: true,
+});
+Object.defineProperty(Performance.prototype, 'interactionCount', {
+  get() { return 0; },
+  enumerable: true,
+  configurable: true,
+});
+Object.defineProperty(Performance.prototype, 'toJSON', {
+  value: function toJSON() {
+    return {
+      timeOrigin: this.timeOrigin,
+    };
+  },
+  writable: true,
   enumerable: true,
   configurable: true,
 });

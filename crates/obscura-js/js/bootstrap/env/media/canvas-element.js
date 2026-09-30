@@ -14,30 +14,32 @@ class HTMLCanvasElement extends Element {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 150;
   }
   set height(value) { this.setAttribute('height', Math.max(0, Number(value) || 0)); }
-  setAttribute(name, value) {
-    super.setAttribute(name, value);
-    const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      // A 2D context resizes through the module helper; a WebGL context owns
-      // its own drawing buffer and its own resize.
-      if (_isCanvas2DContext(this._ctx)) _canvas2dResizeFromCanvas(this._ctx);
-      else if (typeof this._ctx._resizeFromCanvas === 'function') this._ctx._resizeFromCanvas();
-    }
-  }
-  removeAttribute(name) {
-    super.removeAttribute(name);
-    const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      // A 2D context resizes through the module helper; a WebGL context owns
-      // its own drawing buffer and its own resize.
-      if (_isCanvas2DContext(this._ctx)) _canvas2dResizeFromCanvas(this._ctx);
-      else if (typeof this._ctx._resizeFromCanvas === 'function') this._ctx._resizeFromCanvas();
-    }
-  }
+}
+// The width/height resize coupling used to live in setAttribute/removeAttribute
+// overrides on this class -- an own-key pair Chrome's prototype does not carry
+// (both answers come from Element.prototype). The coupling now hooks the
+// Element-layer attribute mutators (the same per-attribute dispatch that
+// drives the style and iframe-src reactions there), so the prototype census
+// reads Chrome's shape while a context resize still follows every path the
+// attribute can change through: the IDL setters, setAttribute,
+// removeAttribute, and innerHTML-parsed attributes alike.
+function _canvasElementAttributeChanged(el, name) {
+  const normalized = String(name).toLowerCase();
+  if (normalized !== 'width' && normalized !== 'height') return;
+  if (!el._ctx) return;
+  // A 2D context resizes through the module helper; a WebGL context owns
+  // its own drawing buffer and its own resize.
+  if (_isCanvas2DContext(el._ctx)) _canvas2dResizeFromCanvas(el._ctx);
+  else if (typeof el._ctx._resizeFromCanvas === 'function') el._ctx._resizeFromCanvas();
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
 HTMLCanvasElement.prototype.getContext = ({ getContext(type, attrs) {
+  if (this._transferred) {
+    throw new DOMException(
+      "Failed to execute 'getContext' on 'HTMLCanvasElement': OffscreenCanvas has been transferred.",
+      'InvalidStateError');
+  }
   if (type === '2d') {
     // A canvas carries exactly one context family; the first request wins
     // and everything else, including a repeat with different attributes,
@@ -117,7 +119,22 @@ HTMLCanvasElement.prototype.toBlob = function toBlob(callback, type, quality) {
   }
   callback(blob);
 };
+// Chrome moves the backing store into a fresh OffscreenCanvas and detaches
+// the element: a second transfer and any later getContext on the element
+// answer InvalidStateError. The OffscreenCanvas minted here carries the
+// element's current size; drawing continues on the offscreen half, which is
+// the flow every caller of this API actually drives.
+HTMLCanvasElement.prototype.transferControlToOffscreen = function transferControlToOffscreen() {
+  if (this._transferred) {
+    throw new DOMException(
+      "Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': OffscreenCanvas has been transferred.",
+      'InvalidStateError');
+  }
+  _hset(this, "_transferred", true);
+  return new OffscreenCanvas(this.width, this.height);
+};
 
 
 _markNative(HTMLCanvasElement.prototype.toDataURL);
 _markNative(HTMLCanvasElement.prototype.toBlob);
+_markNative(HTMLCanvasElement.prototype.transferControlToOffscreen);

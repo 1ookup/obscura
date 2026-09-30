@@ -263,4 +263,5 @@
 // @obscura-module env/media/local-fonts-data.js
 // @obscura-module env/media/local-fonts.js
 // @obscura-module config/webidl-branding.js
+// @obscura-module config/typedarray-base64.js
 // @obscura-module config/proto-order-fixups.js

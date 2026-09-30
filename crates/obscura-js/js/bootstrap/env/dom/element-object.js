@@ -588,6 +588,7 @@ var Element = _swappableInterface('Element', class extends Node {
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
       _queueIframeNavigation(this[_nidSym]);
     }
+    if (this.localName === "canvas") _canvasElementAttributeChanged(this, n);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this[_nidSym], [], [], n);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -631,6 +632,7 @@ var Element = _swappableInterface('Element', class extends Node {
     if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
       _queueIframeNavigation(this[_nidSym]);
     }
+    if (this.localName === "canvas") _canvasElementAttributeChanged(this, n);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
