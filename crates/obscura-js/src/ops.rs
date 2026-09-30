@@ -455,6 +455,13 @@ pub(crate) struct FrameRenderState {
     pub animation_timeline: obscura_render::AnimationTimelineState,
     pub prepared_render: Option<obscura_render::PreparedRender>,
     pub cached_generation: u64,
+    /// The document-level geometry returned to a frame realm's live window
+    /// metrics. Reading `innerWidth` and `innerHeight` repeatedly is common in
+    /// challenge census code; keep the already prepared dimensions for the
+    /// current native activity/task epoch so each getter does not rebuild the
+    /// parent document and frame cascade.
+    pub metrics_epoch: Option<(u64, u64)>,
+    pub metrics: Option<((f32, f32), (f32, f32))>,
 }
 
 impl ObscuraState {
@@ -1501,6 +1508,8 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             #[cfg(feature = "render")]
             for frame_state in state.frame_render_states.values_mut() {
                 frame_state.prepared_render = None;
+                frame_state.metrics_epoch = None;
+                frame_state.metrics = None;
             }
         }
         #[cfg(feature = "render")]
@@ -10358,6 +10367,17 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
     let unrendered = "\
         {\"scrollWidth\":0,\"scrollHeight\":0,\"clientWidth\":0,\"clientHeight\":0,\"rendered\":false}";
     let (viewport, content) = if is_frame {
+        let metrics_epoch = (gs.activity_generation, gs.animation_task_generation);
+        if let Some(frame_state) = gs.frame_render_states.get(&frame_root) {
+            if frame_state.metrics_epoch == Some(metrics_epoch) {
+                if let Some((viewport, content)) = frame_state.metrics {
+                    return format!(
+                        "{{\"scrollWidth\":{},\"scrollHeight\":{},\"clientWidth\":{},\"clientHeight\":{}}}",
+                        content.0, content.1, viewport.0, viewport.1
+                    );
+                }
+            }
+        }
         // The frame viewport is read from its host's box in the parent layout,
         // so the top document must be prepared first. At frame-realm init time
         // the main `prepared_render` is not built yet.
@@ -10386,6 +10406,10 @@ fn op_layout_metrics(state: &OpState, #[string] frame_root_str: String) -> Strin
         };
         let result = (prepared.viewport(), prepared.content_size());
         store_frame_prepared(dom, frame_root, prepared, frame_states);
+        if let Some(frame_state) = frame_states.get_mut(&frame_root) {
+            frame_state.metrics_epoch = Some(metrics_epoch);
+            frame_state.metrics = Some(result);
+        }
         result
     } else {
         let viewport = gs.viewport;

@@ -1484,6 +1484,11 @@ impl ObscuraJsRuntime {
             if state.viewport != viewport {
                 state.viewport = viewport;
                 state.prepared_render = None;
+                for frame_state in state.frame_render_states.values_mut() {
+                    frame_state.prepared_render = None;
+                    frame_state.metrics_epoch = None;
+                    frame_state.metrics = None;
+                }
                 state.pending_style_mutations.clear();
                 state.resolved_scroll = None;
             }
