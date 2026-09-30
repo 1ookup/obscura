@@ -1648,55 +1648,6 @@ impl Page {
         })
     }
 
-    /// Record a subresource fetched while executing a child frame's parser.
-    /// The response is visible to that frame's own Resource Timing buffer;
-    /// recording it only on the top page leaves the frame's census short.
-    fn record_frame_performance_response(
-        &mut self,
-        frame_id: &str,
-        generation: u64,
-        response: &obscura_net::Response,
-        initiator_type: &str,
-    ) {
-        let response_start = response.timing.response_start.as_secs_f64() * 1_000.0;
-        let response_end = response.timing.response_end.as_secs_f64() * 1_000.0;
-        let encoded = response.encoded_body_len();
-        let decoded = response.body.len();
-        let entry = serde_json::json!({
-            "name": response.url.as_str(),
-            "entryType": "resource",
-            "initiatorType": initiator_type,
-            "startTime": 0.0,
-            "duration": response_end.max(0.0),
-            "redirectStart": 0.0,
-            "redirectEnd": 0.0,
-            "fetchStart": 0.0,
-            "domainLookupStart": 0.0,
-            "domainLookupEnd": 0.0,
-            "connectStart": 0.0,
-            "connectEnd": 0.0,
-            "requestStart": 0.0,
-            "responseStart": response_start.max(0.0),
-            "responseEnd": response_end.max(0.0),
-            "nextHopProtocol": if response.url.scheme() == "https" { "h2" } else { "http/1.1" },
-            "transferSize": encoded.saturating_add(300),
-            "encodedBodySize": encoded,
-            "decodedBodySize": decoded,
-            "responseStatus": response.status,
-            "serverTimingHeader": response.header("server-timing").unwrap_or(""),
-            "redirectCount": response.redirected_from.len(),
-            "type": "resource",
-        });
-        if let Some(js) = self.js.as_mut() {
-            let _ = js.execute_script_in_frame_realm(
-                frame_id,
-                generation,
-                "<frame-resource-timing>",
-                &format!("globalThis.__obscura_performance_record({entry});"),
-            );
-        }
-    }
-
     /// File one built Performance Timeline entry, or hold it until a runtime
     /// exists to file it into.
     fn record_performance_entry(&mut self, entry: serde_json::Value) {
@@ -3498,12 +3449,6 @@ impl Page {
             let Some((index, url, resp)) = result else {
                 continue;
             };
-            self.record_frame_performance_response(
-                frame_id,
-                generation,
-                &resp,
-                "script",
-            );
             if !script_response_is_executable(resp.status) {
                 self.record_network_event_with_body_for_frame(
                     frame_id,
@@ -7562,15 +7507,6 @@ impl Page {
                     }
                 };
                 let response_url = response.url.clone();
-                self.record_frame_performance_response(
-                    frame_id,
-                    self.frames
-                        .get(frame_id)
-                        .map(|frame| frame.document_generation)
-                        .unwrap_or_default(),
-                    &response,
-                    "link",
-                );
                 self.record_network_event_with_body_for_frame(
                     frame_id,
                     response_url.as_str(),
