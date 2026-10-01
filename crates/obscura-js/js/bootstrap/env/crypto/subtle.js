@@ -11,6 +11,7 @@ if (!globalThis.crypto.subtle) {
   //
   //   EC  private: the raw scalar;  EC  public: the SEC1 point (04 || X || Y)
   //   RSA private: PKCS#8 DER;      RSA public: SPKI DER
+  let _aqgx8Armed = false;
   const keyMaterial = new WeakMap();
 
   // The four attributes are IDL members of CryptoKey, so they live on the
@@ -329,6 +330,25 @@ if (!globalThis.crypto.subtle) {
           let preview = "";
           for (let i = 0; i < bytes.length; i++) preview += String.fromCharCode(bytes[i]);
           Deno.core.print("[digest-probe] " + name + " in[" + bytes.length + "] " + preview + "\n", true);
+        } catch (_) {}
+      }
+      // Arm a pass-through aQgx8 trap once the blk24 statistics hashes are
+      // flowing: the challenge writes its error flag shortly after them, and
+      // the write instant (vs the digest and op timeline) pins the deciding
+      // probe. Module-scope sentinel, so no own-key lands on any realm.
+      if (!_aqgx8Armed && bytes.length >= 1 && bytes.length <= 64) {
+        _aqgx8Armed = true;
+        try {
+          let v;
+          Object.defineProperty(globalThis, "aQgx8", {
+            configurable: true, enumerable: false,
+            get() { return v; },
+            set(nv) {
+              try { Deno.core.print("[aqgx8-probe] set " + String(nv) + "\n", true); } catch (_) {}
+              v = nv;
+            },
+          });
+          Deno.core.print("[aqgx8-probe] armed\n", true);
         } catch (_) {}
       }
       return bufferOf(Deno.core.ops.op_subtle_digest(name, bytes));
