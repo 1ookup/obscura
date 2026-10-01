@@ -437,6 +437,10 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         let mut request = ResourceRequest::navigation();
+        // The document that supplied the referrer is also the navigation
+        // initiator: Sec-Fetch-Site classifies the request against it, so a
+        // same-document-chain reload reports same-origin rather than none.
+        request.initiator = referrer.clone();
         request.referrer = referrer;
         request.referrer_policy = policy;
         self.fetch_with_profile(url, request, callbacks).await

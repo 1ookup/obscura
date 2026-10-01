@@ -1513,10 +1513,13 @@ impl ObscuraHttpClient {
         policy: ReferrerPolicy,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_document_with_method_referrer(
+        // The referrer document is also the initiator, so Sec-Fetch-Site
+        // classifies against it (same-origin chain, not none).
+        self.fetch_document_with_method_referrer_and_initiator(
             Method::GET,
             url,
             None,
+            referrer.clone(),
             referrer,
             policy,
             callbacks,
