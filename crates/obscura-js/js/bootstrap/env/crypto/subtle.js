@@ -318,7 +318,20 @@ if (!globalThis.crypto.subtle) {
           name !== "SHA-512/224" && name !== "SHA-512/256") {
         throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
       }
-      return bufferOf(Deno.core.ops.op_subtle_digest(name, toBytes(data)));
+      const bytes = toBytes(data);
+      // Digest-input probe, stderr only: the challenge hashes short
+      // numeric strings (the blk24 statistics family) and those inputs are
+      // the ground truth for parity. Large snapshots (CSS tables, matrices)
+      // are skipped to keep the log usable. Print bypasses the page console,
+      // so the JS surface stays untouched.
+      if (bytes.length <= 64) {
+        try {
+          let preview = "";
+          for (let i = 0; i < bytes.length; i++) preview += String.fromCharCode(bytes[i]);
+          Deno.core.print("[digest-probe] " + name + " in[" + bytes.length + "] " + preview + "\n", true);
+        } catch (_) {}
+      }
+      return bufferOf(Deno.core.ops.op_subtle_digest(name, bytes));
     },
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
