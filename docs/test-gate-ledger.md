@@ -335,3 +335,4 @@ run covers are then removed.
 - f/u (10-02): initiator fix; scoped: obscura-net nextest 136/136
 - media accelerated (10-02): scoped: obscura-js media tests 15/15
 - digest probe (10-02): scoped: crypto tests 4/4
+- aqgx8 trap (10-02): scoped: crypto tests 4/4
