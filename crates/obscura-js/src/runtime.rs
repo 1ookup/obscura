@@ -6633,7 +6633,7 @@ mod tests {
                 "decodingBogus": false,
                 "decodingOgg": true,
                 "decodingKeys": [
-                    "powerEfficient", "smooth", "supported", "keySystemAccess"
+                    "supported", "smooth", "powerEfficient", "accelerated", "keySystemAccess"
                 ],
                 "mediaCapabilitiesShape": {
                     "tag": "[object MediaCapabilities]",

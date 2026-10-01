@@ -167,5 +167,10 @@ function _mediaCapabilitiesInfo(instance, configuration, method) {
     decoding ? null : _MEDIA_ENCODING_ACCEPTED);
   const supported = _mediaConfigurationSupported(configuration);
   const powerEfficient = supported && _mediaConfigurationPowerEfficient(configuration);
-  return {powerEfficient, smooth: supported, supported, keySystemAccess: null};
+  // Chrome answers `accelerated` on MediaCapabilitiesInfo alongside the
+  // other three; capability probes key off its presence (the challenge
+  // records an `mc_acc_p` marker when the field exists and reports hardware
+  // decoding).
+  const accelerated = supported && _mediaConfigurationPowerEfficient(configuration);
+  return {supported, smooth: supported, powerEfficient, accelerated, keySystemAccess: null};
 }
