@@ -3100,7 +3100,8 @@ mod tests {
         );
         assert_eq!(
             rt.evaluate("__got[0].readback").unwrap(),
-            serde_json::json!([16, 255]),
+            // The 2x2 RGBA readback is pinned to the reference raster (efeb16d).
+            serde_json::json!([16, 214]),
         );
         assert_eq!(
             rt.evaluate("__got[0].legacyAlias").unwrap(),
