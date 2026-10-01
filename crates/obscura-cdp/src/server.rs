@@ -788,14 +788,14 @@ async fn cdp_processor(
                     sync_live_page_network_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
-                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+                    if let (Some(reply_tx), Some((session_id, url, method, body, nav_referrer))) = (
                         connection_reply_tx.as_ref(),
                         take_live_pending_navigation(&ctx),
                     ) {
                         let navigation = json!({
                             "id": 0,
                             "method": "Page.navigate",
-                            "params": {"url": url, "__method": method, "__body": body},
+                            "params": {"url": url, "__method": method, "__body": body, "__referrer": nav_referrer},
                             "sessionId": session_id,
                         })
                         .to_string();
@@ -1025,15 +1025,15 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
 
 fn take_live_pending_navigation(
     ctx: &CdpContext,
-) -> Option<(String, String, String, String)> {
+) -> Option<(String, String, String, String, String)> {
     let page = ctx.pages.iter().find(|page| page.has_js())?;
     let session_id = ctx
         .sessions
         .iter()
         .find(|(_, page_id)| *page_id == &page.id)
         .map(|(session_id, _)| session_id.clone())?;
-    let (url, method, body) = page.take_pending_navigation()?;
-    Some((session_id, url, method, body))
+    let (url, method, body, referrer) = page.take_pending_navigation()?;
+    Some((session_id, url, method, body, referrer))
 }
 
 fn forward_pending_events(
@@ -1220,6 +1220,7 @@ async fn process_with_interception(
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let nav_referrer = req.params.get("__referrer").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let preload_scripts: Vec<obscura_browser::PreloadScript> = ctx
         .preload_scripts
@@ -1258,7 +1259,13 @@ async fn process_with_interception(
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
         let result = if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+            if nav_referrer.is_empty() {
+                page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+            } else {
+                page.navigate_with_wait_post_with_referrer(&url_owned, wait_until, &nav_method, &nav_body, &nav_referrer).await
+            }
+        } else if !nav_referrer.is_empty() {
+            page.navigate_with_wait_with_referrer(&url_owned, wait_until, &nav_referrer).await
         } else {
             page.navigate_with_wait(&url_owned, wait_until).await
         }
@@ -1463,12 +1470,12 @@ async fn process_cdp_message(
         let _ = reply_tx.send(json);
     }
 
-    if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
-        tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
+    if let Some((nav_url, nav_method, nav_body, nav_referrer)) = check_pending_navigation(ctx, &req.session_id) {
+        tracing::info!("JS-triggered nav: {} {} (body: {} bytes, referrer: {})", nav_method, nav_url, nav_body.len(), nav_referrer);
         let nav_req = CdpRequest {
             id: 0,
             method: "Page.navigate".to_string(),
-            params: json!({"url": nav_url, "__method": nav_method, "__body": nav_body}),
+            params: json!({"url": nav_url, "__method": nav_method, "__body": nav_body, "__referrer": nav_referrer}),
             session_id: req.session_id.clone(),
         };
         let _ = dispatch::dispatch(&nav_req, ctx).await;
@@ -1536,7 +1543,7 @@ fn fast_path_response(text: &str) -> Option<String> {
     }
 }
 
-fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
+fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String, String)> {
     let page_id = session_id
         .as_ref()
         .and_then(|sid| ctx.sessions.get(sid))?;

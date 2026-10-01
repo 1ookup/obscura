@@ -246,7 +246,7 @@ pub struct ObscuraState {
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
-    pub pending_navigation: Option<(String, String, String)>,
+    pub pending_navigation: Option<(String, String, String, String)>,
     /// Navigation requests made by a child Window realm. The u32 is the
     /// calling document root, which the browser layer resolves back to its
     /// stable browsing context before starting the navigation.
@@ -6333,8 +6333,20 @@ fn op_indexeddb_delete(state: &OpState, #[string] name: &str) {
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    // The page that issued the navigation is the referrer Chrome would send.
+    // Snapshot it before `gs.url` moves to the destination. Only an http(s)
+    // document yields a wire referrer; keep opaque roots (about:blank) at the
+    // plain no-referrer navigation shape.
+    let referrer = {
+        let current = gs.url.clone();
+        if current.starts_with("http://") || current.starts_with("https://") {
+            current
+        } else {
+            String::new()
+        }
+    };
     gs.url = url.to_string();
-    gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+    gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string(), referrer));
 }
 
 #[op2(fast)]
@@ -6349,8 +6361,16 @@ fn op_navigate_frame(
     if document_root == 0 {
         let gs = state.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
+        let referrer = {
+            let current = gs.url.clone();
+            if current.starts_with("http://") || current.starts_with("https://") {
+                current
+            } else {
+                String::new()
+            }
+        };
         gs.url = url.to_string();
-        gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+        gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string(), referrer));
         return;
     }
     let gs = state.borrow::<SharedState>().clone();

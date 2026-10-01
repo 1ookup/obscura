@@ -1311,7 +1311,7 @@ impl ObscuraJsRuntime {
         );
     }
 
-    pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+    pub fn take_pending_navigation(&self) -> Option<(String, String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
     }
 
@@ -28156,7 +28156,8 @@ RequestRedirect value",
             Some((
                 "http://example.com/next".to_string(),
                 "GET".to_string(),
-                "".to_string()
+                "".to_string(),
+                "http://example.com/test".to_string()
             ))
         );
     }
@@ -28184,7 +28185,8 @@ RequestRedirect value",
             Some((
                 "http://example.com/submitted".to_string(),
                 "GET".to_string(),
-                "".to_string()
+                "".to_string(),
+                "http://example.com/test".to_string()
             ))
         );
     }
@@ -35534,7 +35536,7 @@ RequestRedirect value",
         assert_eq!(
             rt.take_pending_navigation(),
             Some(("http://example.com/test?pick=two".to_string(), "GET".to_string(),
-                "".to_string()))
+                "".to_string(), "http://example.com/test".to_string()))
         );
         // The point of the fix: no option query reached the page.
         assert!(

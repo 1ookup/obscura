@@ -4799,13 +4799,16 @@ typeofCarrier: typeof __bootstrap, carrierIn: '__bootstrap' in globalThis })";
             "parent.location.href = '/from-frame'",
         )
         .unwrap();
+        let nav = rt.take_pending_navigation();
         assert_eq!(
-            rt.take_pending_navigation(),
-            Some((
-                "http://example.com/from-frame".to_string(),
-                "GET".to_string(),
-                String::new(),
-            )),
+            nav.as_ref().map(|(url, method, body, _)| (url.as_str(), method.as_str(), body.as_str())),
+            Some(("http://example.com/from-frame", "GET", "")),
+        );
+        // The issuing document (the top page, whose location the frame
+        // reassigned) is recorded as the referrer.
+        assert_eq!(
+            nav.as_ref().map(|(_, _, _, referrer)| referrer.as_str()),
+            Some("http://example.com/test"),
         );
     }
 

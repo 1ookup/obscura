@@ -2051,8 +2051,21 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
+        let nav_referrer = params.get("__referrer").and_then(|v| v.as_str()).unwrap_or("");
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+            if nav_referrer.is_empty() {
+                page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                page.navigate_with_wait_post_with_referrer(
+                    url, wait_until, nav_method, nav_body, nav_referrer,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        } else if !nav_referrer.is_empty() {
+            page.navigate_with_wait_with_referrer(url, wait_until, nav_referrer)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {

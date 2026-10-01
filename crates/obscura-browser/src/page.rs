@@ -3765,7 +3765,19 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
+        self.navigate_with_wait_post_with_referrer(url_str, wait_until, "GET", "", "")
+            .await
+    }
+
+    /// [`navigate_with_wait`] with a referrer for the first hop; see
+    /// [`navigate_with_wait_post_with_referrer`].
+    pub async fn navigate_with_wait_with_referrer(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        referrer: &str,
+    ) -> Result<(), PageError> {
+        self.navigate_with_wait_post_with_referrer(url_str, wait_until, "GET", "", referrer)
             .await
     }
 
@@ -3775,6 +3787,23 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
+    ) -> Result<(), PageError> {
+        self.navigate_with_wait_post_with_referrer(url_str, wait_until, method, body, "")
+            .await
+    }
+
+    /// Same as [`navigate_with_wait_post`], but the first hop carries a real
+    /// referrer. Page-initiated navigations (form submits, `location` writes)
+    /// must send `Referer` / a same-origin `Sec-Fetch-Site` / an `Origin` on
+    /// POST, exactly as Chrome would from that document; an empty referrer
+    /// keeps the plain address-bar navigation shape.
+    pub async fn navigate_with_wait_post_with_referrer(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        method: &str,
+        body: &str,
+        initial_referrer: &str,
     ) -> Result<(), PageError> {
         // Hard ceiling on a single end-to-end navigation. Without this a slow
         // primary fetch or a runaway settle loop can hold the V8 lock for
@@ -3790,7 +3819,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, initial_referrer),
         )
         .await
         {
@@ -4014,7 +4043,7 @@ impl Page {
                 &document_referrer,
             )
             .await?;
-            if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
+            if let Some((next_url, next_method, next_body, _next_referrer)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
                     // a navigation to file:// and then read the loaded
@@ -4160,14 +4189,23 @@ impl Page {
                 timing: obscura_net::ResponseTiming::default(),
             })
         } else if method == "POST" {
+            // A page-driven POST navigation is a form submit; Chrome stamps it
+            // with the form default content type even when the caller sent
+            // nothing explicit.
+            let mut nav_headers = std::collections::HashMap::new();
+            nav_headers.insert(
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            );
             self.http_client
-                .fetch_document_with_method_referrer_and_initiator(
+                .fetch_document_with_method_referrer_headers_and_initiator(
                     Method::POST,
                     &url,
                     Some(body.as_bytes().to_vec()),
                     Url::parse(referrer).ok(),
                     Url::parse(referrer).ok(),
                     self.referrer_policy,
+                    nav_headers,
                     Some(&self.callbacks),
                 )
                 .await
@@ -5604,7 +5642,7 @@ impl Page {
         }
     }
 
-    pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+    pub fn take_pending_navigation(&self) -> Option<(String, String, String, String)> {
         if let Some(js) = &self.js {
             js.take_pending_navigation()
         } else {
@@ -6098,7 +6136,7 @@ impl Page {
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
-        if let Some((url, method, body)) = self.take_pending_navigation() {
+        if let Some((url, method, body, _nav_referrer)) = self.take_pending_navigation() {
             let source_url = self
                 .url
                 .as_ref()
