@@ -332,3 +332,4 @@ run covers are then removed.
   pinned prebuilt-V8 archive (source build lacks Xcode on this host). Full
   workspace gate deferred to the next backfill.
 - b8393a7 (10-02): nav referrer fix; scoped: obscura-js+obscura-browser nextest 889/890 (1 pre-existing fail worker_canvas_subsystem_follows_the_creator_gpu_profile, from efeb16d WebGL pin, unrelated to this change); full gate deferred
+- f/u (10-02): initiator fix; scoped: obscura-net nextest 136/136
