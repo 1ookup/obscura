@@ -4722,28 +4722,7 @@ Some((width, height, left, top, coverage))
         } else {
             self.items[idx].layout_wrap
         };
-        let (width, height) = if min_content_query {
-            // Bypass cosmic's width-0 line breaking (its offset-to-glyph
-            // matching misses on the macOS host PingFang data and merges
-            // words at width 0): bisect the wrap width on a cloned buffer so
-            // every shaped line holds exactly one word; the widest such line
-            // is the min-content width.
-            let width = self.measure_min_content_words(idx);
-            let height = {
-                let mut scratch = self.items[idx].buffer.clone();
-                scratch.set_wrap(&mut self.font_system, wrap);
-                scratch.set_size(&mut self.font_system, Some(width), None);
-                scratch.shape_until_scroll(&mut self.font_system, false);
-                let mut hh = 0.0f32;
-                for run in scratch.layout_runs() {
-                    hh = hh.max(run.line_top + run.line_height);
-                }
-                hh
-            };
-            (width, height)
-        } else {
-            self.measure_text_with_wrap(idx, width, wrap)
-        };
+        let (width, height) = self.measure_text_with_wrap(idx, width, wrap);
         taffy::Size { width, height }
     }
 
