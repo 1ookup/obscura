@@ -336,3 +336,4 @@ run covers are then removed.
 - media accelerated (10-02): scoped: obscura-js media tests 15/15
 - digest probe (10-02): scoped: crypto tests 4/4
 - aqgx8 trap (10-02): scoped: crypto tests 4/4
+- intl locale (10-02): scoped: build ok
