@@ -9458,6 +9458,34 @@ fn layout_dom_once(
                         let min_c = min_c.max(
                             max_definite_table_content_width(tree, dom, &styles).unwrap_or(0.0),
                         );
+                        // Chrome sizes the table from its cells and wraps the
+                        // caption to the result: a caption's own margin-box
+                        // max-content never reaches the table's preferred
+                        // width. The caption item spans every column, so it
+                        // leaks into taffy's intrinsic pass here; hide caption
+                        // items for this probe only and restore them for the
+                        // final layout, where they fill and wrap.
+                        let mut caption_restore = Vec::new();
+                        for child in taffy_tree.children(tnode).unwrap_or_default() {
+                            let is_caption = id_map
+                                .get(&child)
+                                .and_then(|nid| tree.get_node(*nid))
+                                .is_some_and(|node| {
+                                    node.as_element()
+                                        .is_some_and(|e| e.local.as_ref() == "caption")
+                                });
+                            if !is_caption {
+                                continue;
+                            }
+                            if let Ok(cur) = taffy_tree.style(child) {
+                                let saved = cur.display;
+                                let mut hidden = cur.clone();
+                                hidden.display = taffy::Display::None;
+                                if taffy_tree.set_style(child, hidden).is_ok() {
+                                    caption_restore.push((child, saved));
+                                }
+                            }
+                        }
                         let max_c = {
                             let _ = taffy_tree.compute_layout_with_measure(
                                 tnode,
@@ -9472,6 +9500,14 @@ fn layout_dom_once(
                                 .map(|l| l.size.width)
                                 .unwrap_or(0.0)
                         };
+                        for (child, display) in caption_restore {
+                            let mut restored = match taffy_tree.style(child) {
+                                Ok(cur) => cur.clone(),
+                                Err(_) => continue,
+                            };
+                            restored.display = display;
+                            let _ = taffy_tree.set_style(child, restored);
+                        }
                         let inline_outer_edges = table_inline_outer_edges(table_style);
                         let preferred_outer = match width_style {
                             crate::Dimension::Px(w)
@@ -9702,6 +9738,44 @@ fn layout_dom_once(
                                     })
                                     .collect();
                                 let _ = taffy_tree.set_style(tnode, s);
+                            }
+                            // Chrome caps the caption's border box at the
+                            // table's border box minus the caption's own
+                            // inline margins, whatever the columns sum to.
+                            // taffy resolves a percent item width against an
+                            // indefinite grid area as zero, so hand the
+                            // caption the definite length instead.
+                            for child in taffy_tree.children(tnode).unwrap_or_default() {
+                                let is_caption = id_map
+                                    .get(&child)
+                                    .and_then(|nid| tree.get_node(*nid))
+                                    .is_some_and(|node| {
+                                        node.as_element()
+                                            .is_some_and(|e| e.local.as_ref() == "caption")
+                                    });
+                                if !is_caption {
+                                    continue;
+                                }
+                                let (ml, mr) = id_map
+                                    .get(&child)
+                                    .and_then(|nid| styles.get(nid))
+                                    .map(|s| (s.margin.left, s.margin.right))
+                                    .unwrap_or((0.0, 0.0));
+                                if let Ok(st) = taffy_tree.style(child).map(|cur| cur.clone()) {
+                                    let mut st = st;
+                                    st.box_sizing = taffy::BoxSizing::BorderBox;
+                                    st.size.width =
+                                        taffy::Dimension::length((used_outer - ml - mr).max(0.0));
+                                    if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+                                        eprintln!(
+                                            "[table-debug] caption width set {} ml={} mr={}",
+                                            (used_outer - ml - mr).max(0.0),
+                                            ml,
+                                            mr
+                                        );
+                                    }
+                                    let _ = taffy_tree.set_style(child, st);
+                                }
                             }
                         } else if let Ok(cur) = taffy_tree.style(tnode) {
                             let mut s = cur.clone();
@@ -11591,6 +11665,19 @@ fn compute_absolute_rects(
             width: layout.size.width,
             height: layout.size.height,
         };
+        if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some()
+            && layout.size.width <= 5.0
+            && layout.size.height > 40.0
+        {
+            let st = taffy_tree.style(taffy_id).ok();
+            eprintln!(
+                "[table-debug] narrow-tall node w={} h={} style-w={:?} box={:?}",
+                layout.size.width,
+                layout.size.height,
+                st.map(|s| s.size.width),
+                st.map(|s| s.box_sizing)
+            );
+        }
 
         if let Some(dom_id) = id_map.get(&taffy_id) {
             rects.insert(*dom_id, rect);
@@ -14716,7 +14803,16 @@ fn build_table(
             // to a 100% width makes its max-content contribution zero in
             // taffy's intrinsic pass while the height still drives the row.
             if caption_nodes.contains(cid) {
-                cstyle.size.width = taffy::Dimension::percent(1.0);
+                // The cell box always fills its grid area, so an explicit
+                // zero width removes the caption from every track-sizing
+                // pass while the stretched item still lays its text out
+                // across the full table width. The percent form used here
+                // before leaked the caption's max-content into the
+                // max-content track and inflated the table. max_size stays
+                // untouched on purpose: clamping the final layout to zero
+                // width broke the caption's own line wrapping (its box is
+                // the table width minus its inline margins).
+                cstyle.size.width = taffy::Dimension::length(0.0);
                 cstyle.min_size.width = taffy::Dimension::length(0.0);
             }
             // Taffy's grid-item automatic minimum is an engine artifact here:
