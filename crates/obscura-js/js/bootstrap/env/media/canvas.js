@@ -205,7 +205,35 @@ function _prepareCanvasText(value) {
 const _canvas2dState = new WeakMap();
 function _canvasStateOf(ctx) {
   const state = _canvas2dState.get(ctx);
-  if (!state) throw new TypeError('Illegal invocation @env/media/canvas.js:208');
+  if (!state) {
+    // Diagnostic for the live OffscreenCanvas.width Illegal invocation: the
+    // receiver that misses this WeakMap is a wrapper the local reproduction
+    // matrix cannot produce -- snapshot what it actually is.
+    try {
+      var chain = [];
+      var p = ctx;
+      for (var i = 0; i < 3 && p; i++) {
+        chain.push(p.constructor && p.constructor.name ? p.constructor.name : String(p));
+        p = Object.getPrototypeOf(p);
+      }
+      var stack = '';
+      try { stack = String(new Error().stack || '').slice(0, 600); } catch (_se) {}
+      var g = (typeof globalThis !== 'undefined') ? globalThis
+        : (typeof self !== 'undefined') ? self : null;
+      var ext = g && g.window && g.window.external ? g.window.external
+        : (g && g.external) ? g.external : null;
+      if (ext && ext.tracelog) {
+        ext.tracelog('canvas-brand', JSON.stringify({
+          toStr: Object.prototype.toString.call(ctx),
+          ctor: ctx && ctx.constructor && ctx.constructor.name,
+          chain: chain.join('>'),
+          keys: ctx ? Object.getOwnPropertyNames(ctx).slice(0, 8).join(',') : '',
+          stack: stack,
+        }));
+      }
+    } catch (_report) {}
+    throw new TypeError('Illegal invocation @env/media/canvas.js:208');
+  }
   return state;
 }
 // The rewrite that moved the implementation here routes `_hset(this, '_x', v)`
