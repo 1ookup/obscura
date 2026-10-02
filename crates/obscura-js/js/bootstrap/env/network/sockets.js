@@ -185,7 +185,7 @@ function _reportOffscreenBrand(site, receiver) {
         throw new TypeError('Illegal invocation @env/network/sockets.js:185');
       }
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) _canvas2dResizeFromCanvas(state.context);
+      if (state.context) _canvas2dResizeFromCanvas(state, this);
     }
     get height() {
       const state = _offscreenCanvasState.get(this);
@@ -202,7 +202,7 @@ function _reportOffscreenBrand(site, receiver) {
         throw new TypeError('Illegal invocation @env/network/sockets.js:202');
       }
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) _canvas2dResizeFromCanvas(state.context);
+      if (state.context) _canvas2dResizeFromCanvas(state, this);
     }
     // Chrome's OffscreenCanvas has no getAttribute; the context reads
     // width/height off this surface as properties (see _canvasSizeAttribute).
@@ -330,7 +330,7 @@ function _reportOffscreenBrand(site, receiver) {
       // color space is, so the snapshot is tagged srgb.
       const bitmap = new globalThis.ImageBitmap(_bitmapKey, state.width, state.height,
         pixels, 'srgb');
-      if (context) _canvas2dResizeFromCanvas(context);
+      if (context) _canvas2dResizeFromCanvas(_canvas2dState.get(context), this);
       return bitmap;
     }
     get [Symbol.toStringTag]() { return 'OffscreenCanvas'; }

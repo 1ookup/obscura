@@ -29,7 +29,9 @@ function _canvasElementAttributeChanged(el, name) {
   if (!el._ctx) return;
   // A 2D context resizes through the module helper; a WebGL context owns
   // its own drawing buffer and its own resize.
-  if (_isCanvas2DContext(el._ctx)) _canvas2dResizeFromCanvas(el._ctx);
+  if (_isCanvas2DContext(el._ctx)) {
+    _canvas2dResizeFromCanvas(_canvas2dState.get(el._ctx), el);
+  }
   else if (typeof el._ctx._resizeFromCanvas === 'function') el._ctx._resizeFromCanvas();
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;

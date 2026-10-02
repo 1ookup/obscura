@@ -523,16 +523,14 @@ function _canvasColorAttribute(ctx, name, value) {
   if (modern !== null) state[name] = modern;
 }
 
-function _canvas2dCanvasDimension(self, name, fallback) {
-  const state = _canvasStateOf(self);
-    const raw = _canvasSizeAttribute(state.canvas, name);
+function _canvas2dCanvasDimension(canvas, name, fallback) {
+    const raw = _canvasSizeAttribute(canvas, name);
     if (raw === null || raw === '') return fallback;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   }
 
-function _canvas2dResetDrawingState(self) {
-  const state = _canvasStateOf(self);
+function _canvas2dResetDrawingState(state) {
     state.fillStyle = '#000000';
     state.strokeStyle = '#000000';
     state.lineWidth = 1;
@@ -569,10 +567,9 @@ function _canvas2dResetDrawingState(self) {
     _canvas2dSet(state, 'path', []);
   }
 
-function _canvas2dResizeFromCanvas(self) {
-  const state = _canvasStateOf(self);
-    const requestedWidth = _canvas2dCanvasDimension(self, 'width', 300);
-    const requestedHeight = _canvas2dCanvasDimension(self, 'height', 150);
+function _canvas2dResizeFromCanvas(state, canvas) {
+    const requestedWidth = _canvas2dCanvasDimension(canvas, 'width', 300);
+    const requestedHeight = _canvas2dCanvasDimension(canvas, 'height', 150);
     const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
       && requestedHeight <= _MAX_CANVAS_DIMENSION
       && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
@@ -583,9 +580,9 @@ function _canvas2dResizeFromCanvas(self) {
       ? new Float32Array(state.buf.length) : null);
     _canvas2dSet(state, 'colorBuf', state.colorSpace === 'srgb' && !state.floatBuf
       ? state.buf : new Uint8ClampedArray(state.buf.length));
-    _canvas2dResetDrawingState(self);
+    _canvas2dResetDrawingState(state);
     const register = Deno.core.ops.op_canvas_register_surface;
-    if (typeof register === 'function' && state.canvas[_nidSym] != null) {
+    if (typeof register === 'function' && canvas[_nidSym] != null) {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
       const bytes = new Uint8Array(
@@ -593,7 +590,7 @@ function _canvas2dResizeFromCanvas(self) {
         state.buf.byteOffset,
         state.buf.byteLength,
       );
-      if (!register(state.canvas[_nidSym], state.w, state.h, bytes)) {
+      if (!register(canvas[_nidSym], state.w, state.h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
@@ -1589,7 +1586,7 @@ class _Canvas2D {
       shadowOffsetX: 0, shadowOffsetY: 0, shadowBlur: 0, lineWidth: 1,
       miterLimit: 10, lineDashOffset: 0,
     });
-    _canvas2dResizeFromCanvas(this);
+    _canvas2dResizeFromCanvas(_canvas2dState.get(this), canvas);
   }
   save() {
     const state = _canvasStateOf(this);
