@@ -96,6 +96,18 @@ const MACOS_MONO_METRICS: FaceMetrics = FaceMetrics {
     line_gap: 0.0,
     units_per_em: 2048.0,
 };
+/// The macOS system-UI face's vertical metrics, which `system-ui` and
+/// `BlinkMacSystemFont` take for `line-height: normal`. The face ships no
+/// file the metrics can be read from, so the numbers fit the reference
+/// browser's measured line boxes at 9..24px and its canvas fontBoundingBox
+/// at 12..17px: grid-fitted separately they answer 17px at 14px text and
+/// 18px at 16px, where the DejaVu stand-in answers 16 and 19.
+const MACOS_UI_METRICS: FaceMetrics = FaceMetrics {
+    ascent: 1981.0,
+    descent: 430.0,
+    line_gap: 0.0,
+    units_per_em: 2048.0,
+};
 /// The macOS monospace face's uniform advance. The bundled mono face the
 /// engine shapes with advances 1229/2048 instead, so a run that resolves to
 /// the identity monospace is scaled to this before its width is reported.
@@ -1229,9 +1241,9 @@ fn identity_face_metrics(family: &str) -> Option<FaceMetrics> {
 }
 
 /// The built-in metrics a *generic* token takes on a macOS identity. Only the
-/// three generics whose answer is a host face the engine carries as data
-/// appear here; a named family keeps the bundled stand-in's metrics, which is
-/// what the Arial/Times parity was checked against.
+/// generics whose answer is a host face the engine carries as data appear
+/// here; a named family keeps the bundled stand-in's metrics, which is what
+/// the Arial/Times parity was checked against.
 fn identity_metrics_for_token(token: &str) -> Option<FaceMetrics> {
     if font_platform() != FontPlatform::MacOs {
         return None;
@@ -1242,6 +1254,10 @@ fn identity_metrics_for_token(token: &str) -> Option<FaceMetrics> {
         Some(MACOS_SERIF_METRICS)
     } else if token.eq_ignore_ascii_case("monospace") {
         Some(MACOS_MONO_METRICS)
+    } else if token.eq_ignore_ascii_case("system-ui")
+        || token.eq_ignore_ascii_case("blinkmacsystemfont")
+    {
+        Some(MACOS_UI_METRICS)
     } else {
         None
     }
