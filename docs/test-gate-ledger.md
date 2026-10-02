@@ -337,3 +337,4 @@ run covers are then removed.
 - digest probe (10-02): scoped: crypto tests 4/4
 - aqgx8 trap (10-02): scoped: crypto tests 4/4
 - intl locale (10-02): scoped: build ok
+- origin-trial surfaces (10-02): scoped: build ok, live payload carries sharedStorage
