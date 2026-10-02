@@ -10104,6 +10104,31 @@ fn frame_geometry_json(
 #[op2]
 #[string]
 fn op_layout_geometry(state: &OpState, #[smi] nid_smi: i32) -> String {
+    let result = op_layout_geometry_inner(state, nid_smi);
+    // Geometry probe, stderr only and env-gated (OBSCURA_GEOM_PROBE=1): the
+    // challenge measures transient UI elements (create -> gBCR -> discard),
+    // and this op is the funnel every such measurement passes through.
+    // Pairing these lines with the op trace maps each payload metric onto
+    // the element and the engine's own rect. stderr keeps the JS surface
+    // untouched and the page console unobserved.
+    if std::env::var_os("OBSCURA_GEOM_PROBE").is_some() {
+        let parsed: Option<(f64, f64, f64, f64)> = serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .and_then(|v| {
+                let x = v.get("x")?.as_f64()?;
+                let y = v.get("y")?.as_f64()?;
+                let w = v.get("width")?.as_f64()?;
+                let h = v.get("height")?.as_f64()?;
+                Some((x, y, w, h))
+            });
+        if let Some((x, y, w, h)) = parsed {
+            eprintln!("[geom-probe] nid={nid_smi} x={x} y={y} w={w} h={h}");
+        }
+    }
+    result
+}
+
+fn op_layout_geometry_inner(state: &OpState, nid_smi: i32) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let nid = obscura_dom::tree::NodeId::new(nid_smi.max(0) as u32);
     let mut gs = shared.borrow_mut();
