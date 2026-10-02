@@ -1,33 +1,44 @@
 // Speech synthesis is intentionally a no-op host service.  Keep its state and
 // voice list in one behavior helper; speech-synthesis.js only installs the
 // browser-facing shape.
-// Chrome on Windows exposes the Microsoft platform voices plus its own
-// network voices; a single-entry list is the headless shape. The set below
-// mirrors a plain en-US Windows install.
+// The reference macOS host (zh-CN system) lists Tingting first, then the
+// system voices in Chrome's fixed order. A Windows/Google table on a macOS
+// fingerprint is wrong on both name and count.
 const _SPEECH_VOICES = [
-  ['Microsoft Paul - English (United States)', 'en-US'],
-  ['Microsoft Zira - English (United States)', 'en-US'],
-  ['Microsoft David - English (United States)', 'en-US'],
-  ['Microsoft Mark - English (United States)', 'en-US'],
-  ['Google UK English Female', 'en-GB'],
-  ['Google UK English Male', 'en-GB'],
-  ['Google US English', 'en-US'],
-  ['Google हिन्दी', 'hi-IN'],
-  ['Google Bahasa Indonesia', 'id-ID'],
-  ['Google italiano', 'it-IT'],
-  ['Google 日本語', 'ja-JP'],
-  ['Google 한국의', 'ko-KR'],
-  ['Google Nederlands', 'nl-NL'],
-  ['Google polski', 'pl-PL'],
-  ['Google português do Brasil', 'pt-BR'],
-  ['Google русский', 'ru-RU'],
-  ['Google 普通话（中国大陆）', 'zh-CN'],
-  ['Google 粤語（香港）', 'zh-HK'],
-  ['Google 台灣國語', 'zh-TW'],
-  ['Google français', 'fr-FR'],
-  ['Google Deutsch', 'de-DE'],
+  ["婷婷", "zh-CN"],
+  ["Albert", "en-US"],
+  ["Alice", "it-IT"],
+  ["Alva", "pt-BR"],
+  ["Amélie", "fr-CA"],
+  ["Amira", "ar-001"],
+  ["Anna", "de-DE"],
+  ["Bad News", "en-US"],
+  ["Bahh", "en-US"],
+  ["Bells", "en-US"],
+  ["Boing", "en-US"],
+  ["Bubbles", "en-US"],
+  ["Carmit", "he-IL"],
+  ["Cellos", "en-US"],
+  ["Damayanti", "id-ID"],
+  ["Daniel", "en-GB"],
+  ["Daria", "sv-SE"],
+  ["Ellen", "nl-BE"],
+  ["Fred", "en-US"],
+  ["Geeta", "en-IN"],
+  ["Good News", "en-US"],
+  ["Ioana", "ro-RO"],
+  ["Jester", "en-US"],
+  ["Joana", "pt-PT"],
+  ["Junior", "en-US"],
+  ["Kanya", "th-TH"],
+  ["Karen", "en-AU"],
+  ["Kathy", "en-US"],
+  ["Kyoko", "ja-JP"],
+  ["Lana", "ru-RU"],
+  ["Laura", "sk-SK"],
+  ["Lekha", "hi-IN"],
 ].map(([name, lang], index) => ({
-  name, lang, default: index === 6, localService: index < 4,
+  name, lang, default: index === 0, localService: true,
   voiceURI: name,
 }));
 function _speechSynthesisVoices() {
