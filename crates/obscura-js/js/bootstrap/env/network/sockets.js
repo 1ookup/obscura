@@ -185,7 +185,17 @@ function _reportOffscreenBrand(site, receiver) {
         throw new TypeError('Illegal invocation @env/network/sockets.js:185');
       }
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) _canvas2dResizeFromCanvas(state, this);
+      if (!state.context) return;
+      if (state.contextType === '2d') {
+        _canvas2dResizeFromCanvas(state, this);
+      } else {
+        // A WebGL context reports the surface size through its drawing
+        // buffer; keep it in step like the reference does on a resize.
+        try {
+          state.context.drawingBufferWidth = state.width;
+          state.context.drawingBufferHeight = state.height;
+        } catch (_e) {}
+      }
     }
     get height() {
       const state = _offscreenCanvasState.get(this);
@@ -202,7 +212,17 @@ function _reportOffscreenBrand(site, receiver) {
         throw new TypeError('Illegal invocation @env/network/sockets.js:202');
       }
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
-      if (state.context) _canvas2dResizeFromCanvas(state, this);
+      if (!state.context) return;
+      if (state.contextType === '2d') {
+        _canvas2dResizeFromCanvas(state, this);
+      } else {
+        // A WebGL context reports the surface size through its drawing
+        // buffer; keep it in step like the reference does on a resize.
+        try {
+          state.context.drawingBufferWidth = state.width;
+          state.context.drawingBufferHeight = state.height;
+        } catch (_e) {}
+      }
     }
     // Chrome's OffscreenCanvas has no getAttribute; the context reads
     // width/height off this surface as properties (see _canvasSizeAttribute).
