@@ -857,6 +857,29 @@ impl ObscuraJsRuntime {
             // race an isolate being built on another connection thread.
             crate::v8_flags::apply_baseline_v8_flags();
 
+            // Intl formatters default to the ICU default locale, which is the
+            // host OS locale in Chrome and en-US in a bare V8. The stealth
+            // fingerprint Accept-Language is the browser-facing view of the
+            // same OS preference, so seed ICU from its primary tag before
+            // the first context exists (ICU locks in per-isolate otherwise).
+            {
+                let primary = std::env::var("OBSCURA_INTL_LOCALE")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        obscura_net::fingerprint::BrowserFingerprint::from_user_agent(
+                            obscura_net::fingerprint::DEFAULT_USER_AGENT,
+                        )
+                        .accept_language()
+                        .split(",")
+                        .next()
+                        .unwrap_or("en-US")
+                        .trim()
+                        .to_string()
+                    });
+                deno_core::v8::icu::set_default_locale(&primary);
+            }
+
             // Either trace stream opts the runtime out of the startup
             // snapshot: op tracing needs the JS-side source-label wrappers, and
             // the tracelog sink installs window.external.tracelog from the
