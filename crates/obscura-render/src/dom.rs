@@ -3327,6 +3327,11 @@ pub(crate) struct IfcRegistry {
     /// The post-width row-sizing pass combines these with each cell's final
     /// content height and pins the tracks before vertical alignment.
     table_rows: HashMap<taffy::NodeId, Vec<Option<f32>>>,
+    /// Tables whose first row is the absolute-positioned caption band: the
+    /// caption leaves the grid flow (so its max-content cannot widen the
+    /// data columns), and the width pass adds its measured height to the
+    /// grid's top padding to restore the band the reference includes.
+    table_caption_bands: HashMap<taffy::NodeId, taffy::NodeId>,
     /// Floats whose direct block parent does not establish a block formatting
     /// context and whose exclusion can therefore continue through later
     /// descendant blocks of the same BFC. The first layout pass gives these
@@ -9701,6 +9706,42 @@ fn layout_dom_once(
                                         })
                                     })
                                     .collect();
+                                // The caption band: the absolute caption's
+                                // measured height goes above the row band,
+                                // between the two border-spacings the grid
+                                // gaps already provide (row 0 is the empty
+                                // caption track; row 1's top gap sits under
+                                // the band). Chromium's row y offset is the
+                                // caption height plus both spacings, and the
+                                // table height grows by the same amount.
+                                let cap_h = if ifc_items
+                                    .table_caption_bands
+                                    .contains_key(&tnode)
+                                {
+                                    let _ = taffy_tree.compute_layout_with_measure(
+                                        tnode,
+                                        taffy::Size {
+                                            width: taffy::AvailableSpace::Definite(
+                                                used_outer,
+                                            ),
+                                            height: taffy::AvailableSpace::MaxContent,
+                                        },
+                                        &mut measure,
+                                    );
+                                    ifc_items
+                                        .table_caption_bands
+                                        .get(&tnode)
+                                        .and_then(|cap| taffy_tree.layout(*cap).ok())
+                                        .map(|l| l.size.height)
+                                        .unwrap_or(0.0)
+                                } else {
+                                    0.0
+                                };
+                                if cap_h > 0.0 {
+                                    let (_, vertical_spacing) = table_spacing(table_style);
+                                    s.padding.top =
+                                        taffy::LengthPercentage::length(vertical_spacing + cap_h);
+                                }
                                 let _ = taffy_tree.set_style(tnode, s);
                             }
                         } else if let Ok(cur) = taffy_tree.style(tnode) {
@@ -14685,12 +14726,16 @@ fn build_table(
 
     // Build each cell and pin it to its grid area.
     let mut children: Vec<taffy::NodeId> = Vec::new();
+    let mut caption_taffy: Option<taffy::NodeId> = None;
     for (cid, r, c, rs, cs) in &placed {
         let Some(cell_node) = build(
             tree, *cid, taffy_tree, id_map, words, engine, ifc_items, styles,
         ) else {
             continue;
         };
+        if caption_nodes.contains(cid) {
+            caption_taffy = Some(cell_node);
+        }
         if let Ok(cur) = taffy_tree.style(cell_node) {
             let mut cstyle = cur.clone();
             cstyle.grid_row = taffy::Line {
@@ -14720,6 +14765,21 @@ fn build_table(
                 .is_some_and(|cell_style| cell_style.min_width == crate::Dimension::Auto)
             {
                 cstyle.min_size.width = taffy::Dimension::length(0.0);
+            }
+            if caption_nodes.contains(cid) {
+                // Chromium draws the caption over the table's border box: its
+                // x is the table x plus the caption margin, unshifted by the
+                // table border. Negating the table border depths in the
+                // absolute insets reproduces that placement (a 145px table
+                // with margin-left 20.8 answers a 124.2px caption), and the
+                // absolute position takes the caption out of the grid flow
+                // so its own max-content cannot widen the data columns.
+                cstyle.position = taffy::Position::Absolute;
+                cstyle.inset.left =
+                    taffy::LengthPercentageAuto::length(-style.border.left);
+                cstyle.inset.top = taffy::LengthPercentageAuto::length(-style.border.top);
+                cstyle.inset.right =
+                    taffy::LengthPercentageAuto::length(-style.border.right);
             }
             let _ = taffy_tree.set_style(cell_node, cstyle);
         }
@@ -14977,6 +15037,9 @@ fn build_table(
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
     ifc_items.table_rows.insert(table_node, row_min);
+    if let Some(cap) = caption_taffy {
+        ifc_items.table_caption_bands.insert(table_node, cap);
+    }
     if fixed_layout {
         ifc_items.fixed_table_cols.insert(table_node, fixed_columns);
     }
