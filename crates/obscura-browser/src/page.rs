@@ -6704,12 +6704,19 @@ impl Page {
                     &parent_origin,
                     parent_cross_origin_isolated_allowed,
                 );
+            // srcdoc/blob inherit the creator's enforced policy verbatim.
+            // Intersecting the embedder's required policy here (the old
+            // behavior) dropped sources the creator document itself allows --
+            // the widget's script-src kept only the nonce and lost
+            // 'unsafe-eval', flipping the srcdoc realm's eval gate to
+            // disallowed where the reference runs it allowed. The required
+            // policy's sandbox tokens still land through the merge above.
             (
                 document_url,
                 base_url,
                 origin,
                 body,
-                combine_required_csp(parent_csp.clone(), required_csp.as_deref()),
+                parent_csp.clone(),
                 parent_permissions_policy.clone(),
                 None,
                 None,
@@ -7836,6 +7843,54 @@ mod tests {
         assert_eq!(child[8], serde_json::json!(30));
         assert_eq!(child[9], serde_json::json!(2));
         assert_eq!(child[10], serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn srcdoc_frame_inherits_the_creator_policy_without_required_intersect() {
+        // The turnstile widget embeds a srcdoc frame and ships a `csp`
+        // attribute whose script-src is the document nonce alone. Intersecting
+        // that with the creator policy dropped 'unsafe-eval' from the srcdoc
+        // scope and flipped its eval gate to disallowed where the reference
+        // runs the same frame allowed: srcdoc inherits the creator policy
+        // verbatim, the way about:blank inherits it.
+        let html = concat!(
+            "<!doctype html><html><head>",
+            "<meta http-equiv=\"content-security-policy\" content=\"default-src 'none'; script-src 'nonce-R' 'unsafe-eval'\">",
+            "</head><body>",
+            "<iframe id=frame srcdoc=\"<p>doc</p>\" csp=\"script-src 'nonce-R'\"></iframe>",
+            "</body></html>",
+        );
+        let mut page = frame_test_page(html);
+        page.document_csp = Some(
+            "default-src 'none'; script-src 'nonce-R' 'unsafe-eval'".to_string(),
+        );
+        let main_id = page.frames.main_frame_id().to_string();
+        let host = page
+            .with_dom(|dom| dom.query_selector("#frame").unwrap().unwrap())
+            .unwrap();
+        let frame_id = page.frames.attach_child(&main_id, host).unwrap();
+        page.navigate_frame(
+            &frame_id,
+            super::FrameNavigationRequest {
+                srcdoc: Some("<p>doc</p>".to_string()),
+                required_csp: Some("script-src 'nonce-R'".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let scope = page
+            .dom
+            .as_ref()
+            .unwrap()
+            .document_scope(page.frames.get(&frame_id).unwrap().active_document_root.unwrap())
+            .unwrap();
+        assert_eq!(
+            scope.csp.as_deref(),
+            Some("default-src 'none'; script-src 'nonce-R' 'unsafe-eval'"),
+            "srcdoc keeps the creator policy verbatim: {:?}",
+            scope.csp
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10295,7 +10350,10 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(srcdoc_csp.as_deref(), Some("connect-src 'none'"));
+        // A srcdoc local inherits the creator policy verbatim (the embedder's
+        // `csp` attribute must not intersect sources away: the live turnstile
+        // srcdoc frame ran its eval gate closed under the old intersect).
+        assert_eq!(srcdoc_csp.as_deref(), Some("connect-src *"));
         assert_eq!(blank_csp.as_deref(), Some("connect-src *"));
 
         local.init_js();
