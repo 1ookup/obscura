@@ -341,3 +341,4 @@ run covers are then removed.
 - sandbox COI gate (10-02): scoped: obscura-browser 140/140
 - navigator modelContext rank (10-02): scoped: navigator tests 11/11; live gsLi5 o-group 122/122 aligned
 - IFC 1/64 snap (10-02): scoped: render+browser+js 1517/1517
+- geom probe (10-02): scoped: build ok; live capture maps HPcn5[0]
