@@ -268,6 +268,9 @@ const _chromeWindowKeyOrder = [
   'scheduler', 'performance', 'trustedTypes', 'crypto',
   'indexedDB', 'localStorage', 'sessionStorage', 'chrome', 'crashReport',
   'cookieStore', 'caches', 'documentPictureInPicture',
+  // Origin-trial surface: present only on challenges.cloudflare.com realms,
+  // immediately before viewport in the reference enumeration.
+  'sharedStorage',
   'viewport', 'launchQueue', 'speechSynthesis', 'globalThis', 'JSON', 'Math',
   'Intl', 'Atomics', 'Reflect', 'console', 'CSS', 'Temporal', 'WebAssembly',
   'GPUBufferUsage', 'GPUColorWrite', 'GPUMapMode', 'GPUShaderStage',
