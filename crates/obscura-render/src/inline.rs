@@ -2208,6 +2208,9 @@ struct IdentityGlyphFaces {
     #[cfg(target_os = "macos")]
     coretext_faces:
         HashMap<(&'static str, u32), Option<crate::coretext::CoreTextFace>>,
+    /// The system font's own face (SFNS.ttf), which carries the Latin glyphs
+    /// the identity sans's PingFang file lacks. Loaded on first use.
+    latin_face: Option<Option<IdentityFaceFile>>,
 }
 
 /// One loaded host file: the shared bytes and the collection index of the
@@ -2232,6 +2235,7 @@ impl IdentityGlyphFaces {
             images: HashMap::new(),
             stroke_images: HashMap::new(),
             context: ScaleContext::new(),
+            latin_face: None,
             #[cfg(target_os = "macos")]
             coretext_faces: HashMap::new(),
         }
@@ -2260,6 +2264,36 @@ impl IdentityGlyphFaces {
         self.faces.get(family).and_then(|file| file.as_ref())
     }
 
+    /// The system font's own face: `/System/Library/Fonts/SFNS.ttf`, the
+    /// same SF New release the reference's system-ui resolves to on macOS.
+    fn latin_face(&mut self) -> Option<IdentityFaceFile> {
+        if self.latin_face.is_none() {
+            self.latin_face = Some(Self::load_latin_face());
+        }
+        self.latin_face.clone().flatten()
+    }
+
+    fn load_latin_face() -> Option<IdentityFaceFile> {
+        let bytes = std::sync::Arc::new(
+            std::fs::read("/System/Library/Fonts/SFNS.ttf").ok()?,
+        );
+        swash::FontRef::from_index(&bytes, 0)?;
+        Some(IdentityFaceFile { bytes, index: 0 })
+    }
+
+    /// The face one glyph of a system-ui run draws from: Latin (and the
+    /// punctuation around it) comes from the SF host file -- PingFang's own
+    /// Latin coverage is what the reference does not draw with -- while CJK
+    /// continues from the PingFang file.
+    fn face_for(&mut self, family: &'static str, ch: char) -> Option<IdentityFaceFile> {
+        if matches!(family, "system-ui" | "BlinkMacSystemFont")
+            && matches!(ch as u32, 0x20..=0x24F | 0x2013..=0x2015 | 0x2018..=0x201F)
+        {
+            return self.latin_face();
+        }
+        self.face(family).cloned()
+    }
+
     /// The stroked outline of one identity glyph: zeno strokes the same
     /// file-loaded face the software fill sampler reads, so the band follows
     /// the identity face's own outline rather than a mapped box.
@@ -2270,7 +2304,7 @@ impl IdentityGlyphFaces {
         size: f32,
         params: &CanvasStrokeParams,
     ) -> Option<StrokeMask> {
-        let file = self.face(family)?.clone();
+        let file = self.face_for(family, ch)?.clone();
         let font = swash::FontRef::from_index(&file.bytes, file.index as usize)?;
         let glyph_id = font.charmap().map(ch as u32);
         if glyph_id == 0 {
@@ -2298,7 +2332,7 @@ impl IdentityGlyphFaces {
         ch: char,
         size: f32,
     ) -> Option<(i32, i32, u32, u32)> {
-        let Some(file) = self.face(family) else { return None };
+        let Some(file) = self.face_for(family, ch) else { return None };
         let file = file.clone();
         let Some(font) = swash::FontRef::from_index(&file.bytes, file.index as usize) else { return None };
         let glyph_id = font.charmap().map(ch as u32);
@@ -2333,6 +2367,33 @@ impl IdentityGlyphFaces {
     /// The family's CoreText face at `size` (macOS): minted from the same
     /// host file the software sampler loads, cached per (family, size).
     #[cfg(target_os = "macos")]
+    /// The CoreText face one glyph draws from, resolved per character: a
+    /// system-ui run's Latin comes from the SF host file while its CJK stays
+    /// on PingFang. The cache key splits on that range.
+    #[cfg(target_os = "macos")]
+    fn coretext_face_for(
+        &mut self,
+        family: &'static str,
+        ch: char,
+        size: f64,
+    ) -> Option<&mut crate::coretext::CoreTextFace> {
+        let latin = matches!(ch as u32, 0x20..=0x24F);
+        let key_family: &'static str = if latin { "\u{1}sfns" } else { family };
+        let key = (key_family, (size * 64.0).round() as u32);
+        if !self.coretext_faces.contains_key(&key) {
+            let face = self
+                .face_for(family, ch)
+                .and_then(|file| {
+                    crate::coretext::CoreTextFace::from_bytes(
+                        std::sync::Arc::clone(&file.bytes),
+                        size,
+                    )
+                });
+            self.coretext_faces.insert(key, face);
+        }
+        self.coretext_faces.get_mut(&key).and_then(|f| f.as_mut())
+    }
+
     fn coretext_face(
         &mut self,
         family: &'static str,
@@ -2438,7 +2499,7 @@ impl IdentityGlyphFaces {
         ch: char,
         size: f32,
     ) -> Option<(f32, f32, f32, f32)> {
-        let file = self.face(family)?.clone();
+        let file = self.face_for(family, ch)?.clone();
         let font = swash::FontRef::from_index(&file.bytes, file.index as usize)?;
         let glyph_id = font.charmap().map(ch as u32);
         if glyph_id == 0 {
@@ -2461,7 +2522,7 @@ impl IdentityGlyphFaces {
         base: Color,
         mut f: F,
     ) {
-        let Some(file) = self.face(family) else { return };
+        let Some(file) = self.face_for(family, ch) else { return };
         let file = file.clone();
         let Some(font) = swash::FontRef::from_index(&file.bytes, file.index as usize) else { return };
         let glyph_id = font.charmap().map(ch as u32);
@@ -3783,13 +3844,13 @@ impl TextEngine {
                     {
                         let size_f64 = f64::from(size);
                         let glyph = identity_glyph_faces
-                            .coretext_face(family, size_f64)
+                            .coretext_face_for(family, ch, size_f64)
                             .and_then(|f| f.glyph_for_char(ch));
                         let placement = identity_glyph_faces.glyph_placement(family, ch, size);
                         let ct_enabled = coretext_glyph_enabled();
                         if ct_enabled {
                             if let (Some(face), Some(glyph), Some((sw_left, sw_top, sw_w, sw_h))) = (
-                                identity_glyph_faces.coretext_face(family, size_f64),
+                                identity_glyph_faces.coretext_face_for(family, ch, size_f64),
                                 glyph,
                                 placement,
                             ) {
