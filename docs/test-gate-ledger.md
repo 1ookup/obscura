@@ -338,3 +338,4 @@ run covers are then removed.
 - aqgx8 trap (10-02): scoped: crypto tests 4/4
 - intl locale (10-02): scoped: build ok
 - origin-trial surfaces (10-02): scoped: build ok, live payload carries sharedStorage
+- sandbox COI gate (10-02): scoped: obscura-browser 140/140
