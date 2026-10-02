@@ -83,7 +83,7 @@ if (typeof OffscreenCanvas === 'undefined') {
   // null, exactly as the rest of this realm's handler attributes behave.
   const _offscreenCanvasHandler = (canvas, name, value) => {
     const state = _offscreenCanvasState.get(canvas);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/network/sockets.js:86');
     state[name] = (typeof value === 'function' || (value && typeof value === 'object')) ? value : null;
     return value;
   };
@@ -174,7 +174,7 @@ function _reportOffscreenBrand(site, receiver) {
       const state = _offscreenCanvasState.get(this);
       if (!state) {
         _reportOffscreenBrand('width.get', this);
-        throw new TypeError('Illegal invocation');
+        throw new TypeError('Illegal invocation @env/network/sockets.js:177');
       }
       return state.width;
     }
@@ -182,7 +182,7 @@ function _reportOffscreenBrand(site, receiver) {
       const state = _offscreenCanvasState.get(this);
       if (!state) {
         _reportOffscreenBrand('width.set', this);
-        throw new TypeError('Illegal invocation');
+        throw new TypeError('Illegal invocation @env/network/sockets.js:185');
       }
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
@@ -191,7 +191,7 @@ function _reportOffscreenBrand(site, receiver) {
       const state = _offscreenCanvasState.get(this);
       if (!state) {
         _reportOffscreenBrand('height.get', this);
-        throw new TypeError('Illegal invocation');
+        throw new TypeError('Illegal invocation @env/network/sockets.js:194');
       }
       return state.height;
     }
@@ -199,7 +199,7 @@ function _reportOffscreenBrand(site, receiver) {
       const state = _offscreenCanvasState.get(this);
       if (!state) {
         _reportOffscreenBrand('height.set', this);
-        throw new TypeError('Illegal invocation');
+        throw new TypeError('Illegal invocation @env/network/sockets.js:202');
       }
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
@@ -855,7 +855,7 @@ if (typeof FontFace === 'undefined') {
   const _fontFaceState = new WeakMap();
   const _fontFaceStateOf = face => {
     const state = _fontFaceState.get(face);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/network/sockets.js:858');
     return state;
   };
   const _fontFaceAttach = (face, set) => { _fontFaceStateOf(face).sets.add(set); };
@@ -1034,7 +1034,7 @@ if (typeof FontFace === 'undefined') {
   const _fontFaceSetState = new WeakMap();
   const _fontFaceSetStateOf = set => {
     const state = _fontFaceSetState.get(set);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/network/sockets.js:1037');
     return state;
   };
   const _fontFaceSetGetHandler = (set, name) => _fontFaceSetStateOf(set)[name];

@@ -5915,7 +5915,7 @@ mod tests {
                     "Failed to execute 'createNSResolver' on 'Document': 1 argument required, but only 0 present."],
                 "badDocument": ["TypeError",
                     "Failed to execute 'createExpression' on 'Document': Illegal invocation"],
-                "badExpression": ["TypeError", "Illegal invocation"],
+                "badExpression": ["TypeError", "Illegal invocation @tools/interaction.js:659"],
             })
         );
     }
@@ -5995,7 +5995,7 @@ mod tests {
                     "Failed to execute 'caretPositionFromPoint' on 'Document': 2 arguments required, but only 0 present."],
                 "badDocument": ["TypeError",
                     "Failed to execute 'caretRangeFromPoint' on 'Document': Illegal invocation"],
-                "badPosition": ["TypeError", "Illegal invocation"],
+                "badPosition": ["TypeError", "Illegal invocation @tools/interaction.js:687"],
             })
         );
     }
@@ -6130,7 +6130,7 @@ mod tests {
                     "callbackBefore": 0, "callbackAfter": 1,
                     "promises": [true, true, true], "root": true,
                     "types": ["[object ViewTransitionTypeSet]", 2, ["alpha", "beta"]],
-                    "skipped": {}, "badGetter": {"name": "TypeError", "message": "Illegal invocation"},
+                    "skipped": {}, "badGetter": {"name": "TypeError", "message": "Illegal invocation @env/security/view-transition.js:62"},
                 },
                 "move": {
                     "returnType": "undefined",
@@ -6806,7 +6806,7 @@ mod tests {
                      "function get jsHeapSizeLimit() { [native code] }",
                      true, true, true],
                 ],
-                "invalidReceiver": "TypeError:Illegal invocation",
+                "invalidReceiver": "TypeError:Illegal invocation @env/performance/memory-info.js:13",
                 "valuesMatch": true,
                 "valuesSane": true,
                 "heapLimit": 4395630592i64,
@@ -6868,10 +6868,14 @@ mod tests {
             serde_json::json!({
                 "results": [
                     ["bound", "no-throw", true],
-                    ["detached", "TypeError", "Illegal invocation"],
-                    ["plainReceiver", "TypeError", "Illegal invocation"],
-                    ["prototypeReceiver", "TypeError", "Illegal invocation"],
-                    ["undefinedReceiver", "TypeError", "Illegal invocation"],
+                    ["detached", "TypeError",
+                     "Illegal invocation @env/performance/support/clock.js:86"],
+                    ["plainReceiver", "TypeError",
+                     "Illegal invocation @env/performance/support/clock.js:86"],
+                    ["prototypeReceiver", "TypeError",
+                     "Illegal invocation @env/performance/support/clock.js:86"],
+                    ["undefinedReceiver", "TypeError",
+                     "Illegal invocation @env/performance/support/clock.js:86"],
                     ["singletonReceiver", "no-throw", true],
                 ],
                 "descriptor": {
@@ -10121,8 +10125,8 @@ mod tests {
                         ["TypeError", "Failed to construct 'FileSystemDirectoryHandle': Illegal constructor"],
                         ["TypeError", "Failed to construct 'FileSystemFileHandle': Illegal constructor"],
                     ],
-                    "badStorage": {"name": "TypeError", "message": "Illegal invocation"},
-                    "badHandle": {"name": "TypeError", "message": "Illegal invocation"},
+                    "badStorage": {"name": "TypeError", "message": "Illegal invocation @config/surface-finalize.js:1862"},
+                    "badHandle": {"name": "TypeError", "message": "Illegal invocation @config/surface-finalize.js:1866"},
                     "missing": {"name": "NotFoundError",
                         "message": "A requested file or directory could not be found."},
                 },
@@ -17180,7 +17184,8 @@ RequestRedirect value",
                 "function IDBKeyRange() { [native code] }", "TypeError",
                 ["constructor", "includes", "lower", "lowerOpen", "upper", "upperOpen"],
                 "[object IDBKeyRange]", 1, 3, true, false, false, true,
-                ["TypeError", "Illegal invocation"]],
+                ["TypeError",
+                 "Illegal invocation @env/storage/indexeddb-cache.js:178"]],
             "globals": {
                 "blur": ["blur", 0, false, true,
                     "function blur() { [native code] }", "TypeError"],
