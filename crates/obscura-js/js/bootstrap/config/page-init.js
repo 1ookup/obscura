@@ -93,8 +93,28 @@ globalThis.__obscura_core_init = function() {
     const sources = scriptSources || defaultSources;
     globalThis.__obscura_csp_allows_unsafe_eval =
       !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'csp.gate',
+        JSON.stringify({
+          root: frameRootNid || 0,
+          url: String((scopeInfo && scopeInfo.url) || location.href).slice(-60),
+          csp: header.slice(0, 400),
+          flag: globalThis.__obscura_csp_allows_unsafe_eval,
+        }));
+    } catch (_report) {}
   } catch (_e) {
     globalThis.__obscura_csp_allows_unsafe_eval = true;
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'csp.gate',
+        JSON.stringify({
+          root: frameRootNid || 0,
+          url: String(location.href).slice(-60),
+          csp: 'EXCEPTION',
+          flag: true,
+        }));
+    } catch (_report2) {}
   }
 };
 
@@ -213,8 +233,28 @@ globalThis.__obscura_init = function() {
     const sources = scriptSources || defaultSources;
     globalThis.__obscura_csp_allows_unsafe_eval =
       !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'csp.gate',
+        JSON.stringify({
+          root: frameRootNid || 0,
+          url: String((scopeInfo && scopeInfo.url) || location.href).slice(-60),
+          csp: header.slice(0, 400),
+          flag: globalThis.__obscura_csp_allows_unsafe_eval,
+        }));
+    } catch (_report) {}
   } catch (_e) {
     globalThis.__obscura_csp_allows_unsafe_eval = true;
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'csp.gate',
+        JSON.stringify({
+          root: frameRootNid || 0,
+          url: String(location.href).slice(-60),
+          csp: 'EXCEPTION',
+          flag: true,
+        }));
+    } catch (_report2) {}
   }
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(globalThis.document.documentElement);
