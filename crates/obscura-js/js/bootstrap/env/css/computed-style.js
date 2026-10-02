@@ -186,9 +186,29 @@ globalThis.getComputedStyle = (el) => {
     'will-change': 'auto', 'backface-visibility': 'visible',
   };
 
+  // The table family's exposed display comes from the element, not from the
+  // renderer's internal container display. An author declaration on the
+  // element (checked inline first) still wins.
+  const tableFamilyDisplay = (el, style) => {
+    if (!el || !el.tagName) return null;
+    const authored = style && style.display;
+    if (authored) return null;
+    return {
+      TABLE: 'table', CAPTION: 'table-caption',
+      THEAD: 'table-header-group', TBODY: 'table-row-group',
+      TFOOT: 'table-footer-group', TR: 'table-row',
+      TD: 'table-cell', TH: 'table-cell',
+      COL: 'table-column', COLGROUP: 'table-column-group',
+    }[String(el.tagName).toUpperCase()] || null;
+  };
   const lookupValue = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
     refreshRendered();
+    const kebab0 = String(rawProp).replace(/([A-Z])/g, '-$1').toLowerCase();
+    if (kebab0 === 'display') {
+      const family = tableFamilyDisplay(el, target);
+      if (family) return family;
+    }
     let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     // CSSOM camelCase vendor properties omit the punctuation from their JS
     // spelling (`webkitLineClamp`) but computed-property names retain it
@@ -209,6 +229,25 @@ globalThis.getComputedStyle = (el) => {
     }
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;
+    // UA-sheet answers for the table family. The internal display name the
+    // renderer carries (the table controller's flex container) is not what
+    // the surface reports, and the separate-border spacing default (2px) is
+    // a UA value the cascade never materializes for author inspection.
+    if (el && el.tagName) {
+      const tag = String(el.tagName).toUpperCase();
+      const familyDisplay = {
+        TABLE: 'table', CAPTION: 'table-caption',
+        THEAD: 'table-header-group', TBODY: 'table-row-group',
+        TFOOT: 'table-footer-group', TR: 'table-row',
+        TD: 'table-cell', TH: 'table-cell',
+        COL: 'table-column', COLGROUP: 'table-column-group',
+      }[tag];
+      if (familyDisplay !== undefined) {
+        if (kebab === 'display') return familyDisplay;
+        if (kebab === 'border-spacing' || kebab === '-webkit-border-horizontal-spacing'
+            || kebab === '-webkit-border-vertical-spacing') return '2px';
+      }
+    }
     if (defaultsKebab[rawProp]) return defaultsKebab[rawProp];
     if (defaultsKebab[kebab]) return defaultsKebab[kebab];
     const camelFallback = _cssKebabToCamel(kebab);
