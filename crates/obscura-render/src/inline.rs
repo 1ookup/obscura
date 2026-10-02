@@ -3888,7 +3888,7 @@ impl TextEngine {
                                     }
                                     let wide = identity_wide_rune(ch);
                                     let c_origin = x + sw_left - PAD as i32 - left;
-                                    let r_origin = base_row - baseline as i32;
+                                    let r_origin = base_row - baseline as i32 + 1;
                                     let cg_cols = (sw_w as i32 - 1).max(1);
                                     let cg_rows = (sw_h as i32 - 1).max(1);
                                     let sw_cols = (sw_w as i32 - 1).max(1);
