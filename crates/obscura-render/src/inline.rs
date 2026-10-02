@@ -5326,10 +5326,14 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     }
     let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
-        // This is the paragraph IFC's intrinsic width, which the engine has
-        // always ceiled to a whole pixel (the word path above keeps the 1/64
-        // grid instead); only the stand-in's share of it is scaled.
-        (w * item.advance_scale + identity_width(emoji_units, emoji_size)).ceil(),
+        // This is the paragraph IFC's intrinsic width. Chrome reports span
+        // widths on the 1/64 LayoutUnit grid (measured live: a 16px
+        // sans-serif "M" answers 14.125 = 904/64 immediately and settled,
+        // never the ceiled 15 nor the canvas f32 14.112): the same snap the
+        // word path applies, not the historical whole-pixel ceiling.
+        snap_layout_unit(
+            w * item.advance_scale + identity_width(emoji_units, emoji_size),
+        ),
         if clamped {
             clamp_height.unwrap_or(h)
         } else {

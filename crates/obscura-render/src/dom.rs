@@ -23940,8 +23940,11 @@ mod tests {
 
         assert_eq!(width("normal"), 125.0);
         assert_eq!(width("break-word"), 125.0);
-        assert_eq!(width("anywhere"), 14.0);
-        assert_eq!(width("break-all"), 14.0);
+        // The min-content of one glyph keeps the 1/64 grid now (Chrome's
+        // span widths are LayoutUnit-snapped, not ceiled), so "a" reads 13
+        // after the track's own rounding where it used to read the ceiled 14.
+        assert_eq!(width("anywhere"), 13.0);
+        assert_eq!(width("break-all"), 13.0);
     }
 
     #[cfg(feature = "paint")]
