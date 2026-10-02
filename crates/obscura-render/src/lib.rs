@@ -863,8 +863,13 @@ impl Affine2 {
         Rect {
             x: saturate(left),
             y: saturate(top),
-            width: saturate(right - left).max(0.0),
-            height: saturate(bottom - top).max(0.0),
+            // Chrome clamps the corners and reports their difference, so a
+            // fully saturated rect keeps `right == x + width` (x = -bound,
+            // right = +bound, width = 2 * bound). Clamping the f64 difference
+            // instead collapsed the width to a single bound and made the rect
+            // degenerate (right = 0), which reads as an engine inconsistency.
+            width: (saturate(right) - saturate(left)).max(0.0),
+            height: (saturate(bottom) - saturate(top)).max(0.0),
         }
     }
 
@@ -3267,5 +3272,43 @@ mod tests {
         border_box.style.box_sizing = BoxSizing::BorderBox;
         let border_out = layout(&border_box, (1000.0, 800.0));
         assert_eq!(border_out.border_box.width, 100.0);
+    }
+
+    #[test]
+    fn map_rect_saturation_keeps_corners_consistent() {
+        // Chrome's live-measured behavior under `transform: scale(1e37, 1.89)`:
+        // the rect components saturate at +/-3.4028232737618185e32 and the
+        // width reads 2x that bound, so `right == x + width` still holds.
+        // Clamping the f64 difference instead collapsed the width to a single
+        // bound and produced a degenerate rect (right = 0).
+        // Production shape: the CSSOM path folds the transform-origin into
+        // the matrix, and the huge scale drives the folded translation to the
+        // f32 range edge, so both mapped extremes land beyond the saturation
+        // bound.
+        let transform = Affine2 {
+            a: 1.0e37,
+            d: 1.89,
+            e: f32::MIN,
+            ..Affine2::IDENTITY
+        };
+        let mapped = transform.map_rect(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 57.0,
+        });
+        let bound: f32 = 3.402_823_273_761_818_5e32;
+        assert_eq!(mapped.x, -bound);
+        assert_eq!(mapped.width, bound * 2.0);
+        assert_eq!(mapped.x + mapped.width, bound);
+        // An ordinary transform stays on the exact-float path.
+        let normal = Affine2::IDENTITY.map_rect(Rect {
+            x: 12.0,
+            y: 8.0,
+            width: 788.0,
+            height: 57.0,
+        });
+        assert_eq!(normal.x, 12.0);
+        assert_eq!(normal.width, 788.0);
     }
 }
