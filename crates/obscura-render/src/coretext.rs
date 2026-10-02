@@ -96,6 +96,13 @@ extern "C" {
         glyphs: *mut CGGlyph,
         count: isize,
     ) -> bool;
+    fn CTFontGetAdvancesForGlyphs(
+        font: CTFontRef,
+        orientation: u32,
+        glyphs: *const CGGlyph,
+        advances: *mut f64,
+        count: usize,
+    ) -> f64;
     fn CFDataCreate(
         allocator: CFAllocatorRef,
         bytes: *const u8,
