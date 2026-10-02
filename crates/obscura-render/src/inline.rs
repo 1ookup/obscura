@@ -3496,6 +3496,75 @@ impl TextEngine {
         width
     }
 
+    /// Min-content width for one shaped item, measured by bisecting the wrap
+    /// width on a cloned buffer until every shaped line holds exactly one
+    /// whitespace-separated word. This bypasses cosmic-text's shape-run cache
+    /// (whose offset-to-glyph matching misses on the macOS host PingFang data
+    /// and merges words at width 0) while reusing the item's own font and
+    /// attribute state, so the answer stays on the same face the layout used.
+    pub(crate) fn measure_min_content_words(&mut self, idx: usize) -> f32 {
+        let full = {
+            let item = &self.items[idx];
+            let mut probe = item.buffer.clone();
+            probe.set_wrap(&mut self.font_system, Wrap::None);
+            probe.set_size(&mut self.font_system, None, None);
+            probe.shape_until_scroll(&mut self.font_system, false);
+            let mut w = 0.0f32;
+            for run in probe.layout_runs() {
+                w = w.max(run.line_w.max(0.0));
+            }
+            w
+        };
+        if full <= 0.0 {
+            return 0.0;
+        }
+        // Word count from the full-width shaping of the same text: cosmic
+        // exposes the text through its lines, so walk those.
+        let full_probe = self.items[idx].buffer.clone();
+        let word_count = {
+            let mut count = 0usize;
+            let mut in_word = false;
+            for line in full_probe.lines.iter() {
+                for ch in line.text().chars() {
+                    let ws = ch.is_whitespace();
+                    if !ws && !in_word {
+                        count += 1;
+                    }
+                    in_word = !ws;
+                }
+                if in_word {
+                    count += 1;
+                    in_word = false;
+                }
+            }
+            count.max(1)
+        };
+        let line_count_at = |font_system: &mut FontSystem,
+                             buffer: &mut Buffer,
+                             width: f32|
+         -> usize {
+            buffer.set_size(font_system, Some(width.max(0.0)), None);
+            buffer.shape_until_scroll(font_system, false);
+            buffer.layout_runs().count()
+        };
+        let mut lo = 0.0f32;
+        let mut hi = full;
+        let mut scratch = self.items[idx].buffer.clone();
+        // The wrap width is monotone in the line count: wider fits more words
+        // per line. Bisect to the narrowest width whose line count still
+        // equals the word count -- that width is the widest word.
+        for _ in 0..24 {
+            let mid = (lo + hi) / 2.0;
+            let lines = line_count_at(&mut self.font_system, &mut scratch, mid);
+            if lines <= word_count {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
     /// Subpixel width for `measureText`/TextMetrics: the fractional line
     /// width quantized to 1/64 px, the resolution Chrome's 26.6 fixed-point
     /// pipeline reports. The layout path keeps its ceiled line width; only
@@ -4648,7 +4717,28 @@ Some((width, height, left, top, coverage))
         } else {
             self.items[idx].layout_wrap
         };
-        let (width, height) = self.measure_text_with_wrap(idx, width, wrap);
+        let (width, height) = if min_content_query {
+            // Bypass cosmic's width-0 line breaking (its offset-to-glyph
+            // matching misses on the macOS host PingFang data and merges
+            // words at width 0): bisect the wrap width on a cloned buffer so
+            // every shaped line holds exactly one word; the widest such line
+            // is the min-content width.
+            let width = self.measure_min_content_words(idx);
+            let height = {
+                let mut scratch = self.items[idx].buffer.clone();
+                scratch.set_wrap(&mut self.font_system, wrap);
+                scratch.set_size(&mut self.font_system, Some(width), None);
+                scratch.shape_until_scroll(&mut self.font_system, false);
+                let mut hh = 0.0f32;
+                for run in scratch.layout_runs() {
+                    hh = hh.max(run.line_top + run.line_height);
+                }
+                hh
+            };
+            (width, height)
+        } else {
+            self.measure_text_with_wrap(idx, width, wrap)
+        };
         taffy::Size { width, height }
     }
 

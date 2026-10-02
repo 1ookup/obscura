@@ -14709,6 +14709,16 @@ fn build_table(
             // grid area. Left in place, a `width:50%` cell would shrink to
             // half of its own already-halved track.
             cstyle.size.width = Dimension::auto();
+            // A caption cell stays out of the table's max-content width:
+            // Chromium sizes the table from its cells and lets the caption
+            // wrap to whatever width the table ends up at (its own margins
+            // shift it inside the border box). Pinning the span-ncols item
+            // to a 100% width makes its max-content contribution zero in
+            // taffy's intrinsic pass while the height still drives the row.
+            if caption_nodes.contains(cid) {
+                cstyle.size.width = taffy::Dimension::percent(1.0);
+                cstyle.min_size.width = taffy::Dimension::length(0.0);
+            }
             // Taffy's grid-item automatic minimum is an engine artifact here:
             // the table track has already collected the cell's min-content
             // contribution and owns final column sizing. Remove only the
