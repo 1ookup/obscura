@@ -3631,6 +3631,12 @@ fn negative_letter_spacing_changes_intrinsic_line_breaks() {
 
     assert_eq!(layout.styles[&tight_id].letter_spacing, Some(-1.8000001));
     assert_eq!(layout.styles[&reset_id].letter_spacing, Some(0.0));
+    // Chromium 149 on this host answers 120 for BOTH divs on 2026-10-03
+    // (three 40px line boxes each): its weight-500 runs shape with the real
+    // PingFang Medium face ('a' = 569/1000 em), which pushes this string to
+    // three lines at -1.8px tracking. Our weight-500 shaping tracks the
+    // narrower pre-host set and fits two lines. Revisit once weight-500
+    // shaping is same-sourced with the reference Medium face.
     assert_eq!(tight.height, 80.0, "negative tracking must shape to two lines: {tight:?}");
     assert_eq!(reset.height, 120.0, "`normal` must reset inherited tracking: {reset:?}");
 }
