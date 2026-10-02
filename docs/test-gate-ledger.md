@@ -342,3 +342,4 @@ run covers are then removed.
 - navigator modelContext rank (10-02): scoped: navigator tests 11/11; live gsLi5 o-group 122/122 aligned
 - IFC 1/64 snap (10-02): scoped: render+browser+js 1517/1517
 - geom probe (10-02): scoped: build ok; live capture maps HPcn5[0]
+- transform saturation (10-02): scoped: render+browser 767/767; live r40 HPcn5[2] still 33554430 (reads a clamped property, not gBCR)
