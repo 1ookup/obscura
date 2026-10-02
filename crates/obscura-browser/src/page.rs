@@ -7173,6 +7173,15 @@ impl Page {
             frame.navigation_start_ms = navigation_start_ms;
         }
         let dom = self.dom.as_ref().expect("checked above");
+        if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+            eprintln!(
+                "[csp-debug] frame={} url={} csp={:?} srcdoc={}",
+                frame_id,
+                document_url,
+                document_csp.as_deref().map(|c| c.chars().take(120).collect::<String>()),
+                request.srcdoc.is_some(),
+            );
+        }
         dom.set_document_scope(
             content_root,
             obscura_dom::DocumentScope {
