@@ -135,6 +135,9 @@ function _workerSerializeMessage(data) {
   if (typeof data === 'function' || typeof data === 'symbol') {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
+  if (typeof OffscreenCanvas === 'function' && data instanceof OffscreenCanvas) {
+    return JSON.stringify({ v: { __obscura_oc: [data.width, data.height] } });
+  }
   let payload;
   try { payload = JSON.stringify({ v: data }); }
   catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
@@ -293,6 +296,9 @@ function _workerDispatchBatch(id, batch) {
     if (entry.kind === 'error') { _workerDispatchError(worker, entry.message || 'Worker error'); continue; }
     let data;
     try { data = JSON.parse(entry.data).v; } catch (e) { continue; }
+    if (data && typeof data === 'object' && data.__obscura_oc) {
+      data = new OffscreenCanvas(data.__obscura_oc[0], data.__obscura_oc[1]);
+    }
     const evt = globalThis.__obscura_markTrusted(new MessageEvent('message', { data }));
     // A worker 'out' message handler runs in the creating context: it
     // executes under the construction-site label, not under whatever

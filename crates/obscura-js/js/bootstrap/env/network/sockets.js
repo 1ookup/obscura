@@ -126,8 +126,9 @@ if (typeof OffscreenCanvas === 'undefined') {
     get [Symbol.toStringTag]() { return 'ImageBitmap'; }
   };
 
-  globalThis.OffscreenCanvas = class OffscreenCanvas {
+  globalThis.OffscreenCanvas = class OffscreenCanvas extends EventTarget {
     constructor(width, height) {
+      super();
       if (arguments.length < 2) {
         throw new TypeError("Failed to construct 'OffscreenCanvas': 2 arguments required, but only "
           + arguments.length + ' present.');
@@ -139,15 +140,25 @@ if (typeof OffscreenCanvas === 'undefined') {
         oncontextlost: null, oncontextrestored: null,
       });
     }
-    get width() { return _offscreenCanvasState.get(this).width; }
+    get width() {
+      const state = _offscreenCanvasState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state.width;
+    }
     set width(value) {
       const state = _offscreenCanvasState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
     }
-    get height() { return _offscreenCanvasState.get(this).height; }
+    get height() {
+      const state = _offscreenCanvasState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state.height;
+    }
     set height(value) {
       const state = _offscreenCanvasState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
     }

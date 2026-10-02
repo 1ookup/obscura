@@ -2087,9 +2087,13 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         throw new DOMException('The object could not be cloned.', 'DataCloneError');
       }
       var payload;
-      try { payload = JSON.stringify({ v: data }); }
-      catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
-      if (payload === undefined) payload = '{}';
+      if (typeof OffscreenCanvas === 'function' && data instanceof OffscreenCanvas) {
+        payload = JSON.stringify({ v: { __obscura_oc: [data.width, data.height] } });
+      } else {
+        try { payload = JSON.stringify({ v: data }); }
+        catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+        if (payload === undefined) payload = '{}';
+      }
       Deno.core.ops.op_worker_post_to_page(payload);
     });
   } else {
@@ -2181,6 +2185,9 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
     var data;
     try { data = JSON.parse(payload).v; } catch (e) { return; }
+    if (data && typeof data === 'object' && data.__obscura_oc) {
+      data = new OffscreenCanvas(data.__obscura_oc[0], data.__obscura_oc[1]);
+    }
     // The user agent dispatches this one, so it is trusted. Worker payloads
     // routinely gate on the whole triple -- Turnstile ships a worker whose
     // handler is `e.isTrusted && '' === e.origin && null === e.source && eval(...)`
