@@ -10627,7 +10627,10 @@ mod tests {
         rows.sort();
         let mut expected = vec![
             (format!("{child_origin}/allow"), true, true),
-            (format!("{child_origin}/live-shape"), true, true),
+            // A sandboxed widget frame never isolates (Chrome reference
+            // answers crossOriginIsolated=false in the live challenge), so
+            // only the delegation grant bit stays true here.
+            (format!("{child_origin}/live-shape"), false, true),
             (format!("{child_origin}/no-allow"), false, false),
             (format!("{parent_origin}/same-child"), true, true),
         ];
@@ -10665,8 +10668,8 @@ mod tests {
         );
         assert_eq!(
             widget_children.iter().filter(|isolated| **isolated).count(),
-            2,
-            "the two delegated frames' children are the isolated ones: {widget_children:?}",
+            1,
+            "only the unsandboxed delegated frame's child is isolated: {widget_children:?}",
         );
 
         // An embedder without COOP isolates nothing anywhere in the tree.
@@ -15051,8 +15054,14 @@ fn frame_document_isolation(
         )
         && response_requires_cross_origin_embedding(response)
         && !response_denies_cross_origin_isolation(response)
-        && (!sandbox.active
-            || sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))
+        // A sandboxed browsing context never enters cross-origin isolation,
+        // even with allow-same-origin: the reference build answers
+        // crossOriginIsolated=false (and exposes no SharedArrayBuffer) in the
+        // challenge widget, whose frame carries sandbox="allow-same-origin
+        // allow-scripts allow-popups" alongside the COOP/COEP headers and the
+        // allow="cross-origin-isolated" delegation that would otherwise
+        // isolate an unsandboxed frame.
+        && !sandbox.active
 }
 
 fn is_text_like_content_type(content_type: Option<&str>) -> bool {
