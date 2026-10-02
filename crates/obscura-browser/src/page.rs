@@ -6421,6 +6421,15 @@ impl Page {
                     .active_document_root
                     .and_then(|root| self.dom.as_ref().and_then(|dom| dom.document_scope(root)))
                 {
+                    if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+                        eprintln!(
+                            "[csp-debug] inheritance frame={} parent={} parent_url={} parent_csp={:?}",
+                            frame_id,
+                            parent.frame_id,
+                            scope.url,
+                            scope.csp.as_deref().map(|c| c.chars().take(120).collect::<String>())
+                        );
+                    }
                     return FrameInheritance {
                         base_url: scope.base_url.clone(),
                         origin: scope.origin.clone(),
