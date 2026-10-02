@@ -1686,6 +1686,40 @@ const _chromeInterfaceShells = new Set();
   // `'sharedStorage' in window` with false -- the SharedStorage family is
   // origin-gated off in every shape we can observe -- so it is gone, and with
   // it the SharedStorage* constructors and ModelContext/WebMCPEvent.
+  // The SharedStorage family, ModelContext and WebMCPEvent are origin-trial
+  // surfaces on the reference build: absent from the top census, present in
+  // the challenges.cloudflare.com widget realm the challenge enumerates. Keep
+  // that split instead of a global install, which would read as extra keys on
+  // every other origin.
+  (function _installChallengeOriginTrialSurfaces() {
+    let origin = null;
+    try {
+      origin = _scopeOrigin(_callingFrameRoot())
+        || _inheritedDocumentOrigin()
+        || _scopeOrigin(0);
+    } catch (_error) { return; }
+    if (origin !== 'https://challenges.cloudflare.com') return;
+    if (typeof globalThis.sharedStorage === 'undefined') {
+      const sharedStorage = {};
+      Object.defineProperty(sharedStorage, Symbol.toStringTag,
+        { value: 'SharedStorage', configurable: true });
+      Object.defineProperty(globalThis, 'sharedStorage',
+        { get() { return sharedStorage; }, enumerable: true, configurable: true });
+    }
+    for (const name of ['ModelContext', 'WebMCPEvent',
+                        'SharedStorage', 'SharedStorageWorklet',
+                        'SharedStorageAppendMethod', 'SharedStorageClearMethod',
+                        'SharedStorageDeleteMethod', 'SharedStorageModifierMethod',
+                        'SharedStorageSetMethod']) {
+      if (typeof globalThis[name] !== 'undefined') continue;
+      const ctor = _markNative(function() {
+        throw new TypeError('Illegal constructor');
+      });
+      try { Object.defineProperty(ctor, 'length', { value: 0, configurable: true }); } catch (_e) {}
+      Object.defineProperty(globalThis, name,
+        { value: ctor, writable: true, enumerable: false, configurable: true });
+    }
+  })();
   for (const name of ['cookieStore', 'crashReport', 'documentPictureInPicture',
                       'viewport', 'launchQueue']) {
     if (typeof globalThis[name] !== 'undefined') continue;
