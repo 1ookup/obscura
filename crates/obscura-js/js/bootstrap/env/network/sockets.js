@@ -126,6 +126,36 @@ if (typeof OffscreenCanvas === 'undefined') {
     get [Symbol.toStringTag]() { return 'ImageBitmap'; }
   };
 
+
+// Diagnostic for the live OffscreenCanvas Illegal invocation pair: a brand
+// check that fails means the receiver reached this surface without its
+// internal state -- the snapshot names what the receiver actually is
+// (toString tag, constructor, prototype chain, own keys) and the stack.
+function _reportOffscreenBrand(site, receiver) {
+  try {
+    if (!(typeof window === 'undefined') && window.external
+      && window.external.tracelog) {
+      var chain = [];
+      var p = receiver;
+      for (var i = 0; i < 3 && p; i++) {
+        chain.push(p.constructor && p.constructor.name
+          ? p.constructor.name : String(p));
+        p = Object.getPrototypeOf(p);
+      }
+      var stack = '';
+      try { stack = String(new Error().stack || '').slice(0, 600); } catch (_e) {}
+      window.external.tracelog('oc-brand', JSON.stringify({
+        site: site,
+        toStr: Object.prototype.toString.call(receiver),
+        ctor: receiver && receiver.constructor && receiver.constructor.name,
+        chain: chain.join('>'),
+        keys: receiver ? Object.getOwnPropertyNames(receiver).slice(0, 8).join(',') : '',
+        stack: stack,
+      }));
+    }
+  } catch (_report) {}
+}
+
   globalThis.OffscreenCanvas = class OffscreenCanvas extends EventTarget {
     constructor(width, height) {
       super();
@@ -142,23 +172,35 @@ if (typeof OffscreenCanvas === 'undefined') {
     }
     get width() {
       const state = _offscreenCanvasState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) {
+        _reportOffscreenBrand('width.get', this);
+        throw new TypeError('Illegal invocation');
+      }
       return state.width;
     }
     set width(value) {
       const state = _offscreenCanvasState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) {
+        _reportOffscreenBrand('width.set', this);
+        throw new TypeError('Illegal invocation');
+      }
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
     }
     get height() {
       const state = _offscreenCanvasState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) {
+        _reportOffscreenBrand('height.get', this);
+        throw new TypeError('Illegal invocation');
+      }
       return state.height;
     }
     set height(value) {
       const state = _offscreenCanvasState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) {
+        _reportOffscreenBrand('height.set', this);
+        throw new TypeError('Illegal invocation');
+      }
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
       if (state.context) _canvas2dResizeFromCanvas(state.context);
     }
